@@ -19,9 +19,10 @@
 //! file the path names now. Where the directory is missing it watches the
 //! nearest one above it that is there, whose every change is a look (each
 //! finding no change until the file is made), so a file whose folder does
-//! not exist yet, or went with it, is heard once both are made. A file with
-//! nothing at all to arm on (every folder above it refused) is armed again
-//! every `REARM_EVERY`, and only while some file is unarmed.
+//! not exist yet, or went with it, is heard once both are made. A file no arm
+//! took (a folder refused it, descriptors ran out, or its folders kept being
+//! made while it armed) is armed again every `REARM_EVERY`, and only while
+//! some file is unarmed.
 //!
 //! The watch only tells: the host re-reads the file through the document's
 //! own capability and decides (reload a clean buffer in place, or offer
@@ -45,9 +46,8 @@ pub const SETTLE_CAP: Duration = Duration::from_millis(600);
 #[cfg(any(test, not(any(target_os = "macos", target_os = "linux"))))]
 const POLL_EVERY: Duration = Duration::from_millis(500);
 
-/// How often the watch arms again a file it could not arm (neither the file nor its directory
-/// is there: a folder deleted with the file, or not made yet), while one is left: no event
-/// tells it the folder came back.
+/// How often the watch arms again a file no arm took ([`Unarmed`]), while one is left: no event
+/// tells it the arm would take now.
 const REARM_EVERY: Duration = Duration::from_millis(500);
 
 /// Wakes a parked [`FileEvents::wait`] from another thread.
@@ -166,8 +166,10 @@ pub trait FileEvents: Send {
     /// `key` was armed on before.
     ///
     /// # Errors
-    /// The platform's, when neither the file nor any directory of its can be
-    /// armed.
+    /// An arm that did not take, which the watch arms again: the platform's,
+    /// when neither the file nor any directory of its can be armed or the file
+    /// is there but descriptors ran out, and [`io::ErrorKind::WouldBlock`]
+    /// when its folders were still being made after every look.
     fn arm(&mut self, key: u64, path: &Path) -> io::Result<()>;
 
     /// Stop hearing `key`.
@@ -334,10 +336,9 @@ fn watch_loop(
     }
 }
 
-/// The watched files no arm took (neither the file nor its directory is
-/// there), which the watch arms again every [`REARM_EVERY`] after the last
-/// arm that failed, while one is left; with none left the watch waits on
-/// events alone.
+/// The watched files no arm took ([`FileEvents::arm`]), which the watch arms
+/// again every [`REARM_EVERY`] after the last arm that failed, while one is
+/// left; with none left the watch waits on events alone.
 #[derive(Debug)]
 struct Unarmed {
     keys: BTreeSet<u64>,
@@ -515,10 +516,11 @@ impl FileEvents for PollEvents {
     }
 }
 
-/// How many times one arm looks again lower, where a missing folder of the
-/// file's was made while it armed: each look starts one folder lower, so a
-/// path made all at once settles in a few, and a folder made and taken away
-/// again and again cannot keep the watch thread arming.
+/// How many more times one arm looks, where a missing folder of the file's was
+/// made while it armed: each look starts again at the file's own folder. A
+/// path still being made when these run out fails the arm, which the watch
+/// arms again later, so a folder made and taken away again and again cannot
+/// keep the watch thread arming.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const ARM_AGAIN: usize = 8;
 
@@ -623,8 +625,15 @@ mod kqueue {
             })
         }
 
-        fn listen(&mut self, key: u64, path: &Path, directory: bool) -> io::Result<()> {
+        fn listen(
+            &mut self,
+            key: u64,
+            path: &Path,
+            directory: bool,
+            step: &mut impl FnMut(Listen, &Path) -> io::Result<()>,
+        ) -> io::Result<()> {
             let file = open_for_events(path, directory)?;
+            step(Listen::Opened, path)?;
             let fd = file.as_raw_fd();
             let fflags = if directory {
                 DIRECTORY_EVENTS
@@ -642,6 +651,10 @@ mod kqueue {
                     udata: std::ptr::null_mut(),
                 },
             )?;
+            // Gone or replaced before the filter took, whose event then never comes.
+            if !still_at(&file, path)? {
+                return Err(io::Error::from(io::ErrorKind::NotFound));
+            }
             self.keys.insert(fd, key);
             self.armed.entry(key).or_default().push(file);
             Ok(())
@@ -650,36 +663,90 @@ mod kqueue {
 
     impl KqueueEvents {
         /// Listen on the nearest folder of `path`'s that is there ([`super::folders_up`]): the
-        /// missing folder just below it, when that is not `path`'s own.
-        fn listen_folder(&mut self, key: u64, path: &Path) -> io::Result<Option<PathBuf>> {
-            let mut missing = None;
+        /// folder just below it that was missing, or `None` where that nearest one is `path`'s
+        /// own.
+        fn listen_folder(
+            &mut self,
+            key: u64,
+            path: &Path,
+            step: &mut impl FnMut(Listen, &Path) -> io::Result<()>,
+        ) -> io::Result<Option<PathBuf>> {
             for (directory, below) in super::folders_up(path) {
-                match self.listen(key, directory, true) {
-                    Ok(()) => return Ok(missing),
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        missing = Some(below.to_path_buf());
-                    }
+                let listened = self.listen(key, directory, true, step);
+                step(Listen::Answered, directory)?;
+                match listened {
+                    Ok(()) => return Ok((below != path).then(|| below.to_path_buf())),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                     Err(error) => return Err(error),
                 }
             }
             Err(io::Error::from(io::ErrorKind::NotFound))
         }
+
+        /// Listen on `path`'s folder, then on `path`, telling `step` how each goes.
+        ///
+        /// The folder goes first because it hears a file made but no write into one. Where
+        /// `path`'s own folder is there, a file made after its listen is heard there and one made
+        /// before it opens below. In the other order a file made between the two has no listener
+        /// of its own, and every later write into it goes unheard.
+        pub(super) fn arm_around(
+            &mut self,
+            key: u64,
+            path: &Path,
+            mut step: impl FnMut(Listen, &Path) -> io::Result<()>,
+        ) -> io::Result<()> {
+            for _ in 0..=super::ARM_AGAIN {
+                self.disarm(key);
+                let folder = self.listen_folder(key, path, &mut step);
+                let file = self.listen(key, path, false, &mut step);
+                step(Listen::Answered, path)?;
+                match folder {
+                    // Made between its failed open and the listen above it, which hears
+                    // nothing inside it: arm again, lower.
+                    Ok(Some(made)) if made.exists() => {}
+                    Ok(_) => return file_answer(file),
+                    Err(error) => return file.or(Err(error)),
+                }
+            }
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        }
+    }
+
+    /// Where a listen has got to, for [`KqueueEvents::arm_around`].
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) enum Listen {
+        /// The path opened, and its filter is not on yet.
+        Opened,
+        /// The listen has answered, either way.
+        Answered,
+    }
+
+    /// Whether `file` is still what `path` names.
+    fn still_at(file: &std::fs::File, path: &Path) -> io::Result<bool> {
+        use std::os::unix::fs::MetadataExt as _;
+        let held = file.metadata()?;
+        match std::fs::symlink_metadata(path) {
+            Ok(there) => Ok((held.dev(), held.ino()) == (there.dev(), there.ino())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// What an arm answers once its folder listens, given how the file's own listen went. A file
+    /// out of descriptors is armed again, since its folder hears no write into it. Any other
+    /// refusal would answer the same at every look, so the folder is what that file gets.
+    fn file_answer(file: io::Result<()>) -> io::Result<()> {
+        match file {
+            Err(error) if matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) => {
+                Err(error)
+            }
+            _ => Ok(()),
+        }
     }
 
     impl FileEvents for KqueueEvents {
         fn arm(&mut self, key: u64, path: &Path) -> io::Result<()> {
-            for again in 0..=super::ARM_AGAIN {
-                self.disarm(key);
-                let file = self.listen(key, path, false);
-                match self.listen_folder(key, path) {
-                    // Made between its failed open and the listen above it, which hears
-                    // nothing inside it: arm again, lower.
-                    Ok(Some(made)) if again < super::ARM_AGAIN && made.exists() => {}
-                    Ok(_) => return Ok(()),
-                    Err(error) => return file.or(Err(error)),
-                }
-            }
-            Ok(())
+            self.arm_around(key, path, |_, _| Ok(()))
         }
 
         fn disarm(&mut self, key: u64) {
@@ -942,7 +1009,7 @@ mod inotify {
 
     impl FileEvents for InotifyEvents {
         fn arm(&mut self, key: u64, path: &Path) -> io::Result<()> {
-            for again in 0..=super::ARM_AGAIN {
+            for _ in 0..=super::ARM_AGAIN {
                 let (wd, below) = self.watch_folder(path)?;
                 let name = below
                     .file_name()
@@ -956,11 +1023,11 @@ mod inotify {
                 }
                 // A folder made between its failed watch and the watch above it, which
                 // hears nothing inside it: arm again, lower.
-                if below == path || again == super::ARM_AGAIN || !below.exists() {
-                    break;
+                if below == path || !below.exists() {
+                    return Ok(());
                 }
             }
-            Ok(())
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
         }
 
         fn disarm(&mut self, key: u64) {

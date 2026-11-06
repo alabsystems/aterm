@@ -136,7 +136,7 @@ pub(crate) fn find(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
             entries.push(entry);
         }
     }
-    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    entries.sort_unstable_by(|a, b| a.path.cmp(&b.path));
     let end = crate::page::cut(End::Complete, &mut entries, inv.global.limit);
     let completeness = if tree.truncated {
         Completeness::Partial {

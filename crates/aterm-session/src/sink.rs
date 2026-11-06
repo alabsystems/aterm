@@ -2654,7 +2654,19 @@ mod tests {
     use std::io::Read;
     use std::os::fd::AsRawFd;
     use std::sync::Arc;
+    use std::sync::mpsc;
     use std::thread;
+
+    /// One message each time `sink` passes `park`.
+    pub(super) fn parks(sink: &SinkWriter, park: Seam) -> mpsc::Receiver<()> {
+        let (tx, rx) = mpsc::channel();
+        sink.seam_for_testing(move |seam| {
+            if seam == park {
+                let _ = tx.send(());
+            }
+        });
+        rx
+    }
 
     #[test]
     fn input_backlog_is_none_off_a_tty() {
@@ -2928,6 +2940,7 @@ mod tests {
         let sink = Arc::new(SinkWriter::new(writer.as_raw_fd()));
         let held = sink.shared.lock.lock().unwrap();
         let initial_epoch = sink.input_epoch();
+        let at_lock = parks(&sink, Seam::FrameLock);
 
         let blocked_sink = Arc::clone(&sink);
         let blocked = thread::spawn(move || {
@@ -2935,14 +2948,16 @@ mod tests {
                 .write_frame_with_receipt(b"A")
                 .expect("delayed blocking receipt")
         });
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        while sink.input_epoch() == initial_epoch {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "blocking writer never reserved its earlier attempt"
-            );
-            aterm_uds::deadline::poll_yield();
-        }
+        // A passes this seam only after it found the spill empty, so from here its one way on is
+        // the lock `held` keeps.
+        at_lock
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("blocking writer reached the fd lock");
+        assert_ne!(
+            sink.input_epoch(),
+            initial_epoch,
+            "blocking writer reserved its earlier attempt"
+        );
 
         let first = sink
             .write_frame_nonparking_with_receipt(b"B")
@@ -4014,6 +4029,7 @@ mod metered_body_tests {
 
 #[cfg(all(test, unix))]
 mod input_io_tests {
+    use super::tests::parks;
     use super::*;
     use std::io::Read;
     use std::os::unix::net::UnixStream;
@@ -4042,16 +4058,6 @@ mod input_io_tests {
 
     fn bracketed(body: &[u8]) -> Vec<u8> {
         [PASTE_OPEN, body, PASTE_CLOSE].concat()
-    }
-
-    fn parks(sink: &SinkWriter, park: Seam) -> mpsc::Receiver<()> {
-        let (tx, rx) = mpsc::channel();
-        sink.seam_for_testing(move |seam| {
-            if seam == park {
-                let _ = tx.send(());
-            }
-        });
-        rx
     }
 
     fn parked_after(parks: &mpsc::Receiver<()>) {

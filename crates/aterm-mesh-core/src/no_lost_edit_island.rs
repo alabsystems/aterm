@@ -3,10 +3,11 @@
 
 // P3, no lost edit: the decisions of `no_lost_edit.rs` and their laws, proved for every size by
 // the kernel on every Trust build. The spec kernels are what no_lost_edit.rs's contract! kernels
-// state they compute; the folds are its Gate::of, settle_reach, publish_forgets, Verdict::of and
-// land, one for one; the Worlds of sections 2 and 8 ask the kernels as parameters, and
-// `no_lost_edit_binding_island.rs` instantiates them with the compiled Rust. `no_lost_edit::tests`
-// recomputes section 11's answer sheets from the Rust and reads their words from this file.
+// state they compute; the folds are its Gate::of, settle_reach, publish_forgets, Verdict::of,
+// land and Takeover::of, one for one; the Worlds of sections 2, 8 and 13 ask the kernels as
+// parameters, and `no_lost_edit_binding_island.rs` instantiates them with the compiled Rust.
+// Section 12 binds the held-draft World's takesOver to server.rs takes_over. `no_lost_edit::tests`
+// recomputes the answer sheets of sections 11 to 13 from the Rust and reads their words here.
 clean {
     -- The decisions' scalar kernels. Each `contract!` kernel of
     -- crates/aterm-mesh-core/src/no_lost_edit.rs states `ensures result ==
@@ -32,6 +33,42 @@ clean {
     def spec_write_signs (done standsOver takeBack : Bool) : Bool := !done && (standsOver && !takeBack)
     -- spec_write_overtaken: not done, and the log holds none of its bases, or a take-back.
     def spec_write_overtaken (done standsOver takeBack : Bool) : Bool := !done && (!standsOver || takeBack)
+    -- spec_takes_head (server.rs takes_over): the pin holds, and it was replaced (no
+    -- sequence and no parents check), or the envelope is newer, carries the held
+    -- chain on, and names the held head among its parents wherever it or the held
+    -- vault names parents.
+    def spec_takes_head (pinOk replaced notNewer chainOk namesParents heldParented amongParents : Bool) : Bool :=
+      pinOk && (replaced || (!notNewer && (chainOk && ((!namesParents && !heldParented) || amongParents))))
+    -- spec_holds_version: the version held (its sequence and bytes), under a pin that
+    -- holds and was not replaced.
+    def spec_holds_version (pinOk replaced notNewer sameVersion : Bool) : Bool :=
+      pinOk && (!replaced && (notNewer && sameVersion))
+    -- spec_refuses_not_newer: 409, not newer than the version held and not it.
+    def spec_refuses_not_newer (pinOk replaced notNewer sameVersion : Bool) : Bool :=
+      pinOk && (!replaced && (notNewer && !sameVersion))
+    -- spec_refuses_chain: 403, newer but it drops or changes a held link.
+    def spec_refuses_chain (pinOk replaced notNewer chainOk : Bool) : Bool :=
+      pinOk && (!replaced && (!notNewer && !chainOk))
+    -- spec_refuses_parents: 409, newer and carries the chain on, but parents are named
+    -- and leave the held head out.
+    def spec_refuses_parents (pinOk replaced notNewer chainOk namesParents heldParented amongParents : Bool) : Bool :=
+      pinOk && (!replaced && (!notNewer && (chainOk && ((namesParents || heldParented) && !amongParents))))
+    -- spec_hold_adopts (adopt_held_draft): the store took the hold's records with no
+    -- error, and the head's stamp is complete with them.
+    def spec_hold_adopts (ingested completes : Bool) : Bool := ingested && completes
+    -- spec_unversioned_goes: records.drafted goes only once it reads and the records
+    -- store holds every record in it.
+    def spec_unversioned_goes (reads allStored : Bool) : Bool := reads && allStored
+    -- spec_drafted_keeps (keep_drafted_until): a version's records are kept only
+    -- while its hold is there.
+    def spec_drafted_keeps (held : Bool) : Bool := held
+    -- spec_spine_settles (forget_landed_draft): a landed version settles the other
+    -- holds by its spine only where it drafted no records or kept them.
+    def spec_spine_settles (drafted kept : Bool) : Bool := !drafted || kept
+    -- spec_draft_refuses (draft_document_diff_with): an edit that writes is refused
+    -- where this Mac's waiting writes, or its held drafts, do not read.
+    def spec_draft_refuses (writes waitingUnread heldUnread : Bool) : Bool :=
+      writes && (waitingUnread || heldUnread)
 
     namespace AtermMeshNoLostEdit
 
@@ -51,6 +88,9 @@ clean {
       passSigns : Bool → Bool → Bool → Bool
       signs : Bool → Bool → Bool → Bool
       overtaken : Bool → Bool → Bool → Bool
+      draftedKeeps : Bool → Bool
+      spineSettles : Bool → Bool → Bool
+      draftRefuses : Bool → Bool → Bool → Bool
 
     def Exact (K : Kernels) : Prop :=
       (∀ a b, K.stays a b = spec_url_stays a b)
@@ -60,14 +100,19 @@ clean {
         ∧ (∀ a b c, K.passSigns a b c = spec_pass_signs a b c)
         ∧ (∀ a b c, K.signs a b c = spec_write_signs a b c)
         ∧ (∀ a b c, K.overtaken a b c = spec_write_overtaken a b c)
+        ∧ (∀ a, K.draftedKeeps a = spec_drafted_keeps a)
+        ∧ (∀ a b, K.spineSettles a b = spec_spine_settles a b)
+        ∧ (∀ a b c, K.draftRefuses a b c = spec_draft_refuses a b c)
 
     def spec : Kernels :=
       Kernels.mk spec_url_stays spec_hold_waits spec_answer_refuses spec_pending_keeps
-        spec_pass_signs spec_write_signs spec_write_overtaken
+        spec_pass_signs spec_write_signs spec_write_overtaken spec_drafted_keeps spec_spine_settles
+        spec_draft_refuses
 
     theorem spec_exact : Exact spec :=
       ⟨fun _ _ => rfl, fun _ _ => rfl, fun _ _ => rfl, fun _ _ => rfl,
-       fun _ _ _ => rfl, fun _ _ _ => rfl, fun _ _ _ => rfl⟩
+       fun _ _ _ => rfl, fun _ _ _ => rfl, fun _ _ _ => rfl, fun _ => rfl, fun _ _ => rfl,
+       fun _ _ _ => rfl⟩
 
     theorem ft {P : Prop} (h : false = true) : P := by cases h
 
@@ -109,9 +154,18 @@ clean {
       cases d <;> cases s <;> cases b <;> decide
     theorem overtaken_true (K : Kernels) (hK : Exact K) (d s b : Bool) (h : K.overtaken d s b = true) :
         d = false := by
-      rw [hK.2.2.2.2.2.2 d s b] at h
+      rw [hK.2.2.2.2.2.2.1 d s b] at h
       revert h
       cases d <;> cases s <;> cases b <;> decide
+    theorem drafted_keeps_true (K : Kernels) (hK : Exact K) (a : Bool) (h : K.draftedKeeps a = true) :
+        a = true := by
+      rw [hK.2.2.2.2.2.2.2.1 a] at h
+      exact h
+    theorem spine_settles_true (K : Kernels) (hK : Exact K) (d k : Bool) (h : K.spineSettles d k = true) :
+        d = false ∨ k = true := by
+      rw [hK.2.2.2.2.2.2.2.2.1 d k] at h
+      revert h
+      cases d <;> cases k <;> decide
 
     -- ===========================================================================
     -- 2. HELD DRAFTS (one-mesh W2): the hold of each version a publish drafted
@@ -247,9 +301,12 @@ clean {
     --   arrive v x pinOk               the server reads it; takes_over decides; the
     --                                  reply may be lost (no event)
     --   refusedAll v                   forget_held_draft: every answer refuses
-    --   keep v                         keep_drafted_until after some server took it
-    --   landed v took                  forget_landed_draft: its hold goes, the
-    --                                  others settle with its spine and took
+    --   keep v                         keep_drafted_until after some server took it,
+    --                                  while its hold is there (drafted_keeps)
+    --   landed v took                  forget_landed_draft, its records kept, none,
+    --                                  or its hold gone: its hold goes, the others
+    --                                  settle with took, and with its spine where
+    --                                  it kept its records or drafted none
     --   adopt v s                      adopt_held_draft: server s serves v, the hold
     --                                  completes its stamp; settle by descent only
     --   republish v s                  a mirror, put-back or another Mac's publish:
@@ -291,17 +348,23 @@ clean {
         { w with hold := upd w.hold v none, phase := upd w.phase v 3 }
       else w
 
-    def stKeep (w : World) (v : Nat) : World :=
-      if decide (w.phase v = 2) && w.mine v && anyL (fun x => isTrueOpt (w.res v x)) (w.reach v) then
+    def stKeep (K : Kernels) (w : World) (v : Nat) : World :=
+      if decide (w.phase v = 2) && w.mine v && anyL (fun x => isTrueOpt (w.res v x)) (w.reach v)
+         && K.draftedKeeps (isHeld (w.hold v)) then
         { w with kept := upd w.kept v true }
       else w
+
+    -- The spine a landed version settles the other holds by: its own where it
+    -- drafted no records or kept them (spine_settles), else none (reach alone).
+    def landSpine (K : Kernels) (w : World) (v : Nat) : List Nat :=
+      if K.spineSettles (w.recs v) (w.kept v) = true then w.spine v else []
 
     def stLanded (K : Kernels) (one : Nat → Bool) (w : World) (v : Nat) (tk : List Nat) : World :=
       if decide (w.phase v = 2) && w.mine v && nonEmpty tk
          && allL (fun x => elem x (w.reach v) && isTrueOpt (w.res v x)) tk
-         && (!w.recs v || w.kept v) then
+         && (!w.recs v || w.kept v || !isHeld (w.hold v)) then
         { w with phase := upd w.phase v 3,
-                 hold := settleAll K one { w with hold := upd w.hold v none } (w.seq v) (w.spine v) tk }
+                 hold := settleAll K one { w with hold := upd w.hold v none } (w.seq v) (landSpine K w v) tk }
       else w
 
     def stAdopt (K : Kernels) (one : Nat → Bool) (w : World) (v s : Nat) : World :=
@@ -324,7 +387,7 @@ clean {
       | Event.send v x => stSend w v x
       | Event.arrive v x ok => stArrive w v x ok
       | Event.refusedAll v => stRefused K w v
-      | Event.keep v => stKeep w v
+      | Event.keep v => stKeep K w v
       | Event.landed v tk => stLanded K one w v tk
       | Event.adopt v s => stAdopt K one w v s
       | Event.republish v s => stRepublish w v s
@@ -1601,7 +1664,8 @@ clean {
           have t := hH u xs e1 e2 x e3 e4
           exact ⟨t.1, by rw [esrv]; exact hd_pastEq w w' eseq ehead _ _ t.2⟩
 
-    theorem hd_keep (one : Nat → Bool) (w : World) (v : Nat) (hi : HeldInv one w) : HeldInv one (stKeep w v) := by
+    theorem hd_keep (K : Kernels) (one : Nat → Bool) (w : World) (v : Nat) (hi : HeldInv one w) :
+        HeldInv one (stKeep K w v) := by
       unfold stKeep
       refine hd_ite one _ _ _ ?_ hi
       intro _
@@ -1612,11 +1676,12 @@ clean {
     theorem hd_landedInv (K : Kernels) (hK : Exact K) (one : Nat → Bool) (w w' : World) (v : Nat) (tk : List Nat)
         (hi : HeldInv one w) (hph : w.phase v = 2) (hm : w.mine v = true) (hne : nonEmpty tk = true)
         (htk : ∀ x, elem x tk = true → elem x (w.reach v) = true ∧ w.res v x = some true)
-        (hrk : w.recs v = true → w.kept v = true)
+        (hrk : w.recs v = true → w.kept v = true ∨ w.hold v = none) (sp : List Nat)
+        (hsp : ∀ u, elem u sp = true → elem u (w.spine v) = true ∧ (w.kept v = true ∨ w.recs v = false))
         (eseq : w'.seq = w.seq) (espine : w'.spine = w.spine) (emine : w'.mine = w.mine) (erecs : w'.recs = w.recs)
         (ereach : w'.reach = w.reach) (ephase : w'.phase = upd w.phase v 3) (ehead : w'.head = w.head)
         (esrv : w'.srv = w.srv) (evia : w'.via = w.via) (einf : w'.inflight = w.inflight) (eres : w'.res = w.res)
-        (ehold : ∀ u, w'.hold u = settleOne K one (w.seq v) (w.spine v) tk u (w.seq u) (upd w.hold v none u))
+        (ehold : ∀ u, w'.hold u = settleOne K one (w.seq v) sp tk u (w.seq u) (upd w.hold v none u))
         (ekept : w'.kept = w.kept) : HeldInv one w' := by
       have hN := hi.1
       have hV := hi.2.1
@@ -1630,10 +1695,6 @@ clean {
       have hHd := hi.2.2.2.2.2.2.2.2.2
       have hv0 : ¬ (v = 0) := fun e => by rw [e, hZ] at hph; exact hd_02 hph
       have stv : Stored w v := Exists.elim (hd_nonEmpty tk hne) (fun x hx => ⟨x, (htk x hx).2⟩)
-      have kr : w.kept v = true ∨ w.recs v = false := by
-        cases e : w.recs v with
-        | false => exact Or.inr rfl
-        | true => exact Or.inl (hrk e)
       have phm : ∀ u, 2 ≤ w.phase u → 2 ≤ w'.phase u := fun u a => by
         rw [ephase]; exact hd_phMono w.phase v 3 u hd_le23 a
       -- A one-server URL that took v is past every other version of v's sequence or lower.
@@ -1692,9 +1753,20 @@ clean {
         rw [ekept] at h4
         rw [ehold u] at h5
         by_cases huv : u = v
-        · rw [huv] at h3
-          rw [huv, hrk h3] at h4
-          exact hd_tf h4
+        · -- v itself: its records were kept (no case here), or its hold had gone.
+          rw [huv] at h2 h3 h4
+          rw [huv]
+          have hvn : w.hold v = none := Or.elim (hrk h3) (fun k => hd_tf (Eq.trans k.symm h4)) (fun n => n)
+          have lb : Live one w' v → Live one w v := hd_liveBack one w w' v (fun s a => by rw [ehead] at a; exact a)
+            (by rw [ereach])
+            (fun y c => hd_canBack one w w' v y (by rw [evia]) (by rw [einf]) (fun _ => hph)
+              (fun s p => hd_pastEq w w' eseq ehead s v p) (fun _ => by rw [esrv]) c)
+          have cf : Covered w v → Covered w' v := hd_covFwd w w' v
+            (fun h _ => by rw [espine, emine, erecs]; exact ⟨rfl, rfl, rfl⟩)
+            (fun h a => by rw [ekept]; exact a) (fun h y a => by rw [eres]; exact a)
+          cases hN v (show 2 ≤ w.phase v by rw [hph]; exact hd_le22) h2 h3 h4 hvn with
+          | inl nl => exact Or.inl (fun l => nl (lb l))
+          | inr c => exact Or.inr (cf c)
         · rw [ephase, hd_updO _ _ _ _ huv] at h1
           rw [hd_updO _ _ _ _ huv] at h5
           have lb : Live one w' u → Live one w u := hd_liveBack one w w' u (fun s a => by rw [ehead] at a; exact a)
@@ -1712,13 +1784,14 @@ clean {
             | inr c => exact Or.inr (cf c)
           | some r =>
             rw [eh] at h5
-            have h5' : settleHold K one (w.seq v) (w.spine v) tk u (w.seq u) r = none := h5
-            cases settle_drops_only_on_proof K hK one (w.seq v) (w.spine v) tk u (w.seq u) r h5' with
+            have h5' : settleHold K one (w.seq v) sp tk u (w.seq u) r = none := h5
+            cases settle_drops_only_on_proof K hK one (w.seq v) sp tk u (w.seq u) r h5' with
             | inl d =>
+              have ds := hsp u d
               refine Or.inr ⟨v, ?_, ?_, ?_, ?_⟩
-              · rw [espine]; exact d
+              · rw [espine]; exact ds.1
               · rw [emine]; exact hm
-              · rw [ekept, erecs]; exact kr
+              · rw [ekept, erecs]; exact ds.2
               · exact Exists.elim stv (fun x e => ⟨x, by rw [eres]; exact e⟩)
             | inr g =>
               exact Exists.elim g.2.2 (fun xs hx => by
@@ -1741,7 +1814,7 @@ clean {
             exact hd_sn e1.symm
           | some r =>
             rw [eh] at e1
-            have e1' : settleHold K one (w.seq v) (w.spine v) tk u (w.seq u) r = some (Reach.known xs) := e1
+            have e1' : settleHold K one (w.seq v) sp tk u (w.seq u) r = some (Reach.known xs) := e1
             cases hd_settleSome K hK one _ _ _ _ _ r _ e1' with
             | inl same =>
               rw [← same] at eh
@@ -1784,6 +1857,21 @@ clean {
         | inl z => exact Or.inl z
         | inr p => exact Or.inr (phm u p)
 
+    -- The spine a landing settles by names a version only where the landed one
+    -- kept its records or drafted none.
+    theorem hd_landSpine (K : Kernels) (hK : Exact K) (w : World) (v : Nat) :
+        ∀ u, elem u (landSpine K w v) = true → elem u (w.spine v) = true ∧ (w.kept v = true ∨ w.recs v = false) := by
+      intro u h
+      unfold landSpine at h
+      cases hs : K.spineSettles (w.recs v) (w.kept v) with
+      | false => rw [hs] at h; exact ft h
+      | true =>
+        rw [hs] at h
+        refine ⟨h, ?_⟩
+        cases spine_settles_true K hK _ _ hs with
+        | inl d => exact Or.inr d
+        | inr k => exact Or.inl k
+
     theorem hd_landed (K : Kernels) (hK : Exact K) (one : Nat → Bool) (w : World) (v : Nat) (tk : List Nat)
         (hi : HeldInv one w) : HeldInv one (stLanded K one w v tk) := by
       unfold stLanded
@@ -1799,7 +1887,14 @@ clean {
         (fun e => by
           cases hd_or (hd_andR g3) with
           | inl n => rw [e] at n; exact ft n
-          | inr k => exact k)
+          | inr r =>
+            cases hd_or r with
+            | inl k => exact Or.inl k
+            | inr n =>
+              cases eh : w.hold v with
+              | none => exact Or.inr rfl
+              | some x => rw [eh] at n; exact ft n)
+        (landSpine K w v) (hd_landSpine K hK w v)
         rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl (fun u => rfl) rfl
 
     -- ---- adopt: v's records are kept; the others settle by descent only (no server
@@ -2108,7 +2203,7 @@ clean {
         | send v x => exact hd_send one w v x hi
         | arrive v x ok => exact hd_arrive one w v x ok hi
         | refusedAll v => exact hd_refused K hK one w v hi
-        | keep v => exact hd_keep one w v hi
+        | keep v => exact hd_keep K one w v hi
         | landed v tk => exact hd_landed K hK one w v tk hi
         | adopt v s => exact hd_adopt K hK one w v s hi
         | republish v s => exact hd_republish one w v s hi
@@ -2211,6 +2306,24 @@ clean {
     theorem hold_first_sends_nothing_unheld : lostAt (run spec oneAll movesNone w0 crashAfterPut) 1 1 = false := rfl
     theorem put_before_hold_loses_v1 : lostAt (runSendFirst spec oneAll movesNone w0 crashAfterPut) 1 1 = true := rfl
 
+    -- The landed spine's gate (spine_settles): v3, drafted from v2 with v1 left out of its spine
+    -- (capped at MAX_PARENTS), lands on s2 first and settles v2's hold by descent, so v2's
+    -- records are never kept; v2 then lands on s2, and settles the other holds by reach alone.
+    def cappedSpine : List Event :=
+      [ Event.draft 1 0 [0] true true [1], Event.hold 1 false, Event.send 1 1, Event.arrive 1 1 true,
+        Event.draft 2 1 [1, 0] true true [2], Event.hold 2 false, Event.send 2 2, Event.arrive 2 2 true,
+        Event.draft 3 2 [2, 0] true true [2], Event.hold 3 false, Event.send 3 2, Event.arrive 3 2 true,
+        Event.keep 3, Event.landed 3 [2], Event.landed 2 [2] ]
+
+    theorem capped_spine_keeps_nothing_of_v2 : (run spec oneAll movesNone w0 cappedSpine).kept 2 = false := rfl
+    theorem spine_gate_keeps_v1 : lostAt (run spec oneAll movesNone w0 cappedSpine) 1 1 = false := rfl
+
+    -- Settling by the spine whatever became of the records (SPINE_ALWAYS): v2's spine names v1,
+    -- whose hold goes while s1 serves it.
+    def spineAlways : Kernels := { spec with spineSettles := fun _ _ => true }
+
+    theorem spine_without_kept_records_loses_v1 : lostAt (run spineAlways oneAll movesNone w0 cappedSpine) 1 1 = true := rfl
+
 
     -- ===========================================================================
     -- 8. WAITING WRITES (one-mesh M4, W3): the [everyone] writes a publish keeps
@@ -2218,9 +2331,17 @@ clean {
     --    the pass that signs them. Writes are ids from 1 in publish order (a later
     --    publish's set is a later set); names and values are Nat (value 0: absent,
     --    a take-back's value); a write's bases are the values it may be signed over.
-    --    One event is one state-lock section; a publish, from before its draft reads
-    --    the log until its pending set is written, is one event because it holds
-    --    its claim (.everyone.claim), which no pass signs through.
+    --    One event is one state-lock section. A publish whose writes wait, from
+    --    before its draft reads the log until its hold and pending set are written,
+    --    is one event: it holds this Mac's draft turn (draft_turn, .everyone.turn),
+    --    in which no other publish of this Mac drafts, and its claim
+    --    (.everyone.claim), which no pass signs through. A publish whose records
+    --    write a name directly (a direct draft, ids from 1) is its steps: the draft
+    --    in its turn, the hold that ends the turn (hold_drafted), and the keep of
+    --    its records once a server took its version (keep_drafted_until, only while
+    --    its hold is there) or the hold's going unkept (a refusal, a descent). A
+    --    pass defers each name a direct draft in flight writes, as it defers each
+    --    name a pending write writes: their records are not in the log it reads.
     -- ===========================================================================
 
     -- lastN n p: the largest i below n with p i, or 0 (no write is 0).
@@ -2246,6 +2367,14 @@ clean {
       passRead : Nat → Nat        -- per name, the write the last pass settled (0: none)
       fate : Nat → Nat            -- ghost: 0 none, 1 signed or done, 2 overtaken, 3 replaced, 4 dropped
       overBy : Nat → Nat          -- ghost: the write that held the name when one was overtaken
+      holdUnread : Bool           -- a held draft does not read (W3: never read as none)
+      dnext : Nat                 -- every direct draft id below dnext is born
+      dnm : Nat → Nat             -- a direct draft's name
+      dval : Nat → Nat            -- the value its records put there
+      dstamp : Nat → Nat          -- next at its draft: the writes born before it are below
+      dphase : Nat → Nat          -- 0 unborn, 1 drafting (its turn), 2 held, 3 kept or gone
+      hdirect : Nat → Nat         -- per name, the stamp of the direct draft whose kept value the log holds (0: none)
+      overD : Nat → Nat           -- ghost: that stamp at the name when a write was overtaken (0: none)
 
     inductive WEvent where
       -- publish v k names vals bases opened: writes next .. next+k-1 pending on v
@@ -2262,6 +2391,13 @@ clean {
       | other : Nat → Nat → WEvent    -- another write of a name (another Mac, a rotation's cascade)
       | due : Bool → WEvent
       | unreadable : Bool → WEvent
+      -- directDraft n x: a publish of this Mac drafts records that write name n to
+      -- x directly, in its turn (no other publish of this Mac drafts meanwhile)
+      | directDraft : Nat → Nat → WEvent
+      | directHold : Nat → WEvent     -- hold_drafted: its hold is written, its turn ends
+      | keep : Nat → WEvent           -- keep_drafted_until: its records enter the log
+      | unhold : Nat → WEvent         -- its hold goes unkept, or its publish ends before it
+      | holdUnreadable : Bool → WEvent
 
     -- Whether write i is born, a later pending write j of its name lands with S.
     def laterLands (w : WWorld) (S : Nat → Bool) (i : Nat) : Bool :=
@@ -2282,8 +2418,20 @@ clean {
              || (!(decide (i = 0)) && (decide (w.waitOf (w.nm i) = i) && !(decide (landingOf w S (w.nm i) = 0))))
           then 3 else w.fate i }
 
-    -- A pending write of this Mac writes name n: a pass leaves n's waiting write for it.
-    def deferredW (w : WWorld) (n : Nat) : Bool := anyN w.next (fun j => w.pend j && decide (w.nm j = n))
+    -- A direct draft of this Mac writes name n, drafted and not yet kept or gone:
+    -- its records are this Mac's own edit in flight, which the log a pass reads
+    -- does not hold yet.
+    def heldW (w : WWorld) (n : Nat) : Bool :=
+      anyN w.dnext (fun d => (decide (w.dphase d = 1) || decide (w.dphase d = 2)) && decide (w.dnm d = n))
+
+    -- A pending write of this Mac writes name n, or a direct draft of this Mac in
+    -- flight does (heldW), or a held draft does not read and may write any name
+    -- (W3): a pass leaves n's waiting write for it. Signed under a direct draft in
+    -- flight, the write would meet that draft's records as a concurrent write of
+    -- the name once they are kept, and an earlier edit's keep would take the place
+    -- of the later edit the pass signed (LaterKept).
+    def deferredW (w : WWorld) (n : Nat) : Bool :=
+      anyN w.next (fun j => w.pend j && decide (w.nm j = n)) || (w.holdUnread || heldW w n)
 
     -- Verdict::of: 0 leaves, 1 done, 2 overtaken, 3 signs.
     def verdictOf (K : Kernels) (deferred done standsOver takeBack : Bool) : Nat :=
@@ -2313,7 +2461,11 @@ clean {
           else w.fate i,
         overBy := fun i =>
           if !(decide (i = 0)) && (decide (w.waitOf (w.nm i) = i) && decide (passVerdict K w (w.nm i) = 2))
-          then w.holder (w.nm i) else w.overBy i }
+          then w.holder (w.nm i) else w.overBy i,
+        hdirect := fun n => if passVerdict K w n = 3 then 0 else w.hdirect n,
+        overD := fun i =>
+          if !(decide (i = 0)) && (decide (w.waitOf (w.nm i) = i) && decide (passVerdict K w (w.nm i) = 2))
+          then w.hdirect (w.nm i) else w.overD i }
 
     def signW (K : Kernels) (opens : Bool) (w : WWorld) : WWorld :=
       if K.passSigns w.due opens (!w.unread) = true then signBody K w else w
@@ -2336,22 +2488,43 @@ clean {
         pend := fun i => if w.next ≤ i ∧ i < w.next + k then true else w.pend i,
         used := upd w.used v true }
 
-    -- A publish's guard: v is a new version, no pending set fails to open (a
-    -- publish that keeps a write refuses then), every version it opened is
-    -- stored, its names are distinct, each write's bases hold what the log holds
-    -- at its name (the log's value the draft read is one of a write's bases), and
-    -- a take-back to absent is drafted only where the log holds none (everyone_edit
-    -- writes the log's value back otherwise).
-    def publishOk (w : WWorld) (v k : Nat) (names vals : Nat → Nat) (bases : Nat → Nat → Bool) (opened : Nat → Bool) : Bool :=
-      !(w.used v) && !(w.unread) && decide (0 < k)
+    -- A publish's guard: v is a new version, its draft is not refused for writes
+    -- that do not read (draft_refuses: no pending set fails to open, and no held
+    -- draft, as hu says of them), every version it opened is stored, its names are
+    -- distinct, each write's bases hold what the log holds at its name (the log's
+    -- value the draft read is one of a write's bases), and a take-back to absent is
+    -- drafted only where the log holds none (everyone_edit writes the log's value
+    -- back otherwise).
+    def pubBase (K : Kernels) (hu : Bool) (w : WWorld) (v k : Nat) (names vals : Nat → Nat)
+        (bases : Nat → Nat → Bool) (opened : Nat → Bool) : Bool :=
+      !(w.used v) && !(K.draftRefuses (decide (0 < k)) w.unread hu) && decide (0 < k)
         && allN w.next (fun i => !(w.pend i && opened (w.ver i)) || w.stored (w.ver i))
         && allN k (fun a => allN k (fun b => decide (a = b) || !(decide (names a = names b))))
         && allN k (fun a => bases a (w.log (names a)))
         && allN k (fun a => !(decide (vals a = 0)) || decide (w.log (names a) = 0))
 
+    -- It is the publish's turn: no direct draft of this Mac is between its draft and
+    -- its hold (draft_turn).
+    def turnFree (w : WWorld) : Bool := allN w.dnext (fun d => !(decide (w.dphase d = 1)))
+
+    -- Each write's bases hold what each held draft of its name leaves there
+    -- (held_values): that publish's records enter the log only once it keeps them.
+    def heldIn (w : WWorld) (k : Nat) (names : Nat → Nat) (bases : Nat → Nat → Bool) : Bool :=
+      allN k (fun a => allN w.dnext (fun d =>
+        !(decide (w.dphase d = 2) && decide (w.dnm d = names a)) || bases a (w.dval d)))
+
+    def publishOk (K : Kernels) (w : WWorld) (v k : Nat) (names vals : Nat → Nat) (bases : Nat → Nat → Bool)
+        (opened : Nat → Bool) : Bool :=
+      pubBase K w.holdUnread w v k names vals bases opened && (turnFree w && heldIn w k names bases)
+
+    -- keep_drafted_until of direct draft d: its value enters the log at its name.
+    def keepBody (w : WWorld) (d : Nat) : WWorld :=
+      { w with log := upd w.log (w.dnm d) (w.dval d), holder := upd w.holder (w.dnm d) 0,
+               hdirect := upd w.hdirect (w.dnm d) (w.dstamp d), dphase := upd w.dphase d 3 }
+
     def wstep (K : Kernels) (w : WWorld) : WEvent → WWorld
       | WEvent.publish v k names vals bases opened =>
-          if publishOk w v k names vals bases opened = true then pushW (landW K opened w) v k names vals bases
+          if publishOk K w v k names vals bases opened = true then pushW (landW K opened w) v k names vals bases
           else w
       | WEvent.stored v => if w.refused v then w else { w with stored := upd w.stored v true }
       | WEvent.dropped v =>
@@ -2364,9 +2537,20 @@ clean {
           else w
       | WEvent.signPass opens => signW K opens w
       | WEvent.settlePass => settleW w
-      | WEvent.other n x => { w with log := upd w.log n x, holder := upd w.holder n 0 }
+      | WEvent.other n x => { w with log := upd w.log n x, holder := upd w.holder n 0, hdirect := upd w.hdirect n 0 }
       | WEvent.due b => { w with due := b }
       | WEvent.unreadable b => { w with unread := b }
+      | WEvent.directDraft n x =>
+          if turnFree w = true then
+            { w with dnext := w.dnext + 1, dnm := upd w.dnm w.dnext n, dval := upd w.dval w.dnext x,
+                     dstamp := upd w.dstamp w.dnext w.next, dphase := upd w.dphase w.dnext 1 }
+          else w
+      | WEvent.directHold d => if decide (w.dphase d = 1) = true then { w with dphase := upd w.dphase d 2 } else w
+      | WEvent.keep d => if K.draftedKeeps (decide (w.dphase d = 2)) = true then keepBody w d else w
+      | WEvent.unhold d =>
+          if (decide (w.dphase d = 1) || decide (w.dphase d = 2)) = true then { w with dphase := upd w.dphase d 3 }
+          else w
+      | WEvent.holdUnreadable b => { w with holdUnread := b }
 
     def wrun (K : Kernels) (w : WWorld) : List WEvent → WWorld
       | [] => w
@@ -2376,7 +2560,9 @@ clean {
       { next := 1, nm := fun _ => 0, val := fun _ => 0, bs := fun _ _ => false, ver := fun _ => 0,
         used := fun _ => false, pend := fun _ => false, waitOf := fun _ => 0, log := fun _ => 0,
         holder := fun _ => 0, stored := fun v => v == 0, refused := fun _ => false, unread := false,
-        due := false, passRead := fun _ => 0, fate := fun _ => 0, overBy := fun _ => 0 }
+        due := false, passRead := fun _ => 0, fate := fun _ => 0, overBy := fun _ => 0,
+        holdUnread := false, dnext := 1, dnm := fun _ => 0, dval := fun _ => 0, dstamp := fun _ => 0,
+        dphase := fun _ => 0, hdirect := fun _ => 0, overD := fun _ => 0 }
 
     def WaitSpec (K : Kernels) : StateMachine WWorld :=
       StateMachine.mk (fun w => w = ww0) (fun w w' => ∃ e, w' = wstep K w e)
@@ -2398,24 +2584,39 @@ clean {
       ∀ i, 1 ≤ i → i < w.next → w.stored (w.ver i) = true → Accounted w i
 
     -- W-b: a pass changes a name's value only by signing the write that waits
-    -- there, over one of its bases, never as a take-back.
+    -- there, over one of its bases, never as a take-back; any other change is
+    -- another write's (holder 0: another Mac's, or this Mac's direct draft's keep).
     def CasStep (w w' : WWorld) : Prop :=
       ∀ n, w'.log n = w.log n ∨ w'.holder n = 0
         ∨ (¬ (w.waitOf n = 0) ∧ w.bs (w.waitOf n) (w.log n) = true ∧ ¬ (w.val (w.waitOf n) = 0)
             ∧ w'.log n = w.val (w.waitOf n))
 
-    -- W-d: a write is overtaken only by a value it never saw from this Mac: the
-    -- write that held its name was another Mac's.
-    def OvertakenByAnother (w : WWorld) : Prop := ∀ i, w.fate i = 2 → w.overBy i = 0
+    -- W-d: a write is overtaken only by a value it never saw from this Mac: no
+    -- waiting write of this Mac held its name, and a direct draft of this Mac whose
+    -- kept value held it was drafted after the write (the person's later edit),
+    -- never one of this Mac's earlier publishes, whose values its bases hold, unless
+    -- the write is a take-back (F15: a pass signs no Delete).
+    def OvertakenByAnother (w : WWorld) : Prop :=
+      ∀ i, w.fate i = 2 → w.overBy i = 0 ∧ (w.val i = 0 ∨ w.overD i = 0 ∨ i < w.overD i)
+
+    -- W-e: a write a pass signed, or found done, keeps its value against every
+    -- direct draft of this Mac from before it: where the log's value of its name
+    -- is a direct draft's kept value, and that draft was drafted before the write,
+    -- the log holds the write's value. An earlier edit's keep never takes the
+    -- place of the person's later edit.
+    def LaterKept (w : WWorld) : Prop :=
+      ∀ i, w.fate i = 1 → w.hdirect (w.nm i) ≠ 0 → w.hdirect (w.nm i) ≤ i → w.log (w.nm i) = w.val i
 
     -- ===========================================================================
     -- 9. THE WAITING-WRITE LAWS, for every number of writes, names, versions and
     --    passes, and for any kernels that compute the spec: a write waits or is
     --    signed only once a server took its version (W-a), a pass changes a value
     --    only by signing the waiting write over one of its bases (W-b), no write
-    --    of a stored version is lost (W-c), and a write is overtaken only by
-    --    another Mac's value (W-d). W-a, W-c and W-d follow from one inductive
-    --    invariant, WaitInv; W-b is a property of every step.
+    --    of a stored version is lost (W-c), a write is overtaken only by
+    --    another Mac's value (W-d), and an earlier direct draft's keep never takes
+    --    the place of a later write a pass signed (W-e). W-a, W-c and W-d follow
+    --    from one inductive invariant, WaitInv (W-d with DirectInv too), W-e from
+    --    LaterInv with both; W-b is a property of every step.
     -- ===========================================================================
 
     theorem ww_and {a b : Bool} (h : (a && b) = true) : a = true ∧ b = true := by
@@ -2504,26 +2705,45 @@ clean {
       show (decide (i < j) && (w.pend j && (S (w.ver j) && decide (w.nm j = w.nm i)))) = true
       rw [dtrue hij, hp, hs, dtrue hn]
 
+    theorem wl_or_l {a b : Bool} (h : a = true) : (a || b) = true := by
+      cases a <;> first | rfl | exact ft h
+    theorem wl_or_r {a b : Bool} (h : b = true) : (a || b) = true := by
+      cases a <;> first | rfl | exact h
+
     theorem ww_deferred (w : WWorld) (n j : Nat) (h : deferredW w n = false) (hj : j < w.next)
         (hp : w.pend j = true) : w.nm j ≠ n := by
       intro e
-      have t : deferredW w n = true := by
+      have a : anyN w.next (fun j => w.pend j && decide (w.nm j = n)) = true := by
         apply anyN_intro _ w.next j hj
         show (w.pend j && decide (w.nm j = n)) = true
         rw [hp, dtrue e]
+      have t : deferredW w n = true := wl_or_l a
+      exact ft (Eq.trans h.symm t)
+
+    -- A pass that reads a name, no direct draft in flight writes it.
+    theorem wl_deferred_held (w : WWorld) (n d : Nat) (h : deferredW w n = false) (hd : d < w.dnext)
+        (hp : w.dphase d = 1 ∨ w.dphase d = 2) : w.dnm d ≠ n := by
+      intro e
+      have p : (decide (w.dphase d = 1) || decide (w.dphase d = 2)) = true :=
+        ww_or_cases hp (fun a => wl_or_l (dtrue a)) (fun b => wl_or_r (dtrue b))
+      have a : heldW w n = true := by
+        apply anyN_intro _ w.dnext d hd
+        show ((decide (w.dphase d = 1) || decide (w.dphase d = 2)) && decide (w.dnm d = n)) = true
+        rw [p, dtrue e]
+      have t : deferredW w n = true := wl_or_r (wl_or_r a)
       exact ft (Eq.trans h.symm t)
 
     -- What the verdicts say, for exact kernels.
     theorem ww_vo3 (K : Kernels) (hK : Exact K) (d dn so tb : Bool) (h : verdictOf K d dn so tb = 3) :
         d = false ∧ dn = false ∧ so = true ∧ tb = false := by
       unfold verdictOf at h
-      rw [hK.2.2.2.2.2.1 dn so tb, hK.2.2.2.2.2.2 dn so tb] at h
+      rw [hK.2.2.2.2.2.1 dn so tb, hK.2.2.2.2.2.2.1 dn so tb] at h
       revert h
       cases d <;> cases dn <;> cases so <;> cases tb <;> decide
     theorem ww_vo2 (K : Kernels) (hK : Exact K) (d dn so tb : Bool) (h : verdictOf K d dn so tb = 2) :
         d = false ∧ dn = false ∧ (so = false ∨ tb = true) := by
       unfold verdictOf at h
-      rw [hK.2.2.2.2.2.1 dn so tb, hK.2.2.2.2.2.2 dn so tb] at h
+      rw [hK.2.2.2.2.2.1 dn so tb, hK.2.2.2.2.2.2.1 dn so tb] at h
       revert h
       cases d <;> cases dn <;> cases so <;> cases tb <;> decide
 
@@ -3324,7 +3544,7 @@ clean {
         overtaken := hi.overtaken }
 
     theorem ww_other (w : WWorld) (n x : Nat) (hi : WaitInv w) :
-        WaitInv { w with log := upd w.log n x, holder := upd w.holder n 0 } :=
+        WaitInv { w with log := upd w.log n x, holder := upd w.holder n 0, hdirect := upd w.hdirect n 0 } :=
       { nextPos := hi.nextPos
         pendBorn := hi.pendBorn
         waitBorn := hi.waitBorn
@@ -3354,15 +3574,36 @@ clean {
       ⟨hi.nextPos, hi.pendBorn, hi.waitBorn, hi.waitName, hi.waitIdle, hi.waitLatest, hi.waitStored,
        hi.fateStored, hi.refusedNot, hi.readBorn, hi.readFate, hi.acc, hi.ownBase, hi.overtaken⟩
 
+    -- A direct draft's steps touch no field WaitInv reads but the keep's, which
+    -- writes a name as another write does.
+    theorem ww_holdUnread (w : WWorld) (b : Bool) (hi : WaitInv w) : WaitInv { w with holdUnread := b } :=
+      ⟨hi.nextPos, hi.pendBorn, hi.waitBorn, hi.waitName, hi.waitIdle, hi.waitLatest, hi.waitStored,
+       hi.fateStored, hi.refusedNot, hi.readBorn, hi.readFate, hi.acc, hi.ownBase, hi.overtaken⟩
+    theorem ww_dphase (w : WWorld) (f : Nat → Nat) (hi : WaitInv w) : WaitInv { w with dphase := f } :=
+      ⟨hi.nextPos, hi.pendBorn, hi.waitBorn, hi.waitName, hi.waitIdle, hi.waitLatest, hi.waitStored,
+       hi.fateStored, hi.refusedNot, hi.readBorn, hi.readFate, hi.acc, hi.ownBase, hi.overtaken⟩
+    theorem ww_draftD (w : WWorld) (n x : Nat) (hi : WaitInv w) :
+        WaitInv { w with dnext := w.dnext + 1, dnm := upd w.dnm w.dnext n, dval := upd w.dval w.dnext x,
+                         dstamp := upd w.dstamp w.dnext w.next, dphase := upd w.dphase w.dnext 1 } :=
+      ⟨hi.nextPos, hi.pendBorn, hi.waitBorn, hi.waitName, hi.waitIdle, hi.waitLatest, hi.waitStored,
+       hi.fateStored, hi.refusedNot, hi.readBorn, hi.readFate, hi.acc, hi.ownBase, hi.overtaken⟩
+    theorem ww_keep (w : WWorld) (d : Nat) (hi : WaitInv w) : WaitInv (keepBody w d) :=
+      have h := ww_other w (w.dnm d) (w.dval d) hi
+      ⟨h.nextPos, h.pendBorn, h.waitBorn, h.waitName, h.waitIdle, h.waitLatest, h.waitStored,
+       h.fateStored, h.refusedNot, h.readBorn, h.readFate, h.acc, h.ownBase, h.overtaken⟩
+
     -- The publish guard's parts the step needs (publishOk, its conjuncts in order).
-    theorem ww_pub_parts (w : WWorld) (v k : Nat) (names vals : Nat → Nat) (bases : Nat → Nat → Bool)
-        (opened : Nat → Bool) (hg : publishOk w v k names vals bases opened = true) :
+    theorem ww_pub_parts (K : Kernels) (w : WWorld) (v k : Nat) (names vals : Nat → Nat) (bases : Nat → Nat → Bool)
+        (opened : Nat → Bool) (hg : publishOk K w v k names vals bases opened = true) :
         allN w.next (fun i => !(w.pend i && opened (w.ver i)) || w.stored (w.ver i)) = true
           ∧ allN k (fun a => bases a (w.log (names a))) = true
           ∧ allN k (fun a => !(decide (vals a = 0)) || decide (w.log (names a) = 0)) = true := by
       unfold publishOk at hg
+      have z := ww_and hg
+      have hb : pubBase K w.holdUnread w v k names vals bases opened = true := z.1
+      unfold pubBase at hb
       -- Clean's && groups to the right: a && (b && c).
-      have a := ww_and hg
+      have a := ww_and hb
       have b := ww_and a.2
       have c := ww_and b.2
       have d := ww_and c.2
@@ -3381,10 +3622,10 @@ clean {
     theorem ww_step_publish (K : Kernels) (hK : Exact K) (w : WWorld) (hi : WaitInv w) (v k : Nat)
         (names vals : Nat → Nat) (bases : Nat → Nat → Bool) (opened : Nat → Bool) :
         WaitInv (wstep K w (WEvent.publish v k names vals bases opened)) :=
-      ww_by_cases (publishOk w v k names vals bases opened = true)
+      ww_by_cases (publishOk K w v k names vals bases opened = true)
         (fun hg => by
           rw [show wstep K w (WEvent.publish v k names vals bases opened) = _ from if_pos hg]
-          have p := ww_pub_parts w v k names vals bases opened hg
+          have p := ww_pub_parts K w v k names vals bases opened hg
           exact ww_pushW (landW K opened w) v k names vals bases (ww_landW K hK opened w hi (ww_guard w opened p.1))
             (fun x hx => allN_elim _ k p.2.1 x hx)
             (fun x hx hv => ww_takeback w k names vals p.2.2 x hx hv))
@@ -3436,6 +3677,23 @@ clean {
       | other n x => exact ww_other w n x hi
       | due b => exact ww_due w b hi
       | unreadable b => exact ww_unread w b hi
+      | directDraft n x =>
+        exact ww_by_cases (turnFree w = true)
+          (fun g => by rw [show wstep K w (WEvent.directDraft n x) = _ from if_pos g]; exact ww_draftD w n x hi)
+          (fun g => by rw [show wstep K w (WEvent.directDraft n x) = _ from if_neg g]; exact hi)
+      | directHold d =>
+        exact ww_by_cases (decide (w.dphase d = 1) = true)
+          (fun g => by rw [show wstep K w (WEvent.directHold d) = _ from if_pos g]; exact ww_dphase w _ hi)
+          (fun g => by rw [show wstep K w (WEvent.directHold d) = _ from if_neg g]; exact hi)
+      | keep d =>
+        exact ww_by_cases (K.draftedKeeps (decide (w.dphase d = 2)) = true)
+          (fun g => by rw [show wstep K w (WEvent.keep d) = _ from if_pos g]; exact ww_keep w d hi)
+          (fun g => by rw [show wstep K w (WEvent.keep d) = _ from if_neg g]; exact hi)
+      | unhold d =>
+        exact ww_by_cases ((decide (w.dphase d = 1) || decide (w.dphase d = 2)) = true)
+          (fun g => by rw [show wstep K w (WEvent.unhold d) = _ from if_pos g]; exact ww_dphase w _ hi)
+          (fun g => by rw [show wstep K w (WEvent.unhold d) = _ from if_neg g]; exact hi)
+      | holdUnreadable b => exact ww_holdUnread w b hi
 
     -- WaitInv holds in every state of every run, for any kernels that compute the spec.
     theorem waits_hold (K : Kernels) (hK : Exact K) : Satisfies (WaitSpec K) (Always (Lift WaitInv)) :=
@@ -3457,12 +3715,770 @@ clean {
       exact ww_or_cases (hi.acc i h1 h2) (fun a => a)
         (fun d => ft (Eq.trans (hi.refusedNot _ d.2).symm hs))
 
-    -- W-d: a write is overtaken only by another Mac's value.
+    -- ---- This Mac's direct drafts. A write is live while it is pending or waits at
+    --      its name. DirectInv: a born direct draft has an id below dnext; one in its
+    --      turn was drafted after every born write; a live write of a name a held
+    --      draft from before it writes has that draft's value among its bases
+    --      (heldIn); a live write of a name whose log value a direct draft from
+    --      before it kept stands over that value, or is done; and an overtaken write
+    --      is born, and is a take-back, or no direct draft's kept value overtook it,
+    --      or one drafted after it.
+    def LiveW (w : WWorld) (i : Nat) : Prop := w.pend i = true ∨ (i ≠ 0 ∧ w.waitOf (w.nm i) = i)
+
+    structure DirectInv (w : WWorld) : Prop where
+      dBorn : ∀ d, w.dphase d ≠ 0 → d < w.dnext
+      drafting : ∀ d, w.dphase d = 1 → w.next ≤ w.dstamp d
+      heldBase : ∀ i d, LiveW w i → w.dphase d = 2 → w.dnm d = w.nm i → w.dstamp d ≤ i →
+        w.bs i (w.dval d) = true
+      directBase : ∀ i, LiveW w i → w.hdirect (w.nm i) ≠ 0 → w.hdirect (w.nm i) ≤ i →
+        w.log (w.nm i) = w.val i ∨ w.bs i (w.log (w.nm i)) = true
+      overDirect : ∀ i, w.fate i = 2 → i < w.next ∧ (w.val i = 0 ∨ w.overD i = 0 ∨ i < w.overD i)
+
+    theorem wd_lt_succ (n : Nat) : n < n + 1 := by omega
+    theorem wd_lt_succ_of (a b : Nat) (h : a < b) : a < b + 1 := by omega
+    theorem wd_lt (a b : Nat) (h : ¬ (a ≤ b)) : b < a := by omega
+    theorem wd_le_eq (a b : Nat) (h : a = b) : a ≤ b := by omega
+
+    theorem wd_init (w : WWorld) (h : w = ww0) : DirectInv w := by
+      subst h
+      exact
+        { dBorn := fun d h => absurd rfl h
+          drafting := fun d h => by have h' : (0 : Nat) = 1 := h; exact absurd h' (by decide)
+          heldBase := fun i d _ h => by have h' : (0 : Nat) = 2 := h; exact absurd h' (by decide)
+          directBase := fun i _ h => absurd rfl h
+          overDirect := fun i h => by have h' : (0 : Nat) = 2 := h; exact absurd h' (by decide) }
+
+    theorem wd_live_born (w : WWorld) (hi : WaitInv w) (i : Nat) (h : LiveW w i) : i < w.next :=
+      ww_or_cases h (fun p => (hi.pendBorn i p).2)
+        (fun q => by
+          have hz : (w.waitOf (w.nm i) ≠ 0) := by rw [q.2]; exact q.1
+          have t := hi.waitBorn (w.nm i) hz
+          rw [q.2] at t
+          exact t)
+
+    -- landW, settleW and a drop make no write live; pushW makes the new ones live.
+    theorem wd_lw_live (K : Kernels) (hK : Exact K) (S : Nat → Bool) (w : WWorld) (i : Nat)
+        (h : LiveW (landW K S w) i) : LiveW w i :=
+      ww_or_cases h (fun p => Or.inl (ww_lw_pend K hK S w i p).1)
+        (fun q => ww_or_cases (ww_lw_wait K S w (w.nm i))
+          (fun a => Or.inr ⟨q.1, Eq.trans a.2.symm q.2⟩)
+          (fun b => Or.inl (by
+            have e : (landingOf w S (w.nm i) = i) := Eq.trans b.2.symm q.2
+            have t := (ww_landing w S (w.nm i) b.1).1
+            rw [e] at t
+            exact t)))
+    theorem wd_lw_fate2 (K : Kernels) (S : Nat → Bool) (w : WWorld) (i : Nat) (h : (landW K S w).fate i = 2) :
+        w.fate i = 2 := by
+      rw [ww_lw_fate_def] at h
+      exact ww_by_cases ((ww_c1 K S w i || ww_c2 S w i) = true)
+        (fun c => by rw [if_pos c] at h; exact absurd h (by decide))
+        (fun c => by rw [if_neg c] at h; exact h)
+    theorem wd_push_live (w : WWorld) (v k : Nat) (names vals : Nat → Nat) (bases : Nat → Nat → Bool) (i : Nat)
+        (hr : ¬ (w.next ≤ i ∧ i < w.next + k)) (h : LiveW (pushW w v k names vals bases) i) : LiveW w i :=
+      have o := ww_push_old w v k names vals bases i hr
+      ww_or_cases h (fun p => Or.inl (Eq.trans o.2.2.2.2.symm p))
+        (fun q => Or.inr ⟨q.1, by rw [← o.1]; exact q.2⟩)
+    theorem wd_settle_live (w : WWorld) (i : Nat) (h : LiveW (settleW w) i) : LiveW w i :=
+      ww_or_cases h (fun p => Or.inl p)
+        (fun q => Or.inr ⟨q.1, ww_or_cases (ww_settle_wait w (w.nm i))
+          (fun e => Eq.trans e.symm q.2)
+          (fun z => absurd (Eq.trans z.1.symm q.2).symm q.1)⟩)
+    theorem wd_drop_live (w : WWorld) (v i : Nat) (h : LiveW (ww_dropW w v) i) : LiveW w i :=
+      ww_or_cases h (fun p => Or.inl (ww_drop_pend w v i p)) (fun q => Or.inr q)
+
+    theorem wd_landW (K : Kernels) (hK : Exact K) (S : Nat → Bool) (w : WWorld) (hD : DirectInv w) :
+        DirectInv (landW K S w) :=
+      { dBorn := hD.dBorn
+        drafting := hD.drafting
+        heldBase := fun i d hl => hD.heldBase i d (wd_lw_live K hK S w i hl)
+        directBase := fun i hl => hD.directBase i (wd_lw_live K hK S w i hl)
+        overDirect := fun i h => hD.overDirect i (wd_lw_fate2 K S w i h) }
+
+    theorem ww_pub_direct (K : Kernels) (w : WWorld) (v k : Nat) (names vals : Nat → Nat) (bases : Nat → Nat → Bool)
+        (opened : Nat → Bool) (hg : publishOk K w v k names vals bases opened = true) :
+        allN w.dnext (fun d => !(decide (w.dphase d = 1))) = true
+          ∧ allN k (fun a => allN w.dnext (fun d =>
+              !(decide (w.dphase d = 2) && decide (w.dnm d = names a)) || bases a (w.dval d))) = true := by
+      unfold publishOk turnFree heldIn at hg
+      exact ww_and (ww_and hg).2
+
+    -- publish: no direct draft is in its turn (turnFree); each new write's bases
+    -- hold every held draft's value of its name (heldIn) and the log's (pubBase).
+    theorem wd_publish (K : Kernels) (hK : Exact K) (w : WWorld) (hi : WaitInv w) (hD : DirectInv w) (v k : Nat)
+        (names vals : Nat → Nat) (bases : Nat → Nat → Bool) (opened : Nat → Bool)
+        (hg : publishOk K w v k names vals bases opened = true) :
+        DirectInv (pushW (landW K opened w) v k names vals bases) :=
+      have p := ww_pub_parts K w v k names vals bases opened hg
+      have z := ww_pub_direct K w v k names vals bases opened hg
+      have hL := wd_landW K hK opened w hD
+      { dBorn := hD.dBorn
+        drafting := fun d h => by
+          have h' : (w.dphase d = 1) := h
+          have hb : (d < w.dnext) := hD.dBorn d (fun e => hd_01 (Eq.trans e.symm h'))
+          have t : ((!(decide (w.dphase d = 1))) = true) := allN_elim _ w.dnext z.1 d hb
+          exact absurd h' (hd_ndec t)
+        heldBase := fun i d hl hp hn hs => ww_by_cases (w.next ≤ i ∧ i < w.next + k)
+          (fun hr => by
+            have nw := ww_push_new (landW K opened w) v k names vals bases i hr
+            have ha : (i - w.next < k) := ww_sub_lt w.next i k hr.1 hr.2
+            have hp' : (w.dphase d = 2) := hp
+            have hdn : (d < w.dnext) := hD.dBorn d (fun e => hd_02 (Eq.trans e.symm hp'))
+            have hn' : w.dnm d = names (i - w.next) := Eq.trans hn nw.1
+            have t : ((!(decide (w.dphase d = 2) && decide (w.dnm d = names (i - w.next)))
+                || bases (i - w.next) (w.dval d)) = true) :=
+              allN_elim _ w.dnext (allN_elim _ k z.2 (i - w.next) ha) d hdn
+            rw [dtrue hp', dtrue hn'] at t
+            rw [nw.2.2.1]
+            exact t)
+          (fun hr => by
+            have o := ww_push_old (landW K opened w) v k names vals bases i hr
+            rw [o.2.2.1]
+            exact hL.heldBase i d (wd_push_live (landW K opened w) v k names vals bases i hr hl) hp
+              (Eq.trans hn o.1) hs)
+        directBase := fun i hl h1 h2 => ww_by_cases (w.next ≤ i ∧ i < w.next + k)
+          (fun hr => by
+            have nw := ww_push_new (landW K opened w) v k names vals bases i hr
+            have ha : (i - w.next < k) := ww_sub_lt w.next i k hr.1 hr.2
+            have t : (bases (i - w.next) (w.log (names (i - w.next))) = true) := allN_elim _ k p.2.1 (i - w.next) ha
+            rw [nw.1, nw.2.2.1]
+            exact Or.inr t)
+          (fun hr => by
+            have o := ww_push_old (landW K opened w) v k names vals bases i hr
+            rw [o.1] at h1 h2
+            rw [o.1, o.2.1, o.2.2.1]
+            exact hL.directBase i (wd_push_live (landW K opened w) v k names vals bases i hr hl) h1 h2)
+        overDirect := fun i h => by
+          have f : (w.fate i = 2) := wd_lw_fate2 K opened w i h
+          have t := hD.overDirect i f
+          have hr : ¬ (w.next ≤ i ∧ i < w.next + k) := ww_not_in w k i t.1
+          have o := ww_push_old (landW K opened w) v k names vals bases i hr
+          refine ⟨ww_le_add i w.next k t.1, ?_⟩
+          rw [o.2.1]
+          exact t.2 }
+
+    -- signBody's overD, by case: the stamp at a name whose waiting write is
+    -- overtaken, else as it was.
+    theorem wd_sb_overD_two (K : Kernels) (w : WWorld) (i : Nat) (hz : ¬ (i = 0)) (hw : w.waitOf (w.nm i) = i)
+        (h2 : passVerdict K w (w.nm i) = 2) : (signBody K w).overD i = w.hdirect (w.nm i) := by
+      show (if (!(decide (i = 0)) && (decide (w.waitOf (w.nm i) = i)
+          && decide (passVerdict K w (w.nm i) = 2))) = true
+        then w.hdirect (w.nm i) else w.overD i) = w.hdirect (w.nm i)
+      rw [dfalse hz, dtrue hw, dtrue h2] <;> rfl
+    theorem wd_sb_overD_not_two (K : Kernels) (w : WWorld) (i : Nat) (h2 : ¬ (passVerdict K w (w.nm i) = 2)) :
+        (signBody K w).overD i = w.overD i := by
+      show (if (!(decide (i = 0)) && (decide (w.waitOf (w.nm i) = i)
+          && decide (passVerdict K w (w.nm i) = 2))) = true
+        then w.hdirect (w.nm i) else w.overD i) = w.overD i
+      rw [dfalse h2, ww_and_and_false] <;> rfl
+    theorem wd_sb_overD_other (K : Kernels) (w : WWorld) (i : Nat) (h : ¬ (¬ (i = 0) ∧ w.waitOf (w.nm i) = i)) :
+        (signBody K w).overD i = w.overD i := by
+      show (if (!(decide (i = 0)) && (decide (w.waitOf (w.nm i) = i)
+          && decide (passVerdict K w (w.nm i) = 2))) = true
+        then w.hdirect (w.nm i) else w.overD i) = w.overD i
+      apply if_neg
+      intro hc
+      have a := ww_and hc
+      have b := ww_and a.2
+      exact h ⟨ww_df (ww_not a.1), of_decide_eq_true b.1⟩
+
+    -- signBody: a signed name's log value is this Mac's write's now (hdirect 0);
+    -- an overtaken write was a take-back, or stood over no direct draft's value
+    -- from before it (directBase).
+    theorem wd_signBody (K : Kernels) (hK : Exact K) (w : WWorld) (hi : WaitInv w) (hD : DirectInv w) :
+        DirectInv (signBody K w) :=
+      { dBorn := hD.dBorn
+        drafting := hD.drafting
+        heldBase := hD.heldBase
+        directBase := fun i hl h1 h2 => ww_by_cases (passVerdict K w (w.nm i) = 3)
+          (fun h3 => absurd (show (signBody K w).hdirect (w.nm i) = 0 from if_pos h3) h1)
+          (fun h3 => by
+            have eh : (signBody K w).hdirect (w.nm i) = w.hdirect (w.nm i) := if_neg h3
+            have el : (signBody K w).log (w.nm i) = w.log (w.nm i) := if_neg h3
+            have h1' : (w.hdirect (w.nm i) ≠ 0) := fun z => h1 (Eq.trans eh z)
+            have h2' : (w.hdirect (w.nm i) ≤ i) := by
+              have t : ((signBody K w).hdirect (w.nm i) ≤ i) := h2
+              rw [eh] at t
+              exact t
+            show (signBody K w).log (w.nm i) = w.val i ∨ w.bs i ((signBody K w).log (w.nm i)) = true
+            rw [el]
+            exact hD.directBase i hl h1' h2')
+        overDirect := fun i h => ww_by_cases (¬ (i = 0) ∧ w.waitOf (w.nm i) = i)
+          (fun c => by
+            have hz : (w.waitOf (w.nm i) ≠ 0) := by rw [c.2]; exact c.1
+            have hb : (i < w.next) := by
+              have t := hi.waitBorn (w.nm i) hz
+              rw [c.2] at t
+              exact t
+            exact ww_by_cases (passVerdict K w (w.nm i) = 2)
+              (fun h2 => by
+                have eo := wd_sb_overD_two K w i c.1 c.2 h2
+                refine ⟨hb, ?_⟩
+                rw [eo]
+                have pv := ww_pv2 K hK w (w.nm i) h2
+                rw [c.2] at pv
+                exact ww_or_cases pv.2.2
+                  (fun nb => Or.inr (ww_by_cases (w.hdirect (w.nm i) = 0) (fun e => Or.inl e)
+                    (fun e => Or.inr (ww_by_cases (w.hdirect (w.nm i) ≤ i)
+                      (fun le => absurd (hD.directBase i (Or.inr c) e le)
+                        (fun r => ww_or_cases r (fun a => pv.2.1 a) (fun b => hd_tf (Eq.trans b.symm nb))))
+                      (fun le => wd_lt _ _ le)))))
+                  (fun tb => Or.inl tb))
+              (fun h2 => by
+                have eo := wd_sb_overD_not_two K w i h2
+                have ef := ww_sb_fate_wait K w i c.1 c.2
+                exact ww_by_cases (passVerdict K w (w.nm i) = 0)
+                  (fun h0 => by
+                    rw [ef, if_pos h0] at h
+                    have t := hD.overDirect i h
+                    refine ⟨t.1, ?_⟩
+                    rw [eo]
+                    exact t.2)
+                  (fun h0 => by
+                    rw [ef, if_neg h0, if_neg h2] at h
+                    exact absurd h (by decide))))
+          (fun c => by
+            have ef := ww_sb_fate_other K w i c
+            have eo := wd_sb_overD_other K w i c
+            have t := hD.overDirect i (Eq.trans ef.symm h)
+            refine ⟨t.1, ?_⟩
+            rw [eo]
+            exact t.2) }
+
+    theorem wd_settleW (w : WWorld) (hD : DirectInv w) : DirectInv (settleW w) :=
+      { dBorn := hD.dBorn
+        drafting := hD.drafting
+        heldBase := fun i d hl => hD.heldBase i d (wd_settle_live w i hl)
+        directBase := fun i hl => hD.directBase i (wd_settle_live w i hl)
+        overDirect := hD.overDirect }
+
+    theorem wd_dropped (w : WWorld) (v : Nat) (hD : DirectInv w) : DirectInv (ww_dropW w v) :=
+      { dBorn := hD.dBorn
+        drafting := hD.drafting
+        heldBase := fun i d hl => hD.heldBase i d (wd_drop_live w v i hl)
+        directBase := fun i hl => hD.directBase i (wd_drop_live w v i hl)
+        overDirect := fun i h => hD.overDirect i (ww_or_cases (ww_drop_cases w v i)
+          (fun a => absurd (Eq.trans a.2.1.symm h) (by decide)) (fun b => Eq.trans b.2.symm h)) }
+
+    -- another write of name n: the log's value there is no direct draft's now.
+    theorem wd_other (w : WWorld) (n x : Nat) (hD : DirectInv w) :
+        DirectInv { w with log := upd w.log n x, holder := upd w.holder n 0, hdirect := upd w.hdirect n 0 } :=
+      { dBorn := hD.dBorn
+        drafting := hD.drafting
+        heldBase := hD.heldBase
+        directBase := fun i hl h1 h2 => ww_by_cases (w.nm i = n)
+          (fun e => absurd (show upd w.hdirect n 0 (w.nm i) = 0 from if_pos e) h1)
+          (fun e => by
+            have eh : upd w.hdirect n 0 (w.nm i) = w.hdirect (w.nm i) := if_neg e
+            have el : upd w.log n x (w.nm i) = w.log (w.nm i) := if_neg e
+            have h1' : (w.hdirect (w.nm i) ≠ 0) := fun z => h1 (Eq.trans eh z)
+            have h2' : (w.hdirect (w.nm i) ≤ i) := by
+              have t : (upd w.hdirect n 0 (w.nm i) ≤ i) := h2
+              rw [eh] at t
+              exact t
+            show upd w.log n x (w.nm i) = w.val i ∨ w.bs i (upd w.log n x (w.nm i)) = true
+            rw [el]
+            exact hD.directBase i hl h1' h2')
+        overDirect := hD.overDirect }
+
+    -- directDraft in its turn: the new draft is stamped after every born write.
+    theorem wd_draftD (w : WWorld) (hD : DirectInv w) (n x : Nat) :
+        DirectInv { w with dnext := w.dnext + 1, dnm := upd w.dnm w.dnext n, dval := upd w.dval w.dnext x,
+                           dstamp := upd w.dstamp w.dnext w.next, dphase := upd w.dphase w.dnext 1 } :=
+      { dBorn := fun d h => ww_by_cases (d = w.dnext)
+          (fun e => by rw [e]; exact wd_lt_succ w.dnext)
+          (fun e => wd_lt_succ_of _ _ (hD.dBorn d (fun z => h (Eq.trans (hd_updO w.dphase w.dnext d 1 e) z))))
+        drafting := fun d h => ww_by_cases (d = w.dnext)
+          (fun e => by
+            have t : (upd w.dstamp w.dnext w.next d = w.next) := by rw [e, hd_updS]
+            show w.next ≤ upd w.dstamp w.dnext w.next d
+            exact wd_le_eq _ _ t.symm)
+          (fun e => by
+            have t : (w.dphase d = 1) := Eq.trans (hd_updO w.dphase w.dnext d 1 e).symm h
+            have u : (upd w.dstamp w.dnext w.next d = w.dstamp d) := hd_updO w.dstamp w.dnext d w.next e
+            show w.next ≤ upd w.dstamp w.dnext w.next d
+            rw [u]
+            exact hD.drafting d t)
+        heldBase := fun i d hl hp hn hs => ww_by_cases (d = w.dnext)
+          (fun e => by
+            have t : (upd w.dphase w.dnext 1 d = 2) := hp
+            rw [e, hd_updS] at t
+            exact absurd t (by decide))
+          (fun e => by
+            have t : (w.dphase d = 2) := Eq.trans (hd_updO w.dphase w.dnext d 1 e).symm hp
+            have tn : (w.dnm d = w.nm i) := Eq.trans (hd_updO w.dnm w.dnext d n e).symm hn
+            have ts : (w.dstamp d ≤ i) := by
+              have u : (upd w.dstamp w.dnext w.next d ≤ i) := hs
+              rw [hd_updO w.dstamp w.dnext d w.next e] at u
+              exact u
+            show w.bs i (upd w.dval w.dnext x d) = true
+            rw [hd_updO w.dval w.dnext d x e]
+            exact hD.heldBase i d hl t tn ts)
+        directBase := hD.directBase
+        overDirect := hD.overDirect }
+
+    -- directHold: a draft held now was stamped after every live write.
+    theorem wd_holdD (w : WWorld) (hi : WaitInv w) (hD : DirectInv w) (d : Nat) (g : w.dphase d = 1) :
+        DirectInv { w with dphase := upd w.dphase d 2 } :=
+      { dBorn := fun e h => ww_by_cases (e = d)
+          (fun ed => by rw [ed]; exact hD.dBorn d (fun z => hd_01 (Eq.trans z.symm g)))
+          (fun ed => hD.dBorn e (fun z => h (Eq.trans (hd_updO w.dphase d e 2 ed) z)))
+        drafting := fun e h => ww_by_cases (e = d)
+          (fun ed => by
+            have t : (upd w.dphase d 2 e = 1) := h
+            rw [ed, hd_updS] at t
+            exact absurd t (by decide))
+          (fun ed => hD.drafting e (Eq.trans (hd_updO w.dphase d e 2 ed).symm h))
+        heldBase := fun i e hl hp hn hs => ww_by_cases (e = d)
+          (fun ed => by
+            have hb := wd_live_born w hi i hl
+            have hd := hD.drafting d g
+            have hs' : (w.dstamp d ≤ i) := by rw [← ed]; exact hs
+            exact False.elim (hd_ltIrr _ _ hs' (ww_lt_le _ _ _ hb hd)))
+          (fun ed => hD.heldBase i e hl (Eq.trans (hd_updO w.dphase d e 2 ed).symm hp) hn hs)
+        directBase := hD.directBase
+        overDirect := hD.overDirect }
+
+    -- keep: a held draft's value enters the log; every live write of its name from
+    -- after its draft has that value among its bases (heldBase).
+    theorem wd_keep (w : WWorld) (hD : DirectInv w) (d : Nat) (g : w.dphase d = 2) : DirectInv (keepBody w d) :=
+      { dBorn := fun e h => ww_by_cases (e = d)
+          (fun ed => by rw [ed]; exact hD.dBorn d (fun z => hd_02 (Eq.trans z.symm g)))
+          (fun ed => hD.dBorn e (fun z => h (Eq.trans (hd_updO w.dphase d e 3 ed) z)))
+        drafting := fun e h => ww_by_cases (e = d)
+          (fun ed => by
+            have t : (upd w.dphase d 3 e = 1) := h
+            rw [ed, hd_updS] at t
+            exact absurd t (by decide))
+          (fun ed => hD.drafting e (Eq.trans (hd_updO w.dphase d e 3 ed).symm h))
+        heldBase := fun i e hl hp hn hs => ww_by_cases (e = d)
+          (fun ed => by
+            have t : (upd w.dphase d 3 e = 2) := hp
+            rw [ed, hd_updS] at t
+            exact absurd t (by decide))
+          (fun ed => hD.heldBase i e hl (Eq.trans (hd_updO w.dphase d e 3 ed).symm hp) hn hs)
+        directBase := fun i hl h1 h2 => ww_by_cases (w.nm i = w.dnm d)
+          (fun en => by
+            have eh : (upd w.hdirect (w.dnm d) (w.dstamp d) (w.nm i) = w.dstamp d) := by rw [en, hd_updS]
+            have el : (upd w.log (w.dnm d) (w.dval d) (w.nm i) = w.dval d) := by rw [en, hd_updS]
+            have hs : (w.dstamp d ≤ i) := by
+              have t : (upd w.hdirect (w.dnm d) (w.dstamp d) (w.nm i) ≤ i) := h2
+              rw [eh] at t
+              exact t
+            show upd w.log (w.dnm d) (w.dval d) (w.nm i) = w.val i
+              ∨ w.bs i (upd w.log (w.dnm d) (w.dval d) (w.nm i)) = true
+            rw [el]
+            exact Or.inr (hD.heldBase i d hl g en.symm hs))
+          (fun en => by
+            have eh : upd w.hdirect (w.dnm d) (w.dstamp d) (w.nm i) = w.hdirect (w.nm i) :=
+              hd_updO w.hdirect (w.dnm d) (w.nm i) (w.dstamp d) en
+            have el : upd w.log (w.dnm d) (w.dval d) (w.nm i) = w.log (w.nm i) :=
+              hd_updO w.log (w.dnm d) (w.nm i) (w.dval d) en
+            have h1' : (w.hdirect (w.nm i) ≠ 0) := fun z => h1 (Eq.trans eh z)
+            have h2' : (w.hdirect (w.nm i) ≤ i) := by
+              have t : (upd w.hdirect (w.dnm d) (w.dstamp d) (w.nm i) ≤ i) := h2
+              rw [eh] at t
+              exact t
+            show upd w.log (w.dnm d) (w.dval d) (w.nm i) = w.val i
+              ∨ w.bs i (upd w.log (w.dnm d) (w.dval d) (w.nm i)) = true
+            rw [el]
+            exact hD.directBase i hl h1' h2')
+        overDirect := hD.overDirect }
+
+    -- unhold: a draft leaves its turn or its hold unkept.
+    theorem wd_unhold (w : WWorld) (hD : DirectInv w) (d : Nat) (g : w.dphase d ≠ 0) :
+        DirectInv { w with dphase := upd w.dphase d 3 } :=
+      { dBorn := fun e h => ww_by_cases (e = d)
+          (fun ed => by rw [ed]; exact hD.dBorn d g)
+          (fun ed => hD.dBorn e (fun z => h (Eq.trans (hd_updO w.dphase d e 3 ed) z)))
+        drafting := fun e h => ww_by_cases (e = d)
+          (fun ed => by
+            have t : (upd w.dphase d 3 e = 1) := h
+            rw [ed, hd_updS] at t
+            exact absurd t (by decide))
+          (fun ed => hD.drafting e (Eq.trans (hd_updO w.dphase d e 3 ed).symm h))
+        heldBase := fun i e hl hp hn hs => ww_by_cases (e = d)
+          (fun ed => by
+            have t : (upd w.dphase d 3 e = 2) := hp
+            rw [ed, hd_updS] at t
+            exact absurd t (by decide))
+          (fun ed => hD.heldBase i e hl (Eq.trans (hd_updO w.dphase d e 3 ed).symm hp) hn hs)
+        directBase := hD.directBase
+        overDirect := hD.overDirect }
+
+    theorem wd_step (K : Kernels) (hK : Exact K) (w : WWorld) (hi : WaitInv w) (hD : DirectInv w) (e : WEvent) :
+        DirectInv (wstep K w e) := by
+      cases e with
+      | publish v k names vals bases opened =>
+        exact ww_by_cases (publishOk K w v k names vals bases opened = true)
+          (fun hg => by
+            rw [show wstep K w (WEvent.publish v k names vals bases opened) = _ from if_pos hg]
+            exact wd_publish K hK w hi hD v k names vals bases opened hg)
+          (fun hg => by
+            rw [show wstep K w (WEvent.publish v k names vals bases opened) = _ from if_neg hg]
+            exact hD)
+      | stored v =>
+        exact ww_by_cases (w.refused v = true)
+          (fun hr => by rw [show wstep K w (WEvent.stored v) = _ from if_pos hr]; exact hD)
+          (fun hr => by
+            rw [show wstep K w (WEvent.stored v) = _ from if_neg hr]
+            exact ⟨hD.dBorn, hD.drafting, hD.heldBase, hD.directBase, hD.overDirect⟩)
+      | dropped v =>
+        exact ww_by_cases (w.stored v = true)
+          (fun hs => by rw [show wstep K w (WEvent.dropped v) = _ from if_pos hs]; exact hD)
+          (fun hs => by rw [show wstep K w (WEvent.dropped v) = _ from if_neg hs]; exact wd_dropped w v hD)
+      | land S =>
+        exact ww_by_cases ((!(w.unread) && allN w.next (fun i => !(w.pend i && S (w.ver i)) || w.stored (w.ver i))) = true)
+          (fun hg => by rw [show wstep K w (WEvent.land S) = _ from if_pos hg]; exact wd_landW K hK S w hD)
+          (fun hg => by rw [show wstep K w (WEvent.land S) = _ from if_neg hg]; exact hD)
+      | signPass opens =>
+        exact ww_by_cases (K.passSigns w.due opens (!w.unread) = true)
+          (fun hps => by
+            show DirectInv (signW K opens w)
+            rw [show signW K opens w = signBody K w from if_pos hps]
+            exact wd_signBody K hK w hi hD)
+          (fun hps => by
+            show DirectInv (signW K opens w)
+            rw [show signW K opens w = w from if_neg hps]
+            exact hD)
+      | settlePass => exact wd_settleW w hD
+      | other n x => exact wd_other w n x hD
+      | due b => exact ⟨hD.dBorn, hD.drafting, hD.heldBase, hD.directBase, hD.overDirect⟩
+      | unreadable b => exact ⟨hD.dBorn, hD.drafting, hD.heldBase, hD.directBase, hD.overDirect⟩
+      | directDraft n x =>
+        exact ww_by_cases (turnFree w = true)
+          (fun g => by rw [show wstep K w (WEvent.directDraft n x) = _ from if_pos g]; exact wd_draftD w hD n x)
+          (fun g => by rw [show wstep K w (WEvent.directDraft n x) = _ from if_neg g]; exact hD)
+      | directHold d =>
+        exact ww_by_cases (decide (w.dphase d = 1) = true)
+          (fun g => by
+            rw [show wstep K w (WEvent.directHold d) = _ from if_pos g]
+            exact wd_holdD w hi hD d (hd_dec g))
+          (fun g => by rw [show wstep K w (WEvent.directHold d) = _ from if_neg g]; exact hD)
+      | keep d =>
+        exact ww_by_cases (K.draftedKeeps (decide (w.dphase d = 2)) = true)
+          (fun g => by
+            rw [show wstep K w (WEvent.keep d) = _ from if_pos g]
+            exact wd_keep w hD d (hd_dec (drafted_keeps_true K hK _ g)))
+          (fun g => by rw [show wstep K w (WEvent.keep d) = _ from if_neg g]; exact hD)
+      | unhold d =>
+        exact ww_by_cases ((decide (w.dphase d = 1) || decide (w.dphase d = 2)) = true)
+          (fun g => by
+            rw [show wstep K w (WEvent.unhold d) = _ from if_pos g]
+            exact wd_unhold w hD d (ww_or_cases (ww_or g)
+              (fun a z => hd_01 (Eq.trans z.symm (hd_dec a)))
+              (fun b z => hd_02 (Eq.trans z.symm (hd_dec b)))))
+          (fun g => by rw [show wstep K w (WEvent.unhold d) = _ from if_neg g]; exact hD)
+      | holdUnreadable b => exact ⟨hD.dBorn, hD.drafting, hD.heldBase, hD.directBase, hD.overDirect⟩
+
+    -- WaitInv and DirectInv hold together in every state of every run.
+    theorem direct_hold (K : Kernels) (hK : Exact K) :
+        Satisfies (WaitSpec K) (Always (Lift (fun w => WaitInv w ∧ DirectInv w))) :=
+      invariantSatisfies (WaitSpec K) (fun w => WaitInv w ∧ DirectInv w)
+        (fun s h => ⟨ww_init s h, wd_init s h⟩)
+        (fun s t hs ht => Exists.elim ht (fun e he =>
+          Eq.mpr (congrArg (fun x => WaitInv x ∧ DirectInv x) he) ⟨ww_step K hK s hs.1 e, wd_step K hK s hs.1 hs.2 e⟩))
+
+    -- W-d: a write is overtaken only by another Mac's value, or by this Mac's own
+    -- later edit; never by one of this Mac's earlier publishes, unless a take-back.
     theorem overtaken_by_another (K : Kernels) (hK : Exact K) :
         Satisfies (WaitSpec K) (Always (Lift OvertakenByAnother)) := by
       intro b runs n
-      have hi : WaitInv (drop b n 0) := waits_hold K hK b runs n
-      exact hi.overtaken
+      have hi : WaitInv (drop b n 0) ∧ DirectInv (drop b n 0) := direct_hold K hK b runs n
+      exact fun i h => ⟨hi.1.overtaken i h, (hi.2.overDirect i h).2⟩
+
+    -- W-e, LaterKept, from one more inductive invariant: no write born after a
+    -- direct draft in flight drafted is signed or done while that draft is in
+    -- flight (a pass defers its name: deferredW), so its keep finds none, and a
+    -- write signed or done keeps its value until another write of its name: a
+    -- pass's signing (which ends the kept value's hold) or another Mac's write.
+    structure LaterInv (w : WWorld) : Prop where
+      unsigned : ∀ i d, (w.dphase d = 1 ∨ w.dphase d = 2) → w.nm i = w.dnm d → w.dstamp d ≤ i → w.fate i ≠ 1
+      kept : ∀ i, w.fate i = 1 → w.hdirect (w.nm i) ≠ 0 → w.hdirect (w.nm i) ≤ i → w.log (w.nm i) = w.val i
+
+    theorem wl_init (w : WWorld) (h : w = ww0) : LaterInv w := by
+      subst h
+      exact
+        { unsigned := fun i d hp _ _ _ => ww_or_cases hp (fun a => hd_01 a) (fun b => hd_02 b)
+          kept := fun i h => by have h' : (0 : Nat) = 1 := h; exact absurd h' (by decide) }
+
+    theorem wl_phase_ne0 (w : WWorld) (d : Nat) (hp : w.dphase d = 1 ∨ w.dphase d = 2) : w.dphase d ≠ 0 :=
+      fun z => ww_or_cases hp (fun a => hd_01 (Eq.trans z.symm a)) (fun b => hd_02 (Eq.trans z.symm b))
+
+    -- Verdict::of answers leaves, overtaken or signs, unless the write is done.
+    theorem wl_vo (K : Kernels) (hK : Exact K) (d dn so tb : Bool) :
+        verdictOf K d dn so tb = 0 ∨ verdictOf K d dn so tb = 2 ∨ verdictOf K d dn so tb = 3 ∨ dn = true := by
+      unfold verdictOf
+      rw [hK.2.2.2.2.2.1 dn so tb, hK.2.2.2.2.2.2.1 dn so tb]
+      cases d <;> cases dn <;> cases so <;> cases tb <;> decide
+
+    theorem wl_pv_undeferred (K : Kernels) (w : WWorld) (n : Nat) (h : passVerdict K w n ≠ 0) :
+        deferredW w n = false :=
+      ww_ne_true (fun t => h (by
+        have hz := ww_pv_wait K w n h
+        have e : passVerdict K w n = verdictOf K (deferredW w n) (decide (w.log n = w.val (w.waitOf n)))
+            (w.bs (w.waitOf n) (w.log n)) (decide (w.val (w.waitOf n) = 0)) := if_neg hz
+        rw [e]
+        unfold verdictOf
+        rw [if_pos t]))
+
+    -- A pass's verdict 1 (done): the log holds the waiting write's value.
+    theorem wl_pv_done (K : Kernels) (hK : Exact K) (w : WWorld) (n i : Nat) (hw : w.waitOf n = i)
+        (h0 : passVerdict K w n ≠ 0) (h2 : passVerdict K w n ≠ 2) (h3 : passVerdict K w n ≠ 3) :
+        w.log n = w.val i := by
+      have hz := ww_pv_wait K w n h0
+      have e : passVerdict K w n = verdictOf K (deferredW w n) (decide (w.log n = w.val (w.waitOf n)))
+          (w.bs (w.waitOf n) (w.log n)) (decide (w.val (w.waitOf n) = 0)) := if_neg hz
+      have v := wl_vo K hK (deferredW w n) (decide (w.log n = w.val (w.waitOf n)))
+        (w.bs (w.waitOf n) (w.log n)) (decide (w.val (w.waitOf n) = 0))
+      rw [← e] at v
+      have dn : decide (w.log n = w.val (w.waitOf n)) = true := ww_or_cases v (fun a => absurd a h0)
+        (fun b => ww_or_cases b (fun a => absurd a h2) (fun c => ww_or_cases c (fun a => absurd a h3) (fun x => x)))
+      rw [← hw]
+      exact hd_dec dn
+
+    theorem wl_lw_fate1 (K : Kernels) (S : Nat → Bool) (w : WWorld) (i : Nat) (h : (landW K S w).fate i = 1) :
+        w.fate i = 1 := by
+      rw [ww_lw_fate_def] at h
+      exact ww_by_cases ((ww_c1 K S w i || ww_c2 S w i) = true)
+        (fun c => by rw [if_pos c] at h; exact absurd h (by decide))
+        (fun c => by rw [if_neg c] at h; exact h)
+
+    theorem wl_landW (K : Kernels) (S : Nat → Bool) (w : WWorld) (hL : LaterInv w) : LaterInv (landW K S w) :=
+      { unsigned := fun i d hp hn hs h => hL.unsigned i d hp hn hs (wl_lw_fate1 K S w i h)
+        kept := fun i h => hL.kept i (wl_lw_fate1 K S w i h) }
+
+    -- publish: its new writes are born unsigned (fateStored: a signed write is born).
+    theorem wl_pub_old (K : Kernels) (S : Nat → Bool) (w : WWorld) (hi : WaitInv w) (k i : Nat)
+        (h : (landW K S w).fate i = 1) : ¬ (w.next ≤ i ∧ i < w.next + k) ∧ w.fate i = 1 :=
+      have f := wl_lw_fate1 K S w i h
+      ⟨fun r => hd_ltIrr _ _ r.1 (hi.fateStored i f).1, f⟩
+
+    theorem wl_pub_kept (K : Kernels) (w : WWorld) (hi : WaitInv w) (hL : LaterInv w) (S : Nat → Bool) (v k : Nat)
+        (names vals : Nat → Nat) (bases : Nat → Nat → Bool) (i : Nat)
+        (h : (pushW (landW K S w) v k names vals bases).fate i = 1)
+        (h1 : (pushW (landW K S w) v k names vals bases).hdirect ((pushW (landW K S w) v k names vals bases).nm i) ≠ 0)
+        (h2 : (pushW (landW K S w) v k names vals bases).hdirect ((pushW (landW K S w) v k names vals bases).nm i) ≤ i) :
+        (pushW (landW K S w) v k names vals bases).log ((pushW (landW K S w) v k names vals bases).nm i)
+          = (pushW (landW K S w) v k names vals bases).val i := by
+      have o := wl_pub_old K S w hi k i h
+      have e := ww_push_old (landW K S w) v k names vals bases i o.1
+      have en : (pushW (landW K S w) v k names vals bases).nm i = w.nm i := e.1
+      have eq : (pushW (landW K S w) v k names vals bases).val i = w.val i := (e.2).1
+      have h1' : (w.hdirect (w.nm i) ≠ 0) := by rw [← en]; exact h1
+      have h2' : (w.hdirect (w.nm i) ≤ i) := by rw [← en]; exact h2
+      show w.log ((pushW (landW K S w) v k names vals bases).nm i) = (pushW (landW K S w) v k names vals bases).val i
+      rw [en, eq]
+      exact hL.kept i o.2 h1' h2'
+
+    theorem wl_publish (K : Kernels) (w : WWorld) (hi : WaitInv w) (hL : LaterInv w) (S : Nat → Bool) (v k : Nat)
+        (names vals : Nat → Nat) (bases : Nat → Nat → Bool) : LaterInv (pushW (landW K S w) v k names vals bases) :=
+      { unsigned := fun i d hp hn hs h =>
+          have o := wl_pub_old K S w hi k i h
+          hL.unsigned i d hp (Eq.trans (ww_push_old (landW K S w) v k names vals bases i o.1).1.symm hn) hs o.2
+        kept := wl_pub_kept K w hi hL S v k names vals bases }
+
+    theorem wl_dropped (w : WWorld) (v : Nat) (hL : LaterInv w) : LaterInv (ww_dropW w v) :=
+      have back : ∀ i, (ww_dropW w v).fate i = 1 → w.fate i = 1 := fun i h => ww_or_cases (ww_drop_cases w v i)
+        (fun a => absurd (Eq.trans a.2.1.symm h) (by decide)) (fun b => Eq.trans b.2.symm h)
+      { unsigned := fun i d hp hn hs h => hL.unsigned i d hp hn hs (back i h)
+        kept := fun i h => hL.kept i (back i h) }
+
+    -- signPass: a write it signs or finds done is of a name no direct draft in
+    -- flight writes (deferredW); one it signs ends the kept value's hold, and one
+    -- it finds done has the log's value.
+    theorem wl_signBody (K : Kernels) (hK : Exact K) (w : WWorld) (hD : DirectInv w) (hL : LaterInv w) :
+        LaterInv (signBody K w) :=
+      { unsigned := fun i d hp hn hs h => ww_by_cases (¬ (i = 0) ∧ w.waitOf (w.nm i) = i)
+          (fun c => ww_by_cases (passVerdict K w (w.nm i) = 0)
+            (fun h0 => hL.unsigned i d hp hn hs (Eq.trans (ww_sb_fate_w0 K w i c.1 c.2 h0).symm h))
+            (fun h0 => wl_deferred_held w (w.nm i) d (wl_pv_undeferred K w (w.nm i) h0)
+              (hD.dBorn d (wl_phase_ne0 w d hp)) hp hn.symm))
+          (fun c => hL.unsigned i d hp hn hs (Eq.trans (ww_sb_fate_other K w i c).symm h))
+        kept := fun i h h1 h2 => ww_by_cases (passVerdict K w (w.nm i) = 3)
+          (fun h3 => absurd (show (signBody K w).hdirect (w.nm i) = 0 from if_pos h3) h1)
+          (fun h3 => by
+            have eh : (signBody K w).hdirect (w.nm i) = w.hdirect (w.nm i) := if_neg h3
+            have el : (signBody K w).log (w.nm i) = w.log (w.nm i) := if_neg h3
+            have h1' : (w.hdirect (w.nm i) ≠ 0) := fun z => h1 (Eq.trans eh z)
+            have h2' : (w.hdirect (w.nm i) ≤ i) := by
+              have t : ((signBody K w).hdirect (w.nm i) ≤ i) := h2
+              rw [eh] at t
+              exact t
+            show (signBody K w).log (w.nm i) = w.val i
+            rw [el]
+            exact ww_by_cases (¬ (i = 0) ∧ w.waitOf (w.nm i) = i)
+              (fun c => ww_by_cases (passVerdict K w (w.nm i) = 0)
+                (fun h0 => hL.kept i (Eq.trans (ww_sb_fate_w0 K w i c.1 c.2 h0).symm h) h1' h2')
+                (fun h0 => ww_by_cases (passVerdict K w (w.nm i) = 2)
+                  (fun h22 => absurd (Eq.trans (ww_sb_fate_w2 K w i c.1 c.2 h0 h22).symm h) (by decide))
+                  (fun h22 => wl_pv_done K hK w (w.nm i) i c.2 h0 h22 h3)))
+              (fun c => hL.kept i (Eq.trans (ww_sb_fate_other K w i c).symm h) h1' h2')) }
+
+    theorem wl_other (w : WWorld) (n x : Nat) (hL : LaterInv w) :
+        LaterInv { w with log := upd w.log n x, holder := upd w.holder n 0, hdirect := upd w.hdirect n 0 } :=
+      { unsigned := hL.unsigned
+        kept := fun i h h1 h2 => ww_by_cases (w.nm i = n)
+          (fun e => absurd (show upd w.hdirect n 0 (w.nm i) = 0 from if_pos e) h1)
+          (fun e => by
+            have eh : upd w.hdirect n 0 (w.nm i) = w.hdirect (w.nm i) := if_neg e
+            have el : upd w.log n x (w.nm i) = w.log (w.nm i) := if_neg e
+            have h1' : (w.hdirect (w.nm i) ≠ 0) := fun z => h1 (Eq.trans eh z)
+            have h2' : (w.hdirect (w.nm i) ≤ i) := by
+              have t : (upd w.hdirect n 0 (w.nm i) ≤ i) := h2
+              rw [eh] at t
+              exact t
+            show upd w.log n x (w.nm i) = w.val i
+            rw [el]
+            exact hL.kept i h h1' h2') }
+
+    -- directDraft: stamped after every born write, and a signed write is born.
+    theorem wl_draftD (w : WWorld) (hi : WaitInv w) (hL : LaterInv w) (n x : Nat) :
+        LaterInv { w with dnext := w.dnext + 1, dnm := upd w.dnm w.dnext n, dval := upd w.dval w.dnext x,
+                          dstamp := upd w.dstamp w.dnext w.next, dphase := upd w.dphase w.dnext 1 } :=
+      { unsigned := fun i d hp hn hs h => ww_by_cases (d = w.dnext)
+          (fun e => by
+            have t : (upd w.dstamp w.dnext w.next d ≤ i) := hs
+            rw [e, hd_updS] at t
+            exact hd_ltIrr _ _ t (hi.fateStored i h).1)
+          (fun e => by
+            have tp : (w.dphase d = 1 ∨ w.dphase d = 2) := ww_or_cases hp
+              (fun a => Or.inl (Eq.trans (hd_updO w.dphase w.dnext d 1 e).symm a))
+              (fun b => Or.inr (Eq.trans (hd_updO w.dphase w.dnext d 1 e).symm b))
+            have tn : (w.nm i = w.dnm d) := Eq.trans hn (hd_updO w.dnm w.dnext d n e)
+            have ts : (w.dstamp d ≤ i) := by
+              have u : (upd w.dstamp w.dnext w.next d ≤ i) := hs
+              rw [hd_updO w.dstamp w.dnext d w.next e] at u
+              exact u
+            exact hL.unsigned i d tp tn ts h)
+        kept := hL.kept }
+
+    theorem wl_holdD (w : WWorld) (hL : LaterInv w) (d : Nat) (g : w.dphase d = 1) :
+        LaterInv { w with dphase := upd w.dphase d 2 } :=
+      { unsigned := fun i e hp hn hs h => ww_by_cases (e = d)
+          (fun ed => by
+            rw [← ed] at g
+            exact hL.unsigned i e (Or.inl g) hn hs h)
+          (fun ed => hL.unsigned i e (ww_or_cases hp
+            (fun a => Or.inl (Eq.trans (hd_updO w.dphase d e 2 ed).symm a))
+            (fun b => Or.inr (Eq.trans (hd_updO w.dphase d e 2 ed).symm b))) hn hs h)
+        kept := hL.kept }
+
+    -- keep: no write of its name born after its draft is signed or done
+    -- (unsigned), so its kept value takes the place of no later edit.
+    theorem wl_keep (w : WWorld) (hL : LaterInv w) (d : Nat) (g : w.dphase d = 2) : LaterInv (keepBody w d) :=
+      { unsigned := fun i e hp hn hs h => ww_by_cases (e = d)
+          (fun ed => by
+            have t : (upd w.dphase d 3 e = 1 ∨ upd w.dphase d 3 e = 2) := hp
+            rw [ed, hd_updS] at t
+            exact ww_or_cases t (fun a => absurd a (by decide)) (fun b => absurd b (by decide)))
+          (fun ed => hL.unsigned i e (ww_or_cases hp
+            (fun a => Or.inl (Eq.trans (hd_updO w.dphase d e 3 ed).symm a))
+            (fun b => Or.inr (Eq.trans (hd_updO w.dphase d e 3 ed).symm b))) hn hs h)
+        kept := fun i h h1 h2 => ww_by_cases (w.nm i = w.dnm d)
+          (fun en => by
+            have t : (upd w.hdirect (w.dnm d) (w.dstamp d) (w.nm i) ≤ i) := h2
+            rw [en, hd_updS] at t
+            exact absurd h (hL.unsigned i d (Or.inr g) en t))
+          (fun en => by
+            have eh : upd w.hdirect (w.dnm d) (w.dstamp d) (w.nm i) = w.hdirect (w.nm i) := if_neg en
+            have el : upd w.log (w.dnm d) (w.dval d) (w.nm i) = w.log (w.nm i) := if_neg en
+            have h1' : (w.hdirect (w.nm i) ≠ 0) := fun z => h1 (Eq.trans eh z)
+            have h2' : (w.hdirect (w.nm i) ≤ i) := by
+              have t : (upd w.hdirect (w.dnm d) (w.dstamp d) (w.nm i) ≤ i) := h2
+              rw [eh] at t
+              exact t
+            show upd w.log (w.dnm d) (w.dval d) (w.nm i) = w.val i
+            rw [el]
+            exact hL.kept i h h1' h2') }
+
+    theorem wl_unhold (w : WWorld) (hL : LaterInv w) (d : Nat) : LaterInv { w with dphase := upd w.dphase d 3 } :=
+      { unsigned := fun i e hp hn hs h => ww_by_cases (e = d)
+          (fun ed => by
+            have t : (upd w.dphase d 3 e = 1 ∨ upd w.dphase d 3 e = 2) := hp
+            rw [ed, hd_updS] at t
+            exact ww_or_cases t (fun a => absurd a (by decide)) (fun b => absurd b (by decide)))
+          (fun ed => hL.unsigned i e (ww_or_cases hp
+            (fun a => Or.inl (Eq.trans (hd_updO w.dphase d e 3 ed).symm a))
+            (fun b => Or.inr (Eq.trans (hd_updO w.dphase d e 3 ed).symm b))) hn hs h)
+        kept := hL.kept }
+
+    theorem wl_step (K : Kernels) (hK : Exact K) (w : WWorld) (hi : WaitInv w) (hD : DirectInv w) (hL : LaterInv w)
+        (e : WEvent) : LaterInv (wstep K w e) := by
+      cases e with
+      | publish v k names vals bases opened =>
+        exact ww_by_cases (publishOk K w v k names vals bases opened = true)
+          (fun hg => by
+            rw [show wstep K w (WEvent.publish v k names vals bases opened) = _ from if_pos hg]
+            exact wl_publish K w hi hL opened v k names vals bases)
+          (fun hg => by
+            rw [show wstep K w (WEvent.publish v k names vals bases opened) = _ from if_neg hg]
+            exact hL)
+      | stored v =>
+        exact ww_by_cases (w.refused v = true)
+          (fun hr => by rw [show wstep K w (WEvent.stored v) = _ from if_pos hr]; exact hL)
+          (fun hr => by
+            rw [show wstep K w (WEvent.stored v) = _ from if_neg hr]
+            exact ⟨hL.unsigned, hL.kept⟩)
+      | dropped v =>
+        exact ww_by_cases (w.stored v = true)
+          (fun hs => by rw [show wstep K w (WEvent.dropped v) = _ from if_pos hs]; exact hL)
+          (fun hs => by rw [show wstep K w (WEvent.dropped v) = _ from if_neg hs]; exact wl_dropped w v hL)
+      | land S =>
+        exact ww_by_cases ((!(w.unread) && allN w.next (fun i => !(w.pend i && S (w.ver i)) || w.stored (w.ver i))) = true)
+          (fun hg => by rw [show wstep K w (WEvent.land S) = _ from if_pos hg]; exact wl_landW K S w hL)
+          (fun hg => by rw [show wstep K w (WEvent.land S) = _ from if_neg hg]; exact hL)
+      | signPass opens =>
+        exact ww_by_cases (K.passSigns w.due opens (!w.unread) = true)
+          (fun hps => by
+            show LaterInv (signW K opens w)
+            rw [show signW K opens w = signBody K w from if_pos hps]
+            exact wl_signBody K hK w hD hL)
+          (fun hps => by
+            show LaterInv (signW K opens w)
+            rw [show signW K opens w = w from if_neg hps]
+            exact hL)
+      | settlePass => exact ⟨hL.unsigned, hL.kept⟩
+      | other n x => exact wl_other w n x hL
+      | due b => exact ⟨hL.unsigned, hL.kept⟩
+      | unreadable b => exact ⟨hL.unsigned, hL.kept⟩
+      | directDraft n x =>
+        exact ww_by_cases (turnFree w = true)
+          (fun g => by rw [show wstep K w (WEvent.directDraft n x) = _ from if_pos g]; exact wl_draftD w hi hL n x)
+          (fun g => by rw [show wstep K w (WEvent.directDraft n x) = _ from if_neg g]; exact hL)
+      | directHold d =>
+        exact ww_by_cases (decide (w.dphase d = 1) = true)
+          (fun g => by
+            rw [show wstep K w (WEvent.directHold d) = _ from if_pos g]
+            exact wl_holdD w hL d (hd_dec g))
+          (fun g => by rw [show wstep K w (WEvent.directHold d) = _ from if_neg g]; exact hL)
+      | keep d =>
+        exact ww_by_cases (K.draftedKeeps (decide (w.dphase d = 2)) = true)
+          (fun g => by
+            rw [show wstep K w (WEvent.keep d) = _ from if_pos g]
+            exact wl_keep w hL d (hd_dec (drafted_keeps_true K hK _ g)))
+          (fun g => by rw [show wstep K w (WEvent.keep d) = _ from if_neg g]; exact hL)
+      | unhold d =>
+        exact ww_by_cases ((decide (w.dphase d = 1) || decide (w.dphase d = 2)) = true)
+          (fun g => by
+            rw [show wstep K w (WEvent.unhold d) = _ from if_pos g]
+            exact wl_unhold w hL d)
+          (fun g => by rw [show wstep K w (WEvent.unhold d) = _ from if_neg g]; exact hL)
+      | holdUnreadable b => exact ⟨hL.unsigned, hL.kept⟩
+
+    -- WaitInv, DirectInv and LaterInv hold together in every state of every run.
+    theorem later_hold (K : Kernels) (hK : Exact K) :
+        Satisfies (WaitSpec K) (Always (Lift (fun w => (WaitInv w ∧ DirectInv w) ∧ LaterInv w))) :=
+      invariantSatisfies (WaitSpec K) (fun w => (WaitInv w ∧ DirectInv w) ∧ LaterInv w)
+        (fun s h => ⟨⟨ww_init s h, wd_init s h⟩, wl_init s h⟩)
+        (fun s t hs ht => Exists.elim ht (fun e he =>
+          Eq.mpr (congrArg (fun x => (WaitInv x ∧ DirectInv x) ∧ LaterInv x) he)
+            ⟨⟨ww_step K hK s hs.1.1 e, wd_step K hK s hs.1.1 hs.1.2 e⟩, wl_step K hK s hs.1.1 hs.1.2 hs.2 e⟩))
+
+    -- W-e: an earlier edit's keep never takes the place of a later edit a pass signed.
+    theorem later_kept (K : Kernels) (hK : Exact K) : Satisfies (WaitSpec K) (Always (Lift LaterKept)) := by
+      intro b runs n
+      have hi : (WaitInv (drop b n 0) ∧ DirectInv (drop b n 0)) ∧ LaterInv (drop b n 0) := later_hold K hK b runs n
+      exact hi.2.kept
 
     -- W-b: a step changes a name's value only by signing its waiting write over
     -- one of its bases, never as a take-back, or as another Mac's write.
@@ -3486,7 +4502,7 @@ clean {
     theorem ww_cas (K : Kernels) (hK : Exact K) (w : WWorld) (e : WEvent) : CasStep w (wstep K w e) := by
       cases e with
       | publish v k names vals bases opened =>
-        exact ww_by_cases (publishOk w v k names vals bases opened = true)
+        exact ww_by_cases (publishOk K w v k names vals bases opened = true)
           (fun hg => by
             rw [show wstep K w (WEvent.publish v k names vals bases opened) = _ from if_pos hg]
             exact fun n => Or.inl rfl)
@@ -3513,6 +4529,27 @@ clean {
           (fun e => Or.inl (show (if n = m then x else w.log n) = w.log n from if_neg e))
       | due b => exact fun n => Or.inl rfl
       | unreadable b => exact fun n => Or.inl rfl
+      | directDraft m x =>
+        exact ww_by_cases (turnFree w = true)
+          (fun g => by rw [show wstep K w (WEvent.directDraft m x) = _ from if_pos g]; exact fun n => Or.inl rfl)
+          (fun g => by rw [show wstep K w (WEvent.directDraft m x) = _ from if_neg g]; exact fun n => Or.inl rfl)
+      | directHold d =>
+        exact ww_by_cases (decide (w.dphase d = 1) = true)
+          (fun g => by rw [show wstep K w (WEvent.directHold d) = _ from if_pos g]; exact fun n => Or.inl rfl)
+          (fun g => by rw [show wstep K w (WEvent.directHold d) = _ from if_neg g]; exact fun n => Or.inl rfl)
+      | keep d =>
+        exact ww_by_cases (K.draftedKeeps (decide (w.dphase d = 2)) = true)
+          (fun g => by
+            rw [show wstep K w (WEvent.keep d) = _ from if_pos g]
+            exact fun n => ww_by_cases (n = w.dnm d)
+              (fun e => Or.inr (Or.inl (show (if n = w.dnm d then 0 else w.holder n) = 0 from if_pos e)))
+              (fun e => Or.inl (show (if n = w.dnm d then w.dval d else w.log n) = w.log n from if_neg e)))
+          (fun g => by rw [show wstep K w (WEvent.keep d) = _ from if_neg g]; exact fun n => Or.inl rfl)
+      | unhold d =>
+        exact ww_by_cases ((decide (w.dphase d = 1) || decide (w.dphase d = 2)) = true)
+          (fun g => by rw [show wstep K w (WEvent.unhold d) = _ from if_pos g]; exact fun n => Or.inl rfl)
+          (fun g => by rw [show wstep K w (WEvent.unhold d) = _ from if_neg g]; exact fun n => Or.inl rfl)
+      | holdUnreadable b => exact fun n => Or.inl rfl
 
     theorem cas_step (K : Kernels) (hK : Exact K) : Satisfies (WaitSpec K) (Always (Act CasStep)) :=
       actionSatisfies (WaitSpec K) CasStep
@@ -3542,7 +4579,7 @@ clean {
 
     def wstepByCount (K : Kernels) (w : WWorld) : WEvent → WWorld
       | WEvent.publish v k names vals bases opened =>
-          if publishOk w v k names vals bases opened = true then pushW (evictOldest (landW K opened w)) v k names vals bases
+          if publishOk K w v k names vals bases opened = true then pushW (evictOldest (landW K opened w)) v k names vals bases
           else w
       | e => wstep K w e
 
@@ -3585,7 +4622,7 @@ clean {
     -- signed though no server took their version.
     def wstepWaitAtOnce (K : Kernels) (w : WWorld) : WEvent → WWorld
       | WEvent.publish v k names vals bases opened =>
-          if publishOk w v k names vals bases opened = true then
+          if publishOk K w v k names vals bases opened = true then
             let p := pushW w v k names vals bases
             { p with pend := fun i => if w.next ≤ i ∧ i < w.next + k then false else p.pend i,
                      waitOf := fun n => if decide (k = 1) && decide (n = names 0) then w.next else w.waitOf n }
@@ -3681,6 +4718,126 @@ clean {
 
     theorem a_pass_over_an_unread_set_signs_nothing : (wrun spec ww0 passOverUnread).log 5 = 12 := rfl
     theorem read_as_none_it_reverts_the_later_edit : (wrunPassUnread spec ww0 passOverUnread).log 5 = 11 := rfl
+
+    -- The direct draft's rules (draft_turn, held_values, keep_drafted_until,
+    -- draft_document_diff_with's held refusal). Each run: this Mac drafts name 5
+    -- to 11 directly (direct draft 1), then a publish writes name 5 to 12 as a
+    -- waiting write (write 1); the shipped rules sign 12, each mutant loses it to
+    -- this Mac's own earlier value 11 (overtaken with overD 1 = 1, a draft from
+    -- before write 1). A run offers the mutant's publish first (bases: the log's
+    -- 0), then the shipped one's (bases also 11); version 1 takes the one each
+    -- rule set accepts.
+    def basesOf (x y : Nat) : Nat → Nat → Bool := fun _ z => z == x || z == y
+    def mutantPublish : WEvent := WEvent.publish 1 1 (one1 5) (one1 12) (baseIs 0) opensNone
+    def shippedPublish : WEvent := WEvent.publish 1 1 (one1 5) (one1 12) (basesOf 0 11) opensNone
+    def landKeepSign : List WEvent :=
+      [ WEvent.stored 1, WEvent.land (only 1), WEvent.keep 1, WEvent.signPass true ]
+
+    -- BASES_WITHOUT_HELD: a waiting write's bases leave out the held draft's value.
+    def wstepBasesWithoutHeld (K : Kernels) (w : WWorld) : WEvent → WWorld
+      | WEvent.publish v k names vals bases opened =>
+          if (pubBase K w.holdUnread w v k names vals bases opened && turnFree w) = true then
+            pushW (landW K opened w) v k names vals bases
+          else w
+      | e => wstep K w e
+    def wrunBasesWithoutHeld (K : Kernels) (w : WWorld) : List WEvent → WWorld
+      | [] => w
+      | e :: es => wrunBasesWithoutHeld K (wstepBasesWithoutHeld K w e) es
+
+    def heldBeforeWrite : List WEvent :=
+      [ WEvent.directDraft 5 11, WEvent.directHold 1, mutantPublish, shippedPublish ] ++ landKeepSign
+
+    theorem held_values_are_among_the_bases : (wrun spec ww0 heldBeforeWrite).log 5 = 12 := rfl
+    theorem bases_without_the_held_value_lose_the_later_edit :
+        (wrunBasesWithoutHeld spec ww0 heldBeforeWrite).log 5 = 11
+          ∧ (wrunBasesWithoutHeld spec ww0 heldBeforeWrite).fate 1 = 2
+          ∧ (wrunBasesWithoutHeld spec ww0 heldBeforeWrite).overD 1 = 1 := ⟨rfl, rfl, rfl⟩
+
+    -- DRAFTS_AT_ONCE: a publish drafts while a direct draft is between its draft
+    -- and its hold, so it reads no held value of it.
+    def wstepDraftsAtOnce (K : Kernels) (w : WWorld) : WEvent → WWorld
+      | WEvent.publish v k names vals bases opened =>
+          if (pubBase K w.holdUnread w v k names vals bases opened && heldIn w k names bases) = true then
+            pushW (landW K opened w) v k names vals bases
+          else w
+      | e => wstep K w e
+    def wrunDraftsAtOnce (K : Kernels) (w : WWorld) : List WEvent → WWorld
+      | [] => w
+      | e :: es => wrunDraftsAtOnce K (wstepDraftsAtOnce K w e) es
+
+    def draftInTurn : List WEvent :=
+      [ WEvent.directDraft 5 11, mutantPublish, WEvent.directHold 1, shippedPublish ] ++ landKeepSign
+
+    theorem a_publish_waits_for_the_drafts_turn : (wrun spec ww0 draftInTurn).log 5 = 12 := rfl
+    theorem drafting_at_once_loses_the_later_edit :
+        (wrunDraftsAtOnce spec ww0 draftInTurn).log 5 = 11
+          ∧ (wrunDraftsAtOnce spec ww0 draftInTurn).fate 1 = 2
+          ∧ (wrunDraftsAtOnce spec ww0 draftInTurn).overD 1 = 1 := ⟨rfl, rfl, rfl⟩
+
+    -- KEEPS_SUPERSEDED: a version's records are kept though its hold is gone (a
+    -- descent superseded it, or a refusal took it), after a publish drafted over
+    -- what the log holds without them.
+    def wstepKeepsSuperseded (K : Kernels) (w : WWorld) : WEvent → WWorld
+      | WEvent.keep d => if decide (w.dphase d = 0) = true then w else keepBody w d
+      | e => wstep K w e
+    def wrunKeepsSuperseded (K : Kernels) (w : WWorld) : List WEvent → WWorld
+      | [] => w
+      | e :: es => wrunKeepsSuperseded K (wstepKeepsSuperseded K w e) es
+
+    def keepAfterUnhold : List WEvent :=
+      [ WEvent.directDraft 5 11, WEvent.directHold 1, WEvent.unhold 1, mutantPublish ] ++ landKeepSign
+
+    theorem a_gone_hold_keeps_nothing : (wrun spec ww0 keepAfterUnhold).log 5 = 12 := rfl
+    theorem keeping_a_superseded_hold_loses_the_later_edit :
+        (wrunKeepsSuperseded spec ww0 keepAfterUnhold).log 5 = 11
+          ∧ (wrunKeepsSuperseded spec ww0 keepAfterUnhold).fate 1 = 2
+          ∧ (wrunKeepsSuperseded spec ww0 keepAfterUnhold).overD 1 = 1 := ⟨rfl, rfl, rfl⟩
+
+    -- An unread hold read as none (W3, held-unread): a held draft that does not
+    -- read contributes no value to the bases, and the draft goes on.
+    def wstepHeldUnreadAsNone (K : Kernels) (w : WWorld) : WEvent → WWorld
+      | WEvent.publish v k names vals bases opened =>
+          if (pubBase K false w v k names vals bases opened
+              && (turnFree w && (w.holdUnread || heldIn w k names bases))) = true then
+            pushW (landW K opened w) v k names vals bases
+          else w
+      | e => wstep K w e
+    def wrunHeldUnreadAsNone (K : Kernels) (w : WWorld) : List WEvent → WWorld
+      | [] => w
+      | e :: es => wrunHeldUnreadAsNone K (wstepHeldUnreadAsNone K w e) es
+
+    def unreadHold : List WEvent :=
+      [ WEvent.directDraft 5 11, WEvent.directHold 1, WEvent.holdUnreadable true, mutantPublish,
+        WEvent.holdUnreadable false, shippedPublish ] ++ landKeepSign
+
+    theorem an_unread_hold_refuses_the_draft : (wrun spec ww0 unreadHold).log 5 = 12 := rfl
+    theorem an_unread_hold_read_as_none_loses_the_later_edit :
+        (wrunHeldUnreadAsNone spec ww0 unreadHold).log 5 = 11
+          ∧ (wrunHeldUnreadAsNone spec ww0 unreadHold).fate 1 = 2
+          ∧ (wrunHeldUnreadAsNone spec ww0 unreadHold).overD 1 = 1 := ⟨rfl, rfl, rfl⟩
+
+    -- HELD_UNDEFERRED: a pass that defers only the names of pending writes signs a
+    -- later edit (12) while this Mac's earlier direct draft of its name (11) is in
+    -- flight; the draft's keep then takes the later edit's place.
+    def wstepHeldUndeferred (K : Kernels) (w : WWorld) : WEvent → WWorld
+      | WEvent.signPass opens =>
+          let s := signW K opens { w with dphase := fun _ => 0 }
+          { s with dphase := w.dphase }
+      | e => wstep K w e
+    def wrunHeldUndeferred (K : Kernels) (w : WWorld) : List WEvent → WWorld
+      | [] => w
+      | e :: es => wrunHeldUndeferred K (wstepHeldUndeferred K w e) es
+
+    def passBeforeKeep : List WEvent :=
+      [ WEvent.directDraft 5 11, WEvent.directHold 1, shippedPublish, WEvent.stored 1, WEvent.land (only 1),
+        WEvent.signPass true, WEvent.settlePass, WEvent.keep 1, WEvent.signPass true, WEvent.settlePass ]
+
+    theorem a_pass_waits_for_the_draft_in_flight :
+        (wrun spec ww0 passBeforeKeep).log 5 = 12 ∧ (wrun spec ww0 passBeforeKeep).fate 1 = 1 := ⟨rfl, rfl⟩
+    theorem signing_under_a_draft_in_flight_loses_the_later_edit :
+        (wrunHeldUndeferred spec ww0 passBeforeKeep).log 5 = 11
+          ∧ (wrunHeldUndeferred spec ww0 passBeforeKeep).fate 1 = 1
+          ∧ (wrunHeldUndeferred spec ww0 passBeforeKeep).hdirect 5 = 1 := ⟨rfl, rfl, rfl⟩
 
     -- ===========================================================================
     -- 11. The answer sheets. Each folds a fixed grid of inputs through the spec
@@ -3807,6 +4964,622 @@ clean {
        0x0f03c0f03c0f03c0, 0x0f03c0f03c0f03c0, 0x0f03c0f03c0f03c0, 0x0f03c0f03c0f03c0,
        0x0f03c0f03c0f03c0, 0x0f03c0f03c0f03c0, 0x0f03c0f03c0f03c0, 0x0f03c0f03c0f03c0,
        0x0f03c0f03c0f03c0, 0x01000100000f03c0] := rfl
+
+    -- The direct draft's three decisions over all their arguments, one bit each:
+    -- drafted_keeps, 2 cases (its hold is there); spine_settles, 4 (k's bits: it
+    -- drafted records, they were kept); draft_refuses, 8 (k's bits: it writes, a
+    -- pending set does not open, a held draft does not read).
+    def draftCase (k : Nat) : Nat :=
+      if k < 2 then bitOf (spec_drafted_keeps (decide (k = 1)))
+      else if k < 6 then
+        bitOf (spec_spine_settles (decide ((k - 2) % 2 = 1)) (decide (((k - 2) / 2) % 2 = 1)))
+      else
+        bitOf (spec_draft_refuses (decide ((k - 6) % 2 = 1)) (decide (((k - 6) / 2) % 2 = 1))
+          (decide (((k - 6) / 4) % 2 = 1)))
+    def draftSheet : List Nat := [pack 2 (gridFrom draftCase 0 14)]
+    theorem draftSheet_is : draftSheet = [0x0000000000002a36] := rfl
+
+
+    -- ===========================================================================
+    -- 12. THE SERVER'S COMPARE-AND-SET (server.rs takes_over, the rule a PUT and
+    --     a version at the vault's store file keep alike, and transport.rs
+    --     write_path_held, a publish to a vault at a path: both ask Takeover::of).
+    --     The Worlds above judge every arrival by takesOver: here that is the
+    --     decision both run, the five kernels and a refused pin answer every
+    --     envelope exactly once, and the replaced pin, which takes a version with
+    --     no sequence check, is named as the environment premise it is, with the
+    --     run that loses an edit where it fails. Outside it: transport.rs
+    --     replace_path's put-back over the version it read (an admin's copy put
+    --     back over a version no reader accepts: a forgery, a retired or followed
+    --     signer, client.rs's put_back), and a path that holds no envelope or
+    --     another vault's, which a publish writes.
+    -- ===========================================================================
+
+    -- Takeover::of, one for one: 0 takes, 1 holds, 2 the pin refused, 3 not newer,
+    -- 4 breaks the chain, 5 off the parents.
+    def takeoverOf (p r n s e a h m : Bool) : Nat :=
+      if spec_takes_head p r n e a h m = true then 0
+      else if spec_holds_version p r n s = true then 1
+      else if spec_refuses_not_newer p r n s = true then 3
+      else if spec_refuses_chain p r n e = true then 4
+      else if spec_refuses_parents p r n e a h m = true then 5
+      else 2
+
+    -- How many answers hold: the five kernels and a refused pin.
+    def answersHolding (p r n s e a h m : Bool) : Nat :=
+      bitOf (spec_takes_head p r n e a h m) + bitOf (spec_holds_version p r n s) + bitOf (!p)
+        + bitOf (spec_refuses_not_newer p r n s) + bitOf (spec_refuses_chain p r n e)
+        + bitOf (spec_refuses_parents p r n e a h m)
+
+    -- Exactly one answer holds for every envelope and every version held, so the
+    -- order Takeover::of asks in (the code's refusal order) changes nothing.
+    theorem takeover_partitions (p r n s e a h m : Bool) : answersHolding p r n s e a h m = 1 := by
+      cases p <;> cases r <;> cases n <;> cases s <;> cases e <;> cases a <;> cases h <;> cases m <;> rfl
+
+    -- The server keeps the envelope: it takes it as its head, or holds it already.
+    def serverKeeps (p r n s e a h m : Bool) : Bool :=
+      spec_takes_head p r n e a h m || spec_holds_version p r n s
+
+    theorem keeps_not_same (newer named p e a : Bool) :
+        takesOver false newer named (p && e) = serverKeeps p false (!newer) false e a true named := by
+      cases newer <;> cases named <;> cases p <;> cases e <;> cases a <;> rfl
+
+    theorem keeps_same (named e a : Bool) :
+        takesOver true false named (true && e) = serverKeeps true false (!false) true e a true named := by
+      cases named <;> cases e <;> cases a <;> rfl
+
+    -- THE WORLDS' ENVIRONMENT IS THE SERVER'S DECISION. On the cases the Worlds
+    -- cover (a pin that was not replaced, a parented vault), takesOver with the pin
+    -- and chain checks folded into its pinOk is exactly what the server keeps,
+    -- wherever the version held is not newer than itself and passes its own pin
+    -- check (the server took it under that pin, and its bytes carry the same signer
+    -- and chain).
+    theorem takes_over_is_the_kernel (same newer named p e a : Bool)
+        (hsame : same = true → newer = false ∧ p = true) :
+        takesOver same newer named (p && e) = serverKeeps p false (!newer) same e a true named := by
+      cases same with
+      | false => exact keeps_not_same newer named p e a
+      | true =>
+        cases newer with
+        | true => exact Bool.noConfusion (hsame rfl).1
+        | false =>
+          cases p with
+          | false => exact Bool.noConfusion (hsame rfl).2
+          | true => exact keeps_same named e a
+
+    theorem dec_lt_self (x : Nat) : decide (x < x) = false := by
+      cases h : decide (x < x) with
+      | false => rfl
+      | true => exact absurd (of_decide_eq_true h) (Nat.lt_irrefl x)
+
+    theorem dec_eq_true_of {x y : Nat} (h : decide (x = y) = true) : x = y := of_decide_eq_true h
+
+    -- accept, as stArrive and stRepublish ask it, is the server's decision: the held
+    -- version is its head, an envelope is newer by sequence and the same by identity,
+    -- and the parents named are the version's spine.
+    theorem accept_is_the_kernel (w : World) (s v : Nat) (p e a : Bool) (hp : w.head s = v → p = true) :
+        accept w s v (p && e) =
+          serverKeeps p false (!decide (w.seq (w.head s) < w.seq v)) (decide (w.head s = v)) e a true
+            (elem (w.head s) (w.spine v)) :=
+      takes_over_is_the_kernel (decide (w.head s = v)) (decide (w.seq (w.head s) < w.seq v))
+        (elem (w.head s) (w.spine v)) p e a
+        (fun h => by
+          have heq : w.head s = v := dec_eq_true_of h
+          exact ⟨Eq.mpr (congrArg (fun y => decide (w.seq y < w.seq v) = false) heq) (dec_lt_self (w.seq v)),
+            hp heq⟩)
+
+    -- A replaced pin takes the envelope with no sequence, chain or parents check.
+    theorem replaced_takes_unchecked (n e a h m : Bool) : spec_takes_head true true n e a h m = true := rfl
+
+    -- REPLACED PINS, the environment premise. Past (section 4) says a server that
+    -- holds a version of v's sequence or later, other than v, never holds v again,
+    -- and the settle rule rests on it: that is each server's head moving only
+    -- forward, which takesOver keeps (accept_is_the_kernel). A server judges under a
+    -- replaced pin (envelope.rs check_pin_with, Pin::Replaced) only while the line it
+    -- holds gives way to the key its build names: a retired signer, or a retired key
+    -- that endorsed a key the build does not know. The version it takes then is of
+    -- the build's own line, and a release retires every key of the chain before the
+    -- key it names (the ALAB_RETIRED line client.rs alab_release prints), so that
+    -- version gives way to nothing: from then on the server judges by takesOver until
+    -- its build changes, and a new build is a new server process, which ends every
+    -- PUT in flight and refuses any version whose signer it retires. So a replaced
+    -- pin judges only an arrival at a server that has not yet taken a version of the
+    -- line, whose head is still the version the line started from (0 here). The
+    -- held-draft World extended with such arrivals (stepReplaced) keeps HeldInv and
+    -- loses no edit (held_safe_replaced, no_lost_edit_replaced); server/takes_over_tests.rs
+    -- checks each clause on the real takes_over, and the run below shows the premise
+    -- carries weight: a replaced pin at a server that took a head brings back the
+    -- version a settled hold was of, and its edit is lost.
+    def ReplacedOnlyAtTheStart (givesWay : Nat → Bool) (w : World) : Prop :=
+      ∀ s, givesWay s = true → w.head s = 0
+
+    -- Where a replaced pin judges: a server givesWay names, still at its line's start.
+    def replacedHere (givesWay : Nat → Bool) (w : World) (s : Nat) : Bool :=
+      givesWay s && decide (w.head s = 0)
+
+    -- What server s keeps of v: as its replaced pin allows there
+    -- (replaced_takes_unchecked), else takesOver.
+    def judged (givesWay : Nat → Bool) (w : World) (s v : Nat) (ok : Bool) : Bool :=
+      if replacedHere givesWay w s = true then ok else accept w s v ok
+
+    def stArriveReplaced (givesWay : Nat → Bool) (w : World) (v x : Nat) (ok : Bool) : World :=
+      match w.via v x with
+      | none => w
+      | some s =>
+        if w.inflight v x then
+          { w with inflight := upd2 w.inflight v x false,
+                   res := upd2 w.res v x (some (judged givesWay w s v ok)),
+                   head := if judged givesWay w s v ok = true then upd w.head s v else w.head }
+        else w
+
+    def stepReplaced (K : Kernels) (one moves givesWay : Nat → Bool) (w : World) : Event → World
+      | Event.arrive v x ok => stArriveReplaced givesWay w v x ok
+      | e => step K one moves w e
+
+    def runReplaced (K : Kernels) (one moves givesWay : Nat → Bool) (w : World) : List Event → World
+      | [] => w
+      | e :: es => runReplaced K one moves givesWay (stepReplaced K one moves givesWay w e) es
+
+    def HeldSpecReplaced (K : Kernels) (one moves givesWay : Nat → Bool) : StateMachine World :=
+      StateMachine.mk (fun w => w = w0) (fun w w' => ∃ e, w' = stepReplaced K one moves givesWay w e)
+
+    -- The guard is the premise: in a state where it holds, the extended step's
+    -- arrival is a replaced pin's wherever givesWay names the server.
+    theorem replaced_here_is_the_premise (givesWay : Nat → Bool) (w : World)
+        (hp : ReplacedOnlyAtTheStart givesWay w) (s : Nat) : replacedHere givesWay w s = givesWay s := by
+      unfold replacedHere
+      cases hg : givesWay s with
+      | false => rfl
+      | true => rw [hd_dect (hp s hg)]
+
+    -- Every drafted version is of sequence 1 or more, over version 0's 0.
+    def SeqGround (w : World) : Prop := w.seq 0 = 0 ∧ ∀ v, ¬ (w.phase v = 0) → 1 ≤ w.seq v
+
+    theorem sg_one (n : Nat) : 1 ≤ n + 1 := by omega
+    theorem sg_ite (c : Bool) (t e : World) (ht : c = true → SeqGround t) (he : SeqGround e) :
+        SeqGround (if c = true then t else e) := by
+      cases c
+      · exact he
+      · exact ht rfl
+    theorem sg_of (w w' : World) (h : SeqGround w) (es : w'.seq = w.seq)
+        (ep : ∀ u, ¬ (w'.phase u = 0) → ¬ (w.phase u = 0)) : SeqGround w' := by
+      refine ⟨?_, ?_⟩
+      · rw [es]; exact h.1
+      · intro u hu
+        rw [es]
+        exact h.2 u (ep u hu)
+    theorem sg_set (w w' : World) (v n : Nat) (h : SeqGround w) (hv : ¬ (w.phase v = 0)) (es : w'.seq = w.seq)
+        (ep : w'.phase = upd w.phase v n) : SeqGround w' :=
+      sg_of w w' h es (fun u hu z => by
+        by_cases e : u = v
+        · rw [e] at z; exact hv z
+        · rw [ep, hd_updO _ _ _ _ e] at hu; exact hu z)
+
+    theorem sg_draft (w : World) (v o : Nat) (sp : List Nat) (m d : Bool) (r : List Nat) (h : SeqGround w) :
+        SeqGround (stDraft w v o sp m d r) := by
+      unfold stDraft
+      refine sg_ite _ _ _ ?_ h
+      intro g
+      have hv0 : ¬ (v = 0) := hd_ndec (hd_andL (hd_andR g))
+      refine ⟨?_, ?_⟩
+      · show upd w.seq v (w.seq o + 1) 0 = 0
+        rw [hd_updO _ _ _ _ (fun e => hv0 e.symm)]
+        exact h.1
+      · intro u hu
+        show 1 ≤ upd w.seq v (w.seq o + 1) u
+        by_cases e : u = v
+        · rw [e, hd_updS]; exact sg_one (w.seq o)
+        · rw [hd_updO _ _ _ _ e]
+          exact h.2 u (fun z => hu (by show upd w.phase v 1 u = 0; rw [hd_updO _ _ _ _ e]; exact z))
+
+    theorem sg_step (K : Kernels) (one moves : Nat → Bool) (w : World) (e : Event) (h : SeqGround w) :
+        SeqGround (step K one moves w e) := by
+      cases e with
+      | draft v o sp m d r => exact sg_draft w v o sp m d r h
+      | hold v unk =>
+        show SeqGround (stHold w v unk)
+        unfold stHold
+        exact sg_ite _ _ _ (fun g => sg_set w _ v 2 h (fun z => hd_01 (Eq.trans z.symm (hd_dec g))) rfl rfl) h
+      | send v x =>
+        show SeqGround (stSend w v x)
+        unfold stSend
+        exact sg_ite _ _ _ (fun _ => sg_of w _ h rfl (fun u z => z)) h
+      | arrive v x ok =>
+        show SeqGround (stArrive w v x ok)
+        unfold stArrive
+        cases w.via v x with
+        | none => exact h
+        | some s => exact sg_ite _ _ _ (fun _ => sg_of w _ h rfl (fun u z => z)) h
+      | refusedAll v =>
+        show SeqGround (stRefused K w v)
+        unfold stRefused
+        exact sg_ite _ _ _ (fun g => sg_set w _ v 3 h (fun z => hd_02 (Eq.trans z.symm (hd_dec (hd_andL g)))) rfl rfl) h
+      | keep v =>
+        show SeqGround (stKeep K w v)
+        unfold stKeep
+        exact sg_ite _ _ _ (fun _ => sg_of w _ h rfl (fun u z => z)) h
+      | landed v tk =>
+        show SeqGround (stLanded K one w v tk)
+        unfold stLanded
+        exact sg_ite _ _ _ (fun g => sg_set w _ v 3 h (fun z => hd_02 (Eq.trans z.symm (hd_dec (hd_andL g)))) rfl rfl) h
+      | adopt v s =>
+        show SeqGround (stAdopt K one w v s)
+        unfold stAdopt
+        exact sg_ite _ _ _ (fun _ => sg_of w _ h rfl (fun u z => z)) h
+      | republish v s =>
+        show SeqGround (stRepublish w v s)
+        unfold stRepublish
+        exact sg_ite _ _ _ (fun _ => sg_of w _ h rfl (fun u z => z)) h
+      | move x s =>
+        show SeqGround (stMove moves w x s)
+        unfold stMove
+        exact sg_ite _ _ _ (fun _ => sg_of w _ h rfl (fun u z => z)) h
+
+    -- A replaced pin takes v at the start of a server's line: newer than version 0,
+    -- so the server was past nothing of v (what hd_accept says of takesOver).
+    theorem hd_arriveR (one givesWay : Nat → Bool) (w : World) (v x : Nat) (ok : Bool) (hi : HeldInv one w)
+        (hs : SeqGround w) : HeldInv one (stArriveReplaced givesWay w v x ok) ∧ SeqGround (stArriveReplaced givesWay w v x ok) := by
+      unfold stArriveReplaced
+      cases hvx : w.via v x with
+      | none => exact ⟨hi, hs⟩
+      | some s0 =>
+        refine ⟨?_, sg_ite _ _ _ (fun _ => sg_of w _ hs rfl (fun u z => z)) hs⟩
+        refine hd_ite one _ _ _ ?_ hi
+        intro hinf
+        by_cases ha : judged givesWay w s0 v ok = true
+        · have hacc : w.head s0 = v ∨ w.seq (w.head s0) < w.seq v ∧ ¬ Past w s0 v := by
+            by_cases hr : replacedHere givesWay w s0 = true
+            · have h0 : w.head s0 = 0 := hd_dec (hd_andR hr)
+              have hp2 : 2 ≤ w.phase v := (hi.2.2.2.2.2.2.2.1 v x (fun e => hd_sn (Eq.trans hvx.symm e))).1
+              have h1 : 1 ≤ w.seq v := hs.2 v (hd_ne02 _ hp2)
+              have hlt : w.seq (w.head s0) < w.seq v := by rw [h0, hs.1]; exact h1
+              exact Or.inr ⟨hlt, fun p => hd_ltIrr _ _ p.1 hlt⟩
+            · have ea : accept w s0 v ok = true := by
+                have t : judged givesWay w s0 v ok = accept w s0 v ok := if_neg hr
+                rw [← t]; exact ha
+              cases hd_accept w s0 v ok ea with
+              | inl e => exact Or.inl e
+              | inr e => exact Or.inr ⟨e, hd_acceptPast w s0 v ok ea⟩
+          have nP : ¬ Past w s0 v := fun p => Or.elim hacc (fun e => p.2 e) (fun e => e.2 p)
+          have hac : w.head s0 = v ∨ w.seq (w.head s0) < w.seq v :=
+            Or.elim hacc (fun e => Or.inl e) (fun e => Or.inr e.1)
+          exact hd_arriveT one w _ v x s0 hi hvx hinf hac nP rfl rfl rfl rfl rfl rfl
+            (by show (if judged givesWay w s0 v ok = true then upd w.head s0 v else w.head) = upd w.head s0 v; rw [if_pos ha])
+            rfl rfl rfl
+            (by show upd2 w.res v x (some (judged givesWay w s0 v ok)) = upd2 w.res v x (some true); rw [ha])
+            rfl rfl
+        · have ha' := not_true_false ha
+          exact hd_arriveF one w _ v x s0 hi hvx hinf rfl rfl rfl rfl rfl rfl
+            (by show (if judged givesWay w s0 v ok = true then upd w.head s0 v else w.head) = w.head; rw [if_neg ha])
+            rfl rfl rfl
+            (by show upd2 w.res v x (some (judged givesWay w s0 v ok)) = upd2 w.res v x (some false); rw [ha'])
+            rfl rfl
+
+    def HeldInvR (one : Nat → Bool) (w : World) : Prop := HeldInv one w ∧ SeqGround w
+
+    theorem hr_plain (K : Kernels) (hK : Exact K) (one moves : Nat → Bool) (hf : OneIsFixed one moves) (w : World)
+        (e : Event) (hi : HeldInvR one w) : HeldInvR one (step K one moves w e) :=
+      ⟨held_inv_step K hK one moves hf w _ hi.1 ⟨e, rfl⟩, sg_step K one moves w e hi.2⟩
+
+    theorem held_inv_step_replaced (K : Kernels) (hK : Exact K) (one moves givesWay : Nat → Bool)
+        (hf : OneIsFixed one moves) (w w' : World) (hi : HeldInvR one w)
+        (hn : ∃ e, w' = stepReplaced K one moves givesWay w e) : HeldInvR one w' :=
+      Exists.elim hn (fun e he => by
+        rw [he]
+        cases e with
+        | arrive v x ok => exact hd_arriveR one givesWay w v x ok hi.1 hi.2
+        | draft v o sp m d r => exact hr_plain K hK one moves hf w (Event.draft v o sp m d r) hi
+        | hold v unk => exact hr_plain K hK one moves hf w (Event.hold v unk) hi
+        | send v x => exact hr_plain K hK one moves hf w (Event.send v x) hi
+        | refusedAll v => exact hr_plain K hK one moves hf w (Event.refusedAll v) hi
+        | keep v => exact hr_plain K hK one moves hf w (Event.keep v) hi
+        | landed v tk => exact hr_plain K hK one moves hf w (Event.landed v tk) hi
+        | adopt v s => exact hr_plain K hK one moves hf w (Event.adopt v s) hi
+        | republish v s => exact hr_plain K hK one moves hf w (Event.republish v s) hi
+        | move x s => exact hr_plain K hK one moves hf w (Event.move x s) hi)
+
+    -- HELD DRAFTS ARE SAFE WITH REPLACED PINS: every run of the held-draft World
+    -- whose servers may judge an arrival by a replaced pin at the start of their
+    -- line keeps HeldInv in every state.
+    theorem held_safe_replaced (K : Kernels) (hK : Exact K) (one moves givesWay : Nat → Bool)
+        (hf : OneIsFixed one moves) :
+        Satisfies (HeldSpecReplaced K one moves givesWay) (Always (Lift (HeldInvR one))) :=
+      invariantSatisfies (HeldSpecReplaced K one moves givesWay) (HeldInvR one)
+        (fun s hs => by
+          have e : s = w0 := hs
+          rw [e]
+          exact ⟨held_inv_init one, rfl, fun v h => absurd rfl h⟩)
+        (fun s t hi hn => held_inv_step_replaced K hK one moves givesWay hf s t hi hn)
+
+    theorem no_lost_edit_replaced (K : Kernels) (hK : Exact K) (one moves givesWay : Nat → Bool)
+        (hf : OneIsFixed one moves) (carries : Nat → Nat → Prop) :
+        Satisfies (HeldSpecReplaced K one moves givesWay)
+          (Always (Lift (fun w => TextInheritance carries w → EditSafe carries one w))) :=
+      fun b runs n ht => by
+        have h : HeldInvR one (drop b n 0) := held_safe_replaced K hK one moves givesWay hf b runs n
+        exact edit_safe_of carries one _ h.1.1 ht
+
+    -- The arrival the premise forbids: a replaced pin wherever givesWay names the
+    -- server, whatever it holds.
+    def stArriveAnywhere (givesWay : Nat → Bool) (w : World) (v x : Nat) (ok : Bool) : World :=
+      match w.via v x with
+      | none => w
+      | some s =>
+        if w.inflight v x then
+          { w with inflight := upd2 w.inflight v x false,
+                   res := upd2 w.res v x (some (if givesWay s then ok else accept w s v ok)),
+                   head := if (if givesWay s then ok else accept w s v ok) then upd w.head s v else w.head }
+        else w
+
+    def stepAnywhere (K : Kernels) (one moves givesWay : Nat → Bool) (w : World) : Event → World
+      | Event.arrive v x ok => stArriveAnywhere givesWay w v x ok
+      | e => step K one moves w e
+
+    def runAnywhere (K : Kernels) (one moves givesWay : Nat → Bool) (w : World) : List Event → World
+      | [] => w
+      | e :: es => runAnywhere K one moves givesWay (stepAnywhere K one moves givesWay w e) es
+
+    -- v1's PUT to s1 is in flight; v2, drafted from the same text, lands on s1 and
+    -- settles v1's hold by reach; then v1 arrives.
+    def landedFirst : List Event :=
+      [ Event.draft 1 0 [0] true true [1], Event.hold 1 false, Event.send 1 1,
+        Event.draft 2 0 [0] true true [1], Event.hold 2 false, Event.send 2 1, Event.arrive 2 1 true,
+        Event.keep 2, Event.landed 2 [1] ]
+    def lateArrival : List Event := landedFirst ++ [Event.arrive 1 1 true]
+
+    def givesWayAtOne : Nat → Bool := fun s => s == 1
+
+    theorem the_settled_hold_goes : (run spec oneAll movesNone w0 lateArrival).hold 1 = none := rfl
+    -- s1 took v2 before v1 arrived: the premise fails exactly there.
+    theorem s1_had_taken_v2 : (run spec oneAll movesNone w0 landedFirst).head 1 = 2 := rfl
+    theorem a_forward_head_refuses_it : lostAt (run spec oneAll movesNone w0 lateArrival) 1 1 = false := rfl
+    -- A replaced pin at s1's start (its first arrival, v2's) and then takesOver: v1 is refused.
+    theorem a_replaced_pin_at_the_start_refuses_it :
+        lostAt (runReplaced spec oneAll movesNone givesWayAtOne w0 lateArrival) 1 1 = false := rfl
+    theorem a_replaced_pin_after_a_take_loses_v1 :
+        lostAt (runAnywhere spec oneAll movesNone givesWayAtOne w0 lateArrival) 1 1 = true := rfl
+
+    -- takes_over, 256 cases: k's bits pin ok, replaced, not newer, the same version,
+    -- extends, names parents, the held vault parented, among the parents.
+    def takeoverCase (k : Nat) : Nat :=
+      takeoverOf (decide (k % 2 = 1)) (decide ((k / 2) % 2 = 1)) (decide ((k / 4) % 2 = 1))
+        (decide ((k / 8) % 2 = 1)) (decide ((k / 16) % 2 = 1)) (decide ((k / 32) % 2 = 1))
+        (decide ((k / 64) % 2 = 1)) (decide ((k / 128) % 2 = 1))
+    def takeoverSheet : List Nat := wordsFrom 8 16 takeoverCase 0 16
+
+    -- The words the sheet is, by the kernel's evaluation; no_lost_edit::tests
+    -- recomputes them from Takeover::of and reads them here.
+    theorem takeoverSheet_is : takeoverSheet =
+      [0x000008a0a209a0a2, 0x000008a08209a082, 0x000008a0a209a0a2, 0x000008a0aa09a0aa,
+       0x000008a0a209a0a2, 0x000008a0aa09a0aa, 0x000008a0a209a0a2, 0x000008a0aa09a0aa,
+       0x000008a0a209a0a2, 0x000008a08209a082, 0x000008a0a209a0a2, 0x000008a08209a082,
+       0x000008a0a209a0a2, 0x000008a08209a082, 0x000008a0a209a0a2, 0x000008a08209a082] := rfl
+
+    -- ===========================================================================
+    -- 13. THE UNVERSIONED HOLD (records.drafted), the one hold builds from
+    --     2026-10-28 to 2026-11-05 kept: the records alone of a version it did not
+    --     name. No build writes it now and nothing rewrites it, so it holds the
+    --     records `orig` it was written with, or is gone. A head whose stamp it
+    --     completes takes it in (adopt_held_draft: the store takes what it takes of
+    --     it, since Store::ingest skips a record Store::insert refuses), a settled
+    --     head may remove it (settle_held_drafts_locked), and other ingests grow the
+    --     records store. Its law: every record it was written with is in the file or
+    --     in the store, and nothing removes it otherwise. The store here is what
+    --     Store::holds counts, its complete records: unversioned_goes asks that, not
+    --     Store::contains, which counts a record waiting on a parent too, and the
+    --     store drops waiting records to make room (store.rs make_room). The
+    --     premise is that a complete record never leaves the store: no event below
+    --     takes one out (the log refuses a complete record past its held total, and a
+    --     records file recovers within it). held_draft_tests'
+    --     a_record_the_store_holds_only_waiting_keeps_the_unversioned_hold shows the
+    --     loss the rule by Store::contains had.
+    -- ===========================================================================
+
+    structure LKernels where
+      adopts : Bool → Bool → Bool
+      goes : Bool → Bool → Bool
+
+    def LExact (K : LKernels) : Prop :=
+      (∀ a b, K.adopts a b = spec_hold_adopts a b) ∧ (∀ a b, K.goes a b = spec_unversioned_goes a b)
+
+    def lspec : LKernels := LKernels.mk spec_hold_adopts spec_unversioned_goes
+
+    theorem lspec_exact : LExact lspec := ⟨fun _ _ => rfl, fun _ _ => rfl⟩
+
+    theorem goes_true (K : LKernels) (hK : LExact K) (a b : Bool) (h : K.goes a b = true) : b = true := by
+      rw [hK.2 a b] at h
+      revert h
+      cases a <;> cases b <;> decide
+
+    structure LWorld where
+      file : Bool
+      store : Nat → Bool
+
+    -- adopt ingested completes took: a head reads back; the ingest raised no error,
+    -- its stamp is complete after it, and the store took the records `took`.
+    -- settle reads: a settled head; the file reads and decodes, and the store loads.
+    -- ingest r: a sync or a kept publish brings record r into the store.
+    inductive LEvent where
+      | adopt : Bool → Bool → List Nat → LEvent
+      | settle : Bool → LEvent
+      | ingest : Nat → LEvent
+
+    def allStored (st : Nat → Bool) : List Nat → Bool
+      | [] => true
+      | r :: l => st r && allStored st l
+
+    def addAll (st : Nat → Bool) (l : List Nat) : Nat → Bool := fun r => st r || elem r l
+
+    def lAdopt (K : LKernels) (orig : List Nat) (w : LWorld) (ing comp : Bool) (took : List Nat) : LWorld :=
+      if (w.file && K.adopts ing comp) = true then
+        { file := !(K.goes true (allStored (addAll w.store took) orig)), store := addAll w.store took }
+      else w
+
+    def lSettle (K : LKernels) (orig : List Nat) (w : LWorld) (reads : Bool) : LWorld :=
+      if (w.file && K.goes reads (allStored w.store orig)) = true then { w with file := false } else w
+
+    def lIngest (w : LWorld) (r : Nat) : LWorld := { w with store := upd w.store r true }
+
+    def lstep (K : LKernels) (orig : List Nat) (w : LWorld) : LEvent → LWorld
+      | LEvent.adopt ing comp took => lAdopt K orig w ing comp took
+      | LEvent.settle reads => lSettle K orig w reads
+      | LEvent.ingest r => lIngest w r
+
+    def lrun (K : LKernels) (orig : List Nat) (w : LWorld) : List LEvent → LWorld
+      | [] => w
+      | e :: es => lrun K orig (lstep K orig w e) es
+
+    def lw0 (st : Nat → Bool) : LWorld := { file := true, store := st }
+
+    def LegacySpec (K : LKernels) (orig : List Nat) (st : Nat → Bool) : StateMachine LWorld :=
+      StateMachine.mk (fun w => w = lw0 st) (fun w w' => ∃ e, w' = lstep K orig w e)
+
+    -- THE LAW: every record the file was written with is in the file or in the store.
+    def LegacyKept (orig : List Nat) (w : LWorld) : Prop :=
+      ∀ r, elem r orig = true → w.file = true ∨ w.store r = true
+
+    -- Nothing removes the file otherwise: a step that removes it leaves the store
+    -- holding every record it was written with.
+    def GoesOnlyStored (orig : List Nat) (w w' : LWorld) : Prop :=
+      w.file = true → w'.file = false → ∀ r, elem r orig = true → w'.store r = true
+
+    theorem allStored_elem (st : Nat → Bool) (l : List Nat) : allStored st l = true →
+        (r : Nat) → elem r l = true → st r = true := by
+      induction l with
+      | nil => intro _ r hr; exact ft hr
+      | cons a l ih =>
+        intro h r hr
+        exact (if hra : r = a then Eq.mpr (congrArg (fun y => st y = true) hra) (hd_andL h)
+          else ih (hd_andR h) r (Eq.trans (elem_cons_neg r a l hra).symm hr))
+
+    theorem l_adopt_goes (K : LKernels) (hK : LExact K) (orig : List Nat) (w : LWorld) (ing comp : Bool)
+        (took : List Nat) (r : Nat) (hr : elem r orig = true) (hw : (w.file && K.adopts ing comp) = true) :
+        (lAdopt K orig w ing comp took).file = true ∨ (lAdopt K orig w ing comp took).store r = true := by
+      unfold lAdopt
+      rw [if_pos hw]
+      cases hg : K.goes true (allStored (addAll w.store took) orig) with
+      | false => exact Or.inl rfl
+      | true => exact Or.inr (allStored_elem _ orig (goes_true K hK _ _ hg) r hr)
+
+    theorem l_adopt_kept (K : LKernels) (hK : LExact K) (orig : List Nat) (w : LWorld) (ing comp : Bool)
+        (took : List Nat) (hi : LegacyKept orig w) : LegacyKept orig (lAdopt K orig w ing comp took) := by
+      intro r hr
+      by_cases hw : (w.file && K.adopts ing comp) = true
+      · exact l_adopt_goes K hK orig w ing comp took r hr hw
+      · have e : lAdopt K orig w ing comp took = w := by unfold lAdopt; rw [if_neg hw]
+        rw [e]
+        exact hi r hr
+
+    theorem l_settle_kept (K : LKernels) (hK : LExact K) (orig : List Nat) (w : LWorld) (reads : Bool)
+        (hi : LegacyKept orig w) : LegacyKept orig (lSettle K orig w reads) := by
+      intro r hr
+      by_cases hw : (w.file && K.goes reads (allStored w.store orig)) = true
+      · have e : lSettle K orig w reads = { w with file := false } := by unfold lSettle; rw [if_pos hw]
+        rw [e]
+        exact Or.inr (allStored_elem w.store orig (goes_true K hK _ _ (hd_andR hw)) r hr)
+      · have e : lSettle K orig w reads = w := by unfold lSettle; rw [if_neg hw]
+        rw [e]
+        exact hi r hr
+
+    theorem l_upd_true (f : Nat → Bool) (k x : Nat) (h : f x = true) : upd f k true x = true := by
+      by_cases e : x = k
+      · rw [e, hd_updS]
+      · rw [hd_updO _ _ _ _ e]; exact h
+
+    theorem l_ingest_kept (orig : List Nat) (w : LWorld) (r : Nat) (hi : LegacyKept orig w) :
+        LegacyKept orig (lIngest w r) := by
+      intro x hx
+      cases hi x hx with
+      | inl hf => exact Or.inl hf
+      | inr hs => exact Or.inr (l_upd_true w.store r x hs)
+
+    theorem l_step_kept (K : LKernels) (hK : LExact K) (orig : List Nat) (w : LWorld) (e : LEvent)
+        (hi : LegacyKept orig w) : LegacyKept orig (lstep K orig w e) := by
+      cases e with
+      | adopt ing comp took => exact l_adopt_kept K hK orig w ing comp took hi
+      | settle reads => exact l_settle_kept K hK orig w reads hi
+      | ingest r => exact l_ingest_kept orig w r hi
+
+    theorem l_init_kept (orig : List Nat) (st : Nat → Bool) : LegacyKept orig (lw0 st) :=
+      fun _ _ => Or.inl rfl
+
+    -- THE LAW, for any exact kernels, any records the file was written with and any
+    -- store it started beside: in every state, each record is in the file or the store.
+    theorem legacy_kept (K : LKernels) (hK : LExact K) (orig : List Nat) (st : Nat → Bool) :
+        Satisfies (LegacySpec K orig st) (Always (Lift (LegacyKept orig))) :=
+      invariantSatisfies (LegacySpec K orig st) (LegacyKept orig)
+        (fun s hs => by
+          have e : s = lw0 st := hs
+          rw [e]
+          exact l_init_kept orig st)
+        (fun s t hi hn => Exists.elim hn (fun e he => by rw [he]; exact l_step_kept K hK orig s e hi))
+
+    -- A step that keeps the file, or finds it gone, removes nothing.
+    theorem l_step_goes (K : LKernels) (hK : LExact K) (orig : List Nat) (w : LWorld) (e : LEvent) :
+        GoesOnlyStored orig w (lstep K orig w e) := by
+      intro hf hg r hr
+      cases e with
+      | adopt ing comp took =>
+        by_cases hw : (w.file && K.adopts ing comp) = true
+        · cases l_adopt_goes K hK orig w ing comp took r hr hw with
+          | inl h1 => exact absurd (Eq.trans h1.symm hg) (fun c => Bool.noConfusion c)
+          | inr h2 => exact h2
+        · have e : lAdopt K orig w ing comp took = w := by unfold lAdopt; rw [if_neg hw]
+          have hg' : w.file = false := Eq.trans (congrArg LWorld.file e).symm hg
+          exact absurd (Eq.trans hf.symm hg') (fun c => Bool.noConfusion c)
+      | settle reads =>
+        by_cases hw : (w.file && K.goes reads (allStored w.store orig)) = true
+        · have e : lSettle K orig w reads = { w with file := false } := by unfold lSettle; rw [if_pos hw]
+          show (lSettle K orig w reads).store r = true
+          rw [e]
+          exact allStored_elem w.store orig (goes_true K hK _ _ (hd_andR hw)) r hr
+        · have e : lSettle K orig w reads = w := by unfold lSettle; rw [if_neg hw]
+          have hg' : w.file = false := Eq.trans (congrArg LWorld.file e).symm hg
+          exact absurd (Eq.trans hf.symm hg') (fun c => Bool.noConfusion c)
+      | ingest x =>
+        have hg' : w.file = false := hg
+        exact absurd (Eq.trans hf.symm hg') (fun c => Bool.noConfusion c)
+
+    theorem goes_only_stored (K : LKernels) (hK : LExact K) (orig : List Nat) (st : Nat → Bool) :
+        Satisfies (LegacySpec K orig st) (Always (Act (GoesOnlyStored orig))) :=
+      actionSatisfies (LegacySpec K orig st) (GoesOnlyStored orig)
+        (fun s t ht => Exists.elim ht (fun e he => by rw [he]; exact l_step_goes K hK orig s e))
+        (fun s hf hg => absurd (Eq.trans hf.symm hg) (fun c => Bool.noConfusion c))
+
+    -- The removals the law forbids, each a run the kernel evaluates. A record is lost
+    -- where the file is gone and the store lacks one it was written with.
+    def recordLost (orig : List Nat) (w : LWorld) : Bool := !w.file && !allStored w.store orig
+
+    def noneStored : Nat → Bool := fun _ => false
+
+    -- The file removed once it reads, whatever the store holds.
+    def lEarly : LKernels := { lspec with goes := fun reads _ => reads }
+
+    theorem a_settle_keeps_the_unstored_file : recordLost [1] (lrun lspec [1] (lw0 noneStored) [LEvent.settle true]) = false := rfl
+    theorem early_removal_loses_a_record : recordLost [1] (lrun lEarly [1] (lw0 noneStored) [LEvent.settle true]) = true := rfl
+
+    -- The adoption before this step: the file removed once the head's stamp is
+    -- complete, whatever record of it the store refused. The store takes record 1
+    -- of records 1 and 2.
+    def lAdoptRemoves (K : LKernels) (w : LWorld) (ing comp : Bool) (took : List Nat) : LWorld :=
+      if (w.file && K.adopts ing comp) = true then { file := false, store := addAll w.store took } else w
+
+    def partialAdopt : List LEvent := [LEvent.adopt true true [1]]
+
+    theorem an_adoption_keeps_what_the_store_refused :
+        recordLost [1, 2] (lrun lspec [1, 2] (lw0 noneStored) partialAdopt) = false := rfl
+    theorem removing_at_adoption_loses_the_refused_record :
+        recordLost [1, 2] (lAdoptRemoves lspec (lw0 noneStored) true true [1]) = true := rfl
+    theorem a_complete_adoption_removes_it :
+        (lrun lspec [1, 2] (lw0 noneStored) [LEvent.adopt true true [1, 2]]).file = false := rfl
+
+    -- hold_adopts, then unversioned_goes, 4 cases each (k's bits: the first argument,
+    -- the second), packed as section 11 packs its sheets.
+    def legacyCase (k : Nat) : Nat :=
+      if k < 4 then bitOf (spec_hold_adopts (decide (k % 2 = 1)) (decide ((k / 2) % 2 = 1)))
+      else bitOf (spec_unversioned_goes (decide (k % 2 = 1)) (decide ((k / 2) % 2 = 1)))
+    def legacySheet : List Nat := [pack 2 (gridFrom legacyCase 0 8)]
+    theorem legacySheet_is : legacySheet = [0x0000000000000088] := rfl
 
     end AtermMeshNoLostEdit
 }

@@ -297,11 +297,13 @@ fn parse_build(word: &str) -> Result<u64> {
 }
 
 fn is_release_number(text: &str) -> bool {
-    let parts: Vec<&str> = text.split('.').collect();
-    parts.len() == 3
-        && parts
-            .iter()
-            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    let mut parts = text.split('.');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(a), Some(b), Some(c), None) => [a, b, c]
+            .into_iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())),
+        _ => false,
+    }
 }
 
 fn is_lower_hex(text: &str, width: usize) -> bool {
@@ -659,14 +661,12 @@ impl Lineage {
             let Some((key, value)) = line.split_once('=') else {
                 return Err(unreadable(format!("`{line}` is not key=value")));
             };
-            if fields
-                .insert(key.trim().to_string(), value.trim().to_string())
-                .is_some()
-            {
-                return Err(unreadable(format!("`{}` is given twice", key.trim())));
+            let key = key.trim();
+            if fields.insert(key, value.trim()).is_some() {
+                return Err(unreadable(format!("`{key}` is given twice")));
             }
         }
-        let field = |key: &str| fields.get(key).map_or("", String::as_str);
+        let field = |key: &str| fields.get(key).copied().unwrap_or("");
         if field("schema") != atpkg::lineage::LINEAGE_SCHEMA {
             return Err(unreadable(format!(
                 "schema `{}` is not {}",
@@ -1087,7 +1087,7 @@ fn compiler_at(
 }
 
 /// [`KEY`]'s steps from the worktree's `publish/config.sh`: split on ` && `, each on whitespace.
-fn key_steps(worktree: &Path) -> Result<Vec<Vec<String>>> {
+pub(crate) fn key_steps(worktree: &Path) -> Result<Vec<Vec<String>>> {
     let path = worktree.join(CONFIG);
     let text = std::fs::read_to_string(&path).map_err(|e| {
         Error::refused(format!(
@@ -1095,9 +1095,10 @@ fn key_steps(worktree: &Path) -> Result<Vec<Vec<String>>> {
             path.display()
         ))
     })?;
+    let prefix = format!("{KEY}=\"");
     let rows: Vec<&str> = text
         .lines()
-        .filter_map(|l| l.strip_prefix(&format!("{KEY}=\"")))
+        .filter_map(|l| l.strip_prefix(&prefix))
         .collect();
     let [row] = rows.as_slice() else {
         return Err(Error::refused(format!(
@@ -1169,7 +1170,13 @@ fn run_key(worktree: &Path, targo: &Path, inputs: &Inputs, branch: &str) -> Resu
             ))
         };
         let ok = if program == "targo" {
-            run_targo(worktree, targo, args, &path).map_err(|e| could_not_start(&e))?
+            run_targo_with_env(
+                worktree,
+                targo,
+                args,
+                &[(OsString::from("PATH"), path.clone())],
+            )
+            .map_err(|e| could_not_start(&e))?
         } else {
             let mut command = aterm_uds::spawnfd::command(program);
             command.args(args).current_dir(worktree).env("PATH", &path);
@@ -1187,13 +1194,13 @@ fn run_key(worktree: &Path, targo: &Path, inputs: &Inputs, branch: &str) -> Resu
     Ok(ran)
 }
 
-/// One `targo` step: `targo` on `args`, placed as the shim places a build typed in `worktree`,
-/// under build admission when the build claims (Unix), else run as it is. Whether it exited 0.
-fn run_targo(
+/// Run an acceptance step with explicit compiler selection, using the shim's build
+/// placement and resource admission. Canary and adopt differ only in their environment.
+pub(crate) fn run_targo_with_env(
     worktree: &Path,
     targo: &Path,
     args: &[String],
-    path: &OsStr,
+    env: &[(OsString, OsString)],
 ) -> std::io::Result<bool> {
     let tool = atpkg::build_cache::Tool::Targo;
     let args = atpkg::build_cache::with_build_dir_from(args, tool, worktree)
@@ -1203,14 +1210,17 @@ fn run_targo(
         targo,
         &args,
         tool,
-        &[(OsString::from("PATH"), path.to_os_string())],
+        env,
         worktree,
         &atpkg::build_admit::Seat::live(),
     ) {
         return Ok(code == std::process::ExitCode::SUCCESS);
     }
     let mut command = aterm_uds::spawnfd::command(targo);
-    command.args(&args).current_dir(worktree).env("PATH", path);
+    command
+        .args(&args)
+        .current_dir(worktree)
+        .envs(env.iter().cloned());
     Ok(command.status()?.success())
 }
 

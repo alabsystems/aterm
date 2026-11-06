@@ -867,7 +867,9 @@ mod tests {
     use aterm_effects::aos_momentum::{MOMENTUM_HOST_MAX_EVENTS, MomentumHost};
 
     use super::*;
-    use crate::lab_build::LAB_BUILD;
+
+    /// The build the tests' windows and replays name.
+    const TEST_BUILD: &str = "aterm-lab+g0123456789ab";
 
     /// A key at `at_ms` ms, as an attached host records it.
     fn key(cursor: u64, at_ms: i128) -> Step {
@@ -1361,7 +1363,8 @@ mod tests {
         plan: Option<SchedulePlan>,
         why: &str,
     ) {
-        let replayed = replay_trace(file, LAB_BUILD, plan).unwrap_or_else(|e| panic!("{why}: {e}"));
+        let replayed =
+            replay_trace(file, TEST_BUILD, plan).unwrap_or_else(|e| panic!("{why}: {e}"));
         assert_eq!(
             replayed.steps.iter().map(|s| s.input).collect::<Vec<_>>(),
             run.calls()
@@ -1413,7 +1416,7 @@ mod tests {
             let sc = scenario(seed).expect("a corpus scenario");
             let origin = Instant::now();
             let mut host = MomentumHost::default();
-            host.aos_attach(origin, MomentumCode::Shipped, LAB_BUILD, 1);
+            host.aos_attach(origin, MomentumCode::Shipped, TEST_BUILD, 1);
             let run = lane::run(&mut host, &sc, origin);
             assert_eq!(run.fault(), None, "seed {seed}");
             assert!(
@@ -1427,7 +1430,7 @@ mod tests {
                 other.contains("is none of build `another build`'s prebuilt codes"),
                 "{other}"
             );
-            let cut = replay_trace(&file[..file.len() - 1], LAB_BUILD, None).expect_err("cut");
+            let cut = replay_trace(&file[..file.len() - 1], TEST_BUILD, None).expect_err("cut");
             assert!(cut.starts_with("the trace file: "), "{cut}");
         }
     }
@@ -1436,14 +1439,14 @@ mod tests {
     #[test]
     fn a_published_plans_trace_replays_with_its_plan_and_counts_as_the_lane_counted() {
         let origin = Instant::now();
-        let ev = Evaluator::v1(LAB_BUILD, origin).expect("the pinned policy");
+        let ev = Evaluator::v1(TEST_BUILD, origin).expect("the pinned policy");
         let winner =
             SchedulePlan::new(Split::SettleAtStep { gap_us: 0 }, Wake::NextStep).expect("in range");
         let admitted = ev
             .admit_one(&winner.encode())
             .expect("the winner is admitted");
         let mut host = MomentumHost::default();
-        host.aos_attach(origin, MomentumCode::Shipped, LAB_BUILD, 1);
+        host.aos_attach(origin, MomentumCode::Shipped, TEST_BUILD, 1);
         host.aos_pause(origin, Duration::from_nanos(16_666_667))
             .expect("a running glow pauses");
         host.aos_publish(admitted).expect("the winner publishes");
@@ -1458,10 +1461,10 @@ mod tests {
             Some(winner),
             "the published plan",
         );
-        let unnamed = replay_trace(&file, LAB_BUILD, None).expect_err("no plan named");
+        let unnamed = replay_trace(&file, TEST_BUILD, None).expect_err("no plan named");
         assert!(unnamed.contains("is none of build"), "{unnamed}");
         let cadence = SchedulePlan::new(Split::Shipped, Wake::Cadence).expect("in range");
-        let other = replay_trace(&file, LAB_BUILD, Some(cadence)).expect_err("another plan");
+        let other = replay_trace(&file, TEST_BUILD, Some(cadence)).expect_err("another plan");
         assert!(other.contains("nor the plan the run published"), "{other}");
     }
 
@@ -1514,23 +1517,23 @@ mod tests {
         let sc = scenario(5).expect("a corpus scenario of 24 keys");
         let origin = Instant::now();
         let mut host = MomentumHost::default();
-        host.aos_attach(origin, MomentumCode::Shipped, LAB_BUILD, 1);
+        host.aos_attach(origin, MomentumCode::Shipped, TEST_BUILD, 1);
         let run = lane::run(&mut host, &sc, origin);
         assert_eq!(run.fault(), None);
         let file = host.aos_trace().expect("attached").encode();
-        let replayed = replay_trace(&file, LAB_BUILD, None).expect("replays");
+        let replayed = replay_trace(&file, TEST_BUILD, None).expect("replays");
         let keys = keys_in(&replayed.steps);
         assert!(keys >= phase_keys(), "fixture: {keys} keys");
         let p = phase(&replayed.steps, keys - phase_keys()).expect("a phase");
         let a = PhaseArgs {
             trace: "t.trace".into(),
-            build: LAB_BUILD.into(),
+            build: TEST_BUILD.into(),
             plan: None,
         };
         let mut want = format!(
             "aos-phase file=t.trace bytes={} build={} plan=none\nMEASURED {}\n",
             file.len(),
-            word(LAB_BUILD),
+            word(TEST_BUILD),
             replay_line(&replayed, &p)
         );
         for line in measured_lines(&p, None) {
@@ -1558,12 +1561,12 @@ mod tests {
                 .map(|w| (*w).to_owned())
                 .collect::<Vec<_>>()
         };
-        assert_eq!(cmd_aos_phase(&args(LAB_BUILD)).expect("measured"), 0);
+        assert_eq!(cmd_aos_phase(&args(TEST_BUILD)).expect("measured"), 0);
         let f = cmd_aos_phase(&args("another build")).expect_err("no replay");
         assert_eq!(f.code, 1, "{:?}", f.msg);
         let missing = dir.path().join("none.trace").display().to_string();
         let f =
-            cmd_aos_phase(&[missing, "--build".into(), LAB_BUILD.into()]).expect_err("unreadable");
+            cmd_aos_phase(&[missing, "--build".into(), TEST_BUILD.into()]).expect_err("unreadable");
         assert_eq!(f.code, 2, "{:?}", f.msg);
     }
 }

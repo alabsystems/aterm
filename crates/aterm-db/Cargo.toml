@@ -51,6 +51,8 @@ aterm-netplace.workspace = true
 aterm-ctl = { path = "../aterm-ctl" }
 [dev-dependencies]
 aterm-spec.workspace = true
+# The process-wide flush tally `tests/table_flushes.rs` reads.
+astream-sys = { path = "../../vendor/astream/crates/astream-sys" }
 aterm-models-db.workspace = true
 # SwarmRecordsCapacity's legacy database fence (control::tests::crossing_tests).
 aterm-models-swarm.workspace = true

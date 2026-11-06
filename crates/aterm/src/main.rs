@@ -26,6 +26,8 @@ mod release_probe;
 mod service_repair;
 #[cfg(unix)]
 mod service_repair_remote;
+#[cfg(target_os = "macos")]
+mod subscriber_scheduling;
 
 use aterm_cli::{AliasRoute, alias_route};
 
@@ -151,11 +153,10 @@ enum InitEntry {
     /// The follow-up of a person's own package install or update ([`package_entry`]). Running it
     /// is aterm's decision, not theirs ([`aterm_machines::init::Decider::Aterm`]), so it puts no
     /// question of macOS's on the screen: its words leave out the sign-outs and the workstation
-    /// preferences ([`aterm_machines::init::PACKAGE_FOLLOW_UP`]), at this Mac's console its look
-    /// for the ALab vault, and its reach of a vault at a URL this Mac is in, wait until macOS has
-    /// answered aterm's Local Network question (over SSH, where macOS asks none, it looks as a
-    /// typed `aterm init` there does), Rust in Spotlight searches no folder of the person's, and
-    /// it hands no grant to the permission walk.
+    /// preferences ([`aterm_machines::init::PACKAGE_FOLLOW_UP`]), its look for the ALab vault
+    /// waits, as every look does, until the LAN broker answers (macOS asks nothing of a look
+    /// that goes through it), Rust in Spotlight searches no folder of the person's, and it hands
+    /// no grant to the permission walk.
     PackageFollowUp,
 }
 
@@ -368,12 +369,10 @@ fn start_node_commons_runtime(
     paths: aterm_secrets::client::Paths,
     config: std::path::PathBuf,
 ) -> Option<aterm_db::runtime::Runtime> {
-    let lan = commons_lan::gate(&config, commons_lan::Host::NodeServe);
     let rounds = alab_register::reports(paths.clone(), config.clone());
     match aterm_db::runtime::Runtime::start_background_with_reports(
         paths,
         config,
-        lan,
         // A refusal warns once per cause (`Status::news`); a standing one logs at debug.
         |status| {
             if let Some(refusal) = status.news() {
@@ -437,20 +436,19 @@ fn dispatch_node(forwarded: &[OsString]) -> ExitCode {
         // installed and does not return (docs/DESIGN-alab-one-mesh-2026-11-05.md §4.13). Only
         // then this closure, before the job's listener or update checker starts. A start that
         // finds the lock held runs neither.
-        return aterm_gui::run_node_serve_owning(|| {
+        let startup = || {
             // The job's automatic LAN uses go only while `[swarm] enabled` leaves sharing on.
             if let Some(home) = aterm_types::dirs::home_dir() {
                 commons_lan::install_sharing(&home);
             }
-            // The job's first LAN uses (its Commons runtime's, its `_alab._tcp` browse and
-            // advert, its listener, heartbeat and facts push) wait while a window's System State
-            // Local Network step is still to come, as its Commons gate does.
-            #[cfg(target_os = "macos")]
-            if let Some(config) = aterm_types::dirs::aterm_config_path() {
-                commons_lan::hold_first_uses_for_the_step(&config, commons_lan::Host::NodeServe);
-            }
+            // Its own pass every minute, and the windows' needs pushes from the first one.
+            metrics_publish::start();
             spawn_node_commons_runtime();
-        });
+        };
+        #[cfg(target_os = "macos")]
+        return input_attachments::node_serve(startup);
+        #[cfg(not(target_os = "macos"))]
+        return aterm_gui::run_node_serve_owning(startup);
     }
     let Some(home) = aterm_types::dirs::home_dir() else {
         eprintln!("aterm node: HOME is not set");
@@ -651,7 +649,10 @@ pub(crate) fn main() -> ExitCode {
     // First: every entry below, the early helper verbs included, reads the installed identity.
     aterm_stamp::install(&STAMP, COMPILED);
     let mut argv: Vec<OsString> = std::env::args_os().collect();
-    // Before even the build-holder/tether helper entries may fork or spawn.
+    #[cfg(target_os = "macos")]
+    subscriber_scheduling::enter(&mut argv);
+    // The watch-only replacement above does no state, key, network or window work.
+    // Window lifetime custody precedes the remaining helper entries that may fork or spawn.
     // This original opaque description remains live through the whole GUI run.
     let lab_window_guard = match lab_window::enter(&mut argv) {
         Ok(guard) => guard,
@@ -691,8 +692,6 @@ fn front_door_main(argv: Vec<OsString>, lab_window_guarded: bool) -> ExitCode {
     if let Some(code) = aterm_pty::serve_console_client() {
         return code;
     }
-    #[cfg(target_os = "macos")]
-    aterm_types::macos_setup::access_record::code_subject_from(local_network_code_subject);
     // Before any vault path runs: the vault refuses every AI CLI's login file as an entry, as the
     // connector rows say where each keeps it (aterm-secrets cannot read them itself).
     #[cfg(unix)]
@@ -721,16 +720,10 @@ fn front_door_main(argv: Vec<OsString>, lab_window_guarded: bool) -> ExitCode {
     });
     #[cfg(unix)]
     aterm_secrets::client::on_native_bootstrap(|paths, current| {
-        let admitted = aterm_agent::members_cli::bootstrap_from_members(paths, current)?;
-        #[cfg(target_os = "macos")]
-        if admitted == aterm_secrets::client::NativeAdmission::Admitted {
-            let keeper = aterm_cli::macos_doctor::LAN_KEEPER;
-            if (keeper.keeps)() {
-                (keeper.keep)(aterm_machines::init_secrets::LanHeard::Reached);
-            }
-        }
-        Ok(admitted)
+        aterm_agent::members_cli::bootstrap_from_members(paths, current)
     });
+    #[cfg(unix)]
+    aterm_secrets::client::on_subscriber_inputs(converge_inputs::observe);
     #[cfg(target_os = "macos")]
     aterm_secrets::client::on_bootstrap_allowed(|_| {
         aterm_cli::macos_doctor::automatic_vault_bootstrap_allowed()
@@ -742,10 +735,6 @@ fn front_door_main(argv: Vec<OsString>, lab_window_guarded: bool) -> ExitCode {
     #[cfg(unix)]
     aterm_agent::service_repair_rpc::install_startup_recovery(service_repair::start_recovery)
         .expect("service recovery callback is installed once before any coordinator");
-    // The vault subscriber's first Local Network use is kept for this Mac and app, so a window's
-    // System State step reads macOS's question as already put to aterm.
-    #[cfg(target_os = "macos")]
-    aterm_secrets::client::on_lan_first_use(commons_lan::keep_subscriber_asked_here);
     // Every `aterm pkg` download races this Mac's fleet members unless `[packages] peers` says
     // otherwise, and its doctor counts them; the read runs only when one of those asks for it.
     #[cfg(unix)]
@@ -761,33 +750,14 @@ fn front_door_main(argv: Vec<OsString>, lab_window_guarded: bool) -> ExitCode {
     aterm_gui::judge_mesh_dials();
     #[cfg(unix)]
     aterm_net::fleet_member::on_unknown_to(aterm_agent::mesh_offer::offer_node);
-    // Once a look heard the Local Network switch on, no route to a LAN vault host is a host that
-    // did not answer (a LAN this Mac left), never the permission.
-    #[cfg(target_os = "macos")]
-    aterm_secrets::transport::set_local_network_granted(|| {
-        matches!(
-            aterm_cli::macos_doctor::local_network_heard(),
-            aterm_cli::macos_doctor::LocalNetworkHeard::On
-        )
-    });
     // The Secrets stage of System State and `aterm init` asks ALab's members for an Allow once
     // its join waits on the ALab vault, as `aterm members join --no-wait` does.
     #[cfg(unix)]
-    aterm_machines::init_secrets::on_ask_members(aterm_agent::members_cli::ask_members);
-    // `aterm init` with nobody to answer looks for the ALab vault from the console login's
-    // session only once macOS has answered aterm's Local Network question, as System State's
-    // records keep it, so its look raises no question on the screen.
-    #[cfg(target_os = "macos")]
-    aterm_machines::init_secrets::on_lan_answered(|| {
-        matches!(
-            aterm_cli::macos_doctor::local_network_first_use(None),
-            aterm_cli::macos_doctor::LocalNetworkFirstUse::Answered
-        )
-    });
-    // What this process's looks and vault syncs at a `.local` address hear of the switch is kept
-    // as the window's own looks keep it, where the question macOS puts it is aterm's own.
-    #[cfg(target_os = "macos")]
-    aterm_machines::init_secrets::on_lan_heard(aterm_cli::macos_doctor::LAN_KEEPER);
+    aterm_machines::init_secrets::on_ask_members(aterm_agent::members_cli::ask_members_admitted);
+    // Every removal path signs its table cutoffs before its `Remove` (one-mesh §4.10, B11):
+    // aterm-db writes table operations and depends on aterm-secrets, which signs the `Remove`.
+    #[cfg(unix)]
+    aterm_secrets::client::on_table_cuts(aterm_db::table::store::cut_removed_writer);
     // The fixed collector runs before GUI initialization or any per-user state is read.
     #[cfg(target_os = "macos")]
     let early_args = argv.get(1..).unwrap_or(&[]);
@@ -898,6 +868,12 @@ fn front_door_main(argv: Vec<OsString>, lab_window_guarded: bool) -> ExitCode {
     // aCaffeine's name before 0.145.0: an old login job runs `caffeine serve` at every login.
     if first == aterm_acaffeine::legacy::VERB {
         return aterm_acaffeine::legacy::main_entry(rest.get(1..).unwrap_or(&[]));
+    }
+
+    // The root LAN broker and its reader: hidden, off the roster.
+    #[cfg(unix)]
+    if first == lan_verb::VERB {
+        return lan_verb::run(rest.get(1..).unwrap_or(&[]));
     }
 
     #[cfg(unix)]
@@ -1014,6 +990,9 @@ fn front_door_main(argv: Vec<OsString>, lab_window_guarded: bool) -> ExitCode {
                 if first.as_deref() == Some("service-repair") {
                     return service_repair::run(forwarded.into_iter().skip(1).collect());
                 }
+                #[cfg(target_os = "macos")]
+                let code = input_attachments::secrets_entry(forwarded);
+                #[cfg(not(target_os = "macos"))]
                 let code = aterm_secrets::cli::main_entry(forwarded);
                 if code == ExitCode::SUCCESS
                     && matches!(
@@ -1210,11 +1189,7 @@ fn front_door_main(argv: Vec<OsString>, lab_window_guarded: bool) -> ExitCode {
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if session_lane_is_interactive() {
-        // Past its wait for a window's Local Network step, the lane's Commons gate asks macOS
-        // only through the door: a person at this Mac with their hands at rest.
-        #[cfg(target_os = "macos")]
-        commons_lan::install_door(commons_lan::Host::SessionLane);
-        spawn_commons_runtime(commons_lan::Host::SessionLane);
+        spawn_commons_runtime();
         let build = aterm_gui::running_build_number();
         #[cfg(target_os = "linux")]
         start_linux_session_trial(build);
@@ -1485,29 +1460,6 @@ fn spawn_detached_pkg_update(layout: &atpkg::store::Layout) {
     }
 }
 
-/// Bind retained LAN observations to this process's loaded code. A stable
-/// designated identity survives an update; an ad hoc cdhash changes with its build.
-#[cfg(all(target_os = "macos", not(test)))]
-fn local_network_code_subject() -> Option<[u8; 32]> {
-    static SUBJECT: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
-    if let Some(subject) = SUBJECT.get() {
-        return Some(*subject);
-    }
-    let identity = aterm_keeper::identity::Identity::for_self(
-        aterm_keeper::identity::IdentityPolicy::Designated,
-    )
-    .ok()?;
-    let mut digest = aterm_digest::Sha256::new();
-    digest.update(b"aterm-local-network-observer-v1\0");
-    digest.update(identity.describe().as_bytes());
-    Some(*SUBJECT.get_or_init(|| digest.finalize()))
-}
-
-#[cfg(all(target_os = "macos", test))]
-const fn local_network_code_subject() -> Option<[u8; 32]> {
-    None
-}
-
 fn session_pass_args(layout: &atpkg::store::Layout) -> Vec<std::ffi::OsString> {
     let mut args: Vec<std::ffi::OsString> = vec![
         "pkg".into(),
@@ -1591,15 +1543,6 @@ fn run_window(args: Vec<OsString>, host: WindowHost, handoff: &[OsString]) -> Ex
         aterm_gui::check_window_args(args.clone());
     }
     let first_run = wire_window(&args);
-    // System State's Local Network step asks macOS first, in a window that runs first-run setup
-    // only: there its Commons runtime, its Secrets stage, Tab Control's sweep and the network
-    // signal's Bonjour browse wait for it; a window that runs none takes no step, so its Commons
-    // gate asks by itself and nothing else waits. One decision feeds the gate and the reader, and
-    // the reader is in place before the GUI starts any of the others.
-    #[cfg(target_os = "macos")]
-    let runs_step = first_lan_uses_wait_for_the_step(ordinary, first_run);
-    #[cfg(target_os = "linux")]
-    let runs_step = false;
     // A window's automatic LAN uses go only while `[swarm] enabled` leaves sharing on.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if ordinary && let Some(home) = aterm_types::dirs::home_dir() {
@@ -1607,21 +1550,12 @@ fn run_window(args: Vec<OsString>, host: WindowHost, handoff: &[OsString]) -> Ex
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if ordinary {
-        spawn_commons_runtime(commons_lan::Host::Window {
-            runs_setup: runs_step,
-        });
+        spawn_commons_runtime();
     }
     #[cfg(target_os = "macos")]
     if ordinary {
         spawn_acaffeine_watch();
         input_attachments::spawn();
-    }
-    #[cfg(target_os = "macos")]
-    if runs_step && let Some(config) = aterm_types::dirs::aterm_config_path() {
-        commons_lan::hold_first_uses_for_the_step(
-            &config,
-            commons_lan::Host::Window { runs_setup: true },
-        );
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let network_source = ordinary.then(network_state_source).flatten();
@@ -1663,18 +1597,6 @@ fn ordinary_window(args: &[OsString]) -> bool {
         }
     }
     true
-}
-
-/// Whether a window's first LAN uses (its Commons runtime's, [`commons_lan::Host::Window`]'s
-/// `runs_setup`; its Secrets stage's vault probe and join, Tab Control's Bonjour sweep and the
-/// network signal's Bonjour browse) wait for System State's Local Network step: only in an
-/// `ordinary` window that runs first-run setup (`first_run`, [`wire_window`]'s), whose System
-/// State runs the step. A window that runs none (started over ssh or away from the console, under
-/// a private state root, outside the person's scope, or running a command) takes no step unless a
-/// person presses Set up now, so none of its uses waits on one: its Commons gate asks by itself.
-#[cfg(target_os = "macos")]
-const fn first_lan_uses_wait_for_the_step(ordinary: bool, first_run: Option<fn() -> bool>) -> bool {
-    ordinary && first_run.is_some()
 }
 
 /// How long a thread [`run_window`] starts ahead of the window's logger waits for that logger
@@ -1813,11 +1735,10 @@ fn claims_observation() -> Option<aterm_types::network_state::NetworkObservation
     .map(account_claims::current_observation)
 }
 
-/// Start this process's Commons runtime once, for `host` (its LAN gate, [`commons_lan::gate`]),
-/// while `[swarm] enabled` leaves sharing on, else once a person turns it on
-/// ([`commons_lan::when_sharing_on`]).
+/// Start this process's Commons runtime once, while `[swarm] enabled` leaves sharing on, else
+/// once a person turns it on ([`commons_lan::when_sharing_on`]).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn spawn_commons_runtime(host: commons_lan::Host) {
+fn spawn_commons_runtime() {
     if !commons_host_enabled() || COMMONS_RUNTIME.get().is_some() {
         return;
     }
@@ -1829,24 +1750,19 @@ fn spawn_commons_runtime(host: commons_lan::Host) {
     };
     let home = paths.home.clone();
     commons_lan::when_sharing_on(&home, commons_lan::SHARING_LOOK, move || {
-        start_commons_runtime(paths, &config, host);
+        start_commons_runtime(paths, &config);
     });
 }
 
-/// Start this process's Commons runtime for `host` now, with `paths` and `config`.
+/// Start this process's Commons runtime now, with `paths` and `config`. On a Mac its LAN
+/// traffic goes through the LAN broker; its first LAN use waits for the broker's answer.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn start_commons_runtime(
-    paths: aterm_secrets::client::Paths,
-    config: &std::path::Path,
-    host: commons_lan::Host,
-) {
+fn start_commons_runtime(paths: aterm_secrets::client::Paths, config: &std::path::Path) {
     let config = config.to_owned();
-    let lan = commons_lan::gate(&config, host);
     let rounds = alab_register::reports(paths.clone(), config.clone());
     match aterm_db::runtime::Runtime::start_with_reports(
         paths,
         config,
-        lan,
         |status| {
             // In a window, the owner thread can report its first status before the window installs
             // its logger, and it reports a status only when it changes, so a dropped one stays
@@ -2308,10 +2224,6 @@ const ALAB_LOOK_FIRST: std::time::Duration = std::time::Duration::from_secs(30);
 #[cfg(any(target_os = "macos", test))]
 const ALAB_LOOK_LONGEST: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
-/// The least time between two looks for the ALab vault, however many wakes come in between.
-#[cfg(any(target_os = "macos", test))]
-const ALAB_LOOK_GAP: std::time::Duration = std::time::Duration::from_secs(10);
-
 /// The longest a watch waits after `looks` looks that heard no ALab vault.
 #[cfg(any(target_os = "macos", test))]
 fn alab_look_after(looks: u32) -> std::time::Duration {
@@ -2320,102 +2232,51 @@ fn alab_look_after(looks: u32) -> std::time::Duration {
         .min(ALAB_LOOK_LONGEST)
 }
 
-/// How long after a watch for the ALab vault first heard Local Network's current answer a
-/// window's focus gain stays a reason to look while that answer is neither on nor off
-/// ([`AlabFocus`]): macOS tells no app that the person answered its question or turned the
-/// switch on in System Settings, and a person who did comes back to aterm within moments.
-#[cfg(any(target_os = "macos", test))]
-const ALAB_FOCUS_FRESH: std::time::Duration = std::time::Duration::from_secs(10 * 60);
-
-/// What aterm last heard of macOS's Local Network switch for it, as a watch for the ALab vault
-/// weighs a focus gain by it (`aterm_cli::macos_doctor::LocalNetworkHeard`).
+/// What the automatic profile is waiting for: local authenticated membership, or a failed
+/// read/publication whose retry must retain its backoff.
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LanHeard {
-    /// Nothing says.
-    Untold,
-    /// The window raised macOS's question, and no look since heard how it went.
-    Asked,
-    /// A look reached the LAN.
-    On,
-    /// macOS refused a look the LAN.
-    Off,
+enum AlabWait {
+    Signal,
+    Retry,
 }
 
-/// What aterm last heard of Local Network for it, from its own records.
-#[cfg(target_os = "macos")]
-fn lan_heard() -> LanHeard {
-    use aterm_cli::macos_doctor::LocalNetworkHeard;
-    match aterm_cli::macos_doctor::local_network_heard() {
-        LocalNetworkHeard::Untold => LanHeard::Untold,
-        LocalNetworkHeard::Asked => LanHeard::Asked,
-        LocalNetworkHeard::On => LanHeard::On,
-        LocalNetworkHeard::Off => LanHeard::Off,
-    }
-}
-
-/// Whether a window's focus gain is a reason for a watch for the ALab vault to look again
-/// ([`WakeMarks::ends_alab_wait`]): never once a look reached the LAN, since a focus gain changes
-/// nothing a look reads; always while macOS refuses aterm the LAN, since only the person's switch
-/// in System Settings moves that and a refused look asks nothing of the network; and otherwise
-/// (macOS's question asked, or nothing heard) for [`ALAB_FOCUS_FRESH`] after the watch first
-/// heard that answer. A Mac with no ALab vault on its network never hears the switch on (nothing
-/// answers its looks), and a look at every focus gain asked its network every ten seconds for as
-/// long as aterm ran.
+/// One durable membership listener across looks. Arm before reading the level so admission
+/// between the previous look and this wait cannot be lost.
 #[cfg(any(target_os = "macos", test))]
-#[derive(Clone, Copy, Debug)]
-struct AlabFocus {
-    /// The answer last weighed, and when the watch first heard it.
-    heard: Option<(LanHeard, std::time::Instant)>,
+struct AlabMembershipWait<W> {
+    seen: WakeMarks,
+    watch: Option<W>,
 }
 
 #[cfg(any(target_os = "macos", test))]
-impl AlabFocus {
-    const fn new() -> Self {
-        Self { heard: None }
+impl<W> AlabMembershipWait<W> {
+    fn new(seen: WakeMarks) -> Self {
+        Self { seen, watch: None }
     }
 
-    /// Whether a focus gain is a reason to look at `now`, aterm having heard `heard` last.
-    fn counts(&mut self, heard: LanHeard, now: std::time::Instant) -> bool {
-        let since = match self.heard {
-            Some((last, since)) if last == heard => since,
-            _ => {
-                self.heard = Some((heard, now));
-                now
-            }
-        };
-        match heard {
-            LanHeard::On => false,
-            LanHeard::Off => true,
-            LanHeard::Untold | LanHeard::Asked => {
-                now.saturating_duration_since(since) < ALAB_FOCUS_FRESH
-            }
+    fn wait(
+        &mut self,
+        wakes: &SetupWakes,
+        limit: std::time::Duration,
+        member: impl FnOnce() -> bool,
+        start: impl FnOnce() -> Option<W>,
+        whole: impl Fn(&W) -> bool,
+    ) -> bool {
+        if !self.watch.as_ref().is_some_and(&whole) {
+            self.watch = start();
+        }
+        if member() {
+            return true;
+        }
+        if self.watch.as_ref().is_some_and(whole) {
+            wakes.back_off_alab(&mut self.seen, limit)
+        } else {
+            // A failed listener must not spin on its own loss notification. Try again on the
+            // ordinary retry deadline; unchanged healthy listeners are retained.
+            wakes.back_off_run(&mut self.seen, limit.min(SETUP_RETRY_WAIT))
         }
     }
-}
-
-/// The network a watch for the ALab vault waits on: the IPv4 subnets a look's record is kept
-/// for (`aterm_secrets::heard::network`), read as the wait starts.
-#[cfg(target_os = "macos")]
-static ALAB_WAIT_NETWORK: std::sync::Mutex<Option<Option<String>>> = std::sync::Mutex::new(None);
-
-/// Whether this Mac's network as it is `now` moved off the one a watch for the ALab vault waits
-/// on (`waited_on`, unset before any wait): only then is a change the network watch heard a
-/// reason to look. An interface that comes and goes without moving the subnets (AirDrop's and
-/// Continuity's peer-to-peer links, a tunnel with no IPv4 address) is no new network, and the
-/// network watch would otherwise end every wait within a minute of the last on a Mac that has
-/// them. A move between two networks with the same subnets is the same network to a look's
-/// record too; System State coming to the front, Check again and the timer look there.
-#[cfg(any(target_os = "macos", test))]
-fn alab_network_moved(
-    waited_on: &std::sync::Mutex<Option<Option<String>>>,
-    now: Option<String>,
-) -> bool {
-    waited_on
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_ref()
-        .is_none_or(|waited_on| *waited_on != now)
 }
 
 /// What [`widen_on_alab_signal`] does on this Mac, or in a test.
@@ -2424,8 +2285,8 @@ trait AlabWatch {
     /// The saved plan is aterm's own provisional one, which the ALab signal widens, or an
     /// upgrade of it this watch holds; an error when aterm's records cannot be read just now.
     fn widens(&mut self) -> Result<bool, String>;
-    /// Wait out `gap`, then until a wake since the last look, or until `limit` has passed.
-    fn wait(&mut self, gap: std::time::Duration, limit: std::time::Duration);
+    /// Wait for a local membership fact, or back off a failed read/publication.
+    fn wait(&mut self, why: AlabWait, limit: std::time::Duration);
     /// Look for the ALab signal: heard, so the plan widens now with nothing asked (design §3.5).
     /// An upgrade this watch holds was heard.
     fn heard(&mut self) -> Result<bool, String>;
@@ -2435,16 +2296,13 @@ trait AlabWatch {
     fn run(&mut self);
 }
 
-/// While the plan aterm chose by itself is provisional, look for the ALab vault on each wake
-/// that is a reason to (the window's Local Network step, System State coming to the front, Check
-/// again, this Mac's network changing: [`WakeMarks::ends_alab_wait`]) and on a slow timer, first
-/// as the watch starts: on a first launch the scoping probe is aterm's first request to the LAN,
-/// which macOS holds until the person answers its Local Network question, so it hears nothing.
-/// Once one hears it, the plan widens to the groups it adds and runs at once, with nothing asked
-/// (on by default, design §6.1).
+/// While aterm's own plan is provisional, follow the locally committed authenticated vault
+/// membership. This reads no network; the subscriber owns admission. Once membership arrives,
+/// widen and run at once, with no discovery cooldown or question (design §6.1).
 #[cfg(any(target_os = "macos", test))]
 fn widen_on_alab_signal<W: AlabWatch>(watch: &mut W) {
     let mut looks = 0;
+    let mut why = AlabWait::Signal;
     // Only a definite no ends the watch: a read that fails (a pass saving its records) waits
     // for the next look and probes nothing.
     loop {
@@ -2461,14 +2319,21 @@ fn widen_on_alab_signal<W: AlabWatch>(watch: &mut W) {
         // The first look goes at once: a signal heard on an earlier launch widens this one as it
         // starts.
         if looks > 0 {
-            watch.wait(ALAB_LOOK_GAP, alab_look_after(looks - 1));
+            watch.wait(
+                if eligible { why } else { AlabWait::Retry },
+                alab_look_after(looks - 1),
+            );
         }
         looks = looks.saturating_add(1);
+        why = AlabWait::Retry;
         if !eligible {
             continue;
         }
         match watch.heard() {
-            Ok(false) => continue,
+            Ok(false) => {
+                why = AlabWait::Signal;
+                continue;
+            }
             Ok(true) => {}
             Err(why) => {
                 aterm_log::warn!("setup: looking for the ALab vault did not finish: {why}");
@@ -2517,9 +2382,7 @@ fn widens_here_with(
 
 #[cfg(target_os = "macos")]
 struct LiveAlabWatch {
-    wakes_seen: WakeMarks,
-    /// When a focus gain is a reason to look ([`AlabFocus`]).
-    focus: AlabFocus,
+    membership: AlabMembershipWait<aterm_cli::macos_doctor::ParkWatch>,
     /// The upgrade this watch began, held while a commit that failed can still finish.
     upgrade: aterm_cli::macos_doctor::InitialSetupUpgrade,
     /// The plan the last look widens, or widened.
@@ -2534,8 +2397,7 @@ struct LiveAlabWatch {
 impl LiveAlabWatch {
     fn new() -> Self {
         Self {
-            wakes_seen: SETUP_WAKES.marks(),
-            focus: AlabFocus::new(),
+            membership: AlabMembershipWait::new(SETUP_WAKES.marks()),
             upgrade: aterm_cli::macos_doctor::InitialSetupUpgrade::default(),
             widened: Widened::default(),
             generation: 0,
@@ -2553,33 +2415,28 @@ impl AlabWatch for LiveAlabWatch {
         }
     }
 
-    fn wait(&mut self, gap: std::time::Duration, limit: std::time::Duration) {
-        // A held upgrade whose write failed is a widen still owed: it is tried again after the
-        // retry wait, never after the longer wait between looks for the signal.
-        let limit = if self.upgrade.pending() {
-            limit.min(SETUP_RETRY_WAIT)
-        } else {
-            limit
-        };
-        // This Mac's network changing is the one wake a provisional plan's Mac meets on the way
-        // onto the ALab vault's LAN; the watch hears it while it waits, once the subnets move
-        // off the ones it waits on ([`alab_network_moved`]). One that could not start leaves the
-        // timer and the other wakes.
-        *ALAB_WAIT_NETWORK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(aterm_secrets::heard::network());
-        let _network = aterm_cli::macos_doctor::ParkWatch::start(
-            aterm_cli::macos_doctor::Watches {
-                network: true,
-                ..aterm_cli::macos_doctor::Watches::default()
+    fn wait(&mut self, why: AlabWait, limit: std::time::Duration) {
+        if why == AlabWait::Retry || self.upgrade.pending() {
+            // State-file churn is no reason to spin a failed read or repeat a publication.
+            SETUP_WAKES.back_off_run(&mut self.membership.seen, limit.min(SETUP_RETRY_WAIT));
+            return;
+        }
+        self.membership.wait(
+            &SETUP_WAKES,
+            limit,
+            aterm_cli::macos_doctor::alab_mac,
+            || {
+                aterm_cli::macos_doctor::ParkWatch::start(
+                    aterm_cli::macos_doctor::Watches {
+                        secrets: true,
+                        ..aterm_cli::macos_doctor::Watches::default()
+                    },
+                    wake_setup_facts,
+                )
+                .ok()
             },
-            wake_setup_network,
-        )
-        .ok();
-        std::thread::sleep(gap);
-        let focus = self.focus.counts(lan_heard(), std::time::Instant::now());
-        SETUP_WAKES.back_off_alab(&mut self.wakes_seen, focus, limit.saturating_sub(gap));
+            aterm_cli::macos_doctor::ParkWatch::whole,
+        );
     }
 
     fn heard(&mut self) -> Result<bool, String> {
@@ -4046,6 +3903,9 @@ fn run_prepared_setup(
         }
         PreparedSetup::Finished => {
             aterm_gui::publish_initial_setup_status(initial_setup_status());
+            // No apply pass ends in this launch to refresh the checklist. Read it now through
+            // the ordinary observer, keeping its selected account and network scope.
+            request_observation(None, aterm_types::macos_setup::Subject::all(), false);
             // A finished setup runs no Secrets stage: while the plan in force keeps the vault in
             // sync ([`vault_sync_kept`]), the mend keeps a vault subscriber whose plist runs a copy
             // that is gone, or that this window owes the Mac.
@@ -4745,7 +4605,7 @@ impl SetupRetryHost for LiveSetupRetry {
                     mark.next_due(),
                     unix_seconds(),
                     watched,
-                    mark.waits_on_lan_door(),
+                    mark.waits_on_lan_broker(),
                 ));
                 previous = Some(mark.clone());
                 mark
@@ -4844,11 +4704,134 @@ mod watch_spawn_recovery_tests;
 #[cfg(test)]
 mod alab_watch_tests {
     use super::{
-        ALAB_LOOK_FIRST, ALAB_LOOK_GAP, ALAB_LOOK_LONGEST, AlabWatch, alab_look_after,
+        ALAB_LOOK_FIRST, ALAB_LOOK_LONGEST, AlabWait, AlabWatch, alab_look_after,
         widen_on_alab_signal,
     };
     use std::collections::VecDeque;
     use std::time::Duration;
+
+    #[test]
+    fn membership_wait_arms_before_its_level_read_and_retains_a_healthy_listener() {
+        use super::{AlabMembershipWait, SetupWakes};
+        use std::cell::Cell;
+        let wakes = SetupWakes::new();
+        let mut waiting = AlabMembershipWait::new(wakes.marks());
+        let armed = Cell::new(false);
+        assert!(waiting.wait(
+            &wakes,
+            Duration::from_secs(60),
+            || {
+                assert!(armed.get(), "a commit before arming must not be lost");
+                true
+            },
+            || {
+                armed.set(true);
+                Some(())
+            },
+            |()| true,
+        ));
+        assert!(!waiting.wait(
+            &wakes,
+            Duration::ZERO,
+            || false,
+            || panic!("a healthy membership listener must not be restarted"),
+            |()| true,
+        ));
+    }
+
+    #[test]
+    fn a_lost_membership_listener_does_not_spin_on_its_own_notification() {
+        use super::{AlabMembershipWait, SetupWakes};
+        use std::cell::Cell;
+        let wakes = SetupWakes::new();
+        let mut waiting = AlabMembershipWait::new(wakes.marks());
+        let starts = Cell::new(0);
+        for _ in 0..2 {
+            assert!(!waiting.wait(
+                &wakes,
+                Duration::ZERO,
+                || false,
+                || {
+                    starts.set(starts.get() + 1);
+                    wakes.raise_facts();
+                    Some(false)
+                },
+                |whole| *whole,
+            ));
+        }
+        assert_eq!(
+            starts.get(),
+            2,
+            "a failed listener may recover on its retry"
+        );
+    }
+
+    #[test]
+    fn a_committed_membership_widens_without_a_network_event_or_timer_expiring() {
+        use super::{AlabMembershipWait, SetupWakes};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Watch<'a> {
+            wakes: &'a SetupWakes,
+            member: &'a AtomicBool,
+            waiting: AlabMembershipWait<()>,
+            read: std::sync::mpsc::Sender<()>,
+            runs: u32,
+        }
+        impl AlabWatch for Watch<'_> {
+            fn widens(&mut self) -> Result<bool, String> {
+                Ok(self.runs == 0)
+            }
+            fn wait(&mut self, why: AlabWait, _limit: Duration) {
+                assert_eq!(why, AlabWait::Signal);
+                assert!(self.waiting.wait(
+                    self.wakes,
+                    Duration::from_secs(60), // A hang detector, not a latency target.
+                    || {
+                        let member = self.member.load(Ordering::SeqCst);
+                        assert!(!member);
+                        self.read.send(()).unwrap();
+                        member
+                    },
+                    || Some(()),
+                    |()| true,
+                ));
+            }
+            fn heard(&mut self) -> Result<bool, String> {
+                Ok(self.member.load(Ordering::SeqCst))
+            }
+            fn look(&mut self) -> Result<Option<u64>, String> {
+                assert!(self.member.load(Ordering::SeqCst));
+                Ok(Some(9))
+            }
+            fn run(&mut self) {
+                self.runs += 1;
+            }
+        }
+
+        let wakes = SetupWakes::new();
+        let member = AtomicBool::new(false);
+        let (read, reading) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let committed = &member;
+            let events = &wakes;
+            scope.spawn(move || {
+                reading.recv_timeout(Duration::from_secs(60)).unwrap();
+                committed.store(true, Ordering::SeqCst);
+                events.raise_facts();
+            });
+            let mut watch = Watch {
+                wakes: &wakes,
+                member: &member,
+                waiting: AlabMembershipWait::new(wakes.marks()),
+                read,
+                runs: 0,
+            };
+            widen_on_alab_signal(&mut watch);
+            assert_eq!(watch.runs, 1);
+            assert_eq!(wakes.marks().all, 0, "no focus, access or Check wake");
+        });
+    }
 
     /// A watch whose answers come from a script; the last `widens` answer sticks.
     #[derive(Default)]
@@ -4857,7 +4840,7 @@ mod alab_watch_tests {
         /// Whether each look hears the signal; once they run out, every look hears it.
         heard: VecDeque<bool>,
         looks: VecDeque<Result<Option<u64>, String>>,
-        waits: Vec<(Duration, Duration)>,
+        waits: Vec<(AlabWait, Duration)>,
         runs: u32,
     }
 
@@ -4870,8 +4853,8 @@ mod alab_watch_tests {
             }
             .ok_or_else(|| "a pass is saving the records".to_string())
         }
-        fn wait(&mut self, gap: Duration, limit: Duration) {
-            self.waits.push((gap, limit));
+        fn wait(&mut self, why: AlabWait, limit: Duration) {
+            self.waits.push((why, limit));
         }
         fn heard(&mut self) -> Result<bool, String> {
             Ok(self.heard.pop_front().unwrap_or(true))
@@ -4902,9 +4885,9 @@ mod alab_watch_tests {
         assert_eq!(
             watch.waits,
             [
-                (ALAB_LOOK_GAP, ALAB_LOOK_FIRST),
-                (ALAB_LOOK_GAP, minute),
-                (ALAB_LOOK_GAP, 2 * minute),
+                (AlabWait::Retry, ALAB_LOOK_FIRST),
+                (AlabWait::Retry, minute),
+                (AlabWait::Retry, 2 * minute),
             ],
             "the first look goes at once, then each waits longer"
         );
@@ -4924,7 +4907,7 @@ mod alab_watch_tests {
             ..Scripted::default()
         };
         widen_on_alab_signal(&mut later);
-        assert_eq!(later.waits, [(ALAB_LOOK_GAP, ALAB_LOOK_FIRST)]);
+        assert_eq!(later.waits, [(AlabWait::Signal, ALAB_LOOK_FIRST)]);
         assert_eq!(later.runs, 1);
         let mut first = Scripted {
             widens: [Some(true)].into(),
@@ -4980,7 +4963,6 @@ mod alab_watch_tests {
         assert_eq!(alab_look_after(5), Duration::from_secs(16 * 60));
         assert_eq!(alab_look_after(6), ALAB_LOOK_LONGEST);
         assert_eq!(alab_look_after(u32::MAX), ALAB_LOOK_LONGEST);
-        assert!(ALAB_LOOK_GAP < ALAB_LOOK_FIRST);
     }
 
     #[cfg(target_os = "macos")]
@@ -5038,8 +5020,8 @@ mod alab_watch_tests {
                 }
             }
 
-            fn wait(&mut self, gap: Duration, limit: Duration) {
-                assert!(gap <= limit);
+            fn wait(&mut self, _why: AlabWait, limit: Duration) {
+                assert!(!limit.is_zero());
                 self.waits += 1;
             }
 
@@ -5181,8 +5163,8 @@ mod alab_watch_tests {
 #[cfg(test)]
 mod setup_retry_tests {
     use super::{
-        ALAB_FOCUS_FRESH, AlabFocus, LanHeard, PassNext, SETUP_RETRY_LIMIT, SetupRetryHost,
-        SetupWakes, alab_network_moved, begin_check_again, idle_after, run_setup_retry,
+        PassNext, SETUP_RETRY_LIMIT, SetupRetryHost, SetupWakes, begin_check_again, idle_after,
+        run_setup_retry,
     };
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -5652,89 +5634,45 @@ mod setup_retry_tests {
         assert!(wakes.marks().checked_since(seen));
     }
 
-    /// One look per reason: a watch for the ALab vault looks again on this Mac's network moving
-    /// and on any wake but a window's focus gain, and on a focus gain only where [`AlabFocus`]
-    /// counts one; a network change wakes no run.
     #[test]
-    fn a_focus_gain_wakes_the_alab_watch_only_where_it_counts() {
+    fn a_membership_fact_wakes_the_provisional_profile_without_a_network_change() {
+        use std::time::Duration;
+        let wakes = SetupWakes::new();
+        let mut seen = wakes.marks();
+        // Another process may commit authenticated membership on the same LAN. Its state-file
+        // notification is a local fact, not a route or window-focus change.
+        wakes.raise_facts();
+        assert!(wakes.back_off_alab(&mut seen, Duration::ZERO));
+        assert!(!wakes.back_off_alab(&mut seen, Duration::ZERO));
+    }
+
+    /// A membership fact ends the profile's local wait, without ending an ordinary retry
+    /// backoff. Window focus alone supplies no membership evidence.
+    #[test]
+    fn membership_facts_wake_scope_reads_but_not_retry_backoffs() {
         use std::time::Duration;
         let wakes = SetupWakes::new();
         let mut seen = wakes.marks();
         wakes.raise_focus();
         assert!(
-            !wakes.back_off_alab(&mut seen, false, Duration::ZERO),
+            !wakes.back_off_alab(&mut seen, Duration::ZERO),
             "a focus gain that does not count: no look"
         );
         assert_eq!(seen, wakes.marks(), "taken as heard");
-        wakes.raise_focus();
-        assert!(wakes.back_off_alab(&mut seen, true, Duration::ZERO));
-        wakes.raise_network();
-        assert!(wakes.back_off_alab(&mut seen, false, Duration::ZERO));
+        wakes.raise_facts();
+        assert!(wakes.back_off_alab(&mut seen, Duration::ZERO));
         wakes.raise();
-        assert!(wakes.back_off_alab(&mut seen, false, Duration::ZERO));
+        assert!(wakes.back_off_alab(&mut seen, Duration::ZERO));
         assert!(
-            !wakes.back_off_alab(&mut seen, true, Duration::ZERO),
+            !wakes.back_off_alab(&mut seen, Duration::ZERO),
             "each wake once"
         );
         let mut run = wakes.marks();
-        wakes.raise_network();
+        wakes.raise_facts();
         assert!(
             !wakes.back_off_run(&mut run, Duration::ZERO),
-            "a network change wakes only the watch"
+            "a local membership hint does not shorten a retry"
         );
-    }
-
-    /// A focus gain is a reason to look for the ALab vault never once a look reached the LAN,
-    /// always while macOS refuses aterm the LAN, and otherwise (the question asked, or nothing
-    /// heard) for ten minutes after the watch first heard that answer, each new answer starting
-    /// its ten minutes afresh. A Mac with no ALab vault on its network never hears the switch on,
-    /// and looked at every focus gain for as long as aterm ran.
-    #[test]
-    fn a_focus_gain_counts_for_ten_minutes_after_an_answer_that_says_neither_on_nor_off() {
-        let start = std::time::Instant::now();
-        let at = |secs: u64| start + std::time::Duration::from_secs(secs);
-        let fresh = ALAB_FOCUS_FRESH.as_secs();
-        for heard in [LanHeard::Untold, LanHeard::Asked] {
-            let mut focus = AlabFocus::new();
-            assert!(focus.counts(heard, at(0)), "{heard:?}");
-            assert!(focus.counts(heard, at(fresh - 1)), "{heard:?}");
-            assert!(!focus.counts(heard, at(fresh)), "{heard:?}: spent");
-            assert!(!focus.counts(heard, at(10 * fresh)), "{heard:?}: spent");
-        }
-        let mut focus = AlabFocus::new();
-        assert!(focus.counts(LanHeard::Untold, at(0)));
-        assert!(!focus.counts(LanHeard::Untold, at(fresh)));
-        // macOS's question, asked later, starts its ten minutes from then.
-        assert!(focus.counts(LanHeard::Asked, at(2 * fresh)));
-        assert!(!focus.counts(LanHeard::Asked, at(3 * fresh)));
-        assert!(
-            !focus.counts(LanHeard::On, at(3 * fresh)),
-            "the LAN reached"
-        );
-        assert!(focus.counts(LanHeard::Off, at(9 * fresh)), "refused");
-        assert!(focus.counts(LanHeard::Off, at(90 * fresh)), "refused");
-    }
-
-    /// A change the network watch hears wakes the ALab watch only once this Mac's IPv4 subnets
-    /// moved off the ones it waits on: an interface that comes and goes without moving them is
-    /// no reason to ask the network.
-    #[test]
-    fn a_network_change_that_leaves_the_subnets_is_no_reason_to_look() {
-        let waited_on = std::sync::Mutex::new(None);
-        assert!(
-            alab_network_moved(&waited_on, Some("192.168.4.0/24".into())),
-            "no wait yet"
-        );
-        *waited_on.lock().unwrap() = Some(Some("192.168.4.0/24".to_owned()));
-        assert!(!alab_network_moved(
-            &waited_on,
-            Some("192.168.4.0/24".into())
-        ));
-        assert!(alab_network_moved(&waited_on, Some("10.0.0.0/8".into())));
-        assert!(alab_network_moved(&waited_on, None), "off every network");
-        *waited_on.lock().unwrap() = Some(None);
-        assert!(!alab_network_moved(&waited_on, None));
-        assert!(alab_network_moved(&waited_on, Some("10.0.0.0/8".into())));
     }
 
     /// A park whose facts are all watched has a timer only for a retry ahead, never a zero one;
@@ -5765,23 +5703,17 @@ mod setup_retry_tests {
     }
 
     #[test]
-    fn a_park_observes_first_lan_readiness_without_a_focus_or_file_wake() {
-        use aterm_types::macos_setup::lan_first_use::Door;
+    fn a_park_observes_broker_readiness_without_a_focus_or_file_wake() {
         use std::cell::Cell;
         use std::time::Duration;
-        let door = Cell::new(Door::Waiting);
+        let broker_ready = Cell::new(false);
         let limit = Cell::new(None);
         let looks = Cell::new(0);
         let ready = super::wait_for_setup_park_change_since(
-            Some(&Door::Waiting),
+            Some(&false),
             || {
-                limit.set(super::park_wait_limit(
-                    None,
-                    100,
-                    true,
-                    door.get() == Door::Waiting,
-                ));
-                door.get()
+                limit.set(super::park_wait_limit(None, 100, true, !broker_ready.get()));
+                broker_ready.get()
             },
             |_| false,
             |now, before| now != before,
@@ -5799,15 +5731,15 @@ mod setup_retry_tests {
                 );
                 // The keyboard rests while System State remains behind the terminal.
                 // No focus, file or network wake is delivered.
-                door.set(Door::Ready);
+                broker_ready.set(true);
             },
         );
-        assert_eq!(ready, Door::Ready);
+        assert!(ready);
         assert_eq!(looks.get(), 1);
         assert_eq!(
             super::park_wait_limit(None, 100, true, false),
             None,
-            "ready/open doors need no readiness polling"
+            "a ready broker needs no readiness polling"
         );
     }
 
@@ -6312,7 +6244,7 @@ impl Drop for InitialSetupBusy {
 }
 
 /// How long the startup coordinator waits before it tries a failed read or write again.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 const SETUP_RETRY_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Automatic claims this process's startup coordinator holds, or is asking
@@ -6758,12 +6690,8 @@ struct WakeMarks {
     focus: u64,
     checks: u64,
     /// A fact a parked run watches may have moved ([`SetupWakes::raise_facts`]): counted apart
-    /// from `all`, so only a park's wait ends on it ([`SetupWakes::wait_for_park`]).
+    /// from `all`, so a park or local membership wait ends on it, but a retry backoff does not.
     facts: u64,
-    /// This Mac's network changed while a watch for the ALab vault waited
-    /// ([`SetupWakes::raise_network`]): counted apart from `all`, so only that watch's wait ends
-    /// on it ([`WakeMarks::ends_alab_wait`]).
-    network: u64,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -6777,11 +6705,10 @@ impl WakeMarks {
         others(self) != others(seen) || (focus && self.focus != seen.focus)
     }
 
-    /// Whether a wake since `seen` is a reason to look for the ALab vault again: this Mac's
-    /// network moving, any other wake but a window's focus gain, and a focus gain only where
-    /// `focus` says one is ([`AlabFocus`]).
-    fn ends_alab_wait(self, seen: Self, focus: bool) -> bool {
-        self.network != seen.network || self.ends_run_wait(seen, focus)
+    /// Local membership inputs can change without a network or window event. They wake the
+    /// profile's local reread as well as the ordinary parked setup, granting no authority.
+    fn ends_alab_wait(self, seen: Self) -> bool {
+        self.facts != seen.facts || self.ends_run_wait(seen, false)
     }
 
     /// Whether a person pressed Check again since `seen`: the run's tries start afresh.
@@ -6806,7 +6733,6 @@ impl SetupWakes {
                 focus: 0,
                 checks: 0,
                 facts: 0,
-                network: 0,
             }),
             raised: std::sync::Condvar::new(),
         }
@@ -6838,25 +6764,13 @@ impl SetupWakes {
     }
 
     /// A fact a parked run watches may have moved (`aterm_cli::macos_doctor::ParkWatch`): the
-    /// park looks at its mark again and runs a pass only if a fact changed. No other wait ends.
+    /// park and the membership watcher reread their local facts. No retry backoff ends.
     fn raise_facts(&self) {
         let mut marks = self
             .count
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         marks.facts = marks.facts.wrapping_add(1);
-        drop(marks);
-        self.raised.notify_all();
-    }
-
-    /// This Mac's network changed (`aterm_cli::macos_doctor::ParkWatch`'s network watch, while
-    /// a watch for the ALab vault waits): only that watch's wait ends ([`WakeMarks::network`]).
-    fn raise_network(&self) {
-        let mut marks = self
-            .count
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        marks.network = marks.network.wrapping_add(1);
         drop(marks);
         self.raised.notify_all();
     }
@@ -6946,11 +6860,10 @@ impl SetupWakes {
     }
 
     /// A watch for the ALab vault's wait between two looks: as [`Self::back_off`], but only on a
-    /// wake that is a reason to look again ([`WakeMarks::ends_alab_wait`], `focus` whether a
-    /// window's focus gain is one).
-    fn back_off_alab(&self, seen: &mut WakeMarks, focus: bool, limit: std::time::Duration) -> bool {
+    /// wake that is a reason to reread local membership ([`WakeMarks::ends_alab_wait`]).
+    fn back_off_alab(&self, seen: &mut WakeMarks, limit: std::time::Duration) -> bool {
         let from = *seen;
-        let woken = self.wait_while(Some(limit), |marks| !marks.ends_alab_wait(from, focus));
+        let woken = self.wait_while(Some(limit), |marks| !marks.ends_alab_wait(from));
         *seen = self.marks();
         woken
     }
@@ -7039,12 +6952,14 @@ struct SetupIo {
     /// Whether this process may never change the person's profile
     /// (`aterm_cli::macos_doctor::lasting_scope_refusal`).
     scope_refused: fn() -> bool,
-    /// A read-only reading of rows for a plan, the network's too when asked
-    /// (`aterm_cli::macos_doctor::observe_initial_setup`).
+    /// Read rows for a plan under their current observation admission, the network's too when
+    /// asked (`aterm_cli::macos_doctor::observe_initial_setup`). Plan mode alone permits no
+    /// hidden query of another app's data.
     read: fn(
         &aterm_types::macos_setup::Plan,
         &[aterm_types::macos_setup::Subject],
         bool,
+        aterm_cli::macos_doctor::ObservationRead,
     ) -> Vec<aterm_types::macos_setup::Observation>,
     /// Save a person's Stop of a run, durably, on the Stop's worker
     /// (`aterm_cli::macos_doctor::request_initial_setup_stop`).
@@ -7089,9 +7004,9 @@ struct SetupIo {
     /// permissions (`aterm_cli::macos_doctor::bring_forward_restored_setup`): a run that waits
     /// for the startup's offer, nothing, or a profile lock another pass holds.
     bring_forward: fn() -> Result<aterm_cli::macos_doctor::BroughtForward, String>,
-    /// Check again's look at the LAN, on the reading's worker
-    /// (`aterm_cli::macos_doctor::probe_local_network_again`).
-    probe_lan: fn(),
+    /// Check again's look for the ALab vault, on the reading's worker
+    /// (`aterm_cli::macos_doctor::look_for_the_vault_again`).
+    look_again: fn(),
     /// Run the startup again on a thread of its own, as a launch runs it ([`start_startup_again`]).
     start_startup: fn() -> bool,
     /// Continue startup on a worker that has released its previous operation's leases.
@@ -7121,7 +7036,7 @@ impl SetupIo {
         put_back: aterm_cli::macos_doctor::put_back_held_initial_setup,
         start_follow_up: start_withheld_follow_up,
         bring_forward: aterm_cli::macos_doctor::bring_forward_restored_setup,
-        probe_lan: aterm_cli::macos_doctor::probe_local_network_again,
+        look_again: aterm_cli::macos_doctor::look_for_the_vault_again,
         start_startup: start_startup_again,
         start_startup_inline: || run_startup_setup(None),
         records_held: aterm_cli::macos_doctor::setup_records_held,
@@ -7191,15 +7106,6 @@ fn wake_setup_facts() {
     SETUP_WAKES.raise_facts();
 }
 
-/// This Mac's network changed while a watch for the ALab vault waited ([`LiveAlabWatch`]): a
-/// wake once the subnets moved off the ones it waits on ([`alab_network_moved`]).
-#[cfg(target_os = "macos")]
-fn wake_setup_network() {
-    if alab_network_moved(&ALAB_WAIT_NETWORK, aterm_secrets::heard::network()) {
-        SETUP_WAKES.raise_network();
-    }
-}
-
 /// What the setup worker hears from the window, registered once before the GUI
 /// starts: a run parked on System State (the Accounts stage) resumes when the
 /// page comes to the front, and an access step the window recorded (handed,
@@ -7207,21 +7113,26 @@ fn wake_setup_network() {
 /// Permissions stage at once (System State design §6). A caller that timed out
 /// behind another dialog also retries once its last guard ends. A window gaining
 /// focus wakes the startup's waits, and a run's park only while an Accounts or
-/// Permissions stage is left. The moment this process's LAN stops being held for
-/// System State's Local Network step (the step hands it over, a use asks through
-/// the door, the wait for the step runs out) is a fact a Secrets join parked on
-/// the step reads again (`lan_first_use::on_open`).
+/// Permissions stage is left. The LAN broker starting to answer (setup's elevation installed
+/// it, or a repair or an upgrade restarted it) wakes them too
+/// ([`aterm_machines::lan_reach::watch_arrivals`]): a vault look or join deferred until it
+/// answers goes on then, waiting on the broker, never on a person.
 #[cfg(target_os = "macos")]
 fn watch_setup_signals() {
     aterm_gui::on_window_focus_gained(wake_setup_on_focus);
     aterm_types::macos_setup::on_system_state_front(wake_setup);
     aterm_types::macos_setup::access_record::on_append(access_step_recorded);
     aterm_types::macos_setup::on_macos_dialog_waiter_ready(wake_setup);
-    aterm_types::macos_setup::lan_first_use::on_open(wake_setup_facts);
+    if let Err(why) = std::thread::Builder::new()
+        .name("lan-broker-arrivals".into())
+        .spawn(|| aterm_machines::lan_reach::watch_arrivals(wake_setup))
+    {
+        aterm_log::info!("setup: no watch for the LAN broker's arrival: {why}");
+    }
 }
 
 /// The window wrote a line to the access record (System State design §6): a step it handed to
-/// macOS, a Not now, the Local Network trigger, a grant it verified or the debugger's outcome.
+/// macOS, a Not now, a grant it verified or the debugger's outcome.
 /// The Access rows are read again so the page and the menu line follow it, and a run parked on
 /// the Permissions stage looks at the record again.
 #[cfg(target_os = "macos")]
@@ -7230,8 +7141,6 @@ fn access_step_recorded(
     access: aterm_types::macos_setup::Access,
     outcome: aterm_types::macos_setup::AccessOutcome,
 ) {
-    // Local Network's step is kept with its time, so it outranks an older answer a look kept.
-    aterm_cli::macos_doctor::initial_setup_access_step(access, outcome);
     access_fact_observed(access, outcome);
 }
 
@@ -7580,14 +7489,14 @@ fn observe_rows(request: ObserveRequest) {
             _ => true,
         })
         .collect();
-    // Check again reads Local Network as macOS answers now: a look at the LAN first, which
-    // never puts macOS's question on screen.
+    // Check again reads the Secrets vault row as the ALab vault answers now: a look for it
+    // first, through the LAN broker.
     if forced
-        && subjects.contains(&aterm_types::macos_setup::Subject::Access(
-            aterm_types::macos_setup::Access::LocalNetwork,
+        && subjects.contains(&aterm_types::macos_setup::Subject::Setting(
+            Setting::Secrets,
         ))
     {
-        (setup_io().probe_lan)();
+        (setup_io().look_again)();
     }
     if network
         && subjects.contains(&aterm_types::macos_setup::Subject::Setting(
@@ -7598,7 +7507,14 @@ fn observe_rows(request: ObserveRequest) {
         token_mark_moved(|| true);
     }
     let started = SETUP_ACTIVITY.lock().map_or(0, |activity| activity.epoch);
-    let read = std::panic::catch_unwind(|| (setup_io().read)(&plan, &subjects, network))
+    let admission = if forced {
+        aterm_cli::macos_doctor::ObservationRead::ExplicitCheck
+    } else {
+        aterm_cli::macos_doctor::ObservationRead::Ordinary {
+            page_front: aterm_gui::system_state_on_screen,
+        }
+    };
+    let read = std::panic::catch_unwind(|| (setup_io().read)(&plan, &subjects, network, admission))
         .unwrap_or_else(|_| {
             // Do not keep a previous success as this reading's result, nor
             // retry the failed batch. The worker still drains accepted work;
@@ -7682,7 +7598,8 @@ fn observe_rows(request: ObserveRequest) {
     }
 }
 
-/// Start a read-only, prompt-free reading of every System State row for `plan`.
+/// Start an ordinary read-only refresh of every System State row for `plan`. Private readers
+/// require the page still in front when their native batch starts.
 #[cfg(target_os = "macos")]
 fn observe_initial_setup(plan: aterm_types::macos_setup::Plan) -> bool {
     request_observation(Some(plan), aterm_types::macos_setup::Subject::all(), false)
@@ -8223,7 +8140,8 @@ fn add_setup_readings(status: &mut aterm_gui::SetupStatus) {
     if let Ok(rows) = OBSERVED_ROWS.lock() {
         let order = aterm_types::macos_setup::Subject::all();
         let mut observed = rows.rows.clone();
-        observed.sort_by_key(|row| order.iter().position(|subject| *subject == row.subject));
+        observed
+            .sort_unstable_by_key(|row| order.iter().position(|subject| *subject == row.subject));
         status.observed = observed;
         status.observed_generation = rows.generation;
         status.observed_vault_url = rows.vault_url.clone();
@@ -9805,8 +9723,8 @@ fn run_setup_restore(
 /// admitted (a Restore pressed while the launch's offer waited for its answer, which it lets go,
 /// or one before any setup ran here) left aterm's own permissions with no run to carry them. The
 /// Restore brought it forward under its own lock, and the startup offers it again now, as the
-/// next launch would (System State design §3.4), so Full Disk Access, Developer Tools, the
-/// debugger and Local Network go on in this launch with no press. The startup also runs when this
+/// next launch would (System State design §3.4), so Full Disk Access, Developer Tools and the
+/// debugger go on in this launch with no press. The startup also runs when this
 /// finished a Restore cut short, or met the profile lock busy (the startup waits for it). A
 /// Restore whose admitted run carries the permissions leaves nothing for the offer and starts
 /// nothing.
@@ -10602,6 +10520,8 @@ mod initial_setup_result_tests {
         /// Readings started: their plan, their rows, and whether they used the
         /// network.
         reads: Vec<(Plan, Vec<Subject>, bool)>,
+        /// Whether each read carries a person's explicit Check intent.
+        read_checks: Vec<bool>,
         /// Replies bound to each reading when it starts, before a held read
         /// can be overtaken by a choice.
         readings: VecDeque<Vec<Observation>>,
@@ -10674,7 +10594,7 @@ mod initial_setup_result_tests {
         /// What bringing a restored setup forward found.
         brought_forward: aterm_cli::macos_doctor::BroughtForward,
         /// Check again's looks at the LAN.
-        lan_probes: usize,
+        vault_looks: usize,
         /// Startups run again in this process.
         startups: usize,
         /// Whether each requested startup worker was accepted by the spawner.
@@ -10692,6 +10612,7 @@ mod initial_setup_result_tests {
     impl Script {
         const NEW: Self = Self {
             reads: Vec::new(),
+            read_checks: Vec::new(),
             readings: VecDeque::new(),
             hold: false,
             panic_read: false,
@@ -10724,7 +10645,7 @@ mod initial_setup_result_tests {
             converge_lanes: 0,
             setup_converges: 0,
             brought_forward: aterm_cli::macos_doctor::BroughtForward::Nothing,
-            lan_probes: 0,
+            vault_looks: 0,
             startups: 0,
             startup_spawns: VecDeque::new(),
             startups_inline: 0,
@@ -10831,7 +10752,7 @@ mod initial_setup_result_tests {
                 put_back: |_| Ok(false),
                 start_follow_up: || change(|script| script.follow_ups += 1),
                 bring_forward: || Ok(script().brought_forward),
-                probe_lan: || change(|script| script.lan_probes += 1),
+                look_again: || change(|script| script.vault_looks += 1),
                 start_startup: || {
                     let mut script = script();
                     script.startups += 1;
@@ -10845,11 +10766,20 @@ mod initial_setup_result_tests {
             Self { _claims: claims }
         }
 
-        fn read(plan: &Plan, subjects: &[Subject], network: bool) -> Vec<Observation> {
+        fn read(
+            plan: &Plan,
+            subjects: &[Subject],
+            network: bool,
+            admission: aterm_cli::macos_doctor::ObservationRead,
+        ) -> Vec<Observation> {
             let mut script = script();
             script
                 .reads
                 .push((plan.clone(), subjects.to_vec(), network));
+            script.read_checks.push(matches!(
+                admission,
+                aterm_cli::macos_doctor::ObservationRead::ExplicitCheck
+            ));
             let reading = script.readings.pop_front().unwrap_or_default();
             let panics = std::mem::take(&mut script.panic_read);
             SCRIPT_MOVED.notify_all();
@@ -10987,8 +10917,8 @@ mod initial_setup_result_tests {
     }
 
     /// The window recording Full Disk Access granted starts the follow-up that puts back what
-    /// waited for it, once per grant; no other step the window records (handed, declined,
-    /// triggered, nor any other access granted) starts one.
+    /// waited for it, once per grant; no other step the window records (handed, declined, nor
+    /// any other access granted) starts one.
     #[test]
     fn recording_full_disk_access_granted_starts_the_follow_up_once() {
         use aterm_types::macos_setup::{Access, AccessOutcome};
@@ -11001,7 +10931,6 @@ mod initial_setup_result_tests {
             for outcome in [
                 AccessOutcome::Handed,
                 AccessOutcome::Declined,
-                AccessOutcome::Triggered,
                 AccessOutcome::Granted,
             ] {
                 if (access, outcome) != (Access::FullDiskAccess, AccessOutcome::Granted) {
@@ -11062,6 +10991,95 @@ mod initial_setup_result_tests {
             1,
             "the converge pass's window lane"
         );
+    }
+
+    /// A completed run starts no apply pass to refresh its readings. Its launch still reads
+    /// the current checklist without opening the page, replaying settings, or widening the
+    /// scope of an ordinary refresh. An unread answer remains unread after publication.
+    #[test]
+    fn a_finished_launch_reads_its_current_checklist_without_replaying_setup() {
+        use aterm_types::macos_setup::Standing;
+
+        let _globals = globals();
+        for (plan, unread) in [
+            (Plan::default(), false),
+            (Plan::default(), true),
+            (
+                Plan::from(aterm_types::macos_setup::Selection::none()),
+                false,
+            ),
+        ] {
+            let _io = TestIo::install();
+            let subjects: Vec<_> = Subject::all()
+                .into_iter()
+                .filter(|subject| {
+                    subject.setting().group() != Group::Accounts
+                        || plan.selection.contains(subject.setting())
+                })
+                .collect();
+            let readings: Vec<_> = subjects
+                .iter()
+                .map(|subject| {
+                    if unread && *subject == Subject::Setting(Setting::Dock) {
+                        Observation::unknown(*subject)
+                    } else {
+                        Observation {
+                            standing: Standing::InPlace,
+                            now: Some("verified current state".into()),
+                            ..Observation::unknown(*subject)
+                        }
+                    }
+                })
+                .collect();
+            {
+                let mut observed = OBSERVED_ROWS.lock().unwrap();
+                observed.plan = Some(plan.clone());
+                observed.rows.clear();
+                observed.vault_url = None;
+            }
+            change(|script| {
+                script.hold = true;
+                script.readings.push_back(readings.clone());
+            });
+
+            run_prepared_setup(PreparedSetup::Finished, None, StartupSent::default());
+
+            assert!(
+                OBSERVE_QUEUE.lock().unwrap().running,
+                "a finished launch must refresh its checklist without a page or apply pass"
+            );
+            wait_until("the completed launch's reading starts", || {
+                script().reads.len() == 1
+            });
+            {
+                let script = script();
+                assert_eq!(
+                    script.reads,
+                    [(
+                        plan.clone(),
+                        subjects,
+                        plan.selection.contains(Setting::Repositories)
+                    )]
+                );
+                assert!(
+                    script.runs.is_empty(),
+                    "completed settings are not replayed"
+                );
+                assert_eq!(script.persists, 0, "no new plan is admitted");
+                assert_eq!(script.offers, 0);
+                assert!(script.stops.is_empty());
+                assert_eq!(
+                    script.read_checks,
+                    [false],
+                    "a completed launch is no explicit Check"
+                );
+            }
+            release_readings();
+            wait_until("the completed launch's reading is published", observe_idle);
+            let mut status = aterm_gui::SetupStatus::default();
+            add_setup_readings(&mut status);
+            assert_eq!(status.observed, readings);
+        }
     }
 
     /// A launch that resumes an admitted run starts the vault subscriber's mend and the converge
@@ -11125,18 +11143,18 @@ mod initial_setup_result_tests {
         assert!(!event(&[], false), "a stage with nothing selected");
     }
 
-    /// Check again looks at the LAN before it reads the Local Network row, so the row reads what
-    /// macOS answers now; a reading nobody forced, or a Check of other rows, never looks.
+    /// Check again looks for the ALab vault before it reads the Secrets vault row, so the row
+    /// reads what the vault answers now; a reading nobody forced, or a Check of other rows, never
+    /// looks.
     #[test]
-    fn check_again_looks_at_the_lan_before_it_reads_local_network() {
-        use aterm_types::macos_setup::Access;
+    fn check_again_looks_for_the_vault_before_it_reads_the_secrets_row() {
         let _globals = globals();
         let _io = TestIo::install();
-        let lan = vec![Subject::Access(Access::LocalNetwork)];
+        let secrets = vec![Subject::Setting(Setting::Secrets)];
         for (forced, subjects, looks) in [
-            (false, lan.clone(), 0),
+            (false, secrets.clone(), 0),
             (true, vec![Subject::Setting(Setting::Dock)], 0),
-            (true, lan, 1),
+            (true, secrets, 1),
         ] {
             let choices = OBSERVED_ROWS.lock().unwrap().choices;
             observe_rows(ObserveRequest {
@@ -11145,7 +11163,8 @@ mod initial_setup_result_tests {
                 subjects,
                 forced,
             });
-            assert_eq!(std::mem::take(&mut script().lan_probes), looks, "{forced}");
+            assert_eq!(std::mem::take(&mut script().vault_looks), looks, "{forced}");
+            assert_eq!(std::mem::take(&mut script().read_checks), [forced]);
         }
     }
 
@@ -14489,6 +14508,9 @@ mod alab_register;
 /// `aterm db alab` with the harness's reading of the account sheet.
 #[cfg(unix)]
 mod alab_sheet;
+/// `aterm lan serve | status`: the root LAN broker and its reader (hidden).
+#[cfg(unix)]
+mod lan_verb;
 #[cfg(unix)]
 mod shared_accounts;
 #[cfg(unix)]
@@ -14502,6 +14524,10 @@ mod account_claims;
 #[cfg(unix)]
 mod alab_journal;
 
+/// The node service's metrics publisher (one-mesh §4.14).
+#[cfg(unix)]
+mod metrics_publish;
+
 /// LabView's cache: the harness's roster source from the lab registry.
 #[cfg(unix)]
 mod alab_view;
@@ -14514,12 +14540,16 @@ mod alab_seen;
 #[cfg(unix)]
 mod converge;
 
+/// Local input changes that make the subscriber's existing converge job due.
+#[cfg(unix)]
+mod converge_inputs;
+
 /// This Mac's fleet as LAN toolset sharing reads it: the members a download races by default.
 #[cfg(unix)]
 mod unit_peers;
 
-/// When the Commons runtime may make its first LAN use: after System State's Local Network
-/// question, on a Mac.
+/// When the Commons runtime and a process's automatic LAN uses may run: while `[swarm] enabled`
+/// leaves sharing on.
 #[cfg(unix)]
 mod commons_lan;
 

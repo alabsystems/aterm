@@ -81,6 +81,237 @@ fn cells(changes: Vec<Change>) -> Cells {
     book.cells()
 }
 
+#[test]
+fn a_bound_machine_projects_nickname_text_without_changing_its_spelling_or_grammar() {
+    for nickname in [
+        None,
+        Some(Value::Null),
+        Some(json!("MissBunny")),
+        Some(json!("m86")),
+    ] {
+        let (pk, mut changes) = machine("m86");
+        if let Some(value) = &nickname {
+            changes.push(put(&MACHINE, &pk, "nickname", value.clone()));
+        }
+        let view = LabView::read(
+            &cells(changes),
+            &facts(&pk, None),
+            &OwnedRead::default(),
+            Some(ME),
+        );
+        let bound = view.my_machine().expect("the existing facts binding");
+        assert_eq!(bound.pk, pk);
+        assert_eq!(bound.label.as_deref(), Some("m86"));
+        let expected =
+            nickname
+                .as_ref()
+                .and_then(Value::as_str)
+                .map_or(MachineNickname::Unset, |word| MachineNickname::Named {
+                    word: word.to_owned(),
+                    automatic: false,
+                });
+        assert_eq!(bound.nickname, expected);
+        assert_eq!(view.my_label(), Some("m86"));
+    }
+}
+
+#[test]
+fn a_bound_machine_keeps_clash_labels_and_hides_conflicted_cells() {
+    let (pk, mut changes) = machine("m40-3fa2");
+    changes.push(put(&MACHINE, &pk, "nickname", json!("MissBunny")));
+    let mut book = Book::new();
+    let base = book.write(1, &[], changes);
+    let view = LabView::read(
+        &book.cells(),
+        &facts(&pk, None),
+        &OwnedRead::default(),
+        Some(ME),
+    );
+    assert_eq!(
+        view.my_machine().expect("the bound row").label.as_deref(),
+        Some("m40-3fa2"),
+        "the database preserves the registry label for naming policy to judge"
+    );
+    book.write(
+        2,
+        &[base],
+        vec![
+            put(&MACHINE, &pk, "label", json!("m86")),
+            put(&MACHINE, &pk, "nickname", json!("Heron")),
+        ],
+    );
+    book.write(
+        3,
+        &[base],
+        vec![
+            put(&MACHINE, &pk, "label", json!("m87")),
+            put(&MACHINE, &pk, "nickname", json!("Otter")),
+        ],
+    );
+    let view = LabView::read(
+        &book.cells(),
+        &facts(&pk, None),
+        &OwnedRead::default(),
+        Some(ME),
+    );
+    let bound = view
+        .my_machine()
+        .expect("a label conflict does not invent a different binding");
+    assert_eq!(bound.pk, pk);
+    assert_eq!(bound.label, None);
+    assert_eq!(bound.nickname, MachineNickname::Conflict);
+    assert_eq!(view.my_label(), None);
+}
+
+#[test]
+fn a_missing_or_retired_machine_is_not_this_macs_bound_name() {
+    let (pk, mut changes) = machine("m86");
+    changes.push(put(&MACHINE, &pk, "nickname", json!("MissBunny")));
+    let live = cells(changes.clone());
+    for own_facts in [OwnedRead::default(), facts("mc-0000000000000000", None)] {
+        let view = LabView::read(&live, &own_facts, &OwnedRead::default(), Some(ME));
+        assert!(view.my_machine().is_none());
+        assert_eq!(view.my_label(), None);
+    }
+    changes.push(put(&MACHINE, &pk, "row", json!("retired")));
+    let retired = LabView::read(
+        &cells(changes),
+        &facts(&pk, None),
+        &OwnedRead::default(),
+        Some(ME),
+    );
+    assert!(retired.my_machine().is_none());
+    assert_eq!(retired.my_label(), None);
+    assert_eq!(
+        retired.machines[&pk].nickname,
+        MachineNickname::Named {
+            word: "MissBunny".into(),
+            automatic: false
+        },
+        "the row remains available for history, not as a live binding"
+    );
+}
+
+#[test]
+fn a_bound_nickname_retains_automatic_provenance_until_the_owner_chooses_it() {
+    use crate::typed::cell::{CellKey, CellValue};
+
+    let (pk, mut changes) = machine("m86");
+    changes.push(
+        cell::change(
+            &MACHINE,
+            CellKey {
+                pk: &pk,
+                col: "nickname",
+                elem: None,
+            },
+            &CellValue::automatic(1, json!("kestrel")),
+        )
+        .expect("an automatic nickname"),
+    );
+    let mut book = Book::new();
+    let base = book.write(1, &[], changes);
+    let view = LabView::read(
+        &book.cells(),
+        &facts(&pk, None),
+        &OwnedRead::default(),
+        Some(ME),
+    );
+    assert_eq!(
+        view.my_machine().expect("the bound row").nickname,
+        MachineNickname::Named {
+            word: "kestrel".into(),
+            automatic: true
+        }
+    );
+    book.write(
+        2,
+        &[base],
+        vec![put(&MACHINE, &pk, "nickname", json!("kestrel"))],
+    );
+    let view = LabView::read(
+        &book.cells(),
+        &facts(&pk, None),
+        &OwnedRead::default(),
+        Some(ME),
+    );
+    assert_eq!(
+        view.my_machine().expect("the bound row").nickname,
+        MachineNickname::Named {
+            word: "kestrel".into(),
+            automatic: false
+        },
+        "choosing an unchanged word still records the owner's provenance"
+    );
+}
+
+#[test]
+fn unreadable_name_candidates_never_become_an_unset_or_authoritative_value() {
+    for column in ["label", "nickname"] {
+        for mixed in [false, true] {
+            let pk = keys::machine_pk("m86");
+            let (other_column, other_word) = if column == "label" {
+                ("nickname", "MissBunny")
+            } else {
+                ("label", "m86")
+            };
+            let word = if column == "label" {
+                "m86"
+            } else {
+                "MissBunny"
+            };
+            let mut book = Book::new();
+            let base = book.write(
+                1,
+                &[],
+                vec![
+                    put(&MACHINE, &pk, "row", json!("live")),
+                    put(&MACHINE, &pk, "status", json!("active")),
+                    put(&MACHINE, &pk, other_column, json!(other_word)),
+                ],
+            );
+            let mut malformed = put(&MACHINE, &pk, column, json!(word));
+            // A stored cell envelope with an unknown field cannot be decoded. The typed
+            // projection retains that unreadability even beside a valid concurrent value.
+            malformed.value = Some(json!({"r": 1, "x": word, "unknown": true}));
+            book.write(2, &[base], vec![malformed]);
+            if mixed {
+                book.write(3, &[base], vec![put(&MACHINE, &pk, column, json!(word))]);
+            }
+            let cells = book.cells();
+            let projected = cell::project(&MACHINE, &cells);
+            let row = &projected.rows[&pk];
+            assert!(row.raw.contains(column));
+            if mixed {
+                assert_eq!(
+                    row.get(column).and_then(Value::as_str),
+                    Some(word),
+                    "the otherwise-readable sibling must not conceal the raw candidate"
+                );
+            } else {
+                assert!(row.get(column).is_none());
+            }
+            let view = LabView::read(&cells, &facts(&pk, None), &OwnedRead::default(), Some(ME));
+            let bound = view
+                .my_machine()
+                .expect("the authenticated binding remains available");
+            if column == "label" {
+                assert_eq!(bound.label, None);
+                assert_eq!(
+                    bound.nickname,
+                    MachineNickname::Named {
+                        word: "MissBunny".into(),
+                        automatic: false
+                    }
+                );
+            } else {
+                assert_eq!(bound.nickname, MachineNickname::Conflict);
+                assert_eq!(bound.label.as_deref(), Some("m86"));
+            }
+        }
+    }
+}
+
 /// This Mac is the machine its own facts row binds, its `merged_into` when it names one; its
 /// preferences come in rank order with an unranked one last; the Macs preferring an account sort
 /// by rank, then by label number (`m3` before `m22`); an ended preference, or one on a retired
@@ -149,7 +380,7 @@ fn a_mac_reads_its_preferences_from_its_facts_binding() {
 
 /// An alias's auth codes arrive where the address it is linked with receives them: the chain is
 /// read nearest first and stops at a retired link or a cycle.
-/// NEGATIVE CONTROL: without the `live()` filter in `alias_targets`, the retired link is
+/// NEGATIVE CONTROL: without the `live()` filter in `alias_targets_of`, the retired link is
 /// followed: `` left: ["hub@…", "gone@…"] right: ["hub@…"] ``.
 #[test]
 fn an_alias_names_the_addresses_its_codes_arrive_at() {
@@ -173,6 +404,82 @@ fn an_alias_names_the_addresses_its_codes_arrive_at() {
     assert_eq!(view.alias_targets(&addr("ann")), [addr("hub")]);
     assert_eq!(view.alias_targets(&addr("la")), [addr("lb")]);
     assert!(view.alias_targets(&addr("nobody")).is_empty());
+}
+
+/// An address row goes by the address it says now: a renamed alias hands over its chain under its
+/// new address and none under its old one, its chain names each target by what it says now, and
+/// the lab places it by its new address; an address two rows say is placed nowhere.
+/// NEGATIVE CONTROLS: with `alias_targets` keyed by `keys::address_pk` again, the renamed alias's
+/// new address hands over no chain: `` left: [] right: ["hub2@example.test"] ``; with
+/// `mailboxes` placing every row's address (its `address_index.row` check `true ||`), the address
+/// two rows say is placed: `` {"ann2@example.test": "mb-hub", "hub2@example.test": "mb-x"} ``
+/// (the last assertion's message).
+#[test]
+fn a_renamed_alias_goes_by_its_new_address() {
+    let pk = |local: &str| keys::address_pk(&format!("{local}@example.test")).unwrap();
+    let addr = |local: &str| format!("{local}@example.test");
+    let all = vec![
+        put(&ADDRESS, &pk("ann"), "addr", json!(addr("ann2"))),
+        put(&ADDRESS, &pk("ann"), "alias_of", json!(pk("hub"))),
+        put(&ADDRESS, &pk("hub"), "addr", json!(addr("hub2"))),
+        put(&ADDRESS, &pk("hub"), "mailbox", json!("mb-hub")),
+        put(&ADDRESS, &pk("x"), "addr", json!(addr("hub2"))),
+        put(&ADDRESS, &pk("x"), "mailbox", json!("mb-x")),
+    ];
+    let view = LabView::read(
+        &cells(all),
+        &OwnedRead::default(),
+        &OwnedRead::default(),
+        None,
+    );
+    assert_eq!(view.alias_targets(&addr("ann2")), [addr("hub2")]);
+    assert!(view.alias_targets(&addr("ann")).is_empty());
+    assert_eq!(
+        view.aliases(),
+        BTreeMap::from([(addr("ann2"), vec![addr("hub2")])])
+    );
+    let placed = view.mailboxes();
+    assert_eq!(
+        placed.get(&addr("ann2")).map(String::as_str),
+        Some("mb-hub")
+    );
+    assert!(!placed.contains_key(&addr("ann")));
+    assert!(!placed.contains_key("hub2@example.test"), "{placed:?}");
+}
+
+/// An alias address two rows say routes nowhere, as it is placed nowhere: `aliases` hands the
+/// harness a chain only from the one row an address names, never one of two rows picked by key
+/// order, and `alias_targets` reads none for it either.
+/// NEGATIVE CONTROL: with `aliases` keeping every row's address (its `address_index.row` filter
+/// `true ||`), the address two rows say routes: `` assertion `left == right` failed left:
+/// {"dup@example.test": ["hub@example.test"], "one@example.test": ["hub@example.test"]} right:
+/// {"one@example.test": ["hub@example.test"]} ``.
+#[test]
+fn an_alias_address_two_rows_say_routes_nowhere() {
+    let pk = |local: &str| keys::address_pk(&format!("{local}@example.test")).unwrap();
+    let addr = |local: &str| format!("{local}@example.test");
+    let all = vec![
+        put(&ADDRESS, &pk("hub"), "addr", json!(addr("hub"))),
+        put(&ADDRESS, &pk("hub"), "mailbox", json!("mb-hub")),
+        put(&ADDRESS, &pk("one"), "addr", json!(addr("one"))),
+        put(&ADDRESS, &pk("one"), "alias_of", json!(pk("hub"))),
+        put(&ADDRESS, &pk("dup1"), "addr", json!(addr("dup"))),
+        put(&ADDRESS, &pk("dup1"), "alias_of", json!(pk("hub"))),
+        put(&ADDRESS, &pk("dup2"), "addr", json!(addr("dup"))),
+        put(&ADDRESS, &pk("dup2"), "alias_of", json!(pk("one"))),
+    ];
+    let view = LabView::read(
+        &cells(all),
+        &OwnedRead::default(),
+        &OwnedRead::default(),
+        None,
+    );
+    assert!(view.alias_targets(&addr("dup")).is_empty());
+    assert_eq!(
+        view.aliases(),
+        BTreeMap::from([(addr("one"), vec![addr("hub")])])
+    );
+    assert!(!view.mailboxes().contains_key(&addr("dup")));
 }
 
 /// The mailboxes the lab itself places an address in: its `mailbox` column, and an alias the
@@ -325,9 +632,9 @@ pub(crate) fn follow_transition(
 /// `hub`, breaking `RetiredNeverFollowed`; a reader that steps past a retired link instead of
 /// stopping there hands over `[root]`, which no `Follow` successor names; a check of the alias's own link alone misses a live
 /// `hub` linked to a retired `root`, breaking `BrokenLinkReported`. Neither is a `Follow`
-/// successor. Run against the code, `alias_targets` without its `live()` filter, `alias_targets`
-/// stepping past a retired link, `alias_targets` with an empty seen set (`[ann]` round a
-/// self-link) and `checks::lab` without its `alias_cycle` arm each fail the walk.
+/// successor. Run against the code, `alias_targets_of` without its `live()` filter,
+/// `alias_targets_of` stepping past a retired link, `alias_targets_of` with an empty seen set
+/// (`[ann]` round a self-link) and `checks::lab` without its `alias_cycle` arm each fail the walk.
 #[test]
 fn an_alias_chain_takes_the_harness_models_steps() {
     let model = aterm_models_harness::fleet_machine_assignment_model();

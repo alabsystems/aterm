@@ -461,9 +461,14 @@ fn waits_rows(d: &Tally, n: usize) -> Vec<String> {
         "| the loop waited on | count | per round trip | ms | ms per round trip |".to_string(),
         "|---|---:|---:|---:|---:|".to_string(),
         row(
-            "requests that read their own reply",
+            "requests that read their own reply, but the subject budget's",
             Some(r(TallyRow::Request).count),
             r(TallyRow::Request).total,
+        ),
+        row(
+            "the subject budget's reads (`subject_budget`)",
+            Some(r(TallyRow::BudgetRequest).count),
+            r(TallyRow::BudgetRequest).total,
         ),
         row(
             "pipelined acks (publishes', and since aterm-0 the group commits')",
@@ -484,7 +489,8 @@ const TAIL_8MS: usize = 14;
 
 pub(super) fn describe(row: TallyRow) -> &'static str {
     match row {
-        TallyRow::Request => "broker: requests that read their own reply",
+        TallyRow::Request => "broker: requests that read their own reply, but the budget's",
+        TallyRow::BudgetRequest => "broker: the subject budget's reads (`subject_budget`)",
         TallyRow::Ack => "broker: pipelined acks read (publishes', the group commits')",
         TallyRow::Commit => "broker: of those, the inbox group's commits",
         TallyRow::LaneOutbox => "verb lane: the outbox peek",
@@ -1317,10 +1323,12 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         },
         "window_ms": window_ms.map(stats::round3),
         "bridge_waits": {
-            "what": "the bridge loop's waits on broker replies over the window, counted inside the bridge (aterm_link::wait_tally): requests that read their own reply, pipelined acks, and of both the inbox group's commits (a request each before aterm-0, a pipelined ack since)",
+            "what": "the bridge loop's waits on broker replies over the window, counted inside the bridge (aterm_link::wait_tally): requests that read their own reply (the subject budget's apart, as budget_requests, since wait-tally v=8), pipelined acks, and of both the inbox group's commits (a request each before aterm-0, a pipelined ack since)",
             "pid": waits.pid,
             "requests": waits.row(TallyRow::Request).count,
             "request_ms": stats::round3(ns_ms(waits.row(TallyRow::Request).total)),
+            "budget_requests": waits.row(TallyRow::BudgetRequest).count,
+            "budget_request_ms": stats::round3(ns_ms(waits.row(TallyRow::BudgetRequest).total)),
             "commits": waits.row(TallyRow::Commit).count,
             "commit_ms": stats::round3(ns_ms(waits.row(TallyRow::Commit).total)),
             "acks": waits.row(TallyRow::Ack).count,
@@ -1741,29 +1749,34 @@ mod tests {
 
         let d = with(&[
             (TallyRow::Request, 400, 1_200_000_000),
+            (TallyRow::BudgetRequest, 32, 100_000_000),
             (TallyRow::Commit, 400, 1_100_000_000),
             (TallyRow::Ack, 400, 800_000_000),
         ]);
         let rows = waits_rows(&d, 200);
-        assert_eq!(rows.len(), 6);
+        assert_eq!(rows.len(), 7);
         assert_eq!(
             rows[2],
-            "| requests that read their own reply | 400 | 2.000 | 1200.00 | 6.000 |"
+            "| requests that read their own reply, but the subject budget's | 400 | 2.000 | 1200.00 | 6.000 |"
         );
         assert_eq!(
-            rows[5],
-            "| **all: the loop held by the broker** | – | – | 2000.00 | 10.000 |"
+            rows[3],
+            "| the subject budget's reads (`subject_budget`) | 32 | 0.160 | 100.00 | 0.500 |"
+        );
+        assert_eq!(
+            rows[6], "| **all: the loop held by the broker** | – | – | 2100.00 | 10.500 |",
+            "the budget's reads are the broker's waits too"
         );
         let mut folded = d;
         folded.rows[TallyRow::Request.index()].count = 399;
         folded.rows[TallyRow::Commit.index()].count = 399;
         let rows = waits_rows(&folded, 200);
         assert!(
-            rows[4].starts_with("| of both: the inbox group's commits | 399 | 1.995 |"),
+            rows[5].starts_with("| of both: the inbox group's commits | 399 | 1.995 |"),
             "{rows:?}"
         );
         assert!(
-            rows[3].starts_with(
+            rows[4].starts_with(
                 "| pipelined acks (publishes', and since aterm-0 the group commits') | 400 | 2.000 |"
             ),
             "{rows:?}"

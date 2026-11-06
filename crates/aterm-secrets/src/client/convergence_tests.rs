@@ -26,14 +26,45 @@ pub(super) fn six() -> Six {
     six_with(false)
 }
 
-/// [`six`], with `m7` an admin too where `m7_admin`.
+/// [`six`], with `m7` an admin too where `m7_admin`: a lab of its own, written from the one lab
+/// of that kind this process builds. Its first two Macs are built by [`two_macs_with`] with the
+/// entry `shared` = `v1`, so `six()` and a `two_macs` of that one entry are one vault under one
+/// signer: a test that needs them to be two says so with [`fresh_two_macs`].
 pub(super) fn six_with(m7_admin: bool) -> Six {
+    let template = six_template(m7_admin);
+    let macs = template.lab.start();
+    let all = SIX_HOMES
+        .map(|home| Paths::for_home(&macs.root.path().join(home)))
+        .to_vec();
+    Six {
+        macs,
+        all,
+        actors: template.actors.clone(),
+        recipients: template.recipients.clone(),
+    }
+}
+
+const SIX_HOMES: [&str; 6] = ["m22", "m7", "m40", "m41", "m42", "m43"];
+
+struct SixTemplate {
+    lab: LabTemplate,
+    actors: Vec<MemberId>,
+    recipients: Vec<Recipient>,
+}
+
+fn six_template(m7_admin: bool) -> &'static SixTemplate {
+    static TEMPLATES: [std::sync::OnceLock<SixTemplate>; 2] =
+        [const { std::sync::OnceLock::new() }; 2];
+    TEMPLATES[usize::from(m7_admin)].get_or_init(|| off_this_thread(|| built_six(m7_admin)))
+}
+
+fn built_six(m7_admin: bool) -> SixTemplate {
     let macs = two_macs_with(
         &[(Audience::Everyone, "shared", b"v1".as_slice())],
         m7_admin,
     );
     let mut all = vec![macs.m22.clone(), macs.m7.clone()];
-    for name in ["m40", "m41", "m42", "m43"] {
+    for name in &SIX_HOMES[2..] {
         let (paths, _, _) = let_in_by(&macs, &macs.m7, name, name);
         all.push(paths);
     }
@@ -46,9 +77,8 @@ pub(super) fn six_with(m7_admin: bool) -> Six {
         .iter()
         .map(|paths| read_identity(paths).unwrap().unwrap().recipient())
         .collect();
-    Six {
-        macs,
-        all,
+    SixTemplate {
+        lab: LabTemplate::of(macs, &all.iter().collect::<Vec<_>>()),
         actors,
         recipients,
     }

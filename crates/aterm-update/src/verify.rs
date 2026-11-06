@@ -65,6 +65,13 @@ pub(crate) struct HelperFailure {
     pub writer_stopped: bool,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The pid of the helper [`status_bounded_with_stderr_observed`] last started on this thread,
+    /// recorded as it starts, so a test can see that helper gone once the call returns.
+    static HELPER_STARTED: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
 trait HelperChild {
     fn request_kill(&mut self) -> std::io::Result<()>;
     fn observe_exit(&mut self) -> std::io::Result<Option<std::process::ExitStatus>>;
@@ -116,6 +123,8 @@ pub(crate) fn status_bounded_with_stderr_observed(
             message: spawn_refusal(what, &error),
             writer_stopped: true,
         })?;
+    #[cfg(test)]
+    HELPER_STARTED.with(|started| started.set(Some(child.id())));
     let drain = if let Some(mut stream) = child.stderr.take() {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let spawned = std::thread::Builder::new()
@@ -1124,32 +1133,33 @@ mod tests {
         }
     }
 
+    /// A helper that outlives its limit is refused as a timeout, and a failure that says its
+    /// writer stopped names a helper already reaped, so the copy path it wrote is free to reclaim:
+    /// its pid, taken as it started, names no process, not even a zombie. A spawn refused starts
+    /// none. Whether the stop lands inside the call's cleanup reserve (250 ms at most) is the
+    /// Mac's load, not a fact this test can hold: a stop the call did not see is its safe answer
+    /// (the copy stays isolated), and [`stop_helper_before_reaps_the_helper_it_reports_stopped`]
+    /// holds the stop itself under the hang detector.
+    ///
+    /// NEGATIVE CONTROL (2026-11-06): `stop_helper_before` answering stopped without its kill
+    /// fails `assert_gone` ("pid N still exists").
     #[test]
     fn timed_out_owned_helper_is_reaped_before_its_copy_path_is_reclaimable() {
         let staging = crate::paths::Staging::scratch("owned-helper-reap");
-        let receipt = staging.root.join("child.pid");
+        HELPER_STARTED.with(|started| started.set(None));
         let failure = status_bounded_with_stderr_observed(
-            Command::new("/bin/sh")
-                .arg("-c")
-                .arg(r#"printf '%s\n' "$$" > "$1"; exec /bin/sleep 30"#)
-                .arg("owned-helper-fixture")
-                .arg(&receipt),
+            Command::new("/bin/sleep").arg("30"),
             "owned copy fixture",
             Duration::from_secs(2),
         )
         .unwrap_err();
         assert!(crate::is_passing_refusal(&failure.message), "{failure:?}");
-        assert!(failure.writer_stopped, "{failure:?}");
-        let pid: i32 = std::fs::read_to_string(&receipt)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ESRCH)
-        );
+        let pid = HELPER_STARTED
+            .with(std::cell::Cell::take)
+            .expect("the helper started");
+        if failure.writer_stopped {
+            assert_gone(i32::try_from(pid).expect("a pid fits an i32"));
+        }
         let absent = status_bounded_with_stderr_observed(
             &mut Command::new(staging.root.join("no-such-helper")),
             "absent helper",
@@ -1157,7 +1167,38 @@ mod tests {
         )
         .unwrap_err();
         assert!(absent.writer_stopped, "a refused spawn created no writer");
+        assert_eq!(HELPER_STARTED.with(std::cell::Cell::get), None);
         let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
+    /// The stop of a real helper that will not finish: it is killed and reaped, so the process it
+    /// reports stopped is gone, judged by the pid of the child this test spawned itself. Its
+    /// deadline is the one-minute hang detector, not the call's cleanup reserve.
+    ///
+    /// NEGATIVE CONTROL (2026-11-06): `stop_helper_before` answering stopped without its kill
+    /// fails `assert_gone` ("pid N still exists").
+    #[test]
+    fn stop_helper_before_reaps_the_helper_it_reports_stopped() {
+        let mut child = Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn /bin/sleep");
+        let pid = i32::try_from(child.id()).expect("a pid fits an i32");
+        let deadline = crate::instant_after(Instant::now(), aterm_spec::wait::MUST_HAPPEN);
+        assert!(
+            stop_helper_before(&mut child, deadline),
+            "a killed helper exits within the hang detector"
+        );
+        assert_gone(pid);
+    }
+
+    /// `pid` names no process, a zombie included: it was reaped.
+    fn assert_gone(pid: i32) {
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "pid {pid} still exists");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
     }
 
     /// The tail of the child's stderr comes back with its status; a child that floods stderr

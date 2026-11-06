@@ -124,9 +124,8 @@ fn growth_past_an_over_wide_stride_copies_the_raster_a_bounded_number_of_times()
     let (_, img) = restride_work(&tall);
     let img = img.expect("1001x4096 fits under SIXEL_MAX_PIXELS");
     assert_eq!((img.width(), img.height()), (1001, 4096));
-    let px = img.pixels();
-    assert!(px[..1001].iter().all(|&p| p == 0xFFFF_0000));
-    assert!(px.iter().step_by(1001).all(|&p| p == 0xFFFF_0000));
+    assert!((0..1001).all(|x| img.pixel(x, 0) == 0xFFFF_0000));
+    assert!((0..4096).all(|y| img.pixel(0, y) == 0xFFFF_0000));
 
     // Each band one column wider than every band above it, alternating width and
     // height growth: 460 bands stay under the cap.
@@ -137,7 +136,7 @@ fn growth_past_an_over_wide_stride_copies_the_raster_a_bounded_number_of_times()
     let (_, img) = restride_work(&widening);
     let img = img.expect("1461x2766 fits under SIXEL_MAX_PIXELS");
     assert_eq!((img.width(), img.height()), (1461, 2766));
-    assert_eq!(img.pixels()[2765 * 1461 + 1460], 0xFFFF_0000);
+    assert_eq!(img.pixel(1460, 2765), 0xFFFF_0000);
 
     // Each step makes the cheaper of the two growths that force a re-stride: one column
     // past the stride, or one row past the height the stride holds.
@@ -191,9 +190,18 @@ fn small_bodies_decode_to_their_geometry_in_the_defined_colour() {
         let what = String::from_utf8_lossy(body);
         let img = decode(body).expect("a painted body produces an image");
         assert_eq!((img.width(), img.height()), (width, height), "{what}");
-        assert_eq!(img.pixels().len(), width * height, "{what}");
+        assert_eq!(
+            (img.raster_width(), img.raster_height()),
+            (width, height),
+            "{what}: painted throughout"
+        );
+        assert_eq!(img.rgba().len(), 4 * width * height, "{what}");
         assert!(
-            img.pixels().iter().all(|&p| p == 0xFFFF_0000),
+            img.rgba()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|&p| p == [0xFF, 0, 0, 0xFF]),
             "{what}: every pixel opaque red"
         );
     }
@@ -257,9 +265,9 @@ fn partial_last_band_at_pixel_cap_decodes_without_band_rounding_refusal() {
         "1026x4088 = 4,194,288 <= SIXEL_MAX_PIXELS must not fail closed to band height 4092",
     );
     assert_eq!((img.width(), img.height()), (1026, 4088));
-    let last_row = &img.pixels()[4087 * 1026..4088 * 1026];
-    assert!(last_row.iter().all(|&px| px == 0xFFFF_0000));
-    assert!(img.pixels()[..4087 * 1026].iter().all(|&px| px == 0));
+    assert_eq!((img.raster_width(), img.raster_height()), (1026, 4088));
+    assert!((0..1026).all(|x| img.pixel(x, 4087) == 0xFFFF_0000));
+    assert!(img.rgba()[..4 * 4087 * 1026].iter().all(|&byte| byte == 0));
 
     // Geometric width doubling (`1024 -> 2048` on column 1025) must compact back within
     // `SIXEL_MAX_PIXELS / new_h` when height later grows to 4088 (`1025 * 4088 <= SIXEL_MAX_PIXELS`).
@@ -269,16 +277,9 @@ fn partial_last_band_at_pixel_cap_decodes_without_band_rounding_refusal() {
     let compacted = decode(&over_strided)
         .expect("1025x4088 fits under SIXEL_MAX_PIXELS even after geometric stride doubling");
     assert_eq!((compacted.width(), compacted.height()), (1025, 4088));
-    assert!(
-        compacted.pixels()[..1025]
-            .iter()
-            .all(|&px| px == 0xFFFF_0000)
-    );
-    assert!(
-        compacted.pixels()[4087 * 1025..4088 * 1025]
-            .iter()
-            .all(|&px| px == 0xFFFF_0000)
-    );
+    assert_eq!(compacted.rgba().len(), 4 * 1025 * 4088);
+    assert!((0..1025).all(|x| compacted.pixel(x, 0) == 0xFFFF_0000));
+    assert!((0..1025).all(|x| compacted.pixel(x, 4087) == 0xFFFF_0000));
 }
 
 #[test]
@@ -288,9 +289,9 @@ fn partial_column_sets_only_low_bits() {
     assert_eq!(img.height(), 6);
     for row in 0..6usize {
         if row == 1 {
-            assert_eq!(img.pixels()[row], 0xFF00_FF00, "row 1 opaque green");
+            assert_eq!(img.pixel(0, row), 0xFF00_FF00, "row 1 opaque green");
         } else {
-            assert_eq!(img.pixels()[row], 0, "row {row} transparent");
+            assert_eq!(img.pixel(0, row), 0, "row {row} transparent");
         }
     }
 }
@@ -301,7 +302,7 @@ fn dimensions_are_clamped() {
     let img = decode(body).expect("image");
     assert_eq!(img.width(), SIXEL_MAX_DIMENSION, "width clamped to 4096");
     assert_eq!(img.height(), 6, "single band height");
-    assert_eq!(img.pixels().len(), SIXEL_MAX_DIMENSION * 6);
+    assert_eq!(img.rgba().len(), 4 * SIXEL_MAX_DIMENSION * 6);
 }
 
 #[test]
@@ -315,7 +316,7 @@ fn register_select_out_of_range_is_clamped_no_panic() {
     assert_eq!(d.current_color, MAX_COLOR_REGISTERS - 1);
     let img = d.unhook().expect("image");
     assert_eq!((img.width(), img.height()), (1, 6));
-    assert!(img.pixels().iter().all(|&px| px == 0xFF00_0000));
+    assert!((0..6).all(|y| img.pixel(0, y) == 0xFF00_0000));
 }
 
 #[test]
@@ -350,7 +351,7 @@ fn reuse_across_cycles_resets_state() {
     assert_eq!(bimg.width(), 1, "geometry reset between cycles");
     assert_eq!(bimg.height(), 6);
     assert_eq!(
-        bimg.pixels()[0] & 0x00FF_FF00,
+        bimg.pixel(0, 0) & 0x00FF_FF00,
         0x0000_FF00,
         "green, not red"
     );
@@ -415,10 +416,12 @@ fn decgra_only_within_cap_uses_declared_geometry() {
     let img = decode(b"\"1;1;4;6").expect("in-cap declared geometry");
     assert_eq!(img.width(), 4);
     assert_eq!(img.height(), 6);
-    assert_eq!(img.pixels().len(), 24);
-    for &p in img.pixels() {
-        assert_eq!(p, 0, "no data painted → fully transparent");
-    }
+    assert_eq!(
+        (img.raster_width(), img.raster_height(), img.rgba().len()),
+        (0, 0, 0),
+        "no data painted → no pixel bytes"
+    );
+    assert!((0..6).all(|y| (0..4).all(|x| img.pixel(x, y) == 0)));
 
     let omitted_pan = decode(b"\";1;4;6").expect("omitted Pan keeps Ph/Pv in slots 2/3");
     assert_eq!((omitted_pan.width(), omitted_pan.height()), (4, 6));
@@ -426,15 +429,33 @@ fn decgra_only_within_cap_uses_declared_geometry() {
     assert_eq!((omitted_both.width(), omitted_both.height()), (5, 7));
 }
 
+/// A DECGRA declaration reserves footprint, not memory: a 4096x1024 declaration holds no pixel
+/// bytes until data paints, and then only the painted extent's.
 #[test]
-fn compose_pads_declared_edges_transparent() {
+fn a_declared_raster_holds_bytes_only_where_data_paints() {
+    let declared = decode(b"\"1;1;4096;1024").expect("in-cap declared geometry");
+    assert_eq!((declared.width(), declared.height()), (4096, 1024));
+    assert!(declared.rgba().is_empty());
+    let dotted = decode(b"\"1;1;4096;1024#1;2;100;0;0#1~").expect("one painted column");
+    assert_eq!((dotted.width(), dotted.height()), (4096, 1024));
+    assert_eq!((dotted.raster_width(), dotted.raster_height()), (1, 6));
+    assert_eq!(dotted.into_rgba(), [0xFF, 0, 0, 0xFF].repeat(6));
+}
+
+#[test]
+fn declared_edges_past_the_paint_are_transparent_and_hold_no_bytes() {
     let img = decode(b"\"1;1;5;13#1;2;100;0;0#1~~").expect("image");
     assert_eq!(img.width(), 5, "declared width wins over painted extent");
     assert_eq!(img.height(), 13, "declared height wins over painted extent");
-    assert_eq!(img.pixels().len(), 5 * 13);
+    assert_eq!((img.raster_width(), img.raster_height()), (2, 6));
+    assert_eq!(
+        img.rgba().len(),
+        4 * 2 * 6,
+        "only the painted 2x6 holds bytes"
+    );
     for y in 0..13 {
         for x in 0..5 {
-            let p = img.pixels()[y * 5 + x];
+            let p = img.pixel(x, y);
             if x < 2 && y < 6 {
                 assert_eq!(p, 0xFFFF_0000, "painted pixel ({x},{y}) opaque red");
             } else {
@@ -517,9 +538,11 @@ fn decoder_is_bounded_on_arbitrary_streams() {
         if let Some(image) = decode(&data) {
             assert!(image.width() <= SIXEL_MAX_DIMENSION, "case {case}");
             assert!(image.height() <= SIXEL_MAX_DIMENSION, "case {case}");
+            assert!(image.raster_width() <= image.width(), "case {case}");
+            assert!(image.raster_height() <= image.height(), "case {case}");
             assert_eq!(
-                image.pixels().len(),
-                image.width() * image.height(),
+                image.rgba().len(),
+                4 * image.raster_width() * image.raster_height(),
                 "case {case}"
             );
         }
@@ -557,5 +580,5 @@ fn hls_to_rgb_follows_dec_shifted_hsl() {
     assert_eq!(hls_to_rgb(480, 250, 250), 0x00FF_FFFF);
 
     let img = decode(b"\"1;1;1;6#1;1;120;50;100#1~").expect("HLS red image");
-    assert!(img.pixels().iter().all(|&px| px == 0xFFFF_0000));
+    assert!((0..6).all(|y| img.pixel(0, y) == 0xFFFF_0000));
 }

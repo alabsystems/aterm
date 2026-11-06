@@ -397,7 +397,7 @@ fn only_supported_elapsed_credentials_are_classified_as_expired() {
             Region::Global,
             EMAIL,
             1000,
-            std::time::Instant::now() + std::time::Duration::from_secs(60),
+            login_drive::Deadline::after(std::time::Duration::from_secs(60)),
         )
         .err()
         .expect("local credential must be refused before I/O");

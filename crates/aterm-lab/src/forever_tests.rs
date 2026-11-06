@@ -5961,9 +5961,8 @@ fn seen_cruise_n() -> Seen {
 }
 
 /// N4's stand-in ask beside its report as [`surfaces::stopped::ask_step`] keeps it (§14.7): on
-/// main (`first`) the ask's row above the report's and no tab pressed (continuous forward), the
-/// report's row carrying `product`'s tip; on main before 7a the older report above, pressed, with
-/// no tip.
+/// main (`first`) the ask's row above the report's, the report's row carrying `product`'s tip; on
+/// main before 7a the older report above with no tip.
 fn stopped_read(product: Option<&str>, first: bool) -> String {
     let ask = format!(
         "◇ {} — approve the stand-in request · 1s",
@@ -5985,9 +5984,8 @@ fn stopped_read(product: Option<&str>, first: bool) -> String {
                 false,
             )
         }),
-        pressing: if first { "-" } else { "@s-cn" }.into(),
     };
-    format!("{} cleared=yes", read.line("s-ask", "s-cn"))
+    format!("{} cleared=yes", read.line())
 }
 
 #[test]

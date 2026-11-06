@@ -35,6 +35,7 @@ impl World {
     }
 
     fn anonymous_throughout(&self) {
+        assert!(self.gh.meter().rest_requests.is_empty());
         assert_eq!(
             self.gh.meter().as_,
             Some(agh::error::IdentityRef::Anonymous),
@@ -204,4 +205,34 @@ fn a_part_name_or_non_regular_dest_is_refused_before_any_request() {
     assert!(w.fake.seen().is_empty(), "{:?}", w.fake.seen());
     assert_eq!(std::fs::read(&target).expect("target intact"), b"keep");
     w.fake.assert_clean();
+}
+
+#[test]
+fn rest_meter_counts_both_identities_and_excludes_public_transfers() {
+    let w = World::new("pub-rest-meter");
+    let slug = common::slug(APP);
+    w.gh.repos().get(&slug).unwrap();
+    w.gh.repos()
+        .how(agh::How::default().anonymous(true))
+        .get(&slug)
+        .unwrap();
+    let before = w.gh.meter();
+    assert_eq!(before.rest_requests.get("dev"), Some(&1));
+    assert_eq!(before.rest_requests.get("anonymous"), Some(&1));
+    let observed_api = w
+        .fake
+        .seen()
+        .iter()
+        .filter(|s| s.origin == FakeOrigin::Api)
+        .count();
+    assert_eq!(observed_api, 2);
+    assert_eq!(before.rest_requests.values().sum::<u32>(), 2);
+    // Negative control for classifying all HTTP requests as REST: a web/CDN
+    // download increments total requests but must leave both REST counters fixed.
+    w.gh.public()
+        .fetch(&slug, "v1", "app.bin", &w.root.path().join("public"), 1024)
+        .unwrap();
+    let after = w.gh.meter();
+    assert!(after.requests > before.requests);
+    assert_eq!(after.rest_requests, before.rest_requests);
 }

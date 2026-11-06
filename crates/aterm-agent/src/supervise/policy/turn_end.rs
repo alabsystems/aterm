@@ -5110,7 +5110,7 @@ fn land_open(
     stands: &[Stand<'_>],
 ) -> bool {
     let (at, end) = (st.at, st.end());
-    if quoted(s, at) || in_path(s, at, end) || nil_item(s, at, end) {
+    if quoted(s, at) || in_path(s, at, end) || nil_item(s, at, end) || needs::token_you(s, at) {
         return false;
     }
     if matches!(st.reads(), Reads::Exception) {
@@ -12088,8 +12088,9 @@ impl TurnEndReading {
 
     /// AN ANSWERED POINT THAT SAYS NOTHING ([`Self::answered_point`]'s shape, a conversation
     /// drawn, no stop notice, no wall or limit notice drawn): no reply read, or one of whitespace
-    /// alone, none of it cut above the screen. A land check's answer read so has not answered it
-    /// yet ([`TurnEndState::unsaid_reading`]).
+    /// alone, none of it cut above the screen. A land check answered so has no audit to read
+    /// ([`TurnEndState::observe`]); one drawn at an idle composer may still draw its words
+    /// ([`Self::words_may_follow`]).
     fn unsaid(&self) -> bool {
         self.answered_point()
             && self.fault.is_none()
@@ -12101,6 +12102,14 @@ impl TurnEndReading {
                 .said_tail
                 .as_deref()
                 .is_none_or(|t| t.trim().is_empty())
+    }
+
+    /// [`Self::unsaid`] AT AN IDLE COMPOSER: the frame agy 1.5.1 on a loaded Mac drew under an
+    /// act's message before the words it then drew (L19), so a Land act's answer read so has not
+    /// answered it yet ([`TurnEndState::unsaid_reading`]). A question box is drawn on purpose,
+    /// never ahead of its words, so one that says nothing is judged where it is read.
+    fn words_may_follow(&self) -> bool {
+        self.phase == Phase::Idle && self.unsaid()
     }
 }
 
@@ -12639,7 +12648,7 @@ struct Awaited {
     submitted: bool,
     submits: Option<u64>,
     screen: Option<u64>,
-    /// THE LAND CHECK'S TURN RAN AND ENDED SAYING NOTHING ([`TurnEndState::unsaid_reading`]):
+    /// THE LAND ACT'S TURN RAN AND ENDED SAYING NOTHING YET ([`TurnEndState::unsaid_reading`]):
     /// the work it ran for, which the reading its words are drawn on is judged with.
     ran: Option<Duration>,
 }
@@ -13270,7 +13279,8 @@ pub struct TurnEndState {
     /// session worked.
     left_after_work: bool,
     /// A program started fresh in the tab since the last point (a taskless screen: its banner,
-    /// no task): the next exchange opens its session, whatever the tab's books say.
+    /// no task; or the host's relaunch afresh, [`Self::relaunched_afresh`]): the next exchange
+    /// opens its session, whatever the tab's books say.
     opened_fresh: bool,
     /// The session ran under Off ([`Self::seed_off_stood`]).
     off_stood: bool,
@@ -16411,6 +16421,17 @@ impl TurnEndState {
         self.key_hour_ends(reading, now).is_some() || self.exchange
     }
 
+    /// Whether the continuation a `/compact` owes leaves [`go_ahead::NEVER_A_NEED`] out where
+    /// `reading` is decided at `now`: the person holds the go-ahead ([`Self::go_ahead_held_at`]),
+    /// or the reading parks on a person's go-ahead ([`Self::go_ahead_parked`]) that answers off
+    /// (`cfg`) leave to the person, as the continuation owed at a break leaves it out
+    /// ([`Self::owed_words`]). The owed act goes ahead of the escalation answers off give such a
+    /// park ([`act_past_walls`]), so it never says the go-ahead is no need over it.
+    fn owed_held_at(&self, reading: &TurnEndReading, cfg: &SupervisorConfig, now: Instant) -> bool {
+        self.go_ahead_held_at(reading, now)
+            || (!cfg.answer_questions && self.go_ahead_parked(reading, now).is_some())
+    }
+
     /// Whether the go-ahead is owed at this point, or Land's instruction before it
     /// ([`Self::go_ahead_parked`], 2026-10-30 review 9), and none was typed on the standing park
     /// yet ([`GoAheads`]): the same-reply hold lets the point through (`act_past_walls`), the
@@ -16482,11 +16503,12 @@ impl TurnEndState {
         &self,
         rule: &str,
         reading: &TurnEndReading,
+        cfg: &SupervisorConfig,
         now: Instant,
     ) -> Option<String> {
         self.compact_owed_words(rule, reading.autopilot, reading.rules.as_deref())
             .map(|words| {
-                go_ahead::unless_held(&words, self.go_ahead_held_at(reading, now)).into_owned()
+                go_ahead::unless_held(&words, self.owed_held_at(reading, cfg, now)).into_owned()
             })
     }
 
@@ -16502,19 +16524,23 @@ impl TurnEndState {
     /// The words of the continuation `rule` owes under Cruise at `now`, as a point types them
     /// ([`act_past_walls`]): the act a full context cut, else Cruise's continuation, each without
     /// [`go_ahead::NEVER_A_NEED`] while the person's hour holds the go-ahead
-    /// ([`go_ahead::unless_held`]).
+    /// ([`go_ahead::unless_held`]), or where the break's turn `parks` on a person's go-ahead that
+    /// answers off (`cfg`) leave to the person, as the carry goes without it there and a point
+    /// types the owed act without it ([`Self::owed_held_at`]).
     #[must_use]
     pub fn owed_words(
         &self,
         rule: &str,
         cfg: &SupervisorConfig,
         rules: Option<&str>,
+        parks: bool,
         now: Instant,
     ) -> String {
         let words = self
             .compact_owed_words(rule, Autopilot::Cruise, rules)
             .unwrap_or_else(|| continuation_text(cfg, rules));
-        go_ahead::unless_held(&words, self.go_ahead_held(now)).into_owned()
+        let held = self.go_ahead_held(now) || (parks && !cfg.answer_questions);
+        go_ahead::unless_held(&words, held).into_owned()
     }
 
     /// THE DONE CHECK [`words_act`] TYPES AT THIS POINT: [`fitted_check`] at the count's angle,
@@ -17956,9 +17982,10 @@ impl TurnEndState {
             }
         }
         let done = says_done(reading.said_tail.as_deref());
-        let clean_words = clean_defense(reading.said_tail.as_deref())
-            && !reading.said_cut
-            && !reading.need_before();
+        // WHAT THE REPLY'S WORDS LAND IS READ ONCE AT MOST, AND ONLY WHERE THE POINT'S OWN FACTS LEAVE
+        // IT TO DECIDE: both reads are functions of this reading alone, and the words of a long reply
+        // are the costliest thing this reads.
+        let defended = std::cell::LazyCell::new(|| clean_defense(reading.said_tail.as_deref()));
         // THE LAND CHECK DECIDES A LANDING (§14.17 item 5): the awaited act was the check and
         // its answer is `LANDED` alone, over a clean repository read at that answer's yield. The
         // word reader's verdict on a defense ([`clean_defense`]) lands nothing.
@@ -17970,16 +17997,19 @@ impl TurnEndState {
         let check_yield = landing && !act_owed && self.land.check_pending;
         // A CHECK'S TURN THE PERSON STOPPED (Esc) gave no answer: its last words are not the
         // agent's audit, so nothing lands on them and the defense stays owed its check. Nor did
-        // one that said nothing, judged once its take window ran out ([`Self::unsaid_reading`]):
-        // no words are no audit either.
+        // one that said nothing, judged once its take window ran out at an idle composer
+        // ([`Self::unsaid_reading`]) or where it is read in a question box: no words are no
+        // audit either.
         let no_answer = check_yield && (reading.interrupted || reading.unsaid());
-        let answer_read = land_check::land_check_answer(
-            reading.said_tail.as_deref().unwrap_or_default(),
-            reading.before(),
-            reading.said_cut,
-        );
-        let landed_answer = answer_read == land_check::CheckAnswer::Landed;
-        let check_answer = check_yield.then(|| answer_read.clone());
+        let answer_read = std::cell::LazyCell::new(|| {
+            land_check::land_check_answer(
+                reading.said_tail.as_deref().unwrap_or_default(),
+                reading.before(),
+                reading.said_cut,
+            )
+        });
+        let landed_answer = || *answer_read == land_check::CheckAnswer::Landed;
+        let check_answer = check_yield.then(|| (*answer_read).clone());
         // A ROW OF THE AGENT'S LEFT RUNNING UNKEPT holds the landing the check's `LANDED` would make
         // ([`Self::left_holds`]). A landing made stands over it: a seeded one, one its words or its
         // wake hold, and one a finished record keeps (`by_record`, which keeps only a landing this
@@ -17990,7 +18020,10 @@ impl TurnEndState {
             && !left_held;
         // A LANDING ITS JOURNAL OR ITS PARK HOLDS stands on the reply that landed it: the check's
         // `LANDED`, or an older build's clean defense.
-        let seed_clean = (clean_words || landed_answer) && reading.repo.is_clean();
+        let seed_clean = || {
+            reading.repo.is_clean()
+                && ((!reading.said_cut && !reading.need_before() && *defended) || landed_answer())
+        };
         let record_says = reading.finished_record == Some(true)
             && !reading.pending_input
             && reading.autopilot != Autopilot::Cruise;
@@ -18005,12 +18038,14 @@ impl TurnEndState {
         let repo_theirs = reading.repo.found().is_some() && began_over;
         let landed_before = self.landed();
         let tail_mark = said_mark(reading.said_tail.as_deref());
-        let words_hold = (clean_defense(reading.said_tail.as_deref()) || landed_answer)
-            && !reading.need_before()
-            && landing_words.is_some_and(|w| tail_mark == Some(w))
-            && (seeded == Some(true) || reading.repo.is_clean())
-            && reading.worked.is_none()
-            && awaited.is_none();
+        let words_hold = || {
+            !reading.need_before()
+                && landing_words.is_some_and(|w| tail_mark == Some(w))
+                && (seeded == Some(true) || reading.repo.is_clean())
+                && reading.worked.is_none()
+                && awaited.is_none()
+                && (*defended || landed_answer())
+        };
         let wake_hold = seeded_by_wake
             && record_says
             && landing_words.is_some_and(|w| tail_mark == Some(w))
@@ -18322,7 +18357,7 @@ impl TurnEndState {
                     && reading.autopilot == Autopilot::Land
                     && ((ok_to_leave
                         && landing_words.is_none_or(|w| tail_mark == Some(w))
-                        && (seed_clean || words_hold || wake_hold))
+                        && (wake_hold || seed_clean() || words_hold()))
                         || at_wall)
                 {
                     self.done = 2;
@@ -18337,7 +18372,7 @@ impl TurnEndState {
             }
             (None, None)
                 if off_landing
-                    .is_some_and(|mark| !(mark == tail_mark && seed_clean && ok_to_leave))
+                    .is_some_and(|mark| !(mark == tail_mark && ok_to_leave && seed_clean()))
                     && landed_before
                     && !by_record =>
             {
@@ -18713,7 +18748,7 @@ impl TurnEndState {
             let answer = (std::mem::take(&mut self.land.check_pending)
                 && !reading.interrupted
                 && !reading.unsaid())
-            .then_some(answer_read);
+            .then(|| (*answer_read).clone());
             match &answer {
                 Some(answer) => {
                     if let Some(mark) = self.land.sent.take()
@@ -18822,11 +18857,11 @@ impl TurnEndState {
         }
         // A RECORD'S LANDING HOLDS at its own answer (the check's `LANDED`) or an older build's
         // clean defense: [`seed_clean`], as a journal's seed reads it.
-        self.point_clean = (seed_clean || (words_hold && seed_was_armed && self.landed()))
-            && ok_to_leave
+        self.point_clean = ok_to_leave
             && reading.worked.is_none()
             && awaited.is_none()
-            && !(seed_was_armed && !self.landed());
+            && !(seed_was_armed && !self.landed())
+            && (seed_clean() || (seed_was_armed && self.landed() && words_hold()));
         if let Some(a) = reading.answered {
             self.last_prompt = Some(a.prompt);
         }
@@ -19323,10 +19358,9 @@ impl TurnEndState {
             self.stale_input = true;
         } else if let Some(a) = &self.awaiting
             && a.ran.is_some()
-            && self.land.check_pending
-            && reading.unsaid()
+            && reading.words_may_follow()
         {
-            // A CHECK'S ANSWER THAT SAYS NOTHING YET ([`Self::unsaid_reading`]): the check stays
+            // A LAND ACT'S ANSWER THAT SAYS NOTHING YET ([`Self::unsaid_reading`]): the act stays
             // awaited until its words are drawn or its take window, counted from that answer,
             // runs out.
             if now < a.due(&self.timing) {
@@ -19344,25 +19378,28 @@ impl TurnEndState {
         true
     }
 
-    /// A LAND CHECK'S ANSWER WITH NO WORDS ANSWERS NOTHING YET (L19, the 2026-11-05 confirm
-    /// run's `land-o` on agy 1.5.1 on a loaded Mac): agy can draw its composer idle under the
-    /// check's message, with nothing between, before the reply it then draws (`LANDED` 0.55 s
-    /// later there). The check is the one act whose answer is its words (`LANDED`, or what is
-    /// left, [`super::land_check::land_check_answer`]); every other act's turn is judged by its
-    /// shape, so a turn that says nothing ends there as before. A check's turn that ran and
-    /// ended so ([`TurnEndReading::unsaid`]) keeps the check awaited, its work kept in
-    /// [`Awaited::ran`] and its take window counted from that answer ([`Self::point_judged`]);
-    /// every reading after it is judged with that work and any run since (`Some`, the reading to
-    /// judge), so the one that draws the words is that turn's end. Past the window an answer
-    /// still unsaid is judged as it stands, and its defense stays owed its check
+    /// A LAND ACT'S ANSWER WITH NO WORDS ANSWERS NOTHING YET (L19, the 2026-11-05 confirm run's
+    /// `land-o` on agy 1.5.1 on a loaded Mac): agy can draw its composer idle under the act's
+    /// message, with nothing between, before the reply it then draws (`LANDED` 0.55 s later
+    /// there, the land check's answer). The race is the frame's, not the check's: Land's
+    /// instruction answered so was judged a short turn and backed off, its defense drawn after
+    /// it nudged instead of checked (the 2026-11-06 review's E4). Every Land act is answered by
+    /// its words (a defense, `LANDED`, a list, a need), so each one's waits for them; Cruise
+    /// judges an act's answer by its work where it ends, as before. A Land act's turn that ran
+    /// and ended so ([`TurnEndReading::words_may_follow`]) keeps the act awaited, its work kept in
+    /// [`Awaited::ran`] (the work of each later run that still says nothing added to it) and its
+    /// take window counted from that answer, or from the end of the latest run that still says
+    /// nothing ([`Self::point_judged`]); every reading after it is judged with that work and any
+    /// run since (`Some`, the reading to judge), so the one that draws the words is that turn's
+    /// end. Past the window an answer still unsaid is judged as it stands, by its shape, and a
+    /// land check answered so audits nothing: its defense stays owed its check
     /// ([`Self::observe`]).
     fn unsaid_reading(&mut self, reading: &TurnEndReading, now: Instant) -> Option<TurnEndReading> {
-        if !self.land.check_pending {
-            return None;
-        }
         let a = self.awaiting.as_mut().filter(|a| !a.command)?;
         let worked = match (a.ran, reading.worked) {
-            (None, Some(w)) if reading.unsaid() => {
+            (None, Some(w))
+                if (self.landing || self.land.check_pending) && reading.words_may_follow() =>
+            {
                 a.unseen_since = Some(now);
                 a.taken = true;
                 a.ran = Some(w);
@@ -19371,7 +19408,10 @@ impl TurnEndState {
             (None, _) => return None,
             (Some(ran), w) => w.map_or(ran, |w| ran.saturating_add(w)),
         };
-        if reading.unsaid() {
+        if reading.words_may_follow() {
+            if reading.worked.is_some() {
+                a.unseen_since = Some(now);
+            }
             a.ran = Some(worked);
         }
         Some(TurnEndReading {
@@ -20037,9 +20077,15 @@ impl TurnEndState {
     }
 
     /// THE HOST'S RELAUNCH STARTED THE AGENT AFRESH (`done:fresh`: no conversation to resume), so
-    /// its screen is a program started fresh ([`Self::opened_fresh`]), not the session's resume.
+    /// its screen is a program started fresh, not the session's resume, and the next exchange
+    /// opens its session ([`Self::opened_fresh`]) whether or not a screen of it is read first:
+    /// [`Self::restarted`], called just before this, cleared any mark its banner set while the
+    /// relaunch was under way (a `wait:` answer before this one). The mark is this loop's alone: a
+    /// loop that takes over before the next point hears no `done:fresh`, and reads the program by
+    /// its screens and by the host's word on its process ([`Self::host_agent_resumed`]).
     pub const fn relaunched_afresh(&mut self) {
         self.resumed = None;
+        self.opened_fresh = true;
     }
 
     #[cfg(test)]
@@ -20058,7 +20104,8 @@ impl TurnEndState {
             self.replies = Replies::default();
             self.settling = None;
             // The relaunch resumes the session's conversation: a banner read while it was under
-            // way (a `wait:` answer before this one), or just after, is its own.
+            // way (a `wait:` answer before this one), or just after, is its own. One that started
+            // afresh marks the program fresh again ([`Self::relaunched_afresh`]).
             self.resumed = Some(now);
             self.opened_fresh = false;
         }
@@ -21872,10 +21919,13 @@ fn act_at_point(
                 with_rules(cleared_text(cleared, clearing), reading.rules.as_deref())
             }
             (None, Autopilot::Land) => land_words(state, reading, state.needs_ack_owed()).0,
-            // The person's key holds the go-ahead, and the continuation's word that it is no need.
+            // The person's key holds the go-ahead, and the continuation's word that it is no need;
+            // so does a park answers off leave to the person. This arm is the continuation a
+            // `/compact` owes (the one rule `cleared_of` reads no condition for), which goes ahead
+            // of the escalation such a park gets ([`TurnEndState::owed_held_at`]).
             (None, Autopilot::Cruise | Autopilot::Off) => go_ahead::unless_held(
                 &continuation_text(cfg, reading.rules.as_deref()),
-                state.go_ahead_held_at(reading, now),
+                state.owed_held_at(reading, cfg, now),
             )
             .into_owned(),
         };
@@ -22115,7 +22165,7 @@ fn act_past_walls(
     // owes the act a full context cut ([`TurnEndState::compact_owes`]), that
     // act again — the done check, the challenge or the land act as typed.
     if let Some(rule) = state.after {
-        if let Some(text) = state.compact_owed_text(rule, reading, now) {
+        if let Some(text) = state.compact_owed_text(rule, reading, cfg, now) {
             return ended_at(
                 trace,
                 "owed",

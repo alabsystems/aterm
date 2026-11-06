@@ -49,9 +49,12 @@ mod temporal;
 pub mod revocation;
 
 pub mod capacity;
+pub mod convergence;
 pub mod gap_heal;
+pub mod inbox_move;
 pub mod no_lost_edit;
 pub mod relay;
+pub mod relay_digest;
 pub mod relay_live;
 
 // Each property's binding island names `trust_import_` terms (the compiled kernels), which defers
@@ -78,4 +81,19 @@ verify_island! {
     #[rustfmt::skip]
     #[path = "relay_live_binding_island.rs"]
     mod relay_live_binding;
+}
+verify_island! {
+    #[rustfmt::skip]
+    #[path = "inbox_move_binding_island.rs"]
+    mod inbox_move_binding;
+}
+verify_island! {
+    #[rustfmt::skip]
+    #[path = "relay_digest_binding_island.rs"]
+    mod relay_digest_binding;
+}
+verify_island! {
+    #[rustfmt::skip]
+    #[path = "convergence_binding_island.rs"]
+    mod convergence_binding;
 }

@@ -3,7 +3,7 @@
 
 //! Build-cache placement for `targo` ([`decide`], [`NOINDEX`], [`target_build_dir`]).
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 /// The cache root, relative to `$HOME`. Its `*.noindex` name keeps Spotlight out, and the `.ubd`
@@ -165,22 +165,133 @@ pub const BUILD_DIR_ENV: &str = "CARGO_BUILD_BUILD_DIR";
 /// alias to a frontend places the outer call alone.
 #[must_use]
 pub fn loses_config(args: &[String], tool: Tool) -> bool {
-    if tool == Tool::Tippy {
-        return true;
-    }
-    let mut it = args.iter().map(String::as_str);
-    while let Some(a) = it.next() {
+    tool == Tool::Tippy
+        || subcommand_at(args).is_some_and(|at| matches!(args[at].as_str(), "clippy" | "tippy"))
+}
+
+/// Where `args`' subcommand is, as cargo reads the line: the first word before `--` that is no
+/// flag (nor `+toolchain`) and no flag's value (`--config`, `--manifest-path`, `--target-dir`,
+/// `-C`, `-Z`, `--color` and `--explain` take one). `None` for a line that names none.
+fn subcommand_at<T: AsRef<OsStr>>(args: &[T]) -> Option<usize> {
+    let mut it = args.iter().enumerate();
+    while let Some((at, a)) = it.next() {
+        let a = a.as_ref().to_str().unwrap_or("");
         match a {
-            "--" => return false,
+            "--" => return None,
             "--config" | "--manifest-path" | "--target-dir" | "-C" | "-Z" | "--color"
             | "--explain" => {
                 it.next();
             }
             _ if a.starts_with(['-', '+']) => {}
-            verb => return matches!(verb, "clippy" | "tippy"),
+            _ => return Some(at),
         }
     }
-    false
+    None
+}
+
+/// Keep global and command-local configuration in the same Cargo parser. Trust 16387's
+/// command-local `--config` replaces the global list instead of appending to it. Moving the
+/// global words after the verb preserves their order and precedence, including inline forms.
+/// Lines whose configs are all global, including the generated test graph, stay unchanged.
+#[must_use]
+pub fn configs_after_subcommand<T: AsRef<OsStr> + Clone>(args: &[T]) -> Vec<T> {
+    let Some(at) = subcommand_at(args) else {
+        return args.to_vec();
+    };
+    // `trust` has its own front end before Cargo's compile command, rather than this native
+    // command boundary. Its explicit lane keeps ownership of its argument grammar.
+    if args[at].as_ref() == "trust" {
+        return args.to_vec();
+    }
+    if !args[at + 1..]
+        .iter()
+        .take_while(|a| a.as_ref() != "--")
+        .any(|a| {
+            a.as_ref()
+                .to_str()
+                .is_some_and(|s| s == "--config" || s.starts_with("--config="))
+        })
+    {
+        return args.to_vec();
+    }
+    let mut before = Vec::new();
+    let mut configs = Vec::new();
+    let mut prefix = args[..at].iter();
+    while let Some(word) = prefix.next() {
+        let text = word.as_ref().to_str().unwrap_or("");
+        if text == "--config" {
+            configs.push(word.clone());
+            if let Some(value) = prefix.next() {
+                configs.push(value.clone());
+            }
+        } else if text.starts_with("--config=") {
+            configs.push(word.clone());
+        } else {
+            before.push(word.clone());
+        }
+    }
+    before.push(args[at].clone());
+    before.extend(configs);
+    before.extend_from_slice(&args[at + 1..]);
+    before
+}
+
+/// The test graph's flag: Cargo's unstable `-Zfeature-unification`, which lets
+/// [`TEST_GRAPH_CONFIG`] resolve a build's features over the whole workspace whatever packages it
+/// selects. A `-p` test build then compiles exactly the units the `--workspace` one did (`verify
+/// test -p aterm-agent` after `verify test --all` held 42 units the workspace graph had not,
+/// before; 0 with the test graph, and the workspace graph itself unchanged). Its presence before
+/// `--` says a line already chose its feature unification.
+///
+/// It goes right after the subcommand ([`with_test_graph`]), never before it: Trust 16387's
+/// `targo` drops a `-Zfeature-unification` it reads before the subcommand and builds the narrow
+/// graph (`aterm-agent`'s test unit graph: 170 units with it there, 173 after the verb, as with
+/// `--workspace`).
+///
+/// Only Trust's `targo` takes it (an upstream `cargo` refuses `-Z`), and the spelling is that
+/// toolchain's: the Trust lock (A14) is what will pin it. The test graph never reaches a release
+/// slice: `aterm_release::buildplan::cargo_build_args` is the slices' only argv source and names
+/// none of it, and neither its sealed config nor the workspace's `.cargo/config.toml` carries a
+/// `[resolver]` table, so a shipped binary keeps the features its own package selects.
+pub const TEST_GRAPH_FLAG: &str = "-Zfeature-unification";
+
+/// The test graph's `--config`: `resolver.feature-unification = "workspace"`, read under
+/// [`TEST_GRAPH_FLAG`].
+///
+/// It goes right before the subcommand ([`with_test_graph`]), with every other `--config` of the
+/// line: Trust 16387's `targo` reads the `--config` words after the subcommand IN PLACE OF those
+/// before it, not beside them, so one after the verb drops the build cache's `--config` and
+/// verify's recording runner ([`with_build_dir`]; `targo --config CACHE --unverified test
+/// -Zfeature-unification --config RESOLVER` built in `target/`, and ran each test binary itself,
+/// not through a runner named before the verb). Before the verb with them, all of them hold, and
+/// the graph is the workspace's (173 units, as above).
+pub const TEST_GRAPH_CONFIG: [&str; 2] = ["--config", "resolver.feature-unification=\"workspace\""];
+
+/// `args` with the test graph around its subcommand ([`subcommand_at`]): [`TEST_GRAPH_CONFIG`]
+/// right before it, [`TEST_GRAPH_FLAG`] right after it. Unchanged when it names no subcommand,
+/// or already names `-Zfeature-unification` before `--` (the caller's own choice, or the test
+/// graph given once already). A caller's own `--config` belongs before the subcommand too.
+#[must_use]
+pub fn with_test_graph(args: &[String]) -> Vec<String> {
+    let chosen = args
+        .iter()
+        .take_while(|a| a.as_str() != "--")
+        .any(|a| a == TEST_GRAPH_FLAG);
+    match subcommand_at(args).filter(|_| !chosen) {
+        Some(verb) => insert_test_graph(args, verb),
+        None => args.to_vec(),
+    }
+}
+
+/// `args` with the test graph around its subcommand at `verb` ([`with_test_graph`]).
+fn insert_test_graph(args: &[String], verb: usize) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len() + 3);
+    out.extend_from_slice(&args[..verb]);
+    out.extend(TEST_GRAPH_CONFIG.map(str::to_owned));
+    out.push(args[verb].clone());
+    out.push(TEST_GRAPH_FLAG.to_owned());
+    out.extend_from_slice(&args[verb + 1..]);
+    out
 }
 
 /// The directory in a literal config value produced by this placement policy. Use only for
@@ -370,6 +481,11 @@ pub fn unresolved_directory(args: &[String], m: &Machine<'_>) -> bool {
 /// Decide the build-cache placement ([`BuildDir::Cache`], [`BuildDir::Target`]).
 #[must_use]
 pub fn decide(args: &[String], tool: Tool, m: &Machine<'_>) -> Option<BuildDir> {
+    decide_line(args, tool, m).map(|(dir, _)| dir)
+}
+
+/// [`decide`], with the line it read.
+fn decide_line(args: &[String], tool: Tool, m: &Machine<'_>) -> Option<(BuildDir, Line)> {
     let home = m
         .home
         .filter(|h| h.is_absolute() && !h.as_os_str().as_encoded_bytes().ends_with(b"/"))?;
@@ -418,12 +534,13 @@ pub fn decide(args: &[String], tool: Tool, m: &Machine<'_>) -> Option<BuildDir> 
             return None;
         }
         if line.cache && cache_writable(home, &root, m) {
-            return Some(BuildDir::Cache(cache));
+            return Some((BuildDir::Cache(cache), line));
         }
         if in_noindex(cwd) {
             return None;
         }
-        return Some(line.place(format!("{{workspace-root}}/target/{TARGET_BUILD_LEAF}")));
+        let dir = line.place(format!("{{workspace-root}}/target/{TARGET_BUILD_LEAF}"));
+        return Some((dir, line));
     };
     let target = target.to_str()?;
     if target.is_empty() {
@@ -441,21 +558,38 @@ pub fn decide(args: &[String], tool: Tool, m: &Machine<'_>) -> Option<BuildDir> 
     {
         return None;
     }
-    Some(line.place(format!("{target}/{TARGET_BUILD_LEAF}")))
+    let dir = line.place(format!("{target}/{TARGET_BUILD_LEAF}"));
+    Some((dir, line))
 }
 
-/// `args` with the `--config` [`decide`] adds, or `None` when it adds none.
+/// `args` with the `--config` [`decide`] adds, or `None` when it adds none. That pair leads (a
+/// shim's front strips it there); a `test`, `t` or `bench` that `targo` runs also gets the test
+/// graph around that verb ([`with_test_graph`]: its `--config` before the verb, beside this one,
+/// so neither drops the other), unless it names `-Zfeature-unification` itself, so a narrow test
+/// build shares the workspace one's units. Never for [`Tool::Cargo`], which
+/// refuses `-Z`, nor for an alias, whose own words are its business.
 #[must_use]
 pub fn with_build_dir(args: &[String], tool: Tool, m: &Machine<'_>) -> Option<Vec<String>> {
-    let (BuildDir::Cache(value) | BuildDir::Target(value)) = decide(args, tool, m)? else {
+    let (dir, line) = decide_line(args, tool, m)?;
+    let (BuildDir::Cache(value) | BuildDir::Target(value)) = dir else {
         return None;
     };
     let at = usize::from(tool == Tool::Cargo && args.first().is_some_and(|a| a.starts_with('+')));
-    let mut out = Vec::with_capacity(args.len() + 2);
+    let rest = match line.verb_at {
+        Some(verb)
+            if tool == Tool::Targo
+                && !line.unified
+                && matches!(args[at + verb].as_str(), "test" | "t" | "bench") =>
+        {
+            insert_test_graph(&args[at..], verb)
+        }
+        _ => args[at..].to_vec(),
+    };
+    let mut out = Vec::with_capacity(at + 2 + rest.len());
     out.extend_from_slice(&args[..at]);
     out.push("--config".to_owned());
     out.push(value);
-    out.extend_from_slice(&args[at..]);
+    out.extend(rest);
     Some(out)
 }
 
@@ -496,6 +630,10 @@ struct Line {
     manifest_path: Option<String>,
     /// A verb cargo does not build by itself, which builds only as an alias that does.
     alias: Option<String>,
+    /// Where the verb is in the line read, when one was.
+    verb_at: Option<usize>,
+    /// A `-Zfeature-unification` before `--`, outside any flag's value.
+    unified: bool,
 }
 
 impl Line {
@@ -511,11 +649,15 @@ impl Line {
                 && (!v.starts_with('/') || p.starts_with(home))
         };
         let mut verb = (tool == Tool::Tippy).then_some("tippy");
+        let mut verb_at = None;
         let mut unverified = false;
+        let mut unified = false;
         let mut target_dir = None;
         let mut manifest_path = None;
-        let mut it = args.iter().map(String::as_str);
-        while let Some(a) = it.next() {
+        let mut words = args.iter().map(String::as_str).enumerate();
+        while let Some((at, a)) = words.next() {
+            // A flag's value is the next word.
+            let mut it = (&mut words).map(|(_, v)| v);
             let ok = match a {
                 "--" => break,
                 "--unverified" => {
@@ -541,8 +683,10 @@ impl Line {
                     } else if a.starts_with("-C") {
                         false
                     } else {
+                        unified |= a == TEST_GRAPH_FLAG;
                         if !a.starts_with('-') && verb.is_none() {
                             verb = Some(a);
+                            verb_at = Some(at);
                         }
                         true
                     }
@@ -566,6 +710,8 @@ impl Line {
             target_dir,
             manifest_path,
             alias,
+            verb_at,
+            unified,
         })
     }
 
@@ -786,6 +932,77 @@ mod tests {
 
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn global_and_command_configs_share_one_parser_without_moving_program_words() {
+        let words = |s: &str| s.split_whitespace().map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(
+            configs_after_subcommand(&words(
+                "--config a=1 --color always --unverified test --config b=2"
+            )),
+            words("--color always --unverified test --config a=1 --config b=2")
+        );
+        assert_eq!(
+            configs_after_subcommand(&words("--config=a=1 --unverified test --config b=2")),
+            words("--unverified test --config=a=1 --config b=2")
+        );
+        for line in [
+            "--config a=1 --unverified test -p x",
+            "--config a=1 --unverified --config b=2 test -Zfeature-unification",
+            "--config a=1",
+            "--config a=1 --unverified run -- --config b=2",
+            "--config a=1 trust check --config b=2",
+        ] {
+            assert_eq!(configs_after_subcommand(&words(line)), words(line));
+        }
+    }
+
+    /// The test graph's `--config` goes right before the subcommand and its flag right after it,
+    /// past every flag and flag value before it, once. NEGATIVE CONTROL: a line naming no
+    /// subcommand before `--`, or one that chose its unification already, is left as it is.
+    #[test]
+    fn the_test_graph_wraps_the_subcommand() {
+        let words = |line: &str| {
+            line.split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let c = TEST_GRAPH_CONFIG.join(" ");
+        let f = TEST_GRAPH_FLAG;
+        for (line, want) in [
+            (
+                "--unverified test -p x",
+                format!("--unverified {c} test {f} -p x"),
+            ),
+            (
+                "--config build.jobs=2 --unverified build -p x",
+                format!("--config build.jobs=2 --unverified {c} build {f} -p x"),
+            ),
+            (
+                "-Z unstable-options --color always run -q -- -x",
+                format!("-Z unstable-options --color always {c} run {f} -q -- -x"),
+            ),
+            (
+                "+trust --manifest-path m/Cargo.toml metadata --no-deps",
+                format!("+trust --manifest-path m/Cargo.toml {c} metadata {f} --no-deps"),
+            ),
+            (
+                "test -- -Zfeature-unification",
+                format!("{c} test {f} -- -Zfeature-unification"),
+            ),
+        ] {
+            assert_eq!(with_test_graph(&words(line)), words(&want), "{line}");
+        }
+        for line in [
+            "",
+            "--unverified",
+            "--config build.jobs=2",
+            "-- test",
+            "--unverified test -Zfeature-unification -p x",
+        ] {
+            assert_eq!(with_test_graph(&words(line)), words(line), "{line}");
+        }
+    }
 
     /// The shared cache sits in a quiet folder fseventsd drops, still named `*.noindex`, and so
     /// does every build directory under it. NEGATIVE CONTROL: the root it moved from, the same

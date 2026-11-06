@@ -3,13 +3,11 @@
 
 //! The words presence prints.
 
-use std::fmt::Write as _;
 use std::marker::PhantomData;
 
-use super::pill::{Pill, PillAct, PillKind};
-use super::{AgentPhase, CTX_WARN_PCT, Host, NeedSeverity, Slot};
+use super::{AgentPhase, CTX_WARN_PCT, Host, Slot};
+use crate::Duration;
 use crate::text::{is_stripped, truncate};
-use crate::{Duration, Instant};
 
 /// One cell of a string as the host's grid draws it ([`cells`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -229,31 +227,16 @@ const BAND_GLYPHS: &[char] = &[
     '\u{1f512}',
 ];
 
-/// The glyphs only the pill's own grammar prints: a label or a need's words
-/// carrying one would forge a need or a hold ([`pill_text`]).
-const PILL_GLYPHS: &[char] = &['\u{25c6}', '\u{25c7}', '\u{270b}'];
-
 /// A wire-safe token.
 #[must_use]
 pub fn sanitize_token<V: Host>(s: &str, cap: usize) -> String {
-    sanitize_without::<V>(s, cap, BAND_GLYPHS)
-}
-
-/// A pill's free text (a tab's label, a need's words) held to [`sanitize_token`]'s rule with only the pill's own glyphs refused ([`PILL_GLYPHS`]).
-#[must_use]
-pub fn pill_text<V: Host>(s: &str, cap: usize) -> String {
-    sanitize_without::<V>(s, cap, PILL_GLYPHS)
-}
-
-/// [`sanitize_token`] refusing the glyphs `forbidden`.
-fn sanitize_without<V: Host>(s: &str, cap: usize, forbidden: &[char]) -> String {
     let mut clean = String::with_capacity(s.len());
     let mut walk = CellWalk::<V>::new();
     let mut used = 0usize;
     let mut at_space = true;
     for c in s.chars() {
         let c = if c.is_whitespace() { ' ' } else { c };
-        if is_stripped(c) || forbidden.contains(&c) || (c == ' ' && at_space) {
+        if is_stripped(c) || BAND_GLYPHS.contains(&c) || (c == ' ' && at_space) {
             continue;
         }
         match walk.step(c) {
@@ -381,130 +364,4 @@ pub fn state_line<V: Host>(slot: &Slot<V>, program: Option<&str>) -> Option<Stri
         },
     }
     (!parts.is_empty()).then(|| parts.join(" \u{00b7} "))
-}
-
-/// The needs pill's words (§5), in the pieces its painters lay out and clip apart ([`super::pill_layout`]).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PillWords {
-    /// `◆` stuck, `◇` decide, `✋` yours.
-    pub glyph: char,
-    /// A background tab's label and number (`fmt (tab 4)`), another pane of the front tab by its label alone.
-    pub label: String,
-    /// The need's words and, for a background tab, its age.
-    pub words: String,
-    /// [`Self::words`] at the widest age figure for its current unit ([`pill_age_room`]).
-    pub room: String,
-    /// The one act the pill offers, if any.
-    pub act: Option<PillAct>,
-    /// `+2`: the window's other needs (a click goes to the next of them, `drive::next_need`).
-    pub more: Option<String>,
-}
-
-/// The joint between the pill's pieces.
-const PILL_SEP: &str = " \u{00b7} ";
-
-impl PillWords {
-    /// The whole sentence, as `chrome presence pill=` prints it and a screen reader speaks it.
-    #[must_use]
-    pub fn text(&self) -> String {
-        let mut out = String::new();
-        out.push(self.glyph);
-        out.push(' ');
-        if !self.label.is_empty() {
-            out.push_str(&self.label);
-            out.push_str(PILL_SEP);
-        }
-        out.push_str(&self.words);
-        if let Some(act) = self.act {
-            out.push_str(PILL_SEP);
-            out.push_str(act.word());
-        }
-        if let Some(more) = &self.more {
-            out.push(' ');
-            out.push_str(more);
-        }
-        out
-    }
-}
-
-/// `pill`'s words at `now` ([`PillWords`]).
-#[must_use]
-pub fn pill_words(pill: &Pill, now: Instant) -> PillWords {
-    let glyph = match pill.kind {
-        PillKind::Need(NeedSeverity::Stuck) => '\u{25c6}',
-        PillKind::Need(NeedSeverity::Decide) => '\u{25c7}',
-        PillKind::Yours => '\u{270b}',
-    };
-    let label = match pill.tab {
-        Some(tab) if !pill.label.is_empty() && pill.label != format!("tab {tab}") => {
-            format!("{} (tab {tab})", pill.label)
-        }
-        Some(tab) => format!("tab {tab}"),
-        None => pill.label.clone(),
-    };
-    let mut words = match pill.kind {
-        PillKind::Yours => "You have this tab".to_string(),
-        PillKind::Need(_) => pill.what.clone(),
-    };
-    let mut room = words.clone();
-    if let Some(since) = pill.since {
-        let age = now.saturating_duration_since(since);
-        let _ = write!(words, "{PILL_SEP}{}", pill_age(age));
-        let _ = write!(room, "{PILL_SEP}{}", pill_age_room(age));
-    }
-    PillWords {
-        glyph,
-        label,
-        words,
-        room,
-        act: pill.act,
-        more: (pill.more > 0).then(|| format!("+{}", pill.more)),
-    }
-}
-
-/// A need's age as the pill prints it, coarse.
-#[must_use]
-pub fn pill_age(d: Duration) -> String {
-    let s = d.as_secs();
-    if s < 60 {
-        format!("{s}s")
-    } else if s < 3600 {
-        format!("{}m", s / 60)
-    } else if s < 86_400 {
-        format!("{}h", s / 3600)
-    } else {
-        format!("{}d", s / 86_400)
-    }
-}
-
-/// The widest figure [`pill_age`] prints in the unit it prints `d` in.
-#[must_use]
-pub fn pill_age_room(d: Duration) -> String {
-    let s = d.as_secs();
-    if s < 60 {
-        "59s".to_string()
-    } else if s < 3600 {
-        "59m".to_string()
-    } else if s < 86_400 {
-        "23h".to_string()
-    } else {
-        let digits = (s / 86_400).to_string().len();
-        let mut out = "9".repeat(digits);
-        out.push('d');
-        out
-    }
-}
-
-/// When a pill whose need began at `since` next prints another age, after `now`.
-#[must_use]
-pub fn pill_due(since: Instant, now: Instant) -> Instant {
-    let age = now.saturating_duration_since(since);
-    let step = match age.as_secs() {
-        0..60 => 1,
-        60..3600 => 60,
-        3600..86_400 => 3600,
-        _ => 86_400,
-    };
-    let next = (age.as_secs() / step + 1) * step;
-    since + Duration::from_secs(next)
 }

@@ -41,6 +41,48 @@ pub use edit::{Edited, GridSecrets, Opener, amacs, in_editor_tab, open_secrets};
 /// table's cells as they are (an account's key needs its login's address).
 pub type Birth = fn(&Collection, &BTreeMap<String, Value>, &Cells) -> Result<String>;
 
+/// A table's rules on what the owner writes, over each row's changes (one record each) and the
+/// table's cells as they are under the writer: it answers the first write the rules stop
+/// ([`Refused`]), and may add to a row's record the cells its rules derive from one the write
+/// changes. It runs on a grid save ([`Handle::apply`]), an owner verb's write
+/// ([`Handle::commit_owner`], [`Handle::commit_owner_sealed`]) and a revert ([`Handle::revert`],
+/// which writes the exact compensation and none of the additions); a plan written through
+/// [`Handle::commit_derived`] or [`Handle::commit_sealed_until`] (the importer's, `adopt`'s,
+/// `prefer`'s) does not pass it.
+///
+/// # Errors
+/// A change is not a typed cell of its collection.
+pub type Guard = fn(&mut [Vec<crate::database::Change>], &Cells) -> Result<Option<Refused>>;
+
+/// A table rule's refusal of an owner write ([`Guard`]): the collection, row and column it stops
+/// and the rule, by keys and column names, never a value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Refused {
+    pub collection: &'static str,
+    pub pk: String,
+    pub column: String,
+    pub rule: String,
+}
+
+impl Refused {
+    /// The rule with the column it stops, as a grid problem reads it (its place names the row).
+    pub fn problem_rule(&self) -> String {
+        format!("{}.{}: {}", self.collection, self.column, self.rule)
+    }
+}
+
+impl From<Refused> for Error {
+    fn from(refused: Refused) -> Self {
+        Self::new(&format!(
+            "{}.{}: row {}: {}",
+            refused.collection,
+            refused.column,
+            command::safe_key(&refused.pk),
+            refused.rule
+        ))
+    }
+}
+
 /// A keyed comparison of a collection. The epoch is part of the output: digests
 /// from different epochs cannot be called a table mismatch.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -169,7 +211,7 @@ pub fn secret_digest(
                     values.push(bytes);
                     populated = true;
                 }
-                values.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+                values.sort_unstable_by(|a, b| a.as_slice().cmp(b.as_slice()));
                 values.dedup_by(|a, b| a.as_slice() == b.as_slice());
                 part(&(values.len() as u64).to_le_bytes());
                 for value in values.iter() {
@@ -190,7 +232,7 @@ pub fn secret_digest(
                             .map(|c| aterm_json::to_vec(&c.value.x))
                             .collect::<std::result::Result<_, _>>()
                             .map_err(|_| Error::new("cannot encode digest field"))?;
-                        encoded.sort();
+                        encoded.sort_unstable();
                         encoded.dedup();
                         part(&(encoded.len() as u64).to_le_bytes());
                         for value in encoded {
@@ -302,6 +344,8 @@ pub struct Compiled {
     /// The table descriptor's version.
     pub version: u32,
     pub birth: Birth,
+    /// Its rules on the owner's writes.
+    pub guard: Guard,
     /// Which generation of its table family this is (`registry` 1, `registry.2` 2, design §3.8).
     pub generation: u32,
     /// The next generation a roll restates this one into, when this build compiles one.
@@ -371,6 +415,7 @@ pub const REGISTRY: Compiled = Compiled {
     table: &registry::REGISTRY,
     version: registry::VERSION,
     birth: registry::birth,
+    guard: registry::guard,
     generation: 1,
     successor: Some(&REGISTRY_2),
 };
@@ -380,6 +425,7 @@ pub const REGISTRY_2: Compiled = Compiled {
     table: &registry::REGISTRY_2,
     version: registry::VERSION,
     birth: registry::birth,
+    guard: registry::guard,
     generation: 2,
     successor: None,
 };
@@ -725,6 +771,8 @@ pub struct Applied {
     pub retired: Vec<String>,
     /// The operations appended.
     pub operations: Vec<Digest>,
+    /// The table's rules refused the save ([`Compiled::guard`]): nothing of it was written.
+    pub refused: Option<Refused>,
 }
 
 /// What a table's capacity asks of the owner (design §3.9), as `check` reports it.
@@ -1001,13 +1049,10 @@ impl Handle {
         let table = self.compiled.table;
         reopened(crate::admission::deadline(), || {
             application::observe_store(&self.paths, self.descriptor(), |session, store, scope| {
-                let used = store.retained_use(session, session.actor())?;
+                let log = Log::read_with(session, store, scope, decode)?;
+                let used = log.local_use();
                 Ok((
-                    View::read(
-                        table,
-                        session,
-                        &Log::read_with(session, store, scope, decode)?,
-                    ),
+                    View::read(table, session, &log),
                     Usage {
                         actor: session.actor(),
                         records: used.records,
@@ -1045,7 +1090,7 @@ impl Handle {
                         })
                     })
                     .collect();
-                entries.sort_by_key(|e| (e.authored_ms, e.operation));
+                entries.sort_unstable_by_key(|e| (e.authored_ms, e.operation));
                 Ok(entries)
             })
         })
@@ -1054,13 +1099,15 @@ impl Handle {
     /// Write a grid save (design §8): under the store's writer, re-read the table and settle
     /// `plan` against it ([`grid::settle`]): each changed register is written only while its
     /// candidates are still the exported ones, a cell that changed meanwhile is left alone and
-    /// returned as stale, and one row's changes go in one owner record (at most 64 changes, a
-    /// fresh random request id each).
+    /// returned as stale, what is left passes the table's rules ([`Compiled::guard`]), and one
+    /// row's changes go in one owner record (at most 64 changes, a fresh random request id each).
+    /// A save the rules refuse writes nothing and comes back with [`Applied::refused`] set, for
+    /// the grid to show at that row as it shows a problem.
     ///
     /// # Errors
     /// No Commons writer; this Mac's history of the table is incomplete (an operation still
-    /// waiting on a causal parent could hold a candidate the comparison cannot see); or a
-    /// record cannot be written.
+    /// waiting on a causal parent could hold a candidate the comparison cannot see); or a record
+    /// cannot be written.
     pub fn apply(&self, collection: &Collection, plan: &Plan) -> Result<Applied> {
         let table = self.compiled.table;
         application::with_store(
@@ -1094,7 +1141,13 @@ impl Handle {
                 } else {
                     plan
                 };
-                let settled = grid::settle(collection, plan, &view.cells);
+                let mut settled = grid::settle(collection, plan, &view.cells);
+                if let Some(refused) = (self.compiled.guard)(&mut settled.rows, &view.cells)? {
+                    return Ok(Applied {
+                        refused: Some(refused),
+                        ..Applied::default()
+                    });
+                }
                 let mut applied = Applied {
                     unchanged: settled.unchanged,
                     stale: settled.stale,
@@ -1176,14 +1229,31 @@ impl Handle {
         })
     }
 
+    /// Observe the table's Secret-cell sealer without re-reading or projecting its log, for a
+    /// caller that already holds the projected [`View`] (`check`'s duplicate phone numbers).
+    ///
+    /// # Errors
+    /// As [`Self::view`], or a Secret's key is unavailable.
+    pub(crate) fn with_sealer<T>(
+        &self,
+        read: impl FnOnce(&dyn typed::secret::Sealer) -> Result<T>,
+    ) -> Result<T> {
+        let compiled = self.compiled;
+        application::observe_store(&self.paths, self.descriptor(), |session, _, scope| {
+            let name = compiled.name();
+            read(&sealer(&name, session, scope)?)
+        })
+    }
+
     /// [`Self::commit_derived`] for the owner's own word (`aterm db alab add|retire|relabel`): each
     /// record takes a random request id, as a grid save does, so the owner saying a value again
     /// after saying another (a relabel back and forth, a retire undone and redone) is written,
     /// never taken for a retry of the first record. A repeat of a value the table holds writes
-    /// nothing anyway: the verbs write only the cells that change.
+    /// nothing anyway: the verbs write only the cells that change. The rows pass the table's
+    /// rules first ([`Compiled::guard`]), as a grid save's do.
     ///
     /// # Errors
-    /// As [`Self::commit_derived`].
+    /// As [`Self::commit_derived`], or the table's rules refuse the rows.
     pub(crate) fn commit_owner<T>(
         &self,
         derive: impl FnOnce(&View) -> Result<(T, Vec<Vec<Change>>)>,
@@ -1254,10 +1324,13 @@ impl Handle {
         })
     }
 
+    /// The plan `derive` makes, written: `owner` is the owner's own word, whose records take
+    /// random request ids and whose rows pass the table's rules ([`Compiled::guard`]); otherwise
+    /// each record's request id derives from its content, so a retry returns its first receipt.
     fn commit_planned<T>(
         &self,
         declare: bool,
-        random: bool,
+        owner: bool,
         deadline: std::time::Instant,
         derive: impl FnOnce(&View, &dyn typed::secret::Sealer) -> Result<(T, Vec<Vec<Change>>)>,
     ) -> Result<(T, Applied)> {
@@ -1270,7 +1343,7 @@ impl Handle {
             deadline,
             |session, store, scope| {
                 session.writer()?;
-                let mut log = Log::read_with(session, store, scope, decode)?;
+                let log = Log::read_with(session, store, scope, decode)?;
                 log.writable(session.actor())?;
                 let view = View::read(table, session, &log);
                 if !view.complete {
@@ -1278,31 +1351,35 @@ impl Handle {
                         "this table's history here is incomplete; an import waits for a complete scan",
                     ));
                 }
-                let (planned, rows) = derive(&view, &sealer(&name, session, scope)?)?;
+                let (planned, mut rows) = derive(&view, &sealer(&name, session, scope)?)?;
+                if owner && let Some(refused) = (self.compiled.guard)(&mut rows, &view.cells)? {
+                    return Err(refused.into());
+                }
                 let mut applied = Applied::default();
-                let packed = pack(rows)?;
-                let packed_len = packed.len();
-                for (index, changes) in packed.into_iter().enumerate() {
+                let mut appended = BTreeMap::new();
+                for changes in pack(rows)? {
                     let count = changes.len();
-                    let request = if random {
+                    let request = if owner {
                         crate::crypto::random()?
                     } else {
                         typed::request_id(table.application, table.role, &changes)?
                     };
                     let command = Command::Write { request, changes };
-                    if !random && let Some(first) = log.retry(session.actor(), &command)? {
+                    if !owner
+                        && let Some(first) =
+                            retry_or_appended(&log, session.actor(), &command, &appended)?
+                    {
                         applied.unchanged += count;
                         applied.operations.push(first);
                         continue;
                     }
                     let receipt = application::append(session, store, &command.encode()?)?;
+                    if !owner {
+                        appended.insert(request, (receipt.id, command));
+                    }
                     applied.records += 1;
                     applied.cells += count;
                     applied.operations.push(receipt.id);
-                    if !random && index + 1 < packed_len {
-                        // Re-read before checking retry on another append.
-                        log = Log::read_with(session, store, scope, decode)?;
-                    }
                 }
                 Ok((planned, applied))
             },
@@ -1311,12 +1388,13 @@ impl Handle {
 
     /// Append the exact compensation of `operation` while every key it wrote still holds it as
     /// the sole candidate (`Log::compensate`); a later edit stays. The target, current value and
-    /// preimage use the same quota-filtered history as [`Self::view`]. An exact retry of
-    /// `request` returns the first operation.
+    /// preimage use the same quota-filtered history as [`Self::view`]. The compensation passes
+    /// the table's rules as any owner write does ([`Compiled::guard`]), and is written exactly:
+    /// a cell the rules would add is not. An exact retry of `request` returns the first operation.
     ///
     /// # Errors
-    /// No Commons writer, the operation is not an eligible typed record here, or a key it wrote
-    /// changed since.
+    /// No Commons writer, the operation is not an eligible typed record here, a key it wrote
+    /// changed since, or the table's rules refuse its compensation.
     pub fn revert(&self, request: [u8; 16], operation: Digest) -> Result<Digest> {
         let table = self.compiled.table;
         application::with_store(
@@ -1332,6 +1410,12 @@ impl Handle {
                 }
                 let view = View::read(table, session, &log);
                 let command = log.compensate(request, operation, &view.quota.over)?;
+                if let Some(changes) = command.changes()
+                    && let Some(refused) =
+                        (self.compiled.guard)(&mut [changes.to_vec()], &view.cells)?
+                {
+                    return Err(refused.into());
+                }
                 Ok(application::append(session, store, &command.encode()?)?.id)
             },
         )
@@ -1352,27 +1436,47 @@ impl Handle {
             self.descriptor(),
             |session, store, scope| {
                 session.writer()?;
-                let mut log = Log::read_with(session, store, scope, decode)?;
+                let log = Log::read_with(session, store, scope, decode)?;
                 log.writable(session.actor())?;
                 let mut written = 0;
-                let packed = pack(schema_rows(table, &View::read(table, session, &log)))?;
-                let packed_len = packed.len();
-                for (index, changes) in packed.into_iter().enumerate() {
+                let mut appended = BTreeMap::new();
+                for changes in pack(schema_rows(table, &View::read(table, session, &log)))? {
                     let request = typed::request_id(table.application, table.role, &changes)?;
                     let command = Command::Write { request, changes };
-                    if log.retry(session.actor(), &command)?.is_some() {
+                    if retry_or_appended(&log, session.actor(), &command, &appended)?.is_some() {
                         continue;
                     }
-                    application::append(session, store, &command.encode()?)?;
+                    let receipt = application::append(session, store, &command.encode()?)?;
+                    appended.insert(request, (receipt.id, command));
                     written += 1;
-                    if index + 1 < packed_len {
-                        log = Log::read_with(session, store, scope, decode)?;
-                    }
                 }
                 Ok(written)
             },
         )
     }
+}
+
+/// Check whether `command` is an exact retry of an eligible record in `log` or of a record already
+/// appended in the current write batch (`appended`), without re-reading the store log on every
+/// append.
+pub(crate) fn retry_or_appended(
+    log: &Log,
+    actor: Actor,
+    command: &Command,
+    appended: &BTreeMap<[u8; 16], (Digest, Command)>,
+) -> Result<Option<Digest>> {
+    if let Some(first) = log.retry(actor, command)? {
+        return Ok(Some(first));
+    }
+    if let Some((first, prev)) = appended.get(&command.request()) {
+        if prev != command {
+            return Err(Error::new(
+                "request identity reused with different commands",
+            ));
+        }
+        return Ok(Some(*first));
+    }
+    Ok(None)
 }
 
 /// The schema rows a build compiled at these versions may publish over `view`: a collection

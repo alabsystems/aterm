@@ -10,6 +10,7 @@ use crate::plan::StageId;
 pub enum Check {
     Fmt,
     Census,
+    ExportScan,
     Lint,
     Test,
     Doc,
@@ -56,7 +57,7 @@ pub struct Spec {
 }
 
 /// Every check, in the order `list` shows them and a verdict names them.
-pub const CHECKS: [Spec; 18] = [
+pub const CHECKS: [Spec; 19] = [
     Spec {
         check: Check::Fmt,
         name: "fmt",
@@ -74,6 +75,18 @@ pub const CHECKS: [Spec; 18] = [
         needs: &[],
         also: "",
         runs: "aterm-census's source guards and its five L0 censuses",
+    },
+    Spec {
+        check: Check::ExportScan,
+        name: "export-scan",
+        stages: &[StageId::ExportScan],
+        reach: Reach::Selection,
+        needs: &["gitleaks"],
+        also: "the publication engine's checkout (~/publication or $PUBLICATION_ENGINE)",
+        runs: "the publication engine's content guards (forbidden content, private references, \
+               gitleaks with its config policy and the engine's adjudication), offline, over the \
+               export of what the change touched (-p, --all, or a change under publish/, to \
+               gitleaks' config or to the export's transforms: the whole export)",
     },
     Spec {
         check: Check::Lint,
@@ -102,6 +115,7 @@ pub const CHECKS: [Spec; 18] = [
             "pwsh",
             "vim",
             "zstd",
+            "gitleaks",
             "chrome-headless-shell",
         ],
         also: "",
@@ -188,11 +202,11 @@ pub const CHECKS: [Spec; 18] = [
     Spec {
         check: Check::Checkers,
         name: "checkers",
-        stages: &[StageId::CheckersCompile, StageId::SpecCheckers],
+        stages: &[StageId::TestCompile, StageId::SpecCheckers],
         reach: Reach::Selection,
         needs: &["targo", "ty"],
         also: "",
-        runs: "targo test <selection plus shared aterm-spec runtime> --features aterm-spec/checkers --tests (own target dir; after test; binaries in parallel); on demand: under release, test carries the feature itself",
+        runs: "ATERM_SPEC_CHECKERS=1 reruns compiled tests (main target dir; after test; binaries in parallel); under release, test asserts the variable itself",
     },
     Spec {
         check: Check::Appkit,
@@ -250,9 +264,10 @@ pub const CHECKS: [Spec; 18] = [
 ];
 
 /// The bare command's set: fast, and scoped to what changed.
-pub const DEV: [Check; 5] = [
+pub const DEV: [Check; 6] = [
     Check::Fmt,
     Check::Census,
+    Check::ExportScan,
     Check::Lint,
     Check::Test,
     Check::Doc,
@@ -489,7 +504,7 @@ pub fn needs_of(check: Check) -> String {
     }
 }
 
-/// What the `test` check needs only under `release`, whose run carries `aterm-spec/checkers`
+/// What the `test` check needs only under `release`, whose run carries `ATERM_SPEC_CHECKERS=1`
 /// (`ty`) and has to reach the [`GOLDEN`] test (a GPU adapter); either missing is its COULD NOT RUN.
 pub const RELEASE_TEST_NEEDS: [&str; 2] = ["ty", "gpu"];
 
@@ -582,7 +597,7 @@ pub fn list_table() -> String {
     out.push_str(
         "\nEvery check needs targo: without it verify runs none (COULD NOT RUN, exit 3).\n\
          \n\
-         dev      fmt census lint test doc: the bare command, on the change cone\n\
+         dev      fmt census export-scan lint test doc: the bare command, on the change cone\n\
          \x20        any run with test (but release) adds wasm-smoke when its selection\n\
          \x20        (the cone, -p or --all) holds aterm-wasm or aterm-gpu-web (on the cone:\n\
          \x20        a change to any crate either builds on) or aterm-wasm-abi (their\n\

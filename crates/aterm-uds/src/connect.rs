@@ -46,7 +46,7 @@ pub fn until(path: &Path, deadline: Instant) -> io::Result<CtlStream> {
     {
         address.sun_len = length as u8;
     }
-    let stream = CtlStream::from(socket(libc::AF_UNIX)?);
+    let stream = CtlStream::from(socket(libc::AF_UNIX, libc::SOCK_STREAM)?);
     stream.set_nonblocking(true)?;
     check_deadline(deadline)?;
     // SAFETY: address is initialized, and length covers its family and terminated path.
@@ -81,12 +81,16 @@ pub fn until(path: &Path, deadline: Instant) -> io::Result<CtlStream> {
 /// connect, which may take all of `timeout`, holds no spawn back. Every TCP dial of aterm's
 /// (a fleet dial, a loopback-scope LAN connection, a vault request, a peer fetch) comes here, and
 /// a debug build's partition cut ([`crate::partition::check`]) refuses one before any socket is
-/// made.
+/// made. On macOS a local-network `addr` ([`crate::lan::is_local_network`]) is then dialled by the
+/// root LAN broker ([`crate::lan::connect`]), whose socket macOS's Local Network privacy does not
+/// gate, and comes back passed to this process; every other address is dialled here.
 ///
 /// # Errors
 /// A zero `timeout` (std refuses one too) or one past the clock's range (`InvalidInput`), an
-/// expired one (`TimedOut`), a debug build's partition cut (`HostUnreachable`), or the original
-/// socket, descriptor, connection or polling error.
+/// expired one (`TimedOut`), a debug build's partition cut (`HostUnreachable`), on macOS a
+/// broker that is not there to ask (`NotConnected`, [`crate::lan::LanError::into_io`]) or the
+/// broker's refusal of the connect, or the original socket, descriptor, connection or polling
+/// error.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn tcp_within(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
     crate::partition::check(*addr)?;
@@ -94,12 +98,41 @@ pub fn tcp_within(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream>
         .filter(|timeout| !timeout.is_zero())
         .and_then(|timeout| Instant::now().checked_add(timeout))
         .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "invalid connect timeout"))?;
+    #[cfg(target_os = "macos")]
+    if crate::lan::is_local_network(&addr.ip()) {
+        return crate::lan::broker::connect(
+            &crate::lan::Target::Addr(*addr),
+            addr.port(),
+            timeout,
+            crate::lan::ConnectOptions::default(),
+        )
+        .map(|(stream, _)| stream)
+        .map_err(crate::lan::LanError::into_io);
+    }
+    tcp_until(addr, deadline, |_| Ok(()))
+}
+
+/// Dial `addr` from this process by `deadline`, `configure` given the socket before its connect
+/// (a bound interface, a source address, a hop limit): [`tcp_within`]'s connect, with no
+/// partition cut and no broker. Returns a blocking stream kept out of children from its creation.
+///
+/// # Errors
+/// An expired `deadline` (`TimedOut`), `configure`'s error, or the original socket, descriptor,
+/// connection or polling error.
+#[cfg_attr(trust_verify, trust::skip)]
+pub(crate) fn tcp_until(
+    addr: &SocketAddr,
+    deadline: Instant,
+    configure: impl FnOnce(&TcpStream) -> io::Result<()>,
+) -> io::Result<TcpStream> {
+    check_deadline(deadline)?;
     let family = if addr.is_ipv4() {
         libc::AF_INET
     } else {
         libc::AF_INET6
     };
-    let stream = TcpStream::from(socket(family)?);
+    let stream = TcpStream::from(socket(family, libc::SOCK_STREAM)?);
+    configure(&stream)?;
     stream.set_nonblocking(true)?;
     let address = Inet::new(*addr);
     let (pointer, length) = address.parts();
@@ -120,13 +153,11 @@ pub fn tcp_within(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream>
     Ok(stream)
 }
 
-/// A stream socket of `domain`, kept out of children from its creation ([`crate::kept_out`]),
-/// closed on `exec`, and on Apple never raising `SIGPIPE`.
-fn socket(domain: libc::c_int) -> io::Result<OwnedFd> {
+/// A socket of `domain` and `kind` (`SOCK_STREAM`, `SOCK_DGRAM`), kept out of children from its
+/// creation ([`crate::kept_out`]), closed on `exec`, and on Apple never raising `SIGPIPE`.
+pub(crate) fn socket(domain: libc::c_int, kind: libc::c_int) -> io::Result<OwnedFd> {
     #[cfg(target_os = "linux")]
-    let kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
-    #[cfg(not(target_os = "linux"))]
-    let kind = libc::SOCK_STREAM;
+    let kind = kind | libc::SOCK_CLOEXEC;
     let fd = crate::kept_out(|| {
         // SAFETY: socket takes only integer arguments and returns an owned descriptor.
         let raw = unsafe { libc::socket(domain, kind, 0) };

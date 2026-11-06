@@ -42,6 +42,12 @@ fn with_log(
     }
 }
 
+/// A file reads back to its trace, and on any epoch it replays to its recorded head and counts; a
+/// check of it replays as the plain replay does, every field of the result, on a log with frames.
+///
+/// NEGATIVE CONTROL (2026-11-05): plain replay's `unseen` raised by one only where
+/// `counts.ticks > 0` fired "a check's replay is the plain replay, on a log with frames", where
+/// `an_export_with_unseen_keys_checks_cleanly_and_says_how_many`, whose log holds only keys, passed.
 #[test]
 fn a_trace_file_round_trips_and_replays_on_another_epoch_to_the_recorded_head() {
     let t0 = Instant::now();
@@ -69,12 +75,26 @@ fn a_trace_file_round_trips_and_replays_on_another_epoch_to_the_recorded_head() 
         assert_eq!((r.log_epoch, r.first_cursor), (1, 0));
         assert_eq!(r.counts, counts);
     }
+    assert!(counts.ticks > 0, "fixture: a log with frames");
+    assert_eq!(
+        trace.check(t0, BUILD).expect("the trace checks").replay,
+        trace.replay(t0, BUILD).expect("the trace replays"),
+        "a check's replay is the plain replay, on a log with frames"
+    );
 }
 
+/// Every cut and every single altered byte of a file is refused. Past its first bytes the file is
+/// sealed and its log opaque to this read, so the file is one key's: each case costs a digest of the
+/// whole file, and a longer log repeats cases and no law.
+///
+/// NEGATIVE CONTROL (2026-11-05): a seal that leaves out the body's last byte fires `"an altered
+/// byte decoded"`.
 #[test]
 fn a_trace_file_cut_or_altered_anywhere_is_refused() {
     let t0 = Instant::now();
-    let trace = typed(t0).aos_trace().expect("attached");
+    let mut host = attached(t0, MomentumCode::Shipped);
+    let _ = burst(&mut host, t0 + ms(5), 1, &cfg(true), &mut Vec::new());
+    let trace = host.aos_trace().expect("attached");
     let file = trace.encode();
     for cut in 0..file.len() {
         let refused = MomentumTrace::decode(&file[..cut]);
@@ -319,6 +339,10 @@ fn the_largest_trace_a_window_exports_fits_twice_under_the_check_bound() {
     assert!(full.check(t0, BUILD).is_ok(), "a full host epoch checks");
 }
 
+/// A whole host log epoch of frames at the 4095-quad cap checks and judges. That plain replay gives
+/// what a check gives is compared on a log of small frames
+/// (`a_trace_file_round_trips_and_replays_on_another_epoch_to_the_recorded_head`), so a plain replay
+/// that differs only on a frame this large goes unseen: this test replays it only through `check`.
 #[test]
 fn a_full_window_of_light_page_4095_quad_frames_checks_and_judges() {
     let t0 = Instant::now();
@@ -368,7 +392,6 @@ fn a_full_window_of_light_page_4095_quad_frames_checks_and_judges() {
     let trace = host.aos_trace().expect("exports");
     let checked = trace.check(t0, BUILD).expect("checks");
     assert!(checked.verdict.passed(), "{:?}", checked.verdict);
-    assert_eq!(trace.replay(t0, BUILD).expect("replays"), checked.replay);
 
     let _ = host.tick(
         Some((4, 40)),
@@ -446,6 +469,11 @@ fn an_export_with_unseen_keys_checks_cleanly_and_says_how_many() {
             .check(t0 + ms(3_600_000), BUILD)
             .expect("the trace checks")
             .replay;
+        assert_eq!(
+            trace.replay(t0 + ms(3_600_000), BUILD).as_ref(),
+            Ok(&r),
+            "unseen={unseen}: a check's replay is the plain replay"
+        );
         assert_eq!(r.state_digest, trace.head_state, "unseen={unseen}");
         assert_eq!(r.unseen, live, "unseen={unseen}: the replayed head's count");
         assert_eq!(

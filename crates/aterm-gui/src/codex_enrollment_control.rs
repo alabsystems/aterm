@@ -1,0 +1,1285 @@
+// Copyright 2026 Andrew Yates
+// SPDX-License-Identifier: Apache-2.0
+
+//! Explicit native account management. Accepted operations own their work; wire
+//! requests carry opaque row references and never credential paths or commands.
+
+use super::*;
+use aterm_agent::harness::{account_work, accounts, cli::Env, codex_enrollment as enrollment};
+use aterm_json::{Value, json};
+use std::os::fd::{AsRawFd, BorrowedFd};
+use std::sync::OnceLock;
+
+const MAX_JOBS: usize = 32;
+const MAX_FRAME: usize = 64 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Command {
+    Enroll {
+        operation: String,
+        revision: String,
+        account: String,
+    },
+    Poll(String),
+    Cancel(String),
+    Discover(String),
+}
+
+fn hex(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn parse(line: &str, read: bool) -> Option<Command> {
+    let words: Vec<_> = line.split_ascii_whitespace().collect();
+    let field = |i: usize, prefix: &str, len: usize| {
+        let value = words.get(i)?.strip_prefix(prefix)?;
+        hex(value, len).then(|| value.to_owned())
+    };
+    if words.get(1) != Some(&"schema=1") {
+        return None;
+    }
+    match (words.first().copied()?, read, words.len()) {
+        ("enroll", false, 5) => Some(Command::Enroll {
+            operation: field(2, "operation=", 32)?,
+            revision: field(3, "revision=", 64)?,
+            account: field(4, "account=", 64)?,
+        }),
+        ("enrollment-poll", false, 3) => Some(Command::Poll(field(2, "operation=", 32)?)),
+        ("enrollment-cancel", false, 3) => Some(Command::Cancel(field(2, "operation=", 32)?)),
+        ("enrollment-status", true, 3) => Some(Command::Discover(field(2, "request=", 32)?)),
+        _ => None,
+    }
+}
+
+impl Command {
+    fn id(&self) -> &str {
+        match self {
+            Self::Enroll { operation, .. }
+            | Self::Poll(operation)
+            | Self::Cancel(operation)
+            | Self::Discover(operation) => operation,
+        }
+    }
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Enroll { .. } => "enroll",
+            Self::Poll(_) => "poll",
+            Self::Cancel(_) => "cancel",
+            Self::Discover(_) => "discover",
+        }
+    }
+}
+
+fn caller(sid: &str, proof: &crate::self_claim::Proven) -> String {
+    let bytes = json!([
+        "aterm-codex-enrollment-caller-v1",
+        sid,
+        proof.pid,
+        proof.start
+    ]);
+    aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(
+        aterm_json::to_vec(&bytes).expect("native caller facts serialize"),
+    ))
+}
+
+fn session(sid: &str, proof: &crate::self_claim::Proven) -> Option<Value> {
+    Some(
+        json!({"sid":sid,"process_pid":proof.pid,"process_birth":proof.start,"epoch":host_epoch()?}),
+    )
+}
+
+fn still_native(ctx: &crate::SessionCtx, proof: &crate::self_claim::Proven, master: i32) -> bool {
+    if !proof.alive()
+        || i64::from(crate::quit_safety::foreground_pgrp(master)) != i64::from(proof.pid)
+    {
+        return false;
+    }
+    let holder = format!("codex-alab@{}", proof.pid);
+    let qualified = ctx.native_policy.holder(&holder).map_or_else(
+        || crate::self_claim::runs_alab_build(proof.pid),
+        |(row, pid)| pid == proof.pid && ctx.native_policy.actor_image(row, pid),
+    );
+    qualified && proof.alive()
+}
+
+fn progress(request: &enrollment::RejectedIntent, status: &enrollment::Status) -> Value {
+    json!({"operation":request.id,"account_id":request.account_id,
+        "phase":status.phase,"generation":status.generation})
+}
+
+struct Job {
+    command: Command,
+    proof: crate::self_claim::Proven,
+    started: std::time::Instant,
+    intent_sequence: u64,
+    result: Mutex<Option<Result<Option<Value>, ()>>>,
+}
+
+type Key = (String, &'static str, String);
+#[derive(Default)]
+struct Registry {
+    entries: BTreeMap<Key, Arc<Job>>,
+    sequence: u64,
+    exhausted: bool,
+}
+
+impl Registry {
+    fn changed(&mut self) {
+        match self.sequence.checked_add(1) {
+            Some(sequence) => self.sequence = sequence,
+            None => self.exhausted = true,
+        }
+    }
+    fn insert(&mut self, key: Key, job: Arc<Job>) {
+        if matches!(job.command, Command::Enroll { .. }) {
+            self.changed();
+        }
+        self.entries.insert(key, job);
+    }
+    fn remove(&mut self, key: &Key, job: &Arc<Job>) {
+        if self
+            .entries
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, job))
+        {
+            if matches!(job.command, Command::Enroll { .. }) {
+                self.changed();
+            }
+            self.entries.remove(key);
+        }
+    }
+    fn prune(&mut self) {
+        let expired: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|(_, job)| {
+                job.started.elapsed() >= Duration::from_secs(120)
+                    && job
+                        .result
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .is_some()
+            })
+            .map(|(key, job)| (key.clone(), Arc::clone(job)))
+            .collect();
+        for (key, job) in expired {
+            self.remove(&key, &job);
+        }
+    }
+}
+
+fn jobs() -> &'static Mutex<Registry> {
+    static JOBS: OnceLock<Mutex<Registry>> = OnceLock::new();
+    JOBS.get_or_init(Mutex::default)
+}
+
+/// Rolls an unstarted dispatch back before its last admission scope retires.
+struct Reservation {
+    key: Key,
+    job: Option<Arc<Job>>,
+    scope: Option<account_work::Scope>,
+}
+
+impl Reservation {
+    fn new(key: Key) -> Self {
+        Self {
+            key,
+            job: None,
+            scope: None,
+        }
+    }
+
+    fn arm(&mut self, job: &Arc<Job>, scope: &account_work::Scope) {
+        self.scope = Some(scope.clone());
+        self.job = Some(Arc::clone(job));
+    }
+
+    fn dispatched(mut self) {
+        self.job = None;
+        drop(self.scope.take());
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if let Some(job) = &self.job {
+            jobs()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&self.key, job);
+        }
+    }
+}
+
+fn complete(job: &Arc<Job>, result: Result<Option<Value>, ()>) {
+    let mut table = jobs().lock().unwrap_or_else(|p| p.into_inner());
+    if matches!(job.command, Command::Enroll { .. }) {
+        table.changed();
+    }
+    *job.result.lock().unwrap_or_else(|p| p.into_inner()) = Some(result);
+}
+
+fn owned_completion(
+    job: &Arc<Job>,
+    scope: account_work::Scope,
+    work: impl FnOnce() -> Result<Option<Value>, ()> + Send + 'static,
+) -> impl FnOnce() + Send + 'static {
+    let job = Arc::clone(job);
+    scope.wrap(move || {
+        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+            Ok(result) => result,
+            Err(payload) => {
+                if let Err(secondary) =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        drop(payload);
+                    }))
+                {
+                    std::mem::forget(secondary);
+                }
+                Err(())
+            }
+        };
+        complete(&job, result);
+    })
+}
+
+fn launch(key: &Key, job: &Arc<Job>, spawn: impl FnOnce() -> std::io::Result<()>) -> bool {
+    if spawn().is_ok() {
+        return true;
+    }
+    complete(job, Err(()));
+    jobs()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(key, job);
+    false
+}
+
+type Controls = BTreeMap<(String, String), Arc<enrollment::Control>>;
+fn controls() -> &'static Mutex<Controls> {
+    static CONTROLS: OnceLock<Mutex<Controls>> = OnceLock::new();
+    CONTROLS.get_or_init(Mutex::default)
+}
+
+fn discovery(env: &Env, sid: &str, proof: &crate::self_claim::Proven) -> Result<Option<Value>, ()> {
+    discovery_with(env, sid, proof, || {})
+}
+
+fn discovery_with(
+    env: &Env,
+    sid: &str,
+    proof: &crate::self_claim::Proven,
+    after_read: impl FnOnce(),
+) -> Result<Option<Value>, ()> {
+    let (sequence, pending) = {
+        let table = jobs().lock().unwrap_or_else(|p| p.into_inner());
+        if table.exhausted {
+            return Err(());
+        }
+        let pending: Vec<_> = table
+            .entries
+            .iter()
+            .filter(|((job_sid, kind, _), job)| {
+                job_sid == sid && *kind == "enroll" && job.proof == *proof
+            })
+            .map(|(_, job)| Arc::clone(job))
+            .collect();
+        (table.sequence, pending)
+    };
+    let config = env
+        .config
+        .as_deref()
+        .and_then(std::path::Path::parent)
+        .ok_or(())?;
+    let store = env.accounts_store_for(accounts::Cli::Codex).ok_or(())?;
+    let path = config.join(accounts::Cli::Codex.accounts().roster_file);
+    let records = store.peek_account_records(&path, env.now).map_err(|_| ())?;
+    after_read();
+    // Insertion, completion and removal all advance under the same registry
+    // lock. A completed and removed intent cannot disappear behind an old read.
+    let table = jobs().lock().unwrap_or_else(|p| p.into_inner());
+    if table.exhausted {
+        return Err(());
+    }
+    if table.sequence != sequence {
+        return Ok(None);
+    }
+    let owner = caller(sid, proof);
+    for job in pending {
+        if records
+            .logins
+            .enrollment
+            .retained(job.command.id(), &owner)
+            .is_err()
+            && job
+                .result
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_none()
+        {
+            return Ok(None);
+        }
+    }
+    drop(table);
+    if records.roster.rows.len() > 128 {
+        return Err(());
+    }
+    let targets: Result<Vec<_>, ()> = records
+        .roster
+        .rows
+        .iter()
+        .map(|row| {
+            if row.label.chars().count() > 128 || row.label.chars().any(char::is_control) {
+                return Err(());
+            }
+            Ok(json!({"account_id":accounts_control::account_id(&row.label),"label":row.label}))
+        })
+        .collect();
+    let operations: Vec<_> = records
+        .logins
+        .enrollment
+        .retained_for(&caller(sid, proof))
+        .map_err(|_| ())?
+        .iter()
+        .map(|(request, status)| {
+            let mut value = progress(request, status);
+            value
+                .as_object_mut()
+                .expect("progress object")
+                .insert("revision".into(), json!(request.revision));
+            value
+        })
+        .collect();
+    // Source-aware creation has a separate admission contract. Enrollment here
+    // resolves only existing source rows, and never changes session assignment.
+    Ok(Some(
+        json!({"schema":1,"revision":accounts::pool_authority_revision(&records.raw_roster,&records.logins).map_err(|_| ())?,
+        "capabilities":{"enroll":true,"create":false},"targets":targets?,"operations":operations}),
+    ))
+}
+
+fn run(
+    command: &Command,
+    sid: &str,
+    proof: &crate::self_claim::Proven,
+    lifetime: &account_work::Lifetime,
+) -> Result<Option<Value>, ()> {
+    let env = Env::from_process().map_err(|_| ())?;
+    run_in(command, sid, proof, lifetime, &env, enrollment::Work::run)
+}
+
+fn run_in(
+    command: &Command,
+    sid: &str,
+    proof: &crate::self_claim::Proven,
+    lifetime: &account_work::Lifetime,
+    env: &Env,
+    drive: impl FnOnce(enrollment::Work, &Env) -> Result<enrollment::Status, String>,
+) -> Result<Option<Value>, ()> {
+    if let Command::Discover(_) = command {
+        return discovery(env, sid, proof);
+    }
+    let store = env.accounts_store_for(accounts::Cli::Codex).ok_or(())?;
+    let owner = caller(sid, proof);
+    let key = (sid.to_owned(), command.id().to_owned());
+    match command {
+        Command::Enroll {
+            operation,
+            revision,
+            account,
+        } => {
+            let intent = enrollment::RejectedIntent {
+                id: operation.clone(),
+                caller: owner.clone(),
+                account_id: account.clone(),
+                revision: revision.clone(),
+            };
+            let refuse = || {
+                enrollment::reject(env, &intent)
+                    .map(|status| Some(progress(&intent, &status)))
+                    .map_err(|_| ())
+            };
+            let (logins, warning) = store.load_logins(env.now).map_err(|_| ())?;
+            if warning.is_some() {
+                return Err(());
+            }
+            if let Ok((retained, status)) = logins.enrollment.retained(operation, &owner) {
+                if retained.revision != *revision || retained.account_id != *account {
+                    return Err(());
+                }
+                return Ok(Some(progress(&retained, &status)));
+            }
+            let config = env
+                .config
+                .as_deref()
+                .and_then(std::path::Path::parent)
+                .ok_or(())?;
+            let path = config.join(accounts::Cli::Codex.accounts().roster_file);
+            let records = store.peek_account_records(&path, env.now).map_err(|_| ())?;
+            let Some(row) = records
+                .roster
+                .rows
+                .iter()
+                .find(|row| accounts_control::account_id(&row.label) == *account)
+            else {
+                return refuse();
+            };
+            if row.held_by.is_some()
+                || row.expected_identity_email().is_none()
+                || accounts::pool_authority_revision(&records.raw_roster, &records.logins)
+                    .map_err(|_| ())?
+                    != *revision
+            {
+                return refuse();
+            }
+            let request = enrollment::Request {
+                id: operation.clone(),
+                caller: owner,
+                label: row.label.clone(),
+                revision: revision.clone(),
+            };
+            let Some(scope) = lifetime.enter() else {
+                return refuse();
+            };
+            let (work, control) = enrollment::owned_work(request.clone(), scope);
+            let control = Arc::new(control);
+            {
+                let mut table = controls().lock().unwrap_or_else(|p| p.into_inner());
+                if table.contains_key(&key) || table.len() >= MAX_JOBS {
+                    drop(table);
+                    return refuse();
+                }
+                table.insert(key.clone(), Arc::clone(&control));
+            }
+            let result = drive(work, env);
+            let result = match result {
+                Ok(status) if status.phase == enrollment::Phase::CancelRequested => control
+                    .retired()
+                    .map(|proof| proof.finish(env))
+                    .unwrap_or(Ok(status)),
+                other => other,
+            };
+            if control.work_retired()
+                && result.as_ref().is_ok_and(|status| {
+                    matches!(
+                        status.phase,
+                        enrollment::Phase::Applied
+                            | enrollment::Phase::AuthenticationRequired
+                            | enrollment::Phase::Refused
+                            | enrollment::Phase::Cancelled
+                    )
+                })
+            {
+                controls()
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&key);
+            }
+            Ok(Some(progress(&request.intent(), &result.map_err(|_| ())?)))
+        }
+        Command::Poll(operation) | Command::Cancel(operation) => {
+            let (logins, warning) = store.load_logins(env.now).map_err(|_| ())?;
+            if warning.is_some() {
+                return Err(());
+            }
+            let (request, mut status) = logins
+                .enrollment
+                .retained(operation, &owner)
+                .map_err(|_| ())?;
+            if status.phase == enrollment::Phase::Refused {
+                return Ok(Some(progress(&request, &status)));
+            }
+            let admitted = logins
+                .enrollment
+                .admitted(operation, &owner)
+                .map_err(|_| ())?;
+            if status.phase == enrollment::Phase::CancelRequested {
+                let control = controls()
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(&key)
+                    .cloned();
+                if let Some(control) = control
+                    && let Some(proof) = control.retired()
+                {
+                    status = proof.finish(env).map_err(|_| ())?;
+                    controls()
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(&key);
+                }
+            }
+            if matches!(command, Command::Cancel(_)) {
+                let control = controls()
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(&key)
+                    .cloned();
+                status = match control {
+                    Some(control) => {
+                        let status = control.cancel(env).map_err(|_| ())?;
+                        if status.phase == enrollment::Phase::CancelRequested {
+                            control
+                                .retired()
+                                .map(|proof| proof.finish(env))
+                                .unwrap_or(Ok(status))
+                                .map_err(|_| ())?
+                        } else {
+                            status
+                        }
+                    }
+                    None => enrollment::cancel(env, &admitted).map_err(|_| ())?,
+                };
+            }
+            if status.phase == enrollment::Phase::Cancelled {
+                controls()
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&key);
+            }
+            Ok(Some(progress(&request, &status)))
+        }
+        Command::Discover(_) => unreachable!(),
+    }
+}
+
+pub(crate) fn serve(
+    ctx: &Arc<crate::SessionCtx>,
+    master: i32,
+    line: &str,
+    lifetime: &account_work::Lifetime,
+    read: bool,
+) -> String {
+    let namespace = if read {
+        "codex-accounts"
+    } else {
+        "codex-accounts-change"
+    };
+    let Some(command) = parse(line, read) else {
+        return format!("ERR {namespace} refused\n");
+    };
+    let Some(before) = accounts_control::claim(ctx, master) else {
+        return format!("ERR {namespace} denied\n");
+    };
+    if !read && ctx.fabric.hold().is_some() {
+        return format!("ERR {namespace} denied\n");
+    }
+    let key = (
+        ctx.self_id.as_str().to_owned(),
+        command.kind(),
+        command.id().to_owned(),
+    );
+    // The rollback owner outlives the inner registry guard, including unwind.
+    let mut reservation = Reservation::new(key.clone());
+    let (job, start) = {
+        let mut table = jobs().lock().unwrap_or_else(|p| p.into_inner());
+        table.prune();
+        if table.exhausted {
+            return format!("ERR {namespace} refused\n");
+        }
+        if let Some(job) = table.entries.get(&key) {
+            if job.proof != before || job.command != command {
+                return format!("ERR {namespace} refused\n");
+            }
+            (Arc::clone(job), None)
+        } else {
+            if table.entries.len() >= MAX_JOBS {
+                return format!("ERR {namespace} refused\n");
+            }
+            let Some(scope) = lifetime.enter() else {
+                return format!("ERR {namespace} refused\n");
+            };
+            let job = Arc::new(Job {
+                command: command.clone(),
+                proof: before.clone(),
+                started: std::time::Instant::now(),
+                intent_sequence: table.sequence,
+                result: Mutex::new(None),
+            });
+            // SAFETY: the dispatch target owns this live PTY master while this
+            // request is served. The duplicate owns its identity through the
+            // worker's admission recheck and cannot name a reused descriptor.
+            let Ok(owned_master) = (unsafe { BorrowedFd::borrow_raw(master) }).try_clone_to_owned()
+            else {
+                return format!("ERR {namespace} refused\n");
+            };
+            reservation.arm(&job, &scope);
+            table.insert(key.clone(), Arc::clone(&job));
+            (job, Some((scope, owned_master)))
+        }
+    };
+    if let Some((scope, owned_master)) = start {
+        let worker = Arc::clone(&job);
+        let sid = key.0.clone();
+        let weak = Arc::downgrade(ctx);
+        let lifetime = lifetime.clone();
+        // Release the registry before starting work. Even an immediate
+        // completion observes its original reservation.
+        if !launch(&key, &job, || {
+            std::thread::Builder::new()
+                .name("codex-enrollment".into())
+                .spawn(owned_completion(&job, scope, move || {
+                    let admitted = weak.upgrade().is_some_and(|ctx| {
+                        still_native(&ctx, &worker.proof, owned_master.as_raw_fd())
+                            && (read || ctx.fabric.hold().is_none())
+                    });
+                    drop(owned_master);
+                    if admitted {
+                        run(&worker.command, &sid, &worker.proof, &lifetime)
+                    } else {
+                        Err(())
+                    }
+                }))
+                .map(|_| ())
+        }) {
+            return format!("ERR {namespace} refused\n");
+        }
+    }
+    reservation.dispatched();
+
+    if !before.alive() || accounts_control::claim(ctx, master).as_ref() != Some(&before) {
+        return format!("ERR {namespace} denied\n");
+    }
+    let result = job.result.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let Some(result) = result else {
+        if read {
+            return format!("OK codex-accounts state=waiting request={}\n", command.id());
+        }
+        let Some(binding) = session(ctx.self_id.as_str(), &before) else {
+            return format!("ERR {namespace} refused\n");
+        };
+        return format!(
+            "OK codex-accounts-change waiting {}\n",
+            json!({"schema":1,"operation":command.id(),"session":binding})
+        );
+    };
+    {
+        let mut table = jobs().lock().unwrap_or_else(|p| p.into_inner());
+        let stale = read && (table.exhausted || table.sequence != job.intent_sequence);
+        table.remove(&key, &job);
+        if stale {
+            return format!("OK codex-accounts state=waiting request={}\n", command.id());
+        }
+    }
+    let Ok(value) = result else {
+        return format!("ERR {namespace} refused\n");
+    };
+    let Some(mut value) = value else {
+        return format!("OK codex-accounts state=waiting request={}\n", command.id());
+    };
+    let Some(binding) = session(ctx.self_id.as_str(), &before) else {
+        return format!("ERR {namespace} refused\n");
+    };
+    let object = value.as_object_mut().expect("worker result object");
+    object.insert("schema".into(), json!(1));
+    object.insert("session".into(), binding);
+    if read {
+        object.insert("request".into(), json!(command.id()));
+    }
+    let prefix = if read {
+        "OK codex-accounts enrollment-status "
+    } else {
+        "OK codex-accounts-change enrollment "
+    };
+    match aterm_json::to_string(&value) {
+        Ok(body) if prefix.len() + body.len() < MAX_FRAME => format!("{prefix}{body}\n"),
+        _ => format!("ERR {namespace} refused\n"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aterm_agent::harness::cli::{AccountsHost, RenewBrowser};
+    use aterm_agent::harness::{align::Captured, login_drive};
+    use std::cell::Cell;
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+        SERIAL.get_or_init(Mutex::default).lock().unwrap()
+    }
+
+    fn fixture() -> (
+        aterm_tempfile::TempDir,
+        Env,
+        crate::self_claim::Proven,
+        String,
+    ) {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let mut env = Env::from_process().unwrap();
+        env.home = Some(root.path().join("home"));
+        env.state = root.path().join("state");
+        env.config = Some(root.path().join("config/aterm.toml"));
+        env.now = 1_000_000;
+        std::fs::create_dir_all(root.path().join("config")).unwrap();
+        let row = accounts::Row {
+            label: "main".into(),
+            email: Some("main@example.test".into()),
+            dir: Some(root.path().join("configured").to_str().unwrap().into()),
+            ..Default::default()
+        };
+        std::fs::write(
+            root.path().join("config/accounts-codex.toml"),
+            accounts::append_rows_for(accounts::Cli::Codex, "", &[row]).unwrap(),
+        )
+        .unwrap();
+        let proof = crate::self_claim::Proven {
+            pid: 42,
+            start: "fixture-birth".into(),
+        };
+        let sid = root
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        (root, env, proof, sid)
+    }
+
+    struct FailedProvider(Cell<usize>);
+    impl AccountsHost for FailedProvider {
+        fn stdin_is_terminal(&self) -> bool {
+            false
+        }
+        fn auth_status(&self, _: &str) -> Result<Captured, String> {
+            panic!("no default auth")
+        }
+        fn unaskable(&self) -> Option<String> {
+            None
+        }
+        fn login(&self, _: Option<&str>) -> Result<i32, String> {
+            panic!("no default login")
+        }
+        fn now(&self) -> i64 {
+            1_000_000
+        }
+        fn renew_flow(&self, _: &str, _: &str, _: &RenewBrowser) -> Result<i32, String> {
+            panic!("no browser")
+        }
+        fn vendor_sign_in(&self, _: &login_drive::Request<'_>) -> login_drive::Drove {
+            self.0.set(self.0.get() + 1);
+            login_drive::Drove {
+                outcome: login_drive::Outcome::Failed,
+                host: None,
+            }
+        }
+    }
+
+    #[test]
+    fn uncertain_provider_retains_its_exact_retirement_permit_for_later_cancel() {
+        let _serial = serial();
+        let (_root, env, proof, sid) = fixture();
+        let view = discovery(&env, &sid, &proof).unwrap().unwrap();
+        let command = Command::Enroll {
+            operation: "a".repeat(32),
+            revision: view["revision"].as_str().unwrap().into(),
+            account: accounts_control::account_id("main"),
+        };
+        let lifetime = account_work::Lifetime::default();
+        let provider = FailedProvider(Cell::new(0));
+        let running = run_in(&command, &sid, &proof, &lifetime, &env, |work, env| {
+            work.run_with_host(env, &provider)
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(running["phase"].as_str(), Some("running"));
+        assert_eq!(provider.0.get(), 1);
+        let key = (sid.clone(), "a".repeat(32));
+        assert!(
+            controls().lock().unwrap().contains_key(&key),
+            "uncertain custody is retained after work returns"
+        );
+        let wrong = crate::self_claim::Proven {
+            start: "replacement-birth".into(),
+            ..proof.clone()
+        };
+        assert!(
+            run_in(
+                &Command::Poll("a".repeat(32)),
+                &sid,
+                &wrong,
+                &lifetime,
+                &env,
+                |_, _| panic!("foreign caller cannot dispatch")
+            )
+            .is_err()
+        );
+        assert!(
+            run_in(
+                &Command::Cancel("a".repeat(32)),
+                &sid,
+                &wrong,
+                &lifetime,
+                &env,
+                |_, _| panic!("foreign caller cannot cancel")
+            )
+            .is_err()
+        );
+        let cancelled = run_in(
+            &Command::Cancel("a".repeat(32)),
+            &sid,
+            &proof,
+            &lifetime,
+            &env,
+            |_, _| panic!("cancel cannot dispatch provider"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(cancelled["phase"].as_str(), Some("cancelled"));
+        assert_eq!(cancelled["generation"], Value::Null);
+        let retained = run_in(&command, &sid, &proof, &lifetime, &env, |_, _| {
+            panic!("retained operation cannot redispatch provider")
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(retained, cancelled);
+        assert_eq!(provider.0.get(), 1);
+        assert!(
+            !controls().lock().unwrap().contains_key(&key),
+            "committed cancellation releases the runtime slot"
+        );
+    }
+
+    #[test]
+    fn published_job_can_complete_and_retire_before_spawn_returns() {
+        let _serial = serial();
+        let lifetime = account_work::Lifetime::default();
+        let scope = lifetime.enter().unwrap();
+        let custody = scope.cancellation();
+        let job = Arc::new(Job {
+            command: Command::Enroll {
+                operation: "7".repeat(32),
+                revision: "a".repeat(64),
+                account: "b".repeat(64),
+            },
+            proof: crate::self_claim::Proven {
+                pid: 42,
+                start: "completion-fixture".into(),
+            },
+            started: std::time::Instant::now(),
+            intent_sequence: 0,
+            result: Mutex::new(None),
+        });
+        let key = ("owned-completion".into(), "enroll", job.command.id().into());
+        jobs().lock().unwrap().insert(key.clone(), Arc::clone(&job));
+        let worker = Arc::clone(&job);
+        let worker_key = key.clone();
+        let value = json!({"phase":"refused"});
+        let result = value.clone();
+        assert!(launch(&key, &job, || {
+            assert!(
+                jobs().try_lock().is_ok(),
+                "launch must not hold the registry"
+            );
+            let task = owned_completion(&job, scope, move || {
+                let table = jobs().lock().unwrap();
+                assert!(Arc::ptr_eq(
+                    table.entries.get(&worker_key).unwrap(),
+                    &worker
+                ));
+                drop(table);
+                Ok(Some(result))
+            });
+            let (done, retired) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                task();
+                done.send(()).unwrap();
+            });
+            retired.recv_timeout(Duration::from_secs(60)).unwrap();
+            thread.join().unwrap();
+            Ok(())
+        }));
+        assert!(custody.retired());
+        assert_eq!(*job.result.lock().unwrap(), Some(Ok(Some(value))));
+        let mut table = jobs().lock().unwrap();
+        assert!(Arc::ptr_eq(table.entries.get(&key).unwrap(), &job));
+        table.remove(&key, &job);
+        assert!(!table.entries.contains_key(&key));
+    }
+
+    #[test]
+    fn panicking_owned_work_publishes_failure_before_its_scope_retires() {
+        let _serial = serial();
+        struct PanicOnDrop;
+        impl Drop for PanicOnDrop {
+            fn drop(&mut self) {
+                panic!("controlled panic payload drop");
+            }
+        }
+        for drop_bomb in [false, true] {
+            let lifetime = account_work::Lifetime::default();
+            let scope = lifetime.enter().unwrap();
+            let custody = scope.cancellation();
+            let job = Arc::new(Job {
+                command: Command::Enroll {
+                    operation: "9".repeat(32),
+                    revision: "a".repeat(64),
+                    account: "b".repeat(64),
+                },
+                proof: crate::self_claim::Proven {
+                    pid: 42,
+                    start: "panic-completion-fixture".into(),
+                },
+                started: std::time::Instant::now(),
+                intent_sequence: 0,
+                result: Mutex::new(None),
+            });
+            let (mut observer, owned) = std::os::unix::net::UnixStream::pair().unwrap();
+            observer
+                .set_read_timeout(Some(Duration::from_secs(60)))
+                .unwrap();
+            let task = owned_completion(&job, scope, move || {
+                let _owned = owned;
+                if drop_bomb {
+                    std::panic::panic_any(PanicOnDrop);
+                }
+                panic!("controlled owned work panic");
+            });
+            let thread = std::thread::spawn(task);
+            thread.join().unwrap();
+            assert_eq!(std::io::Read::read(&mut observer, &mut [0]).unwrap(), 0);
+            assert_eq!(*job.result.lock().unwrap(), Some(Err(())));
+            assert!(custody.retired());
+            lifetime
+                .pause()
+                .unwrap()
+                .try_wait()
+                .expect("joined work retired");
+        }
+    }
+
+    #[test]
+    fn failed_launch_retires_captures_and_removes_only_its_own_reservation() {
+        let _serial = serial();
+        for replace in [false, true] {
+            let lifetime = account_work::Lifetime::default();
+            let scope = lifetime.enter().unwrap();
+            let custody = scope.cancellation();
+            let job = Arc::new(Job {
+                command: Command::Enroll {
+                    operation: "8".repeat(32),
+                    revision: "a".repeat(64),
+                    account: "b".repeat(64),
+                },
+                proof: crate::self_claim::Proven {
+                    pid: 42,
+                    start: "failed-launch-fixture".into(),
+                },
+                started: std::time::Instant::now(),
+                intent_sequence: 0,
+                result: Mutex::new(None),
+            });
+            let replacement = Arc::new(Job {
+                command: job.command.clone(),
+                proof: crate::self_claim::Proven {
+                    start: "replacement-fixture".into(),
+                    ..job.proof.clone()
+                },
+                started: std::time::Instant::now(),
+                intent_sequence: 0,
+                result: Mutex::new(None),
+            });
+            let key = ("failed-launch".into(), "enroll", job.command.id().into());
+            let sequence = {
+                let mut table = jobs().lock().unwrap();
+                table.insert(key.clone(), Arc::clone(&job));
+                table.sequence
+            };
+            let (mut observer, owned) = std::os::unix::net::UnixStream::pair().unwrap();
+            observer
+                .set_read_timeout(Some(Duration::from_secs(60)))
+                .unwrap();
+            let task = owned_completion(&job, scope, move || {
+                drop(owned);
+                panic!("a refused launch cannot run its work")
+            });
+            assert!(!launch(&key, &job, || {
+                drop(task);
+                if replace {
+                    jobs()
+                        .lock()
+                        .unwrap()
+                        .insert(key.clone(), Arc::clone(&replacement));
+                }
+                Err(std::io::Error::other("controlled launch refusal"))
+            }));
+            assert!(custody.retired());
+            assert_eq!(std::io::Read::read(&mut observer, &mut [0]).unwrap(), 0);
+            assert!(matches!(*job.result.lock().unwrap(), Some(Err(()))));
+            let mut table = jobs().lock().unwrap();
+            assert!(
+                table.sequence > sequence,
+                "failed admission invalidates old discovery"
+            );
+            if replace {
+                assert!(Arc::ptr_eq(table.entries.get(&key).unwrap(), &replacement));
+                assert!(replacement.result.lock().unwrap().is_none());
+                table.remove(&key, &replacement);
+            }
+            assert!(!table.entries.contains_key(&key));
+        }
+    }
+
+    #[test]
+    fn pending_start_intent_blocks_empty_discovery_before_durable_admission() {
+        let _serial = serial();
+        let (root, env, proof, sid) = fixture();
+        let command = Command::Enroll {
+            operation: "b".repeat(32),
+            revision: "c".repeat(64),
+            account: accounts_control::account_id("main"),
+        };
+        let key = (sid.clone(), "enroll", command.id().to_owned());
+        let job = Arc::new(Job {
+            command,
+            proof: proof.clone(),
+            started: std::time::Instant::now(),
+            intent_sequence: 0,
+            result: Mutex::new(None),
+        });
+        jobs().lock().unwrap().insert(key.clone(), Arc::clone(&job));
+        assert!(discovery(&env, &sid, &proof).unwrap().is_none());
+        let replacement = crate::self_claim::Proven {
+            start: "different-birth".into(),
+            ..proof.clone()
+        };
+        assert!(discovery(&env, &sid, &replacement).unwrap().is_some());
+        complete(&job, Err(()));
+        assert!(discovery(&env, &sid, &proof).unwrap().is_some());
+        assert!(
+            !env.state.exists(),
+            "discovery never creates account custody"
+        );
+        assert!(!root.path().join("home").exists());
+        jobs().lock().unwrap().remove(&key, &job);
+    }
+
+    #[test]
+    fn unstarted_reservation_removal_invalidates_discovery_without_erasing_a_replacement() {
+        let _serial = serial();
+        for replace in [false, true] {
+            let (_root, env, proof, sid) = fixture();
+            let command = Command::Enroll {
+                operation: "e".repeat(32),
+                revision: "c".repeat(64),
+                account: accounts_control::account_id("main"),
+            };
+            let key = (sid.clone(), "enroll", command.id().to_owned());
+            let make_job = || {
+                Arc::new(Job {
+                    command: command.clone(),
+                    proof: proof.clone(),
+                    started: std::time::Instant::now(),
+                    intent_sequence: 0,
+                    result: Mutex::new(None),
+                })
+            };
+            let job = make_job();
+            let lifetime = account_work::Lifetime::default();
+            let scope = lifetime.enter().unwrap();
+            let mut reservation = Reservation::new(key.clone());
+            {
+                let mut table = jobs().lock().unwrap();
+                reservation.arm(&job, &scope);
+                table.insert(key.clone(), Arc::clone(&job));
+            }
+            drop(scope);
+            let pause = lifetime
+                .pause()
+                .unwrap()
+                .try_wait()
+                .expect_err("reservation still owns admission");
+            assert!(discovery(&env, &sid, &proof).unwrap().is_none());
+            let replacement = replace.then(make_job);
+            if let Some(replacement) = &replacement {
+                jobs()
+                    .lock()
+                    .unwrap()
+                    .insert(key.clone(), Arc::clone(replacement));
+            }
+            let old = discovery_with(&env, &sid, &proof, || drop(reservation)).unwrap();
+            assert!(old.is_none());
+            assert!(pause.try_wait().is_ok());
+            if let Some(replacement) = replacement {
+                assert!(
+                    jobs()
+                        .lock()
+                        .unwrap()
+                        .entries
+                        .get(&key)
+                        .is_some_and(|current| Arc::ptr_eq(current, &replacement))
+                );
+                assert!(discovery(&env, &sid, &proof).unwrap().is_none());
+                jobs().lock().unwrap().remove(&key, &replacement);
+            } else {
+                assert!(!jobs().lock().unwrap().entries.contains_key(&key));
+                assert!(discovery(&env, &sid, &proof).unwrap().is_some());
+            }
+            assert!(!env.state.exists());
+        }
+    }
+
+    #[test]
+    fn removed_target_gets_a_durable_refusal_that_source_reversion_cannot_revive() {
+        let _serial = serial();
+        let (_root, env, proof, sid) = fixture();
+        let baseline = discovery(&env, &sid, &proof).unwrap().unwrap();
+        let path = env.accounts_roster_for(accounts::Cli::Codex).unwrap();
+        let original = std::fs::read_to_string(&path).unwrap();
+        let command = Command::Enroll {
+            operation: "e".repeat(32),
+            revision: baseline["revision"].as_str().unwrap().into(),
+            account: accounts_control::account_id("main"),
+        };
+        std::fs::write(&path, "").unwrap();
+        let lifetime = account_work::Lifetime::default();
+        let refused = run_in(&command, &sid, &proof, &lifetime, &env, |_, _| {
+            panic!("an unresolved opaque target has zero provider authority")
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(refused["phase"].as_str(), Some("refused"));
+        let store = env.accounts_store_for(accounts::Cli::Codex).unwrap();
+        let (logins, _) = store.load_logins(env.now).unwrap();
+        assert_eq!(
+            aterm_json::from_str::<Value>(&logins.to_json()).unwrap()["schema"].as_u64(),
+            Some(8)
+        );
+        assert!(
+            logins
+                .enrollment
+                .admitted(command.id(), &caller(&sid, &proof))
+                .is_err()
+        );
+        std::fs::write(&path, &original).unwrap();
+        for retained in [
+            command.clone(),
+            Command::Poll(command.id().into()),
+            Command::Cancel(command.id().into()),
+        ] {
+            assert_eq!(
+                run_in(&retained, &sid, &proof, &lifetime, &env, |_, _| panic!(
+                    "a refused ID cannot become a provider attempt"
+                ))
+                .unwrap()
+                .unwrap(),
+                refused
+            );
+        }
+        let fresh = discovery(&env, &sid, &proof).unwrap().unwrap();
+        let next = Command::Enroll {
+            operation: "f".repeat(32),
+            revision: fresh["revision"].as_str().unwrap().into(),
+            account: accounts_control::account_id("main"),
+        };
+        let provider = FailedProvider(Cell::new(0));
+        let running = run_in(&next, &sid, &proof, &lifetime, &env, |work, env| {
+            work.run_with_host(env, &provider)
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(running["phase"].as_str(), Some("running"));
+        assert_eq!(provider.0.get(), 1);
+        let cancelled = run_in(
+            &Command::Cancel(next.id().into()),
+            &sid,
+            &proof,
+            &lifetime,
+            &env,
+            |_, _| panic!("no provider replay"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(cancelled["phase"].as_str(), Some("cancelled"));
+    }
+
+    #[test]
+    fn completed_and_removed_start_cannot_hide_behind_an_old_empty_read() {
+        let _serial = serial();
+        let (_root, env, proof, sid) = fixture();
+        let baseline = discovery(&env, &sid, &proof).unwrap().unwrap();
+        let command = Command::Enroll {
+            operation: "d".repeat(32),
+            revision: baseline["revision"].as_str().unwrap().into(),
+            account: accounts_control::account_id("main"),
+        };
+        let key = (sid.clone(), "enroll", command.id().to_owned());
+        let job = Arc::new(Job {
+            command: command.clone(),
+            proof: proof.clone(),
+            started: std::time::Instant::now(),
+            intent_sequence: 0,
+            result: Mutex::new(None),
+        });
+        let lifetime = account_work::Lifetime::default();
+        let provider = FailedProvider(Cell::new(0));
+        let old = discovery_with(&env, &sid, &proof, || {
+            jobs().lock().unwrap().insert(key.clone(), Arc::clone(&job));
+            let result = run_in(&command, &sid, &proof, &lifetime, &env, |work, env| {
+                work.run_with_host(env, &provider)
+            });
+            assert!(result.is_ok());
+            complete(&job, result);
+            jobs().lock().unwrap().remove(&key, &job);
+        })
+        .unwrap();
+        assert!(
+            old.is_none(),
+            "completion and ACK removal cannot make the old empty image authoritative"
+        );
+        let fresh = discovery(&env, &sid, &proof).unwrap().unwrap();
+        assert_eq!(
+            fresh["operations"][0]["operation"].as_str(),
+            Some(command.id())
+        );
+        assert_eq!(provider.0.get(), 1);
+        let cancelled = run_in(
+            &Command::Cancel(command.id().to_owned()),
+            &sid,
+            &proof,
+            &lifetime,
+            &env,
+            |_, _| panic!("no provider replay"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(cancelled["phase"].as_str(), Some("cancelled"));
+    }
+
+    #[test]
+    fn protocol_and_caller_binding_do_not_accept_extra_authority() {
+        let operation = "a".repeat(32);
+        assert!(
+            parse(
+                &format!("enrollment-poll schema=1 operation={operation}"),
+                false
+            )
+            .is_some()
+        );
+        for bad in [
+            format!("enrollment-poll schema=2 operation={operation}"),
+            format!(
+                "enrollment-poll schema=1 operation={operation} account={}",
+                "b".repeat(64)
+            ),
+            format!("enrollment-poll schema=1 operation={}", "A".repeat(32)),
+            format!("enrollment-status schema=1 request={operation}"),
+        ] {
+            assert!(parse(&bad, false).is_none());
+        }
+        let proof = crate::self_claim::Proven {
+            pid: 42,
+            start: "first".into(),
+        };
+        let replacement = crate::self_claim::Proven {
+            start: "second".into(),
+            ..proof.clone()
+        };
+        assert_ne!(caller("sid", &proof), caller("sid", &replacement));
+        assert_ne!(caller("sid", &proof), caller("other", &proof));
+    }
+}

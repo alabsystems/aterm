@@ -550,27 +550,14 @@ fn describe_host_hardware(model_id: Option<&str>) -> String {
         .to_owned()
 }
 
-fn parse_device_info_txt(text: &str) -> (Option<String>, Option<u32>) {
-    let mut decoded = String::from(text);
-    for line in text.lines() {
-        if let Some((_, hex_part)) = line.split_once("bytes:") {
-            decoded.push(' ');
-            for tok in hex_part.split_whitespace().filter(|t| !t.starts_with('+')) {
-                if tok.len() == 2
-                    && let Ok(b) = u8::from_str_radix(tok, 16)
-                {
-                    if (0x21..=0x7e).contains(&b) {
-                        decoded.push(b as char);
-                    } else {
-                        decoded.push(' ');
-                    }
-                }
-            }
-        }
-    }
+/// The model and macOS major version a Mac's `_device-info._tcp` TXT record names (its
+/// `model=` and `osxvers=` strings, `strings` as [`crate::port::bonjour::txt_strings`] reads
+/// them).
+fn device_info(strings: &[Vec<u8>]) -> (Option<String>, Option<u32>) {
     let mut model = None;
     let mut osxvers = None;
-    for tok in decoded.split(|c: char| c.is_whitespace() || c == '\\') {
+    for string in strings {
+        let tok = String::from_utf8_lossy(string);
         if let Some(m) = tok.strip_prefix("model=") {
             let clean: String = m
                 .chars()
@@ -594,24 +581,42 @@ fn resolve_ipv4_and_ssh_banner(hostname: &str, port: u16) -> (Option<String>, Op
     (ipv4, banner)
 }
 
+/// How long [`resolve_ipv4_banner_and_rtt`] lets a name resolve: the system resolver's own
+/// wait for a `.local` name's mDNS answer (about five seconds), which the unbounded
+/// `getaddrinfo` this replaced waited for too. The connect and the banner keep their own
+/// [`BANNER_WITHIN`].
+const RESOLVE_WITHIN: Duration = Duration::from_secs(5);
+
+/// How long [`resolve_ipv4_banner_and_rtt`] gives the connect to a resolved address, and then
+/// its SSH banner: a Mac on this LAN answers within it.
+const BANNER_WITHIN: Duration = Duration::from_millis(120);
+
+/// `hostname`'s IPv4 address, the SSH banner on its `port` and the connect's round trip: the
+/// name resolved and the connection made through the root LAN broker on macOS
+/// (`aterm_uds::lan`), the name within [`RESOLVE_WITHIN`] and the connect and banner each within
+/// [`BANNER_WITHIN`]; whatever could not be learned (a resolve the broker could not make
+/// included) is `None`.
 fn resolve_ipv4_banner_and_rtt(
     hostname: &str,
     port: u16,
 ) -> (Option<String>, Option<String>, Option<u64>) {
-    use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-    let ipv4 = (hostname, port).to_socket_addrs().ok().and_then(|addrs| {
-        let v4s: Vec<std::net::Ipv4Addr> = addrs
-            .filter_map(|a| match a {
-                SocketAddr::V4(v4) => Some(*v4.ip()),
-                SocketAddr::V6(_) => None,
-            })
-            .collect();
-        v4s.iter()
-            .copied()
-            .find(|ip| !ip.is_loopback() && !ip.is_unspecified())
-            .or_else(|| v4s.first().copied())
-            .map(|ip| ip.to_string())
-    });
+    use std::net::{IpAddr, SocketAddr};
+    let ipv4 = aterm_uds::lan::resolve(hostname, RESOLVE_WITHIN)
+        .ok()
+        .and_then(|addrs| {
+            let v4s: Vec<std::net::Ipv4Addr> = addrs
+                .into_iter()
+                .filter_map(|a| match a {
+                    IpAddr::V4(v4) => Some(v4),
+                    IpAddr::V6(_) => None,
+                })
+                .collect();
+            v4s.iter()
+                .copied()
+                .find(|ip| !ip.is_loopback() && !ip.is_unspecified())
+                .or_else(|| v4s.first().copied())
+                .map(|ip| ip.to_string())
+        });
     let target_ip = ipv4
         .as_deref()
         .and_then(|ip| ip.parse::<std::net::Ipv4Addr>().ok());
@@ -619,12 +624,15 @@ fn resolve_ipv4_banner_and_rtt(
     let banner = target_ip.and_then(|ip| {
         let addr = SocketAddr::from((ip, port));
         let t0 = std::time::Instant::now();
-        let stream = TcpStream::connect_timeout(&addr, Duration::from_millis(120)).ok()?;
-        rtt_us = u64::try_from(t0.elapsed().as_micros().max(1)).ok();
-        read_ssh_banner(
-            &stream,
-            std::time::Instant::now() + Duration::from_millis(120),
+        let (stream, _) = aterm_uds::lan::connect(
+            &aterm_uds::lan::Target::Addr(addr),
+            port,
+            BANNER_WITHIN,
+            aterm_uds::lan::ConnectOptions::default(),
         )
+        .ok()?;
+        rtt_us = u64::try_from(t0.elapsed().as_micros().max(1)).ok();
+        read_ssh_banner(&stream, std::time::Instant::now() + BANNER_WITHIN)
     });
     (ipv4, banner, rtt_us)
 }
@@ -1153,13 +1161,12 @@ pub fn tabs(env: &Env<'_>, names: &[String], all: bool) -> ExitCode {
             super::discover::RFB_SERVICE,
         ];
         let browsed = ssh::fan_out(&services, services.len(), |svc| {
-            let cmd = crate::port::Cmd::new(super::discover::DNS_SD)
-                .args(["-B", svc, "local."])
-                .budget(Duration::from_millis(200))
-                .until_deadline();
             env.sys
-                .run(&cmd)
-                .map(|ran| super::discover::parse_browse(&ran.out(), svc))
+                .bonjour(
+                    &crate::port::Bonjour::Browse((*svc).to_owned()),
+                    Duration::from_millis(200),
+                )
+                .map(|heard| super::discover::instances(&heard, svc))
                 .unwrap_or_default()
         });
         let mut ssh_instances = browsed.first().cloned().unwrap_or_default();
@@ -1204,16 +1211,24 @@ pub fn tabs(env: &Env<'_>, names: &[String], all: bool) -> ExitCode {
                 Duration::from_millis(120),
             );
             let (dot_local, port) = resolved.first()?.clone();
-            let txt_q = format!("{}._device-info._tcp.local.", inst.name);
-            let txt_cmd = crate::port::Cmd::new(super::discover::DNS_SD)
-                .args(["-Q", &txt_q, "TXT"])
-                .budget(Duration::from_millis(120))
-                .until_deadline();
-            let (model_id, osxvers) = env
+            let txt = crate::port::Bonjour::Query {
+                name: format!("{}._device-info._tcp.local.", inst.name),
+                rrtype: 16,
+            };
+            let strings: Vec<Vec<u8>> = env
                 .sys
-                .run(&txt_cmd)
-                .map(|ran| parse_device_info_txt(&ran.out()))
-                .unwrap_or((None, None));
+                .bonjour(&txt, Duration::from_millis(120))
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|event| match event {
+                    aterm_uds::lan::Event::Record { rdata, added, .. } if *added => {
+                        Some(crate::port::bonjour::txt_strings(rdata))
+                    }
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            let (model_id, osxvers) = device_info(&strings);
             let (ipv4, ssh_banner, rtt_us) = resolve_ipv4_banner_and_rtt(&dot_local, port);
             let vitals = ssh_banner.is_some().then(|| crate::protocol::HostVitals {
                 rtt_us,
@@ -1469,24 +1484,10 @@ impl HelloError {
         matches!(self, Self::Ssh(f) if f.unreachable())
     }
 
-    const fn blames_nothing_on_the_lan(&self) -> bool {
-        matches!(
-            self,
-            Self::Ssh(ssh::Failure::NoRoute | ssh::Failure::Unresolved) | Self::Run(_)
-        )
-    }
-
     fn why(&self) -> String {
         match self {
             Self::Ssh(f) => f.why(),
             Self::Run(why) | Self::Answer(why) => why.clone(),
-        }
-    }
-
-    fn why_alone(&self, host: &Host) -> String {
-        match self {
-            Self::Ssh(f) => f.why_alone(&host.address),
-            other => other.why(),
         }
     }
 }
@@ -1610,7 +1611,7 @@ pub fn plan_or_apply_only(
     };
 
     let reached = hello_sweep(env, &hosts, parallel);
-    if let Some(stop) = local_network_wall(&reached) {
+    if let Some(stop) = broker_wall(&reached) {
         errln!("{stop}");
         return ExitCode::FAILURE;
     }
@@ -1870,15 +1871,16 @@ fn ask_hello(env: &Env<'_>, host: &Host) -> Result<Hello, HelloError> {
     Ok(hello)
 }
 
-fn local_network_wall(reached: &[Reached<'_>]) -> Option<&'static str> {
-    let no_route = reached.iter().any(|r| {
-        matches!(&r.hello, Err(HelloError::Ssh(ssh::Failure::NoRoute)))
-            && ssh::is_local_address(&r.host.address)
+/// The one line a sweep stops on where no host answered and the LAN broker, which makes every
+/// LAN connection of the controller's `ssh`, could not make one ([`ssh::Failure::Broker`]): the
+/// broker's own words stand for every host, which says nothing of them.
+fn broker_wall(reached: &[Reached<'_>]) -> Option<String> {
+    let none_reached = reached.iter().all(|r| r.hello.is_err());
+    let broker = reached.iter().find_map(|r| match &r.hello {
+        Err(HelloError::Ssh(ssh::Failure::Broker(line))) => Some(format!("controller: {line}")),
+        _ => None,
     });
-    let none_reached = reached
-        .iter()
-        .all(|r| matches!(&r.hello, Err(why) if why.blames_nothing_on_the_lan()));
-    (no_route && none_reached).then_some(ssh::LOCAL_NETWORK_ROW)
+    broker.filter(|_| none_reached)
 }
 
 const ONLY_SENT_KEPT: usize = 8;
@@ -2675,7 +2677,7 @@ pub fn attach(env: &Env<'_>, name: &str, run: Option<&str>) -> ExitCode {
             errln!(
                 "aterm machines attach: {}: {}",
                 host.name,
-                shown(&why.why_alone(host))
+                shown(&why.why())
             );
             return if why.unreachable() {
                 ExitCode::from(2)
@@ -2760,7 +2762,7 @@ pub fn run(
     };
     let parallel = parallel(env, &inv);
     let reached = hello_sweep(env, &hosts, parallel);
-    if let Some(stop) = local_network_wall(&reached) {
+    if let Some(stop) = broker_wall(&reached) {
         errln!("{stop}");
         return ExitCode::FAILURE;
     }
@@ -3191,7 +3193,7 @@ pub fn walk(
         let (steps, waiting) = walk_steps(&report, host, at_console, step)?;
         let reached = reach_one(env, host);
         let host: &Host = &reached.host;
-        let hello = reached.hello.map_err(|e| e.why_alone(host))?;
+        let hello = reached.hello.map_err(|e| e.why())?;
         let remote = LiveRemote {
             env,
             host,
@@ -3557,7 +3559,7 @@ pub fn rekey(
     let mut targets = Vec::new();
     let mut bodies = Vec::new();
     let reached = hello_sweep(env, &hosts, parallel);
-    if let Some(stop) = local_network_wall(&reached) {
+    if let Some(stop) = broker_wall(&reached) {
         errln!("{stop}");
         return ExitCode::FAILURE;
     }
@@ -4243,10 +4245,7 @@ mod tests {
                     .as_str()
             )
         );
-        assert!(
-            !out.contains("removable media") && !out.contains("Local Network"),
-            "{out}"
-        );
+        assert!(!out.contains("removable media"), "{out}");
         let before = sys.calls().len();
         assert_eq!(init(&env(&sys), false, &mut Vec::new()), ExitCode::SUCCESS);
         assert!(
@@ -4538,11 +4537,15 @@ mod tests {
         );
     }
 
+    /// Where no host answered and the LAN broker made no connection, the sweep stops on the
+    /// broker's words, once; a host that answered, or failures that are the hosts' own, keep
+    /// the per-host rows. NEGATIVE CONTROL: a wall on any broker failure stops a sweep a host
+    /// answered.
     #[test]
-    fn the_local_network_line_stands_for_the_hosts_only_when_none_answered() {
+    fn the_broker_line_stands_for_the_hosts_only_when_none_answered() {
         let (a, b) = (lab(1, UUID_1), lab(2, UUID_2));
         let reached = |ha: Result<Hello, HelloError>, hb: Result<Hello, HelloError>| {
-            local_network_wall(&[
+            broker_wall(&[
                 Reached {
                     host: Cow::Borrowed(&a),
                     hello: ha,
@@ -4553,33 +4556,26 @@ mod tests {
                 },
             ])
         };
-        let no_route = || Err(HelloError::Ssh(ssh::Failure::NoRoute));
-        assert_eq!(reached(Ok(hello_of(&a)), no_route()), None);
+        let said = format!(
+            "{}{}",
+            super::super::lan_proxy::BROKER_SAID,
+            aterm_uds::lan::Unavailable::NotInstalled
+        );
+        let broker = || Err(HelloError::Ssh(ssh::Failure::Broker(said.clone())));
+        assert_eq!(reached(Ok(hello_of(&a)), broker()), None);
         assert_eq!(
-            reached(no_route(), no_route()),
-            Some(ssh::LOCAL_NETWORK_ROW)
+            reached(broker(), broker()),
+            Some(format!("controller: {said}"))
         );
         assert_eq!(
-            reached(no_route(), Err(HelloError::Ssh(ssh::Failure::Refused))),
-            None
+            reached(broker(), Err(HelloError::Ssh(ssh::Failure::Refused))),
+            Some(format!("controller: {said}"))
         );
         assert_eq!(
-            reached(no_route(), Err(HelloError::Ssh(ssh::Failure::TimedOut))),
-            None
-        );
-        assert_eq!(
-            reached(no_route(), Err(HelloError::Ssh(ssh::Failure::Unresolved))),
-            Some(ssh::LOCAL_NETWORK_ROW)
-        );
-        let far = Host {
-            address: "8.8.8.8".into(),
-            ..lab(3, UUID_1)
-        };
-        assert_eq!(
-            local_network_wall(&[Reached {
-                host: Cow::Borrowed(&far),
-                hello: no_route()
-            }]),
+            reached(
+                Err(HelloError::Ssh(ssh::Failure::NoRoute)),
+                Err(HelloError::Ssh(ssh::Failure::TimedOut))
+            ),
             None
         );
     }
@@ -6912,9 +6908,14 @@ mod tests {
         server.join().unwrap();
         assert_eq!(opened.as_deref(), explicit_sock.to_str());
         assert_eq!(
-            parse_device_info_txt("bytes: 6d 6f 64 65 6c 3d 4d +a 61 63"),
-            (Some("Mac".to_owned()), None)
+            device_info(&[
+                b"model=Mac16,1".to_vec(),
+                b"osxvers=26".to_vec(),
+                b"x".to_vec()
+            ]),
+            (Some("Mac16,1".to_owned()), Some(26))
         );
+        assert_eq!(device_info(&[b"model=".to_vec()]), (None, None));
     }
 
     /// A window name a host reports reaches the owner's terminal escaped, as the supervisor

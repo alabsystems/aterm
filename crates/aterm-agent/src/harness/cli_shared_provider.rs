@@ -16,6 +16,10 @@ pub use claude::{ClaudeProfile, read_claude_profile};
 #[path = "cli_shared_kimi.rs"]
 mod kimi;
 pub use kimi::KimiOauth;
+#[cfg(unix)]
+pub use kimi::RefreshAuthority as KimiRefreshAuthority;
+#[cfg(unix)]
+pub use kimi::RefreshRecoveryContext as KimiRecoveryContext;
 #[cfg(all(unix, not(test)))]
 pub(in crate::harness) use kimi::verify_or_refresh as verify_or_refresh_kimi;
 #[cfg(unix)]
@@ -420,6 +424,9 @@ impl CodexOauth {
 fn codex_execution(outcome: super::super::login_drive::Outcome) -> Execution {
     match outcome {
         super::super::login_drive::Outcome::SignedIn { .. } => Execution::Completed,
+        super::super::login_drive::Outcome::CompletedHeld => {
+            Execution::Deferred("completed native login retained without publication".into())
+        }
         super::super::login_drive::Outcome::NotRun(why) => Execution::NotStarted(why),
         super::super::login_drive::Outcome::PageNotOpened(why)
         | super::super::login_drive::Outcome::Unverified(why) => Execution::Unknown(why),

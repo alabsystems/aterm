@@ -48,6 +48,16 @@ struct Pool {
     env: Env,
     old: PathBuf,
     new: PathBuf,
+    laid: std::cell::RefCell<Option<LaidRecords>>,
+}
+
+/// The records as the last [`Pool::lay`]'s commit left them, for laying that world again. One slot:
+/// another world, or another `now`, commits for itself.
+struct LaidRecords {
+    world: LawWorld,
+    now: i64,
+    state: Vec<u8>,
+    logins: Vec<u8>,
 }
 
 impl Pool {
@@ -100,6 +110,7 @@ impl Pool {
             env,
             old,
             new,
+            laid: std::cell::RefCell::default(),
         }
     }
 
@@ -2695,7 +2706,7 @@ impl AccountsHost for LawHost {
 }
 
 /// One cell of the law's matrix. `work: None` is a roster of `main` alone.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LawWorld {
     main: LawLogin,
     work: Option<LawLogin>,
@@ -2804,7 +2815,10 @@ fn law_forbidden(
 }
 
 impl Pool {
-    /// The pool's roster, login files, `aterm.toml` and records as `world` has them.
+    /// The pool's roster, login files, `aterm.toml` and records as `world` has them. A commit lays
+    /// the records of a world the pool did not just lay. Laying that world again puts back what
+    /// that commit left, whatever a step has made of them since; a step leaves no receipt pending,
+    /// since none of these worlds fails a publication.
     fn lay(&self, world: &LawWorld) {
         let (cli, now) = (self.cli, self.env.now);
         let store_file = cli.connector().stores.first().copied().unwrap_or("login");
@@ -2868,9 +2882,17 @@ impl Pool {
             LawRotation::Warned => "[harness]\nno_such_key = true\n",
             LawRotation::LoginsOff => "[harness]\nlogins = \"off\"\n",
         });
-        self.env
-            .accounts_store_for(cli)
-            .expect("a store")
+        let store = self.env.accounts_store_for(cli).expect("a store");
+        let mut laid = self.laid.borrow_mut();
+        if let Some(laid) = laid
+            .as_ref()
+            .filter(|laid| laid.world == *world && laid.now == now)
+        {
+            std::fs::write(store.state_file(), &laid.state).expect("the state");
+            std::fs::write(store.logins_file(), &laid.logins).expect("the logins");
+            return;
+        }
+        store
             .transact_logins(now, &mut None, |state, logins| {
                 *state = accounts::State::default();
                 logins.labels.clear();
@@ -2943,6 +2965,15 @@ impl Pool {
                 Ok(Vec::new())
             })
             .expect("the records");
+        *laid = Some(LaidRecords {
+            world: *world,
+            now,
+            state: std::fs::read(store.state_file()).expect("the state"),
+            // A commit that changed no logins writes none, and a step may write some since: the
+            // empty logins read as that absent file does.
+            logins: std::fs::read(store.logins_file())
+                .unwrap_or_else(|_| (accounts::Logins::default().to_json() + "\n").into_bytes()),
+        });
     }
 
     /// The report's `next`, in structured values, as the JSON command says it.
@@ -3700,6 +3731,90 @@ fn law_share(build: LawBuild, share: &[LawWorld]) -> (usize, Vec<(String, String
     (share.len(), wrong)
 }
 
+/// A WORLD LAID AGAIN IS THE ONE ITS COMMIT LEFT, whatever a step made of the records since, and
+/// another world is never laid from it.
+///
+/// NEGATIVE CONTROL (2026-11-05): with the slot keyed on `main` alone this fails at "another world
+/// took this one's records", and so does the launch law, with 2 disagreements. With the state not
+/// put back it fails at the bytes compared after the second lay, and the step law with 7 wrong in 4
+/// classes; the launch law, which judges agreement on the records as they stand, passes that one.
+/// With the logins not put back it fails at the records compared after the second lay.
+#[test]
+fn a_world_laid_again_is_the_one_its_commit_left() {
+    let pool = Pool::new("lay-again");
+    let now = pool.env.now;
+    let store = pool.env.accounts_store_for(pool.cli).expect("a store");
+    let world = LawWorld {
+        main: LawLogin::SignedOut,
+        work: Some(LawLogin::Usable),
+        hold: LawHold::None,
+        claim: LawClaim::None,
+        rotation: LawRotation::On,
+    };
+    // A fresh pool's first commit has no logins to write, and the step below does.
+    pool.lay(&world);
+    assert!(!store.logins_file().exists());
+    let as_laid = (
+        store.load(now).expect("state").0,
+        store.load_logins(now).expect("logins").0,
+    );
+    let state = std::fs::read(store.state_file()).expect("state");
+    let step = || {
+        store
+            .transact_logins(now, &mut None, |state, logins| {
+                state.active = Some("work".into());
+                state.proven = true;
+                state.pinned = true;
+                logins.labels.insert(
+                    "work".to_string(),
+                    accounts::Binding {
+                        was: vec![None],
+                        ..accounts::Binding::default()
+                    },
+                );
+                Ok(Vec::new())
+            })
+            .expect("the step");
+    };
+    step();
+    assert_ne!(std::fs::read(store.state_file()).expect("state"), state);
+    assert!(store.logins_file().exists());
+    pool.lay(&world);
+    assert_eq!(std::fs::read(store.state_file()).expect("state"), state);
+    assert_eq!(
+        (
+            store.load(now).expect("state").0,
+            store.load_logins(now).expect("logins").0,
+        ),
+        as_laid
+    );
+    // With logins of its own, as each later world of a pool has.
+    let world = LawWorld {
+        work: Some(LawLogin::Displaced),
+        hold: LawHold::Pin("main"),
+        ..world
+    };
+    pool.lay(&world);
+    let images = || {
+        (
+            std::fs::read(store.state_file()).expect("state"),
+            std::fs::read(store.logins_file()).expect("logins"),
+        )
+    };
+    let laid = images();
+    step();
+    assert_ne!(images(), laid);
+    pool.lay(&world);
+    assert_eq!(images(), laid);
+    let other = LawWorld {
+        hold: LawHold::None,
+        ..world
+    };
+    pool.lay(&other);
+    assert_ne!(images().0, laid.0, "another world took this one's records");
+    assert!(!store.load(now).expect("state").0.pinned);
+}
+
 /// THE SURFACES THAT SAY WHAT A LAUNCH DOES SAY THE SAME, AND NO LAUNCH DOES WHAT IT MUST REFUSE:
 /// across Codex (a build that keeps `CODEX_AUTH_PATH`'s login, one that does not, none there), Grok
 /// Build and Kimi Code CLI (there and not), the report's `next`, what `accounts use` decides,
@@ -4377,6 +4492,8 @@ fn a_renewal_with_no_email_names_a_step_that_keeps_the_roster_admitted() {
         accounts: Vec::new(),
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),
+        #[cfg(unix)]
+        machine_name: None,
         places: Default::default(),
     };
     let err = crate::harness::alab_roster::with_lab(lab, || renew(&no_twin));

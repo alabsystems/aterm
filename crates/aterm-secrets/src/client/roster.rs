@@ -20,46 +20,39 @@ fn base_swarm_roster(paths: &Paths) -> crate::Result<Option<SwarmRoster>> {
     let Some(lock) = StateLock::observe(paths)? else {
         return Ok(None);
     };
-    base_swarm_roster_for(paths, &lock)
+    base_swarm_roster_for(&Reads::new(paths), &lock)
 }
 
-fn base_swarm_roster_for(paths: &Paths, _lock: &StateLock) -> crate::Result<Option<SwarmRoster>> {
-    let Some(expected) = config(paths)? else {
+fn base_swarm_roster_for(
+    reads: &Reads<'_>,
+    _lock: &StateLock,
+) -> crate::Result<Option<SwarmRoster>> {
+    let Some(expected) = reads.config()? else {
         return Ok(None);
     };
     if expected.signer.is_none() {
         return Ok(None);
     }
-    let state = load_state(paths)?;
-    let log_only_bound = state.digest.is_none()
-        && fsx::kind(&paths.cache_file())? == fsx::Kind::Missing
-        && state.source_identity == Some(source_identity(&expected));
-    let cached = if source_bound(&expected, &state) {
-        read_held_copy(paths, &expected, &state)?
-    } else {
-        None
-    };
+    let state = reads.state()?;
+    let log_only_bound = log_only_bound(reads, expected, state)?;
+    let cached = envelope_held(reads, expected, state)?;
     let envelope_bound = cached.is_some();
     if state.membership == Stored::In
         && !state.failed
         && state.pending.is_empty()
-        && pin_admitted(&expected, None)
+        && pin_admitted(expected, None)
         && (log_only_bound || envelope_bound)
-        && let Some(identity) = read_identity(paths)?
+        && let Some(identity) = reads.identity()?
     {
-        if let Some(cached_bytes) = &cached {
-            let env = envelope::parse(cached_bytes)?;
-            let seeded = log_entries::trusted_seeded_log(paths, &expected, &env)?;
-            if !log_entries::applied_log_available(
-                &state,
-                seeded.as_ref().map(|(_, digest)| *digest),
-            ) {
+        if let Some(env) = cached {
+            let seeded = log_entries::seeded_under(reads, expected, &env.signer, &env.handoff)?;
+            if !log_entries::applied_log_available(state, seeded.as_ref().map(HeldLog::digest)) {
                 return Ok(None);
             }
             if let Ok((read, log_digest)) = log_entries::roster_with_log(
-                seeded.as_ref().map(|(log, digest)| (log, *digest)),
-                &env,
-                &identity,
+                seeded.as_ref().map(|held| (held.log(), held.digest())),
+                env,
+                identity,
             ) {
                 let visible = read.visible;
                 if let Some(roster) = read.into_roster()? {
@@ -70,20 +63,46 @@ fn base_swarm_roster_for(paths: &Paths, _lock: &StateLock) -> crate::Result<Opti
                 }
             }
         }
-        if let Some(log) = log_entries::trusted_local_log(paths, &expected)?
-            && !log.recipient_is_removed(&identity.recipient())
-            && !log_entries::recipient_denied_by_roster_or_log(None, &log, &identity.recipient())
-            && !log.audience_left_out_recipient(
+        if let Some(held) = log_entries::local_log_under(reads, expected)?
+            && !held.log().recipient_is_removed(&identity.recipient())
+            && !log_entries::recipient_denied_by_roster_or_log(
+                None,
+                held.log(),
+                &identity.recipient(),
+            )
+            && !held.log().audience_left_out_recipient(
                 &crate::membership_log::EpochAudience::Everyone,
                 &identity.recipient(),
             )
-            && log.wraps_to(&identity.recipient())
-            && let Some(roster) = log_entries::roster_from_log(&log, &identity)?.into_roster()?
+            && held.log().wraps_to(&identity.recipient())
+            && let Some(roster) =
+                log_entries::roster_from_log(held.log(), identity)?.into_roster()?
         {
             return Ok(Some(roster));
         }
     }
     Ok(None)
+}
+
+/// Whether `state` applied no version of `expected` and the vault file is absent: the log alone
+/// binds this Mac to its source.
+fn log_only_bound(reads: &Reads<'_>, expected: &Config, state: &State) -> crate::Result<bool> {
+    Ok(state.digest.is_none()
+        && fsx::kind(&reads.paths().cache_file())? == fsx::Kind::Missing
+        && state.source_identity == Some(source_identity(expected)))
+}
+
+/// The vault's envelope, where `state` holds this Mac in the vault under `expected` and it is the
+/// version `state` applied.
+fn envelope_held<'r>(
+    reads: &'r Reads<'_>,
+    expected: &Config,
+    state: &State,
+) -> crate::Result<Option<&'r crate::envelope::Envelope>> {
+    if state.membership != Stored::In || !source_bound(expected, state) {
+        return Ok(None);
+    }
+    reads.verified_under(expected, state)
 }
 
 /// Read authenticated roster evidence without granting a current membership view.
@@ -107,7 +126,11 @@ fn base_denial_roster(reads: &Reads<'_>) -> crate::Result<Option<SwarmRoster>> {
 /// Local state or the verified cache cannot be read safely, or the roster is malformed.
 #[cfg(any(test, debug_assertions))]
 pub fn test_unwaited_roster(paths: &Paths) -> crate::Result<Option<SwarmRoster>> {
-    swarm_roster_with(paths, || {}, || {})
+    with_roster_observation(paths, |observation| match observation {
+        RosterObservation::Held(lock) => swarm_roster_held(paths, lock),
+        RosterObservation::Standalone => Ok(None),
+    })
+    .map(Option::flatten)
 }
 
 pub(crate) enum RosterObservation<'a> {
@@ -129,8 +152,7 @@ pub(crate) fn with_roster_observation<T>(
     paths: &Paths,
     read: impl FnOnce(RosterObservation<'_>) -> crate::Result<T>,
 ) -> crate::Result<Option<T>> {
-    StateLock::narrow_owned(paths)?;
-    match StateLock::observe_classified(paths)? {
+    match StateLock::observe_narrowed(paths)? {
         StateObservation::Held(lock) => read(RosterObservation::Held(&lock)).map(Some),
         StateObservation::Busy => Ok(None),
         StateObservation::Absent => {
@@ -147,27 +169,18 @@ pub(crate) fn with_roster_observation<T>(
     }
 }
 
-#[cfg(any(test, debug_assertions))]
-fn swarm_roster_with(
-    paths: &Paths,
-    after_config: impl FnOnce(),
-    after_base: impl FnOnce(),
-) -> crate::Result<Option<SwarmRoster>> {
-    with_roster_observation(paths, |observation| match observation {
-        RosterObservation::Held(lock) => {
-            swarm_roster_held_with(paths, lock, after_config, after_base)
-        }
-        RosterObservation::Standalone => Ok(None),
-    })
-    .map(Option::flatten)
-}
-
 /// Read while the caller retains the state lock for this vault, shared or exclusive.
 pub(super) fn swarm_roster_held(
     paths: &Paths,
     lock: &StateLock,
 ) -> crate::Result<Option<SwarmRoster>> {
-    swarm_roster_held_with(paths, lock, || {}, || {})
+    // One read of the vault under the caller's lock: no writer moves these files until it drops.
+    let reads = Reads::new(paths);
+    let Some(expected) = reads.config()? else {
+        return Ok(None);
+    };
+    let base = base_swarm_roster_for(&reads, lock)?;
+    swarm_roster_with_base(&reads, expected, base)
 }
 
 /// Authenticated denial evidence remains readable when a positive snapshot is unavailable.
@@ -186,21 +199,6 @@ pub(super) fn swarm_roster_for_denial(paths: &Paths) -> crate::Result<Option<Swa
     .and_then(|observed| {
         observed.ok_or_else(|| Error::new("the vault is unavailable while reading denial evidence"))
     })
-}
-
-fn swarm_roster_held_with(
-    paths: &Paths,
-    lock: &StateLock,
-    after_config: impl FnOnce(),
-    after_base: impl FnOnce(),
-) -> crate::Result<Option<SwarmRoster>> {
-    let Some(expected) = config(paths)? else {
-        return Ok(None);
-    };
-    after_config();
-    let base = base_swarm_roster_for(paths, lock)?;
-    after_base();
-    swarm_roster_with_base(paths, &expected, base)
 }
 
 /// An authenticated negative-only snapshot, including membership removals and
@@ -267,37 +265,37 @@ fn roster_under_evidence(mut roster: SwarmRoster, evidence: Option<&Log>) -> Swa
 }
 
 fn swarm_roster_with_base(
-    paths: &Paths,
+    reads: &Reads<'_>,
     expected: &Config,
     base: Option<SwarmRoster>,
 ) -> crate::Result<Option<SwarmRoster>> {
-    let evidence = log_entries::trusted_local_log(paths, expected)?;
+    let evidence = log_entries::local_log_under(reads, expected)?;
     if let Some(roster) = base {
-        return Ok(Some(roster_under_evidence(roster, evidence.as_ref())));
+        return Ok(Some(roster_under_evidence(
+            roster,
+            evidence.as_ref().map(HeldLog::log),
+        )));
     }
-    let state = load_state(paths)?;
-    let log_only_bound = state.digest.is_none()
-        && fsx::kind(&paths.cache_file())? == fsx::Kind::Missing
-        && state.source_identity == Some(source_identity(expected));
-    let envelope_bound =
-        source_bound(expected, &state) && read_held_copy(paths, expected, &state)?.is_some();
+    let state = reads.state()?;
+    let log_only_bound = log_only_bound(reads, expected, state)?;
+    let envelope_bound = envelope_held(reads, expected, state)?.is_some();
     if state.membership == Stored::In
         && !state.failed
         && state.pending.is_empty()
         && pin_admitted(expected, None)
         && (log_only_bound || envelope_bound)
-        && let Some(identity) = read_identity(paths)?
-        && let Some(log) = log_entries::trusted_local_log(paths, expected)?
-        && !log.recipient_is_removed(&identity.recipient())
-        && !log_entries::recipient_denied_by_roster_or_log(None, &log, &identity.recipient())
-        && !log.audience_left_out_recipient(
+        && let Some(identity) = reads.identity()?
+        && let Some(held) = &evidence
+        && !held.log().recipient_is_removed(&identity.recipient())
+        && !log_entries::recipient_denied_by_roster_or_log(None, held.log(), &identity.recipient())
+        && !held.log().audience_left_out_recipient(
             &crate::membership_log::EpochAudience::Everyone,
             &identity.recipient(),
         )
-        && log.wraps_to(&identity.recipient())
+        && held.log().wraps_to(&identity.recipient())
     {
         let mut roster = SwarmRoster::default();
-        overlay_log_membership(&log, Some(&identity.recipient()), &mut roster);
+        overlay_log_membership(held.log(), Some(&identity.recipient()), &mut roster);
         if !roster.members.is_empty()
             || !roster.deny_labels.is_empty()
             || !roster.deny_nodes.is_empty()
@@ -1609,8 +1607,18 @@ mod tests {
         macs.server.stop();
     }
 
+    /// A roster read holds the state lock from before its one `Reads` to after it, so no writer
+    /// moves the source under it, and what it reads carries the log's removal over an older entry.
+    /// No source moves here: the lock excludes that, and the reader the hold is watched on is
+    /// [`with_roster_observation`]. Until 2026-11-05 this was
+    /// `a_source_move_during_a_roster_read_cannot_lose_log_removals`, whose firing with a writer
+    /// planted at each cut `docs/measured/authorization-read-integration-2026-11-03.md` records.
+    ///
+    /// NEGATIVE CONTROLS (2026-11-05): with the `Held` arm of [`with_roster_observation`] releasing
+    /// its lock, or with `file.try_lock_shared()` gone from `StateLock::classify`, it fails at
+    /// "a writer took the state lock under a roster read".
     #[test]
-    fn a_source_move_during_a_roster_read_cannot_lose_log_removals() {
+    fn a_roster_read_keeps_a_writer_out_and_its_overlay_keeps_a_log_removal() {
         let macs = super::super::log_entries_tests::two_macs(&[]);
         let paths = &macs.m22;
         let before = admin_seed_swarm_roster(paths, &[]).unwrap();
@@ -1640,59 +1648,18 @@ mod tests {
             .unwrap()
         )));
 
-        let mut exposed = Vec::new();
-        for after_base in [false, true] {
-            let move_source = || {
-                let Some(_writer) = StateLock::try_take(paths).unwrap() else {
-                    return;
-                };
-                let mut next = config(paths).unwrap().unwrap();
-                next.source = Source::Path(
-                    macs.root
-                        .path()
-                        .join(if after_base {
-                            "after-base"
-                        } else {
-                            "after-config"
-                        })
-                        .join("alab.vault"),
-                );
-                let mut state = load_state(paths).unwrap();
-                state.source_identity = Some(source_identity(&next));
-                save_state(paths, &state).unwrap();
-                save_config(paths, &next).unwrap();
-            };
-            let raced = swarm_roster_with(
-                paths,
-                || {
-                    if !after_base {
-                        move_source();
-                    }
-                },
-                || {
-                    if after_base {
-                        move_source();
-                    }
-                },
-            )
-            .unwrap();
-            if !safe(raced.as_ref()) {
-                exposed.push(after_base);
-            }
-            assert!(safe(Some(
-                &swarm_roster_until(
-                    paths,
-                    std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN
-                )
-                .unwrap()
-                .unwrap()
-            )));
-        }
+        let read = with_roster_observation(paths, |observation| {
+            let lock = observation
+                .state_lock()
+                .expect("a vault's read holds its lock");
+            assert!(
+                StateLock::try_take(paths).unwrap().is_none(),
+                "a writer took the state lock under a roster read"
+            );
+            swarm_roster_held(paths, lock)
+        });
+        assert!(safe(read.unwrap().unwrap().as_ref()));
         macs.server.stop();
-        assert!(
-            exposed.is_empty(),
-            "source move lost the log overlay: {exposed:?}"
-        );
     }
 
     #[test]

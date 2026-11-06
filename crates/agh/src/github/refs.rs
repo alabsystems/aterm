@@ -23,6 +23,7 @@ use crate::wire::Method;
 use crate::write::{Deleted, Effect, Ensured, Outcome, WriteOp};
 
 mod atomic;
+mod native;
 pub(crate) use atomic::ATOMIC_KEY;
 pub(crate) use atomic::AtomicRefWrite;
 pub use atomic::{AtomicRefBatch, RefUpdate};

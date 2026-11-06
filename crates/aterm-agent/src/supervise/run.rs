@@ -951,7 +951,8 @@ const FRAME_REREADS: u32 = 8;
 const WRITING_CAP: Duration = Duration::from_secs(3);
 /// Duration an unvouched idle read must persist before being treated as a point.
 const NO_EVIDENCE_HOLD: Duration = Duration::from_secs(1);
-/// Hang-detector cap for an idle read held while the program's window title still reports a running turn.
+/// Hang detector for an idle read held while the program's window title still reports a running
+/// turn: a minute of its reply unchanged, not a latency budget.
 const TITLE_HOLD: Duration = Duration::from_secs(60);
 /// Hang detector for a read held while the agent has drawn nothing of its own
 /// ([`Session::first_frame_owed`]): a minute of unmoved screen, not a latency budget, since a
@@ -1836,10 +1837,15 @@ struct Looking {
     face_owed: bool,
 }
 
+/// What the reads of a turn saw, kept by the looks that end before it is judged
+/// ([`Looking::moved`]).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct Saw {
     busy: bool,
     live: bool,
+    /// A read saw the turn run: a busy read, output still arriving, or an idle read held under
+    /// the program's running title.
+    ran: bool,
 }
 
 struct BoxAsk {
@@ -1974,6 +1980,12 @@ struct Episode {
     message: String,
 }
 
+/// THE TURN THAT RESUMED PAST A LIMIT EPISODE `seq` CLOSED ([`Session::limit_on_busy`], or an Off
+/// park's start, `Session::lower_badges`): the wall again within that turn is the same episode
+/// ([`Session::open_episode`]). It lasts as long as that turn: an unattended read of a point of
+/// another phase than the limit's (an Off park's included), or a settled break of the agent's
+/// background work the turn ends at ([`Session::limit_at_break`]), ends it, so a wall after
+/// either opens an episode of its own; so does a relaunch under another account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Retry {
     seq: u64,
@@ -3353,6 +3365,7 @@ impl<'a, C: Ctl> Session<'a, C> {
         self.watch_sleep();
         let r = r.map_err(Fail::Hard)?;
         self.note_status(args, &r);
+        self.cruise_carry.wrote(args, &r);
         if claim::is_input(args) && !(r.is_err("halted") || r.is_err("busy") || r.is_err("rate")) {
             self.refusal_said = None;
         }
@@ -4300,11 +4313,15 @@ impl<'a, C: Ctl> Session<'a, C> {
         };
         let mut background_since: Option<Instant> = None;
         let mut footer_seen = false;
-        let mut title_held: Option<Instant> = None;
-        // A read in this wait saw the turn run: a busy read, output still arriving, or the
-        // program's title running.
-        let mut ran = false;
-        // A title read since found the program at rest, no busy read after it.
+        // An idle read held under a running title: what its reply said
+        // ([`ScreenReader::said_tail`]), and since when it has said it. A reply still drawing
+        // restarts it; a status line or a footer timer moving under the same reply does not, so
+        // [`TITLE_HOLD`] of the reply unchanged ends the hold.
+        let mut title_held: Option<(Option<String>, Instant)> = None;
+        // A read of this turn saw it run (`saw.ran`). A wait taken up again keeps the run an
+        // earlier wait saw: `saw` lasts until a look judges the turn, past a lost connection and
+        // past a look the usage panel, an Off park or a reset ended. A title read since found the
+        // program at rest, no busy read after it.
         let mut title_rested = false;
         let mut unvouched_since: Option<Instant> = None;
         // The last read held as still starting (its seq), and since when ([`FIRST_FRAME_HANG`]).
@@ -4466,39 +4483,42 @@ impl<'a, C: Ctl> Session<'a, C> {
                 // line Claude Code draws its reply with no busy sign (no `esc to interrupt`, its
                 // spinner row gone once the reply's first line is drawn), and Muse Code shows its
                 // last reply before its run ends. A read under a running title is held and read
-                // again after the short settle. Once this wait saw the turn run, an end decides
-                // only where a title read earlier in it had already rested: Claude Code rests its
-                // title about 23 ms before the frame that draws the reply's last line, so a screen
-                // read just before that flip under a title read just after it is a reply short of
-                // its last line. An end the program drew (Claude Code's done row, which comes with
-                // that last line or after it), a wall, and an end the transcript told decide as
-                // read: the title also runs while the agent's background agents or workflows do,
-                // its turn over.
+                // again after the short settle. Once a read of the turn saw it run, an end
+                // decides only where a title read earlier in this wait had already rested: Claude
+                // Code rests its title about 23 ms before the frame that draws the reply's last
+                // line, so a screen read just before that flip under a title read just after it is
+                // a reply short of its last line. An end the program drew (Claude Code's done row,
+                // which comes with that last line or after it), a wall, and an end the transcript
+                // told decide as read: the title also runs while the agent's background agents or
+                // workflows do, its turn over.
                 if matches!(phase, Phase::Idle | Phase::Question)
                     && !transcript_idle
                     && !reader.end_drawn(&screen.rows)
                     && reader.wall(&screen.rows).is_none()
                     && self.fx.mono() < deadline
                 {
-                    match title_held {
-                        Some(at) if self.fx.since(at) >= TITLE_HOLD => {
+                    let said = reader.said_tail(&screen.rows);
+                    match &title_held {
+                        Some((held, at)) if *held == said && self.fx.since(*at) >= TITLE_HOLD => {
                             review.note(&format!(
-                                "NOTE seq={} the agent's title still said its run goes on {} s \
-                                 into the hold: its end read as the screen shows it",
+                                "NOTE seq={} the agent's title still said its run goes on, its \
+                                 reply unchanged {} s: its end read as the screen shows it",
                                 screen.seq,
                                 TITLE_HOLD.as_secs()
                             ));
                         }
                         _ => match self.title_reading(reader)? {
                             Some(true) => {
-                                title_held.get_or_insert(self.fx.mono());
-                                ran = true;
+                                if title_held.as_ref().is_none_or(|(held, _)| *held != said) {
+                                    title_held = Some((said, self.fx.mono()));
+                                }
+                                saw.ran = true;
                                 title_rested = false;
                                 next = Next::Settle;
                                 footer_seen = false;
                                 continue;
                             }
-                            Some(false) if ran && !title_rested => {
+                            Some(false) if saw.ran && !title_rested => {
                                 title_rested = true;
                                 next = Next::Settle;
                                 footer_seen = false;
@@ -4516,7 +4536,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             }
             unvouched_since = None;
             title_held = None;
-            ran = true;
+            saw.ran = true;
             title_rested = false;
             if writing {
                 phase = Phase::Busy;
@@ -6508,8 +6528,9 @@ impl<C: Ctl> Session<'_, C> {
     /// A busy read closes the episode of a notice that resumes by itself, and a `live` read (the
     /// agent's own turn, no break of its background work) one whose reset and grace have passed:
     /// the agent works past it, and a turn of it may end at such a break, where no point closes
-    /// it. The wall again is the same episode ([`Retry`]). Any other live read marks the episode
-    /// worked, for the break that turn ends at ([`Self::limit_at_break`]).
+    /// it. The wall again within that turn is the same episode ([`Retry`]), until the point or the
+    /// settled break the turn ends at ([`Self::limit_at_break`]). Any other live read marks the
+    /// episode worked, for the break that turn ends at.
     fn limit_on_busy(&mut self, seq: u64, live: bool, review: &mut dyn Review) -> Result<(), Fail> {
         let Some(ep) = self.limit.as_ref() else {
             return Ok(());
@@ -6533,8 +6554,13 @@ impl<C: Ctl> Session<'_, C> {
     /// A settled break of the agent's background work that its live turn reached since the wall
     /// closes the episode, as a point it reached working does (`answered after a busy spell`),
     /// reset or no reset. A turn that met the wall again ended at a Limited point, and a break
-    /// after it reads as that wall ([`Self::remembered_wall`]), so it reaches no break.
+    /// after it reads as that wall ([`Self::remembered_wall`]), so it reaches no break. The break
+    /// ends the turn that resumed past a closed episode, too, so a wall after it, hours on or
+    /// minutes, opens an episode of its own, escalated as new, never the old one's retry
+    /// ([`Retry`]). The clear reads no condition: only an unattended run sets a retry
+    /// ([`Self::limit_on_busy`], an Off park's start), so an attended run has none to clear.
     fn limit_at_break(&mut self, seq: u64, review: &mut dyn Review) -> Result<(), Fail> {
+        self.retry = None;
         if !self.limit.as_ref().is_some_and(|ep| ep.worked) {
             return Ok(());
         }
@@ -7678,7 +7704,10 @@ impl<C: Ctl> Session<'_, C> {
                 // awaited (a continuation, a land check) keeps its record and judges that answer,
                 // and what the loop owes past it (a compact, a reset's resume) stays owed.
                 match kind {
-                    super::policy::turn_end::HostTurn::Fact => self.turn_end.fact_typed(),
+                    super::policy::turn_end::HostTurn::Fact => {
+                        self.cruise_carry.host_typed();
+                        self.turn_end.fact_typed();
+                    }
                     kind => self.host_turn(kind, screen.seq),
                 }
                 self.hold_line(screen.seq, cfg, review);

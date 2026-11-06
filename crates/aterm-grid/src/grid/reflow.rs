@@ -1379,6 +1379,7 @@ impl Grid {
             for (i, row) in result.rows.drain(..push_count).enumerate() {
                 let row_idx = u16::try_from(i).unwrap_or(u16::MAX);
                 let extracted = Self::extract_row_extras(&row, &result.extras, row_idx);
+                result.extras.release_scrolled_row(row_idx, row.as_slice());
                 self.storage.lazy_buffer.push_row(&row, extracted);
                 // SAFETY: reflow built these rows in result.pages, not the old storage.pages. The lazy buffer now owns the preserved data.
                 unsafe { row.recycle(&mut result.pages) };

@@ -230,3 +230,49 @@ fn a_need_past_an_exactly_full_row_is_read_whole() {
         );
     }
 }
+
+/// A BARE HEAD BEFORE A FINITE AUXILIARY IS PROSE on Claude Code, agy and Muse Code at 80 columns
+/// and at 50 (live 2026-11-04: `claude needs you: can be lost.` in `aterm ctl survey`): the
+/// incident's bullet, as written and as drawn, and the same sentence wrapped so that a row opens
+/// on the head, name no need. A question after a bare head, wrapped by the width, is one need read
+/// whole: its rows join the head's row (`needs::apart`). NEGATIVE CONTROL: on the reader before
+/// the rule each prose screen named `can be lost. …`, and the question named the same need.
+#[test]
+fn a_bare_head_before_an_auxiliary_is_prose_on_every_reader() {
+    const LOST: &str = "NEEDS YOU can be lost. Nothing else is open.";
+    const QUESTION: &str = "NEEDS YOU can the release go out today, or should it wait for the \
+                            notary to answer the ticket?";
+    for (program, cols) in PANES {
+        let room = room(program, cols);
+        let at = format!("{program:?} at {cols}");
+        for bullet in [
+            "- **NEEDS YOU can be lost.** A NEEDS YOU line in a turn that ended on a usage wall \
+             is dropped.",
+            "- NEEDS YOU can be lost. A NEEDS YOU line in a turn that ended on a usage wall is \
+             dropped.",
+        ] {
+            let rows = reply_screen(program, cols, &[&["Merged the parser."], &[bullet]]);
+            assert_eq!(
+                needs_at_point(program, &rows),
+                Vec::<String>::new(),
+                "{at}: {rows:#?}"
+            );
+        }
+        let first = row_of("Merged the parser and", room - 1, "the");
+        let line = format!("{first} {LOST}");
+        assert_eq!(ink_wrap(&line, room), [first, LOST.to_string()], "{at}");
+        let rows = reply_screen(program, cols, &[&["Merged the parser."], &[&line]]);
+        assert_eq!(
+            needs_at_point(program, &rows),
+            Vec::<String>::new(),
+            "{at}: {rows:#?}"
+        );
+        assert!(ink_wrap(QUESTION, room).len() > 1, "{at}");
+        let rows = reply_screen(program, cols, &[&["Merged the parser."], &[QUESTION]]);
+        assert_eq!(
+            needs_at_point(program, &rows),
+            [QUESTION.trim_start_matches("NEEDS YOU ")],
+            "{at}: {rows:#?}"
+        );
+    }
+}

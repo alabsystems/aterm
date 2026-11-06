@@ -498,6 +498,61 @@ fn summary_filters_keep_fetch_stats_and_subscribe_from_reading_cold_non_matches(
     handle.shutdown();
 }
 
+/// `Broker::stats` and `Broker::health`, which aterm's broker takes every 30 s under the log
+/// lock, read no will back at a budget of 0: they count the pending wills from the log's
+/// latest-will map, not from its `/a/will` records, every one of them cold here (aterm F19).
+#[cfg(unix)]
+#[test]
+fn stats_and_health_read_no_retained_will_back_at_a_budget_of_zero() {
+    let root = crate::test_scratch::Scratch::new("tier-stats-wills");
+    let path = root.path().join("log");
+    let sock = root.path().join("sock");
+    let mut opts = crate::OpenOptions::new(Durability::Relaxed);
+    opts.resident_budget = Some(0);
+    let broker = crate::Broker::open_opts(&path, opts, || Ok(crate::Prepared::Nothing)).unwrap();
+    let mut handle = broker.serve(&sock).unwrap();
+    let mut wills = Vec::new();
+    for k in 0..6u64 {
+        let mut c = crate::Client::connect(&sock).unwrap();
+        let seq = crate::will_seq(1).unwrap();
+        c.will(100 + k, seq, &format!("/f/tier/will/{k}"), b"gone")
+            .unwrap();
+        wills.push(c);
+    }
+    // Three of the connections end, and their wills fire.
+    wills.truncate(3);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while broker.head() < 9 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "three wills fired within a minute (head {})",
+            broker.head()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let mut cli = crate::Client::connect(&sock).unwrap();
+    for i in 0..300u64 {
+        cli.publish(1, i + 1, "/f/tier/noise", &body(i)).unwrap();
+    }
+    let (resident, _, retained) = broker.residency();
+    assert_eq!((resident, retained), (1, 309));
+
+    broker.reset_cold_reads();
+    let st = broker.stats();
+    assert_eq!(st.log.pending_wills, 3, "the three live connections' wills");
+    let health = broker.health();
+    assert_eq!((health.head, health.pending_wills), (309, 3));
+    assert_eq!(
+        broker.cold_reads(),
+        0,
+        "Broker::stats and Broker::health read a retained will back"
+    );
+
+    drop(cli);
+    drop(wills);
+    handle.shutdown();
+}
+
 #[cfg(feature = "retention")]
 fn assert_rule_retention_parity(at_rest: Option<[u8; 32]>) {
     let tag = if at_rest.is_some() {

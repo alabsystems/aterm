@@ -17,6 +17,10 @@ const PROVIDER: &str = "managed:kimi-code";
 #[path = "cli_shared_kimi_refresh.rs"]
 mod refresh;
 #[cfg(unix)]
+pub use refresh::Authority as RefreshAuthority;
+#[cfg(unix)]
+pub use refresh::RecoveryContext as RefreshRecoveryContext;
+#[cfg(unix)]
 pub(in crate::harness) use refresh::{
     Snapshot as RejectedSnapshot, rejected_snapshot, verify_or_refresh,
     verify_or_refresh_with_rejection,
@@ -118,8 +122,7 @@ impl Provider for KimiOauth {
                 )
                 .map_err(ObservationError::Unavailable)?
             {
-                let deadline =
-                    crate::harness::wake_deadline::WakeDeadline::after(AUTH_CHECK_BUDGET);
+                let deadline = login_drive::Deadline::after(AUTH_CHECK_BUDGET);
                 if let Some(proof) = journal.observe_existing(&request, home, deadline)? {
                     return Ok(Some(Box::new(proof)));
                 }
@@ -142,8 +145,21 @@ impl Provider for KimiOauth {
                 region,
                 email,
                 now,
-                std::time::Instant::now() + AUTH_CHECK_BUDGET,
-                std::sync::Arc::new(refresh::AdmissionGuard(admission.clone())),
+                login_drive::Deadline::after(AUTH_CHECK_BUDGET),
+                std::sync::Arc::new(refresh::AdmissionGuard {
+                    admission: admission.authority(),
+                    recovery: refresh::RecoveryContext::new(
+                        context.store,
+                        &row.label,
+                        admission.key(),
+                        context.env.home.as_deref().ok_or_else(|| {
+                            ObservationError::Unavailable(
+                                "Kimi recovery home is unavailable".into(),
+                            )
+                        })?,
+                    ),
+                    work: context.host.work_scope(),
+                }),
             )
             .map(|proof| proof.map(|proof| Box::new(proof) as Box<dyn LoginProof>))
             .map_err(observation_error);
@@ -153,7 +169,7 @@ impl Provider for KimiOauth {
             region,
             email,
             now,
-            std::time::Instant::now() + AUTH_CHECK_BUDGET,
+            login_drive::Deadline::after(AUTH_CHECK_BUDGET),
         )
         .map(|proof| proof.map(|proof| Box::new(proof) as Box<dyn LoginProof>))
         .map_err(observation_error)
@@ -221,7 +237,7 @@ pub(in crate::harness) fn verify_native_classified(
     region: Region,
     expected: &str,
     now: i64,
-    deadline: std::time::Instant,
+    deadline: login_drive::Deadline<'_>,
 ) -> Result<Option<KimiProof>, NativeError> {
     verify_native_guarded(staging, region, expected, now, deadline, None)
 }
@@ -231,17 +247,16 @@ fn verify_native_guarded(
     region: Region,
     expected: &str,
     now: i64,
-    deadline: std::time::Instant,
+    deadline: login_drive::Deadline<'_>,
     guard: Option<std::sync::Arc<dyn aterm_http::Guard>>,
 ) -> Result<Option<KimiProof>, NativeError> {
-    if std::time::Instant::now() >= deadline {
+    if deadline.expired() {
         return Err(NativeError::Temporary);
     }
     let proof = verify_with(staging, region, expected, now, |url, token| {
         let wait = deadline
-            .checked_duration_since(std::time::Instant::now())
-            .filter(|wait| !wait.is_zero())
-            .ok_or_else(|| "Kimi identity verification deadline expired".to_owned())?
+            .remaining()
+            .map_err(|_| "Kimi identity verification deadline expired".to_owned())?
             .min(AUTH_CHECK_BUDGET);
         let client = Client::new(Trust::PlatformVerifier, ProxyMode::Direct, wait);
         let mut request = client
@@ -262,9 +277,7 @@ fn verify_native_guarded(
             .map_err(|_| "Kimi identity request did not complete".to_owned())?;
         Ok((reply.status(), reply.body().to_vec()))
     });
-    if std::time::Instant::now() >= deadline
-        || guard.as_ref().is_some_and(|guard| !guard.is_authorized())
-    {
+    if deadline.expired() || guard.as_ref().is_some_and(|guard| !guard.is_authorized()) {
         return Err(NativeError::Temporary);
     }
     proof
@@ -436,8 +449,6 @@ impl FileEvidence {
 
 pub(in crate::harness) struct KimiProof {
     #[cfg(unix)]
-    native_lock: Option<refresh::native_lock::NativeLock>,
-    #[cfg(unix)]
     region: Region,
     #[cfg(unix)]
     staging: PathBuf,
@@ -445,6 +456,9 @@ pub(in crate::harness) struct KimiProof {
     config: FileEvidence,
     email: String,
     principal: [u8; 32],
+    // The lease's retained counted authority retires after the proof's own resources.
+    #[cfg(unix)]
+    native_lock: Option<refresh::native_lock::NativeLock>,
 }
 
 impl KimiProof {

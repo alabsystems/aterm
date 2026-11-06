@@ -13,7 +13,7 @@ use std::time::Duration;
 use agh::config::{self, Dirs};
 use agh::fx::Fx;
 use agh::fx::child::ChildSpec;
-use agh::git::{GitRun, HelperCommand};
+use agh::git::{FetchBatch, FetchRow, GitRun, HelperCommand};
 use agh::identity::MapEnv;
 use agh::policy::{Named, RefusalCode, Router};
 use agh::retry::RetryPolicy;
@@ -184,6 +184,723 @@ impl World {
     }
 }
 
+fn push_batch(rows: &[(&str, &str, &str)]) -> agh::github::refs::AtomicRefBatch {
+    agh::github::refs::AtomicRefBatch::new(
+        rows.iter()
+            .map(|(reference, before, after)| agh::github::refs::RefUpdate {
+                reference: (*reference).into(),
+                before: (*before).into(),
+                after: (*after).into(),
+            })
+            .collect(),
+    )
+    .expect("batch")
+}
+
+const ABSENT: &str = "0000000000000000000000000000000000000000";
+
+#[test]
+fn native_push_preserves_exact_objects_to_an_empty_remote_and_changes_no_local_state() {
+    use agh::journal::IntentStore as _;
+    use agh::policy::{RouteRequest, RouteTarget};
+    let world = World::canonical("native-push-empty");
+    common::canonical_repos(&world.fake);
+    let source = bare_repo(world.path(), "source");
+    host_git(
+        &source,
+        &["tag", "-a", "v1", "-m", "an annotated release", "main"],
+    );
+    let sha = host_git(&source, &["rev-parse", "main"]);
+    let tag = host_git(&source, &["rev-parse", "refs/tags/v1"]);
+    let tag_bytes = host_git(&source, &["cat-file", "tag", &tag]);
+    let remote = world.path().join("empty.git");
+    host_git(
+        world.path(),
+        &["init", "--quiet", "--bare", &remote.to_string_lossy()],
+    );
+    let gh = world
+        .client(git_env())
+        .git_remote_for_tests("fixture-dev/app", &remote)
+        .build();
+    let slug = common::slug("fixture-dev/app");
+    let permit = common::permit(&gh, &RouteRequest::write(RouteTarget::Repo(slug.clone())));
+    let batch = push_batch(&[
+        ("refs/heads/main", ABSENT, &sha),
+        ("refs/tags/v1", ABSENT, &tag),
+        ("refs/attest/release", ABSENT, &sha),
+        ("refs/tags/版本", ABSENT, &tag),
+    ]);
+    let refs_before = host_git(&source, &["show-ref"]);
+    let config_before = std::fs::read(source.join("config")).expect("source config");
+    gh.refs(&slug)
+        .check_push(&permit, &source, &batch)
+        .expect("dry run");
+    assert!(host_git(&remote, &["for-each-ref", "--format=%(refname)"]).is_empty());
+    assert!(!world.dirs.journal().exists(), "dry run made a journal");
+    let journal = gh.journal(&slug).expect("journal");
+    gh.refs(&slug)
+        .push_atomic(&permit, &source, &batch, &journal)
+        .expect("push")
+        .into_result()
+        .expect("acknowledged");
+    assert_eq!(host_git(&remote, &["rev-parse", "refs/tags/v1"]), tag);
+    assert_eq!(host_git(&remote, &["cat-file", "tag", &tag]), tag_bytes);
+    assert_eq!(
+        host_git(&remote, &["rev-parse", "refs/attest/release"]),
+        sha
+    );
+    assert_eq!(host_git(&source, &["show-ref"]), refs_before);
+    assert_eq!(
+        std::fs::read(source.join("config")).expect("config"),
+        config_before
+    );
+    assert!(!source.join("FETCH_HEAD").exists());
+    assert!(journal.open().expect("open intents").is_empty());
+    assert!(files(&world.dirs.grants()).is_empty());
+    let pushes: Vec<_> = gh
+        .fx()
+        .children_run()
+        .into_iter()
+        .filter(|s| s.args.iter().any(|a| a == "push"))
+        .collect();
+    assert_eq!(pushes.len(), 2);
+    for p in pushes {
+        assert!(p.args.iter().any(|a| a == "--atomic"));
+        assert!(!p.cwd.as_ref().expect("cwd").starts_with(&source));
+        assert_eq!(
+            env_of(&p, "GIT_NO_REPLACE_OBJECTS").map(|v| v.as_os_str()),
+            Some(std::ffi::OsStr::new("1"))
+        );
+    }
+}
+
+#[test]
+fn native_push_checks_fast_forward_immutable_tags_stale_leases_and_missing_objects() {
+    let world = World::canonical("native-push-guards");
+    let remote = bare_repo(world.path(), "remote");
+    let source = world.path().join("source");
+    host_git(
+        world.path(),
+        &[
+            "clone",
+            "--quiet",
+            &remote.to_string_lossy(),
+            &source.to_string_lossy(),
+        ],
+    );
+    let before = host_git(&source, &["rev-parse", "main"]);
+    host_git(
+        &source,
+        &["commit", "--quiet", "--allow-empty", "-m", "next"],
+    );
+    let after = host_git(&source, &["rev-parse", "main"]);
+    let gh = world
+        .client(git_env())
+        .git_remote_for_tests("fixture-dev/app", &remote)
+        .build();
+    let slug = common::slug("fixture-dev/app");
+    gh.run_git(&GitRun::push_refs(
+        &slug,
+        &source,
+        push_batch(&[("refs/heads/main", &before, &after)]),
+        false,
+    ))
+    .expect("fast-forward");
+    host_git(&remote, &["tag", "v1", &before]);
+    host_git(
+        &source,
+        &[
+            "tag",
+            "-a",
+            "source-tag",
+            "-m",
+            "an immutable custom tag",
+            "main",
+        ],
+    );
+    let custom_tag = host_git(&source, &["rev-parse", "refs/tags/source-tag"]);
+    host_git(
+        &remote,
+        &[
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            &source.to_string_lossy(),
+            &format!("{custom_tag}:refs/attest/tag"),
+        ],
+    );
+    for (rows, kind) in [
+        (vec![("refs/heads/main", &*after, &*before)], Kind::Refused),
+        (vec![("refs/tags/v1", &*before, &*after)], Kind::Refused),
+        (
+            vec![("refs/attest/tag", &*custom_tag, &*after)],
+            Kind::Refused,
+        ),
+        (
+            vec![
+                ("refs/heads/main", &*before, &*after),
+                ("refs/tags/new", ABSENT, &*after),
+            ],
+            Kind::Conflict,
+        ),
+        (
+            vec![("refs/heads/missing", ABSENT, common::MAIN_SHA)],
+            Kind::CouldNotRun,
+        ),
+        (vec![("refs/heads/main", &*after, &*after)], Kind::Usage),
+    ] {
+        let error = gh
+            .run_git(&GitRun::push_refs(&slug, &source, push_batch(&rows), false))
+            .expect_err("refused");
+        assert_eq!(error.kind, kind, "{}", error.why);
+        assert_eq!(error.side_effect, SideEffect::None);
+        assert_eq!(host_git(&remote, &["rev-parse", "main"]), after);
+        assert_eq!(host_git(&remote, &["tag", "--list"]), "v1");
+    }
+    host_git(
+        &source,
+        &["config", "hook.pre-push.command", "touch must-not-run"],
+    );
+    let error = gh
+        .run_git(&GitRun::push_refs(
+            &slug,
+            &source,
+            push_batch(&[("refs/tags/new", ABSENT, &after)]),
+            false,
+        ))
+        .expect_err("config hook");
+    assert_eq!(error.kind, Kind::Refused);
+    assert!(matches!(error.sub, Sub::GitConfig { .. }));
+}
+
+/// A real remote base with an old blob, followed by one local new-blob commit.
+fn incremental_source(world: &World) -> (PathBuf, PathBuf, String, String) {
+    let remote = bare_repo(world.path(), "remote");
+    let source = world.path().join("source");
+    host_git(
+        world.path(),
+        &[
+            "clone",
+            "--quiet",
+            &remote.to_string_lossy(),
+            &source.to_string_lossy(),
+        ],
+    );
+    std::fs::write(source.join("old"), b"the authenticated old blob\n").expect("old");
+    host_git(&source, &["add", "old"]);
+    host_git(&source, &["commit", "--quiet", "-m", "base"]);
+    host_git(&source, &["push", "--quiet", "origin", "main"]);
+    let before = host_git(&source, &["rev-parse", "main"]);
+    std::fs::write(source.join("new"), b"new object that must be checked\n").expect("new");
+    host_git(&source, &["add", "new"]);
+    host_git(&source, &["commit", "--quiet", "-m", "after"]);
+    let after = host_git(&source, &["rev-parse", "main"]);
+    (remote, source, before, after)
+}
+
+/// Unlink before writing: a local clone can share the old loose inode with its
+/// fixture remote, whose authenticated bytes must stay independent.
+fn replace_loose(source: &Path, wanted: &str, substitute: &str) {
+    let objects = source.join(".git/objects");
+    let path = |oid: &str| objects.join(&oid[..2]).join(&oid[2..]);
+    let replacement = std::fs::read(path(substitute)).expect("substitute object");
+    std::fs::remove_file(path(wanted)).expect("unlink owned loose object");
+    std::fs::write(path(wanted), replacement).expect("substituted bytes");
+}
+
+#[test]
+fn native_push_incremental_refuses_corrupt_metadata_new_blobs_and_missing_closure() {
+    for broken in [
+        "commit",
+        "tree",
+        "old-tree",
+        "new-blob",
+        "missing-blob",
+        "missing-parent",
+    ] {
+        let world = World::canonical(&format!("incremental-{broken}"));
+        let (remote, source, before, after) = incremental_source(&world);
+        let old_blob = host_git(&source, &["rev-parse", &format!("{before}:old")]);
+        let new_blob = host_git(&source, &["rev-parse", &format!("{after}:new")]);
+        match broken {
+            "commit" => replace_loose(&source, &after, &before),
+            "tree" | "old-tree" => {
+                let old = host_git(&source, &["rev-parse", &format!("{before}^{{tree}}")]);
+                let new = host_git(&source, &["rev-parse", &format!("{after}^{{tree}}")]);
+                if broken == "old-tree" {
+                    replace_loose(&source, &old, &new);
+                } else {
+                    replace_loose(&source, &new, &old);
+                }
+            }
+            "new-blob" => replace_loose(&source, &new_blob, &old_blob),
+            _ => {
+                let oid = if broken == "missing-blob" {
+                    &new_blob
+                } else {
+                    &before
+                };
+                std::fs::remove_file(source.join(".git/objects").join(&oid[..2]).join(&oid[2..]))
+                    .expect("remove closure member");
+            }
+        }
+        let gh = world
+            .client(git_env())
+            .git_remote_for_tests("fixture-dev/app", &remote)
+            .build();
+        let error = gh
+            .run_git(&GitRun::push_refs(
+                &common::slug("fixture-dev/app"),
+                &source,
+                push_batch(&[("refs/heads/main", &before, &after)]),
+                false,
+            ))
+            .expect_err("broken source cannot write");
+        assert_eq!(
+            error.side_effect,
+            SideEffect::None,
+            "{broken}: {}",
+            error.why
+        );
+        assert!(
+            !gh.fx()
+                .children_run()
+                .iter()
+                .any(|s| s.args.iter().any(|a| a == "push")),
+            "{broken} reached the writer"
+        );
+        assert_eq!(host_git(&remote, &["rev-parse", "main"]), before);
+        assert_eq!(
+            host_git(&remote, &["show", "main:old"]),
+            "the authenticated old blob"
+        );
+    }
+}
+
+#[test]
+fn native_push_incremental_borrows_only_authenticated_old_blob_authority() {
+    let world = World::canonical("incremental-old-blob");
+    let (remote, source, before, after) = incremental_source(&world);
+    let old = host_git(&source, &["rev-parse", &format!("{before}:old")]);
+    let new = host_git(&source, &["rev-parse", &format!("{after}:new")]);
+    replace_loose(&source, &old, &new);
+    let gh = world
+        .client(git_env())
+        .git_remote_for_tests("fixture-dev/app", &remote)
+        .build();
+    gh.run_git(&GitRun::push_refs(
+        &common::slug("fixture-dev/app"),
+        &source,
+        push_batch(&[("refs/heads/main", &before, &after)]),
+        false,
+    ))
+    .expect("remote already owns the exact BEFORE blob");
+    assert_eq!(
+        host_git(&remote, &["show", "main:old"]),
+        "the authenticated old blob"
+    );
+    assert_eq!(
+        host_git(&remote, &["show", "main:new"]),
+        "new object that must be checked"
+    );
+    let children = gh.fx().children_run();
+    assert!(
+        !children.iter().any(|s| s.args.iter().any(|a| a == "fetch")),
+        "incremental route downloaded an old graph"
+    );
+    let pack = children
+        .iter()
+        .find(|s| s.args.iter().any(|a| a == "pack-objects"))
+        .expect("new-object pack");
+    assert!(pack.args.iter().any(|a| a == "--threads=8"));
+    assert!(!pack.args.iter().any(|a| a == "--thin"));
+    assert_eq!(
+        children
+            .iter()
+            .filter(|s| s.args.iter().any(|a| a == "ls-remote"))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn native_push_incremental_preserves_raw_signed_objects_and_ignores_source_grafts() {
+    let world = World::canonical("incremental-raw");
+    let (remote, source, before, after) = incremental_source(&world);
+    let tree = host_git(&source, &["rev-parse", &format!("{after}^{{tree}}")]);
+    let raw = format!(
+        "tree {tree}\nparent {before}\nauthor fixture <fixture> 1700000000 +0000\ncommitter fixture <fixture> 1700000000 +0000\ngpgsig -----BEGIN PGP SIGNATURE-----\n fixture bytes\n -----END PGP SIGNATURE-----\n\nsigned commit bytes\n"
+    );
+    let input = world.path().join("commit-input");
+    std::fs::write(&input, &raw).expect("raw commit");
+    let signed = host_git(
+        &source,
+        &[
+            "hash-object",
+            "-w",
+            "-t",
+            "commit",
+            &input.to_string_lossy(),
+        ],
+    );
+    let tag_raw = format!(
+        "object {signed}\ntype commit\ntag v1\ntagger fixture <fixture> 1700000000 +0000\n\nrelease\n-----BEGIN PGP SIGNATURE-----\nfixture tag bytes\n-----END PGP SIGNATURE-----\n"
+    );
+    std::fs::write(&input, &tag_raw).expect("raw tag");
+    let tag = host_git(
+        &source,
+        &["hash-object", "-w", "-t", "tag", &input.to_string_lossy()],
+    );
+    let config = std::fs::read(source.join(".git/config")).expect("config");
+    // The original source claims this commit has no parents. The clean graph
+    // view must ignore that graft and preserve the actual raw parent/FF edge.
+    std::fs::create_dir_all(source.join(".git/info")).expect("info");
+    std::fs::write(source.join(".git/info/grafts"), format!("{signed}\n")).expect("graft");
+    let gh = world
+        .client(git_env())
+        .git_remote_for_tests("fixture-dev/app", &remote)
+        .build();
+    gh.run_git(&GitRun::push_refs(
+        &common::slug("fixture-dev/app"),
+        &source,
+        push_batch(&[
+            ("refs/heads/main", &before, &signed),
+            ("refs/tags/v1", ABSENT, &tag),
+        ]),
+        false,
+    ))
+    .expect("raw graph ignores graft");
+    assert_eq!(
+        host_git(&remote, &["cat-file", "commit", &signed]),
+        raw.trim_end()
+    );
+    assert_eq!(
+        host_git(&remote, &["cat-file", "tag", &tag]),
+        tag_raw.trim_end()
+    );
+    assert_eq!(
+        std::fs::read(source.join(".git/config")).expect("config"),
+        config
+    );
+    assert!(!source.join(".git/FETCH_HEAD").exists());
+}
+
+/// Both controls execute the actual Git atomic push. One changes a fixture ref
+/// just before advertisement; the other loses only the successful result.
+fn native_push_unknown_case(race_to_after: bool, incremental: bool) {
+    use agh::journal::IntentStore as _;
+    use agh::policy::{RouteRequest, RouteTarget};
+    let world = World::canonical("native-push-unknown");
+    common::canonical_repos(&world.fake);
+    let source = bare_repo(world.path(), "source");
+    let old = host_git(&source, &["rev-parse", "main"]);
+    let sha = if incremental {
+        let tree = host_git(&source, &["rev-parse", "main^{tree}"]);
+        host_git(&source, &["commit-tree", &tree, "-p", &old, "-m", "next"])
+    } else {
+        old.clone()
+    };
+    let remote = world.path().join("empty.git");
+    host_git(
+        world.path(),
+        &["init", "--quiet", "--bare", &remote.to_string_lossy()],
+    );
+    host_git(
+        &remote,
+        &[
+            "fetch",
+            "--quiet",
+            "--no-write-fetch-head",
+            &source.to_string_lossy(),
+            &if incremental {
+                format!("{old}:refs/heads/main")
+            } else {
+                sha.clone()
+            },
+        ],
+    );
+    if incremental {
+        // Another writer can only race the ref to AFTER after supplying its
+        // objects. Preload those fixture bytes without changing the old ref.
+        host_git(
+            &remote,
+            &[
+                "fetch",
+                "--quiet",
+                "--no-write-fetch-head",
+                &source.to_string_lossy(),
+                &sha,
+            ],
+        );
+    }
+    let slug = common::slug("fixture-dev/app");
+    let batch = push_batch(&[
+        (
+            "refs/heads/main",
+            if incremental { &old } else { ABSENT },
+            &sha,
+        ),
+        ("refs/tags/v1", ABSENT, &sha),
+    ]);
+    let probe = world
+        .client(git_env())
+        .git_remote_for_tests("fixture-dev/app", &remote)
+        .build();
+    probe
+        .run_git(&GitRun::push_refs(&slug, &source, batch.clone(), true))
+        .expect("preflight");
+    let spec = probe
+        .fx()
+        .children_run()
+        .into_iter()
+        .find(|s| s.args.iter().any(|a| a == "push"))
+        .expect("push child");
+    let args = spec.args.into_iter().filter(|a| a != "--dry-run").collect();
+    let race_remote = remote.clone();
+    let race_sha = sha.clone();
+    let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let before_seen = seen.clone();
+    let fx = Fx::simulated(live_start()).with_git_intercept_once_for_tests(
+        spec.program,
+        args,
+        move || {
+            before_seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            if race_to_after {
+                host_git(&race_remote, &["update-ref", "refs/heads/main", &race_sha]);
+            }
+        },
+        move |result| {
+            assert_eq!(result.as_ref().expect("actual Git child").code, Some(0));
+            if !race_to_after {
+                *result = Err(
+                    agh::Error::could_not_run("fixture lost the push acknowledgement")
+                        .with_side_effect(SideEffect::Unknown),
+                );
+            }
+        },
+    );
+    let gh = world
+        .client(git_env())
+        .git_remote_for_tests("fixture-dev/app", &remote)
+        .fx(Arc::new(fx))
+        .build();
+    let permit = common::permit(&gh, &RouteRequest::write(RouteTarget::Repo(slug.clone())));
+    let journal = gh.journal(&slug).expect("journal");
+    let outcome = gh
+        .refs(&slug)
+        .push_atomic(&permit, &source, &batch, &journal)
+        .expect("settled outcome");
+    let agh::write::Outcome::Unknown { intent, error } = outcome else {
+        panic!("the ambiguous write must stay open");
+    };
+    assert_eq!(error.side_effect, SideEffect::Unknown);
+    assert!(seen.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(journal.open().expect("open").len(), 1);
+    assert_eq!(host_git(&remote, &["rev-parse", "main"]), sha);
+    assert_eq!(host_git(&remote, &["rev-parse", "refs/tags/v1"]), sha);
+    let pushes = gh
+        .fx()
+        .children_run()
+        .iter()
+        .filter(|s| s.args.iter().any(|a| a == "push"))
+        .count();
+    let error = gh
+        .refs(&slug)
+        .push_atomic(&permit, &source, &batch, &journal)
+        .expect_err("open intent blocks retry");
+    assert_eq!(
+        error.kind,
+        Kind::OutcomeUnknown,
+        "{}: {}",
+        intent,
+        error.why
+    );
+    assert_eq!(
+        gh.fx()
+            .children_run()
+            .iter()
+            .filter(|s| s.args.iter().any(|a| a == "push"))
+            .count(),
+        pushes
+    );
+    assert!(files(&world.dirs.grants()).is_empty());
+}
+
+#[test]
+fn native_push_racing_to_after_is_unknown_instead_of_a_false_cas_success() {
+    native_push_unknown_case(true, false);
+}
+
+#[test]
+fn native_push_lost_acknowledgement_keeps_a_nonretryable_intent() {
+    native_push_unknown_case(false, false);
+}
+
+#[test]
+fn native_push_incremental_racing_to_after_keeps_a_nonretryable_intent() {
+    native_push_unknown_case(true, true);
+}
+
+#[test]
+fn native_push_incremental_lost_acknowledgement_keeps_a_nonretryable_intent() {
+    native_push_unknown_case(false, true);
+}
+
+#[test]
+fn native_push_a_stale_lease_at_advertisement_rejects_the_whole_real_batch() {
+    use agh::journal::IntentStore as _;
+    use agh::policy::{RouteRequest, RouteTarget};
+    let world = World::canonical("native-push-stale");
+    common::canonical_repos(&world.fake);
+    let source = bare_repo(world.path(), "source");
+    let before = host_git(&source, &["rev-parse", "main"]);
+    let work = world.path().join("source-work");
+    host_git(&work, &["commit", "--quiet", "--allow-empty", "-m", "next"]);
+    let after = host_git(&work, &["rev-parse", "main"]);
+    host_git(
+        &source,
+        &[
+            "fetch",
+            "--quiet",
+            &work.to_string_lossy(),
+            "main:refs/heads/main",
+        ],
+    );
+    let remote = world.path().join("empty.git");
+    host_git(
+        world.path(),
+        &["init", "--quiet", "--bare", &remote.to_string_lossy()],
+    );
+    host_git(
+        &remote,
+        &[
+            "fetch",
+            "--quiet",
+            "--no-write-fetch-head",
+            &source.to_string_lossy(),
+            &after,
+        ],
+    );
+    let slug = common::slug("fixture-dev/app");
+    let batch = push_batch(&[
+        ("refs/heads/main", ABSENT, &after),
+        ("refs/tags/v1", ABSENT, &after),
+    ]);
+    let probe = world
+        .client(git_env())
+        .git_remote_for_tests("fixture-dev/app", &remote)
+        .build();
+    probe
+        .run_git(&GitRun::push_refs(&slug, &source, batch.clone(), true))
+        .expect("dry preflight");
+    let spec = probe
+        .fx()
+        .children_run()
+        .into_iter()
+        .find(|s| s.args.iter().any(|a| a == "push"))
+        .expect("push");
+    let args = spec.args.into_iter().filter(|a| a != "--dry-run").collect();
+    let race_remote = remote.clone();
+    let race_before = before.clone();
+    let fx = Fx::simulated(live_start()).with_git_intercept_once_for_tests(
+        spec.program,
+        args,
+        move || {
+            host_git(
+                &race_remote,
+                &["update-ref", "refs/heads/main", &race_before],
+            );
+        },
+        |result| assert_ne!(result.as_ref().expect("real Git").code, Some(0)),
+    );
+    let gh = world
+        .client(git_env())
+        .git_remote_for_tests("fixture-dev/app", &remote)
+        .fx(Arc::new(fx))
+        .build();
+    let permit = common::permit(&gh, &RouteRequest::write(RouteTarget::Repo(slug.clone())));
+    let journal = gh.journal(&slug).expect("journal");
+    let result = gh
+        .refs(&slug)
+        .push_atomic(&permit, &source, &batch, &journal)
+        .expect("known refusal")
+        .into_result();
+    let error = result.expect_err("stale lease");
+    assert_eq!(error.kind, Kind::Conflict, "{}", error.why);
+    assert_eq!(error.side_effect, SideEffect::None);
+    assert_eq!(host_git(&remote, &["rev-parse", "main"]), before);
+    assert_eq!(host_git(&remote, &["tag", "--list"]), "");
+    assert!(journal.open().expect("open").is_empty());
+}
+
+#[test]
+fn native_push_cli_reports_dry_run_and_journaled_success_and_validates_before_routing() {
+    let world = World::canonical("native-push-cli");
+    common::canonical_repos(&world.fake);
+    let source = bare_repo(world.path(), "source");
+    let sha = host_git(&source, &["rev-parse", "main"]);
+    let remote = world.path().join("empty.git");
+    host_git(
+        world.path(),
+        &["init", "--quiet", "--bare", &remote.to_string_lossy()],
+    );
+    let input = world.path().join("push.json");
+    let write_input = |before: &str, after: &str| {
+        std::fs::write(
+            &input,
+            aterm_json::json!([
+                { "ref": "refs/heads/main", "before": before, "after": after }
+            ])
+            .to_string(),
+        )
+        .expect("input")
+    };
+    let run = |dry: bool| {
+        let (ctx, captured) = common::ctx(world.path(), &world.fake, git_env());
+        let mut ctx = ctx
+            .with_git_helper(common::helper())
+            .with_git_remote("fixture-dev/app", &remote);
+        ctx.fx = Arc::new(Fx::simulated(live_start()));
+        let mut args = vec![
+            "repo",
+            "push",
+            "fixture-dev/app",
+            source.to_str().expect("source"),
+            "--input",
+            input.to_str().expect("input"),
+        ];
+        if dry {
+            args.push("--dry-run");
+        }
+        let exit = common::run_cli(&mut ctx, &args);
+        (exit, captured)
+    };
+    write_input(ABSENT, &sha);
+    let (exit, captured) = run(true);
+    assert_eq!(exit, 0, "{}", captured.stderr_text());
+    assert_eq!(
+        common::stdout_json(&captured)["outcome"],
+        aterm_json::Value::from("would_send")
+    );
+    assert!(!world.dirs.journal().exists());
+    let (exit, captured) = run(false);
+    assert_eq!(exit, 0, "{}", captured.stderr_text());
+    let report = common::stdout_json(&captured);
+    assert_eq!(report["outcome"], aterm_json::Value::from("created"));
+    assert!(report["intent"].as_str().is_some());
+    assert_eq!(host_git(&remote, &["rev-parse", "main"]), sha);
+    for (before, after) in [(&*sha, &*sha), (&*sha, ABSENT)] {
+        write_input(before, after);
+        world.fake.clear_seen();
+        let (exit, captured) = run(false);
+        assert_eq!(exit, 2, "{}", captured.stderr_text());
+        assert!(
+            world.fake.seen().is_empty(),
+            "invalid batch routed or read GitHub"
+        );
+    }
+}
+
 /// The files in `dir`, none when it does not exist.
 fn files(dir: &Path) -> Vec<PathBuf> {
     std::fs::read_dir(dir)
@@ -264,6 +981,82 @@ fn a_clone_ignores_the_parent_s_git_environment() {
 }
 
 #[test]
+fn read_only_fetches_preserve_pushurl_refusals_and_writes_still_reject_them() {
+    let world = World::canonical("fetch-write-only-config");
+    let remote = bare_repo(world.path(), "remote");
+    let elsewhere = bare_repo(world.path(), "elsewhere");
+    let source = world.path().join("source");
+    host_git(
+        world.path(),
+        &[
+            "clone",
+            "--quiet",
+            &remote.to_string_lossy(),
+            &source.to_string_lossy(),
+        ],
+    );
+    host_git(
+        &source,
+        &[
+            "config",
+            "remote.upstream.pushurl",
+            "NEVER-PUSH-TO-UPSTREAM",
+        ],
+    );
+    host_git(
+        &source,
+        &[
+            "config",
+            "remote.origin.pushurl",
+            &elsewhere.to_string_lossy(),
+        ],
+    );
+    let config = std::fs::read(source.join(".git/config")).unwrap();
+    let head = host_git(&remote, &["rev-parse", "main"]);
+    let other = host_git(&elsewhere, &["for-each-ref"]);
+    let gh = world
+        .client(git_env())
+        .git_remote_for_tests("fixture-dev/app", &remote)
+        .build();
+    let slug = common::slug("fixture-dev/app");
+    for run in [
+        GitRun::fetch(&slug, &source),
+        GitRun::fetch_main(&slug, &source, "refs/agh/main"),
+        GitRun::fetch_ref(&slug, &source, "refs/heads/main", "refs/agh/exact", true),
+        GitRun::fetch_batch(
+            &slug,
+            &source,
+            fetch_rows(&[("refs/heads/main", "refs/agh/batch", &head)]),
+            true,
+        ),
+    ] {
+        gh.run_git(&run).unwrap();
+    }
+    assert_eq!(host_git(&source, &["rev-parse", "refs/agh/batch"]), head);
+    assert_eq!(host_git(&source, &["rev-parse", "HEAD"]), head);
+    assert_eq!(std::fs::read(source.join(".git/config")).unwrap(), config);
+    assert_eq!(host_git(&elsewhere, &["for-each-ref"]), other);
+    host_git(
+        &source,
+        &["commit", "--quiet", "--allow-empty", "-m", "next"],
+    );
+    let after = host_git(&source, &["rev-parse", "HEAD"]);
+    let error = gh
+        .run_git(&GitRun::push_refs(
+            &slug,
+            &source,
+            push_batch(&[("refs/heads/main", &head, &after)]),
+            true,
+        ))
+        .expect_err("write screening remains strict even for a dry run")
+        .into_data();
+    assert_eq!(error.kind, Kind::Refused);
+    assert!(matches!(error.sub, Sub::GitConfig { key } if key == "remote.origin.pushurl"));
+    assert_eq!(host_git(&remote, &["rev-parse", "main"]), head);
+    assert_eq!(host_git(&elsewhere, &["for-each-ref"]), other);
+}
+
+#[test]
 fn a_fetch_refuses_a_rewriting_config() {
     let world = World::canonical("git-fetch-screen");
     let bare = bare_repo(world.path(), "app");
@@ -292,11 +1085,6 @@ fn a_fetch_refuses_a_rewriting_config() {
     let other_url = format!("file://{}", other.display());
     let rows: Vec<(String, String, String)> = vec![
         ("url.https://x/.insteadOf", "y", "url.https://x/.insteadof"),
-        (
-            "remote.origin.pushurl",
-            "file:///nowhere",
-            "remote.origin.pushurl",
-        ),
         ("core.hooksPath", "/nowhere", "core.hookspath"),
         (
             "core.alternateRefsCommand",
@@ -335,11 +1123,18 @@ fn a_fetch_refuses_a_rewriting_config() {
     ]
     .into_iter()
     .map(|(k, v, e)| (k.to_string(), v.to_string(), e.to_string()))
-    .chain(std::iter::once((
-        format!("remote.{url}.url"),
-        other_url,
-        format!("remote.{url}.url"),
-    )))
+    .chain([
+        (
+            format!("remote.{url}.url"),
+            other_url.clone(),
+            format!("remote.{url}.url"),
+        ),
+        (
+            format!("remote.{url}.pushurl"),
+            other_url,
+            format!("remote.{url}.pushurl"),
+        ),
+    ])
     .collect();
     for (key, value, listed) in &rows {
         host_git(&clone, &["config", "--local", key, value]);
@@ -626,6 +1421,351 @@ fn an_exact_fetch_keeps_tag_objects_and_leaves_checkout_state_alone() {
             .all(|spec| !runs_agh_s_helper(spec))
     );
     assert!(files(&world.dirs.grants()).is_empty());
+}
+
+fn fetch_rows(rows: &[(&str, &str, &str)]) -> FetchBatch {
+    FetchBatch::new(
+        rows.iter()
+            .map(|(source, into, expected)| FetchRow {
+                source: (*source).into(),
+                into: (*into).into(),
+                expected_oid: (*expected).into(),
+            })
+            .collect(),
+    )
+    .expect("admitted fixture rows")
+}
+
+#[test]
+fn batch_fetch_checks_raw_tag_identities_in_one_transfer_and_preserves_the_checkout() {
+    let world = World::canonical("git-batch-fetch");
+    let bare = bare_repo(world.path(), "app");
+    let checkout = world.path().join("checkout with spaces");
+    host_git(
+        world.path(),
+        &[
+            "clone",
+            "--quiet",
+            &bare.to_string_lossy(),
+            &checkout.to_string_lossy(),
+        ],
+    );
+    let first = host_git(&bare, &["rev-parse", "main"]);
+    let tree = host_git(&bare, &["rev-parse", "main^{tree}"]);
+    let second = host_git(&bare, &["commit-tree", &tree, "-p", &first, "-m", "two"]);
+    host_git(&bare, &["update-ref", "refs/heads/main", &second]);
+    host_git(&bare, &["tag", "-a", "v2", &second, "-m", "two"]);
+    let tag = host_git(&bare, &["rev-parse", "refs/tags/v2"]);
+    let rows = fetch_rows(&[
+        ("refs/heads/main", "refs/agh/main", &second),
+        ("refs/tags/v2", "refs/agh/tag", &tag),
+    ]);
+    let config = std::fs::read(checkout.join(".git/config")).unwrap();
+    std::fs::write(checkout.join(".git/FETCH_HEAD"), b"kept fetch head\n").unwrap();
+    std::fs::write(checkout.join("local-work"), b"kept local work\n").unwrap();
+    let marker = world.path().join("hook-ran");
+    let hook = checkout.join(".git/hooks/reference-transaction");
+    std::fs::write(
+        &hook,
+        format!("#!/bin/sh\necho called > '{}'\n", marker.display()),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let gh = world
+        .client(git_env())
+        .git_remote_for_tests("fixture-dev/app", &bare)
+        .build();
+    let out = gh
+        .run_git(&GitRun::fetch_batch(
+            &common::slug("fixture-dev/app"),
+            &checkout,
+            rows,
+            true,
+        ))
+        .unwrap();
+    assert_eq!((out.as_, out.grant), (None, None));
+    assert_eq!(host_git(&checkout, &["rev-parse", "refs/agh/main"]), second);
+    assert_eq!(host_git(&checkout, &["rev-parse", "refs/agh/tag"]), tag);
+    assert_eq!(host_git(&checkout, &["rev-parse", "HEAD"]), first);
+    assert_eq!(std::fs::read(checkout.join(".git/config")).unwrap(), config);
+    assert_eq!(
+        std::fs::read(checkout.join(".git/FETCH_HEAD")).unwrap(),
+        b"kept fetch head\n"
+    );
+    assert_eq!(
+        std::fs::read(checkout.join("local-work")).unwrap(),
+        b"kept local work\n"
+    );
+    assert!(
+        !marker.exists(),
+        "reference transaction hooks must stay disabled"
+    );
+    let children = gh.fx().children_run();
+    let fetches = children
+        .iter()
+        .filter(|spec| spec.args.iter().any(|arg| arg == "fetch"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        fetches.len(),
+        2,
+        "one network fetch and one local object import"
+    );
+    assert!(
+        fetches
+            .iter()
+            .all(|spec| spec.args.iter().any(|arg| arg == "--stdin"))
+    );
+    assert!(children.iter().all(|spec| !runs_agh_s_helper(spec)));
+    assert!(files(&world.dirs.grants()).is_empty());
+    let third = host_git(&bare, &["commit-tree", &tree, "-p", &second, "-m", "three"]);
+    host_git(&bare, &["update-ref", "refs/heads/main", &third]);
+    let rows = fetch_rows(&[("refs/heads/main", "refs/agh/main", &third)]);
+    gh.run_git(&GitRun::fetch_batch(
+        &common::slug("fixture-dev/app"),
+        &checkout,
+        rows,
+        true,
+    ))
+    .unwrap();
+    assert_eq!(
+        host_git(
+            &checkout,
+            &["reflog", "show", "--format=%H", "refs/agh/main"]
+        )
+        .lines()
+        .collect::<Vec<_>>(),
+        vec![third.as_str(), second.as_str()],
+        "cache history retains the previous exact snapshot"
+    );
+}
+
+#[test]
+fn a_missing_or_moved_batch_source_leaves_every_cache_ref_unchanged() {
+    let world = World::canonical("git-batch-source-change");
+    let bare = bare_repo(world.path(), "app");
+    let receiver = world.path().join("receiver.git");
+    std::fs::create_dir(&receiver).unwrap();
+    host_git(&receiver, &["init", "--quiet", "--bare"]);
+    let first = host_git(&bare, &["rev-parse", "main"]);
+    host_git(
+        &receiver,
+        &[
+            "fetch",
+            "--quiet",
+            &bare.to_string_lossy(),
+            "refs/heads/main:refs/agh/kept",
+        ],
+    );
+    host_git(&bare, &["tag", "-a", "v1", &first, "-m", "raw tag"]);
+    let before = host_git(&receiver, &["for-each-ref"]);
+    let gh = world
+        .client(git_env())
+        .git_remote_for_tests("fixture-dev/app", &bare)
+        .build();
+    for source in ["refs/tags/v1", "refs/tags/missing"] {
+        let fetches_before = gh
+            .fx()
+            .children_run()
+            .iter()
+            .filter(|spec| spec.args.iter().any(|arg| arg == "fetch"))
+            .count();
+        let rows = fetch_rows(&[
+            ("refs/heads/main", "refs/agh/new-main", &first),
+            (source, "refs/agh/new-tag", &first),
+        ]);
+        let error = gh
+            .run_git(&GitRun::fetch_batch(
+                &common::slug("fixture-dev/app"),
+                &receiver,
+                rows,
+                true,
+            ))
+            .expect_err("moved or missing source");
+        assert_eq!(error.side_effect, SideEffect::None);
+        assert_eq!(
+            gh.fx()
+                .children_run()
+                .iter()
+                .filter(|spec| spec.args.iter().any(|arg| arg == "fetch"))
+                .count(),
+            fetches_before + 1,
+            "the actual scratch fetch must expose the source mismatch, before object import"
+        );
+        if source == "refs/tags/v1" {
+            assert!(error.why.contains("expected raw object ID"));
+        }
+        assert_eq!(host_git(&receiver, &["for-each-ref"]), before);
+    }
+}
+
+#[test]
+fn a_cold_catalog_batch_larger_than_argv_transfers_all_1490_refs_once() {
+    let world = World::canonical("git-batch-cold-catalog");
+    let bare = bare_repo(world.path(), "app");
+    let first = host_git(&bare, &["rev-parse", "main"]);
+    std::fs::create_dir_all(bare.join("refs/tags")).unwrap();
+    let mut rows = Vec::new();
+    for index in 0..1490 {
+        let source = format!("refs/tags/{}-{index:04}", "v".repeat(230));
+        std::fs::write(bare.join(&source), format!("{first}\n")).unwrap();
+        rows.push(FetchRow {
+            source,
+            into: format!("refs/agh/catalog-{index:04}"),
+            expected_oid: first.clone(),
+        });
+    }
+    assert!(rows.iter().map(|row| row.source.len() + 24).sum::<usize>() > 256 * 1024);
+    let receiver = world.path().join("receiver.git");
+    std::fs::create_dir(&receiver).unwrap();
+    host_git(&receiver, &["init", "--quiet", "--bare"]);
+    let gh = world
+        .client(git_env())
+        .git_remote_for_tests("fixture-dev/app", &bare)
+        .build();
+    gh.run_git(&GitRun::fetch_batch(
+        &common::slug("fixture-dev/app"),
+        &receiver,
+        FetchBatch::new(rows).unwrap(),
+        true,
+    ))
+    .unwrap();
+    assert_eq!(
+        host_git(
+            &receiver,
+            &["for-each-ref", "--format=%(objectname)", "refs/agh/"]
+        )
+        .lines()
+        .count(),
+        1490
+    );
+    assert!(
+        host_git(
+            &receiver,
+            &["for-each-ref", "--format=%(objectname)", "refs/agh/"]
+        )
+        .lines()
+        .all(|oid| oid == first)
+    );
+    assert_eq!(
+        gh.fx()
+            .children_run()
+            .iter()
+            .filter(|spec| spec.args.iter().any(|arg| arg == "fetch"))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn batch_fetch_cas_preserves_a_concurrent_cache_change_without_partial_updates() {
+    let world = World::canonical("git-batch-cache-race");
+    let bare = bare_repo(world.path(), "app");
+    let checkout = world.path().join("checkout");
+    host_git(
+        world.path(),
+        &[
+            "clone",
+            "--quiet",
+            &bare.to_string_lossy(),
+            &checkout.to_string_lossy(),
+        ],
+    );
+    let first = host_git(&bare, &["rev-parse", "main"]);
+    host_git(&bare, &["tag", "v1", &first]);
+    let rows = fetch_rows(&[
+        ("refs/heads/main", "refs/agh/main", &first),
+        ("refs/tags/v1", "refs/agh/tag", &first),
+    ]);
+    let slug = common::slug("fixture-dev/app");
+    let probe = world
+        .client(git_env())
+        .git_remote_for_tests("fixture-dev/app", &bare)
+        .build();
+    probe
+        .run_git(&GitRun::fetch_batch(&slug, &checkout, rows.clone(), true))
+        .unwrap();
+    let update = probe
+        .fx()
+        .children_run()
+        .into_iter()
+        .find(|spec| spec.args.iter().any(|arg| arg == "update-ref"))
+        .unwrap();
+    host_git(&checkout, &["update-ref", "-d", "refs/agh/main"]);
+    host_git(&checkout, &["update-ref", "-d", "refs/agh/tag"]);
+    let concurrent = checkout.clone();
+    let concurrent_oid = first.clone();
+    let fx = Fx::simulated(live_start()).with_git_intercept_once_for_tests(
+        update.program,
+        update.args,
+        move || {
+            host_git(
+                &concurrent,
+                &["update-ref", "refs/agh/main", &concurrent_oid],
+            );
+        },
+        |result| {
+            assert_ne!(
+                result.as_ref().expect("actual ref transaction").code,
+                Some(0)
+            )
+        },
+    );
+    let gh = world
+        .client(git_env())
+        .git_remote_for_tests("fixture-dev/app", &bare)
+        .fx(Arc::new(fx))
+        .build();
+    let error = gh
+        .run_git(&GitRun::fetch_batch(&slug, &checkout, rows, true))
+        .expect_err("concurrent cache write");
+    assert_eq!(error.side_effect, SideEffect::None);
+    assert_eq!(host_git(&checkout, &["rev-parse", "refs/agh/main"]), first);
+    assert_eq!(host_git(&checkout, &["for-each-ref", "refs/agh/tag"]), "");
+}
+
+#[test]
+fn batch_fetch_refuses_unsafe_cache_paths_before_any_fetch() {
+    use std::os::unix::fs::symlink;
+    for hard_link in [false, true] {
+        let world = World::canonical("git-batch-cache-path");
+        let bare = bare_repo(world.path(), "app");
+        let receiver = world.path().join("receiver.git");
+        std::fs::create_dir(&receiver).unwrap();
+        host_git(&receiver, &["init", "--quiet", "--bare"]);
+        let first = host_git(&bare, &["rev-parse", "main"]);
+        let outside = world.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let kept = outside.join("kept");
+        std::fs::write(&kept, b"kept external bytes\n").unwrap();
+        if hard_link {
+            std::fs::create_dir_all(receiver.join("logs/refs/agh")).unwrap();
+            std::fs::hard_link(&kept, receiver.join("logs/refs/agh/main")).unwrap();
+        } else {
+            symlink(&outside, receiver.join("refs/agh")).unwrap();
+        }
+        let gh = world
+            .client(git_env())
+            .git_remote_for_tests("fixture-dev/app", &bare)
+            .build();
+        let rows = fetch_rows(&[("refs/heads/main", "refs/agh/main", &first)]);
+        let error = gh
+            .run_git(&GitRun::fetch_batch(
+                &common::slug("fixture-dev/app"),
+                &receiver,
+                rows,
+                true,
+            ))
+            .expect_err("unsafe cache path");
+        assert_eq!(error.kind, Kind::Refused);
+        assert_eq!(std::fs::read(kept).unwrap(), b"kept external bytes\n");
+        assert!(
+            gh.fx()
+                .children_run()
+                .iter()
+                .all(|spec| !spec.args.iter().any(|arg| arg == "fetch"))
+        );
+    }
 }
 
 #[test]

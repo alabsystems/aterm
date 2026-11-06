@@ -623,10 +623,11 @@ pub(crate) fn propagate_attachments(buffer: &mut Buffer) {
     }
     let len = buffer.len;
     let direction = buffer.direction;
-    let advances = advance_sums(&buffer.pos[..len]);
+    let mut pos = Positions::new(&mut buffer.pos[..len]);
+    let advances = advance_sums(&pos);
     for i in 0..len {
         propagate_attachment_offsets(
-            &mut buffer.pos[..len],
+            &mut pos,
             &mut buffer.attach[..len],
             &advances,
             len,
@@ -636,28 +637,64 @@ pub(crate) fn propagate_attachments(buffer: &mut Buffer) {
     }
 }
 
+mod propagation {
+    use super::GlyphPosition;
+
+    /// Glyph positions as attachment propagation sees them: their offsets to read and move, and
+    /// their advances only through [`Positions::advance`], which counts every read in
+    /// `Spent::attachment_steps`. The slice is private to this module, so a mark that adds up
+    /// the advances between it and its base one glyph at a time counts every glyph it reads.
+    pub(super) struct Positions<'a>(&'a mut [GlyphPosition]);
+
+    impl<'a> Positions<'a> {
+        pub(super) fn new(pos: &'a mut [GlyphPosition]) -> Self {
+            Self(pos)
+        }
+
+        pub(super) fn len(&self) -> usize {
+            self.0.len()
+        }
+
+        /// Glyph `k`'s advance, `(x, y)`, one counted step.
+        pub(super) fn advance(&self, k: usize) -> (i32, i32) {
+            #[cfg(all(any(test, debug_assertions), not(trust_verify)))]
+            crate::work::note(|s| s.attachment_steps += 1);
+            (self.0[k].x_advance, self.0[k].y_advance)
+        }
+
+        /// Glyph `k`'s offset, `(x, y)`.
+        pub(super) fn offset(&self, k: usize) -> (i32, i32) {
+            (self.0[k].x_offset, self.0[k].y_offset)
+        }
+
+        /// Glyph `k`'s offset, `(x, y)`, to move.
+        pub(super) fn offset_mut(&mut self, k: usize) -> (&mut i32, &mut i32) {
+            let p = &mut self.0[k];
+            (&mut p.x_offset, &mut p.y_offset)
+        }
+    }
+}
+
+use propagation::Positions;
+
 /// The running sums of the glyphs' advances, `sums[k]` totalling glyphs `..k`, wrapping as
 /// adding them one at a time wraps. A mark moves back by the advances between it and its base:
 /// two of these sums give them in one step, where adding them up mark by mark costs the square
 /// of a run of marks on one base.
-fn advance_sums(pos: &[GlyphPosition]) -> Vec<(i32, i32)> {
-    #[cfg(all(any(test, debug_assertions), not(trust_verify)))]
-    crate::work::note(|s| s.attachment_steps += pos.len() as u64);
+fn advance_sums(pos: &Positions<'_>) -> Vec<(i32, i32)> {
     let mut sums = Vec::with_capacity(pos.len() + 1);
     let mut sum = (0i32, 0i32);
     sums.push(sum);
-    for p in pos {
-        sum = (
-            sum.0.wrapping_add(p.x_advance),
-            sum.1.wrapping_add(p.y_advance),
-        );
+    for k in 0..pos.len() {
+        let (x, y) = pos.advance(k);
+        sum = (sum.0.wrapping_add(x), sum.1.wrapping_add(y));
         sums.push(sum);
     }
     sums
 }
 
 fn apply_propagated_attachment_offset(
-    pos: &mut [GlyphPosition],
+    pos: &mut Positions<'_>,
     advances: &[(i32, i32)],
     curr: usize,
     next: usize,
@@ -666,28 +703,30 @@ fn apply_propagated_attachment_offset(
 ) {
     #[cfg(all(any(test, debug_assertions), not(trust_verify)))]
     crate::work::note(|s| s.attachment_steps += 1);
+    let (next_x, next_y) = pos.offset(next);
+    let (x, y) = pos.offset_mut(curr);
     match kind {
         attach_type::MARK if next < curr => {
-            pos[curr].x_offset = pos[curr].x_offset.wrapping_add(pos[next].x_offset);
-            pos[curr].y_offset = pos[curr].y_offset.wrapping_add(pos[next].y_offset);
+            *x = x.wrapping_add(next_x);
+            *y = y.wrapping_add(next_y);
 
             // Forward, less the advances of `next..curr`; backward, plus those of
             // `next + 1..=curr`.
             if direction.is_forward() {
-                let (x, y) = advances_between(advances, next, curr);
-                pos[curr].x_offset = pos[curr].x_offset.wrapping_sub(x);
-                pos[curr].y_offset = pos[curr].y_offset.wrapping_sub(y);
+                let (dx, dy) = advances_between(advances, next, curr);
+                *x = x.wrapping_sub(dx);
+                *y = y.wrapping_sub(dy);
             } else {
-                let (x, y) = advances_between(advances, next + 1, curr + 1);
-                pos[curr].x_offset = pos[curr].x_offset.wrapping_add(x);
-                pos[curr].y_offset = pos[curr].y_offset.wrapping_add(y);
+                let (dx, dy) = advances_between(advances, next + 1, curr + 1);
+                *x = x.wrapping_add(dx);
+                *y = y.wrapping_add(dy);
             }
         }
         attach_type::CURSIVE => {
             if direction.is_horizontal() {
-                pos[curr].y_offset = pos[curr].y_offset.wrapping_add(pos[next].y_offset);
+                *y = y.wrapping_add(next_y);
             } else {
-                pos[curr].x_offset = pos[curr].x_offset.wrapping_add(pos[next].x_offset);
+                *x = x.wrapping_add(next_x);
             }
         }
         _ => {}
@@ -703,7 +742,7 @@ fn advances_between(advances: &[(i32, i32)], start: usize, end: usize) -> (i32, 
 }
 
 fn propagate_attachment_offsets(
-    pos: &mut [GlyphPosition],
+    pos: &mut Positions<'_>,
     attach: &mut [Attachment],
     advances: &[(i32, i32)],
     len: usize,

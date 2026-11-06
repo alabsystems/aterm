@@ -119,15 +119,6 @@ impl HeartbeatClock {
         Self { last, every, moved }
     }
 
-    /// Whether [`Self::due`] would answer at `now`, answering nothing: a caller asks it before it
-    /// asks the LAN door, which only a use about to go may go through.
-    pub(crate) fn is_due(&self, now: std::time::Instant) -> bool {
-        self.moved.due_at(now)
-            || self
-                .last
-                .is_none_or(|last| now.saturating_duration_since(last) >= self.every)
-    }
-
     /// [`Self::due`] for a caller whose last round may still be out (`busy`): while it is, this
     /// answers nothing and takes nothing, so a move told meanwhile (the settled place's, seconds
     /// after a route move began a round that finds the LAN still down) gets a round of its own
@@ -2634,17 +2625,13 @@ fn watch_fleet_generation(
         let why = match read_fleet_key() {
             Ok(now) if now == *secret && node_now() == proved => {
                 follow_serving(generation, addr);
-                // A facts push and a heartbeat round dial members on the LAN: neither goes while
-                // System State's Local Network step, which asks macOS first, is still to come.
-                // The door is asked only once one of them is due, right before it goes: past the
-                // step's wait it takes the dialog slot for macOS's question.
+                // Each dial selects the broker at the transport boundary for LAN targets.
+                // Loopback peers remain reachable without a LAN broker.
                 let now = std::time::Instant::now();
                 let facts_due = last_facts_push.elapsed() >= FACTS_HEARTBEAT_EVERY;
                 // A round still out takes no move: the move waits for the round after it.
                 let busy = hb_in_flight.load(Ordering::Acquire);
-                let lan = (facts_due || (!busy && heartbeat.is_due(now)))
-                    && aterm_types::macos_setup::lan_first_use::may_use();
-                if lan && facts_due {
+                if facts_due {
                     last_facts_push = std::time::Instant::now();
                     push_facts_heartbeat(secret);
                 }
@@ -2652,7 +2639,7 @@ fn watch_fleet_generation(
                     last_census_refresh = std::time::Instant::now();
                     maybe_refresh_local_census();
                 }
-                if lan && let Some(woke) = heartbeat.due_when_free(now, busy) {
+                if let Some(woke) = heartbeat.due_when_free(now, busy) {
                     say_heartbeat_woke("fleet listener", woke);
                     spawn_member_heartbeat(addr, secret.clone(), (running, &hb_in_flight));
                 }

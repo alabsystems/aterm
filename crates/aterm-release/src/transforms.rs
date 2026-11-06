@@ -3,9 +3,10 @@
 
 //! Export source rewrites (`vendor/astream` materialization, `Cargo.lock` pruning, target stripping, and content rewrite).
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
-use aterm_census::export::rewrite;
+use aterm_census::export::rewrite_cow;
 
 /// Inputs to the export transforms.
 #[derive(Debug, Clone)]
@@ -161,8 +162,28 @@ fn astream(inputs: &Inputs) -> Result<(String, Vec<String>), String> {
         }
     }
     let _ = std::fs::remove_file(inputs.export.join(".gitmodules"));
-    let crates = astream_closure(&inputs.export, &sub, &rev)
-        .map_err(|e| format!("could not derive the astream crates the export depends on: {e}"))?;
+    let mut found = Vec::new();
+    manifests(&inputs.export, &mut found);
+    let exported = found
+        .iter()
+        .map(|manifest| {
+            let rel = manifest.strip_prefix(&inputs.export).unwrap_or(manifest);
+            crate::durable::read_text(manifest)
+                .map(|text| (rel.to_string_lossy().replace('\\', "/"), text))
+                .map_err(|e| format!("{}: {e}", manifest.display()))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let at_rev = |path: &str| {
+        git(&sub, &["show", &format!("{rev}:{path}")])
+            .ok()
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+    };
+    let crates = aterm_verify::export_scan::astream_closure(
+        &exported,
+        &at_rev,
+        &rev[..rev.len().min(12)],
+    )
+    .map_err(|e| format!("could not derive the astream crates the export depends on: {e}"))?;
     std::fs::create_dir_all(&dest).map_err(|e| format!("{}: {e}", dest.display()))?;
     let mut paths = vec!["Cargo.toml".to_string()];
     let mut roots = vec!["Cargo.toml".to_string()];
@@ -391,155 +412,6 @@ fn array_end(s: &str) -> Option<usize> {
     None
 }
 
-/// A manifest's dependency rows that cargo follows: its `[dependencies]` and
-/// `[build-dependencies]`, target-specific and `[workspace.dependencies]` ones included,
-/// optional ones too (a feature can turn any on), and with `dev` its
-/// `[dev-dependencies]`.
-fn dependency_rows(manifest: &aterm_toml::Value, dev: bool) -> Vec<(String, Option<String>, bool)> {
-    use aterm_toml::Value;
-    const KINDS: [&str; 5] = [
-        "dependencies",
-        "build-dependencies",
-        "build_dependencies",
-        "dev-dependencies",
-        "dev_dependencies",
-    ];
-    let kinds = if dev { &KINDS[..] } else { &KINDS[..3] };
-    let Some(root) = manifest.as_table() else {
-        return Vec::new();
-    };
-    let mut scopes = vec![root];
-    scopes.extend(root.get("workspace").and_then(Value::as_table));
-    if let Some(targets) = root.get("target").and_then(Value::as_table) {
-        scopes.extend(targets.values().filter_map(Value::as_table));
-    }
-    let mut rows = Vec::new();
-    for scope in scopes {
-        for &kind in kinds {
-            let Some(table) = scope.get(kind).and_then(Value::as_table) else {
-                continue;
-            };
-            for (name, spec) in table.iter() {
-                let path = spec.get("path").and_then(Value::as_str).map(str::to_string);
-                let workspace = spec.get("workspace").and_then(Value::as_bool) == Some(true);
-                rows.push((name.clone(), path, workspace));
-            }
-        }
-    }
-    rows
-}
-
-/// `base` joined with the relative `path`, `.` and `..` resolved lexically.
-fn join_lexically(base: &str, path: &str) -> String {
-    let mut parts: Vec<&str> = Vec::new();
-    for part in base.split('/').chain(path.split('/')) {
-        match part {
-            "" | "." => {}
-            ".." => {
-                parts.pop();
-            }
-            p => parts.push(p),
-        }
-    }
-    parts.join("/")
-}
-
-/// Computes the sorted closure of `vendor/astream/crates/*` path dependencies reached by `export` at `rev`.
-///
-/// # Errors
-/// Returns an error if no exported manifest reaches astream (the scan is wrong), a crate
-/// the export reaches is not at `rev`, or an astream crate path-depends outside astream's
-/// `crates/`.
-pub fn astream_closure(export: &Path, sub: &Path, rev: &str) -> Result<Vec<String>, String> {
-    let parse = |text: &str, what: &str| {
-        aterm_toml::from_str::<aterm_toml::Value>(text).map_err(|e| format!("{what}: {e}"))
-    };
-    let mut found = Vec::new();
-    manifests(export, &mut found);
-    let mut reached: std::collections::BTreeMap<String, String> = Default::default();
-    for manifest in found {
-        let rel_manifest = manifest.strip_prefix(export).unwrap_or(&manifest);
-        let rel_dir = rel_manifest
-            .parent()
-            .map(|d| d.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_default();
-        let text = crate::durable::read_text(&manifest)
-            .map_err(|e| format!("{}: {e}", manifest.display()))?;
-        let rows = dependency_rows(&parse(&text, &rel_manifest.display().to_string())?, true);
-        for (_, path, _) in rows {
-            let Some(path) = path else { continue };
-            let target = join_lexically(&rel_dir, &path);
-            if let Some(name) = target.strip_prefix("vendor/astream/crates/")
-                && !name.is_empty()
-                && !name.contains('/')
-            {
-                reached
-                    .entry(name.to_string())
-                    .or_insert_with(|| rel_manifest.display().to_string());
-            }
-        }
-    }
-    if reached.is_empty() {
-        return Err(
-            "no exported Cargo.toml path-depends on vendor/astream/crates/<crate>, yet \
-                    vendor/astream is a gitlink: the dependency scan is wrong"
-                .into(),
-        );
-    }
-    let at_rev = |path: &str| {
-        git(sub, &["show", &format!("{rev}:{path}")])
-            .ok()
-            .map(|b| String::from_utf8_lossy(&b).into_owned())
-    };
-    let short = &rev[..rev.len().min(12)];
-    let root =
-        at_rev("Cargo.toml").ok_or_else(|| format!("astream {short} has no root Cargo.toml"))?;
-    let workspace: std::collections::BTreeMap<String, String> =
-        dependency_rows(&parse(&root, "astream's root Cargo.toml")?, false)
-            .into_iter()
-            .filter_map(|(name, path, _)| Some((name, path?)))
-            .collect();
-    let mut todo: Vec<String> = reached.keys().cloned().collect();
-    let mut done = std::collections::BTreeSet::new();
-    while let Some(krate) = todo.pop() {
-        if !done.insert(krate.clone()) {
-            continue;
-        }
-        let Some(manifest) = at_rev(&format!("crates/{krate}/Cargo.toml")) else {
-            return Err(format!(
-                "{} path-depends on vendor/astream/crates/{krate}, which astream {short} does \
-                 not have",
-                reached[&krate]
-            ));
-        };
-        let own = format!("crates/{krate}");
-        for (name, path, in_workspace) in dependency_rows(&parse(&manifest, &own)?, false) {
-            let target = match (path, in_workspace) {
-                (Some(p), _) => join_lexically(&own, &p),
-                (None, true) => match workspace.get(&name) {
-                    Some(p) => join_lexically("", p),
-                    None => continue,
-                },
-                (None, false) => continue,
-            };
-            let Some(dep) = target
-                .strip_prefix("crates/")
-                .filter(|d| !d.is_empty() && !d.contains('/'))
-            else {
-                return Err(format!(
-                    "astream {own}/Cargo.toml depends on {name} at {target}, which is not an \
-                     astream crate the export can carry"
-                ));
-            };
-            reached
-                .entry(dep.to_string())
-                .or_insert_with(|| format!("astream {own}/Cargo.toml"));
-            todo.push(dep.to_string());
-        }
-    }
-    Ok(done.into_iter().collect())
-}
-
 /// The package names the export withholds: each `[package]` whose manifest the exported
 /// commit has (`CAPTURED_COMMIT`'s tree) and the export does not, unless an exported
 /// manifest carries the same name.
@@ -731,7 +603,7 @@ fn manifests(dir: &Path, out: &mut Vec<PathBuf>) {
             }
         })
         .collect();
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     for (_, is_dir, e) in entries {
         if is_dir {
             manifests(&e.path(), out);
@@ -909,8 +781,7 @@ fn rewrite_dir(dir: &Path) -> Result<(), String> {
             if bytes.contains(&0) {
                 continue;
             }
-            let out = rewrite(&bytes);
-            if out != bytes {
+            if let Cow::Owned(out) = rewrite_cow(&bytes) {
                 crate::durable::write_fresh(&path, &out)
                     .map_err(|e| format!("{}: {e}", path.display()))?;
             }

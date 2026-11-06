@@ -2,9 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! WHAT A TIER'S READERS AND WRITERS DID, counted: the pushes, the one-record reads by index,
-//! the walks and the rows they read, the subject walks and the pages they read, the pages a
-//! filtered read passed whole and the times it asked its filter of a subject, and the values
-//! read from the wide maps. A measurement says by it how much of the pages' code a piece of
+//! the walks and the rows they read, the pages a filtered read passed whole and the times it
+//! asked its filter of a subject, and the values read from the wide maps. A measurement says by it how much of the pages' code a piece of
 //! work ran (aterm's attach bench reads it around each restart, its item D10f), so a cost is
 //! put down to the tier, or not, by a count rather than a guess. Only a test or debug build
 //! counts (`Counters` and the broker's readers of them): a shipped broker keeps no counters.
@@ -34,10 +33,6 @@ pub struct TierTally {
     pub walks: u64,
     /// The rows those walks read.
     pub rows: u64,
-    /// The subject walks begun (the pending wills' reading, `Tier::naming`).
-    pub namings: u64,
-    /// The pages those walks read: the pages whose ids name the subject.
-    pub named_pages: u64,
     /// The pages a filtered read's pass (`Tier::passing`, a walk counted in `walks`) passed
     /// whole, none of their ids a subject the read wants: their records are not in `rows`.
     pub passed_pages: u64,
@@ -60,8 +55,6 @@ impl TierTally {
             wide: self.wide.saturating_sub(before.wide),
             walks: self.walks.saturating_sub(before.walks),
             rows: self.rows.saturating_sub(before.rows),
-            namings: self.namings.saturating_sub(before.namings),
-            named_pages: self.named_pages.saturating_sub(before.named_pages),
             passed_pages: self.passed_pages.saturating_sub(before.passed_pages),
             verdicts: self.verdicts.saturating_sub(before.verdicts),
         }
@@ -78,8 +71,6 @@ pub(crate) struct Counters {
     wide: AtomicU64,
     walks: AtomicU64,
     rows: AtomicU64,
-    namings: AtomicU64,
-    named_pages: AtomicU64,
     passed_pages: AtomicU64,
     verdicts: AtomicU64,
 }
@@ -93,8 +84,6 @@ pub(crate) enum Count {
     Wide,
     Walk,
     Rows,
-    Naming,
-    NamedPage,
     PassedPage,
     Verdict,
 }
@@ -108,8 +97,6 @@ impl Counters {
             Count::Wide => &self.wide,
             Count::Walk => &self.walks,
             Count::Rows => &self.rows,
-            Count::Naming => &self.namings,
-            Count::NamedPage => &self.named_pages,
             Count::PassedPage => &self.passed_pages,
             Count::Verdict => &self.verdicts,
         }
@@ -129,8 +116,6 @@ impl Counters {
             wide: r(Count::Wide),
             walks: r(Count::Walk),
             rows: r(Count::Rows),
-            namings: r(Count::Naming),
-            named_pages: r(Count::NamedPage),
             passed_pages: r(Count::PassedPage),
             verdicts: r(Count::Verdict),
         }
@@ -145,8 +130,6 @@ impl Counters {
             wide: AtomicU64::new(t.wide),
             walks: AtomicU64::new(t.walks),
             rows: AtomicU64::new(t.rows),
-            namings: AtomicU64::new(t.namings),
-            named_pages: AtomicU64::new(t.named_pages),
             passed_pages: AtomicU64::new(t.passed_pages),
             verdicts: AtomicU64::new(t.verdicts),
         }

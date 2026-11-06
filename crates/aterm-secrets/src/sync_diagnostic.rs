@@ -76,7 +76,6 @@ impl SyncDiagnostic {
                 "vault-changed" => ErrorKind::VaultChanged,
                 "membership-capacity" => ErrorKind::MembershipCapacity,
                 "membership-history-unavailable" => ErrorKind::MembershipHistoryUnavailable,
-                "local-network-pending" => ErrorKind::LocalNetworkPending,
                 "timed-out" => ErrorKind::TimedOut,
                 "join-queue-incomplete" => ErrorKind::JoinQueueIncomplete,
                 "not-stored" => ErrorKind::NotStored,
@@ -101,7 +100,6 @@ pub const fn failure_reason(kind: ErrorKind) -> &'static str {
         ErrorKind::VaultChanged => "local vault observation changed",
         ErrorKind::MembershipCapacity => "membership record capacity exhausted",
         ErrorKind::MembershipHistoryUnavailable => "retained membership history needs repair",
-        ErrorKind::LocalNetworkPending => "local network unavailable or permission pending",
         ErrorKind::TimedOut => "request timed out",
         ErrorKind::JoinQueueIncomplete => "join queues could not all be observed",
         ErrorKind::NotStored => "source did not store the version",
@@ -121,7 +119,6 @@ const fn failure_code(kind: ErrorKind) -> &'static str {
         ErrorKind::VaultChanged => "vault-changed",
         ErrorKind::MembershipCapacity => "membership-capacity",
         ErrorKind::MembershipHistoryUnavailable => "membership-history-unavailable",
-        ErrorKind::LocalNetworkPending => "local-network-pending",
         ErrorKind::TimedOut => "timed-out",
         ErrorKind::JoinQueueIncomplete => "join-queue-incomplete",
         ErrorKind::NotStored => "not-stored",
@@ -153,7 +150,6 @@ mod tests {
             SyncDiagnostic::Failed(ErrorKind::VaultChanged),
             SyncDiagnostic::Failed(ErrorKind::MembershipCapacity),
             SyncDiagnostic::Failed(ErrorKind::MembershipHistoryUnavailable),
-            SyncDiagnostic::Failed(ErrorKind::LocalNetworkPending),
             SyncDiagnostic::Failed(ErrorKind::TimedOut),
             SyncDiagnostic::Failed(ErrorKind::JoinQueueIncomplete),
             SyncDiagnostic::Failed(ErrorKind::NotStored),
@@ -183,6 +179,7 @@ mod tests {
             "aterm-secrets-sync-v1 applied 2",
             "aterm-secrets-sync-v1 unchanged 3\napplied seq 99",
             "aterm-secrets-sync-v1\nunchanged 3",
+            "aterm-secrets-sync-v1 failed local-network-pending",
         ] {
             assert_eq!(SyncDiagnostic::parse(text), None);
         }

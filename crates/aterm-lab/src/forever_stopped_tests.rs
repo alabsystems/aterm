@@ -1,20 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The stopped-first want (§14.7) over `chrome` as main prints it under continuous forward (no
-//! presence line), as a 7a build printed it (the ask's tab pressed) and as main before 7a, with
-//! `cruise-n`'s report and the stand-in ask standing.
+//! The stopped-first want (§14.7) over `chrome` as main prints it and as main before 7a printed
+//! it, with `cruise-n`'s report and the stand-in ask standing.
 
 use super::super::Window;
 use super::*;
 
-const ASK_SID: &str = "s-ask";
-const REPORT_SID: &str = "s-cn";
-
-/// `chrome`'s Needs you lines with the ask first or second and the report at the other row, the
-/// report row's `tip`, and a presence line pressing the tab `pressing` where one is drawn (none
-/// since continuous forward removed the window's pressing session).
-fn chrome(ask_first: bool, tip: Option<&str>, pressing: Option<&str>) -> String {
+/// `chrome`'s Needs you lines with the ask first or second and the report at the other row, and
+/// the report row's `tip`.
+fn chrome(ask_first: bool, tip: Option<&str>) -> String {
     let ask = format!(
         "statusmenu \"◇ {ASK_TAB} — {} · 1s\" enabled=yes checked=no at=1",
         ASK_WORDS.join(" ")
@@ -29,17 +24,11 @@ fn chrome(ask_first: bool, tip: Option<&str>, pressing: Option<&str>) -> String 
     } else {
         (report, ask)
     };
-    let presence = pressing.map_or_else(String::new, |p| {
-        format!(
-            "\npresence rim=decide pressing=@{p} pill=\"◇ {ASK_TAB} (tab 4) · approve the stand-in \
-             request · 1s\""
-        )
-    });
     format!(
         "statusitem title=❯2 needs=2 stuck=0 exceptions=0 done=0 fleet=off\n\
          statusmenu \"Needs you (2)\" enabled=no at=0\n{one}\n{two}\n\
          statusmenu --- at=4\n\
-         statusmenu \"This Mac — 2 need you · 3 working\" enabled=no at=5{presence}"
+         statusmenu \"This Mac — 2 need you · 3 working\" enabled=no at=5"
     )
 }
 
@@ -49,10 +38,7 @@ fn judged(chrome: &str, program: &'static str) -> Verdict {
         window: Window {
             read: true,
             label: "cruise-n".into(),
-            stopped: Some((
-                5_000,
-                format!("{} cleared=yes", read.line(ASK_SID, REPORT_SID)),
-            )),
+            stopped: Some((5_000, format!("{} cleared=yes", read.line()))),
             ..Window::default()
         },
         ..Seen::default()
@@ -67,11 +53,10 @@ fn judged(chrome: &str, program: &'static str) -> Verdict {
     )
 }
 
-/// Main's read under continuous forward passes on every harness, each in its own program's name;
-/// THE NEGATIVE CONTROL is 7a's (the ask's tab pressed), and main's before 7a (the older report
-/// first, the front tab's report pressed, no tip) fails on each count.
+/// Main's read passes on every harness, each in its own program's name; THE NEGATIVE CONTROL is
+/// main's before 7a (the older report first, no tip), which fails on each count.
 #[test]
-fn the_ask_lists_first_nothing_presses_and_the_report_carries_on() {
+fn the_ask_lists_first_and_the_report_carries_on() {
     for (program, product) in [
         ("claude", "Claude Code"),
         ("agy", "Antigravity CLI"),
@@ -82,35 +67,22 @@ fn the_ask_lists_first_nothing_presses_and_the_report_carries_on() {
             aterm_agent::harness::hold_said::NeedTail::CarryingOn,
             false,
         );
-        let ours = chrome(true, Some(&tip), None);
+        let ours = chrome(true, Some(&tip));
         let read = Read::of(&ours, "cruise-n");
         assert_eq!((read.ask, read.report), (Some(0), Some(1)), "{read:?}");
         assert_eq!(read.tip.as_deref(), Some(tip.as_str()));
-        assert_eq!(read.pressing, "-");
         let v = judged(&ours, program);
         assert!(matches!(v, Verdict::Pass(_)), "{program}: {v:?}");
 
-        let pressed = chrome(true, Some(&tip), Some(ASK_SID));
-        assert_eq!(
-            Read::of(&pressed, "cruise-n").pressing,
-            format!("@{ASK_SID}")
-        );
-        let Verdict::Fail(why) = judged(&pressed, program) else {
-            panic!("CONTROL: 7a's pressed ask passed on {program}");
-        };
-        assert!(why.contains("PRESSED: presence pressing=ask"), "{why}");
-
-        let main = chrome(false, None, Some(REPORT_SID));
+        let main = chrome(false, None);
         let Verdict::Fail(why) = judged(&main, program) else {
             panic!("CONTROL: main's read passed on {program}");
         };
         assert!(why.contains("after its older report"), "{why}");
-        assert!(why.contains("pressing=report"), "{why}");
         assert!(why.contains("tip is none"), "{why}");
         for (one, broken) in [
-            ("order", chrome(false, Some(&tip), None)),
-            ("pressing", chrome(true, Some(&tip), Some(REPORT_SID))),
-            ("tip", chrome(true, None, None)),
+            ("order", chrome(false, Some(&tip))),
+            ("tip", chrome(true, None)),
         ] {
             assert!(
                 matches!(judged(&broken, program), Verdict::Fail(_)),
@@ -125,7 +97,6 @@ fn the_ask_lists_first_nothing_presses_and_the_report_carries_on() {
                     aterm_agent::harness::hold_said::NeedTail::CarryingOn,
                     false,
                 )),
-                None,
             );
             assert!(
                 matches!(judged(&claude, program), Verdict::Fail(_)),
@@ -157,10 +128,10 @@ fn an_ask_never_read_is_unobserved_and_one_never_listed_fails() {
         aterm_agent::harness::hold_said::NeedTail::CarryingOn,
         false,
     );
-    let mut alone = chrome(true, Some(&tip), None);
+    let mut alone = chrome(true, Some(&tip));
     alone = alone
         .lines()
-        .filter(|l| !l.contains(ASK_TAB) || l.starts_with("presence "))
+        .filter(|l| !l.contains(ASK_TAB))
         .collect::<Vec<_>>()
         .join("\n");
     let read = Read::of(&alone, "cruise-n");
@@ -173,19 +144,13 @@ fn an_ask_never_read_is_unobserved_and_one_never_listed_fails() {
         },
         ..Seen::default()
     };
-    let Verdict::Fail(why) = first(
-        &seen(format!("{} cleared=yes", read.line(ASK_SID, REPORT_SID))),
-        &cx,
-    ) else {
+    let Verdict::Fail(why) = first(&seen(format!("{} cleared=yes", read.line())), &cx) else {
         panic!("unlisted passed");
     };
     assert!(why.contains("did not list"), "{why}");
-    let ours = Read::of(&chrome(true, Some(&tip), None), "cruise-n");
+    let ours = Read::of(&chrome(true, Some(&tip)), "cruise-n");
     assert!(matches!(
-        first(
-            &seen(format!("{} cleared=no", ours.line(ASK_SID, REPORT_SID))),
-            &cx
-        ),
+        first(&seen(format!("{} cleared=no", ours.line())), &cx),
         Verdict::Fail(_)
     ));
 }

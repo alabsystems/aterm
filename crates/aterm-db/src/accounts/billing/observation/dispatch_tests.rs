@@ -102,7 +102,7 @@ pub(super) fn succeed(f: &Fixture, source: &Billing, decision: Digest) -> Resour
     f.repair();
     let actor = f.lab.bootstrap(1).request().unwrap().binding().actor();
     let config = f.lab.paths[0].home.join("harness.toml");
-    std::fs::write(&config, "").unwrap();
+    aterm_uds::atomic_file::write(&config, b"", 0o600).unwrap();
     crate::test_complete_writer_successor(
         f.lab._home.path(),
         &f.lab.paths[0],

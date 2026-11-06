@@ -7,8 +7,6 @@ use super::*;
 
 use aterm_agent::harness::acts::{Act, TaskFace};
 
-const ACCENT: [u8; 3] = [0, 128, 255];
-
 fn blank() -> RenderCell {
     RenderCell {
         ch: ' ',
@@ -74,7 +72,7 @@ struct Row {
 
 fn rows() -> Vec<Row> {
     use crate::autopilot::mode_words;
-    use ChipTone::{Accent, Amber, Dim, Off};
+    use ChipTone::{Letter, Quiet};
     use aterm_agent::supervise::Autopilot;
     let timed = crate::autopilot::TIMED_CRUISE_CHIP;
     let landed = aterm_agent::supervise::mode_words::landed_brief(None);
@@ -101,7 +99,7 @@ fn rows() -> Vec<Row> {
             ChipFace::Cruise,
             "\u{221e}",
             "\u{221e}",
-            (Accent, Accent),
+            (Letter, Letter),
             &format!(
                 "autopilot: cruise \u{2014} {cruise} \u{b7} click: land \u{b7} right-click: more"
             ),
@@ -114,7 +112,7 @@ fn rows() -> Vec<Row> {
             ChipFace::CruiseUntil,
             "\u{221e} \u{2913}18:00",
             "\u{221e}",
-            (Accent, Amber),
+            (Letter, Letter),
             &format!(
                 "autopilot: cruise until 18:00, then land \u{2014} {timed} \u{b7} click: land now \
                  \u{b7} right-click: more"
@@ -128,7 +126,7 @@ fn rows() -> Vec<Row> {
             ChipFace::CruiseUntil,
             "\u{221e} \u{2913}16:00",
             "\u{221e}",
-            (Accent, Amber),
+            (Letter, Letter),
             &format!(
                 "autopilot: cruise until Sat 16:00, then land \u{2014} {timed} \u{b7} click: land \
                  now \u{b7} right-click: more"
@@ -142,7 +140,7 @@ fn rows() -> Vec<Row> {
             ChipFace::Cruise,
             "\u{221e}",
             "\u{221e}",
-            (Accent, Accent),
+            (Letter, Letter),
             &format!(
                 "autopilot: cruise \u{2014} {cruise} \u{b7} click: land \u{b7} right-click: more"
             ),
@@ -155,7 +153,7 @@ fn rows() -> Vec<Row> {
             ChipFace::CruiseUntil,
             "\u{221e} \u{2913}16:00",
             "\u{221e}",
-            (Accent, Amber),
+            (Letter, Letter),
             &format!(
                 "autopilot: cruise until Sat 16:00, then land \u{2014} {timed} \u{b7} click: land \
                  now \u{b7} right-click: more"
@@ -169,7 +167,7 @@ fn rows() -> Vec<Row> {
             ChipFace::Cruise,
             "\u{221e}",
             "\u{221e}",
-            (Accent, Accent),
+            (Letter, Letter),
             &format!(
                 "autopilot: cruise \u{2014} {cruise} \u{b7} click: land \u{b7} right-click: more"
             ),
@@ -182,7 +180,7 @@ fn rows() -> Vec<Row> {
             ChipFace::CruiseUntil,
             "\u{221e} \u{2913}18:00",
             "\u{221e}",
-            (Accent, Amber),
+            (Letter, Letter),
             &format!(
                 "autopilot: cruise until 18:00, then land \u{2014} {timed} \u{b7} click: land now \
                  \u{b7} right-click: more"
@@ -196,7 +194,7 @@ fn rows() -> Vec<Row> {
             ChipFace::Land,
             "\u{2913}",
             "\u{2913}",
-            (Amber, Amber),
+            (Letter, Letter),
             &format!("autopilot: land \u{2014} {land} \u{b7} click: off \u{b7} right-click: more"),
             "autopilot: land",
             "Autopilot: land.",
@@ -207,7 +205,7 @@ fn rows() -> Vec<Row> {
             ChipFace::Land,
             "\u{2913}",
             "\u{2913}",
-            (Amber, Amber),
+            (Letter, Letter),
             &format!("autopilot: land \u{2014} {land} \u{b7} click: off \u{b7} right-click: more"),
             "autopilot: land",
             "Autopilot: land.",
@@ -218,7 +216,7 @@ fn rows() -> Vec<Row> {
             ChipFace::Landed,
             "\u{2713} landed",
             "\u{2713}",
-            (Amber, Amber),
+            (Letter, Letter),
             &format!(
                 "autopilot: land, landed 17:42 \u{2014} {landed} \u{b7} click: off \u{b7} \
                  right-click: more"
@@ -232,7 +230,7 @@ fn rows() -> Vec<Row> {
             ChipFace::Theirs,
             "\u{2913} quiet",
             "\u{2913}",
-            (Dim, Dim),
+            (Quiet, Quiet),
             "autopilot: land, quiet \u{2014} a person's own exchange; the harness types nothing \
              until someone else's turn ends \u{b7} click: off \u{b7} right-click: more",
             "autopilot: land, quiet",
@@ -244,7 +242,7 @@ fn rows() -> Vec<Row> {
             ChipFace::Failed,
             "\u{2715} failed",
             "\u{2715}",
-            (Dim, Dim),
+            (Quiet, Quiet),
             "autopilot: land, failed \u{2014} the worker could not finish; the harness types \
              nothing until someone else's turn \u{b7} click: off \u{b7} right-click: more",
             "autopilot: land, failed",
@@ -256,7 +254,7 @@ fn rows() -> Vec<Row> {
             ChipFace::Cruise,
             "\u{221e}",
             "\u{221e}",
-            (Accent, Accent),
+            (Letter, Letter),
             &format!(
                 "autopilot: cruise \u{2014} {cruise} \u{b7} click: land \u{b7} right-click: more"
             ),
@@ -269,7 +267,7 @@ fn rows() -> Vec<Row> {
             ChipFace::Off,
             "\u{25cb}",
             "\u{25cb}",
-            (Off, Off),
+            (Quiet, Quiet),
             &format!("autopilot: off \u{2014} {off} \u{b7} click: cruise \u{b7} right-click: more"),
             "autopilot: off",
             "Autopilot: off.",
@@ -280,7 +278,7 @@ fn rows() -> Vec<Row> {
             ChipFace::MasterOff,
             "\u{2298} off",
             "\u{2298}",
-            (Off, Off),
+            (Quiet, Quiet),
             "harness off in Settings \u{b7} click: turn the harness on \u{b7} right-click: more",
             "harness off in Settings",
             "Autopilot: off. The harness is off in Settings.",
@@ -291,7 +289,7 @@ fn rows() -> Vec<Row> {
             ChipFace::AgentOff(aterm_phase::Program::Claude),
             "\u{2298} off",
             "\u{2298}",
-            (Off, Off),
+            (Quiet, Quiet),
             "Supervise Claude Code sessions is off \u{b7} click: turn the harness on \u{b7} \
              right-click: more",
             "Supervise Claude Code sessions is off",
@@ -303,7 +301,7 @@ fn rows() -> Vec<Row> {
             ChipFace::Unhosted,
             "\u{2298} off",
             "\u{2298}",
-            (Off, Off),
+            (Quiet, Quiet),
             "no harness: this aterm has no control socket \u{b7} click: open Settings \u{25b8} \
              Harness \u{b7} right-click: more",
             "no harness: this aterm has no control socket",
@@ -312,12 +310,12 @@ fn rows() -> Vec<Row> {
     ]
 }
 
+/// A tone's ink on [`blank`] for the Autopilot chip, the block's first, under Cruise.
 fn ink(tone: ChipTone) -> [u8; 3] {
+    let at = ChipAt::cruise(blank());
     match tone {
-        ChipTone::Accent => ACCENT,
-        ChipTone::Amber => AMBER,
-        ChipTone::Dim => dim_of(blank()),
-        ChipTone::Off => off_of(blank()),
+        ChipTone::Letter => at.letter_at(0),
+        ChipTone::Quiet => at.quiet(),
     }
 }
 
@@ -527,7 +525,7 @@ fn the_hovered_landed_title_keeps_what_aterm_checked_beside_the_footer() {
             7,
             blank(),
             now,
-            ACCENT,
+            ChipAt::cruise(blank()),
             None,
             Some(Chip::Autopilot),
             (400, true),
@@ -593,14 +591,14 @@ fn the_face_table_gives_every_state_its_face_ink_titles_and_words() {
         if row.view == AutopilotView::Unhosted {
             let w = lights(row.view, row.glass);
             assert!(
-                w.block(7, blank(), now, ACCENT, Keep::Drawn)
+                w.block(7, blank(), now, ChipAt::cruise(blank()), Keep::Drawn)
                     .lights
                     .is_empty()
             );
             continue;
         }
         let w = lights(row.view, row.glass);
-        let block = w.block(7, blank(), now, ACCENT, Keep::Drawn);
+        let block = w.block(7, blank(), now, ChipAt::cruise(blank()), Keep::Drawn);
         let n = row.drawn.chars().count();
         assert_eq!(text(&block.lights), row.drawn, "{what}");
         assert_eq!(block.cols[0], (0..n, Chip::Autopilot), "{what}");
@@ -622,7 +620,7 @@ fn the_face_table_gives_every_state_its_face_ink_titles_and_words() {
                     s,
                     Chip::row().filter(|chip| on(*chip)),
                     Keep::Drawn,
-                    Inks::of(blank(), ACCENT),
+                    Inks::of(blank(), ChipAt::cruise(blank())),
                     None,
                 ),
                 block.lights.len(),
@@ -631,7 +629,7 @@ fn the_face_table_gives_every_state_its_face_ink_titles_and_words() {
         }
         let mut w = w;
         w.hover = Some((7, Target::from(Chip::Autopilot)));
-        let block = w.block(7, blank(), now, ACCENT, Keep::Drawn);
+        let block = w.block(7, blank(), now, ChipAt::cruise(blank()), Keep::Drawn);
         assert_eq!(text(&block.title), format!("{}  ", row.whole), "{what}");
         assert_eq!(
             text(&block.short_title),
@@ -902,7 +900,7 @@ fn every_face_keeps_its_clicks_after_its_explanation() {
             7,
             blank(),
             now,
-            ACCENT,
+            ChipAt::cruise(blank()),
             None,
             Some(Chip::Autopilot),
             (400, true),
@@ -1099,7 +1097,7 @@ fn each_glyph_only_rung_is_the_glyph_alone() {
         }
         let what = format!("{:?} {:?}", row.view, row.glass);
         let w = lights(row.view, row.glass);
-        let block = w.block(7, blank(), now, ACCENT, Keep::GlyphOnly);
+        let block = w.block(7, blank(), now, ChipAt::cruise(blank()), Keep::GlyphOnly);
         assert_eq!(text(&block.lights), row.glyph, "{what}");
         assert!(
             block.lights.iter().all(|c| c.fg == ink(row.tones.0)),
@@ -1116,7 +1114,7 @@ fn each_glyph_only_rung_is_the_glyph_alone() {
                 s,
                 Chip::row().filter(|chip| on(*chip)),
                 Keep::GlyphOnly,
-                Inks::of(blank(), ACCENT),
+                Inks::of(blank(), ChipAt::cruise(blank())),
                 None,
             ),
             block.lights.len(),
@@ -1127,7 +1125,10 @@ fn each_glyph_only_rung_is_the_glyph_alone() {
     w.sessions.get_mut(&7).unwrap().autopilot_pending =
         Some((Autopilot::Land, now + Duration::from_secs(1)));
     assert_eq!(
-        text(&w.block(7, blank(), now, ACCENT, Keep::GlyphOnly).lights),
+        text(
+            &w.block(7, blank(), now, ChipAt::cruise(blank()), Keep::GlyphOnly)
+                .lights
+        ),
         PENDING_GLYPH
     );
     assert_eq!(
@@ -1174,7 +1175,7 @@ fn a_narrow_rule_gives_a_standing_face_down_to_its_glyph() {
         let face = row.drawn.chars().count();
         let mut wider = usize::MAX;
         for room in (0..=face + 4).rev() {
-            let block = w.fitted(7, blank(), now, ACCENT, None, None, room);
+            let block = w.fitted(7, blank(), now, ChipAt::cruise(blank()), None, None, room);
             let drawn = block.as_ref().map(|b| text(&b.lights));
             let want = if room >= face {
                 Some(row.drawn.to_owned())
@@ -1464,11 +1465,11 @@ fn a_face_clock_that_moves_under_its_face_repaints_the_title_being_read() {
 fn the_acts_label_and_the_glass_clock_are_the_tables() {
     assert_eq!(
         act_label(AutopilotView::Cruise, Act::Approved),
-        ("\u{2713}", "approved", ChipTone::Accent)
+        ("\u{2713}", "approved", ChipTone::Letter)
     );
     assert_eq!(
         act_label(AutopilotView::Land, Act::Continued),
-        ("\u{21bb}", "kept going", ChipTone::Amber)
+        ("\u{21bb}", "kept going", ChipTone::Letter)
     );
     for minute in [0, 59, 60, 1080, 1439] {
         assert_eq!(Clock::of_minute(minute).minute(), minute);
@@ -1485,43 +1486,67 @@ fn the_acts_label_and_the_glass_clock_are_the_tables() {
     );
 }
 
+/// The amber Land and auto wore before the glass's tokens (Claude Code's auto-mode pill).
+const PILL_AMBER: [u8; 3] = [0xE8, 0xB0, 0x3C];
+
+/// A built-in theme's row cell.
+fn theme_row(name: &str) -> RenderCell {
+    let rgb = |c: u32| [(c >> 16) as u8, (c >> 8) as u8, c as u8];
+    let scheme = aterm_types::scheme::builtin(name).expect("a listed scheme exists");
+    let theme = aterm_render::Theme::from(&scheme);
+    RenderCell {
+        ch: ' ',
+        fg: rgb(theme.fg),
+        bg: rgb(theme.bg),
+        ..RenderCell::default()
+    }
+}
+
+/// LAND'S LETTERS READ ON EVERY BUILT-IN THEME: under each view's palette the Land chip, a
+/// landed one and a timed cruise's `⤓18:00` wear the letter of the chip's column, at 4.5:1 or
+/// more, and an act's label the letter of its own column. NEGATIVE CONTROL: the fixed amber
+/// Land wore before fails a light ground.
 #[test]
-fn lands_amber_clears_the_text_floor_on_every_builtin_theme() {
+fn lands_letters_read_on_every_builtin_theme() {
     use crate::chrome_band::contrast;
     let now = Instant::now();
-    let rgb = |c: u32| [(c >> 16) as u8, (c >> 8) as u8, c as u8];
     let mut under = Vec::new();
     for name in aterm_types::scheme::builtin_names() {
-        let scheme = aterm_types::scheme::builtin(name).expect("a listed scheme exists");
-        let theme = aterm_render::Theme::from(&scheme);
-        let ground = rgb(theme.bg);
-        let row = RenderCell {
-            ch: ' ',
-            fg: rgb(theme.fg),
-            bg: ground,
-            ..RenderCell::default()
-        };
-        if contrast(AMBER, ground) < CHIP_INK_FLOOR {
+        let row = theme_row(name);
+        let ground = row.bg;
+        if contrast(PILL_AMBER, ground) < 4.5 {
             under.push(name);
         }
-        let floored = land_ink(ground);
-        assert!(
-            contrast(floored, ground) >= CHIP_INK_FLOOR,
-            "{name}: {floored:?} on {ground:?}"
-        );
-        if contrast(AMBER, ground) >= CHIP_INK_FLOOR {
-            assert_eq!(floored, AMBER, "{name}: the amber itself where it clears");
-        }
-        for (view, glass, amber) in [
-            (AutopilotView::Land, ChipGlass::default(), 0..1),
-            (AutopilotView::Land, told(TaskFace::Landed), 0..8),
-            (AutopilotView::Cruise, timer(18, 0, None), 2..8),
+        for (view, glass, at, cells) in [
+            (
+                AutopilotView::Land,
+                ChipGlass::default(),
+                ChipAt::land(row),
+                0..1,
+            ),
+            (
+                AutopilotView::Land,
+                told(TaskFace::Landed),
+                ChipAt::land(row),
+                0..8,
+            ),
+            (
+                AutopilotView::Cruise,
+                timer(18, 0, None),
+                ChipAt::cruise(row),
+                0..8,
+            ),
         ] {
             let w = lights(view, glass);
-            let block = w.block(7, row, now, ACCENT, Keep::Drawn);
-            let cells = &block.lights[amber.clone()];
+            let block = w.block(7, row, now, at, Keep::Drawn);
+            let letter = at.letter_at(0);
             assert!(
-                cells.iter().all(|c| c.fg == floored),
+                contrast(letter, ground) >= 4.5,
+                "{name} {view:?}: {letter:?} on {ground:?}"
+            );
+            let cells = &block.lights[cells];
+            assert!(
+                cells.iter().all(|c| c.fg == letter),
                 "{name} {view:?}: {:?}",
                 text(cells)
             );
@@ -1534,12 +1559,14 @@ fn lands_amber_clears_the_text_floor_on_every_builtin_theme() {
             },
         );
         w.hover = None;
-        let block = w.block(7, row, now, ACCENT, Keep::Drawn);
+        let at = ChipAt::land(row);
+        let block = w.block(7, row, now, at, Keep::Drawn);
+        let letter = at.letter_at(block.lights.len() + 2);
         let label: Vec<&RenderCell> = block.title.iter().filter(|c| c.ch != ' ').collect();
         assert!(!label.is_empty(), "{name}: the act's label");
         assert!(
-            label.iter().all(|c| c.fg == floored),
-            "{name}: the act's label in Land's ink"
+            label.iter().all(|c| c.fg == letter),
+            "{name}: the act's label in its column's letter"
         );
     }
     assert!(
@@ -1548,127 +1575,101 @@ fn lands_amber_clears_the_text_floor_on_every_builtin_theme() {
     );
 }
 
+/// AUTO READS AS A VALUE ON EVERY BUILT-IN THEME: the expected mode's light (`⏵⏵ auto`) wears
+/// the glass's value ink, at 7:1 or more, never its pill's amber. NEGATIVE CONTROL: the pill's
+/// amber fails a light ground.
 #[test]
-fn autos_own_hue_clears_the_text_floor_on_every_builtin_theme() {
+fn auto_reads_as_a_value_on_every_builtin_theme() {
     use crate::chrome_band::contrast;
     let now = Instant::now();
-    let rgb = |c: u32| [(c >> 16) as u8, (c >> 8) as u8, c as u8];
-    let ModeInk::Hue(hue) = Mode::Auto.ink() else {
-        panic!("auto wears its pill's hue");
-    };
+    assert_eq!(Mode::Auto.ink(), ModeInk::Value, "auto: the value ink");
     let mut under = Vec::new();
     for name in aterm_types::scheme::builtin_names() {
-        let scheme = aterm_types::scheme::builtin(name).expect("a listed scheme exists");
-        let theme = aterm_render::Theme::from(&scheme);
-        let ground = rgb(theme.bg);
-        let row = RenderCell {
-            ch: ' ',
-            fg: rgb(theme.fg),
-            bg: ground,
-            ..RenderCell::default()
-        };
-        if contrast(hue, ground) < CHIP_INK_FLOOR {
+        let row = theme_row(name);
+        let ground = row.bg;
+        if contrast(PILL_AMBER, ground) < 4.5 {
             under.push(name);
         }
         let mut w = lights(AutopilotView::Cruise, ChipGlass::default());
         w.sessions.get_mut(&7).expect("session 7").shown.mode = Some(Mode::Auto);
         w.hover = Some((7, Target::from(Chip::Light(Light::Mode))));
-        let block = w.block(7, row, now, ACCENT, Keep::Drawn);
+        let at = ChipAt::cruise(row);
+        let block = w.block(7, row, now, at, Keep::Drawn);
         let pill: String = format!("{} {}", Mode::Auto.glyph(), Mode::Auto.word());
         let all = text(&block.lights);
-        let at = all
+        let first = all
             .find(&pill)
+            .map(|at| all[..at].chars().count())
             .unwrap_or_else(|| panic!("{name}: the light drawn: {all:?}"));
-        let first = all[..at].chars().count();
-        let cells = &block.lights[first..first + pill.chars().count()];
-        for cell in cells.iter().filter(|c| c.ch != ' ') {
+        for cell in block.lights[first..first + pill.chars().count()]
+            .iter()
+            .filter(|c| c.ch != ' ')
+        {
+            assert_eq!(cell.fg, at.value(), "{name}: the value ink");
             assert!(
-                contrast(cell.fg, ground) >= CHIP_INK_FLOOR,
+                contrast(cell.fg, ground) >= 6.99,
                 "{name}: {:?} on {ground:?}",
                 cell.fg
             );
-            if contrast(hue, ground) >= CHIP_INK_FLOOR {
-                assert_eq!(cell.fg, hue, "{name}: the hue itself");
-            }
         }
     }
     assert!(
         under.contains(&"Aterm Day"),
-        "NEGATIVE CONTROL: the fixed amber fails a light ground: {under:?}"
+        "NEGATIVE CONTROL: the pill's amber fails a light ground: {under:?}"
     );
 }
 
-/// YOLO IS DRAWN IN THE RULE'S INK, NEVER RED (the owner, 2026-11-02): on every built-in theme,
-/// under Claude's dark rule grey (0x88), its light one (0x99) and a rule in the row's own ink,
-/// every cell of `yolo` (a rewritten row) and of `⏵⏵ bypass` (Claude's own row) is the rule's
-/// ink floored to the chip floor, and the rule's ink itself where it clears it; a block with no
-/// rule noted draws it in the row's ink.
+/// YOLO READS AS A VALUE, NEVER RED (the owner, 2026-11-02): on every built-in theme every cell
+/// of `yolo` (a rewritten row) and of `⏵⏵ bypass` (Claude's own row) wears the glass's value ink,
+/// at 7:1 or more, whatever grey the rule it sits on wears. NEGATIVE CONTROL: Claude's rule grey,
+/// floored to read, is not that ink on some ground, so the rule no longer decides it.
 #[test]
-fn yolo_wears_the_rules_ink_floored_on_every_builtin_theme() {
+fn yolo_wears_the_value_ink_on_every_builtin_theme() {
     use crate::chrome_band::contrast;
     let now = Instant::now();
-    let rgb = |c: u32| [(c >> 16) as u8, (c >> 8) as u8, c as u8];
     let old_red = [0xE0, 0x5A, 0x5A];
-    let mut under = Vec::new();
+    let mut apart = Vec::new();
     for name in aterm_types::scheme::builtin_names() {
-        let scheme = aterm_types::scheme::builtin(name).expect("a listed scheme exists");
-        let theme = aterm_render::Theme::from(&scheme);
-        let ground = rgb(theme.bg);
-        let row = RenderCell {
-            ch: ' ',
-            fg: rgb(theme.fg),
-            bg: ground,
-            ..RenderCell::default()
-        };
-        for rule in [Some([0x88; 3]), Some([0x99; 3]), Some(row.fg), None] {
-            for rewritten in [true, false] {
-                let mut w = lights(AutopilotView::Cruise, ChipGlass::default());
-                let s = w.sessions.get_mut(&7).expect("session 7");
-                s.shown.mode = Some(Mode::Bypass);
-                s.rewritten = rewritten;
-                s.rule = rule;
-                w.hover = Some((7, Target::from(Chip::Light(Light::Mode))));
-                let block = w.block(7, row, now, ACCENT, Keep::Drawn);
-                let face = match Mode::Bypass.glyph_on_glass(rewritten) {
-                    "" => Mode::Bypass.word_on_glass(rewritten).to_owned(),
-                    glyph => format!("{glyph} {}", Mode::Bypass.word_on_glass(rewritten)),
-                };
-                assert_eq!(face == "yolo", rewritten, "{name}");
-                let all = text(&block.lights);
-                let at = all
-                    .find(&face)
-                    .unwrap_or_else(|| panic!("{name} {rule:?}: {face:?} drawn: {all:?}"));
-                let first = all[..at].chars().count();
-                let want = rule.map_or_else(|| Inks::of(row, ACCENT).ink, |r| floored(r, ground));
-                for cell in block.lights[first..first + face.chars().count()]
-                    .iter()
-                    .filter(|c| c.ch != ' ')
-                {
-                    assert_eq!(cell.fg, want, "{name} {rule:?} rewritten={rewritten}");
-                    assert_ne!(cell.fg, old_red, "{name}: never Claude's red");
-                    assert!(
-                        contrast(cell.fg, ground) >= CHIP_INK_FLOOR,
-                        "{name} {rule:?}: {:?} on {ground:?}",
-                        cell.fg
-                    );
-                    if let Some(r) = rule
-                        && contrast(r, ground) >= CHIP_INK_FLOOR
-                    {
-                        assert_eq!(cell.fg, r, "{name}: the rule's ink itself");
-                    }
-                }
-                if let Some(r) = rule
-                    && contrast(r, ground) < CHIP_INK_FLOOR
-                {
-                    under.push((name, r));
-                }
+        let row = theme_row(name);
+        let ground = row.bg;
+        let at = ChipAt::cruise(row);
+        if crate::chrome_band::ensure_contrast([0x88; 3], ground, 4.5) != at.value() {
+            apart.push(name);
+        }
+        for rewritten in [true, false] {
+            let mut w = lights(AutopilotView::Cruise, ChipGlass::default());
+            let s = w.sessions.get_mut(&7).expect("session 7");
+            s.shown.mode = Some(Mode::Bypass);
+            s.rewritten = rewritten;
+            w.hover = Some((7, Target::from(Chip::Light(Light::Mode))));
+            let block = w.block(7, row, now, at, Keep::Drawn);
+            let face = match Mode::Bypass.glyph_on_glass(rewritten) {
+                "" => Mode::Bypass.word_on_glass(rewritten).to_owned(),
+                glyph => format!("{glyph} {}", Mode::Bypass.word_on_glass(rewritten)),
+            };
+            assert_eq!(face == "yolo", rewritten, "{name}");
+            let all = text(&block.lights);
+            let first = all
+                .find(&face)
+                .map(|at| all[..at].chars().count())
+                .unwrap_or_else(|| panic!("{name}: {face:?} drawn: {all:?}"));
+            for cell in block.lights[first..first + face.chars().count()]
+                .iter()
+                .filter(|c| c.ch != ' ')
+            {
+                assert_eq!(cell.fg, at.value(), "{name} rewritten={rewritten}");
+                assert_ne!(cell.fg, old_red, "{name}: never Claude's red");
+                assert!(
+                    contrast(cell.fg, ground) >= 6.99,
+                    "{name}: {:?} on {ground:?}",
+                    cell.fg
+                );
             }
         }
     }
     assert!(
-        under.contains(&("Aterm Day", [0x99; 3])),
-        "NEGATIVE CONTROL: Claude's light rule grey fails a light ground, so the floor is \
-         exercised: {under:?}"
+        !apart.is_empty(),
+        "NEGATIVE CONTROL: Claude's grey is the value ink on every ground"
     );
 }
 
@@ -2027,13 +2028,6 @@ fn the_dim_faces_and_the_rows_ink_read_on_every_ground() {
         }
     };
     let names = aterm_types::scheme::builtin_names();
-    let accents: Vec<[u8; 3]> = names
-        .iter()
-        .map(|name| {
-            let scheme = aterm_types::scheme::builtin(name).expect("a built-in");
-            crate::chrome_band::band_colors(aterm_render::Theme::from(&scheme)).accent
-        })
-        .collect();
     let soft = RenderCell {
         ch: ' ',
         fg: [0x7a; 3],
@@ -2045,48 +2039,54 @@ fn the_dim_faces_and_the_rows_ink_read_on_every_ground() {
         .map(|&name| (name, blank_of(name)))
         .chain(std::iter::once(("a soft theme of one's own", soft)))
         .collect();
-    let (mut checked, mut kept) = (0usize, 0usize);
+    let mut checked = 0usize;
+    let mut lifted = 0usize;
     for &(tab, blank) in &tabs {
-        let ink = Inks::of(blank, ACCENT).ink;
-        let ink_k = reads(ink, blank.bg);
+        let inks = Inks::of(blank, ChipAt::cruise(blank));
+        let (ink, value) = (inks.ink, inks.title);
+        let (ink_k, value_k) = (reads(ink, blank.bg), reads(value, blank.bg));
+        // The row's ink reads as words do and never quieter than a value, so an unexpected
+        // mode never reads under an expected one: the pane's own ink where it reads that loud.
         assert!(
-            ink_k >= NAME_CONTRAST,
-            "{tab}: the row's ink at {ink_k:.2}:1"
+            ink_k >= NAME_CONTRAST && ink_k >= value_k,
+            "{tab}: the row's ink at {ink_k:.2}:1, a value at {value_k:.2}:1"
         );
-        if reads(blank.fg, blank.bg) >= NAME_CONTRAST {
-            assert_eq!(ink, blank.fg, "{tab}: an ink that reads is kept");
+        let own = reads(blank.fg, blank.bg);
+        if own >= value_k {
+            assert_eq!(
+                ink, blank.fg,
+                "{tab}: an ink that reads as loud as a value is kept"
+            );
         }
-        let old = halfway(blank);
-        for &accent in &accents {
-            for view in [
+        lifted += usize::from((NAME_CONTRAST..value_k).contains(&own));
+        for (view, palette) in [
+            (
                 AutopilotView::Off,
-                AutopilotView::MasterOff,
-                AutopilotView::Unhosted,
-            ] {
-                let block = Block::of_autopilot(view, blank, accent);
-                for c in block.lights.iter().filter(|c| c.ch != ' ') {
-                    let k = reads(c.fg, blank.bg);
-                    // Quiet, never faint: as words read, and quieter than the row's ink, as
-                    // loud only on a tab whose own ink reads under the floor, which leaves no
-                    // room above it.
-                    let room = reads(blank.fg, blank.bg) >= NAME_CONTRAST;
-                    assert!(
-                        k >= NAME_CONTRAST && (k < ink_k || (!room && k <= ink_k)),
-                        "{tab}, {view:?}: {:?} at {k:.2}:1, the row's ink at {ink_k:.2}:1",
-                        c.ch
-                    );
-                    if reads(old, blank.bg) >= NAME_CONTRAST {
-                        assert_eq!(c.fg, old, "{tab}, {view:?}: halfway that reads is kept");
-                        kept += 1;
-                    }
-                    checked += 1;
-                }
+                Some(aterm_effects::harness_card::CardPalette::Off),
+            ),
+            (AutopilotView::MasterOff, None),
+            (AutopilotView::Unhosted, None),
+        ] {
+            let at = ChipAt::test(palette, blank);
+            let block = Block::of_autopilot(view, blank, at);
+            for c in block.lights.iter().filter(|c| c.ch != ' ') {
+                let k = reads(c.fg, blank.bg);
+                // Quiet, never faint: as words read, and quieter than the row's ink, as loud
+                // only on a tab whose own ink reads under the floor, which leaves no room above
+                // it.
+                let room = reads(blank.fg, blank.bg) >= NAME_CONTRAST;
+                assert!(
+                    k >= NAME_CONTRAST && (k < ink_k || (!room && k <= ink_k)),
+                    "{tab}, {view:?}: {:?} at {k:.2}:1, the row's ink at {ink_k:.2}:1",
+                    c.ch
+                );
+                assert_eq!(c.fg, at.quiet(), "{tab}, {view:?}: the quiet ink");
+                checked += 1;
             }
         }
     }
-    // Off's `○` and the master's `⊘ off`, on every tab under every accent.
-    assert!(checked >= tabs.len() * accents.len() * 5, "{checked}");
-    assert!(kept > 0, "some theme's halfway reads and is kept");
+    // Off's `○` and the master's `⊘ off`, on every tab.
+    assert!(checked >= tabs.len() * 5, "{checked}");
     for name in ["Solarized Light", "Default Light"] {
         let blank = blank_of(name);
         assert!(
@@ -2099,5 +2099,9 @@ fn the_dim_faces_and_the_rows_ink_read_on_every_ground() {
         reads(soft.fg, soft.bg) < NAME_CONTRAST,
         "CONTROL: the soft theme's ink at {:.2}:1",
         reads(soft.fg, soft.bg)
+    );
+    assert!(
+        lifted > 0,
+        "CONTROL: no tab's own ink reads between the name floor and a value (Solarized does)"
     );
 }

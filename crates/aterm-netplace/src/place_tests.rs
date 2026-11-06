@@ -792,9 +792,8 @@ fn looks_at_home_leave_the_record_unchanged_until_the_confirmation_is_an_hour_ol
     );
 }
 
-/// At home with Local Network turned off (or members refusing this Mac's key), the heartbeat's
-/// dials to the members on this network are refused by this Mac itself (no route) or by the
-/// members: those rounds are not silence, and the remembered network stays the ALab LAN however
+/// At home behind a firewall here (or with members refusing this Mac's key), the heartbeat's
+/// dials to the members on this network are refused by this Mac itself or by the members: those rounds are not silence, and the remembered network stays the ALab LAN however
 /// many of them come.
 /// NEGATIVE CONTROL: counting every round that heard no member as silent (dropping
 /// `round.blocked == 0` from `silent_rounds`) reads home as "a network members were once on",

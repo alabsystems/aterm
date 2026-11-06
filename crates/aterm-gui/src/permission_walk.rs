@@ -11,23 +11,10 @@
 //!
 //! * It starts by itself once, on a cold first launch or in an update's successor
 //!   ([`starts`], [`WalkLane::note_successor`]): no page aterm brought up before and no typing
-//!   ([`START_KEYS_QUIET`]), the Mac Setup tab not the window's next macOS ask
-//!   (`App::mac_setup_tab_comes_next`: setup's one password goes first), System Settings
-//!   asking nothing (`App::system_settings_may_ask`), and System State's Local Network step run
-//!   and its alert's hold over ([`App::local_network_step_to_come`]): macOS's answer heard by the
-//!   LAN re-probe, the alert seen answered by the window-list watch, a new window of its owner
-//!   come and then, with the person at the Mac, none of that owner left
-//!   ([`App::on_local_network_alert_answered`]), or the
-//!   person at the Mac for
-//!   [`crate::system_state_access::LOCAL_NETWORK_ALERT_HOLD`] counted from their first touch
-//!   after the ask, their time away not counted ([`App::look_at_local_network_alert`]), so
-//!   System Settings does not come up beside that
-//!   alert, even one asked while nobody was there; or that step still to come once it alone has
-//!   held a ready walk for [`LOCAL_NETWORK_WAIT`] of unbroken looks and its own moment has not
-//!   come ([`App::waited_out_local_network`]), after which the walk goes first and the step, and
-//!   every step after it asks once it is over: the one exception to
-//!   the Local Network step going first. Automatic acquisition requires no visit to System
-//!   State and no recent keyboard activity.
+//!   ([`START_KEYS_QUIET`]), the Mac Setup tab not the next macOS ask
+//!   (`App::mac_setup_tab_comes_next`), System Settings
+//!   asking nothing (`App::system_settings_may_ask`). Automatic acquisition requires no visit
+//!   to System State and no recent keyboard activity.
 //!   `aterm ctl permissions walk now` (at most once a minute, [`VERB_AGAIN_AFTER`])
 //!   and the Permissions row's press start one; the verb sent while one is under way joins it
 //!   ([`WalkLane::join`]) and takes back a page the walk passed
@@ -71,35 +58,13 @@ use aterm_types::macos_setup::{Access, AccessOutcome};
 use crate::App;
 use crate::devtools_helper::{Closed, HandOver, Moment, Origin, Page};
 
-/// Presence window for interactive-page timers and the Local Network alert watch. Starting
-/// automatic acquisition does not depend on this window.
+/// Presence window for interactive-page timers. Starting automatic acquisition does not depend
+/// on this window.
 pub(crate) const START_PRESENT_WITHIN: Duration = Duration::from_secs(60);
 
 /// How long the keyboard must have been still for the walk to start by itself: a word being
 /// typed (a vault password, a first command) is not cut off by System Settings.
 pub(crate) const START_KEYS_QUIET: Duration = Duration::from_secs(2);
-
-/// How long the walk that starts by itself waits for System State's Local Network step
-/// ([`App::local_network_step_to_come`]), counted over an unbroken run of looks at which the walk
-/// was ready to start and only that step held it ([`App::waited_out_local_network`]): a look the
-/// walk is not ready at (System State out of the front, a key typed, a gesture or walk up), and
-/// System Settings asking something at the look the count runs out (where it is read, once per
-/// wait), start the count again, as does focus back after none of aterm's
-/// windows had it for `FOCUS_AWAY_FOR` or more, while a shorter flick of focus does not (the
-/// steps' key rest reads the same away rule, `App::note_keyboard_focus`); a look at which the
-/// step's own moment has come lets the step ask first; and any walk starting spends the count,
-/// so the next walk by itself waits afresh. Past it the walk starts, and the step, which waits
-/// out every gesture of the window's, the walk among them, asks once the walk is over. While the
-/// walk is ready the step's moment differs from its start in its key rest
-/// (`devtools_helper::QUIET_FOR`, not [`START_KEYS_QUIET`]) and focus-return rest, and the
-/// launch's settle, which pass within seconds, and in parts that may last: an update hand-off
-/// pending or in flight (one that stays parked), and a condition no reading here names. This ends
-/// only a wait on such a part, which would otherwise hold the walk for good; presence and System
-/// Settings asking the two read alike (`App::person_present_within`,
-/// `App::system_settings_asks`), so neither ends it: the walk's presence, held through an
-/// unbroken wait keeps the wait counting. Automatic acquisition does not require a new touch
-/// when the wait ends.
-pub(crate) const LOCAL_NETWORK_WAIT: Duration = Duration::from_secs(60);
 
 /// How often the window reads the grant the walk's page asks for while the panel is up, until
 /// it shows its done words: the Full Disk Access probe, `AXIsProcessTrusted`, the Developer Tools
@@ -774,24 +739,8 @@ pub(crate) struct WalkLane {
     ax_declined: Option<(String, bool)>,
     /// What a walk left at a Quit & Reopen for this process ([`App::take_walk_reopen`]).
     reopened: Reopened,
-    /// The walk's wait for System State's Local Network step ([`LOCAL_NETWORK_WAIT`]), from the
-    /// first of an unbroken run of looks at which only that step held a start; spent by any walk
-    /// that starts ([`Self::start`]).
-    local_network_wait: Option<LocalNetworkWait>,
     /// This process is an update's successor ([`Self::note_successor`]).
     successor: bool,
-}
-
-/// The walk's wait for System State's Local Network step ([`App::waited_out_local_network`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct LocalNetworkWait {
-    /// The approved revision whose step it waits for: another revision's step starts it again.
-    revision: u64,
-    /// The first of the unbroken run of looks at which the walk was ready to start and only the
-    /// step still to come held it.
-    since: Instant,
-    /// The run lasted [`LOCAL_NETWORK_WAIT`]: the walk waits for that revision's step no more.
-    over: bool,
 }
 
 /// The pages a walk under way left for the aterm System Settings' Quit & Reopen opened, as this
@@ -833,7 +782,6 @@ impl WalkLane {
             asked_automation: false,
             ax_declined: None,
             reopened: Reopened::Unread,
-            local_network_wait: None,
             successor: false,
         }
     }
@@ -894,10 +842,6 @@ impl WalkLane {
     /// pages it opens as the owner's press would. Pages a Quit & Reopen left that wait for the
     /// start's rules wait no more: this walk (a person's press, the control verb) came first.
     pub(crate) fn start(&mut self, walk: Walk, by: &'static str) {
-        // A walk under way holds the Local Network step, and no look counts the walk's readiness
-        // while it lasts, so a wait run before it (over or not) says nothing of the looks after
-        // it: the next walk by itself waits [`LOCAL_NETWORK_WAIT`] afresh.
-        self.local_network_wait = None;
         self.yields = false;
         self.slot_won = false;
         self.asked_automation = false;
@@ -1077,12 +1021,9 @@ enum Opened {
 }
 
 impl App {
-    /// The walk's turn before the hand-overs: the person's time with System State's Local Network
-    /// alert counted first ([`App::look_at_local_network_alert`]), so its hold reads as of this
-    /// turn; on a cold first launch with the person at System State, start one by itself
-    /// ([`starts`]); then [`Self::drive_permission_walk`].
+    /// The walk's turn before the hand-overs: on a cold first launch with the person at System
+    /// State, start one by itself ([`starts`]); then [`Self::drive_permission_walk`].
     pub(crate) fn tick_permission_walk(&mut self, now: Instant) {
-        self.look_at_local_network_alert(now);
         if !cfg!(target_os = "macos") || !self.devtools_helper.windowed() {
             return;
         }
@@ -1099,63 +1040,40 @@ impl App {
     /// ([`Self::declined_for_the_verb`]: a re-ask after a decline waits for a quiet moment on the
     /// automatic hand-overs). A walk the setup run has not admitted (no approved revision, a
     /// `[privacy]` switch off) never starts by itself, nor one while another of the window's
-    /// gestures (the Local Network alert's hold among them) or a macOS dialog of aterm's is up, nor
-    /// one while the Mac Setup tab is the window's next macOS ask
-    /// ([`Self::mac_setup_tab_comes_next`]: setup's one password goes first, and the walk follows
-    /// once the tab gave the dialog slot back), nor one while System Settings asks something ([`Self::system_settings_may_ask`], a question
-    /// seen asking that lapsed off screen among them: the walk opens its pages), nor one before
-    /// the approved revision's Local Network step has run or is found on record
-    /// ([`Self::local_network_step_to_come`]): that step goes first in the run, at its own moment,
-    /// and its alert is not left beside System Settings. That wait ends once only the step has held
-    /// a ready walk for [`LOCAL_NETWORK_WAIT`] of unbroken looks, and never at a look where the
-    /// step's own moment has come ([`Self::waited_out_local_network`]): the walk starts then, says
-    /// so in aterm.log with what held the step, and the step, held by the walk as by any of the
-    /// window's gestures, asks after it, never beside it. Readiness does not require a focused
-    /// System State page or a recent-input signal. This runs at every park,
-    /// so the in-memory readings come first, the access record once per revision, then the page
-    /// markers ([`Self::fresh_mac`]), the declines and the subjects missing (files and grants
-    /// read), and System Settings asking last (it may read the window list), read once per look
-    /// and only at a look that would start a walk. A wait for the Local Network step reads the
-    /// page markers, declines and grants at the look that begins it, which found a walk to start,
-    /// and again, with System Settings, only at the look that finds it run out: the looks between
-    /// read memory alone ([`Self::waited_out_local_network`]). Pages a walk left at System Settings' Quit & Reopen, which the first look
-    /// takes ([`Self::take_walk_reopen`]), start a walk under these rules in place of the page
-    /// markers: those still missing and not held back by the owner's Not now, in the walk's order.
+    /// gestures or a macOS dialog of aterm's is up, nor one while the Mac Setup tab comes next
+    /// ([`Self::mac_setup_tab_comes_next`]) or System Settings asks something
+    /// ([`Self::system_settings_may_ask`], a question seen asking that lapsed off screen among
+    /// them: the walk opens its pages). Readiness does not require a focused System State page or
+    /// a recent-input signal. This runs at every park, so the in-memory readings come first, then
+    /// the page markers ([`Self::fresh_mac`]), the declines and the subjects missing (files and
+    /// grants read), and System Settings asking last (it may read the window list), read once per
+    /// look and only at a look that would start a walk. Pages a walk left at System Settings'
+    /// Quit & Reopen, which the first look takes ([`Self::take_walk_reopen`]), start a walk under
+    /// these rules in place of the page markers: those still missing and not held back by the
+    /// owner's Not now, in the walk's order.
     fn look_for_walk_start(&mut self, now: Instant) {
         self.take_walk_reopen();
         let cold = self.walk_may_start_by_itself();
-        let Some(revision) = self
+        if self
             .access_revision()
             .filter(|_| cold && self.access_steps_allowed() && self.permission_steps_admitted())
-        else {
-            self.restart_local_network_wait();
+            .is_none()
+        {
             return;
-        };
+        }
         let facts = StartFacts {
             cold,
             typing: self
                 .last_keystroke_at
                 .is_some_and(|at| now.saturating_duration_since(at) < START_KEYS_QUIET),
         };
-        let ready = starts(facts)
-            && !self.access_gesture_up(now)
-            && !self.access_dialog_up()
-            && !self.mac_setup_tab_comes_next();
-        if !ready {
-            self.restart_local_network_wait();
+        if !starts(facts)
+            || self.access_gesture_up(now)
+            || self.access_dialog_up()
+            || self.mac_setup_tab_comes_next()
+        {
             return;
         }
-        let ahead_of_local_network = self.local_network_step_to_come();
-        // A wait under way found a walk to start at the look that began it: its later looks read
-        // no markers, declines, grants or System Settings until it runs out.
-        let ran_out = match ahead_of_local_network
-            .then(|| self.waited_out_local_network(revision, now))
-            .flatten()
-        {
-            Some(false) => return,
-            Some(true) => true,
-            None => false,
-        };
         let reopened = matches!(self.permission_walk.reopened, Reopened::Waits(_));
         let walk = if let Reopened::Waits(left) = &self.permission_walk.reopened {
             let left = left.clone();
@@ -1170,7 +1088,6 @@ impl App {
                 aterm_log::info!(
                     "permission walk: every page Quit & Reopen left reads held or declined"
                 );
-                self.restart_local_network_wait();
                 return;
             }
             walk
@@ -1179,7 +1096,6 @@ impl App {
                 && !self.permission_walk.gave_way
                 && !self.fresh_mac()
             {
-                self.restart_local_network_wait();
                 return;
             }
             let missing = Subject::ORDER.map(|subject| {
@@ -1190,98 +1106,19 @@ impl App {
             Walk::new(subjects(&[], |subject| missing[subject.index()]), now)
         };
         let Some(walk) = walk else {
-            self.restart_local_network_wait();
             return;
         };
-        if ahead_of_local_network && !ran_out {
-            self.begin_local_network_wait(revision, now);
-            return;
-        }
         // Read last, once per look, and only at a look that would start the walk: one that opens
         // System Settings' pages, so a question seen asking that lapsed off screen holds it too.
         if self.system_settings_may_ask() {
-            self.restart_local_network_wait();
             return;
-        }
-        if ran_out && let Some(wait) = self.permission_walk.local_network_wait.as_mut() {
-            wait.over = true;
         }
         if reopened {
             self.permission_walk.reopened = Reopened::Spent;
-            self.start_walk_by_itself(walk, "Quit & Reopen", ahead_of_local_network, now);
+            self.permission_walk.start(walk, "Quit & Reopen");
         } else {
-            self.start_walk_by_itself(walk, "first launch", ahead_of_local_network, now);
+            self.permission_walk.start(walk, "first launch");
         }
-    }
-
-    /// Start `walk` by itself, `by` in aterm.log's words; one that goes `ahead` of System State's
-    /// Local Network step ([`Self::waited_out_local_network`]) says so with what held the step
-    /// ([`Self::local_network_holds`]), read before the walk counts among them.
-    fn start_walk_by_itself(&mut self, walk: Walk, by: &'static str, ahead: bool, now: Instant) {
-        // System Settings read asking nothing at this look ([`Self::look_for_walk_start`]).
-        let holds = ahead.then(|| self.local_network_holds_read(now, Some(false)));
-        self.permission_walk.start(walk, by);
-        if let Some(holds) = holds {
-            aterm_log::info!(
-                "permission walk: System State's Local Network step has not come in {} s of \
-                 looks with the walk ready to start ({}); the walk goes first, and the step asks \
-                 once it is over",
-                LOCAL_NETWORK_WAIT.as_secs(),
-                if holds.is_empty() {
-                    "nothing it reads holds it now".to_owned()
-                } else {
-                    format!("it waits: {}", holds.join("; "))
-                }
-            );
-        }
-    }
-
-    /// The walk's wait for System State's Local Network step starts again at a look the walk is
-    /// not ready at, unless it is over: [`LOCAL_NETWORK_WAIT`] counts only unbroken readiness.
-    fn restart_local_network_wait(&mut self) {
-        if self
-            .permission_walk
-            .local_network_wait
-            .is_some_and(|wait| !wait.over)
-        {
-            self.permission_walk.local_network_wait = None;
-        }
-    }
-
-    /// Whether the walk that starts by itself, ready to start at this look, has waited
-    /// [`LOCAL_NETWORK_WAIT`] for `revision`'s Local Network step, still to come, as far as the
-    /// wait under way knows: `None` when no unbroken wait is under way for that revision (this
-    /// look, finding a walk to start, begins one: [`Self::begin_local_network_wait`]);
-    /// `Some(false)` while it counts, or once it ran out but the step's own moment has come
-    /// ([`Self::local_network_moment_but_settings`]: the step asks later in this turn, unless
-    /// System Settings asks something, which holds the walk too); `Some(true)` once it ran out (or
-    /// ran out before) with the step's moment not come. It reads nothing but in memory, and the
-    /// step's moment only once the wait ran out, so a look that finds it counting returns before
-    /// the walk is worked out again. An aterm window taking keyboard focus back after none had it
-    /// for [`crate::FOCUS_AWAY_FOR`] or more since the clock started breaks the run, though no
-    /// look fell in that time away (`App::note_keyboard_focus`).
-    fn waited_out_local_network(&self, revision: u64, now: Instant) -> Option<bool> {
-        let back = self.keyboard_focus_back_at;
-        let wait = self.permission_walk.local_network_wait.filter(|wait| {
-            wait.revision == revision && (wait.over || back.is_none_or(|back| back <= wait.since))
-        })?;
-        let ran_out = wait.over || now.saturating_duration_since(wait.since) >= LOCAL_NETWORK_WAIT;
-        Some(ran_out && !self.local_network_moment_but_settings(now))
-    }
-
-    /// Begin the walk's wait for `revision`'s Local Network step at this look, the first of an
-    /// unbroken run (or of another revision) at which a walk would start
-    /// ([`Self::waited_out_local_network`]), unless the step's own moment has come
-    /// ([`Self::local_network_moment_but_settings`]): it asks later in this turn.
-    fn begin_local_network_wait(&mut self, revision: u64, now: Instant) {
-        if self.local_network_moment_but_settings(now) {
-            return;
-        }
-        self.permission_walk.local_network_wait = Some(LocalNetworkWait {
-            revision,
-            since: now,
-            over: false,
-        });
     }
 
     /// Take, once per process, the pages a walk under way left when System Settings' Quit &

@@ -1429,6 +1429,7 @@ fn machinewide(dir: &Path) -> super::Machinewide {
             work: "lint".to_owned(),
             crates: Some(vec!["aterm-capacity".to_owned()]),
         },
+        more: vec!["lint".to_owned(), "test".to_owned()],
     }
 }
 

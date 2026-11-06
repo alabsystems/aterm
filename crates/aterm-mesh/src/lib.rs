@@ -25,6 +25,10 @@
 //! the node service opens a [`Mesh`] only then.
 
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    all(unix, anchor_rules, any(test, debug_assertions)),
+    feature(macro_attr)
+)]
 #![cfg(unix)]
 
 #[cfg(test)]

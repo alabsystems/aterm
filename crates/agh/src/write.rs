@@ -266,21 +266,27 @@ pub(crate) fn settle_table(
                 why: format!("GitHub answered {} with no object id", answered.status),
             },
         },
-        Err(error)
-            if error.side_effect == SideEffect::None
-                && error.http.is_none()
-                && error.kind != Kind::OutcomeUnknown =>
-        {
-            Settled::NeverSent
-        }
-        Err(error) => match &error.http {
+        Err(error) => settle_error(error),
+    }
+}
+
+/// The common HTTP/native write error settlement: only a proven no-effect
+/// error closes without a remote acknowledgement.
+pub(crate) fn settle_error(error: &Error) -> Settled {
+    if error.side_effect == SideEffect::None
+        && error.http.is_none()
+        && error.kind != Kind::OutcomeUnknown
+    {
+        Settled::NeverSent
+    } else {
+        match &error.http {
             Some(http) if (400..=499).contains(&http.status) => Settled::Refused {
                 status: http.status,
             },
             _ => Settled::Unknown {
                 why: crate::redact::Redactor::shapes(&error.why),
             },
-        },
+        }
     }
 }
 

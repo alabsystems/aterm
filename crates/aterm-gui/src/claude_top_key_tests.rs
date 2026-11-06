@@ -107,7 +107,7 @@ fn the_ghost_is_drawn_only_on_evidence_of_off() {
     let row = top_row(&app, wid);
     let rule = top_cells(&app, wid)[w - 1];
     let greyed =
-        crate::claude_footer::greyed_ink(rule.fg, app.windows[&wid].input_scratch.implicit_blank);
+        crate::claude_footer::quiet_ink(rule, app.windows[&wid].input_scratch.implicit_blank);
     assert_ne!(greyed, rule.fg, "CONTROL: a rule in the pane's own ink");
     for cell in &top_cells(&app, wid)[w - 15..w - 2] {
         assert_eq!(
@@ -202,8 +202,8 @@ fn a_click_on_the_ghost_types_key_on_and_reads_it_back() {
     frame(&mut app, wid);
     let pending = top_text(&app, wid);
     assert!(
-        pending.contains(&format!("\u{25d0}{}", ghost_text())),
-        "◐ before the ghost: {pending:?}"
+        pending.contains(&format!("\u{25cc}{}", ghost_text())),
+        "◌ before the ghost: {pending:?}"
     );
     let slash = Slash::TopEffort(true);
     let at = through_enter_after_probe(&mut app, session, &mut reader, slash);
@@ -303,7 +303,7 @@ fn a_double_click_on_the_key_opens_no_menu_while_aterm_types() {
 /// A CLICK ON CLAUDE'S TAG TYPES THE KEY OFF AND NEVER WRITES ITS CELLS:
 /// what the click turns the key to is the ENGINE's — off, its tag drawn —
 /// and through the press the tag's cells and its leading blank are never in
-/// the footer's write, only the `◐` in the `─` before them; Claude's tag
+/// the footer's write, only the `◌` in the `─` before them; Claude's tag
 /// gone ends it with its notice, and the ghost stands in its slot (the
 /// process showed the key).
 #[cfg(target_os = "macos")]
@@ -320,8 +320,8 @@ fn a_click_on_claudes_tag_types_key_off_and_never_writes_its_cells() {
     frame(&mut app, wid);
     assert_eq!(
         top_cells(&app, wid)[tag.cols.0 - 2].ch,
-        '\u{25d0}',
-        "◐ before it"
+        '\u{25cc}',
+        "◌ before it"
     );
     assert_eq!(
         top_cells(&app, wid)[tag.cols.0 - 1..],
@@ -676,7 +676,7 @@ fn the_keys_mark_reads_on_a_tab_theme_the_instance_did_not_choose() {
     assert_eq!(pty(&mut reader, 1), b"/");
     frame(&mut app, wid);
     let mark = top_cells(&app, wid)[tag.cols.0 - 2];
-    assert_eq!(mark.ch, '\u{25d0}', "◐ before the tag");
+    assert_eq!(mark.ch, '\u{25cc}', "◌ before the tag");
     let paper = aterm_types::scheme::builtin("Default Light")
         .expect("a built-in")
         .background;

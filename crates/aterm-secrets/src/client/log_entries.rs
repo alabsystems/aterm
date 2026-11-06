@@ -22,6 +22,10 @@ mod commit_tests;
 mod held_draft_tests;
 
 #[cfg(test)]
+#[path = "log_entries/held_conformance_tests.rs"]
+mod held_conformance_tests;
+
+#[cfg(test)]
 #[path = "log_entries/enrollment_seat_tests.rs"]
 mod enrollment_seat_tests;
 
@@ -236,27 +240,37 @@ pub(super) fn caller_covers_custody(log: &Log, custody: Option<&(Log, [u8; 32])>
 }
 
 pub(super) fn trusted_local_log(paths: &Paths, config: &Config) -> crate::Result<Option<Log>> {
-    let state = super::load_state(paths)?;
+    Ok(local_log_under(&Reads::new(paths), config)?.map(|held| held.log().clone()))
+}
+
+/// The acknowledged store under `config`, where this Mac is in the vault and has applied it: under
+/// the version it applied ([`seeded_under`]), or with no version and no vault file, under the
+/// signer `config` pins alone ([`configured_under`]).
+pub(super) fn local_log_under(
+    reads: &Reads<'_>,
+    config: &Config,
+) -> crate::Result<Option<HeldLog>> {
+    let state = reads.state()?;
     if state.membership != super::Stored::In || state.failed || !state.pending.is_empty() {
         return Ok(None);
     }
-    if state.digest.is_none() && super::fsx::kind(&paths.cache_file())? == super::fsx::Kind::Missing
+    if state.digest.is_none()
+        && super::fsx::kind(&reads.paths().cache_file())? == super::fsx::Kind::Missing
     {
         if state.source_identity != Some(super::source_identity(config))
             || !super::pin_admitted(config, None)
         {
             return Ok(None);
         }
-        return Ok(trusted_configured_log(paths, config)?.map(|c| c.log));
+        return configured_under(reads, config);
     }
-    if !super::source_bound(config, &state) || !super::pin_admitted(config, None) {
+    if !super::source_bound(config, state) || !super::pin_admitted(config, None) {
         return Ok(None);
     }
-    let Some(cached) = super::read_held_copy(paths, config, &state)? else {
+    let Some(envelope) = reads.verified_under(config, state)? else {
         return Ok(None);
     };
-    let envelope = super::envelope::parse(&cached)?;
-    Ok(trusted_seeded_log(paths, config, &envelope)?.map(|(log, _)| log))
+    seeded_under(reads, config, &envelope.signer, &envelope.handoff)
 }
 
 /// Configure a newcomer's local vault source, signer pin, and lock state from a pinned source
@@ -976,6 +990,41 @@ fn merge_optional_roster(
             None => *into = Some(roster),
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The negative control of an unchanged edit over a log's departure: while set, an edit that
+    /// changes nothing in `[everyone]` mints a fresh epoch there for a departure the log made, as
+    /// an admin's mirror once did over a prefix its tender still held.
+    pub(super) static DEPARTURE_MINTS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn departure_mints() -> bool {
+    DEPARTURE_MINTS.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+const fn departure_mints() -> bool {
+    false
+}
+
+/// Whether an edit's entries of one audience, `doc_map`, are the ones the log holds there,
+/// `log_map`: the same names, each with the same value, and none a person's save resolves
+/// (`resolving`), so the edit writes nothing there of its own.
+fn unchanged_audience(
+    doc_map: Option<&BTreeMap<String, Entry>>,
+    log_map: Option<&BTreeMap<String, Entry>>,
+    resolving: impl Fn(&String) -> bool,
+) -> bool {
+    let empty = BTreeMap::new();
+    let (doc, held) = (doc_map.unwrap_or(&empty), log_map.unwrap_or(&empty));
+    doc.len() == held.len()
+        && doc.iter().all(|(name, entry)| {
+            !resolving(name) && held.get(name).is_some_and(|cur| same_entry(cur, entry))
+        })
 }
 
 fn same_entry(a: &Entry, b: &Entry) -> bool {
@@ -2032,9 +2081,10 @@ fn held_draft_file(paths: &Paths, seq: u64, version: &[u8; 32]) -> PathBuf {
 }
 
 /// The one hold a build before per-version holds kept: the records alone, of a version it did not
-/// name. The first head whose stamp they complete takes them in ([`adopt_held_draft`]); a settled
-/// head removes the file only once every record it holds is in the records store. No answer can
-/// say whether its unnamed version was stored, so nothing else removes it, and it is one file.
+/// name. The first head whose stamp they complete takes them in ([`adopt_held_draft`]); there, and
+/// at a settled head, the file goes only once every record it holds is in the records store
+/// ([`unversioned_goes`]). No answer can say whether its unnamed version was stored, so nothing
+/// else removes it, and it is one file.
 fn unversioned_held_draft_file(paths: &Paths) -> PathBuf {
     paths.dir.join("records.drafted")
 }
@@ -2212,12 +2262,23 @@ pub(super) fn forget_held_draft(
 }
 
 /// A server took the version of sequence `seq` whose envelope digest is `version`, and its records,
-/// where `drafted`, are kept: it is this Mac's head now. Forget its hold, then settle every other
-/// hold with what the version proves ([`settle_held_drafts_locked`]): `parents`, its parent spine,
-/// and `took`, every server that stored it. Under the state lock, by `deadline` where one is given
-/// ([`hold_lock`]): where it is not taken, every hold, this version's own included, waits for the
-/// next settled head, and this version's adds nothing to a pass that reads it, since its records
-/// are kept.
+/// where `drafted`, are kept (`kept`), or stay where a head that descends from it left them
+/// ([`keep_drafted_until`]): it is this Mac's head now, or that head's parent. Forget its hold,
+/// then settle every other hold with what the version proves ([`settle_held_drafts_locked`]):
+/// `took`, every server that stored it, and `parents`, its parent spine, where its records were
+/// kept or it drafted none ([`nle::spine_settles`]). A server that took it holds it or a newer
+/// version. It was drafted from the text of each version its spine names, but the edits that text
+/// carries are in its records: where they were not kept, the head that settled its hold by descent
+/// carries them, and that head's own spine settled the holds it names. A spine is capped at
+/// [`MAX_PARENTS`](crate::envelope::MAX_PARENTS), so that head's may name fewer than this one's,
+/// and a hold this version's spine alone names stays for its reach or a later head. Under the
+/// state lock, by `deadline` where one is given ([`hold_lock`]): where it is not taken, every
+/// hold, this version's own included, waits for the next settled head, and this version's, still
+/// there only where its records were kept, adds nothing to a pass that reads it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one landed version: its identity, its two proofs, what it drafted and kept, the deadline"
+)]
 pub(super) fn forget_landed_draft(
     paths: &Paths,
     seq: u64,
@@ -2225,6 +2286,7 @@ pub(super) fn forget_landed_draft(
     parents: &[[u8; 32]],
     took: &[String],
     drafted: bool,
+    kept: bool,
     deadline: Option<std::time::Instant>,
 ) {
     let Some(_lock) = hold_lock(paths, deadline) else {
@@ -2238,7 +2300,37 @@ pub(super) fn forget_landed_draft(
         return;
     }
     let _ = std::fs::remove_file(held_draft_file(paths, seq, version));
+    let parents = if nle::spine_settles(drafted, kept) || spine_always() {
+        parents
+    } else {
+        &[]
+    };
     settle_held_drafts_locked(paths, seq, parents, took);
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// The negative control of the landed spine's gate (one-mesh P3, [`forget_landed_draft`]):
+    /// while set, a landed version settles the other holds by its parent spine whatever became of
+    /// its records, as before the gate, so a version whose hold went by descent drops a hold its
+    /// spine names that the descending head's capped spine left out. A test sets it for its
+    /// thread; a lab instance turns it on for its whole process with `spine-always` in
+    /// `ATERM_TEST_NEGATIVE_CONTROL` ([`aterm_types::negative_control::on`]).
+    pub(crate) static SPINE_ALWAYS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Whether [`SPINE_ALWAYS`] is on: set on this thread, or named for this process
+/// (`spine-always`); never in a release build, which has neither switch.
+fn spine_always() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    {
+        SPINE_ALWAYS.with(std::cell::Cell::get) || aterm_types::negative_control::on("spine-always")
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        false
+    }
 }
 
 /// Whether a server's answer to `url` speaks for every version a publish to `url` may have
@@ -2318,11 +2410,83 @@ fn settle_held_drafts_locked(paths: &Paths, seq: u64, parents: &[[u8; 32]], took
     let unversioned = unversioned_held_draft_file(paths);
     if let Ok(Some(held)) =
         fsx::read_private(&unversioned, crate::membership_log::MAX_RECORDS_STREAM)
-        && let Ok(records) = crate::membership_log::decode_records(held.as_slice())
-        && let Ok(store) = super::load_records(paths)
-        && records.iter().all(|record| store.contains(record.id()))
+        && unversioned_goes(held.as_slice(), super::load_records(paths).ok().as_ref())
     {
         let _ = std::fs::remove_file(unversioned);
+    }
+}
+
+/// Whether the unversioned hold, its records `records`, goes beside `store`, the records store
+/// where it loads ([`nle::unversioned_goes`], P3 section 13): the records decode and the store
+/// holds every one of them complete ([`Store::holds`]). It is the one rule of both places it
+/// goes, a settled head and an adoption ([`adopt_held_draft`]), so every record it was written
+/// with is in it or in the store. A record the store holds only waiting on a parent does not
+/// count ([`Store::contains`] would): the store drops waiting records, highest first, to make
+/// room for others, and the hold would be the record's last copy. A complete record never leaves
+/// the store (its log refuses one past the held total, and a records file recovers within it),
+/// the premise section 13 names.
+fn unversioned_goes(records: &[u8], store: Option<&Store>) -> bool {
+    let decoded = crate::membership_log::decode_records(records).ok();
+    let all_stored = match (&decoded, store) {
+        (Some(records), Some(store)) => records.iter().all(|record| {
+            store.holds(record.id()) || (waiting_counts_stored() && store.contains(record.id()))
+        }),
+        _ => false,
+    };
+    nle::unversioned_goes(
+        decoded.is_some() && store.is_some(),
+        all_stored || unversioned_goes_early(),
+    )
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// The negative control of the unversioned hold's law (P3 section 13): while set, the
+    /// unversioned hold goes once it reads, whatever of it the records store holds. A test sets
+    /// it for its thread; a lab instance turns it on for its whole process with
+    /// `unversioned-goes-early` in `ATERM_TEST_NEGATIVE_CONTROL`
+    /// ([`aterm_types::negative_control::on`]).
+    pub(crate) static UNVERSIONED_GOES_EARLY: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// The negative control of the unversioned hold's complete records (P3 section 13): while
+    /// set, a record the records store holds only waiting on a parent counts as stored
+    /// ([`Store::contains`]), as before, so the hold goes while the store may still drop that
+    /// record to make room. A test sets it for its thread; a lab instance turns it on for its
+    /// whole process with `waiting-counts-stored` in `ATERM_TEST_NEGATIVE_CONTROL`
+    /// ([`aterm_types::negative_control::on`]).
+    pub(crate) static WAITING_COUNTS_STORED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Whether [`WAITING_COUNTS_STORED`] is on: set on this thread, or named for this process
+/// (`waiting-counts-stored`); never in a release build, which has neither switch.
+fn waiting_counts_stored() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    {
+        WAITING_COUNTS_STORED.with(std::cell::Cell::get)
+            || aterm_types::negative_control::on("waiting-counts-stored")
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        false
+    }
+}
+
+/// Whether [`UNVERSIONED_GOES_EARLY`] is on: set on this thread, or named for this process
+/// (`unversioned-goes-early`); never in a release build, which has neither switch.
+fn unversioned_goes_early() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    {
+        UNVERSIONED_GOES_EARLY.with(std::cell::Cell::get)
+            || aterm_types::negative_control::on("unversioned-goes-early")
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        false
     }
 }
 
@@ -2348,6 +2512,32 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// The negative control of a keep after descent (one-mesh P3, [`keep_drafted_until`]): while
+    /// set, a publish keeps its records once a server took its version even where a later head
+    /// of this Mac settled its hold by descent meanwhile, as before, so they put its values back
+    /// over the edits drafted from that head's text. A test sets it for its thread; a lab instance
+    /// turns it on for its whole process with `keeps-superseded` in `ATERM_TEST_NEGATIVE_CONTROL`
+    /// ([`aterm_types::negative_control::on`]).
+    pub(crate) static KEEPS_SUPERSEDED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Whether [`KEEPS_SUPERSEDED`] is on: set on this thread, or named for this process
+/// (`keeps-superseded`); never in a release build, which has neither switch.
+fn keeps_superseded() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    {
+        KEEPS_SUPERSEDED.with(std::cell::Cell::get)
+            || aterm_types::negative_control::on("keeps-superseded")
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        false
+    }
+}
+
 /// Whether [`SINGLE_SLOT_HOLD`] is on: set on this thread, or named for this process
 /// (`single-slot-hold`); never in a release build, which has neither switch.
 fn single_slot_hold() -> bool {
@@ -2369,9 +2559,10 @@ fn single_slot_hold() -> bool {
 /// for good. The hold taken in is that version's own, found by its sequence and envelope digest,
 /// or else the unversioned one a build before per-version holds kept. Another version's hold is
 /// never taken in: its records are another edit, which may never have been stored. Once they are
-/// in, the version is this Mac's head: its hold goes, and the others are settled with its parent
-/// spine ([`settle_held_drafts_locked`]). The caller holds the state lock. Returns whether the
-/// records store took them.
+/// in ([`nle::hold_adopts`]), the version is this Mac's head: its hold goes (the unversioned one
+/// only once the store holds every record in it, [`unversioned_goes`]), and the others are settled
+/// with its parent spine ([`settle_held_drafts_locked`]). The caller holds the state lock. Returns
+/// whether the records store took them.
 ///
 /// # Errors
 /// The records store or a hold cannot be read, or the store cannot be written.
@@ -2411,22 +2602,47 @@ pub(super) fn adopt_held_draft(
             Some(store) => store,
             None => super::load_records(paths)?,
         };
-        if store.ingest(held.records()).is_err() || !covered(&store) {
+        let ingested = store.ingest(held.records()).is_ok();
+        if !nle::hold_adopts(ingested, covered(&store)) {
             continue;
         }
         super::write_records(paths, &store)?;
-        let _ = std::fs::remove_file(&path);
+        // The version's own hold goes with its adoption. The unversioned one goes only once the
+        // store holds every record in it: the ingest skips a record the store refuses, and the
+        // stamp can be complete without it.
+        if versioned || unversioned_goes(held.records(), Some(&store)) {
+            let _ = std::fs::remove_file(&path);
+        }
         settle_held_drafts_locked(paths, envelope.seq, &envelope.parents, &[]);
         return Ok(true);
     }
     Ok(false)
 }
 
-/// Keep what [`draft_document_diff_until`] drafted once a server holds the envelope stamped with it:
-/// add the records to `paths.records_file()`, then send the whole local store to `urls`, every
-/// one of them at once and by `posts_by` (one exchange from now where none is given,
+/// Keep what [`draft_document_diff_until`] drafted once a server holds the envelope stamped with it,
+/// the version of sequence `seq` whose envelope digest is `version`: add the records to
+/// `paths.records_file()`, then send the whole local store to `urls`, every one of them at once
+/// and by `posts_by` (one exchange from now where none is given,
 /// [`super::fan_out::post_records_to`]): a server that takes the post and never reads it holds
 /// the command whose version has landed for that one deadline, not one each.
+///
+/// The records are kept only while the version's hold is there ([`hold_drafted`]), whose file
+/// every removal takes the state lock for, as this does. The publish wrote it before its PUT, so
+/// a hold gone once a server stored the version went by adoption ([`adopt_held_draft`]), whose
+/// records the store holds already, or by descent ([`settle_held_drafts_locked`]): a head whose
+/// parent spine names this version landed after this publish's PUT, drafted from this version's
+/// text while this Mac's log lacked the records, so that head carries the edit. (The reach rule
+/// takes no hold of a version a server stored: such a server takes only a head that names it,
+/// unless it rolled back or its pin was replaced, P3's environment axioms.) Kept after a
+/// descent, the records would put
+/// this version's values back over every edit drafted from that head's text before they arrived:
+/// a person's later waiting write of a name would read as overtaken by this Mac's own earlier
+/// one, and a later write signed at once would meet it as a conflict (one-mesh P3). They stay
+/// where that head left them, as a publish cut short after its PUT leaves them. The gate is
+/// [`nle::drafted_keeps`], the island's keep (P3 section 2).
+///
+/// Returns whether the version's records are kept: it drafted none, or its hold stood and they
+/// are in the store now. [`forget_landed_draft`] settles the other holds by its spine only then.
 ///
 /// # Errors
 /// The complete draft cannot be retained, the records file cannot be read or written, or the
@@ -2434,39 +2650,51 @@ pub(super) fn adopt_held_draft(
 pub(super) fn keep_drafted_until(
     paths: &Paths,
     drafted: &Drafted,
+    (seq, version): (u64, &[u8; 32]),
     urls: &[String],
     deadline: Option<std::time::Instant>,
     posts_by: Option<std::time::Instant>,
-) -> crate::Result<()> {
+) -> crate::Result<bool> {
+    let mut kept = true;
     if !drafted.records.is_empty() {
         let _lock = match deadline {
             Some(deadline) => StateLock::take_at_until(paths, &paths.lock_file(), deadline)?,
             None => StateLock::take(paths)?,
         };
         let mut current = super::load_records(paths)?;
+        // Every hold is removed under the state lock taken above ([`hold_lock`],
+        // [`adopt_held_draft`]'s callers), so what this reads stands until the records are kept.
+        // `SINGLE_SLOT_HOLD`'s one hold goes at any other publish's hold or answer, and its mode
+        // keeps as before, whatever became of it.
+        let held = nle::drafted_keeps(held_draft_file(paths, seq, version).exists())
+            || keeps_superseded()
+            || single_slot_hold();
         // The envelope already names these exact signed records. Peer ingress
         // may have consumed their room since drafting; a partial keep must not
         // let the publisher discard its only complete recovery copy.
-        commit_authored_records(
-            paths,
-            &mut current,
-            &encode_records(&drafted.records),
-            &drafted.records,
-        )?;
+        if held {
+            commit_authored_records(
+                paths,
+                &mut current,
+                &encode_records(&drafted.records),
+                &drafted.records,
+            )?;
+        }
+        kept = held;
     }
     if urls.is_empty() || deadline.is_some() {
         // The normal subscriber transfers this durable log. A bounded caller
         // must not start best-effort post-publication network work here.
-        return Ok(());
+        return Ok(kept);
     }
     let store = super::load_records(paths)?;
     if store.is_empty() {
-        return Ok(());
+        return Ok(kept);
     }
     let by = posts_by.unwrap_or_else(super::fan_out::one_exchange);
     let bound = super::records_bound(paths, &store)?;
     let _ = super::fan_out::post_records_to(urls, &store.encode(), bound, by);
-    Ok(())
+    Ok(kept)
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -2552,20 +2780,22 @@ pub(super) fn wraps_removed(
 mod waiting;
 #[cfg(test)]
 pub(super) use waiting::{
-    BASES_LOG_ONLY, DRAFT_UNCLAIMED, MOVES_WAIT, NAMES_UNMERGED, OVERTAKEN_UNRECORDED,
-    PENDING_BY_COUNT, RACE_UNDEFERRED, SETTLE_UNCARRIED, UNREAD_AS_NONE, VIEW_WITHOUT_WAITING,
-    Values, pending_reach, waiting_and_pending, waiting_file, waiting_values,
+    BASES_LOG_ONLY, BASES_WITHOUT_HELD, DRAFT_UNCLAIMED, DRAFTS_AT_ONCE, HELD_UNDEFERRED,
+    MOVES_WAIT, NAMES_UNMERGED, OVERTAKEN_UNRECORDED, PASS_COMMITTED, PENDING_BY_COUNT,
+    RACE_UNDEFERRED, SETTLE_UNCARRIED, Shapes, TURN_WAITS, UNREAD_AS_NONE, VIEW_WITHOUT_WAITING,
+    Values, base_of, everyone_edit, held_values_or_unread, pending_reach, waiting_and_pending,
+    waiting_file, waiting_shapes, waiting_values, waits_over,
 };
 pub use waiting::{Overtaken, Overtaker};
 pub(super) use waiting::{
-    Waiting, claim_draft, forget_unsent, forget_waiting, land_published, land_waiting,
+    Waiting, claim_draft, draft_turn, forget_unsent, forget_waiting, land_published, land_waiting,
     land_waiting_held, overlay_waiting_onto_document, overtaken_seen, read_overtaken,
     sign_waiting_writes, sign_waiting_writes_by, stored_versions, unread_waiting, view_waiting,
     wait_for_key, waiting_pending,
 };
-use waiting::{
-    everyone_edit, moves_wait, read_waiting, settle_uncarried, standing, unread_as_none,
-};
+#[cfg(not(test))]
+use waiting::{everyone_edit, held_values_or_unread};
+use waiting::{moves_wait, read_waiting, settle_uncarried, standing, unread_as_none};
 
 /// The recipients of each locker `doc` seals, by audience, less any `log` removed or left out of
 /// `[everyone]` (unless `readmit` lets it back in, or its `Wrap` may still arrive: `flight`).
@@ -3237,6 +3467,15 @@ fn draft_document_diff_with(
         Ok(held) => (held, None),
         Err(error) => (&unread_held, Some(error)),
     };
+    // What this Mac's own earlier publishes whose records are held, not kept, leave at each
+    // name: a waiting write drafted now is signed over it too (one-mesh P3, [`held_values`]). A
+    // hold that does not read is never read as leaving nothing (one-mesh W3): an edit whose
+    // writes wait refuses over it, as over unread waiting writes.
+    let (held_by_earlier, held_unread) = if rotation_waits {
+        held_values_or_unread(paths, store, identity)
+    } else {
+        (BTreeMap::new(), None)
+    };
     let edit = everyone_edit(
         everyone_read,
         view,
@@ -3245,15 +3484,28 @@ fn draft_document_diff_with(
             opened.by_audience.get(&Audience::Everyone),
             &opened.conflicts,
         ),
+        &held_by_earlier,
         entries_by_aud.get(&Audience::Everyone),
         |name| resolving(&Audience::Everyone, name),
     );
-    if let Some(error) = unread
-        && !edit.writes.is_empty()
-    {
-        return Err(Error::new(format!(
+    // An edit whose writes wait refuses over what does not read, this Mac's waiting writes or
+    // its held drafts, never reading either as none (one-mesh W3, [`nle::draft_refuses`]); the
+    // refusal names the waiting writes first.
+    let waiting_refusal = unread.map(|error| {
+        format!(
             "{error}; no [everyone] edit is drafted over this Mac's waiting writes until they read"
-        )));
+        )
+    });
+    let held_refusal = held_unread.map(|error| {
+        format!("{error}; no [everyone] write waits over this Mac's held drafts until they read")
+    });
+    if nle::draft_refuses(
+        !edit.writes.is_empty(),
+        waiting_refusal.is_some(),
+        held_refusal.is_some(),
+    ) && let Some(refusal) = waiting_refusal.or(held_refusal)
+    {
+        return Err(Error::new(refusal));
     }
     if view.is_some_and(|view| !view.is_empty()) {
         if edit.entries.is_empty() {
@@ -3460,6 +3712,32 @@ fn draft_document_diff_with(
                         .keys()
                         .any(|name| doc_map.is_none_or(|m| !m.contains_key(name)))
                 });
+            // A departure the log made (a `Remove`, whose winning or newest epoch still wraps the
+            // removed Mac) is the ranked tender's to reseal, and the tender holds it over a prefix
+            // of another Mac's batch for the settle grace ([`super::remove::tend_epochs_at`]). An
+            // edit that changes nothing in `[everyone]` mints nothing for that departure alone,
+            // as it mints no Commons epoch for one: an admin's mirror of the heads a heal left
+            // diverged would otherwise mint over that prefix, unranked, beside the tender, the
+            // gap closer and every other admin. A departure only the text makes (a Mac retired
+            // from `[machines]`, which no `Remove` records) is the edit's own and mints as before.
+            if plan.audience == Audience::Everyone
+                && departed_wrapped
+                && !minted_outside
+                && !left_everyone
+                && !departure_mints()
+                && unchanged_audience(doc_map, log_map, |name| resolving(&plan.audience, name))
+                && active_epochs.iter().all(|ep_id| {
+                    opened.wrapped_recipients.get(ep_id).is_none_or(|wrapped| {
+                        wrapped.iter().all(|r| {
+                            plan_recipients.contains(r)
+                                || undecided.contains(r)
+                                || log.recipient_is_removed(r)
+                        })
+                    })
+                })
+            {
+                continue;
+            }
             let reusable_epoch: Option<([u8; 32], [u8; 32])> = if !departed_wrapped
                 && !left_everyone
                 && let Some(ep_id) = sealing_epoch(
@@ -3887,7 +4165,10 @@ pub fn acknowledged_commons_log(
     paths: &Paths,
     trust: crate::commons::journal::Trust,
 ) -> crate::Result<CommonsLog> {
-    commons_log_from_store(paths, &super::load_acknowledged_records(paths)?, trust)
+    // One read of the vault: the store, its lineage and its retained history, whichever asks first.
+    let reads = Reads::new(paths);
+    let store = super::acknowledged_under(&reads, false)?.acknowledged;
+    commons_log_under(&reads, &store, trust)
 }
 
 /// Load the locally held [`Log`] and its heads digest when it carries [`EpochAudience::Commons`]
@@ -3908,13 +4189,13 @@ pub(super) fn trusted_commons_log_from_store(
     store: &Store,
     trust: crate::commons::journal::Trust,
 ) -> crate::Result<Option<(Log, [u8; 32])>> {
-    commons_log_from_store(paths, store, trust).map(CommonsLog::trusted)
+    commons_log_under(&Reads::new(paths), store, trust).map(CommonsLog::trusted)
 }
 
 /// `store`'s log classified for judging a Commons peer: its root and lineage first, so a log of
 /// another root or lineage is never read as one with nothing to judge by.
-fn commons_log_from_store(
-    paths: &Paths,
+fn commons_log_under(
+    reads: &Reads<'_>,
     store: &Store,
     trust: crate::commons::journal::Trust,
 ) -> crate::Result<CommonsLog> {
@@ -3928,14 +4209,14 @@ fn commons_log_from_store(
     if !matches!(log.genesis().body(), Body::Genesis { root, .. } if *root == ours) {
         return Ok(CommonsLog::OtherRoot);
     }
-    if !commons_log_matches_local_lineage(paths, log)? {
+    if !genesis_record_under(reads, log.genesis())? {
         return Ok(CommonsLog::OtherLineage);
     }
     if !log.has_commons_epochs() {
         return Ok(CommonsLog::NoCommonsEpochs);
     }
-    if let Some(config) = super::config(paths)? {
-        super::retained_history::require_covers(&Reads::new(paths), &config, log)?;
+    if let Some(config) = reads.config()? {
+        super::retained_history::require_covers(reads, config, log)?;
     }
     let digest = records_heads_digest(log);
     Ok(CommonsLog::Trusted(Box::new(log.clone()), digest))
@@ -4194,29 +4475,29 @@ pub(super) fn genesis_record_matches_local_lineage(
     paths: &Paths,
     record: &Record,
 ) -> crate::Result<bool> {
+    genesis_record_under(&Reads::new(paths), record)
+}
+
+fn genesis_record_under(reads: &Reads<'_>, record: &Record) -> crate::Result<bool> {
     let Body::Genesis { signer, .. } = record.body() else {
         return Ok(false);
     };
-    if genesis_signer_matches_local_lineage(paths, signer)? {
+    if genesis_signer_under(reads, signer)? {
         return Ok(true);
     }
-    let Some(config) = super::config(paths)? else {
+    let Some(config) = reads.config()? else {
         return Ok(false);
     };
-    super::retained_history::durably_bound(&Reads::new(paths), &config, record.id())
+    super::retained_history::durably_bound(reads, config, record.id())
 }
 
-pub(super) fn genesis_signer_matches_local_lineage(
-    paths: &Paths,
-    signer: &[u8; 32],
-) -> crate::Result<bool> {
-    if let Some(cfg) = super::config(paths)? {
+fn genesis_signer_under(reads: &Reads<'_>, signer: &[u8; 32]) -> crate::Result<bool> {
+    if let Some(cfg) = reads.config()? {
         let mut lineage_ok = cfg.signer.as_ref() == Some(signer) || cfg.followed.contains(signer);
         if !lineage_ok
             && let Some(pin) = &cfg.signer
-            && let Ok(Some(bytes)) = fsx::read_private(&paths.cache_file(), envelope::MAX_ENVELOPE)
-            && let Ok((env, _, _)) =
-                envelope::verify_for_reader(bytes.as_slice(), &cfg.name, pin, &cfg.followed, None)
+            && let Ok(Some(vault)) = reads.vault()
+            && let Ok((env, _, _)) = vault.verify_for_reader(&cfg.name, pin, &cfg.followed, None)
         {
             // A current signer can carry a broken older prefix before the
             // trusted pin. Only verified predecessors belong to its lineage.
@@ -4286,12 +4567,15 @@ mod lineage_tests {
     fn genesis_lineage_accepts_an_endorsed_rotation_before_the_pin_is_updated() {
         let (_home, paths) = configured();
         let pin = envelope::signer_public(&PIN).unwrap();
-        assert!(genesis_signer_matches_local_lineage(&paths, &pin).unwrap());
+        assert!(genesis_signer_under(&Reads::new(&paths), &pin).unwrap());
         let bytes = wire(VAULT, &[PIN, NEXT]);
         fsx::write_atomic(&paths.cache_file(), &bytes, 0o600).unwrap();
         assert!(
-            genesis_signer_matches_local_lineage(&paths, &envelope::signer_public(&NEXT).unwrap())
-                .unwrap()
+            genesis_signer_under(
+                &Reads::new(&paths),
+                &envelope::signer_public(&NEXT).unwrap()
+            )
+            .unwrap()
         );
     }
 
@@ -4313,8 +4597,8 @@ mod lineage_tests {
             let (_home, paths) = configured();
             fsx::write_atomic(&paths.cache_file(), &bytes, 0o600).unwrap();
             assert!(
-                !genesis_signer_matches_local_lineage(
-                    &paths,
+                !genesis_signer_under(
+                    &Reads::new(&paths),
                     &envelope::signer_public(&NEXT).unwrap()
                 )
                 .unwrap(),
@@ -4324,7 +4608,7 @@ mod lineage_tests {
     }
 
     /// A store holding only a genesis `seed` signed for `root`, which takes a genesis of `seed`'s
-    /// key alone: what a caller hands [`commons_log_from_store`] when the store it classifies
+    /// key alone: what a caller hands [`commons_log_under`] when the store it classifies
     /// was not read under this Mac's lineage (a removal plan's or a retirement's candidate).
     fn founded_by(seed: &[u8; 32], root: Root) -> Store {
         let request = crate::commons::binding::Request::create(
@@ -4369,14 +4653,15 @@ mod lineage_tests {
             authority: root.authority,
             genesis: [0; 32],
         };
-        let kind =
-            |store: &Store, trust| match commons_log_from_store(&paths, store, trust).unwrap() {
-                CommonsLog::Trusted(..) => "trusted",
-                CommonsLog::NoLog => "no log",
-                CommonsLog::NoCommonsEpochs => "no commons epochs",
-                CommonsLog::OtherRoot => "other root",
-                CommonsLog::OtherLineage => "other lineage",
-            };
+        let kind = |store: &Store, trust| match commons_log_under(&Reads::new(&paths), store, trust)
+            .unwrap()
+        {
+            CommonsLog::Trusted(..) => "trusted",
+            CommonsLog::NoLog => "no log",
+            CommonsLog::NoCommonsEpochs => "no commons epochs",
+            CommonsLog::OtherRoot => "other root",
+            CommonsLog::OtherLineage => "other lineage",
+        };
         let ours = founded_by(&PIN, root);
         let foreign = founded_by(&UNRELATED, root);
         assert_eq!(kind(&Store::dormant(&[]), trust), "no log");
@@ -4405,13 +4690,16 @@ mod lineage_tests {
         let bytes = signed(VAULT, &NEXT, handoff);
         fsx::write_atomic(&paths.cache_file(), &bytes, 0o600).unwrap();
         assert!(
-            genesis_signer_matches_local_lineage(&paths, &envelope::signer_public(&NEXT).unwrap())
-                .unwrap(),
+            genesis_signer_under(
+                &Reads::new(&paths),
+                &envelope::signer_public(&NEXT).unwrap()
+            )
+            .unwrap(),
             "the valid suffix from the pinned key remains usable"
         );
         assert!(
-            !genesis_signer_matches_local_lineage(
-                &paths,
+            !genesis_signer_under(
+                &Reads::new(&paths),
                 &envelope::signer_public(&UNRELATED).unwrap()
             )
             .unwrap(),

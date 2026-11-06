@@ -63,7 +63,9 @@ pub const LOCK_PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits 
       - INTERPROCEDURAL DEPTH: exactly ONE hop — a call made while a guard is
         held, to a same-corpus fn (free-fn `name(..)`, bare `self.name(..)`, or
         a TYPE-DIRECTED `self.field.name(..)`) whose own body directly
-        acquires. The callee's callees are NOT followed. Same-named fns merge
+        acquires. The callee's callees are NOT followed. An unqualified call
+        prefers a free fn in its proven file-level module. Nested/unproved
+        module shapes retain the conservative fallback. Other same-named fns merge
         WITHIN a namespace unless an explicit qualifier names a known impl
         owner. `Self::name` uses the caller's enclosing impl; `Type::name`
         selects that impl when the corpus supplies it, including UFCS methods.
@@ -716,11 +718,10 @@ pub(crate) fn unmasked_lines(text: &str, is_gate: &dyn Fn(&str) -> bool) -> Vec<
             let first = lines[k];
             let single = first.matches('{').count() == first.matches('}').count();
             if !single {
-                let pad = " ".repeat(indent);
                 let end = (k + 1..lines.len()).find(|m| {
                     let c = lines[*m];
-                    lines[*m].starts_with(&pad)
-                        && c.as_bytes().get(indent) == Some(&b'}')
+                    c.as_bytes().get(indent) == Some(&b'}')
+                        && c.as_bytes()[..indent].iter().all(|&b| b == b' ')
                         && !c.contains('{')
                 });
                 match end {
@@ -1324,6 +1325,8 @@ fn alias_target(line: &str, ctx: &SiteCtx<'_>) -> Option<String> {
 struct CallTarget {
     name: String,
     qualifier: Option<String>,
+    /// Neither a qualified path nor a method call: module-local free functions may shadow.
+    unqualified: bool,
     /// A lexical parameter can shadow `Key::f`, but not the explicit path `crate::Key::f`.
     bare_qualifier: bool,
 }
@@ -1524,6 +1527,7 @@ fn held_call_targets(line: &str) -> (Vec<TrustedCall>, Vec<FieldRecvCall>) {
             CallTarget {
                 name: name.to_string(),
                 qualifier,
+                unqualified: !line[..start].trim_end().ends_with(['.', ':']),
                 bare_qualifier,
             },
         ));
@@ -1538,6 +1542,10 @@ struct FnLockFacts {
     span: String,
     /// The identity namespace of the crate defining this fn ([`WORKSPACE_NS`] for aterm crates).
     namespace: Option<&'static str>,
+    /// Proven file-level module; inline/unproved modules keep the by-name fallback.
+    module: Option<String>,
+    /// An actual free function, not a method or an unnameable impl's associated function.
+    free_function: bool,
     /// The enclosing named impl, using the same lexical type identity as lock receivers.
     impl_ty: Option<String>,
     /// Lexical fn and enclosing impl type parameters, which are not concrete call owners.
@@ -1637,6 +1645,22 @@ struct FileCtx<'a> {
     namespace: Option<&'static str>,
     /// The file's `impl` blocks.
     impls: &'a [ImplSpan],
+    root_lines: &'a BTreeSet<usize>,
+}
+
+/// Lines beginning at the file's module root. Strings and comments are already masked;
+/// nested modules remain unproved rather than borrowing this file-level identity.
+fn module_root_lines(masked: &str) -> BTreeSet<usize> {
+    let mut depth = 0i32;
+    masked
+        .lines()
+        .enumerate()
+        .filter_map(|(line, code)| {
+            let root = depth == 0;
+            depth += code.matches('{').count() as i32 - code.matches('}').count() as i32;
+            root.then_some(line + 1)
+        })
+        .collect()
 }
 
 /// Scan one fn body.
@@ -1653,10 +1677,25 @@ fn scan_fn(
         .and_then(|n| n.parse().ok())
         .unwrap_or(1);
     let lines = logical_lines(body, start_line);
+    let enclosing_impl = file
+        .impls
+        .iter()
+        .filter(|span| span.start <= start_line && start_line <= span.end)
+        .max_by_key(|span| span.start);
+    let module_root = file
+        .root_lines
+        .contains(&enclosing_impl.map_or(start_line, |span| span.start));
+    let nested_functions: BTreeSet<_> = body
+        .iter()
+        .skip(1)
+        .filter_map(|line| crate::parse_fn_def(line).map(|(_, name)| name))
+        .collect();
     let mut facts = FnLockFacts {
         name: name.to_string(),
         span: span.to_string(),
         namespace: file.namespace,
+        module: module_root.then(|| file.rel.to_owned()),
+        free_function: enclosing_impl.is_none() && module_root,
         impl_ty: file
             .impls
             .iter()
@@ -1812,8 +1851,13 @@ fn scan_fn(
                     }
                 }
             }
-            for (pos, target) in trusted {
+            for (pos, mut target) in trusted {
                 let callee = target.name.as_str();
+                // A nested function item can shadow the module function too. Its scope is not
+                // proved here, so it must retain the conservative lookup rather than narrow.
+                if nested_functions.contains(callee) {
+                    target.unqualified = false;
+                }
                 let call_span = format!("{}:{}", file.rel, ll.lineno);
                 let before = &line[..pos - callee.len()];
                 if !before.trim_end().ends_with(['.', ':']) {
@@ -1996,10 +2040,12 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
             let masked = lock_graph_code(&text);
             field_types.harvest(&masked);
             let impls = impl_spans(&masked);
+            let root_lines = module_root_lines(&masked);
             let ctx = FileCtx {
                 rel: &rel,
                 namespace: None,
                 impls: &impls,
+                root_lines: &root_lines,
             };
             let mut parsed = Vec::new();
             parse_source_fns(&masked, &rel, &mut parsed);
@@ -2033,10 +2079,12 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
             let rel = crate::rel_path(root, &file);
             let masked = lock_graph_code(&text);
             let impls = impl_spans(&masked);
+            let root_lines = module_root_lines(&masked);
             let ctx = FileCtx {
                 rel: &rel,
                 namespace: Some(v.namespace),
                 impls: &impls,
+                root_lines: &root_lines,
             };
             let mut parsed = Vec::new();
             parse_source_fns(&masked, &rel, &mut parsed);
@@ -2097,6 +2145,7 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
                     CallTarget {
                         name: callee,
                         qualifier: None,
+                        unqualified: false,
                         bare_qualifier: false,
                     },
                     span,
@@ -2287,6 +2336,15 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
             });
             let compatible =
                 |g: usize| owner.is_none_or(|owner| fns[g].impl_ty.as_deref() == Some(owner));
+            let module_local = |g: usize| {
+                target.unqualified
+                    && fns[g].free_function
+                    && fns[g].namespace == f.namespace
+                    && f.module
+                        .as_ref()
+                        .is_some_and(|module| fns[g].module.as_ref() == Some(module))
+            };
+            let local_definition = per_ns.values().flatten().copied().any(module_local);
             let shadowed = per_ns
                 .get(&f.namespace)
                 .is_some_and(|local| local.iter().copied().any(compatible));
@@ -2296,7 +2354,7 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
                     continue;
                 }
                 for &g in callee_fns {
-                    if !compatible(g) {
+                    if !compatible(g) || (local_definition && !module_local(g)) {
                         continue;
                     }
                     for &acq in &fns[g].acq {
@@ -3435,6 +3493,69 @@ fn shipped() {
                 out.log
             );
         }
+    }
+
+    #[test]
+    fn local_free_function_resolution_shadows_duplicate_names_without_hiding_qualified_hops() {
+        let foreign = "fn admitted() {\n    beta_lock.lock().unwrap();\n}\n\
+            fn reverse() {\n    let held = beta_lock.lock().unwrap();\n    alpha_lock.lock().unwrap();\n}\n";
+        for (call, local_body, cycle) in [
+            ("admitted()", "", false),
+            ("admitted()", "beta_lock.lock().unwrap();", true),
+            ("crate::foreign::admitted()", "", true),
+        ] {
+            let source = format!(
+                "fn admitted() {{\n    {local_body}\n}}\n\
+                fn forward() {{\n    let held = alpha_lock.lock().unwrap();\n    {call};\n}}\n"
+            );
+            let out = run_synth_files(
+                "local-free-priority",
+                &source,
+                &[("crates/aterm-gui/src/foreign.rs", foreign)],
+            );
+            assert_eq!(out.ok, !cycle, "{call}, local={local_body}: {}", out.log);
+            assert_eq!(
+                out.log.contains("EDGE alpha_lock -> beta_lock"),
+                cycle,
+                "{}",
+                out.log
+            );
+        }
+        let out = run_synth_files(
+            "unshadowed-free-fallback",
+            "fn forward() {\n    let held = alpha_lock.lock().unwrap();\n    admitted();\n}\n",
+            &[("crates/aterm-gui/src/foreign.rs", foreign)],
+        );
+        assert!(
+            !out.ok,
+            "an unshadowed imported helper still supplies its edge: {}",
+            out.log
+        );
+    }
+
+    #[test]
+    fn module_free_function_resolution_inside_an_impl_keeps_nested_modules_conservative() {
+        let foreign = "fn admitted() {\n    beta_lock.lock().unwrap();\n}\n\
+            fn reverse() {\n    let held = beta_lock.lock().unwrap();\n    alpha_lock.lock().unwrap();\n}\n";
+        let out = run_synth_files(
+            "impl-module-free-priority",
+            "fn admitted() {}\nstruct Caller;\nimpl Caller {\n    fn forward(&self) {\n        let held = alpha_lock.lock().unwrap();\n        admitted();\n    }\n}\n",
+            &[("crates/aterm-gui/src/foreign.rs", foreign)],
+        );
+        assert!(
+            out.ok,
+            "an impl's bare free-function call uses its module: {}",
+            out.log
+        );
+        let out = run_synth(
+            "inline-module-free-fallback",
+            "fn admitted() {}\nmod inner {\n    fn admitted() {\n        beta_lock.lock().unwrap();\n    }\n    fn forward() {\n        let held = alpha_lock.lock().unwrap();\n        admitted();\n    }\n}\nfn reverse() {\n    let held = beta_lock.lock().unwrap();\n    alpha_lock.lock().unwrap();\n}\n",
+        );
+        assert!(
+            !out.ok,
+            "an unproved inline module cannot borrow the file root's harmless definition: {}",
+            out.log
+        );
     }
 
     #[test]

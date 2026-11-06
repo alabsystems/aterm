@@ -21,6 +21,8 @@ pub mod ring;
 pub mod rules;
 pub mod said;
 pub mod source_episode;
+#[cfg(any(test, debug_assertions))]
+mod sources_environment;
 pub mod templates;
 pub mod wake_atoms;
 pub mod wakes;
@@ -44,6 +46,10 @@ pub use wakes_seen::{WakeClaim, WakeDoor, WakeFacts, WakeSeen, WakesSeen};
 pub use door_environment::occupancy_door_environment;
 #[cfg(any(test, debug_assertions))]
 pub use left_environment::left_write_environment;
+#[cfg(any(test, debug_assertions))]
+pub use sources_environment::{
+    owner_tell_environment, source_episode_environment, workflow_step_environment,
+};
 #[cfg(any(test, debug_assertions))]
 pub use wakes_environment::wake_book_environment;
 

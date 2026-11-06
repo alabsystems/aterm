@@ -314,6 +314,7 @@ fn recent_login_activity_keeps_the_blocker_and_filters_unrelated_or_invalid_time
         ..accounts::Row::default()
     };
     let activity = |label: &str, at| LoginActivity {
+        queued: None,
         label: label.into(),
         identity: Some(LoginIdentity::for_test(&row)),
         route: None,
@@ -386,6 +387,7 @@ fn different_accounts_keep_the_earliest_available_login_retry() {
             .iter()
             .zip(deadlines)
             .map(|(row, next)| LoginActivity {
+                queued: None,
                 label: row.label.clone(),
                 route: None,
                 active: false,
@@ -459,6 +461,7 @@ fn login_activity_requires_one_exact_captured_account_row() {
             };
             let baseline = read(Vec::new());
             let got = read(vec![LoginActivity {
+                queued: None,
                 label: label.into(),
                 identity: captured.clone(),
                 route: Some("mailbox".into()),
@@ -529,6 +532,7 @@ fn completed_login_diagnostics_reach_the_menu_only_for_the_captured_account() {
         )
     };
     let activity = |diagnostic, active| LoginActivity {
+        queued: None,
         label: row.label.clone(),
         identity: Some(LoginIdentity::for_test(&row)),
         route: Some("mailbox".into()),
@@ -737,6 +741,7 @@ fn recent_login_activity_does_not_replace_an_account_move() {
             &BTreeSet::from(["current".into()]),
             std::slice::from_ref(&row),
             vec![LoginActivity {
+                queued: None,
                 label: "current".into(),
                 identity: Some(LoginIdentity::for_test(&row)),
                 route: Some("profile".into()),
@@ -963,6 +968,7 @@ fn a_retired_judgment_keeps_independently_observed_work_visible() {
                 |_, _, _| {
                     Some(if kind == 3 {
                         vec![LoginActivity {
+                            queued: None,
                             label: row.label.clone(),
                             identity: Some(LoginIdentity::for_test(&row)),
                             route: Some("mailbox".into()),
@@ -1140,6 +1146,7 @@ fn service_progress_retries_a_busy_activity_read_and_then_shows_sign_in() {
                             |_, _, stamp| match step {
                                 0 => None,
                                 1 => Some(vec![LoginActivity {
+                                    queued: None,
                                     label: "alternate".into(),
                                     identity: Some(LoginIdentity::for_test(&activity_row)),
                                     route: None,

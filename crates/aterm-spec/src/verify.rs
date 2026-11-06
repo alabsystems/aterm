@@ -77,7 +77,8 @@ pub fn require_checkers() {
 /// Whether this process runs the external checkers.
 #[must_use]
 pub fn checkers_required() -> bool {
-    *CHECKERS_REQUIRED.get_or_init(|| cfg!(feature = "checkers"))
+    *CHECKERS_REQUIRED
+        .get_or_init(|| std::env::var_os("ATERM_SPEC_CHECKERS").is_some_and(|v| v == "1"))
 }
 
 #[cfg_attr(

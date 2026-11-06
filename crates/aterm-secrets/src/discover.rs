@@ -12,6 +12,10 @@
 use crate::server::VaultTxt;
 use crate::transport::{self, Source};
 use crate::wake::{Bell, Wake};
+#[cfg(all(target_os = "macos", not(test)))]
+use aterm_uds::lan::{self, LanError};
+#[cfg(any(test, target_os = "macos"))]
+use aterm_uds::lan::{Event, Instance};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
@@ -24,11 +28,9 @@ pub const MAX_CANDIDATES: usize = 16;
 /// process rotate through a stable larger set without raising the per-attempt limit.
 pub const MAX_MEMBERS: usize = 64;
 
+/// The domain every browse and resolve here names: mDNS's own.
 #[cfg(all(target_os = "macos", not(test)))]
-const DNS_SD: &str = aterm_uds::os_path!("dns-sd");
-
-#[cfg(all(target_os = "macos", not(test)))]
-const POLICY_DENIED: &str = "-65570";
+const DOMAIN: &str = "local.";
 
 /// One `_alab-vault._tcp` service target resolved on the local network.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,39 +41,37 @@ pub struct DiscoveredVault {
     pub txt: Option<VaultTxt>,
 }
 
-/// Parse active instance names from a `dns-sd -B _alab-vault._tcp local.` transcript in
-/// first-seen order, removing instances whose last interface emitted `Rmv`.
-#[must_use]
-pub fn parse_browse(text: &str) -> Vec<String> {
-    parse_browse_service(text, crate::server::SERVICE_TYPE)
-}
-
-/// Parse active instance names from a `dns-sd -B _alab._tcp local.` transcript in first-seen
-/// order, removing instances whose last interface emitted `Rmv`, at most [`MAX_MEMBERS`]. This
-/// is a bounded observation; [`browse_members`] selects a rotating batch from the full snapshot.
-#[must_use]
-pub fn parse_browse_members(text: &str) -> Vec<String> {
-    parse_browse_members_of(text, MEMBER_SERVICE)
-}
-
-/// [`parse_browse_members`] of a transcript of `dns-sd -B <service> local.`: `service`'s rows
-/// alone, at most [`MAX_MEMBERS`]. [`browse_members`] reads its browse of [`member_service`]
-/// with it.
-#[must_use]
-pub fn parse_browse_members_of(text: &str, service: &str) -> Vec<String> {
-    let mut instances = parse_browse_service(text, service);
-    instances.truncate(MAX_MEMBERS);
-    instances
-}
-
-#[cfg(test)]
-fn member_candidate_names(text: &str, from: &AtomicUsize) -> Vec<String> {
-    member_candidate_names_of(text, MEMBER_SERVICE, from)
-}
-
+/// Whether `instance` (as a browse heard it) is of `service`: DNS-SD names the type with its
+/// trailing dot (`_alab._tcp.`).
 #[cfg(any(test, target_os = "macos"))]
-fn member_candidate_names_of(text: &str, service: &str, from: &AtomicUsize) -> Vec<String> {
-    rotated_names(parse_browse_service(text, service), from, MAX_MEMBERS)
+fn of_service(instance: &Instance, service: &str) -> bool {
+    instance
+        .service
+        .strip_suffix('.')
+        .unwrap_or(&instance.service)
+        == service
+}
+
+/// The instances of `service` a browse's `events` leave heard, in first-seen order: each
+/// [`Event::Added`] on an interface, until the [`Event::Removed`] of the last interface it was
+/// heard on.
+#[cfg(any(test, target_os = "macos"))]
+fn heard_instances(events: impl IntoIterator<Item = Event>, service: &str) -> Vec<String> {
+    let mut instances: Vec<(String, Vec<u32>)> = Vec::new();
+    for event in events {
+        let (add, instance) = match &event {
+            Event::Added(instance) => (true, instance),
+            Event::Removed(instance) => (false, instance),
+            _ => continue,
+        };
+        if of_service(instance, service) && !instance.name.is_empty() {
+            apply_row(&mut instances, add, instance.interface, &instance.name);
+        }
+    }
+    instances
+        .into_iter()
+        .filter_map(|(name, interfaces)| (!interfaces.is_empty()).then_some(name))
+        .collect()
 }
 
 /// The environment variable that points [`browse_members`] at a lab's own members service in
@@ -118,39 +118,100 @@ pub fn member_service(value: Option<&std::ffi::OsStr>) -> crate::Result<String> 
     }
 }
 
-fn parse_browse_service(text: &str, expected_service: &str) -> Vec<String> {
-    let mut instances: Vec<(String, Vec<u32>)> = Vec::new();
-    for line in text.lines() {
-        if let Some((add, interface, name)) = browse_row(line, expected_service) {
-            apply_row(&mut instances, add, interface, name);
+/// The environment variable that points the client's vault look at a lab's own vault service in
+/// place of [`crate::server::SERVICE_TYPE`]: every vault browse the look runs ([`browse_alab`],
+/// [`browse_names`], the subscriber's standing [`Watch::start_look`]) browses the type it names,
+/// and the look asks no compiled-in [`crate::ALAB_DEFAULT_URLS`] ([`look_defaults`]), so it names
+/// only what its lab browse heard. `lab mac nux --scenario first-launch-vault` sets it in its
+/// guest's GUI session, whose app must find the lab vault served there and never the live
+/// `_alab-vault._tcp`. As with [`LAB_MEMBER_SERVICE_ENV`], this build takes only a
+/// [`lab_service`] here ([`vault_service`]), so a value it cannot take browses for no vault, and
+/// the variable set marks the process a lab's ([`crate::Making`]). A vault server's own browse
+/// ([`Watch::start`]) and advert keep `_alab-vault._tcp` whatever it says. No install sets it.
+pub const LAB_VAULT_SERVICE_ENV: &str = "ATERM_LAB_VAULT_SERVICE";
+
+/// The type a vault browse browses, given [`LAB_VAULT_SERVICE_ENV`]'s value (`None`: unset):
+/// [`crate::server::SERVICE_TYPE`], or the [`lab_service`] the variable names.
+///
+/// # Errors
+/// The variable is set to anything but a lab service (`_alab-vault._tcp` itself, an empty value
+/// and one that is no UTF-8 included): the browse then looks for no vault, never for the real one.
+pub fn vault_service(value: Option<&std::ffi::OsStr>) -> crate::Result<String> {
+    let Some(value) = value else {
+        return Ok(crate::server::SERVICE_TYPE.to_owned());
+    };
+    match value.to_str().filter(|v| lab_service(v)) {
+        Some(lab) => Ok(lab.to_owned()),
+        None => Err(crate::Error::new(format!(
+            "{LAB_VAULT_SERVICE_ENV} names no lab service (`_alab-lab-<1 to 6 lowercase letters \
+             or digits>._tcp`), so this Mac browses for no vault"
+        ))),
+    }
+}
+
+/// [`vault_service`] of this process's [`LAB_VAULT_SERVICE_ENV`].
+fn vault_type() -> crate::Result<String> {
+    vault_service(std::env::var_os(LAB_VAULT_SERVICE_ENV).as_deref())
+}
+
+/// The compiled-in addresses the vault look asks beside what its browse heard, given
+/// [`LAB_VAULT_SERVICE_ENV`]'s value (`None`: unset): [`crate::ALAB_DEFAULT_URLS`], or none at all
+/// where the variable is set, whatever it says (a lab's look names only what its lab browse
+/// heard, never the live vault by its well-known name).
+#[must_use]
+pub(crate) fn look_defaults(lab_vault: Option<&std::ffi::OsStr>) -> &'static [&'static str] {
+    if lab_vault.is_some() {
+        &[]
+    } else {
+        crate::ALAB_DEFAULT_URLS
+    }
+}
+
+/// [`look_defaults`] of this process's [`LAB_VAULT_SERVICE_ENV`].
+#[must_use]
+pub(crate) fn look_default_urls() -> &'static [&'static str] {
+    look_defaults(std::env::var_os(LAB_VAULT_SERVICE_ENV).as_deref())
+}
+
+/// The `aterm.log` line for the look hearing vault instance `instance` of `service`, which `lab
+/// mac nux`'s `first-launch-vault` reads (it names the service and the instance).
+#[cfg(any(test, target_os = "macos"))]
+fn vault_heard_line(service: &str, instance: &str) -> String {
+    format!("vault look: heard {instance} on {service}")
+}
+
+/// The most distinct vault instances one process logs hearing ([`note_vault_heard`]); mDNS is
+/// anyone's to write on the LAN, so what it logs is bounded.
+#[cfg(any(test, target_os = "macos"))]
+const MOST_LOGGED: usize = 64;
+
+/// Whether `instance` of `service` is new to `logged` (then added to it, while it holds fewer
+/// than [`MOST_LOGGED`]): each instance is logged once per process, not at every look.
+#[cfg(any(test, target_os = "macos"))]
+fn first_heard(logged: &mut Vec<(String, String)>, service: &str, instance: &str) -> bool {
+    if logged.len() >= MOST_LOGGED
+        || logged
+            .iter()
+            .any(|(s, i)| s == service && i.eq_ignore_ascii_case(instance))
+    {
+        return false;
+    }
+    logged.push((service.to_owned(), instance.to_owned()));
+    true
+}
+
+/// Log to `aterm.log` ([`vault_heard_line`]) each vault instance of `service` in `heard` this
+/// process has not logged before.
+#[cfg(any(test, target_os = "macos"))]
+fn note_vault_heard<'a>(service: &str, heard: impl IntoIterator<Item = &'a str>) {
+    static LOGGED: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+    let mut logged = LOGGED.lock().unwrap_or_else(PoisonError::into_inner);
+    for instance in heard {
+        if first_heard(&mut logged, service, instance) {
+            aterm_log::info!("{}", vault_heard_line(service, instance));
         }
     }
-    instances
-        .into_iter()
-        .filter_map(|(name, interfaces)| (!interfaces.is_empty()).then_some(name))
-        .collect()
 }
-
-/// One `Add` or `Rmv` row of `service` in a `dns-sd -B <service> local.` transcript: whether it
-/// adds, the interface it names and the instance's name. The line may end in the newline a
-/// reader keeps (`read_line`), which is no part of the name.
-fn browse_row<'a>(line: &'a str, service: &str) -> Option<(bool, u32, &'a str)> {
-    let line = line.trim_end_matches(['\r', '\n']);
-    let (cols, name) = columns(line, 6)?;
-    let add = match cols[1] {
-        "Add" => true,
-        "Rmv" => false,
-        _ => return None,
-    };
-    let interface = cols[3]
-        .bytes()
-        .all(|b| b.is_ascii_digit())
-        .then(|| cols[3].parse::<u32>().ok())
-        .flatten()?;
-    let named = cols[5].strip_suffix('.')?;
-    (named == service && !name.is_empty()).then_some((add, interface, name))
-}
-
 /// Apply one browse row to `instances` (each name with the interfaces it is heard on, in
 /// first-seen order): whether the row added a name, or an interface to one.
 fn apply_row(
@@ -180,93 +241,139 @@ fn apply_row(
     }
 }
 
-/// Parse resolved `(host, port)` targets and optional [`VaultTxt`] hints for `vault` from a
-/// `dns-sd -L` transcript.
-#[must_use]
-pub fn parse_resolve(text: &str, vault: &str) -> Vec<DiscoveredVault> {
-    let mut out: Vec<DiscoveredVault> = Vec::new();
-    let mut pending: Option<(String, u16)> = None;
-
-    let flush = |out: &mut Vec<DiscoveredVault>, target: (String, u16), txt: Option<VaultTxt>| {
-        let (host, port) = target;
-        let url = format!("http://{host}:{port}/v1/{vault}");
-        if let Some(existing) = out
-            .iter_mut()
-            .find(|item| item.url.eq_ignore_ascii_case(&url))
-        {
-            let newer = match (&existing.txt, &txt) {
-                (None, Some(_)) => true,
-                (Some(old), Some(new)) => new.seq > old.seq,
-                _ => false,
-            };
-            if newer {
-                existing.txt = txt;
-            }
-        } else {
-            out.push(DiscoveredVault { url, txt });
-        }
-    };
-
-    for raw in text.lines() {
-        let line = raw.trim_end_matches('\r');
-        if let Some((_, rest)) = reach_line(line) {
-            if let Some(prev) = pending.take() {
-                flush(&mut out, prev, None);
-            }
-            pending = reach_target(rest);
-            continue;
-        }
-        if let Some(target) = pending.take() {
-            match classify_txt_line(line, vault) {
-                TxtVerdict::NotTxt => {
-                    pending = Some(target);
-                }
-                TxtVerdict::Foreign => {}
-                TxtVerdict::Admitted(txt) => flush(&mut out, target, txt),
-            }
-        }
-    }
-    if let Some(prev) = pending {
-        flush(&mut out, prev, None);
-    }
-    out
-}
-
 /// The service every ALab member's fleet port advertises (`aterm_agent::node_service`), which
 /// a joining Mac browses to find the members it asks (`docs/DESIGN-fluid-swarm-2026-10-28.md`
 /// §3.3.1).
 pub const MEMBER_SERVICE: &str = "_alab._tcp";
 
-/// The `host:port` targets a `dns-sd -L` transcript resolves, first-seen order, each once.
-#[must_use]
-pub fn parse_reached(text: &str) -> Vec<String> {
-    const REACHED: &str = " can be reached at ";
-    let mut out: Vec<String> = Vec::new();
-    for line in text.lines() {
-        let Some(at) = line.find(REACHED) else {
-            continue;
-        };
-        let rest = &line[at + REACHED.len()..];
-        let hostport = rest.split(" (interface ").next().unwrap_or(rest).trim();
-        let Some((host, port)) = hostport.rsplit_once(':') else {
-            continue;
-        };
-        let host = host.trim_end_matches('.').to_ascii_lowercase();
-        if !port.bytes().all(|b| b.is_ascii_digit()) {
-            continue;
+/// The host, lowercase without its trailing dot, and the port a service resolve's `event`
+/// answers (`m3.local.`, `7484`). `None` for another event, port 0, or a host of other
+/// characters than a DNS name's.
+#[cfg(any(test, target_os = "macos"))]
+fn reached(event: &Event) -> Option<(String, u16)> {
+    let Event::Resolved { host, port, .. } = event else {
+        return None;
+    };
+    let host = host.trim_end_matches('.');
+    (*port != 0 && plain_host(host)).then(|| (host.to_ascii_lowercase(), *port))
+}
+
+/// A resolve's TXT strings that are UTF-8: one that is not names no key aterm reads.
+#[cfg(any(test, target_os = "macos"))]
+fn txt_strings(event: &Event) -> Vec<&str> {
+    match event {
+        Event::Resolved { txt, .. } => txt
+            .iter()
+            .filter_map(|string| std::str::from_utf8(string).ok())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The `host:port` a member's resolve answers ([`reached`]).
+#[cfg(any(test, target_os = "macos"))]
+fn member_target(event: &Event) -> Option<String> {
+    reached(event).map(|(host, port)| format!("{host}:{port}"))
+}
+
+/// The vault `vault` a `_alab-vault._tcp` resolve answers: its URL, and the [`VaultTxt`] hint its
+/// TXT carries. `None` for no usable target, or a TXT naming another path than `/v1` or another
+/// vault (each key case-insensitive, its first string winning, as [`VaultTxt::from_txt`] reads).
+#[cfg(any(test, target_os = "macos"))]
+fn resolved_vault(event: &Event, vault: &str) -> Option<DiscoveredVault> {
+    let (host, port) = reached(event)?;
+    let strings = txt_strings(event);
+    let first = |name: &str| {
+        strings.iter().find_map(|string| {
+            let (key, value) = string.split_once('=')?;
+            key.eq_ignore_ascii_case(name).then_some(value)
+        })
+    };
+    if first("path").is_some_and(|path| path != "/v1")
+        || first("vault").is_some_and(|named| named != vault)
+    {
+        return None;
+    }
+    let txt = VaultTxt::from_txt(strings.iter().copied());
+    if txt.as_ref().is_some_and(|txt| txt.vault != vault) {
+        return None;
+    }
+    Some(DiscoveredVault {
+        url: format!("http://{host}:{port}/v1/{vault}"),
+        txt,
+    })
+}
+
+/// `instance`'s advert as its resolve's `event` answers it: where it can be reached and its TXT
+/// strings as `key=value` pairs, a string with no `=` or an empty key left out.
+#[cfg(any(test, target_os = "macos"))]
+fn advert_of(instance: &str, event: &Event) -> Option<Advert> {
+    let (host, port) = reached(event)?;
+    let txt = txt_strings(event)
+        .into_iter()
+        .filter_map(|string| {
+            let (key, value) = string.split_once('=')?;
+            (!key.is_empty()).then(|| (key.to_owned(), value.to_owned()))
+        })
+        .collect();
+    Some(Advert {
+        instance: instance.to_owned(),
+        host,
+        port,
+        txt,
+    })
+}
+
+/// [`LanError`] as this crate's error, saying what was asked.
+#[cfg(all(target_os = "macos", not(test)))]
+fn lan_failed(what: &str, error: &LanError) -> crate::Error {
+    crate::Error::new(format!("{what}: {error}"))
+}
+
+/// What a browse of `service` hears within `within`, through the LAN broker: the instances it
+/// leaves heard ([`heard_instances`]).
+///
+/// # Errors
+/// The broker is unavailable ([`aterm_uds::lan::Unavailable`], in its words) or refused the
+/// browse.
+#[cfg(all(target_os = "macos", not(test)))]
+fn browse_within(service: &str, within: Duration) -> crate::Result<Vec<String>> {
+    let what = format!("browsing {service}");
+    let mut events = lan::browse(service, DOMAIN).map_err(|error| lan_failed(&what, &error))?;
+    let deadline = Instant::now() + within;
+    let mut heard = Vec::new();
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
         }
-        let Ok(port) = port.parse::<u16>() else {
-            continue;
-        };
-        if port == 0 || !plain_host(&host) {
-            continue;
-        }
-        let target = format!("{host}:{port}");
-        if !out.contains(&target) {
-            out.push(target);
+        match events.next_within(left) {
+            Ok(Some(event)) => heard.push(event),
+            Ok(None) => break,
+            Err(error) if heard.is_empty() => return Err(lan_failed(&what, &error)),
+            Err(_) => break,
         }
     }
-    out
+    Ok(heard_instances(heard, service))
+}
+
+/// The first answer a resolve of `instance` of `service` hears within `within`, through the LAN
+/// broker: `None` when none came in time, or the resolve failed.
+#[cfg(all(target_os = "macos", not(test)))]
+fn resolve_first(instance: &str, service: &str, within: Duration) -> Option<Event> {
+    let mut events = lan::resolve_service(instance, service, DOMAIN).ok()?;
+    let deadline = Instant::now() + within;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        match events.next_within(left) {
+            Ok(Some(event @ Event::Resolved { .. })) => return Some(event),
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => return None,
+        }
+    }
 }
 
 /// What [`browse_members`] says off macOS, which this build browses for members on alone: a
@@ -274,7 +381,7 @@ pub fn parse_reached(text: &str) -> Vec<String> {
 pub const NO_BROWSE: &str = "this Mac cannot browse the network for ALab's members (that needs \
      macOS's Bonjour): name one with `aterm members join --at <host>`";
 
-/// In unit tests: no `dns-sd` runs, and no member is found.
+/// In unit tests: nothing is browsed, and no member is found.
 #[cfg(test)]
 pub fn browse_members(_budget: Duration) -> crate::Result<Vec<String>> {
     Ok(Vec::new())
@@ -290,43 +397,27 @@ pub fn browse_members(_budget: Duration) -> crate::Result<Vec<String>> {
     Err(crate::Error::new(NO_BROWSE))
 }
 
-/// Browse [`member_service`] on macOS within `budget` and resolve the fleet ports (`host:port`)
-/// of at most [`MAX_MEMBERS`] service instances. Successive calls in this process rotate through
-/// names in a stable order, including names beyond the first batch.
+/// Browse [`member_service`] on macOS within `budget`, through the LAN broker, and resolve the
+/// fleet ports (`host:port`) of at most [`MAX_MEMBERS`] service instances. Successive calls in
+/// this process rotate through names in a stable order, including names beyond the first batch.
 ///
 /// # Errors
-/// The browse cannot start, [`LAB_MEMBER_SERVICE_ENV`] names no lab service, or macOS refused
-/// this program the local network.
+/// [`LAB_MEMBER_SERVICE_ENV`] names no lab service, the LAN broker is unavailable (its words say
+/// what installs it), or it refused the browse.
 #[cfg(all(target_os = "macos", not(test)))]
 pub fn browse_members(budget: Duration) -> crate::Result<Vec<String>> {
     static FROM: AtomicUsize = AtomicUsize::new(0);
     let started = Instant::now();
     let service = member_service(std::env::var_os(LAB_MEMBER_SERVICE_ENV).as_deref())?;
     let service = service.as_str();
-    let (out, err) = run_dns_sd(&["-B", service, "local."], budget / 2, |_| false)?;
-    let said = format!("{out}\n{err}");
-    if said
-        .lines()
-        .filter(|line| !is_browse_row(line))
-        .any(|line| line.split_whitespace().any(|word| word == POLICY_DENIED))
-    {
-        return Err(crate::Error::new(format!(
-            "browsing {service}: {}",
-            aterm_http::LOCAL_NETWORK_REFUSED
-        )));
-    }
-    let instances = member_candidate_names_of(&out, service, &FROM);
+    let instances = rotated_names(browse_within(service, budget / 2)?, &FROM, MAX_MEMBERS);
     let left = budget.saturating_sub(started.elapsed());
-    let resolved: Vec<Vec<String>> = std::thread::scope(|scope| {
+    let resolved: Vec<Option<String>> = std::thread::scope(|scope| {
         let resolving: Vec<_> = instances
             .iter()
             .map(|name| {
                 scope.spawn(move || {
-                    run_dns_sd(&["-L", name.as_str(), service, "local."], left, |line| {
-                        line.contains(" can be reached at ")
-                    })
-                    .map(|(text, _)| parse_reached(&text))
-                    .unwrap_or_default()
+                    resolve_first(name, service, left).and_then(|event| member_target(&event))
                 })
             })
             .collect();
@@ -369,73 +460,8 @@ pub fn is_alab_holder_instance(name: &str) -> bool {
     !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// Parse resolved `alab-secrets` holder targets and [`VaultTxt`] hints from `dns-sd -L` output
-/// without collapsing equal-URL collisions (`DESIGN-fluid-swarm` §4.1 F7: two holders after a heal
-/// both resolve `alab-secrets.local:7484`, distinguished by `label=` in their TXT).
-#[must_use]
-pub fn parse_alab_holders(text: &str) -> Vec<DiscoveredVault> {
-    let vault = crate::ALAB_VAULT;
-    let mut out: Vec<DiscoveredVault> = Vec::new();
-    let mut pending: Option<(String, u16)> = None;
-
-    let flush = |out: &mut Vec<DiscoveredVault>, target: (String, u16), txt: Option<VaultTxt>| {
-        let (host, port) = target;
-        let url = format!("http://{host}:{port}/v1/{vault}");
-        let item = DiscoveredVault { url, txt };
-        if !out.contains(&item) {
-            out.push(item);
-        }
-    };
-
-    for raw in text.lines() {
-        let line = raw.trim_end_matches('\r');
-        if let Some((_, rest)) = reach_line(line) {
-            if let Some(prev) = pending.take() {
-                flush(&mut out, prev, None);
-            }
-            pending = reach_target(rest);
-            continue;
-        }
-        if let Some(target) = pending.take() {
-            match classify_txt_line(line, vault) {
-                TxtVerdict::NotTxt => {
-                    pending = Some(target);
-                }
-                TxtVerdict::Foreign => {}
-                TxtVerdict::Admitted(txt) => flush(&mut out, target, txt),
-            }
-        }
-    }
-    if let Some(prev) = pending {
-        flush(&mut out, prev, None);
-    }
-    out
-}
-
-/// A `dns-sd -L` line that says an instance can be reached: what comes before
-/// ` can be reached at ` (the timestamp and the instance's full name) and what comes after.
-fn reach_line(line: &str) -> Option<(&str, &str)> {
-    const REACHED: &str = " can be reached at ";
-    let at = line.find(REACHED)?;
-    Some((&line[..at], &line[at + REACHED.len()..]))
-}
-
-/// The host, lowercase without its trailing dot, and the port a reach line names after
-/// ` can be reached at ` (`m3.local.:7484 (interface 9) Flags: 1`). `None` for port 0, or a host
-/// of other characters than a DNS name's.
-fn reach_target(rest: &str) -> Option<(String, u16)> {
-    let hostport = rest.split(" (interface ").next().unwrap_or(rest).trim();
-    let (host, port) = hostport.rsplit_once(':')?;
-    let host = host.trim_end_matches('.');
-    if !port.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let port = port.parse::<u16>().ok()?;
-    (port != 0 && plain_host(host)).then(|| (host.to_ascii_lowercase(), port))
-}
-
-/// One instance's advert as `dns-sd -L` resolves it: where it can be reached and the TXT it
-/// carries. The node job's `_alab._tcp` advert is a fleet member's dial hint: its port is the
+/// One instance's advert as a service resolve answers it: where it can be reached and the TXT
+/// it carries. The node job's `_alab._tcp` advert is a fleet member's dial hint: its port is the
 /// fleet port and its TXT is `v=1 role=<member|steward> fleet=<port> window=<0|1>`. A hint only,
 /// as a vault's TXT is: whoever dials it still proves who answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -504,161 +530,6 @@ mod mesh_hint_tests {
     }
 }
 
-/// Parse `instance`'s advert from a `dns-sd -L <instance> <service> local.` transcript: the first
-/// line that says `instance` can be reached, its full name as `dns-sd` prints it (a space as
-/// `\032`, a dot as `\.`), and the TXT line under it, if any. `None` with no such line, or with
-/// only lines whose host or port is unusable.
-#[must_use]
-pub fn parse_advert(instance: &str, transcript: &str) -> Option<Advert> {
-    let mut lines = transcript.lines().map(|line| line.trim_end_matches('\r'));
-    while let Some(line) = lines.next() {
-        let Some((head, rest)) = reach_line(line) else {
-            continue;
-        };
-        if !names_instance(full_name(head), instance) {
-            continue;
-        }
-        let Some((host, port)) = reach_target(rest) else {
-            continue;
-        };
-        // `dns-sd` prints the TXT on the next line, each string after a space.
-        let txt = lines
-            .next()
-            .filter(|next| next.starts_with([' ', '\t']))
-            .map(txt_pairs)
-            .unwrap_or_default();
-        return Some(Advert {
-            instance: instance.to_owned(),
-            host,
-            port,
-            txt,
-        });
-    }
-    None
-}
-
-/// The full name in what a reach line says before ` can be reached at `, past its timestamp
-/// (` 6:21:48.497  m3._alab._tcp.local.`).
-fn full_name(head: &str) -> &str {
-    let head = head.trim();
-    match head.split_once(char::is_whitespace) {
-        Some((stamp, name))
-            if !stamp.is_empty()
-                && stamp
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || matches!(b, b':' | b'.')) =>
-        {
-            name.trim()
-        }
-        _ => head,
-    }
-}
-
-/// Whether `full` (`<instance>.<service>.<domain>.`, as `dns-sd -L` prints it: a byte as `\DDD`
-/// in decimal, a dot or backslash in the name after a `\`) names `instance`, ignoring ASCII case
-/// as DNS does.
-fn names_instance(full: &str, instance: &str) -> bool {
-    let raw = full.as_bytes();
-    let mut label = Vec::with_capacity(raw.len());
-    let mut at = 0;
-    while let Some(&byte) = raw.get(at) {
-        match byte {
-            b'.' => break,
-            b'\\' => {
-                let digits = raw
-                    .get(at + 1..at + 4)
-                    .filter(|digits| digits.iter().all(u8::is_ascii_digit));
-                if let Some(digits) = digits {
-                    let value = digits
-                        .iter()
-                        .fold(0_u32, |n, digit| n * 10 + u32::from(digit - b'0'));
-                    let Ok(value) = u8::try_from(value) else {
-                        return false;
-                    };
-                    label.push(value);
-                    at += 4;
-                } else if let Some(&next) = raw.get(at + 1) {
-                    label.push(next);
-                    at += 2;
-                } else {
-                    return false;
-                }
-            }
-            _ => {
-                label.push(byte);
-                at += 1;
-            }
-        }
-    }
-    label.eq_ignore_ascii_case(instance.as_bytes())
-}
-
-/// The `key=value` pairs of a TXT line as `dns-sd` prints it: each string after a space, a space
-/// or shell metacharacter in a string after a `\`.
-fn txt_pairs(line: &str) -> Vec<(String, String)> {
-    let mut strings: Vec<String> = Vec::new();
-    let mut string = String::new();
-    let mut chars = line.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => string.extend(chars.next()),
-            c if c.is_whitespace() => {
-                if !string.is_empty() {
-                    strings.push(std::mem::take(&mut string));
-                }
-            }
-            c => string.push(c),
-        }
-    }
-    if !string.is_empty() {
-        strings.push(string);
-    }
-    strings
-        .iter()
-        .filter_map(|string| {
-            let (key, value) = string.split_once('=')?;
-            (!key.is_empty()).then(|| (key.to_owned(), value.to_owned()))
-        })
-        .collect()
-}
-
-enum TxtVerdict {
-    NotTxt,
-    Foreign,
-    Admitted(Option<VaultTxt>),
-}
-
-fn classify_txt_line(line: &str, expected_vault: &str) -> TxtVerdict {
-    let mut saw_pair = false;
-    let mut path = None;
-    let mut named_vault = None;
-    for word in line.split_whitespace() {
-        let Some((key, value)) = word.split_once('=') else {
-            continue;
-        };
-        saw_pair = true;
-        if key.eq_ignore_ascii_case("path") {
-            path.get_or_insert(value);
-        } else if key.eq_ignore_ascii_case("vault") {
-            named_vault.get_or_insert(value);
-        }
-    }
-    if !saw_pair {
-        return TxtVerdict::NotTxt;
-    }
-    if path.is_some_and(|p| p != "/v1") {
-        return TxtVerdict::Foreign;
-    }
-    if named_vault.is_some_and(|v| v != expected_vault) {
-        return TxtVerdict::Foreign;
-    }
-    let parsed = VaultTxt::from_resolve_line(line);
-    if parsed.as_ref().is_some_and(|t| t.vault != expected_vault) {
-        return TxtVerdict::Foreign;
-    }
-    TxtVerdict::Admitted(parsed)
-}
-
 /// Build the deduplicated candidate URL list for `vault`: `defaults` first in compiled-in order,
 /// followed by `discovered` ordered by advertised TXT `seq` descending, capped at
 /// [`MAX_CANDIDATES`].
@@ -708,6 +579,7 @@ pub(crate) fn same_endpoint(a: &str, b: &str) -> bool {
     transport::describe(a).eq_ignore_ascii_case(&transport::describe(b))
 }
 
+#[cfg(any(test, target_os = "macos"))]
 fn plain_host(host: &str) -> bool {
     !host.is_empty()
         && !host.starts_with('-')
@@ -716,36 +588,24 @@ fn plain_host(host: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
 }
 
-fn columns(line: &str, n: usize) -> Option<(Vec<&str>, &str)> {
-    let mut cols = Vec::with_capacity(n);
-    let mut rest = line;
-    for _ in 0..n {
-        rest = rest.trim_start();
-        let end = rest.find(char::is_whitespace)?;
-        cols.push(&rest[..end]);
-        rest = &rest[end..];
-    }
-    Some((cols, rest.trim_start()))
-}
-
-#[cfg(all(target_os = "macos", not(test)))]
-fn is_browse_row(line: &str) -> bool {
-    columns(line, 6).is_some_and(|(cols, _)| matches!(cols[1], "Add" | "Rmv"))
-}
-
 /// Browse `_alab-vault._tcp` on macOS within `budget` and resolve advertised targets for `vault`.
 ///
-/// In unit tests and off macOS this touches neither `dns-sd` nor the network and returns an empty
-/// list; tests exercise discovery and candidate selection deterministically through
-/// [`parse_browse`], [`parse_resolve`], [`candidate_urls`] and `client::probe_candidates_with`.
+/// In unit tests and off macOS this asks nothing of the network and returns an empty list; tests
+/// exercise discovery and candidate selection deterministically through [`heard_instances`],
+/// [`resolved_vault`], [`candidate_urls`] and `client::probe_candidates_with`.
 #[cfg(any(test, not(target_os = "macos")))]
 pub fn browse_alab(_budget: std::time::Duration) -> crate::Result<Vec<DiscoveredVault>> {
     Ok(Vec::new())
 }
 
-/// Browse `_alab-vault._tcp` on macOS within `budget` and resolve advertised targets for `alab`.
-/// Successive browses in this process rotate through the names in stable name order,
-/// reserving space for the compiled-in defaults in [`candidate_urls`].
+/// Browse `_alab-vault._tcp` (or the lab vault service [`LAB_VAULT_SERVICE_ENV`] names) on
+/// macOS within `budget`, through the LAN broker, and resolve advertised targets for `alab`.
+/// Successive browses in this process rotate through the names in stable name order, reserving
+/// space for the compiled-in defaults the look asks ([`look_default_urls`]) in
+/// [`candidate_urls`].
+///
+/// # Errors
+/// As [`browse_names`].
 #[cfg(all(target_os = "macos", not(test)))]
 pub fn browse_alab(budget: Duration) -> crate::Result<Vec<DiscoveredVault>> {
     static FROM: AtomicUsize = AtomicUsize::new(0);
@@ -765,77 +625,70 @@ pub fn browse_alab(budget: Duration) -> crate::Result<Vec<DiscoveredVault>> {
     Ok(resolve_all(&instances, left))
 }
 
-/// In tests and off macOS, no Bonjour process runs.
+/// In tests and off macOS, nothing is browsed.
 #[cfg(any(test, not(target_os = "macos")))]
 pub(crate) fn browse_names(_budget: Duration) -> crate::Result<Vec<String>> {
     Ok(Vec::new())
 }
 
-/// Hear names without resolving them, so a caller can reserve its URL slots first.
+/// Hear names of the vault's type ([`vault_type`]) without resolving them, so a caller can
+/// reserve its URL slots first, logging each instance heard ([`note_vault_heard`]).
 ///
 /// # Errors
-/// The browse cannot start or macOS refuses this program the local network.
+/// [`LAB_VAULT_SERVICE_ENV`] names no lab service, the LAN broker is unavailable (its words say
+/// what installs it), or it refused the browse.
 #[cfg(all(target_os = "macos", not(test)))]
 pub(crate) fn browse_names(budget: Duration) -> crate::Result<Vec<String>> {
     if budget.is_zero() {
         return Ok(Vec::new());
     }
+    let service = vault_type()?;
     let browse_budget = (budget / 4).clamp(Duration::from_millis(50), Duration::from_millis(250));
-    let (out, err) = run_dns_sd(
-        &["-B", crate::server::SERVICE_TYPE, "local."],
-        browse_budget,
-        |_| false,
-    )?;
-    let said = format!("{out}\n{err}");
-    let denied = said
-        .lines()
-        .filter(|line| !is_browse_row(line))
-        .any(|line| line.split_whitespace().any(|word| word == POLICY_DENIED));
-    if denied {
-        return Err(crate::Error::new(format!(
-            "browsing {}: {}",
-            crate::server::SERVICE_TYPE,
-            aterm_http::LOCAL_NETWORK_REFUSED
-        )));
-    }
-    Ok(parse_browse(&out))
+    let heard = browse_within(&service, browse_budget)?;
+    note_vault_heard(&service, heard.iter().map(String::as_str));
+    Ok(heard)
 }
 
-/// Resolve each of `instances` (`dns-sd -L`) within `budget`, all at once, into the targets
-/// they advertise for `alab`, one per endpoint (the highest TXT `seq` kept).
+/// Resolve each of `instances` of the vault's type ([`vault_type`]; none where it names no lab
+/// service), all at once within `budget`, through the LAN broker: the first answer of each, as
+/// `read` takes it.
 #[cfg(all(target_os = "macos", not(test)))]
-pub(crate) fn resolve_all(instances: &[String], budget: Duration) -> Vec<DiscoveredVault> {
+fn resolve_each_vault(
+    instances: &[String],
+    budget: Duration,
+    read: impl Fn(&Event) -> Option<DiscoveredVault> + Sync,
+) -> Vec<DiscoveredVault> {
+    let Ok(service) = vault_type() else {
+        return Vec::new();
+    };
+    let service = service.as_str();
     let resolve_budget = (budget / 3).clamp(Duration::from_millis(40), Duration::from_millis(250));
-    let resolved: Vec<Vec<DiscoveredVault>> = std::thread::scope(|scope| {
+    let read = &read;
+    std::thread::scope(|scope| {
         let handles: Vec<_> = instances
             .iter()
             .map(|name| {
                 scope.spawn(move || {
-                    let mut saw_reach = false;
-                    run_dns_sd(
-                        &["-L", name.as_str(), crate::server::SERVICE_TYPE, "local."],
-                        resolve_budget,
-                        |line| {
-                            if line.contains(" can be reached at ") {
-                                saw_reach = true;
-                                false
-                            } else {
-                                saw_reach && line.contains('=')
-                            }
-                        },
-                    )
-                    .map(|(text, _)| parse_resolve(&text, crate::ALAB_VAULT))
-                    .unwrap_or_default()
+                    resolve_first(name, service, resolve_budget).and_then(|event| read(&event))
                 })
             })
             .collect();
         handles
             .into_iter()
-            .map(|handle| handle.join().unwrap_or_default())
+            .filter_map(|handle| handle.join().unwrap_or_default())
             .collect()
+    })
+}
+
+/// Resolve each of `instances` within `budget`, all at once, into the targets they advertise for
+/// `alab`, one per endpoint (the highest TXT `seq` kept).
+#[cfg(all(target_os = "macos", not(test)))]
+pub(crate) fn resolve_all(instances: &[String], budget: Duration) -> Vec<DiscoveredVault> {
+    let resolved = resolve_each_vault(instances, budget, |event| {
+        resolved_vault(event, crate::ALAB_VAULT)
     });
     let mut merged: Vec<DiscoveredVault> = Vec::new();
-    for item in resolved.into_iter().flatten() {
+    for item in resolved {
         if let Some(existing) = merged
             .iter_mut()
             .find(|prev| same_endpoint(&prev.url, &item.url))
@@ -855,45 +708,22 @@ pub(crate) fn resolve_all(instances: &[String], budget: Duration) -> Vec<Discove
     merged
 }
 
-/// A test build, or one off macOS, resolves nothing: no `dns-sd` runs.
+/// A test build, or one off macOS, resolves nothing.
 #[cfg(any(test, not(target_os = "macos")))]
 pub(crate) fn resolve_all(_instances: &[String], _budget: Duration) -> Vec<DiscoveredVault> {
     Vec::new()
 }
 
+/// Resolve each `alab-secrets` holder of `instances` within `budget` without collapsing
+/// equal-URL collisions (`DESIGN-fluid-swarm` §4.1 F7: two holders after a heal both resolve
+/// `alab-secrets.local:7484`, distinguished by `label=` in their TXT); an exact repeat is kept
+/// once.
 #[cfg(all(target_os = "macos", not(test)))]
 fn resolve_alab_holders(instances: &[String], budget: Duration) -> Vec<DiscoveredVault> {
-    let resolve_budget = (budget / 3).clamp(Duration::from_millis(40), Duration::from_millis(250));
-    let resolved: Vec<Vec<DiscoveredVault>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = instances
-            .iter()
-            .map(|name| {
-                scope.spawn(move || {
-                    let mut saw_reach = false;
-                    run_dns_sd(
-                        &["-L", name.as_str(), crate::server::SERVICE_TYPE, "local."],
-                        resolve_budget,
-                        |line| {
-                            if line.contains(" can be reached at ") {
-                                saw_reach = true;
-                                false
-                            } else {
-                                saw_reach && line.contains('=')
-                            }
-                        },
-                    )
-                    .map(|(text, _)| parse_alab_holders(&text))
-                    .unwrap_or_default()
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|handle| handle.join().unwrap_or_default())
-            .collect()
-    });
     let mut out = Vec::new();
-    for item in resolved.into_iter().flatten() {
+    for item in resolve_each_vault(instances, budget, |event| {
+        resolved_vault(event, crate::ALAB_VAULT)
+    }) {
         if !out.contains(&item) {
             out.push(item);
         }
@@ -906,13 +736,12 @@ fn resolve_alab_holders(_instances: &[String], _budget: Duration) -> Vec<Discove
     Vec::new()
 }
 
-/// Resolve each of `instances` of `service` (`dns-sd -L`), at most [`MAX_CANDIDATES`] at once, all
-/// within `budget`, into the adverts they answer with, in the order of `instances`. One that does
-/// not answer before its share of the budget ends is left out, and none starts once less than
-/// 40 ms of it is left.
+/// Resolve each of `instances` of `service`, at most [`MAX_CANDIDATES`] at once, all within
+/// `budget`, through the LAN broker, into the adverts they answer with, in the order of
+/// `instances`. One that does not answer before its share of the budget ends is left out, and
+/// none starts once less than 40 ms of it is left.
 #[cfg(all(target_os = "macos", not(test)))]
 fn resolve_adverts(service: &str, instances: &[String], budget: Duration) -> Vec<Advert> {
-    use std::sync::atomic::AtomicUsize;
     let deadline = Instant::now().checked_add(budget);
     let each = (budget / 3).clamp(Duration::from_millis(40), Duration::from_millis(250));
     let next = AtomicUsize::new(0);
@@ -933,21 +762,8 @@ fn resolve_adverts(service: &str, instances: &[String], budget: Duration) -> Vec
                         if left < Duration::from_millis(40) {
                             return got;
                         }
-                        let mut saw_reach = false;
-                        let ran = run_dns_sd(
-                            &["-L", name.as_str(), service, "local."],
-                            each.min(left),
-                            |line| {
-                                if line.contains(" can be reached at ") {
-                                    saw_reach = true;
-                                    false
-                                } else {
-                                    saw_reach && line.contains('=')
-                                }
-                            },
-                        );
-                        if let Some(advert) =
-                            ran.ok().and_then(|(text, _)| parse_advert(name, &text))
+                        if let Some(advert) = resolve_first(name, service, each.min(left))
+                            .and_then(|event| advert_of(name, &event))
                         {
                             got.push((at, advert));
                         }
@@ -965,13 +781,13 @@ fn resolve_adverts(service: &str, instances: &[String], budget: Duration) -> Vec
     resolved.into_iter().map(|(_, advert)| advert).collect()
 }
 
-/// A test build, or one off macOS, resolves nothing: no `dns-sd` runs.
+/// A test build, or one off macOS, resolves nothing.
 #[cfg(any(test, not(target_os = "macos")))]
 fn resolve_adverts(_service: &str, _instances: &[String], _budget: Duration) -> Vec<Advert> {
     Vec::new()
 }
 
-/// How long a browse child's first rows are its baseline on a watch of a service other than the
+/// How long a browse's first events are its baseline on a watch of a service other than the
 /// vault's (the node job's `_alab._tcp`): what it hears then was there before this process
 /// looked, so it is held but rings nothing.
 const SETTLE: Duration = Duration::from_secs(30);
@@ -980,13 +796,18 @@ const SETTLE: Duration = Duration::from_secs(30);
 /// held nor rung for (mDNS is anyone's to write on the LAN).
 const MOST_HELD: usize = 256;
 
-/// How soon after an instance left an interface its return there is it re-registering, no
-/// return, on a watch of a service other than the vault's: a peer's window opening or closing
-/// restarts its node's registration under the same name, a removal and an add moments apart.
-pub const REREGISTERING_WITHIN: Duration = Duration::from_secs(2 * 60);
+/// How long every member but this process's own must go unheard, on a watch of a service other
+/// than the vault's, for the next one heard to be a move: this Mac back on a LAN is one, a
+/// peer's comings and goings are none. Each process names its advert afresh
+/// (`aterm_agent::node_service::random_alab_instance_name`), so a peer's window or node job
+/// starting again is a member never heard, and among some 40 Macs one comes or goes every half
+/// minute: counted a member at a time, the browse ran the window's converge pass 1,138 times in
+/// two days, at its move source's rest floor, where route changes ran it 52 times (0.155.0,
+/// 2026-11-03 to 05).
+pub const SILENCE: Duration = Duration::from_secs(2 * 60);
 
 /// A watch of `service`'s settle window and the most instances it holds. The vault's watch rings
-/// from a browse child's first row and holds every instance it hears, as it always has; a watch
+/// from a browse's first event and holds every instance it hears, as it always has; a watch
 /// of another service takes [`SETTLE`] and [`MOST_HELD`].
 fn holding(service: &str) -> (Duration, usize) {
     if service == crate::server::SERVICE_TYPE {
@@ -996,17 +817,18 @@ fn holding(service: &str) -> (Duration, usize) {
     }
 }
 
-/// A standing `dns-sd -B <service> local.` (`docs/DESIGN-fluid-swarm-2026-10-28.md` §3.5.2):
+/// A standing browse of `<service> local.` through the LAN broker
+/// (`docs/DESIGN-fluid-swarm-2026-10-28.md` §3.5.2):
 /// the vault's `_alab-vault._tcp`, beside the bounded [`browse_alab`] ([`Watch::start`]), or the
 /// node job's `_alab._tcp`, whose adverts are the fleet's dial hints ([`Watch::start_for`],
 /// [`Watch::adverts`]). It keeps the browse running, starting it again when it ends, and keeps
-/// the instances it hears, each forgotten at the `Rmv` of the last interface it was heard on. At
-/// each Add of an instance, or (the vault's) of one on an interface it was not heard on, it rings
-/// its bell with [`Wake::Browse`]: a server or member that came back, or a new one; another
-/// service's watch passes over a member back within [`REREGISTERING_WITHIN`], which is
-/// re-registering. Adds of this
-/// process's own instances ring nothing, and nor do those a browse child hears within the
-/// watch's settle window. Dropping it ends the browse.
+/// the instances it hears, each forgotten at the removal from the last interface it was heard on.
+/// The vault's watch rings its bell with [`Wake::Browse`] at each add of an instance, or of one
+/// on an interface it was not heard on: a server that came back, or a new one. Another service's
+/// watch rings only at the add of a member heard once every member but this process's own was
+/// unheard for longer than [`SILENCE`], or before it held any: this Mac back on a LAN, not a
+/// peer's comings and goings. Adds of this process's own instances ring nothing, and nor do those
+/// a browse hears within the watch's settle window. Dropping it ends the browse.
 pub struct Watch {
     watched: Arc<Watched>,
 }
@@ -1025,23 +847,31 @@ impl std::fmt::Debug for Watch {
 type Resolver = Box<dyn Fn(&str) -> Option<Advert> + Send + Sync>;
 
 struct Watched {
-    /// The service browsed (`_alab-vault._tcp`, `_alab._tcp`).
+    /// The service watched (`_alab-vault._tcp`, `_alab._tcp`).
     service: &'static str,
-    /// How long a browse child's first rows are its baseline ([`holding`]).
+    /// The type its browse browses and its resolves name: the service, or for the look's vault
+    /// watch ([`Watch::start_look`]) the type [`vault_type`] names; `None` (no browse runs) where
+    /// [`LAB_VAULT_SERVICE_ENV`] names no lab service.
+    browsed: Option<String>,
+    /// Whether it is the client look's vault watch ([`Watch::start_look`]), which logs each
+    /// instance it hears ([`note_vault_heard`]).
+    look: bool,
+    /// How long a browse's first events are its baseline ([`holding`]).
     settle: Duration,
     /// The most instances held ([`holding`]).
     most: usize,
     /// Each instance heard, with the interfaces it is heard on.
     instances: Mutex<Vec<(String, Vec<u32>)>>,
-    /// When the running browse child began, and how long before that it is taken to have
+    /// When the running browse began, and how long before that it is taken to have
     /// begun (a test's seam, `Watch::child_began`); `None` while none has (an idle watch).
     began: Mutex<Option<(Instant, Duration)>>,
     bell: Weak<Bell>,
     /// This process's own instances.
     own: Mutex<Vec<String>>,
-    /// When each instance left an interface within the last [`REREGISTERING_WITHIN`], at most
-    /// [`Watched::most`] of them (none kept on the vault's watch).
-    gone: Mutex<Vec<((String, u32), Instant)>>,
+    /// The last event at which the watch held a member but this process's own; `None` while it
+    /// has held none since it began or forgot ([`Watched::forget`]). Kept only on a watch of a
+    /// service other than the vault's.
+    last_held: Mutex<Option<Instant>>,
     /// Where the next [`Watch::found`] starts its cut of what is heard ([`rotated`]).
     found_from: AtomicUsize,
     /// Where the next [`Watch::peer_vaults`] starts its cut of what is heard ([`rotated`]).
@@ -1049,31 +879,52 @@ struct Watched {
     /// Where the next [`Watch::alab_holders`] starts its own cut of eligible holders.
     holders_from: AtomicUsize,
     closed: AtomicBool,
-    /// The `dns-sd -B` running now, killed when the watch is dropped.
-    child: Mutex<Option<aterm_uds::spawnfd::Child>>,
-    /// What [`Watch::adverts`] resolves through in place of `dns-sd -L`, a test's.
+    /// What [`Watch::adverts`] resolves through in place of a service resolve, a test's.
     #[cfg(any(test, debug_assertions))]
     resolve: Option<Resolver>,
 }
 
 impl Watch {
-    /// Start a standing `_alab-vault._tcp` browse that rings `bell` ([`Watch::start_for`]).
+    /// Start a standing `_alab-vault._tcp` browse that rings `bell` ([`Watch::start_for`]): a
+    /// vault server's, which [`LAB_VAULT_SERVICE_ENV`] does not move.
     #[must_use]
     pub fn start(bell: &Arc<Bell>, own: &[&str]) -> Watch {
         Watch::start_for(crate::server::SERVICE_TYPE, bell, own)
     }
 
+    /// Start the client look's standing vault browse that rings `bell`: [`Watch::start`], whose
+    /// browse browses the type [`vault_type`] names (the lab vault service
+    /// [`LAB_VAULT_SERVICE_ENV`] names in a lab's process), and none at all where that variable
+    /// names no lab service.
+    #[must_use]
+    pub fn start_look(bell: &Arc<Bell>, own: &[&str]) -> Watch {
+        let mut watched = Watched::new(crate::server::SERVICE_TYPE, vault_type().ok(), bell, own);
+        watched.look = true;
+        Watch::running(watched)
+    }
+
     /// Start a standing browse of `service` that rings `bell`. `own` names this process's own
-    /// instances. A watch of the vault's `_alab-vault._tcp` rings from each browse child's first
-    /// row and holds every instance it hears; a watch of another service (the node job's
-    /// `_alab._tcp`) holds what a child hears in its first 30 s as its baseline, ringing
-    /// nothing for it, and holds at most 256 instances. In a test build, and off macOS, no
-    /// browse runs: the watch is [`Watch::idle_for`].
+    /// instances. A watch of the vault's `_alab-vault._tcp` rings from each browse's first event
+    /// and holds every instance it hears; a watch of another service (the node job's
+    /// `_alab._tcp`) holds what a browse hears in its first 30 s as its baseline, ringing
+    /// nothing for it, holds at most 256 instances, and rings only for a member heard after
+    /// every member's [`SILENCE`]. The browse goes through the LAN broker,
+    /// and waits for it while it is unavailable. In a test build, and off macOS, no browse runs:
+    /// the watch is [`Watch::idle_for`].
     #[must_use]
     pub fn start_for(service: &'static str, bell: &Arc<Bell>, own: &[&str]) -> Watch {
-        let watch = Watch::idle_for(service, bell, own);
+        Watch::running(Watched::new(service, Some(service.to_owned()), bell, own))
+    }
+
+    /// A watch of `watched` whose standing browse runs on its own thread on macOS outside a test
+    /// build ([`browse_standing`]); elsewhere, idle.
+    fn running(watched: Watched) -> Watch {
+        let watch = Watch {
+            watched: Arc::new(watched),
+        };
         #[cfg(all(target_os = "macos", not(test)))]
         {
+            let service = watch.watched.service;
             let watched = Arc::clone(&watch.watched);
             if let Err(error) = std::thread::Builder::new()
                 .name(format!("browse {service}"))
@@ -1091,17 +942,17 @@ impl Watch {
         Watch::idle_for(crate::server::SERVICE_TYPE, bell, own)
     }
 
-    /// A watch of `service` that runs no browse: rows reach it only through [`Watch::feed`], and
-    /// with no browse child begun, none of them is a baseline.
+    /// A watch of `service` that runs no browse: what it hears reaches it only through
+    /// [`Watch::hear`] (or [`Watch::feed`]), and with no browse begun, none of it is a baseline.
     #[must_use]
     pub fn idle_for(service: &'static str, bell: &Arc<Bell>, own: &[&str]) -> Watch {
         Watch {
-            watched: Arc::new(Watched::new(service, bell, own)),
+            watched: Arc::new(Watched::new(service, Some(service.to_owned()), bell, own)),
         }
     }
 
     /// Seam: [`Watch::idle_for`] whose [`Watch::adverts`] resolves each instance with `resolve`
-    /// in place of `dns-sd -L`, for a test that feeds the watch rows and reads its dial hints.
+    /// in place of a service resolve, for a test that feeds the watch and reads its dial hints.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
     pub fn idle_resolving(
@@ -1110,16 +961,16 @@ impl Watch {
         own: &[&str],
         resolve: impl Fn(&str) -> Option<Advert> + Send + Sync + 'static,
     ) -> Watch {
-        let mut watched = Watched::new(service, bell, own);
+        let mut watched = Watched::new(service, Some(service.to_owned()), bell, own);
         watched.resolve = Some(Box::new(resolve));
         Watch {
             watched: Arc::new(watched),
         }
     }
 
-    /// Seam: take it that a browse child began `ago` ago, as the standing browse does at each
-    /// child it starts with `ago` zero: rows fed while the child is younger than the watch's
-    /// settle window are its baseline, held but ringing nothing.
+    /// Seam: take it that a browse began `ago` ago, as the standing browse does at each browse it
+    /// starts with `ago` zero: what is heard while the browse is younger than the watch's settle
+    /// window is its baseline, held but ringing nothing.
     #[cfg(any(test, debug_assertions))]
     pub fn child_began(&self, ago: Duration) {
         self.watched.begin(ago);
@@ -1143,38 +994,25 @@ impl Watch {
         }
     }
 
-    /// Take one line of the browse's transcript: an `Add` or `Rmv` row of the watch's service
-    /// (as [`parse_browse`] reads the vault's), with or without its newline.
-    pub fn feed(&self, line: &str) {
-        if let Some((add, interface, name)) = browse_row(line, self.watched.service) {
-            self.watched.hear(add, interface, name, Instant::now());
-        }
-    }
-
     /// Take one event of a browse of the watch's service that its process runs itself (a native
     /// Bonjour connection, which [`Watch::idle_for`] leaves to it): instance `name` added
-    /// (`added`) or removed on `interface`, as [`Watch::feed`] takes a row.
+    /// (`added`) or removed on `interface`, as the standing browse takes the broker's events.
     pub fn hear(&self, added: bool, interface: u32, name: &str) {
         self.watched.hear(added, interface, name, Instant::now());
     }
 
-    /// Seam: [`Watch::hear`] at `now`, which times a re-registration ([`REREGISTERING_WITHIN`]);
-    /// the settle window still runs on the clock ([`Watch::child_began`]).
+    /// Seam: [`Watch::hear`] at `now`, which times every member's silence ([`SILENCE`]); the
+    /// settle window still runs on the clock ([`Watch::child_began`]).
     #[cfg(any(test, debug_assertions))]
     pub fn hear_at(&self, added: bool, interface: u32, name: &str, now: Instant) {
         self.watched.hear(added, interface, name, now);
     }
 
     /// A browse its process runs itself ([`Watch::hear`]) began, or began again after it ended:
-    /// what the last one heard is forgotten, and what this one hears within the settle window is
-    /// its baseline, as at each browse child [`Watch::start_for`] starts.
+    /// what the last one heard is forgotten ([`Watched::forget`]), and what this one hears within
+    /// the settle window is its baseline, as at each browse [`Watch::start_for`] starts.
     pub fn began_browse(&self) {
-        self.watched.lock().clear();
-        self.watched
-            .gone
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
+        self.watched.forget();
         self.watched.begin(Duration::ZERO);
     }
 
@@ -1271,9 +1109,9 @@ impl Watch {
         rotated_names(names, &self.watched.holders_from, MAX_CANDIDATES)
     }
 
-    /// Resolve each instance held now but this process's own (`dns-sd -L <instance> <service>
-    /// local.`), at most [`MAX_CANDIDATES`] at once, all within `budget`: where each can be
-    /// reached and the TXT it carries ([`parse_advert`]), in first-heard order. One that does not
+    /// Resolve each instance held now but this process's own through the LAN broker, at most
+    /// [`MAX_CANDIDATES`] at once, all within `budget`: where each can be reached and the TXT it
+    /// carries ([`advert_of`]), in first-heard order. One that does not
     /// answer in time is left out. On the node job's `_alab._tcp` watch these are the fleet's
     /// dial hints. A test build, and one off macOS, resolves nothing, except through the
     /// resolver of a watch a test made with `Watch::idle_resolving`.
@@ -1295,7 +1133,10 @@ impl Watch {
         if let Some(resolve) = &self.watched.resolve {
             return names.iter().filter_map(|name| resolve(name)).collect();
         }
-        resolve_adverts(self.watched.service, &names, budget)
+        let Some(browsed) = self.watched.browsed.as_deref() else {
+            return Vec::new();
+        };
+        resolve_adverts(browsed, &names, budget)
     }
 }
 
@@ -1303,7 +1144,7 @@ impl Watch {
 /// candidate list. Resolving a full batch first would discard its tail in [`candidate_urls`]
 /// on every pass for some fleet sizes, even though the name-selection cursor rotates.
 fn alab_candidate_names(names: Vec<String>, from: &AtomicUsize) -> Vec<String> {
-    let defaults = candidate_urls(crate::ALAB_DEFAULT_URLS, &[], crate::ALAB_VAULT);
+    let defaults = candidate_urls(look_default_urls(), &[], crate::ALAB_VAULT);
     rotated_names(names, from, MAX_CANDIDATES - defaults.len())
 }
 
@@ -1327,22 +1168,29 @@ pub(crate) fn rotated<T>(mut names: Vec<T>, from: &AtomicUsize, limit: usize) ->
 }
 
 impl Watched {
-    fn new(service: &'static str, bell: &Arc<Bell>, own: &[&str]) -> Watched {
+    /// A watch of `service` whose browse browses `browsed` (none where `None`).
+    fn new(
+        service: &'static str,
+        browsed: Option<String>,
+        bell: &Arc<Bell>,
+        own: &[&str],
+    ) -> Watched {
         let (settle, most) = holding(service);
         Watched {
             service,
+            browsed,
+            look: false,
             settle,
             most,
             instances: Mutex::new(Vec::new()),
             began: Mutex::new(None),
             bell: Arc::downgrade(bell),
             own: Mutex::new(own.iter().map(|name| (*name).to_owned()).collect()),
-            gone: Mutex::new(Vec::new()),
+            last_held: Mutex::new(None),
             found_from: AtomicUsize::new(0),
             peers_from: AtomicUsize::new(0),
             holders_from: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
-            child: Mutex::new(None),
             #[cfg(any(test, debug_assertions))]
             resolve: None,
         }
@@ -1365,7 +1213,7 @@ impl Watched {
         *self.began.lock().unwrap_or_else(PoisonError::into_inner) = Some((Instant::now(), ago));
     }
 
-    /// Whether a row heard now is the running browse child's baseline.
+    /// Whether what is heard now is the running browse's baseline.
     fn baseline(&self) -> bool {
         self.began
             .lock()
@@ -1373,322 +1221,281 @@ impl Watched {
             .is_some_and(|(at, ago)| ago.saturating_add(at.elapsed()) < self.settle)
     }
 
-    fn is_own(&self, name: &str) -> bool {
-        self.own
+    /// Forget what a browse that ended heard: its instances, and when it last held a member. What
+    /// the next one hears in its settle window is its baseline.
+    fn forget(&self) {
+        self.lock().clear();
+        *self
+            .last_held
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .any(|own| own.eq_ignore_ascii_case(name))
+            .unwrap_or_else(PoisonError::into_inner) = None;
     }
 
-    /// Take one row heard at `now`. The vault's watch rings at each add of an instance, or of one
-    /// on an interface it was not heard on; another service's watch only at an add of an
-    /// instance it does not hold that did not leave that interface within
-    /// [`REREGISTERING_WITHIN`] (one heard on another interface is the same member, and one back
-    /// that soon is re-registering). Neither rings in its settle window or for its own.
+    /// Take one event heard at `now`. The vault's watch rings at each add of an instance, or of one
+    /// on an interface it was not heard on. Another service's watch rings only at an add of a
+    /// member while it holds none but this process's own and held none within [`SILENCE`] (or
+    /// never did): a member never heard, one back, or one heard on another interface beside
+    /// members it holds or held lately is a peer coming or going, no move of this Mac's network.
+    /// Neither rings in its settle window or for its own.
     fn hear(&self, add: bool, interface: u32, name: &str, now: Instant) {
         if name.is_empty() {
             return;
         }
-        let (added, new) = {
+        let own = self
+            .own
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let is_own = |name: &str| own.iter().any(|own| own.eq_ignore_ascii_case(name));
+        let holds =
+            |instances: &[(String, Vec<u32>)]| instances.iter().any(|(held, _)| !is_own(held));
+        let rings = {
             let mut instances = self.lock();
             let held = instances.iter().any(|(held, _)| held == name);
             if add && instances.len() >= self.most && !held {
                 return;
             }
-            let was_on = instances
-                .iter()
-                .any(|(held, on)| held == name && on.contains(&interface));
+            let held_before = holds(&instances);
             let added = apply_row(&mut instances, add, interface, name);
             instances.retain(|(_, interfaces)| !interfaces.is_empty());
-            if !add && was_on && !self.is_vault() {
-                self.went(name, interface, now);
+            if self.is_vault() {
+                added
+            } else {
+                // Every event, a removal too, says when the watch last held a member.
+                let alone = self.alone(held_before, holds(&instances), now);
+                add && alone
             }
-            (added, add && !held)
-        };
-        let rings = if self.is_vault() {
-            added
-        } else {
-            let back = add && self.back(name, interface, now);
-            new && !back
         };
         if rings
             && !self.baseline()
-            && !self.is_own(name)
+            && !is_own(name)
             && let Some(bell) = self.bell.upgrade()
         {
             bell.ring(Wake::Browse);
         }
     }
 
-    /// Note `name`'s removal from `interface` at `now`, forgetting removals older than
-    /// [`REREGISTERING_WITHIN`] and, past [`Watched::most`], the oldest.
-    fn went(&self, name: &str, interface: u32, now: Instant) {
-        let mut gone = self.gone.lock().unwrap_or_else(PoisonError::into_inner);
-        gone.retain(|((held, on), at)| {
-            !(held == name && *on == interface)
-                && now.saturating_duration_since(*at) <= REREGISTERING_WITHIN
-        });
-        if gone.len() >= self.most {
-            gone.remove(0);
+    /// Take one event of a browse of this watch's browsed type, heard at `now`: an add or a
+    /// removal ([`Watched::hear`]), the look's add logged ([`note_vault_heard`]); any other
+    /// event, or another type's, is none, and so is every event of a watch with no browsed type.
+    #[cfg(any(test, target_os = "macos"))]
+    fn hear_event(&self, event: &Event, now: Instant) {
+        let (add, instance) = match event {
+            Event::Added(instance) => (true, instance),
+            Event::Removed(instance) => (false, instance),
+            _ => return,
+        };
+        let Some(browsed) = self.browsed.as_deref() else {
+            return;
+        };
+        if of_service(instance, browsed) {
+            if add && self.look {
+                note_vault_heard(browsed, [instance.name.as_str()]);
+            }
+            self.hear(add, instance.interface, &instance.name, now);
         }
-        gone.push(((name.to_owned(), interface), now));
     }
 
-    /// Whether an add of `name` on `interface` at `now` comes within [`REREGISTERING_WITHIN`] of
-    /// its removal there: an instance re-registering, not one back. It forgets that removal
-    /// either way.
-    fn back(&self, name: &str, interface: u32, now: Instant) -> bool {
-        let mut gone = self.gone.lock().unwrap_or_else(PoisonError::into_inner);
-        let Some(at) = gone
-            .iter()
-            .position(|((held, on), _)| held == name && *on == interface)
-        else {
-            return false;
-        };
-        let (_, went) = gone.remove(at);
-        now.saturating_duration_since(went) <= REREGISTERING_WITHIN
+    /// Whether an event at `now` came while the watch held no member but this process's own
+    /// (`before`: it held one as the event came) and had held none within [`SILENCE`], or never
+    /// had. An event before or after which it holds one (`after`) is the last it held one at.
+    fn alone(&self, before: bool, after: bool, now: Instant) -> bool {
+        let mut last_held = self
+            .last_held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let alone =
+            !before && last_held.is_none_or(|at| now.saturating_duration_since(at) > SILENCE);
+        if before || after {
+            *last_held = Some(now);
+        }
+        alone
     }
 }
 
 impl Drop for Watch {
+    /// The standing browse sees the watch closed within [`LOOK_CLOSED_EVERY`] and ends its
+    /// request to the broker.
     fn drop(&mut self) {
         self.watched.closed.store(true, Ordering::SeqCst);
-        if let Some(mut child) = self
-            .watched
-            .child
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
     }
 }
 
-/// The first pause before a standing browse that ended starts again, doubled each time it ends
-/// within [`RESTART_LONGEST`] of its start, up to that.
-#[cfg(all(target_os = "macos", not(test)))]
+/// The first pause before a standing browse that ended (or could not start for a reason other
+/// than the broker's absence) starts again, doubled each time it ends within [`RESTART_LONGEST`]
+/// of its start, up to that.
+#[cfg(any(test, target_os = "macos"))]
 const RESTART_FIRST: Duration = Duration::from_secs(5);
-#[cfg(all(target_os = "macos", not(test)))]
+#[cfg(any(test, target_os = "macos"))]
 const RESTART_LONGEST: Duration = Duration::from_secs(60);
 
-/// Largest `dns-sd` line [`browse_standing`] or [`run_dns_sd`] buffers before draining to LF.
-#[cfg(all(target_os = "macos", not(test)))]
-const BROWSE_LINE_MOST: usize = 8192;
+/// How often a standing browse asks again while the LAN broker is unavailable: its socket is
+/// what it waits for (setup's Mac password installs it), and a browse starts as soon as it
+/// answers, never on the doubled backoff of a browse that ran and ended.
+#[cfg(any(test, target_os = "macos"))]
+const BROKER_PAUSE: Duration = Duration::from_secs(2);
 
-/// Largest transcript [`run_dns_sd`] retains from `stdout` or `stderr`.
+/// How long the standing browse waits for an event before it looks whether its watch was
+/// dropped.
 #[cfg(all(target_os = "macos", not(test)))]
-const MAX_DNS_SD_OUTPUT: usize = 4 << 20;
+const LOOK_CLOSED_EVERY: Duration = Duration::from_secs(1);
 
-#[cfg(all(target_os = "macos", not(test)))]
-fn read_bounded_line(
-    reader: &mut impl std::io::BufRead,
-    line: &mut String,
-    max: usize,
-) -> std::io::Result<usize> {
-    use std::io::{BufRead as _, Read as _};
-    line.clear();
-    let mut raw = Vec::new();
-    let n = reader
-        .by_ref()
-        .take((max as u64).saturating_add(1))
-        .read_until(b'\n', &mut raw)?;
-    if n == 0 {
-        return Ok(0);
-    }
-    if raw.len() > max && !raw.ends_with(b"\n") {
-        loop {
-            let buf = reader.fill_buf()?;
-            if buf.is_empty() {
-                break;
-            }
-            if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                reader.consume(pos + 1);
-                break;
-            }
-            let len = buf.len();
-            reader.consume(len);
-        }
-        return Ok(n);
-    }
-    if raw.len() <= max {
-        *line = String::from_utf8_lossy(&raw).into_owned();
-    }
-    Ok(n)
+/// How a standing browse's last start went ([`restart_pause`]).
+#[cfg(any(test, target_os = "macos"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Started {
+    /// The LAN broker was unavailable: nothing started.
+    NoBroker,
+    /// It started (and ran this long before it ended), or failed for another reason.
+    Ran(Duration),
 }
 
-/// Run `dns-sd -B <service> local.` for `watched` until the watch is dropped, starting it again
-/// whenever it ends (macOS's mDNSResponder restarted, or refused this process the local network),
-/// and feed it each row. A browse that ended heard nothing more, so what it heard is forgotten,
-/// and the next child's settle window begins with it.
+/// How long a standing browse waits before it starts again after `last`, given the backoff
+/// `pause` it holds, and the backoff the next end gets: the broker's absence waits
+/// [`BROKER_PAUSE`] and leaves the backoff at [`RESTART_FIRST`]; another end waits `pause`
+/// (reset to [`RESTART_FIRST`] once a browse ran [`RESTART_LONGEST`]) and doubles it, up to that.
+#[cfg(any(test, target_os = "macos"))]
+fn restart_pause(last: Started, pause: Duration) -> (Duration, Duration) {
+    match last {
+        Started::NoBroker => (BROKER_PAUSE, RESTART_FIRST),
+        Started::Ran(ran) => {
+            let pause = if ran >= RESTART_LONGEST {
+                RESTART_FIRST
+            } else {
+                pause
+            };
+            (pause, pause.saturating_mul(2).min(RESTART_LONGEST))
+        }
+    }
+}
+
+/// Browse `<type> local.` (the watch's [`Watched::browsed`] type) through the LAN broker for
+/// `watched` until the watch is dropped, starting it again whenever it ends (mDNSResponder
+/// restarted, or the broker did) or cannot start (no broker yet: [`restart_pause`]), and hand it
+/// each event. A browse that ended heard nothing more, so what it heard is forgotten, and the
+/// next one's settle window begins with it. A watch with no type to browse browses nothing.
 #[cfg(all(target_os = "macos", not(test)))]
 fn browse_standing(watched: &Watched) {
-    use aterm_uds::spawnfd::Stdio;
+    let Some(browsed) = watched.browsed.as_deref() else {
+        crate::log_line(&format!(
+            "not browsing {}: {LAB_VAULT_SERVICE_ENV} names no lab service",
+            watched.service
+        ));
+        return;
+    };
     let mut pause = RESTART_FIRST;
     while !watched.closed.load(Ordering::SeqCst) {
         let started = Instant::now();
-        let spawned = aterm_uds::spawnfd::command(DNS_SD)
-            .args(["-B", watched.service, "local."])
-            .setsid(true)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn();
-        if let Ok(mut child) = spawned {
-            watched.begin(Duration::ZERO);
-            let stdout = child.stdout.take();
-            *watched.child.lock().unwrap_or_else(PoisonError::into_inner) = Some(child);
-            // A drop between the start and the store above found no child to kill.
-            if watched.closed.load(Ordering::SeqCst) {
-                end_browse(watched);
-                return;
-            }
-            if let Some(stdout) = stdout {
-                let mut reader = std::io::BufReader::new(stdout);
-                let mut line = String::new();
-                while read_bounded_line(&mut reader, &mut line, BROWSE_LINE_MOST).unwrap_or(0) > 0 {
-                    if let Some((add, interface, name)) = browse_row(&line, watched.service) {
-                        watched.hear(add, interface, name, Instant::now());
+        let last = match lan::browse(browsed, DOMAIN) {
+            Ok(mut events) => {
+                watched.begin(Duration::ZERO);
+                while !watched.closed.load(Ordering::SeqCst) {
+                    match events.next_within(LOOK_CLOSED_EVERY) {
+                        Ok(Some(event)) => watched.hear_event(&event, Instant::now()),
+                        Ok(None) => {}
+                        Err(_) => break,
                     }
                 }
+                watched.forget();
+                Started::Ran(started.elapsed())
             }
-            end_browse(watched);
-            watched.lock().clear();
-            watched
-                .gone
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clear();
-        }
-        if started.elapsed() >= RESTART_LONGEST {
-            pause = RESTART_FIRST;
-        }
+            Err(LanError::Unavailable(_)) => Started::NoBroker,
+            Err(LanError::Io(_)) => Started::Ran(started.elapsed()),
+        };
+        let (wait, next) = restart_pause(last, pause);
+        pause = next;
         let sleep_start = Instant::now();
-        while !watched.closed.load(Ordering::SeqCst) && sleep_start.elapsed() < pause {
-            let rem = pause.saturating_sub(sleep_start.elapsed());
+        while !watched.closed.load(Ordering::SeqCst) && sleep_start.elapsed() < wait {
+            let rem = wait.saturating_sub(sleep_start.elapsed());
             std::thread::sleep(Duration::from_secs(1).min(rem));
         }
-        pause = pause.saturating_mul(2).min(RESTART_LONGEST);
     }
-}
-
-#[cfg(all(target_os = "macos", not(test)))]
-fn end_browse(watched: &Watched) {
-    if let Some(mut child) = watched
-        .child
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .take()
-    {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-}
-
-#[cfg(all(target_os = "macos", not(test)))]
-fn run_dns_sd(
-    args: &[&str],
-    budget: Duration,
-    mut enough: impl FnMut(&str) -> bool,
-) -> crate::Result<(String, String)> {
-    use aterm_uds::spawnfd::Stdio;
-    use std::sync::mpsc;
-
-    let mut child = aterm_uds::spawnfd::command(DNS_SD)
-        .args(args)
-        .setsid(true)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            crate::Error::new(format!(
-                "dns-sd {}: {e}",
-                args.first().copied().unwrap_or("")
-            ))
-        })?;
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let (tx, rx) = mpsc::channel::<String>();
-    let out_handle = std::thread::spawn(move || {
-        let mut collected = String::new();
-        if let Some(stdout) = stdout {
-            let mut reader = std::io::BufReader::new(stdout);
-            let mut line = String::new();
-            while read_bounded_line(&mut reader, &mut line, BROWSE_LINE_MOST).unwrap_or(0) > 0 {
-                if !line.is_empty() {
-                    if collected.len().saturating_add(line.len()) <= MAX_DNS_SD_OUTPUT {
-                        collected.push_str(&line);
-                    }
-                    let _ = tx.send(line.clone());
-                }
-            }
-        }
-        collected
-    });
-    let err_handle = std::thread::spawn(move || {
-        let mut collected = String::new();
-        if let Some(stderr) = stderr {
-            use std::io::Read as _;
-            let mut reader = std::io::BufReader::new(stderr);
-            let mut bounded = Vec::new();
-            let _ = reader
-                .by_ref()
-                .take(MAX_DNS_SD_OUTPUT as u64)
-                .read_to_end(&mut bounded);
-            collected = String::from_utf8_lossy(&bounded).into_owned();
-            let _ = std::io::copy(&mut reader, &mut std::io::sink());
-        }
-        collected
-    });
-    let deadline = Instant::now() + budget.min(Duration::from_secs(365 * 24 * 60 * 60));
-    while let Some(wait) = deadline
-        .checked_duration_since(Instant::now())
-        .filter(|wait| !wait.is_zero())
-    {
-        match rx.recv_timeout(wait) {
-            Ok(line) => {
-                if enough(&line) {
-                    break;
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-    let out = out_handle.join().unwrap_or_default();
-    let err = err_handle.join().unwrap_or_default();
-    Ok((out, err))
 }
 
 #[cfg(test)]
 mod tests {
-    /// A member's instance name from `dns-sd -B _alab._tcp local.` and its fleet port from
-    /// `dns-sd -L`: active `_alab._tcp` instances only, each `host:port` once, a bad port or host
-    /// left out.
+    use super::*;
+    use crate::envelope;
+
+    /// While the LAN broker is unavailable a standing browse asks again every [`BROKER_PAUSE`],
+    /// however long it has waited, and the first browse that then ends waits [`RESTART_FIRST`];
+    /// a browse that ran and ended backs off doubling, up to [`RESTART_LONGEST`], and from the
+    /// start again once one ran that long. Negative control: the broker's absence on the
+    /// doubled backoff waits 5, 10, 20, 40 and 60 s.
+    #[test]
+    fn a_standing_browse_waits_for_the_broker_on_a_short_cadence() {
+        let mut pause = RESTART_FIRST;
+        for _ in 0..8 {
+            let (wait, next) = restart_pause(Started::NoBroker, pause);
+            assert_eq!(wait, BROKER_PAUSE);
+            pause = next;
+        }
+        let quick = Started::Ran(Duration::from_secs(1));
+        let mut waits = Vec::new();
+        for _ in 0..6 {
+            let (wait, next) = restart_pause(quick, pause);
+            waits.push(wait.as_secs());
+            pause = next;
+        }
+        assert_eq!(waits, [5, 10, 20, 40, 60, 60]);
+        let (wait, _) = restart_pause(Started::Ran(RESTART_LONGEST), pause);
+        assert_eq!(wait, RESTART_FIRST);
+    }
+
+    /// A browse's add of `name` of `service` on `interface`, as the broker streams it.
+    fn added(service: &str, interface: u32, name: &str) -> Event {
+        Event::Added(Instance {
+            name: name.to_owned(),
+            service: format!("{service}."),
+            domain: "local.".to_owned(),
+            interface,
+        })
+    }
+
+    /// A browse's removal of `name` of `service` from `interface`.
+    fn removed(service: &str, interface: u32, name: &str) -> Event {
+        let Event::Added(instance) = added(service, interface, name) else {
+            unreachable!("added makes an add")
+        };
+        Event::Removed(instance)
+    }
+
+    /// A service resolve's answer: `host` on `port` with `txt`'s strings.
+    fn resolved(host: &str, port: u16, txt: &[&str]) -> Event {
+        Event::Resolved {
+            host: host.to_owned(),
+            port,
+            txt: txt
+                .iter()
+                .map(|string| string.as_bytes().to_vec())
+                .collect(),
+            interface: 4,
+        }
+    }
+
+    /// A member's instance name from a browse of `_alab._tcp` and its fleet port from its
+    /// resolve: active `_alab._tcp` instances only, the host lowercase without its dot, and a bad
+    /// port or host left out.
     #[test]
     fn a_resolved_member_is_its_host_and_fleet_port() {
-        let browse = "Browsing for _alab._tcp.local.\n\
-            12:00:00.000  Add        3  14 local.               _alab._tcp.          alab-gone\n\
-            12:00:00.001  Add        3  14 local.               _alab._tcp.          alab-1a2b3c4d\n\
-            12:00:00.002  Add        2  15 local.               _alab._tcp.          alab-9f8e7d6c\n\
-            12:00:00.003  Add        2  14 local.               _alab-vault._tcp.    alab-secrets\n\
-            12:00:00.004  Rmv        0  14 local.               _alab._tcp.          alab-gone\n";
+        let browse = [
+            added(MEMBER_SERVICE, 14, "alab-gone"),
+            added(MEMBER_SERVICE, 14, "alab-1a2b3c4d"),
+            added(MEMBER_SERVICE, 15, "alab-9f8e7d6c"),
+            added("_alab-vault._tcp", 14, "alab-secrets"),
+            removed(MEMBER_SERVICE, 14, "alab-gone"),
+        ];
         assert_eq!(
-            super::parse_browse_members(browse),
+            heard_instances(browse, MEMBER_SERVICE),
             ["alab-1a2b3c4d", "alab-9f8e7d6c"]
         );
-
-        let text = "Lookup alab-1a2b3c4d._alab._tcp.local\n\
-            12:00:00.000  alab-1a2b3c4d._alab._tcp.local. can be reached at m22.local.:7100 (interface 14)\n\
-             v=1 role=member fleet=7100 window=1\n\
-            12:00:00.001  alab-1a2b3c4d._alab._tcp.local. can be reached at M22.local.:7100 (interface 15)\n\
-            12:00:00.002  x._alab._tcp.local. can be reached at m7.local.:0 (interface 14)\n\
-            12:00:00.003  y._alab._tcp.local. can be reached at bad host.local.:7100 (interface 14)\n";
-        assert_eq!(super::parse_reached(text), ["m22.local:7100"]);
+        assert_eq!(
+            member_target(&resolved("M22.local.", 7100, &["v=1"])).as_deref(),
+            Some("m22.local:7100")
+        );
+        assert_eq!(member_target(&resolved("m7.local.", 0, &[])), None);
+        assert_eq!(member_target(&resolved("bad host.local.", 7100, &[])), None);
+        assert_eq!(member_target(&added(MEMBER_SERVICE, 4, "m7")), None);
     }
 
     /// `ATERM_LAB_MEMBER_SERVICE` unset browses `_alab._tcp`; set, it names a lab service or the
@@ -1735,47 +1542,179 @@ mod tests {
         }
     }
 
-    /// A browse of a lab service reads that service's rows alone: a real member heard in the same
-    /// transcript is no lab member, and a lab member is no real one.
+    /// `ATERM_LAB_VAULT_SERVICE` unset, a vault browse browses `_alab-vault._tcp`; set, it names
+    /// a lab service or no vault is browsed at all, never the real vault's type.
     ///
-    /// NEGATIVE CONTROL (2026-10-29): `parse_browse_members_of` reading `MEMBER_SERVICE` whatever
-    /// service it is given fails here: `left: ["alab-1a2b3c4d"]`, `right: ["alab-5e6f7a8b"]`.
+    /// NEGATIVE CONTROL: `vault_service` with its refusal arm returning
+    /// `Ok(SERVICE_TYPE.to_owned())` fails here at the first refused value.
     #[test]
-    fn a_lab_browse_reads_its_own_service_alone() {
-        let browse = "Browsing for _alab-lab-k3x9q2._tcp.local.\n\
-            12:00:00.000  Add        3  14 local.               _alab._tcp.               alab-1a2b3c4d\n\
-            12:00:00.001  Add        2   6 local.               _alab-lab-k3x9q2._tcp.    alab-5e6f7a8b\n\
-            12:00:00.002  Add        2   6 local.               _alab-lab-zzzzzz._tcp.    alab-00000000\n";
-        assert_eq!(
-            super::parse_browse_members_of(browse, "_alab-lab-k3x9q2._tcp"),
-            ["alab-5e6f7a8b"]
-        );
-        assert_eq!(super::parse_browse_members(browse), ["alab-1a2b3c4d"]);
+    fn a_lab_vault_service_is_taken_and_any_other_value_browses_no_vault() {
+        use std::ffi::OsStr;
+        let vault = crate::server::SERVICE_TYPE;
+        let lab = "_alab-lab-k3x9q2._tcp";
+        assert_eq!(super::vault_service(None).unwrap(), vault);
+        assert_eq!(super::vault_service(Some(OsStr::new(lab))).unwrap(), lab);
+        for refused in [vault, "_alab._tcp", "", "_alab-lab-K3X9._tcp"] {
+            let said = super::vault_service(Some(OsStr::new(refused)));
+            assert!(said.is_err(), "{refused:?} fell back to {said:?}");
+        }
     }
 
-    /// A joiner's browse keeps every member of a lab of 40 Macs, so each one is asked and can
-    /// show the row a person presses Allow on.
+    /// `ATERM_LAB_VAULT_SERVICE` set, good value or bad, the look's candidates hold no
+    /// compiled-in ALab address: a lab's look names only what its lab browse heard. Unset, the
+    /// defaults come first, as ever.
+    ///
+    /// NEGATIVE CONTROL: `look_defaults` answering `ALAB_DEFAULT_URLS` for a set variable fails
+    /// at the first value.
+    #[test]
+    fn a_lab_look_asks_no_compiled_in_address() {
+        use std::ffi::OsStr;
+        let heard = DiscoveredVault {
+            url: "http://alab-secrets.local:7485/v1/alab".to_owned(),
+            txt: None,
+        };
+        for set in ["_alab-lab-k3x9q2._tcp", crate::server::SERVICE_TYPE, ""] {
+            let urls = candidate_urls(
+                super::look_defaults(Some(OsStr::new(set))),
+                std::slice::from_ref(&heard),
+                crate::ALAB_VAULT,
+            );
+            assert!(
+                urls.iter().all(|url| !crate::is_alab_default_url(url)),
+                "{set:?}: {urls:?}"
+            );
+            assert_eq!(urls, std::slice::from_ref(&heard.url), "{set:?}");
+        }
+        let urls = candidate_urls(
+            super::look_defaults(None),
+            std::slice::from_ref(&heard),
+            crate::ALAB_VAULT,
+        );
+        assert_eq!(
+            urls.first().map(String::as_str),
+            Some(crate::ALAB_DEFAULT_URL)
+        );
+        assert!(urls.contains(&heard.url));
+    }
+
+    /// The look logs each vault instance it hears once per process, on a line naming the
+    /// instance and the service (what `lab mac nux`'s `first-launch-vault` reads), and holds at
+    /// most `MOST_LOGGED` of them.
+    ///
+    /// NEGATIVE CONTROL: `first_heard` returning `true` for one already logged fails at the
+    /// second hearing.
+    #[test]
+    fn each_vault_instance_heard_is_logged_once() {
+        let lab = "_alab-lab-k3x9q2._tcp";
+        let line = super::vault_heard_line(lab, "alab-secrets");
+        assert!(
+            line.contains(lab) && line.contains("alab-secrets"),
+            "{line}"
+        );
+        let mut logged = Vec::new();
+        assert!(super::first_heard(&mut logged, lab, "alab-secrets"));
+        assert!(!super::first_heard(&mut logged, lab, "ALAB-SECRETS"));
+        assert!(super::first_heard(
+            &mut logged,
+            crate::server::SERVICE_TYPE,
+            "alab-secrets"
+        ));
+        for n in logged.len()..super::MOST_LOGGED {
+            assert!(super::first_heard(&mut logged, lab, &format!("m{n}")));
+        }
+        assert!(!super::first_heard(&mut logged, lab, "one-more"));
+    }
+
+    /// Only the client look's watch logs what it hears and takes the lab knob; a vault server's
+    /// [`Watch::start`] browses `_alab-vault._tcp`, the type its own advert is registered under.
+    ///
+    /// NEGATIVE CONTROL: `Watch::start_for` building its watch with `vault_type().ok()` or
+    /// `look: true` fails here.
+    #[test]
+    fn a_servers_vault_watch_is_not_the_look() {
+        let bell = Arc::new(Bell::default());
+        let server = Watch::start(&bell, &[]);
+        assert!(!server.watched.look);
+        assert_eq!(
+            server.watched.browsed.as_deref(),
+            Some(crate::server::SERVICE_TYPE)
+        );
+        assert!(Watch::start_look(&bell, &[]).watched.look);
+    }
+
+    /// The vault's watch, where `ATERM_LAB_VAULT_SERVICE` names a lab service, hears that
+    /// service's instances alone; the real vault's type is another type's event to it.
+    ///
+    /// NEGATIVE CONTROL: `hear_event` matching `Watched::service` in place of `browsed` hears the
+    /// real vault and not the lab's.
+    #[test]
+    fn the_vault_watch_of_a_lab_service_hears_that_service_alone() {
+        let lab = "_alab-lab-k3x9q2._tcp";
+        let bell = Arc::new(Bell::default());
+        let watch = Watch::idle(&bell, &[]);
+        let watched = Watched::new(
+            crate::server::SERVICE_TYPE,
+            Some(lab.to_owned()),
+            &bell,
+            &[],
+        );
+        let lab_watch = Watch {
+            watched: Arc::new(watched),
+        };
+        for w in [&watch, &lab_watch] {
+            hears(w, &added(crate::server::SERVICE_TYPE, 4, "alab-secrets"));
+            hears(w, &added(lab, 4, "alab-secrets (2)"));
+        }
+        assert_eq!(watch.heard(), ["alab-secrets"]);
+        assert_eq!(lab_watch.heard(), ["alab-secrets (2)"]);
+    }
+
+    /// A browse of a lab service reads that service's instances alone: a real member heard on the
+    /// same browse is no lab member, and a lab member is no real one.
+    ///
+    /// NEGATIVE CONTROL: `heard_instances` reading `MEMBER_SERVICE` whatever service it is given
+    /// fails here: `left: ["alab-1a2b3c4d"]`, `right: ["alab-5e6f7a8b"]`.
+    #[test]
+    fn a_lab_browse_reads_its_own_service_alone() {
+        let browse = [
+            added(MEMBER_SERVICE, 14, "alab-1a2b3c4d"),
+            added("_alab-lab-k3x9q2._tcp", 6, "alab-5e6f7a8b"),
+            added("_alab-lab-zzzzzz._tcp", 6, "alab-00000000"),
+        ];
+        assert_eq!(
+            heard_instances(browse.clone(), "_alab-lab-k3x9q2._tcp"),
+            ["alab-5e6f7a8b"]
+        );
+        assert_eq!(heard_instances(browse, MEMBER_SERVICE), ["alab-1a2b3c4d"]);
+    }
+
+    /// A joiner's browse keeps every member of a lab of 40 Macs, so each one is asked; a flood of
+    /// instances is asked at most [`MAX_MEMBERS`] at a time.
     /// NEGATIVE CONTROL: the cut at `MAX_CANDIDATES` (16) this browse had leaves 24 of them
     /// never asked.
     #[test]
     fn a_joiners_browse_keeps_every_member_of_a_lab_of_forty() {
-        let mut browse = String::from("Browsing for _alab._tcp.local.\n");
-        for n in 0..40 {
-            browse.push_str(&format!(
-                "12:00:00.000  Add        3  14 local.               _alab._tcp.          alab-{n:08x}\n"
-            ));
-        }
-        let heard = super::parse_browse_members(&browse);
+        let mut browse: Vec<Event> = (0..40)
+            .map(|n| added(MEMBER_SERVICE, 14, &format!("alab-{n:08x}")))
+            .collect();
+        let heard = heard_instances(browse.clone(), MEMBER_SERVICE);
         assert_eq!(heard.len(), 40, "{heard:?}");
         assert_eq!(heard[39], "alab-00000027");
-        for n in 40..super::MAX_MEMBERS + 10 {
-            browse.push_str(&format!(
-                "12:00:00.000  Add        3  14 local.               _alab._tcp.          alab-{n:08x}\n"
-            ));
-        }
         assert_eq!(
-            super::parse_browse_members(&browse).len(),
-            super::MAX_MEMBERS,
+            rotated_names(heard, &AtomicUsize::new(0), MAX_MEMBERS).len(),
+            40
+        );
+        browse.extend(
+            (40..MAX_MEMBERS + 10).map(|n| added(MEMBER_SERVICE, 14, &format!("alab-{n:08x}"))),
+        );
+        assert_eq!(
+            rotated_names(
+                heard_instances(browse, MEMBER_SERVICE),
+                &AtomicUsize::new(0),
+                MAX_MEMBERS
+            )
+            .len(),
+            MAX_MEMBERS,
             "a flood of instances stays bounded"
         );
     }
@@ -1794,16 +1733,10 @@ mod tests {
                 if reordered {
                     arrivals.rotate_right((pass * MAX_MEMBERS) % names.len());
                 }
-                let transcript: String = arrivals
-                    .iter()
-                    .map(|name| format!("12:00:00.000 Add 3 14 local. _alab._tcp. {name}\n"))
-                    .collect();
-                assert_eq!(
-                    parse_browse_members(&transcript),
-                    arrivals[..MAX_MEMBERS],
-                    "the public parser retains its bounded observation order"
-                );
-                let batch = member_candidate_names(&transcript, &from);
+                let browse = arrivals.iter().map(|name| added(MEMBER_SERVICE, 14, name));
+                let heard = heard_instances(browse, MEMBER_SERVICE);
+                assert_eq!(heard, arrivals, "the fold keeps the browse's order");
+                let batch = rotated_names(heard, &from, MAX_MEMBERS);
                 assert!(batch.len() <= MAX_MEMBERS);
                 assert!(batch.iter().all(|name| expected.contains(name)));
                 selected.extend(batch);
@@ -1815,23 +1748,22 @@ mod tests {
     #[test]
     fn lab_member_batches_rotate_without_selecting_live_members() {
         let service = "_alab-lab-merge1._tcp";
-        let transcript: String = (0..MAX_MEMBERS * 2)
+        let browse: Vec<Event> = (0..MAX_MEMBERS * 2)
             .flat_map(|n| {
-                [service, MEMBER_SERVICE]
-                    .map(move |kind| format!("12:00:00.000 Add 3 14 local. {kind}. alab-{n:08x}\n"))
+                [service, MEMBER_SERVICE].map(move |kind| added(kind, 14, &format!("alab-{n:08x}")))
             })
             .collect();
         let from = AtomicUsize::new(0);
-        let first = member_candidate_names_of(&transcript, service, &from);
-        let second = member_candidate_names_of(&transcript, service, &from);
+        let batch = |service: &str| {
+            rotated_names(heard_instances(browse.clone(), service), &from, MAX_MEMBERS)
+        };
+        let first = batch(service);
+        let second = batch(service);
         assert_eq!(first.len(), MAX_MEMBERS);
         assert_eq!(second.len(), MAX_MEMBERS);
         assert!(first.iter().all(|name| !second.contains(name)));
-        assert!(member_candidate_names_of(&transcript, "_alab-lab-other._tcp", &from).is_empty());
+        assert!(batch("_alab-lab-other._tcp").is_empty());
     }
-
-    use super::*;
-    use crate::envelope;
 
     /// `alab-secrets` and its Bonjour renames are holders; any other name, including one from
     /// the LAN whose multibyte character sits across the cut after `alab-secrets`' length, is
@@ -1868,30 +1800,24 @@ mod tests {
     fn a_standing_browse_rings_for_each_server_it_had_not_heard() {
         let bell = Arc::new(Bell::default());
         let watch = Watch::idle(&bell, &["m22"]);
-        let row = |kind: &str, interface: u32, name: &str| {
-            format!(
-                "8:30:01.200  {kind}        3   {interface} local.               _alab-vault._tcp.    {name}"
-            )
-        };
         let rung = || bell.nap(Duration::ZERO);
-        watch.feed("Browsing for _alab-vault._tcp.local.");
-        assert_eq!(rung(), Wake::Timer, "no row");
-        watch.feed(&row("Add", 4, "m3"));
+        assert_eq!(rung(), Wake::Timer, "nothing heard");
+        watch.hear(true, 4, "m3");
         assert_eq!(rung(), Wake::Browse, "a server not heard before");
-        watch.feed(&row("Add", 4, "m3"));
+        watch.hear(true, 4, "m3");
         assert_eq!(rung(), Wake::Timer, "heard already");
-        watch.feed(&row("Add", 9, "m3"));
+        watch.hear(true, 9, "m3");
         assert_eq!(rung(), Wake::Browse, "heard on another interface");
-        watch.feed(&row("Add", 4, "m22"));
+        watch.hear(true, 4, "m22");
         assert_eq!(rung(), Wake::Timer, "this process's own");
-        watch.feed(&row("Add", 9, "M22"));
+        watch.hear(true, 9, "M22");
         assert_eq!(rung(), Wake::Timer, "this process's own in uppercase");
-        watch.feed(&row("Rmv", 9, "M22"));
-        watch.feed(&row("Rmv", 4, "m3"));
-        watch.feed(&row("Rmv", 9, "m3"));
+        watch.hear(false, 9, "M22");
+        watch.hear(false, 4, "m3");
+        watch.hear(false, 9, "m3");
         assert_eq!(rung(), Wake::Timer, "a removal");
         assert_eq!(watch.heard(), ["m22"]);
-        watch.feed(&row("Add", 4, "m3"));
+        watch.hear(true, 4, "m3");
         assert_eq!(rung(), Wake::Browse, "back after it left");
         assert_eq!(watch.heard(), ["m22", "m3"]);
         assert!(
@@ -1903,20 +1829,20 @@ mod tests {
     /// The node job's service.
     const ALAB_TCP: &str = "_alab._tcp";
 
-    /// One `dns-sd -B _alab._tcp local.` row as the standing browse feeds it, newline and all.
-    fn alab_row(kind: &str, interface: u32, name: &str) -> String {
-        format!(
-            "16:02:11.123  {kind}        3   {interface} local.               _alab._tcp.          {name}\n"
-        )
+    /// Have `watch` hear `event` now, as the standing browse hands it the broker's.
+    fn hears(watch: &Watch, event: &Event) {
+        watch.watched.hear_event(event, Instant::now());
     }
 
-    /// A browse its process runs itself feeds the watch as a child's rows do: each start forgets
-    /// what the last one heard and opens a settle window, and after it a member the watch did
-    /// not hold rings once, this process's own instance and a nameless event nothing.
+    /// A browse its process runs itself feeds the watch as the standing browse does: each start
+    /// forgets what the last one heard and when it last held a member, and opens a settle window.
+    /// After it a member heard beside one held, this process's own instance and a nameless event
+    /// ring nothing, and a member heard after a settle window that heard none rings once.
     /// NEGATIVE CONTROL: a start that keeps what the last browse heard still holds a member that
-    /// went while no browse ran, so its return rings nothing.
+    /// went while no browse ran, and one that keeps when the last browse held a member takes the
+    /// member as heard beside those: either way its return rings nothing.
     #[test]
-    fn a_browse_its_process_runs_feeds_the_watch_as_a_childs_rows_do() {
+    fn a_browse_its_process_runs_feeds_the_watch_as_the_standing_browse_does() {
         let bell = Arc::new(Bell::default());
         let rung = || bell.nap(Duration::ZERO);
         let watch = Watch::idle_for(ALAB_TCP, &bell, &["alab-0000a0a0"]);
@@ -1925,7 +1851,7 @@ mod tests {
         assert_eq!(rung(), Wake::Timer, "heard in the settle window");
         watch.child_began(SETTLE);
         watch.hear(true, 4, "alab-c3d4e5f6");
-        assert_eq!(rung(), Wake::Browse, "a member it did not hold");
+        assert_eq!(rung(), Wake::Timer, "beside a member it holds");
         watch.hear(true, 4, "alab-0000a0a0");
         watch.hear(true, 4, "");
         assert_eq!(rung(), Wake::Timer, "its own, and no name");
@@ -1941,86 +1867,163 @@ mod tests {
         assert_eq!(rung(), Wake::Browse, "heard again on the new connection");
     }
 
-    /// An `_alab._tcp` watch holds what a browse child hears in its settle window as its
-    /// baseline, ringing nothing for it. After it, a member it did not hold rings once; one it
-    /// holds, another service's row and this process's own instance ring nothing; and a member
-    /// that left (the `Rmv` of its last interface) and came back rings again, unless it came back
-    /// within [`REREGISTERING_WITHIN`] (re-registering). It holds at most
-    /// [`MOST_HELD`] members. The vault watch has no settle window and hears no `_alab._tcp` row.
-    /// NEGATIVE CONTROLS: a watch with no baseline rings in the settle window; one that keeps a
-    /// row's newline in the name rings for its own instance; one that keeps another service's
-    /// row rings for it; one that keeps a removed member still holds it; one with no cap holds
-    /// a 257th; one that gives the vault watch the settle window misses its server; one that
-    /// passes no member over as re-registering rings for it.
+    /// An `_alab._tcp` watch holds what a browse hears in its settle window as its baseline,
+    /// ringing nothing for it, nor for a member heard beside it. With nothing held but its own, a
+    /// member rings once; one it holds, one heard beside it, another service's event and this
+    /// process's own instance ring nothing, and a removed member is held no more. It holds at
+    /// most [`MOST_HELD`] members. The vault watch has no settle window and hears no
+    /// `_alab._tcp` event. Members coming and going are
+    /// `an_alab_tcp_watch_rings_only_for_a_member_heard_after_every_member_was_silent`'s.
+    /// NEGATIVE CONTROLS: a watch with no baseline rings in the settle window; one that keeps
+    /// another service's event rings for it; one that keeps a removed member still holds it; one
+    /// with no cap holds a 257th; one that gives the vault watch the settle window misses its
+    /// server.
     #[test]
-    fn an_alab_tcp_watch_rings_for_a_member_it_did_not_hold_once_its_child_settled() {
+    fn an_alab_tcp_watch_holds_a_baseline_and_rings_for_a_member_where_it_held_none() {
         let bell = Arc::new(Bell::default());
         let rung = || bell.nap(Duration::ZERO);
-        let watch = Watch::idle_for(ALAB_TCP, &bell, &["alab-0000a0a0"]);
-        watch.feed("Browsing for _alab._tcp.local.\n");
-        watch.child_began(Duration::ZERO);
-        watch.feed(&alab_row("Add", 4, "alab-a1b2c3d4"));
+        let settling = Watch::idle_for(ALAB_TCP, &bell, &[]);
+        settling.child_began(Duration::ZERO);
+        hears(&settling, &added(ALAB_TCP, 4, "alab-a1b2c3d4"));
         assert_eq!(rung(), Wake::Timer, "heard in the settle window");
-        assert_eq!(watch.heard(), ["alab-a1b2c3d4"], "a baseline row is held");
+        assert_eq!(
+            settling.heard(),
+            ["alab-a1b2c3d4"],
+            "a baseline event is held"
+        );
+        settling.child_began(SETTLE);
+        hears(&settling, &added(ALAB_TCP, 4, "alab-c3d4e5f6"));
+        assert_eq!(rung(), Wake::Timer, "beside a baseline member");
+
+        let watch = Watch::idle_for(ALAB_TCP, &bell, &["alab-0000a0a0"]);
         watch.child_began(SETTLE);
-        watch.feed(&alab_row("Add", 4, "alab-a1b2c3d4"));
-        assert_eq!(rung(), Wake::Timer, "held");
-        watch.feed(&alab_row("Add", 4, "alab-c3d4e5f6"));
-        assert_eq!(rung(), Wake::Browse, "a member it did not hold");
-        watch.feed(&alab_row("Add", 4, "alab-c3d4e5f6"));
-        assert_eq!(rung(), Wake::Timer, "held since");
-        watch
-            .feed("16:02:11.123  Add        3   4 local.               _alab-vault._tcp.    m22\n");
+        hears(&watch, &added(crate::server::SERVICE_TYPE, 4, "m22"));
         assert_eq!(rung(), Wake::Timer, "another service");
-        watch.feed(&alab_row("Add", 4, "alab-0000a0a0"));
+        hears(&watch, &added(ALAB_TCP, 4, "alab-0000a0a0"));
         assert_eq!(rung(), Wake::Timer, "this process's own");
-        watch.feed(&alab_row("Add", 5, "ALAB-0000A0A0"));
+        hears(&watch, &added(ALAB_TCP, 5, "ALAB-0000A0A0"));
         assert_eq!(rung(), Wake::Timer, "this process's own (case-insensitive)");
+        hears(&watch, &added(ALAB_TCP, 4, "alab-c3d4e5f6"));
+        assert_eq!(rung(), Wake::Browse, "a member, where it held none");
+        hears(&watch, &added(ALAB_TCP, 4, "alab-c3d4e5f6"));
+        assert_eq!(rung(), Wake::Timer, "held since");
+        hears(&watch, &added(ALAB_TCP, 4, "alab-a1b2c3d4"));
+        assert_eq!(rung(), Wake::Timer, "beside one it holds");
         assert_eq!(
             watch.peer_names(),
             ["alab-a1b2c3d4", "alab-c3d4e5f6"],
             "own instances excluded from peer_names regardless of case"
         );
-        let left = Instant::now();
-        watch.hear_at(false, 5, "ALAB-0000A0A0", left);
-        watch.hear_at(false, 4, "alab-c3d4e5f6", left);
+        hears(&watch, &removed(ALAB_TCP, 5, "ALAB-0000A0A0"));
+        hears(&watch, &removed(ALAB_TCP, 4, "alab-c3d4e5f6"));
         assert_eq!(rung(), Wake::Timer, "a removal");
-        assert_eq!(watch.heard(), ["alab-a1b2c3d4", "alab-0000a0a0"]);
-        watch.hear_at(true, 4, "alab-c3d4e5f6", left + REREGISTERING_WITHIN);
-        assert_eq!(rung(), Wake::Timer, "re-registering");
-        let again = left + REREGISTERING_WITHIN;
-        watch.hear_at(false, 4, "alab-c3d4e5f6", again);
-        watch.hear_at(
-            true,
-            4,
-            "alab-c3d4e5f6",
-            again + REREGISTERING_WITHIN + Duration::from_secs(1),
-        );
-        assert_eq!(rung(), Wake::Browse, "back after it left");
+        assert_eq!(watch.heard(), ["alab-0000a0a0", "alab-a1b2c3d4"]);
 
         let crowd = Watch::idle_for(ALAB_TCP, &bell, &[]);
         for n in 0..MOST_HELD {
-            crowd.feed(&alab_row("Add", 4, &format!("alab-{n:08x}")));
+            hears(&crowd, &added(ALAB_TCP, 4, &format!("alab-{n:08x}")));
         }
         assert_eq!(rung(), Wake::Browse);
-        crowd.feed(&alab_row("Add", 4, "alab-ffffffff"));
+        hears(&crowd, &added(ALAB_TCP, 4, "alab-ffffffff"));
         assert_eq!(rung(), Wake::Timer, "one more than it holds");
         assert_eq!(crowd.heard().len(), MOST_HELD);
-        crowd.feed(&alab_row("Rmv", 4, "alab-00000000"));
-        crowd.feed(&alab_row("Add", 4, "alab-ffffffff"));
-        assert_eq!(rung(), Wake::Browse, "room again");
+        hears(&crowd, &removed(ALAB_TCP, 4, "alab-00000000"));
+        hears(&crowd, &added(ALAB_TCP, 4, "alab-ffffffff"));
+        assert_eq!(rung(), Wake::Timer, "beside the members it holds");
+        assert_eq!(crowd.heard().len(), MOST_HELD, "room again");
+        assert_eq!(
+            crowd.heard().last().map(String::as_str),
+            Some("alab-ffffffff")
+        );
 
         let vault = Watch::idle(&bell, &[]);
         vault.child_began(Duration::ZERO);
-        vault.feed("8:30:01.200  Add        3   4 local.               _alab-vault._tcp.    m3\n");
+        hears(&vault, &added(crate::server::SERVICE_TYPE, 4, "m3"));
         assert_eq!(rung(), Wake::Browse, "the vault watch has no settle window");
-        vault.feed(&alab_row("Add", 4, "alab-a1b2c3d4"));
+        hears(&vault, &added(ALAB_TCP, 4, "alab-a1b2c3d4"));
         assert_eq!(
             rung(),
             Wake::Timer,
-            "the vault watch hears no _alab._tcp row"
+            "the vault watch hears no _alab._tcp event"
         );
         assert_eq!(vault.heard(), ["m3"]);
+    }
+
+    /// A peer's comings and goings on `_alab._tcp` are no move of this Mac's network (each
+    /// process names its advert afresh, so a peer's window or node job starting again is a name
+    /// never heard): while the watch holds a member, one never heard, one back after leaving for
+    /// longer than [`SILENCE`], and one heard on another interface ring nothing, over an hour
+    /// and a half of such churn. A member heard once every member but this process's own was
+    /// silent for longer than [`SILENCE`] (this Mac back on a LAN) rings once, and the next one
+    /// heard with it nothing.
+    /// NEGATIVE CONTROLS: a member heard after a silence no longer than [`SILENCE`] rings
+    /// nothing, and nor does this process's own instance, nor an event in the settle window.
+    /// MUTANTS: the rule before this one (each member not held rings unless back within the
+    /// silence) fails "never heard"; taking the watch as alone whenever it holds no member, with
+    /// no silence, or noting when it held one only at adds fails "back within the silence";
+    /// noting it at every event after which it holds one, not at the last member's removal,
+    /// fails "within the silence of the last member's removal"; taking it as alone once it heard
+    /// no event for the silence, though it holds a member, fails "back after it left"; counting
+    /// this process's own instance as a member fails "after every member's silence".
+    #[test]
+    fn an_alab_tcp_watch_rings_only_for_a_member_heard_after_every_member_was_silent() {
+        let secs = Duration::from_secs;
+        let silence = SILENCE;
+        let bell = Arc::new(Bell::default());
+        let rung = || bell.nap(Duration::ZERO);
+        let watch = Watch::idle_for(ALAB_TCP, &bell, &["alab-0000a0a0"]);
+        let start = Instant::now();
+        watch.child_began(Duration::ZERO);
+        watch.hear_at(true, 4, "alab-00000000", start);
+        assert_eq!(rung(), Wake::Timer, "heard in the settle window");
+        watch.child_began(SETTLE);
+        watch.hear_at(true, 4, "alab-0000a0a0", start);
+        let mut at = start;
+        for i in 1..40_u32 {
+            let name = format!("alab-{i:08x}");
+            at += secs(31);
+            watch.hear_at(true, 4, &name, at);
+            assert_eq!(rung(), Wake::Timer, "never heard: {name}");
+            watch.hear_at(false, 4, &name, at + secs(1));
+            at += silence + secs(2);
+            watch.hear_at(true, 4, &name, at);
+            assert_eq!(rung(), Wake::Timer, "back after it left: {name}");
+            watch.hear_at(true, 5, &name, at);
+            assert_eq!(rung(), Wake::Timer, "on another interface: {name}");
+        }
+        assert!(at - start > secs(90 * 60), "{:?}", at - start);
+        assert_eq!(watch.heard().len(), 41, "{:?}", watch.heard());
+
+        let left = at + secs(1);
+        for name in watch.heard() {
+            for interface in [4, 5] {
+                watch.hear_at(false, interface, &name, left);
+            }
+        }
+        assert!(watch.heard().is_empty(), "{:?}", watch.heard());
+        watch.hear_at(true, 4, "alab-00000000", left + silence);
+        assert_eq!(rung(), Wake::Timer, "back within the silence");
+        let left = left + silence + secs(1);
+        watch.hear_at(false, 4, "alab-00000000", left);
+        watch.hear_at(true, 4, "alab-0badcafe", left + silence);
+        assert_eq!(
+            rung(),
+            Wake::Timer,
+            "within the silence of the last member's removal"
+        );
+        let left = left + silence;
+        watch.hear_at(false, 4, "alab-0badcafe", left);
+        let back = left + silence + secs(1);
+        watch.hear_at(true, 4, "alab-0000a0a0", back);
+        assert_eq!(rung(), Wake::Timer, "its own, after every member's silence");
+        watch.hear_at(true, 4, "alab-feedface", back);
+        assert_eq!(rung(), Wake::Browse, "after every member's silence");
+        watch.hear_at(true, 4, "alab-00000000", back);
+        assert_eq!(rung(), Wake::Timer, "one heard with it");
+        assert_eq!(
+            watch.heard(),
+            ["alab-0000a0a0", "alab-feedface", "alab-00000000"]
+        );
     }
 
     /// `adverts` resolves each member the watch holds but this process's own, in first-heard
@@ -2044,7 +2047,7 @@ mod tests {
             "alab-deadbeef",
             "alab-a1b2c3d4",
         ] {
-            watch.feed(&alab_row("Add", 4, name));
+            hears(&watch, &added(ALAB_TCP, 4, name));
         }
         let adverts = watch.adverts(Duration::from_secs(1));
         assert_eq!(
@@ -2055,27 +2058,34 @@ mod tests {
             ["alab-c3d4e5f6", "alab-a1b2c3d4"]
         );
         let plain = Watch::idle_for(ALAB_TCP, &bell, &[]);
-        plain.feed(&alab_row("Add", 4, "alab-c3d4e5f6"));
+        hears(&plain, &added(ALAB_TCP, 4, "alab-c3d4e5f6"));
         assert!(plain.adverts(Duration::from_secs(1)).is_empty());
     }
 
-    /// `parse_advert` reads an `_alab._tcp` resolve as `dns-sd -L` prints it: the host without
-    /// its trailing dot, the fleet port it registered and its TXT pairs, for an instance named
-    /// as the browse heard it (a space printed as `\032`). It refuses a transcript with no
-    /// "can be reached at" line, or with only another instance's.
-    /// NEGATIVE CONTROLS: a parse that takes any instance's line reads the other's; one that
-    /// leaves `\032` as it is misses the spaced name.
+    /// `advert_of` reads an `_alab._tcp` resolve's answer: the host lowercase without its
+    /// trailing dot, the fleet port it registered and its TXT pairs (a string with no `=`, an
+    /// empty key or no UTF-8 left out), under the instance name the browse heard. It refuses an
+    /// answer with no usable target, and any other event.
+    /// NEGATIVE CONTROL: an `advert_of` that keeps a string with no `=` reads `"bare"` as a pair.
     #[test]
-    fn parse_advert_reads_an_alab_tcp_resolve_and_refuses_one_with_no_target() {
-        let transcript = "Lookup alab-1a2b3c4d._alab._tcp.local.\n\
-                          DATE: ---Tue 28 Oct 2026---\n\
-                          16:02:11.456  ...STARTING...\n\
-                          16:02:11.789  alab-1a2b3c4d._alab._tcp.local. can be reached at M3.local.:7100 (interface 4) Flags: 1\n\
-                          \x20v=1 role=steward fleet=7100 window=1\n\
-                          16:02:11.790  alab-1a2b3c4d._alab._tcp.local. can be reached at M3.local.:7100 (interface 9)\n\
-                          \x20v=1 role=steward fleet=7100 window=1\n";
+    fn advert_of_reads_an_alab_tcp_resolve_and_refuses_one_with_no_target() {
+        let mut answer = resolved(
+            "M3.local.",
+            7100,
+            &[
+                "v=1",
+                "role=steward",
+                "bare",
+                "=x",
+                "fleet=7100",
+                "window=1",
+            ],
+        );
+        if let Event::Resolved { txt, .. } = &mut answer {
+            txt.push(vec![b'k', b'=', 0xff]);
+        }
         assert_eq!(
-            parse_advert("alab-1a2b3c4d", transcript),
+            advert_of("alab-1a2b3c4d", &answer),
             Some(Advert {
                 instance: "alab-1a2b3c4d".to_owned(),
                 host: "m3.local".to_owned(),
@@ -2091,61 +2101,76 @@ mod tests {
                 .collect(),
             })
         );
+        let spaced = advert_of("m3 (2)", &resolved("m3-2.local.", 7101, &["role=member"]))
+            .expect("the spaced name's advert");
         assert_eq!(
-            parse_advert("alab-ffffffff", transcript),
-            None,
-            "another instance's"
+            (spaced.instance.as_str(), spaced.host.as_str(), spaced.port),
+            ("m3 (2)", "m3-2.local", 7101)
         );
-
-        let spaced = "Lookup m3 (2)._alab._tcp.local.\n\
-                      DATE: ---Tue 28 Oct 2026---\n\
-                      \x206:21:48.496  ...STARTING...\n\
-                      \x206:21:48.497  m3\\032(2)._alab._tcp.local. can be reached at m3-2.local.:7101 (interface 5)\n\
-                      \x20v=1 role=member fleet=7101 window=0\n";
-        let advert = parse_advert("m3 (2)", spaced).expect("the spaced name's advert");
-        assert_eq!((advert.host.as_str(), advert.port), ("m3-2.local", 7101));
-        assert_eq!(advert.txt[1], ("role".to_owned(), "member".to_owned()));
-
-        let unanswered = "Lookup alab-1a2b3c4d._alab._tcp.local.\n\
-                          DATE: ---Tue 28 Oct 2026---\n\
-                          16:02:11.456  ...STARTING...\n";
-        assert_eq!(parse_advert("alab-1a2b3c4d", unanswered), None);
-        assert_eq!(parse_advert("alab-1a2b3c4d", ""), None);
+        assert_eq!(advert_of("x", &resolved("m3.local.", 0, &[])), None);
+        assert_eq!(advert_of("x", &resolved("-m3.local.", 7100, &[])), None);
+        assert_eq!(advert_of("x", &added(ALAB_TCP, 4, "x")), None);
     }
 
     #[test]
-    fn browse_and_resolve_parse_active_instances_and_order_txt_hints_behind_defaults() {
-        let browse = "Browsing for _alab-vault._tcp.local.\n\
-                      8:30:01.200  Add        3  15 local.               _alab-vault._tcp.    gone-node\n\
-                      8:30:01.201  Add        3   4 local.               _alab-vault._tcp.    alab-secrets\n\
-                      8:30:01.202  Add        2   9 local.               _alab-vault._tcp.    m3\n\
-                      8:30:01.203  Add        2   4 local.               _alab-vault._tcp.    m7\n\
-                      8:30:01.204  Rmv        0  15 local.               _alab-vault._tcp.    gone-node\n";
-        assert_eq!(parse_browse(browse), vec!["alab-secrets", "m3", "m7"]);
+    fn browse_and_resolve_read_active_instances_and_order_txt_hints_behind_defaults() {
+        let vault = crate::server::SERVICE_TYPE;
+        let browse = [
+            added(vault, 15, "gone-node"),
+            added(vault, 4, "alab-secrets"),
+            added(vault, 9, "m3"),
+            added(vault, 4, "m7"),
+            removed(vault, 15, "gone-node"),
+        ];
+        assert_eq!(
+            heard_instances(browse, vault),
+            vec!["alab-secrets", "m3", "m7"]
+        );
 
         let signer = crate::b64::decode_padded(crate::ALAB_SIGNER).expect("signer");
         let signer = <[u8; 32]>::try_from(signer.as_slice()).expect("32 bytes");
         let fp = envelope::fingerprint(&signer);
         let head = "ab".repeat(32);
-        let resolve_text = format!(
-            "Lookup m3._alab-vault._tcp.local\n\
-             8:30:01.210  m3._alab-vault._tcp.local. can be reached at m3.local.:7484 (interface 9)\n \
-             path=/v1 vault=alab signer={fp} seq=19 head={head}\n\
-             8:30:01.211  m7._alab-vault._tcp.local. can be reached at m7.local.:7484 (interface 4)\n \
-             path=/v1\n\
-             8:30:01.212  other._alab-vault._tcp.local. can be reached at other.local.:7484 (interface 4)\n \
-             path=/v1 vault=team signer={fp} seq=99 head={head}\n"
+        let signed = [
+            "path=/v1".to_owned(),
+            "vault=alab".to_owned(),
+            format!("signer={fp}"),
+            "seq=19".to_owned(),
+            format!("head={head}"),
+        ];
+        let signed: Vec<&str> = signed.iter().map(String::as_str).collect();
+        let resolved_m3 =
+            resolved_vault(&resolved("m3.local.", 7484, &signed), "alab").expect("m3's answer");
+        assert_eq!(resolved_m3.url, "http://m3.local:7484/v1/alab");
+        assert_eq!(resolved_m3.txt.as_ref().map(|t| t.seq), Some(19));
+        let resolved_m7 = resolved_vault(&resolved("M7.local.", 7484, &["path=/v1"]), "alab")
+            .expect("m7's answer");
+        assert_eq!(resolved_m7.url, "http://m7.local:7484/v1/alab");
+        assert_eq!(resolved_m7.txt, None);
+        let team: Vec<&str> = signed
+            .iter()
+            .map(|string| {
+                if *string == "vault=alab" {
+                    "vault=team"
+                } else {
+                    string
+                }
+            })
+            .collect();
+        assert_eq!(
+            resolved_vault(&resolved("other.local.", 7484, &team), "alab"),
+            None,
+            "another vault"
         );
-        let resolved = parse_resolve(&resolve_text, "alab");
-        assert_eq!(resolved.len(), 2);
-        assert_eq!(resolved[0].url, "http://m3.local:7484/v1/alab");
-        assert_eq!(resolved[0].txt.as_ref().map(|t| t.seq), Some(19));
-        assert_eq!(resolved[1].url, "http://m7.local:7484/v1/alab");
-        assert_eq!(resolved[1].txt, None);
-
+        assert_eq!(
+            resolved_vault(&resolved("other.local.", 7484, &["path=/v2"]), "alab"),
+            None,
+            "another path"
+        );
+        let resolved = [resolved_m7, resolved_m3];
         let extra = DiscoveredVault {
             url: "http://m9.local:7484/v1/alab".into(),
-            txt: resolved[0].txt.clone().map(|mut t| {
+            txt: resolved[1].txt.clone().map(|mut t| {
                 t.seq = 42;
                 t
             }),
@@ -2154,13 +2179,13 @@ mod tests {
             url: crate::ALAB_DEFAULT_URL
                 .to_uppercase()
                 .replace("V1/ALAB", "v1/alab"),
-            txt: resolved[0].txt.clone(),
+            txt: resolved[1].txt.clone(),
         };
         let urls = candidate_urls(
             crate::ALAB_DEFAULT_URLS,
             &[
-                resolved[1].clone(),
                 resolved[0].clone(),
+                resolved[1].clone(),
                 extra,
                 duplicate_default,
             ],
@@ -2187,9 +2212,7 @@ mod tests {
         let bell = Arc::new(Bell::default());
         let watch = Watch::idle(&bell, &["m00"]);
         for n in 0..36 {
-            watch.feed(&format!(
-                "8:30:01.200  Add        3   4 local.               _alab-vault._tcp.    m{n:02}"
-            ));
+            watch.hear(true, 4, &format!("m{n:02}"));
         }
         let (mut peers, mut found) = (
             std::collections::BTreeSet::new(),
@@ -2208,9 +2231,7 @@ mod tests {
         assert_eq!(found.len(), 36, "{found:?}");
 
         let alab_watch = Watch::idle(&bell, &["ALAB-SECRETS"]);
-        alab_watch.feed(
-            "8:30:01.200  Add        3   4 local.               _alab-vault._tcp.    alab-secrets",
-        );
+        alab_watch.hear(true, 4, "alab-secrets");
         assert_eq!(
             alab_watch.peer_names(),
             vec!["alab-secrets"],
@@ -2271,12 +2292,11 @@ mod tests {
             // that cancels a cursor's progress through first-heard names.
             let mut arrivals = names.clone();
             arrivals.rotate_right((pass * limit) % names.len());
-            let transcript: String = arrivals
+            let browse = arrivals
                 .iter()
-                .map(|name| format!("08:30:01.200 Add 3 4 local. _alab-vault._tcp. {name}\n"))
-                .collect();
-            let heard = parse_browse(&transcript);
-            assert_eq!(heard, arrivals, "the parser preserves event order");
+                .map(|name| added(crate::server::SERVICE_TYPE, 4, name));
+            let heard = heard_instances(browse, crate::server::SERVICE_TYPE);
+            assert_eq!(heard, arrivals, "the fold preserves event order");
             let discovered: Vec<_> = alab_candidate_names(heard, &from)
                 .into_iter()
                 .map(|name| DiscoveredVault {
@@ -2321,9 +2341,7 @@ mod tests {
                 arrivals.rotate_right((pass * limit) % names.len());
                 watch.began_browse();
                 for name in arrivals {
-                    watch.feed(&format!(
-                        "08:30:01.200 Add 3 4 local. _alab-vault._tcp. {name}"
-                    ));
+                    watch.hear(true, 4, &name);
                 }
                 let selected = select(&watch);
                 assert!(selected.len() <= limit);

@@ -144,7 +144,7 @@ struct Sandbox {
 impl Sandbox {
     /// A scratch world whose `aterm.toml` is `extra`, the smoke's root keys and a scratch world's
     /// lanes off ([`aterm_types::world::LANES_OFF`]): the handed bundle's window would otherwise
-    /// browse the local network (macOS's consent prompt on the desk), submit that bundle's keeper
+    /// browse the person's real LAN through the LAN broker, submit that bundle's keeper
     /// job into the login's launchd domain, and run its update and package lanes.
     fn with_config(tag: &str, extra: &str) -> Option<Self> {
         let tmp = crate::mktemp_dir(tag).ok()?;

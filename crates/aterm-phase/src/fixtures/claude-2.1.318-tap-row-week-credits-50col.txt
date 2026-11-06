@@ -1,0 +1,28 @@
+# claude-code 2.1.318 · MEASURED 2026-11-06, `aterm ctl text` of a private headless aterm (50x40, aterm 0.158.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the usage tap's row in its week form beside the usage-credits notice (credits headers as in claude-2.1.318-tap-row-week-credits.txt) at a turn end, resized from 70 to 50 columns: the row too narrow for both, `Now using usage credits` moves to a row of its own under the mode row, right-aligned, and the tap's row holds the tap's words alone
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Sonnet 5.5 · Claude API
+ ▝▝   ▝▝   /private/tmp/at.lT6Q/proj
+
+
+❯ /clear
+
+❯ hi
+
+⏺ Hi! I am the local lab stub, not a model. (reply
+  8)
+
+✻ Crunched for 0s · done 3:17 AM
+
+❯ hi with credits
+
+⏺ Hi! I am the local lab stub, not a model. (reply
+  9)
+
+✻ Brewed for 0s · done 3:17 AM
+
+──────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────
+  week 63% used · resets Sat 10:00
+  ⏵⏵ auto mode on (shift+tab to cycle)
+                         Now using usage credits

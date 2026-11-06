@@ -4,10 +4,24 @@
 //! Deadline-bounded TCP/TLS byte stream with revocable [`Guard`] authority checked per I/O step.
 
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+#[cfg(any(windows, test))]
+mod native_dns;
+
+/// Use the broker-aware resolver on Unix and bounded system resolution on Windows.
+fn resolve_host(host: &str, within: Duration) -> io::Result<Vec<IpAddr>> {
+    #[cfg(unix)]
+    {
+        aterm_uds::lan::resolve(host, within).map_err(aterm_uds::lan::LanError::into_io)
+    }
+    #[cfg(windows)]
+    {
+        native_dns::resolve(host, within)
+    }
+}
 
 /// Revocable permission checked before every I/O step.
 pub trait Guard: Send + Sync + std::fmt::Debug {
@@ -191,35 +205,22 @@ impl TcpConnector {
         deadline: Deadline,
         failed: &mut dyn FnMut(SocketAddr, &io::Error),
     ) -> io::Result<TcpStream> {
-        use std::net::ToSocketAddrs;
-        connect_with(
-            host,
-            port,
-            deadline,
-            |host, port| (host, port).to_socket_addrs(),
-            crate::local_network::denied,
-            failed,
-        )
+        connect_with(host, port, deadline, resolve_host, failed)
     }
 }
 
-/// [`TcpConnector::connect_noting`] over `resolver`, a failed lookup asking `denied`
-/// ([`refused_local`]).
-fn connect_with<F, I>(
+/// [`TcpConnector::connect_noting`] over `resolver` ([`resolve_host`], which on macOS has the root
+/// LAN broker resolve a local name), within what the deadline has left. Each address is dialled by
+/// [`crate::connect::connect_timeout`], which on macOS has the broker dial a local-network one.
+fn connect_with(
     host: &str,
     port: u16,
     deadline: Deadline,
-    resolver: F,
-    denied: impl FnOnce(&str, Duration) -> bool,
+    resolver: impl FnOnce(&str, Duration) -> io::Result<Vec<IpAddr>>,
     failed: &mut dyn FnMut(SocketAddr, &io::Error),
-) -> io::Result<TcpStream>
-where
-    F: FnOnce(&str, u16) -> io::Result<I> + Send + 'static,
-    I: Iterator<Item = SocketAddr>,
-{
+) -> io::Result<TcpStream> {
     let within = deadline.remaining_or_timeout()?;
-    let addrs = resolve_within(host, port, within, resolver)
-        .map_err(|error| refused_local(host, error, denial_wait(&deadline), denied))?;
+    let addrs = lookup(host, port, within, resolver)?;
     connect_each(
         host,
         &addrs,
@@ -227,6 +228,30 @@ where
         crate::connect::connect_timeout,
         failed,
     )
+}
+
+/// `host`'s addresses on `port`, by `resolver` within `within`, a failure named as the
+/// resolution's (`dns: <host>: …`) with its kind kept: on macOS a missing LAN broker for a local
+/// name is `NotConnected`, its words naming what installs it.
+fn lookup(
+    host: &str,
+    port: u16,
+    within: Duration,
+    resolver: impl FnOnce(&str, Duration) -> io::Result<Vec<IpAddr>>,
+) -> io::Result<Vec<SocketAddr>> {
+    match resolver(host, within) {
+        Ok(found) => Ok(found
+            .into_iter()
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect()),
+        Err(error) => {
+            let error = io::Error::new(error.kind(), format!("dns: {host}: {error}"));
+            // Only the resolver's own answer can lack mDNS.
+            #[cfg(target_os = "linux")]
+            let error = without_mdns(host, error);
+            Err(error)
+        }
+    }
 }
 
 /// Connect by `connect` to the first of `addrs`, `host`'s, that answers within `deadline`,
@@ -281,275 +306,30 @@ fn connect_each(
     }))
 }
 
-/// How long a failed lookup of a local name waits for mDNSResponder to say
-/// whether it refuses this process the name ([`refused_local`]).
-const DENIAL_WAIT: Duration = Duration::from_secs(1);
-
-/// [`DENIAL_WAIT`], or what is left of `deadline` when less (nothing once it
-/// has passed).
-fn denial_wait(deadline: &Deadline) -> Duration {
-    deadline
-        .remaining()
-        .map_or(Duration::ZERO, |left| left.min(DENIAL_WAIT))
-}
-
-/// `error`, a failed lookup of `host`, named as macOS's Local Network refusal
-/// when `denied` says mDNSResponder refuses this process the local name within
-/// `wait` (`crate::local_network`). `getaddrinfo` reports that refusal as a
-/// definite "no such name", read as "nothing there"; a connect macOS refuses
-/// the same app fails `HostUnreachable`, so the lookup's refusal takes that
-/// kind too. A lookup that timed out (a question still on screen holds it) and
-/// a name the gate does not cover are left as they are, without asking.
-fn refused_local(
-    host: &str,
-    error: io::Error,
-    wait: Duration,
-    denied: impl FnOnce(&str, Duration) -> bool,
-) -> io::Error {
-    if error.kind() == io::ErrorKind::TimedOut
-        || wait.is_zero()
-        || !crate::local_network::is_local_name(host)
-        || !denied(host, wait)
-    {
-        return error;
-    }
-    io::Error::new(
-        io::ErrorKind::HostUnreachable,
-        format!("dns: {host}: {}", crate::local_network::REFUSED),
-    )
-}
-
 /// `error`, a failed lookup of `host`, with what Linux needs to resolve a local
 /// name when `host` is one: glibc asks mDNS only through Avahi's nss-mdns (or
 /// systemd-resolved with MulticastDNS on), which many installs lack, and then
 /// says only that the name is unknown. A lookup that timed out is left as it
 /// is, and so is its kind, which callers judge.
+#[cfg(all(unix, any(test, target_os = "linux")))]
 fn without_mdns(host: &str, error: io::Error) -> io::Error {
-    if error.kind() == io::ErrorKind::TimedOut || !crate::local_network::is_local_name(host) {
+    let local = host
+        .strip_suffix('.')
+        .unwrap_or(host)
+        .rsplit_once('.')
+        .is_some_and(|(name, label)| !name.is_empty() && label.eq_ignore_ascii_case("local"));
+    if error.kind() == io::ErrorKind::TimedOut || !local {
         return error;
     }
-    io::Error::new(
-        error.kind(),
-        format!("{error} ({})", crate::local_network::NO_MDNS),
-    )
+    io::Error::new(error.kind(), format!("{error} ({NO_MDNS})"))
 }
 
-/// Resolve `host:port` through `resolver` on a helper thread, waiting at most
-/// `within` for its answer; a lookup of `host:port` whose helper still runs is
-/// waited on, not started again ([`Flights`]).
-fn resolve_within<F, I>(
-    host: &str,
-    port: u16,
-    within: Duration,
-    resolver: F,
-) -> io::Result<Vec<SocketAddr>>
-where
-    F: FnOnce(&str, u16) -> io::Result<I> + Send + 'static,
-    I: Iterator<Item = SocketAddr>,
-{
-    resolve_within_using(
-        host,
-        port,
-        within,
-        resolver,
-        |lookup| {
-            std::thread::Builder::new()
-                .name("aterm-http-dns".into())
-                .spawn(lookup)
-                .map(drop)
-        },
-        &FLIGHTS,
-    )
-}
-
-/// This process's lookups under way ([`Flights`]).
-static FLIGHTS: Flights = Flights::new();
-
-/// The lookups under way, one per host and port. A lookup that finds one for its
-/// host and port waits for that helper's answer and starts no helper of its own:
-/// macOS holds a `.local` lookup (`getaddrinfo` waits in `mdns_addrinfo`) while it
-/// asks the person whether aterm may find devices on the local network, so a
-/// helper left to finish alone may not finish for as long as nobody answers. E3's
-/// guest (2026-11-05) grew two such helpers a second, one pair per vault read;
-/// now each name keeps one. An answer goes to the lookups waiting on it and is
-/// kept for none after: the next lookup asks afresh.
-struct Flights {
-    under_way: Mutex<Vec<(String, u16, Arc<Flight>)>>,
-}
-
-/// One lookup under way, and its helper's answer once it gave one.
-struct Flight {
-    answer: Mutex<Option<Answer>>,
-    landed: Condvar,
-    /// The lookups waiting on it now ([`Flights::waiting`]).
-    waiting: AtomicUsize,
-}
-
-/// A helper's answer, kept so each lookup waiting on it gets its own copy.
-type Answer = Result<Vec<SocketAddr>, (io::ErrorKind, String)>;
-
-impl Flights {
-    const fn new() -> Self {
-        Self {
-            under_way: Mutex::new(Vec::new()),
-        }
-    }
-
-    /// The flight of `host:port`, and whether this lookup started it, and so
-    /// starts its helper.
-    fn join(&self, host: &str, port: u16) -> (Arc<Flight>, bool) {
-        let mut under_way = self
-            .under_way
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some((_, _, flight)) = under_way
-            .iter()
-            .find(|(named, at, _)| named == host && *at == port)
-        {
-            return (Arc::clone(flight), false);
-        }
-        let flight = Arc::new(Flight {
-            answer: Mutex::new(None),
-            landed: Condvar::new(),
-            waiting: AtomicUsize::new(0),
-        });
-        under_way.push((host.to_owned(), port, Arc::clone(&flight)));
-        (flight, true)
-    }
-
-    /// `flight`'s helper answered, or never started: the lookups waiting on it get
-    /// `answer`, and the next lookup of its host and port starts a helper of its own.
-    fn land(&self, flight: &Arc<Flight>, answer: Answer) {
-        self.under_way
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .retain(|(_, _, under_way)| !Arc::ptr_eq(under_way, flight));
-        *flight.answer.lock().unwrap_or_else(PoisonError::into_inner) = Some(answer);
-        flight.landed.notify_all();
-    }
-
-    /// How many lookups wait on the flight of `host:port` now (tests).
-    #[cfg(test)]
-    fn waiting(&self, host: &str, port: u16) -> usize {
-        self.under_way
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .find(|(named, at, _)| named == host && *at == port)
-            .map_or(0, |(_, _, flight)| flight.waiting.load(Ordering::SeqCst))
-    }
-}
-
-impl Flight {
-    /// Its answer, waiting at most `within` for it: `None` once that passed first.
-    fn wait(&self, within: Duration) -> Option<Answer> {
-        self.waiting.fetch_add(1, Ordering::SeqCst);
-        let answer = self.answer.lock().unwrap_or_else(PoisonError::into_inner);
-        let (answer, _) = self
-            .landed
-            .wait_timeout_while(answer, within, |answer| answer.is_none())
-            .unwrap_or_else(PoisonError::into_inner);
-        let answer = answer.clone();
-        self.waiting.fetch_sub(1, Ordering::SeqCst);
-        answer
-    }
-}
-
-/// A started helper's duty to land its flight: by its answer ([`Self::land`]), or,
-/// should the resolver unwind first, by saying it ended without one, so no flight
-/// stays under way with no helper to answer it.
-struct Landing {
-    flights: &'static Flights,
-    flight: Arc<Flight>,
-    host: String,
-    landed: bool,
-}
-
-impl Landing {
-    fn land(mut self, answer: Answer) {
-        self.flights.land(&self.flight, answer);
-        self.landed = true;
-    }
-}
-
-impl Drop for Landing {
-    fn drop(&mut self) {
-        if !self.landed {
-            let words = format!("dns: {}: the resolver ended without an answer", self.host);
-            self.flights
-                .land(&self.flight, Err((io::ErrorKind::Other, words)));
-        }
-    }
-}
-
-/// The resolver path with helper creation and the flights injected, so a refused
-/// spawn can be checked without exhausting the process's threads or calling the
-/// system resolver, and each test keeps its lookups apart.
-fn resolve_within_using<F, I>(
-    host: &str,
-    port: u16,
-    within: Duration,
-    resolver: F,
-    spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> io::Result<()>,
-    flights: &'static Flights,
-) -> io::Result<Vec<SocketAddr>>
-where
-    F: FnOnce(&str, u16) -> io::Result<I> + Send + 'static,
-    I: Iterator<Item = SocketAddr>,
-{
-    /// One lookup, its failure named as a resolution failure.
-    fn lookup<F, I>(resolver: F, host: &str, port: u16) -> io::Result<Vec<SocketAddr>>
-    where
-        F: FnOnce(&str, u16) -> io::Result<I>,
-        I: Iterator<Item = SocketAddr>,
-    {
-        resolver(host, port)
-            .map(Iterator::collect)
-            .map_err(|error| {
-                let error = io::Error::new(error.kind(), format!("dns: {host}: {error}"));
-                // Only the resolver's own answer can lack mDNS: a helper that never started or a
-                // lookup that never answered keeps its words.
-                if cfg!(target_os = "linux") {
-                    without_mdns(host, error)
-                } else {
-                    error
-                }
-            })
-    }
-    let (flight, starts) = flights.join(host, port);
-    if starts {
-        let (helper_host, helper_flight) = (host.to_owned(), Arc::clone(&flight));
-        // A failed spawn drops this closure without invoking the resolver, and the
-        // flight lands that failure below.
-        let spawned = spawn(Box::new(move || {
-            let landing = Landing {
-                flights,
-                flight: helper_flight,
-                host: helper_host,
-                landed: false,
-            };
-            let answer = lookup(resolver, &landing.host, port)
-                .map_err(|error| (error.kind(), error.to_string()));
-            landing.land(answer);
-        }));
-        if let Err(error) = spawned {
-            let error = io::Error::new(
-                error.kind(),
-                format!("dns: {host}: could not start the resolver: {error}"),
-            );
-            flights.land(&flight, Err((error.kind(), error.to_string())));
-            return Err(error);
-        }
-    }
-    match flight.wait(within) {
-        Some(Ok(addrs)) => Ok(addrs),
-        Some(Err((kind, words))) => Err(io::Error::new(kind, words)),
-        None => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!("dns: no answer within {}ms", within.as_millis()),
-        )),
-    }
-}
+/// What a failed lookup of a `.local` name adds on Linux (`dns: <host>: … (…)`), where glibc
+/// resolves one over mDNS only through a resolver many installs lack.
+#[cfg(all(unix, any(test, target_os = "linux")))]
+const NO_MDNS: &str = "this system resolves .local names over mDNS only through Avahi's \
+     nss-mdns or systemd-resolved with MulticastDNS on; a URL naming the server's address needs \
+     neither";
 
 /// A socket carrying the request's deadline and authority, re-checked before
 /// every call made on it.
@@ -816,7 +596,7 @@ impl Write for Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
 
     /// A wait for something that must happen is a hang detector, never a latency budget.
@@ -968,66 +748,9 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::ConnectionReset, "{error:?}");
     }
 
-    #[test]
-    fn a_resolver_that_never_answers_is_a_dns_timeout() {
-        let (never_tx, never_rx) = mpsc::channel::<()>();
-        let error = resolve_within(
-            "never-answers.invalid",
-            443,
-            Duration::from_millis(100),
-            move |_, _| {
-                let _ = never_rx.recv_timeout(HANG_DETECTOR);
-                Ok(std::iter::empty())
-            },
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        assert_eq!(error.to_string(), "dns: no answer within 100ms");
-        drop(never_tx);
-    }
-
-    /// A local name mDNSResponder refuses is named as macOS's refusal, the kind
-    /// a refused connect has; a timeout, a name the gate does not cover, no
-    /// time left and no refusal keep the lookup's own error, and only a local
-    /// name with time left is asked about.
-    #[test]
-    fn only_a_refused_local_name_is_named_as_the_local_network_refusal() {
-        let no_such_name =
-            || io::Error::other("dns: alab-secrets.local: nodename nor servname provided");
-        let wait = Duration::from_secs(1);
-        let asked = std::cell::RefCell::new(Vec::new());
-        let refuses = |host: &str, within: Duration| {
-            asked.borrow_mut().push((host.to_owned(), within));
-            true
-        };
-        let error = refused_local("alab-secrets.local", no_such_name(), wait, refuses);
-        assert_eq!(error.kind(), io::ErrorKind::HostUnreachable);
-        assert_eq!(
-            error.to_string(),
-            "dns: alab-secrets.local: macOS does not let this app use the local network (Local Network privacy)"
-        );
-        assert_eq!(*asked.borrow(), [("alab-secrets.local".to_owned(), wait)]);
-
-        let held = io::Error::new(io::ErrorKind::TimedOut, "dns: no answer within 8000ms");
-        for (host, error, wait) in [
-            ("alab-secrets.local", held, wait),
-            ("github.com", no_such_name(), wait),
-            ("alab-secrets.local", no_such_name(), Duration::ZERO),
-        ] {
-            let kind = error.kind();
-            let text = error.to_string();
-            let kept = refused_local(host, error, wait, refuses);
-            assert_eq!((kept.kind(), kept.to_string()), (kind, text), "{host}");
-        }
-        assert_eq!(asked.borrow().len(), 1, "none of those asks mDNSResponder");
-
-        let kept = refused_local("alab-secrets.local", no_such_name(), wait, |_, _| false);
-        assert_eq!(kept.kind(), io::ErrorKind::Other);
-        assert!(kept.to_string().contains("nodename nor servname"), "{kept}");
-    }
-
     /// A failed lookup of a local name says what Linux resolves one with, keeping
     /// its words and kind; a timeout and any other name keep the lookup's error.
+    #[cfg(unix)]
     #[test]
     fn a_local_name_linux_cannot_resolve_names_what_it_lacks() {
         let unknown = |host: &str| {
@@ -1109,256 +832,87 @@ mod tests {
         );
     }
 
-    /// The wait to ask is [`DENIAL_WAIT`] with time to spare, never more than
-    /// the deadline has left, and nothing once it has passed.
+    /// A lookup's addresses take the port asked for; a failed one is named as the resolution's
+    /// with its kind kept, and a missing LAN broker reads as not connected, its words naming what
+    /// installs it.
+    #[cfg(unix)]
     #[test]
-    fn the_wait_to_ask_is_capped_by_what_the_deadline_has_left() {
-        assert_eq!(denial_wait(&Deadline::after(HANG_DETECTOR)), DENIAL_WAIT);
-        let short = DENIAL_WAIT / 4;
-        assert!(denial_wait(&Deadline::after(short)) <= short);
+    fn a_lookup_takes_the_port_and_names_a_failure_by_its_host() {
+        let ip: IpAddr = "192.0.2.7".parse().unwrap();
         assert_eq!(
-            denial_wait(&Deadline::after(Duration::ZERO)),
-            Duration::ZERO
+            lookup("alab-secrets.local", 7484, HANG_DETECTOR, |_, _| Ok(vec![
+                ip
+            ]))
+            .unwrap(),
+            [SocketAddr::new(ip, 7484)]
         );
-    }
-
-    /// The connector's failed lookup goes through that naming, with at most
-    /// [`DENIAL_WAIT`] to ask; CONTROL: no refusal keeps the lookup's error,
-    /// which on Linux alone then says what resolves a local name there.
-    #[test]
-    fn the_connector_names_a_refused_local_lookup() {
-        let lookup = |_: &str, _: u16| {
-            Err::<std::iter::Empty<SocketAddr>, _>(io::Error::new(
-                io::ErrorKind::NotFound,
-                "nodename nor servname provided",
-            ))
-        };
-        let waits = std::cell::RefCell::new(Vec::new());
-        let error = connect_with(
-            "alab-secrets.local",
-            7484,
-            Deadline::after(HANG_DETECTOR),
-            lookup,
-            |_, within| {
-                waits.borrow_mut().push(within);
-                true
-            },
-            &mut |_, _| {},
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::HostUnreachable, "{error}");
-        assert_eq!(*waits.borrow(), [DENIAL_WAIT]);
-
-        let error = connect_with(
-            "alab-secrets.local",
-            7484,
-            Deadline::after(HANG_DETECTOR),
-            lookup,
-            |_, _| false,
-            &mut |_, _| {},
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
-        assert!(
-            error
-                .to_string()
-                .starts_with("dns: alab-secrets.local: nodename"),
-            "{error}"
-        );
-        assert_eq!(
-            error
-                .to_string()
-                .ends_with(&format!("({})", crate::local_network::NO_MDNS)),
-            cfg!(target_os = "linux"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn a_failed_lookup_keeps_its_kind_and_names_the_host() {
-        let error = resolve_within("example.invalid", 443, HANG_DETECTOR, |_, _| {
-            Err::<std::iter::Empty<SocketAddr>, _>(io::Error::new(
-                io::ErrorKind::NotFound,
-                "no such host",
-            ))
+        let error = lookup("example.invalid", 443, HANG_DETECTOR, |_, _| {
+            Err(io::Error::new(io::ErrorKind::NotFound, "no such host"))
         })
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
         assert!(
-            error.to_string().starts_with("dns: example.invalid:"),
+            error
+                .to_string()
+                .starts_with("dns: example.invalid: no such host"),
             "{error}"
         );
-
-        let called = Arc::new(AtomicBool::new(false));
-        let observed = Arc::clone(&called);
-        let error = resolve_within_using(
-            "example.invalid",
-            443,
-            HANG_DETECTOR,
-            move |_, _| {
-                observed.store(true, Ordering::SeqCst);
-                Ok(std::iter::empty::<SocketAddr>())
-            },
-            |_lookup| {
-                Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "no helper threads available",
-                ))
-            },
-            {
-                static FLIGHTS: Flights = Flights::new();
-                &FLIGHTS
-            },
-        )
-        .unwrap_err();
-        assert!(!called.load(Ordering::SeqCst));
-        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
-        assert!(
-            error.to_string().starts_with("dns: example.invalid:"),
-            "{error}"
-        );
-    }
-
-    /// A lookup of a host and port whose helper still runs waits on that helper's
-    /// answer and starts no helper: macOS holds a `.local` lookup while it asks
-    /// whether aterm may find devices on the local network, and E3's guest
-    /// (2026-11-05) grew two stuck helpers a second, one pair per vault read. A
-    /// lookup that waited when the helper answers gets that answer; one after it
-    /// asks afresh, and another port is another lookup. NEGATIVE CONTROL: with
-    /// each lookup starting its own helper (no join), the held name's second
-    /// lookup starts a second helper and `helpers` reads 2 where it reads 1.
-    #[test]
-    fn a_lookup_behind_one_still_running_starts_no_second_helper() {
-        static FLIGHTS: Flights = Flights::new();
-        let helpers = Arc::new(AtomicUsize::new(0));
-        let spawn = |helpers: &Arc<AtomicUsize>| {
-            let helpers = Arc::clone(helpers);
-            move |lookup: Box<dyn FnOnce() + Send>| {
-                helpers.fetch_add(1, Ordering::SeqCst);
-                std::thread::Builder::new().spawn(lookup).map(drop)
-            }
-        };
-        let at = |port| SocketAddr::from(([192, 168, 64, 17], port));
-        let (release, held) = mpsc::channel::<()>();
-        let (host, port) = ("held.local", 7484);
-        let error = resolve_within_using(
-            host,
-            port,
-            Duration::from_millis(50),
-            move |_, port| {
-                let _ = held.recv_timeout(HANG_DETECTOR);
-                Ok(std::iter::once(at(port)))
-            },
-            spawn(&helpers),
-            &FLIGHTS,
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
-        let error = resolve_within_using(
-            host,
-            port,
-            Duration::from_millis(50),
-            |_, _| -> io::Result<std::iter::Empty<SocketAddr>> {
-                unreachable!("a lookup behind one under way runs no resolver")
-            },
-            spawn(&helpers),
-            &FLIGHTS,
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
-        assert_eq!(helpers.load(Ordering::SeqCst), 1, "one helper for the name");
-
-        // One more waits; the held helper answers; the waiter gets its answer.
-        let waiter = std::thread::spawn({
-            let spawn = spawn(&helpers);
-            move || {
-                resolve_within_using(
-                    host,
-                    port,
-                    HANG_DETECTOR,
-                    |_, _| -> io::Result<std::iter::Empty<SocketAddr>> {
-                        unreachable!("the waiter runs no resolver")
-                    },
-                    spawn,
-                    &FLIGHTS,
+        #[cfg(unix)]
+        {
+            let error = lookup("alab-secrets.local", 7484, HANG_DETECTOR, |_, _| {
+                Err(aterm_uds::lan::LanError::Unavailable(
+                    aterm_uds::lan::Unavailable::NotInstalled,
                 )
-            }
-        });
-        let started = Instant::now();
-        while FLIGHTS.waiting(host, port) == 0 {
-            assert!(started.elapsed() < HANG_DETECTOR, "the waiter never waited");
-            aterm_uds::deadline::poll_yield();
+                .into_io())
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::NotConnected, "{error}");
         }
-        release.send(()).unwrap();
-        assert_eq!(waiter.join().unwrap().unwrap(), vec![at(port)]);
-        assert_eq!(helpers.load(Ordering::SeqCst), 1);
-
-        // Answered, the name is asked afresh; another port is another lookup.
-        for port in [port, port + 1] {
-            let addrs = resolve_within_using(
-                host,
-                port,
-                HANG_DETECTOR,
-                move |_, port| Ok(std::iter::once(at(port))),
-                spawn(&helpers),
-                &FLIGHTS,
-            )
-            .unwrap();
-            assert_eq!(addrs, vec![at(port)]);
-        }
-        assert_eq!(helpers.load(Ordering::SeqCst), 3);
     }
 
-    /// A resolver that unwinds lands its flight as having ended without an answer,
-    /// so the next lookup of that name starts a helper of its own rather than wait
-    /// on one nobody will answer.
+    /// The connector dials what its resolver gave, within what the deadline has left.
+    /// `localhost` is the loopback's, so a connect to it needs no LAN broker: with this thread's
+    /// broker a socket nothing serves, it still reaches a loopback listener.
+    #[cfg(unix)]
     #[test]
-    fn a_resolver_that_unwinds_leaves_no_flight_under_way() {
-        static FLIGHTS: Flights = Flights::new();
-        let spawn = |lookup: Box<dyn FnOnce() + Send>| {
-            std::thread::Builder::new()
-                .spawn(move || {
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(lookup));
-                })
-                .map(drop)
+    #[cfg(unix)]
+    fn localhost_connects_with_no_broker() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let root = aterm_tempfile::tempdir().unwrap();
+        let absent = aterm_uds::lan::Seam {
+            socket: Some(root.path().join("absent.sock")),
+            ..aterm_uds::lan::Seam::default()
         };
-        let error = resolve_within_using(
-            "unwinds.invalid",
-            443,
-            HANG_DETECTOR,
-            |_, _| -> io::Result<std::iter::Empty<SocketAddr>> { panic!("the resolver unwinds") },
-            spawn,
-            &FLIGHTS,
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::Other, "{error}");
-        assert_eq!(
-            error.to_string(),
-            "dns: unwinds.invalid: the resolver ended without an answer"
-        );
-        let addr = SocketAddr::from(([127, 0, 0, 1], 443));
-        let addrs = resolve_within_using(
-            "unwinds.invalid",
-            443,
-            HANG_DETECTOR,
-            move |_, _| Ok(std::iter::once(addr)),
-            spawn,
-            &FLIGHTS,
-        )
+        let stream = aterm_uds::lan::seam_here(absent, || {
+            TcpConnector.connect_noting(
+                "localhost",
+                port,
+                Deadline::after(HANG_DETECTOR),
+                &mut |_, _| {},
+            )
+        })
         .unwrap();
-        assert_eq!(addrs, vec![addr]);
+        assert!(stream.peer_addr().unwrap().ip().is_loopback());
+        drop(listener.accept().unwrap());
     }
 
     #[test]
     fn a_resolved_address_connects() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let addrs = resolve_within("loopback.test", addr.port(), HANG_DETECTOR, move |_, _| {
-            Ok(std::iter::once(addr))
-        })
+        let stream = connect_with(
+            "loopback.test",
+            addr.port(),
+            Deadline::after(HANG_DETECTOR),
+            |host, within| {
+                assert_eq!(host, "loopback.test");
+                assert!(within <= HANG_DETECTOR);
+                Ok(vec![addr.ip()])
+            },
+            &mut |_, _| {},
+        )
         .unwrap();
-        assert_eq!(addrs, vec![addr]);
-        let stream = TcpStream::connect_timeout(&addrs[0], HANG_DETECTOR).unwrap();
         assert_eq!(stream.peer_addr().unwrap(), addr);
         drop(listener.accept().unwrap());
     }

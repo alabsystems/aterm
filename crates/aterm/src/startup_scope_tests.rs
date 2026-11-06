@@ -6,9 +6,8 @@
 //! account home.
 
 use super::{
-    DoctorStartupEnv, PreparedSetup, SetupAdmission, SetupStartup, doctor_startup_env,
-    doctor_startup_env_from, first_lan_uses_wait_for_the_step, first_run_start,
-    first_run_window_eligible, ordinary_window, prepare_setup,
+    PreparedSetup, SetupAdmission, SetupStartup, doctor_startup_env, doctor_startup_env_from,
+    first_run_start, first_run_window_eligible, prepare_setup,
 };
 use aterm_cli::macos_doctor::{
     AutomaticSetupClaim, InitialSetupObservation, InitialSetupSnapshot, ProvisionalSetupWatchTest,
@@ -323,64 +322,6 @@ fn a_real_home_keeps_first_run_setup_and_a_scratch_home_never_starts_it() {
     // The launch's own reader: a test binary runs under its private state root, a lasting
     // refusal, so this process is never the person's.
     assert!(doctor_startup_env().outside_person_scope);
-}
-
-/// A window's other first LAN uses wait for System State's Local Network step only where the
-/// window runs first-run setup, whose System State runs the step: one started over ssh or away
-/// from the console, under a private state root or outside the person's scope, one that runs a
-/// command, and a launch that is not ordinary wait on no step this window will not take.
-#[test]
-fn only_a_window_that_runs_setup_holds_its_lan_uses_for_the_step() {
-    fn start() -> bool {
-        true
-    }
-    let osv = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
-    let waits = |args: &[OsString], env: DoctorStartupEnv| {
-        let start: fn() -> bool = start;
-        first_lan_uses_wait_for_the_step(
-            ordinary_window(args),
-            first_run_window_eligible(args, env).then_some(start),
-        )
-    };
-    let at_the_mac = DoctorStartupEnv::default();
-    assert!(waits(&osv(&["--window"]), at_the_mac));
-    assert!(waits(&[], at_the_mac), "a Dock launch");
-    for (env, why) in [
-        (
-            DoctorStartupEnv {
-                remote: true,
-                ..at_the_mac
-            },
-            "over ssh, or away from the console",
-        ),
-        (
-            DoctorStartupEnv {
-                isolated: true,
-                ..at_the_mac
-            },
-            "a private state root or CI",
-        ),
-        (
-            DoctorStartupEnv {
-                outside_person_scope: true,
-                ..at_the_mac
-            },
-            "outside the person's scope",
-        ),
-    ] {
-        assert!(
-            ordinary_window(&osv(&["--window"])),
-            "{why}: still an ordinary window"
-        );
-        assert!(!waits(&osv(&["--window"]), env), "{why}");
-    }
-    for args in [
-        osv(&["-e", "zsh"]),
-        osv(&["--headless"]),
-        osv(&["--control-sock", "/tmp/private"]),
-    ] {
-        assert!(!waits(&args, at_the_mac), "{args:?}");
-    }
 }
 
 #[test]

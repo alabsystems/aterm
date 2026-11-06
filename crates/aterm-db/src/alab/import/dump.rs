@@ -587,8 +587,7 @@ impl Planner<'_> {
                 if let Some(root_pk) = self.address(&root, kind, &at) {
                     self.link_alias(&pk, &root_pk, &at);
                 }
-                if !protected {
-                    let mb = self.mailbox(&root, kind, &at)?;
+                if !protected && let Some(mb) = self.mailbox(&root, kind, &at)? {
                     self.want(&ADDRESS, &pk, "mailbox", json!(mb), &at);
                 }
             }
@@ -628,9 +627,10 @@ impl Planner<'_> {
             } else {
                 self.want_secret(&ADDRESS, &pk, "password", secret, &at);
                 // A login with a password signs in to its own mailbox.
-                let mb = self.mailbox(&address, kind, &at)?;
-                self.want(&ADDRESS, &pk, "mailbox", json!(mb), &at);
-                mailbox = Some(mb);
+                if let Some(mb) = self.mailbox(&address, kind, &at)? {
+                    self.want(&ADDRESS, &pk, "mailbox", json!(mb), &at);
+                    mailbox = Some(mb);
+                }
             }
         } else if read.conflicted("password") {
             // A concurrent value claims what this row's own empty cell does not.
@@ -787,7 +787,7 @@ impl Planner<'_> {
                 return Ok(());
             }
             Mark::Held => {
-                self.hold_kimi(&address);
+                self.hold_kimi(&address, &address_pk);
                 self.find(Kind::Held, Some(ACCOUNT.name), None, vec![tier_at]);
                 return Ok(());
             }
@@ -795,7 +795,7 @@ impl Planner<'_> {
             Mark::Paused(terms) => (terms, true),
         };
         let Some((realm, _)) = provider_realm(provider, terms.region) else {
-            self.hold_kimi(&address);
+            self.hold_kimi(&address, &address_pk);
             self.find(Kind::Held, Some(ACCOUNT.name), None, vec![tier_at]);
             return Ok(());
         };
@@ -850,8 +850,8 @@ impl Planner<'_> {
         ) && let Ok(receiving) = keys::address(&receiving)
             && receiving != address
             && !self.protected.contains(&address_pk)
+            && let Some(mb) = self.mailbox(&receiving, kind, &at)?
         {
-            let mb = self.mailbox(&receiving, kind, &at)?;
             self.want(&ADDRESS, &address_pk, "mailbox", json!(mb), &at);
         }
         if let Some((labels, at)) = self.agreed(

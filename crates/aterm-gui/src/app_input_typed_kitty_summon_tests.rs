@@ -515,9 +515,6 @@ fn ime_and_external_local_boundaries_retire_older_candidates_before_consumers() 
     assert_boundary_dark(App::headless_for_test(), |app, _wid| {
         app.clear_tab_surface_move_license(None);
     });
-    assert_boundary_dark(App::headless_for_test(), |app, wid| {
-        app.on_pill_wake(wid, 0, crate::presence::PillHit::Go);
-    });
 }
 
 /// The typing witness's clock starts when the key reaches the terminal, not at event-loop

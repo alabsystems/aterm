@@ -34,7 +34,6 @@ mod recovery_tests;
 mod stop_tests;
 
 thread_local! {
-    static INSTALL_LAN_TRIGGERS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static INSTALL_EXTERNAL_PROBES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static INSTALL_FDA_DIALOG_UP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// How many times a wait of the tab's armed the window's wake for the dialog slot's end
@@ -557,17 +556,12 @@ fn clt_landing_holds_the_dialog_slot_until_the_installer_exits() {
     drop(worker);
 
     app.access_steps.set_reach(StepsReach {
-        trigger_local_network: || {
-            INSTALL_LAN_TRIGGERS.with(|count| count.set(count.get() + 1));
-            true
-        },
         frontmost: App::system_state_frontmost,
         quiet: |_, _| true,
         holds_dialog: true,
         dialog_up: macos_dialog_up,
         ..StepsReach::INERT
     });
-    INSTALL_LAN_TRIGGERS.with(|count| count.set(0));
     let permissions = Some(crate::InitialSetupPermissionPolicy {
         revision: 4,
         allowed: true,
@@ -625,20 +619,15 @@ fn clt_landing_holds_the_dialog_slot_until_the_installer_exits() {
     assert!(app.open_system_state_tab_in_window(wid));
     let now = std::time::Instant::now();
     app.release_unused_access_dialog(now);
-    app.tick_local_network_step(now);
-    assert_eq!(INSTALL_LAN_TRIGGERS.with(std::cell::Cell::get), 0);
     assert!(
         macos_dialog_up(),
         "returning to setup must not release the installer"
     );
     assert!(app.exit_session_logical(0).is_empty());
-    app.tick_local_network_step(now);
-    assert_eq!(
-        INSTALL_LAN_TRIGGERS.with(std::cell::Cell::get),
-        0,
+    assert!(
+        macos_dialog_up(),
         "an unrelated shell's exit does not end the install"
     );
-    assert!(macos_dialog_up());
 
     let before_exit = tabs(&app);
     assert!(app.exit_session_logical(id).is_empty());
@@ -670,12 +659,6 @@ fn clt_landing_holds_the_dialog_slot_until_the_installer_exits() {
     let next_worker = MacosDialog::when_none_up(Duration::ZERO)
         .expect("the worker can acquire after the install process exits");
     drop(next_worker);
-    app.tick_local_network_step(now);
-    assert_eq!(
-        INSTALL_LAN_TRIGGERS.with(std::cell::Cell::get),
-        1,
-        "the same approved step proceeds after the install, without another approval"
-    );
     assert!(
         drain(&read).is_empty(),
         "the install command was submitted once"

@@ -6,11 +6,10 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
-
-use aterm_regex::{Regex, RegexBuilder};
+use std::path::Path;
 
 use super::{Finding, Rule, Tree};
+use crate::export_scan::rows::{EXTRA, Row, baseline, file_rows};
 
 pub(super) const CAPTURE_PRIVACY: Rule = Rule {
     id: "capture-privacy",
@@ -20,11 +19,6 @@ pub(super) const CAPTURE_PRIVACY: Rule = Rule {
     scope: &[],
     check: capture_privacy,
 };
-
-/// The export's own rows, relative to the checkout.
-pub(super) const EXTRA: &str = "publish/forbidden-extra.txt";
-
-const BASELINE: &str = "baseline/forbidden-content.txt";
 
 /// Capture-specific forbidden `(description, pattern)` pairs beyond the export's rows.
 pub(super) const CAPTURE_ROWS: &[(&str, &str)] = &[
@@ -295,59 +289,6 @@ impl View {
     }
 }
 
-/// One pattern a capture is held to.
-pub(super) struct Row {
-    /// Where it comes from, as a finding names it.
-    pub(super) source: String,
-    /// The pattern as grep runs it, on one line.
-    pub(super) line: Regex,
-    /// The same with `(?m)`: a whole view without a match of it holds no line
-    /// with one.
-    any: Regex,
-}
-
-const VIEW_STEPS: u64 = 1 << 32;
-
-impl Row {
-    pub(super) fn new(source: String, pattern: &str) -> Result<Self, String> {
-        let line = Regex::new(pattern).map_err(|e| e.to_string())?;
-        let any = RegexBuilder::new(&format!("(?m){pattern}"))
-            .step_limit(VIEW_STEPS)
-            .build()
-            .map_err(|e| e.to_string())?;
-        Ok(Self { source, line, any })
-    }
-}
-
-/// Compiles the non-comment pattern rows of `text`, recording compile errors into `out`.
-pub(super) fn file_rows(
-    text: &str,
-    label: &str,
-    finding_path: &str,
-    rule: &'static str,
-    out: &mut Vec<Finding>,
-) -> Vec<Row> {
-    let mut rows = Vec::new();
-    for (i, raw) in text.lines().enumerate() {
-        let pattern = raw.trim();
-        if pattern.is_empty() || pattern.starts_with('#') {
-            continue;
-        }
-        match Row::new(format!("{label}:{}", i + 1), pattern) {
-            Ok(row) => rows.push(row),
-            Err(why) => out.push(Finding {
-                rule,
-                path: finding_path.to_string(),
-                line: i + 1,
-                detail: format!(
-                    "this row does not compile in aterm-regex ({why}), so nothing is held to it"
-                ),
-            }),
-        }
-    }
-    rows
-}
-
 /// [`CAPTURE_ROWS`], compiled.
 pub(super) fn capture_rows() -> Vec<Row> {
     CAPTURE_ROWS
@@ -357,23 +298,6 @@ pub(super) fn capture_rows() -> Vec<Row> {
                 .unwrap_or_else(|e| panic!("capture row {pattern:?} compiles: {e}"))
         })
         .collect()
-}
-
-fn baseline_path() -> Option<PathBuf> {
-    std::env::var_os("PUBLICATION_ENGINE")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join("publication")))
-        .map(|engine| engine.join(BASELINE))
-}
-
-/// The engine's baseline `(where, text)`, or why the rules judge without it.
-pub(super) fn baseline() -> Result<(String, String), String> {
-    let path = baseline_path().ok_or("neither PUBLICATION_ENGINE nor HOME names the engine")?;
-    let shown = path.display().to_string();
-    crate::tree::read_to_string(&path)
-        .map(|text| (shown.clone(), text))
-        .map_err(|e| format!("{shown}: {e}"))
 }
 
 /// Returns census notes listing any absent baseline or extras files.
@@ -389,9 +313,21 @@ pub(super) fn notes(root: &Path) -> Vec<String> {
         return Vec::new();
     }
     vec![format!(
-        "capture-privacy and export-content judged without {}; the capture rows still held",
+        "capture-privacy judged without {}; the capture rows still held",
         without.join(" or ")
     )]
+}
+
+/// The rows of `text` ([`file_rows`]), each that does not compile a finding at `path`.
+fn rows_of(text: &str, label: &str, path: &str, out: &mut Vec<Finding>) -> Vec<Row> {
+    let (rows, refused) = file_rows(text, label);
+    out.extend(refused.into_iter().map(|(line, detail)| Finding {
+        rule: CAPTURE_PRIVACY.id,
+        path: path.to_string(),
+        line,
+        detail,
+    }));
+    rows
 }
 
 fn capture_privacy(tree: &Tree<'_>, out: &mut Vec<Finding>) {
@@ -421,15 +357,9 @@ fn held_to(tree: &Tree<'_>, baseline: Result<(String, String), String>, out: &mu
             String::new()
         }
     };
-    let mut rows = file_rows(&extra, EXTRA, EXTRA, CAPTURE_PRIVACY.id, out);
+    let mut rows = rows_of(&extra, EXTRA, EXTRA, out);
     if let Ok((path, text)) = baseline {
-        rows.extend(file_rows(
-            &text,
-            "the engine's baseline",
-            &path,
-            CAPTURE_PRIVACY.id,
-            out,
-        ));
+        rows.extend(rows_of(&text, "the engine's baseline", &path, out));
     }
     rows.extend(capture_rows());
     for rel in captures {

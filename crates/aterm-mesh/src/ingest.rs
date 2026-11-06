@@ -124,6 +124,9 @@ pub struct Ingest {
     /// ([`Self::no_retry_for_test`]).
     #[cfg(any(test, debug_assertions))]
     no_retry: AtomicBool,
+    /// A test's hold: the worker settles nothing delivered ([`Self::hold_for_test`]).
+    #[cfg(test)]
+    held: AtomicBool,
 }
 
 impl std::fmt::Debug for Ingest {
@@ -180,6 +183,8 @@ impl Ingest {
             closer: Mutex::new(None),
             #[cfg(any(test, debug_assertions))]
             no_retry: AtomicBool::new(false),
+            #[cfg(test)]
+            held: AtomicBool::new(false),
         })
     }
 
@@ -203,6 +208,24 @@ impl Ingest {
     #[cfg(not(any(test, debug_assertions)))]
     const fn retries(&self) -> bool {
         true
+    }
+
+    /// Hold the worker: while `on`, what the reader delivers waits in the queue, unsettled, so the
+    /// stores lack what the log holds and the floor stays below it.
+    #[cfg(test)]
+    pub(crate) fn hold_for_test(&self, on: bool) {
+        self.held.store(on, Ordering::Release);
+        self.bell.ring();
+    }
+
+    #[cfg(test)]
+    fn held(&self) -> bool {
+        self.held.load(Ordering::Acquire)
+    }
+
+    #[cfg(not(test))]
+    const fn held(&self) -> bool {
+        false
     }
 
     /// The records waiting now.
@@ -346,7 +369,7 @@ impl Ingest {
             }
             let mut landed = self.kicked.swap(false, Ordering::AcqRel);
             let full = self.state.lock_or_recover().waiting.len() >= WAITING_MAX;
-            if !full {
+            if !full && !self.held() {
                 let took: Vec<Delivered> = {
                     let mut queue = self.queue.lock_or_recover();
                     let n = queue.len().min(TAKE);
@@ -356,7 +379,7 @@ impl Ingest {
                 if !took.is_empty() {
                     landed |= self.settle(&mesh, took);
                 }
-            } else if !std::mem::replace(&mut self.state.lock_or_recover().asked, true) {
+            } else if full && !std::mem::replace(&mut self.state.lock_or_recover().asked, true) {
                 aterm_log::warn!(
                     "mesh: {WAITING_MAX} table records wait for membership records; an Inventory \
                      of the membership log starts"
@@ -374,8 +397,15 @@ impl Ingest {
                 self.retry_busy(&mesh);
             }
             self.commit(&mesh, committer.as_mut());
-            let more =
-                !self.queue.lock_or_recover().is_empty() && !self.state.lock_or_recover().asked;
+            // The floor moves with a commit, and with a waiting or busy record that settles on its
+            // retry with nothing new delivered: a relay start's second ask waits for it to pass the
+            // last table record its log held (`Inventory::ask_once_ingested`).
+            if self.inventory.awaits_ingest() {
+                self.inventory.ingested(self.floor(&mesh));
+            }
+            let more = !self.held()
+                && !self.queue.lock_or_recover().is_empty()
+                && !self.state.lock_or_recover().asked;
             drop(mesh);
             if more {
                 continue;
@@ -582,16 +612,25 @@ impl Ingest {
             // Every offset not yet settled for good: a busy record may sit below the group's
             // position (one that waited, then found its store busy), and an unread one is not
             // known yet.
-            let waiting: BTreeSet<u64> = state
-                .waiting
-                .keys()
-                .chain(state.busy.keys())
-                .chain(state.unread.iter())
-                .copied()
-                .collect();
+            let waiting = if state.busy.is_empty()
+                && state.unread.is_empty()
+                && state.waiting.len() == state.written.len()
+                && state.waiting.keys().eq(state.written.iter())
+            {
+                None
+            } else {
+                let waiting: BTreeSet<u64> = state
+                    .waiting
+                    .keys()
+                    .chain(state.busy.keys())
+                    .chain(state.unread.iter())
+                    .copied()
+                    .collect();
+                (waiting != state.written).then_some(waiting)
+            };
             let upto =
                 Self::commit_upto(&state).filter(|upto| state.committed.is_none_or(|c| *upto > c));
-            (upto, (waiting != state.written).then_some(waiting))
+            (upto, waiting)
         };
         // The waiting offsets go to disk before the commit passes them.
         if let Some(waiting) = waiting {
@@ -705,9 +744,14 @@ impl Ingest {
         else {
             return;
         };
-        let offsets: BTreeSet<u64> = String::from_utf8_lossy(&bytes)
-            .lines()
-            .filter_map(|line| line.parse().ok())
+        let offsets: BTreeSet<u64> = bytes
+            .split(|&b| b == b'\n')
+            .filter_map(|raw| {
+                std::str::from_utf8(raw.strip_suffix(b"\r").unwrap_or(raw))
+                    .ok()?
+                    .parse()
+                    .ok()
+            })
             .collect();
         let mut state = self.state.lock_or_recover();
         state.written.clone_from(&offsets);

@@ -3,6 +3,8 @@
 
 //! Release notes Markdown renderer for `/releases`.
 
+use std::fmt::Write as _;
+
 use super::html_escape as esc;
 use super::releases::{Release, stable, version_key};
 
@@ -59,15 +61,12 @@ fn links(t: &str) -> String {
                 .map_or(after.len(), |(n, _)| n);
             (url_len > scheme.len() && after[url_len..].starts_with(')')).then(|| {
                 let url = &after[..url_len];
-                (
-                    format!("<a href=\"{url}\">{}</a>", &rest[1..close]),
-                    close + 2 + url_len + 1,
-                )
+                (url, &rest[1..close], close + 2 + url_len + 1)
             })
         });
         match hit.flatten() {
-            Some((html, len)) => {
-                out.push_str(&html);
+            Some((url, label, len)) => {
+                let _ = write!(out, "<a href=\"{url}\">{label}</a>");
                 i += len;
             }
             None => {
@@ -394,7 +393,7 @@ pub fn from_changelog(text: &str) -> Vec<Section> {
             s
         })
         .collect();
-    out.sort_by_key(|s| std::cmp::Reverse(version_key(&s.tag)));
+    out.sort_by_cached_key(|s| std::cmp::Reverse(version_key(&s.tag)));
     out
 }
 
@@ -406,12 +405,23 @@ fn strip_asset_preamble(body: &str) -> String {
     if !legend {
         return body.to_string();
     }
-    let normalized = body.replace("\r\n", "\n");
-    let lines: Vec<&str> = normalized.split('\n').collect();
-    match lines.iter().take(40).position(|l| rule(l)) {
-        Some(idx) => lines[idx + 1..].join("\n").trim_matches('\n').to_string(),
-        None => body.to_string(),
+    let normalized = if body.contains("\r\n") {
+        std::borrow::Cow::Owned(body.replace("\r\n", "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(body)
+    };
+    let mut rem: &str = &normalized;
+    for _ in 0..40 {
+        let (line, rest) = rem.split_once('\n').unwrap_or((rem, ""));
+        if rule(line) {
+            return rest.trim_matches('\n').to_string();
+        }
+        if rest.is_empty() {
+            break;
+        }
+        rem = rest;
     }
+    body.to_string()
 }
 
 /// The stable releases' bodies, newest version first.

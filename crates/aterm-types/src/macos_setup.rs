@@ -214,19 +214,16 @@ pub enum Access {
     DeveloperTools,
     /// macOS developer mode (`DevToolsSecurity`): debugging without a password.
     Debugger,
-    /// Local Network access for aterm and what runs in it.
-    LocalNetwork,
     /// Accessibility, which the Messages and FaceTime sign-outs need.
     Accessibility,
 }
 
 impl Access {
     /// Every access row, in page order.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 4] = [
         Self::FullDiskAccess,
         Self::DeveloperTools,
         Self::Debugger,
-        Self::LocalNetwork,
         Self::Accessibility,
     ];
 
@@ -237,7 +234,6 @@ impl Access {
             Self::FullDiskAccess => "Full Disk Access",
             Self::DeveloperTools => "Developer Tools",
             Self::Debugger => "Debugger access",
-            Self::LocalNetwork => "Local Network",
             Self::Accessibility => "Accessibility",
         }
     }
@@ -246,11 +242,9 @@ impl Access {
     #[must_use]
     pub const fn wanted(self) -> &'static str {
         match self {
-            Self::FullDiskAccess
-            | Self::DeveloperTools
-            | Self::Debugger
-            | Self::LocalNetwork
-            | Self::Accessibility => "On",
+            Self::FullDiskAccess | Self::DeveloperTools | Self::Debugger | Self::Accessibility => {
+                "On"
+            }
         }
     }
 
@@ -413,20 +407,13 @@ pub enum Standing {
     Unknown,
     /// Does not apply on this Mac.
     NotNeeded,
-    /// macOS tells aterm nothing of it, and nothing in this launch can read it (Local Network,
-    /// whose switch macOS does not report to an app): shown as `—` with its note, and settled,
-    /// since no step aterm or a person takes now gives the page more to say.
-    Untold,
 }
 
 impl Standing {
     /// Whether the row counts as in place for the page's "N of M" count.
     #[must_use]
     pub const fn settled(self) -> bool {
-        matches!(
-            self,
-            Self::InPlace | Self::AtLogin | Self::NotNeeded | Self::Untold
-        )
+        matches!(self, Self::InPlace | Self::AtLogin | Self::NotNeeded)
     }
 
     /// Whether the row needs a person, or failed: the only states that may
@@ -484,14 +471,6 @@ pub const TRIES_AGAIN_BY_ITSELF: &str = "aterm tries again by itself.";
 /// it again by itself ([`FailureKind::Transient`]).
 pub const TRIED_TWICE: &str =
     "Two tries did not take, so aterm tries again once this Mac's network or vault changes.";
-
-/// The Local Network row's note when nothing says whether aterm may use the local network
-/// ([`Standing::Untold`]): macOS does not tell apps (design §3.3).
-pub const LOCAL_NETWORK_UNTOLD: &str = "macOS does not tell apps whether it is on";
-
-/// The Local Network row's note once the window raised macOS's question in this approval and
-/// nothing since says how it was answered ([`Standing::Untold`]).
-pub const LOCAL_NETWORK_ASKED: &str = "macOS asked you, and does not tell apps your answer";
 
 /// The GitHub repositories row's note while Apple's Command Line Tools, which every clone runs,
 /// are not installed: a person's remedy (`init_observe::Wait::CommandLineTools`), which System
@@ -1039,8 +1018,6 @@ pub enum AccessOutcome {
     Handed,
     /// The person answered aterm's panel with Not now, or cancelled macOS's dialog.
     Declined,
-    /// The step was started without anything to show (the Local Network trigger).
-    Triggered,
     /// The grant read on.
     Granted,
 }
@@ -1052,13 +1029,12 @@ impl AccessOutcome {
         match self {
             Self::Handed => "handed",
             Self::Declined => "declined",
-            Self::Triggered => "triggered",
             Self::Granted => "granted",
         }
     }
 
     fn parse(word: &str) -> Option<Self> {
-        [Self::Handed, Self::Declined, Self::Triggered, Self::Granted]
+        [Self::Handed, Self::Declined, Self::Granted]
             .into_iter()
             .find(|outcome| outcome.word() == word)
     }
@@ -1072,11 +1048,11 @@ impl Access {
             Self::FullDiskAccess => "full-disk-access",
             Self::DeveloperTools => "developer-tools",
             Self::Debugger => "debugger",
-            Self::LocalNetwork => "local-network",
             Self::Accessibility => "accessibility",
         }
     }
 
+    /// The row a record's word names, if it is one of [`Self::ALL`].
     fn parse(word: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|access| access.word() == word)
     }
@@ -1281,15 +1257,14 @@ pub mod opt_out {
         }
     }
 
-    static OPTED_OUT: std::sync::Mutex<[Option<OptOut>; 5]> = std::sync::Mutex::new([None; 5]);
+    static OPTED_OUT: std::sync::Mutex<[Option<OptOut>; 4]> = std::sync::Mutex::new([None; 4]);
 
     const fn slot(access: Access) -> usize {
         match access {
             Access::FullDiskAccess => 0,
             Access::DeveloperTools => 1,
             Access::Debugger => 2,
-            Access::LocalNetwork => 3,
-            Access::Accessibility => 4,
+            Access::Accessibility => 3,
         }
     }
 
@@ -1311,1492 +1286,30 @@ pub mod opt_out {
 /// own for a later pass: a hang detector (`MacosDialog::when_none_up`).
 pub const DIALOG_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// How long macOS's Local Network question counts as up once aterm raised it. macOS reports
-/// neither the alert nor its answer, so this is a bound, not a reading: the Commons runtime that
-/// asks by itself holds the dialog slot this long from its first LAN use,
-/// as a door pass's question is held below. System State's Local
-/// Network step holds its own alert until the answer is heard, until the window list, after
-/// showing a new window of the alert's owner, shows no window of that owner left, on screen or
-/// off, at a read with the person at the Mac (macOS 26 and 27), or until the person has been at
-/// the Mac this long, counted from their first input after the ask and paused while they are
-/// away (`aterm-gui`'s `system_state_access`), so no page of the window's comes up beside an
-/// alert nobody has seen (`docs/DESIGN-system-state-2026-10-21.md` §6). A question asked through
-/// the first LAN use's door, or by the Commons runtime past that wait
-/// ([`lan_first_use::asking`]), is held this long of the person's time too where a door is
-/// installed, ended sooner by the same window-list watch where the window installed it
-/// ([`lan_first_use::install_question_watch`]) or by the re-probe's answer
-/// ([`lan_first_use::answer_heard`]).
-pub const LOCAL_NETWORK_QUESTION_HOLD: std::time::Duration = std::time::Duration::from_secs(30);
+/// Whether `[swarm] enabled` leaves this process's automatic LAN uses on: the reader a process
+/// installs ([`sharing::install`]) is asked right before such a use (Tab Control's sweep), so
+/// a person who turned sharing off sees none go by itself
+/// (`docs/DESIGN-alab-swarm-2026-10-27.md` §9).
+pub mod sharing {
+    use std::sync::OnceLock;
 
-/// Whether this process's LAN was handed to the Commons runtime. System State's Local Network
-/// step hands it over at its trigger, the moment it asked macOS the question under the window's
-/// dialog slot (`docs/DESIGN-system-state-2026-10-21.md` §6): Commons opens no LAN socket before
-/// that, unless other evidence says macOS asked aterm already or the step will not run.
-pub mod lan_first_use {
-    // `aterm_time`'s clock, which a browser's wasm has too (`std::time::Instant::now` panics
-    // there).
-    use aterm_time::{Duration, Instant};
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Mutex, OnceLock, PoisonError};
-
-    static HANDED: OnceLock<u64> = OnceLock::new();
-
-    /// The question's hold counts at most a minute between presence reads.
-    #[cfg(any(test, not(target_family = "wasm")))]
-    const PRESENT_GAP: Duration = Duration::from_secs(60);
-
-    /// Time with an already visible question. This never delays the initial request.
-    #[cfg(any(test, not(target_family = "wasm")))]
-    struct Waited {
-        counted: Duration,
-        last: Option<(Instant, bool)>,
-    }
-
-    #[cfg(any(test, not(target_family = "wasm")))]
-    impl Waited {
-        const fn new() -> Self {
-            Self {
-                counted: Duration::ZERO,
-                last: None,
-            }
-        }
-
-        fn count(&mut self, now: Instant, present: bool, gap: Option<Duration>) -> Duration {
-            if let Some((at, true)) = self.last
-                && present
-            {
-                let since = now.saturating_duration_since(at);
-                self.counted = self
-                    .counted
-                    .saturating_add(gap.map_or(since, |gap| since.min(gap)));
-            }
-            self.last = Some((now, present));
-            self.counted
-        }
-    }
-
-    /// A reader of something this process sees now, from any thread.
+    /// A reader of the switch, from any thread.
     type Reader = Box<dyn Fn() -> bool + Send + Sync>;
-    type DoorReaders<'a> = (&'a dyn Fn() -> bool, &'a dyn Fn() -> bool);
 
-    /// The door a window's first eligible LAN use goes through ([`install_door`]).
-    struct InstalledDoor {
-        /// A person is at this Mac now: input within the last minute and the screen unlocked.
-        present: Reader,
-        /// The window's quiet moment: an aterm window has keyboard focus, and no key went to aterm
-        /// for the steps' key rest, so no key on its way lands in macOS's question.
-        quiet: Reader,
-    }
-
-    static DOOR: OnceLock<InstalledDoor> = OnceLock::new();
-
-    /// The watch a window keeps on macOS's Local Network question a use raises through its door,
-    /// or the Commons gate's first eligible LAN use raises itself
-    /// ([`install_question_watch`]): it ends the door's hold of that question once it sees the
-    /// question answered. Function pointers, so the door's code reaches no window list itself.
-    #[derive(Clone, Copy)]
-    pub struct QuestionWatch {
-        /// Start a watch of the question door pass `pass` is about to raise, wait for its first
-        /// read (the windows up before the ask, which the use asks only after), and, with that
-        /// read in, let it read on until stopped: whether it did. With it, the watch runs
-        /// `answered(pass)` from a thread of its own once it sees the question answered. `false`
-        /// where no watch reads on (a macOS whose alert was not measured, no worker, a first read
-        /// not back in time or unable to read the window list): the hold then runs
-        /// [`super::LOCAL_NETWORK_QUESTION_HOLD`] of the person's time, ended sooner only by the
-        /// re-probe's answer ([`answer_heard`]).
-        pub start: fn(u64, fn(u64)) -> bool,
-        /// The door's hold of pass `pass` is over: stop that pass's watch, if it still reads.
-        pub stop: fn(u64),
-    }
-
-    /// This process's question watch ([`install_question_watch`]).
-    static QUESTION_WATCH: OnceLock<QuestionWatch> = OnceLock::new();
-
-    /// This process's reader of whether System State's Local Network step is still to come for
-    /// it ([`install_step_to_come`]).
-    static STEP_TO_COME: OnceLock<Reader> = OnceLock::new();
-
-    /// This process's reader of whether `[swarm] enabled` leaves sharing on ([`install_sharing`]).
+    /// This process's reader ([`install`]).
     static SHARING: OnceLock<Reader> = OnceLock::new();
-
-    /// A use of this process asked macOS through the door ([`note_asked`]).
-    static ASKED: AtomicBool = AtomicBool::new(false);
-
-    /// This process's reader of whether macOS's Local Network question was put to this app on
-    /// this Mac outside this process: by another process of it (the vault subscriber, a
-    /// background job) or in an earlier launch whose window lived through it
-    /// ([`install_asked_elsewhere`]).
-    static ASKED_ELSEWHERE: OnceLock<Reader> = OnceLock::new();
-
-    /// When [`asked`] last read [`ASKED_ELSEWHERE`].
-    static ELSEWHERE_LOOKED: Mutex<Option<Instant>> = Mutex::new(None);
-
-    /// How often [`asked`] reads [`ASKED_ELSEWHERE`] at most: a file read, and uses ask often.
-    const ELSEWHERE_LOOK: Duration = Duration::from_secs(2);
-
-    /// What runs the moment this process's LAN stops being held for System State's step
-    /// ([`on_open`]).
-    static OPENED: OnceLock<fn()> = OnceLock::new();
-
-    /// The hold on the dialog slot the door took for the question a use raised
-    /// ([`hold_door_slot`]), or the Commons gate's first eligible LAN use raised
-    /// ([`Asking`]): [`super::LOCAL_NETWORK_QUESTION_HOLD`] of the person's time, or
-    /// less once the question's watch sees it answered or the re-probe hears its answer
-    /// ([`answer_heard`]) ([`hold_question`]), during which the use whose door pass took it may
-    /// hold it through its own LAN use ([`take_door_slot`]) and give it back.
-    struct Hold<G> {
-        /// The slot, while the hold has it.
-        slot: Option<G>,
-        /// The door pass that took it: the count of door passes so far.
-        pass: u64,
-        /// The question's hold is over (the person's time with it ran out, its watch saw it
-        /// answered, or the re-probe heard the answer): a slot given back now goes at once.
-        over: bool,
-    }
-
-    impl<G> Hold<G> {
-        const fn new() -> Self {
-            Self {
-                slot: None,
-                pass: 0,
-                over: true,
-            }
-        }
-
-        /// A door pass took `slot` for the question its use raises: the hold starts. Its pass,
-        /// and what an earlier hold still had (to let go).
-        #[cfg(any(test, not(target_family = "wasm")))]
-        fn start(&mut self, slot: G) -> (u64, Option<G>) {
-            self.pass = self.pass.wrapping_add(1);
-            self.over = false;
-            (self.pass, self.slot.replace(slot))
-        }
-
-        /// The slot, for the use whose door pass `pass` took it, while the hold has it.
-        fn take(&mut self, pass: u64) -> Option<G> {
-            if pass == self.pass {
-                self.slot.take()
-            } else {
-                None
-            }
-        }
-
-        /// The slot the use of `pass` took over, given back: the hold keeps it while the
-        /// question's hold lasts; past it (or for another pass) it goes, returned to let go.
-        fn give_back(&mut self, pass: u64, slot: G) -> Option<G> {
-            if pass == self.pass && !self.over && self.slot.is_none() {
-                self.slot = Some(slot);
-                None
-            } else {
-                Some(slot)
-            }
-        }
-
-        /// The question's hold of `pass` is over (it ran out, or its question was answered): what
-        /// it still has, returned to let go.
-        fn end(&mut self, pass: u64) -> Option<G> {
-            if pass != self.pass {
-                return None;
-            }
-            self.over = true;
-            self.slot.take()
-        }
-
-        /// Whether the question's hold of `pass` still stands: no later pass started one, and
-        /// nothing ended it.
-        #[cfg(any(test, not(target_family = "wasm")))]
-        const fn stands(&self, pass: u64) -> bool {
-            pass == self.pass && !self.over
-        }
-
-        /// The question's answer was heard: the hold that stands, if one does, is over. Whether
-        /// one stood, and what it still has, returned to let go.
-        fn end_standing(&mut self) -> (bool, Option<G>) {
-            let stood = !self.over;
-            (stood, self.end(self.pass))
-        }
-    }
-
-    /// This process's door hold ([`Hold`]).
-    static HELD: Mutex<Hold<super::MacosDialog>> = Mutex::new(Hold::new());
-
-    /// The door pass that took this process's dialog slot for the question its use raised
-    /// ([`lan_use`]): only that use may take the slot over ([`take_door_slot`]).
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct DoorPass(u64);
-
-    /// The door's slot, taken over by the use whose door pass took it ([`take_door_slot`]): held
-    /// while this lives. Let go within the question's hold, it goes back to that hold, which
-    /// keeps it until the hold is over ([`hold_door_slot`]: at most
-    /// [`super::LOCAL_NETWORK_QUESTION_HOLD`] of the person's time after the ask); past it, it
-    /// goes.
-    #[must_use = "the slot is held only while this lives"]
-    pub struct DoorSlot {
-        slot: Option<super::MacosDialog>,
-        pass: u64,
-    }
-
-    impl Drop for DoorSlot {
-        fn drop(&mut self) {
-            if let Some(slot) = self.slot.take() {
-                // Let go after the lock: the last dialog's drop may wake a waiter.
-                let goes = HELD
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .give_back(self.pass, slot);
-                drop(goes);
-            }
-        }
-    }
-
-    /// What a use of the LAN finds now ([`lan_use`]).
-    #[derive(Debug, PartialEq, Eq)]
-    pub enum LanUse {
-        /// The use waits: sharing is off, or System State's Local Network step is still to come
-        /// and the wait for it holds the use.
-        Waits,
-        /// The use goes, with the door pass that took this process's dialog slot for the
-        /// question it raises where it went through the door ([`take_door_slot`]).
-        Goes(Option<DoorPass>),
-    }
-
-    /// Where this process's LAN stands for a use held for System State's step, read without
-    /// counting a look or taking a slot ([`door`]).
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum Door {
-        /// Nothing holds a use for the step: it handed the LAN over, a use asked through the
-        /// door, or the step is not to come.
-        Open,
-        /// The step is still to come and presence, quiet or the dialog slot holds the use.
-        Waiting,
-        /// A first use may request the process's dialog slot now ([`install_door`]).
-        Ready,
-    }
-
-    /// Register what runs the moment this process's LAN stops being held for System State's
-    /// step: the step hands it over ([`hand_over`]), a use first asks through the door
-    /// ([`note_asked`]). The
-    /// setup worker registers its wake, so a Secrets join parked on the step goes on then. The
-    /// first registration wins.
-    pub fn on_open(opened: fn()) {
-        let _ = OPENED.set(opened);
-    }
-
-    /// Run what [`on_open`] registered.
-    fn tell_open() {
-        if let Some(opened) = OPENED.get() {
-            opened();
-        }
-    }
-
-    /// Hand this process's LAN to the Commons runtime: the step of approved revision `revision`
-    /// asked macOS. The first hand-over wins; a later one changes nothing.
-    pub fn hand_over(revision: u64) {
-        if HANDED.set(revision).is_ok() {
-            tell_open();
-        }
-    }
-
-    /// The revision whose Local Network step handed this process's LAN over, if one did.
-    #[must_use]
-    pub fn handed() -> Option<u64> {
-        HANDED.get().copied()
-    }
-
-    /// Install this process's reader of whether System State's Local Network step is still to
-    /// come for it: true while the step is meant to raise macOS's question first and has not
-    /// yet, by the rule the Commons runtime's own gate waits on. A window that runs first-run
-    /// setup installs it, since its System State runs the step. The first reader installed wins.
-    pub fn install_step_to_come(reader: impl Fn() -> bool + Send + Sync + 'static) {
-        let _ = STEP_TO_COME.set(Box::new(reader));
-    }
-
-    /// Install this process's door for its first eligible LAN use ([`may_use`]):
-    /// `present` reads a person at this Mac (input within the last minute, screen unlocked),
-    /// and `quiet` the window's quiet moment (an aterm window has keyboard focus and no
-    /// key went to aterm for the steps' key rest). A use goes only with both true
-    /// and this process's dialog slot free, which it takes for the question's hold; the Commons
-    /// gate goes through the same door ([`ready_for_question`]), and once one use asked, every other
-    /// follows its answer ([`asked`]). A window that runs first-run setup installs it. The first
-    /// door installed wins.
-    pub fn install_door(
-        present: impl Fn() -> bool + Send + Sync + 'static,
-        quiet: impl Fn() -> bool + Send + Sync + 'static,
-    ) {
-        let _ = DOOR.set(InstalledDoor {
-            present: Box::new(present),
-            quiet: Box::new(quiet),
-        });
-    }
-
-    /// Install this process's watch of macOS's Local Network question a use raises through its
-    /// door ([`install_door`]), or the Commons gate's first LAN use raises by itself past
-    /// its first eligible use ([`asking`]): such a use starts it, with this process's dialog slot taken into
-    /// the door's hold and before the use's ask is noted or the use made, and waits for its first
-    /// read ([`QuestionWatch::start`]); the door's hold of the question then ends once the watch
-    /// sees it answered, and stops the watch when it ends otherwise ([`hold_question`]). A window
-    /// installs it beside its door; a process with no window (a terminal session lane, the node
-    /// job, a command) installs none, and its door's hold runs its bound. The first watch
-    /// installed wins.
-    pub fn install_question_watch(watch: QuestionWatch) {
-        let _ = QUESTION_WATCH.set(watch);
-    }
-
-    /// The LAN re-probe heard macOS's answer to its Local Network question (a LAN server
-    /// answered, or macOS refused a `.local` lookup), so the question is no longer up: the
-    /// door's hold of it, if one stands, is over now, letting go the slot it still has (a use
-    /// that took the slot over lets it go when it gives it back), and its watch is stopped at the
-    /// hold's next look ([`hold_question`]). Whether a hold stood.
-    pub fn answer_heard() -> bool {
-        let (stood, goes) = HELD
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .end_standing();
-        // Let go after the lock: the last dialog's drop may wake a waiter.
-        drop(goes);
-        stood
-    }
-
     /// Install this process's reader of whether `[swarm] enabled` leaves sharing on: while it
-    /// reads off (or cannot be read), no automatic LAN use goes ([`may_use`]), whatever System
-    /// State's step did (`docs/DESIGN-alab-swarm-2026-10-27.md` §9). A person's own action (a
-    /// phrase typed, a command run) does not ask it. The first reader installed wins.
-    pub fn install_sharing(reader: impl Fn() -> bool + Send + Sync + 'static) {
+    /// reads off (or cannot be read), no automatic LAN use goes ([`is_on`]). A person's own action
+    /// (a phrase typed, a command run) does not ask it. The first reader installed wins.
+    pub fn install(reader: impl Fn() -> bool + Send + Sync + 'static) {
         let _ = SHARING.set(Box::new(reader));
     }
 
     /// Whether `[swarm] enabled` leaves sharing on, as this process's installed reader says; on
     /// where none is installed.
     #[must_use]
-    pub fn sharing_on() -> bool {
+    pub fn is_on() -> bool {
         SHARING.get().is_none_or(|on| on())
-    }
-
-    /// Install this process's reader of whether macOS's Local Network question was already put
-    /// to this app on this Mac outside this process: by another process of it (the vault
-    /// subscriber, a background job with no window) or in an earlier launch whose window lived
-    /// through the question's hold. [`asked`] reads it, at most every [`ELSEWHERE_LOOK`], and
-    /// once it says so this process counts the question asked; [`asked_elsewhere`] reads it at
-    /// each call. A window that runs first-run setup installs it. The first reader installed
-    /// wins.
-    pub fn install_asked_elsewhere(reader: impl Fn() -> bool + Send + Sync + 'static) {
-        let _ = ASKED_ELSEWHERE.set(Box::new(reader));
-    }
-
-    /// Whether macOS's Local Network question was put to this app on this Mac outside this
-    /// process, as the installed reader says now ([`install_asked_elsewhere`]); `false` where
-    /// none is installed. Unlike [`asked`], a question a use of this process raised through the
-    /// door does not count: that question's hold is this process's, under its dialog slot. A use
-    /// that holds the slot while its LAN use may raise the question (the Secrets stage's vault
-    /// join) needs none once this says so: its use raises no question of this process's, so it
-    /// waits behind no other dialog of this process's (a Full Disk Access panel nobody answers).
-    #[must_use]
-    pub fn asked_elsewhere() -> bool {
-        ASKED_ELSEWHERE.get().is_some_and(|elsewhere| elsewhere())
-    }
-
-    /// Whether a LAN use of this process went through the door and raised macOS's Local Network
-    /// question by itself ([`note_asked`]), or the question was put to this app on this Mac
-    /// outside this process ([`install_asked_elsewhere`]): every later use follows its answer,
-    /// raising no question of its own (macOS asks each app once).
-    #[must_use]
-    pub fn asked() -> bool {
-        if ASKED.load(Ordering::Acquire) {
-            return true;
-        }
-        let Some(elsewhere) = ASKED_ELSEWHERE.get() else {
-            return false;
-        };
-        let now = Instant::now();
-        let due = elsewhere_due(
-            &mut ELSEWHERE_LOOKED
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner),
-            now,
-        );
-        if due && elsewhere() {
-            note_asked();
-            return true;
-        }
-        false
-    }
-
-    /// Whether [`asked`] reads [`ASKED_ELSEWHERE`] at `now`, `looked` being when it last did,
-    /// which a read due notes (pure but for that).
-    fn elsewhere_due(looked: &mut Option<Instant>, now: Instant) -> bool {
-        if looked.is_some_and(|at| now.saturating_duration_since(at) < ELSEWHERE_LOOK) {
-            return false;
-        }
-        *looked = Some(now);
-        true
-    }
-
-    /// Note that a LAN use of this process went through the door ([`install_door`]): the Commons
-    /// gate that asked on its first eligible use, or a use [`may_use`] let through. The first
-    /// note tells [`on_open`].
-    pub fn note_asked() {
-        if !ASKED.swap(true, Ordering::AcqRel) {
-            tell_open();
-        }
-    }
-
-    /// Take over the dialog slot the door took for the question a use raised, for the use whose
-    /// door pass took it (`pass`, from [`lan_use`]) and that holds the slot through its own LAN
-    /// use (the Secrets stage's vault join): the slot is held while the [`DoorSlot`] lives, and
-    /// goes back to the door's hold when it goes, so the question keeps its hold
-    /// ([`hold_door_slot`]). `None` where the door's hold has no slot of that pass: it is over,
-    /// or another use's pass took it.
-    #[must_use]
-    pub fn take_door_slot(pass: DoorPass) -> Option<DoorSlot> {
-        let slot = HELD
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take(pass.0)?;
-        Some(DoorSlot {
-            slot: Some(slot),
-            pass: pass.0,
-        })
-    }
-
-    /// Whether an automatic use of the LAN by this process (a probe, a sweep, a browse, a join)
-    /// may go now without putting macOS's Local Network question on screen out of turn: sharing
-    /// is on ([`install_sharing`]), and the step handed the LAN over, a use already asked through
-    /// the door ([`asked`]), the installed reader says the step is not still to come, or this use
-    /// goes through the door at its first eligible moment: where
-    /// a door is installed (a window), a person present in the window's quiet moment and this
-    /// process's dialog slot free, which the use takes for the question's hold. In a process that
-    /// installed no reader (a command, a window that runs no first-run setup) nothing waits on a
-    /// step; in one with a reader and no door (the node job) the first use goes immediately.
-    /// Ask it right before the use, and only for a use that is due: a pass through the door
-    /// spends the door on that use.
-    #[must_use]
-    pub fn may_use() -> bool {
-        matches!(lan_use(), LanUse::Goes(_))
-    }
-
-    /// [`may_use`], with the door pass that took this process's dialog slot for the question the
-    /// use raises where it went through the door: a use that holds the slot through its own LAN
-    /// use takes it over with that pass ([`take_door_slot`]).
-    pub fn lan_use() -> LanUse {
-        lan_use_sharing(sharing_on())
-    }
-
-    /// [`lan_use`] for a use that reads `[swarm] enabled` itself and says so where it holds the
-    /// use (the Secrets stage's join, whose row then names the switch): the step's rule alone.
-    pub fn step_use() -> LanUse {
-        lan_use_sharing(true)
-    }
-
-    /// [`lan_use`] with `sharing` read.
-    fn lan_use_sharing(sharing: bool) -> LanUse {
-        let mut pass = None;
-        let goes = may_use_with(
-            sharing,
-            handed().is_some() || asked(),
-            STEP_TO_COME
-                .get()
-                .map(|reader| &**reader as &dyn Fn() -> bool),
-            |to_come| to_come && !ready_for_question(),
-            || {
-                through_the_door().is_some_and(|through| {
-                    pass = through;
-                    true
-                })
-            },
-        );
-        if goes {
-            LanUse::Goes(pass)
-        } else {
-            LanUse::Waits
-        }
-    }
-
-    /// Where this process's first LAN use stands, without taking a dialog slot.
-    /// Readiness changes are facts for a parked Secrets join; no countdown holds the use.
-    #[must_use]
-    pub fn door() -> Door {
-        if handed().is_some() || asked() || STEP_TO_COME.get().is_none_or(|to_come| !to_come()) {
-            return Door::Open;
-        }
-        if ready_for_question() && !super::macos_dialog_up() {
-            Door::Ready
-        } else {
-            Door::Waiting
-        }
-    }
-
-    /// Whether a first use may request the dialog slot now: a window needs the
-    /// installed door's person and quiet moment; a background job installs no door.
-    /// The slot itself is still taken immediately before the actual network use.
-    #[must_use]
-    pub fn ready_for_question() -> bool {
-        ready_with(DOOR.get().map(|door| {
-            (
-                &*door.present as &dyn Fn() -> bool,
-                &*door.quiet as &dyn Fn() -> bool,
-            )
-        }))
-    }
-
-    fn ready_with(door: Option<DoorReaders<'_>>) -> bool {
-        door.is_none_or(|(present, quiet)| present() && quiet())
-    }
-
-    /// [`may_use`] of what it read (pure but for `waits` and `door`): `sharing`, whether the LAN
-    /// was handed over or a use already asked (`handed`), the reader, if one was installed,
-    /// `waits`, whether the door's present and quiet conditions hold the use, and `door`,
-    /// whether the use, past that wait, goes through the door ([`through_the_door`]); each asked
-    /// only where the one before it leaves the use waiting.
-    fn may_use_with(
-        sharing: bool,
-        handed: bool,
-        step_to_come: Option<&dyn Fn() -> bool>,
-        waits: impl FnOnce(bool) -> bool,
-        door: impl FnOnce() -> bool,
-    ) -> bool {
-        sharing
-            && (handed || step_to_come.is_none_or(|to_come| !to_come() || (!waits(true) && door())))
-    }
-
-    /// Whether a first eligible use goes through this process's door, and with which pass:
-    /// with no door installed, at once and with none; with one, only where this process's dialog
-    /// slot is free, which it takes for the question's hold, the question's watch started
-    /// ([`install_question_watch`]) and its first read in before the ask is noted
-    /// ([`through_the_door_with`]). `None`: the use waits at the door.
-    fn through_the_door() -> Option<Option<DoorPass>> {
-        #[cfg(not(target_family = "wasm"))]
-        {
-            through_the_door_with(
-                DOOR.get().is_some(),
-                || {
-                    super::MacosDialog::when_none_up(std::time::Duration::ZERO)
-                        .map(take_into_hold::<DoorHold>)
-                },
-                watch_the_question,
-                note_asked,
-                hold_door_slot,
-            )
-        }
-        // A browser's wasm has no macOS question to ask, and no clock to wait with.
-        #[cfg(target_family = "wasm")]
-        {
-            Some(None)
-        }
-    }
-
-    /// [`through_the_door`] (pure): where a `door` is installed, `take` the dialog slot into the
-    /// door's hold, which gives the pass, start the question's `watch` for that pass (it returns
-    /// once the watch's first read is in, or with no watch), only then note the ask (`asked`), and
-    /// `hold` the slot for the question with what the watch gave; a slot another macOS question
-    /// holds keeps the use waiting (`None`), with no watch started and no ask noted. With no door
-    /// the use goes with no pass.
-    #[cfg(not(target_family = "wasm"))]
-    fn through_the_door_with<W, T>(
-        door: bool,
-        take: impl FnOnce() -> Option<u64>,
-        watch: impl FnOnce(u64) -> W,
-        asked: impl FnOnce(),
-        hold: impl FnOnce(u64, W) -> T,
-    ) -> Option<Option<T>> {
-        if !door {
-            return Some(None);
-        }
-        let pass = take()?;
-        let watched = watch(pass);
-        asked();
-        Some(Some(hold(pass, watched)))
-    }
-
-    /// Where a question's hold is kept ([`Hold`]): this process's door hold ([`DoorHold`]), or a
-    /// test's own, so a hold's ends are tested without this process's dialog slot.
-    #[cfg(any(test, not(target_family = "wasm")))]
-    trait HoldIn: 'static {
-        /// What the hold holds: this process's dialog slot.
-        type Slot: Send + 'static;
-        /// The hold.
-        fn held() -> &'static Mutex<Hold<Self::Slot>>;
-    }
-
-    /// This process's door hold, [`HELD`].
-    #[cfg(not(target_family = "wasm"))]
-    struct DoorHold;
-
-    #[cfg(not(target_family = "wasm"))]
-    impl HoldIn for DoorHold {
-        type Slot = super::MacosDialog;
-        fn held() -> &'static Mutex<Hold<super::MacosDialog>> {
-            &HELD
-        }
-    }
-
-    /// Take the dialog `slot` a question is about to be raised under into `H`'s hold, before the
-    /// question's watch starts or the ask is noted: the hold's pass. What an earlier hold still
-    /// had goes.
-    #[cfg(any(test, not(target_family = "wasm")))]
-    fn take_into_hold<H: HoldIn>(slot: H::Slot) -> u64 {
-        let (pass, earlier) = H::held()
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .start(slot);
-        drop(earlier);
-        pass
-    }
-
-    /// Start `watch`, where there is one, for the question hold pass `pass` of `H` is about to
-    /// raise, whose answer ends that pass's hold ([`end_hold`]): the watch, where one reads on
-    /// with its first read in; `None` where there is none or it did not start.
-    #[cfg(any(test, not(target_family = "wasm")))]
-    fn start_watch<H: HoldIn>(watch: Option<QuestionWatch>, pass: u64) -> Option<QuestionWatch> {
-        watch.filter(|watch| (watch.start)(pass, end_hold::<H>))
-    }
-
-    /// [`start_watch`] of this process's question watch ([`install_question_watch`]) for its door
-    /// hold's pass `pass`.
-    #[cfg(not(target_family = "wasm"))]
-    fn watch_the_question(pass: u64) -> Option<QuestionWatch> {
-        start_watch::<DoorHold>(QUESTION_WATCH.get().copied(), pass)
-    }
-
-    /// How often a question's hold looks for a person at the Mac ([`hold_question`]).
-    #[cfg(any(test, not(target_family = "wasm")))]
-    const HOLD_LOOK: std::time::Duration = std::time::Duration::from_secs(1);
-
-    /// Hold the slot the door took for pass `pass` ([`hold_question`], with nothing run at its
-    /// end). The use whose door pass this is may take the slot over meanwhile and give it back
-    /// ([`take_door_slot`]).
-    #[cfg(not(target_family = "wasm"))]
-    fn hold_door_slot(pass: u64, watch: Option<QuestionWatch>) -> DoorPass {
-        hold_question::<DoorHold>(pass, watch, || {});
-        DoorPass(pass)
-    }
-
-    /// Hold the slot in `H`'s hold of pass `pass`, from a thread of its own, until the person has
-    /// had [`super::LOCAL_NETWORK_QUESTION_HOLD`] with the question, counted as System State's
-    /// step counts its own alert's hold: the time between two looks with the person present at
-    /// both, at most [`PRESENT_GAP`] of it, where a door is installed, and the wall clock where
-    /// none is ([`held_out`]). macOS says neither when its question closes nor how it was
-    /// answered, so the next macOS question of this process waits the hold out, unless it ends
-    /// sooner: the question's `watch`, where one reads on, ends it once it sees the question
-    /// answered, and the LAN re-probe once it hears the answer ([`answer_heard`]). However it
-    /// ends, `over` runs and the watch is stopped ([`run_question_hold`]). A hold that cannot
-    /// start ends at once, its watch stopped, and runs no `over`.
-    #[cfg(any(test, not(target_family = "wasm")))]
-    fn hold_question<H: HoldIn>(
-        pass: u64,
-        watch: Option<QuestionWatch>,
-        over: impl FnOnce() + Send + 'static,
-    ) {
-        let spawned = std::thread::Builder::new()
-            .name("lan-first-use-question-hold".into())
-            .spawn(move || {
-                let mut waited = Waited::new();
-                let present = || DOOR.get().map(|door| &*door.present as &dyn Fn() -> bool);
-                let ended = run_question_hold::<H>(
-                    pass,
-                    watch,
-                    || held_out(&mut waited, Instant::now(), present()),
-                    || std::thread::sleep(HOLD_LOOK),
-                    over,
-                );
-                if ended == HoldEnd::RanOut {
-                    aterm_log::info!(
-                        "lan first use: the door's hold of macOS's Local Network question is \
-                         over: its {} s with the question ran out, of the person's time where a \
-                         door is installed (door pass {pass})",
-                        super::LOCAL_NETWORK_QUESTION_HOLD.as_secs()
-                    );
-                }
-            });
-        if spawned.is_err() {
-            end_question_hold::<H>(pass, watch);
-        }
-    }
-
-    /// A question's hold of pass `pass` in `H`'s hold, as its thread runs it (pure but for that
-    /// hold and `watch`): it looks until the hold no longer stands (its `watch`'s answer or the
-    /// re-probe's ended it) or the person's time `ran_out`, `wait`ing between looks
-    /// ([`hold_until_over`]); then `over` runs, and the hold ends with its watch stopped
-    /// ([`end_question_hold`]). How it ended.
-    #[cfg(any(test, not(target_family = "wasm")))]
-    fn run_question_hold<H: HoldIn>(
-        pass: u64,
-        watch: Option<QuestionWatch>,
-        ran_out: impl FnMut() -> bool,
-        wait: impl FnMut(),
-        over: impl FnOnce(),
-    ) -> HoldEnd {
-        let ended = hold_until_over(
-            || {
-                H::held()
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .stands(pass)
-            },
-            ran_out,
-            wait,
-        );
-        over();
-        end_question_hold::<H>(pass, watch);
-        ended
-    }
-
-    /// How a question's hold ended ([`hold_until_over`]).
-    #[cfg(any(test, not(target_family = "wasm")))]
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum HoldEnd {
-        /// The person had [`super::LOCAL_NETWORK_QUESTION_HOLD`] with the question.
-        RanOut,
-        /// Something else ended it first: the question's watch saw it answered, or the re-probe
-        /// heard its answer ([`answer_heard`]).
-        Ended,
-    }
-
-    /// A question's hold's looks (pure but for its readers): at each look, over once the hold no
-    /// longer `stands` (ended elsewhere), else once it `ran_out`, else `wait` and look again.
-    #[cfg(any(test, not(target_family = "wasm")))]
-    fn hold_until_over(
-        mut stands: impl FnMut() -> bool,
-        mut ran_out: impl FnMut() -> bool,
-        mut wait: impl FnMut(),
-    ) -> HoldEnd {
-        loop {
-            if !stands() {
-                return HoldEnd::Ended;
-            }
-            if ran_out() {
-                return HoldEnd::RanOut;
-            }
-            wait();
-        }
-    }
-
-    /// Whether a question's hold has run out at a look at `now`: the person, as the door's
-    /// `present` reader reads them (every look where no door is installed), has had
-    /// [`super::LOCAL_NETWORK_QUESTION_HOLD`] with the question, counted in `waited`.
-    #[cfg(any(test, not(target_family = "wasm")))]
-    fn held_out(waited: &mut Waited, now: Instant, present: Option<&dyn Fn() -> bool>) -> bool {
-        let here = present.is_none_or(|present| present());
-        waited.count(now, here, present.map(|_| PRESENT_GAP)) >= super::LOCAL_NETWORK_QUESTION_HOLD
-    }
-
-    /// `H`'s hold of `pass` is over: stop its question's `watch`, if one reads, before the slot
-    /// goes, then end the hold ([`end_hold`]).
-    #[cfg(any(test, not(target_family = "wasm")))]
-    fn end_question_hold<H: HoldIn>(pass: u64, watch: Option<QuestionWatch>) {
-        if let Some(watch) = watch {
-            (watch.stop)(pass);
-        }
-        end_hold::<H>(pass);
-    }
-
-    /// End `H`'s question hold of `pass`, letting go the slot it still has: its question's watch
-    /// saw the question answered ([`QuestionWatch::start`]), or the hold is over
-    /// ([`end_question_hold`]). A hold of another pass is left alone.
-    #[cfg(any(test, not(target_family = "wasm")))]
-    fn end_hold<H: HoldIn>(pass: u64) {
-        let goes = H::held()
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .end(pass);
-        drop(goes);
-    }
-
-    /// The question about to be raised under the slot `H`'s hold took for pass `pass`
-    /// ([`Asking`]), with its watch, if one reads on.
-    #[cfg(any(test, not(target_family = "wasm")))]
-    struct Question<H: HoldIn> {
-        pass: u64,
-        watch: Option<QuestionWatch>,
-        /// The use asked, and the question's hold runs ([`Self::asked`]).
-        asked: bool,
-        held: std::marker::PhantomData<fn() -> H>,
-    }
-
-    #[cfg(any(test, not(target_family = "wasm")))]
-    impl<H: HoldIn> Question<H> {
-        /// Take `slot` into `H`'s hold, then start `watch`, if there is one, for its pass
-        /// ([`start_watch`]): its first read is in when this returns.
-        fn begin(slot: H::Slot, watch: Option<QuestionWatch>) -> Self {
-            let pass = take_into_hold::<H>(slot);
-            Self {
-                pass,
-                watch: start_watch::<H>(watch, pass),
-                asked: false,
-                held: std::marker::PhantomData,
-            }
-        }
-
-        /// The use asked: hold the question ([`hold_question`]), with `over` run once the hold is
-        /// over.
-        fn asked(mut self, over: impl FnOnce() + Send + 'static) {
-            self.asked = true;
-            hold_question::<H>(self.pass, self.watch, over);
-        }
-    }
-
-    #[cfg(any(test, not(target_family = "wasm")))]
-    impl<H: HoldIn> Drop for Question<H> {
-        /// No use asked: the hold ends at once, its watch stopped and its slot let go.
-        fn drop(&mut self) {
-            if !self.asked {
-                end_question_hold::<H>(self.pass, self.watch);
-            }
-        }
-    }
-
-    /// The question the Commons gate's first LAN use is about to raise by itself once this
-    /// process's first eligible use requested it ([`asking`]): the dialog slot
-    /// the gate took, in the door's hold, with the question's watch started where this process
-    /// installed one. Once the use was made, [`Self::asked`] holds the question as a door pass's
-    /// is held; dropped before that (the use reached no LAN socket, or none came within the gate's
-    /// wait for it), the hold ends at once: the watch stops and the slot goes.
-    #[cfg(not(target_family = "wasm"))]
-    #[must_use = "the slot is held only while this lives, until the use asks"]
-    pub struct Asking(Question<DoorHold>);
-
-    /// The Commons gate's first LAN use is about to raise macOS's Local Network question by
-    /// itself at its first eligible use, under this process's dialog `slot`, which the gate took: take
-    /// the slot into the door's hold and start the question's watch ([`install_question_watch`]),
-    /// as a use through the door does ([`through_the_door`]). With a watch installed, this returns
-    /// once its first read is in, or at most the watch's own wait for it, past which the use asks
-    /// unwatched. Call it right before the use.
-    #[cfg(not(target_family = "wasm"))]
-    pub fn asking(slot: super::MacosDialog) -> Asking {
-        Asking(Question::begin(slot, QUESTION_WATCH.get().copied()))
-    }
-
-    #[cfg(not(target_family = "wasm"))]
-    impl Asking {
-        /// The use was made: the door's hold of its question runs as a door pass's does
-        /// ([`hold_question`]): [`super::LOCAL_NETWORK_QUESTION_HOLD`] of the person's time where a
-        /// door is installed (of the wall clock where none is), ended sooner by the question's
-        /// watch or the re-probe's answer ([`answer_heard`]). `over` runs once the hold is over:
-        /// before the slot goes where the person's time ran out, and after it went where an
-        /// answer ended the hold.
-        pub fn asked(self, over: impl FnOnce() + Send + 'static) {
-            self.0.asked(over);
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::Waited;
-        use std::time::{Duration, Instant};
-
-        /// One test: the hand-over and a use's ask are process-wide, so a second test could see
-        /// this one's. Each tells the setup worker's watcher once, the moment the LAN opens: a
-        /// Secrets join parked on System State's step goes on then.
-        #[test]
-        fn lan_first_use_the_first_hand_over_wins() {
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            static OPENED: AtomicUsize = AtomicUsize::new(0);
-            fn opened() {
-                OPENED.fetch_add(1, Ordering::SeqCst);
-            }
-            super::on_open(opened);
-            assert!(!super::asked(), "nothing asked yet");
-            super::note_asked();
-            assert_eq!(
-                OPENED.load(Ordering::SeqCst),
-                1,
-                "a use asked: the LAN opened"
-            );
-            super::note_asked();
-            assert_eq!(OPENED.load(Ordering::SeqCst), 1, "told once");
-            assert_eq!(super::handed(), None, "nothing handed over yet");
-            super::hand_over(8_401);
-            assert_eq!(super::handed(), Some(8_401));
-            assert_eq!(OPENED.load(Ordering::SeqCst), 2, "the hand-over is told");
-            super::hand_over(8_402);
-            assert_eq!(super::handed(), Some(8_401), "the first hand-over wins");
-            assert_eq!(OPENED.load(Ordering::SeqCst), 2, "and only it is told");
-        }
-
-        /// A use went through the door, which took this process's dialog slot for the question it
-        /// raised. The Secrets stage's join takes it over with its own door pass and returns at
-        /// once (its probe found no vault here, or the join failed fast): the slot goes back to
-        /// the question's hold, which keeps it until the hold runs out, so no System Settings page
-        /// of the walk comes up beside the question. Another use's pass takes nothing, and a slot
-        /// given back once the hold ran out goes at once.
-        #[test]
-        fn a_slot_taken_from_the_door_keeps_the_questions_hold() {
-            struct Slot<'a>(&'a std::cell::Cell<u32>);
-            impl Drop for Slot<'_> {
-                fn drop(&mut self) {
-                    self.0.set(self.0.get() + 1);
-                }
-            }
-            let gone = std::cell::Cell::new(0);
-            let mut hold = super::Hold::new();
-            let (pass, earlier) = hold.start(Slot(&gone));
-            assert!(earlier.is_none());
-            assert!(
-                hold.take(pass.wrapping_add(1)).is_none(),
-                "another use's pass takes nothing"
-            );
-            let joined = hold
-                .take(pass)
-                .expect("the join's own pass takes the slot over");
-            assert!(hold.give_back(pass, joined).is_none());
-            assert_eq!(
-                gone.get(),
-                0,
-                "the join returned at once: the question keeps its hold"
-            );
-            drop(hold.end(pass));
-            assert_eq!(gone.get(), 1, "the question's hold ran out: the slot goes");
-            let (pass, _) = hold.start(Slot(&gone));
-            let joined = hold.take(pass).expect("taken over");
-            assert!(
-                hold.end(pass).is_none(),
-                "the hold ran out while the join held the slot"
-            );
-            drop(hold.give_back(pass, joined));
-            assert_eq!(
-                gone.get(),
-                2,
-                "given back past the hold, the slot goes at once"
-            );
-        }
-
-        /// The door's question hold counts the person's time with the question, as System State's
-        /// step counts its own alert's: hours away count nothing, and it runs out once they have
-        /// had [`super::super::LOCAL_NETWORK_QUESTION_HOLD`] with it. A process with no door
-        /// counts every second.
-        #[test]
-        fn the_doors_question_hold_counts_only_the_persons_time() {
-            let t0 = Instant::now();
-            let at = |seconds: u64| t0 + Duration::from_secs(seconds);
-            let (away, here) = (|| false, || true);
-            let mut waited = Waited::new();
-            assert!(!super::held_out(&mut waited, at(0), Some(&here)));
-            assert!(!super::held_out(&mut waited, at(10), Some(&here)));
-            for seconds in (11..=7_200).step_by(5) {
-                assert!(
-                    !super::held_out(&mut waited, at(seconds), Some(&away)),
-                    "away at {seconds} s: the question keeps its hold"
-                );
-            }
-            assert!(!super::held_out(&mut waited, at(7_205), Some(&here)));
-            assert!(!super::held_out(&mut waited, at(7_220), Some(&here)));
-            assert!(
-                super::held_out(&mut waited, at(7_225), Some(&here)),
-                "ten seconds before the person left and twenty after they came back"
-            );
-            let mut wall = Waited::new();
-            assert!(!super::held_out(&mut wall, at(0), None));
-            assert!(
-                super::held_out(&mut wall, at(30), None),
-                "no door: the wall clock"
-            );
-        }
-
-        /// Another process of this app on this Mac (the vault subscriber) putting macOS's
-        /// question to aterm is read at most every two seconds: uses ask often.
-        #[test]
-        fn another_process_ask_is_read_at_most_every_two_seconds() {
-            let t0 = Instant::now();
-            let mut looked = None;
-            assert!(super::elsewhere_due(&mut looked, t0));
-            assert!(!super::elsewhere_due(
-                &mut looked,
-                t0 + Duration::from_secs(1)
-            ));
-            assert!(super::elsewhere_due(
-                &mut looked,
-                t0 + Duration::from_secs(2)
-            ));
-            assert!(!super::elsewhere_due(
-                &mut looked,
-                t0 + Duration::from_secs(3)
-            ));
-        }
-
-        /// A use with the door's slot `free` or held by another macOS question: whether it went
-        /// through, and whether it noted the ask.
-        fn door(free: bool) -> (bool, bool) {
-            let asked = std::cell::Cell::new(false);
-            let went = super::through_the_door_with(
-                true,
-                || free.then_some(1),
-                |_| (),
-                || asked.set(true),
-                |_, ()| (),
-            )
-            .is_some();
-            (went, asked.get())
-        }
-
-        /// A LAN use waits only while an installed reader says System State's Local Network step
-        /// is still to come, the step has not handed the LAN over, and the wait for it has not run
-        /// out: a process with no reader waits on nothing, and the hand-over opens it whatever the
-        /// reader says.
-        #[test]
-        fn lan_first_use_waits_only_for_a_step_still_to_come() {
-            let to_come = || true;
-            let not_to_come = || false;
-            let waits = |to_come: bool| to_come;
-            let open = || true;
-            assert!(
-                super::may_use_with(true, false, None, waits, open),
-                "no reader: no step waits"
-            );
-            assert!(
-                !super::may_use_with(true, false, Some(&to_come), waits, open),
-                "the step is still to come and asks first"
-            );
-            assert!(super::may_use_with(
-                true,
-                false,
-                Some(&not_to_come),
-                waits,
-                open
-            ));
-            assert!(
-                super::may_use_with(true, true, Some(&to_come), waits, open),
-                "the step handed the LAN over"
-            );
-            assert!(
-                super::may_use_with(true, false, Some(&to_come), |_| false, open),
-                "the wait for the step ran out"
-            );
-        }
-
-        /// A background job has no window door: the first eligible use requests
-        /// macOS access immediately, even with System State behind a terminal tab.
-        #[test]
-        fn the_first_background_lan_use_has_no_artificial_wait() {
-            let to_come = || true;
-            assert!(super::ready_with(None));
-            assert!(super::may_use_with(
-                true,
-                false,
-                Some(&to_come),
-                |_| !super::ready_with(None),
-                || true,
-            ));
-        }
-
-        /// A window's first eligible LAN use (the `_alab._tcp` browse, the
-        /// Secrets stage's join, Tab Control's sweep, the fleet's heartbeat, facts push and
-        /// glance) goes only through the door the Commons gate goes through: never while another
-        /// macOS question of this process holds its dialog slot (the walk's System Settings page,
-        /// the debugger's password dialog, the Command Line Tools' installer), so macOS's Local
-        /// Network question never comes up beside one.
-        #[test]
-        fn a_lan_use_past_the_step_wait_waits_for_another_macos_question() {
-            let to_come = || true;
-            let past = |_| false;
-            assert!(
-                !super::may_use_with(true, false, Some(&to_come), past, || door(false).0),
-                "another macOS question holds the slot: the use waits"
-            );
-            assert_eq!(door(false), (false, false), "and notes no ask");
-            assert!(
-                super::may_use_with(true, false, Some(&to_come), past, || door(true).0),
-                "the slot is free: the use goes"
-            );
-            assert_eq!(
-                door(true),
-                (true, true),
-                "taking the slot and noting the ask"
-            );
-            assert_eq!(
-                super::through_the_door_with(false, || None, |_| (), || {}, |_, ()| ()),
-                Some(None),
-                "no door (the node job): past the wait a use goes as it did, with no pass"
-            );
-        }
-
-        /// A window's first use waits for a person at the Mac in the window's
-        /// quiet moment (keys at rest), as the Commons gate's look does: macOS's question comes up
-        /// with the person there and no key on its way into it.
-        #[test]
-        fn a_first_lan_use_needs_a_person_in_a_quiet_moment() {
-            for (present, quiet, waits) in [
-                (true, true, false),
-                (true, false, true),
-                (false, true, true),
-                (false, false, true),
-            ] {
-                let (now_present, now_quiet) = (move || present, move || quiet);
-                assert_eq!(
-                    super::ready_with(Some((&now_present, &now_quiet))),
-                    !waits,
-                    "present {present}, quiet {quiet}"
-                );
-            }
-        }
-
-        /// One use goes through the door and asks; the others follow its answer, taking no slot
-        /// of their own and raising no question of their own (macOS asks each app once), even
-        /// while the first use's slot is still held.
-        #[test]
-        fn one_use_asks_and_the_others_follow_its_answer() {
-            let to_come = || true;
-            let past = |_| false;
-            let asked = std::cell::Cell::new(false);
-            let slot_free = std::cell::Cell::new(true);
-            let take = || slot_free.replace(false).then_some(1);
-            let first = super::may_use_with(true, asked.get(), Some(&to_come), past, || {
-                super::through_the_door_with(true, take, |_| (), || asked.set(true), |_, ()| ())
-                    .is_some()
-            });
-            assert!(first && asked.get(), "the first use asks under the slot");
-            for use_ in ["browse", "sweep", "heartbeat", "join"] {
-                let taken = std::cell::Cell::new(false);
-                assert!(
-                    super::may_use_with(true, asked.get(), Some(&to_come), past, || {
-                        taken.set(true);
-                        false
-                    }),
-                    "{use_}: follows the first use's answer"
-                );
-                assert!(!taken.get(), "{use_}: no door of its own");
-            }
-        }
-
-        /// A use through the door takes the dialog slot into the door's hold, then starts the
-        /// question's watch for that hold's pass, whose first read is in when it returns, and only
-        /// then notes its ask (after which this and every other use may raise the question), so
-        /// the watch's first read lists only windows up before the question; the hold gets what
-        /// the watch gave (none where its first read was not back in time, so the hold runs its
-        /// bound). A slot another macOS question holds starts no watch and notes no ask.
-        /// NEGATIVE CONTROL: with `asked()` called before `watch(pass)` in
-        /// `through_the_door_with`, the order reads asked before the watch.
-        #[test]
-        fn a_use_through_the_door_watches_its_question_from_before_its_ask() {
-            let order = std::cell::RefCell::new(Vec::new());
-            let went = super::through_the_door_with(
-                true,
-                || {
-                    order.borrow_mut().push("slot");
-                    Some(7)
-                },
-                |pass| {
-                    order.borrow_mut().push("watch");
-                    (pass == 7).then_some("watching")
-                },
-                || order.borrow_mut().push("asked"),
-                |pass, watched| {
-                    order.borrow_mut().push("hold");
-                    (pass, watched)
-                },
-            );
-            assert_eq!(went, Some(Some((7, Some("watching")))));
-            assert_eq!(*order.borrow(), ["slot", "watch", "asked", "hold"]);
-            for (watched, holds) in [(None, None), (Some("watching"), Some("watching"))] {
-                let went =
-                    super::through_the_door_with(true, || Some(8), |_| watched, || {}, |_, w| w);
-                assert_eq!(went, Some(Some(holds)), "the hold gets what the watch gave");
-            }
-            order.borrow_mut().clear();
-            let waits = super::through_the_door_with(
-                true,
-                || {
-                    order.borrow_mut().push("slot");
-                    None
-                },
-                |_| order.borrow_mut().push("watch"),
-                || order.borrow_mut().push("asked"),
-                |_, ()| order.borrow_mut().push("hold"),
-            );
-            assert_eq!(
-                waits, None,
-                "another question holds the slot: the use waits"
-            );
-            assert_eq!(*order.borrow(), ["slot"], "no watch, no ask, no hold");
-        }
-
-        /// The door's hold of a question is over at the first look that finds it ended
-        /// elsewhere (its watch saw the question answered, or the re-probe heard the answer),
-        /// without waiting out the person's time; otherwise once that time ran out. The re-probe's
-        /// answer ends the hold that stands, whichever pass, and lets its slot go; a slot a use
-        /// took over goes when it is given back; with no hold standing it ends nothing. The
-        /// watch's answer ends only its own pass's hold. NEGATIVE CONTROLS: a look that ignores
-        /// `stands` (its check taken out of `hold_until_over`) waits out the person's time; an
-        /// `end_standing` that reads `stood` as true whatever `over` says reads a hold as standing
-        /// after it ran out.
-        #[test]
-        fn the_doors_hold_ends_once_its_question_is_answered() {
-            let looks = std::cell::Cell::new(0);
-            let waits = std::cell::Cell::new(0);
-            let ended = super::hold_until_over(
-                || looks.get() < 2,
-                || {
-                    looks.set(looks.get() + 1);
-                    looks.get() >= 30
-                },
-                || waits.set(waits.get() + 1),
-            );
-            assert_eq!(
-                ended,
-                super::HoldEnd::Ended,
-                "the answer came at the third look"
-            );
-            assert_eq!(
-                (looks.get(), waits.get()),
-                (2, 2),
-                "nothing waited out after it"
-            );
-            looks.set(0);
-            let ran_out = super::hold_until_over(
-                || true,
-                || {
-                    looks.set(looks.get() + 1);
-                    looks.get() >= 30
-                },
-                || {},
-            );
-            assert_eq!(ran_out, super::HoldEnd::RanOut);
-            assert_eq!(looks.get(), 30, "no answer: the person's time");
-
-            struct Slot<'a>(&'a std::cell::Cell<u32>);
-            impl Drop for Slot<'_> {
-                fn drop(&mut self) {
-                    self.0.set(self.0.get() + 1);
-                }
-            }
-            let gone = std::cell::Cell::new(0);
-            let mut hold = super::Hold::new();
-            let (pass, _) = hold.start(Slot(&gone));
-            assert!(hold.stands(pass));
-            assert!(
-                hold.end(pass.wrapping_add(1)).is_none() && hold.stands(pass),
-                "another pass's answer ends nothing"
-            );
-            drop(hold.end(pass));
-            assert_eq!(gone.get(), 1, "the watch saw it answered: the slot goes");
-            assert!(!hold.stands(pass), "and the hold's next look finds it over");
-            let (stood, goes) = hold.end_standing();
-            assert!(
-                !stood && goes.is_none(),
-                "no hold stands: the answer ends nothing"
-            );
-
-            let (pass, _) = hold.start(Slot(&gone));
-            let joined = hold.take(pass).expect("the join takes the slot over");
-            let (stood, goes) = hold.end_standing();
-            assert!(stood && goes.is_none(), "the re-probe heard the answer");
-            assert!(!hold.stands(pass));
-            drop(hold.give_back(pass, joined));
-            assert_eq!(
-                gone.get(),
-                2,
-                "given back once the hold is over, the slot goes"
-            );
-            let (later, _) = hold.start(Slot(&gone));
-            assert!(
-                !hold.stands(pass) && hold.stands(later),
-                "a later pass's hold stands"
-            );
-        }
-
-        /// A question's hold as the door and the Commons gate's ask past the wait run it, on a
-        /// hold of the test's own: the slot is in the hold before the question's watch starts,
-        /// and the `answered` the watch is given ends that pass's hold alone, letting its slot go;
-        /// a watch that does not read on is kept by nothing. The hold's looks end at the first
-        /// that finds the hold ended (by the watch's answer or the re-probe's), or once the
-        /// person's time ran out, and however it ends `over` runs while the hold still has what
-        /// it had, then the watch is stopped by its pass and the slot goes. A question dropped
-        /// before its use asked ends its hold at once, its watch stopped; one whose use asked
-        /// holds on from a thread of its own until its watch's answer. NEGATIVE CONTROLS: an
-        /// `end_question_hold` that does not stop the watch (`(watch.stop)(pass)` taken out)
-        /// leaves the stops unrecorded; a `start_watch` that hands the watch a no-op in place of
-        /// `end_hold::<H>` leaves the hold standing after its answer; a `run_question_hold` whose
-        /// looks ignore whether the hold stands waits out the person's time; a `Question::asked`
-        /// that leaves `asked` false ends the hold as it starts.
-        #[test]
-        fn a_questions_hold_stops_its_watch_and_lets_its_slot_go_however_it_ends() {
-            use super::{HoldEnd, HoldIn, Question, QuestionWatch};
-            use std::sync::Mutex;
-            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-            static GONE: AtomicUsize = AtomicUsize::new(0);
-            struct Slot;
-            impl Drop for Slot {
-                fn drop(&mut self) {
-                    GONE.fetch_add(1, Ordering::SeqCst);
-                }
-            }
-            static TEST_HOLD: Mutex<super::Hold<Slot>> = Mutex::new(super::Hold::new());
-            struct Held;
-            impl HoldIn for Held {
-                type Slot = Slot;
-                fn held() -> &'static Mutex<super::Hold<Slot>> {
-                    &TEST_HOLD
-                }
-            }
-            /// A start: the pass, whether its hold stood then, and the `answered` it was given.
-            type Started = (u64, bool, fn(u64));
-            static READS_ON: AtomicBool = AtomicBool::new(true);
-            static STARTED: Mutex<Vec<Started>> = Mutex::new(Vec::new());
-            static STOPPED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
-            fn start(pass: u64, answered: fn(u64)) -> bool {
-                let stood = TEST_HOLD.lock().unwrap().stands(pass);
-                STARTED.lock().unwrap().push((pass, stood, answered));
-                READS_ON.load(Ordering::SeqCst)
-            }
-            fn stop(pass: u64) {
-                STOPPED.lock().unwrap().push(pass);
-            }
-            const WATCH: QuestionWatch = QuestionWatch { start, stop };
-            let stands = |pass| TEST_HOLD.lock().unwrap().stands(pass);
-            let gone = || GONE.load(Ordering::SeqCst);
-            let started = || *STARTED.lock().unwrap().last().unwrap();
-            let stopped = || STOPPED.lock().unwrap().clone();
-
-            let question = Question::<Held>::begin(Slot, Some(WATCH));
-            let (pass, stood, answered) = started();
-            assert!(
-                pass == question.pass && stood,
-                "the slot is in the hold before its watch starts"
-            );
-            assert!(question.watch.is_some(), "a watch that reads on is kept");
-            answered(pass.wrapping_add(1));
-            assert!(
-                stands(pass) && gone() == 0,
-                "another pass's answer ends nothing"
-            );
-            answered(pass);
-            assert!(
-                !stands(pass) && gone() == 1,
-                "the watch's answer ends its hold and lets the slot go"
-            );
-            drop(question);
-            assert_eq!(
-                stopped(),
-                [pass],
-                "dropped, its watch is stopped by its pass"
-            );
-
-            let question = Question::<Held>::begin(Slot, Some(WATCH));
-            let pass = question.pass;
-            drop(question);
-            assert!(
-                !stands(pass) && gone() == 2 && stopped().ends_with(&[pass]),
-                "dropped before its use asked: the hold ends at once, its watch stopped"
-            );
-
-            READS_ON.store(false, Ordering::SeqCst);
-            let unread = Question::<Held>::begin(Slot, Some(WATCH));
-            assert!(
-                unread.watch.is_none(),
-                "a watch that does not read on is kept by nothing"
-            );
-            let starts = STARTED.lock().unwrap().len();
-            let unwatched = Question::<Held>::begin(Slot, None);
-            assert_eq!(
-                STARTED.lock().unwrap().len(),
-                starts,
-                "no watch: none starts"
-            );
-            drop((unread, unwatched));
-            assert_eq!(gone(), 4);
-            READS_ON.store(true, Ordering::SeqCst);
-
-            let pass = super::take_into_hold::<Held>(Slot);
-            let looks = std::cell::Cell::new(0);
-            let held_at_over = std::cell::Cell::new(None);
-            let ended = super::run_question_hold::<Held>(
-                pass,
-                Some(WATCH),
-                || {
-                    looks.set(looks.get() + 1);
-                    if looks.get() == 2 {
-                        answered(pass);
-                    }
-                    looks.get() >= 30
-                },
-                || {},
-                || held_at_over.set(Some(gone())),
-            );
-            assert_eq!(ended, HoldEnd::Ended, "the watch's answer ended it");
-            assert_eq!(
-                looks.get(),
-                2,
-                "at the look after the answer, not the person's time"
-            );
-            assert_eq!(
-                held_at_over.get(),
-                Some(5),
-                "over ran, the answer having let the slot go"
-            );
-            assert!(stopped().ends_with(&[pass]), "and the watch is stopped");
-
-            let pass = super::take_into_hold::<Held>(Slot);
-            looks.set(0);
-            let ended = super::run_question_hold::<Held>(
-                pass,
-                Some(WATCH),
-                || {
-                    looks.set(looks.get() + 1);
-                    looks.get() >= 3
-                },
-                || {},
-                || held_at_over.set(Some(gone())),
-            );
-            assert_eq!(ended, HoldEnd::RanOut);
-            assert_eq!(
-                held_at_over.get(),
-                Some(5),
-                "over ran with the slot still held"
-            );
-            assert!(
-                !stands(pass) && gone() == 6 && stopped().ends_with(&[pass]),
-                "then the watch is stopped and the slot goes"
-            );
-
-            let pass = super::take_into_hold::<Held>(Slot);
-            let ended = super::run_question_hold::<Held>(
-                pass,
-                Some(WATCH),
-                || {
-                    let (stood, goes) = TEST_HOLD.lock().unwrap().end_standing();
-                    assert!(stood);
-                    drop(goes);
-                    false
-                },
-                || {},
-                || {},
-            );
-            assert_eq!(ended, HoldEnd::Ended, "the re-probe's answer ended it");
-            assert!(gone() == 7 && stopped().ends_with(&[pass]));
-
-            let question = Question::<Held>::begin(Slot, Some(WATCH));
-            let (pass, _, answered) = started();
-            let (over, overs) = std::sync::mpsc::channel();
-            question.asked(move || over.send(()).unwrap());
-            assert!(stands(pass) && gone() == 7, "its use asked: the hold runs");
-            answered(pass);
-            overs
-                .recv_timeout(Duration::from_secs(60))
-                .expect("the hold's thread finds it answered and is over");
-            assert_eq!(gone(), 8);
-        }
-
-        /// With `[swarm] enabled = false` no automatic LAN use goes: not the `_alab._tcp`
-        /// browse, the heartbeat, the glance, the node job's advert, nor Tab Control's sweep,
-        /// whether or not a step is to come, the LAN was handed over or a use asked.
-        #[test]
-        fn swarm_off_holds_the_automatic_lan_uses() {
-            let to_come = || true;
-            let not_to_come = || false;
-            for (handed, reader) in [
-                (false, None),
-                (false, Some(&not_to_come as &dyn Fn() -> bool)),
-                (true, Some(&to_come as &dyn Fn() -> bool)),
-                (false, Some(&to_come as &dyn Fn() -> bool)),
-            ] {
-                assert!(
-                    !super::may_use_with(false, handed, reader, |_| false, || true),
-                    "sharing off holds the use (handed {handed})"
-                );
-                assert!(
-                    super::may_use_with(true, true, reader, |_| false, || true),
-                    "sharing on: the use goes"
-                );
-            }
-        }
     }
 }
 
@@ -2821,25 +1334,6 @@ pub mod access_record {
 
     use super::{Access, AccessOutcome};
 
-    /// The composing application's loaded signing identity, hashed without a path.
-    pub type CodeSubject = [u8; 32];
-
-    static CODE_SUBJECT: std::sync::OnceLock<fn() -> Option<CodeSubject>> =
-        std::sync::OnceLock::new();
-
-    /// Install the process's identity reader. Uncomposed and headless test hosts
-    /// have no identity unless their host injects one; no platform probe runs here.
-    pub fn code_subject_from(read: fn() -> Option<CodeSubject>) {
-        let _ = CODE_SUBJECT.set(read);
-    }
-
-    /// This process's code subject, or unknown. Unknown never matches a kept
-    /// Local Network grant from another process.
-    #[must_use]
-    pub fn code_subject() -> Option<CodeSubject> {
-        CODE_SUBJECT.get().and_then(|read| read())
-    }
-
     /// The file's name inside aterm's state directory.
     pub const FILE: &str = "system-state-access";
 
@@ -2861,7 +1355,7 @@ pub mod access_record {
     }
 
     /// Append one step's outcome for `revision`, keeping the file short: an outcome that is
-    /// already its row's latest in `revision` and its Local Network code subject is not written again. Once it is on disk, the
+    /// already its row's latest in `revision` is not written again. Once it is on disk, the
     /// registered watcher ([`on_append`]) is told.
     ///
     /// # Errors
@@ -2882,18 +1376,7 @@ pub mod access_record {
         outcome: AccessOutcome,
         after_read: impl FnOnce(),
     ) -> std::io::Result<()> {
-        append_for_subject(dir, revision, access, outcome, code_subject(), after_read)
-    }
-
-    pub(super) fn append_for_subject(
-        dir: &Path,
-        revision: u64,
-        access: Access,
-        outcome: AccessOutcome,
-        subject: Option<CodeSubject>,
-        after_read: impl FnOnce(),
-    ) -> std::io::Result<()> {
-        write(dir, revision, access, outcome, subject, after_read)?;
+        write(dir, revision, access, outcome, after_read)?;
         if let Some(appended) = APPENDED.get() {
             appended(revision, access, outcome);
         }
@@ -2905,7 +1388,6 @@ pub mod access_record {
         revision: u64,
         access: Access,
         outcome: AccessOutcome,
-        subject: Option<CodeSubject>,
         after_read: impl FnOnce(),
     ) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
@@ -2920,25 +1402,15 @@ pub mod access_record {
         after_read();
         // Every reader takes the latest applicable line per row, so a repeat (each new process that judges
         // the same step again) adds nothing it reads, and would only push older steps out of
-        // the kept lines: a revision's Local Network step, its first, would be asked again.
+        // the kept lines: a revision's first step would be asked again.
         let latest = previous.lines().rev().find_map(|line| {
             let step = parse_step(line)?;
-            (step.revision == revision
-                && step.access == access
-                && (access != Access::LocalNetwork || step.subject == subject))
-                .then_some(step.outcome)
+            (step.revision == revision && step.access == access).then_some(step.outcome)
         });
         if latest == Some(outcome) {
             return Ok(());
         }
-        let mut line = format!("{revision} {} {}", access.word(), outcome.word());
-        if access == Access::LocalNetwork
-            && let Some(subject) = subject
-        {
-            line.push(' ');
-            line.push_str(&aterm_codec::hex::encode_lower(&subject));
-        }
-        lines.push(line);
+        lines.push(format!("{revision} {} {}", access.word(), outcome.word()));
         let start = lines.len().saturating_sub(KEEP);
         let staging = aterm_tempfile::Builder::new()
             .prefix(".system-state-access-")
@@ -3006,35 +1478,20 @@ pub mod access_record {
         }
     }
 
-    /// Applicable outcomes for `revision`, oldest first. Local Network events
-    /// require a known current code subject matching the recorded subject.
+    /// The outcomes recorded for `revision`, oldest first.
     #[must_use]
     pub fn read(dir: &Path, revision: u64) -> Vec<(Access, AccessOutcome)> {
-        read_for_subject(dir, revision, code_subject())
-    }
-
-    pub(super) fn read_for_subject(
-        dir: &Path,
-        revision: u64,
-        subject: Option<CodeSubject>,
-    ) -> Vec<(Access, AccessOutcome)> {
-        outcomes(
-            &read_record(&dir.join(FILE)).unwrap_or_default(),
-            revision,
-            subject,
-        )
-        .collect()
+        outcomes(&read_record(&dir.join(FILE)).unwrap_or_default(), revision).collect()
     }
 
     /// The outcomes the record's `text` holds for `revision`, oldest first.
     fn outcomes(
         text: &str,
         revision: u64,
-        subject: Option<CodeSubject>,
     ) -> impl DoubleEndedIterator<Item = (Access, AccessOutcome)> + '_ {
         text.lines().filter_map(move |line| {
-            let (at, access, outcome) = parse_line(line, subject)?;
-            (at == revision).then_some((access, outcome))
+            let step = parse_step(line)?;
+            (step.revision == revision).then_some((step.access, step.outcome))
         })
     }
 
@@ -3042,9 +1499,10 @@ pub mod access_record {
         revision: u64,
         access: Access,
         outcome: AccessOutcome,
-        subject: Option<CodeSubject>,
     }
 
+    /// One `<revision> <row> <outcome>` line, or `None` for a line this build does not know: an
+    /// unknown row or outcome (an older or newer aterm's), or more fields than these.
     fn parse_step(line: &str) -> Option<Step> {
         let mut words = line.split_whitespace();
         let at = words
@@ -3054,49 +1512,17 @@ pub mod access_record {
             .ok()?;
         let access = Access::parse(words.next()?)?;
         let outcome = AccessOutcome::parse(words.next()?)?;
-        let subject = match words.next() {
-            Some(encoded) if access == Access::LocalNetwork && encoded.len() == 64 => Some(
-                aterm_codec::hex::decode_vec(encoded.as_bytes())?
-                    .try_into()
-                    .ok()?,
-            ),
-            Some(_) => return None,
-            None => None,
-        };
         words.next().is_none().then_some(Step {
             revision: at,
             access,
             outcome,
-            subject,
         })
-    }
-
-    /// Local Network events require the current loaded identity. Legacy unbound
-    /// events remain in history but cannot establish another application's grant.
-    fn parse_line(
-        line: &str,
-        subject: Option<CodeSubject>,
-    ) -> Option<(u64, Access, AccessOutcome)> {
-        let step = parse_step(line)?;
-        if step.access == Access::LocalNetwork && (subject.is_none() || step.subject != subject) {
-            return None;
-        }
-        Some((step.revision, step.access, step.outcome))
     }
 
     /// The latest outcome recorded for `access` in `revision`.
     #[must_use]
     pub fn latest(dir: &Path, revision: u64, access: Access) -> Option<AccessOutcome> {
-        latest_for_subject(dir, revision, access, code_subject())
-    }
-
-    pub(super) fn latest_for_subject(
-        dir: &Path,
-        revision: u64,
-        access: Access,
-        subject: Option<CodeSubject>,
-    ) -> Option<AccessOutcome> {
-        read_for_subject(dir, revision, subject)
+        read(dir, revision)
             .into_iter()
             .rev()
             .find_map(|(row, outcome)| (row == access).then_some(outcome))
@@ -3104,22 +1530,13 @@ pub mod access_record {
 
     /// The last outcome the record holds for `access` in any revision, revision 0 included: the
     /// file's last line for that row. Read like [`read`], so a line this build does not know (an
-    /// unknown row, outcome or fields) is skipped. Local Network events require
-    /// the current loaded code subject, including when reading an older revision.
+    /// unknown row, outcome or fields) is skipped.
     #[must_use]
     pub fn latest_of_any_revision(dir: &Path, access: Access) -> Option<AccessOutcome> {
-        latest_of_any_revision_for_subject(dir, access, code_subject())
-    }
-
-    fn latest_of_any_revision_for_subject(
-        dir: &Path,
-        access: Access,
-        subject: Option<CodeSubject>,
-    ) -> Option<AccessOutcome> {
         let text = read_record(&dir.join(FILE)).unwrap_or_default();
         text.lines().rev().find_map(|line| {
-            let (_, row, outcome) = parse_line(line, subject)?;
-            (row == access).then_some(outcome)
+            let step = parse_step(line)?;
+            (step.access == access).then_some(step.outcome)
         })
     }
 
@@ -3162,103 +1579,6 @@ pub mod access_record {
         use std::sync::mpsc;
         use std::time::Duration;
 
-        const TEST_SUBJECT: CodeSubject = [0x54; 32];
-
-        fn append(
-            dir: &Path,
-            revision: u64,
-            access: Access,
-            outcome: AccessOutcome,
-        ) -> std::io::Result<()> {
-            append_with(dir, revision, access, outcome, || {})
-        }
-
-        fn append_with(
-            dir: &Path,
-            revision: u64,
-            access: Access,
-            outcome: AccessOutcome,
-            after_read: impl FnOnce(),
-        ) -> std::io::Result<()> {
-            super::append_for_subject(
-                dir,
-                revision,
-                access,
-                outcome,
-                Some(TEST_SUBJECT),
-                after_read,
-            )
-        }
-
-        fn read(dir: &Path, revision: u64) -> Vec<(Access, AccessOutcome)> {
-            super::read_for_subject(dir, revision, Some(TEST_SUBJECT))
-        }
-
-        fn latest(dir: &Path, revision: u64, access: Access) -> Option<AccessOutcome> {
-            super::latest_for_subject(dir, revision, access, Some(TEST_SUBJECT))
-        }
-
-        fn latest_of_any_revision(dir: &Path, access: Access) -> Option<AccessOutcome> {
-            super::latest_of_any_revision_for_subject(dir, access, Some(TEST_SUBJECT))
-        }
-
-        #[test]
-        fn local_network_events_do_not_cross_code_subjects_or_reuse_unbound_grants() {
-            let dir = aterm_tempfile::tempdir().unwrap();
-            let root = dir.path();
-            let release = Some([0x11; 32]);
-            let dev = Some([0x22; 32]);
-            std::fs::write(root.join(FILE), "9 local-network granted\n").unwrap();
-            assert_eq!(super::read_for_subject(root, 9, dev), []);
-            super::append_for_subject(
-                root,
-                9,
-                Access::LocalNetwork,
-                AccessOutcome::Granted,
-                release,
-                || {},
-            )
-            .unwrap();
-            assert_eq!(
-                super::read_for_subject(root, 9, release),
-                [(Access::LocalNetwork, AccessOutcome::Granted)]
-            );
-            assert_eq!(super::read_for_subject(root, 9, dev), []);
-            assert_eq!(super::read_for_subject(root, 9, None), []);
-            super::append_for_subject(
-                root,
-                9,
-                Access::LocalNetwork,
-                AccessOutcome::Triggered,
-                dev,
-                || {},
-            )
-            .unwrap();
-            assert_eq!(
-                super::latest_for_subject(root, 9, Access::LocalNetwork, release),
-                Some(AccessOutcome::Granted)
-            );
-            assert_eq!(
-                super::latest_of_any_revision_for_subject(root, Access::LocalNetwork, dev),
-                Some(AccessOutcome::Triggered)
-            );
-            let before = std::fs::read(root.join(FILE)).unwrap();
-            super::append_for_subject(
-                root,
-                9,
-                Access::LocalNetwork,
-                AccessOutcome::Granted,
-                release,
-                || {},
-            )
-            .unwrap();
-            assert_eq!(
-                std::fs::read(root.join(FILE)).unwrap(),
-                before,
-                "another subject's newer outcome must not defeat deduplication"
-            );
-        }
-
         #[test]
         fn access_record_an_unreadable_history_is_preserved_until_it_can_be_read() {
             let dir = aterm_tempfile::tempdir().unwrap();
@@ -3292,12 +1612,7 @@ pub mod access_record {
                 std::io::ErrorKind::InvalidData
             );
 
-            let result = append(
-                root,
-                revision,
-                Access::LocalNetwork,
-                AccessOutcome::Triggered,
-            );
+            let result = append(root, revision, Access::Accessibility, AccessOutcome::Handed);
             assert_eq!(
                 std::fs::read(&path).unwrap(),
                 unreadable,
@@ -3308,18 +1623,12 @@ pub mod access_record {
             // Repair this test's damaged input, then the same append can succeed
             // while retaining both earlier outcomes and their separate revisions.
             std::fs::write(&path, readable).unwrap();
-            append(
-                root,
-                revision,
-                Access::LocalNetwork,
-                AccessOutcome::Triggered,
-            )
-            .unwrap();
+            append(root, revision, Access::Accessibility, AccessOutcome::Handed).unwrap();
             assert_eq!(
                 read(root, revision),
                 [
                     (Access::DeveloperTools, AccessOutcome::Declined),
-                    (Access::LocalNetwork, AccessOutcome::Triggered),
+                    (Access::Accessibility, AccessOutcome::Handed),
                 ]
             );
             assert_eq!(
@@ -3479,41 +1788,35 @@ pub mod access_record {
             );
         }
 
-        /// The Commons runtime asks whether macOS ever asked aterm about Local Network: the row's
-        /// last line in any revision, revision 0 (an older aterm's legacy run) included, past every
-        /// line this build does not know.
+        /// The latest of any revision is the row's last line in any revision, revision 0 (an older
+        /// aterm's legacy run) included, past every line this build does not know: an older
+        /// aterm's `local-network` row, an older aterm's `triggered` outcome, an unknown outcome,
+        /// extra fields, an unparsed revision.
         #[test]
         fn access_record_the_latest_of_any_revision_reads_every_revision_and_skips_unknown_lines() {
             let dir = aterm_tempfile::tempdir().unwrap();
             let root = dir.path();
-            assert_eq!(latest_of_any_revision(root, Access::LocalNetwork), None);
-            std::fs::write(root.join(FILE), "0 local-network triggered\n").unwrap();
+            assert_eq!(latest_of_any_revision(root, Access::Debugger), None);
+            append(root, 0, Access::Debugger, AccessOutcome::Handed).unwrap();
             assert_eq!(
-                latest_of_any_revision(root, Access::LocalNetwork),
-                None,
-                "an unbound legacy event establishes no current identity's access"
-            );
-            append(root, 0, Access::LocalNetwork, AccessOutcome::Triggered).unwrap();
-            assert_eq!(
-                latest_of_any_revision(root, Access::LocalNetwork),
-                Some(AccessOutcome::Triggered)
+                latest_of_any_revision(root, Access::Debugger),
+                Some(AccessOutcome::Handed)
             );
             std::fs::write(
                 root.join(FILE),
-                format!(
-                    "0 local-network triggered\n\
-                 7 local-network granted {}\n\
+                "0 debugger triggered\n\
+                 7 debugger granted\n\
                  9 full-disk-access handed\n\
-                 12 local-network asked-twice\n\
+                 10 local-network granted 5454545454545454545454545454545454545454545454545454545454545454\n\
+                 11 local-network triggered\n\
+                 12 debugger asked-twice\n\
                  13 bluetooth triggered\n\
-                 14 local-network declined later\n\
-                 not-a-revision local-network declined\n",
-                    aterm_codec::hex::encode_lower(&TEST_SUBJECT)
-                ),
+                 14 debugger declined later\n\
+                 not-a-revision debugger declined\n",
             )
             .unwrap();
             assert_eq!(
-                latest_of_any_revision(root, Access::LocalNetwork),
+                latest_of_any_revision(root, Access::Debugger),
                 Some(AccessOutcome::Granted),
                 "an older revision's line, past another row's and every unknown or newer line"
             );
@@ -3521,11 +1824,16 @@ pub mod access_record {
                 latest_of_any_revision(root, Access::FullDiskAccess),
                 Some(AccessOutcome::Handed)
             );
-            assert_eq!(latest_of_any_revision(root, Access::Debugger), None);
-            append(root, 3, Access::LocalNetwork, AccessOutcome::Triggered).unwrap();
             assert_eq!(
-                latest_of_any_revision(root, Access::LocalNetwork),
-                Some(AccessOutcome::Triggered),
+                read(root, 10),
+                [],
+                "an older aterm's local-network row is skipped"
+            );
+            assert_eq!(latest_of_any_revision(root, Access::Accessibility), None);
+            append(root, 3, Access::Debugger, AccessOutcome::Handed).unwrap();
+            assert_eq!(
+                latest_of_any_revision(root, Access::Debugger),
+                Some(AccessOutcome::Handed),
                 "the file's last line for the row, whatever its revision"
             );
         }
@@ -3919,13 +2227,12 @@ mod tests {
             Standing::Failed,
             Standing::Unknown,
             Standing::NotNeeded,
-            Standing::Untold,
         ] {
             assert_eq!(
                 standing.settled(),
                 matches!(
                     standing,
-                    Standing::InPlace | Standing::AtLogin | Standing::NotNeeded | Standing::Untold
+                    Standing::InPlace | Standing::AtLogin | Standing::NotNeeded
                 )
             );
             assert_eq!(
@@ -3933,7 +2240,7 @@ mod tests {
                 matches!(standing, Standing::NeedsYou | Standing::Failed)
             );
         }
-        let unread = Observation::unknown(Subject::Access(Access::LocalNetwork));
+        let unread = Observation::unknown(Subject::Access(Access::Debugger));
         assert_eq!(unread.now, None);
         assert_eq!(unread.wanted, "On");
     }
@@ -4005,8 +2312,8 @@ mod tests {
                 .count()
         };
         for n in 0..100 {
-            let outcome = [AccessOutcome::Triggered, AccessOutcome::Granted][n % 2];
-            access_record::append(root, 9, Access::LocalNetwork, outcome).unwrap();
+            let outcome = [AccessOutcome::Handed, AccessOutcome::Granted][n % 2];
+            access_record::append(root, 9, Access::Accessibility, outcome).unwrap();
             assert!(lines() <= 64, "{n}");
         }
         assert_eq!(lines(), 64, "the file is kept to its last lines");
@@ -4014,45 +2321,36 @@ mod tests {
 
     /// A step judged again in each new process (a Not now that still holds) repeats its row's
     /// latest outcome: the record keeps it once, so it never pushes the revision's earlier steps,
-    /// Local Network's first, out of the kept lines. A changed outcome is written, a repeat of an
+    /// Accessibility's first, out of the kept lines. A changed outcome is written, a repeat of an
     /// earlier one included, and so is the same outcome in another revision.
     #[test]
     fn the_access_record_does_not_repeat_a_rows_latest_outcome() {
         let dir = aterm_tempfile::tempdir().unwrap();
         let root = dir.path();
-        let subject = Some([0x54; 32]);
         let lines = || {
             std::fs::read_to_string(root.join(access_record::FILE))
                 .unwrap()
                 .lines()
                 .count()
         };
-        access_record::append_for_subject(
-            root,
-            9,
-            Access::LocalNetwork,
-            AccessOutcome::Triggered,
-            subject,
-            || {},
-        )
-        .unwrap();
+        access_record::append(root, 9, Access::Accessibility, AccessOutcome::Handed).unwrap();
         for _ in 0..100 {
             access_record::append(root, 9, Access::FullDiskAccess, AccessOutcome::Declined)
                 .unwrap();
         }
         assert_eq!(lines(), 2);
         assert_eq!(
-            access_record::latest_for_subject(root, 9, Access::LocalNetwork, subject),
-            Some(AccessOutcome::Triggered)
+            access_record::latest(root, 9, Access::Accessibility),
+            Some(AccessOutcome::Handed)
         );
         access_record::append(root, 9, Access::FullDiskAccess, AccessOutcome::Handed).unwrap();
         access_record::append(root, 9, Access::FullDiskAccess, AccessOutcome::Declined).unwrap();
         access_record::append(root, 10, Access::FullDiskAccess, AccessOutcome::Declined).unwrap();
         assert_eq!(lines(), 5);
         assert_eq!(
-            access_record::read_for_subject(root, 9, subject),
+            access_record::read(root, 9),
             vec![
-                (Access::LocalNetwork, AccessOutcome::Triggered),
+                (Access::Accessibility, AccessOutcome::Handed),
                 (Access::FullDiskAccess, AccessOutcome::Declined),
                 (Access::FullDiskAccess, AccessOutcome::Handed),
                 (Access::FullDiskAccess, AccessOutcome::Declined),

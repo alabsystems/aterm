@@ -425,7 +425,15 @@ fn relaunch_held(
     k: &dyn AlabKernel,
 ) -> Report {
     let old = st.pid;
-    if !wait_until(EXIT_WAIT, || !k.alive(old)) {
+    // The TUI is gone once its pid is free or names a process born at another time than
+    // the one this record relaunches (`proc_start`): after a reboot pids are reused, and
+    // waiting on another process's pid would hold the relaunch until it gives up.
+    let born = st.proc_start.clone();
+    let gone = || {
+        !k.alive(old)
+            || super::super::relaunch::gone_by_identity(&born, true, k.birth(old).as_deref())
+    };
+    if !wait_until(EXIT_WAIT, gone) {
         // Never a signal: a later step finds the TUI as it is.
         return said(r, "wait:exiting");
     }

@@ -1586,7 +1586,7 @@ fn setup_status_over(rest: &str, read: &dyn Fn() -> Result<String, String>) -> S
         return "ERR usage: setup status\n".into();
     }
     match read() {
-        Ok(state) => format!("OK schema=1 setup={state}\n"),
+        Ok(state) => format!("OK schema=2 {state}\n"),
         Err(error) => format!("ERR {error}\n"),
     }
 }
@@ -1597,9 +1597,9 @@ fn background_setup_status_only_reads_and_rejects_action_words_before_posting() 
     let reads = std::cell::Cell::new(0);
     let reply = setup_status_over("status", &|| {
         reads.set(reads.get() + 1);
-        Ok("done;offered:lan".into())
+        Ok("setup=done;offered:lan verified=0".into())
     });
-    assert_eq!(reply, "OK schema=1 setup=done;offered:lan\n");
+    assert_eq!(reply, "OK schema=2 setup=done;offered:lan verified=0\n");
     assert_eq!(reads.get(), 1);
     for rest in ["", "start", "on", "status now"] {
         assert!(

@@ -90,6 +90,35 @@ pub fn installed_git_without_atpkg(sys: &dyn System) -> Option<PathBuf> {
         .find(|git| file(git))
 }
 
+/// What a child's `DEVELOPER_DIR` names on a Mac whose `/usr/bin` developer shims would ask a
+/// person to install the tools ([`shims_ask_for_tools`]): a path that cannot exist, under the
+/// empty, root-owned `/var/empty`, so a shim it runs (`python3`, `make`, `clang`, `git`) fails at
+/// once (`xcrun: error: missing DEVELOPER_DIR path: …`, measured on macOS 27.0) instead.
+pub const NO_DEVELOPER_DIR: &str = "/var/empty/aterm-no-developer-tools";
+
+/// Whether macOS's `/usr/bin` developer shims would ask a person to install the Command Line
+/// Tools here, Apple's dialog on their screen, because no developer directory holds the tools:
+/// not the one `xcode-select -s` chose, else neither Xcode's nor the tools' own, as `xcrun`
+/// looks. Never off macOS, which has no shims. Read without a child process.
+#[must_use]
+pub fn shims_ask_for_tools(sys: &dyn System) -> bool {
+    if !sys.macos() {
+        return false;
+    }
+    let holds_tools = |dir: &PathBuf| sys.stat(&dir.join("usr/bin")).is_ok_and(|stat| stat.dir);
+    let chosen = sys
+        .read_link(Path::new(XCODE_SELECT_LINK))
+        .ok()
+        .filter(|dir| dir.is_absolute());
+    match chosen {
+        Some(dir) => !holds_tools(&dir),
+        None => ![XCODE_DEVELOPER, crate::items::developer::CLT_DIR]
+            .into_iter()
+            .map(PathBuf::from)
+            .any(|dir| holds_tools(&dir)),
+    }
+}
+
 /// [`installed_git`] for `user_home`'s store when given, otherwise this process's account.
 /// A named account never borrows another account's managed build; native Git is the fallback.
 #[must_use]
@@ -97,11 +126,28 @@ pub fn installed_git_for(sys: &dyn System, user_home: Option<&Path>) -> Option<P
     installed_git_reading(sys, user_home).map(GitInstallation::program)
 }
 
+/// The admitted Git command and the immutable payload its package selects. They are the
+/// same path for native Git. A managed shim can be repaired without replacing its payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitExecution {
+    /// The command setup actually starts, including a managed package's shim.
+    pub program: PathBuf,
+    /// The selected package payload, or the native executable itself.
+    pub payload: PathBuf,
+}
+
+/// Observe the selected command and payload through the same ordinary admission as
+/// [`installed_git`], without starting a program or granting execution authority.
+#[must_use]
+pub fn installed_git_execution(sys: &dyn System) -> Option<GitExecution> {
+    installed_git_reading(sys, None).map(GitInstallation::execution)
+}
+
 /// The selected Git's admitted executable identity, without starting it. A managed build's
 /// immutable payload path changes when activation replaces the build behind its stable shim.
 #[must_use]
 pub fn installed_git_identity(sys: &dyn System) -> Option<PathBuf> {
-    installed_git_reading(sys, None).map(GitInstallation::identity)
+    installed_git_execution(sys).map(|git| git.payload)
 }
 
 enum GitInstallation {
@@ -116,9 +162,16 @@ impl GitInstallation {
         }
     }
 
-    fn identity(self) -> PathBuf {
+    fn execution(self) -> GitExecution {
         match self {
-            Self::Native(path) | Self::Managed { payload: path, .. } => path,
+            Self::Native(path) => GitExecution {
+                program: path.clone(),
+                payload: path,
+            },
+            Self::Managed { shim, payload } => GitExecution {
+                program: shim,
+                payload,
+            },
         }
     }
 }

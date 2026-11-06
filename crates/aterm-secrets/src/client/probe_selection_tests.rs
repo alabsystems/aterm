@@ -10,7 +10,6 @@ enum Answer {
     Timeout,
     Another,
     Absent,
-    Refused,
     Found(u64, &'static str),
 }
 
@@ -21,7 +20,6 @@ fn answer(answer: Answer) -> crate::Result<ProbeOutcome> {
         Answer::Timeout => Err(Error::new("request deadline exceeded")),
         Answer::Another => Ok(ProbeOutcome::AnotherVault("another signer".into())),
         Answer::Absent => Ok(ProbeOutcome::Absent),
-        Answer::Refused => Err(Error::new(super::LOCAL_NETWORK_REFUSED)),
         Answer::Found(seq, url) => Ok(ProbeOutcome::Found(Probed {
             url: url.into(),
             seq,
@@ -152,21 +150,4 @@ fn every_verified_candidate_competes_and_ties_keep_the_input_order() {
         };
         assert_eq!(found.url, "first", "origin does not break a verified tie");
     }
-}
-
-#[test]
-fn local_network_refusal_is_preserved_unless_a_verified_vault_answered() {
-    use Answer::{Absent, Another, Found, Refused};
-    use Origin::{Default, Discovered};
-
-    for replies in [
-        [(Default, Refused), (Discovered, Another)],
-        [(Default, Another), (Discovered, Refused)],
-        [(Default, Refused), (Discovered, Absent)],
-    ] {
-        let outcome = select(&replies).expect_err("a refusal is not cached as absence");
-        assert!(super::refused_by_local_network(&outcome));
-    }
-    let found = select(&[(Default, Refused), (Discovered, Found(9, "verified"))]);
-    assert!(matches!(found, Ok(ProbeOutcome::Found(_))));
 }

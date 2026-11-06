@@ -1689,10 +1689,6 @@ impl App {
         };
         let mut out: Vec<GridMessage> = Vec::new();
 
-        if let Some(message) = self.presence_a11y_message(wid) {
-            out.push(message);
-        }
-
         let presentation = if self.message_band_rows > 0 {
             Some(self.band_presentation(usize::from(ws.cols)))
         } else {
@@ -1847,7 +1843,6 @@ impl App {
     ) {
         use crate::a11y_tree::ChromeMessage;
         match message {
-            ChromeMessage::PresenceStatus => {}
             ChromeMessage::BandRow0 | ChromeMessage::BandRow1 | ChromeMessage::BandRow2 => {
                 if let Some(id) =
                     self.committed_a11y_message(wid, message.band_row_index(), context)

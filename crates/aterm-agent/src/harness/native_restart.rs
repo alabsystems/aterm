@@ -318,6 +318,9 @@ pub(super) fn begin_completed_rollback(
         return Err("native-completed-target-changed");
     }
     st.pid = observed.registration.vendor.pid;
+    // `exited_at` speaks of the agent `st.pid` named; the rollback's vendor is another one,
+    // whose exit the relaunch still waits on.
+    st.exited_at = 0;
     st.shell = observed.registration.shell.pid;
     let target = command.target.clone();
     begin_plan(

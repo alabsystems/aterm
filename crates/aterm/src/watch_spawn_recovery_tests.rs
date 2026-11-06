@@ -4,7 +4,7 @@
 //! Scratch plans at the common worker, park poll and retiring-watch boundaries.
 
 use super::{
-    AlabWatch, SetupWatch, WatchMaintenance, WatchReservation, maintain_setup_watch_with,
+    AlabWait, AlabWatch, SetupWatch, WatchMaintenance, WatchReservation, maintain_setup_watch_with,
     read_setup_park_mark_with, run_reserved_alab_watch, wait_for_setup_park_change,
     widen_on_alab_signal, with_setup_watch,
 };
@@ -76,7 +76,7 @@ impl AlabWatch for ScratchWatch<'_, '_> {
     fn widens(&mut self) -> Result<bool, String> {
         self.harness.setup.widens()
     }
-    fn wait(&mut self, _: Duration, _: Duration) {}
+    fn wait(&mut self, _: AlabWait, _: Duration) {}
     fn heard(&mut self) -> Result<bool, String> {
         Ok(true)
     }

@@ -34,6 +34,7 @@ fn recorder_discovery_stops_at_the_first_test_header() {
     assert_eq!(
         take_recording_executables(&mut log).expect("readable Cargo prelude"),
         [TestExe {
+            harness: false,
             exe: "/r/target/debug/deps/actual-1".into(),
             flag: "--lib".into(),
             bin_env: Vec::new(),
@@ -62,6 +63,7 @@ fn colored_and_doc_test_headers_keep_the_remaining_bytes_owned_by_the_test() {
         assert_eq!(
             take_recording_executables(&mut log).expect("test JSON is not Cargo metadata"),
             [TestExe {
+                harness: false,
                 exe: "/r/target/debug/deps/actual-1".into(),
                 flag: "--lib".into(),
                 bin_env: Vec::new(),
@@ -119,6 +121,7 @@ fn a_recording_without_a_test_header_still_reads_its_compile_metadata() {
     assert_eq!(
         take_recording_executables(&mut log).expect("complete metadata before failure"),
         [TestExe {
+            harness: false,
             exe: "/r/target/debug/deps/partial-1".into(),
             flag: "--test partial".into(),
             bin_env: Vec::new(),

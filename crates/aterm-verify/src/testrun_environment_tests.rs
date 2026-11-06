@@ -5,6 +5,7 @@ use super::*;
 
 fn binary() -> Binary {
     Binary {
+        harness: false,
         header: "     Running unittests src/lib.rs (/owned/target/deps/fixture)".into(),
         spec: "-p fixture --lib".into(),
         record: Record {
@@ -43,6 +44,7 @@ fn failed(binary: &Binary, chatter: &str, failures: &[(&str, &str)]) -> Run {
     output.push_str(&format!("\ntest result: FAILED. 1 passed; {} failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s\n\n", failures.len()));
     assert!(!output.contains("to rerun pass"));
     Run {
+        stopped_at: None,
         ok: false,
         output,
         code: Some(101),
@@ -106,9 +108,11 @@ fn measured_sample(binary: &Binary, run: &Run) -> (aterm_json::Value, crate::tes
 /// A BINARY'S HISTORY KEEPS ONLY THE RUNS THAT MEASURED IT: one the run's ceiling left no time
 /// to start ([`not_started`]), one something outside it ended (an interrupt that came before it
 /// started, a stuck holder: `spawn_error`) and one that ended as an interrupt was ending the run
-/// keep no sample, each with its event as before; one the ceiling ended mid-run keeps its
-/// sample, a lower bound with its wall and its test count. NEGATIVE CONTROL: the unstarted run
-/// counted as started, and the interrupted one once the run is no longer ending, each keep one.
+/// keep no sample, each with its event as before, and so does one verify stopped at its first red
+/// case (its FAIL event stands); one the ceiling ended mid-run keeps its sample, a lower bound
+/// with its wall and its test count. NEGATIVE CONTROL: the unstarted run counted as started, the
+/// stopped one with no stop, and the interrupted one once the run is no longer ending, each keep
+/// one.
 #[test]
 fn only_a_run_that_measured_its_binary_keeps_a_sample() {
     use std::sync::Arc;
@@ -133,7 +137,19 @@ fn only_a_run_that_measured_its_binary_keeps_a_sample() {
         assert!(sample.is_none(), "{why}: {sample:?}");
     }
 
+    let mut stopped = failed(&binary, "", &[("broke", "assertion failed")]);
+    stopped.stopped_at = Some(crate::libtest_json::Stopped {
+        spec: binary.spec.clone(),
+        case: "broke".to_owned(),
+    });
+    let (event, sample) = event_and_sample(&binary, &stopped, true);
+    assert_eq!(event["outcome"].as_str(), Some("FAIL"));
+    assert!(sample.is_none(), "{sample:?}");
+    stopped.stopped_at = None;
+    assert!(event_and_sample(&binary, &stopped, true).1.is_some());
+
     let ceiling = Run {
+        stopped_at: None,
         ok: false,
         output: format!(
             "{}\n\nrunning 3 tests\ntest slow ... ok\n{} — killed at the ceiling\n",
@@ -318,6 +334,7 @@ fn a_direct_capability_refusal_keeps_its_scope_and_reason() {
 fn an_enospc_abort_retains_the_actual_missing_exit_code() {
     let binary = binary();
     let run = Run {
+        stopped_at: None,
         ok: false,
         output: format!(
             "{}\n\nrunning 1 test\nfatal write error: {}\n",

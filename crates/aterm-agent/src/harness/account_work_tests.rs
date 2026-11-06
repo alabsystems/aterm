@@ -61,7 +61,7 @@ fn stale_epoch_cannot_reopen_a_newer_closed_epoch() {
 fn wrapped_work_retires_real_signin_before_its_count_in_every_disposition() {
     use crate::harness::accounts;
     struct Work {
-        signin: Option<accounts::Lock>,
+        signin: Option<accounts::SigninTurn>,
         path: std::path::PathBuf,
         lifetime: Lifetime,
         witnessed: Arc<Mutex<Option<(usize, bool, bool)>>>,
@@ -121,4 +121,24 @@ fn wrapped_work_retires_real_signin_before_its_count_in_every_disposition() {
                 .is_some()
         );
     }
+}
+
+#[test]
+fn operation_cancellation_is_isolated_and_does_not_own_retirement() {
+    let lifetime = Lifetime::default();
+    let first = lifetime.enter().unwrap();
+    let detached = first.clone();
+    let other = lifetime.enter().unwrap();
+    let cancellation = first.cancellation();
+    cancellation.cancel();
+    assert!(first.cancelled());
+    assert!(detached.cancelled());
+    assert!(!other.cancelled());
+    assert!(!cancellation.retired());
+    drop(first);
+    assert!(!cancellation.retired());
+    drop(detached);
+    assert!(cancellation.retired());
+    assert!(!other.cancelled());
+    assert!(!lifetime.enter().unwrap().cancelled());
 }

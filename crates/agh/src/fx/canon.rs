@@ -6,7 +6,8 @@
 //! responses and wire failures, route decisions, facts, git runs and their answers, streamed
 //! bodies, and credentialed requests with their write bodies.
 
-use std::io::Cursor;
+use std::fmt::Write as _;
+use std::io::{Cursor, Write as _};
 
 #[cfg(any(unix, test))]
 use crate::error::SideEffect;
@@ -147,9 +148,9 @@ const fn role_word(role: OriginRole) -> &'static str {
 }
 
 /// Sorts `query`'s `&`-separated parameters by raw name and value bytes.
-fn sorted_query(query: &str) -> String {
+fn sorted_query(query: &str) -> std::borrow::Cow<'_, str> {
     if !query.contains('&') {
-        return query.to_owned();
+        return std::borrow::Cow::Borrowed(query);
     }
     let mut pairs: Vec<(&str, Option<&str>, &str)> = query
         .split('&')
@@ -170,7 +171,7 @@ fn sorted_query(query: &str) -> String {
         }
         out.push_str(pair);
     }
-    out
+    std::borrow::Cow::Owned(out)
 }
 
 /// The next of a request an anonymous tape cannot hold: every run of it would be refused the same.
@@ -239,13 +240,20 @@ fn head(req: &WireRequest<'_>, endpoints: &Endpoints) -> Result<String> {
     }
     text.push_str("\norigin ");
     text.push_str(role_word(role));
-    let mut headers: Vec<(String, &str)> = req
+    let mut headers: Vec<(std::borrow::Cow<'_, str>, &str)> = req
         .headers
         .iter()
         .filter(|(name, _)| {
             !name.eq_ignore_ascii_case("user-agent") && !door::is_authorization(name)
         })
-        .map(|(name, value)| (name.to_ascii_lowercase(), value.as_str()))
+        .map(|(name, value)| {
+            let lower = if name.bytes().any(|b| b.is_ascii_uppercase()) {
+                std::borrow::Cow::Owned(name.to_ascii_lowercase())
+            } else {
+                std::borrow::Cow::Borrowed(name.as_str())
+            };
+            (lower, value.as_str())
+        })
         .collect();
     headers.sort_by(|a, b| {
         a.0.as_bytes()
@@ -291,13 +299,15 @@ pub fn request_credentialed(req: &WireRequest<'_>, endpoints: &Endpoints) -> Res
         WireBody::Empty => text.push_str("\nbody none"),
         WireBody::Bytes(bytes) => match std::str::from_utf8(bytes) {
             Ok(json) if bytes.len() <= BODY_TAPE_MAX => {
-                text.push_str(&format!("\nbody json {}", bytes.len()));
+                let _ = write!(text, "\nbody json {}", bytes.len());
                 for line in json.split('\n') {
                     text.push('\n');
                     text.push_str(line);
                 }
             }
-            _ => text.push_str(&format!("\nbody {} {}", sha256_of(bytes), bytes.len())),
+            _ => {
+                let _ = write!(text, "\nbody {} {}", sha256_of(bytes), bytes.len());
+            }
         },
         WireBody::Reader { len, .. } => {
             let Some(digest) = req.body_digest else {
@@ -312,7 +322,7 @@ pub fn request_credentialed(req: &WireRequest<'_>, endpoints: &Endpoints) -> Res
                     "run it without --record or --replay: a tape names a file body by its digest",
                 ));
             };
-            text.push_str(&format!("\nbody {digest} {len}"));
+            let _ = write!(text, "\nbody {digest} {len}");
         }
     }
     Ok(text.into_bytes())
@@ -324,24 +334,37 @@ pub fn request_credentialed(req: &WireRequest<'_>, endpoints: &Endpoints) -> Res
 /// joined by `\n`.
 #[must_use]
 pub fn route_request(req: &RouteRequest) -> Vec<u8> {
-    let target = match &req.target {
-        RouteTarget::Repo(slug) => format!("route repo {slug}"),
-        RouteTarget::Owner(owner) => format!("route owner {owner}"),
-        RouteTarget::Unscoped => "route unscoped".to_string(),
-        RouteTarget::Identity => "route identity".to_string(),
-    };
-    let named = match &req.named {
-        Named::Default => "named default".to_string(),
-        Named::Literal(literal) => format!("named literal {}", literal.slug()),
-        Named::Target(name) => format!("named target {name}"),
-    };
-    format!(
-        "{target}\naccess {}\n{named}\nanonymous {}\nas {}",
-        req.access.slug(),
+    let mut out = String::with_capacity(96);
+    match &req.target {
+        RouteTarget::Repo(slug) => {
+            let _ = write!(out, "route repo {slug}");
+        }
+        RouteTarget::Owner(owner) => {
+            out.push_str("route owner ");
+            out.push_str(owner);
+        }
+        RouteTarget::Unscoped => out.push_str("route unscoped"),
+        RouteTarget::Identity => out.push_str("route identity"),
+    }
+    out.push_str("\naccess ");
+    out.push_str(req.access.slug());
+    match &req.named {
+        Named::Default => out.push_str("\nnamed default"),
+        Named::Literal(literal) => {
+            let _ = write!(out, "\nnamed literal {}", literal.slug());
+        }
+        Named::Target(name) => {
+            out.push_str("\nnamed target ");
+            out.push_str(name);
+        }
+    }
+    let _ = write!(
+        out,
+        "\nanonymous {}\nas {}",
         u8::from(req.anonymous),
         req.as_profile.as_deref().unwrap_or("-")
-    )
-    .into_bytes()
+    );
+    out.into_bytes()
 }
 
 /// A routing fact's question (`Fx::fact`): `fact {question} {profile}`, one line.
@@ -436,11 +459,12 @@ pub fn route_reply(decision: &Decision) -> Vec<u8> {
                 one_line(&refusal.next)
             );
             for (step, presence) in &refusal.tried {
-                text.push_str(&format!(
+                let _ = write!(
+                    text,
                     "\ntried {} {}",
                     one_line(step.label()),
                     presence.slug()
-                ));
+                );
             }
             text
         }
@@ -523,6 +547,7 @@ pub fn route_decode(bytes: &[u8]) -> Result<Decision> {
 pub fn git_request(run: &crate::git::GitRun) -> Vec<u8> {
     let slug = &run.slug;
     let text = match &run.op {
+        GitOp::CheckLocal { .. } => format!("git check-local {slug}\nread-only true"),
         GitOp::Mirror { .. } => format!("git clone-mirror {slug}"),
         GitOp::Clone { depth, .. } => match depth {
             Some(depth) => format!("git clone {slug}\ndepth {depth}"),
@@ -536,12 +561,45 @@ pub fn git_request(run: &crate::git::GitRun) -> Vec<u8> {
             anonymous,
             ..
         } => format!("git fetch-ref {slug}\nref {reference}\ninto {into}\nanonymous {anonymous}"),
-        GitOp::LsRemote { reference } => match reference {
-            Some(reference) => format!("git ls-remote {slug}\nref {reference}"),
-            None => format!("git ls-remote {slug}"),
-        },
+        GitOp::FetchBatch {
+            batch, anonymous, ..
+        } => {
+            let mut text = format!("git fetch-batch {slug}\nanonymous {anonymous}");
+            for row in batch.rows() {
+                let _ = write!(
+                    text,
+                    "\nsource {}\ninto {}\nexpected {}",
+                    row.source, row.into, row.expected_oid
+                );
+            }
+            text
+        }
+        GitOp::LsRemote {
+            reference,
+            anonymous,
+        } => {
+            let mut text = match reference {
+                Some(reference) => format!("git ls-remote {slug}\nref {reference}"),
+                None => format!("git ls-remote {slug}"),
+            };
+            if *anonymous {
+                text.push_str("\nanonymous true");
+            }
+            text
+        }
         GitOp::PushDelete { reference, expect } => {
             format!("git push-delete {slug}\nref {reference}\nexpect {expect}")
+        }
+        GitOp::PushRefs { batch, dry_run, .. } => {
+            let mut text = format!("git push-refs {slug}\ndry-run {dry_run}");
+            for update in batch.updates() {
+                let _ = write!(
+                    text,
+                    "\nref {}\nbefore {}\nafter {}",
+                    update.reference, update.before, update.after
+                );
+            }
+            text
         }
     };
     text.into_bytes()
@@ -550,7 +608,7 @@ pub fn git_request(run: &crate::git::GitRun) -> Vec<u8> {
 /// One stream's pieces for `git_reply`: `{name} {n}`, then each piece, shaped.
 fn git_stream(out: &mut Vec<u8>, name: &str, bytes: &[u8]) {
     let count = bytes.iter().filter(|&&b| b == b'\n').count() + 1;
-    out.extend_from_slice(format!("\n{name} {count}").as_bytes());
+    let _ = write!(out, "\n{name} {count}");
     for piece in bytes.split(|&b| b == b'\n') {
         out.push(b'\n');
         out.extend_from_slice(&super::tape::shaped(piece));
@@ -679,7 +737,7 @@ pub(crate) fn stream_reply(
         text.push_str(value);
         text.push('\n');
     }
-    text.push_str(&format!("{BODY_FILE} sha256:{hex} {len}"));
+    let _ = write!(text, "{BODY_FILE} sha256:{hex} {len}");
     text.into_bytes()
 }
 
@@ -752,11 +810,7 @@ pub fn reply(status: u16, headers: &[(String, String)], body: &[u8]) -> Vec<u8> 
         text.push('\n');
     }
     if body.len() > BODY_TAPE_MAX {
-        text.push_str(&format!(
-            "{BODY_DIGEST} {} {}\n\n",
-            sha256_of(body),
-            body.len()
-        ));
+        let _ = write!(text, "{BODY_DIGEST} {} {}\n\n", sha256_of(body), body.len());
         return text.into_bytes();
     }
     text.push('\n');
@@ -1023,6 +1077,65 @@ mod tests {
                 expected,
                 request("/first/checkout", source, into, anonymous)
             );
+        }
+    }
+
+    #[test]
+    fn batch_fetch_identity_binds_the_snapshot_and_auth_mode_without_local_paths() {
+        use crate::git::{FetchBatch, FetchRow, GitRun};
+        let slug = crate::slug::Slug::new("owner", "repo").unwrap();
+        let request = |path: &str, expected: &str, anonymous| {
+            let batch = FetchBatch::new(vec![FetchRow {
+                source: "refs/heads/main".into(),
+                into: "refs/agh/main".into(),
+                expected_oid: expected.into(),
+            }])
+            .unwrap();
+            super::git_request(&GitRun::fetch_batch(
+                &slug,
+                std::path::Path::new(path),
+                batch,
+                anonymous,
+            ))
+        };
+        let expected = "a".repeat(40);
+        let first = request("/one", &expected, true);
+        assert_eq!(first, request("/two", &expected, true));
+        assert_ne!(first, request("/one", &"b".repeat(40), true));
+        assert_ne!(first, request("/one", &expected, false));
+    }
+
+    #[test]
+    fn native_push_identity_binds_each_old_new_ref_and_dry_run_but_not_source_path() {
+        use crate::git::GitRun;
+        use crate::github::refs::{AtomicRefBatch, RefUpdate};
+        let slug = crate::slug::Slug::new("owner", "repo").unwrap();
+        let request = |dir: &str, reference: &str, before: char, after: char, dry| {
+            let batch = AtomicRefBatch::new(vec![RefUpdate {
+                reference: reference.into(),
+                before: before.to_string().repeat(40),
+                after: after.to_string().repeat(40),
+            }])
+            .unwrap();
+            super::git_request(&GitRun::push_refs(
+                &slug,
+                std::path::Path::new(dir),
+                batch,
+                dry,
+            ))
+        };
+        let expected = request("/first", "refs/heads/main", '0', 'a', false);
+        assert_eq!(
+            expected,
+            request("/other", "refs/heads/main", '0', 'a', false)
+        );
+        for (reference, before, after, dry) in [
+            ("refs/tags/v1", '0', 'a', false),
+            ("refs/heads/main", 'b', 'a', false),
+            ("refs/heads/main", '0', 'c', false),
+            ("refs/heads/main", '0', 'a', true),
+        ] {
+            assert_ne!(expected, request("/first", reference, before, after, dry));
         }
     }
 

@@ -24,25 +24,30 @@
 //! [`OWN_SHARE`]: super::OWN_SHARE
 
 use aterm_render::{GlyphRaster, TextLevel};
+use std::sync::Arc;
+
+/// A face's rasters by glyph index ([`aterm_render::GlyphInk::raster_table`]).
+pub(super) type RasterTable = Arc<[Option<GlyphRaster>]>;
 
 /// One cell of a judged letter's neighbourhood (its own cell and the eight round it), as the
 /// letter's ring box meets it.
-#[derive(Clone, Copy)]
-pub(super) enum Neighbour<'a> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Neighbour {
     /// A cell whose pixels the guard knows: its ground, what the frame lays on it under every
     /// light (`base`: the ground, or the cursor trail's fill of the cell, which the clean frame
-    /// does not draw) and, for a lettered cell, its glyph's raster and colour.
+    /// does not draw) and, for a lettered cell, its glyph's index in the face's table and its
+    /// colour.
     Known {
         ground: u32,
         base: u32,
-        glyph: Option<(&'a GlyphRaster, u32)>,
+        glyph: Option<(u8, u32)>,
     },
     /// A cell whose pixels it does not (a glyph the face's table holds no raster for, a slanted
     /// or decorated one, a block caret's fill): no pixel of it reads as the letter's ground.
     Opaque,
 }
 
-/// A ring box's frame pixel, read by [`RingCell::reading`].
+/// A ring box's frame pixel, read by [`RingCell::holds`].
 pub(super) trait FramePx {
     /// The frame's colour at box pixel `k`.
     fn at(&self, k: usize) -> u32;
@@ -87,95 +92,233 @@ impl Levels {
     }
 }
 
-/// One lettered cell read as the judge reads it ([`self`]): its ring box's clean pixels, its solid
-/// ink and each solid pixel's ring.
-pub(super) struct RingCell {
-    /// The ring box's size, px.
-    w: usize,
-    h: usize,
-    /// The clean frame's colour per box pixel (meaningless where [`Self::opaque`]), and the
-    /// frame's ground under every light ([`Neighbour::Known`]'s `base`).
-    clean: Vec<u32>,
-    base: Vec<u32>,
-    opaque: Vec<bool>,
-    /// Per box pixel, whether the clean frame shows the letter's ground there.
-    ground: Vec<bool>,
-    /// Per box pixel, whether a glyph lays text there; and each glyph's text, in the renderer's
-    /// draw order: the box pixel and its level.
-    has_text: Vec<bool>,
-    text: Vec<(u32, TextLevel)>,
+/// The most pixels one solid pixel's ring reads: the Chebyshev ring [`super::RING`] px out.
+const RING_MOST: usize = 8 * super::RING as usize;
+
+/// Everything [`RingCell::read`] reads a neighbourhood from, and so all a [`RingRead`] depends on
+/// but the face's table, which [`RingCell::reads`] are kept for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ReadKey {
+    /// The ring box's size, the cell's size, the ring, px.
+    sizes: [u32; 5],
+    corrected: bool,
+    cells: [Neighbour; 9],
+}
+
+impl ReadKey {
+    /// The slot of [`RingCell::reads`] this key lies in, the first of its [`READ_WAYS`].
+    fn slot(&self) -> usize {
+        let mut h = u64::from(self.corrected);
+        for v in self.sizes {
+            h = super::fold(h, u64::from(v));
+        }
+        for cell in &self.cells {
+            let (a, b) = match *cell {
+                Neighbour::Opaque => (u64::MAX, u64::MAX),
+                Neighbour::Known {
+                    ground,
+                    base,
+                    glyph,
+                } => (
+                    u64::from(ground) | u64::from(base) << 32,
+                    glyph.map_or(u64::MAX, |(i, fg)| u64::from(i) | u64::from(fg) << 8),
+                ),
+            };
+            h = super::fold(super::fold(h, a), b);
+        }
+        ((h ^ (h >> 32)) as usize % (READ_SLOTS / READ_WAYS)) * READ_WAYS
+    }
+}
+
+/// How many neighbourhoods a [`RingCell`] keeps read, in sets of [`READ_WAYS`]. A letter stands in
+/// the same neighbourhood frame after frame while the lights over it move, and a line's letters
+/// share many, so a trail's cells are read from these; at this many a neighbourhood that does not
+/// fit is read again, as all were. The bound is in reads and a read's size follows its cell's
+/// pixels, so the bytes follow the font: holding 107 to 118 reads of a typed Fire replay, DejaVu
+/// Sans Mono, it retained 0.16 MB at 16 px, 0.34 MB at 22 px, 1.31 MB at 48 px and 3.81 MB at 144 px
+/// (2026-11-05; the slots counted, an allocator's overhead not), until the face's table changes or
+/// its guard goes.
+const READ_SLOTS: usize = 128;
+/// How many of [`READ_SLOTS`] one key can lie in, the latest read first.
+const READ_WAYS: usize = 4;
+
+/// One neighbourhood as the judge reads it ([`self`]): what its letter's readings take from it,
+/// whichever frame's lights lie over it, wherever on the page it stands. Kept for as long as
+/// [`RingCell::reads`] holds it, so its lists hold no room to grow.
+struct RingRead {
+    /// The text its glyphs lay on the pixels a reading reads, in the renderer's draw order: the
+    /// box pixel and its level.
+    text: Box<[(u32, TextLevel)]>,
+    /// The pixels a reading reads, each once and in order, where a glyph lays text: the box
+    /// pixel, the frame's ground under every light there ([`Neighbour::Known`]'s `base`), and
+    /// that with the text laid on it.
+    text_px: Box<[(u32, u32, u32)]>,
+    /// The pixels a reading reads where no glyph lays text: the box pixel, and the frame's ground
+    /// under every light there.
+    plain_px: Box<[(u32, u32)]>,
     /// The solid ink pixels, row-major: each box pixel, its row, and where its ring starts in
     /// [`Self::rings`] (`ring_at[i] .. ring_at[i + 1]`).
-    solid: Vec<(u32, u32)>,
-    ring_at: Vec<u32>,
-    rings: Vec<u32>,
+    solid: Box<[(u32, u32)]>,
+    ring_at: Box<[u32]>,
+    rings: Box<[u32]>,
     /// The letter's own reading (the judge on the clean frame); infinite where no solid pixel has
     /// ground within the ring.
-    pub(super) own: f32,
+    own: f32,
     /// The least luminance of the clean solid ink.
-    pub(super) l_min: f32,
+    l_min: f32,
     /// Whether some ring pixel holds text (a glyph's faint rim that rounds to the ground).
+    ring_text: bool,
+    /// Whether some box pixel's colour on the clean frame is not what the frame lays there under
+    /// every light: a cursor trail's fill, or a glyph's ink.
+    filled: bool,
+}
+
+impl RingRead {
+    /// The read of a neighbourhood whose own cell the guard does not know: nothing to read.
+    fn nothing() -> Self {
+        Self {
+            text: Box::default(),
+            text_px: Box::default(),
+            plain_px: Box::default(),
+            solid: Box::default(),
+            ring_at: Box::new([0]),
+            rings: Box::default(),
+            own: f32::INFINITY,
+            l_min: f32::INFINITY,
+            ring_text: false,
+            filled: false,
+        }
+    }
+}
+
+/// One lettered cell read as the judge reads it ([`self`]): the read of its neighbourhood, and the
+/// neighbourhoods kept read for the next.
+pub(super) struct RingCell {
+    /// The neighbourhood last read. [`Self::read`] comes first.
+    current: Option<Arc<RingRead>>,
+    /// The table every kept read's glyphs were read from: a read is only as good as its rasters,
+    /// so another table starts them over.
+    table: Option<RasterTable>,
+    /// The neighbourhoods kept read, [`READ_SLOTS`] of them once one is, each in one of the
+    /// [`READ_WAYS`] its key names ([`ReadKey::slot`]), those the latest read first.
+    reads: Vec<Option<(ReadKey, Arc<RingRead>)>>,
+    /// The letter's own reading, as the read last read holds it.
+    pub(super) own: f32,
+    /// The least luminance of its clean solid ink.
+    pub(super) l_min: f32,
+    /// Whether some ring pixel holds text.
     pub(super) ring_text: bool,
-    /// Scratch: a ring's colours per channel, a row's ratios.
-    chan: [Vec<u8>; 3],
+    /// Scratch of a read: the clean frame's colour per box pixel (meaningless where
+    /// [`Self::opaque`]), whether the guard knows a box pixel, whether the clean frame shows the
+    /// letter's ground there, and whether a glyph lays text there.
+    clean: Vec<u32>,
+    opaque: Vec<bool>,
+    ground: Vec<bool>,
+    has_text: Vec<bool>,
+    /// Scratch: a row's ratios.
     ratios: Vec<f32>,
     levels: Levels,
+    /// A test's count of the neighbourhoods read anew, not taken from [`Self::reads`].
+    #[cfg(test)]
+    pub(super) anew: usize,
 }
 
 impl RingCell {
     pub(super) const EMPTY: Self = Self {
-        w: 0,
-        h: 0,
-        clean: Vec::new(),
-        base: Vec::new(),
-        opaque: Vec::new(),
-        ground: Vec::new(),
-        has_text: Vec::new(),
-        text: Vec::new(),
-        solid: Vec::new(),
-        ring_at: Vec::new(),
-        rings: Vec::new(),
+        current: None,
+        table: None,
+        reads: Vec::new(),
         own: f32::INFINITY,
         l_min: f32::INFINITY,
         ring_text: false,
-        chan: [Vec::new(), Vec::new(), Vec::new()],
+        clean: Vec::new(),
+        opaque: Vec::new(),
+        ground: Vec::new(),
+        has_text: Vec::new(),
         ratios: Vec::new(),
         levels: Levels {
             ways: Vec::new(),
             next: 0,
         },
+        #[cfg(test)]
+        anew: 0,
     };
 
     /// Read the cell whose ring box is `w` x `h` px, its cell `cw` x `ch` px at `(ring, ring)` in
     /// it, from its neighbourhood `cells` (row by row from the row above, each row left to right:
-    /// the renderer's draw order), its own at `cells[4]`, and the renderer's blend (`corrected`).
+    /// the renderer's draw order), its own at `cells[4]`, their glyphs from the face's `table`,
+    /// and the renderer's blend (`corrected`). A neighbourhood read before from this table is
+    /// taken as it was read: a read depends on nothing else.
     pub(super) fn read(
         &mut self,
         (w, h): (usize, usize),
         (cw, ch): (usize, usize),
         ring: usize,
-        cells: &[Neighbour<'_>; 9],
-        corrected: bool,
+        cells: &[Neighbour; 9],
+        (table, corrected): (&RasterTable, bool),
     ) {
-        let table = crate::color_math::relative_luminance_table();
-        let lum = |c: u32| crate::color_math::relative_luminance_with(table, c);
+        if !self.table.as_ref().is_some_and(|t| Arc::ptr_eq(t, table)) {
+            self.reads.clear();
+            self.table = Some(Arc::clone(table));
+        }
+        if self.reads.is_empty() {
+            self.reads.resize_with(READ_SLOTS, || None);
+        }
+        let key = ReadKey {
+            sizes: [w, h, cw, ch, ring].map(|v| u32::try_from(v).unwrap_or(u32::MAX)),
+            corrected,
+            cells: *cells,
+        };
+        let slot = key.slot();
+        let held = self.reads[slot..slot + READ_WAYS]
+            .iter()
+            .position(|way| way.as_ref().is_some_and(|(k, _)| *k == key));
+        let read = match held {
+            Some(way) => {
+                self.reads[slot..=slot + way].rotate_right(1);
+                self.reads[slot].as_ref().map(|(_, read)| Arc::clone(read))
+            }
+            None => None,
+        };
+        let read = read.unwrap_or_else(|| {
+            let read = Arc::new(self.read_anew((w, h), (cw, ch), ring, cells, table, corrected));
+            self.reads[slot..slot + READ_WAYS].rotate_right(1);
+            self.reads[slot] = Some((key, Arc::clone(&read)));
+            read
+        });
+        (self.own, self.l_min, self.ring_text) = (read.own, read.l_min, read.ring_text);
+        self.current = Some(read);
+    }
+
+    /// [`Self::read`]'s work.
+    fn read_anew(
+        &mut self,
+        (w, h): (usize, usize),
+        (cw, ch): (usize, usize),
+        ring: usize,
+        cells: &[Neighbour; 9],
+        table: &RasterTable,
+        corrected: bool,
+    ) -> RingRead {
+        #[cfg(test)]
+        {
+            self.anew += 1;
+        }
+        let lums = crate::color_math::relative_luminance_table();
+        let lum = |c: u32| crate::color_math::relative_luminance_with(lums, c);
         let ratio = |a: f32, b: f32| (a.max(b) + 0.05) / (a.min(b) + 0.05);
         let Neighbour::Known { ground, .. } = cells[4] else {
-            self.own = f32::INFINITY;
-            self.solid.clear();
-            return;
+            return RingRead::nothing();
         };
-        (self.w, self.h) = (w, h);
         let n = w * h;
+        let mut base = vec![ground; n];
         self.clean.clear();
         self.clean.resize(n, ground);
-        self.base.clear();
-        self.base.resize(n, ground);
         self.opaque.clear();
         self.opaque.resize(n, false);
         self.has_text.clear();
         self.has_text.resize(n, false);
-        self.text.clear();
+        let mut text = Vec::new();
         // Which neighbour a box pixel lies in, along one axis.
         let side = |v: usize, cell: usize| -> usize {
             if v < ring {
@@ -191,8 +334,8 @@ impl RingCell {
                 let k = y * w + x;
                 match cells[side(y, ch) * 3 + side(x, cw)] {
                     Neighbour::Known {
-                        ground: g, base, ..
-                    } => (self.clean[k], self.base[k]) = (g, base),
+                        ground: g, base: b, ..
+                    } => (self.clean[k], base[k]) = (g, b),
                     Neighbour::Opaque => self.opaque[k] = true,
                 }
             }
@@ -201,10 +344,13 @@ impl RingCell {
         for (i, cell) in cells.iter().enumerate() {
             let Neighbour::Known {
                 ground: g,
-                glyph: Some((raster, fg)),
+                glyph: Some((glyph, fg)),
                 ..
             } = *cell
             else {
+                continue;
+            };
+            let Some(raster) = table.get(usize::from(glyph)).and_then(Option::as_ref) else {
                 continue;
             };
             // The cell's top left in the box.
@@ -227,7 +373,7 @@ impl RingCell {
                     let level = self.levels.level_at(way, cov);
                     self.clean[k] = level.over(self.clean[k]);
                     self.has_text[k] = true;
-                    self.text.push((k as u32, level));
+                    text.push((k as u32, level));
                 }
             }
         }
@@ -237,7 +383,7 @@ impl RingCell {
         // The cell's extreme and its solid ink.
         let l_g = lum(ground);
         // The cell's own pixels in the box, row-major, each clean pixel's luminance read once
-        // (into `ratios`, which [`Self::reading`] clears before it reads its own).
+        // (into `ratios`, which [`Self::read_until`] clears before it reads its own).
         let (x_end, y_end) = ((ring + cw).min(w), (ring + ch).min(h));
         self.ratios.clear();
         let mut extreme = 1.0f32;
@@ -251,11 +397,9 @@ impl RingCell {
             }
         }
         let solid_at = super::SOLID_SHARE * extreme;
-        self.solid.clear();
-        self.ring_at.clear();
-        self.rings.clear();
-        self.ring_text = false;
-        self.l_min = f32::INFINITY;
+        let (mut solid, mut ring_at, mut rings) = (Vec::new(), Vec::new(), Vec::<u32>::new());
+        let mut ring_text = false;
+        let mut l_min = f32::INFINITY;
         let mut li = 0;
         for y in ring..y_end {
             for x in ring..x_end {
@@ -269,7 +413,7 @@ impl RingCell {
                     continue;
                 }
                 let (x, y) = (x as i64, y as i64);
-                let from = self.rings.len();
+                let from = rings.len();
                 for d in 1..=super::RING as i64 {
                     // The Chebyshev ring at `d`, row-major: its top and bottom rows whole, its
                     // two sides between.
@@ -285,100 +429,206 @@ impl RingCell {
                             if xx >= 0 && xx < w as i64 {
                                 let kk = yy as usize * w + xx as usize;
                                 if self.ground[kk] {
-                                    self.rings.push(kk as u32);
-                                    self.ring_text |= self.has_text[kk];
+                                    rings.push(kk as u32);
+                                    ring_text |= self.has_text[kk];
                                 }
                             }
                             dx += if edge { 1 } else { 2 * d };
                         }
                     }
-                    if self.rings.len() > from {
+                    if rings.len() > from {
                         break;
                     }
                 }
-                if self.rings.len() == from {
+                if rings.len() == from {
                     continue;
                 }
-                self.ring_at.push(from as u32);
-                self.solid.push((k as u32, y as u32));
-                self.l_min = self.l_min.min(lk);
+                ring_at.push(from as u32);
+                solid.push((k as u32, y as u32));
+                l_min = l_min.min(lk);
             }
         }
-        self.ring_at.push(self.rings.len() as u32);
+        ring_at.push(rings.len() as u32);
         // Its own reading: every ring on the clean frame is the ground itself.
-        struct Clean<'a>(&'a [u32]);
-        impl FramePx for Clean<'_> {
-            fn at(&self, k: usize) -> u32 {
-                self.0[k]
-            }
-        }
-        let clean = std::mem::take(&mut self.clean);
-        self.own = self.reading(&Clean(&clean));
-        self.clean = clean;
-    }
-
-    /// The text this cell's neighbourhood lays, in draw order: each box pixel and its level.
-    pub(super) fn text(&self) -> &[(u32, TextLevel)] {
-        &self.text
-    }
-
-    /// The frame's ground under every light, per box pixel ([`Neighbour::Known`]'s `base`).
-    pub(super) fn base(&self) -> &[u32] {
-        &self.base
-    }
-
-    /// Whether some box pixel's ground under the lights is not the cell's clean ground (a cursor
-    /// trail's fill).
-    pub(super) fn filled(&self) -> bool {
-        self.base
+        let own = Self::read_until(
+            (&solid, &ring_at, &rings),
+            &Clean(&self.clean),
+            f32::NEG_INFINITY,
+            &mut self.ratios,
+        );
+        let filled = base
             .iter()
             .zip(&self.clean)
             .zip(&self.opaque)
-            .any(|((b, c), o)| !o && b != c)
+            .any(|((b, c), o)| !o && b != c);
+        // What a reading reads: the solid ink and its rings, each pixel once.
+        let mut is_read = vec![false; n];
+        for &k in solid.iter().map(|(k, _)| k).chain(&rings) {
+            is_read[k as usize] = true;
+        }
+        text.retain(|&(k, _)| is_read[k as usize]);
+        let mut on_base = base.clone();
+        for &(k, level) in &text {
+            let k = k as usize;
+            on_base[k] = level.over(on_base[k]);
+        }
+        let (mut text_px, mut plain_px) = (Vec::new(), Vec::new());
+        for k in (0..n).filter(|&k| is_read[k]) {
+            if self.has_text[k] {
+                text_px.push((k as u32, base[k], on_base[k]));
+            } else {
+                plain_px.push((k as u32, base[k]));
+            }
+        }
+        RingRead {
+            text: text.into_boxed_slice(),
+            text_px: text_px.into_boxed_slice(),
+            plain_px: plain_px.into_boxed_slice(),
+            solid: solid.into_boxed_slice(),
+            ring_at: ring_at.into_boxed_slice(),
+            rings: rings.into_boxed_slice(),
+            own,
+            l_min,
+            ring_text,
+            filled,
+        }
     }
 
-    /// Whether a glyph lays text on box pixel `k`.
-    pub(super) fn has_text(&self, k: usize) -> bool {
-        self.has_text[k]
+    /// A test's list of the pixels a reading reads: the solid ink, then each ring.
+    #[cfg(test)]
+    pub(super) fn read_pixels(&self) -> Vec<usize> {
+        let read = self.current();
+        read.solid
+            .iter()
+            .map(|&(k, _)| k)
+            .chain(read.rings.iter().copied())
+            .map(|k| k as usize)
+            .collect()
+    }
+
+    /// The neighbourhood last read.
+    fn current(&self) -> &RingRead {
+        self.current.as_deref().expect("a cell is read first")
+    }
+
+    /// The text this cell's neighbourhood lays on the pixels a reading reads, in draw order: each
+    /// box pixel and its level.
+    pub(super) fn text(&self) -> &[(u32, TextLevel)] {
+        &self.current().text
+    }
+
+    /// The pixels a reading reads where a glyph lays text: each box pixel, the frame's ground
+    /// under every light there, and that with the text laid on it.
+    pub(super) fn text_px(&self) -> &[(u32, u32, u32)] {
+        &self.current().text_px
+    }
+
+    /// The pixels a reading reads where no glyph lays text: each box pixel, and the frame's
+    /// ground under every light there.
+    pub(super) fn plain_px(&self) -> &[(u32, u32)] {
+        &self.current().plain_px
+    }
+
+    /// Whether some box pixel's colour on the clean frame is not what the frame lays there under
+    /// every light: a cursor trail's fill, or a glyph's ink.
+    pub(super) fn filled(&self) -> bool {
+        self.current().filled
     }
 
     /// The letter's reading on frame `px`: each solid ink pixel against its ring's channel
     /// medians, each pixel row's lower median, the worst row (infinite with no solid pixel).
+    #[cfg(test)]
     pub(super) fn reading(&mut self, px: &impl FramePx) -> f32 {
+        self.read_under(px, f32::NEG_INFINITY)
+    }
+
+    /// Whether the letter's reading on frame `px` (each solid ink pixel against its ring's channel
+    /// medians, each pixel row's lower median, the worst row, infinite with no solid pixel) is at
+    /// least `bar`: the first row under it settles that.
+    pub(super) fn holds(&mut self, px: &impl FramePx, bar: f32) -> bool {
+        self.read_under(px, bar) >= bar
+    }
+
+    fn read_under(&mut self, px: &impl FramePx, stop: f32) -> f32 {
+        let read = self.current.as_deref().expect("a cell is read first");
+        Self::read_until(
+            (&read.solid, &read.ring_at, &read.rings),
+            px,
+            stop,
+            &mut self.ratios,
+        )
+    }
+
+    /// The reading of solid ink `solid` and its rings `(ring_at, rings)` on frame `px`, or the
+    /// first row's worst so far once it falls under `stop`.
+    fn read_until(
+        (solid, ring_at, rings): (&[(u32, u32)], &[u32], &[u32]),
+        px: &impl FramePx,
+        stop: f32,
+        ratios: &mut Vec<f32>,
+    ) -> f32 {
         let table = crate::color_math::relative_luminance_table();
         let lum = |c: u32| crate::color_math::relative_luminance_with(table, c);
         let mut worst = f32::INFINITY;
+        // A stroke's pixels are mostly one colour over one ring colour: the last pair's ratio
+        // stands for the next.
+        let mut last = (u32::MAX, u32::MAX, 0.0f32);
         let mut i = 0;
-        while i < self.solid.len() {
-            let row = self.solid[i].1;
-            self.ratios.clear();
-            while i < self.solid.len() && self.solid[i].1 == row {
-                let (k, _) = self.solid[i];
-                let ring = &self.rings[self.ring_at[i] as usize..self.ring_at[i + 1] as usize];
-                for c in &mut self.chan {
-                    c.clear();
+        while i < solid.len() {
+            let row = solid[i].1;
+            ratios.clear();
+            while i < solid.len() && solid[i].1 == row {
+                let ring = &rings[ring_at[i] as usize..ring_at[i + 1] as usize];
+                let g = ring_median(ring, px);
+                let p = px.at(solid[i].0 as usize) & 0x00FF_FFFF;
+                if (p, g) != (last.0, last.1) {
+                    let (li, lg) = (lum(p), lum(g));
+                    last = (p, g, (li.max(lg) + 0.05) / (li.min(lg) + 0.05));
                 }
-                for &kk in ring {
-                    let v = px.at(kk as usize);
-                    self.chan[0].push((v >> 16) as u8);
-                    self.chan[1].push((v >> 8) as u8);
-                    self.chan[2].push(v as u8);
-                }
-                // Each channel's median, the upper one of an even count (the judges').
-                let mut g = 0u32;
-                for (c, sh) in self.chan.iter_mut().zip([16u32, 8, 0]) {
-                    let mid = c.len() / 2;
-                    g |= u32::from(*c.select_nth_unstable(mid).1) << sh;
-                }
-                let (li, lg) = (lum(px.at(k as usize) & 0x00FF_FFFF), lum(g));
-                self.ratios.push((li.max(lg) + 0.05) / (li.min(lg) + 0.05));
+                ratios.push(last.2);
                 i += 1;
             }
-            let mid = (self.ratios.len() - 1) / 2;
-            worst = worst.min(*self.ratios.select_nth_unstable_by(mid, f32::total_cmp).1);
+            let mid = (ratios.len() - 1) / 2;
+            worst = worst.min(*ratios.select_nth_unstable_by(mid, f32::total_cmp).1);
+            if worst < stop {
+                return worst;
+            }
         }
         worst
     }
+}
+
+/// A clean frame's pixels, for a neighbourhood's own reading.
+struct Clean<'a>(&'a [u32]);
+
+impl FramePx for Clean<'_> {
+    fn at(&self, k: usize) -> u32 {
+        self.0[k]
+    }
+}
+
+/// Each channel's median, the upper one of an even count (the judges'), of a ring's pixels on
+/// frame `px`; a ring of one colour is that colour.
+#[inline]
+fn ring_median(ring: &[u32], px: &impl FramePx) -> u32 {
+    let first = px.at(ring[0] as usize) & 0x00FF_FFFF;
+    let mut chan = [[0u8; RING_MOST]; 3];
+    let mut uniform = true;
+    for (i, &k) in ring.iter().enumerate() {
+        let v = px.at(k as usize);
+        uniform &= v & 0x00FF_FFFF == first;
+        chan[0][i] = (v >> 16) as u8;
+        chan[1][i] = (v >> 8) as u8;
+        chan[2][i] = v as u8;
+    }
+    if uniform {
+        return first;
+    }
+    let (n, mut g) = (ring.len(), 0u32);
+    for (c, sh) in chan.iter_mut().zip([16u32, 8, 0]) {
+        g |= u32::from(*c[..n].select_nth_unstable(n / 2).1) << sh;
+    }
+    g
 }
 
 #[cfg(test)]
@@ -445,6 +695,242 @@ mod tests {
         worst
     }
 
+    /// Every part of `kept`'s read and `fresh`'s, a reading of each on a frame, and where
+    /// [`RingCell::holds`] stands either side of it.
+    fn same_read(kept: &mut RingCell, fresh: &mut RingCell, frame: &[u32], what: &str) {
+        let (k, f) = (kept.current(), fresh.current());
+        assert_eq!(k.text, f.text, "{what}: its text");
+        assert_eq!(k.text_px, f.text_px, "{what}: its text pixels");
+        assert_eq!(k.plain_px, f.plain_px, "{what}: its plain pixels");
+        assert_eq!(k.solid, f.solid, "{what}: its solid ink");
+        assert_eq!(k.ring_at, f.ring_at, "{what}: its rings' starts");
+        assert_eq!(k.rings, f.rings, "{what}: its rings");
+        assert_eq!(k.filled, f.filled, "{what}: whether it is filled");
+        for (a, b, part) in [
+            (k.own, f.own, "own reading"),
+            (k.l_min, f.l_min, "least ink"),
+            (kept.own, f.own, "own reading kept"),
+            (kept.l_min, f.l_min, "least ink kept"),
+        ] {
+            assert_eq!(a.to_bits(), b.to_bits(), "{what}: its {part}: {a} {b}");
+        }
+        assert_eq!(k.ring_text, f.ring_text, "{what}: its ring text");
+        assert_eq!(kept.ring_text, f.ring_text, "{what}: its ring text kept");
+        let read = kept.reading(&Px(frame));
+        assert_eq!(
+            read.to_bits(),
+            fresh.reading(&Px(frame)).to_bits(),
+            "{what}: its reading"
+        );
+        for (bar, holds) in [
+            (read.next_down(), true),
+            (read, true),
+            (read.next_up(), read.is_infinite()),
+        ] {
+            assert_eq!(kept.holds(&Px(frame), bar), holds, "{what}: holds {bar}");
+        }
+    }
+
+    /// A NEIGHBOURHOOD READ BEFORE IS TAKEN AS IT WAS READ, AND ONLY THEN. Over neighbourhoods
+    /// differing in one part each (a cell's ground, base, glyph, colour, or being opaque, a box or
+    /// cell or ring size, the blend), read twice, more of them than are kept, and on another
+    /// table at the same glyph indices, a cell that keeps its reads holds exactly what a new one
+    /// reads, and its reads stay within [`READ_SLOTS`]; the neighbourhood just read, and most of a
+    /// second pass, are not read again. NEGATIVE CONTROLS (2026-11-05), each fails here on that
+    /// part of the key's neighbourhood: a key blind to `base` on its text pixels, to the blend or a
+    /// glyph's colour on its text, and a table change that keeps the reads on another table's text.
+    #[test]
+    fn a_neighbourhood_read_before_is_taken_as_it_was_read() {
+        let (cw, ch, r) = (6usize, 10usize, 2usize);
+        let raster = |cols: [usize; 2], rows: std::ops::Range<usize>, cov: u8| {
+            let mut c = vec![0u8; cw * ch];
+            for y in rows {
+                for x in cols {
+                    c[y * cw + x] = cov;
+                }
+            }
+            c[(ch - 1) * cw + cols[0]] = 90;
+            Some(GlyphRaster::placed(&c, cw, (0, 0)).expect("ink"))
+        };
+        let table: RasterTable = vec![
+            raster([2, 2], 2..8, 255),
+            raster([0, 5], 1..9, 200),
+            raster([1, 3], 3..6, 255),
+        ]
+        .into();
+        let other: RasterTable = vec![
+            raster([3, 4], 1..7, 255),
+            raster([1, 1], 0..4, 160),
+            raster([0, 2], 5..9, 255),
+        ]
+        .into();
+        let known = |ground, glyph| Neighbour::Known {
+            ground,
+            base: ground,
+            glyph,
+        };
+        let mut fixture = [known(PAGE, None); 9];
+        fixture[4] = known(PAGE, Some((0, INK)));
+        fixture[5] = known(PAGE, Some((1, INK)));
+        fixture[7] = known(WARM, None);
+        let sizes = [
+            (cw + 2 * r, ch + 2 * r, cw, ch, r),
+            (cw + 2, ch + 2, cw, ch, 1),
+            (cw + 2 * r, ch + 2 * r + 2, cw, ch + 2, r),
+        ];
+        type Hood = ((usize, usize, usize, usize, usize), [Neighbour; 9], bool);
+        let mut hoods: Vec<Hood> = vec![(sizes[0], fixture, false)];
+        hoods.extend(sizes[1..].iter().map(|&s| (s, fixture, false)));
+        hoods.push((sizes[0], fixture, true));
+        for at in 0..9 {
+            let Neighbour::Known {
+                ground,
+                base,
+                glyph,
+            } = fixture[at]
+            else {
+                continue;
+            };
+            for changed in [
+                Neighbour::Known {
+                    ground: TEAL,
+                    base,
+                    glyph,
+                },
+                Neighbour::Known {
+                    ground,
+                    base: TEAL,
+                    glyph,
+                },
+                Neighbour::Known {
+                    ground,
+                    base,
+                    glyph: Some((2, INK)),
+                },
+                Neighbour::Known {
+                    ground,
+                    base,
+                    glyph: Some((0, WARM)),
+                },
+                Neighbour::Opaque,
+            ] {
+                let mut cells = fixture;
+                cells[at] = changed;
+                hoods.push((sizes[0], cells, false));
+            }
+        }
+        // A frame of some other colours, for the readings.
+        let mut x = 0x9E37_79B9u32;
+        let mut frame = vec![0u32; 256 * 16];
+        for px in &mut frame {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *px = [PAGE, WARM, TEAL, INK][(x % 4) as usize];
+        }
+        let mut kept = RingCell::EMPTY;
+        let read = |cell: &mut RingCell, hood: &Hood, table: &RasterTable| {
+            let &((w, h, cw, ch, r), cells, corrected) = hood;
+            cell.read((w, h), (cw, ch), r, &cells, (table, corrected));
+        };
+        let mut first_pass = 0;
+        for pass in 0..2 {
+            if pass == 1 {
+                first_pass = kept.anew;
+            }
+            for (i, hood) in hoods.iter().enumerate() {
+                read(&mut kept, hood, &table);
+                let mut fresh = RingCell::EMPTY;
+                read(&mut fresh, hood, &table);
+                same_read(
+                    &mut kept,
+                    &mut fresh,
+                    &frame,
+                    &format!("pass {pass} hood {i}"),
+                );
+                let anew = kept.anew;
+                read(&mut kept, hood, &table);
+                assert_eq!(
+                    kept.anew, anew,
+                    "hood {i}: read again as soon as it was read"
+                );
+            }
+        }
+        let again = kept.anew - first_pass;
+        assert!(
+            again < hoods.len() / 2,
+            "a second pass read {again} of {} neighbourhoods again",
+            hoods.len()
+        );
+        // Another table: the same key, other rasters.
+        let hood = &hoods[0];
+        read(&mut kept, hood, &table);
+        let of_table = kept.current().text.clone();
+        read(&mut kept, hood, &other);
+        let mut fresh = RingCell::EMPTY;
+        read(&mut fresh, hood, &other);
+        same_read(&mut kept, &mut fresh, &frame, "another table");
+        assert_ne!(kept.current().text, of_table, "fixture: the tables differ");
+        // More neighbourhoods than are kept.
+        for i in 0..3 * READ_SLOTS as u32 {
+            let mut cells = fixture;
+            cells[0] = known(0x0010_0000 + i, None);
+            let hood = (sizes[0], cells, false);
+            read(&mut kept, &hood, &other);
+            let mut fresh = RingCell::EMPTY;
+            read(&mut fresh, &hood, &other);
+            same_read(&mut kept, &mut fresh, &frame, &format!("sweep {i}"));
+            assert_eq!(kept.reads.len(), READ_SLOTS, "its reads stay bounded");
+        }
+    }
+
+    /// [`RingCell::holds`] STOPS ONLY AT A ROW UNDER THE BAR: over a stem whose rows read lower
+    /// and lower, at each row's reading and either side of it, it answers as the whole reading
+    /// does. NEGATIVE CONTROL (2026-11-05): a stop at `worst <= stop` takes a first row at the bar
+    /// for the reading and fails here.
+    #[test]
+    fn holds_answers_as_the_whole_reading_at_every_row_s_reading() {
+        let (cw, ch, r) = (6usize, 10usize, 2usize);
+        let (w, h) = (cw + 2 * r, ch + 2 * r);
+        let mut stem = vec![0u8; cw * ch];
+        for y in 2..8 {
+            stem[y * cw + 2] = 255;
+        }
+        let table: RasterTable = vec![GlyphRaster::placed(&stem, cw, (0, 0))].into();
+        let mut cells = [Neighbour::Known {
+            ground: PAGE,
+            base: PAGE,
+            glyph: None,
+        }; 9];
+        cells[4] = Neighbour::Known {
+            ground: PAGE,
+            base: PAGE,
+            glyph: Some((0, 0x00FF_FFFF)),
+        };
+        let mut cell = RingCell::EMPTY;
+        cell.read((w, h), (cw, ch), r, &cells, (&table, false));
+        let mut frame = vec![PAGE; w * h];
+        let inks: Vec<u32> = (0..6u32).map(|i| 0x00F0_F0F0 - i * 0x0020_2020).collect();
+        for (i, ink) in inks.iter().enumerate() {
+            frame[(r + 2 + i) * w + r + 2] = *ink;
+        }
+        let reading = cell.reading(&Px(&frame));
+        assert_eq!(
+            reading.to_bits(),
+            ratio(inks[5], PAGE).to_bits(),
+            "the last row is the worst"
+        );
+        for bar in inks.iter().map(|ink| ratio(*ink, PAGE)) {
+            for bar in [bar.next_down(), bar, bar.next_up()] {
+                assert_eq!(
+                    cell.holds(&Px(&frame), bar),
+                    reading >= bar,
+                    "a bar of {bar} on a reading of {reading}"
+                );
+            }
+        }
+    }
+
     /// A STROKE READS AGAINST ITS RING'S CHANNEL MEDIANS, AS THE JUDGES READ IT: a cell read from
     /// its glyph's own raster finds the judges' solid ink and rings (the nearest ring of its
     /// ground, a neighbour's glyph and a block caret's cell no ground), reads its own reading on
@@ -462,12 +948,13 @@ mod tests {
         for y in 2..8 {
             stem[y * cw + 2] = 255;
         }
-        let stem = aterm_render::GlyphRaster::placed(&stem, cw, (0, 0)).expect("ink");
+        let stem = GlyphRaster::placed(&stem, cw, (0, 0)).expect("ink");
         // The neighbour to the right lays a pixel of ink at its left edge, beside the stem's
         // ring; the neighbour below is a block caret's fill.
         let mut dot = vec![0u8; cw * ch];
         dot[4 * cw] = 255;
-        let dot = aterm_render::GlyphRaster::placed(&dot, cw, (0, 0)).expect("ink");
+        let dot = GlyphRaster::placed(&dot, cw, (0, 0)).expect("ink");
+        let table: RasterTable = vec![Some(stem), Some(dot)].into();
         let blank = Neighbour::Known {
             ground: PAGE,
             base: PAGE,
@@ -477,16 +964,16 @@ mod tests {
         cells[4] = Neighbour::Known {
             ground: PAGE,
             base: PAGE,
-            glyph: Some((&stem, INK)),
+            glyph: Some((0, INK)),
         };
         cells[5] = Neighbour::Known {
             ground: PAGE,
             base: PAGE,
-            glyph: Some((&dot, INK)),
+            glyph: Some((1, INK)),
         };
         cells[7] = Neighbour::Opaque;
         let mut cell = RingCell::EMPTY;
-        cell.read((w, h), (cw, ch), r, &cells, false);
+        cell.read((w, h), (cw, ch), r, &cells, (&table, false));
         let own = ratio(INK, PAGE);
         assert!(
             (cell.own - own).abs() < 1e-4,
@@ -500,7 +987,8 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            cell.solid
+            cell.current()
+                .solid
                 .iter()
                 .map(|&(k, _)| k as usize)
                 .collect::<Vec<_>>(),

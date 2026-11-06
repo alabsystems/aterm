@@ -55,6 +55,8 @@ pub use effect_util::TWINKLE_FLASH_BOUND_HZ;
 /// Hardened, bounded file admission shared by every native visual-feed loader.
 pub mod file_feed;
 pub mod genome;
+/// The harness glass's one token set: every ink lines B, D and E wear.
+pub mod glass_inks;
 /// The harness card.
 pub mod harness_card;
 /// The agents panel's glass.

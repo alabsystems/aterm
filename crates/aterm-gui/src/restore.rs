@@ -158,6 +158,13 @@ pub(crate) struct TerminalLeafRestore {
     pub lineage: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_ep: Option<u32>,
+    /// The ids the herald's told-once memory held for this leaf's session at the quit
+    /// ([`crate::status_item::told_ids_row`]), so a need its owner was told of before the quit is
+    /// told once across the restart ([`crate::status_item::Herald::adopt`]). Only a quit's desk
+    /// writes it ([`RestoreManifest::fill_told`]); a seamless update carries the ids in the
+    /// session's status row (`SessionRecord::status_seen`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub told: Option<String>,
 }
 
 /// The word that a tab's agent cannot be brought back, as a seamless update's handoff leaf carries it ([`TerminalLeafRestore::lost`]).
@@ -996,6 +1003,9 @@ impl TerminalLeafRestore {
         self.lineage = self.lineage.take().filter(|sid| carried_sid(sid));
         self.log_ep = self.log_ep.and_then(crate::session_log::told_epoch);
         self.holds = crate::fabric::render_holds(&self.carried_holds());
+        self.told = self.told.take().and_then(|row| {
+            crate::status_item::told_ids_row(&crate::status_item::parse_told_ids(&row))
+        });
         self.sanitize_user_metadata();
     }
 
@@ -2113,6 +2123,7 @@ impl RestoredTab {
                         not_claim_worker: false,
                         claim_worker: None,
                         task: None,
+                        told: None,
                     }))
                 }
                 PaneLayout::Split {
@@ -2494,6 +2505,16 @@ impl RestoreManifest {
         });
     }
 
+    /// Put on every terminal leaf the told-once ids `told` says its session's herald holds
+    /// ([`TerminalLeafRestore::told`]), for a quit's desk.
+    pub(crate) fn fill_told(&mut self, told: &dyn Fn(u64) -> Option<String>) {
+        self.fill_terminals(&mut |terminal| {
+            if let Some(id) = terminal.local_id {
+                terminal.told = told(id);
+            }
+        });
+    }
+
     fn fill_terminals(&mut self, fill: &mut dyn FnMut(&mut TerminalLeafRestore)) {
         fn walk(node: &mut RestoredSplitTree, fill: &mut dyn FnMut(&mut TerminalLeafRestore)) {
             match node {
@@ -2648,6 +2669,7 @@ impl RestoreManifest {
                     not_claim_worker: false,
                     claim_worker: None,
                     task: None,
+                    told: None,
                 })),
                 focused_path: Vec::new(),
                 zoomed: false,
@@ -4615,6 +4637,7 @@ mod tests {
             not_claim_worker: false,
             claim_worker: None,
             task: None,
+            told: None,
         }))
     }
 
@@ -6201,6 +6224,7 @@ metadata = "opaque=copy-me"
                     not_claim_worker: false,
                     claim_worker: None,
                     task: None,
+                    told: None,
                 })),
                 focused_path: Vec::new(),
                 zoomed: false,

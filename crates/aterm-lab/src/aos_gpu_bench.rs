@@ -1181,7 +1181,7 @@ pub struct Header {
     pub rounds: usize,
     /// The session's tag, every run id's prefix.
     pub session: String,
-    /// This runner's build commit.
+    /// This runner's commit ([`crate::lab_build::lab_commit`], read when it runs).
     pub runner_commit: String,
     /// This runner's build profile.
     pub runner_profile: String,
@@ -2286,7 +2286,7 @@ pub const DISCLOSURES: &[&str] = &[
     "G3 also voids a G run whose canonical pipeline took at least 2 ms: its warm-cache start missed the per-user Metal cache, so it would be a cold start under the warm-cache figure's name.",
     "G5 also voids a T run whose pool threads did not all take the main thread's QoS, when that QoS is a class the pool can apply (user-interactive, user-initiated, default, utility or background); under an unspecified class the pool runs at the main thread's, which is the registered arm.",
     "Every reading the runner makes of a run is in runs/<run>.runner (aos-gpu-runner-v1): the spawn and exit stamps on the runner's timebase, the exit status, signal and deadline kill, wait4's CPU and ru_maxrss, any error, the load average, vm.swapusage, `pmset -g` and `pmset -g ps` verbatim, the driver's identity and both GPU readings, so every runner figure and condition gate here can be recomputed from it.",
-    "G0's doctest stage (`targo --unverified test -p aterm-gpu --features compute --doc`: 9 compile_fail and 1 no_run, each ok), verify's required-features pass and the harness's unit tests (`targo --unverified test -p aterm-bench --features aos-gpu --example aos_gpu`, where none run is a failure) are the operator's check; the runner checks the commit (its own build stamp against the harness's, neither -dirty), the profile `release opt-level=3`, debug_assertions=false and the harness digest at start and end.",
+    "G0's doctest stage (`targo --unverified test -p aterm-gpu --features compute --doc`: 9 compile_fail and 1 no_run, each ok), verify's required-features pass and the harness's unit tests (`targo --unverified test -p aterm-bench --features aos-gpu --example aos_gpu`, where none run is a failure) are the operator's check; the runner checks the commit (its checkout's, read when it runs, against the harness's build stamp, neither -dirty), the profile `release opt-level=3`, debug_assertions=false and the harness digest at start and end.",
     "G5's declared bytes are checked for G runs against the device limits the harness printed (params ≤ params limit, B16384's job ≤ job limit, the most live declared bytes ≤ domain limit); the CPU arms declare host buffers, which §12.5's limits do not cover.",
     "Medians over valid rounds are of each run's own p50, p95 and p99 (nearest rank, in the harness); rows/s divides the accepted rows by the series' summed end-to-end times (gaps and compares excluded), rows per CPU-second by the series' RUSAGE_SELF user + system delta.",
     "G − I is the difference of the two arms' medians.",
@@ -2622,7 +2622,7 @@ pub fn cmd_aos_gpu_bench(args: &[String]) -> Res {
     let header = Header {
         rounds: args.rounds,
         session: format!("m5a-{started}-{}", std::process::id()),
-        runner_commit: env!("ATERM_LAB_GIT_COMMIT").to_owned(),
+        runner_commit: crate::lab_build::lab_commit().to_owned(),
         runner_profile: env!("ATERM_LAB_PROFILE").to_owned(),
         harness: harness.display().to_string(),
         harness_digest: digest.short(),

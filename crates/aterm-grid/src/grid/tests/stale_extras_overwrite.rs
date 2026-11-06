@@ -186,7 +186,6 @@ fn write_ascii_run_with_extras_does_not_merge_stale_hyperlink() {
         Some(0x01_FF_00_00), // underline color only — forces the HashMap path
         0,
         None, // NO hyperlink in the new style
-        None,
         &mut last,
     );
 
@@ -202,7 +201,10 @@ fn write_ascii_run_with_extras_does_not_merge_stale_hyperlink() {
 
 #[test]
 fn an_extras_run_never_adopts_an_orphaned_entry() {
-    let url: Arc<str> = Arc::from("https://example.com/new");
+    let url = Arc::new(crate::HyperlinkData {
+        url: Arc::from("https://example.com/new"),
+        id: None,
+    });
     let pens = [
         ("underline colour", Some(0x01_FF_00_00), None),
         ("hyperlink", None, Some(&url)),
@@ -229,7 +231,6 @@ fn an_extras_run_never_adopts_an_orphaned_entry() {
             underline,
             0,
             link,
-            None,
             &mut last,
         );
 
@@ -241,7 +242,7 @@ fn an_extras_run_never_adopts_an_orphaned_entry() {
         );
         assert_eq!(
             extra.hyperlink().map(|u| &**u),
-            link.map(|u| &**u),
+            link.map(|u| u.url.as_ref()),
             "{pen}: the run adopted the orphan's link"
         );
         grid.assert_extras_claimed();

@@ -40,6 +40,13 @@ path = "tests/support/claude_fixture_main.rs"
 test = false
 bench = false
 
+# Dev-only scheduler qualification; never a shipped front door or fleet service.
+[[bin]]
+name = "aterm-subscriber-scheduling-probe"
+path = "tests/support/subscriber_scheduling_probe.rs"
+test = false
+bench = false
+
 [dependencies]
 # The four faces of the one command, all libraries:
 aterm-cli = { path = "../aterm-cli" }     # the SESSION (PTY passthrough) + parser/diag/manual
@@ -115,6 +122,9 @@ aterm-link = { path = "../aterm-link" }
 # which Windows has none of, so there the verb stays on the roster and
 # refuses by name (`secrets_unavailable` in src/main.rs).
 aterm-secrets = { workspace = true }
+# `aterm lan serve | status` (hidden): the root LAN broker the LaunchDaemon runs, and its
+# reader for `aterm doctor` and the lab lane (docs/DESIGN-lan-broker-2026-11-05.md).
+aterm-lan = { workspace = true }
 aterm-db = { workspace = true }
 # The shared-login composition binds full Commons identities and parses public
 # request digests; both libraries are already present through aterm-db.
@@ -124,6 +134,12 @@ aterm-digest = { workspace = true }
 # process's store sinks wake its egress, and its Commons runtime asks it who speaks `Bus` and for
 # a push's relay ack. Already in the graph through aterm-gui.
 aterm-mesh = { workspace = true }
+# The node service's metrics publisher (`src/metrics_publish.rs`, one-mesh §11 Q4): the rows and
+# subjects of `metrics.log`, the window summaries they carry, and the origin envelope its own rows
+# read back in. Already in the graph through aterm-gui and aterm-mesh.
+aterm-metrics = { path = "../aterm-metrics" }
+astream-wire = { path = "../../vendor/astream/crates/astream-wire" }
+astream-broker = { path = "../../vendor/astream/crates/astream-broker" }
 
 # `aterm init` (crates/aterm-machines' `init`): on a Mac the workstation too; elsewhere the
 # base layer, the vault and the repositories. `aterm machines` itself stays macOS-only

@@ -20,14 +20,33 @@
 //! - **a new link**: a relay with no cursor (a neighbour never relayed to, rebuilt, renewed, or
 //!   silent for 7 days, or a new Mac whose stores are empty) starts at the log's head, and what
 //!   lies before it moves here;
-//! - **the membership log**: the ingest consumer's waiting set is full, or its group lost records.
+//! - **the membership log**: the ingest consumer's waiting set is full, or its group lost records;
+//! - **the digest trigger** (PF5b's finding H1): a neighbour's presence rows show a digest of a
+//!   store an exchange moves other than this Mac's own latest row's, two rows in a row, while both
+//!   relays are caught up (`relay_digest::digest_asks`, [`Inventory::digest_row`]): the membership
+//!   log's, or the lab tables', which names their operations and their conflict records. A record
+//!   that entered this Mac by an exchange is in no log, so no relay carries it on; this is what
+//!   does, hop by hop, whichever unit brought it.
+//!
+//! A relay start that asked a lineage or new link's exchange while this Mac's ingest had not yet
+//! passed the last table record its log held asks it once more when the ingest does
+//! ([`Inventory::ask_once_ingested`], `relay_live::asks_again`): the first exchange can run before
+//! this Mac's stores hold what its log held at the start, and move nothing, with nothing else
+//! asking again (PF5b's finding H2).
 //!
 //! After an exchange that moved nothing, the pair does not exchange again until this Mac's digest
-//! changes. An exchange whose received records wait for a membership record runs again once one
-//! lands; one whose records found a store busy runs again after a doubling back-off.
+//! changes, and the digest trigger asks once for each pair of digests it reads, again only after
+//! an exchange with that neighbour failed. An exchange whose received records wait for a
+//! membership record runs again once one lands; one whose records found a store busy runs again
+//! after a doubling back-off.
 //!
 //! **`NO_INVENTORY_ON_GAP`** (`no-inventory-on-gap`) is the gap rule's negative control: a gap
 //! notice starts no exchange, so a record cut below a sleeping Mac's cursor never reaches it.
+//! **`NO_DIGEST_TRIGGER`** (`no-digest-trigger`) is the digest trigger's: a neighbour's rows ask
+//! nothing, so a record that reached a Mac by `Inventory` stays one hop from where it was cut.
+//! **`NO_SECOND_ASK`** (`no-second-ask`) is the second ask's (the island's `noSecondAsk`): a
+//! start's exchange is never asked again, so a record its stores had not yet ingested never
+//! reaches a neighbour whose relay started at the head.
 //!
 //! **The wire.** Both sides first send `atm-inv 1` and their summary digest (over every digest
 //! they would list); equal summaries end the exchange. Then each table list, then per unit (the
@@ -36,8 +55,10 @@
 
 use crate::egress::Egress;
 use crate::logs::Mesh;
+use crate::presence::Held;
 use crate::relay::{self, Event};
 use crate::stores::{Digest, Kind, ProofKey, Stores, Verdict};
+use aterm_mesh_core::relay_digest::Trigger;
 use aterm_mesh_core::relay_live;
 use aterm_net::fleet::FleetOp;
 use aterm_net::fleet::link::{Bell, BusLog, Incoming, Link, LinkStream};
@@ -85,6 +106,27 @@ pub enum Reason {
     Members,
     /// The ingest consumer's group lost records.
     Lost,
+    /// A neighbour's presence rows showed a membership or tables digest other than this Mac's,
+    /// two rows in a row, while both relays were caught up (the digest trigger).
+    Digest,
+}
+
+/// What a presence row says its Mac holds of each store an exchange moves: the digest of its
+/// membership log and of its lab tables (their operations and conflict records), `None` where
+/// the row does not know it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Holds {
+    pub(crate) membership: Option<Held>,
+    pub(crate) tables: Option<Held>,
+}
+
+/// The digest trigger's memory of one neighbour's presence rows: a fold of each store's digests
+/// (the island's `Mem` for each), and a row asks where either asks. So a lasting difference in one
+/// store is asked whether the other's digest is unknown, moving or in step.
+#[derive(Default)]
+struct Triggers {
+    membership: Trigger<Held>,
+    tables: Trigger<Held>,
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -104,6 +146,47 @@ fn no_inventory_on_gap() -> bool {
 
 #[cfg(not(any(test, debug_assertions)))]
 const fn no_inventory_on_gap() -> bool {
+    false
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// The negative control of the digest trigger (`no-digest-trigger`): while set on the thread
+    /// that opens a mesh, a neighbour's presence rows ask no `Inventory`, so a record that reached
+    /// this Mac by one goes no further (PF5b's `h1_hole`). A lab instance turns it on for its whole
+    /// process with `no-digest-trigger` in `ATERM_TEST_NEGATIVE_CONTROL`.
+    pub static NO_DIGEST_TRIGGER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether [`NO_DIGEST_TRIGGER`] is on for a mesh opened on this thread.
+#[cfg(any(test, debug_assertions))]
+fn no_digest_trigger() -> bool {
+    NO_DIGEST_TRIGGER.with(std::cell::Cell::get)
+        || aterm_types::negative_control::on("no-digest-trigger")
+}
+
+#[cfg(not(any(test, debug_assertions)))]
+const fn no_digest_trigger() -> bool {
+    false
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// The negative control of the second ask (`no-second-ask`): while set on the thread that opens
+    /// a mesh, a relay start's exchange is never asked again once the ingest passes the last table
+    /// record its log held. A lab instance turns it on for its whole process with
+    /// `no-second-ask` in `ATERM_TEST_NEGATIVE_CONTROL`.
+    pub static NO_SECOND_ASK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether [`NO_SECOND_ASK`] is on for a mesh opened on this thread.
+#[cfg(any(test, debug_assertions))]
+fn no_second_ask() -> bool {
+    NO_SECOND_ASK.with(std::cell::Cell::get) || aterm_types::negative_control::on("no-second-ask")
+}
+
+#[cfg(not(any(test, debug_assertions)))]
+const fn no_second_ask() -> bool {
     false
 }
 
@@ -150,7 +233,14 @@ pub struct Inventory {
     /// The neighbours whose last exchange left records a busy store did not take: asked again
     /// after [`Self::busy_wait`].
     busy: Mutex<BTreeSet<String>>,
+    /// The digest trigger's memory of each neighbour's presence rows ([`Self::digest_row`]).
+    digests: Mutex<BTreeMap<String, Triggers>>,
+    /// The neighbours a relay start asks again once this Mac's ingest floor passes the last table
+    /// record its log held then, and why ([`Self::ask_once_ingested`]).
+    after_ingest: Mutex<BTreeMap<String, (u64, Reason)>>,
     no_gap: bool,
+    no_digest: bool,
+    no_second_ask: bool,
     /// Whether the worker runs an exchange now, and its change's notice.
     inflight: (Mutex<bool>, std::sync::Condvar),
     stop: AtomicBool,
@@ -177,7 +267,11 @@ impl Inventory {
             links: Mutex::new(BTreeMap::new()),
             waiting: Mutex::new(BTreeSet::new()),
             busy: Mutex::new(BTreeSet::new()),
+            digests: Mutex::new(BTreeMap::new()),
+            after_ingest: Mutex::new(BTreeMap::new()),
             no_gap: no_inventory_on_gap(),
+            no_digest: no_digest_trigger(),
+            no_second_ask: no_second_ask(),
             inflight: (Mutex::new(false), std::sync::Condvar::new()),
             stop: AtomicBool::new(false),
             #[cfg(any(test, debug_assertions))]
@@ -187,9 +281,13 @@ impl Inventory {
 
     /// A relay to `peer` follows its log over `link`.
     pub(crate) fn linked(&self, peer: &str, link: &Arc<Link>) {
-        self.links
-            .lock_or_recover()
-            .insert(peer.to_owned(), Arc::downgrade(link));
+        let mut links = self.links.lock_or_recover();
+        let weak = Arc::downgrade(link);
+        if let Some(slot) = links.get_mut(peer) {
+            *slot = weak;
+        } else {
+            links.insert(peer.to_owned(), weak);
+        }
     }
 
     /// Ask for an exchange with `peer` over `link`, for `reason`. A gap notice under
@@ -207,6 +305,97 @@ impl Inventory {
         queue.push_back((peer.to_owned(), Arc::downgrade(link), reason));
         drop(queue);
         self.bell.ring();
+    }
+
+    /// `peer`'s presence row advanced here: what it holds `theirs`, against `mine`, this Mac's own
+    /// latest row's, while this Mac's tables relay to it `follows` or not. Ask an exchange with it
+    /// where the digest trigger asks for either store (`relay_digest::digest_asks`, over the link
+    /// that relay follows on): the store's two digests differ, both known; they are the ones its
+    /// last row was compared under (two rows in a row, neither Mac's store moving in between, so
+    /// neither relay carried anything that changed it); the relay follows; and the trigger has
+    /// not asked for this pair since an exchange with `peer` failed. Both stores' records travel
+    /// on `tables.log`, so one relay's following stands for both.
+    pub(crate) fn digest_row(&self, peer: &str, theirs: Holds, mine: Holds, follows: bool) {
+        let link = follows.then(|| self.link_to(peer)).flatten();
+        let asks = {
+            let mut digests = self.digests.lock_or_recover();
+            let triggers = match digests.get_mut(peer) {
+                Some(triggers) => triggers,
+                None => digests.entry(peer.to_owned()).or_default(),
+            };
+            let (follows, off) = (link.is_some(), self.no_digest);
+            // Both folds read every row, whatever the other answers.
+            let membership =
+                triggers
+                    .membership
+                    .row(theirs.membership, mine.membership, follows, off);
+            let tables = triggers
+                .tables
+                .row(theirs.tables, mine.tables, follows, off);
+            membership || tables
+        };
+        if let Some(link) = link.filter(|_| asks) {
+            self.request(peer, &link, Reason::Digest);
+        }
+    }
+
+    /// An exchange with `peer` did not run to its end: the digest trigger may ask the pairs it
+    /// last asked for again.
+    fn not_run(&self, peer: &str) {
+        if let Some(triggers) = self.digests.lock_or_recover().get_mut(peer) {
+            triggers.membership.failed();
+            triggers.tables.failed();
+        }
+    }
+
+    /// A relay start asked an exchange with `peer` for `reason` while this Mac's ingest had not
+    /// passed `last`, the last table record its log held then (`relay_live::asks_again`): ask it
+    /// again once the ingest floor passes `last`. A later start's replaces it. The caller reads the
+    /// floor after this and hands it to [`Self::ingested`], so a commit between the two is not
+    /// missed. Under [`NO_SECOND_ASK`] nothing is asked again.
+    pub(crate) fn ask_once_ingested(&self, peer: &str, reason: Reason, last: u64) {
+        if self.no_second_ask {
+            return;
+        }
+        let mut after_ingest = self.after_ingest.lock_or_recover();
+        if let Some(slot) = after_ingest.get_mut(peer) {
+            *slot = (last, reason);
+        } else {
+            after_ingest.insert(peer.to_owned(), (last, reason));
+        }
+    }
+
+    /// Whether a relay start's second ask waits for the ingest ([`Self::ask_once_ingested`]).
+    pub(crate) fn awaits_ingest(&self) -> bool {
+        !self.after_ingest.lock_or_recover().is_empty()
+    }
+
+    /// This Mac's ingest floor is `floor`: its stores hold every record of `tables.log` below it.
+    /// Ask each exchange a relay start left for it ([`Self::ask_once_ingested`]). One whose
+    /// neighbour has no live link now stays, due, for the next start over a new one to ask.
+    pub(crate) fn ingested(&self, floor: u64) {
+        let due: BTreeMap<String, (u64, Reason)> = {
+            let mut after = self.after_ingest.lock_or_recover();
+            if after.is_empty() {
+                return;
+            }
+            let (due, wait) = std::mem::take(&mut *after)
+                .into_iter()
+                .partition(|(_, (last, _))| *last < floor);
+            *after = wait;
+            due
+        };
+        for (peer, held) in due {
+            match self.link_to(&peer) {
+                Some(link) => self.request(&peer, &link, held.1),
+                None => {
+                    self.after_ingest
+                        .lock_or_recover()
+                        .entry(peer)
+                        .or_insert(held);
+                }
+            }
+        }
     }
 
     /// The ingest consumer's waiting set is full: exchange with one neighbour a relay follows.
@@ -312,6 +501,7 @@ impl Inventory {
                 .filter(|link| link.closed().is_none())
                 .or_else(|| self.link_to(&peer))
             else {
+                self.not_run(&peer);
                 continue;
             };
             self.initiate(&mesh, &peer, &link, reason);
@@ -354,6 +544,7 @@ impl Inventory {
             Ok(summary) => summary,
             Err(e) => {
                 aterm_log::warn!("mesh: an Inventory with {peer} could not read the stores: {e}");
+                self.not_run(peer);
                 return;
             }
         };
@@ -382,7 +573,10 @@ impl Inventory {
                     received: moved.received,
                 });
             }
-            Err(e) => aterm_log::info!("mesh: an Inventory with {peer} ended: {e}"),
+            Err(e) => {
+                aterm_log::info!("mesh: an Inventory with {peer} ended: {e}");
+                self.not_run(peer);
+            }
         }
     }
 
@@ -406,16 +600,27 @@ impl Inventory {
         {
             let mut quiet = self.quiet.lock_or_recover();
             if moved.nothing() && self.remembers() {
-                quiet.insert(peer.to_owned(), summary);
+                if let Some(slot) = quiet.get_mut(peer) {
+                    *slot = summary;
+                } else {
+                    quiet.insert(peer.to_owned(), summary);
+                }
             } else {
                 quiet.remove(peer);
             }
         }
         if moved.waiting > 0 {
-            self.waiting.lock_or_recover().insert(peer.to_owned());
+            let mut waiting = self.waiting.lock_or_recover();
+            if !waiting.contains(peer) {
+                waiting.insert(peer.to_owned());
+            }
         }
         if moved.busy > 0 {
-            self.busy.lock_or_recover().insert(peer.to_owned());
+            let mut busy = self.busy.lock_or_recover();
+            if !busy.contains(peer) {
+                busy.insert(peer.to_owned());
+            }
+            drop(busy);
             self.bell.ring();
         }
     }

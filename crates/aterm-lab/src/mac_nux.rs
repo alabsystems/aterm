@@ -103,18 +103,26 @@ pub const USAGE: &str = "\
                   first-launch     the app opened, then watched until the guest's own aterm ctl status says
                                    setup=done (the progress record's completion on a build without the
                                    field), or until setup stood still a minute with no new press by the
-                                   person and no app process starting or going (a minute after the vault
-                                   look's own bound while only the vault is left): git and /usr/bin/git
+                                   person and no app process starting or going: git and /usr/bin/git
                                    typed in the first tab at its prompt and git again after the wait,
                                    the presses setup= waited on (the row fails on one aterm could have
-                                   made) and the grants on offer, first prompt, first
+                                   made, or names a Local Network step: target none) and the grants on
+                                   offer, first prompt, first
                                    present, each stage's start (a guest-side watch of initial-setup.json)
                                    and the first one's after first present, n_present and present and
                                    input p50/p95/p99 while setup ran, aterm's state folder at boot and at
                                    window focus, WARN lines, consent dialogs (with a ~/Desktop control),
-                                   which process macOS held back to ask its Local Network question and
-                                   when, beside System State's own ask (the unified log's
-                                   networkextension lines, each pid's command as ps reads it),
+                                   aterm's Local Network alerts (target 0: nehelper's showings naming
+                                   com.aterm.* in the unified log and, with --reader, each alert whose
+                                   words ask about “aterm”, each alert once; another program's, the
+                                   lane's own tart exec traffic's among them, named and never counted),
+                                   which processes macOS held back on its question and when (each pid
+                                   placed by its ancestors as ps reads them: aterm's, or not aterm's),
+                                   the LAN broker (launchctl print of
+                                   systems.alab.aterm-lan read as root, aterm lan status as the account,
+                                   its log's last lines; NOT MEASURED on a build with no lan verb; the
+                                   row fails when the elevation ran and no broker serves), its root
+                                   aterm never counted as the elevation's root half,
                                    folder dialogs after Full Disk Access was granted (target 0), the
                                    toolset pass, the setup lines and hand-overs in order, the mDNS
                                    questions for the ALab vault, change-journal records, defaults and
@@ -126,14 +134,22 @@ pub const USAGE: &str = "\
                                    through the guest's own aterm ctl image (the guest helper
                                    following those watches, never a timer): first present, each
                                    stage's start, each card setup= names and clears, each person
-                                   stage's dialog up and gone (System Settings, Local Network,
-                                   SecurityAgent, Apple's install dialog, ...), a relaunch, and
+                                   stage's dialog up and gone (System Settings, SecurityAgent,
+                                   Apple's install dialog, ...), a relaunch, and
                                    setup=done (or the wait's end), copied back with a contact sheet
                                    into <record>-frames/ beside --record FILE (else the lab's state
                                    folder, mac-nux/frames/); once setup's wait ended, the first tab's
                                    fleet=, aterm members status, and a no-URL aterm members join
                                    --no-wait, FAILED unless it refuses as a lab identity before it
                                    dials (a guest is a virtual machine: A12)
+                  first-launch-vault (by name only, never in all) first-launch's row with a lab vault in the
+                                   guest: served at the guest's own address, registered as alab-secrets
+                                   under a lab vault service made for the run (_alab-lab-<nonce>._tcp,
+                                   which no ALab Mac browses), named to the app by
+                                   ATERM_LAB_VAULT_SERVICE set with launchctl setenv in its GUI session;
+                                   FAILED unless aterm.log names the lab vault its own look heard (the
+                                   broker's log of the service beside it); NOT RUN on an app whose
+                                   executable does not name the variable
                   terminal-launch  a bare aterm on a terminal (Terminal.app's shape) to its shell's first
                                    prompt, cold then warm
                   app-launch       the app opened to its first tab's prompt, cold then warm
@@ -471,6 +487,7 @@ pub enum Scenario {
     LaunchRepairs,
     DevtoolsControl,
     FirstLaunch,
+    FirstLaunchVault,
     TerminalLaunch,
     AppLaunch,
     Vault,
@@ -532,14 +549,19 @@ pub const FAULTS: [Scenario; 13] = [
     Scenario::ClockBack,
 ];
 
+/// The rows run only by name, never in `all`: `first-launch-vault`, a second whole first launch
+/// that judges the vault found with no press, NOT RUN until the app names its knob
+/// ([`lan::LAB_VAULT_SERVICE_ENV`]).
+pub const BY_NAME: [Scenario; 1] = [Scenario::FirstLaunchVault];
+
 /// The rows that read a window's accessibility tree (`tree`; `mac_nux_reveal.rs`, one-mesh design
 /// §11 A17c), after [`FAULTS`]': `lab reveal-tab`'s world in the person base, and its negative
 /// control.
 pub const TREE: [Scenario; 2] = [Scenario::RevealTab, Scenario::RevealTabControl];
 
-/// Every row [`ALL`], [`FAULTS`] and [`TREE`] name, in run order.
+/// Every row [`ALL`], [`FAULTS`], [`BY_NAME`] and [`TREE`] name, in run order.
 fn every() -> impl Iterator<Item = Scenario> {
-    ALL.into_iter().chain(FAULTS).chain(TREE)
+    ALL.into_iter().chain(FAULTS).chain(BY_NAME).chain(TREE)
 }
 
 impl Scenario {
@@ -555,6 +577,7 @@ impl Scenario {
             Scenario::LaunchRepairs => "launch-repairs",
             Scenario::DevtoolsControl => "devtools-control",
             Scenario::FirstLaunch => "first-launch",
+            Scenario::FirstLaunchVault => "first-launch-vault",
             Scenario::TerminalLaunch => "terminal-launch",
             Scenario::AppLaunch => "app-launch",
             Scenario::Vault => "vault",
@@ -598,6 +621,7 @@ impl Scenario {
         matches!(
             self,
             Scenario::FirstLaunch
+                | Scenario::FirstLaunchVault
                 | Scenario::InitApply
                 | Scenario::InstallSh
                 | Scenario::PassHeld
@@ -1497,17 +1521,6 @@ pub fn distinct_messages(log: &str, max: usize) -> Vec<String> {
     out
 }
 
-/// Each process `ps -o pid=,command=` listed: its pid and command line.
-#[must_use]
-pub fn ps_commands(ps: &str) -> BTreeMap<u32, String> {
-    ps.lines()
-        .filter_map(|line| {
-            let (pid, command) = line.trim_start().split_once(' ')?;
-            Some((pid.parse().ok()?, command.trim().to_owned()))
-        })
-        .collect()
-}
-
 /// The folder (TCC) dialogs tccd put up for the app at or after `since_ms` (epoch ms): a
 /// `SystemPolicy…` service other than Full Disk Access itself, asked for a subject naming aterm
 /// (never the guest agent's ~/Desktop control).
@@ -1585,8 +1598,6 @@ pub struct Launch {
     pub handovers: Vec<(u64, String)>,
     /// The grant of Full Disk Access, as aterm observed it.
     pub fda_granted_ms: Option<u64>,
-    /// System State's own Local Network step handing its question to macOS.
-    pub local_network_asked_ms: Option<u64>,
     /// Every setup line ([`SETUP_LINES`]), in order.
     pub setup: Vec<(u64, String)>,
     pub toolset: Option<(u64, String)>,
@@ -1623,10 +1634,6 @@ pub fn read_launch(log: &str, open_ms: u64) -> Launch {
             })
             .collect(),
         fda_granted_ms: first(&|l| l.message.contains("full disk access observed granted")),
-        local_network_asked_ms: first(&|l| {
-            l.message
-                .starts_with("system state: Local Network asked for")
-        }),
         setup: lines
             .iter()
             .filter(|l| SETUP_LINES.iter().any(|p| l.message.starts_with(p)))
@@ -2344,7 +2351,10 @@ impl Watchers {
                             .get()
                             .or(census.started.map(|(at, _)| at))
                             .unwrap_or(0);
-                        let seen = dialogs(&census, since);
+                        // The reader's words name a UserNotificationCenter window that is
+                        // macOS's Local Network question (none when no reader ran).
+                        let read = read_reader(&g.read(&format!("{GUEST_NUX}/reader.txt"))?);
+                        let seen = dialogs(&census, since, &read.words);
                         devtools_verdict(row, &seen);
                         if seen.iter().any(|d| d.kind == GATEKEEPER_DIALOG) {
                             gatekeeper_since = Some(since);
@@ -2505,7 +2515,7 @@ fn devtools_control(g: &Guest, row: &mut Row) -> Result<(), Fail> {
     let started = Instant::now();
     loop {
         stop::check()?;
-        if !apple_devtools_dialogs(&dialogs(&read_census(&g.read(&census)?), 0)).is_empty() {
+        if !apple_devtools_dialogs(&dialogs(&read_census(&g.read(&census)?), 0, &[])).is_empty() {
             row.cell("dialog seen after", Value::Ms(millis(started.elapsed())));
             return Ok(());
         }
@@ -2582,15 +2592,20 @@ fn reader_start(g: &Guest) -> Result<(), Fail> {
 }
 
 /// Stop the reader and put each dialog's words in the row, timed from the open (`open_ms`): the
-/// alert's own words name what raised it, which the window list's owner alone does not.
-fn reader_cells(g: &Guest, row: &mut Row, open_ms: u64) -> Result<(), Fail> {
+/// alert's own words name what raised it, which the window list's owner alone does not. The
+/// reader's record, for the readings a row counts.
+fn reader_cells(
+    g: &Guest,
+    row: &mut Row,
+    open_ms: u64,
+) -> Result<crate::mac_nux_guest::Reader, Fail> {
     g.agent_stop(READER_AGENT);
     let r = read_reader(&g.read(&format!("{GUEST_NUX}/reader.txt"))?);
     row.cell(
         "dialog words (read, never answered)",
         reader_value(&r, open_ms),
     );
-    Ok(())
+    Ok(r)
 }
 
 /// The reader's cell: each reading as `<owner> <ms from the open> ms: <words>`; NOT MEASURED
@@ -2601,11 +2616,12 @@ fn reader_value(r: &crate::mac_nux_guest::Reader, open_ms: u64) -> Value {
         Some(true) => Value::Text(
             r.words
                 .iter()
-                .map(|(at, owner, words)| {
+                .map(|w| {
                     format!(
-                        "{owner} {} ms: {}",
-                        at.saturating_sub(open_ms),
-                        squeeze(words, 400)
+                        "{} {} ms: {}",
+                        w.owner,
+                        w.at_ms.saturating_sub(open_ms),
+                        squeeze(&w.words, 400)
                     )
                 })
                 .collect::<Vec<_>>()
@@ -4231,7 +4247,7 @@ fn first_launch(g: &Guest, ask: &Ask, row: &mut Row) -> Result<(), Fail> {
     }
     // The page at each milestone the records name, from before the open on.
     let captures = capture::Captures::start(g);
-    watch_elevations(g)?;
+    let broker_before = watch_elevations(g)?;
     // What the app asks after the ALab vault while it is watched: System State's watch for the
     // vault looks on a Mac that has none.
     start_mdns(g)?;
@@ -4258,7 +4274,8 @@ fn first_launch(g: &Guest, ask: &Ask, row: &mut Row) -> Result<(), Fail> {
     presses_cells(row, &g.presses.borrow(), ask.person);
     tab_git(g, row, "git", "once setup's wait ended")?;
     fleet_member_cells(g, row)?;
-    elevation_cells(g, ask, row, open_ms)?;
+    let (elevated, broker) = elevation_cells(g, ask, row, open_ms, broker_before.as_ref())?;
+    lan::broker_cells(g, row, &broker, elevated)?;
     // Before the reads below: the ~/Desktop control's own consent dialog is no milestone.
     captures.stop(g);
     reopen_cells(g, ask, row, open_ms)?;
@@ -4297,11 +4314,14 @@ fn first_launch(g: &Guest, ask: &Ask, row: &mut Row) -> Result<(), Fail> {
             Err(why) => Value::Missing(format!("control FAILED: {why}")),
         },
     );
+    let read = if ask.reader {
+        Some(reader_cells(g, row, open_ms)?)
+    } else {
+        None
+    };
+    lan::alert_cells(g, row, open_ms, read.as_ref().map(|r| r.words.as_slice()))?;
     let alerts = local_network_cell(g, row, open_ms)?;
     unc_cells(g, row, open_ms)?;
-    if ask.reader {
-        reader_cells(g, row, open_ms)?;
-    }
     let log = g.log()?;
     if !alerts.is_empty() {
         // What raised each alert is in what the app logged just before it (finding 11).
@@ -4381,14 +4401,6 @@ fn first_launch(g: &Guest, ask: &Ask, row: &mut Row) -> Result<(), Fail> {
         } else {
             Value::Text(timeline(&launch.handovers, usize::MAX))
         },
-    );
-    row.cell(
-        "System State's Local Network ask",
-        or_missing(
-            launch.local_network_asked_ms,
-            Value::Ms,
-            &format!("no `system state: Local Network asked for` line {within}"),
-        ),
     );
     row.cell(
         "Full Disk Access granted",
@@ -4481,12 +4493,18 @@ const ELEVATIONS: &str = "elevations.txt";
 /// (`aterm_machines::init_clt`'s `sudo -k -p 'Mac password: ' aterm machines here apply --plain`).
 const ELEVATION_ARGV: &str = "machines here apply";
 
+/// What the root LAN broker runs, in its argv (`aterm lan serve --source <bundle>`): a long-lived
+/// root aterm that is never the elevation's root half, nor an ask.
+const BROKER_ARGV: &str = "lan serve";
+
 /// Start the elevation watch: every 200 ms the guest's process table, each process whose argv
 /// names [`ELEVATION_ARGV`] appended as `<epoch s> <pid> <ppid> <user> <command>`. A `sudo`
 /// there whose parent is no such `sudo` is one ask for the Mac password (its `-k` drops any
 /// cached credential, so each run asks where the account's sudo needs one; a `sudo` under it is
-/// its `use_pty` monitor); a root process there is the root half running.
-fn watch_elevations(g: &Guest) -> Result<(), Fail> {
+/// its `use_pty` monitor); a root process there is the root half running. Returns launchd's
+/// reading of the LAN broker's job as accounting starts ([`broker_print`]), for
+/// [`root_halves`]: a broker run that ended before then is in no accounting record.
+fn watch_elevations(g: &Guest) -> Result<Option<lan::Daemon>, Fail> {
     g.sh(
         &root_command(
             g.standard,
@@ -4494,6 +4512,7 @@ fn watch_elevations(g: &Guest) -> Result<(), Fail> {
         ),
         STEP,
     )?;
+    let broker = lan::read_launchctl(&g.sh(&broker_print(g.standard), STEP)?);
     g.sh(
         &format!(
             "f={GUEST_NUX}/{ELEVATIONS}; : > $f; nohup /bin/sh -c 'while :; do t=$(date +%s); \
@@ -4503,7 +4522,19 @@ fn watch_elevations(g: &Guest) -> Result<(), Fail> {
         ),
         STEP,
     )?;
-    Ok(())
+    Ok(broker)
+}
+
+/// launchd's reading of the root LAN broker's job ([`aterm_uds::lan::LABEL`]), as root: empty
+/// where no such job is loaded.
+fn broker_print(standard: bool) -> String {
+    root_command(
+        standard,
+        &format!(
+            "/bin/launchctl print system/{} 2>/dev/null || true",
+            aterm_uds::lan::LABEL
+        ),
+    )
 }
 
 /// Each process the elevation watch saw, once, at its first sighting.
@@ -4516,8 +4547,9 @@ pub struct Elevations {
 }
 
 /// [`Elevations`] over the watch's lines ([`watch_elevations`]): the watch's own shell (whose
-/// argv quotes the pattern) is neither, and a `sudo` whose parent is a `sudo` of the elevation
-/// is that one's `use_pty` monitor, no ask of its own. Pure.
+/// argv quotes the pattern) is neither, a `sudo` whose parent is a `sudo` of the elevation is
+/// that one's `use_pty` monitor, no ask of its own, and the LAN broker ([`BROKER_ARGV`]), a
+/// root aterm whose `--source` could name anything, is never either. Pure.
 #[must_use]
 pub fn read_elevations(text: &str) -> Elevations {
     let mut e = Elevations::default();
@@ -4540,7 +4572,11 @@ pub fn read_elevations(text: &str) -> Elevations {
             continue;
         };
         let program = command.split_whitespace().next().unwrap_or("");
-        if !command.contains(ELEVATION_ARGV) || program.ends_with("sh") || program == "ps" {
+        if !command.contains(ELEVATION_ARGV)
+            || command.contains(BROKER_ARGV)
+            || program.ends_with("sh")
+            || program == "ps"
+        {
             continue;
         }
         if program.rsplit('/').next() == Some("sudo") {
@@ -4567,8 +4603,8 @@ pub fn read_elevations(text: &str) -> Elevations {
 const ACCOUNTING: &str = "/var/account/nux-elevation";
 
 /// How many `aterm` processes ran as root in `lastcomm(1)`'s report of [`ACCOUNTING`]: in a row
-/// that runs no `aterm` as root itself, each is one run of the elevation's root half, its `sudo`
-/// one ask. Pure.
+/// that runs no `aterm` as root itself, each is one run of the elevation's root half or one of
+/// the LAN broker's ([`root_halves`] tells them apart). Pure.
 #[must_use]
 pub fn root_aterm_runs(lastcomm: &str) -> usize {
     lastcomm
@@ -4580,8 +4616,41 @@ pub fn root_aterm_runs(lastcomm: &str) -> usize {
         .count()
 }
 
+/// The root halves among the root `aterm` processes process accounting saw end (`lastcomm`,
+/// [`root_aterm_runs`]), with launchd's view of the LAN broker (`broker`, `launchctl print`
+/// read just after accounting stopped, in the same root command, so every broker exit accounting
+/// recorded is one launchd's `runs` already holds; a broker that ends between the two is
+/// subtracted with no record, which can only hide a root half, never add one).
+///
+/// The rule: every root `aterm` that ended is a root half, but for each broker process that
+/// ended, which launchd counts. Accounting records a process only as it exits, by its command
+/// name (`aterm` for both: the broker's image is a clone of the app bundle), its user and its
+/// start to the minute, never its path, argv or parent, so a record alone cannot tell the
+/// broker from a root half: `lastcomm` does not show the broker's image path
+/// (`/Library/Application Support/aterm/lan/aterm.app`), and a start to the minute cannot place
+/// a record beside a `sudo` the 200 ms watch may never have seen. launchd can: its `runs` is how
+/// many times it started the broker since its bootstrap, so the broker processes that ended
+/// are `runs` less the one running now ([`lan::broker_exits`]): an adoption's restart, a crash.
+/// Those that had ended already when accounting started (`before`) are in no record.
+/// A running broker has not ended, so it is in no record. A bootout ends the count with the
+/// job, which only an elevation's own reinstall does, after its first, so it can hide a broker
+/// exit only in a row already failed for a second ask. Pure.
+#[must_use]
+pub fn root_halves(
+    lastcomm: &str,
+    before: Option<&lan::Daemon>,
+    broker: Option<&lan::Daemon>,
+) -> usize {
+    let ended = lan::broker_exits(broker).saturating_sub(lan::broker_exits(before));
+    root_aterm_runs(lastcomm).saturating_sub(ended)
+}
+
+/// What the elevation cells' one root read prints between launchd's view of the broker and the
+/// rest.
+const PRINTED: &str = "nux-launchctl-printed";
+
 /// [`Elevations`] with the root halves process accounting counted (`accounted`,
-/// [`root_aterm_runs`]): runs the watch missed are added, each with its ask, at no known time
+/// [`root_halves`]): runs the watch missed are added, each with its ask, at no known time
 /// (`(0, 0)`, which [`sightings`] names as accounted). Pure.
 #[must_use]
 pub fn with_accounting(mut seen: Elevations, accounted: usize) -> Elevations {
@@ -4615,8 +4684,16 @@ fn sightings(seen: &[(u64, u32)], open_ms: u64) -> String {
 /// than one), whether the account's sudo asks one at all (the image's administrator's asks none,
 /// so no prompt can show there: the ask is counted by its `sudo` process instead), the prompts
 /// still on screen, and what it was to apply with no press: developer mode, the naming rule, the
-/// Mac's own names; then the PTY keeper, on by default.
-fn elevation_cells(g: &Guest, ask: &Ask, row: &mut Row, open_ms: u64) -> Result<(), Fail> {
+/// Mac's own names; then the PTY keeper, on by default. Whether the root half ran, and launchd's
+/// view of the LAN broker (`launchctl print`), read once accounting stopped, for
+/// [`lan::broker_cells`].
+fn elevation_cells(
+    g: &Guest,
+    ask: &Ask,
+    row: &mut Row,
+    open_ms: u64,
+    before: Option<&lan::Daemon>,
+) -> Result<(bool, String), Fail> {
     let text = g.sh(
         &format!(
             "f={GUEST_NUX}/{ELEVATIONS}; kill $(cat $f.pid) 2>/dev/null; cat $f 2>/dev/null || true"
@@ -4626,11 +4703,22 @@ fn elevation_cells(g: &Guest, ask: &Ask, row: &mut Row, open_ms: u64) -> Result<
     let report = g.sh(
         &format!(
             "{}; /usr/bin/lastcomm -f {ACCOUNTING} 2>/dev/null || true",
-            root_command(g.standard, "/usr/sbin/accton")
+            root_command(
+                g.standard,
+                &format!(
+                    "/usr/sbin/accton; /bin/launchctl print system/{} 2>&1; echo {PRINTED}",
+                    aterm_uds::lan::LABEL
+                )
+            )
         ),
         STEP,
     )?;
-    let seen = with_accounting(read_elevations(&text), root_aterm_runs(&report));
+    let (print, report) = report.split_once(PRINTED).unwrap_or(("", &report));
+    let broker = lan::read_launchctl(print);
+    let seen = with_accounting(
+        read_elevations(&text),
+        root_halves(report, before, broker.as_ref()),
+    );
     row.cell(
         "setup's Mac password asks (target 1)",
         if seen.asks.is_empty() {
@@ -4747,7 +4835,7 @@ fn elevation_cells(g: &Guest, ask: &Ask, row: &mut Row, open_ms: u64) -> Result<
             squeeze(&keeper, 80)
         ));
     }
-    Ok(())
+    Ok((!seen.root_runs.is_empty(), print.to_owned()))
 }
 
 /// What the naming rule setup left lets the account do with no password, the name an admission
@@ -4878,8 +4966,26 @@ fn tab_git(g: &Guest, row: &mut Row, git: &str, label: &str) -> Result<(), Fail>
 
 /// The presses a first launch's `setup=` readings asked of the person ([`Presses`]): the row fails
 /// on any aterm could have made itself ([`Presses::avoidable`]; `person`: someone at the console
-/// asked for macOS's batch); the macOS grants on offer are no press and are listed beside it.
+/// asked for macOS's batch); the macOS grants on offer are no press and are listed beside it. The
+/// row fails too on a Local Network step in System State ([`Presses::local_network_step`]):
+/// aterm's own LAN use goes through the LAN broker, which macOS never asks about.
 fn presses_cells(row: &mut Row, presses: &Presses, person: bool) {
+    let step = presses.local_network_step();
+    row.cell(
+        "System State's Local Network step (target none)",
+        Value::Text(if step {
+            format!("named: {}", presses.named.join(", "))
+        } else {
+            "none".into()
+        }),
+    );
+    if step {
+        row.fail(
+            "System State showed a Local Network step: aterm's LAN use goes through its broker, \
+             which needs no answer"
+                .to_owned(),
+        );
+    }
     let avoidable = presses.avoidable(person);
     row.cell(
         "presses aterm could have made (target 0)",
@@ -5355,9 +5461,13 @@ fn person_stage_cells(g: &Guest, ask: &Ask, row: &mut Row) -> Result<(), Fail> {
     Ok(())
 }
 
-/// Which process macOS held back to ask its Local Network question since the open (`open_ms`,
-/// epoch ms), from the guest's unified log, each by its command as `ps` reads it now: the
-/// question System State's step is meant to ask first. Each alert's time it could read (epoch ms).
+/// Which processes macOS held back on its Local Network question since the open (`open_ms`,
+/// epoch ms), from the guest's unified log (UserEventAgent's `blocked notification`, one per held
+/// connection, so each pid is named once with how many times it was held), placed by the process
+/// tree as `ps` reads it now ([`lan::whose`]): aterm's own, and those that were not aterm's (the
+/// lane's `tart exec` traffic, another program's, a pid gone before the read), named and never
+/// counted. A diagnostic beside [`lan::alert_cells`]' count. The time of each hold that may be
+/// aterm's (aterm's, or gone) it could read (epoch ms), for what aterm logged before it.
 fn local_network_cell(g: &Guest, row: &mut Row, open_ms: u64) -> Result<Vec<u64>, Fail> {
     let since_s = g.clock_ms()?.saturating_sub(open_ms) / 1000 + 5;
     let log = g.sh(
@@ -5372,36 +5482,72 @@ fn local_network_cell(g: &Guest, row: &mut Row, open_ms: u64) -> Result<Vec<u64>
         .into_iter()
         .filter(|(at, _)| at.is_none_or(|at| at >= open_ms))
         .collect();
-    let pids: Vec<String> = blocks.iter().map(|(_, pid)| pid.to_string()).collect();
-    let commands = if pids.is_empty() {
+    let tree = if blocks.is_empty() {
         BTreeMap::new()
     } else {
-        ps_commands(&g.sh(
-            &format!("ps -o pid=,command= -p {} || true", pids.join(",")),
-            STEP,
-        )?)
+        lan::ps_tree(&g.sh("ps -axww -o pid=,ppid=,command= || true", STEP)?)
     };
-    row.cell(
-        "Local Network alert raised by",
-        Value::Text(if blocks.is_empty() {
+    // Each pid once, in the order first held: its first hold's time and how many there were.
+    let mut held: Vec<(u32, Option<u64>, usize)> = Vec::new();
+    for (at, pid) in &blocks {
+        match held.iter_mut().find(|(p, _, _)| p == pid) {
+            Some((_, _, n)) => *n += 1,
+            None => held.push((*pid, *at, 1)),
+        }
+    }
+    let name = |pid: u32, at: Option<u64>, n: usize, whose: lan::Whose| {
+        let who = tree.get(&pid).map_or_else(
+            || format!("pid {pid} (gone)"),
+            |(_, c)| format!("pid {pid} {}", squeeze(c, 80)),
+        );
+        let whose = match whose {
+            lan::Whose::Lane => " (the lane's tart exec)",
+            lan::Whose::Other => " (another program)",
+            lan::Whose::Gone => " (whose unknown)",
+            lan::Whose::Aterm => "",
+        };
+        let times = if n > 1 {
+            format!(" x{n}")
+        } else {
+            String::new()
+        };
+        match at {
+            Some(at) => format!("{who}{whose} {} ms{times}", at.saturating_sub(open_ms)),
+            None => format!("{who}{whose}{times}"),
+        }
+    };
+    let (mut aterms_own, mut others) = (Vec::new(), Vec::new());
+    for &(pid, at, n) in &held {
+        let whose = lan::whose(&tree, pid);
+        let line = name(pid, at, n, whose);
+        if whose == lan::Whose::Aterm {
+            aterms_own.push(line);
+        } else {
+            others.push(line);
+        }
+    }
+    let list = |l: Vec<String>| {
+        Value::Text(if l.is_empty() {
             "none".to_owned()
         } else {
-            blocks
-                .iter()
-                .map(|(at, pid)| {
-                    let who = commands
-                        .get(pid)
-                        .map_or_else(|| format!("pid {pid} (gone)"), |c| squeeze(c, 80));
-                    match at {
-                        Some(at) => format!("{who} {} ms", at.saturating_sub(open_ms)),
-                        None => who,
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("; ")
-        }),
+            l.join("; ")
+        })
+    };
+    row.cell("Local Network holds of aterm's processes", list(aterms_own));
+    row.cell(
+        "Local Network holds not aterm's (never counted)",
+        list(others),
     );
-    Ok(blocks.iter().filter_map(|(at, _)| *at).collect())
+    Ok(blocks
+        .iter()
+        .filter(|(_, pid)| {
+            matches!(
+                lan::whose(&tree, *pid),
+                lan::Whose::Aterm | lan::Whose::Gone
+            )
+        })
+        .filter_map(|(at, _)| *at)
+        .collect())
 }
 
 /// How many of UserNotificationCenter's and Background Task Management's messages a first launch
@@ -6070,18 +6216,19 @@ fn run_row(
     let watchers = Watchers::start(&g)?;
     // A first launch times its readings from the app's open; every other row from its start, so
     // an alert any row raises is read by its words, not only its window's owner.
-    let started = if ask.reader && scenario != Scenario::FirstLaunch {
-        reader_start(&g).and_then(|()| g.clock_ms()).map(Some)
-    } else {
-        Ok(None)
-    };
+    let started =
+        if ask.reader && !matches!(scenario, Scenario::FirstLaunch | Scenario::FirstLaunchVault) {
+            reader_start(&g).and_then(|()| g.clock_ms()).map(Some)
+        } else {
+            Ok(None)
+        };
     let (read_from, body) = match started {
         Ok(from) => (from, row_body(&g, run, ask, scenario, &mut row)),
         Err(fail) => (None, Err(fail)),
     };
     // The census, tccd and the guard are read whatever the row came to, before the clone goes.
     let read = read_from.map_or(Ok(()), |from| {
-        reader_cells(&g, &mut row, from).and_then(|()| unc_cells(&g, &mut row, from))
+        reader_cells(&g, &mut row, from).and_then(|_| unc_cells(&g, &mut row, from))
     });
     let watched = watchers.finish(&g, &mut row);
     let guarded = alab_guard(&g, run, &mut row);
@@ -6122,6 +6269,7 @@ fn row_body(
         Scenario::LaunchRepairs => launch_repairs(g, row),
         Scenario::DevtoolsControl => devtools_control(g, row),
         Scenario::FirstLaunch => first_launch(g, ask, row),
+        Scenario::FirstLaunchVault => lan::first_launch_vault(g, ask, row),
         Scenario::TerminalLaunch => terminal_launch(g, row),
         Scenario::AppLaunch => app_launch(g, row),
         Scenario::Vault => vault(g, row),
@@ -6391,6 +6539,9 @@ mod capture;
 #[path = "mac_nux_fault.rs"]
 mod fault;
 
+#[path = "mac_nux_lan.rs"]
+mod lan;
+
 #[path = "mac_nux_phrase.rs"]
 mod phrase;
 
@@ -6439,6 +6590,13 @@ mod tests {
         for s in every() {
             assert_eq!(parse_scenarios(s.name()).unwrap(), [s]);
         }
+        // `first-launch-vault` comes by name alone, in neither `all` nor `faults`.
+        assert_eq!(
+            parse_scenarios("first-launch-vault").unwrap(),
+            [Scenario::FirstLaunchVault]
+        );
+        assert!(!ALL.contains(&Scenario::FirstLaunchVault));
+        assert!(!FAULTS.contains(&Scenario::FirstLaunchVault));
         // The fault rows come by name or as `faults`, never with `all`, and after its rows.
         assert_eq!(parse_scenarios("faults").unwrap(), FAULTS);
         assert!(
@@ -6586,11 +6744,12 @@ mod tests {
         // Its cell: the words, never "none" for a reader that could not read.
         let read = crate::mac_nux_guest::Reader {
             trusted: Some(true),
-            words: vec![(
-                1500,
-                "CoreServicesUIAgent".into(),
-                "AXStaticText \"x\"".into(),
-            )],
+            words: vec![crate::mac_nux_guest::Words {
+                at_ms: 1500,
+                pid: 80,
+                owner: "CoreServicesUIAgent".into(),
+                words: "AXStaticText \"x\"".into(),
+            }],
         };
         assert_eq!(
             reader_value(&read, 1000).to_string(),
@@ -6926,13 +7085,14 @@ mod tests {
             local_network_blocks(&blocks),
             [(Some(1_793_197_104_716), 777)]
         );
-        let ps = "  777 /Applications/aterm.app/Contents/MacOS/aterm\n  827 /Applications/aterm.app/Contents/MacOS/aterm acaffeine serve\n";
-        let commands = ps_commands(ps);
+        let ps = "  777     1 /Applications/aterm.app/Contents/MacOS/aterm\n  827   777 /Applications/aterm.app/Contents/MacOS/aterm acaffeine serve\n";
+        let tree = lan::ps_tree(ps);
         assert_eq!(
-            commands.get(&777).map(String::as_str),
+            tree.get(&777).map(|(_, c)| c.as_str()),
             Some("/Applications/aterm.app/Contents/MacOS/aterm")
         );
-        assert_eq!(commands.len(), 2);
+        assert_eq!(tree.len(), 2);
+        assert_eq!(lan::whose(&tree, 777), lan::Whose::Aterm);
     }
 
     #[test]
@@ -7201,6 +7361,44 @@ mod tests {
             read_elevations("garbage\n1 x 1 root sudo machines here apply\n"),
             Elevations::default()
         );
+    }
+
+    /// The LAN broker is a root aterm too: it is never a root half or an ask, by its argv in the
+    /// watch and by launchd's count of its ended processes in process accounting.
+    #[test]
+    fn the_lan_broker_is_never_counted_as_an_elevation() {
+        let watch = "1001 812 700 root /usr/bin/sudo -k -p Mac password:  /Applications/aterm.app/Contents/MacOS/aterm machines here apply --plain\n\
+                     1002 814 812 root /Applications/aterm.app/Contents/MacOS/aterm machines here apply --plain\n\
+                     1005 900 1 root /Library/Application Support/aterm/lan/aterm.app/Contents/MacOS/aterm lan serve --source /Applications/aterm.app machines here apply\n";
+        let seen = read_elevations(watch);
+        assert_eq!(seen.asks, [(1001, 812)]);
+        assert_eq!(
+            seen.root_runs,
+            [(1002, 814)],
+            "the broker's argv is no root half"
+        );
+        // Accounting: the root half, and one broker that ended on its adoption's restart.
+        let report = "aterm      -       root     __         0.02 secs Wed Nov  4 11:47 (0:00:00.31)\n\
+                      aterm      -       root     __         0.40 secs Wed Nov  4 11:47 (0:00:41.00)\n";
+        let restarted = lan::read_launchctl(
+            "system/systems.alab.aterm-lan = {\n\tstate = running\n\truns = 2\n\tpid = 950\n}\n",
+        );
+        assert_eq!(root_halves(report, None, restarted.as_ref()), 1);
+        assert_eq!(with_accounting(seen, 1).asks.len(), 1, "one ask, not two");
+        // NEGATIVE CONTROL: with no broker the same records are two root halves, two asks.
+        assert_eq!(root_halves(report, None, None), 2);
+        assert_eq!(with_accounting(Elevations::default(), 2).asks.len(), 2);
+        // A broker still running has not ended, so it takes nothing off.
+        let running = lan::read_launchctl(
+            "system/systems.alab.aterm-lan = {\n\tstate = running\n\truns = 1\n}\n",
+        );
+        assert_eq!(root_halves(report, None, running.as_ref()), 2);
+        // A broker run that had ended before accounting started is in no record: only the
+        // runs that ended since come off.
+        let earlier = lan::read_launchctl(
+            "system/systems.alab.aterm-lan = {\n\tstate = running\n\truns = 2\n\tpid = 900\n}\n",
+        );
+        assert_eq!(root_halves(report, earlier.as_ref(), restarted.as_ref()), 2);
     }
 
     /// A root half too quick for the watch is still counted from process accounting, with its

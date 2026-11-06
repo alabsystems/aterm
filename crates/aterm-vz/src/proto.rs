@@ -396,10 +396,6 @@ impl Take<'_> {
         Ok(b)
     }
 
-    fn bytes(&mut self) -> Result<Vec<u8>, ProtoError> {
-        Ok(self.slice()?.to_vec())
-    }
-
     fn text(&mut self) -> Result<String, ProtoError> {
         std::str::from_utf8(self.slice()?)
             .map(str::to_owned)
@@ -407,8 +403,8 @@ impl Take<'_> {
     }
 
     fn path(&mut self) -> Result<PathBuf, ProtoError> {
-        use std::os::unix::ffi::OsStringExt as _;
-        Ok(PathBuf::from(std::ffi::OsString::from_vec(self.bytes()?)))
+        use std::os::unix::ffi::OsStrExt as _;
+        Ok(PathBuf::from(std::ffi::OsStr::from_bytes(self.slice()?)))
     }
 
     fn opt_u64(&mut self) -> Result<Option<u64>, ProtoError> {

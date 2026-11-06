@@ -454,7 +454,7 @@ impl Paths {
         self.root.join(MINT_SECRET)
     }
     pub(crate) fn state(&self) -> PathBuf {
-        self.root.join("link-state")
+        self.root.join(crate::federate::BRIDGE_STATE_DIR)
     }
     /// The launchd job's plist.
     pub(crate) fn plist(&self) -> PathBuf {
@@ -1744,22 +1744,42 @@ impl From<io::Error> for CapMiss {
     }
 }
 
-/// The node ring an aterm before D08 (`49b5230d88`, which minted from the ceiling) minted for
-/// `node` on `fleet`: `ceiling`'s grants and the two `term/` grants of the drive face cut in
-/// `678ad583d5`. It is wider than the ceiling, and `on` mints the ceiling's ring over it
-/// without keeping it aside or warning of it, as it does a ring of another fleet: an `on`
-/// minted it, and every grant it holds beyond the ceiling's reaches a face nothing serves.
-fn earlier_node_grants(
-    ceiling: &astream_cap::GrantCeiling,
-    fleet: &str,
-    node: &str,
-) -> Vec<String> {
-    let mut ring = ceiling.rules();
-    ring.extend([
+/// The two grants aterm's fleet-wide halts (§11 C4) gave `node`'s ring on `fleet`: every Mac's
+/// halt subject read, and its own written.
+fn halt_grants(fleet: &str, node: &str) -> [String; 2] {
+    [
+        format!("ro:/f/{fleet}/halt/>"),
+        format!("rw,p={node}:/f/{fleet}/halt/{node}"),
+    ]
+}
+
+/// The node ring an aterm before its fleet-wide halts minted for `node` on `fleet`: `ceiling`'s
+/// rules without [`halt_grants`]. It is within the ceiling, and `on` mints the ceiling's ring
+/// over it, since a bridge holding it can neither say a halt nor read another Mac's.
+fn before_halt_grants(ceiling: &astream_cap::GrantCeiling, fleet: &str, node: &str) -> Vec<String> {
+    let halts = halt_grants(fleet, node);
+    ceiling
+        .rules()
+        .into_iter()
+        .filter(|grant| !halts.contains(grant))
+        .collect()
+}
+
+/// The frozen node ring an aterm before D08 (`49b5230d88`) minted: the six faces it
+/// served then and the two retired `term/` drive faces. It must not follow today's ceiling:
+/// later additions, such as halt grants, were never in that historical ring. `on` replaces
+/// this generated ring without keeping it aside; its extra faces are no longer served.
+fn earlier_node_grants(fleet: &str, node: &str) -> Vec<String> {
+    vec![
+        format!("rw,p={node}:/f/{fleet}/pub/{node}/>"),
+        format!("ro:/f/{fleet}/pub/>"),
+        format!("ro:/f/{fleet}/fleet/>"),
+        format!("rw,p={node}:/f/{fleet}/in/*/*/{node}/*"),
+        format!("ro:/f/{fleet}/in/{node}/>"),
+        format!("rw,p={node}:/f/{fleet}/cur/{node}/>"),
         format!("ro:/f/{fleet}/term/{node}/>"),
         format!("rw,p={node}:/f/{fleet}/term/{node}/*/screen"),
-    ]);
-    ring
+    ]
 }
 
 /// Whether `held` is `grants`, in any order.
@@ -1779,6 +1799,9 @@ enum Fit {
     Within,
     /// The ring an earlier aterm minted ([`earlier_node_grants`]), which `on` mints over.
     Earlier,
+    /// The ring an aterm before its fleet-wide halts minted ([`before_halt_grants`]), within the
+    /// ceiling but short of its halt grants, which `on` mints over.
+    BeforeHalts,
     /// Wider than the ceiling, and no ring `on` ever minted: the check's first violation.
     Wider(astream_cap::CeilingViolation),
 }
@@ -1789,9 +1812,12 @@ enum Fit {
 /// A fleet or node id the ceiling refuses (neither is one `on` makes).
 fn fit(held: &[astream_cap::Capability], fleet: &str, node: &str) -> Result<Fit, String> {
     let ceiling = astream_cap::GrantCeiling::aterm_node_ring(fleet, node)?;
+    if same_grants(held, &before_halt_grants(&ceiling, fleet, node)) {
+        return Ok(Fit::BeforeHalts);
+    }
     Ok(match ceiling.check_ring(held) {
         Ok(()) => Fit::Within,
-        Err(_) if same_grants(held, &earlier_node_grants(&ceiling, fleet, node)) => Fit::Earlier,
+        Err(_) if same_grants(held, &earlier_node_grants(fleet, node)) => Fit::Earlier,
         Err(violation) => Fit::Wider(violation),
     })
 }
@@ -1811,16 +1837,18 @@ fn binds(held: &[astream_cap::Capability], node: &str) -> bool {
 }
 
 /// Whether `held` is, grant for grant, a ring an `on` for `node` mints on a fleet its own grants
-/// name: the node's ceiling rules there, or the eight grants an aterm before D08 minted
-/// ([`earlier_node_grants`]). `on` mints over such a ring without keeping it, whatever secret
-/// minted it, because `on --fleet <it>` here mints it again; every other ring it keeps aside,
-/// since nothing else records what it held.
+/// name: the node's ceiling rules there, the six an aterm before its fleet-wide halts minted
+/// ([`before_halt_grants`]), or the eight an aterm before D08 minted ([`earlier_node_grants`]).
+/// `on` mints over such a ring without keeping it, whatever secret minted it, because `on
+/// --fleet <it>` here mints it again; every other ring it keeps aside, since nothing else records
+/// what it held.
 fn minted_by_on(held: &[astream_cap::Capability], node: &str) -> bool {
     let fleets: BTreeSet<String> = held.iter().filter_map(|c| fleet_of(&c.filter)).collect();
     fleets.iter().any(|fleet| {
         astream_cap::GrantCeiling::aterm_node_ring(fleet, node).is_ok_and(|ceiling| {
             same_grants(held, &ceiling.rules())
-                || same_grants(held, &earlier_node_grants(&ceiling, fleet, node))
+                || same_grants(held, &before_halt_grants(&ceiling, fleet, node))
+                || same_grants(held, &earlier_node_grants(fleet, node))
         })
     })
 }
@@ -1961,6 +1989,13 @@ fn ring_is_for(
             Fit::Earlier => Err(CapMiss {
                 why: "the ring an earlier aterm minted, with the cut drive face's two term/ \
                       grants"
+                    .to_string(),
+                keep: false,
+                refused: false,
+            }),
+            Fit::BeforeHalts => Err(CapMiss {
+                why: "the ring an aterm before fleet-wide halts minted, without the node's two \
+                      halt grants"
                     .to_string(),
                 keep: false,
                 refused: false,
@@ -2784,6 +2819,12 @@ fn program_step(p: &Paths, out: &mut Out) -> bool {
 /// `on`'s node step with the mesh on (§11 C3): the node this Mac's node key in `keys` names,
 /// recorded in the state dir `state`, which held `held`. No key fails the step: the node service
 /// writes it as it starts.
+///
+/// The record is made under the dir's bridge lock, so a dir names a node only while no bridge
+/// runs there or by that bridge itself: the move of a retired node's unread mail opens once the
+/// dir names another node (§11 C3b, `federate::Shared::gate_old_inbox`), and a bridge still
+/// running as the old node holds the lock. While one does, the step records nothing and says so,
+/// and the next bridge names the node there as it takes the dir.
 fn mesh_node_step(
     keys: &Path,
     state: &Path,
@@ -2819,18 +2860,33 @@ fn mesh_node_step(
         );
         return Ok(node);
     }
+    let held = held.map_or_else(String::new, |h| format!(" (it held {})", safe(&h, 64)));
     let would = format!(
-        "record {node}, named by this Mac's node key, in {}/node{}",
-        state.display(),
-        held.map_or_else(String::new, |h| format!(" (it held {})", safe(&h, 64)))
+        "record {node}, named by this Mac's node key, in {}/node{held}",
+        state.display()
     );
     if dry_run {
         out.done("node", &would, "");
         return Ok(node);
     }
-    match crate::state::StateDir::open(state).and_then(|s| s.name_node(&node)) {
+    let named = crate::state::StateDir::open(state).and_then(|s| {
+        let _bridge = s.lock_bridge()?;
+        s.name_node(&node)
+    });
+    match named {
         Ok(_) => {
             out.done("node", &would, &format!("recorded {node}"));
+            Ok(node)
+        }
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+            out.note(
+                "node",
+                &format!(
+                    "{node}, named by this Mac's node key, is not recorded in {}/node{held}: {e}; \
+                     the bridge aterm starts next records it as it takes the dir",
+                    state.display()
+                ),
+            );
             Ok(node)
         }
         Err(e) => {
@@ -10059,8 +10115,8 @@ mod tests {
         assert!(Rendezvous::parse("[x\n").is_err());
     }
 
-    /// THE RINGS ATERM MINTS ARE ASTREAM'S CEILINGS' RULES: a node's six grants, the eight an
-    /// earlier aterm minted being those and the cut drive face's two `term/` grants; a person's
+    /// THE RINGS ATERM MINTS ARE ASTREAM'S CEILINGS' RULES. The historical node ring is frozen,
+    /// including its two retired drive faces and excluding later halt grants. A person's
     /// ring is byte for byte the one `enable::person_grants` minted before it was deleted (its
     /// output for a human and a service, spelled here), so a ring `mint-for` minted then is the
     /// one it mints now. Every node id `on` makes is one the node ceiling takes.
@@ -10076,10 +10132,16 @@ mod tests {
                 "rw,p=n-a:/f/local/in/*/*/n-a/*",
                 "ro:/f/local/in/n-a/>",
                 "rw,p=n-a:/f/local/cur/n-a/>",
+                "ro:/f/local/halt/>",
+                "rw,p=n-a:/f/local/halt/n-a",
             ]
         );
         assert_eq!(
-            earlier_node_grants(&ceiling, "local", "n-a")[6..],
+            before_halt_grants(&ceiling, "local", "n-a"),
+            ceiling.rules()[..6]
+        );
+        assert_eq!(
+            earlier_node_grants("local", "n-a")[6..],
             [
                 "ro:/f/local/term/n-a/>",
                 "rw,p=n-a:/f/local/term/n-a/*/screen",
@@ -10145,6 +10207,11 @@ mod tests {
         let held = minted(&ceiling.rules());
         assert!(ceiling.check_ring(&held).is_ok());
         assert!(matches!(fit(&held, "lab", node), Ok(Fit::Within)));
+        // A ring minted before the halt grants is within the ceiling too, and `on` mints over it.
+        let before = minted(&before_halt_grants(&ceiling, "lab", node));
+        assert!(ceiling.check_ring(&before).is_ok());
+        assert!(matches!(fit(&before, "lab", node), Ok(Fit::BeforeHalts)));
+        assert!(minted_by_on(&before, node));
         for person in ["h-andrew", "a-bot"] {
             let ceiling =
                 astream_cap::GrantCeiling::aterm_person_ring("lab", person).expect("a person");
@@ -11301,7 +11368,7 @@ mod tests {
             path
         };
         let own = cap_under(&[4u8; 32], "own.cap", &ring);
-        assert_eq!(cap_is_for(&own, "lab", node, &[4u8; 32]), Ok(6));
+        assert_eq!(cap_is_for(&own, "lab", node, &[4u8; 32]), Ok(ring.len()));
         {
             use std::os::unix::fs::PermissionsExt as _;
             let at = |mode| std::fs::set_permissions(&own, std::fs::Permissions::from_mode(mode));
@@ -11415,7 +11482,9 @@ mod tests {
         assert!(miss.keep && !miss.refused, "{miss:?}");
         assert!(
             miss.why.starts_with(WIDER_RING)
-                && miss.why.contains("ring[6]")
+                && miss
+                    .why
+                    .contains(&format!("ring[{}]", ceiling.rules().len()))
                 && miss.why.contains("rw:/f/lab/>")
                 && miss.why.contains("god capability"),
             "{miss:?}"
@@ -11429,7 +11498,7 @@ mod tests {
             "{warning}: {fix}"
         );
 
-        let earlier = earlier_node_grants(&ceiling, "lab", node);
+        let earlier = earlier_node_grants("lab", node);
         let mut one_term = ceiling.rules();
         one_term.push(earlier[7].clone());
         let one_term = cap_under("one-term.cap", &one_term);
@@ -11444,14 +11513,7 @@ mod tests {
         assert!(!miss.keep && !miss.refused, "{miss:?}");
         assert!(miss.why.contains("earlier aterm"), "{miss:?}");
         assert_eq!(named(&earlier), None);
-        let elsewhere = cap_under(
-            "elsewhere.cap",
-            &earlier_node_grants(
-                &astream_cap::GrantCeiling::aterm_node_ring("work", node).expect("a node"),
-                "work",
-                node,
-            ),
-        );
+        let elsewhere = cap_under("elsewhere.cap", &earlier_node_grants("work", node));
         let miss = ring_is_for(Ok(elsewhere.clone()), "lab", node, &secret).expect_err("other");
         assert!(
             !miss.keep && miss.why == "minted for fleet work, not lab",
@@ -11460,7 +11522,10 @@ mod tests {
         assert_eq!(named(&elsewhere), None);
 
         let own = cap_under("own.cap", &ceiling.rules());
-        assert_eq!(ring_is_for(Ok(own.clone()), "lab", node, &secret), Ok(6));
+        assert_eq!(
+            ring_is_for(Ok(own.clone()), "lab", node, &secret),
+            Ok(ceiling.rules().len())
+        );
         assert_eq!(named(&own), None);
     }
 
@@ -11558,21 +11623,20 @@ mod tests {
         let node = "n-0123456789abcdef";
         let ceiling = astream_cap::GrantCeiling::aterm_node_ring("lab", node).expect("a node");
         let rules = ceiling.rules();
-        let earlier = earlier_node_grants(&ceiling, "lab", node);
+        let earlier = earlier_node_grants("lab", node);
         let god = "rw:/f/lab/>".to_string();
         let with = |ring: &[String], extra: &str| {
             let mut ring = ring.to_vec();
             ring.push(extra.to_string());
             ring
         };
-        let work = astream_cap::GrantCeiling::aterm_node_ring("work", node).expect("a node");
         let another = node_rules("lab", "n-other");
         let shapes: [(&str, Vec<String>); 9] = [
             ("own", rules.clone()),
             ("wide", with(&rules, &god)),
             ("one-term", with(&rules, &earlier[7])),
             ("earlier", earlier.clone()),
-            ("work", earlier_node_grants(&work, "work", node)),
+            ("work", earlier_node_grants("work", node)),
             ("another", another.clone()),
             ("another-wide", with(&another, &god)),
             ("god", vec![god.clone()]),
@@ -11653,7 +11717,7 @@ mod tests {
         );
         for (name, grants) in [
             ("own.cap", ceiling.rules()),
-            ("earlier.cap", earlier_node_grants(&ceiling, "lab", node)),
+            ("earlier.cap", earlier_node_grants("lab", node)),
         ] {
             let miss = ring_is_for(ring_under(&other, name, &grants), "lab", node, &root)
                 .expect_err("another secret");
@@ -12254,6 +12318,60 @@ mod tests {
             bus_hosting(&p),
             BusHosting::Off,
             "the off record beside aterm.toml"
+        );
+    }
+
+    /// `on`'S NODE STEP RECORDS UNDER THE BRIDGE LOCK (§11 C3b): while a bridge holds the state
+    /// dir, as a bridge of the old node does after a key rotation until aterm relaunches it, the
+    /// step leaves `node` naming that node, so the move of its unread mail stays shut and that
+    /// bridge goes on owning its group alone; once the lock is free, the same step records the
+    /// node the key names (the control).
+    #[test]
+    fn the_mesh_node_step_names_no_node_under_a_running_bridge() {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let keys = dir.path().join("keys");
+        aterm_uds::private_file::ensure_private_dir(&keys).expect("a private dir");
+        let text = format!("{}\n", aterm_codec::hex::encode_lower(&[7u8; 32]));
+        aterm_uds::private_file::write_private(
+            &keys,
+            crate::federate::NODE_KEY_FILE,
+            text.as_bytes(),
+        )
+        .expect("the key");
+        let node = crate::federate::node_of_key(&keys)
+            .expect("a key")
+            .expect("a node");
+        let state = dir.path().join(crate::federate::BRIDGE_STATE_DIR);
+        let old = "n-0123456789abcdef";
+        let dir_of = crate::state::StateDir::open(&state).expect("the state dir");
+        dir_of.name_node(old).expect("the old node");
+
+        let bridge = dir_of.lock_bridge().expect("a bridge holds the dir");
+        let mut out = Out::kept();
+        let named = mesh_node_step(&keys, &state, read_node(&state), false, &mut out);
+        assert_eq!(named.ok().as_deref(), Some(node.as_str()), "{}", out.said());
+        assert!(!out.failed, "{}", out.said());
+        assert!(
+            out.said().contains("held by another bridge"),
+            "{}",
+            out.said()
+        );
+        assert_eq!(
+            read_node(&state).as_deref(),
+            Some(old),
+            "the running bridge's node stays: {}",
+            out.said()
+        );
+
+        drop(bridge);
+        let mut out = Out::kept();
+        let named = mesh_node_step(&keys, &state, read_node(&state), false, &mut out);
+        assert_eq!(named.ok().as_deref(), Some(node.as_str()), "{}", out.said());
+        assert_eq!(
+            read_node(&state).as_deref(),
+            Some(node.as_str()),
+            "with no bridge running the key's node is recorded: {}",
+            out.said()
         );
     }
 }

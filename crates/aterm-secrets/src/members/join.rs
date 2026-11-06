@@ -49,10 +49,22 @@ pub fn ask_all(
     joining: &Joining<'_>,
     ats: &[String],
 ) -> (Vec<Heard>, Vec<(String, String)>) {
+    ask_all_admitted(dial, joining, ats, &|| Ok(()))
+}
+
+/// [`ask_all`] under an existing caller's authority, checked before each dial and before
+/// sending a request after the member's greeting. A greeting never authorizes the ask.
+#[must_use]
+pub fn ask_all_admitted(
+    dial: &Dial<'_>,
+    joining: &Joining<'_>,
+    ats: &[String],
+    current: &(dyn Fn() -> Result<()> + Sync),
+) -> (Vec<Heard>, Vec<(String, String)>) {
     let answers: Vec<(String, Result<Heard>)> = std::thread::scope(|scope| {
         let asking: Vec<_> = ats
             .iter()
-            .map(|at| (at, scope.spawn(move || ask_one(dial, joining, at))))
+            .map(|at| (at, scope.spawn(move || ask_one(dial, joining, at, current))))
             .collect();
         asking
             .into_iter()
@@ -75,9 +87,16 @@ pub fn ask_all(
     (heard, missed)
 }
 
-fn ask_one(dial: &Dial<'_>, joining: &Joining<'_>, at: &str) -> Result<Heard> {
+fn ask_one(
+    dial: &Dial<'_>,
+    joining: &Joining<'_>,
+    at: &str,
+    current: &(dyn Fn() -> Result<()> + Sync),
+) -> Result<Heard> {
+    current()?;
     let mut stream = dial(at)?;
     let greeting = joiner::greeting(&mut stream)?;
+    current()?;
     let (answer, signed) = joiner::ask_checked(&mut stream, &greeting, joining)?;
     Ok(Heard {
         at: at.to_owned(),

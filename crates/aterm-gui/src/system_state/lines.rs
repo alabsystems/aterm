@@ -399,27 +399,13 @@ const GO_TO_TAB_LABEL: &str = "Go to tab: Command Line Tools";
 pub(super) const GO_TO_INSTALLER_LABEL: &str = "Go to installer: Apple's Command Line Tools";
 
 /// THE CARD RULE (§4.8, pure): everything that needs the person, once each, in the order they
-/// meet it — the permission walk's page, macOS's Local Network question, the Command Line Tools'
-/// password, the vault's Allow and phrase, a code to approve, a failed step with what aterm does
+/// meet it — the permission walk's page, the Command Line Tools' password, the vault's Allow and phrase, a code to approve, a failed step with what aterm does
 /// next.
 pub(crate) fn card_items(app: &SystemStateApp, rows: &[RowView]) -> Vec<CardItem> {
     let status = &app.status;
     let mut items = Vec::new();
     if !app.plan_known || status.newer() {
         return items;
-    }
-    // macOS's Local Network question is up (or about to be), which the walk's one-gesture rule
-    // holds for its moment: the person answers it in macOS's own dialog.
-    if status.access_step == Some(Access::LocalNetwork) {
-        items.push(
-            CardItem::new(
-                "local-network",
-                Mark::NeedsYou,
-                "Allow aterm on your local network",
-            )
-            .reason(Some("If macOS asks, press Allow".to_owned()))
-            .for_row(Subject::Access(Access::LocalNetwork)),
-        );
     }
     let needs = |row: &RowView| row.managed && row.standing == Some(Standing::NeedsYou);
     for row in rows.iter().filter(|row| needs(row)) {
@@ -623,9 +609,9 @@ pub(crate) const TRIES_BY_ITSELF: &str = "aterm tries it again by itself.";
 
 /// Whether the permission walk shows a page for `access`: a grant the person turns on in System
 /// Settings, which the walk visits in turn. Debugger access, which setup's one early elevation
-/// turns on, and macOS's Local Network question, a dialog of its own, are never a walk page.
+/// turns on, is never a walk page.
 const fn walks_to(access: Access) -> bool {
-    !matches!(access, Access::Debugger | Access::LocalNetwork)
+    !matches!(access, Access::Debugger)
 }
 
 impl RowView {

@@ -17,6 +17,8 @@ pub mod bundle;
 pub mod desk;
 pub mod join;
 pub mod joiner;
+#[cfg(any(test, debug_assertions))]
+pub mod lab_lan;
 pub(crate) mod proof_retry;
 mod wire;
 

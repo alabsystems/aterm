@@ -30,7 +30,6 @@ mod custody;
 mod discovery;
 #[cfg(any(test, debug_assertions))]
 mod isolation;
-mod lan;
 mod owner;
 mod place;
 mod report;
@@ -39,7 +38,6 @@ mod vault;
 pub(crate) use discovery::MAX_UNVERIFIED_ENDPOINTS;
 #[cfg(test)]
 pub(crate) use discovery::Outcome;
-pub use lan::{LanGate, LanTurn};
 pub use report::{AuthenticatedConnection, RepairRound};
 #[cfg(test)]
 pub(crate) use transport::test_worker;
@@ -129,8 +127,6 @@ struct Network {
     /// Public scheduling hints survive a rebuilt endpoint, scoped to its
     /// current trust and writer. A replacement captures fresh authority.
     repairs: crate::control::PeerCache,
-    /// What holds the owner before its observer and first LAN use ([`LanGate`]).
-    lan: LanGate,
     /// Authenticated contacts go to the machine's shared place; fixtures are inert.
     place: place::Publisher,
     /// The one-mesh transport is on (`aterm_types::mesh_switch::MESH`, read once, in
@@ -146,7 +142,7 @@ struct Network {
     #[cfg(test)]
     opens: Option<Arc<std::sync::atomic::AtomicUsize>>,
     /// A LAN attachment's stand-in (tests): its address is no loopback one, so the runtime's first
-    /// LAN use asks its gate's host, and its transport reaches the LAN only once the flag reads
+    /// LAN use asks for the LAN broker, and its transport reaches the LAN only once the flag reads
     /// true ([`transport::Transport::standing_in`]).
     #[cfg(test)]
     stand_in: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -156,24 +152,20 @@ struct Network {
     /// Each wait the owner took after a try that did not serve, in order (tests; [`Self::retry`]).
     #[cfg(test)]
     retries: Option<Arc<Mutex<Vec<Duration>>>>,
-    /// This runtime kept its LAN use ([`Self::note_use`]).
-    used: std::cell::Cell<bool>,
-    /// What the gate's host last deferred the runtime's first LAN use for ([`Self::may_use`]).
+    /// The LAN broker's stand-in (tests): what [`Self::may_use`] hears in place of the broker's
+    /// hello, the broker answering where there is none.
+    #[cfg(test)]
+    broker: Option<Arc<dyn Fn() -> std::result::Result<(), &'static str> + Send + Sync>>,
+    /// The LAN broker answered this runtime once ([`Self::may_use`]).
+    brokered: std::cell::Cell<bool>,
+    /// What the runtime's first LAN use last waited for ([`Self::may_use`]).
     waits: std::cell::Cell<&'static str>,
 }
 impl Network {
-    /// The live network, whose owner waits at `lan` before its first LAN use.
-    /// A guarded debug attachment uses loopback alone, so it asks no LAN permission.
-    fn gated(lan: LanGate) -> Result<Self> {
-        #[cfg(any(test, debug_assertions))]
-        let lan = if isolation::port()?.is_some() {
-            LanGate::open()
-        } else {
-            lan
-        };
-        Ok(Self {
+    /// The live network.
+    fn live() -> Self {
+        Self {
             repairs: crate::control::PeerCache::default(),
-            lan,
             place: place::Publisher::live(),
             mesh: aterm_types::mesh_switch::MESH,
             bus: transport::Bus::default(),
@@ -187,13 +179,15 @@ impl Network {
             open_fails: false,
             #[cfg(test)]
             retries: None,
-            used: std::cell::Cell::new(false),
+            #[cfg(test)]
+            broker: None,
+            brokered: std::cell::Cell::new(false),
             waits: std::cell::Cell::new(""),
-        })
+        }
     }
 
-    /// The owner's `wait` on `stop` after a try that did not serve: held at its gate, or ended
-    /// with a status other than a rebuild.
+    /// The owner's `wait` on `stop` after a try that did not serve: waiting for the LAN broker,
+    /// or ended with a status other than a rebuild.
     fn retry(&self, stop: &Stop, wait: Duration) {
         #[cfg(test)]
         if let Some(retries) = &self.retries {
@@ -202,49 +196,41 @@ impl Network {
         stop.wait(wait);
     }
 
-    /// Whether the runtime may open or refresh its transport on `candidates` now: asked of its
-    /// gate's host right before its first LAN use ([`LanGate::before_use`]), at each try until it
-    /// kept one ([`Self::note_use`]). Only loopback candidates are no LAN use and ask nothing. A use
-    /// the host defers is [`Status::LanHeld`], with what it waits for kept for the owner's
-    /// observation.
+    /// Whether the runtime may open or refresh its transport on `candidates` now: on macOS once
+    /// the root LAN broker answers a hello (`aterm_uds::lan::broker::hello`), which makes every
+    /// LAN socket of aterm's (`docs/DESIGN-lan-broker-2026-11-05.md`); elsewhere at once. It is
+    /// asked at each try until it once answered; a broker that goes away later fails the
+    /// transport's binds, which the next refresh tries again. Only loopback candidates are no LAN
+    /// use and ask nothing. A runtime waiting for the broker is [`Status::LanHeld`], with what it
+    /// waits for kept for the owner's observation.
     fn may_use(&self, candidates: &[std::net::SocketAddr]) -> std::result::Result<(), Status> {
-        if self.used.get() || candidates.iter().all(|address| address.ip().is_loopback()) {
+        if self.brokered.get() || candidates.iter().all(|address| address.ip().is_loopback()) {
             return Ok(());
         }
-        match self.lan.ready_for_use() {
-            None => Ok(()),
-            Some(why) => {
+        #[cfg(test)]
+        let answer = self.broker.as_ref().map_or(Ok(()), |broker| broker());
+        #[cfg(not(test))]
+        let answer = broker_answers();
+        match answer {
+            Ok(()) => {
+                self.brokered.set(true);
+                Ok(())
+            }
+            Err(why) => {
                 self.waits.set(why);
                 Err(Status::LanHeld)
             }
         }
     }
 
-    /// Keep, once for this runtime, that it made a LAN use, with its gate's keeper
-    /// ([`LanGate::keeping_use`]): it opened or refreshed its transport on `candidates`, one of
-    /// them is not a loopback address, and the transport reached the LAN (`bound`,
-    /// [`transport::Transport::bound`]). A use the keeper could not keep is tried again at the
-    /// next. A try that reached none is no use: the gate's host hears it
-    /// ([`LanGate::missing_use`]), and the next try asks it again ([`Self::may_use`]). A try on
-    /// loopback candidates only, or none, is no try: nothing is asked, kept or missed. Nothing is kept per home: the OS asks
-    /// each app on each Mac, and only the host knows whose question its runtime's use was.
-    fn note_use(&self, candidates: &[std::net::SocketAddr], bound: bool) {
-        if self.used.get() || candidates.iter().all(|address| address.ip().is_loopback()) {
-            return;
-        }
-        self.used.set(self.lan.used(bound));
-    }
-
-    /// Refresh `transport` on `candidates`, a LAN use where it reaches the LAN
-    /// ([`Self::note_use`]).
+    /// Refresh `transport` on `candidates`.
     fn refresh(&self, transport: &mut transport::Transport, candidates: &[std::net::SocketAddr]) {
         transport.refresh(candidates);
-        self.note_use(candidates, transport.bound());
     }
 
     fn addresses(&self) -> std::result::Result<Vec<std::net::SocketAddr>, Status> {
-        // An isolated attachment is one loopback address, there whether or not its flag (the OS's
-        // Local Network permission) lets the transport's sends through (tests).
+        // An isolated attachment is one loopback address, there whether or not its flag lets the
+        // transport's sends through (tests).
         #[cfg(test)]
         if self.isolated.is_some() {
             return Ok(vec!["127.0.0.1:0".parse().unwrap()]);
@@ -256,21 +242,14 @@ impl Network {
         addresses()
     }
 
-    /// Open a transport on `candidates`, a LAN use where it reaches the LAN
-    /// ([`Self::note_use`]); one that fails to open reaches none.
+    /// Open a transport on `candidates`.
     fn open(
         &self,
         endpoint: Option<Endpoint>,
         candidates: &[std::net::SocketAddr],
     ) -> Result<transport::Transport> {
-        let opened = self
-            .opening(endpoint, candidates)
-            .map(|transport| transport.hearing_bus(self.bus.clone()));
-        self.note_use(
-            candidates,
-            opened.as_ref().is_ok_and(transport::Transport::bound),
-        );
-        opened
+        self.opening(endpoint, candidates)
+            .map(|transport| transport.hearing_bus(self.bus.clone()))
     }
 
     fn opening(
@@ -295,7 +274,7 @@ impl Network {
             return transport::Transport::isolated(
                 endpoint,
                 attachment.port,
-                Some(attachment.lan_allowed.clone()),
+                Some(attachment.delivering.clone()),
             );
         }
         match endpoint {
@@ -333,8 +312,8 @@ pub enum Status {
     /// A local writer or changed authenticated snapshot requires fresh admission.
     /// The owner retries after [`POLL`] without accumulating refusal backoff.
     Retrying(&'static str),
-    /// The owner waits before its first LAN use ([`LanGate`]): it opened no observer and no
-    /// socket yet, or (its host deferred the use, [`LanGate::before_use`]) no LAN socket.
+    /// The owner waits for the LAN broker before its first LAN use ([`Network::may_use`]): on
+    /// macOS no broker answers yet (setup's Mac password installs it), so it opened no LAN socket.
     LanHeld,
 }
 impl Status {
@@ -766,30 +745,29 @@ impl Runtime {
     /// Start default-on background repair using only this explicit secrets root
     /// and config file. Missing control permits opaque presence discovery and
     /// local observation history, never enrollment or data repair. Call only
-    /// from a long-lived app/session host. `lan` holds the owner before its observer and its
-    /// first LAN use until the host says the LAN is the runtime's ([`LanGate`]).
+    /// from a long-lived app/session host. On macOS its first LAN use waits for the LAN broker
+    /// ([`Status::LanHeld`]).
     pub fn start(
         paths: Paths,
         config: PathBuf,
-        lan: LanGate,
         observe: impl Fn(Status) + Send + 'static,
     ) -> Result<Self> {
-        Self::start_on(paths, config, observe, Network::gated(lan)?)
+        Self::start_on(paths, config, observe, Network::live())
     }
 
     /// Start the same automatic owner with bounded completed-round diagnostics.
     /// The callback runs on the owner thread after the worker has joined, with
     /// no custody/control/table journal or channel/cache guard held. It receives
     /// no payloads or keys and should return promptly. Lifetime ownership and
-    /// observation leases remain held until this runtime stops.
+    /// observation leases remain held until this runtime stops. Its first LAN use waits for the
+    /// LAN broker ([`Status::LanHeld`]).
     pub fn start_with_reports(
         paths: Paths,
         config: PathBuf,
-        lan: LanGate,
         observe: impl Fn(Status) + Send + 'static,
         reports: impl Fn(RepairRound) + Send + 'static,
     ) -> Result<Self> {
-        Self::start_on_with_reports(paths, config, observe, Network::gated(lan)?, reports)
+        Self::start_on_with_reports(paths, config, observe, Network::live(), reports)
     }
 
     /// Observe the production runtime under explicit development instrumentation.
@@ -801,7 +779,6 @@ impl Runtime {
         paths: Paths,
         config: PathBuf,
         diagnostic: Diagnostic,
-        lan: LanGate,
         observe: impl Fn(Status) + Send + 'static,
         reports: impl Fn(RepairRound) + Send + 'static,
     ) -> Result<Self> {
@@ -810,7 +787,7 @@ impl Runtime {
             config,
             (diagnostic.observer_config, diagnostic.recover_writer),
             observe,
-            Network::gated(lan)?,
+            Network::live(),
             false,
             reports,
         )
@@ -821,26 +798,24 @@ impl Runtime {
     /// observation and transport while no interactive `aterm` window runs, yields both within
     /// one tick when a window claims [`owner::WindowClaim`], and resumes once the last window
     /// exits. With the mesh on it yields to no window: the node service is the one owner, and a
-    /// window's runtime waits for its lease. `lan` gates its first LAN use as
+    /// window's runtime waits for its lease. Its first LAN use waits for the LAN broker as
     /// [`Self::start`]'s does.
     pub fn start_background(
         paths: Paths,
         config: PathBuf,
-        lan: LanGate,
         observe: impl Fn(Status) + Send + 'static,
     ) -> Result<Self> {
-        Self::start_background_on(paths, config, observe, Network::gated(lan)?)
+        Self::start_background_on(paths, config, observe, Network::live())
     }
 
     /// [`Self::start_background`] with [`Self::start_with_reports`]'s completed-round reports.
     pub fn start_background_with_reports(
         paths: Paths,
         config: PathBuf,
-        lan: LanGate,
         observe: impl Fn(Status) + Send + 'static,
         reports: impl Fn(RepairRound) + Send + 'static,
     ) -> Result<Self> {
-        Self::start_mode_with_reports(paths, config, observe, Network::gated(lan)?, true, reports)
+        Self::start_mode_with_reports(paths, config, observe, Network::live(), true, reports)
     }
 
     fn start_on(
@@ -912,7 +887,6 @@ impl Runtime {
         let task = thread::Builder::new()
             .name("commons-owner".into())
             .spawn(move || {
-                let mut network = network;
                 let observer_dir = crate::network_state::directory(&observer_config);
                 let mut window_claim = None;
                 let mut previous = None;
@@ -922,13 +896,10 @@ impl Runtime {
                         previous = Some(status);
                     }
                 };
-                // What this owner serves of its wait while its gate or a disabled Commons holds it.
-                let mut wait_relay = crate::network_state::WaitRelay::default();
-                // One streak of refusals, whether the gate or a try refused ([`Refusals`]).
+                // One streak of refusals ([`Refusals`]).
                 let mut refusals = Refusals::new(background);
                 while !worker.requested() {
                     if yields && owner::window_claimed(&observer_dir) {
-                        wait_relay.stop();
                         let publication = waiting_publication(
                             &paths,
                             &config,
@@ -940,32 +911,11 @@ impl Runtime {
                         worker.wait(POLL);
                         continue;
                     }
-                    // Before the observer: opening it creates the observation history, and an
-                    // owner holds no observation or transport ownership while its LAN waits. It
-                    // shows the journal owner's live observation where one answers, else its own
-                    // wait, which it serves to other local processes as an open owner serves its
-                    // observation.
-                    if let Some((visibility, detail, mut status)) = network.lan.held(&config) {
-                        published.replace_publication(
-                            transport_publication(&paths)
-                                .or_else(|| crate::network_state::read_owner_publication(&config).ok())
-                                .unwrap_or_else(|| held_publication(&config, visibility, detail)),
-                        );
-                        wait_relay.keep(&observer_config, &published);
-                        let wait = refusals.after(Some(&mut status), None);
-                        report(status);
-                        network.retry(&worker, wait);
-                        continue;
-                    }
                     if !background && window_claim.is_none() {
-                        // Keep the working background owner until this window's first LAN
-                        // gate opens. Retain priority across observer contention afterward.
+                        // Keep the working background owner until this window owns Commons.
+                        // Retain priority across observer contention afterward.
                         window_claim = owner::WindowClaim::acquire(&observer_dir).ok();
                     }
-                    wait_relay.stop();
-                    // Before the observer, whose history then says nothing of a LAN use: a
-                    // history with no record is one an aterm with no gate left.
-                    let _ = crate::network_state::begin_lan_use(&observer_config);
                     let mut history = match Observer::open(&observer_config, published.clone()) {
                         Ok(history) => history,
                         Err(crate::network_state::OpenFailure::Unavailable) => {
@@ -1108,20 +1058,6 @@ impl Drop for Runtime {
     }
 }
 
-/// What a held owner publishes as its own wait: the retained history with `visibility` and
-/// `detail`, observed now, so it reads as current here and over its relay.
-fn held_publication(
-    config: &Path,
-    visibility: Visibility,
-    detail: &str,
-) -> crate::network_state::Publication {
-    let mut retained = crate::network_state::read_history(config).unwrap_or_default();
-    retained.visibility = visibility;
-    retained.detail = detail.into();
-    retained.observed_at_ms = aterm_time::unix_millis().unwrap_or(0);
-    crate::network_state::Publication::new(retained, Instant::now())
-}
-
 /// What an owner with no observer of its own publishes: the live owner's relayed snapshot when
 /// one answers, else the retained history with `visibility` and `detail`.
 fn waiting_publication(
@@ -1240,6 +1176,11 @@ fn serve_mode_with_recovery(
     reports: &impl Fn(RepairRound),
     board: &Board,
 ) -> std::result::Result<(), Status> {
+    // A background owner yields to a window's claim before it reads its configuration, so one
+    // its configuration refuses still yields.
+    if yield_to_window.is_some_and(owner::window_claimed) {
+        return Err(Status::Waiting);
+    }
     if !enabled(config).map_err(refusal("configuration"))? {
         return Err(Status::Disabled);
     }
@@ -1365,7 +1306,6 @@ fn serve_selected(
     // The lab journal's flusher, on a thread of its own; an enrolling owner has no writer to
     // publish anything with.
     let mut lab = (!pending).then(|| crate::alab::upkeep::Upkeep::new(Instant::now()));
-    let mut refused = network.lan.refused();
     let mut refresh = Instant::now() + Duration::from_secs(30);
     let result = (|| {
         let _serving = board.serving();
@@ -1430,7 +1370,6 @@ fn serve_selected(
                 let candidates = network.addresses()?;
                 network.may_use(&candidates)?;
                 network.refresh(&mut transport, &candidates);
-                refused = network.lan.refused();
                 poll = now + POLL;
             }
             if let Some(ask) = board.take() {
@@ -1493,7 +1432,6 @@ fn serve_selected(
                 } else {
                     ObservationMode::Repair
                 },
-                refused,
             );
             report(if transport.interfaces() == 0 {
                 Status::Offline
@@ -1779,9 +1717,7 @@ fn accounts_exchange_candidate(
     exchange: crate::replica::MatchingInventory,
 ) -> Option<crate::network_state::account_exchange::Candidate> {
     let scope =
-        crate::catalog::Descriptor::application(bootstrap.trust(), "accounts", "proposals", 1)
-            .ok()?
-            .scope;
+        crate::catalog::application_scope(bootstrap.trust(), "accounts", "proposals").ok()?;
     if exchange.scope() != scope || exchange.local_actor() != access.local().binding().actor() {
         return None;
     }
@@ -1860,7 +1796,6 @@ fn serve_presence(
     let mut transport = network
         .open(None, &candidates)
         .map_err(|_| Status::Offline)?;
-    let mut refused = network.lan.refused();
     let mut poll = Instant::now() + POLL;
     let mut refresh = Instant::now() + Duration::from_secs(30);
     report(Status::Dormant);
@@ -1891,30 +1826,14 @@ fn serve_presence(
             let candidates = network.addresses()?;
             network.may_use(&candidates)?;
             network.refresh(&mut transport, &candidates);
-            refused = network.lan.refused();
             poll = now + POLL;
         }
         transport.tick(now).map_err(|_| Status::Offline)?;
-        observe_transport(history, &transport, ObservationMode::Discovery, refused);
+        observe_transport(history, &transport, ObservationMode::Discovery);
         stop.wait(TICK);
     }
     Ok(())
 }
-
-/// [`LAN_REFUSED`] followed by a literal suffix.
-macro_rules! concat_refused {
-    ($suffix:literal) => {
-        concat!(
-            "macOS refused aterm the local network when it last asked: turn aterm on in System \
-             Settings > Privacy & Security > Local Network",
-            $suffix
-        )
-    };
-}
-
-/// What an observation says while the host's records hear that the OS refused the runtime the LAN
-/// and its transport's links all failed ([`observe_transport`]).
-const LAN_REFUSED: &str = concat_refused!("");
 
 #[derive(Clone, Copy)]
 enum ObservationMode {
@@ -1923,35 +1842,26 @@ enum ObservationMode {
     Discovery,
 }
 
-/// The description must reflect the same transport evidence as visibility. A refusal shows as
-/// links that bound and then failed (the OS fails a refused app's LAN sends): a transport whose
-/// links all failed (Unavailable), while the host's records hear that the OS `refused` the runtime
-/// the LAN ([`LanGate::with_refusal`]), says that refusal and where to lift it. Peers the
+/// The description must reflect the same transport evidence as visibility. A transport whose
+/// links all failed is Unavailable, its latest socket failure kept beside the detail. Peers the
 /// transport still holds hints of do not say otherwise: with no link left nothing is heard now,
-/// they were heard before its links failed (a refusal made mid-session among them), and with no
-/// link to dial them a repairing transport keeps them for good. With no candidate address (Offline) the refusal is not the
-/// cause, whatever the records say: no usable interface is.
+/// they were heard before its links failed, and with no link to dial them a repairing transport
+/// keeps them for good. With no candidate address the transport is Offline: no usable interface.
 fn observe_transport(
     history: &mut Observer,
     transport: &transport::Transport,
     mode: ObservationMode,
-    refused: bool,
 ) {
     let (visibility, detail) = if transport.unavailable() {
         (
             Visibility::Unavailable,
-            match (mode, refused) {
-                (ObservationMode::Repair, false) => "Local network sockets unavailable",
-                (ObservationMode::Enrollment, false) => {
+            match mode {
+                ObservationMode::Repair => "Local network sockets unavailable",
+                ObservationMode::Enrollment => {
                     "Local network sockets unavailable; enrollment pending"
                 }
-                (ObservationMode::Discovery, false) => {
+                ObservationMode::Discovery => {
                     "Local network sockets unavailable; Commons control unavailable"
-                }
-                (ObservationMode::Repair, true) => LAN_REFUSED,
-                (ObservationMode::Enrollment, true) => concat_refused!("; enrollment pending"),
-                (ObservationMode::Discovery, true) => {
-                    concat_refused!("; Commons control unavailable")
                 }
             },
         )
@@ -1978,9 +1888,9 @@ fn observe_transport(
             },
         )
     };
-    // A recorded OS refusal has its actionable explanation above. Otherwise retain the actual
-    // socket failure while unavailable; a healthy or addressless transport has its own cause.
-    let failure = if visibility == Visibility::Unavailable && !refused {
+    // Retain the actual socket failure while unavailable; a healthy or addressless transport has
+    // its own cause.
+    let failure = if visibility == Visibility::Unavailable {
         transport.failure().map(|why| format!("{detail}: {why}"))
     } else {
         None
@@ -1992,6 +1902,34 @@ fn observe_transport(
         aterm_time::unix_millis().unwrap_or(0),
         Instant::now(),
     );
+}
+
+/// Whether the root LAN broker answers a hello, else what the runtime waits for, as its
+/// observation's detail ([`Network::may_use`]). Off macOS sockets are made in-process: nothing
+/// is waited for.
+#[cfg(not(test))]
+fn broker_answers() -> std::result::Result<(), &'static str> {
+    #[cfg(target_os = "macos")]
+    {
+        use aterm_uds::lan::{LanError, Unavailable};
+        match aterm_uds::lan::broker::hello() {
+            Ok(_) => Ok(()),
+            Err(LanError::Unavailable(Unavailable::NotInstalled)) => {
+                Err("Waits for the LAN broker, which setup's Mac password installs")
+            }
+            Err(LanError::Unavailable(Unavailable::Outdated { .. })) => {
+                Err("Waits for the LAN broker to be renewed for this aterm")
+            }
+            Err(LanError::Unavailable(Unavailable::Refused(_))) => {
+                Err("Waits for a LAN broker that admits this aterm")
+            }
+            Err(LanError::Io(_)) => Err("Waits for the LAN broker to answer"),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(())
+    }
 }
 
 #[cfg(not(test))]

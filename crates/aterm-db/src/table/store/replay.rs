@@ -195,15 +195,18 @@ pub(super) fn restore(
     let envelope = Envelope::parse(scope, &wire)?;
     let header = envelope.header.clone();
     super::operation_policy(scope, &header, envelope.body.len() - 16)?;
-    let quarantine = if aterm_db_core::quarantine_eligible(
+    let (quarantine, cut) = if aterm_db_core::quarantine_eligible(
         acknowledged,
         receipt.offset,
         batch.discarded_source(&envelope)?,
     ) {
-        Some((envelope.roster, envelope.epoch, envelope.authored_ms))
+        (
+            Some((envelope.roster, envelope.epoch, envelope.authored_ms)),
+            None,
+        )
     } else {
-        batch.open_envelope(envelope)?;
-        None
+        let record = batch.open_envelope(envelope)?;
+        (None, super::cutoff::decode(record.payload()))
     };
     if header.id != receipt.id {
         return Err(Error::new("replayed receipt differs from ciphertext"));
@@ -213,6 +216,7 @@ pub(super) fn restore(
         header,
         receipt,
         quarantine,
+        cut,
     })
 }
 

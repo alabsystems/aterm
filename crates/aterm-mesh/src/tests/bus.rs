@@ -1044,6 +1044,47 @@ fn held_topics_are_what_this_macs_newest_topics_record_names() {
     assert_eq!(crate::mail::held_topics(a.mesh()), ["build", "deploy"]);
 }
 
+/// A BRIDGE THAT NAMES ITS NODE WAKES THE MOVE (§11 C3b): the own-inbox move of a retired node's
+/// unread mail waits, backing off, until the bridge state dir beside `bus.log` names another node
+/// than the one it ran as; the pass that first sees the dir name a node kicks the pushes, so the
+/// move opens then rather than at its next back-off.
+/// NEGATIVE CONTROL: a pass that sees the dir name the node it named at the last pass kicks
+/// nothing.
+#[test]
+fn a_bridge_that_names_its_node_wakes_the_pushes_once() {
+    let lab = Lab::new();
+    let macs = lab_of(&lab, 2);
+    let a = &macs[0];
+    let root = Root::new(63);
+    let _slot = host_bus(a, &root);
+    let me = aterm_net::fleet::NodeIdentity::from_seed(&a.principal, &a.seed).expect("a node");
+    let table = &a.run.as_ref().expect("runs").table;
+    let no_hints: crate::overlay::Hints = Arc::new(Vec::new);
+    let links =
+        crate::mail::MailLinks::start(&me, a.mesh(), table, no_hints).expect("the pushes start");
+    links.pass();
+    let hosted = links.kicks();
+    links.pass();
+    assert_eq!(
+        links.kicks(),
+        hosted,
+        "a pass that sees nothing new kicks nothing"
+    );
+    let dir =
+        aterm_link::state::StateDir::open(root.path().join(aterm_link::federate::BRIDGE_STATE_DIR))
+            .expect("the bridge state dir");
+    dir.name_node("n-0123456789abcdef")
+        .expect("a bridge names its node");
+    links.pass();
+    assert_eq!(links.kicks(), hosted + 1, "the pass that sees it kicks");
+    links.pass();
+    assert_eq!(links.kicks(), hosted + 1, "once");
+    dir.name_node("n-fedcba9876543210")
+        .expect("another rotation");
+    links.pass();
+    assert_eq!(links.kicks(), hosted + 2, "and again for the next node");
+}
+
 /// §11 C3c, the person key: each pass of the mail pushes vouches with this Mac's node key for
 /// its person key, made the first time and asking nothing. The certificate names the node key and
 /// is a record of it under aterm-net's framing (`record_message`), so it is what

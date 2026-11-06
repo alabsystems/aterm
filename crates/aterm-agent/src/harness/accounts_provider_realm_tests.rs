@@ -7,11 +7,11 @@ use aterm_spec::interp::State;
 fn files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     Bed::tree(root)
         .into_iter()
-        .filter(|(path, _)| {
+        .filter(|(path, bytes)| {
             !matches!(
                 path.file_name().and_then(|name| name.to_str()),
                 Some("accounts.lock" | "signin.lock")
-            )
+            ) && !empty_queue_gate(root, path, bytes)
         })
         .collect()
 }

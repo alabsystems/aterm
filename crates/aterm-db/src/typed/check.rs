@@ -191,7 +191,7 @@ pub fn findings(schemas: &[&Collection], tables: &BTreeMap<&str, &Projection>) -
             }
         }
     }
-    found.sort();
+    found.sort_unstable();
     found.dedup();
     found
 }

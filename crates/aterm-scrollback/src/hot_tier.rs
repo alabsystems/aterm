@@ -63,6 +63,11 @@ impl HotTier {
         })
     }
 
+    /// Every inline-image span the hot lines hold, oldest line first.
+    pub(crate) fn images(&self) -> impl Iterator<Item = &ImageSpan> {
+        self.lines.iter().filter_map(Line::images).flatten()
+    }
+
     /// Inline-image spans on hot line `idx` (`0` = oldest in hot tier), if any.
     #[must_use]
     #[cfg_attr(trust_verify, trust::skip)]

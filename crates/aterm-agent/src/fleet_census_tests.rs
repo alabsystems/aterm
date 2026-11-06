@@ -2156,3 +2156,95 @@ fn census_fleet_names_resolve_bound_issuer_book_sequences_reject_impostor_keys_a
         Some("upper-mac")
     );
 }
+
+/// B11's adoption gate is fed from the census: the fold turns on once every member heard in seven
+/// days reports a build that reads fold keys; one member behind keeps it off (the control).
+#[cfg(unix)]
+#[test]
+fn the_census_turns_the_fold_on_once_every_member_heard_reads_it() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let paths = aterm_secrets::client::Paths::for_home(root.path());
+    let now_s = 1_800_000_000;
+    let member = |label: &str, version: &str| CensusMember {
+        label: label.to_owned(),
+        fleet_name: None,
+        aliases: Vec::new(),
+        node: None,
+        host: None,
+        version: Some(version.to_owned()),
+        facts_at: Some(now_s - 60),
+        window: false,
+        window_last: None,
+        sessions: 0,
+        accounts: MemberAccountSummary::default(),
+        last_seen: Some(now_s - 60),
+        converge_failures: 0,
+        eligible: true,
+        in_fleet: true,
+        in_commons: true,
+    };
+    let census = |versions: &[&str]| SwarmCensus {
+        generated_at: now_s,
+        members: versions
+            .iter()
+            .enumerate()
+            .map(|(at, v)| member(&format!("m{at}"), v))
+            .collect(),
+        ..SwarmCensus::default()
+    };
+    let gate = aterm_secrets::commons::fold::Gate {
+        reads: Some((0, 158)),
+        r2_shipped_ms: None,
+    };
+    assert!(
+        !note_fold_gate(&paths, &census(&["0.158.0", "0.157.0"]), &gate, now_s).unwrap(),
+        "CONTROL: a member heard on an older build keeps the fold off"
+    );
+    assert!(!aterm_secrets::commons::fold::on(&paths));
+    assert!(note_fold_gate(&paths, &census(&["0.158.0", "0.159.0+gabc"]), &gate, now_s).unwrap());
+    assert!(aterm_secrets::commons::fold::on(&paths));
+    assert!(
+        note_fold_gate(&paths, &census(&["0.157.0"]), &gate, now_s).unwrap(),
+        "the gate is sticky"
+    );
+}
+
+/// A member heard recently through the census's other sources (the vault's server rows, the
+/// fleet book) whose survey facts never reached this Mac reports no build, and keeps the fold off:
+/// the gate takes the census's last-heard time, not the facts' arrival.
+#[cfg(unix)]
+#[test]
+fn a_member_heard_with_no_facts_keeps_the_fold_off() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let paths = aterm_secrets::client::Paths::for_home(root.path());
+    let now_s = 1_800_000_000;
+    let member = |label: &str, version: Option<&str>| CensusMember {
+        label: label.to_owned(),
+        fleet_name: None,
+        aliases: Vec::new(),
+        node: None,
+        host: None,
+        version: version.map(str::to_owned),
+        facts_at: version.map(|_| now_s - 60),
+        window: false,
+        window_last: None,
+        sessions: 0,
+        accounts: MemberAccountSummary::default(),
+        last_seen: Some(now_s - 60),
+        converge_failures: 0,
+        eligible: true,
+        in_fleet: true,
+        in_commons: true,
+    };
+    let census = SwarmCensus {
+        generated_at: now_s,
+        members: vec![member("m0", Some("0.158.0")), member("m1", None)],
+        ..SwarmCensus::default()
+    };
+    let gate = aterm_secrets::commons::fold::Gate {
+        reads: Some((0, 158)),
+        r2_shipped_ms: None,
+    };
+    assert!(!note_fold_gate(&paths, &census, &gate, now_s).unwrap());
+    assert!(!aterm_secrets::commons::fold::on(&paths));
+}

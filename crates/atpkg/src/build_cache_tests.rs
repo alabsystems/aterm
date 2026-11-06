@@ -234,16 +234,56 @@ fn check_tool<'a>(
             format!("build.build-dir='{dir}'"),
         ],
     };
-    let want: Vec<String> = first.into_iter().chain(args.iter().cloned()).collect();
+    let rest = if first.iter().any(|w| w.starts_with("--config")) {
+        graphed(tool, &args)
+    } else {
+        args.clone()
+    };
+    let want: Vec<String> = first.into_iter().chain(rest).collect();
+    check_exact(tool, &f.home, cwd, &env, &args, &want);
+}
+
+/// A placed call's words after its `--config` pair: a `targo` row that spells a test verb right
+/// after `--unverified` gets the test graph around it, [`TEST_GRAPH_CONFIG`] before and
+/// [`TEST_GRAPH_FLAG`] after (the rows of [`check`] that place one spell it so;
+/// [`a_placed_test_build_takes_the_workspace_graph_around_its_verb`] reads the rest).
+#[cfg(unix)]
+fn graphed(tool: Tool, args: &[String]) -> Vec<String> {
+    match args {
+        [lane, verb, rest @ ..]
+            if tool == Tool::Targo
+                && lane == "--unverified"
+                && matches!(verb.as_str(), "test" | "t" | "bench") =>
+        {
+            std::iter::once(lane.clone())
+                .chain(TEST_GRAPH_CONFIG.map(str::to_owned))
+                .chain([verb.clone(), TEST_GRAPH_FLAG.to_owned()])
+                .chain(rest.iter().cloned())
+                .collect()
+        }
+        _ => args.to_vec(),
+    }
+}
+
+/// Both halves of the rule turn `args` into `want`.
+#[cfg(unix)]
+fn check_exact(
+    tool: Tool,
+    home: &Path,
+    cwd: &Path,
+    env: &HashMap<&str, String>,
+    args: &[String],
+    want: &[String],
+) {
     assert_eq!(
-        rust(&f.home, cwd, &env, &args, tool),
+        rust(home, cwd, env, args, tool),
         want,
         "rust {tool:?}: {args:?} in {}",
         cwd.display()
     );
     for shell in shells() {
         assert_eq!(
-            sh(&shell, tool, &f.home, cwd, &env, &args),
+            sh(&shell, tool, home, cwd, env, args),
             want,
             "{shell:?} {tool:?}: {args:?} in {}",
             cwd.display()
@@ -757,6 +797,81 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
     }
 }
 
+/// A placed `test`, `t` or `bench` gets the test graph around its verb, its `--config` right
+/// before the verb (with every other `--config`, which one after the verb would replace) and its
+/// flag right after it, past the flags and flag values before it and ahead of `--` and the test
+/// binary's own words, once; the build-dir pair still leads (a shim's front strips it there).
+/// NEGATIVE CONTROL: a call that names `-Zfeature-unification` itself, another verb, a `test`
+/// after `--` and an alias, even one to `test`, keep their words as typed.
+#[cfg(unix)]
+#[test]
+fn a_placed_test_build_takes_the_workspace_graph_around_its_verb() {
+    let f = Fixture::new("build-cache-graph");
+    let ws = f.dir("home/ws");
+    f.file(
+        "home/ws/.cargo/config.toml",
+        "[alias]\nxt = \"test -p x\"\n",
+    );
+    // `C` stands for the test graph's `--config`, `F` for its flag.
+    let words = |line: &str| -> Vec<String> {
+        line.split_whitespace()
+            .flat_map(|w| match w {
+                "C" => TEST_GRAPH_CONFIG.to_vec(),
+                "F" => vec![TEST_GRAPH_FLAG],
+                _ => vec![w],
+            })
+            .map(str::to_owned)
+            .collect()
+    };
+    for (typed, placed) in [
+        ("--unverified test -p x", "--unverified C test F -p x"),
+        ("--unverified t --lib", "--unverified C t F --lib"),
+        (
+            "--unverified bench --no-run",
+            "--unverified C bench F --no-run",
+        ),
+        (
+            "--color always -Z unstable-options --unverified test -q",
+            "--color always -Z unstable-options --unverified C test F -q",
+        ),
+        (
+            "--config build.jobs=2 --manifest-path sub/Cargo.toml --unverified test",
+            "--config build.jobs=2 --manifest-path sub/Cargo.toml --unverified C test F",
+        ),
+        (
+            "--unverified test -- --exact -Zfeature-unification",
+            "--unverified C test F -- --exact -Zfeature-unification",
+        ),
+        (
+            "--unverified test -Zfeature-unification -p x",
+            "--unverified test -Zfeature-unification -p x",
+        ),
+        (
+            "--unverified test -Z unstable-options -Zfeature-unification",
+            "--unverified test -Z unstable-options -Zfeature-unification",
+        ),
+        ("--unverified build -p x", "--unverified build -p x"),
+        (
+            "--unverified run -p x -- test",
+            "--unverified run -p x -- test",
+        ),
+        ("--unverified xt", "--unverified xt"),
+    ] {
+        let want: Vec<String> = ["--config".to_owned(), f.value()]
+            .into_iter()
+            .chain(words(placed))
+            .collect();
+        check_exact(
+            Tool::Targo,
+            &f.home,
+            &ws,
+            &HashMap::new(),
+            &words(typed),
+            &want,
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn a_home_cargo_cannot_take_is_left_alone() {
@@ -850,7 +965,11 @@ fn a_build_started_at_a_named_folder_gets_that_folders_answer() {
     };
     assert_eq!(with_build_dir(&bench, Tool::Targo, &read_pwd), None);
     let mut cached = vec!["--config".to_owned(), f.value()];
-    cached.extend(bench.iter().cloned());
+    cached.extend(bench[..1].iter().cloned());
+    cached.extend(TEST_GRAPH_CONFIG.map(str::to_owned));
+    cached.push(bench[1].clone());
+    cached.push(TEST_GRAPH_FLAG.to_owned());
+    cached.extend(bench[2..].iter().cloned());
     assert_eq!(
         with_build_dir_at(&bench, Tool::Targo, &ws, &m),
         Some(cached)
@@ -1018,7 +1137,11 @@ fn the_rendered_shim_hands_targo_the_config() {
     };
     assert_eq!(
         run(&["--unverified", "test", "-q"]),
-        format!("--config {} --unverified test -q\n", f.value())
+        format!(
+            "--config {} --unverified {} test {TEST_GRAPH_FLAG} -q\n",
+            f.value(),
+            TEST_GRAPH_CONFIG.join(" ")
+        )
     );
     assert_eq!(run(&["trust", "check"]), "trust check\n");
     assert_eq!(
@@ -1269,11 +1392,21 @@ fn the_rendered_hop_hands_its_front_the_placed_call() {
         w.push(format!("build-dir={dir}"));
         w.join("\n") + "\n"
     };
+    let [config, workspace] = TEST_GRAPH_CONFIG;
     assert_eq!(
         run(&ws, &["--unverified", "test", "-q"]),
         front(
             "config",
-            &["--config", &f.value(), "--unverified", "test", "-q"],
+            &[
+                "--config",
+                &f.value(),
+                "--unverified",
+                config,
+                workspace,
+                "test",
+                TEST_GRAPH_FLAG,
+                "-q"
+            ],
             "unset"
         )
     );

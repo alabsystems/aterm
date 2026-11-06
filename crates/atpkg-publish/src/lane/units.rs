@@ -128,33 +128,48 @@ pub enum Plist {
     Dict(Vec<(String, Plist)>),
 }
 
-fn xml(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+fn xml(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.contains(['&', '<', '>']) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    std::borrow::Cow::Owned(
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;"),
+    )
 }
 
 impl Plist {
     fn write(&self, depth: usize, out: &mut String) {
-        let pad = "\t".repeat(depth);
+        use std::fmt::Write as _;
+        out.extend(std::iter::repeat_n('\t', depth));
         match self {
-            Self::Str(s) => out.push_str(&format!("{pad}<string>{}</string>\n", xml(s))),
-            Self::Int(n) => out.push_str(&format!("{pad}<integer>{n}</integer>\n")),
-            Self::Bool(b) => out.push_str(&format!("{pad}<{b}/>\n")),
+            Self::Str(s) => {
+                let _ = writeln!(out, "<string>{}</string>", xml(s));
+            }
+            Self::Int(n) => {
+                let _ = writeln!(out, "<integer>{n}</integer>");
+            }
+            Self::Bool(b) => {
+                let _ = writeln!(out, "<{b}/>");
+            }
             Self::Array(items) => {
-                out.push_str(&format!("{pad}<array>\n"));
+                out.push_str("<array>\n");
                 for i in items {
                     i.write(depth + 1, out);
                 }
-                out.push_str(&format!("{pad}</array>\n"));
+                out.extend(std::iter::repeat_n('\t', depth));
+                out.push_str("</array>\n");
             }
             Self::Dict(entries) => {
-                out.push_str(&format!("{pad}<dict>\n"));
+                out.push_str("<dict>\n");
                 for (k, v) in entries {
-                    out.push_str(&format!("{pad}\t<key>{}</key>\n", xml(k)));
+                    out.extend(std::iter::repeat_n('\t', depth + 1));
+                    let _ = writeln!(out, "<key>{}</key>", xml(k));
                     v.write(depth + 1, out);
                 }
-                out.push_str(&format!("{pad}</dict>\n"));
+                out.extend(std::iter::repeat_n('\t', depth));
+                out.push_str("</dict>\n");
             }
         }
     }

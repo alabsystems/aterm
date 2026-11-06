@@ -281,9 +281,10 @@ fn verify(trust: Trust, wire: &[u8]) -> Result<Node> {
     Ok(node)
 }
 
-/// Bounded strict astream log and its disposable causal index. A writer opens,
-/// appends and closes locally; never hold it across peer network IO. A reader
-/// ([`Journal::read_existing`]) takes no lock and cannot append.
+/// Bounded astream journal (`aterm_journal::Log`, each append acknowledged once durable) and
+/// its disposable causal index. A writer opens, appends and closes locally; never hold it
+/// across peer network IO. A reader ([`Journal::read_existing`]) takes no lock and cannot
+/// append.
 pub struct Journal {
     dir: PathBuf,
     trust: Trust,

@@ -35,18 +35,31 @@ fn seeded_digest(domain: &[u8], seed: &str) -> [u8; 32] {
     hasher.finalize()
 }
 
+pub(crate) fn sha256_prefixed(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(7 + 64);
+    out.push_str("sha256:");
+    aterm_codec::hex::push_lower(&mut out, &aterm_digest::Sha256::digest(bytes));
+    out
+}
+
 /// Generates a deterministic classic test token (`ghp_...`) from `seed`.
 #[must_use]
 pub fn token(seed: &str) -> String {
     let digest = seeded_digest(b"agh-fake\0", seed);
-    format!("ghp_{}", aterm_codec::hex::encode_lower(&digest[..18]))
+    let mut out = String::with_capacity(4 + 36);
+    out.push_str("ghp_");
+    aterm_codec::hex::push_lower(&mut out, &digest[..18]);
+    out
 }
 
 /// Generates a deterministic fine-grained test token (`github_pat_...`) from `seed`.
 #[must_use]
 pub fn fine_grained_token(seed: &str) -> String {
     let digest = seeded_digest(b"agh-fake/fine-grained\0", seed);
-    format!("github_pat_{}", aterm_codec::hex::encode_lower(&digest))
+    let mut out = String::with_capacity(11 + 64);
+    out.push_str("github_pat_");
+    aterm_codec::hex::push_lower(&mut out, &digest);
+    out
 }
 
 /// An asset as [`FakeGithub::release_state`] reports it: its name and its bytes.
@@ -786,7 +799,7 @@ impl FakeGithub {
             .filter(|k| k.login.eq_ignore_ascii_case(login))
             .map(|k| k.key.clone())
             .collect();
-        keys.sort_by_key(|k| k.id);
+        keys.sort_unstable_by_key(|k| k.id);
         keys
     }
 
@@ -821,18 +834,17 @@ impl FakeGithub {
                     .assets
                     .iter()
                     .map(|a| {
-                        let digest = aterm_digest::Sha256::digest(&a.spec.bytes);
                         (
                             a.id,
                             a.spec.name.clone(),
                             a.spec.state.clone(),
-                            format!("sha256:{}", aterm_codec::hex::encode_lower(&digest)),
+                            sha256_prefixed(&a.spec.bytes),
                         )
                     })
                     .collect(),
             })
             .collect();
-        releases.sort_by_key(|r| r.id);
+        releases.sort_unstable_by_key(|r| r.id);
         releases
     }
 

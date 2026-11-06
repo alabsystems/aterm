@@ -16,20 +16,31 @@ use headless_boot::{Instance, boot_session, ctl, ctl_ok, field, status, type_lin
 const HANG: Duration = Duration::from_secs(60);
 const HANG_MS: &str = "timeout=60000";
 /// Longer than a `turn` gives the echo of a text its program has read.
-const PAST_THE_ECHO_CAP: Duration = Duration::from_millis(TURN_ECHO_CAP_MS + 1_000);
+pub(crate) const PAST_THE_ECHO_CAP: Duration = Duration::from_millis(TURN_ECHO_CAP_MS + 1_000);
 /// Shorter than the cap by less than a `late` stand-in's draw comes after its read, so a line
 /// read this long after its typing is drawn past the cap.
 const INSIDE_THE_ECHO_CAP: Duration = Duration::from_millis(TURN_ECHO_CAP_MS - 1_000);
 
 /// Claude Code's frame around a composer, a logo that repaints whatever the input loop does, and
-/// that loop, which reads nothing while `$0.hold` stands. Its second word is `still` for a logo
-/// that stands still while the hold does, as a starved Claude Code, one process, draws nothing
-/// while it reads nothing, or `late` for a loop that draws what it read 1.5 s after the read. Its first word is `takes` for a composer whose Enter moves the line up to the
-/// next history row (row 3 first) and empties it.
+/// that loop, which reads nothing while `$0.hold` stands. Its first word is `takes` for a
+/// composer whose Enter moves the line up to the next history row (row 3 first) and empties it.
+/// Its second word is `still` for a logo that stands still while the hold does, as a starved
+/// Claude Code, one process, draws nothing while it reads nothing, or `late` for a loop that
+/// draws what it read 1.5 s after the read. Its third word is `bracketed` for a composer that
+/// turns DEC 2004 on, as Claude Code does: a paste is the text between its brackets, however its
+/// reads split it, an Enter inside an open paste is text (drawn `⏎`), never a submit, and each
+/// paste is counted once it closes, on row 24 (`bracketed pastes: <n>`). The shell reads bytes
+/// (`LC_ALL=C`), so a read that ends inside a character is taken as it comes.
 pub(crate) const COMPOSER: &str = r#"#!/bin/sh
 mode="$1"
+LC_ALL=C
+export LC_ALL
 stty raw -echo 2>/dev/null
 esc=$(printf '\033')
+pastes=0
+inpaste=0
+carry=
+[ "$3" = bracketed ] && printf '%s[?2004h' "$esc"
 rule=$(printf '%80s' '' | sed 's/ /─/g')
 printf '%s[?1049h%s[2J' "$esc" "$esc"
 printf '%s[1;1H▐▛███▜▌   Claude Code v2.1.301' "$esc"
@@ -56,6 +67,51 @@ while :; do
   chunk=${chunk%x}
   [ -z "$chunk" ] && exit 0
   [ "$2" = late ] && sleep 1.5
+  if [ "$3" = bracketed ]; then
+    chunk=$carry$chunk
+    carry=
+    # A read that ends part-way into a bracket keeps that part for the next read.
+    case $chunk in
+      *"$esc"|*"$esc["|*"$esc[2"|*"$esc[20"|*"$esc[20"[01])
+        carry=$esc${chunk##*"$esc"}
+        chunk=${chunk%"$esc"*}
+        ;;
+    esac
+    rest=$chunk
+    chunk=
+    closed=$pastes
+    while [ -n "$rest" ]; do
+      if [ "$inpaste" = 1 ]; then
+        case $rest in
+          *"$esc[201~"*)
+            part=${rest%%"$esc[201~"*}
+            rest=${rest#*"$esc[201~"}
+            inpaste=0
+            pastes=$((pastes + 1))
+            ;;
+          *) part=$rest rest= ;;
+        esac
+        while :; do
+          case $part in
+            *"$cr"*) part="${part%%"$cr"*}⏎${part#*"$cr"}" ;;
+            *) break ;;
+          esac
+        done
+      else
+        case $rest in
+          *"$esc[200~"*)
+            part=${rest%%"$esc[200~"*}
+            rest=${rest#*"$esc[200~"}
+            inpaste=1
+            ;;
+          *) part=$rest rest= ;;
+        esac
+      fi
+      chunk=$chunk$part
+    done
+    [ "$pastes" != "$closed" ] &&
+      printf '%s7%s[24;1H%s[2Kbracketed pastes: %d%s8' "$esc" "$esc" "$esc" "$pastes" "$esc"
+  fi
   case $chunk in
     *"$cr"*)
       draft="$draft${chunk%%"$cr"*}"

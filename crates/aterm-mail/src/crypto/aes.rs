@@ -59,15 +59,21 @@ pub(super) fn cfb(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Zeroizing<
     for quad in quads {
         let [c0, c1, c2, c3] = *quad.as_chunks::<16>().0.first_chunk::<4>().unwrap();
         let mut masks = key.blocks(&[feedback, c0, c1, c2], false);
-        for (block, mask) in [c0, c1, c2, c3].iter().zip(&masks) {
-            plain.extend(block.iter().zip(mask).map(|(c, m)| c ^ m));
+        for (mask, block) in masks.iter_mut().zip([c0, c1, c2, c3]) {
+            for (m, c) in mask.iter_mut().zip(block) {
+                *m ^= c;
+            }
         }
+        plain.extend_from_slice(masks.as_flattened());
         feedback = c3;
         masks.zeroize();
     }
     for chunk in rem.chunks(16) {
         let mut mask = key.block(feedback, false);
-        plain.extend(chunk.iter().zip(&mask).map(|(c, m)| c ^ m));
+        for (m, &c) in mask[..chunk.len()].iter_mut().zip(chunk) {
+            *m ^= c;
+        }
+        plain.extend_from_slice(&mask[..chunk.len()]);
         feedback[..chunk.len()].copy_from_slice(chunk);
         mask.zeroize();
     }
@@ -83,8 +89,8 @@ pub(super) fn encrypt_cfb(key: &[u8], iv: &[u8], plaintext: &[u8]) -> Result<Vec
         let mut mask = key.block(feedback, false);
         for (i, byte) in chunk.iter().enumerate() {
             feedback[i] = byte ^ mask[i];
-            output.push(feedback[i]);
         }
+        output.extend_from_slice(&feedback[..chunk.len()]);
         mask.zeroize();
     }
     feedback.zeroize();

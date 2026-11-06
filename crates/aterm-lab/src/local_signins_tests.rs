@@ -100,3 +100,17 @@ fn only_a_path_beside_the_mark_is_a_standin() {
     assert!(is_standin(&link.to_string_lossy()));
     assert!(!is_standin("codex"));
 }
+
+#[test]
+fn a_death_journal_line_is_counted_and_any_other_line_is_not() {
+    let killed = aterm_uds::deaths::line(10, "aterm", 42, 9);
+    let spaced = aterm_uds::deaths::line(11, "aterm (dev)", 43, 15);
+    let text =
+        format!("{killed}{spaced}\nreaped 1 signal 9 trailing\n10 aterm reaped x signal 9\n");
+    assert_eq!(
+        deaths(&text),
+        vec![killed.trim_end().to_string(), spaced.trim_end().to_string()]
+    );
+    // The negative control: an empty or unwritten journal counts nothing.
+    assert!(deaths("").is_empty());
+}

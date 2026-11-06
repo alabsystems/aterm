@@ -352,15 +352,17 @@ impl Layers {
         say: &mut dyn FnMut(&str),
     ) -> Result<Prepared, Error> {
         ensure_real_dir(&self.root)?;
-        for dir in [self.baked_dir(), self.live_dir()] {
-            ensure_real_dir(&dir)?;
+        let baked_dir = self.baked_dir();
+        let live_dir = self.live_dir();
+        for dir in [&baked_dir, &live_dir] {
+            ensure_real_dir(dir)?;
         }
         #[cfg(any(test, debug_assertions))]
         if let Some(planted) = self.planted(host, base, seed)? {
             return Ok(planted);
         }
-        for dir in [self.baked_dir(), self.live_dir()] {
-            for partial in files(&dir, |name| name.ends_with(PARTIAL)) {
+        for dir in [&baked_dir, &live_dir] {
+            for partial in files(dir, |name| name.ends_with(PARTIAL)) {
                 std::fs::remove_file(&partial).map_err(|e| io("remove", &partial, &e))?;
                 say(&format!(
                     "removed {}: a bake or a clone that did not finish",
@@ -387,7 +389,7 @@ impl Layers {
                 cloned: None,
             },
             Some(why) => {
-                let baked = self.baked_dir().join(&want);
+                let baked = baked_dir.join(&want);
                 if crate::is_regular_file(&baked) {
                     self.clone_live(host, &baked, base, seed)?;
                     say(&format!(
@@ -486,7 +488,8 @@ impl Layers {
             )));
         }
         let stem = want.strip_suffix(".img").unwrap_or(want);
-        let partial = self.baked_dir().join(format!("{stem}{PARTIAL}"));
+        let baked_dir = self.baked_dir();
+        let partial = baked_dir.join(format!("{stem}{PARTIAL}"));
         host.clone_file(&base.path, &partial)
             .map_err(|e| io("clone the base to", &partial, &e))?;
         crate::writable(&partial)?;
@@ -504,7 +507,7 @@ impl Layers {
             .map_err(|e| io("grow", &partial, &e))?;
         Ok(PartialBake {
             partial,
-            sealed: self.baked_dir().join(want),
+            sealed: baked_dir.join(want),
         })
     }
 
@@ -518,7 +521,8 @@ impl Layers {
         seed: &str,
     ) -> Result<(), Error> {
         let live = self.live_disk();
-        let partial = self.live_dir().join(format!("{VM}{PARTIAL}"));
+        let live_dir = self.live_dir();
+        let partial = live_dir.join(format!("{VM}{PARTIAL}"));
         host.clone_file(baked, &partial)
             .map_err(|e| io("clone the baked disk to", &partial, &e))?;
         crate::writable(&partial)?;
@@ -530,10 +534,10 @@ impl Layers {
             cloned: aterm_time::unix_secs().unwrap_or(0),
         };
         let path = self.record_path();
-        let staged = self.live_dir().join(format!(".{VM}.toml.partial"));
+        let staged = live_dir.join(format!(".{VM}.toml.partial"));
         write_durably(&staged, &record.text())?;
         std::fs::rename(&staged, &path).map_err(|e| io("place", &path, &e))?;
-        aterm_durable::durable_dir(&self.live_dir()).map_err(|e| io("flush", &self.live_dir(), &e))
+        aterm_durable::durable_dir(&live_dir).map_err(|e| io("flush", &live_dir, &e))
     }
 
     /// The seed ISO `seed/<fingerprint>.iso`, made in a scratch directory and renamed into
@@ -645,7 +649,7 @@ fn files(dir: &Path, keep: impl Fn(&str) -> bool) -> Vec<PathBuf> {
             .then(|| dir.join(name))
         })
         .collect();
-    found.sort();
+    found.sort_unstable();
     found
 }
 

@@ -32,7 +32,18 @@ pub fn write(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
 /// # Errors
 /// As [`write`]. With `None` there is no directory flush to fail.
 pub fn write_flushed(path: &Path, bytes: &[u8], mode: u32, flush: Option<Flush>) -> io::Result<()> {
-    write_landing(path, bytes, mode, || Ok(()), flush, Flush::dir)?
+    write_landing(path, bytes, mode, || Ok(()), flush, best_effort(Flush::dir))?
+}
+
+/// [`write_flushed`] for a writer whose promise rests on the new entry: `flush` finishes the
+/// temporary and, after the rename, `path`'s directory, and a directory whose entries cannot be
+/// flushed here ([`aterm_durable::DirFlushed::Unavailable`]) is refused like any failed flush,
+/// where every other writer here goes on without that flush.
+/// # Errors
+/// As [`write`]; and the directory's flush after the rename failed or is unavailable here: `path`
+/// holds `bytes`, but its entry may not survive a power loss.
+pub fn write_entry_flushed(path: &Path, bytes: &[u8], mode: u32, flush: Flush) -> io::Result<()> {
+    write_landing(path, bytes, mode, || Ok(()), Some(flush), Flush::dir)?
 }
 
 /// Produce a file atomically, with the same permissions and durability as [`write`].
@@ -51,7 +62,7 @@ pub fn write_with(
         produce,
         || Ok(()),
         Some(Flush::Durable),
-        Flush::dir,
+        best_effort(Flush::dir),
     )?
 }
 
@@ -73,7 +84,7 @@ pub fn write_with_metadata(
         std::fs::File::metadata,
         || Ok(()),
         Some(Flush::Durable),
-        Flush::dir,
+        best_effort(Flush::dir),
     )?;
     landed?;
     Ok(metadata)
@@ -103,12 +114,33 @@ pub(super) fn write_flushing_dir(
     check: impl FnOnce() -> io::Result<()>,
     flush_dir: impl FnOnce(Flush, &Path) -> io::Result<()>,
 ) -> io::Result<()> {
-    write_landing(path, bytes, mode, check, Some(Flush::Durable), flush_dir)?
+    write_landing(
+        path,
+        bytes,
+        mode,
+        check,
+        Some(Flush::Durable),
+        best_effort(flush_dir),
+    )?
+}
+
+/// `flush_dir` for a writer that goes on where the directory's entries cannot be flushed here
+/// ([`aterm_durable::DirFlushed::Unavailable`]: a volume that refuses to flush a directory, a
+/// directory this process may write but not open): the bytes are flushed on their own handle,
+/// and the rename has landed. Every careful write here takes it but [`write_entry_flushed`]. A
+/// failed flush is returned as it came, its errno kept for a caller that classifies it.
+pub(super) fn best_effort(
+    flush_dir: impl FnOnce(Flush, &Path) -> io::Result<()>,
+) -> impl FnOnce(Flush, &Path) -> io::Result<()> {
+    move |flush, dir| {
+        aterm_durable::DirFlushed::classify(flush_dir(flush, dir)).map(|_flushed_or_unavailable| ())
+    }
 }
 
 /// What a careful write's rename left ([`write_landing`]): `path` holds the bytes either way.
-/// `Err` is the directory's flush after the rename, failed other than as unavailable, so the
-/// entry may not survive a power loss. A write finished by no flush has none to fail.
+/// `Err` is the directory's flush after the rename as `flush_dir` answered it (failed, or
+/// unavailable where no [`best_effort`] accepts that), so the entry may not survive a power
+/// loss. A write finished by no flush has none to fail.
 pub(super) type Landed = io::Result<()>;
 
 /// [`write_flushed`] with a check before the rename and the directory's flush handed in,
@@ -204,15 +236,8 @@ pub(super) fn write_captured_landing<T>(
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => Path::new("."),
     };
-    // Unavailable (a volume that cannot flush a directory, a directory this process may
-    // write but not open) is accepted: the bytes are flushed on their own handle, and the
-    // rename has landed. A failed flush is returned as it came, its errno kept for a caller
-    // that classifies it.
-    Ok((
-        captured,
-        aterm_durable::DirFlushed::classify(flush_dir(flush, dir))
-            .map(|_flushed_or_unavailable| ()),
-    ))
+    // What an unavailable flush means is the caller's: `best_effort` accepts it.
+    Ok((captured, flush_dir(flush, dir)))
 }
 
 /// Deterministic publication failures for tests using the real atomic writer.

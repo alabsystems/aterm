@@ -772,6 +772,13 @@ fn native_owning_waits_restore_a_real_terminals_foreground_group() {
             aterm_spec::wait::MUST_HAPPEN,
             "actor terminal handed over",
             || {
+                // Several modes write ready and end at once, so the exit is
+                // read first: in every mode ready exists before the actor
+                // ends (the actor writes it, or a worker does while the actor
+                // waits on this test), so an exit seen before the look means
+                // the look finds ready. Only an exit with no ready is an end
+                // before the handoff.
+                let exited = actor.try_wait().unwrap();
                 if world.path().join("ready").exists() {
                     return Some(());
                 }
@@ -780,13 +787,13 @@ fn native_owning_waits_restore_a_real_terminals_foreground_group() {
                     eprintln!("terminal {mode}: {step}");
                     last = step;
                 }
-                if let Some(status) = actor.try_wait().unwrap() {
+                if let Some(status) = exited {
                     panic!(
                         "terminal actor ended before handoff ({mode}): {status}: {}",
                         diagnostics(&mut actor)
                     );
                 }
-                world.path().join("ready").exists().then_some(())
+                None
             },
         );
         if mode.starts_with("live-") {
@@ -867,7 +874,12 @@ fn native_owning_waits_restore_a_real_terminals_foreground_group() {
             || actor.try_wait().unwrap(),
         );
         let output = diagnostics(&mut actor);
-        assert!(status.success(), "{mode}: {output}");
+        // How it ended and its last step: a signal's end loses the actor's buffered stdout.
+        let step = std::fs::read_to_string(world.path().join("trace")).unwrap_or_default();
+        assert!(
+            status.success(),
+            "{mode}: {status} after {step:?}: {output}"
+        );
         drop(master);
         reader.join().unwrap();
     }

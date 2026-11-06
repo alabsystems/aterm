@@ -671,14 +671,18 @@ pub(crate) fn watch_for_tools() {
 /// console account is not authorized to use (`member`), or `rule`, the stat of the
 /// rule that names the Mac after admission ([`aterm_types::macos_setup::ADMITTED_NAME_RULE`]),
 /// reading no root-owned 0440 file while no refused rule stands
-/// ([`aterm_types::macos_setup::ADMITTED_NAME_RULE_REFUSED`], `refused`). A step that cannot be
-/// read is not owed: no password is asked for want of a reading. Only macOS reads it.
+/// ([`aterm_types::macos_setup::ADMITTED_NAME_RULE_REFUSED`], `refused`), or `broker`, the LAN
+/// broker's install owed as both read it ([`aterm_uds::lan::install::owed_here`]: its image or
+/// plist missing or not this build's, save an image of the source's own signing team, which the
+/// running broker adopts with no password). A step that cannot be read is not owed: no password is
+/// asked for want of a reading. Only macOS reads it.
 #[cfg(any(target_os = "macos", all(test, unix)))]
 pub(crate) fn root_steps_owed_by(
     off: Option<bool>,
     member: aterm_containment::consent::DebuggerMember,
     rule: std::io::Result<(u32, u32, bool)>,
     refused: bool,
+    broker: bool,
 ) -> bool {
     let rule_owed = match rule {
         Ok((uid, mode, file)) => !(file && uid == 0 && mode == 0o440),
@@ -687,6 +691,7 @@ pub(crate) fn root_steps_owed_by(
     off == Some(true)
         || (off == Some(false) && member == aterm_containment::consent::DebuggerMember::NotMember)
         || rule_owed
+        || broker
 }
 
 /// Read, on a thread of its own, whether setup's one early elevation owes this Mac anything
@@ -722,7 +727,8 @@ pub(crate) fn read_root_steps() -> bool {
                 let refused =
                     std::fs::symlink_metadata(aterm_types::macos_setup::ADMITTED_NAME_RULE_REFUSED)
                         .is_ok();
-                let owed = root_steps_owed_by(off, member, rule, refused);
+                let broker = aterm_uds::lan::install::owed_here();
+                let owed = root_steps_owed_by(off, member, rule, refused, broker);
                 aterm_log::info!("System State: setup's one Mac password owes this Mac: {owed}");
                 let _ = crate::workstation_setup::send_setup_wake(Wake::RootStepsOwed(owed));
             }
@@ -1675,7 +1681,7 @@ impl App {
 
     /// The launch's reading of setup's one early elevation ([`read_root_steps`]): `owed`, a root
     /// step beside the tools is still to do (developer mode, the rule that names the Mac after
-    /// admission). Owed, the launch wants the tab as it wants it for missing tools
+    /// admission, the LAN broker). Owed, the launch wants the tab as it wants it for missing tools
     /// ([`LAUNCH_WANT`]), on a Mac that has them too, so its one password does every root step
     /// setup has, asked by aterm itself with no press; the same holds and gates keep it (no
     /// scratch world, the account's [`Mark`], a quiet keyboard, no macOS dialog up, an
@@ -2733,24 +2739,31 @@ mod tests {
             Some(true),
             Admin,
             Ok((0, 0o440, true)),
+            false,
             false
         ));
-        assert!(root_steps_owed_by(Some(false), Admin, gone(), false));
+        assert!(root_steps_owed_by(Some(false), Admin, gone(), false, false));
         assert!(root_steps_owed_by(
             Some(false),
             Admin,
             Ok((501, 0o440, true)),
+            false,
             false
         ));
         assert!(!root_steps_owed_by(
             Some(false),
             Admin,
             Ok((0, 0o440, true)),
+            false,
             false
         ));
-        assert!(!root_steps_owed_by(None, Admin, denied(), false));
         assert!(
-            !root_steps_owed_by(Some(false), Admin, gone(), true),
+            root_steps_owed_by(Some(false), Admin, Ok((0, 0o440, true)), false, true),
+            "the broker alone owes the elevation"
+        );
+        assert!(!root_steps_owed_by(None, Admin, denied(), false, false));
+        assert!(
+            !root_steps_owed_by(Some(false), Admin, gone(), true, false),
             "refused stands"
         );
     }
@@ -2770,7 +2783,7 @@ mod tests {
             (None, NotMember, false),
         ] {
             assert_eq!(
-                root_steps_owed_by(off, member, Ok((0, 0o440, true)), false),
+                root_steps_owed_by(off, member, Ok((0, 0o440, true)), false, false),
                 owed,
                 "{off:?} {member:?}"
             );

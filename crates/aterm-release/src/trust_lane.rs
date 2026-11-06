@@ -671,7 +671,7 @@ pub fn gate_list(
             lib.name.clone_from(&lib.spec);
         }
     }
-    out.sort_by(|a, b| {
+    out.sort_unstable_by(|a, b| {
         (a.kind == Kind::Fork, &a.name, &a.spec).cmp(&(b.kind == Kind::Fork, &b.name, &b.spec))
     });
     Ok(out)
@@ -848,7 +848,7 @@ pub fn parse_costs(text: &str) -> BTreeMap<String, Cost> {
 #[must_use]
 pub fn order(names: &[&str], costs: &BTreeMap<String, Cost>) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..names.len()).collect();
-    idx.sort_by_key(|&i| match costs.get(names[i]) {
+    idx.sort_unstable_by_key(|&i| match costs.get(names[i]) {
         None => (0, 0, i),
         Some(c) => (1, u64::MAX - c.cpu, i),
     });
@@ -2530,7 +2530,14 @@ fn tree_state(repo: &Path) -> Option<(String, String)> {
 fn disk_run(cfg: &Config, root: &Path) -> atpkg::admit_disk::Run {
     let scope = match &cfg.scope {
         Scope::WholeTree => String::new(),
-        Scope::Packages(p) => p.iter().map(|n| format!(" -p {n}")).collect(),
+        Scope::Packages(p) => {
+            let mut s = String::new();
+            for n in p {
+                s.push_str(" -p ");
+                s.push_str(n);
+            }
+            s
+        }
         Scope::Remeasure => " --remeasure".to_owned(),
     };
     let kept_by = match &cfg.scope {
@@ -2539,10 +2546,15 @@ fn disk_run(cfg: &Config, root: &Path) -> atpkg::admit_disk::Run {
             let mut p = p.clone();
             p.sort_unstable();
             p.dedup();
-            p.iter()
-                .map(|n| format!("-p {n}"))
-                .collect::<Vec<_>>()
-                .join(" ")
+            let mut s = String::new();
+            for (i, n) in p.iter().enumerate() {
+                if i > 0 {
+                    s.push(' ');
+                }
+                s.push_str("-p ");
+                s.push_str(n);
+            }
+            s
         }
         Scope::Remeasure => "--remeasure".to_owned(),
     };

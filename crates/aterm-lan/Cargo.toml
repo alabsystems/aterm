@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-lan"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm — the root LAN broker (`aterm lan serve`, docs/DESIGN-lan-broker-2026-11-05.md): a root LaunchDaemon that makes aterm's own outbound LAN sockets and DNS-SD calls, which macOS's Local Network privacy exempts, and passes the sockets and streams the results to aterm processes it admits by code signature; it adopts a signed update of its source bundle by itself."
+
+[dependencies]
+# The broker's wire, the client's types, the classifier and the in-process socket acts it makes
+# as root (`aterm_uds::lan`), and the accept, readiness, peer and descriptor-passing helpers.
+aterm-uds = { workspace = true }
+# Code identity: the admission check of each client's audit token against the broker's team
+# requirement (regardless of uid), the strict static check of a bundle before adoption, and the
+# running image's signing team.
+aterm-keeper = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# chmod/chown of the socket and its folder, poll, clonefile and renamex_np's swap.
+libc = { workspace = true }
+
+[dev-dependencies]
+aterm-tempfile = { workspace = true }
+
+[lints]
+workspace = true

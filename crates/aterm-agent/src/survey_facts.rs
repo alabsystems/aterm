@@ -1374,10 +1374,14 @@ mod tests {
             enrolled: condition != Condition::NotEnrolled,
             condition,
             five_hour_pct: Some(10),
+            five_hour_reset: Some(1_793_140_000),
             seven_day_pct: Some(42),
             week_reset: Some(1_793_500_000),
             used_at: Some(1_793_130_000),
             read_at: Some(1_793_130_000),
+            pk: None,
+            plan: None,
+            plan_tier: None,
         };
         let claude = SurveyPool {
             moves: Some(PoolMoves {

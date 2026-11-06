@@ -42,7 +42,7 @@ pub(crate) fn seed_reference(state: &mut State, logins: &mut Logins, label: &str
             state.previous = Some(label.into());
         }
         6 => {
-            state.pending_pin = PinRequest::new(label, "a".repeat(32));
+            state.pending_pin = PinRequest::new(label, "a".repeat(32)).map(Into::into);
         }
         7 => {
             // A running session's usage tap also marks this Mac's use of the account.

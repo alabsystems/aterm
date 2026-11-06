@@ -739,7 +739,9 @@ fn rate_login(f: &Facts, mut row: Row, unmeasured: &str, now: i64) -> Row {
     if claude_expired || pool_expired {
         // Accounts v2 and a CLI's own pool each write one word for a wall, a displacement by the
         // vendor's own sign-in and a check that found no login, so it is quoted as recorded, with
-        // when.
+        // when. With no recorded time, the row may instead be one whose own credential file shows
+        // its login lapsed (`accounts::signed_out_here`), which nothing recorded: the store reads
+        // it signed out.
         let (by, at) = if claude_expired {
             (
                 "accounts v2",
@@ -756,7 +758,7 @@ fn rate_login(f: &Facts, mut row: Row, unmeasured: &str, now: i64) -> Row {
                 "its login has ended ({by} recorded it signed out {} ago)",
                 span(now.saturating_sub(at))
             ),
-            None => format!("its login has ended ({by} recorded it signed out)"),
+            None => format!("its login has ended ({by} reads it signed out here)"),
         };
         signed_out(&mut row, fact);
         return row;

@@ -43,12 +43,6 @@ libc.workspace = true
 aterm-dirfd.workspace = true
 
 [features]
-# Every test that discharges a model through a tiered helper also runs the Trust
-# checkers and must agree with the interpreter: `targo --unverified test
-# --workspace --features aterm-spec/checkers` (`verify::checkers_required`).
-# A feature, not an environment variable: nothing a process inherits changes a
-# plain run's verdict.
-checkers = []
 # Re-export the authoring macros. On through the workspace row.
 anchors = ["dep:aterm-spec-macros"]
 

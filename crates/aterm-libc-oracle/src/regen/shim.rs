@@ -236,7 +236,7 @@ fn struct_lines(os: Os, record: &Record, measured: &Measured) -> Result<Vec<Stri
         align: mut forced,
         ..
     } = repr;
-    let mut types = measured.field_types.clone();
+    let mut types = std::borrow::Cow::Borrowed(&measured.field_types);
     let mut notes = Vec::new();
     let slots: Vec<Slot> = if !record.stripped {
         record
@@ -256,14 +256,16 @@ fn struct_lines(os: Os, record: &Record, measured: &Measured) -> Result<Vec<Stri
             return Err(format!("{name}: {size} bytes is not a multiple of {align}"));
         }
         notes.push(format!("opaque in libc: {size} bytes, align {align}"));
-        types.insert(format!("[{unit}; {}]", size / align), (size, align));
+        types
+            .to_mut()
+            .insert(format!("[{unit}; {}]", size / align), (size, align));
         vec![(
             "__opaque".into(),
             format!("[{unit}; {}]", size / align),
             false,
         )]
     } else {
-        let slots = padded(record, measured, size, &mut types)?;
+        let slots = padded(record, measured, size, types.to_mut())?;
         notes.push(format!(
             "libc keeps private fields here; the __pad members reproduce their measured \
              extent (total {size} bytes, align {align})"
@@ -384,13 +386,13 @@ fn types(os: Os, decls: &Decls, measured: &Measured, out: &mut Vec<String>) -> R
         out.push(String::new());
     }
     let mut structs: Vec<&Record> = decls.structs.iter().collect();
-    structs.sort_by(|a, b| a.name.cmp(&b.name));
+    structs.sort_unstable_by(|a, b| a.name.cmp(&b.name));
     for record in structs {
         out.extend(struct_lines(os, record, measured)?);
         out.push(String::new());
     }
     let mut unions: Vec<&Record> = decls.unions.iter().collect();
-    unions.sort_by(|a, b| a.name.cmp(&b.name));
+    unions.sort_unstable_by(|a, b| a.name.cmp(&b.name));
     for union in unions {
         if union.stripped {
             return Err(format!("{}: a union with private fields", union.name));
@@ -417,7 +419,7 @@ fn constants(
 ) -> Result<(), String> {
     out.push("// ------------------------------------------------------------ constants".into());
     let mut consts: Vec<&Const> = decls.consts.iter().collect();
-    consts.sort_by(|a, b| a.name.cmp(&b.name));
+    consts.sort_unstable_by(|a, b| a.name.cmp(&b.name));
     let mut by_bytes = Vec::new();
     for constant in consts {
         match const_expr(constant)? {
@@ -470,7 +472,7 @@ fn functions(decls: &Decls, out: &mut Vec<String>) {
     out.push("// ------------------------------------------------------------ functions".into());
     out.push("unsafe extern \"C\" {".into());
     let mut fns: Vec<&Func> = decls.fns.iter().filter(|f| !f.has_body).collect();
-    fns.sort_by(|a, b| a.name.cmp(&b.name));
+    fns.sort_unstable_by(|a, b| a.name.cmp(&b.name));
     for func in fns {
         let mut args = args(func);
         if func.variadic {
@@ -521,7 +523,7 @@ fn bodies(cell: &Cell, decls: &Decls, out: &mut Vec<String>) -> Result<(), Strin
         );
     }
     let mut fns: Vec<&Func> = decls.fns.iter().filter(|f| f.has_body).collect();
-    fns.sort_by(|a, b| a.name.cmp(&b.name));
+    fns.sort_unstable_by(|a, b| a.name.cmp(&b.name));
     for func in fns {
         let body = handwritten::macro_body(cell.os, &func.name)
             .ok_or_else(|| format!("no body written for {} on {}", func.name, cell.key))?;

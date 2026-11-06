@@ -414,7 +414,7 @@ fn owner(
     let statuses = observed.clone();
     let rounds = observed.clone();
     let started = Instant::now();
-    // The probe drives the LAN on purpose, so its runtime's first LAN use waits for nothing.
+    // Its first LAN use waits for the LAN broker to answer, as every runtime's does.
     let runtime = start_runtime(
         paths.clone(),
         &configuration,
@@ -581,7 +581,6 @@ fn start_runtime(
                     .to_owned(),
                 recover_writer: configuration.observer.is_some(),
             },
-            aterm_db::runtime::LanGate::open(),
             observe,
             reports,
         )?)

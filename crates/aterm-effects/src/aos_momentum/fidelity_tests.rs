@@ -4,20 +4,18 @@
 //! `momentum-glow.lane-fidelity` v1 corpus calibration and usefulness tests.
 
 use std::fmt::Write as _;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use aterm_aos::ArtifactKind;
-use aterm_aos::contract::{Contract, Verdict};
-use aterm_aos::effects::NoEffects;
-use aterm_aos::replay::replay;
+use aterm_aos::contract::Verdict;
 use aterm_aos::task::state_digest;
 use aterm_aos::wire::Enc;
 use aterm_render::GlowQuad;
 use aterm_time::Instant;
 
-use super::corpus::{Corpus, CorpusSplit, GOLDEN_TRACE};
+use super::bundle::RowVerdict;
+use super::corpus::{Corpus, CorpusSplit};
 use super::fidelity::{
     CLEARED_BY_END, LANE_FIDELITY_NAME, LANE_SETTLES, LaneFidelity, NO_STEP_SLEPT, ORACLE,
     PROBE_DELTA,
@@ -26,11 +24,14 @@ use super::lane::{
     After, Exo, Glow, HANG_NS, LANE_MAX_EVENTS, LANE_MODEL, LaneFault, LaneRun, Presentation,
     S0_TAU, Scenario, encode_glass, run, s0, s0_geom,
 };
+use super::m4_tests::evaluator;
 use super::plan::{DEMO_PLAN, SHIPPED_PLAN, SchedulePlan, Split, Wake};
-use super::test_fixtures::{BUILD, attached_for_lane, cfg, hosted, judged_log};
+use super::test_fixtures::{
+    attached_for_lane, cfg, hosted, judged_log, refused_off_the_pinned_target,
+};
 use super::{
-    MomentumCode, MomentumEvent, MomentumHost, MomentumObservation, MomentumTrace, NoStrandedLight,
-    PrebuiltMomentum, Sched, WAKE_NO_LATER_THAN_CLEAR,
+    Applied, MomentumCode, MomentumEvent, MomentumHost, MomentumState, NoStrandedLight, Sched,
+    WAKE_NO_LATER_THAN_CLEAR,
 };
 use crate::cursor_glow::Geom;
 use crate::cursor_momentum::{MomentumGlow, MomentumGlowConfig, MomentumGlowFrame};
@@ -395,6 +396,16 @@ fn one_probe_covers_each_interval() {
     );
 }
 
+/// A plan's host draws on its own calls what the first-party engine the judge reruns draws and what
+/// the shipped code draws, and leaves the state the shipped code leaves. The shipped leg applies the
+/// code to a state ([`Sched::apply`], the step a host's delivery runs): the shipped host's boundary,
+/// log and chain around that step are `shipped_passes_lane_fidelity_on_every_item`'s, on its own
+/// calls, and a fault in them that shows only on a plan's calls is not seen here.
+///
+/// NEGATIVE CONTROL (2026-11-05): `Sched::apply` resetting the glow on `{SettleAtStep{0}, NextStep}`'s
+/// query fires `"… train-01: tick 2"` (left this leg's frame of 436 quads, right the host's of 340);
+/// one that raises only the unseen count on any plan's query fires `"… train-01: the state"`, the
+/// frames being equal.
 #[test]
 fn no_plan_changes_the_glow_the_judge_reruns() {
     let t0 = Instant::now();
@@ -410,40 +421,32 @@ fn no_plan_changes_the_glow_the_judge_reruns() {
             scope.spawn(move || {
                 for &(id, _, s) in items {
                     let (r, h) = hosted_run(t0, Sched::Plan(p), s);
-                    let mut shipped = attached_for_lane(t0, SHIPPED);
+                    let mut shipped = MomentumState::new(MomentumGlow::default());
                     let (mut out, mut under) = (Vec::new(), Vec::new());
                     let mut fresh = MomentumGlow::default();
                     let (mut fo, mut fu) = (Vec::new(), Vec::new());
                     let mut n = 0usize;
                     for call in r.calls() {
                         let at = |t: i128| t0 + Duration::from_nanos(u64::try_from(t).unwrap_or(0));
+                        out.clear();
+                        under.clear();
+                        let applied = SHIPPED.apply(&mut shipped, t0, call, &mut out, &mut under);
                         match *call {
                             MomentumEvent::Key {
                                 at: k, tau_bits, ..
-                            } => {
-                                shipped.key(at(k), f32::from_bits(tau_bits));
-                                fresh.on_key(at(k), f32::from_bits(tau_bits));
-                            }
-                            MomentumEvent::Reset => {
-                                shipped.rest();
-                                fresh.reset();
-                            }
-                            MomentumEvent::Query {
-                                at: q,
-                                frame_interval,
-                            } => {
-                                let _ = shipped.wake(at(q), frame_interval);
-                            }
+                            } => fresh.on_key(at(k), f32::from_bits(tau_bits)),
+                            MomentumEvent::Reset => fresh.reset(),
+                            MomentumEvent::Query { .. } => {}
                             MomentumEvent::Tick {
                                 cur,
                                 at: k,
                                 geom,
                                 cfg,
                             } => {
+                                let Applied::Frame(a) = applied else {
+                                    panic!("{p:?} {id}: tick {n}: {applied:?}");
+                                };
                                 let (geom, cfg) = (geom.geom(), cfg.config());
-                                out.clear();
-                                under.clear();
-                                let a = shipped.frame(cur, at(k), geom, &cfg, &mut out, &mut under);
                                 fo.clear();
                                 fu.clear();
                                 let b = fresh.tick(cur, at(k), geom, &cfg, &mut fo, &mut fu);
@@ -465,10 +468,10 @@ fn no_plan_changes_the_glow_the_judge_reruns() {
                         }
                     }
                     assert_eq!(n, r.ticks().len());
-                    let (hp, hs) = (hosted(&h), hosted(&shipped));
+                    let hp = hosted(&h);
                     assert_eq!(
                         state_digest(hp.boundary.schema(), hp.state()),
-                        state_digest(hs.boundary.schema(), hs.state()),
+                        state_digest(hp.boundary.schema(), &shipped),
                         "{p:?} {id}: the state"
                     );
                     checked.fetch_add(1, Ordering::Relaxed);
@@ -679,130 +682,73 @@ fn grid_plans() -> Vec<(String, SchedulePlan)> {
     v
 }
 
-/// One table row's results on one lane item.
-#[derive(Clone, Debug)]
-struct Cell {
-    t: u64,
-    p: u64,
-    fidelity: Verdict,
-    stranded_light: Verdict,
-    reproduced: bool,
-}
-
-fn cell(t0: Instant, sched: Option<Sched>, s: &Scenario) -> Cell {
-    let (r, h) = match sched {
-        Some(sched) => hosted_run(t0, sched, s),
-        None => {
-            let direct = run(&mut MomentumGlow::default(), s, t0);
-            let (attached, h) = hosted_run(t0, SHIPPED, s);
-            assert_same_run("the bare engine vs the attached host", &direct, &attached);
-            (direct, h)
-        }
-    };
-    let (stranded_light, reproduced) = judged_log(&h);
-    Cell {
-        t: r.counts().ticks,
-        p: r.counts().presented,
-        fidelity: LaneFidelity::new().judge(&r),
-        stranded_light,
-        reproduced,
+/// The name of the law `v` failed, if it failed one.
+fn row_law(v: &RowVerdict) -> Option<&str> {
+    match v {
+        RowVerdict::Fail { law, .. } => Some(law),
+        RowVerdict::Pass | RowVerdict::NotRun => None,
     }
 }
 
-fn golden(t0: Instant, sched: Sched) -> (u64, u64, Verdict) {
-    let trace = MomentumTrace::decode(GOLDEN_TRACE).expect("the golden trace decodes");
-    let read = trace.read(t0).expect("the golden trace reads");
-    let start = read
-        .checkpoint
-        .restore(&read.schema, &trace.identity)
-        .expect("its checkpoint restores");
-    let code = PrebuiltMomentum::of(sched, BUILD);
-    let r = replay(
-        &read.schema,
-        &code,
-        start,
-        read.log.inputs(),
-        read.log.header().first_cursor,
-        &mut NoEffects,
-    );
-    assert_eq!(r.refused, None, "the golden trace replays");
-    let (mut t, mut p) = (0u64, 0u64);
-    let mut glass = (None, false, 0u64, Vec::new(), Vec::new());
-    for (_, o) in &r.observations {
-        if let MomentumObservation::Frame {
-            fill,
-            hot,
-            fp,
-            out,
-            under,
-        } = o
-        {
-            t += 1;
-            let now = (*fill, *hot, *fp, out.clone(), under.clone());
-            if now != glass {
-                p += 1;
-                glass = now;
-            }
-        }
-    }
-    let v = NoStrandedLight::new().judge(&read.schema, read.log.inputs(), &r);
-    (t, p, v)
-}
-
+/// The table of design §10's early check, read off the evaluator the tests share
+/// ([`evaluator`]): a row is what a host attached with the code, driven by the lane and replayed
+/// from its log was judged to do, and most of these pairs are ones the grid search and the chains
+/// judge anyway, which this table judged again for itself. The shipped row reads the attached host:
+/// that the bare engine draws the same on every item is `shipped_passes_lane_fidelity_on_every_item`'s.
+/// Off the pinned target nothing here runs, as no evaluator is built; the calibrations stay held
+/// there by that test, `cold_only_fails_no_step_slept` and
+/// `the_shipped_plan_lane_equals_shipped_on_every_item`, while every other row's log replaying to
+/// its live head is held only on the pinned target.
+///
+/// The table is the old one's on every row and every total (2026-11-05, the two printed side by side
+/// in one build), its shipped row renamed.
+///
+/// NEGATIVE CONTROL (2026-11-05): a live chain corrupted at the third link for
+/// `{SettleAtStep{33334}, NextStep}` alone (`Hosted::link`) fires
+/// `"{SettleAtStep{33334}, NextStep}: every log replays to its live head"` (left 0, right 25);
+/// `{Shipped, ColdOnly}` waking as `NextStep` fires `"{Shipped, ColdOnly}: the calibration"` (left
+/// (25, 0, 25), right (1, 24, 25)).
 #[test]
 fn the_early_usefulness_table() {
-    let t0 = Instant::now();
+    if refused_off_the_pinned_target() {
+        return;
+    }
+    let ev = evaluator();
     let c = corpus();
-    let items = lane_items(&c);
-    let mut rows: Vec<(String, Option<Sched>)> = vec![("SHIPPED (bare engine)".to_owned(), None)];
+    let items: Vec<(usize, CorpusSplit, &str)> = c
+        .items()
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| i.scenario().is_some())
+        .map(|(k, i)| (k, i.split(), i.id()))
+        .collect();
+    let golden_at = c
+        .items()
+        .iter()
+        .position(|i| i.scenario().is_none())
+        .expect("the golden trace is an item");
+    let mut rows: Vec<(String, Sched)> = vec![("SHIPPED (attached host)".to_owned(), SHIPPED)];
     rows.extend(
         grid_plans()
             .into_iter()
-            .map(|(name, p)| (name, Some(Sched::Plan(p)))),
+            .map(|(name, p)| (name, Sched::Plan(p))),
     );
     let jobs: Vec<(usize, usize)> = (0..rows.len())
-        .flat_map(|r| (0..items.len()).map(move |i| (r, i)))
+        .flat_map(|r| {
+            items
+                .iter()
+                .map(move |&(k, ..)| (r, k))
+                .chain(core::iter::once((r, golden_at)))
+        })
         .collect();
-    let cells: Mutex<Vec<Option<Cell>>> = Mutex::new(vec![None; jobs.len()]);
-    let goldens: Mutex<Vec<Option<(u64, u64, Verdict)>>> = Mutex::new(vec![None; rows.len()]);
-    let next = AtomicUsize::new(0);
-    std::thread::scope(|scope| {
-        for _ in 0..std::thread::available_parallelism().map_or(4, usize::from) {
-            scope.spawn(|| {
-                loop {
-                    let j = next.fetch_add(1, Ordering::Relaxed);
-                    if j < jobs.len() {
-                        let (r, i) = jobs[j];
-                        let got = cell(t0, rows[r].1, items[i].2);
-                        cells.lock().expect("no panic holds it")[j] = Some(got);
-                    } else if j < jobs.len() + rows.len() {
-                        let r = j - jobs.len();
-                        let got = golden(t0, rows[r].1.unwrap_or(SHIPPED));
-                        goldens.lock().expect("no panic holds it")[r] = Some(got);
-                    } else {
-                        break;
-                    }
-                }
-            });
-        }
+    let judged = crate::test_pool::par_map(&jobs, |&(r, k)| {
+        ev.judge(rows[r].1, k).expect("a corpus item").0
     });
-    let cells: Vec<Cell> = cells
-        .into_inner()
-        .expect("no panic holds it")
-        .into_iter()
-        .map(|c| c.expect("every job ran"))
-        .collect();
-    let goldens: Vec<(u64, u64, Verdict)> = goldens
-        .into_inner()
-        .expect("no panic holds it")
-        .into_iter()
-        .map(|g| g.expect("every golden job ran"))
-        .collect();
     let n = items.len();
     assert_eq!(n, 25);
     let s0_ix = items
         .iter()
-        .position(|i| i.0 == "s0")
+        .position(|i| i.2 == "s0")
         .expect("S0 is an item");
 
     let mut table = String::new();
@@ -839,28 +785,33 @@ fn the_early_usefulness_table() {
     );
     let mut summary = Vec::new();
     for (r, (name, sched)) in rows.iter().enumerate() {
-        let row = &cells[r * n..(r + 1) * n];
+        let of_row = &judged[r * (n + 1)..(r + 1) * (n + 1)];
+        let (row, golden) = of_row.split_at(n);
+        let golden = &golden[0];
         let sum = |split: CorpusSplit| {
             row.iter()
                 .zip(&items)
                 .filter(|(_, i)| i.1 == split)
-                .fold((0u64, 0u64), |a, (c, _)| (a.0 + c.t, a.1 + c.p))
+                .fold((0u64, 0u64), |a, (c, _)| (a.0 + c.ticks, a.1 + c.presented))
         };
         let (tt, tp) = sum(CorpusSplit::Train);
         let (ht, hp) = sum(CorpusSplit::HeldOut);
         let s = &row[s0_ix];
-        let pass = row.iter().filter(|c| c.fidelity.passed()).count();
-        let first = |l: &str| row.iter().filter(|c| law(&c.fidelity) == Some(l)).count();
+        let pass = row.iter().filter(|c| c.lane_fidelity.passed()).count();
+        let first = |l: &str| {
+            row.iter()
+                .filter(|c| row_law(&c.lane_fidelity) == Some(l))
+                .count()
+        };
         let nsl = row.iter().filter(|c| c.stranded_light.passed()).count();
-        let repro = row.iter().filter(|c| c.reproduced).count();
-        let (gt, gp, gv) = &goldens[r];
+        let repro = row.iter().filter(|c| c.run.passed()).count();
         let _ = writeln!(
             table,
-            "{:<30} {:>6} {:>6} {:>6} | {:>7} {:>7} {:>7} | {:>7} {:>7} {:>7} | {:>5}/25 {:>13} | {:>3} {:>5} | {} (T {gt} P {gp})",
+            "{:<30} {:>6} {:>6} {:>6} | {:>7} {:>7} {:>7} | {:>7} {:>7} {:>7} | {:>5}/25 {:>13} | {:>3} {:>5} | {} (T {} P {})",
             name,
-            s.t,
-            s.p,
-            s.t - s.p,
+            s.ticks,
+            s.presented,
+            s.wasted,
             tt,
             tp,
             tt - tp,
@@ -876,7 +827,9 @@ fn the_early_usefulness_table() {
             ),
             nsl,
             repro,
-            law(gv).unwrap_or("pass"),
+            row_law(&golden.stranded_light).unwrap_or("pass"),
+            golden.ticks,
+            golden.presented,
         );
         summary.push((
             name.clone(),
@@ -884,7 +837,7 @@ fn the_early_usefulness_table() {
             pass,
             nsl,
             repro,
-            gv.passed(),
+            golden.stranded_light.passed(),
             first(NO_STEP_SLEPT),
         ));
     }
@@ -893,11 +846,11 @@ fn the_early_usefulness_table() {
     for (name, sched, pass, nsl, repro, golden_pass, nss) in summary {
         assert_eq!(repro, 25, "{name}: every log replays to its live head");
         match sched {
-            None | Some(Sched::Plan(SHIPPED_PLAN)) => {
+            SHIPPED | Sched::Plan(SHIPPED_PLAN) => {
                 assert_eq!((pass, nsl), (25, 25), "{name}: the calibration");
                 assert!(golden_pass, "{name}: the golden trace");
             }
-            Some(Sched::Plan(p)) if p == plan(Split::Shipped, Wake::ColdOnly) => {
+            Sched::Plan(p) if p == plan(Split::Shipped, Wake::ColdOnly) => {
                 assert_eq!((pass, nss, nsl), (1, 24, 25), "{name}: the calibration");
             }
             _ => {}

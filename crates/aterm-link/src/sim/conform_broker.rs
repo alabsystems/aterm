@@ -361,15 +361,6 @@ struct Real {
     /// The records earlier opens read back cold (`Broker::cold_reads`, which counts from each
     /// open): with the open that serves now's, [`Real::cold_reads`].
     cold_before: u64,
-    /// The records the broker read back cold while one of [`run_keeping`]'s requests,
-    /// deliveries, ticks or cuts ran: the compared steps but [`Step::RateLimited`], whose
-    /// comparison reads `Broker::stats`, as the harness's own waits do ([`Real::settle`] and an
-    /// open's wait for its first tick poll it), and `Broker::stats` reads every retained
-    /// `/a/will` record, cold ones from the file. Attributed by time, not by cause: astream's
-    /// counter is the broker's, and its own threads (a tail catching up after a subscribe) read
-    /// at their own pace, so a read is counted in whichever window it falls in and the count
-    /// moves between runs of one script; the cold test holds it only to not being 0.
-    answered_cold: u64,
     boot: Boot,
     /// The power losses so far ([`boot_after`]).
     losses: u64,
@@ -516,7 +507,6 @@ impl Real {
             at_rest,
             resident_budget,
             cold_before: 0,
-            answered_cold: 0,
             up: None,
             conns: BTreeMap::new(),
             will_producers: BTreeSet::new(),
@@ -1157,18 +1147,6 @@ fn run_arms(
     let mut answers = 0u64;
     for (i, step) in steps.iter().enumerate() {
         let at = |what: &str| format!("{tier} step {i} {step:?}: {what}");
-        // The cold reads while a compared step runs ([`Real::answered_cold`]), `RateLimited`
-        // aside, as it reads `Broker::stats`; none of these opens or stops the broker.
-        let compared = matches!(
-            step,
-            Step::Send(..)
-                | Step::Pipeline(..)
-                | Step::Deliver(_)
-                | Step::DeliverAny(_)
-                | Step::Tick(_)
-                | Step::Cut(_)
-        )
-        .then(|| real.cold_reads());
         match step {
             Step::Dial(c) => {
                 real.dial(*c);
@@ -1302,9 +1280,6 @@ fn run_arms(
                 }
                 answers += 1;
             }
-        }
-        if let Some(cold) = compared {
-            real.answered_cold += real.cold_reads() - cold;
         }
         // Between steps the refinement arm's log holds what the model's does, so nothing of a
         // rolled-back batch (a publish's, a commit's, a fired will's) is visible past one.
@@ -2821,13 +2796,15 @@ const HEAD_ONLY: &[&str] = &["binary payload"];
 /// tier the host serves. Residency is on no answer, so the model answers each as it answers a
 /// resident log.
 ///
-/// The arm provably reached the cold tier: in every run of a script that reads below its head
+/// The arm provably reached the cold tier: every run of a script that reads below its head
 /// (each but [`HEAD_ONLY`]: a `Fetch` or a `Last` page, a group's resume, a tail's catch-up, the
-/// records retention's tick weighs under aterm's hold rules), and of every journal, records
-/// were read back cold while the requests, deliveries, ticks and cuts whose answers were
-/// compared ran (`Broker::cold_reads` over those steps, `Real::answered_cold`: never over the
-/// harness's own waits or `RateLimited`'s, which poll `Broker::stats`), and no [`HEAD_ONLY`]
-/// run read any.
+/// records retention's tick weighs under aterm's hold rules), and of every journal, read
+/// records back cold over the run (`Broker::cold_reads` over every open, [`Real::cold_reads`]),
+/// and no [`HEAD_ONLY`] run read any. The count is the whole run's: the harness's waits and
+/// `RateLimited`'s comparison poll `Broker::stats`, which reads no record (astream's latest-will
+/// map, critic item F19), so every cold read is a script's request, delivery, tick or cut
+/// being served, whether in its step or by the broker's own threads after it (a tail catching
+/// up after a subscribe).
 /// NEGATIVE CONTROLS: a model that forgets its dedup (`FreshDedup`), or its subject budget
 /// (`PublishPastTheBudget`, on the subject budget's long script), is still caught on the cold
 /// arm, and at aterm's own budget a script the cold arm reads back records for reads none, so
@@ -2860,7 +2837,7 @@ fn a_cold_log_answers_every_script_as_the_model_does() {
                 if key.is_some() && !real.bound_at_rest() {
                     Err("no `.seal`: nothing sealed it".to_string())
                 } else {
-                    Ok((real.answered_cold, real.cold_reads()))
+                    Ok(real.cold_reads())
                 }
             });
         (what, !HEAD_ONLY.contains(name), verdict)
@@ -2874,7 +2851,7 @@ fn a_cold_log_answers_every_script_as_the_model_does() {
         let tier = opts.tier.expect("a journalled world names its tier");
         let steps = replay(&super::world::run(opts).journal);
         let verdict = run_keeping(tier, opts.rules(), None, COLD, ArmMutant::None, &steps)
-            .map(|real| (real.answered_cold, real.cold_reads()));
+            .map(|real| real.cold_reads());
         (format!("seed {seed}'s journal at {tier}"), true, verdict)
     }));
     runs.extend(served.iter().map(|&tier| {
@@ -2884,24 +2861,23 @@ fn a_cold_log_answers_every_script_as_the_model_does() {
         };
         let steps = replay(&super::world::run_reclaim(&opts, 3, true).journal);
         let verdict = run_keeping(tier, opts.rules(), None, COLD, ArmMutant::None, &steps)
-            .map(|real| (real.answered_cold, real.cold_reads()));
+            .map(|real| real.cold_reads());
         (format!("the reclaim journal at {tier}"), true, verdict)
     }));
-    let (mut answered, mut cold) = (0, 0);
+    let mut cold = 0;
     let mut failed = Vec::new();
     let mut fewest: Option<(u64, &str)> = None;
     for (what, below_the_head, verdict) in &runs {
         match *verdict {
             Err(ref e) => failed.push(format!("{what}: {e}")),
-            Ok((0, _)) if *below_the_head => failed.push(format!(
-                "{what}: no answer read a record back cold, so none came from the cold tier"
+            Ok(0) if *below_the_head => failed.push(format!(
+                "{what}: read no record back cold, so no answer came from the cold tier"
             )),
-            Ok((_, all)) if !*below_the_head && all > 0 => failed.push(format!(
-                "{what}: read {all} records back cold, so it reads below its head"
+            Ok(reads) if !*below_the_head && reads > 0 => failed.push(format!(
+                "{what}: read {reads} records back cold, so it reads below its head"
             )),
-            Ok((reads, all)) => {
-                answered += reads;
-                cold += all;
+            Ok(reads) => {
+                cold += reads;
                 if *below_the_head && fewest.is_none_or(|(least, _)| reads < least) {
                     fewest = Some((reads, what));
                 }
@@ -2909,8 +2885,7 @@ fn a_cold_log_answers_every_script_as_the_model_does() {
         }
     }
     eprintln!(
-        "the cold arm's answers read {answered} records back cold over {} runs (the fewest \
-         {fewest:?}), and with the harness's waits {cold}",
+        "the cold arm read {cold} records back cold over {} runs (the fewest {fewest:?})",
         runs.len()
     );
     assert!(
@@ -2918,10 +2893,7 @@ fn a_cold_log_answers_every_script_as_the_model_does() {
         "the model diverged from a cold log:\n{}",
         failed.join("\n")
     );
-    assert!(
-        answered > 0,
-        "the cold arm's answers read nothing back cold"
-    );
+    assert!(cold > 0, "the cold arm read nothing back cold");
     let resident = run_keeping(
         Tier::Relaxed,
         rules(),

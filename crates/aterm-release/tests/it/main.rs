@@ -137,6 +137,9 @@ mod release_timeline;
 )]
 mod service_qualification;
 
+#[path = "../../src/managed_prerequisites.rs"]
+#[allow(dead_code)]
+mod managed_prerequisites;
 #[path = "../../src/sign.rs"]
 #[allow(dead_code)]
 mod sign;

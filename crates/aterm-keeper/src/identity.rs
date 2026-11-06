@@ -193,6 +193,21 @@ impl std::fmt::Display for CheckError {
     }
 }
 
+/// The team identifier this process's code is signed by: `None` for an ad-hoc or unsigned image,
+/// and off macOS.
+/// # Errors
+/// Security.framework could not read this process's signing information.
+pub fn own_team() -> Result<Option<String>, String> {
+    #[cfg(target_vendor = "apple")]
+    {
+        sec::own_team()
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        Ok(None)
+    }
+}
+
 /// The identity check in force.
 #[derive(Debug)]
 pub struct Identity {
@@ -200,6 +215,8 @@ pub struct Identity {
     #[cfg(target_vendor = "apple")]
     requirement: Option<Arc<sec::Owned>>,
     description: String,
+    /// Admit a peer of any uid whose code meets the requirement ([`Identity::regardless_of_uid`]).
+    any_uid: bool,
 }
 
 impl Identity {
@@ -211,6 +228,7 @@ impl Identity {
             #[cfg(target_vendor = "apple")]
             requirement: None,
             description: "same-uid".to_string(),
+            any_uid: false,
         }
     }
 
@@ -232,6 +250,7 @@ impl Identity {
             policy: IdentityPolicy::Designated,
             requirement: Some(Arc::new(requirement)),
             description: format!("designated requirement: {text}"),
+            any_uid: false,
         })
     }
 
@@ -251,6 +270,7 @@ impl Identity {
                 policy: IdentityPolicy::Designated,
                 requirement: Some(Arc::new(compiled)),
                 description: format!("requirement: {text}"),
+                any_uid: false,
             })
         }
         #[cfg(not(target_vendor = "apple"))]
@@ -271,6 +291,7 @@ impl Identity {
                 policy: IdentityPolicy::Designated,
                 requirement: Some(Arc::new(compiled)),
                 description: format!("designated requirement of {}: {text}", path.display()),
+                any_uid: false,
             })
         }
         #[cfg(not(target_vendor = "apple"))]
@@ -278,6 +299,36 @@ impl Identity {
             let _ = path;
             Err("code identity is checked on macOS only".to_string())
         }
+    }
+
+    /// This identity checked by code alone, a peer of any uid admitted when its code meets the
+    /// requirement: a root service every login's processes may ask (the LAN broker). The same-uid
+    /// floor ([`Self::same_uid`]) has no code to check, so it keeps its uid check.
+    #[must_use]
+    pub fn regardless_of_uid(mut self) -> Self {
+        self.any_uid = self.policy == IdentityPolicy::Designated;
+        self
+    }
+
+    /// Whether the code at `path` (a bundle) meets the requirement in force under the strictest
+    /// static check (`kSecCSStrictValidate`, every architecture, nested code): a copy about to be
+    /// adopted as a root service's image.
+    /// # Errors
+    /// Why the code does not pass, could not be read, or (off macOS, or with no requirement in
+    /// force) cannot be checked.
+    pub fn admits_code_at_strictly(&self, path: &Path) -> Result<(), String> {
+        #[cfg(target_vendor = "apple")]
+        if let Some(req) = &self.requirement {
+            let (owned, req) = (path.to_path_buf(), Arc::clone(req));
+            return through_trust_gate(
+                CODE_CHECK_HANG,
+                CODE_CHECK_HANG,
+                &path.display().to_string(),
+                move || sec::check_static_with(&owned, &req, sec::STRICT),
+            )?;
+        }
+        let _ = path;
+        Err("no code requirement is in force to check a copy against".to_string())
     }
 
     /// The policy in force.
@@ -350,7 +401,7 @@ impl Identity {
         suspect: Duration,
     ) -> PeerCheck {
         #[cfg(unix)]
-        {
+        if !self.any_uid {
             let ours = aterm_uds::peer::our_uid();
             match aterm_uds::peer::peer_uid(stream) {
                 Some(uid) if uid == ours => {}
@@ -431,6 +482,7 @@ mod sec {
             value_callbacks: *const c_void,
         ) -> CFTypeRef;
         fn CFStringGetCString(s: CFTypeRef, buf: *mut u8, size: isize, encoding: u32) -> u8;
+        fn CFDictionaryGetValue(dict: CFTypeRef, key: CFTypeRef) -> CFTypeRef;
         fn CFStringCreateWithBytes(
             alloc: CFTypeRef,
             bytes: *const u8,
@@ -469,7 +521,13 @@ mod sec {
             out: *mut CFTypeRef,
         ) -> OSStatus;
         fn SecStaticCodeCheckValidity(code: CFTypeRef, flags: u32, req: CFTypeRef) -> OSStatus;
+        fn SecCodeCopySigningInformation(
+            code: CFTypeRef,
+            flags: u32,
+            out: *mut CFTypeRef,
+        ) -> OSStatus;
         static kSecGuestAttributeAudit: CFTypeRef;
+        static kSecCodeInfoTeamIdentifier: CFTypeRef;
     }
 
     #[link(name = "CoreFoundation", kind = "framework")]
@@ -631,12 +689,64 @@ mod sec {
     /// `req`.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn check_static(path: &std::path::Path, req: &Owned) -> Result<(), String> {
+        check_static_with(path, req, 0)
+    }
+
+    /// `kSecCSCheckAllArchitectures | kSecCSCheckNestedCode | kSecCSStrictValidate`.
+    pub const STRICT: u32 = 1 | (1 << 3) | (1 << 4);
+
+    /// [`check_static`] under the validity `flags`.
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub fn check_static_with(
+        path: &std::path::Path,
+        req: &Owned,
+        flags: u32,
+    ) -> Result<(), String> {
         let code = static_code_at(path)?;
         // SAFETY: both objects are live.
         status(
-            unsafe { SecStaticCodeCheckValidity(code.0, 0, req.0) },
+            unsafe { SecStaticCodeCheckValidity(code.0, flags, req.0) },
             "the code does not satisfy the requirement in force",
         )
+    }
+
+    /// The team identifier this process's code is signed by, or `None` (ad hoc, or unsigned).
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub fn own_team() -> Result<Option<String>, String> {
+        const SIGNING_INFORMATION: u32 = 1 << 1;
+        let mut me: CFTypeRef = std::ptr::null();
+        // SAFETY: an out-parameter for one new reference.
+        status(unsafe { SecCodeCopySelf(0, &mut me) }, "SecCodeCopySelf")?;
+        let me = owned(me, "SecCodeCopySelf")?;
+        let mut info: CFTypeRef = std::ptr::null();
+        // SAFETY: `me` is a live code object; an out-parameter for one reference.
+        status(
+            unsafe { SecCodeCopySigningInformation(me.0, SIGNING_INFORMATION, &mut info) },
+            "SecCodeCopySigningInformation",
+        )?;
+        let info = owned(info, "SecCodeCopySigningInformation")?;
+        // SAFETY: reading an immutable framework constant; `info` is a live dictionary, and the
+        // value it answers is borrowed from it (the Get rule), read while `info` lives.
+        let team = unsafe { CFDictionaryGetValue(info.0, kSecCodeInfoTeamIdentifier) };
+        if team.is_null() {
+            return Ok(None);
+        }
+        let mut buf = vec![0u8; 256];
+        // SAFETY: `team` is a CFString `info` keeps alive; `buf` is its stated size.
+        let ok = unsafe {
+            CFStringGetCString(
+                team,
+                buf.as_mut_ptr(),
+                buf.len() as isize,
+                K_CF_STRING_ENCODING_UTF8,
+            )
+        };
+        if ok == 0 {
+            return Err("the signing team identifier is unprintable".to_string());
+        }
+        let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+        let team = String::from_utf8_lossy(&buf[..end]).into_owned();
+        Ok((!team.is_empty()).then_some(team))
     }
 
     /// The code object of the process `token` names.
@@ -717,6 +827,26 @@ mod tests {
         Identity::same_uid()
             .check(&a, WITHIN)
             .expect("same uid passes");
+    }
+
+    #[test]
+    fn a_check_regardless_of_uid_still_checks_code_and_the_floor_keeps_its_uid() {
+        aterm_uds::deadline::require_trust_service();
+        let id = Identity::for_self(IdentityPolicy::Designated)
+            .expect("own requirement")
+            .regardless_of_uid();
+        assert!(id.any_uid);
+        let (a, _b) = CtlStream::pair().expect("pair");
+        verdict(id.check(&a, WITHIN)).expect("self passes by code");
+        assert!(!Identity::same_uid().regardless_of_uid().any_uid);
+        // A test binary is signed ad hoc by its linker: no team, and no strict check without a
+        // requirement in force.
+        assert_eq!(own_team(), Ok(None));
+        assert!(
+            Identity::same_uid()
+                .admits_code_at_strictly(Path::new("/bin/ls"))
+                .is_err()
+        );
     }
 
     #[test]

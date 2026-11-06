@@ -11208,21 +11208,12 @@ impl App {
                 border_scale_q4: 0,
             })
         } else {
-            self.level_up
-                .as_ref()
-                .map(|level| OverlayGlow {
-                    accent: level.accent(accent, now),
-                    wash_a: level.wash_alpha(now),
-                    border_a: level.border_alpha(now),
-                    border_scale_q4: level.border_scale_q4(now),
-                })
-                .or_else(|| {
-                    if overlay_open {
-                        None
-                    } else {
-                        self.presence_overlay(id)
-                    }
-                })
+            self.level_up.as_ref().map(|level| OverlayGlow {
+                accent: level.accent(accent, now),
+                wash_a: level.wash_alpha(now),
+                border_a: level.border_alpha(now),
+                border_scale_q4: level.border_scale_q4(now),
+            })
         };
         HostVisualState { invert, overlay }
     }
@@ -13053,7 +13044,6 @@ impl App {
                 ws.band_hover,
                 band_geom,
             );
-            let presence_fp = ws.presence.fp();
             let key = RepaintKey {
                 damage_epoch: epoch,
                 grid_top,
@@ -13094,7 +13084,6 @@ impl App {
                 deck_fp,
                 level_up_fp,
                 band_fp,
-                presence_fp,
                 question,
                 system_dark: repaint_system_dark(self.os_appearance),
                 link_caption: ws.link_hover,
@@ -13298,6 +13287,7 @@ impl App {
         let Some(composed) = self.compose_route_chrome(id, route, plan) else {
             return;
         };
+        self.note_cells_composed(id, plan);
         if !multi_pane && let Some(ws) = self.windows.get_mut(&id) {
             ws.capture_leaf_snapshot_seqs.clear();
             ws.capture_leaf_snapshot_seqs
@@ -16783,7 +16773,6 @@ impl App {
                 self.band_geometry(wid),
             )
         });
-        let presence_fp = self.presence_fp(wid);
         let overlay_fp = match overlay_inputs {
             Some(inputs) => self.windows.get_mut(&wid).map_or(0, |ws| {
                 ws.pane_overlay
@@ -16841,7 +16830,6 @@ impl App {
             deck_fp,
             level_up_fp,
             band_fp,
-            presence_fp,
             question: self.question_key(wid),
             system_dark: repaint_system_dark(self.os_appearance),
             link_caption: self.windows.get(&wid).and_then(|ws| ws.link_hover),
@@ -17473,10 +17461,6 @@ impl App {
             .windows
             .get(&wid)
             .is_some_and(|ws| ws.strip_hover_version);
-        let pill_key = self
-            .strip_carries_pill(wid)
-            .then(|| self.presence_pill_key(wid))
-            .flatten();
         #[cfg(any(windows, target_os = "linux"))]
         let caption = tab_bar::CaptionSlot::measure(
             self.windows.get(&wid).and_then(|ws| ws.client_frame),
@@ -17504,7 +17488,6 @@ impl App {
                         && key.7 == version_hovered
                         && key.8 == caption
                         && key.9 == caption_hovered
-                        && key.10 == pill_key
                 })
         });
         if !hit {
@@ -17519,7 +17502,6 @@ impl App {
                 .get_mut(&wid)
                 .map(|ws| std::mem::take(&mut ws.strip_metadata_scratch))
                 .unwrap_or_default();
-            let pill = pill_key.and_then(|_| self.presence_pill(wid));
             let shown = tab_bar::team_titles(&titles, &metadata);
             #[cfg(any(windows, target_os = "linux"))]
             let wants = tab_bar::pixel_band::tab_wants(
@@ -17544,7 +17526,6 @@ impl App {
                     active,
                     show_update,
                     version_slot,
-                    pill.as_ref().map(|pill| &pill.words),
                     caption,
                     sizing,
                 )
@@ -17575,17 +17556,6 @@ impl App {
                         tab_bar::paint_strip_with_metadata_and_rename_caret(
                             &mut row, &segments, &shown, &metadata, paint, active, palette, floor,
                         );
-                    if let Some(pill) = pill.as_ref() {
-                        tab_bar::paint_strip_pill(
-                            &mut row,
-                            &segments,
-                            tab_bar::StripPill {
-                                kind: pill.kind,
-                                words: &pill.words,
-                            },
-                            palette,
-                        );
-                    }
                 }
                 if r + 1 == strip {
                     tab_bar::seal_strip_bottom(&mut row, palette);
@@ -17654,7 +17624,6 @@ impl App {
                 ws.cached_strip_rows = rows;
                 ws.cached_strip_images = strip_images;
                 ws.cached_strip_rename_caret = strip_rename_caret;
-                ws.strip_pill_session = pill.as_ref().map(|pill| pill.session);
                 ws.last_strip_fp = Some((
                     tab_strip,
                     cols,
@@ -17666,7 +17635,6 @@ impl App {
                     version_hovered,
                     caption,
                     caption_hovered,
-                    pill_key,
                 ));
                 #[cfg(any(windows, target_os = "linux"))]
                 {

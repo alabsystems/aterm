@@ -1,0 +1,18 @@
+# claude-code 2.1.318 · MEASURED 2026-11-06, `aterm ctl text` of a private headless aterm (170x40, aterm 0.158.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a statusLine command that prints nothing (the stand-in's file emptied after it printed `week · no figure yet`, refreshInterval 1) at a turn end, idle, 170x40: the row is gone and the mode row stands directly under the composer's bottom rule
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Sonnet 5.5 · Claude API
+ ▝▝   ▝▝   /private/tmp/at.lT6Q/proj
+
+
+❯ /clear
+
+❯ hi
+
+⏺ Hi! I am the local lab stub, not a model. (reply 8)
+
+✻ Crunched for 0s · done 3:17 AM
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)

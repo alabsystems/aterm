@@ -173,7 +173,7 @@ fn config_of_m2(
         prebound_listener: None,
         tick_every: Duration::from_millis(20),
         wake_timeout: Duration::from_secs(1),
-        lan_may_go: || false,
+        lan_unavailable: || Some("no root LAN broker answers".to_owned()),
         stop: Arc::clone(stop),
         members: None,
         alab_browse: None,

@@ -27,10 +27,12 @@
 //! whose units may serve other selections, no less than a fresh one, however warm the runs kept of
 //! the selection began. A selection's figure is the most of its runs' (a light run never hides a
 //! heavy one). A run claims the least of the covers this record holds for it: its own
-//! selection's figure, a wider selection's (the same work over more crates, or the whole
-//! workspace, built every unit it builds), or the sum of the figures of selections of the same
-//! work whose crates together hold its, each crate's cheapest (each built the units of its
-//! crates; the sum counts the dependencies they share once for each). Each is an upper bound on
+//! selection's figure, a wider selection's (work that bounds its, [`Bounds`], over more crates, or
+//! the whole workspace, built every unit it builds), or the sum of the figures of selections of
+//! work bounding its whose crates together hold its, each crate's cheapest (each built the units
+//! of its crates; the sum counts the dependencies they share once for each). Work bounds its own,
+//! and the same with more of the words its keeper names as adding work alone
+//! ([`MachineFootprints::cover_by`]; for verify, its checks that build). Each is an upper bound on
 //! what the run writes, so the least is too, but for one reach: were every run the record keeps
 //! begun warm, the floor would stand above what a fresh run begins from, and a run would claim
 //! less than it writes by at most the difference. Kept nowhere, no cover: the run claims as
@@ -53,8 +55,23 @@ pub const SCHEMA: u64 = 1;
 /// The most bytes [`MachineFootprints::load`] reads, and [`MachineFootprints::save`] writes.
 const FILE_MAX: u64 = 16 << 20;
 
+/// Whether a run that did the work `done` wrote at least what a run of the work `asked` writes over
+/// the same crates: `done` has every word `asked` has, and beyond them only words of `more`, each
+/// of which adds work to the same directories and takes none away (for verify, a check that
+/// builds); a word of any other kind (the cells chosen, `--compile-only`) changes what the rest
+/// write, so it must be the same in both.
+fn does_at_least(done: &str, asked: &str, more: &[String]) -> bool {
+    let done: Vec<&str> = done.split_whitespace().collect();
+    let asked: Vec<&str> = asked.split_whitespace().collect();
+    asked.iter().all(|w| done.contains(w))
+        && done
+            .iter()
+            .all(|w| asked.contains(w) || more.iter().any(|m| m == w))
+}
+
 /// WHAT A RUN BUILT, as the machine's record keeps it: the work, which a run bounding it must
-/// have done the same, and the crates it did it for.
+/// have done the same of or more ([`MachineFootprints::cover_by`]), and the crates it did it
+/// for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Selection {
     /// The work, spelled the same each time it is the same: verify's checks that build, sorted,
@@ -72,12 +89,17 @@ impl Selection {
     /// selection, and a list one whose every crate it names.
     #[must_use]
     pub fn holds(&self, other: &Selection) -> bool {
-        self.work == other.work
-            && match (&self.crates, &other.crates) {
-                (None, _) => true,
-                (Some(_), None) => false,
-                (Some(mine), Some(theirs)) => theirs.iter().all(|c| mine.contains(c)),
-            }
+        self.work == other.work && self.holds_crates(other)
+    }
+
+    /// Whether it names every crate `other` does: the workspace names every crate, and a list
+    /// none beyond its own.
+    fn holds_crates(&self, other: &Selection) -> bool {
+        match (&self.crates, &other.crates) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(mine), Some(theirs)) => theirs.iter().all(|c| mine.contains(c)),
+        }
     }
 
     /// Whether the work was done for `name`: a list naming it, or the whole workspace.
@@ -182,13 +204,30 @@ impl MachineFootprints {
     }
 
     /// The least this record bounds a run of `selection` to write into directories holding
-    /// `holds` bytes, of a kind that writes `cold` into empty ones: its own selection's figure
-    /// ([`Kept::figure`], above the record's floor, [`Cover::floor`]), a wider selection's
-    /// ([`Selection::holds`]), or the sum of the figures of selections of the same work whose
-    /// crates together name every crate it names, each crate's the cheapest naming it. `None`
-    /// where no selection kept covers it: no run of the same work, or a crate no run of it named.
+    /// `holds` bytes, of a kind that writes `cold` into empty ones, read from runs of the same
+    /// work alone ([`Self::cover_by`] with no word that adds work).
     #[must_use]
     pub fn cover(&self, selection: &Selection, holds: u64, cold: u64) -> Option<Cover> {
+        self.cover_by(selection, holds, cold, &[])
+    }
+
+    /// The least this record bounds a run of `selection` to write into directories holding
+    /// `holds` bytes, of a kind that writes `cold` into empty ones: its own selection's figure
+    /// ([`Kept::figure`], above the record's floor, [`Cover::floor`]), a wider selection's (work
+    /// that bounds its, over every crate it names), or the sum of the figures of selections of
+    /// work that bounds its whose crates together name every crate it names, each crate's the
+    /// cheapest naming it. Work bounds its own, and the same with more of the words `more` names
+    /// (each adds work to the same directories and takes none away: verify's checks that build).
+    /// `None` where no selection kept covers it: no run of work bounding its, or a crate no such
+    /// run named.
+    #[must_use]
+    pub fn cover_by(
+        &self,
+        selection: &Selection,
+        holds: u64,
+        cold: u64,
+        more: &[String],
+    ) -> Option<Cover> {
         let floor = self
             .rows
             .iter()
@@ -199,12 +238,12 @@ impl MachineFootprints {
         let same: Vec<(&Kept, u64)> = self
             .rows
             .iter()
-            .filter(|r| r.selection.work == selection.work)
+            .filter(|r| does_at_least(&r.selection.work, &selection.work, more))
             .filter_map(|r| r.figure(floor, cold).map(|f| (r, f)))
             .collect();
         let mut best: Option<Cover> = same
             .iter()
-            .filter(|(r, _)| r.selection.holds(selection))
+            .filter(|(r, _)| r.selection.holds_crates(selection))
             .map(|(r, f)| Cover {
                 bytes: *f,
                 selections: 1,

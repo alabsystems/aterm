@@ -3,11 +3,11 @@
 
 use super::*;
 
-fn attempt(store: &Store, signin: bool) -> io::Result<Option<Lock>> {
+fn attempt(store: &Store, signin: bool) -> io::Result<Option<()>> {
     if signin {
-        store.signin_now()
+        store.signin_now().map(|held| held.map(drop))
     } else {
-        store.try_acquire()
+        store.try_acquire().map(|held| held.map(drop))
     }
 }
 
@@ -36,8 +36,7 @@ fn existing_regular_lock_files_keep_their_contents_and_identity() {
             let metadata = std::fs::metadata(&path).unwrap();
             (metadata.dev(), metadata.ino(), metadata.mode())
         };
-        let held = attempt(&store, signin).unwrap().unwrap();
-        drop(held);
+        attempt(&store, signin).unwrap().unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         #[cfg(unix)]
         {

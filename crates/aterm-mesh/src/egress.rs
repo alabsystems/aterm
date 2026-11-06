@@ -32,10 +32,10 @@
 //! write publishes the record a second time at the next start: a duplicate every store answers by
 //! its digest.
 //!
-//! **What the tables hold.** The egress keeps the ids of the operations each primary table store
-//! holds: at its first catch-up it reads each store's records once, and after that it adds each
-//! record its cursor passes, the mesh's included. This Mac's presence row reads them
-//! ([`Egress::tables_held`]), so the row reads no store.
+//! **What the tables hold.** The egress keeps the ids of the operations and of the conflict
+//! records each primary table store holds: at its first catch-up it reads each store's records
+//! once, and after that it adds each record its cursor passes, the mesh's included. This Mac's
+//! presence row reads them ([`Egress::tables_held`]), so the row reads no store.
 
 use crate::logs::{Mesh, MeshLog};
 use crate::stores::{self, Digest, Held, Kind, Stores, TableKey};
@@ -320,37 +320,60 @@ pub struct Egress {
     republish: AtomicBool,
 }
 
-/// The operations each primary table store holds, as far as the egress has read them
+/// The records each primary table store holds, as far as the egress has read them
 /// ([`Egress::tables_held`]).
 #[derive(Default)]
 struct TableHoldings {
-    /// Each table's, by its digest.
-    tables: BTreeMap<Digest, TableHolding>,
+    /// Each table's operations, by its digest.
+    operations: BTreeMap<Digest, Holding>,
+    /// Each table's conflict records, by its digest.
+    conflicts: BTreeMap<Digest, Holding>,
     /// Whether the first catch-up read every store's records.
     seeded: bool,
 }
 
-/// One table's operations.
+/// The ids of one table's records of one kind.
 #[derive(Default)]
-struct TableHolding {
+struct Holding {
     ids: BTreeSet<Digest>,
     /// Its summary, until another id joins.
     summary: Option<crate::presence::Held>,
 }
 
 impl TableHoldings {
-    /// Add the operations among `records` of `key`'s store: a recovery store's and every conflict
-    /// record are left out.
+    /// Add the records among `records` of `key`'s store, operations and conflict records apart: a
+    /// recovery store's are left out.
     fn hold(&mut self, key: TableKey, records: &[Held]) {
         if key.recovery {
             return;
         }
-        for record in records.iter().filter(|r| r.kind == Kind::Operation) {
-            let holding = self.tables.entry(key.table).or_default();
+        for record in records {
+            let kind = match record.kind {
+                Kind::Operation => &mut self.operations,
+                Kind::Conflict => &mut self.conflicts,
+            };
+            let holding = kind.entry(key.table).or_default();
             if holding.ids.insert(stores::digest(&record.wire)) {
                 holding.summary = None;
             }
         }
+    }
+
+    /// Each table that holds a record of the kind `of` keeps, with its summary under `summarize`.
+    fn summaries(
+        of: &mut BTreeMap<Digest, Holding>,
+        summarize: fn(&BTreeSet<Digest>) -> crate::presence::Held,
+    ) -> BTreeMap<Digest, crate::presence::Held> {
+        of.iter_mut()
+            .filter(|(_, holding)| !holding.ids.is_empty())
+            .map(|(table, holding)| {
+                let ids = &holding.ids;
+                (
+                    *table,
+                    *holding.summary.get_or_insert_with(|| summarize(ids)),
+                )
+            })
+            .collect()
     }
 }
 
@@ -501,11 +524,11 @@ impl Egress {
         if !arrived.1 {
             return;
         }
-        let text: String = arrived
-            .0
-            .iter()
-            .map(|id| format!("{}\n", aterm_codec::hex::encode_lower(id)))
-            .collect();
+        let mut text = String::with_capacity(arrived.0.len() * 65);
+        for id in &arrived.0 {
+            aterm_codec::hex::push_lower(&mut text, id);
+            text.push('\n');
+        }
         match aterm_uds::private_file::write_private(&self.dir, ARRIVED_FILE, text.as_bytes()) {
             Ok(()) => arrived.1 = false,
             Err(e) => {
@@ -521,27 +544,30 @@ impl Egress {
 
     /// What this Mac's primary table stores hold, as far as this egress has read them: each table
     /// that holds an operation, with how many and the fingerprint of their ids (aterm-db's
-    /// `InventorySummary`), under [`crate::presence::Held::tables`]. `None` until the first
-    /// catch-up has read every store. It reads no store.
+    /// `InventorySummary`), and each that holds a conflict record, with how many and the digest
+    /// of their ids, under [`crate::presence::Held::tables`]. `None` until the first catch-up has
+    /// read every store. It reads no store.
+    ///
+    /// It names every kind of table record `Inventory` moves (PF5b's finding H1): an exchange
+    /// lists operations by id, and conflict proofs by a key the store derives from these records
+    /// (a fork from two operations or a certificate; a discarded source from its certificate, or
+    /// from the operation and the recovery that discarded it), so a proof one Mac lists and its
+    /// neighbour does not comes with a record one holds and the other does not. The converse need
+    /// not hold: a store keeps one certificate per key and refuses another, so two Macs whose
+    /// certificates for one key came from different exporters read apart while an exchange moves
+    /// nothing between them, which costs one greeting per pair of digests (the quiet rule). The
+    /// keys themselves are derived state a store reads only in a session.
     #[must_use]
     pub fn tables_held(&self) -> Option<crate::presence::Held> {
         let mut holdings = self.table_holdings.lock_or_recover();
         if !holdings.seeded {
             return None;
         }
-        let tables: BTreeMap<Digest, crate::presence::Held> = holdings
-            .tables
-            .iter_mut()
-            .filter(|(_, holding)| !holding.ids.is_empty())
-            .map(|(table, holding)| {
-                let ids = &holding.ids;
-                let summary = *holding
-                    .summary
-                    .get_or_insert_with(|| crate::presence::Held::table(ids));
-                (*table, summary)
-            })
-            .collect();
-        Some(crate::presence::Held::tables(&tables))
+        let operations =
+            TableHoldings::summaries(&mut holdings.operations, crate::presence::Held::table);
+        let conflicts =
+            TableHoldings::summaries(&mut holdings.conflicts, crate::presence::Held::conflicts);
+        Some(crate::presence::Held::tables(&operations, &conflicts))
     }
 
     /// Note records `key`'s store holds ([`Self::tables_held`]).
@@ -901,9 +927,11 @@ fn read_arrived(dir: &Path) -> BTreeSet<Digest> {
     else {
         return BTreeSet::new();
     };
-    String::from_utf8_lossy(&bytes)
-        .lines()
+    bytes
+        .split(|&b| b == b'\n')
         .filter_map(|line| {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            let line = std::str::from_utf8(line).ok()?;
             let mut id = [0u8; 32];
             (aterm_codec::hex::is_lower(line, 64)
                 && aterm_codec::hex::decode_into(line.as_bytes(), &mut id))

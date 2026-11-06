@@ -17,6 +17,7 @@ use super::google_credentials::Credentials;
 use super::google_identity::{Identity, Registry};
 use super::headless_oauth::{self as oauth, FlowBound, Gate, Step, VendorApprover};
 use super::login_drive::{self, Approval, Handoff};
+#[cfg(test)]
 use super::wake_deadline::WakeDeadline;
 use crate::ai::connector::{Cli, Region};
 
@@ -28,7 +29,7 @@ const REGISTRY_FILE: &str = "google-identities.toml";
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct NativeAttempt {
     recovery: Option<login_drive::RecoveryKey>,
-    admission: Option<login_drive::RecoveryAdmission>,
+    admission: Option<login_drive::RecoveryAuthority>,
     cli: Cli,
     store_cli: Cli,
     device: bool,
@@ -46,7 +47,9 @@ impl NativeAttempt {
     pub(super) fn capture(request: &login_drive::Request<'_>) -> Self {
         Self {
             recovery: request.recovery,
-            admission: request.admission.cloned(),
+            admission: request
+                .admission
+                .map(login_drive::RecoveryAdmission::authority),
             cli: request.cli,
             store_cli: request.store.cli(),
             device: matches!(
@@ -230,7 +233,7 @@ impl PendingFederation {
         mut self,
         request: &login_drive::Request<'_>,
         outcome: &login_drive::Outcome,
-        deadline: WakeDeadline,
+        deadline: login_drive::Deadline<'_>,
         journal: Option<&recovery::Journal>,
     ) -> Result<(), String> {
         let cached = self.native.take();
@@ -245,14 +248,12 @@ impl PendingFederation {
             let now = aterm_time::unix_secs()
                 .and_then(|now| i64::try_from(now).ok())
                 .ok_or("Kimi account clock is unavailable")?;
-            // Kimi's native check is a leaf that takes an `Instant`: its requests' own timeouts
-            // bound it, and the checks around it read both clocks.
             let result = verify_native_kimi_classified(
                 request.staging,
                 scope.region,
                 &scope.expected,
                 now,
-                deadline.instant(),
+                deadline,
             );
             if let Some(journal) = journal {
                 journal.check(request)?;
@@ -282,7 +283,7 @@ impl PendingFederation {
         mut self,
         request: &login_drive::Request<'_>,
         journal: &recovery::Journal,
-        deadline: WakeDeadline,
+        deadline: login_drive::Deadline<'_>,
     ) -> Result<KimiProof, String> {
         let native = self
             .native
@@ -309,7 +310,7 @@ impl PendingFederation {
         self,
         request: &login_drive::Request<'_>,
         outcome: &login_drive::Outcome,
-        deadline: WakeDeadline,
+        deadline: login_drive::Deadline<'_>,
         verify: impl FnOnce(&FederationScope) -> Result<KimiProof, String>,
     ) -> Result<(), String> {
         self.complete_checked(request, outcome, deadline, None, verify)
@@ -320,7 +321,7 @@ impl PendingFederation {
         self,
         request: &login_drive::Request<'_>,
         outcome: &login_drive::Outcome,
-        deadline: WakeDeadline,
+        deadline: login_drive::Deadline<'_>,
         journal: Option<&recovery::Journal>,
         verify: impl FnOnce(&FederationScope) -> Result<KimiProof, String>,
     ) -> Result<Option<KimiProof>, String> {
@@ -328,12 +329,12 @@ impl PendingFederation {
             return Ok(None);
         }
         self.scope.check_request(request)?;
-        if deadline.passed() {
+        if deadline.expired() {
             return Err("Kimi federation verification deadline expired".into());
         }
         let native = verify(&self.scope)?;
         self.scope.check_request(request)?;
-        if deadline.passed() {
+        if deadline.expired() {
             return Err("Kimi federation verification deadline expired".into());
         }
         let proof = VerifiedKimiGoogle {
@@ -347,7 +348,7 @@ impl PendingFederation {
                 .commit_kimi(&proof)
                 .map_err(|_| "Verified Kimi Google session could not be persisted")?;
         }
-        if deadline.passed() {
+        if deadline.expired() {
             return Err("Kimi federation verification deadline expired".into());
         }
         proof.check_browser_identity(&proof.scope.identity)?;
@@ -593,7 +594,7 @@ fn run(
     pending_session: &mut Option<PendingSession>,
     configuration_current: impl Fn() -> bool,
 ) -> Approval {
-    if handoff.deadline.passed() {
+    if handoff.deadline.expired() {
         return quiet("Google federation reached its deadline");
     }
     if !configuration_current() {
@@ -607,7 +608,7 @@ fn run(
     if !login_drive::pinned(handoff.url, handoff.hosts) {
         return Approval::Refused("Native sign-in URL is outside its provider realm".into());
     }
-    let mut browser = match MemoryBrowser::start_scoped(
+    let mut browser = match MemoryBrowser::start_until(
         identity,
         &approver.google_state,
         Some(home),
@@ -661,7 +662,7 @@ fn run(
         types_email: approver.types_email,
     };
     loop {
-        if handoff.deadline.passed() {
+        if handoff.deadline.expired() {
             return quiet("Google federation reached its deadline");
         }
         if !configuration_current() {
@@ -955,7 +956,7 @@ fn run(
 }
 
 fn read_page(
-    browser: &mut MemoryBrowser,
+    browser: &mut MemoryBrowser<'_>,
     page: &BrowserPage,
 ) -> Result<oauth::Page, super::google_browser::Error> {
     browser
@@ -967,7 +968,7 @@ fn verification_mail(
     identity: &Identity,
     approver: &VendorApprover,
     started: Option<i64>,
-    deadline: WakeDeadline,
+    deadline: login_drive::Deadline<'_>,
     seen: &mut BTreeSet<String>,
 ) -> Result<String, &'static str> {
     verification_mail_from(
@@ -988,7 +989,7 @@ pub(super) fn verification_mail_from(
     home: Option<&Path>,
     source: Option<&oauth::MailboxConfig>,
     started: Option<i64>,
-    deadline: WakeDeadline,
+    deadline: login_drive::Deadline<'_>,
     seen: &mut BTreeSet<String>,
 ) -> Result<String, &'static str> {
     let target = identity
@@ -1001,14 +1002,14 @@ pub(super) fn verification_mail_from(
     config.strict_since = true;
     // The code-only relay has no account-body witness. Use a full-message reader here.
     config.relay_enabled = false;
-    let left = deadline.remaining();
-    if left.is_zero() {
+    if deadline.expired() {
         return Err("Google verification mail deadline expired");
     }
-    match oauth::poll_mailbox_config_for_credential_with_seen_otps(
+    match oauth::poll_mailbox_config_until(
         &config,
         Some(target),
-        left.min(Duration::from_secs(60)),
+        deadline.limited(Duration::from_secs(60)),
+        false,
         seen,
     )? {
         oauth::MailboxCredential::Otp(code)
@@ -1091,7 +1092,7 @@ fn select_google(url: &str) -> String {
 }
 
 fn choose_google(
-    browser: &mut MemoryBrowser,
+    browser: &mut MemoryBrowser<'_>,
     page: &BrowserPage,
     url: &str,
 ) -> Result<bool, super::google_browser::Error> {
@@ -1415,9 +1416,9 @@ mod tests {
                 }
             };
             let deadline = if scenario == 3 {
-                WakeDeadline::after(Duration::ZERO)
+                login_drive::Deadline::after(Duration::ZERO)
             } else {
-                WakeDeadline::after(Duration::from_secs(60))
+                login_drive::Deadline::after(Duration::from_secs(60))
             };
             let result = pending.complete_using(&request, &outcome, deadline, |_| {
                 assert!(
@@ -1637,7 +1638,7 @@ mod tests {
             hosts: HOSTS,
             email: Some("person@example.com"),
             finished: &|| false,
-            deadline: WakeDeadline::after(Duration::ZERO),
+            deadline: login_drive::Deadline::after(Duration::ZERO),
         };
         assert!(configured(&mut approver, &handoff).is_none());
         let text = "[[identities]]\nid='one'\nemail='person@example.com'\ncredential_ref='missing-google-entry'\n[[bindings]]\nprovider='kimi-global'\naccount='work'\nidentity='one'\nexpected_email='person@example.com'\n";
@@ -2311,7 +2312,7 @@ mod tests {
                 &identity("person@example.com"),
                 &approver,
                 Some(1000),
-                WakeDeadline::after(Duration::from_secs(1)),
+                login_drive::Deadline::after(Duration::from_secs(1)),
                 &mut seen
             )
             .unwrap(),
@@ -2322,7 +2323,7 @@ mod tests {
                 &identity("other@example.com"),
                 &approver,
                 Some(1000),
-                WakeDeadline::after(Duration::from_secs(1)),
+                login_drive::Deadline::after(Duration::from_secs(1)),
                 &mut seen
             )
             .unwrap(),
@@ -2333,7 +2334,7 @@ mod tests {
                 &identity("person@example.com"),
                 &approver,
                 Some(1000),
-                WakeDeadline::after(Duration::from_millis(50)),
+                login_drive::Deadline::after(Duration::from_millis(50)),
                 &mut seen
             )
             .is_err(),

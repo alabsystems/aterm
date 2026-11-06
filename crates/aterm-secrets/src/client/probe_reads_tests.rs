@@ -198,35 +198,27 @@ fn servers_a_browse_named_cannot_keep_the_vaults_own_address_from_being_read() {
 }
 
 /// Every candidate's failed read reaches the probe's fold as the read said it, kind and words,
-/// whether the first read failed or the whole read an answer longer than the peek took: a Local
-/// Network refusal still ends the probe as one, a read macOS holds for a Local Network answer
-/// ([`crate::ErrorKind::LocalNetworkPending`]) still says so over a failure before it, and the
-/// first of two other failures is the one the probe gives. The fan-out the probes read through
-/// ([`fan_out::reads_within`]) hands each failure on; the envelope reads that share it
-/// ([`fan_out::envelopes_within`]) drop them.
+/// whether the first read failed or the whole read an answer longer than the peek took, and the
+/// first failure of those the fold is given is the one the probe gives. The fan-out the probes
+/// read through ([`fan_out::reads_within`]) hands each failure on; the envelope reads that share
+/// it ([`fan_out::envelopes_within`]) drop them.
 ///
 /// NEGATIVE CONTROL: in `reads_within`, hand `judge` a failed read as a failure that says nothing
 /// of it (`read(url, left, limit).map_err(|_| Error::new("no answer"))` in `read_by`): every
-/// outcome is `Err(Error("no answer", Other))`, the kinds and the refusal's words are lost, and
-/// the first assert fails.
+/// outcome is `Err(Error("no answer", Other))`, the kinds and the words are lost, and the first
+/// assert fails.
 #[test]
 fn every_failed_read_reaches_the_probe_fold_as_it_was_said() {
     use ProbeOrigin::{Default, Discovered};
-    let pending = Error::of_kind(
-        crate::ErrorKind::LocalNetworkPending,
-        "fetching pending.local: no route to host; macOS lets aterm reach the local network only once allowed",
-    );
-    let refused = Error::new(format!("fetching refused.local: {LOCAL_NETWORK_REFUSED}"));
+    let refused = Error::new("fetching gone.local: connection refused");
     let timed_out = Error::of_kind(crate::ErrorKind::TimedOut, "fetching slow.local: timed out");
     let reset = Error::new("fetching reset.local: connection reset by peer");
     // Each candidate: its host, whether its answer is longer than the peek (so its whole read
     // is the one that fails), and the failure its read gives.
     let candidates = [
-        ("pending", false, &pending),
-        ("refused", false, &refused),
+        ("gone", false, &refused),
         ("slow", false, &timed_out),
-        ("pending-whole", true, &pending),
-        ("refused-whole", true, &refused),
+        ("gone-whole", true, &refused),
         ("reset-whole", true, &reset),
     ];
     let urls: Vec<String> = candidates
@@ -258,20 +250,17 @@ fn every_failed_read_reaches_the_probe_fold_as_it_was_said() {
         )
     };
     assert_eq!(
-        fold(&[(2, Default), (0, Default)]),
-        Err(pending.clone()),
-        "a read macOS holds for a Local Network answer says so over a timeout before it"
+        fold(&[(1, Default), (0, Default)]),
+        Err(timed_out.clone()),
+        "the first failure, whatever its kind"
     );
     assert_eq!(
-        fold(&[(3, Default), (4, Discovered)]),
-        Err(refused.clone()),
-        "a Local Network refusal read whole ends the probe as one"
+        fold(&[(2, Default), (1, Discovered)]),
+        Err(refused),
+        "a failure of a whole read, in its words"
     );
-    assert!(refused_by_local_network(
-        &fold(&[(1, Default)]).expect_err("refused")
-    ));
     assert_eq!(
-        fold(&[(5, Default), (2, Discovered)]),
+        fold(&[(3, Default), (1, Discovered)]),
         Err(reset),
         "the first of two other failures"
     );

@@ -1881,7 +1881,7 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Lines,
         App,
-        "the front window's native UI (toolbar + menu bar) and its presence line",
+        "the front window's native UI (toolbar + menu bar)",
         "— off macOS there is no menu bar (`menu \"<title>\"` lines give the menu model; `controls \
          menu` shows the live palette); macOS `--headless` prints `toolbar (none)`, `toolbar-tabs` \
          (with `\"done\"` tab states) and `menu (none)`. On Windows a `strip-version \
@@ -1895,16 +1895,11 @@ pub const VERBS: &[VerbSpec] = &[
          then `a11y window=<id> autopilot sid=<sid>|band row=<0..2> role=<role> \
          label=\"<words>\" description=\"<words>\"|description=-` lines: each Autopilot chip's and \
          Messages band row's node as the window's accessibility tree is built for a screen \
-         reader). Then `statusitem title=<❯|❯•|❯N> needs=<n> stuck=<n> exceptions=<n> \
+         reader). Then `statusitem title=❯ needs=<n> stuck=<n> exceptions=<n> \
          done=<n> fleet=<off|unread|reading|failed|as_of:<unix ms>>` and, on macOS, the `❯` menu's \
          `statusmenu \"<label>\" enabled=<yes|no> [checked=<yes|no>] [tip=\"<text>\"] [indent=<n>] \
          [submenu]` lines (`statusmenu ---` for a separator; debug builds add `at=<i>[.<j>…]` for \
-         `person menubar press`). Last, `presence rim=<none|stuck|decide|yours> pressing=<@sid|-> \
-         pill=\"<sentence>\"`: the window's needs border and tab-bar pill (`\"` and `\\` escaped). \
-         `pressing` names the border's session and the pill may name another; a worker's report \
-         can light the border with no pill. `stuck`/`decide` come from the most pressing session's \
-         `status needs=`, `yours` from a person's hold on the front tab; `[presence] rim` off \
-         hides both.",
+         `person menubar press`).",
     ),
     v(
         "controls",
@@ -2760,7 +2755,9 @@ pub const VERBS: &[VerbSpec] = &[
         Session,
         "turn [option=value ...] <text>: ONE HUMAN TURN",
         concat!(
-            "— types `<text>`, verifies the submit (`submit=` names any `key`, default \
+            "— types `<text>` (a trailing `\\n` stays the two characters it is, where `paste` \
+             reads a line break; a control character besides a tab or line break is dropped), \
+             verifies the submit (`submit=` names any `key`, default \
              `enter`; `none` skips it), waits for the screen to settle (`idle=<ms>`, default \
              1500, within `timeout=<ms>`, default 240000), and returns the settled screen. \
              Options, after a leading `id=` and `if-supervisor=`: `[idle=<ms>] [timeout=<ms>] \
@@ -2807,27 +2804,36 @@ pub const VERBS: &[VerbSpec] = &[
             "`, the text typed and not submitted, and a re-press it takes none of stops the \
              re-presses as a miss does). `typed=1` presses key by key at \
              `cadence=<ms>` (default 70) up to `cap=<n>` graphemes (default 240, max 4096) and \
-             pastes the rest (`typed=<keys> pasted=<graphemes>`). The timeout never leaves part \
-             of the text typed: a key goes only while it, one paste of the rest and the \
-             submit's window (at most half of `timeout=`, with the echo's 150 ms settle) still \
+             pastes the rest (`typed=<keys> pasted=<graphemes>`) as typing it would go: its \
+             text pasted, each Tab or line break in it pressed as its key between the pastes. \
+             The timeout never leaves part \
+             of the text typed (a fenced turn's waits for its program aside, below): a key \
+             goes only while it, the rest's writes and the submit's window (at most half of `timeout=`, with the echo's 150 ms settle) still \
              fit before `timeout=` at the pace the keys have gone, with room for the longest \
-             wait a fenced key has needed so far, and once they would not the rest goes as that \
-             one paste (bracketed where the program asked for bracketed paste), so the submit \
+             wait a fenced key has needed so far, and once they would not the rest goes so \
+             (each paste bracketed where the program asked for bracketed paste), so the submit \
              takes the whole text; the echo's settle then waits only while that share of the \
              submit still fits (a Claude Code composer's echo is waited for as ever, since an \
              Enter before it shows proves nothing; an echo that spends the submit's share sends \
              the Enter late, `pressed=<n>` when unverified). A turn \
              whose first key does not fit writes nothing (`OK 0 turn skipped \
              reason=deadline typed=0 pasted=0 submitted=0 seq=<n> id=<n>`, the composer as it \
-             was). A person's \
+             was). Once its first key or paste has gone, a turn types and submits whatever its \
+             caller does, its Enter after the text (into a session not in front, once its \
+             paste has reached that session's input, up to 30 s: one not all there by then is \
+             left queued and unsubmitted, `ERR paste delivery failed`); a caller already gone \
+             when it would first write gets nothing written (`ERR paste delivery failed`, or \
+             `ERR key delivery failed` for a first key or Enter). A person's \
              key or a screen or input-frame change stops it with `OK 0 turn skipped \
              reason=<person|changed> typed=<k> pasted=<p> submitted=0 seq=<n> id=<n>`, the part \
              typed left standing. Fenced on a composer box, a key waits for an open DEC 2026 \
-             frame to close, a digit also for the program to read and draw the key before it, \
-             and a guarded submit for the last key; a wait gives its time back to `timeout=` \
-             once it ends, so the time the turn has left bounds each wait, not their sum, a hang \
-             detector: one that outlasts it, as one the program never ends does, is cut there \
-             (`reason=deadline typed=<k>`). \
+             frame to close, a digit also for the program to read and draw the key before it \
+             (as does the pasted rest, where it holds a digit), and a guarded submit for the \
+             program to draw the last write, key or paste; a wait gives its time back to \
+             `timeout=` once it ends, so the time the turn has left bounds each wait, not their \
+             sum: one that outlasts it, as one the program never ends does or one slower than \
+             the room the pace keeps (the submit's share, and the longest wait so far), is cut \
+             there, the part typed left standing (`reason=deadline typed=<k>`). \
              `yield=<floor 0..=1>` waits for `trail status` `momentum=` to fall to \
              `<floor>` before typing (`yielded_ms=<n>`, or `ERR yield timeout momentum=<v>`). \
              `if-gen=<epoch>.<seq>` (`status gen=`) and `if-rows=<first>-<last>:<hex16>` \
@@ -3167,6 +3173,22 @@ pub const VERBS: &[VerbSpec] = &[
         Session,
         "native Codex weekly quota rotation",
         "A kernel-authenticated completed quota wall may select a fresh pooled account through a sealed native restart. No caller paths, commands or credentials are accepted.",
+    ).input(Input::NONE),
+    v(
+        "codex-accounts",
+        Read,
+        Status,
+        Session,
+        "observe this Codex session's account pool",
+        "Authenticated Codex only. Versioned cached account metadata, without credentials or assignment authority.",
+    ).input(Input::NONE),
+    v(
+        "codex-accounts-change",
+        Signal,
+        Status,
+        Session,
+        "manage this Codex account pool",
+        "Authenticated native Codex account enrollment with durable operation custody. No credential paths or commands are accepted.",
     ).input(Input::NONE),
     v(
         "codex-exec-handoff",
@@ -4463,8 +4485,12 @@ pub const VERBS: &[VerbSpec] = &[
          (`goal=` the agent's active goal, as `status` reads it), `needs=ask` selects the ask \
          excerpt and \
          `by=harness` turns are skipped in `prompt=`): `user_title= title= cwd= branch= prompt= \
-         said= cmd= rows=` (<= 400 B per excerpt, credentials/fleet codes redacted, fleet \
+         said= cmd= rows= need_ids=` (<= 400 B per excerpt, credentials/fleet codes redacted, fleet \
          replies capped at 256 KiB; `rows=-` on an unfinished DEC 2026 frame, never waited for). \
+         `need_ids=` names each need of an ask as the herald tells them once (at most 33, \
+         comma-separated, ids in hex: `<id>` read whole, `<id>/<entry>` read whole beside the \
+         entry's cut of it, `/<id>` read from the entry alone; `-` for any other need), so a fleet \
+         peer's herald tells each of them once too. \
          A codex-alab row, whose screen names no state, takes `agent=` from what codex-alab says of \
          itself in OSC 7501 (`working` is `busy`; `blocked` is `prompt`, `question` or \
          `wall:auth`; at rest, `idle`; nothing said, `unknown`) and `model= effort= ctx_left_pct= \
@@ -4738,7 +4764,16 @@ pub fn json_verbs() -> impl Iterator<Item = &'static str> {
 
 /// The grammar generation each side states in `hello` (`lane=`) to identify its private protocol.
 /// Generation 10 removes compatibility notices; generation 9 is not reused for another grammar.
-pub const BRIDGE_LANE: u32 = 10;
+/// Generation 11 adds `deliver … was=<n>` ([`LINK_MOVED_LANE`]).
+pub const BRIDGE_LANE: u32 = 11;
+
+/// The lane that added `was=<n>` to `deliver` (11 in [`BRIDGE_LANE`]'s list), for both sides: the
+/// record was moved here across this Mac's own key rotation (§11 C3b), its mail first at offset
+/// `n` of this log (or `n` is the earliest offset its bridge could read it back to), and the
+/// endpoint answers it from its memory of `n` as it answers a repeat of an offset it holds, so a
+/// record its session was shown before the move is not shown again; it remembers each offset
+/// such a delivery names.
+pub const LINK_MOVED_LANE: u32 = 11;
 
 /// The lane that added `link quarantine torn=<k>` (5 in [`BRIDGE_LANE`]'s list), for both sides.
 pub const LINK_QUARANTINE_LANE: u32 = 5;

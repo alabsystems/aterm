@@ -381,6 +381,7 @@ mod tests {
     #[test]
     fn a_child_that_died_of_the_machine_is_could_not_run_and_one_that_failed_is_a_finding() {
         let run = |ok: bool, output: &str, spawn: Option<&str>| Run {
+            stopped_at: None,
             ok,
             output: output.into(),
             code: None,
@@ -442,6 +443,7 @@ mod tests {
             )
         };
         let run = |output: String| Run {
+            stopped_at: None,
             ok: false,
             output,
             code: Some(101),

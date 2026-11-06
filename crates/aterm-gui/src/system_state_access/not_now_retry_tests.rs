@@ -100,7 +100,7 @@ fn client(app: &mut App, view: ViewId, access: Access, now: Instant) {
         value: None,
     })
     .expect("the current row accepts the control action");
-    app.tick_local_network_step(now);
+    app.end_lapsed_access_pane(now);
     app.tick_devtools_hand_over(now);
 }
 
@@ -123,9 +123,6 @@ fn declined(access: Access) -> (App, WindowId, ViewId, Instant) {
             Ok(())
         },
         recorded: |revision, access| {
-            if access == Access::LocalNetwork {
-                return Some(AccessOutcome::Triggered);
-            }
             SAVED.with(|records| {
                 records
                     .borrow()
@@ -144,7 +141,7 @@ fn declined(access: Access) -> (App, WindowId, ViewId, Instant) {
     let (_, view) = app.active_native_view(wid).unwrap();
     focus(&mut app, true);
     let now = Instant::now();
-    app.tick_local_network_step(now);
+    app.end_lapsed_access_pane(now);
     person(&mut app, wid, access);
     decline(&mut app, now);
     assert!(ATTEMPTS.with(|records| records.borrow().contains(&(

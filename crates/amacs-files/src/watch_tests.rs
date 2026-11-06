@@ -196,8 +196,8 @@ fn the_platform_hears_a_rewrite_and_a_replace_by_rename() {
 /// A file deleted under the watch is heard, and so is the file made again at
 /// its path, which only the directory's events can tell (the deleted file's
 /// own events end with it): a buffer whose file went hears it come back. Its
-/// folder deleted too leaves nothing to arm on, and the watch arms again until
-/// the folder is back, so the file made again in it is heard as well; a file
+/// folder deleted too moves the listen to the folder above, which hears it
+/// back, so the file made again in it is heard as well; a file
 /// in another folder, whose arm never failed, hears its writes throughout (the
 /// control).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -268,7 +268,7 @@ fn the_platform_hears_a_delete_and_the_file_made_again() {
         Ok(9),
         "the folder deleted with the file"
     );
-    // The look after that delete found nothing to arm on.
+    // The look after that delete armed on the folder above.
     armed(7);
     std::fs::write(&beside, "two, beside\n").unwrap();
     assert_eq!(
@@ -344,11 +344,13 @@ fn a_file_no_arm_took_is_armed_again_until_one_takes_and_then_waits_untimed() {
         Ok(5),
         "the first look"
     );
+    // A wait before the watch has nothing to bound.
+    let first_look = events.waits.lock().unwrap().len();
     // Refused at the watch and at its first look, then armed again unasked.
     aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "armed again", || {
         (*events.arms.lock().unwrap() >= 4).then_some(())
     });
-    let refused_waits = events.waits.lock().unwrap().clone();
+    let refused_waits = events.waits.lock().unwrap()[first_look..].to_vec();
     assert!(
         refused_waits.iter().all(Option::is_some),
         "an unarmed file bounds every wait: {refused_waits:?}"
@@ -382,6 +384,201 @@ fn a_due_wait_polls_at_once_and_a_short_one_never_spins() {
     assert_eq!(poll_millis(Some(Duration::from_micros(1))), 1);
     assert_eq!(poll_millis(Some(QUIET)), 80);
     assert_eq!(poll_millis(Some(Duration::MAX)), i32::MAX);
+}
+
+/// What `events` hears for `write`, past anything arming left to hear. The wait is a hang detector
+/// for an event that must come.
+#[cfg(target_os = "macos")]
+fn heard_for(events: &mut kqueue::KqueueEvents, write: impl FnOnce()) -> Vec<u64> {
+    let mut touched = Vec::new();
+    events.wait(Some(Duration::ZERO), &mut touched).unwrap();
+    touched.clear();
+    write();
+    events
+        .wait(Some(Duration::from_secs(60)), &mut touched)
+        .unwrap();
+    touched
+}
+
+/// A file made while its watch arms is heard being written. A folder hears a file made but no
+/// write into one, so a file made right after the first listen must still get a listener of its
+/// own, or every later write goes unheard.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_file_made_while_its_watch_arms_hears_its_next_write() {
+    let dir = scratch("amacs-watch-arming");
+    let path = dir.path().join("doc.txt");
+    let mut events = kqueue::KqueueEvents::new().unwrap();
+    let mut first = true;
+    events
+        .arm_around(1, &path, |step, _| {
+            if step == kqueue::Listen::Answered && std::mem::take(&mut first) {
+                std::fs::write(&path, "").unwrap();
+            }
+            Ok(())
+        })
+        .unwrap();
+
+    let touched = heard_for(&mut events, || std::fs::write(&path, "written").unwrap());
+
+    assert_eq!(touched, [1]);
+}
+
+/// A file and its folder that are both there take one listen each: there is nothing to go lower
+/// for.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_file_already_there_arms_in_one_pass() {
+    let dir = scratch("amacs-watch-arming-once");
+    let path = dir.path().join("doc.txt");
+    std::fs::write(&path, "").unwrap();
+    let mut events = kqueue::KqueueEvents::new().unwrap();
+    let mut listens = 0;
+
+    events
+        .arm_around(1, &path, |step, _| {
+            listens += usize::from(step == kqueue::Listen::Answered);
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(listens, 2);
+}
+
+/// A file out of descriptors has only its folder, which hears no write into it, so the arm says
+/// so and the watch arms it again. A file refused for good, as a link is, answers the same at every
+/// look, so its folder is what it gets and the arm stands.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_file_out_of_descriptors_is_armed_again_and_a_link_is_not() {
+    let dir = scratch("amacs-watch-arming-out");
+    let path = dir.path().join("doc.txt");
+    std::fs::write(&path, "").unwrap();
+    let mut events = kqueue::KqueueEvents::new().unwrap();
+
+    for out in [libc::EMFILE, libc::ENFILE] {
+        let refused = events.arm_around(1, &path, |step, at| {
+            if step == kqueue::Listen::Opened && at == path {
+                Err(io::Error::from_raw_os_error(out))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert_eq!(refused.unwrap_err().raw_os_error(), Some(out));
+    }
+
+    let link = dir.path().join("link.txt");
+    std::os::unix::fs::symlink(&path, &link).unwrap();
+    assert!(events.arm_around(1, &link, |_, _| Ok(())).is_ok());
+}
+
+/// A folder deleted between its open and its filter never fires that filter, so the listen goes
+/// to the folder above, which hears the folder made again.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_folder_deleted_as_its_listen_takes_is_heard_made_again() {
+    let dir = scratch("amacs-watch-arming-gone");
+    let folder = dir.path().join("secrets");
+    let path = folder.join("doc.txt");
+    std::fs::create_dir(&folder).unwrap();
+    let mut events = kqueue::KqueueEvents::new().unwrap();
+    events
+        .arm_around(1, &path, |step, at| {
+            if step == kqueue::Listen::Opened && at == folder && folder.exists() {
+                std::fs::remove_dir(&folder).unwrap();
+            }
+            Ok(())
+        })
+        .unwrap();
+
+    let touched = heard_for(&mut events, || std::fs::create_dir(&folder).unwrap());
+
+    assert_eq!(touched, [1]);
+}
+
+/// A folder replaced between its open and its filter leaves that listen on the old one, so the arm
+/// goes on to the folder the path names now.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_folder_replaced_as_its_listen_takes_hears_the_new_one() {
+    let dir = scratch("amacs-watch-arming-replaced");
+    let folder = dir.path().join("secrets");
+    let path = folder.join("doc.txt");
+    std::fs::create_dir(&folder).unwrap();
+    let mut replaced = false;
+    let mut events = kqueue::KqueueEvents::new().unwrap();
+    events
+        .arm_around(1, &path, |step, at| {
+            if step == kqueue::Listen::Opened
+                && at == folder
+                && !std::mem::replace(&mut replaced, true)
+            {
+                std::fs::rename(&folder, dir.path().join("old")).unwrap();
+                std::fs::create_dir(&folder).unwrap();
+            }
+            Ok(())
+        })
+        .unwrap();
+
+    let touched = heard_for(&mut events, || std::fs::write(&path, "written").unwrap());
+
+    assert_eq!(touched, [1]);
+}
+
+/// Folders still being made after every look leave the arm on a folder that may hear none of what
+/// is below it, so the arm says it did not take and the watch arms it again.
+#[cfg(target_os = "macos")]
+#[test]
+fn folders_still_being_made_after_every_look_fail_the_arm() {
+    let dir = scratch("amacs-watch-arming-deep");
+    let mut folder = dir.path().to_path_buf();
+    let levels: Vec<PathBuf> = (0..=ARM_AGAIN + 2)
+        .map(|level| {
+            folder.push(level.to_string());
+            folder.clone()
+        })
+        .collect();
+    let path = folder.join("doc.txt");
+    let mut events = kqueue::KqueueEvents::new().unwrap();
+
+    let answer = events.arm_around(1, &path, |step, at| {
+        // One more level at each look, the topmost still missing.
+        if step == kqueue::Listen::Answered
+            && levels
+                .iter()
+                .find(|level| !level.exists())
+                .is_some_and(|next| next == at)
+        {
+            std::fs::create_dir(at).unwrap();
+        }
+        Ok(())
+    });
+
+    assert_eq!(answer.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+}
+
+/// A folder made just after its failed listen is one the listen above it never hears made, so the
+/// arm has to see that folder and go lower, or nothing that happens in it is ever heard.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_folder_made_while_its_watch_arms_hears_the_file_made_in_it() {
+    let dir = scratch("amacs-watch-arming-folder");
+    let folder = dir.path().join("secrets");
+    let path = folder.join("doc.txt");
+    let mut events = kqueue::KqueueEvents::new().unwrap();
+    events
+        .arm_around(1, &path, |step, at| {
+            if step == kqueue::Listen::Answered && at == folder && !folder.exists() {
+                std::fs::create_dir(&folder).unwrap();
+            }
+            Ok(())
+        })
+        .unwrap();
+
+    let touched = heard_for(&mut events, || std::fs::write(&path, "written").unwrap());
+
+    assert_eq!(touched, [1]);
 }
 
 /// A file whose folder, and that folder's folder, are not there yet is heard

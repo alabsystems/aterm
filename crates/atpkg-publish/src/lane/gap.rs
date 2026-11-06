@@ -397,6 +397,6 @@ pub fn trust_cut_commands(main_sha: &str) -> Vec<String> {
         format!("scripts/publish_seed_cut.sh --pack \"$STAGE\" --mint {mint} --publish   # creates the archives' release, then pushes seed/repin-{c12}"),
         "# once main contains the re-pin:".into(),
         "atpkg-publish publish-group rustc --seal \"$STAGE\" --dry-run".into(),
-        "atpkg-publish publish-group rustc --seal \"$STAGE\" --upload".into(),
+        "atpkg-publish publish-group rustc --seal \"$STAGE\" --stage-upload".into(),
     ]
 }

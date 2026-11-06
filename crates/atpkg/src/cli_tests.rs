@@ -590,7 +590,7 @@ fn the_lease_verb_parses_a_directory_a_name_and_a_whole_command() {
             "--no-smoke",
         ])),
         Ok(LeaseArgs {
-            dir: std::path::PathBuf::from("/p/store/trust/9/bin"),
+            subject: LeaseSubject::Directory(std::path::PathBuf::from("/p/store/trust/9/bin")),
             who: Some("atpkg-pack ty".into()),
             command: argv(&["bash", "pack.sh", "--", "--no-smoke"]),
         })
@@ -617,14 +617,59 @@ fn the_lease_verb_parses_a_directory_a_name_and_a_whole_command() {
 }
 
 #[test]
+fn named_prerequisite_leases_preserve_the_command_and_refuse_ambiguous_or_unmanaged_names() {
+    use crate::prerequisite::Prerequisite;
+    let args = |parts: &[&str]| parts.iter().map(ToString::to_string).collect::<Vec<_>>();
+    let parsed = parse_lease_args(&args(&[
+        "--tool",
+        "python3.14",
+        "--tool",
+        "lake",
+        "--who",
+        "publication",
+        "--",
+        "python3.14",
+        "pub",
+        "--tool",
+        "argument-to-pub",
+    ]))
+    .unwrap();
+    assert_eq!(
+        parsed.subject,
+        LeaseSubject::Prerequisites(vec![Prerequisite::Python, Prerequisite::Lake])
+    );
+    assert_eq!(parsed.who.as_deref(), Some("publication"));
+    assert_eq!(
+        parsed.command,
+        args(&["python3.14", "pub", "--tool", "argument-to-pub"])
+    );
+    for bad in [
+        &["--tool", "lean", "--", "build"][..],
+        &["--tool", "/unmanaged/python3.14", "--", "build"],
+        &["--tool", "python3", "--", "build"],
+        &["--tool", "--", "build"],
+        &["directory", "--tool", "lake", "--", "build"],
+        &["--tool", "lake", "directory", "--", "build"],
+        &["--tool", "lake", "--"],
+    ] {
+        assert!(parse_lease_args(&args(bad)).is_err(), "{bad:?}");
+    }
+}
+
+#[test]
 fn the_lease_verb_holds_the_build_while_its_command_runs() {
+    if !crate::testdir::isolated_lifecycle(
+        "cli::tests::the_lease_verb_holds_the_build_while_its_command_runs",
+    ) {
+        return;
+    }
     let layout = temp_layout("lease-verb-held");
     let bin = layout.build_dir("trust", 9192).join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let started = layout.prefix.join("started");
     let go = layout.prefix.join("go");
     let args = LeaseArgs {
-        dir: bin.clone(),
+        subject: LeaseSubject::Directory(bin.clone()),
         who: Some("atpkg-pack ty".into()),
         command: vec![
             "/bin/sh".into(),
@@ -685,7 +730,7 @@ fn the_lease_verb_runs_nothing_on_a_missing_build_and_holds_nothing_outside_the_
     let layout = temp_layout("lease-verb-missing");
     let ran = layout.prefix.join("ran");
     let touch = |dir: std::path::PathBuf| LeaseArgs {
-        dir,
+        subject: LeaseSubject::Directory(dir),
         who: None,
         command: vec!["/usr/bin/touch".into(), ran.display().to_string()],
     };
@@ -742,7 +787,7 @@ fn the_lease_verb_runs_nothing_when_a_managed_lease_cannot_be_taken() {
     std::fs::write(crate::lease::dir(&layout.prefix), b"not a directory").unwrap();
     let ran = layout.prefix.join("ran");
     let args = LeaseArgs {
-        dir: bin,
+        subject: LeaseSubject::Directory(bin),
         who: None,
         command: vec!["/usr/bin/touch".into(), ran.display().to_string()],
     };
@@ -772,7 +817,7 @@ fn the_lease_verb_runs_nothing_without_a_package_prefix() {
     std::fs::create_dir_all(&bin).unwrap();
     let ran = layout.prefix.join("ran");
     let args = LeaseArgs {
-        dir: bin,
+        subject: LeaseSubject::Directory(bin),
         who: None,
         command: vec!["/usr/bin/touch".into(), ran.display().to_string()],
     };
@@ -794,6 +839,11 @@ fn the_lease_verb_runs_nothing_without_a_package_prefix() {
 
 #[test]
 fn the_lease_verb_requires_a_directory_and_follows_directory_symlinks() {
+    if !crate::testdir::isolated_lifecycle(
+        "cli::tests::the_lease_verb_requires_a_directory_and_follows_directory_symlinks",
+    ) {
+        return;
+    }
     let layout = temp_layout("lease-verb-directory");
     let managed = layout.build_dir("trust", 9196).join("bin");
     let unmanaged = layout.prefix.join("outside");
@@ -802,7 +852,7 @@ fn the_lease_verb_requires_a_directory_and_follows_directory_symlinks() {
     std::fs::write(&unmanaged, b"not a directory").unwrap();
     let ran = layout.prefix.join("ran");
     let args = |dir: &std::path::Path| LeaseArgs {
-        dir: dir.to_path_buf(),
+        subject: LeaseSubject::Directory(dir.to_path_buf()),
         who: None,
         command: vec!["/usr/bin/touch".into(), ran.display().to_string()],
     };
@@ -883,7 +933,7 @@ fn the_lease_verb_hands_its_command_every_descriptor_its_caller_gave_it() {
     // SAFETY: `fd` was just opened here and nothing else owns it.
     let held = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
     let args = LeaseArgs {
-        dir: bin,
+        subject: LeaseSubject::Directory(bin),
         who: None,
         command: vec![
             "/bin/sh".into(),
@@ -1012,6 +1062,7 @@ fn a_marker_reads_as_a_sentence_on_a_terminal() {
 }
 
 use super::*;
+use crate::source::discovery_hint;
 use std::os::unix::fs::PermissionsExt;
 
 #[test]
@@ -1330,6 +1381,62 @@ fn clip_cause_keeps_the_first_line_bounded() {
     let clipped = clip_cause(&long);
     assert_eq!(clipped.chars().count(), 241, "{clipped}");
     assert!(clipped.ends_with('…'));
+}
+
+/// A group abort's line keeps every member's name past a long cause: only the causes are
+/// clipped, the members rolled back follow the flip's cause, and a member whose rollback failed
+/// is named with its own cause and never among those rolled back. With nothing flipped the line
+/// is the cause alone.
+#[test]
+fn abort_cause_names_the_members_past_a_long_cause() {
+    let long = format!("{}\nthe second line", "x".repeat(300));
+    let stuck = format!("re-pointing current: {}", "y".repeat(300));
+    assert_eq!(abort_cause(&long, &[]), clip_cause(&long));
+    let back = abort_cause(&long, &[("ay".into(), Ok(())), ("trust-ir".into(), Ok(()))]);
+    assert!(
+        back.starts_with(&clip_cause(&long)) && back.ends_with(": ay, trust-ir"),
+        "{back}"
+    );
+    let partly = abort_cause(
+        &long,
+        &[
+            ("ay".into(), Ok(())),
+            ("trust-ir".into(), Err(stuck.clone())),
+        ],
+    );
+    let rest = partly
+        .strip_prefix(&clip_cause(&long))
+        .and_then(|rest| rest.strip_suffix(&clip_cause(&stuck)))
+        .unwrap_or_else(|| panic!("{partly}"));
+    assert!(
+        rest.contains(": ay;") && !rest.contains("ay, trust-ir") && rest.contains("trust-ir"),
+        "{partly}"
+    );
+}
+
+/// A group abort says a member is back on its previous version only when its rollback put it
+/// there: a failed rollback changes both the phase and those words; no rollback at all, or one
+/// that succeeded, leaves them as a clean rollback's.
+#[test]
+fn abort_words_never_claim_a_failed_rollback_put_a_member_back() {
+    let clean = abort_words(true, &[("ay".into(), Ok(()))]);
+    assert_eq!(abort_words(true, &[]), clean);
+    let failed = abort_words(
+        true,
+        &[
+            ("ay".into(), Ok(())),
+            ("trust-ir".into(), Err("stuck".into())),
+        ],
+    );
+    assert!(
+        failed.0 != clean.0 && failed.1 != clean.1,
+        "{failed:?} vs {clean:?}"
+    );
+    assert_ne!(
+        abort_words(false, &[]).0,
+        clean.0,
+        "a stage abort is its own phase"
+    );
 }
 
 #[cfg(unix)]
@@ -7379,7 +7486,7 @@ fn an_unpublished_pin_never_quietly_holds_a_revoked_current_build() {
     assert!(
         matches!(
             outcome_of(&report, "ta"),
-            crate::TxnOutcome::Aborted { failed, during_flip: false, why }
+            crate::TxnOutcome::Aborted { failed, during_flip: false, why, .. }
                 if failed == "ta" && why.contains("is not published for")
         ),
         "never a quiet hold over a revoked build — and the abort names what it disabled, \
@@ -7518,6 +7625,47 @@ fn an_installed_group_whose_new_pin_is_published_here_upgrades_as_before() {
             "{p}'s new signed root is recorded: {root:?}"
         );
     }
+    let _ = std::fs::remove_dir_all(&layout.prefix);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The control of the row above with tb's shim place occupied: ta flips, tb's flip cannot lay
+/// its shim, and tb's row records that cause and then ta, which the abort rolled back, so the
+/// cause's clipping never drops the sibling's name.
+#[cfg(unix)]
+#[test]
+fn a_group_flip_failure_row_names_the_sibling_it_rolled_back() {
+    let dir = scratch("update-group-flip-fails");
+    write_installed_group_registry(&dir, current_triple(), &[]);
+    let layout = temp_layout("update-group-flip-fails");
+    let fetcher = crate::DirFetcher::new(dir.clone());
+    make_installed_group_live(&layout);
+    let tb = layout.shim(&crate::store::ToolName::new("tb").unwrap());
+    std::fs::remove_file(&tb).unwrap();
+    std::fs::create_dir_all(tb.join("kept")).unwrap();
+
+    let (report, failures) = update_pass(&layout, &fetcher);
+    assert_eq!(failures, 1, "{:?}", report.groups);
+    let crate::TxnOutcome::Aborted {
+        failed,
+        during_flip: true,
+        rolled_back,
+        ..
+    } = outcome_of(&report, "tb")
+    else {
+        panic!("tb's flip aborts the group: {:?}", report.groups);
+    };
+    assert_eq!(
+        (failed.as_str(), rolled_back.as_slice()),
+        ("tb", &[("ta".to_string(), Ok(()))][..])
+    );
+    let state = &crate::status::read(&layout).unwrap().programs["tb"].state;
+    assert!(state.ends_with(": ta"), "{state}");
+    assert_eq!(
+        crate::active_builds(&layout).get("ta").copied(),
+        Some(3),
+        "ta is back on its previous build"
+    );
     let _ = std::fs::remove_dir_all(&layout.prefix);
     let _ = std::fs::remove_dir_all(&dir);
 }

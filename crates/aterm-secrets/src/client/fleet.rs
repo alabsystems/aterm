@@ -77,8 +77,7 @@ pub fn alab_fleet_code(paths: &Paths) -> crate::Result<Option<SecretBytes>> {
 /// [`alab_fleet`]'s read of `expected`'s applied copy, any vault's: an apply
 /// that has not finished is an error naming it, never read as no code.
 pub(super) fn reserved_fleet(paths: &Paths, expected: &Config) -> crate::Result<Option<AlabFleet>> {
-    StateLock::narrow_owned(paths)?;
-    let lock = match StateLock::observe_classified(paths)? {
+    let lock = match StateLock::observe_narrowed(paths)? {
         StateObservation::Held(lock) => lock,
         StateObservation::Absent => return Ok(None),
         StateObservation::Busy => {
@@ -290,8 +289,7 @@ fn swarm_roster_until_with(
 ) -> crate::Result<Option<crate::swarm_roster::SwarmRoster>> {
     let mut backoff = Duration::from_millis(1);
     loop {
-        StateLock::narrow_owned(paths)?;
-        match StateLock::observe_classified(paths)? {
+        match StateLock::observe_narrowed(paths)? {
             StateObservation::Held(lock) => return super::roster::swarm_roster_held(paths, &lock),
             // No lock file: no copy was ever applied here, so no roster either way
             // ([`super::roster::with_roster_observation`]'s absent arm).
@@ -381,6 +379,8 @@ fn observe_denied_nodes(
     pinned: Option<&Option<Config>>,
     after_entry: impl FnOnce(),
 ) -> crate::Result<DeniedObservation> {
+    // Before the early answers below, so a deny read narrows the lock on every path, and opens it
+    // twice where it goes on to observe; a roster read's `observe_narrowed` opens it once.
     StateLock::narrow_owned(paths)?;
     let configured = config(paths)?;
     if let Some(Some(expected)) = pinned
@@ -953,7 +953,9 @@ mod tests {
     /// (`another user's lock is left`); with it opening the lock by its name
     /// (`std::fs::File::open`, which follows a symlink) and checking only the opened file's
     /// owner, kind and links, the symlink's target is narrowed (`assertion failed:
-    /// !StateLock::narrow_owned(&admin_paths)...`).
+    /// !StateLock::narrow_owned(&admin_paths)...`). NEGATIVE CONTROL (2026-11-05): with
+    /// `observe_narrowed` taking no lock as wide, the roster's read fails on it (`assertion failed:
+    /// swarm_roster_until(&admin_paths, ...`).
     #[test]
     fn an_own_wide_lock_is_narrowed_by_the_deny_list_read_and_a_foreign_or_linked_one_is_not() {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};

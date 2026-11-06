@@ -107,6 +107,20 @@ impl Device {
     #[cfg(not(test))]
     const fn appended(&mut self, _from: Option<usize>) {}
 
+    /// Write `bytes` at byte `from`, growing the file (zeros in any gap) where they reach
+    /// past its end: a positional write. An append when `from` is the file's length, the
+    /// only place the product writes; anywhere else is F24's negative control.
+    fn put(&mut self, from: usize, bytes: &[u8]) {
+        let old = self.logical.len();
+        let to = from.saturating_add(bytes.len());
+        if to > old {
+            self.logical.resize(to, 0);
+        }
+        self.logical[from..to].copy_from_slice(bytes);
+        self.touch(from.min(old), to);
+        self.appended((from == old).then_some(from));
+    }
+
     /// The contents of block `b` as reads see it now (short at the file's end).
     fn block_now(&self, b: usize) -> Vec<u8> {
         let from = (b * self.block).min(self.logical.len());
@@ -232,6 +246,14 @@ impl Device {
 struct State {
     dev: Device,
     trace: Option<Vec<Device>>,
+    /// THE FILE CURSOR of the handle the log has open on this device, kept as Windows
+    /// keeps a file's: an open puts it at 0, and every read leaves it at the end of what
+    /// it read (`seek_read` does, though it reads by position). The product writes by
+    /// position and never reads it; F24's negative control writes at it
+    /// ([`Sim::write_at_cursor`]), the append as it was, so on every OS that control meets
+    /// the cursor a Windows read leaves.
+    #[cfg(test)]
+    cursor: usize,
 }
 
 impl State {
@@ -240,6 +262,15 @@ impl State {
             t.push(self.dev.clone());
         }
     }
+
+    /// A read of the log left the cursor at `at` ([`State::cursor`]).
+    #[cfg(test)]
+    fn read_to(&mut self, at: usize) {
+        self.cursor = at;
+    }
+
+    #[cfg(not(test))]
+    const fn read_to(&mut self, _at: usize) {}
 }
 
 /// The simulated device behind the storage seam: cheap to clone (one shared state).
@@ -260,7 +291,12 @@ impl Sim {
 
     pub(crate) fn with(dev: Device) -> Sim {
         Sim {
-            inner: Arc::new(Mutex::new(State { dev, trace: None })),
+            inner: Arc::new(Mutex::new(State {
+                dev,
+                trace: None,
+                #[cfg(test)]
+                cursor: 0,
+            })),
             path: Arc::new(PathBuf::from("sim.log")),
         }
     }
@@ -278,13 +314,16 @@ impl Sim {
         let mut s = self.lock();
         let created = !s.dev.exists;
         s.dev.exists = true;
+        s.read_to(0);
         created
     }
 
     pub(crate) fn read_log(&self, out: &mut Vec<u8>) -> usize {
-        let s = self.lock();
+        let mut s = self.lock();
         out.extend_from_slice(&s.dev.logical);
-        s.dev.logical.len()
+        let len = s.dev.logical.len();
+        s.read_to(len);
+        len
     }
 
     /// The log's length.
@@ -294,23 +333,46 @@ impl Sim {
 
     /// Up to `buf.len()` bytes of the log from byte `start`, fewer where it ends: how many.
     pub(crate) fn read_log_at(&self, start: u64, buf: &mut [u8]) -> usize {
-        let s = self.lock();
+        let mut s = self.lock();
         let from = usize::try_from(start).unwrap_or(usize::MAX);
         let have = s.dev.logical.get(from..).unwrap_or(&[]);
         let n = have.len().min(buf.len());
         if let (Some(dst), Some(src)) = (buf.get_mut(..n), have.get(..n)) {
             dst.copy_from_slice(src);
         }
+        if n > 0 {
+            s.read_to(from.saturating_add(n));
+        }
         n
     }
 
-    pub(crate) fn append(&self, bytes: &[u8]) {
+    /// Exactly `len` bytes of the log from byte `start`, or `None` where it ends first.
+    pub(crate) fn read_at(&self, start: u64, len: usize) -> Option<Vec<u8>> {
         let mut s = self.lock();
-        let from = s.dev.logical.len();
-        s.dev.logical.extend_from_slice(bytes);
-        let to = s.dev.logical.len();
-        s.dev.touch(from, to);
-        s.dev.appended(Some(from));
+        let from = usize::try_from(start).ok()?;
+        let to = from.checked_add(len)?;
+        let bytes = s.dev.logical.get(from..to)?.to_vec();
+        s.read_to(to);
+        Some(bytes)
+    }
+
+    /// Write `bytes` at byte `at` of the log: a positional write (`pwrite`, `seek_write`),
+    /// which no cursor decides.
+    pub(crate) fn write_at(&self, at: u64, bytes: &[u8]) {
+        let mut s = self.lock();
+        let from = usize::try_from(at).unwrap_or(usize::MAX);
+        s.dev.put(from, bytes);
+        s.record();
+    }
+
+    /// F24's NEGATIVE CONTROL: write `bytes` at the cursor ([`State::cursor`]) and move it
+    /// past them, as a `write` on a file handle does.
+    #[cfg(test)]
+    pub(crate) fn write_at_cursor(&self, bytes: &[u8]) {
+        let mut s = self.lock();
+        let from = s.cursor;
+        s.dev.put(from, bytes);
+        s.cursor = from.saturating_add(bytes.len());
         s.record();
     }
 

@@ -210,8 +210,9 @@ pub struct ClaudeAccounts {
     pub pool_picks: bool,
     /// Whether a login was made in that bound directory (`accounts::login_made`).
     pub made: bool,
-    /// `accounts::LoginState::as_str` where the row renews, or `"expired"` for a
-    /// plain row that the account store records as signed out.
+    /// `accounts::LoginState::as_str` where the row renews, or `"expired"` for a plain row
+    /// `accounts::condition` reads signed out (enrolled here, and `accounts::signed_out_here`: the
+    /// account store records it signed out, or its own credential file shows the login lapsed).
     pub state: Option<&'static str>,
     /// The forecast end, when due.
     pub renew_by: Option<i64>,
@@ -418,8 +419,10 @@ pub struct CliAccounts {
     /// row, and where that program serves that row alone ([`Self::default_only`]) it is `None`:
     /// no other row runs on that build.
     pub next: Option<String>,
-    /// The first row with no email and no current login (its login is not made here, or the pool
-    /// recorded it signed out), which `accounts login` signs in and no renewal does.
+    /// The first row with no email and no current login (its login is not made here, the pool
+    /// recorded it signed out, or its own credential file shows the login lapsed: the row the
+    /// report calls signed out, [`crate::harness::accounts::condition`]), which `accounts login`
+    /// signs in and no renewal does.
     pub unaddressed: Option<String>,
     /// How many rows the roster lists.
     pub rows: usize,
@@ -430,7 +433,10 @@ pub struct CliAccounts {
     /// How many of them are signed in here: a login made on this machine that the pool has not
     /// recorded signed out.
     pub signed_in: usize,
-    /// The rows whose login is due for renewal or has ended (`accounts::renew_due`), by label.
+    /// The rows with an email enrolled here that nothing refuses a local sign-in (not held for
+    /// another Mac's warm set, admitted by their execution verdict, and needing no shared sign-in:
+    /// `local_sign_in_refusal`) whose login is due for renewal or has ended
+    /// (`accounts::login_state` `due` or `expired`, a lapsed credential file included), by label.
     pub due: Vec<String>,
     /// The pool's on-disk store (`accounts::Store::at_for`), when loaded.
     pub store: Option<crate::harness::accounts::Store>,
@@ -490,8 +496,10 @@ pub struct CliAccounts {
     /// The serving row's login file on disk and when the vendor last wrote it, when `serving_login`
     /// is `Some`.
     pub serving_login_file: Option<(PathBuf, Option<i64>)>,
-    /// `accounts::LoginState::as_str` on the serving row, where it renews, or `"expired"` when the
-    /// pool store recorded a non-renewing serving row signed out.
+    /// `accounts::LoginState::as_str` on the serving row, where it renews, or `"expired"` for a
+    /// non-renewing serving row `accounts::condition` reads signed out (enrolled here, and
+    /// `accounts::signed_out_here`: the pool store recorded it signed out, or its own credential
+    /// file shows the login lapsed).
     pub state: Option<&'static str>,
     /// When the pool store recorded the serving row signed out, where it did and said when (one
     /// word for a login wall, a displacement by the vendor's own sign-in and a check that found
@@ -1361,19 +1369,17 @@ fn pool_for_with(
         })
         .map(|row| row.label.clone())
         .collect();
-    // A row with no email that has no current login: `accounts login`, the sign-in that takes no
-    // email, is its step.
+    let row_cond =
+        |r: &accounts::Row| accounts::condition(r, &state, enrolled_here.contains(&r.label), m.now);
+    // A row with no email that has no current login, judged as the report judges it (its login
+    // is not made here, the pool recorded it signed out, or its own credential file shows the
+    // login lapsed, [`accounts::State::lapsed_logins`]): `accounts login`, the sign-in that takes
+    // no email, is its step.
     let unaddressed = bound
         .rows
         .iter()
         .filter(|r| local(r) && r.email.is_none())
-        .find(|r| {
-            !enrolled_here.contains(&r.label)
-                || state
-                    .accounts
-                    .get(&r.label)
-                    .is_some_and(|a| a.current_auth(r) == accounts::Auth::SignedOut)
-        })
+        .find(|r| matches!(row_cond(r), Condition::NotEnrolled | Condition::SignedOut))
         .map(|r| r.label.clone());
     let next = with_email()
         .find(|r| !enrolled_here.contains(&r.label) && !other_macs.contains_key(&r.label))
@@ -1400,8 +1406,6 @@ fn pool_for_with(
             .0
             .accounts_for(cli.program())
     });
-    let row_cond =
-        |r: &accounts::Row| accounts::condition(r, &state, enrolled_here.contains(&r.label), m.now);
     let row_present =
         |r: &accounts::Row| !matches!(row_cond(r), Condition::NotEnrolled | Condition::SignedOut);
     let row_ready = |r: &accounts::Row| {

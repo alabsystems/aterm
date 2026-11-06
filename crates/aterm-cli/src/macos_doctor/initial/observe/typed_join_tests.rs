@@ -13,7 +13,7 @@
 
 use super::*;
 use aterm_machines::init_secrets::SecretsOps;
-use aterm_types::macos_setup::{AccessOutcome, BASE_PLAN};
+use aterm_types::macos_setup::BASE_PLAN;
 use std::sync::{Arc, Mutex};
 
 /// One Secrets try, with the resulting `row` and the join password left for the next try, or
@@ -135,6 +135,10 @@ impl SecretsLane for Lane {
         Some(pace())
     }
 
+    fn lan_unavailable(&mut self) -> Option<String> {
+        None
+    }
+
     fn configured_vault(&mut self) -> Result<Option<ConfiguredVault>, String> {
         Ok(None)
     }
@@ -238,15 +242,11 @@ fn plan() -> Plan {
     Plan::from(selection)
 }
 
-/// A state root with `plan` admitted, and its run's revision. A lane's run has heard macOS grant
-/// Local Network already, so its lane tries at once.
-fn admitted(lane: bool) -> (aterm_tempfile::TempDir, u64) {
+/// A state root with `plan` admitted, and its run's revision. A lane's run finds the root LAN
+/// broker answering ([`Lane`]), so its lane tries at once.
+fn admitted(_lane: bool) -> (aterm_tempfile::TempDir, u64) {
     let root = aterm_tempfile::tempdir().unwrap();
     let revision = authorize_at(root.path(), &plan()).unwrap().unwrap();
-    if lane {
-        let access = access_revision_at(root.path()).unwrap();
-        access::record_step_isolated_at(root.path(), access, AccessOutcome::Granted);
-    }
     (root, revision)
 }
 
@@ -261,21 +261,15 @@ fn pass(host: &mut Host, root: &Path, revision: u64, password: &mut Option<Secre
 type Reading = (Standing, String, String, Option<String>);
 
 /// The vault row of [`plan`] on a Mac in no vault, as System State reads it from `root` on
-/// `network`, with no LAN look heard.
+/// `network`.
 fn row_on(root: &Path, network: &Network) -> Reading {
     row_heard(heard_for(&plan(), Some(root), network), root)
 }
 
 /// The vault row of [`plan`] on a Mac in no vault, with what aterm heard at the ALab vault's
-/// address (`here`) and the run's records in `root`, with no LAN look heard.
+/// address (`here`) and the run's records in `root`.
 fn row_heard(here: scope::VaultHere, root: &Path) -> Reading {
-    let seen = vault_heard(
-        &VaultRead::Unconfigured,
-        plan().selection,
-        here,
-        None,
-        Some(root),
-    );
+    let seen = vault_heard(&VaultRead::Unconfigured, plan().selection, here, Some(root));
     (seen.standing, seen.now.unwrap(), seen.wanted, seen.note)
 }
 
@@ -882,7 +876,6 @@ fn swarm_off_leaves_the_vault_row_settled_not_a_change_to_make() {
             &VaultRead::Unconfigured,
             plan().selection,
             scope::VaultHere::Unasked,
-            None,
             None,
         ))
     };

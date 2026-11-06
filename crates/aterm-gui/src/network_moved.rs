@@ -4,8 +4,9 @@
 //! THIS PROCESS'S "NETWORK MOVED" SIGNAL (docs/DESIGN-fluid-swarm-2026-10-28.md §3.5.2, F3c).
 //! Nothing carries the signal between processes, so the window and the node job each watch
 //! their own sources: the kernel's route socket ([`aterm_uds::network::RouteChanges`]), the one
-//! `_alab._tcp` browse a process holds, on a Bonjour connection it owns, which tells each member
-//! it did not hold and resolves what it holds to dial hints ([`hear_alab_tcp`]: the node job's,
+//! `_alab._tcp` browse a process holds, through the root LAN broker, which tells a member heard
+//! after every member's silence of [`aterm_secrets::discover::SILENCE`] and resolves what it
+//! holds to dial hints ([`hear_alab_tcp`]: the node job's,
 //! and a window's only while it serves the fleet port, §4.1 F17), and the Commons runtime's peers, the first heard after every
 //! peer's silence of [`SILENCE`], or one heard for the first time ([`Heard`]). Each consumer (the window's converge lane, a fleet heartbeat, the sign-in
 //! ladder's waits and the account claims, the fleet glance's backoff) holds its own [`Watch`],
@@ -27,7 +28,8 @@ pub(crate) enum Woke {
     /// The kernel told of a change to this Mac's addresses or links (macOS's and Linux's source;
     /// every platform's watch tells a route move it has not heard as one: [`Told::heard_since`]).
     Route,
-    /// The process's `_alab._tcp` browse heard a member it did not hold ([`hear_alab_tcp`]).
+    /// The process's `_alab._tcp` browse heard a member after every member's silence
+    /// ([`aterm_secrets::discover::SILENCE`], [`hear_alab_tcp`]).
     #[cfg_attr(
         not(any(target_os = "macos", test)),
         expect(dead_code, reason = "the browse source is macOS's")
@@ -35,9 +37,6 @@ pub(crate) enum Woke {
     Browse,
     /// The Commons runtime heard a peer after every peer's silence ([`SILENCE`]), or a new one.
     Beacon,
-    /// macOS's Local Network answer for aterm moved as the window heard it
-    /// ([`local_network_moved`]): which LAN hosts aterm may reach changed, or may have.
-    LocalNetwork,
     /// The network place settled ([`hear_place`], `aterm_netplace::moves`): the keeper read the
     /// new network, so it is usable now, told behind a route move's with only the flap rest
     /// (`aterm_netplace::moves::REST_MS`). Off macOS and Linux nothing tells it, tests included
@@ -58,9 +57,8 @@ impl Woke {
         match self {
             Self::Timer => "its timer",
             Self::Route => "a route change",
-            Self::Browse => "a member heard on the _alab._tcp browse",
+            Self::Browse => "a member heard on the _alab._tcp browse after two minutes of none",
             Self::Beacon => "a Commons beacon after two minutes of no peer, or from a new one",
-            Self::LocalNetwork => "macOS's Local Network answer for aterm",
             Self::Place => "the network place settling onto a network",
         }
     }
@@ -119,9 +117,8 @@ impl Moved {
         Self::spread_by(Duration::ZERO)
     }
 
-    /// A signal no source has told yet, whose watches hear each move `spread` after it was told,
-    /// save macOS's Local Network answer ([`Woke::LocalNetwork`]), which they hear at once: a
-    /// signal whose Mac shares its moves with a whole herd.
+    /// A signal no source has told yet, whose watches hear each move `spread` after it was told:
+    /// a signal whose Mac shares its moves with a whole herd.
     #[cfg(test)]
     pub(crate) const fn spread_by(spread: Duration) -> Self {
         /// A herd past any [`HERD`].
@@ -133,8 +130,7 @@ impl Moved {
 
     /// A signal no source has told yet, whose watches hear each move the share of `spread` that
     /// `herd` (how many other Macs share this one's moves, read at each move) makes after it was
-    /// told ([`herded`]), save macOS's Local Network answer ([`Woke::LocalNetwork`]), which they
-    /// hear at once.
+    /// told ([`herded`]).
     pub(crate) const fn herded_by(spread: Duration, herd: fn() -> usize) -> Self {
         Self {
             told: Mutex::new(Told {
@@ -158,10 +154,9 @@ impl Moved {
     /// the share of it the herd read now makes ([`herded`]), has passed since `at` (a watch made
     /// by [`Moved::watch_at_once`] at once). A move told while another is still to be heard is
     /// one wake with it, at the later one's time, told as a route move where one of them was
-    /// ([`Told::route`]). macOS's Local Network answer is this Mac's own, no event on the LAN
-    /// every Mac hears at once, so its watches hear it at once.
+    /// ([`Told::route`]).
     pub(crate) fn tell_at(&self, source: Woke, at: Instant) {
-        let spread = if self.spread.is_zero() || source == Woke::LocalNetwork {
+        let spread = if self.spread.is_zero() {
             Duration::ZERO
         } else {
             herded(self.spread, (self.herd)())
@@ -283,18 +278,6 @@ impl Watch {
                 woke
             },
         )
-    }
-
-    /// Whether [`Watch::take_at`] would take a move at `now`, taking none. Its one caller, the
-    /// heartbeat clock, is Unix's.
-    #[cfg(unix)]
-    pub(crate) fn due_at(&self, now: Instant) -> bool {
-        let told = self
-            .moved
-            .told
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        told.count != self.seen && told.due.is_none_or(|due| !self.spread || now >= due)
     }
 
     /// [`Watch::take_at`] now.
@@ -469,15 +452,33 @@ pub(crate) fn watch_at_once() -> Watch {
     process().watch_at_once()
 }
 
-/// The window heard macOS's Local Network answer for aterm move (`App::tick_local_network_step`):
-/// its question went up, which the access record keeps as asked from then on, the alert watch
-/// saw no window of the alert's owner left with the person at the Mac
-/// (`App::on_local_network_alert_answered`), or the
-/// re-probe after it ended, whatever it heard. Each watch of this process wakes with
-/// [`Woke::LocalNetwork`], so what reads the LAN (the converge pass's `sync.peers`, which reads
-/// "macOS has not asked" until the record says asked) reads it again now, not at its own time.
-pub(crate) fn local_network_moved() {
-    process().tell(Woke::LocalNetwork);
+/// Whether aterm's own LAN traffic can go out now: on macOS the root LAN broker answers a hello
+/// ([`aterm_uds::lan::broker::hello`]), since there is no direct path; elsewhere always, as the
+/// LAN is used in-process there. A LAN lane that waits for it waits for the broker's socket,
+/// never for a person.
+pub(crate) fn lan_answers() -> bool {
+    lan_unavailable().is_none()
+}
+
+/// Why aterm's own LAN traffic cannot go out now, in the broker's own words (its error's
+/// `Display`, [`aterm_uds::lan::LanError::Unavailable`] where no root broker serves); `None`
+/// once the broker answers its hello, and always off macOS ([`lan_answers`]). A process under
+/// the loopback guard ([`aterm_net::loopback::confined`], a debug build's isolated fleet world)
+/// reaches the loopback alone, which needs no broker, so for it this is always `None` too.
+pub(crate) fn lan_unavailable() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        if aterm_net::loopback::confined() {
+            return None;
+        }
+        aterm_uds::lan::broker::hello()
+            .err()
+            .map(|error| error.to_string())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
 }
 
 /// Start this process's route source and its one `_alab._tcp` browse ([`hear_alab_tcp`]), so a
@@ -504,11 +505,15 @@ static ALAB_TCP: OnceLock<Arc<aterm_secrets::discover::Watch>> = OnceLock::new()
 
 /// Start this process's one `_alab._tcp` browse ([`hear_browse`], read by an
 /// [`aterm_secrets::discover::Watch`]), holding `own` (this process's own advert names) as its
-/// own: each member it did not hold is a move ([`Woke::Browse`]), and what it holds resolves to
-/// dial hints ([`alab_tcp`]). Each process starts it with its sources ([`start_sources`]), so the
-/// move detector and the heartbeat share one browse; a later call adds its `own` names. None
-/// starts in a test build, outside macOS, or under a private state root or CI (`ATERM_STATE_HOME`,
-/// `CI`, as the Commons runtime).
+/// own: a member heard once every other member was silent for
+/// [`aterm_secrets::discover::SILENCE`] is a move ([`Woke::Browse`]), a peer's comings and goings
+/// none, and what it holds resolves to dial hints ([`alab_tcp`]). Each process starts it with its
+/// sources ([`start_sources`]), so the move detector and the heartbeat share one browse; a later
+/// call adds its `own` names. A window names none, so this Mac's node job's advert is a member
+/// on its browse; the node job withdraws it while this Mac has no route
+/// ([`aterm_agent::node_service::advertises`]), so this Mac off every network for longer than
+/// the silence and back is a move there too. None starts in a test build, outside macOS, or
+/// under a private state root or CI (`ATERM_STATE_HOME`, `CI`, as the Commons runtime).
 #[cfg(unix)]
 pub(crate) fn hear_alab_tcp(own: &[&str]) {
     hear_alab_tcp_on(process(), own);
@@ -565,14 +570,13 @@ pub(crate) fn alab_tcp() -> Option<Arc<aterm_secrets::discover::Watch>> {
 #[cfg(all(not(test), target_os = "macos"))]
 const BROWSE_AGAIN: Duration = Duration::from_secs(60);
 
-/// How long the browse, waiting for System State's Local Network step or for sharing to be on
-/// ([`keep_browse`]), waits before it looks again with no move told: the step's question wakes it
-/// sooner ([`local_network_moved`]).
+/// How long the browse, waiting for sharing to be on ([`keep_browse`]), waits before it looks
+/// again with no move told.
 #[cfg(all(not(test), target_os = "macos"))]
-const STEP_LOOK: Duration = Duration::from_secs(10);
+const OFF_LOOK: Duration = Duration::from_secs(10);
 
 /// How often a running browse looks at `[swarm] enabled` while it hears nothing
-/// ([`aterm_net::bonjour::browse_while`]): one `stat` ([`aterm_secrets::swarm::Switch`]).
+/// ([`aterm_uds::lan::Events::next_within`]): one `stat` ([`aterm_secrets::swarm::Switch`]).
 #[cfg(all(not(test), target_os = "macos"))]
 const SHARING_LOOK: Duration = Duration::from_secs(5);
 
@@ -581,54 +585,39 @@ const SHARING_LOOK: Duration = Duration::from_secs(5);
 const BROWSE_SHARING_OFF: &str = "network moved: sharing is off ([swarm] enabled = false), so the \
     _alab._tcp browse is stopped until it is on";
 
-/// What the browse's keeper says once it waited for System State's Local Network step
-/// ([`keep_browse`]).
-#[cfg(target_os = "macos")]
-const BROWSE_WAITED: &str =
-    "network moved: the _alab._tcp browse waited for System State's Local Network step";
-
 /// What the browse's keeper says once a person turns sharing back on ([`keep_browse`]).
 #[cfg(target_os = "macos")]
 const BROWSE_SHARING_ON: &str = "network moved: sharing is on again, so the _alab._tcp browse \
     starts again";
 
 /// Keep this process's `_alab._tcp` browse while `[swarm] enabled` leaves sharing on
-/// (`sharing`, `docs/DESIGN-alab-swarm-2026-10-27.md` §9): it starts only with sharing on and
-/// once this process `may_use` the LAN ([`browse_after_the_step`]), both read again after each
-/// `wait`; it runs (`browse`, told to go on only while `sharing` stays on) until sharing goes
-/// off, and starts again once a person turns it back on. Each stop and start is said once in
-/// `said`. It returns once `browse` says the browse is not to be kept (a test's end).
+/// (`sharing`, `docs/DESIGN-alab-swarm-2026-10-27.md` §9): it starts only with sharing on, read
+/// again after each `wait`; it runs (`browse`, told to go on only while `sharing` stays on) until
+/// sharing goes off, and starts again once a person turns it back on. Each stop and start is said
+/// once in `said`. It returns once `browse` says the browse is not to be kept (a test's end).
 #[cfg(target_os = "macos")]
 fn keep_browse(
     mut sharing: impl FnMut() -> bool,
-    mut may_use: impl FnMut() -> bool,
     mut wait: impl FnMut(),
     mut browse: impl FnMut(&mut dyn FnMut() -> bool) -> bool,
     mut said: impl FnMut(&str),
 ) {
     let mut off = false;
     loop {
-        let mut for_the_step = false;
-        browse_after_the_step(
-            || {
-                let on = sharing();
-                if on == off {
-                    off = !on;
-                    said(if on {
-                        BROWSE_SHARING_ON
-                    } else {
-                        BROWSE_SHARING_OFF
-                    });
-                }
-                let goes = on && may_use();
-                for_the_step |= on && !goes;
-                goes
-            },
-            &mut wait,
-            || {},
-        );
-        if for_the_step {
-            said(BROWSE_WAITED);
+        loop {
+            let on = sharing();
+            if on == off {
+                off = !on;
+                said(if on {
+                    BROWSE_SHARING_ON
+                } else {
+                    BROWSE_SHARING_OFF
+                });
+            }
+            if on {
+                break;
+            }
+            wait();
         }
         if !browse(&mut sharing) {
             return;
@@ -636,32 +625,12 @@ fn keep_browse(
     }
 }
 
-/// Start the `browse` (a Bonjour browse is a Local Network use: it puts macOS's Local Network
-/// question on screen where macOS never asked aterm) only once this process `may_use` the LAN
-/// ([`aterm_types::macos_setup::lan_first_use::may_use`]): not while System State's Local Network
-/// step is still to come in a window that runs first-run setup, which asks that question first.
-/// Until then it `wait`s (for a move told, or a while) and reads `may_use` again. Whether it had
-/// to wait.
-#[cfg(target_os = "macos")]
-fn browse_after_the_step(
-    mut may_use: impl FnMut() -> bool,
-    mut wait: impl FnMut(),
-    browse: impl FnOnce(),
-) -> bool {
-    let mut waited = false;
-    while !may_use() {
-        waited = true;
-        wait();
-    }
-    browse();
-    waited
-}
-
-/// The native `_alab._tcp` browse `watch` reads: a Bonjour connection this process owns
-/// ([`aterm_net::bonjour::browse`]), so no browser helper outlives it, read on a thread of its
-/// own. Each event reaches the watch ([`aterm_secrets::discover::Watch::hear`]), which keeps the
-/// baseline, each instance's interfaces and the bound, and rings its bell for a member it did not
-/// hold without blocking the reader. A connection that ended starts again after
+/// The `_alab._tcp` browse `watch` reads: the root LAN broker's ([`aterm_uds::lan::browse`],
+/// which macOS never asks about), whose request lives as long as this process holds its events,
+/// read on a thread of its own. Each event reaches the watch
+/// ([`aterm_secrets::discover::Watch::hear`]), which keeps the baseline, each instance's
+/// interfaces and the bound, and rings its bell for a member heard after every member's silence
+/// without blocking the reader. A connection that ended starts again after
 /// [`BROWSE_AGAIN`], its first events a baseline again.
 #[cfg(all(not(test), target_os = "macos"))]
 fn hear_browse(watch: &Arc<aterm_secrets::discover::Watch>, moved: &Arc<Moved>) {
@@ -671,11 +640,6 @@ fn hear_browse(watch: &Arc<aterm_secrets::discover::Watch>, moved: &Arc<Moved>) 
         .name("aterm-moved-bonjour".to_owned())
         .spawn(move || {
             crate::qos::set_self(crate::qos::Role::Background);
-            let Ok(service) = std::ffi::CString::new(aterm_agent::node_service::ALAB_TCP_SERVICE)
-            else {
-                aterm_log::warn!("network moved: the browse service name contains a NUL");
-                return;
-            };
             let mut switch =
                 aterm_types::dirs::home_dir().map(|home| aterm_secrets::swarm::Switch::new(&home));
             keep_browse(
@@ -685,12 +649,11 @@ fn hear_browse(watch: &Arc<aterm_secrets::discover::Watch>, moved: &Arc<Moved>) 
                             == Ok(true)
                     })
                 },
-                aterm_types::macos_setup::lan_first_use::may_use,
                 || {
-                    let _ = step.wait(STEP_LOOK);
+                    let _ = step.wait(OFF_LOOK);
                 },
                 |sharing| {
-                    browse_until_off(&service, &watch, sharing);
+                    browse_until_off(aterm_agent::node_service::ALAB_TCP_SERVICE, &watch, sharing);
                     true
                 },
                 |line| aterm_log::info!("{line}"),
@@ -701,39 +664,43 @@ fn hear_browse(watch: &Arc<aterm_secrets::discover::Watch>, moved: &Arc<Moved>) 
     }
 }
 
-/// Browse `service` on `local.` while `sharing` stays on, each event reaching `watch`
-/// ([`aterm_secrets::discover::Watch::hear`]), a fresh connection [`BROWSE_AGAIN`] after one
-/// that failed; it returns once sharing is off (looked at each [`SHARING_LOOK`] the browse hears
-/// nothing, and before each event).
+/// Browse `service` on `local.` through the root LAN broker while `sharing` stays on, each event
+/// reaching `watch` ([`aterm_secrets::discover::Watch::hear`]), a fresh request [`BROWSE_AGAIN`]
+/// after one that failed or found no broker (its words, the broker's, said once); it returns once
+/// sharing is off (looked at each [`SHARING_LOOK`] the browse hears nothing, and before each
+/// event).
 #[cfg(all(not(test), target_os = "macos"))]
 fn browse_until_off(
-    service: &std::ffi::CStr,
+    service: &str,
     watch: &aterm_secrets::discover::Watch,
     sharing: &mut dyn FnMut() -> bool,
 ) {
-    use std::ops::ControlFlow;
+    use aterm_uds::lan::Event;
     let mut said = false;
     while sharing() {
         watch.began_browse();
-        let result = aterm_net::bonjour::browse_while(
-            service,
-            c"local.",
-            SHARING_LOOK,
-            &mut *sharing,
-            |event| {
-                if let Ok(name) = event.name.to_str() {
-                    watch.hear(event.added, event.interface, name);
+        let ended = match aterm_uds::lan::browse(service, "local.") {
+            Ok(mut events) => loop {
+                if !sharing() {
+                    return;
                 }
-                ControlFlow::Continue(())
+                match events.next_within(SHARING_LOOK) {
+                    Ok(None) => {}
+                    Ok(Some(Event::Added(instance))) => {
+                        watch.hear(true, instance.interface, &instance.name);
+                    }
+                    Ok(Some(Event::Removed(instance))) => {
+                        watch.hear(false, instance.interface, &instance.name);
+                    }
+                    Ok(Some(_)) => {}
+                    Err(error) => break error,
+                }
             },
-        );
-        match result {
-            Ok(()) => return,
-            Err(error) if !said => {
-                said = true;
-                aterm_log::warn!("network moved: the _alab._tcp browse ended: {error}");
-            }
-            Err(_) => {}
+            Err(error) => error,
+        };
+        if !said {
+            said = true;
+            aterm_log::warn!("network moved: the _alab._tcp browse ended: {ended}");
         }
         std::thread::sleep(BROWSE_AGAIN);
     }
@@ -998,14 +965,13 @@ pub(crate) mod tests {
     /// verify measure, its GUI smoke and the perf arena start aterm in a scratch world
     /// ([`aterm_types::world`]), often a release build that reads no development seam. Its
     /// marker and its lanes-off tables turn off, by the product's own gates, every launch lane
-    /// that can reach the local network (macOS keys that consent to the account and the app,
-    /// so a world's use of it puts the Local Network prompt on the person's desk) or the login's
-    /// launchd domain: this process's `_alab._tcp` browse, the converge runner's window lane, the
-    /// browse's own `[swarm]` switch, fleet reads, System State's Local Network step and the
-    /// keeper job, besides the update and package lanes. Each gate is first shown open without
-    /// the world, so none passes by being shut anyway.
-    /// NEGATIVE CONTROL: a lanes-off text without its `[swarm]` table leaves the browse's switch,
-    /// fleet reads and the Local Network step on.
+    /// that can reach the local network (a world's use of it would reach the person's real LAN
+    /// and its members) or the login's launchd domain: this process's `_alab._tcp` browse, the
+    /// converge runner's window lane, the browse's own `[swarm]` switch, fleet reads and the
+    /// keeper job, besides the update and package lanes. Each gate is first shown open without the world, so none passes by being
+    /// shut anyway.
+    /// NEGATIVE CONTROL: a lanes-off text without its `[swarm]` table leaves the browse's switch
+    /// and fleet reads on.
     #[test]
     fn a_scratch_world_starts_no_lane_that_reaches_the_local_network() {
         let none = |_: &str| false;
@@ -1020,7 +986,6 @@ pub(crate) mod tests {
 
         let open = crate::app_config::Config::parse("").expect("an empty config");
         assert!(open.swarm_enabled() && open.fleet_watch_enabled());
-        assert_eq!(open.local_network_step_off(), None);
         assert_eq!(open.keeper_setting(), None);
         assert!(crate::app_config::update_checks_automatic(&open));
         assert!(open.packages_enabled());
@@ -1030,10 +995,6 @@ pub(crate) mod tests {
         let config = crate::app_config::Config::parse(off).expect("the lanes-off tables parse");
         assert!(!config.swarm_enabled(), "swarm participation off: {off}");
         assert!(!config.fleet_watch_enabled(), "no fleet reads: {off}");
-        assert!(
-            config.local_network_step_off().is_some(),
-            "no Local Network step: {off}"
-        );
         assert_eq!(config.keeper_setting(), Some(false), "no keeper job: {off}");
         assert!(
             !crate::app_config::update_checks_automatic(&config),
@@ -1046,45 +1007,6 @@ pub(crate) mod tests {
             Ok(false),
             "the browse's own switch reads the swarm off: {off}"
         );
-    }
-
-    /// The `_alab._tcp` browse is a Local Network use, so it starts only once this process may
-    /// use the LAN: while System State's Local Network step is still to come it waits, woken by
-    /// a move (the step's question) or its timer, and reads again; once the step asked, or where
-    /// nothing waits on a step, it browses at once. NEGATIVE CONTROL: a seam that browses before
-    /// `may_use` says yes browses while the step is still to come.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn the_browse_starts_only_once_the_local_network_step_asked() {
-        use std::cell::Cell;
-        let (asked, waited, browsed_at) = (Cell::new(0), Cell::new(0), Cell::new(None));
-        let to_come_twice = || {
-            asked.set(asked.get() + 1);
-            asked.get() > 2
-        };
-        assert!(browse_after_the_step(
-            to_come_twice,
-            || waited.set(waited.get() + 1),
-            || browsed_at.set(Some(asked.get())),
-        ));
-        assert_eq!(
-            waited.get(),
-            2,
-            "it waited while the step was still to come"
-        );
-        assert_eq!(
-            browsed_at.get(),
-            Some(3),
-            "it browsed once, only after may_use said yes"
-        );
-
-        let browsed = Cell::new(0);
-        assert!(!browse_after_the_step(
-            || true,
-            || panic!("nothing to wait for"),
-            || browsed.set(browsed.get() + 1),
-        ));
-        assert_eq!(browsed.get(), 1, "no step to come: it browses at once");
     }
 
     /// The automatic `_alab._tcp` browse runs only while `[swarm] enabled` leaves sharing on: off
@@ -1108,7 +1030,6 @@ pub(crate) mod tests {
         let said = RefCell::new(Vec::new());
         keep_browse(
             sharing,
-            || true,
             || waits.set(waits.get() + 1),
             |going| {
                 browses.set(browses.get() + 1);
@@ -1161,7 +1082,7 @@ pub(crate) mod tests {
     /// drops it. A watch that heard the route move already is told the later move's own source.
     /// NEGATIVE CONTROL: keeping only the latest move's source wakes the watch with `Browse`.
     #[test]
-    fn a_route_move_followed_by_a_browse_still_wakes_the_local_network_step() {
+    fn a_route_move_followed_by_a_browse_still_wakes_a_route_watch() {
         let moved = Arc::new(Moved::spread_by(Duration::from_millis(300)));
         let mut watch = moved.watch();
         let mut at_once = moved.watch_at_once();
@@ -1184,8 +1105,7 @@ pub(crate) mod tests {
 
     /// A PER-MAC SPREAD AFTER A MOVE (docs/DESIGN-fluid-swarm-2026-10-28.md, F4's follow-up): on
     /// a signal spread by 3 s, a move is due 3 s after it was told, never before; a second move
-    /// told before the first was heard is one wake, at the later one's time; macOS's Local
-    /// Network answer, this Mac's own, is due at once; a wait shorter than the spread reads
+    /// told before the first was heard is one wake, at the later one's time; a wait shorter than the spread reads
     /// `Timer` and leaves the move to a later one, and a wait past it is woken by it.
     /// NEGATIVE CONTROL: a `Moved` that ignores its spread (each move due at once) fails "not
     /// before its spread".
@@ -1219,13 +1139,6 @@ pub(crate) mod tests {
             "told as the route move among them"
         );
         assert_eq!(watch.take_at(t0 + secs(60)), None, "one wake for both");
-
-        moved.tell_at(Woke::LocalNetwork, t0 + secs(100));
-        assert_eq!(
-            watch.take_at(t0 + secs(100)),
-            Some(Woke::LocalNetwork),
-            "this Mac's own answer, at once"
-        );
 
         let hour = Arc::new(Moved::spread_by(secs(3600)));
         let mut waiting = hour.watch();
@@ -1499,20 +1412,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// The window's Local Network answer reaches every watch of this process's signal, the one
-    /// the converge lane's live wait holds (`converge_lane::spawn_lane`), so the lane's next pass
-    /// runs now rather than at its half hour. No source starts in a test build, so nothing else
-    /// tells this signal here.
-    /// NEGATIVE CONTROL: a `local_network_moved` that tells a signal of its own, or none, leaves
-    /// the process's watch to its hang detector (`Timer`).
-    #[test]
-    fn the_local_network_answer_wakes_this_processs_watches() {
-        let mut watch = watch();
-        let teller = std::thread::spawn(local_network_moved);
-        assert_eq!(watch.wait(HANG), Woke::LocalNetwork);
-        teller.join().expect("teller");
-    }
-
     /// A source thread tells a move each time its source hears one, and nothing for what it
     /// hears that is none; it ends when its source does.
     /// NEGATIVE CONTROL: a source thread that drops what it heard fails the wait (`Timer`).
@@ -1533,59 +1432,96 @@ pub(crate) mod tests {
         drop(tx);
     }
 
-    /// The browse's first settle window is its baseline, no move; after it, a member not held is,
-    /// one held is not (nor one heard on another interface), one back on an interface within
-    /// [`aterm_secrets::discover::REREGISTERING_WITHIN`] of leaving it is re-registering and no
-    /// move (a peer's window opening restarts its node's registration under the same name), and
-    /// one that left (its last interface) and came back after that is a move again. The silence
+    /// A peer's comings and goings on the browse are no move of this Mac's network: over an hour
+    /// in which, each half minute, a member starts under a name never heard (each process names
+    /// its advert afresh), one leaves, and one comes back after longer than
+    /// [`aterm_secrets::discover::SILENCE`], the source, asked each half minute as its rest
+    /// allows, tells none. This Mac back after every member's silence is one move. The silence
     /// runs at its real length, on injected times.
-    /// NEGATIVE CONTROL: a watch that ignores its settle fails "baseline"; one that keeps no
-    /// silence fails "re-registering".
+    /// NEGATIVE CONTROL: the rule that took each member not held as a move (0.155.0, at its rest
+    /// floor in the owner's log) tells a move at every half minute of the hour; the closing
+    /// rejoin tells its one move under either rule.
     #[test]
     #[cfg(unix)]
-    fn a_member_the_browse_did_not_hold_is_a_move() {
+    fn an_hour_of_members_coming_and_going_on_the_browse_tells_no_move() {
         let secs = Duration::from_secs;
-        let silence = aterm_secrets::discover::REREGISTERING_WITHIN;
+        let silence = aterm_secrets::discover::SILENCE;
         let bell = Arc::new(aterm_secrets::wake::Bell::new());
         let browse = aterm_secrets::discover::Watch::idle_for(
             aterm_agent::node_service::ALAB_TCP_SERVICE,
             &bell,
-            &[],
+            &["alab-0000a0a0"],
         );
-        let rang = || bell.nap(Duration::ZERO) == aterm_secrets::wake::Wake::Browse;
+        let moved = Arc::new(Moved::new());
+        let (look, looks) = std::sync::mpsc::channel::<()>();
+        let (answer, answers) = std::sync::mpsc::channel::<bool>();
+        let (ended, end) = std::sync::mpsc::channel::<()>();
+        assert!(spawn_source(
+            "test-browse-churn",
+            Arc::clone(&moved),
+            (Woke::Browse, Duration::ZERO),
+            move || {
+                if looks.recv().is_err() {
+                    let _ = ended.send(());
+                    return None;
+                }
+                let rung = bell.nap(Duration::ZERO) == aterm_secrets::wake::Wake::Browse;
+                answer.send(rung).ok()?;
+                Some(rung)
+            }
+        ));
+        let ask = || {
+            look.send(()).expect("the source is running");
+            answers.recv_timeout(HANG).expect("the source looks")
+        };
+        let name = |i: u32| format!("alab-{i:08x}");
         let start = Instant::now();
         browse.began_browse();
-        browse.hear_at(true, 4, "a1b2", start);
-        assert!(!rang(), "baseline");
+        browse.hear_at(true, 4, &name(0), start);
+        browse.hear_at(true, 4, "alab-0000a0a0", start);
         browse.child_began(secs(3600));
-        browse.hear_at(true, 4, "", start);
-        assert!(!rang(), "no name");
-        browse.hear_at(true, 4, "a1b2", start);
-        assert!(!rang(), "held");
-        browse.hear_at(true, 4, "Desk A", start);
-        assert!(rang(), "a new member");
-        browse.hear_at(true, 9, "Desk A", start);
-        assert!(!rang(), "another interface");
-        browse.hear_at(false, 4, "Desk A", start);
-        browse.hear_at(true, 4, "Desk A", start);
-        assert!(!rang(), "still on 9");
-        let gone = start + secs(10);
-        browse.hear_at(false, 4, "Desk A", gone);
-        browse.hear_at(false, 9, "Desk A", gone);
-        assert!(!rang(), "gone");
-        browse.hear_at(true, 9, "Desk A", gone + silence);
-        assert!(!rang(), "re-registering");
-        let left = gone + silence + secs(1);
-        browse.hear_at(false, 9, "Desk A", left);
-        browse.hear_at(true, 9, "Desk A", left + silence + Duration::from_millis(1));
-        assert!(rang(), "back after a silence");
+        let mut at = start;
+        let mut told = 0;
+        for i in 1..=120 {
+            at += secs(30);
+            browse.hear_at(true, 4, &name(i), at);
+            if i > 4 {
+                browse.hear_at(false, 4, &name(i - 4), at);
+            }
+            if i > 9 {
+                browse.hear_at(true, 4, &name(i - 9), at);
+            }
+            told += usize::from(ask());
+        }
+        assert_eq!(told, 0, "moves told over {:?} of churn", at - start);
+        let members = browse.heard();
+        assert!(members.len() > 100, "{members:?}");
+        let left = at + secs(1);
+        for member in &members {
+            browse.hear_at(false, 4, member, left);
+        }
+        assert!(!ask(), "every member left");
+        for member in &members {
+            browse.hear_at(true, 4, member, left + silence + secs(1));
+        }
+        assert!(ask(), "back after every member's silence");
+        assert!(!ask(), "told once");
+        drop(look);
+        end.recv_timeout(HANG)
+            .expect("the source ends once nothing asks");
+        assert_eq!(
+            moved.told(),
+            1,
+            "one move for the rejoin, none for the hour"
+        );
+        drop(browse);
     }
 
     /// One rejoin heard on the browse is one move: when this Mac comes back after longer than
-    /// [`aterm_secrets::discover::REREGISTERING_WITHIN`], every member's `Add` comes at once (none
-    /// is held since its `Rmv` as the Mac left), and the browse's bell keeps one ring for all of
-    /// them, so the source tells them as one move, as the route source and the Commons beacon
-    /// tell theirs, not one move a rest each for a quarter of an hour.
+    /// [`aterm_secrets::discover::SILENCE`], every member's `Add` comes at once (none is held
+    /// since its `Rmv` as the Mac left), and the browse's bell keeps one ring for all of them, so
+    /// the source tells them as one move, as the route source and the Commons beacon tell theirs,
+    /// not one move a rest each for a quarter of an hour.
     /// NEGATIVE CONTROL: a nap that leaves the bell rung tells a move each time it is asked.
     #[test]
     #[cfg(unix)]
@@ -1598,7 +1534,7 @@ pub(crate) mod tests {
         );
         let start = Instant::now();
         let left = start + Duration::from_secs(30);
-        let back = left + aterm_secrets::discover::REREGISTERING_WITHIN + Duration::from_secs(1);
+        let back = left + aterm_secrets::discover::SILENCE + Duration::from_secs(1);
         for (add, at) in [(true, start), (false, left), (true, back)] {
             for i in 0..34 {
                 browse.hear_at(add, 4, &format!("member-{i:02}"), at);

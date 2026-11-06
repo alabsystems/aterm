@@ -145,6 +145,24 @@ const CASES: [(Option<SwitchPaint>, Option<CardPalette>); 9] = [
     (Some(TURNING_OFF), Some(CardPalette::Off)),
 ];
 
+/// The width of the pane a test's top line is laid across ([`key_for`]): wider than any run.
+const PANE_COLS: usize = 240;
+
+/// The glass's tokens on [`blank`]'s pane under `palette`, over [`plain_run`]'s grey.
+fn top_glass(palette: Option<CardPalette>) -> GlassInks {
+    GlassInks::of(
+        palette,
+        pack_rgb(blank().bg),
+        pack_rgb(blank().fg),
+        pack_rgb([90, 90, 90]),
+    )
+}
+
+/// The marks ink at frame column `col` of the test pane under `palette` ([`GlassInks::mark`]).
+fn mark_at(palette: Option<CardPalette>, col: usize) -> [u8; 3] {
+    rgb_of(top_glass(palette).mark(aterm_effects::glass_inks::field(col, PANE_COLS)))
+}
+
 fn key_for(
     program: aterm_phase::Program,
     run: TopRun,
@@ -162,7 +180,10 @@ fn key_for(
         switch,
         palette,
         blank,
-        mark_fg: [0xd7, 0x77, 0x57],
+        field: PaneField {
+            col_off: 0,
+            cols: PANE_COLS,
+        },
         face,
         cell: CELL,
         clip: aterm_core::render::PxRect::EVERYWHERE,
@@ -821,14 +842,14 @@ fn the_ghost_sits_left_of_the_switch() {
             let (a, b) = top.ghost.expect("the ghost is drawn");
             let ghost = a - 1..b + 1;
             assert_eq!(text(ghost.clone()), ghost_text, "{at}: the ghost whole");
-            // Claude's grey, floored to read as words do ([`greyed_on`]).
-            let greyed = FactInks::of(run.rule.fg, blank().fg, run.rule.bg).stub;
+            // The glass's quiet ink ([`GlassInks::quiet`]).
+            let greyed = rgb_of(top_glass(palette).quiet());
             for c in ghost.clone() {
                 let cell = top.cells[c - top.col];
                 assert_eq!(
                     (cell.fg, cell.bold, cell.script),
                     (greyed, false, aterm_core::terminal::Script::Normal),
-                    "{at}: the ghost in Claude's gray"
+                    "{at}: the ghost in the quiet ink"
                 );
             }
             let laid = lay_top(run.span(GHOST), Some(switch), Some(lockup));
@@ -1292,8 +1313,8 @@ fn hb_int_narrowest(paint: SwitchPaint) -> &'static str {
     match paint.face {
         HarnessSwitch::On => " \u{25cf} on ",
         HarnessSwitch::Off(_) => " \u{2590} on \u{258c} ",
-        HarnessSwitch::Turning => " \u{25d0} on ",
-        HarnessSwitch::TurningOff => " \u{25d0} off ",
+        HarnessSwitch::Turning => " \u{25cc} on ",
+        HarnessSwitch::TurningOff => " \u{25cc} off ",
     }
 }
 
@@ -1386,7 +1407,7 @@ fn the_mark_cell_survives_every_rung() {
                 let face = KeyFace {
                     ghost: None,
                     tag: Some(tag),
-                    mark: Some('\u{25d0}'),
+                    mark: Some('\u{25cc}'),
                 };
                 let top = composed_with((program, build), run, switch, palette, face, &tail);
                 if top.cells.is_empty() {
@@ -1397,8 +1418,8 @@ fn the_mark_cell_survives_every_rung() {
                 let now = top.tag.unwrap_or(tag);
                 assert_eq!(
                     cell(now.0 - 2).map(|c| (c.ch, c.fg)),
-                    Some(('\u{25d0}', [0xd7, 0x77, 0x57])),
-                    "{at}: the mark, in the accent"
+                    Some(('\u{25cc}', mark_at(palette, now.0 - 2))),
+                    "{at}: the mark, in its column's marks ink"
                 );
                 if top.tag.is_some() {
                     let word: String = (now.0..now.1).filter_map(cell).map(|c| c.ch).collect();
@@ -1421,62 +1442,46 @@ fn the_mark_cell_survives_every_rung() {
         KeyFace {
             ghost: None,
             tag: Some(tag_in(len)),
-            mark: Some('\u{25d0}'),
+            mark: Some('\u{25cc}'),
         },
         &tail,
     );
     assert!(top.tag.is_some(), "CONTROL: the zone moved");
     assert_ne!(
         top.cells[tag_in(len).0 - 2 - top.col].ch,
-        '\u{25d0}',
+        '\u{25cc}',
         "CONTROL: the grid's column holds the harness now"
     );
 }
 
-fn tint_at(palette: CardPalette, t: f32) -> [u8; 3] {
-    let dark = crate::claude_card::dark_ground(blank());
-    let lifted = mix(rgb_of(palette.art(t, dark)), blank().fg, 0.25);
-    let fg = mix([90, 90, 90], lifted, 0.68);
-    if fg == [90, 90, 90] {
-        [fg[0] ^ 1, fg[1], fg[2]]
-    } else {
-        fg
-    }
+/// The arc's `─` at palette position `t` under `palette` ([`GlassInks::rule`]).
+fn tint_of(palette: CardPalette, t: f32) -> [u8; 3] {
+    rgb_of(top_glass(Some(palette)).rule(t))
 }
 
-/// Whether `top`'s rule flows into its switch under `palette`: the rule after the lockup at the
-/// arc's end, the last of `gap` at its start, the `─` from there to the switch at its start, and
-/// the close at its end again.
-fn flows(
-    top: &ComposedTop,
-    palette: CardPalette,
-    gap: std::ops::Range<usize>,
-) -> Result<(), String> {
-    let at = |c: usize| top.cells[c - top.col];
-    let s = top.switch.as_ref().ok_or("no switch")?;
-    let end = top.col + top.cells.len();
-    if at(gap.start).fg != tint_at(palette, 1.0) {
-        return Err("the rule after the lockup is not t = 1".into());
-    }
-    if at(gap.end - 1).fg != tint_at(palette, 0.0) {
-        return Err(format!(
-            "the gap's last cell is not t = 0: {:?}",
-            at(gap.end - 1).fg
-        ));
-    }
-    for c in gap.end..s.cols.start {
-        if at(c).ch == '\u{2500}' && at(c).fg != tint_at(palette, 0.0) {
-            return Err(format!(
-                "the `\u{2500}` at {c} into the switch is not t = 0"
-            ));
-        }
-    }
-    for c in end - 2..end {
-        if at(c).fg != tint_at(palette, 1.0) {
-            return Err("the close is not t = 1".into());
-        }
-    }
-    Ok(())
+/// The arc's `─` at frame column `col` of the test pane under `palette`.
+fn tint_at(palette: CardPalette, col: usize) -> [u8; 3] {
+    tint_of(palette, aterm_effects::glass_inks::field(col, PANE_COLS))
+}
+
+/// Whether every `─` of `top`'s rule under `palette`, from its lead to its close, wears the arc
+/// of its own column ([`tint_at`]).
+fn flows(top: &ComposedTop, palette: CardPalette) -> Result<(), String> {
+    top.cells
+        .iter()
+        .enumerate()
+        .map(|(k, cell)| (top.col + k, cell))
+        .filter(|(col, cell)| cell.ch == '\u{2500}' && !top.lockup.contains(col))
+        .try_for_each(|(col, cell)| {
+            if cell.fg == tint_at(palette, col) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "the `\u{2500}` at {col} is not its column's arc: {:?}",
+                    cell.fg
+                ))
+            }
+        })
 }
 
 #[test]
@@ -1518,21 +1523,20 @@ fn the_rule_flows_into_the_switch() {
         ] {
             let at = format!("{what} {palette:?} {:?}", paint.face);
             let gap = gap_of(top);
-            flows(top, palette, gap.clone()).unwrap_or_else(|e| panic!("{at}: {e}"));
+            flows(top, palette).unwrap_or_else(|e| panic!("{at}: {e}"));
             assert_eq!(top.col, run.col, "{at}: the whole span");
             assert_eq!(
                 top.col + top.cells.len(),
                 run.end,
                 "{at}: to the rule's end"
             );
-            for cell in &top.cells[..2] {
-                assert_eq!(cell.fg, tint_at(palette, 1.0), "{at}: the lead");
+            for (k, cell) in top.cells[..2].iter().enumerate() {
+                assert_eq!(cell.fg, tint_at(palette, top.col + k), "{at}: the lead");
             }
-            let g = gap.len() as f32 - 1.0;
             for (j, c) in gap.clone().enumerate() {
                 assert_eq!(
                     top.cells[c - top.col].fg,
-                    tint_at(palette, 1.0 - j as f32 / g),
+                    tint_at(palette, c),
                     "{at}: gap cell {j}"
                 );
             }
@@ -1547,10 +1551,15 @@ fn the_rule_flows_into_the_switch() {
                 );
             }
             let (label, _) = s.label.clone().expect("the label");
-            let brand = FaceInks::of(&paint, Some(palette), blank(), [0xd7, 0x77, 0x57]).brand;
-            for c in label.start..label.start + 4 {
+            let inks = FaceInks::of(&top_glass(Some(palette)));
+            for (k, c) in (label.start..label.start + 4).enumerate() {
                 let cell = top.cells[c - top.col];
-                assert_eq!((cell.fg, cell.bold), (brand, true), "{at}: `alab`");
+                let brand = inks.brand(k as f32 / 3.0);
+                assert_eq!(
+                    (cell.fg, cell.bold),
+                    (brand, true),
+                    "{at}: `alab`, letter {k}"
+                );
             }
         }
         let layout = |t: &ComposedTop| t.cells.iter().map(|c| c.ch).collect::<String>();
@@ -1566,13 +1575,14 @@ fn the_rule_flows_into_the_switch() {
                 assert_eq!(a, b, "{what} cell {k}: the switch keeps the pane's inks");
             }
         }
+        // Line B's old arc ran the gap from its own end to its start, whatever its columns.
         let mut old = cruise.cells.clone();
         let gap = gap_of(&cruise);
         let g = gap.len() as f32 - 1.0;
-        for (j, c) in gap.clone().enumerate() {
-            old[c - cruise.col].fg = tint_at(CardPalette::Cruise, j as f32 / g);
+        for (j, c) in gap.enumerate() {
+            old[c - cruise.col].fg = tint_of(CardPalette::Cruise, 1.0 - j as f32 / g);
         }
-        let reversed = ComposedTop {
+        let relative = ComposedTop {
             cells: old,
             switch: cruise.switch.clone(),
             lockup: cruise.lockup.clone(),
@@ -1580,18 +1590,18 @@ fn the_rule_flows_into_the_switch() {
             ..ComposedTop::default()
         };
         assert!(
-            flows(&reversed, CardPalette::Cruise, gap).is_err(),
-            "CONTROL {what}: the left-to-right walk leaves a seam"
+            flows(&relative, CardPalette::Cruise).is_err(),
+            "CONTROL {what}: the gap-relative ramp is not the column's"
         );
     }
 }
 
-/// A SHORT GAP RAMPS TOO: where the pane leaves only a few `─` between the lockup and the
-/// harness (2 to 7 cells), they still run the arc from its end at the lockup to its start at the
-/// switch, one step a cell, as a wide gap does. CONTROL: the gap in one ink, the arc's start,
-/// does not flow.
+/// THE ARC IS THE COLUMN'S AT EVERY WIDTH: from a pane that leaves a few `─` between the
+/// lockup and the harness (2 to 7 cells) to a wide one, every `─` of the top line wears the arc of
+/// its own column, so a column's hue is the same whatever else the line lays. CONTROL: a short
+/// gap in one ink does not.
 #[test]
-fn a_short_gap_ramps_too() {
+fn the_arc_is_the_columns_at_every_width() {
     let mut short = std::collections::BTreeSet::new();
     for len in 20..68 {
         let run = plain_run(len);
@@ -1604,6 +1614,8 @@ fn a_short_gap_ramps_too() {
         let Some(s) = top.switch.as_ref() else {
             continue;
         };
+        let at = format!("run {len}");
+        flows(&top, CardPalette::Cruise).unwrap_or_else(|e| panic!("{at}: {e}"));
         if top.lockup.is_empty() {
             continue;
         }
@@ -1613,18 +1625,9 @@ fn a_short_gap_ramps_too() {
             continue;
         }
         short.insert(g);
-        let at = format!("run {len}, gap {g}");
-        flows(&top, CardPalette::Cruise, gap.clone()).unwrap_or_else(|e| panic!("{at}: {e}"));
-        for (j, c) in gap.clone().enumerate() {
-            assert_eq!(
-                top.cells[c - top.col].fg,
-                tint_at(CardPalette::Cruise, 1.0 - j as f32 / (g - 1) as f32),
-                "{at}: gap cell {j}"
-            );
-        }
         let mut flat = top.cells.clone();
-        for c in gap.clone() {
-            flat[c - top.col].fg = tint_at(CardPalette::Cruise, 0.0);
+        for c in gap {
+            flat[c - top.col].fg = tint_of(CardPalette::Cruise, 0.0);
         }
         let flat = ComposedTop {
             cells: flat,
@@ -1634,8 +1637,8 @@ fn a_short_gap_ramps_too() {
             ..ComposedTop::default()
         };
         assert!(
-            flows(&flat, CardPalette::Cruise, gap).is_err(),
-            "CONTROL {at}: one ink does not flow"
+            flows(&flat, CardPalette::Cruise).is_err(),
+            "CONTROL {at}, gap {g}: one ink is not the columns'"
         );
     }
     assert!(
@@ -1723,7 +1726,7 @@ fn the_tag_is_redrawn_whole_left_of_the_switch() {
         None,
         None,
         KeyFace {
-            mark: Some('\u{25d0}'),
+            mark: Some('\u{25cc}'),
             ..GHOST
         },
     );
@@ -1732,8 +1735,12 @@ fn the_tag_is_redrawn_whole_left_of_the_switch() {
         run.col + 19 - GHOST_CELLS - 2,
         "the mark's cell first"
     );
-    assert_eq!(pending.cells[0].ch, '\u{25d0}');
-    assert_eq!(pending.cells[0].fg, [0xd7, 0x77, 0x57], "the accent");
+    assert_eq!(pending.cells[0].ch, '\u{25cc}');
+    assert_eq!(
+        pending.cells[0].fg,
+        mark_at(None, pending.col),
+        "the marks ink: with no palette, the value's"
+    );
     assert_eq!(pending.cells.len(), 1 + GHOST_CELLS);
     let lit = composed(
         run,
@@ -1747,7 +1754,7 @@ fn the_tag_is_redrawn_whole_left_of_the_switch() {
     for cell in &lit.cells[at - (lit.col - run.col)..] {
         let underlined = cell.underline == aterm_core::terminal::UnderlineStyle::Single;
         assert_eq!(underlined, cell.ch != ' ', "{:?}", cell.ch);
-        assert_eq!(cell.fg, value_fg(run.rule.fg, [220, 220, 220]), "lifted");
+        assert_eq!(cell.fg, rgb_of(top_glass(None).value()), "the value ink");
     }
     let tail = claude_tail();
     let len = 60;
@@ -2311,8 +2318,8 @@ fn marks_write_only_the_run() {
 
 /// THE BARE SWITCH READS ON EVERY GROUND: with no harness theme the switch's and the label's every
 /// glyph, at every tier, in every state, at rest and under the pointer, keeps the pane's ground
-/// and reads at the name floor on it, for every built-in scheme's ground under every built-in's
-/// accent. CONTROL: the label's quiet words unfloored, and an accent alone, fail on paper.
+/// and reads at the name floor on it, for every built-in scheme's ground; no system accent reads
+/// into it. CONTROL: the label's quiet words unfloored fail on paper.
 #[test]
 fn the_bare_switch_reads_on_every_ground() {
     use aterm_effects::color_math::contrast_ratio;
@@ -2320,9 +2327,6 @@ fn the_bare_switch_reads_on_every_ground() {
     let pack = |c: [u8; 3]| u32::from_be_bytes([0, c[0], c[1], c[2]]);
     let reads = |a: [u8; 3], b: [u8; 3]| contrast_ratio(pack(a), pack(b));
     let rgb = |c: aterm_types::Rgb| [c.r, c.g, c.b];
-    let accent_of = |s: &aterm_types::ColorScheme| {
-        crate::chrome_band::band_colors(aterm_render::Theme::from(s)).accent
-    };
     let floor = aterm_effects::cli_marks::NAME_CONTRAST;
     let schemes: Vec<_> = builtin_names()
         .into_iter()
@@ -2337,68 +2341,69 @@ fn the_bare_switch_reads_on_every_ground() {
             bg: rgb(ground.background),
             ..RenderCell::default()
         };
-        for (accent_name, instance) in &schemes {
-            let accent = accent_of(instance);
-            for face in [
-                HarnessSwitch::On,
-                HarnessSwitch::Off(SwitchOff::Master),
-                HarnessSwitch::Off(SwitchOff::Agent(aterm_phase::Program::Claude)),
-                HarnessSwitch::Turning,
-                HarnessSwitch::TurningOff,
+        let glass = GlassInks::of(
+            None,
+            pack(blank.bg),
+            pack(blank.fg),
+            pack(mix(blank.bg, blank.fg, 0.35)),
+        );
+        for face in [
+            HarnessSwitch::On,
+            HarnessSwitch::Off(SwitchOff::Master),
+            HarnessSwitch::Off(SwitchOff::Agent(aterm_phase::Program::Claude)),
+            HarnessSwitch::Turning,
+            HarnessSwitch::TurningOff,
+        ] {
+            for hover in [
+                HoverAt::None,
+                HoverAt::Switch,
+                HoverAt::Label,
+                HoverAt::Arrow,
             ] {
-                for hover in [
-                    HoverAt::None,
-                    HoverAt::Switch,
-                    HoverAt::Label,
-                    HoverAt::Arrow,
-                ] {
-                    let paint = SwitchPaint {
-                        hover,
-                        cli_ver: Inline::new("2.1.305"),
-                        up: arrow_paint(UpState::Ready).up,
-                        ..SwitchPaint::bare(face, Some(aterm_phase::CliHarness::ClaudeCode))
+                let paint = SwitchPaint {
+                    hover,
+                    cli_ver: Inline::new("2.1.305"),
+                    up: arrow_paint(UpState::Ready).up,
+                    ..SwitchPaint::bare(face, Some(aterm_phase::CliHarness::ClaudeCode))
+                };
+                let inks = FaceInks::of(&glass);
+                let mut cells: Vec<(String, RenderCell)> = switch_face(paint)
+                    .cells()
+                    .iter()
+                    .map(|&ch| {
+                        let c = switch_cell(ch, &paint, &inks, blank);
+                        (format!("switch {ch:?}"), c)
+                    })
+                    .collect();
+                for tier in 0..LABEL_TIERS {
+                    let Some(f) = label_face(&paint, tier) else {
+                        continue;
                     };
-                    let inks = FaceInks::of(&paint, None, blank, accent);
-                    let mut cells: Vec<(String, RenderCell)> = switch_face(paint)
-                        .cells()
-                        .iter()
-                        .map(|&ch| {
-                            let c = switch_cell(ch, &paint, &inks, blank);
-                            (format!("switch {ch:?}"), c)
-                        })
-                        .collect();
-                    for tier in 0..LABEL_TIERS {
-                        let Some(f) = label_face(&paint, tier) else {
-                            continue;
-                        };
-                        // The label, and every form of the words its slot may show in its place.
-                        let forms = slot_words(&paint, tier).map(|w| w.0).unwrap_or_default();
-                        let shown = std::iter::once(f)
-                            .chain(forms.iter().map(|form| LabelFace::of_words(form)));
-                        for face in shown {
-                            for &(ch, ink) in face.cells() {
-                                let c = label_cell(ch, ink, &inks, blank);
-                                cells.push((format!("label {tier} {ch:?}"), c));
-                            }
+                    // The label, and every form of the words its slot may show in its place.
+                    let forms = slot_words(&paint, tier).map(|w| w.0).unwrap_or_default();
+                    let shown = std::iter::once(f)
+                        .chain(forms.iter().map(|form| LabelFace::of_words(form)));
+                    for face in shown {
+                        for &(ch, ink) in face.cells() {
+                            let c = label_cell(ch, ink, 0.0, &inks, blank);
+                            cells.push((format!("label {tier} {ch:?}"), c));
                         }
                     }
-                    for (what, c) in cells {
-                        let what = format!(
-                            "{accent_name}'s accent on {ground_name}, {face:?} {hover:?}, {what}"
-                        );
-                        assert_eq!(c.bg, blank.bg, "{what}: on the ground");
-                        if c.ch == ' ' {
-                            continue;
-                        }
-                        let k = reads(c.fg, blank.bg);
-                        assert!(k >= floor, "{what}: at {k:.2}:1");
-                        checked += 1;
+                }
+                for (what, c) in cells {
+                    let what = format!("{ground_name}, {face:?} {hover:?}, {what}");
+                    assert_eq!(c.bg, blank.bg, "{what}: on the ground");
+                    if c.ch == ' ' {
+                        continue;
                     }
+                    let k = reads(c.fg, blank.bg);
+                    assert!(k >= floor, "{what}: at {k:.2}:1");
+                    checked += 1;
                 }
             }
         }
     }
-    assert!(checked >= 17 * 17 * 5 * 3 * 40, "{checked}");
+    assert!(checked >= 17 * 5 * 3 * 40, "{checked}");
     let solarized = builtin("Solarized Light").expect("a built-in");
     let paper = rgb(solarized.background);
     let quiet = mix(rgb(solarized.foreground), paper, 0.35);
@@ -2407,18 +2412,11 @@ fn the_bare_switch_reads_on_every_ground() {
         "CONTROL: the quiet words unfloored at {:.2}:1 on Solarized Light",
         reads(quiet, paper)
     );
-    let dracula = accent_of(&builtin("Dracula").expect("a built-in"));
-    let light = rgb(builtin("Default Light").expect("a built-in").background);
-    assert!(
-        reads(dracula, light) < 1.5,
-        "CONTROL: Dracula's accent at {:.2}:1 on Default Light",
-        reads(dracula, light)
-    );
 }
 
 /// THE THEMED SWITCH READS ON EVERY GROUND: under every harness theme the switch's and the
-/// label's inks (the version's, the quiet words and the switch at rest, the switch under the
-/// pointer, `alab` in the arc's end) read at the name floor on every built-in scheme's ground and
+/// label's inks (the version's and the switch under the pointer, the quiet words and the switch
+/// at rest, `alab`'s hero letters) read at the name floor on every built-in scheme's ground and
 /// on a grey ramp, Silver Aerogel's and Unikitty's included, and so does every glyph of the switch
 /// at rest and under the pointer. CONTROL: the arc's letter lifted but unfloored reads under 1.5:1
 /// on Silver Aerogel.
@@ -2447,7 +2445,6 @@ fn the_themed_switch_reads_on_every_ground() {
     grounds.push(("Silver Aerogel".into(), [0x92; 3], [0; 3]));
     grounds.push(("Unikitty".into(), [0xff, 0x8c, 0xd9], [0x0b; 3]));
     let floor = aterm_effects::cli_marks::NAME_CONTRAST;
-    let accent = [0x3b, 0x8e, 0xea];
     let (mut checked, mut glyphs, mut lows) = (0usize, 0usize, Vec::new());
     for (name, bg, fg) in &grounds {
         let blank = RenderCell {
@@ -2458,7 +2455,13 @@ fn the_themed_switch_reads_on_every_ground() {
         };
         for palette in [CardPalette::Cruise, CardPalette::Land, CardPalette::Off] {
             for paint in [LIT, OFF, MASTER_OFF, TURNING, TURNING_OFF] {
-                let inks = FaceInks::of(&paint, Some(palette), blank, accent);
+                let glass = GlassInks::of(
+                    Some(palette),
+                    pack(blank.bg),
+                    pack(blank.fg),
+                    pack(mix(blank.bg, blank.fg, 0.35)),
+                );
+                let inks = FaceInks::of(&glass);
                 for hover in [HoverAt::None, HoverAt::Switch] {
                     let paint = SwitchPaint { hover, ..paint };
                     for &ch in switch_face(paint).cells().iter().filter(|&&ch| ch != ' ') {
@@ -2477,8 +2480,10 @@ fn the_themed_switch_reads_on_every_ground() {
                 for (what, ink) in [
                     ("the version", inks.lit),
                     ("the quiet words", inks.muted),
-                    ("the switch under the pointer", inks.lifted),
-                    ("alab", inks.brand),
+                    ("alab's first letter", inks.brand(0.0)),
+                    ("alab's second letter", inks.brand(1.0 / 3.0)),
+                    ("alab's third letter", inks.brand(2.0 / 3.0)),
+                    ("alab's last letter", inks.brand(1.0)),
                 ] {
                     let k = reads(ink, blank.bg);
                     if k < floor {
@@ -2923,9 +2928,9 @@ fn arrow_paint(state: UpState) -> SwitchPaint {
 
 /// THE ARROW ENDS THE RULE A BLANK FROM ITS CLOSE: on a wide rule the ⬆️ takes the two cells
 /// before the close's blank, emoji-presented with its continuation, a blank before it, the label
-/// right-aligned to that blank; its hit takes it and both blanks. An asked move's one-cell `◐`
+/// right-aligned to that blank; its hit takes it and both blanks. An asked move's one-cell `◌`
 /// takes the first of those cells with the second blank, and the close runs on from there as
-/// rule (`◐ ───`): one blank either side of it, as of the ⬆️. The ladder keeps it on every rung,
+/// rule (`◌ ───`), each `─` in its column's arc: one blank either side of it, as of the ⬆️. The ladder keeps it on every rung,
 /// three cells more for the same label and chrome. CONTROL:
 /// with no arrow the label ends at the close's blank.
 #[test]
@@ -2967,13 +2972,17 @@ fn the_arrow_ends_the_rule_a_blank_from_its_close() {
             _ => {
                 assert_eq!(
                     (at(field - 5).ch, at(field - 5).fg, at(field - 4).ch),
-                    ('\u{25d0}', [0xd7, 0x77, 0x57], ' '),
-                    "asked: the accent's half-moon, a blank"
+                    (
+                        '\u{25cc}',
+                        mark_at(Some(CardPalette::Cruise), field - 5),
+                        ' '
+                    ),
+                    "asked: the in-flight mark in its column's marks ink, a blank"
                 );
                 assert_eq!(
                     (at(field - 3).ch, at(field - 3).fg),
-                    ('\u{2500}', at(field - 2).fg),
-                    "asked: the close runs on to the half-moon's blank, in its own ink"
+                    ('\u{2500}', tint_at(CardPalette::Cruise, field - 3)),
+                    "asked: the close runs on to the mark's blank, in its column's arc"
                 );
             }
         }
@@ -3053,7 +3062,7 @@ fn the_arrow_ends_the_rule_a_blank_from_its_close() {
     );
 }
 
-/// AN ASKED MOVE KEEPS THE LABEL'S WIDTH: a press turns the ⬆️ to `◐` and nothing else moves,
+/// AN ASKED MOVE KEEPS THE LABEL'S WIDTH: a press turns the ⬆️ to `◌` and nothing else moves,
 /// the rung and the label as they were at every width; under the pointer the asked arrow says
 /// the move is on its way.
 #[test]
@@ -3125,7 +3134,7 @@ fn laid_at(top: &ComposedTop) -> (std::ops::Range<usize>, Option<(usize, usize)>
 /// (`v2.1.310 · after 1 shell`), and only where the room holds no form with the when does the
 /// verb and the target, then the target alone, take the label's own cells, moving nothing. A
 /// refused press's words win for a few seconds; a sprite rings the arrow, and none rings an
-/// asked move's `◐`, which takes no press. CONTROL: at rest the label shows, and at a tier with
+/// asked move's `◌`, which takes no press. CONTROL: at rest the label shows, and at a tier with
 /// no label the hover writes nothing new.
 #[test]
 fn the_arrows_words_say_when_the_move_lands() {
@@ -3255,7 +3264,7 @@ fn the_arrows_words_say_when_the_move_lands() {
          ({kept})"
     );
     let (key, over) = slot_top(jobs, 158);
-    let inks = FaceInks::of(&jobs, Some(CardPalette::Cruise), blank(), key.mark_fg);
+    let inks = FaceInks::of(&top_glass(Some(CardPalette::Cruise)));
     let (cols, _) = over
         .switch
         .as_ref()
@@ -3268,8 +3277,8 @@ fn the_arrows_words_say_when_the_move_lands() {
         .take("v2.1.310".len())
         .collect();
     assert!(
-        target.iter().all(|c| c.bold && c.fg == inks.target) && inks.target != inks.muted,
-        "the target build bold in its own ink: {target:?}"
+        target.iter().all(|c| c.bold && c.fg == inks.lit) && inks.lit != inks.muted,
+        "the target build bold in the lit ink, as a version: {target:?}"
     );
     let ring = ring_layer(&key, &over, 7, &mut RingContents::default()).expect("a ring");
     let s = over.switch.as_ref().expect("laid");
@@ -3288,7 +3297,7 @@ fn the_arrows_words_say_when_the_move_lands() {
     );
     assert!(
         ring_layer(&asked_key, &asked_over, 7, &mut RingContents::default()).is_none(),
-        "an asked move's \u{25d0} takes no press: no ring"
+        "an asked move's \u{25cc} takes no press: no ring"
     );
     let held = SwitchPaint {
         up: arrow_paint(UpState::Held).up,
@@ -3540,18 +3549,14 @@ fn the_labels_hover_says_only_what_it_leaves_out() {
         (grew, stood.len()),
         "the switch moves left by exactly the cells the words grew"
     );
-    let inks = FaceInks::of(
-        &over,
-        Some(CardPalette::Cruise),
-        blank(),
-        [0xd7, 0x77, 0x57],
-    );
+    let inks = FaceInks::of(&top_glass(Some(CardPalette::Cruise)));
     let lead = cells.iter().position(|c| c.ch != ' ').expect("words");
     assert!(
         cells[lead..lead + 4]
             .iter()
-            .all(|c| c.bold && c.fg == inks.brand),
-        "`alab` keeps the brand's ink"
+            .enumerate()
+            .all(|(k, c)| c.bold && c.fg == inks.brand(k as f32 / 3.0)),
+        "`alab` keeps the hero's letters"
     );
     let snug = (60..158)
         .find(|&w| {
@@ -3795,7 +3800,7 @@ fn a_slot_never_shows_a_cut_form() {
 }
 
 /// Why the switch `top` laid from `key` reads as a box, if it does: a cell of it off the pane's
-/// ground, bold, or in an ink other than the label's quiet one (the lifted one under the pointer),
+/// ground, bold, or in an ink other than the label's quiet one (the lit one under the pointer),
 /// or a sprite of `layers` that writes a pixel of its cells.
 fn boxed(
     key: &TopKey,
@@ -3804,11 +3809,15 @@ fn boxed(
 ) -> Result<(), String> {
     let paint = key.switch.ok_or("no switch painted")?;
     let s = top.switch.as_ref().ok_or("no switch laid")?;
-    let inks = FaceInks::of(&paint, key.palette, key.blank, key.mark_fg);
-    let ink = if paint.forced {
+    let glass = GlassInks::of(
+        key.palette,
+        pack_rgb(key.blank.bg),
+        pack_rgb(key.blank.fg),
+        pack_rgb(key.run.rule.fg),
+    );
+    let inks = FaceInks::of(&glass);
+    let ink = if paint.forced || paint.hovered() {
         inks.lit
-    } else if paint.hovered() {
-        inks.lifted
     } else {
         inks.muted
     };

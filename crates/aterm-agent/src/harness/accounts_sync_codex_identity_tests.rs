@@ -536,6 +536,8 @@ fn the_second_lab_sync_follows_the_native_default_after_the_actual_first_import(
             .collect(),
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),
+        #[cfg(unix)]
+        machine_name: None,
         places: Default::default(),
     };
     alab_roster::with_lab(lab, || {

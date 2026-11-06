@@ -89,7 +89,7 @@ mod queued_panes {
                 QUEUED_PANE_OPENS.with(|opened| opened.borrow_mut().push(access));
                 true
             },
-            recorded: |_, _| Some(AccessOutcome::Triggered),
+            recorded: |_, _| Some(AccessOutcome::Handed),
             quiet: |app, _| queued_pane_front(app),
             ..StepsReach::INERT
         });
@@ -107,7 +107,7 @@ mod queued_panes {
             Some(app.system_state_host.generation),
             queued_accessibility_status(Plan::default(), Standing::NeedsYou),
         );
-        app.tick_local_network_step(Instant::now());
+        app.end_lapsed_access_pane(Instant::now());
         let (_, view) = app.active_native_view(wid).unwrap();
         set_queued_pane_front(false);
         QUEUED_PANE_OPENS.with(|opened| opened.borrow_mut().clear());

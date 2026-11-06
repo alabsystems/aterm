@@ -271,7 +271,7 @@ fn spread_json(s: &Spread) -> aterm_json::Value {
 #[must_use]
 pub fn render_json(reading: &Reading, since_ms: Option<u64>, dir: &str, rows: bool) -> String {
     let kinds: Vec<aterm_json::Value> = by_kind(&reading.rows)
-        .iter()
+        .into_iter()
         .map(|k| {
             aterm_json::json!({
                 "kind": k.kind,

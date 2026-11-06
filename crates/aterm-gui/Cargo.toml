@@ -457,6 +457,8 @@ aterm-digest = { workspace = true }
 aterm-winres = { workspace = true }
 
 [dev-dependencies]
+# The lib tests' counting global allocator (`work_counts::allocations_in`).
+aterm-heap-count = { path = "../aterm-heap-count" }
 aterm-link = { path = "../aterm-link" }
 # `verify perf throughput`'s corpus, for the `c_cut_cost` bench (a lib with no
 # dependencies of its own).
@@ -528,6 +530,8 @@ aterm-win32 = { workspace = true }
 # The mesh logs and their relay (docs/DESIGN-alab-one-mesh-2026-11-05.md §11 B7a): the node job
 # hosts tables.log and metrics.log, serves their `Bus` streams and relays them to its neighbours.
 aterm-mesh = { workspace = true }
+# The `now/needs` row's codec (§4.14): each window frames its needs row to the node job in it.
+aterm-metrics = { path = "../aterm-metrics" }
 # `video frames` and the confined artifact store (`pinned_dir.rs`) open every
 # path component relative to a RETAINED directory descriptor and never re-resolve
 # a name afterwards. aterm-dirfd supplies those fd-relative `*at` wrappers over

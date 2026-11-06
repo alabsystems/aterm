@@ -238,6 +238,83 @@ fn sync_commit_rejects_changed_target_corruption_and_read_epoch() {
     assert!(bed.store.recover_sync_held(&held, &bed.path).is_err());
 }
 
+/// A commit's barrier flushes every directory on the way up from each directory it names, each one
+/// once however many of those ways pass it.
+///
+/// NEGATIVE CONTROL (2026-11-05): with no check of what was flushed, this fails at "two ways up"
+/// with 20 flushes for 12 directories; with `/` skipped, at the same words with 11 for 12.
+#[test]
+fn a_commits_ancestry_flushes_each_directory_up_to_the_root_once() {
+    use aterm_durable::{Flush, seam::Recording};
+    let root = aterm_tempfile::TempDir::new().unwrap();
+    let store = root.path().join("state/accounts");
+    let roster = root.path().join("config/rosters");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::create_dir_all(&roster).unwrap();
+    let union: BTreeSet<&Path> = store.ancestors().chain(roster.ancestors()).collect();
+    let flushed = |dirs: &[&Path]| {
+        let recording = Recording::start();
+        durable_ancestry(dirs.iter().copied()).unwrap();
+        recording.take()
+    };
+    assert_eq!(
+        flushed(&[&store, &roster]),
+        vec![Flush::Durable; union.len()],
+        "two ways up from {}",
+        root.path().display()
+    );
+    assert_eq!(
+        flushed(&[&store]).len(),
+        store.ancestors().count(),
+        "one way up"
+    );
+    // A directory already passed on the way up from the other ends only its own walk.
+    assert_eq!(
+        flushed(&[&store, root.path(), &store]).len(),
+        store.ancestors().count(),
+        "one directory named on the way up from another"
+    );
+}
+
+/// The one path to a commit with no recovery of its own refuses a pending receipt before it reads
+/// or edits anything: its snapshots read with no receipt check under the lock it holds.
+///
+/// NEGATIVE CONTROL (2026-11-05): with this path's receipt read removed, this fails at "a pending
+/// receipt", `(false, true)` against `(true, false)`: it read past the receipt, edited and published.
+#[test]
+fn a_held_sync_refuses_a_pending_or_damaged_receipt_before_its_edit() {
+    let bed = Bed::new();
+    let text = std::fs::read_to_string(&bed.path).unwrap();
+    let held = bed.store.acquire().unwrap();
+    let attempt = || {
+        let mut edited = false;
+        let got = bed.store.transact_sync_held(
+            &held,
+            NOW,
+            &mut None,
+            SyncTarget {
+                path: &bed.path,
+                before: Some(&text),
+                after: Some(&text),
+                mode: None,
+            },
+            |_, _| {
+                edited = true;
+                Ok(Vec::new())
+            },
+            || Ok(()),
+        );
+        (got.is_err(), edited)
+    };
+    bed.pending();
+    let before = bed.files();
+    assert_eq!(attempt(), (true, false), "a pending receipt");
+    assert_eq!(bed.files(), before);
+    std::fs::write(bed.store.dir.join(RECEIPT), "not JSON").unwrap();
+    assert_eq!(attempt(), (true, false), "a damaged receipt");
+    assert_eq!(bed.files(), before);
+}
+
 #[test]
 fn sync_commit_rejects_linked_receipt_and_preserves_target() {
     let bed = Bed::new();

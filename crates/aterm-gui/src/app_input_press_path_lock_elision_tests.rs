@@ -1148,8 +1148,6 @@ fn a_press_keeps_the_glow_s_hand_on_its_row_exactly_when_the_seam_does() {
         Menu(crate::menu::MenuAction),
         /// A click on the native tab bar's chip for the tab already in front.
         ActiveTabChip,
-        /// A click on the window's presence pill.
-        Pill,
         /// A tab's context menu opening (its chip right-clicked).
         #[cfg(target_os = "macos")]
         TabMenuOpening,
@@ -1255,7 +1253,6 @@ fn a_press_keeps_the_glow_s_hand_on_its_row_exactly_when_the_seam_does() {
             true,
         ),
         ("active tab chip", Via::ActiveTabChip, true),
-        ("pill", Via::Pill, true),
         (
             "bound Copy, ctrl+shift+c",
             Via::Bound(
@@ -1466,10 +1463,6 @@ fn a_press_keeps_the_glow_s_hand_on_its_row_exactly_when_the_seam_does() {
                         crate::app_tabs::NativeTabCommand::Select(tab)
                     )
                 );
-            }
-            Via::Pill => {
-                let session = app.front_terminal(wid).expect("terminal").session;
-                app.on_pill_wake(wid, session, crate::presence::PillHit::Go);
             }
             #[cfg(target_os = "macos")]
             Via::TabMenuOpening => app.on_tab_context_menu_opening(wid),

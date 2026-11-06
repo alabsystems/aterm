@@ -628,6 +628,16 @@ impl Endpoint {
             })
             .collect()
     }
+    /// Where discovery keeps what it remembers of this endpoint's peers across restarts: its
+    /// Commons custody directory (the journal's parent, beside the owner's lease and the contact
+    /// ledger), with the trust and seat a kept file must name to be read. None while enrollment
+    /// is pending: a Mac with no seat has verified no peer.
+    pub(crate) fn discovery_memory(&self) -> Option<(&Path, Trust, Actor)> {
+        (!self.pending)
+            .then(|| self.dir.parent())
+            .flatten()
+            .map(|dir| (dir, self.trust, self.actor))
+    }
     /// The current seats whose fleet node key `speaks` names (it speaks `Bus`), by this
     /// endpoint's log: only a key that is one member's current node key names a seat, so neither
     /// a removed, replaced nor contested key holds anyone out of repair.
@@ -852,6 +862,26 @@ impl Endpoint {
         self.application = self
             .application
             .map(|application| application.with_marks(marks));
+        self
+    }
+
+    /// Neither ask nor answer which tables differ, as a build from before CR1 does.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_witnesses(mut self, witnesses: bool) -> Self {
+        self.application = self
+            .application
+            .map(|application| application.with_witnesses(witnesses));
+        self
+    }
+
+    /// MUTANT: echo every witness ask heard, as CR1's first cut did.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_echoes(mut self, echoes: bool) -> Self {
+        self.application = self
+            .application
+            .map(|application| application.with_echoes(echoes));
         self
     }
 

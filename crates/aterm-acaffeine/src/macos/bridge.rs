@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Keep-awake bridge process across aterm update restarts.
+//! Keep-awake bridge process across aterm update restarts. It holds what the mug would
+//! ([`crate::model::hold`]): nothing while the lid is closed without Keep Awake with Lid Closed,
+//! and that option's `PreventSystemSleep` besides the activity when it is on.
 
 use std::io::{self, BufRead as _, Read as _, Write};
 use std::path::Path;
@@ -117,7 +119,11 @@ pub(crate) fn run() -> ExitCode {
         return ExitCode::FAILURE;
     };
     let me = std::process::id();
-    match bridge(&paths, me, &mut io::stdout(), Awake::begin, POLL, MAX) {
+    let doors = Doors {
+        begin: Awake::begin,
+        machine: crate::held::machine_now,
+    };
+    match bridge(&paths, me, &mut io::stdout(), doors, POLL, MAX) {
         Ok(()) => ExitCode::SUCCESS,
         Err(why) => {
             eprintln!("aterm acaffeine: bridge (pid {me}): {why}");
@@ -126,29 +132,49 @@ pub(crate) fn run() -> ExitCode {
     }
 }
 
+/// What a bridge holds its activity with (`begin`) and reads the machine with (`machine`,
+/// [`crate::held::machine_now`]; a test's arm reads an open lid).
+#[derive(Clone, Copy)]
+struct Doors {
+    begin: fn(&str) -> Option<Awake>,
+    machine: fn() -> crate::model::Machine,
+}
+
 fn bridge(
     paths: &Paths,
     me: u32,
     out: &mut impl Write,
-    begin: fn(&str) -> Option<Awake>,
+    doors: Doors,
     poll: Duration,
     max: Duration,
 ) -> Result<(), String> {
-    if !mode_on(paths) {
+    let wanted = || wanted(paths, doors.machine);
+    let Some(hold) = wanted() else {
         return Ok(());
-    }
+    };
     let file = paths.bridge_file();
     write_pid(&file, me).map_err(|e| format!("{}: {e}", file.display()))?;
-    let Some(awake) = begin(AWAKE_REASON) else {
+    let Some(awake) = (doors.begin)(AWAKE_REASON) else {
         forget(&file, me);
         return Err("the keep-awake activity did not begin".into());
     };
+    let lid = hold
+        .system()
+        .then(|| aterm_sysprobe::power::hold(crate::held::LID_ASSERTION, AWAKE_REASON))
+        .flatten();
     let _ = writeln!(out, "{HELD}").and_then(|()| out.flush());
     eprintln!("aterm acaffeine: bridge (pid {me}) keeps the Mac awake while the mug restarts");
     let since = Instant::now();
-    while holds(read_pid(&file), me, mode_on(paths), since.elapsed(), max) {
+    while holds(
+        read_pid(&file),
+        me,
+        wanted().is_some(),
+        since.elapsed(),
+        max,
+    ) {
         std::thread::sleep(poll);
     }
+    drop(lid);
     drop(awake);
     forget(&file, me);
     eprintln!(
@@ -162,9 +188,13 @@ fn holds(named: Option<u32>, me: u32, on: bool, held: Duration, max: Duration) -
     named == Some(me) && on && held < max
 }
 
-fn mode_on(paths: &Paths) -> bool {
+/// What the mug would hold now ([`crate::model::hold`]) when that is the activity, with or
+/// without the lid's assertion: `None` while the mode is off or paused.
+fn wanted(paths: &Paths, machine: fn() -> crate::model::Machine) -> Option<crate::model::Hold> {
     let now = state::clocks().unwrap_or_default();
-    state::load(&paths.state_file(), now).is_on(now)
+    let on = state::load(&paths.state_file(), now).is_on(now);
+    let hold = crate::model::hold(on, state::load_lid(&paths.lid_file()), machine());
+    hold.activity().then_some(hold)
 }
 
 /// Releases any running update-restart bridge by removing the bridge PID file.
@@ -288,6 +318,48 @@ mod tests {
 
     const SAYS: Duration = Duration::from_secs(60);
 
+    /// A bridge's doors in a test: `begin`, and a machine with its lid open in a full wake.
+    fn doors(begin: fn(&str) -> Option<Awake>) -> Doors {
+        Doors {
+            begin,
+            machine: crate::model::Machine::default,
+        }
+    }
+
+    /// A bridge over a closed lid with Keep Awake with Lid Closed off holds nothing and says
+    /// nothing, the mode staying on; with the option on it holds.
+    /// NEGATIVE CONTROL: the same bridge over an open lid holds.
+    #[test]
+    fn a_bridge_over_a_closed_lid_holds_only_with_the_opt_in() {
+        let dir = crate::test_scratch_dir("bridge");
+        let paths = scratch(dir.path());
+        state::save(&paths.state_file(), Mode::Forever).expect("saved on");
+        let closed = || crate::model::Machine {
+            lid_closed: true,
+            ..crate::model::Machine::default()
+        };
+        assert_eq!(wanted(&paths, closed), None);
+        let (tx, rx) = mpsc::channel();
+        let mut out = Said(tx, Vec::new());
+        let doors = Doors {
+            begin: |_| panic!("nothing to hold with the lid closed"),
+            machine: closed,
+        };
+        bridge(&paths, 4242, &mut out, doors, POLL, MAX).expect("paused");
+        assert!(rx.try_recv().is_err());
+        assert!(!paths.bridge_file().exists());
+        assert_eq!(
+            wanted(&paths, crate::model::Machine::default),
+            Some(crate::model::Hold::Idle),
+            "CONTROL"
+        );
+        state::save_lid(&paths.lid_file(), true).expect("lid on");
+        assert_eq!(
+            wanted(&paths, closed),
+            Some(crate::model::Hold::LidClosedToo)
+        );
+    }
+
     #[test]
     fn a_bridge_holds_while_it_is_named_on_and_short_of_its_bound() {
         let max = Duration::from_secs(60);
@@ -321,7 +393,15 @@ mod tests {
         let mut out = Said(tx, Vec::new());
         let poll = Duration::from_millis(20);
         let begun = Instant::now();
-        bridge(&paths, 4242, &mut out, |_| Awake::begin(REASON), poll, SAYS).expect("bridge");
+        bridge(
+            &paths,
+            4242,
+            &mut out,
+            doors(|_| Awake::begin(REASON)),
+            poll,
+            SAYS,
+        )
+        .expect("bridge");
         assert!(
             begun.elapsed() < SAYS,
             "it let go when its file went, not at its bound"
@@ -354,7 +434,7 @@ mod tests {
                     let mut out = Said(said, Vec::new());
                     let begin = |_: &str| Awake::begin("aterm acaffeine bridge let-go test");
                     let poll = Duration::from_millis(20);
-                    let _ = done.send(bridge(&paths, 4242, &mut out, begin, poll, max));
+                    let _ = done.send(bridge(&paths, 4242, &mut out, doors(begin), poll, max));
                 });
             }
             assert_eq!(heard.recv_timeout(SAYS).as_deref(), Ok(HELD));
@@ -387,7 +467,7 @@ mod tests {
             &paths,
             4242,
             &mut out,
-            |_| panic!("nothing to hold"),
+            doors(|_| panic!("nothing to hold")),
             POLL,
             MAX,
         )
@@ -397,7 +477,7 @@ mod tests {
         state::save(&paths.state_file(), Mode::Forever).expect("saved on");
         let (tx, rx) = mpsc::channel();
         let mut out = Said(tx, Vec::new());
-        assert!(bridge(&paths, 4242, &mut out, |_| None, POLL, MAX).is_err());
+        assert!(bridge(&paths, 4242, &mut out, doors(|_| None), POLL, MAX).is_err());
         assert!(rx.try_recv().is_err());
         assert!(!paths.bridge_file().exists());
     }

@@ -86,10 +86,9 @@ impl Goal {
 /// The ink a mode's chip is drawn in ([`Mode::ink`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModeInk {
-    /// The ink of the composer's bottom rule the chip sits on: bypass, the default, named quietly.
-    Rule,
-    /// The mode's own hue, as Claude's pill wears it (auto's warning amber).
-    Hue([u8; 3]),
+    /// The glass's value ink: a mode the owner expects (bypass, the default, and auto) named as
+    /// a fact's value is, with no hue of its own.
+    Value,
     /// The row's plain ink: a mode the owner does not expect, drawn as plainly as Claude's text.
     Row,
 }
@@ -221,15 +220,16 @@ impl Mode {
             .map_or("", |pill| pill.glyph)
     }
 
-    /// The ink the mode's chip is drawn in: bypass in the rule's own ink (`yolo` is the default
-    /// and reads as quietly as the rule it sits on, never Claude's red; the owner, 2026-11-02),
-    /// auto in its pill's warning amber, every other mode in the row's plain ink.
+    /// The ink the mode's chip is drawn in: an expected mode (bypass, the default, and auto) in
+    /// the glass's value ink, never Claude's red nor its pill's amber (`yolo` reads as a value,
+    /// the owner, 2026-11-02; `docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §4.1), every
+    /// other mode in the row's plain ink.
     #[must_use]
     pub const fn ink(self) -> ModeInk {
-        match self {
-            Mode::Bypass => ModeInk::Rule,
-            Mode::Auto => ModeInk::Hue([0xE8, 0xB0, 0x3C]),
-            _ => ModeInk::Row,
+        if self.is_expected() {
+            ModeInk::Value
+        } else {
+            ModeInk::Row
         }
     }
 }
@@ -499,18 +499,15 @@ mod tests {
         assert_eq!(Goal::Off.words(false), "manual");
     }
 
-    /// YOLO IS DRAWN IN THE RULE'S INK, NEVER RED (the owner, 2026-11-02): bypass takes the
-    /// rule's own ink, auto keeps its pill's amber, every other mode the row's plain ink.
+    /// YOLO AND AUTO ARE VALUES, NEVER RED NOR AMBER (the owner, 2026-11-02; the glass's one
+    /// token set): an expected mode takes the glass's value ink, every other mode the row's
+    /// plain ink.
     #[test]
-    fn yolo_wears_the_rules_ink_and_auto_its_amber() {
-        assert_eq!(Mode::Bypass.ink(), ModeInk::Rule);
-        assert_eq!(Mode::Auto.ink(), ModeInk::Hue([0xE8, 0xB0, 0x3C]));
+    fn expected_modes_wear_the_value_ink_and_the_rest_the_rows() {
+        assert_eq!(Mode::Bypass.ink(), ModeInk::Value);
+        assert_eq!(Mode::Auto.ink(), ModeInk::Value);
         for mode in ALL_MODES {
-            assert_eq!(
-                matches!(mode.ink(), ModeInk::Row),
-                !mode.is_expected(),
-                "{mode:?}"
-            );
+            assert_eq!(mode.ink() == ModeInk::Row, !mode.is_expected(), "{mode:?}");
         }
     }
 

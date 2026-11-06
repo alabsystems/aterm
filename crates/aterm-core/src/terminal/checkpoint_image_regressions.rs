@@ -110,7 +110,11 @@ fn a_live_png_above_the_kitty_limit_roundtrips_its_loose_carry() {
 fn a_live_sixel_above_the_kitty_limit_roundtrips_its_loose_carry() {
     let mut live = Terminal::new(4, 20);
     live.set_cell_pixel_size(10, 20);
-    live.process(b"\x1bP0;0;0q\"1;1;1025;1025#1;2;100;0;0~\x1b\\");
+    // 1025x1025 painted: 170 full bands and a last one of 5 rows.
+    let mut sixel = b"\x1bP0;0;0q\"1;1;1025;1025#1;2;100;0;0#1".to_vec();
+    sixel.extend_from_slice(&b"!1025~-".repeat(170));
+    sixel.extend_from_slice(b"!1025^\x1b\\");
+    live.process(&sixel);
     let carry = PaneStepCarry::capture(&live, aterm_time::Instant::now(), 1000);
     assert_eq!(
         carry.loose_images.len(),

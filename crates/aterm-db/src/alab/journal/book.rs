@@ -17,7 +17,7 @@ use super::{
 use crate::{
     Error, Result,
     catalog::ring::{JOURNAL_SHARES, Used},
-    database::{Change, Command, MAX_WRITES},
+    database::{Change, MAX_WRITES},
     typed::owned::{caps, fit},
 };
 use aterm_json::{Map, Value, json};
@@ -182,6 +182,14 @@ impl Facts {
         }
     }
 
+    /// The session starts it holds in the 7 days before `now`: a `use` row's `sessions_7d`.
+    pub(crate) fn sessions_7d(&self, now: u64) -> usize {
+        self.starts
+            .iter()
+            .filter(|t| t.saturating_add(7 * DAY) > now)
+            .count()
+    }
+
     /// The `use` row (design §4.17) at counter `n` in week `period`, within `cap` bytes: over
     /// it, walls whose `until` has passed go first, then the oldest readings, never anything
     /// else (`typed::owned::fit`).
@@ -196,12 +204,10 @@ impl Facts {
         base.insert("first".into(), Value::from(self.first));
         base.insert("last_start".into(), Value::from(self.last_start));
         base.insert("last_end".into(), Value::from(self.last_end));
-        let recent = self
-            .starts
-            .iter()
-            .filter(|t| t.saturating_add(7 * DAY) > now)
-            .count();
-        base.insert("sessions_7d".into(), Value::from(recent as u64));
+        base.insert(
+            "sessions_7d".into(),
+            Value::from(self.sessions_7d(now) as u64),
+        );
         if let Some(s) = &self.signin {
             base.insert(
                 "signin".into(),
@@ -277,6 +283,87 @@ fn same_content(stated: &Value, row: &Value) -> bool {
         && stated
             .iter()
             .all(|(k, v)| !matches!(k.as_str(), "n" | "period") && row.get(k) == Some(v))
+}
+
+/// One account's facts as this Mac's book holds them, for a reader outside the flusher: the
+/// metrics publisher's quota row (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.14) takes its
+/// sign-in word, last session start and end, sessions in 7 days and plan from here.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AccountFacts {
+    /// The newest sign-in word (`in`, `out`, `ended`, `wrong`, `failed`) and when it was seen,
+    /// Unix seconds.
+    pub signin: Option<(&'static str, u64)>,
+    /// The last session start here, Unix seconds; `None` before the first.
+    pub last_start: Option<u64>,
+    /// The last session end here, Unix seconds; `None` before the first.
+    pub last_end: Option<u64>,
+    /// Sessions started here in the 7 days before the read's `now`.
+    pub sessions_7d: u32,
+    /// The plan word and when it was seen.
+    pub plan: Option<(String, u64)>,
+}
+
+/// One account this Mac holds that no preference here names, as the book holds it: why, since
+/// when, and until when its row stands unless restated. An ended place has `until` at its end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlaceFacts {
+    /// Why this Mac holds it.
+    pub why: Why,
+    /// Since when it has held for that reason, Unix seconds.
+    pub since: u64,
+    /// Until when the place stands unless restated, Unix seconds.
+    pub until: u64,
+    /// The harness no longer reports it.
+    pub ended: bool,
+}
+
+/// What this Mac's book knows of the accounts it used and the places it holds, by account key.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BookFacts {
+    /// Each account's (or workspace's, under its `sa-` key) facts.
+    pub accounts: BTreeMap<Pk, AccountFacts>,
+    /// Each place.
+    pub places: BTreeMap<Pk, PlaceFacts>,
+}
+
+impl Book {
+    /// What the book knows, as of `now`.
+    pub(crate) fn facts(&self, now: u64) -> BookFacts {
+        let when = |t: u64| (t > 0).then_some(t);
+        BookFacts {
+            accounts: self
+                .accounts
+                .iter()
+                .map(|(pk, facts)| {
+                    (
+                        *pk,
+                        AccountFacts {
+                            signin: facts.signin.as_ref().map(|s| (s.state, s.t)),
+                            last_start: when(facts.last_start),
+                            last_end: when(facts.last_end),
+                            sessions_7d: u32::try_from(facts.sessions_7d(now)).unwrap_or(u32::MAX),
+                            plan: facts.plan.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            places: self
+                .places
+                .iter()
+                .map(|(pk, place)| {
+                    (
+                        *pk,
+                        PlaceFacts {
+                            why: place.why,
+                            since: place.since,
+                            until: place.until,
+                            ended: place.ended,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
 }
 
 /// What this Mac states about itself in its `sum` row (design §4.17), read by the caller.
@@ -361,24 +448,11 @@ pub(crate) struct Planned {
     pub off: bool,
 }
 
-/// Whether `changes` fit one flush record: at most 64 changes and 60 KiB of payload.
-fn fits(changes: &mut Vec<Change>) -> bool {
-    if changes.len() > MAX_WRITES {
-        return false;
-    }
-    let command = Command::Write {
-        request: [0; 16],
-        changes: std::mem::take(changes),
-    };
-    let ok = command
-        .encode()
-        .is_ok_and(|payload| payload.len() <= caps::RECORD);
-    let Command::Write { changes: kept, .. } = command else {
-        unreachable!()
-    };
-    *changes = kept;
-    ok
-}
+/// `Command::Write::encode()` wraps the serialized `changes` JSON array (`[...]`) in a fixed
+/// 78-byte envelope (`{"changes":...,"kind":"write","request":"<32-hex>","v":1}`), so an empty
+/// write command is 80 bytes and each change adds its serialized JSON length (plus 1 comma byte
+/// after the first change).
+const EMPTY_WRITE_BYTES: usize = 80;
 
 /// `outbox` with `absorbed` added, each event once, oldest first, those older than 30 days and
 /// the oldest past the spool's cap dropped; and which of `absorbed` were new.
@@ -734,27 +808,43 @@ impl Book {
             off,
             ..Planned::default()
         };
+        let mut payload_len = EMPTY_WRITE_BYTES;
         let outbox = if off { &[] } else { outbox };
         if !outbox.is_empty() {
             let values: Vec<Value> = outbox.iter().map(Event::to_value).collect();
             let batch = |kept: &[Value]| json!({"r": VERSION, "n": n, "e": kept});
             let events = fit(&values, caps::EV_BATCH, batch)?;
             if events > 0 {
-                planned.changes.push(Change {
+                let change = Change {
                     collection: super::EV.name.into(),
                     key: format!("{uuid}.{n}"),
                     value: Some(batch(&values[..events])),
-                });
+                };
+                let change_len = aterm_json::to_vec(&change)
+                    .map_err(|_| Error::new("a journal flush record passes its limits"))?
+                    .len();
+                payload_len += change_len;
+                if payload_len > caps::RECORD {
+                    return Err(Error::new("a journal flush record passes its limits"));
+                }
+                planned.changes.push(change);
                 planned.events = events;
             }
         }
-        let offer = |planned: &mut Planned, change: Change| {
-            planned.changes.push(change);
-            let fit = fits(&mut planned.changes);
-            if !fit {
-                planned.changes.pop();
+        let offer = |planned: &mut Planned, payload_len: &mut usize, change: Change| {
+            if planned.changes.len() >= MAX_WRITES {
+                return false;
             }
-            fit
+            let Some(change_len) = aterm_json::to_vec(&change).ok().map(|b| b.len()) else {
+                return false;
+            };
+            let next_len = *payload_len + usize::from(!planned.changes.is_empty()) + change_len;
+            if next_len > caps::RECORD {
+                return false;
+            }
+            *payload_len = next_len;
+            planned.changes.push(change);
+            true
         };
         if self.sum_period != Some(period) || self.sum_off != off {
             let row = self.sum_row(presence, n, period, now, off);
@@ -763,7 +853,7 @@ impl Book {
                 key: uuid.clone(),
                 value: Some(row),
             };
-            planned.sum = offer(&mut planned, change);
+            planned.sum = offer(&mut planned, &mut payload_len, change);
         }
         if off {
             return Ok(planned);
@@ -774,7 +864,7 @@ impl Book {
                 key: format!("{}.{uuid}", pk.as_str()),
                 value: Some(row.clone()),
             };
-            if offer(&mut planned, change) {
+            if offer(&mut planned, &mut payload_len, change) {
                 planned.uses.push((pk, row));
             }
         }
@@ -784,7 +874,7 @@ impl Book {
                 key: format!("{}.{uuid}", pk.as_str()),
                 value: Some(row.clone()),
             };
-            if offer(&mut planned, change) {
+            if offer(&mut planned, &mut payload_len, change) {
                 planned.places.push((pk, row));
             }
         }
@@ -794,12 +884,9 @@ impl Book {
                 key: format!("rl-{bucket:x}.{uuid}"),
                 value: Some(row.clone()),
             };
-            if offer(&mut planned, change) {
+            if offer(&mut planned, &mut payload_len, change) {
                 planned.relays.push((bucket, row));
             }
-        }
-        if !fits(&mut planned.changes) {
-            return Err(Error::new("a journal flush record passes its limits"));
         }
         Ok(planned)
     }

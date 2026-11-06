@@ -76,10 +76,11 @@ fn bind(pkg: &atpkg::PkgManifest, program: &str, build: u64, which: &str, tag: &
 /// # Errors
 ///
 /// A refusal naming what does not hold: the signed manifest pair under the client's rule,
-/// the program/build bind, at least one artifact, every release asset's sha256, and exactly
-/// the signed set plus an optional matching version reservation; an I/O error when an
+/// the program/build bind, at least one artifact, every payload asset's sha256, required
+/// native reference evidence, and exactly that set plus an optional matching version reservation; an I/O error when an
 /// asset cannot be hashed or reservation metadata cannot be read.
 pub fn check_staged(
+    ctx: &Ctx,
     quad: &VerifiedQuad,
     dir: &Path,
     staged: &[String],
@@ -128,11 +129,32 @@ pub fn check_staged(
             expected.push(asset);
         }
     }
+    for receipt in crate::artifact::bottle::reference::qualification::receipt_names(&bytes)? {
+        if !staged.contains(&receipt) {
+            return Err(Error::refused(format!(
+                "{tag} staging release lacks native reference evidence {receipt}"
+            )));
+        }
+        expected.push(receipt);
+    }
+    crate::artifact::bottle::reference::qualification::require(
+        &dir.join(pkgdoc::manifest_name(program, build)),
+        &bytes,
+    )?;
     if staged
         .iter()
         .any(|name| name == upload::VERSION_RESERVATION)
     {
         upload::check_version_reservation(&dir.join(upload::VERSION_RESERVATION), &pkg.version)?;
+    }
+    if program == "trust" {
+        // The mirror has no authority to substitute a pack after native canary execution.
+        // Verification is under the same head roster as the package, never a host claim.
+        crate::canary::check_receipt(ctx, quad, dir, build)?;
+        expected.extend([
+            crate::canary::RECEIPT.to_string(),
+            crate::canary::SIGNATURE.to_string(),
+        ]);
     }
     if let Some(extra) = staged
         .iter()
@@ -312,7 +334,11 @@ fn one(
         })?;
         bind(&pkg, program, build, "the public", &tag)?;
         let mut complete = true;
-        for (asset, _) in release_assets(&pkg) {
+        for asset in release_assets(&pkg)
+            .into_iter()
+            .map(|(asset, _)| asset)
+            .chain(crate::artifact::bottle::reference::qualification::receipt_names(&bytes)?)
+        {
             match channel.probe_public(&public, &tag, &asset) {
                 Probe::Present => {}
                 Probe::Absent => complete = false,
@@ -347,7 +373,8 @@ fn one(
         )),
         e => host_error(format!("download {staging}@{tag}"), &e),
     })?;
-    let (expected, staged_pkg) = check_staged(quad, &dir, &staged_release.assets, program, build)?;
+    let (expected, staged_pkg) =
+        check_staged(ctx, quad, &dir, &staged_release.assets, program, build)?;
     if public_mf {
         let same = |name: &str, cached: Option<&[u8]>| {
             let pub_bytes = match cached {

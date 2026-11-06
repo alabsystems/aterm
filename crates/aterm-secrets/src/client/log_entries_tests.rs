@@ -9,7 +9,6 @@ use crate::membership_log::{
     Entrant, EpochAudience, Evidence, Kind, MemberId, Record, encode_records,
 };
 use crate::server::Options as ServerOptions;
-use std::collections::VecDeque;
 
 #[path = "coalesce_tests.rs"]
 mod coalesce;
@@ -50,6 +49,14 @@ pub(super) fn start_loopback_server(store: &Path) -> crate::server::Running {
 
 fn start_loopback_server_at(store: &Path, clock: Option<fn() -> u64>) -> crate::server::Running {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    start_server_on(listener, store, clock)
+}
+
+fn start_server_on(
+    listener: std::net::TcpListener,
+    store: &Path,
+    clock: Option<fn() -> u64>,
+) -> crate::server::Running {
     let options = ServerOptions {
         listen: "127.0.0.1:0".parse().expect("addr"),
         store: store.to_path_buf(),
@@ -271,6 +278,19 @@ fn a_mac_writes_the_same_files_from_the_log_as_from_the_envelope() {
     );
 }
 
+/// Law 5 on two lab Macs: m22 and m7 each `Put` the `[everyone]` entry `race-token` beside the
+/// other and each receives the other's after its own. Both open the lower record id's value as a
+/// conflict from their own logs, both `Put`s survive in each store, both Macs write that value to
+/// disk, and one later save settles the conflict.
+///
+/// No arrival-order control fits here: a Mac reads its log from its records file, which the
+/// records cache recovers ([`crate::membership_log::Store::recover`]) inserting each record after
+/// its parents, ties by record id. So two homes holding the same records hold them in one order
+/// whatever order they arrived in, and a register whose first sibling seen wins
+/// (`entries-arrival-order`) reads alike on both (measured 2026-11-06: under it both read the
+/// lower id's `Put`). The arrival order reaches a register only in a log that stays in memory
+/// across inserts, where
+/// `entries::tests::every_arrival_order_of_concurrent_writes_reads_the_same_entries` catches it.
 #[test]
 fn concurrent_puts_both_survive_and_every_mac_writes_the_same_one() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -368,21 +388,37 @@ fn concurrent_puts_both_survive_and_every_mac_writes_the_same_one() {
         })
         .unwrap();
 
-    // Negative control ("Order by arrival"): choosing the last-arrived write makes two Macs that
-    // hear `[put_m22, put_m7]` vs `[put_m7, put_m22]` materialize different values!
-    let arrival_last = |order: &[(&Record, &[u8])]| -> Vec<u8> { order.last().unwrap().1.to_vec() };
-    let by_arrival_on_m22 = arrival_last(&[(&put_m22, b"from-m22"), (&put_m7, b"from-m7")]);
-    let by_arrival_on_m7 = arrival_last(&[(&put_m7, b"from-m7"), (&put_m22, b"from-m22")]);
-    assert_ne!(
-        by_arrival_on_m22, by_arrival_on_m7,
-        "negative control: arrival ordering diverges across opposite delivery orders"
-    );
-
     // Deliver in opposite orders locally BEFORE talking to the server, then materialize on each:
     save_records(&m22, put_m22.bytes()).unwrap();
     save_records(&m22, put_m7.bytes()).unwrap();
     save_records(&m7, put_m7.bytes()).unwrap();
     save_records(&m7, put_m22.bytes()).unwrap();
+
+    // Each Mac opens the lower `RecordId`'s value, as a conflict, from its own log.
+    let expected_winner: &[u8] = if put_m22.id() < put_m7.id() {
+        b"from-m22"
+    } else {
+        b"from-m7"
+    };
+    let opens = |paths: &Paths| {
+        let store = load_records(paths).unwrap();
+        let opened = store
+            .log()
+            .unwrap()
+            .open_entry_set(&read_identity(paths).unwrap().unwrap())
+            .unwrap()
+            .unwrap();
+        let race = (Audience::Everyone, "race-token".to_owned());
+        let value = opened
+            .entries
+            .iter()
+            .find(|e| e.audience == race.0 && e.name == race.1)
+            .map(|e| e.value.as_slice().to_vec());
+        (value, opened.conflicts.contains(&race))
+    };
+    for paths in [&m22, &m7] {
+        assert_eq!(opens(paths), (Some(expected_winner.to_vec()), true));
+    }
 
     // Post both to server so envelope fetch sees no conflict and both Macs materialize from log.
     transport::post_records(&url, &encode_records([&put_m22, &put_m7])).unwrap();
@@ -407,11 +443,6 @@ fn concurrent_puts_both_survive_and_every_mac_writes_the_same_one() {
 
     // BOTH Macs write the exact value of the lower `RecordId`: m7 from the log, and m22, an admin
     // whose log moved, by mirroring the merged log (which leaves both values candidates).
-    let expected_winner: &[u8] = if put_m22.id() < put_m7.id() {
-        b"from-m22"
-    } else {
-        b"from-m7"
-    };
     sync(&m7, None).expect("m7 materializes concurrent puts");
     sync(&m22, None).expect("m22 materializes concurrent puts");
     sync(&m7, None).expect("m7 applies m22's mirror");
@@ -695,19 +726,39 @@ fn an_entry_edited_on_the_lower_seq_side_of_a_split_survives_the_heal() {
     s2.stop();
 }
 
-/// Copy the tree at `src` to `dst`, each directory private and each file `0600`: a home or a
-/// journal a replay starts from.
+/// Copy the private tree at `src` to `dst`, each entry with its mode: a home or a journal a replay
+/// starts from. A clone wherever one can be made, one call whatever the tree holds, which makes a
+/// model walk's copy of its Macs for every transition cost next to nothing.
 pub(super) fn copy_private_tree(src: &Path, dst: &Path) {
-    fsx::ensure_private_dir(dst).expect("ensure dst dir");
+    use std::os::unix::fs::DirBuilderExt as _;
+    let parent = dst.parent().expect("a copy's parent");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(parent)
+        .expect("make the copy's parent");
+    if aterm_tempfile::clone_tree(src, dst).is_err() {
+        copy_each_file(src, dst);
+    }
+}
+
+/// [`copy_private_tree`] where no clone can be made: off APFS, or into a `dst` that exists.
+fn copy_each_file(src: &Path, dst: &Path) {
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
+    let mode = std::fs::metadata(src).expect("src dir metadata").mode();
+    std::fs::DirBuilder::new()
+        .mode(mode & 0o7777)
+        .recursive(true)
+        .create(dst)
+        .expect("ensure dst dir");
     for entry in std::fs::read_dir(src).expect("read src dir") {
         let entry = entry.expect("dir entry");
         let ty = entry.file_type().expect("file type");
         let target = dst.join(entry.file_name());
         if ty.is_dir() {
-            copy_private_tree(&entry.path(), &target);
+            copy_each_file(&entry.path(), &target);
         } else if ty.is_file() {
-            let bytes = std::fs::read(entry.path()).expect("read file");
-            fsx::write_atomic(&target, &bytes, 0o600).expect("write file");
+            std::fs::copy(entry.path(), &target).expect("copy file");
         }
     }
 }
@@ -875,6 +926,31 @@ impl<'a> CommonsLogHarness<'a> {
         h
     }
 
+    /// A copy at `run_dir` of the Macs as `self` leaves them: a run that goes on from where this
+    /// one stands, without this one seeing it.
+    fn fork(&self, run_dir: &Path) -> Self {
+        let homes = [
+            ("m1", &self.m1),
+            ("m2", &self.m2),
+            ("m3", &self.m3),
+            ("m4", &self.m4),
+            ("m5", &self.m5),
+        ];
+        for (home, paths) in homes {
+            copy_private_tree(&paths.home, &run_dir.join(home));
+        }
+        Self {
+            fixture: self.fixture,
+            m1: Paths::for_home(&run_dir.join("m1")),
+            m2: Paths::for_home(&run_dir.join("m2")),
+            m3: Paths::for_home(&run_dir.join("m3")),
+            m4: Paths::for_home(&run_dir.join("m4")),
+            m5: Paths::for_home(&run_dir.join("m5")),
+            merged: self.merged,
+            reconciled: self.reconciled,
+        }
+    }
+
     fn apply(&mut self, action: &str) {
         match action {
             "AdmitDOnIslandA" => {
@@ -1039,6 +1115,14 @@ impl<'a> CommonsLogHarness<'a> {
     }
 }
 
+/// Each enabled action of the model runs on real Macs from a copy of a run standing in the state
+/// it leaves, and must reach the one state the model says it reaches.
+///
+/// NEGATIVE CONTROLS (2026-11-05): with [`CommonsLogHarness::fork`] forgetting `merged`,
+/// `ForkLegacyJournal` from a merged state reads `merged: 0` against the model's `1`; with it
+/// copying the template's homes instead of its run's, `RemoveBOnIslandA` from an admitted D reads
+/// `admitted_d: 0` against `1`. `prove_and_catch` and the skipped-reconcile run still hold each
+/// law and mutant.
 #[test]
 fn commons_log_model_conforms_and_catches_its_mutants() {
     let model = aterm_models_swarm::commons_log_model();
@@ -1046,78 +1130,44 @@ fn commons_log_model_conforms_and_catches_its_mutants() {
     let fired = aterm_spec::interp::fired_actions(&model);
     assert_eq!(fired.len(), 6, "fired actions: {fired:?}");
 
-    let mut paths: BTreeMap<aterm_spec::interp::State, Vec<&'static str>> = BTreeMap::new();
-    let mut queue = VecDeque::from([model.init_state()]);
-    paths.insert(model.init_state(), Vec::new());
-    while let Some(state) = queue.pop_front() {
-        for action in &model.actions {
-            for next in model.successors(action.name, &state) {
-                if !paths.contains_key(&next) {
-                    let mut path = paths[&state].clone();
-                    path.push(action.name);
-                    paths.insert(next.clone(), path);
-                    queue.push_back(next);
-                }
-            }
-        }
-    }
-    assert_eq!(
-        paths.len(),
-        aterm_spec::interp::reachable_states(&model).len()
-    );
-
-    // Every state but the start was found by one action from a state before it, so its path is
-    // that state's path and that action: the replay of the action there is the replay of the
-    // state's own path, and is judged against the state itself. Only the start is replayed alone.
-    let found_by: BTreeMap<&[&str], &aterm_spec::interp::State> = paths
-        .iter()
-        .map(|(state, path)| (path.as_slice(), state))
-        .collect();
-    assert_eq!(
-        found_by.len(),
-        paths.len(),
-        "every state has a path of its own"
-    );
-
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let fixture = CommonsLogFixture::build(root.path());
     let mut run_id = 0usize;
 
+    // Each enabled action runs on a copy of a run that stands in the state it leaves, and is judged
+    // against the one state the model says it reaches: a state's first such run is the one its own
+    // actions go on from. Only the start is replayed from the template.
     let start = model.init_state();
-    let observed = CommonsLogHarness::replay(&fixture, &root.path().join("s0"), &[]).observe();
-    assert_eq!(observed, start, "state mismatch after []");
-    let mut judged = BTreeSet::from([&start]);
-    for (state, path) in &paths {
+    let first = CommonsLogHarness::replay(&fixture, &root.path().join("s0"), &[]);
+    assert_eq!(first.observe(), start, "state mismatch after []");
+    let mut order = vec![start.clone()];
+    let mut realized = BTreeMap::from([(start, first)]);
+    let mut at = 0;
+    while let Some(state) = order.get(at).cloned() {
+        at += 1;
         for action in &model.actions {
-            if model.action_enabled(action.name, state) {
+            if model.action_enabled(action.name, &state) {
                 run_id += 1;
-                let mut h = CommonsLogHarness::replay(
-                    &fixture,
-                    &root.path().join(format!("t{run_id}")),
-                    path,
-                );
+                let mut h = realized[&state].fork(&root.path().join(format!("t{run_id}")));
                 h.apply(action.name);
-                let next_obs = h.observe();
-                let next_path = [path.as_slice(), &[action.name]].concat();
-                match found_by.get(next_path.as_slice()) {
-                    // The walk found `next` among this action's successors here.
-                    Some(&next) => {
-                        assert_eq!(&next_obs, next, "state mismatch after {next_path:?}");
-                        judged.insert(next);
-                    }
-                    None => assert!(
-                        model.successors(action.name, state).contains(&next_obs),
-                        "{} after {path:?} gave {next_obs:?}",
-                        action.name
-                    ),
+                let observed = h.observe();
+                assert_eq!(
+                    model.successors(action.name, &state),
+                    vec![observed.clone()],
+                    "{} from {state:?}",
+                    action.name
+                );
+                if let std::collections::btree_map::Entry::Vacant(slot) = realized.entry(observed) {
+                    order.push(slot.key().clone());
+                    slot.insert(h);
                 }
             }
         }
     }
     assert_eq!(
-        judged.len(),
-        paths.len(),
-        "every state was replayed and judged"
+        realized.len(),
+        aterm_spec::interp::reachable_states(&model).len(),
+        "every state was reached and judged"
     );
 
     // Negative control: claiming reconciliation finished without running the members' vault
@@ -1184,8 +1234,285 @@ pub(super) fn two_macs_with(entries: &[(Audience, &str, &[u8])], m7_admin: bool)
 }
 
 /// [`two_macs_with`], its server started by [`crate::server::start_with_clock`] on `clock` (unix
-/// seconds) where one is given.
+/// seconds) where one is given. A clock's lab is always built, its server having seen every
+/// publish by that clock.
 pub(super) fn two_macs_at(
+    entries: &[(Audience, &str, &[u8])],
+    m7_admin: bool,
+    clock: Option<fn() -> u64>,
+) -> TwoMacs {
+    if clock.is_some() {
+        return built_two_macs(entries, m7_admin, clock);
+    }
+    lab_template(entries, m7_admin).start()
+}
+
+/// [`two_macs`] with keys and a genesis no other lab holds: every other lab of the same entries
+/// is one vault under one signer, copied. For a test that needs a second vault, or searches keys
+/// for a rank.
+pub(super) fn fresh_two_macs(entries: &[(Audience, &str, &[u8])]) -> TwoMacs {
+    built_two_macs(entries, false, None)
+}
+
+/// One lab, stopped, for every test that asks for that lab: each is written from it into that
+/// test's own folder, with its own server on its own port, so nothing on disk is shared. Building
+/// a `two_macs(&[])` lab makes 1,735 counted file reads; writing one, its 61 files (2026-11-05).
+pub(super) struct LabTemplate {
+    tree: LabTree,
+    signer: String,
+}
+
+impl LabTemplate {
+    /// `lab`, stopped, whose `homes` are every home that names its url.
+    pub(super) fn of(lab: TwoMacs, homes: &[&Paths]) -> Self {
+        lab.server.stop();
+        Self {
+            tree: LabTree::of(lab.root.path(), &lab.url, homes),
+            signer: lab.signer,
+        }
+    }
+
+    /// A lab of this one's keys and files, in a new folder under a new server.
+    pub(super) fn start(&self) -> TwoMacs {
+        let (root, server, url) = self.tree.start();
+        TwoMacs {
+            m22: Paths::for_home(&root.path().join("m22")),
+            m7: Paths::for_home(&root.path().join("m7")),
+            root,
+            server,
+            url,
+            signer: self.signer.clone(),
+        }
+    }
+}
+
+/// What `build` makes, made on a thread of its own: a seam a test has set on its thread is that
+/// test's, never in a template every later test starts from.
+pub(super) fn off_this_thread<T: Send>(build: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let _answering = ServersAnswering::set();
+                build()
+            })
+            .join()
+            .expect("a lab template builds")
+    })
+}
+
+/// The template of `(entries, m7_admin)`, built once for each pair a test names.
+fn lab_template(
+    entries: &[(Audience, &str, &[u8])],
+    m7_admin: bool,
+) -> std::sync::Arc<LabTemplate> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    type Key = (Vec<(String, String, Vec<u8>)>, bool);
+    type Slot = Arc<OnceLock<Arc<LabTemplate>>>;
+    static TEMPLATES: Mutex<BTreeMap<Key, Slot>> = Mutex::new(BTreeMap::new());
+    let key = entries
+        .iter()
+        .map(|(audience, name, value)| {
+            (format!("{audience:?}"), (*name).to_owned(), value.to_vec())
+        })
+        .collect();
+    let slot = TEMPLATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry((key, m7_admin))
+        .or_default()
+        .clone();
+    slot.get_or_init(|| {
+        off_this_thread(|| {
+            let lab = built_two_macs(entries, m7_admin, None);
+            let (m22, m7) = (lab.m22.clone(), lab.m7.clone());
+            Arc::new(LabTemplate::of(lab, &[&m22, &m7]))
+        })
+    })
+    .clone()
+}
+
+/// Each directory by name, with its mode.
+type TreeDirs = Vec<(PathBuf, u32)>;
+/// Each file by name, with its bytes and its mode.
+type TreeFiles = Vec<(PathBuf, Vec<u8>, u32)>;
+
+/// Each directory and each file under `root`.
+fn tree_of(root: &Path) -> (TreeDirs, TreeFiles) {
+    fn walk(root: &Path, dir: &Path, dirs: &mut TreeDirs, files: &mut TreeFiles) {
+        use std::os::unix::fs::MetadataExt as _;
+        for entry in std::fs::read_dir(dir).expect("read lab dir") {
+            let entry = entry.expect("lab dir entry");
+            let path = entry.path();
+            let meta = entry.metadata().expect("lab file metadata");
+            let name = path
+                .strip_prefix(root)
+                .expect("under the lab")
+                .to_path_buf();
+            let mode = meta.mode() & 0o7777;
+            if meta.is_dir() {
+                dirs.push((name, mode));
+                walk(root, &path, dirs, files);
+            } else {
+                assert!(meta.is_file(), "{}: a lab holds files", path.display());
+                files.push((name, std::fs::read(&path).expect("read lab file"), mode));
+            }
+        }
+    }
+    let (mut dirs, mut files) = (Vec::new(), Vec::new());
+    walk(root, root, &mut dirs, &mut files);
+    (dirs, files)
+}
+
+/// A stopped lab's folder as bytes, each directory and file with its mode: a real tree to write
+/// out, whose files hold the lab's url only as [`Self::of`] says.
+pub(super) struct LabTree {
+    dirs: TreeDirs,
+    files: TreeFiles,
+    url: String,
+    /// Each home's `source.toml`, `state.toml` and configuration.
+    homes: Vec<(PathBuf, PathBuf, Config)>,
+}
+
+impl LabTree {
+    /// The tree at `root`, whose server has stopped and whose `homes` name `url` as their source:
+    /// their `source.toml` says it and their `state.toml` binds its digests, and no file holds it
+    /// otherwise, or a lab written from this would still point at this one's.
+    ///
+    /// NEGATIVE CONTROL (2026-11-05): with a file holding the url planted in the lab's folder, every
+    /// template panics (`planted binds the lab it was built in`, `left: Some("127.0.0.1:53956")`).
+    fn of(root: &Path, url: &str, homes: &[&Paths]) -> Self {
+        let (dirs, files) = tree_of(root);
+        let relative = |path: PathBuf| {
+            path.strip_prefix(root)
+                .expect("under the lab")
+                .to_path_buf()
+        };
+        let tree = Self {
+            dirs,
+            files,
+            url: url.to_owned(),
+            homes: homes
+                .iter()
+                .map(|paths| {
+                    (
+                        relative(paths.source_file()),
+                        relative(paths.state_file()),
+                        configured(paths).expect("a lab's home is configured"),
+                    )
+                })
+                .collect(),
+        };
+        let authority = url
+            .strip_prefix("http://")
+            .and_then(|rest| rest.split('/').next())
+            .expect("a lab's url names a host");
+        let mut bound = vec![authority.to_owned()];
+        for (_, _, config) in &tree.homes {
+            bound.extend(
+                [
+                    source_identity(config),
+                    network_observation::configuration_binding(config),
+                ]
+                .map(|digest| aterm_codec::hex::encode_lower(&digest)),
+            );
+        }
+        let rebound = tree.rebound("http://127.0.0.1:1/v1/alab");
+        for (name, bytes, _) in &tree.files {
+            let bytes = rebound.get(name).unwrap_or(bytes);
+            let held = bound.iter().find(|needle| {
+                bytes
+                    .windows(needle.len())
+                    .any(|at| at == needle.as_bytes())
+            });
+            assert_eq!(
+                held,
+                None,
+                "{} binds the lab it was built in",
+                name.display()
+            );
+        }
+        tree
+    }
+
+    /// This lab in a new folder, under a new server of its own, with what each home holds of the
+    /// old url made the new one's.
+    pub(super) fn start(&self) -> (aterm_tempfile::TempDir, crate::server::Running, String) {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let url = format!(
+            "http://{}/v1/alab",
+            listener.local_addr().expect("its port")
+        );
+        self.write(root.path(), &url);
+        let server = start_server_on(listener, &root.path().join("s1"), None);
+        (root, server, url)
+    }
+
+    fn write(&self, root: &Path, url: &str) {
+        use std::io::Write as _;
+        use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+        for (dir, mode) in &self.dirs {
+            std::fs::DirBuilder::new()
+                .mode(*mode)
+                .create(root.join(dir))
+                .expect("make lab dir");
+        }
+        let rebound = self.rebound(url);
+        for (name, bytes, mode) in &self.files {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(*mode)
+                .open(root.join(name))
+                .expect("make lab file");
+            let written = rebound.get(name).map_or(bytes.as_slice(), Vec::as_slice);
+            if !written.is_empty() {
+                file.write_all(written).expect("write lab file");
+            }
+        }
+    }
+
+    /// Each file that binds this lab's url, as it reads under `url`.
+    fn rebound(&self, url: &str) -> BTreeMap<PathBuf, Vec<u8>> {
+        let held = |name: &PathBuf| {
+            let (_, bytes, _) = self
+                .files
+                .iter()
+                .find(|(file, _, _)| file == name)
+                .expect("a home's file is in its tree");
+            String::from_utf8(bytes.clone()).expect("a home's toml is text")
+        };
+        let mut rebound = BTreeMap::new();
+        for (source, state, config) in &self.homes {
+            let next = Config {
+                source: Source::Url(url.to_owned()),
+                ..config.clone()
+            };
+            let mut text = held(state);
+            for (old, new) in [
+                (source_identity(config), source_identity(&next)),
+                (
+                    network_observation::configuration_binding(config),
+                    network_observation::configuration_binding(&next),
+                ),
+            ] {
+                text = text.replace(
+                    &aterm_codec::hex::encode_lower(&old),
+                    &aterm_codec::hex::encode_lower(&new),
+                );
+            }
+            rebound.insert(state.clone(), text.into_bytes());
+            rebound.insert(
+                source.clone(),
+                held(source).replace(&self.url, url).into_bytes(),
+            );
+        }
+        rebound
+    }
+}
+
+/// The lab [`two_macs_at`] describes, built step by step.
+fn built_two_macs(
     entries: &[(Audience, &str, &[u8])],
     m7_admin: bool,
     clock: Option<fn() -> u64>,
@@ -1229,6 +1556,141 @@ pub(super) fn two_macs_at(
         m22,
         m7,
     }
+}
+
+/// Everything a home holds that its lab's url could change, read as a Mac reads it, the url aside.
+fn home_reads(paths: &Paths) -> String {
+    let config = configured(paths).unwrap();
+    let state = load_state(paths).unwrap();
+    let recipient = read_identity(paths).unwrap().map(|key| key.recipient().0);
+    format!(
+        "{:?}",
+        (
+            [
+                source_bound(&config, &state),
+                materialization_ready(paths).unwrap(),
+                network_observation::project(paths, &config, &state).is_some(),
+                http204_observation::project(&config, recipient, &state).is_some(),
+                matches!(
+                    observe_commons(paths).unwrap(),
+                    crate::commons::Observation::Visible(_)
+                ),
+            ],
+            network_refresh::project(&config, recipient, &state),
+            (state.seq, state.digest, state.records_digest, state.heard),
+            (config.name, config.signer, config.followed, config.host),
+            load_records(paths).unwrap().encode(),
+            recipient,
+        )
+    )
+}
+
+/// A lab written from a template reads as the lab it copies, its url apart, holds nothing of that
+/// url, and shares nothing with a second lab written from the same template.
+///
+/// NEGATIVE CONTROLS (2026-11-05): with [`LabTree::rebound`] leaving `state.toml` as it stands,
+/// [`LabTree::of`] refuses it (`state.toml binds the lab it was built in`, naming the digest). With
+/// that check off too, `m22 reads as it was built` fails on `[false, false, false, false, false]`
+/// against `[true, true, true, false, true]`; with only the configuration binding left alone, on
+/// `[true, true, false, false, true], None` against the same and a refresh receipt. With
+/// [`LabTree::start`] handing the second lab the first one's folder, its server refuses (`another
+/// vault server holds the heard-history store`).
+#[test]
+fn a_lab_written_from_a_template_is_the_lab_it_copies() {
+    let _answering = ServersAnswering::set();
+    let entries = [(Audience::Everyone, "shared", b"copied".as_slice())];
+    let built = built_two_macs(&entries, false, None);
+    let reads = [home_reads(&built.m22), home_reads(&built.m7)];
+    let (m22, m7) = (built.m22.clone(), built.m7.clone());
+    let (old_url, signer) = (built.url.clone(), built.signer.clone());
+    let template = LabTemplate::of(built, &[&m22, &m7]);
+
+    let (first, second) = (template.start(), template.start());
+    assert_ne!(first.url, second.url, "each lab has its own server");
+    assert_eq!(
+        home_reads(&first.m22),
+        reads[0],
+        "m22 reads as it was built"
+    );
+    assert_eq!(home_reads(&first.m7), reads[1], "m7 reads as it was built");
+    assert_eq!(
+        configured(&first.m7).unwrap().source,
+        Source::Url(first.url.clone()),
+        "m7 reads from its own lab's server"
+    );
+    assert!(matches!(
+        sync(&first.m7, None).unwrap(),
+        SyncOutcome::Unchanged { .. }
+    ));
+
+    let admin = admin_open(&first.m22).unwrap();
+    let authority = old_url.strip_prefix("http://").unwrap();
+    let authority = authority.split('/').next().unwrap();
+    let rendered = admin.doc.render();
+    let rendered = String::from_utf8_lossy(rendered.as_slice()).into_owned();
+    assert!(
+        !rendered.contains(authority),
+        "the vault's document names the lab it was built in"
+    );
+    let mut doc = admin.doc.clone();
+    doc.set_entry(&Audience::Everyone, "shared", b"first")
+        .unwrap();
+    admin_publish(&first.m22, &admin, &doc).unwrap();
+    sync(&first.m7, None).unwrap();
+    sync(&second.m7, None).unwrap();
+    let shared = |paths: &Paths| std::fs::read(paths.home.join(".secrets/shared")).unwrap();
+    assert_eq!(shared(&first.m7), b"first");
+    assert_eq!(shared(&second.m7), b"copied", "the other lab heard nothing");
+    assert_eq!(shared(&second.m22), b"copied");
+
+    first.server.stop();
+    second.server.stop();
+    let fresh = fresh_two_macs(&entries);
+    assert_ne!(fresh.signer, signer, "a fresh lab is another vault");
+    fresh.server.stop();
+}
+
+/// Both arms of [`copy_private_tree`] make the tree they copy, names, modes and bytes.
+///
+/// NEGATIVE CONTROLS (2026-11-05): with [`copy_each_file`] leaving out `records.frontiers`, or
+/// making each directory `0700`, the `0755` `.config` a home holds reads `448`, `the copy made it`
+/// fails.
+#[test]
+fn a_clone_and_a_copy_of_a_home_are_the_same_tree() {
+    let _answering = ServersAnswering::set();
+    let lab = two_macs(&[]);
+    lab.server.stop();
+    let sorted = |root: &Path| {
+        let (mut dirs, mut files) = tree_of(root);
+        dirs.sort();
+        files.sort();
+        (dirs, files)
+    };
+    let source = sorted(&lab.m7.home);
+    assert!(
+        source.1.len() > 10,
+        "a home holds files: {} of them",
+        source.1.len()
+    );
+    let (cloned, copied) = (
+        lab.root.path().join("cloned"),
+        lab.root.path().join("copied"),
+    );
+    copy_private_tree(&lab.m7.home, &cloned);
+    copy_each_file(&lab.m7.home, &copied);
+    assert_eq!(sorted(&cloned), source, "the clone made it");
+    assert_eq!(sorted(&copied), source, "the copy made it");
+    let home_mode = |path: &Path| {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata(path).unwrap().mode() & 0o7777
+    };
+    assert_eq!(home_mode(&cloned), home_mode(&lab.m7.home));
+    assert_eq!(home_mode(&copied), home_mode(&lab.m7.home));
+
+    // Each is its own: a Mac's write in one reaches neither the other nor the source.
+    std::fs::write(lab.m7.source_file(), b"changed at the source").unwrap();
+    assert_ne!(sorted(&lab.m7.home), sorted(&cloned));
+    assert_eq!(sorted(&cloned), sorted(&copied));
 }
 
 #[test]
@@ -3538,6 +4000,14 @@ fn filled_join_log(member: &Paths, count: usize) -> crate::membership_log::Log {
     log
 }
 
+/// The one test here that builds its lab under larger budgets: [`two_macs`] writes it from a
+/// template built off this thread, under production's, so genesis, enrollment, join and publish run
+/// under these only if this one builds them.
+///
+/// NEGATIVE CONTROL (2026-11-05): with `sign_genesis` refusing while [`RecordBudgets::current`]
+/// holds 8192, this fails building its lab (`sign genesis: Error("... a genesis under the larger
+/// budgets", Other)`), and `join_bundles_keep_waiting_records_local_and_fit_the_advertised_history`,
+/// whose lab is written from the template, passes.
 #[test]
 fn join_reader_capacity_is_checked_before_and_after_admission() {
     use crate::crossing::RecordsBound;
@@ -3549,7 +4019,11 @@ fn join_reader_capacity_is_checked_before_and_after_admission() {
         ..RecordBudgets::PRODUCTION
     };
     LARGER.within(|| {
-        let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
+        let macs = built_two_macs(
+            &[(Audience::Everyone, "shared", b"everyone-v1".as_slice())],
+            false,
+            None,
+        );
         let member = &macs.m7;
         let log = filled_join_log(member, LEGACY_RECORDS - 1);
         save_records(member, &encode_records(log.records())).unwrap();

@@ -426,8 +426,8 @@ fn bodies_under(w: &World, filter: &str) -> Vec<String> {
 /// **A BRIDGE THROUGH AN UPDATE'S ORDERING: the predecessor's aterm goes while
 /// its bridge is mid-drain, and the successor's starts at once on the same
 /// state dir.** Two posts wait for the broker; the drain sends the first and,
-/// before the second's send, reads the first's answer (the new lane's
-/// subject-budget read), and parks at that post's retirement. So one post is
+/// before the second's send, the retirement fault reads the first's answer
+/// and parks at that post's retirement. So one post is
 /// sent and one is not when aterm goes. The successor's bridge stands by while
 /// the orphan holds the state dir, and still does at the release; released, the
 /// orphan meets its aterm gone at the first post's `outbox sent` and must send

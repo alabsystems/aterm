@@ -40,8 +40,18 @@
 //!   (no account: its region decides which account a sign-in makes), Codex and Grok Build carry
 //!   flow words, and a disqualifying note pauses Claude Code's account whatever vendor it
 //!   names, and any other column's account only when it names that vendor or none.
+//! - **An address row is matched by its key, and the table wins**: a source's address names the
+//!   row its key derives where the table holds that row, whatever that row's `addr` says now
+//!   (a renamed row keeps its birth key; its `addr` stays the owner's and is reported kept),
+//!   else the one row whose `addr` says it now ([`AddressIndex::matched`]), else a row born
+//!   under its key. An address several rows say, with no row under its key, is a
+//!   [`Kind::AddressAmbiguous`] finding: nothing of a source row whose own address it is is
+//!   written, and an address a row only refers to (a root, a receiving or a mailbox login) links
+//!   nothing.
 //! - **One key per account**: the canonical account key (`keys::account_pk`) from the claims
-//!   realm and the claims email, one provider word per realm.
+//!   realm and the claims email, one provider word per realm. The email is what its login row's
+//!   `addr` says in the table where it says one address, else the sheet's: a sheet may name a
+//!   renamed row by its birth address, and the table wins.
 //! - **A mailbox is its login's** (one-mesh design §4.7): a receiving mailbox becomes a row keyed
 //!   from its login address's key ([`keys::mailbox_pk`]), with a plain label, a service and its
 //!   `login`, that member-readable address row. A phone's key is random; the importer finds an
@@ -61,7 +71,8 @@
 //!   run writes or withdraws the `+tag` link.
 
 use super::registry::{
-    ACCOUNT, ADDRESS, DIFFER_COLUMNS, MACHINE, MAILBOX, MAX_DIFFERS, PHONE, PREFERENCE, SOURCE,
+    ACCOUNT, ADDRESS, AddressHolder, AddressIndex, DIFFER_COLUMNS, MACHINE, MAILBOX, MAX_DIFFERS,
+    PHONE, PREFERENCE, SOURCE,
 };
 use crate::{
     Error, Result,
@@ -421,10 +432,12 @@ impl Sheet {
         row.get(at.col.checked_sub(1)?).map(String::as_str)
     }
 
-    /// The address key of each row whose password column is set (a flag, never a value), read
-    /// from the sheet's own address column (an `email`, `login` or `address` header that names no
-    /// other address: not a root, recovery, receiving or forwarding one), with how many rows are
-    /// set and how many of them name no address: what `--compare-sheet` holds against the registry.
+    /// The address of each row whose password column is set (a flag, never a value), in the
+    /// claims spelling, read from the sheet's own address column (an `email`, `login` or `address`
+    /// header that names no other address: not a root, recovery, receiving or forwarding one),
+    /// with how many rows are set and how many of them name no address: what `--compare-sheet`
+    /// holds against the registry, matching each to its row as the import does
+    /// ([`AddressIndex::matched`]). The addresses stay in this process and are never printed.
     pub fn password_flags(&self) -> (BTreeSet<String>, usize, usize) {
         let flags: Vec<usize> = (0..self.headers.len())
             .filter(|col| secret_header(&self.headers[*col]))
@@ -447,10 +460,10 @@ impl Sheet {
             set += 1;
             match address
                 .and_then(|col| row.get(col))
-                .and_then(|cell| keys::address_pk(cell.trim()).ok())
+                .and_then(|cell| keys::address(cell).ok())
             {
-                Some(pk) => {
-                    keyed.insert(pk);
+                Some(address) => {
+                    keyed.insert(address);
                 }
                 None => unkeyed += 1,
             }
@@ -620,6 +633,11 @@ pub enum Kind {
     /// More than one live row names a known Mac's fleet node: nothing of that Mac is written
     /// until the owner keeps one.
     NodeAmbiguous,
+    /// More than one address row says a source's address now, and no row holds the key it
+    /// derives: until the owner keeps one, nothing of a source row whose own address it is is
+    /// written, and a source row that only refers to it (a root, a receiving or a mailbox
+    /// login) links nothing there.
+    AddressAmbiguous,
     /// A known Mac matched no row (`adopt` births none; step 7 does).
     Unadopted,
     /// An earlier import of a sheet read now made this row, and that sheet no longer lists it:
@@ -664,6 +682,7 @@ impl Kind {
             Self::CoordinatesTruncated => "coordinates-truncated",
             Self::AdoptedByNode => "adopted-by-node",
             Self::NodeAmbiguous => "node-ambiguous",
+            Self::AddressAmbiguous => "address-ambiguous",
             Self::Unadopted => "unadopted",
             Self::NoLongerListed => "no-longer-listed",
             Self::Differs => "differs",
@@ -942,6 +961,8 @@ struct RowWant {
 struct Planner<'a> {
     input: &'a Input<'a>,
     current: BTreeMap<&'static str, Projection>,
+    /// `current`'s address rows by what each row's `addr` says now.
+    address_index: AddressIndex,
     rows: BTreeMap<&'static str, BTreeMap<String, RowWant>>,
     findings: BTreeSet<Finding>,
     /// Phone keys by their number's digits, found or minted this run, so every source naming
@@ -1056,7 +1077,7 @@ fn roster_source(macs: &[KnownMac]) -> (String, String) {
 /// A value the importer built breaks its column's type, which is a bug, not a sheet problem
 /// (sheet problems are findings).
 pub fn plan(input: &Input<'_>, cells: &Cells) -> Result<Plan> {
-    let current = [
+    let current: BTreeMap<&'static str, Projection> = [
         &ADDRESS,
         &ACCOUNT,
         &MACHINE,
@@ -1068,9 +1089,11 @@ pub fn plan(input: &Input<'_>, cells: &Cells) -> Result<Plan> {
     .into_iter()
     .map(|collection| (collection.name, cell::project(collection, cells)))
     .collect();
+    let address_index = AddressIndex::of(&current[ADDRESS.name]);
     let mut planner = Planner {
         input,
         current,
+        address_index,
         rows: BTreeMap::new(),
         findings: BTreeSet::new(),
         phones: BTreeMap::new(),
@@ -1336,9 +1359,31 @@ impl Planner<'_> {
         }
     }
 
-    /// Want the address row of `address` from `at`; returns its key.
+    /// Want the address row of `address` from `at`; returns its key: the row its key derives
+    /// where the table holds it or this run planned it, else the one row whose `addr` says it now,
+    /// else a row born under its key ([`AddressIndex::matched`]). An address several rows say,
+    /// with no row under its key, is a finding, and `None`: the caller writes nothing of a source
+    /// row whose own address it is, and links nothing to an address the row only refers to.
     fn address(&mut self, address: &str, kind: SheetKind, at: &Coord) -> Option<String> {
-        let pk = keys::address_pk(address).ok()?;
+        let derived = keys::address_pk(address).ok()?;
+        let pk = if self.has_row(ADDRESS.name, &derived) {
+            derived
+        } else {
+            match self.address_index.matched(address).ok()? {
+                AddressHolder::Row(pk) => pk.to_owned(),
+                AddressHolder::Several(_) => {
+                    self.address_unread = true;
+                    self.find(
+                        Kind::AddressAmbiguous,
+                        Some(ADDRESS.name),
+                        None,
+                        vec![at.clone()],
+                    );
+                    return None;
+                }
+                AddressHolder::Free { .. } => derived,
+            }
+        };
         let domain = address.split_once('@').map_or("", |(_, d)| d).to_owned();
         self.want(&ADDRESS, &pk, "addr", json!(address), at);
         self.want(&ADDRESS, &pk, "domain", json!(domain), at);
@@ -1465,7 +1510,7 @@ impl Planner<'_> {
                         continue;
                     }
                     Mark::Held => {
-                        self.hold_kimi(&address);
+                        self.hold_kimi(&address, &address_pk);
                         self.find(Kind::Held, Some(ACCOUNT.name), None, vec![at]);
                         continue;
                     }
@@ -1473,7 +1518,7 @@ impl Planner<'_> {
                     Mark::Paused(terms) => (terms, true),
                 };
                 let Some((realm, _)) = provider_realm(provider, terms.region) else {
-                    self.hold_kimi(&address);
+                    self.hold_kimi(&address, &address_pk);
                     self.find(Kind::Held, Some(ACCOUNT.name), None, vec![at]);
                     continue;
                 };
@@ -1577,7 +1622,25 @@ impl Planner<'_> {
         });
     }
 
-    /// Want the account of `address` at `realm`; returns its key.
+    /// The address an account signing in with row `address_pk`, which a source names as
+    /// `address`, is keyed by: what that row's `addr` says in the table now where it says one
+    /// address, else `address`. A renamed row keeps its key, so a sheet still naming its birth
+    /// address finds it ([`Self::address`]); where the table and the sheet disagree the table
+    /// wins, and the view and the harness name the account by what its row says.
+    fn signs_in(&self, address: &str, address_pk: &str) -> String {
+        self.current[ADDRESS.name]
+            .rows
+            .get(address_pk)
+            .and_then(|row| match row.fields.get("addr") {
+                Some(Field::Value(candidate)) => candidate.value.x.as_str(),
+                _ => None,
+            })
+            .and_then(|text| keys::address(text).ok())
+            .unwrap_or_else(|| address.to_owned())
+    }
+
+    /// Want the account of row `address_pk`, which the source names as `address`, at `realm`:
+    /// keyed from the address it signs in as ([`Self::signs_in`]); returns its key.
     fn account(
         &mut self,
         address: &str,
@@ -1585,7 +1648,7 @@ impl Planner<'_> {
         realm: &'static str,
         at: &Coord,
     ) -> Option<String> {
-        let pk = keys::account_pk(realm, address).ok()?;
+        let pk = keys::account_pk(realm, &self.signs_in(address, address_pk)).ok()?;
         let provider = keys::provider_of_realm(realm)?;
         self.want(&ACCOUNT, &pk, "provider", json!(provider), at);
         self.want(&ACCOUNT, &pk, "realm", json!(realm), at);
@@ -1707,10 +1770,12 @@ impl Planner<'_> {
         }
     }
 
-    /// No sign-in decides a held Kimi cell's region: its address's Kimi accounts keep their rows.
-    fn hold_kimi(&mut self, address: &str) {
+    /// No sign-in decides a held Kimi cell's region: the Kimi accounts of row `address_pk`
+    /// (named `address` in the source, [`Self::signs_in`]) keep their rows.
+    fn hold_kimi(&mut self, address: &str, address_pk: &str) {
+        let email = self.signs_in(address, address_pk);
         for realm in ["kimi:global", "kimi:mainland-cn"] {
-            if let Ok(pk) = keys::account_pk(realm, address) {
+            if let Ok(pk) = keys::account_pk(realm, &email) {
                 self.unsettled.insert(pk);
             }
         }
@@ -2032,16 +2097,18 @@ impl Planner<'_> {
                 match keys::address(text) {
                     Ok(mailbox) => {
                         // The owner's word that codes for this login arrive at another listed
-                        // login: the alias link the owner's model names.
+                        // login: the alias link the owner's model names, to the row that login
+                        // names (`address`, which the mailbox's own login reads again below).
                         if column == "mailbox"
                             && mailbox != address
                             && self.logins.contains(&mailbox)
-                            && let Ok(target) = keys::address_pk(&mailbox)
+                            && let Some(target) = self.address(&mailbox, sheet.kind, &at)
                         {
                             self.link_alias(&address_pk, &target, &at);
                         }
-                        let pk = self.mailbox(&mailbox, sheet.kind, &at)?;
-                        self.want(&ADDRESS, &address_pk, column, json!(pk), &at);
+                        if let Some(pk) = self.mailbox(&mailbox, sheet.kind, &at)? {
+                            self.want(&ADDRESS, &address_pk, column, json!(pk), &at);
+                        }
                     }
                     Err(_) => {
                         self.find(
@@ -2112,7 +2179,7 @@ impl Planner<'_> {
             }
             let Some((realm, _)) = provider_realm(provider, None) else {
                 // Kimi with no region, as the vault sheet's bare 1.
-                self.hold_kimi(address);
+                self.hold_kimi(address, address_pk);
                 if decided
                     .as_ref()
                     .is_none_or(|(realms, _)| !realms.iter().any(|r| r.starts_with("kimi")))
@@ -2132,7 +2199,7 @@ impl Planner<'_> {
                     });
                 }
                 Some(_) => {
-                    if let Ok(pk) = keys::account_pk(realm, address) {
+                    if let Ok(pk) = keys::account_pk(realm, &self.signs_in(address, address_pk)) {
                         for (_, service) in &read {
                             self.element(&ACCOUNT, &pk, "services", service, &at);
                         }
@@ -2160,13 +2227,15 @@ impl Planner<'_> {
         accounts
     }
 
-    /// The mailbox that signs in as `address`: keyed from the address's key
-    /// ([`keys::mailbox_pk`]), with its `login` that address's row (wanted too, from `kind`).
-    /// A new row's label is the first free `<service>-<n>`; a held row keeps the label it has.
-    fn mailbox(&mut self, address: &str, kind: SheetKind, at: &Coord) -> Result<String> {
-        let login = self
-            .address(address, kind, at)
-            .ok_or_else(|| Error::new("a mailbox's login is not an address"))?;
+    /// The mailbox that signs in as `address`: keyed from the key of that address's row
+    /// ([`keys::mailbox_pk`], the row [`Self::address`] names, wanted too, from `kind`), with its
+    /// `login` that row. A new row's label is the first free `<service>-<n>`; a held row keeps the
+    /// label it has. `None` where the address names no one row (several say it): nothing of the
+    /// mailbox is written.
+    fn mailbox(&mut self, address: &str, kind: SheetKind, at: &Coord) -> Result<Option<String>> {
+        let Some(login) = self.address(address, kind, at) else {
+            return Ok(None);
+        };
         let pk = keys::mailbox_pk(&login)?;
         let domain = address.split_once('@').map_or("", |(_, d)| d);
         let (service, code_path) = mailbox_service(domain);
@@ -2193,7 +2262,7 @@ impl Planner<'_> {
         self.want(&MAILBOX, &pk, "service", json!(service), at);
         self.want(&MAILBOX, &pk, "code_path", json!(code_path), at);
         self.want(&MAILBOX, &pk, "login", json!(login), at);
-        Ok(pk)
+        Ok(Some(pk))
     }
 
     /// The phone row of a number (`raw`, at least four digits once read by [`phone_digits`]):
@@ -2223,17 +2292,17 @@ impl Planner<'_> {
                     .unwrap_or_default();
                 let mut holds = false;
                 for token in tokens.into_iter().filter_map(Value::as_str) {
-                    if sealer.holds(PHONE.name, pk, "number", token, &number) {
-                        holds = true;
-                    } else if sealer.open(PHONE.name, pk, "number", token).is_err() {
-                        unopened = true;
+                    match sealer.open(PHONE.name, pk, "number", token) {
+                        Ok(opened) if opened.same(&number) => holds = true,
+                        Ok(_) => {}
+                        Err(_) => unopened = true,
                     }
                 }
                 if holds {
                     held.push((!row.live(), pk.clone()));
                 }
             }
-            held.sort();
+            held.sort_unstable();
             let live = held.iter().filter(|(retired, _)| !retired).count();
             if live > 1 {
                 self.findings.insert(Finding {
@@ -2603,8 +2672,9 @@ impl Planner<'_> {
                         if let Some(root_pk) = self.address(&root_addr, SheetKind::Emails, &at) {
                             self.link_alias(&address_pk, &root_pk, &at);
                         }
-                        if !is_protected {
-                            let mb_pk = self.mailbox(&root_addr, SheetKind::Emails, &at)?;
+                        if !is_protected
+                            && let Some(mb_pk) = self.mailbox(&root_addr, SheetKind::Emails, &at)?
+                        {
                             self.want(&ADDRESS, &address_pk, "mailbox", json!(mb_pk), &at);
                         }
                     } else {
@@ -2625,8 +2695,9 @@ impl Planner<'_> {
                 // The sheet's flag says this address signs in to its own mailbox; its password,
                 // where there is one, comes from a replica's dump, never from this column.
                 let at = coord(sheet, n, row, pw_col);
-                let mb_pk = self.mailbox(&address, SheetKind::Emails, &at)?;
-                self.want(&ADDRESS, &address_pk, "mailbox", json!(mb_pk), &at);
+                if let Some(mb_pk) = self.mailbox(&address, SheetKind::Emails, &at)? {
+                    self.want(&ADDRESS, &address_pk, "mailbox", json!(mb_pk), &at);
+                }
                 self.want(
                     &ADDRESS,
                     &address_pk,
@@ -3317,7 +3388,7 @@ impl Planner<'_> {
                     }
                     if !want.notes.is_empty() {
                         let mut notes = std::mem::take(&mut want.notes);
-                        notes.sort();
+                        notes.sort_unstable();
                         notes.dedup();
                         if notes.len() > MAX_NOTES {
                             plan.findings.push(Finding {
@@ -3550,7 +3621,7 @@ impl Planner<'_> {
             source_rows.extend(written_rows);
             source_rows
         };
-        plan.findings.sort();
+        plan.findings.sort_unstable();
         plan.findings.dedup();
         Ok(plan)
     }

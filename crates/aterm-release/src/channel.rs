@@ -178,7 +178,7 @@ pub fn required_asset_names(version: &str, signed: bool, rostered: bool) -> Vec<
         names.push(aterm_update_core::roster::ROSTER_ASSET.to_string());
         names.push(aterm_update_core::roster::ROSTER_SIG_ASSET.to_string());
     }
-    names.sort();
+    names.sort_unstable();
     names
 }
 
@@ -214,7 +214,7 @@ pub fn validate_channel_asset_set(
         }
         required.push(name.clone());
     }
-    required.sort();
+    required.sort_unstable();
     for src in SOURCE_ATTESTATION_ASSETS {
         if names.iter().filter(|n| n.as_str() == src).count() > 1 {
             return Err(Error::new(format!(
@@ -228,7 +228,7 @@ pub fn validate_channel_asset_set(
         .filter(|n| !SOURCE_ATTESTATION_ASSETS.contains(&n.as_str()))
         .cloned()
         .collect();
-    observed.sort();
+    observed.sort_unstable();
     if observed == required {
         return Ok(());
     }
@@ -328,7 +328,7 @@ pub fn publishable_asset_names(version: &str) -> Vec<String> {
     let mut names = required_asset_names(version, true, true);
     names.push(crate::service_qualification::REPORT_ASSET.to_string());
     names.extend(linux_asset_names(version));
-    names.sort();
+    names.sort_unstable();
     names
 }
 

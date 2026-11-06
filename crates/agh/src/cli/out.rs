@@ -307,7 +307,7 @@ fn columns(noun: Noun, plan: &Plan, defaults: Vec<FieldPath>, values: &[Value]) 
         .filter_map(Value::as_object)
         .flat_map(Map::keys)
         .collect();
-    keys.sort();
+    keys.sort_unstable();
     keys.dedup();
     let mut columns: Vec<FieldPath> = keys
         .into_iter()
@@ -470,36 +470,32 @@ pub(crate) fn receipt_value(out: &mut String, value: &str) {
 /// Formats `receipt` as an `agh: ok verb=...` line with redacted values.
 #[must_use]
 pub fn receipt_line(receipt: &Receipt, redactor: &Redactor) -> String {
-    let mut pairs: Vec<(&str, String)> = vec![("verb", receipt.verb.clone())];
-    if let Some(repo) = &receipt.repo {
-        pairs.push(("repo", repo.clone()));
-    }
-    if let Some(as_) = &receipt.as_ {
-        pairs.push(("as", as_.label().to_string()));
-    }
-    pairs.push(("reqs", receipt.requests.to_string()));
-    pairs.push(("pages", receipt.pages.to_string()));
-    pairs.push((
-        "complete",
-        if receipt.complete { "1" } else { "0" }.to_string(),
-    ));
-    if let Some(consistency) = receipt.consistency {
-        pairs.push(("consistency", consistency.slug().to_string()));
-    }
-    pairs.push(("ms", receipt.elapsed_ms.to_string()));
-    if let Some(rate) = &receipt.rate {
-        pairs.push(("rate", rate.line()));
-    }
     let mut line = String::from("agh: ok");
-    for (key, value) in pairs
-        .iter()
-        .map(|(k, v)| (*k, v.as_str()))
-        .chain(receipt.notes.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-    {
+    let mut push = |key: &str, value: &str| {
         line.push(' ');
         line.push_str(key);
         line.push('=');
         receipt_value(&mut line, &redactor.apply(value));
+    };
+    push("verb", &receipt.verb);
+    if let Some(repo) = &receipt.repo {
+        push("repo", repo);
+    }
+    if let Some(as_) = &receipt.as_ {
+        push("as", as_.label());
+    }
+    push("reqs", &receipt.requests.to_string());
+    push("pages", &receipt.pages.to_string());
+    push("complete", if receipt.complete { "1" } else { "0" });
+    if let Some(consistency) = receipt.consistency {
+        push("consistency", consistency.slug());
+    }
+    push("ms", &receipt.elapsed_ms.to_string());
+    if let Some(rate) = &receipt.rate {
+        push("rate", &rate.line());
+    }
+    for (key, value) in &receipt.notes {
+        push(key, value);
     }
     line
 }

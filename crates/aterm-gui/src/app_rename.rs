@@ -356,7 +356,6 @@ impl App {
                 self.refresh_presence_session(session);
                 self.mark_status_dirty();
             }
-            self.reproject_pill_of(session);
         }
         Ok(changed)
     }

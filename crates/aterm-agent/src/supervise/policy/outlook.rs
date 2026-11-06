@@ -131,8 +131,7 @@ pub const fn outlook(
     }
 }
 
-/// What a surface that shows a wall (the needs border's pill, the tab chip) needs of
-/// its [`Outlook`]: who answers it.
+/// What a surface that shows a wall (the tab chip) needs of its [`Outlook`]: who answers it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Answer {
     /// Nobody: a person is needed, or nothing supervises the wall here.

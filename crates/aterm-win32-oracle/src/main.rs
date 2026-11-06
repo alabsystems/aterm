@@ -134,8 +134,9 @@ fn find_root(start: &Path) -> Option<PathBuf> {
     start
         .ancestors()
         .find(|p| {
-            p.join("win32-oracle/Cargo.toml").is_file()
-                && p.join("crates/aterm-win32/Cargo.toml").is_file()
+            std::fs::symlink_metadata(p.join("win32-oracle/Cargo.toml")).is_ok_and(|m| m.is_file())
+                && std::fs::symlink_metadata(p.join("crates/aterm-win32/Cargo.toml"))
+                    .is_ok_and(|m| m.is_file())
         })
         .map(Path::to_path_buf)
 }
@@ -145,6 +146,7 @@ fn upstream() -> Result<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo")))
         .ok_or("no Cargo registry location")?;
     let dir = home.join("registry/src");
+    let win_dir = format!("windows-sys-{VERSION}");
     let mut hits = vec![];
     for e in
         std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}; use --upstream", dir.display()))?
@@ -157,12 +159,12 @@ fn upstream() -> Result<PathBuf> {
         {
             continue;
         }
-        let path = e.path().join(format!("windows-sys-{VERSION}"));
-        if path.join("Cargo.toml").is_file() {
+        let path = e.path().join(&win_dir);
+        if std::fs::symlink_metadata(path.join("Cargo.toml")).is_ok_and(|m| m.is_file()) {
             hits.push(path)
         }
     }
-    hits.sort();
+    hits.sort_unstable();
     hits.into_iter()
         .next()
         .ok_or("no cached windows-sys 0.61.2; use --upstream".into())
@@ -289,7 +291,7 @@ fn toolchain_llvm_nm(rustc: &Path) -> Option<PathBuf> {
         .map(|entry| entry.path().join("bin").join(name))
         .filter(|candidate| candidate.is_file())
         .collect();
-    found.sort();
+    found.sort_unstable();
     found.into_iter().next()
 }
 fn formatted(
@@ -356,13 +358,13 @@ fn with_seal_line(rel: &Path, text: &str) -> Result<String> {
         &text[at..]
     ))
 }
-/// Returns whether `path` is a hand-written file under `crates/aterm-win32/src`.
-fn hand_written(root: &Path, path: &Path) -> bool {
-    let src = root.join("crates/aterm-win32/src");
-    ["lib.rs"]
-        .iter()
-        .chain(model::HAND_WRITTEN.iter())
-        .any(|f| path == src.join(f))
+/// Returns whether `rel` is a hand-written file under `crates/aterm-win32/src`.
+fn hand_written(rel: &Path) -> bool {
+    let Ok(file) = rel.strip_prefix("crates/aterm-win32/src") else {
+        return false;
+    };
+    file.to_str()
+        .is_some_and(|f| f == "lib.rs" || model::HAND_WRITTEN.contains(&f))
 }
 fn generate(
     root: &Path,
@@ -375,7 +377,7 @@ fn generate(
     if out == root {
         for path in model::rust_files(&root.join("crates/aterm-win32/src"))? {
             let rel = path.strip_prefix(root).map_err(|e| e.to_string())?;
-            if !hand_written(root, &path) && !outputs.contains_key(rel) {
+            if !hand_written(rel) && !outputs.contains_key(rel) {
                 std::fs::remove_file(&path).map_err(|e| e.to_string())?;
             }
         }
@@ -395,7 +397,7 @@ fn check(root: &Path, model: &model::Model, tools: &Tools) -> Result<u8> {
     }
     for p in model::rust_files(&root.join("crates/aterm-win32/src"))? {
         let rel = p.strip_prefix(root).map_err(|e| e.to_string())?;
-        if !hand_written(root, &p) && !outputs.contains_key(rel) {
+        if !hand_written(rel) && !outputs.contains_key(rel) {
             drift.push(format!("{} (no longer generated)", rel.display()))
         }
     }
@@ -412,18 +414,19 @@ fn check(root: &Path, model: &model::Model, tools: &Tools) -> Result<u8> {
 fn parse_record(tsv: &str) -> Result<Value> {
     let mut items = aterm_json::Map::new();
     for line in tsv.lines() {
-        let parts: Vec<_> = line.split('\t').collect();
-        let key = parts.get(1).ok_or("record row lacks key")?;
-        match parts.first().copied() {
-            Some("layout") if parts.len() == 4 => {
-                if parts[2].starts_with('+') || parts[3].starts_with('+') {
+        let mut split = line.split('\t');
+        let kind = split.next();
+        let key = split.next().ok_or("record row lacks key")?;
+        match (kind, split.next(), split.next(), split.next()) {
+            (Some("layout"), Some(size_s), Some(align_s), None) => {
+                if size_s.starts_with('+') || align_s.starts_with('+') {
                     return Err("invalid digit found in string".into());
                 }
-                let size = parts[2].parse::<u64>().map_err(|e| e.to_string())?;
-                let align = parts[3].parse::<u64>().map_err(|e| e.to_string())?;
+                let size = size_s.parse::<u64>().map_err(|e| e.to_string())?;
+                let align = align_s.parse::<u64>().map_err(|e| e.to_string())?;
                 if items
                     .insert(
-                        (*key).into(),
+                        key.into(),
                         aterm_json::json!({"size":size,"align":align,"offsets":{}}),
                     )
                     .is_some()
@@ -431,28 +434,24 @@ fn parse_record(tsv: &str) -> Result<Value> {
                     return Err("duplicate layout record".into());
                 }
             }
-            Some("offset") if parts.len() == 4 => {
+            (Some("offset"), Some(field), Some(offset_s), None) => {
                 let offsets = items
-                    .get_mut(*key)
+                    .get_mut(key)
                     .and_then(Value::as_object_mut)
                     .and_then(|v| v.get_mut("offsets"))
                     .and_then(Value::as_object_mut)
                     .ok_or("offset precedes layout")?;
-                if parts[3].starts_with('+') {
+                if offset_s.starts_with('+') {
                     return Err("invalid digit found in string".into());
                 }
-                let offset = parts[3].parse::<u64>().map_err(|e| e.to_string())?;
-                if offsets
-                    .insert(parts[2].into(), Value::from(offset))
-                    .is_some()
-                {
+                let offset = offset_s.parse::<u64>().map_err(|e| e.to_string())?;
+                if offsets.insert(field.into(), Value::from(offset)).is_some() {
                     return Err("duplicate offset".into());
                 }
             }
-            Some("value" | "cstr") if parts.len() == 3 => {
-                let k = parts[0];
+            (Some(k @ ("value" | "cstr")), Some(val), None, None) => {
                 if items
-                    .insert((*key).into(), aterm_json::json!({k:parts[2]}))
+                    .insert(key.into(), aterm_json::json!({k:val}))
                     .is_some()
                 {
                     return Err("duplicate recorded value".into());
@@ -499,13 +498,11 @@ fn record(root: &Path, model: &model::Model, tools: &Tools, target: &Path) -> Re
 
 fn pretty_json(value: &Value) -> Result<String> {
     fn write(value: &Value, depth: usize, out: &mut String) -> Result<()> {
-        let pad = " ".repeat(depth + 1);
-        let close_pad = " ".repeat(depth);
         match value {
             Value::Object(fields) if !fields.is_empty() => {
                 out.push_str("{\n");
                 for (i, (key, value)) in fields.iter().enumerate() {
-                    out.push_str(&pad);
+                    out.extend(std::iter::repeat_n(' ', depth + 1));
                     out.push_str(&aterm_json::to_string(key).map_err(|e| e.to_string())?);
                     out.push_str(": ");
                     write(value, depth + 1, out)?;
@@ -514,20 +511,20 @@ fn pretty_json(value: &Value) -> Result<String> {
                     }
                     out.push('\n');
                 }
-                out.push_str(&close_pad);
+                out.extend(std::iter::repeat_n(' ', depth));
                 out.push('}');
             }
             Value::Array(items) if !items.is_empty() => {
                 out.push_str("[\n");
                 for (i, value) in items.iter().enumerate() {
-                    out.push_str(&pad);
+                    out.extend(std::iter::repeat_n(' ', depth + 1));
                     write(value, depth + 1, out)?;
                     if i + 1 != items.len() {
                         out.push(',');
                     }
                     out.push('\n');
                 }
-                out.push_str(&close_pad);
+                out.extend(std::iter::repeat_n(' ', depth));
                 out.push(']');
             }
             _ => out.push_str(&aterm_json::to_string(value).map_err(|e| e.to_string())?),

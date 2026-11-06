@@ -67,6 +67,7 @@ impl AccountsHost for NativeRenewal {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_running_renewal_blocks_readoption_of_its_removed_label() {
     let (_tmp, env) = renew_env("renew-readoption");
     let path = env.accounts_roster().unwrap();
@@ -86,7 +87,17 @@ fn a_running_renewal_blocks_readoption_of_its_removed_label() {
     host.during_flow = Some(Box::new(move || {
         // Model an external edit while the managed provider flow is pending.
         std::fs::write(&changed_path, "").unwrap();
-        let (code, out, err) = acc_quiet(
+        let cancelled = std::cell::Cell::new(false);
+        let positions = RefCell::new(Vec::new());
+        let queued = |position| {
+            positions.borrow_mut().push(position);
+            cancelled.set(true);
+        };
+        let stop = || cancelled.get();
+        let mut adoption = FakeHost::new(&never_asked);
+        adoption.queued = Some(&queued);
+        adoption.cancelled = Some(&stop);
+        let (code, out, err) = acc(
             AccountsCmd::AdoptDefault {
                 label: "main".into(),
                 email: Some(OWNER.into()),
@@ -94,9 +105,19 @@ fn a_running_renewal_blocks_readoption_of_its_removed_label() {
                 browser: None,
             },
             &changed_env,
+            &adoption,
         );
         assert_eq!(code, exit(1), "{out}{err}");
-        assert!(err.contains(accounts::SIGNIN_HELD), "{err}");
+        assert!(err.contains("cancelled"), "{err}");
+        assert_eq!(
+            *positions.borrow(),
+            [accounts::SigninPosition {
+                ahead: 1,
+                blocker: accounts::SigninBlocker::ManualAhead,
+            }]
+        );
+        assert!(adoption.asked.borrow().is_empty());
+        assert!(adoption.logins.borrow().is_empty());
         assert_eq!(std::fs::read_to_string(&changed_path).unwrap(), "");
     }));
     let (code, _, err) = acc(renew(&["main"], false, None), &env, &host);
@@ -2154,18 +2175,20 @@ fn a_mailbox_directory_runs_accounts_renew_without_a_terminal_through_the_opener
 #[cfg(unix)]
 #[test]
 fn an_unattended_renewal_injects_a_hosted_code_into_the_provider_stdin() {
-    let tmp = aterm_tempfile::tempdir().unwrap();
-    let program = tmp.path().join("provider");
-    aterm_tempfile::stand_in(
+    for code in ["secret".to_owned(), "v".repeat(16 * 1024)] {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let program = tmp.path().join("provider");
+        aterm_tempfile::stand_in(
         &program,
-        "#!/bin/sh\nprintf secret > \"$ATERM_OPEN_URL_OUTCOME.code.part\"\nmv \"$ATERM_OPEN_URL_OUTCOME.code.part\" \"$ATERM_OPEN_URL_OUTCOME.code\"\nread answer\nprintf '%s' \"$answer\"\n",
+        &format!("#!/bin/sh\nprintf '%s' '{code}' > \"$ATERM_OPEN_URL_OUTCOME.code.part\"\nmv \"$ATERM_OPEN_URL_OUTCOME.code.part\" \"$ATERM_OPEN_URL_OUTCOME.code\"\nread answer\nprintf '%s' \"$answer\"\n"),
     )
     .unwrap();
-    let mut cmd = aterm_uds::spawnfd::command(program);
-    cmd.env("PATH", "/usr/bin:/bin");
-    let (ran, _) = capture_unattended_renewal(cmd, aterm_spec::wait::MUST_HAPPEN).unwrap();
-    assert_eq!(ran.code, Some(0));
-    assert_eq!(ran.stdout, b"secret");
+        let mut cmd = aterm_uds::spawnfd::command(program);
+        cmd.env("PATH", "/usr/bin:/bin");
+        let (ran, _) = capture_unattended_renewal(cmd, aterm_spec::wait::MUST_HAPPEN).unwrap();
+        assert_eq!(ran.code, Some(0));
+        assert_eq!(ran.stdout, code.as_bytes());
+    }
 }
 
 /// A hosted code file that holds no valid code ends the capture, as the opener's recorded
@@ -2988,7 +3011,7 @@ fn a_deferred_opener_stops_the_owned_provider_without_an_auth_failure_or_exit_co
     worker.join().unwrap();
     assert!(returned);
     let failure = answer.expect_err("deferred stopping never fabricates a provider exit");
-    assert!(failure.is_deferred());
+    assert!(failure.is_deferred(), "{failure}");
     assert!(!failure.is_cancelled());
     let observation = RenewalObservation::from_outcome(&Err(failure));
     assert_eq!(observation.exit_code(), None);

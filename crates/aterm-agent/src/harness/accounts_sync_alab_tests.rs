@@ -93,6 +93,8 @@ fn a_sync_from_the_lab_adds_preferred_accounts_and_drops_no_row() {
         ],
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),
+        #[cfg(unix)]
+        machine_name: None,
         places: Default::default(),
     };
     let sync = || {
@@ -223,6 +225,8 @@ fn a_cli_sync_from_a_settled_lab_migrates_the_label_and_keeps_the_login() {
         }],
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),
+        #[cfg(unix)]
+        machine_name: None,
         places: Default::default(),
     };
     let fetch = |_: &Env, _: &str| -> Result<String, String> { panic!("the lab is the source") };
@@ -325,6 +329,8 @@ fn a_cli_sync_from_a_lab_that_prefers_nothing_here_keeps_every_row_and_clears_ho
         }],
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),
+        #[cfg(unix)]
+        machine_name: None,
         places: Default::default(),
     };
     let fetch = |_: &Env, _: &str| -> Result<String, String> { panic!("the lab is the source") };
@@ -475,6 +481,8 @@ fn lab_of(settled: bool, accounts: Vec<LabAccount>) -> Lab {
         accounts,
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),
+        #[cfg(unix)]
+        machine_name: None,
         places: Default::default(),
     }
 }
@@ -834,7 +842,7 @@ fn a_synced_antigravity_row_is_told_only_renew() {
         fs::create_dir_all(&config).unwrap();
         fs::create_dir_all(&state).unwrap();
         let toml = config.join("aterm.toml");
-        fs::write(&toml, "").unwrap();
+        aterm_uds::atomic_file::write(&toml, b"", 0o600).unwrap();
         let region = if cli == Cli::Kimi {
             "region = \"global\"\n"
         } else {
@@ -949,6 +957,8 @@ fn a_first_lab_sync_lists_the_default_login_under_its_lab_label() {
             ],
             aliases: BTreeMap::new(),
             mailboxes: BTreeMap::new(),
+            #[cfg(unix)]
+            machine_name: None,
             places: Default::default(),
         };
         let fetch =

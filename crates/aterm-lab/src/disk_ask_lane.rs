@@ -1063,10 +1063,11 @@ impl Lane<'_> {
     }
 
     /// The ask's lease, as the window last wrote it.
-    fn lease(&self) -> ask::Lease {
-        self.ledger
-            .parent()
-            .map_or_else(ask::Lease::default, ask::read)
+    fn lease(&self) -> Result<ask::Lease, Fail> {
+        let Some(state) = self.ledger.parent() else {
+            return Ok(ask::Lease::default());
+        };
+        ask::read(state).map_err(|e| Fail::die(format!("disk-ask: the lease: {e}")))
     }
 
     fn since(&self, at: Instant) -> String {
@@ -1580,7 +1581,7 @@ fn worker(
         || format!("started as {started:?}; over: {over:?}"),
     );
     let mut sids = worker_sids(&rows, at);
-    for e in &lane.lease().volumes {
+    for e in &lane.lease()?.volumes {
         if let Some(s) = e.worker.as_ref().and_then(ask::Worker::sid)
             && !sids.iter().any(|x| x == s)
         {
@@ -1992,7 +1993,7 @@ fn missed(
         answered,
         || lane.door.out(&[&format!("@{}", tab.sid), "text"]),
     );
-    let asked = lane.lease().volumes.iter().find_map(|e| match &e.phase {
+    let asked = lane.lease()?.volumes.iter().find_map(|e| match &e.phase {
         ask::Phase::Asked {
             pick,
             typed_ms,

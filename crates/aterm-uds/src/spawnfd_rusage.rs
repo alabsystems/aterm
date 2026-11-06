@@ -74,6 +74,7 @@ fn collect(pid: u32, options: i32) -> io::Result<Option<Rusage>> {
             }
             return Err(error);
         }
+        crate::deaths::note(got, status);
         let rss = u64::try_from(usage.maxrss).unwrap_or(0);
         return Ok(Some(Rusage {
             status: std::process::ExitStatus::from_raw(status),

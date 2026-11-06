@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Presence facts ([`Facts::need`]), per-session [`Slot`] state, wire severity ([`Level`]), and
-//! window border/tab indicators ([`Rim`], [`ChipLevel`]).
+//! tab indicators ([`ChipLevel`]).
 
 use std::borrow::Cow;
 
@@ -242,12 +242,12 @@ pub struct NeedFact {
     pub severity: NeedSeverity,
     /// What a stuck need's remedy turns on.
     pub cause: StopCause,
-    /// The word and the transition's identity within it, as one key.
+    /// The word and the transition's identity within it, as one key: nothing reads it by name;
+    /// through the derived `PartialEq` it makes [`Slot::absorb`] see a transition that keeps the
+    /// words.
     pub key: (u8, u64),
     /// Its words, one clipped line, without the tab's label.
     pub what: String,
-    /// Whether to display a tab-bar pill for this need.
-    pub show_pill: bool,
 }
 
 /// Everything one refresh reads.
@@ -420,8 +420,6 @@ pub struct Slot<V: Host> {
     pub wall_answer: WallAnswer,
     /// [`Facts::need`].
     pub need: Option<NeedFact>,
-    /// When the standing need began.
-    pub need_since: Instant,
     /// [`Facts::held_by_person`].
     pub held_by_person: bool,
     /// [`Facts::program_turn_ends`], as the last refresh read it.
@@ -467,7 +465,6 @@ impl<V: Host> Slot<V> {
             input_stall: None,
             wall_answer: WallAnswer::Nobody,
             need: None,
-            need_since: now,
             held_by_person: false,
             program_turn_ends: 0,
             turn_end_news: 0,
@@ -693,10 +690,6 @@ impl<V: Host> Slot<V> {
             self.program_turn_ends = facts.program_turn_ends;
             changed = true;
         }
-        let episode = |n: &Option<NeedFact>| n.as_ref().map(|n| n.key);
-        if episode(&self.need) != episode(&facts.need) {
-            self.need_since = now;
-        }
         if self.need != facts.need {
             self.need = facts.need;
             changed = true;
@@ -708,12 +701,6 @@ impl<V: Host> Slot<V> {
         self.baselined = true;
         self.noting_aterm = false;
         changed
-    }
-
-    /// The need's severity, `None` with no need.
-    #[must_use]
-    pub fn severity(&self) -> Option<NeedSeverity> {
-        self.need.as_ref().map(|n| n.severity)
     }
 
     /// The tab chip's mark from the published need and the person's hold.
@@ -862,42 +849,6 @@ impl Level {
             Self::Attention => "attention",
             Self::Limited => "limited",
             Self::Hold => "hold",
-        }
-    }
-}
-
-/// The window's border.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum Rim {
-    /// No border.
-    #[default]
-    None,
-    /// A stuck need: the stop tone.
-    Stuck,
-    /// A decide need and no stuck one.
-    Decide,
-    /// The front session has the person's hold and nothing in the window needs them.
-    Yours,
-}
-
-impl Rim {
-    /// The wire word `chrome presence rim=` prints.
-    #[must_use]
-    pub const fn wire(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Stuck => "stuck",
-            Self::Decide => "decide",
-            Self::Yours => "yours",
-        }
-    }
-
-    /// The border a need of `severity` lights.
-    #[must_use]
-    pub const fn of(severity: NeedSeverity) -> Self {
-        match severity {
-            NeedSeverity::Stuck => Self::Stuck,
-            NeedSeverity::Decide => Self::Decide,
         }
     }
 }

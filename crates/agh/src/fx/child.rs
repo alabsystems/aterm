@@ -19,7 +19,7 @@ use crate::error::{Error, Result, SideEffect};
 const DEFAULT_BUDGET: Duration = Duration::from_secs(60);
 
 /// One child.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ChildSpec {
     /// The program, absolute wherever a child runs: WP8's `gh` is one of `GH_ABSOLUTE`, given
@@ -38,6 +38,21 @@ pub struct ChildSpec {
     pub cwd: Option<PathBuf>,
     /// Its bound.
     pub budget: Duration,
+    /// Explicit nonsecret Git ref data; never the caller's ambient stdin.
+    pub(crate) input: Option<Vec<u8>>,
+}
+
+impl fmt::Debug for ChildSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ChildSpec")
+            .field("program", &self.program)
+            .field("args", &self.args)
+            .field("env", &self.env)
+            .field("cwd", &self.cwd)
+            .field("budget", &self.budget)
+            .field("input_bytes", &self.input.as_ref().map(Vec::len))
+            .finish()
+    }
 }
 
 impl ChildSpec {
@@ -50,6 +65,7 @@ impl ChildSpec {
             env: Vec::new(),
             cwd: None,
             budget: DEFAULT_BUDGET,
+            input: None,
         }
     }
 
@@ -80,6 +96,13 @@ impl ChildSpec {
         self.budget = budget;
         self
     }
+
+    /// Attach explicit nonsecret input; `check` bounds it before dispatch.
+    #[cfg(unix)]
+    pub(crate) fn input(mut self, bytes: &[u8]) -> ChildSpec {
+        self.input = Some(bytes.to_vec());
+        self
+    }
 }
 
 /// What a child left: the last `aterm_uds::deadline::OUTPUT_KEEP` bytes of each stream. Its
@@ -93,6 +116,14 @@ pub struct ChildOut {
     pub stdout: Vec<u8>,
     /// stderr.
     pub stderr: Vec<u8>,
+}
+
+#[cfg(unix)]
+impl ChildOut {
+    /// A full retention window cannot prove that stdout is a complete inventory.
+    pub(crate) fn stdout_may_be_truncated(&self) -> bool {
+        self.stdout.len() >= deadline::OUTPUT_KEEP
+    }
 }
 
 impl fmt::Debug for ChildOut {
@@ -119,14 +150,21 @@ pub struct ScriptedChild {
     pub out: ChildOut,
 }
 
-/// The refusal every door that runs or logs a spec shares (`run`, and the simulated arms of
-/// `Fx::child` and `Fx::git`), before anything runs or is logged: a relative program is
-/// could_not_run, `Sub::Local`, why `{program} is not an absolute path`.
+/// The refusals every door that runs or logs a spec shares (`run`, and the simulated arms of
+/// `Fx::child` and `Fx::git`), before anything runs or is logged: a relative program or
+/// explicit input above 1 MiB is could_not_run, `Sub::Local`.
 ///
 /// # Errors
 ///
-/// As above.
+/// A relative program or oversized explicit input, as above.
 pub(crate) fn check(spec: &ChildSpec) -> Result<()> {
+    if spec
+        .input
+        .as_ref()
+        .is_some_and(|input| input.len() > 1024 * 1024)
+    {
+        return Err(Error::local("child input exceeds 1 MiB"));
+    }
     if spec.program.is_absolute() {
         Ok(())
     } else {
@@ -139,20 +177,22 @@ pub(crate) fn check(spec: &ChildSpec) -> Result<()> {
 
 /// Run `spec` to completion or its bound: `check(spec)`, then `spawnfd::command(program)`,
 /// `args`, `env_clear()` then `envs(env)`, and `current_dir(cwd)` when set, then
-/// `deadline::output_until(&mut cmd, until)`, with `until` =
+/// `deadline::output_until_from(&mut cmd, input, until)`, with `until` =
 /// `Instant::now().checked_add(spec.budget)` (a budget past the clock is refused before
-/// anything spawns). `output_until` takes an
+/// anything spawns). `output_until_from` takes an
 /// `Instant`, not a `Duration`, so the deadline is computed here, inside `fx/`, the one place
-/// census's agh-fx clause lets agh read a clock. `output_until` itself makes stdin
-/// `/dev/null`, pipes both streams, keeps the last `deadline::OUTPUT_KEEP` bytes of each, and
-/// puts the child at the head of a new process group (`process_group(0)`), which its
+/// census's agh-fx clause lets agh read a clock. This runner attaches `/dev/null` unless
+/// explicit bounded ref input is attached through a private data file.
+/// Both paths pipe the output streams, keep the last `deadline::OUTPUT_KEEP` bytes of each, and
+/// put the child at the head of a new process group (`process_group(0)`), which its
 /// termination path targets.
 ///
 /// # Errors
 ///
 /// could_not_run, `Sub::Local`. Before anything is spawned: why `{program} is not an absolute
-/// path`, `{program}'s budget {budget} is past what the clock holds`, or `{program} could not
-/// start: {e}`. These pre-dispatch refusals carry `SideEffect::None`.
+/// path`, oversized explicit input, `{program}'s budget {budget} is past what the clock holds`,
+/// private input directory/write/open errors, or `{program} could not start: {e}`.
+/// These pre-dispatch refusals carry `SideEffect::None`.
 /// A capture failure after successful dispatch, wait failure or timeout carries
 /// `SideEffect::Unknown`: a git push may already have reached its remote. Neither the
 /// collector failure nor its termination attempt proves that nothing happened; its cleanup
@@ -167,6 +207,8 @@ pub(crate) fn run(spec: &ChildSpec) -> Result<ChildOut> {
             spec.budget
         )));
     };
+    // Keep the private input directory until the command drops its descriptor.
+    let input_dir;
     let mut cmd = spawnfd::command(&spec.program);
     cmd.args(&spec.args);
     cmd.env_clear();
@@ -174,7 +216,21 @@ pub(crate) fn run(spec: &ChildSpec) -> Result<ChildOut> {
     if let Some(dir) = &spec.cwd {
         cmd.current_dir(dir);
     }
-    match deadline::output_until(&mut cmd, until) {
+    let input = if let Some(bytes) = &spec.input {
+        input_dir = aterm_tempfile::Builder::new()
+            .prefix("agh-input-")
+            .tempdir()
+            .map_err(|error| Error::local(format!("child input directory: {error}")))?;
+        let path = input_dir.path().join("input");
+        std::fs::write(&path, bytes)
+            .map_err(|error| Error::local(format!("child input write: {error}")))?;
+        let file = std::fs::File::open(path)
+            .map_err(|error| Error::local(format!("child input open: {error}")))?;
+        spawnfd::Stdio::from(file)
+    } else {
+        spawnfd::Stdio::null()
+    };
+    match deadline::output_until_from(&mut cmd, input, until) {
         Ok(output) => Ok(ChildOut {
             code: output.status.code(),
             stdout: output.stdout,
@@ -266,6 +322,24 @@ mod tests {
             (err.kind, err.sub, err.side_effect),
             (Kind::CouldNotRun, Sub::Local, SideEffect::None)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_child_input_is_bounded_and_never_inherited_or_debug_printed() {
+        let cat = ChildSpec::new(Path::new("/bin/cat"));
+        assert!(run(&cat).expect("null input").stdout.is_empty());
+        let mut input = vec![b'x'; 128 * 1024];
+        input.extend_from_slice(b"input-content-marker");
+        let spec = cat.clone().input(&input);
+        assert!(!format!("{spec:?}").contains("input-content-marker"));
+        assert_eq!(
+            run(&spec).expect("input larger than a pipe buffer").stdout,
+            input
+        );
+        let oversized = cat.input(&vec![0; 1024 * 1024 + 1]);
+        let error = run(&oversized).expect_err("bounded before spawn");
+        assert_eq!(error.side_effect, SideEffect::None);
     }
 
     /// A child that started and was killed at its bound may have acted first (a git push may

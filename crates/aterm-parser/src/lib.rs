@@ -172,6 +172,10 @@ pub struct Parser {
     pub(crate) last_was_colon: bool,
     /// Whether 8-bit C1 controls (`0x80..=0x9F`) are interpreted.
     pub(crate) c1_controls_enabled: bool,
+    /// Test seam: decode multi-byte runs as before they joined the ASCII between their
+    /// characters ([`Parser::set_reference_runs`]).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) reference_runs: bool,
 }
 
 impl Default for Parser {
@@ -203,6 +207,8 @@ impl Parser {
             subparam_mask: 0,
             last_was_colon: false,
             c1_controls_enabled: false,
+            #[cfg(any(test, debug_assertions))]
+            reference_runs: false,
         }
     }
 
@@ -213,6 +219,16 @@ impl Parser {
         let mut parser = Self::new();
         parser.c1_controls_enabled = true;
         parser
+    }
+
+    /// Test seam: with `on`, a multi-byte run ends at the first ASCII byte, as it did before runs
+    /// joined the printable ASCII between their characters, so the differential tests can hold
+    /// the joined runs to the reference path. The prints are the same either way; only how they
+    /// group into `print_ascii_bulk` and `print_unicode_bulk` calls differs.
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn set_reference_runs(&mut self, on: bool) {
+        self.reference_runs = on;
     }
 
     /// Reset parser to ground state.

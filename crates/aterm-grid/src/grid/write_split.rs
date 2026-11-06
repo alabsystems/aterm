@@ -365,6 +365,86 @@ impl Grid {
         }
     }
 
+    /// Write a run of width-1 BMP characters with deferred autowrap: the cells, cursor and pending
+    /// wrap [`Self::write_narrow_autowrap_fast`] leaves after writing them one at a time, batched
+    /// per row as the styled ASCII run is (`write_ascii_run_styled_packed`). A screen with
+    /// DECSLRM margins or a double-width row takes the per-glyph writer. A character past
+    /// U+FFFF, which no width-1 run holds, is stored as U+FFFD, as the per-glyph cell write does.
+    #[inline]
+    pub fn write_narrow_run_autowrap(
+        &mut self,
+        chars: &[char],
+        colors: PackedColors,
+        flags: CellFlags,
+    ) {
+        if self.storage.has_horizontal_margins || self.storage.any_double_width {
+            for &c in chars {
+                self.write_narrow_autowrap_fast(c, colors, flags);
+            }
+            return;
+        }
+        let cols = self.storage.cols;
+        let scan_stale = !self.storage.extras.is_empty();
+        let mut rest = chars;
+        while !rest.is_empty() {
+            if self.storage.take_pending_wrap() {
+                self.advance_autowrap_line();
+            }
+            let cursor_row = self.storage.cursor.row;
+            let cursor_col = self.storage.cursor.col;
+            let room = usize::from(cols.saturating_sub(cursor_col));
+            if room == 0 {
+                // A cursor past the last column (no state this writer leaves): one glyph at a
+                // time, as the per-glyph writer handles it.
+                let Some((&c, tail)) = rest.split_first() else {
+                    break;
+                };
+                self.write_narrow_autowrap_fast(c, colors, flags);
+                rest = tail;
+                continue;
+            }
+            let (run, tail) = rest.split_at(rest.len().min(room));
+            let end_col = cursor_col.saturating_add(u16::try_from(run.len()).unwrap_or(u16::MAX));
+            let row_may_have_extras = scan_stale
+                && self
+                    .storage
+                    .extras
+                    .map_may_have_row(cursor_row, usize::from(cols));
+
+            let mut stale = StaleExtras::NONE;
+            if let Some(row) = self.storage.row_mut(cursor_row) {
+                if row_may_have_extras {
+                    stale = StaleExtras::probe(row, cursor_col, end_col);
+                }
+                let count = end_col.saturating_sub(cursor_col);
+                if let Some(target) =
+                    row.cells_mut_with_fixup(cursor_col, count, Cell::bce_blank(colors))
+                {
+                    for (cell, &c) in target.iter_mut().zip(run) {
+                        let cp = c as u32;
+                        let char_data = if cp <= Cell::MAX_DIRECT_CODEPOINT {
+                            cp as u16
+                        } else {
+                            '\u{FFFD}' as u16
+                        };
+                        *cell = Cell::from_raw_parts(char_data, colors, flags);
+                    }
+                }
+                row.update_len(end_col);
+            }
+            self.remove_stale_extras(cursor_row, stale);
+            self.storage.mark_content_row(cursor_row);
+
+            rest = tail;
+            if end_col >= cols {
+                self.storage.cursor.col = cols.saturating_sub(1);
+                self.storage.mark_pending_wrap();
+            } else {
+                self.storage.cursor.col = end_col;
+            }
+        }
+    }
+
     /// Write a run of BMP width-2 characters with autowrap, batched per row.
     #[inline]
     pub fn write_wide_run_autowrap(
@@ -691,8 +771,7 @@ impl Grid {
         bg_rgb: Option<[u8; 3]>,
         underline_color: Option<u32>,
         extended_flags_bits: u16,
-        hyperlink_url: Option<&Arc<str>>,
-        hyperlink_id: Option<&Arc<str>>,
+        hyperlink: Option<&Arc<crate::HyperlinkData>>,
         last_byte: &mut Option<u8>,
     ) -> usize {
         if ascii.is_empty() {
@@ -784,8 +863,7 @@ impl Grid {
                     bg_rgb,
                     underline_color,
                     extended_flags: extended_flags_bits,
-                    hyperlink: hyperlink_url,
-                    hyperlink_id,
+                    hyperlink,
                 };
                 let vr = self.storage.visible_rows;
                 let c = self.storage.cols;

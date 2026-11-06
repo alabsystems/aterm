@@ -876,12 +876,14 @@ fn a_pass_declares_nothing_respects_exclusions_and_writes_once() {
     first.seed().unwrap();
     repair_commons(&lab, 6);
     let table = second.table().unwrap().unwrap();
-    std::fs::write(
-        lab_config(&lab, 1),
+    aterm_uds::atomic_file::write(
+        &lab_config(&lab, 1),
         format!(
             "[commons]\nexclude_tables = [\"{}\"]\n",
             aterm_codec::hex::encode_lower(&table)
-        ),
+        )
+        .as_bytes(),
+        0o600,
     )
     .unwrap();
     let before = second.view().unwrap().ops.len();
@@ -893,7 +895,7 @@ fn a_pass_declares_nothing_respects_exclusions_and_writes_once() {
         Outcome::Excluded
     );
     assert_eq!(second.view().unwrap().ops.len(), before);
-    std::fs::write(lab_config(&lab, 1), "").unwrap();
+    aterm_uds::atomic_file::write(&lab_config(&lab, 1), b"", 0o600).unwrap();
     let deferred = second
         .register(&lab_config(&lab, 1), &probe(), false, NOW)
         .unwrap();

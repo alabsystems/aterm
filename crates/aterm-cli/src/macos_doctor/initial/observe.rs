@@ -3,9 +3,10 @@
 
 //! The read-only pass behind System State's rows (`docs/DESIGN-system-state-2026-10-21.md` §3.5,
 //! §5): every local row, managed or not, read through the same items a run applies, in `Plan`
-//! mode, which writes nothing and raises no prompt. It takes neither the profile lock nor the
-//! setup slot, so it runs beside a pass; the caller drops a reading taken while that row's own
-//! stage ran.
+//! mode, which writes nothing. Reads of another app's data can still raise macOS privacy
+//! dialogs, so their admission is separate from the run mode. It takes neither the profile
+//! lock nor the setup slot, so it runs beside a pass; the caller drops a reading taken while
+//! that row's own stage ran.
 
 use super::*;
 use aterm_machines::init::WorkstationGroup;
@@ -17,11 +18,37 @@ use aterm_types::macos_setup::{
 #[cfg(test)]
 mod typed_join_tests;
 
+/// The context for reading checklist rows, not a macOS permission grant.
+#[derive(Clone, Copy)]
+pub enum ObservationRead {
+    /// An automatic refresh: evaluate the current page visibility at each private batch.
+    Ordinary {
+        /// The window's current frontness and person-presence check, with no privacy query.
+        page_front: fn() -> bool,
+    },
+    /// A person's explicit Check, whose existing read intent survives the queue.
+    ExplicitCheck,
+}
+
+impl ObservationRead {
+    fn admits_private(self) -> bool {
+        match self {
+            Self::Ordinary { page_front } => page_front(),
+            Self::ExplicitCheck => true,
+        }
+    }
+}
+
 /// Read `subjects` for `plan` without changing anything. `network` adds the
 /// GitHub repositories row (the network and the token file); without it that row
 /// is left out. A row that cannot be read comes back Unknown with the reason in
-/// its detail; nothing is guessed.
-pub fn observe_initial_setup(plan: &Plan, subjects: &[Subject], network: bool) -> Vec<Observation> {
+/// its detail; nothing is guessed. `admission` controls reads that can raise privacy dialogs.
+pub fn observe_initial_setup(
+    plan: &Plan,
+    subjects: &[Subject],
+    network: bool,
+    admission: ObservationRead,
+) -> Vec<Observation> {
     let unread = |subject: Subject, why: &str| Observation {
         detail: Some(why.to_owned()),
         ..Observation::unknown(subject)
@@ -32,7 +59,52 @@ pub fn observe_initial_setup(plan: &Plan, subjects: &[Subject], network: bool) -
             .map(|subject| unread(*subject, &why))
             .collect();
     }
-    observe_subjects(plan, subjects, network)
+    read_batches(subjects, network, admission, |subjects, network| {
+        observe_subjects(plan, subjects, network)
+    })
+}
+
+/// Dispatch an observation's native reads under their own admission.
+fn read_batches(
+    subjects: &[Subject],
+    network: bool,
+    admission: ObservationRead,
+    mut read: impl FnMut(&[Subject], bool) -> Vec<Observation>,
+) -> Vec<Observation> {
+    let mut safe = Vec::new();
+    let mut workstation = Vec::new();
+    let mut spotlight = Vec::new();
+    for subject in subjects {
+        match subject {
+            Subject::Setting(setting) if setting.is_workstation() => workstation.push(*subject),
+            Subject::Setting(Setting::Spotlight) => spotlight.push(*subject),
+            _ => safe.push(*subject),
+        }
+    }
+    let mut out = if safe.is_empty() {
+        Vec::new()
+    } else {
+        read(&safe, network)
+    };
+    // A native batch may wait on another process or the network. Its entry needs the page's
+    // current visibility, not the one a queue or an earlier batch saw. FDA and Plan mode
+    // establish no permission to query another app's preferences or protected project paths.
+    for private in [workstation, spotlight] {
+        if private.is_empty() {
+            continue;
+        }
+        if admission.admits_private() {
+            out.extend(read(&private, false));
+        } else {
+            out.extend(private.into_iter().map(|subject| Observation {
+                note: Some("Not read in the background".into()),
+                ..Observation::unknown(subject)
+            }));
+        }
+    }
+    let order = Subject::all();
+    out.sort_by_key(|row| order.iter().position(|subject| *subject == row.subject));
+    out
 }
 
 /// [`observe_initial_setup`] past its scope check.
@@ -430,13 +502,7 @@ fn vault(plan: &Plan, here: scope::VaultHere, root: Option<&Path>) -> Result<Obs
                 .as_deref(),
         ),
     };
-    Ok(vault_heard(
-        &read,
-        plan.selection,
-        here,
-        super::access::last_answer(),
-        root,
-    ))
+    Ok(vault_heard(&read, plan.selection, here, root))
 }
 
 /// Where this Mac is for its own ALab join's words, from its network place
@@ -487,17 +553,15 @@ fn pending_read(
 }
 
 /// [`vault_observation`] of `read` for `selection`, with what aterm last heard at the ALab vault's
-/// address for its plan (`here`, [`heard_for`]), said with what a LAN look last heard of macOS's
-/// Local Network switch (`lan`, [`scope::VaultHere::note_for`]), and whether a join password the
-/// person typed is held for a try there ([`scope::join_typed`]), as the records in `root` say.
+/// address for its plan (`here`, [`heard_for`]), and whether a join password the person typed is
+/// held for a try there ([`scope::join_typed`]), as the records in `root` say.
 fn vault_heard(
     read: &VaultRead,
     selection: Selection,
     here: scope::VaultHere,
-    lan: Option<super::access::LanAnswer>,
     root: Option<&Path>,
 ) -> Observation {
-    let here = here.note_for(lan);
+    let here = here.note();
     // Only a row the probe left a note on can wait for a join, so only then is the run read.
     let typed = here.is_some() && root.is_some_and(scope::join_typed);
     vault_observation(read, selection, here, typed)
@@ -821,6 +885,116 @@ mod tests {
     use aterm_secrets::alab_join::JoinPlace;
     use aterm_types::macos_setup::BASE_PLAN;
 
+    /// Ordinary reads admit each private batch only where the page is still in front. A
+    /// queued visibility observation and an earlier safe or private batch grant nothing to
+    /// the next one. An explicit Check retains its existing intent instead.
+    #[test]
+    fn ordinary_private_reads_require_current_visibility_at_each_batch() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        static FRONT: AtomicBool = AtomicBool::new(false);
+        fn front() -> bool {
+            FRONT.load(Ordering::SeqCst)
+        }
+        let fda = Subject::Access(Access::FullDiskAccess);
+        let safe = vec![
+            fda,
+            Subject::Setting(Setting::Secrets),
+            Subject::Setting(Setting::Repositories),
+        ];
+        let workstation = vec![
+            Subject::Setting(Setting::Dock),
+            Subject::Setting(Setting::Messages),
+        ];
+        let spotlight = vec![Subject::Setting(Setting::Spotlight)];
+        let subjects: Vec<_> = safe
+            .iter()
+            .chain(&workstation)
+            .chain(&spotlight)
+            .copied()
+            .collect();
+        for (queued, current, after_safe, after_workstation, check, ws_read, sp_read) in [
+            (false, false, None, None, false, false, false),
+            (true, false, None, None, false, false, false),
+            (true, true, Some(false), None, false, false, false),
+            (true, true, None, Some(false), false, true, false),
+            (false, false, Some(true), None, false, true, true),
+            (false, false, None, None, true, true, true),
+        ] {
+            FRONT.store(queued, Ordering::SeqCst);
+            let admission = if check {
+                ObservationRead::ExplicitCheck
+            } else {
+                ObservationRead::Ordinary { page_front: front }
+            };
+            FRONT.store(current, Ordering::SeqCst);
+            let mut calls = Vec::new();
+            let seen = read_batches(&subjects, true, admission, |batch, network| {
+                calls.push((batch.to_vec(), network));
+                let change = if batch == safe {
+                    after_safe
+                } else if batch == workstation {
+                    after_workstation
+                } else {
+                    None
+                };
+                if let Some(front) = change {
+                    FRONT.store(front, Ordering::SeqCst);
+                }
+                batch
+                    .iter()
+                    .map(|subject| Observation {
+                        standing: Standing::InPlace,
+                        now: Some("verified current state".into()),
+                        ..Observation::unknown(*subject)
+                    })
+                    .collect()
+            });
+            let mut expected = vec![(safe.clone(), true)];
+            if ws_read {
+                expected.push((workstation.clone(), false));
+            }
+            if sp_read {
+                expected.push((spotlight.clone(), false));
+            }
+            assert_eq!(
+                calls, expected,
+                "private readers must not be invoked without admission"
+            );
+            for subject in &subjects {
+                let row = seen.iter().find(|row| row.subject == *subject).unwrap();
+                let was_read = safe.contains(subject)
+                    || (ws_read && workstation.contains(subject))
+                    || (sp_read && spotlight.contains(subject));
+                assert_eq!(
+                    row.standing,
+                    if was_read {
+                        Standing::InPlace
+                    } else {
+                        Standing::Unknown
+                    }
+                );
+                assert_eq!(row.now.is_some(), was_read);
+            }
+            assert_eq!(
+                seen.iter().find(|row| row.subject == fda).unwrap().standing,
+                Standing::InPlace,
+                "a verified FDA row never admits the other-app readers"
+            );
+        }
+        FRONT.store(false, Ordering::SeqCst);
+        let seen = read_batches(
+            &workstation,
+            false,
+            ObservationRead::Ordinary { page_front: front },
+            |_, _| panic!("a hidden private-only refresh invoked its native reader"),
+        );
+        assert!(
+            seen.iter()
+                .all(|row| row.standing == Standing::Unknown && row.now.is_none())
+        );
+    }
+
     #[test]
     fn a_restore_refused_before_effects_keeps_the_pending_login_reading() {
         for failure in ["stop", "backup", "activation"] {
@@ -1038,20 +1212,6 @@ mod tests {
         assert_eq!(scope::VaultHere::Unreached.note(), Some(scope::NOT_REACHED));
         assert_eq!(scope::VaultHere::Found.note(), None);
         assert_eq!(scope::VaultHere::Unasked.note(), None);
-        // macOS refusing aterm the LAN is named: only the person's Local Network switch moves it.
-        let refused = Some(super::access::LanAnswer::Refused);
-        assert_eq!(
-            scope::VaultHere::Unreached.note_for(refused),
-            Some(scope::LAN_OFF)
-        );
-        assert_eq!(
-            scope::VaultHere::Unreached.note_for(Some(super::access::LanAnswer::Reached)),
-            Some(scope::NOT_REACHED)
-        );
-        assert_eq!(
-            scope::VaultHere::Absent.note_for(refused),
-            Some(scope::NO_VAULT)
-        );
         assert_eq!(
             words(VaultRead::Unconfigured, None),
             (Standing::Differs, "Not joined".into(), None)
@@ -1087,8 +1247,8 @@ mod tests {
     }
 
     /// A vault not joined where no ALab vault answered waits on nothing for aterm's own join,
-    /// whatever else the plan sets up: whether a server there holds no vault, nobody answered, or
-    /// Local Network kept the probe in, the row reads Not joined in place, the value it then
+    /// whatever else the plan sets up: whether a server there holds no vault or nobody answered,
+    /// the row reads Not joined in place, the value it then
     /// wants, and keeps what the probe heard as its note, on the base plan, on it with any one
     /// group of the ALab profile, and on the whole profile. A join the person typed a password
     /// for waits for that vault with the same note, on the base plan too.
@@ -1108,7 +1268,7 @@ mod tests {
             let seen = vault_observation(&VaultRead::Unconfigured, selection, here, typed);
             (seen.standing, seen.now.unwrap(), seen.wanted, seen.note)
         };
-        for note in [scope::NO_VAULT, scope::NOT_REACHED, scope::LAN_OFF] {
+        for note in [scope::NO_VAULT, scope::NOT_REACHED] {
             for selection in plans.iter().copied() {
                 let settled = reads(selection, Some(note), false);
                 assert_eq!(

@@ -331,6 +331,12 @@ pub struct Client<S = UnixStream> {
     /// Whether this connection asked for broker-stamped wall times (`bt=`, R3) and the
     /// broker took the ask ([`broker_times`](Client::broker_times)); `None`: not asked.
     broker_times: Option<bool>,
+    /// Whether this connection asked for each delivery's origin and the broker took the ask
+    /// ([`origin_stamps`](Client::origin_stamps)).
+    origins: bool,
+    /// The origin of each record the newest page delivered, in order
+    /// ([`page_origins`](Client::page_origins)).
+    page_origins: Vec<Option<(u64, u64)>>,
     /// The gap notices the pages [`fetch`](Client::fetch) read carried since
     /// [`take_gaps`](Client::take_gaps) last took them, each with its fetch's filter, in the
     /// order read.
@@ -386,6 +392,12 @@ pub struct Client<S = TcpStream> {
     /// Whether this connection asked for broker-stamped wall times (`bt=`, R3) and the
     /// broker took the ask ([`broker_times`](Client::broker_times)); `None`: not asked.
     broker_times: Option<bool>,
+    /// Whether this connection asked for each delivery's origin and the broker took the ask
+    /// ([`origin_stamps`](Client::origin_stamps)).
+    origins: bool,
+    /// The origin of each record the newest page delivered, in order
+    /// ([`page_origins`](Client::page_origins)).
+    page_origins: Vec<Option<(u64, u64)>>,
     /// The gap notices the pages [`fetch`](Client::fetch) read carried since
     /// [`take_gaps`](Client::take_gaps) last took them, each with its fetch's filter, in the
     /// order read.
@@ -687,6 +699,8 @@ impl<S: Read + Write> Client<S> {
             oldest: None,
             told: None,
             broker_times: None,
+            origins: false,
+            page_origins: Vec::new(),
             gaps: Vec::new(),
             owed: 0,
             rx: RecvBuf::default(),
@@ -1856,15 +1870,38 @@ impl<S: Read + Write> Client<S> {
     }
 
     /// Ask that this connection's deliveries carry each record's own `(producer_id, producer_seq)`
-    /// ([`Request::OriginStamps`], read back with [`Subscription::last_origin`]). `Ok(false)` from
-    /// a broker that predates the verb, with the stream still framed.
+    /// ([`Request::OriginStamps`], read back with [`Subscription::last_origin`] on a tail and with
+    /// [`page_origins`](Self::page_origins) on a page). `Ok(false)` from a broker that predates
+    /// the verb, with the stream still framed.
     pub fn origin_stamps(&mut self) -> io::Result<bool> {
         self.send(&Request::OriginStamps)?;
-        match self.read_mark() {
-            Ok(_) => Ok(true),
-            Err(e) if is_refused_error(&e) => Ok(false),
-            Err(e) => Err(e),
-        }
+        let took = match self.read_mark() {
+            Ok(_) => true,
+            Err(e) if is_refused_error(&e) => false,
+            Err(e) => return Err(e),
+        };
+        self.origins = took;
+        Ok(took)
+    }
+
+    /// The origin of each record the newest page this connection read delivered, in the order
+    /// it delivered them: the record's own `(producer_id, producer_seq)`, the key it was
+    /// published or relayed under, so a reader of a page learns where each record came from
+    /// with no read of its own. Every bounded read refills it ([`fetch`](Self::fetch),
+    /// [`fetch_told`](Self::fetch_told), [`last`](Self::last), [`last_page`](Self::last_page)
+    /// and their stamped forms); a walk of several requests ([`last_walk`](Self::last_walk),
+    /// [`last_all`](Self::last_all), [`last_all_stamped`](Self::last_all_stamped)) leaves only
+    /// its last request's page, which its collected rows do not pair with. Filled only on a
+    /// connection that asked with [`origin_stamps`](Self::origin_stamps) and was taken, one
+    /// entry per record, `None` for a record the broker stamped no origin on; empty on any
+    /// other connection. Each request this connection sends clears it first, so it is empty
+    /// after a request that read no page or was refused as it was sent or by the broker. Read
+    /// it after a page call returned `Ok`: a call refused before it sent anything (a failed
+    /// negotiation) leaves what was there, and a connection lost partway through a page leaves
+    /// the origins of what that page read before it failed.
+    #[must_use]
+    pub fn page_origins(&self) -> &[Option<(u64, u64)>] {
+        &self.page_origins
     }
 
     /// Append a record that originated elsewhere, under its origin's `(producer_id, producer_seq)`
@@ -1950,7 +1987,7 @@ impl<S: Read + Write> Client<S> {
     /// that batch got.
     ///
     /// What it is for: a writer whose own file is on the log's device
-    /// ([`log_device`](Self::log_device), [`LogDevice::settles`]) orders its writes by a
+    /// ([`log_device`](Self::log_device), [`LogDevice::settles`](crate::LogDevice::settles)) orders its writes by a
     /// barrier (`astream_sys::barrier_sync`), then sends this, and holds what depends on
     /// those writes until it reads the answer. Sent before the barrier returned, the answer
     /// proves nothing about them: the flush may have run ahead of the barrier. A broker that
@@ -2443,7 +2480,8 @@ impl<S: Read + Write> Client<S> {
         let mut page = Vec::new();
         let mut gap = None;
         loop {
-            match self.read_response()? {
+            let (resp, _, origin) = self.read_response_stamped()?;
+            match resp {
                 Response::Gap(g) if told && page.is_empty() && gap.is_none() => gap = Some(g),
                 // The rest of that page is still on the stream, unread: out of step.
                 Response::Delivery { .. } if page.len() >= max as usize => {
@@ -2456,7 +2494,10 @@ impl<S: Read + Write> Client<S> {
                     offset,
                     subject,
                     body,
-                } => page.push((offset, subject, body)),
+                } => {
+                    page.push((offset, subject, body));
+                    self.note_page_origin(origin);
+                }
                 Response::Mark {
                     next,
                     head,
@@ -2482,7 +2523,7 @@ impl<S: Read + Write> Client<S> {
         let mut page = Vec::new();
         let mut gap = None;
         loop {
-            let (resp, bt_ms) = self.read_response_with_bt()?;
+            let (resp, bt_ms, origin) = self.read_response_stamped()?;
             match resp {
                 Response::Gap(g) if told && page.is_empty() && gap.is_none() => gap = Some(g),
                 Response::Delivery { .. } if page.len() >= max as usize => {
@@ -2495,7 +2536,10 @@ impl<S: Read + Write> Client<S> {
                     offset,
                     subject,
                     body,
-                } => page.push((offset, subject, body, bt_ms)),
+                } => {
+                    page.push((offset, subject, body, bt_ms));
+                    self.note_page_origin(origin);
+                }
                 Response::Mark {
                     next,
                     head,
@@ -2514,6 +2558,14 @@ impl<S: Read + Write> Client<S> {
                 }
                 other => return Err(self.reply_error(other)),
             }
+        }
+    }
+
+    /// Keep the origin of a record the page in hand delivered, on a connection that asked for
+    /// origins ([`page_origins`](Self::page_origins)).
+    fn note_page_origin(&mut self, origin: Option<(u64, u64)>) {
+        if self.origins {
+            self.page_origins.push(origin);
         }
     }
 
@@ -2676,6 +2728,9 @@ impl<S: Read + Write> Client<S> {
     /// [`AcksOwed`] while a pipelined ack is owed: the next frame is that ack's. The
     /// pipelined writes go through [`write_owed`](Self::write_owed) instead.
     fn send(&mut self, req: &Request) -> io::Result<()> {
+        // A request's reply is the newest page, or no page: the last one's origins go first, so a
+        // request refused here or by the broker leaves none in place.
+        self.page_origins.clear();
         self.owes_nothing()?;
         let mut out = Vec::new();
         append_frame(&mut out, &encode_request(req))?;
@@ -2701,14 +2756,27 @@ impl<S: Read + Write> Client<S> {
     }
 
     fn read_response_with_bt(&mut self) -> io::Result<(Response, Option<u64>)> {
+        let (resp, bt_ms, _) = self.read_response_stamped()?;
+        Ok((resp, bt_ms))
+    }
+
+    /// [`read_response_with_bt`](Self::read_response_with_bt), and on a connection that asked
+    /// for origins ([`origin_stamps`](Self::origin_stamps)) the one a `Delivery` carries.
+    fn read_response_stamped(&mut self) -> io::Result<(Response, Option<u64>, Option<(u64, u64)>)> {
         self.in_step()?;
         let frame = if self.rx.is_empty() {
             read_frame(&mut self.stream)
         } else {
             self.rx.next_frame(&mut self.stream)
         };
+        let origins = self.origins;
         let read = match frame {
-            Ok(Some(p)) => decode_reply_with_bt(&p),
+            Ok(Some(p)) => decode_reply_with_bt(&p).map(|(resp, bt_ms)| {
+                let origin = (origins && matches!(resp, Response::Delivery { .. }))
+                    .then(|| decode_delivery_origin(&p))
+                    .flatten();
+                (resp, bt_ms, origin)
+            }),
             Ok(None) => Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "broker closed",

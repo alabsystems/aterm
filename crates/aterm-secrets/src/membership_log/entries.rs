@@ -37,6 +37,20 @@ use zeroize::{Zeroize, Zeroizing};
 mod keyed;
 mod register;
 
+/// `f`, its openings on this thread run under the NEGATIVE CONTROL `entries-arrival-order`: no
+/// sibling beats another, so the first a Mac's log holds wins, and the register oracle counts the
+/// disagreement rather than failing on it. For a test of law 5 to show it catches a register that
+/// reads arrival order.
+#[cfg(test)]
+fn reading_arrival_order<T>(f: impl FnOnce() -> T) -> T {
+    register::oracle::COUNT_ONLY.set(true);
+    register::ARRIVAL_ORDER.set(true);
+    let read = f();
+    register::ARRIVAL_ORDER.set(false);
+    register::oracle::COUNT_ONLY.set(false);
+    read
+}
+
 /// Maximum binary age capsule size carried by [`Body::Wrap`].
 pub const MAX_WRAP_CAPSULE: usize = 1024;
 /// Maximum ChaCha20-Poly1305 ciphertext size carried by [`Body::Put`].
@@ -937,18 +951,6 @@ struct CandidateOp {
     record_id: RecordId,
     epoch: RecordId,
     op: DecodedOp,
-}
-
-/// Whether two register ops write the same thing: two `Delete`s, or two `Put`s of one value with
-/// the same flags.
-fn same_op(a: &DecodedOp, b: &DecodedOp) -> bool {
-    match (a, b) {
-        (DecodedOp::Delete, DecodedOp::Delete) => true,
-        (DecodedOp::Put(a), DecodedOp::Put(b)) => {
-            a.if_absent == b.if_absent && a.anchor == b.anchor && a.value_class == b.value_class
-        }
-        _ => false,
-    }
 }
 
 /// Drop each winning entry whose anchor (`if-absent=<anchor>`) no view of `by_audience` holds as a
@@ -2141,10 +2143,7 @@ impl Log {
                 continue;
             };
             let winner = &candidates[w];
-            if siblings
-                .iter()
-                .any(|&i| !same_op(&candidates[i].op, &winner.op))
-            {
+            if register.conflict(&siblings, w) {
                 conflicts.insert((audience.clone(), name.clone()));
             }
             if let DecodedOp::Put(entry) = &winner.op {
@@ -2409,6 +2408,7 @@ mod tests {
     use super::*;
     use crate::commons::binding::Request;
     use crate::membership_log::epochs;
+    use crate::membership_log::tests::permutations;
     use crate::membership_log::tests::signed::{Mac, generated, three_macs};
     use crate::membership_log::{Entrant, Evidence, Inserted};
 
@@ -2828,6 +2828,149 @@ mod tests {
         let opened = side_a.open_entry_set(&t.id2).unwrap().unwrap();
         assert!(opened.conflicts.is_empty());
         assert_eq!(read(&side_a, &t.id2, "c").unwrap(), winner);
+    }
+
+    /// What `id` opens: each entry's audience, name and value, and the conflicts.
+    type Opened = (
+        Vec<(Audience, String, Vec<u8>)>,
+        BTreeSet<(Audience, String)>,
+    );
+
+    fn opened(log: &Log, id: &Identity) -> Opened {
+        let set = log.open_entry_set(id).unwrap().unwrap();
+        let mut entries: Vec<_> = set
+            .entries
+            .iter()
+            .map(|e| {
+                (
+                    e.audience.clone(),
+                    e.name.clone(),
+                    e.value.as_slice().to_vec(),
+                )
+            })
+            .collect();
+        entries.sort();
+        (entries, set.conflicts)
+    }
+
+    /// Law 5 on signed logs: three Macs write `[everyone]` entries beside each other (m1 reseals
+    /// `k1` and `k2` under a fresh epoch, m2 edits `k1` and deletes `k2`, m9 edits `k1` and adds
+    /// `k3`, both under the old epoch, each Mac's second record on its first), and a Mac
+    /// receives the six records in each of the 720 orders (a record whose parent has not come
+    /// yet waits, so the log holds them in an order the arrival chose). Every order reads the
+    /// same entries and conflicts, for m1 and for m2: `k1` the conflict of the two edits, the
+    /// lower record id's value, its reseal taken out; `k2` gone, its reseal taken out; `k3`.
+    /// NEGATIVE CONTROL `entries-arrival-order` (the first sibling a Mac's log holds wins): two
+    /// orders read `k1` apart, so the arrival order reaches the register and the test sees it.
+    #[test]
+    fn every_arrival_order_of_concurrent_writes_reads_the_same_entries() {
+        let t = three();
+        let mut pre = t.log.clone();
+        for entry in [put("k1", b"v0"), put("k2", b"w0")] {
+            let rec = pre
+                .draft_put(&t.m1, 1_500, t.epoch, &t.key, &entry)
+                .unwrap()
+                .sign(&t.w1, t.inc1)
+                .unwrap();
+            pre.insert(rec).unwrap();
+        }
+        // m9 departs: m1's fresh epoch and its wraps to m1 and m2 are held first, the carries of
+        // the reseal arrive with the edits.
+        let mut base = pre.clone();
+        let (draft, key) = base
+            .draft_epoch(&t.m1, 2_000, Audience::Everyone, 2)
+            .unwrap();
+        let ep = draft.sign(&t.w1, t.inc1).unwrap();
+        let fresh = *ep.id();
+        base.insert(ep).unwrap();
+        for id in [&t.id1, &t.id2] {
+            let wrap = base
+                .draft_wrap(&t.m1, 2_001, fresh, &key, id.recipient())
+                .unwrap()
+                .sign(&t.w1, t.inc1)
+                .unwrap();
+            base.insert(wrap).unwrap();
+        }
+        let mut records = Vec::new();
+        let mut m1 = base.clone();
+        for entry in [put("k1", b"v0"), put("k2", b"w0")] {
+            let rec = m1
+                .draft_put(&t.m1, 2_002, fresh, &key, &entry)
+                .unwrap()
+                .sign(&t.w1, t.inc1)
+                .unwrap();
+            m1.insert(rec.clone()).unwrap();
+            records.push(rec);
+        }
+        let mut m2 = pre.clone();
+        let edit = m2
+            .draft_put(&t.m2, 1_600, t.epoch, &t.key, &put("k1", b"v1-m2"))
+            .unwrap()
+            .sign(&t.w2, t.inc2)
+            .unwrap();
+        m2.insert(edit.clone()).unwrap();
+        let delete = m2
+            .draft_delete(&t.m2, 1_601, t.epoch, &t.key, "k2")
+            .unwrap()
+            .sign(&t.w2, t.inc2)
+            .unwrap();
+        let mut m9 = pre.clone();
+        let other = m9
+            .draft_put(&t.m9, 1_600, t.epoch, &t.key, &put("k1", b"v1-m9"))
+            .unwrap()
+            .sign(&t.w9, t.inc9)
+            .unwrap();
+        m9.insert(other.clone()).unwrap();
+        let added = m9
+            .draft_put(&t.m9, 1_601, t.epoch, &t.key, &put("k3", b"z"))
+            .unwrap()
+            .sign(&t.w9, t.inc9)
+            .unwrap();
+        let lower: &[u8] = if edit.id() < other.id() {
+            b"v1-m2"
+        } else {
+            b"v1-m9"
+        };
+        records.extend([edit, delete, other, added]);
+
+        let arrive = |order: &[usize]| {
+            let mut log = base.clone();
+            for &i in order {
+                log.insert(records[i].clone()).unwrap();
+            }
+            [opened(&log, &t.id1), opened(&log, &t.id2)]
+        };
+        let orders = permutations(records.len());
+        assert_eq!(orders.len(), 720);
+        let want = arrive(&orders[0]);
+        let k = |name: &str| (Audience::Everyone, name.to_owned());
+        for (entries, conflicts) in &want {
+            assert_eq!(
+                *conflicts,
+                BTreeSet::from([k("k1")]),
+                "k1 alone is a conflict"
+            );
+            let names: Vec<(&str, &[u8])> = entries
+                .iter()
+                .map(|(audience, name, value)| {
+                    assert_eq!(*audience, Audience::Everyone);
+                    (name.as_str(), value.as_slice())
+                })
+                .collect();
+            assert_eq!(names, [("k1", lower), ("k3", b"z".as_slice())]);
+        }
+        for order in &orders {
+            assert!(
+                arrive(order) == want,
+                "arrival order {order:?} reads otherwise"
+            );
+        }
+
+        let read_apart = reading_arrival_order(|| {
+            let first = arrive(&orders[0]);
+            orders.iter().any(|order| arrive(order) != first)
+        });
+        assert!(read_apart, "the first sibling seen winning goes unnoticed");
     }
 
     /// Registers merge one name at a time: one side of a split removes an anchored set while the
@@ -4614,7 +4757,8 @@ mod tests {
     /// the three readings every opening and probe takes, of each copy after each step and of the
     /// merge, is what the one it replaced gives: every epoch verdict ([`epochs::oracle::check`]),
     /// every keyed-epoch reading ([`keyed::oracle::check`]), which finds keyed epochs, covered ones
-    /// among them, and every register ([`register::oracle`]). Each oracle fails the generation on
+    /// among them, and every register ([`register::oracle`]), each also the island's fold's reading
+    /// (law 5's `aterm_mesh_core::convergence::Register`). Each oracle fails the generation on
     /// a disagreement, so a failure names its reading in its own panic and not in this test's name.
     /// NEGATIVE CONTROLS: with what a writer held keeping every carry, the openings disagree; a
     /// verdict that reads no seat entry, no prior wrap, lets a newest epoch the seat entry follows
@@ -4626,6 +4770,7 @@ mod tests {
         keyed::oracle::CHECKED.set((0, 0));
         keyed::oracle::FOUND.set((0, 0));
         register::oracle::CHECKED.set((0, 0));
+        register::oracle::ISLAND_CHECKED.set(0);
         let logs: Vec<Log> = (1..=200).map(generated).collect();
 
         let (checked, wrong) = epochs::oracle::CHECKED.get();
@@ -4642,6 +4787,11 @@ mod tests {
         let (checked, wrong) = register::oracle::CHECKED.get();
         assert!(checked > 5_000, "the openings checked registers: {checked}");
         assert_eq!(wrong, 0, "of {checked} registers");
+        let island = register::oracle::ISLAND_CHECKED.get();
+        assert!(
+            island > 5_000,
+            "the island's fold resolved registers: {island} of {checked}"
+        );
 
         let (macs, _) = three_macs();
         let left_out = logs

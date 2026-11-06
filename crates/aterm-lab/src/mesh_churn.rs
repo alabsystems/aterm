@@ -539,6 +539,10 @@ pub struct Seen {
     pub newest_wrap: BTreeSet<Recipient>,
     /// Its identity opens every one of them.
     pub opens_newest: bool,
+    /// Those of them its log reads as possibly a prefix of their minter's batch
+    /// ([`aterm_secrets::membership_log::Log::unsettled`]): the gap closer and the tender hold
+    /// over each until it settles or the settle grace runs out.
+    pub unsettled: Vec<RecordId>,
     /// The labels of the current seats in its per-seat view (`aterm members list`), `None` where
     /// the view did not read: it reads the local roster under a nonblocking take of the vault's
     /// state lock, which a running subscriber holds through each pass, so the lab reads it once
@@ -1433,6 +1437,7 @@ pub fn see(name: &str, paths: &Paths, up: bool) -> Seen {
         *seen.node_seats.entry(node).or_default() += 1;
     }
     seen.newest = log.newest_epochs(&EpochAudience::Everyone);
+    seen.unsettled = log.unsettled(&seen.newest);
     if let Some(identity) = &identity
         && let Ok(Some(opened)) = log.open_audience_entries(identity)
     {
@@ -1681,6 +1686,9 @@ enum Act {
     Desk,
     /// Let a Mac back in by its node key's proof alone.
     Prove,
+    /// One records pass of this Mac's vault (`client::sync_records`): pull what its servers
+    /// hold and post what they lack, signing nothing.
+    Pull,
 }
 
 impl Act {
@@ -1692,6 +1700,7 @@ impl Act {
             Self::Repoint => "repoint",
             Self::Desk => "desk",
             Self::Prove => "prove",
+            Self::Pull => "pull",
         }
     }
 
@@ -1703,6 +1712,7 @@ impl Act {
             Self::Repoint,
             Self::Desk,
             Self::Prove,
+            Self::Pull,
         ]
         .into_iter()
         .find(|a| a.word() == word)
@@ -2063,6 +2073,8 @@ impl Lab {
         let start = Instant::now();
         let mut last_move = start;
         let mut last: Option<Vec<Seen>> = None;
+        // When each Mac's own read last changed: the Macs that changed last held the wait.
+        let mut changed: Vec<Instant> = vec![start; macs.len()];
         loop {
             stop::check().map_err(|_| Unsettled::Stopped)?;
             if let Some(&i) = macs.iter().find(|&&i| !self.macs[i].up()) {
@@ -2085,6 +2097,14 @@ impl Lab {
                 .map(|&i| see(&self.macs[i].name, &self.macs[i].paths(), true))
                 .collect();
             let refs: Vec<&Seen> = all.iter().collect();
+            if let Some(prev) = &last {
+                let now = Instant::now();
+                for ((at, a), b) in changed.iter_mut().zip(prev).zip(&all) {
+                    if read_moved(a, b) {
+                        *at = now;
+                    }
+                }
+            }
             let why = settled(&refs, need);
             if why.is_none() {
                 let ms = elapsed_ms(from);
@@ -2093,16 +2113,12 @@ impl Lab {
                     macs.len(),
                     ms as f64 / 1000.0
                 ));
+                self.say(&format!("{what}: {}", last_settled(&refs, &changed, from)));
                 return Ok(ms);
             }
-            let moved = last.as_ref().is_none_or(|prev| {
-                prev.iter().zip(&all).any(|(a, b)| {
-                    a.heads != b.heads
-                        || a.records != b.records
-                        || a.opens_newest != b.opens_newest
-                        || a.newest_wrap != b.newest_wrap
-                })
-            });
+            let moved = last
+                .as_ref()
+                .is_none_or(|prev| prev.iter().zip(&all).any(|(a, b)| read_moved(a, b)));
             if moved {
                 last_move = Instant::now();
                 last = Some(all);
@@ -2172,6 +2188,14 @@ impl Lab {
     /// The end's read of every Mac, once the script's last wait settled: each subscriber ends
     /// first, so nothing holds a vault's state lock and each per-seat view reads ([`Seen::seats`]);
     /// each Mac reads as up or down as it was just before.
+    ///
+    /// A wait settles on one frontier and the newest key, not on every timer done, so a
+    /// subscriber may sign a record (a gap's `Wrap` at a later rank, a re-key) in its last round,
+    /// and ending the subscribers one by one leaves it on that Mac alone, or on it and its
+    /// servers. So once every subscriber ended, each Mac whose server runs takes two records
+    /// passes in its own world ([`Act::Pull`], which signs nothing): the first posts what a Mac
+    /// holds to the servers that lack it, the second takes what the first posted. The line it
+    /// says names each Mac whose store grew there: what reached it only by the end's passes.
     fn read_end(&mut self) -> Vec<Seen> {
         let up: Vec<bool> = self.macs.iter().map(Mac::up).collect();
         for mac in &mut self.macs {
@@ -2179,12 +2203,80 @@ impl Lab {
                 kid.end();
             }
         }
+        let serving: Vec<usize> = (0..self.macs.len())
+            .filter(|&i| self.macs[i].server.as_ref().is_some_and(Kid::running))
+            .collect();
+        let count = |lab: &Self, i: usize| {
+            client::load_records(&lab.macs[i].paths())
+                .ok()
+                .and_then(|store| store.log().map(Log::held_count))
+                .unwrap_or(0)
+        };
+        let before: Vec<usize> = serving.iter().map(|&i| count(self, i)).collect();
+        for _ in 0..2 {
+            for &i in &serving {
+                let _ = self.act(i, Act::Pull, &[]);
+            }
+        }
+        let grew: Vec<String> = serving
+            .iter()
+            .zip(&before)
+            .filter_map(|(&i, &was)| {
+                let now = count(self, i);
+                (now > was).then(|| format!("{} +{}", self.macs[i].name, now - was))
+            })
+            .collect();
+        self.say(&format!(
+            "end: every subscriber ended; the end's records passes took records into {}",
+            if grew.is_empty() {
+                "no Mac".to_owned()
+            } else {
+                grew.join(", ")
+            }
+        ));
         self.macs
             .iter()
             .zip(up)
             .map(|(m, up)| see_whole(&m.name, &m.paths(), up))
             .collect()
     }
+}
+
+/// Whether a Mac's read moved between two reads of a wait: what its hang detector counts.
+fn read_moved(a: &Seen, b: &Seen) -> bool {
+    a.heads != b.heads
+        || a.records != b.records
+        || a.opens_newest != b.opens_newest
+        || a.newest_wrap != b.newest_wrap
+}
+
+/// The per-Mac line of a settled wait: the Macs whose read changed last, each with when (from
+/// `from`, what the wait's time counts from), so a slow wait names the Macs that held it, and
+/// how many read a newest `[everyone]` epoch as a prefix of its minter's batch at the end.
+#[must_use]
+pub fn last_settled(seen: &[&Seen], changed: &[Instant], from: Instant) -> String {
+    let mut order: Vec<(Instant, &str)> = changed
+        .iter()
+        .zip(seen)
+        .map(|(&at, s)| (at, s.name.as_str()))
+        .collect();
+    order.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+    let last: Vec<String> = order
+        .iter()
+        .take(5)
+        .map(|(at, name)| {
+            format!(
+                "{name} {:.1}s",
+                at.saturating_duration_since(from).as_secs_f64()
+            )
+        })
+        .collect();
+    let unsettled = seen.iter().filter(|s| !s.unsettled.is_empty()).count();
+    format!(
+        "last settled {}; {unsettled} of {} read a newest [everyone] epoch as a prefix",
+        last.join(", "),
+        seen.len()
+    )
 }
 
 /// How a wait that has not settled ends.
@@ -2843,10 +2935,15 @@ fn run(lab: &mut Lab) -> Result<Evidence, Fail> {
     // 8. The heal, the remover still down; what every Mac holds once its wait ends is the key
     // assertion's evidence ([`NEWEST_KEY`]).
     let t = Timed::now();
+    let all: Vec<usize> = (0..lab.macs.len()).collect();
+    let before_heal = held_by(lab, &all);
+    let heal_ms = unix_ms();
     lab.cut(false)?;
     lab.say("the islands heal (the cut files emptied)");
     let watch = lab.current_up(&ev.current);
     let healed = waited(lab.await_settled("heal", &watch, Need::Key(&ev.removed), Schedule::HEAL));
+    let signed = signed_during(lab, &before_heal, heal_ms, ev.partial.epoch);
+    lab.say(&format!("heal: signed during its wait: {signed}"));
     ev.healed = lab.read_all();
     if let Some(epoch) = ev.partial.epoch {
         ev.partial.heal_wraps = heal_wraps(lab, &epoch);
@@ -3269,6 +3366,36 @@ fn split_steps(
             Err(why) => broke.push(format!("island {}: {why}", island.word())),
         }
     }
+    let batch_ids: BTreeSet<RecordId> = batch.iter().map(|rec| *rec.id()).collect();
+    let mut whole = 0;
+    let mut most = 0;
+    let mut prefix_read = 0;
+    let island_a: Vec<usize> = plan
+        .on(Island::A)
+        .into_iter()
+        .filter(|&i| i != r && i < lab.macs.len() && lab.macs[i].up())
+        .collect();
+    for &i in &island_a {
+        let held = held_by(lab, &[i]);
+        let n = batch_ids.iter().filter(|id| held.contains_key(*id)).count();
+        whole += usize::from(n == batch_ids.len());
+        most = most.max(n);
+        prefix_read += usize::from(
+            !see(&name(i), &lab.macs[i].paths(), true)
+                .unsettled
+                .is_empty(),
+        );
+    }
+    lab.say(&format!(
+        "island a before the heal: {whole} of {} up Macs hold the remover's whole batch, the most \
+         any holds is {most} of {}; {prefix_read} read its newest [everyone] epoch {} as a prefix",
+        island_a.len(),
+        batch_ids.len(),
+        ev.partial
+            .epoch
+            .as_ref()
+            .map_or_else(|| "-".to_owned(), short)
+    ));
     let on_a = held_by(lab, &plan.on(Island::A));
     let on_b = held_by(lab, &plan.on(Island::B));
     let signers = signers(lab);
@@ -3290,6 +3417,73 @@ fn split_steps(
         return Err(broke.join("; "));
     }
     Ok((!unsettled.is_empty()).then(|| unsettled.join("; ")))
+}
+
+/// The wall clock in ms, as a record's authored time reads.
+fn unix_ms() -> u64 {
+    aterm_time::unix_millis().unwrap_or(0)
+}
+
+/// The records some Mac holds now that none held in `before`, each by kind, the Mac that signed
+/// it and its authored time past `from_ms`, in authored order: what a wait's Macs signed.
+fn signed_during(
+    lab: &Lab,
+    before: &BTreeMap<RecordId, aterm_secrets::membership_log::MemberId>,
+    from_ms: u64,
+    partial: Option<RecordId>,
+) -> String {
+    let signers = signers(lab);
+    let mut found: BTreeMap<RecordId, (u64, String)> = BTreeMap::new();
+    for mac in &lab.macs {
+        let Ok(store) = client::load_records(&mac.paths()) else {
+            continue;
+        };
+        let Some(log) = store.log() else {
+            continue;
+        };
+        for record in log.records().filter(|rec| !before.contains_key(rec.id())) {
+            found.entry(*record.id()).or_insert_with(|| {
+                let by = signers
+                    .get(record.actor())
+                    .map_or_else(|| "?".to_owned(), |&i| name(i));
+                let what = match record.body() {
+                    Body::Epoch { audience, .. } => {
+                        let over = partial.is_some_and(|p| {
+                            log.ancestor_closure(&[*record.id()])
+                                .iter()
+                                .any(|rec| *rec.id() == p)
+                        });
+                        format!(
+                            "Epoch {audience:?} {}{}",
+                            short(record.id()),
+                            if over { " over the prefix" } else { "" }
+                        )
+                    }
+                    Body::Wrap { epoch, .. } => format!("Wrap of {}", short(epoch)),
+                    _ => format!("{:?}", record.kind()),
+                };
+                (
+                    record.authored_ms(),
+                    format!(
+                        "{what} by {by} at {:.1}s",
+                        record.authored_ms().saturating_sub(from_ms) as f64 / 1000.0
+                    ),
+                )
+            });
+        }
+    }
+    let mut rows: Vec<(u64, String)> = found.into_values().collect();
+    rows.sort();
+    if rows.is_empty() {
+        return "nothing".to_owned();
+    }
+    let mut out = format!("{} records: ", rows.len());
+    let shown: Vec<String> = rows.iter().take(40).map(|(_, row)| row.clone()).collect();
+    out.push_str(&shown.join(", "));
+    if rows.len() > shown.len() {
+        let _ = write!(out, ", and {} more", rows.len() - shown.len());
+    }
+    out
 }
 
 /// Every record the logs of `macs` hold, with the seat that signed it.
@@ -3970,6 +4164,9 @@ mod acts {
                 admit(paths, Path::new(home), name, Way::AllowAgain)
             }
             (Act::Prove, [home, name]) => admit(paths, Path::new(home), name, Way::Prove),
+            (Act::Pull, []) => client::sync_records(paths, None)
+                .map(|n| format!("{n} records taken"))
+                .map_err(|e| e.to_string()),
             _ => Err(format!("{}: wrong words {words:?}", act.word())),
         }
     }

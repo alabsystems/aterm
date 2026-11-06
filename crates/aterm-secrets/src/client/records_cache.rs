@@ -751,6 +751,86 @@ mod tests {
         }
     }
 
+    /// A writer renames a new records file over the one a read holds open, as every writer of the
+    /// client's records does (`write_atomic`): the read returns the store of the bytes it read,
+    /// from the file it opened, cold (a small and a large observation) or from a warm entry taken
+    /// by its stamp, and the next read the new file's. The rename moves the replaced inode's
+    /// change time, which a read once refused as a change, failing a node-pass test's poll
+    /// (2026-11-06). NEGATIVE CONTROL: [`a_held_file_changed_another_way_is_still_refused`].
+    #[test]
+    fn a_file_renamed_over_mid_read_returns_what_the_read_held() {
+        for (large, warm) in [(false, false), (true, false), (false, true)] {
+            let home = aterm_tempfile::tempdir().unwrap();
+            let paths = Paths::for_home(home.path());
+            fsx::ensure_private_dir(&paths.dir).unwrap();
+            let padded = |mut wire: Vec<u8>| {
+                if large {
+                    wire.resize(MAX_INPUT_BYTES + 64, 0);
+                }
+                wire
+            };
+            let (before, after) = (padded(signed(&SIGNER, 1)), padded(signed(&SIGNER, 2)));
+            let read = |cache: &Cache| {
+                cache
+                    .read(&paths, "fixture".into(), base(&SIGNER))
+                    .unwrap()
+                    .encode()
+            };
+            fsx::write_atomic(&paths.records_file(), &after, 0o600).unwrap();
+            let read_after = read(&Cache::new());
+            fsx::write_atomic(&paths.records_file(), &before, 0o600).unwrap();
+            let read_before = read(&Cache::new());
+            assert_ne!(read_before, read_after);
+            let cache = Cache::new();
+            if warm {
+                assert_eq!(read(&cache), read_before);
+            }
+            let observed = cache.observations.load(Ordering::Relaxed);
+            let held = cache.read_then(&paths, "fixture".into(), base(&SIGNER), || {
+                fsx::write_atomic(&paths.records_file(), &after, 0o600).unwrap();
+            });
+            let case = format!("large={large} warm={warm}");
+            assert_eq!(held.expect(&case).encode(), read_before, "{case}");
+            assert_eq!(
+                cache.observations.load(Ordering::Relaxed) - observed,
+                usize::from(!warm),
+                "{case}: a warm read takes its entry by its stamp, a cold one streams the file"
+            );
+            assert_eq!(read(&cache), read_after, "{case}");
+        }
+    }
+
+    /// A file a read holds open that changed in any other way is still refused: written in place
+    /// and then renamed over (its last link gone, its length changed too), or renamed aside (still
+    /// linked, only its change time moved, as measured on APFS).
+    #[test]
+    fn a_held_file_changed_another_way_is_still_refused() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::for_home(home.path());
+        fsx::ensure_private_dir(&paths.dir).unwrap();
+        let (records, aside) = (paths.records_file(), paths.dir.join("records.aside"));
+        let wire = signed(&SIGNER, 1);
+        let in_place_then_over = || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&records)
+                .unwrap()
+                .set_len(0)
+                .unwrap();
+            fsx::write_atomic(&records, &wire, 0o600).unwrap();
+        };
+        let renamed_aside = || std::fs::rename(&records, &aside).unwrap();
+        let changes: [(&str, &dyn Fn()); 2] = [
+            ("written in place, then renamed over", &in_place_then_over),
+            ("renamed aside", &renamed_aside),
+        ];
+        for (name, change) in changes {
+            fsx::write_atomic(&records, &wire, 0o600).unwrap();
+            let changed = Cache::new().read_then(&paths, "fixture".into(), base(&SIGNER), change);
+            assert!(changed.is_err(), "{name}");
+        }
+    }
+
     #[test]
     fn changed_large_decode_never_installs_its_partial_store() {
         let home = aterm_tempfile::tempdir().unwrap();

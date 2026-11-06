@@ -614,14 +614,6 @@ fn retry_window(root: &Path, revision: u64) -> Option<(u64, u64)> {
     Some((last.at, last.at.saturating_add(last.pause().as_secs())))
 }
 
-/// Clear any recorded unfinished Secrets pause in `root` (for example, when a fresh Local Network
-/// grant lifts a pre-grant `UNREACHED` hold).
-pub(super) fn clear_at(root: &Path) {
-    if std::fs::remove_file(root.join(RECORD)).is_ok() {
-        let _ = durable_directory(root);
-    }
-}
-
 /// Records the outcome of a Secrets attempt for `revision` at `pace`.
 /// # Errors
 /// The record cannot be written or removed.

@@ -402,10 +402,11 @@ impl Command {
         self.suspended
     }
 
-    /// Start the child OUT OF THIS PROCESS'S BACKGROUND BAND (`true`): on macOS as a standard
+    /// Start the child, or replace this process, OUT OF THIS PROCESS'S BACKGROUND BAND (`true`):
+    /// on macOS as a standard
     /// daemon task (`POSIX_SPAWN_PROC_TYPE_DAEMON_STANDARD`) in place of the task type it would
     /// inherit, so a child of a launchd job of `ProcessType` `Background`, whose every thread runs
-    /// at priority 4 whatever class it asks for (a process there cannot leave the band itself),
+    /// at priority 4 whatever class it asks for (changing priority there cannot leave the band),
     /// runs each of its threads at the class that thread asks for. Measured on macOS 27.0 in a
     /// private-label `Background` job: a plain child's thread read 4 at the default class, one
     /// started so read 31 there and 20 at utility. A QoS clamp this process runs under (a
@@ -1446,6 +1447,7 @@ impl Handle {
             self.observe_wait_error(error);
         }
         let status = result?;
+        self.noted(status);
         self.status = Some(status);
         Ok(status)
     }
@@ -1460,7 +1462,18 @@ impl Handle {
             self.observe_wait_error(error);
         }
         self.status = result?;
+        if let Some(status) = self.status {
+            self.noted(status);
+        }
         Ok(self.status)
+    }
+
+    /// Hand a status `std`'s wait just reaped to the death journal ([`crate::deaths`]).
+    fn noted(&self, status: ExitStatus) {
+        crate::deaths::note(
+            i32::try_from(self.id()).unwrap_or(0),
+            std::os::unix::process::ExitStatusExt::into_raw(status),
+        );
     }
 }
 

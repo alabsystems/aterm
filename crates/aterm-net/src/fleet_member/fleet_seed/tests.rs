@@ -153,9 +153,8 @@ fn a_seed_is_replaced_only_by_its_own_minters_earlier_one() {
 }
 
 #[test]
-fn floor_tries_the_held_seed_the_kept_digest_and_the_zero_digest() {
-    let dir = private_state("floor");
-    assert_eq!(floor_digests(&dir), vec![ZERO_DIGEST], "nothing held");
+fn seed_and_saved_digest_files_round_trip_and_reject_a_malformed_digest() {
+    let dir = private_state("seed-files");
     assert_eq!(read(&dir).expect("reads"), None);
     assert_eq!(read_digest(&dir).expect("reads"), None);
     let seed = FleetSeed::mint(&identity(1), mark(1), NOW).expect("mints");
@@ -166,13 +165,7 @@ fn floor_tries_the_held_seed_the_kept_digest_and_the_zero_digest() {
         .expect("writes");
     assert_eq!(read(&dir).expect("reads"), Some(seed));
     assert_eq!(read_digest(&dir).expect("reads"), Some(kept));
-    assert_eq!(floor_digests(&dir), vec![seed.digest(), kept, ZERO_DIGEST]);
     aterm_uds::private_file::write_private(&dir, DIGEST_FILE, b"07070707\n").expect("writes");
     assert!(read_digest(&dir).is_err(), "a short digest");
-    assert_eq!(
-        floor_digests(&dir),
-        vec![seed.digest(), ZERO_DIGEST],
-        "a bad digest file adds nothing"
-    );
     std::fs::remove_dir_all(&dir).expect("cleans up");
 }

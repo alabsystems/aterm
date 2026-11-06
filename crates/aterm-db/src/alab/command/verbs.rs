@@ -400,7 +400,7 @@ pub(super) fn accounts(paths: &Paths) -> Result<Value> {
 pub(super) fn preferences(paths: &Paths) -> Result<Value> {
     let (view, lab) = lab(paths)?;
     let rows = view.project(&PREFERENCE);
-    let mut out: Vec<(Value, Value)> = rows
+    let mut out: Vec<(String, Value)> = rows
         .rows
         .iter()
         .map(|(pk, row)| {
@@ -417,12 +417,12 @@ pub(super) fn preferences(paths: &Paths) -> Result<Value> {
                 "row": row.lifecycle(),
             });
             (
-                json!([lab.machine_label(machine), text(row, "rank"), account]),
+                json!([lab.machine_label(machine), text(row, "rank"), account]).to_string(),
                 entry,
             )
         })
         .collect();
-    out.sort_by_key(|(key, _)| key.to_string());
+    out.sort_by(|(a, _), (b, _)| a.cmp(b));
     Ok(json!({
         "complete": view.complete,
         "preferences": out.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
@@ -822,9 +822,13 @@ fn add_machine(paths: &Paths, args: &Args) -> Result<Value> {
 }
 
 /// `add account <provider|realm>`: an account row of that realm for the address read from stdin
-/// (never argv, §8), born `pending` under the canonical account key, with the address row it
-/// signs in with when the registry has none. The address is never printed back. An account the
-/// registry already holds is refused.
+/// (never argv, §8), born `pending` under the canonical account key, signing in with the row
+/// whose `addr` says that address now ([`registry::AddressIndex`]), or with a row born for it
+/// where no row says it and none holds the key it derives. The address is never printed back.
+/// An account the registry already holds is refused, and so is an address several rows say, one
+/// whose birth key a row renamed since holds, and one whose row is retired; the write passes the
+/// registry's rules ([`registry::guard`]), which refuse it beside a live account of the realm
+/// that signs in as that address already.
 fn add_account(paths: &Paths, args: &Args, io: &mut Io<'_>) -> Result<Value> {
     let [_, realm] = args.operands.as_slice() else {
         return Err(Error::new(
@@ -842,7 +846,6 @@ fn add_account(paths: &Paths, args: &Args, io: &mut Io<'_>) -> Result<Value> {
         keys::provider_of_realm(realm).ok_or_else(|| Error::new("no provider has that realm"))?;
     let line = (io.stdin)()?;
     let addr = keys::address(line.lines().next().unwrap_or_default())?;
-    let address = keys::address_pk(&addr)?;
     let account = keys::account_pk(realm, &keys::claims_email(None, Some(&addr))?)?;
     let domain = addr
         .rsplit_once('@')
@@ -856,8 +859,26 @@ fn add_account(paths: &Paths, args: &Args, io: &mut Io<'_>) -> Result<Value> {
             ));
         }
         let addresses = view.project(&ADDRESS);
+        let (address, born) = match registry::AddressIndex::of(&addresses).holder(&addr)? {
+            registry::AddressHolder::Row(pk) => (pk.to_owned(), false),
+            registry::AddressHolder::Free {
+                derived,
+                taken: false,
+            } => (derived, true),
+            registry::AddressHolder::Several(_) => {
+                return Err(Error::new(
+                    "more than one email row holds that address: keep one in `aterm db emails --edit` first",
+                ));
+            }
+            registry::AddressHolder::Free { derived, .. } => {
+                return Err(Error::new(&format!(
+                    "no email row holds that address now; row {} was born with it and says \
+                     another: add the account with the address that row says",
+                    att::command::safe_key(&derived)
+                )));
+            }
+        };
         let mut rows = Vec::new();
-        let born = !addresses.rows.contains_key(&address);
         if born {
             rows.push(changes(
                 &ADDRESS,
@@ -887,8 +908,9 @@ fn add_account(paths: &Paths, args: &Args, io: &mut Io<'_>) -> Result<Value> {
                 (LIFECYCLE, json!("live")),
             ],
         )?);
-        Ok((born, rows))
+        Ok(((address, born), rows))
     })?;
+    let (address, born) = born;
     let label = keys::default_account_label(realm, &account).ok();
     Ok(json!({
         "ac": account,

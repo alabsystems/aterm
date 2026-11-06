@@ -430,13 +430,16 @@ Run aterm's checks in place, alone or in any combination.
   verify browser-site DIR         the browser check's first half: both web
                                   modules built and the site laid in DIR
   verify browser-drive SITE OUT [--engine metal|swiftshader|firefox|webkit|safari]...
+                       [--admit wait|now]
                                   its second half: the sessions run on a laid
                                   site, frames in OUT (no targo: the Linux
                                   lane's guest); webkit and safari, whose pages
-                                  keep windows, only when named
+                                  keep windows, only when named; safari's waits
+                                  for a quiet machine (--admit wait, the
+                                  default; under now it is could-not-run)
 
 Sets:
-  dev      fmt census lint test doc (the default); its lint brings cells,
+  dev      fmt census export-scan lint test doc (the default); its lint brings cells,
            one cell per other OS that builds a selected crate, and one of
            this OS for a lint with debug assertions off, which shipped code
            calling a debug-only seam fails
@@ -457,7 +460,7 @@ Options:
       --cell <name>       the forge cell `cells` checks (repeatable; any cell)
       --compile-only      with test/checkers: compile tests without executing them
       --as-release        with test or doc and --all: as release runs them, with
-                          aterm-spec/checkers on, and test owes the golden frame
+                          ATERM_SPEC_CHECKERS=1, and test owes the golden frame
                           test (--compile-only: what release's test stage compiles)
       --cursor-pacing     with measure --app: run only the GUI pacing burst
       --no-windows        skip each stage that opens a window (a named skip)

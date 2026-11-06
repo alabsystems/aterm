@@ -375,6 +375,38 @@ fn drained_response_bucket() -> Fixture {
     }
 }
 
+/// The memory budget of [`history_images`]' tiered store: eight of its 256 KiB sixel bands.
+const HISTORY_IMAGE_BUDGET: usize = 2 << 20;
+
+/// 4096x16 px sixel bands (256 KiB each, one text row tall) flooding an 8-row primary screen
+/// past [`HISTORY_IMAGE_BUDGET`], then a taller screen that pulls history back: when history's
+/// pictures are measured, and so which oldest ones it takes off, follows the history-image room.
+fn history_images() -> Fixture {
+    let mut events: Vec<Ev> = (0..40)
+        .map(|_| out("\x1bPq#1!4096~-!4096~-!4096N\x1b\\"))
+        .collect();
+    events.push(Ev::Resize(40, 80));
+    Fixture {
+        name: "history_images",
+        rows: 8,
+        cols: 80,
+        policy: ResizePolicy::Native,
+        ring: None,
+        events,
+    }
+}
+
+/// A fresh engine for `fx` on a tiered store held to [`HISTORY_IMAGE_BUDGET`], with 8x16 px cells.
+fn tiered(fx: &Fixture) -> Terminal {
+    let blank = Terminal::new(fx.rows, fx.cols).checkpoint();
+    let mut t = Terminal::replay_from_checkpoint(&blank);
+    t.set_cell_pixel_size(8, 16);
+    t.set_memory_budget(HISTORY_IMAGE_BUDGET)
+        .expect("a tiered store");
+    fx.configure(&mut t);
+    t
+}
+
 fn fixtures() -> Vec<Fixture> {
     let mut fixtures = vec![
         session(),
@@ -944,6 +976,86 @@ fn a_replay_restore_with_carry_folds_the_rest_as_the_straight_fold_does() {
             );
         }
     }
+}
+
+#[test]
+fn a_copy_takes_off_the_history_pictures_its_source_does() {
+    let fx = history_images();
+    let origin = fixture_epoch();
+    let mut straight = tiered(&fx);
+    fx.apply(&mut straight, origin, 0);
+    let pictures: std::collections::HashSet<_> = straight
+        .main_grid()
+        .history_images()
+        .map(|span| std::sync::Arc::as_ptr(&span.image))
+        .collect();
+    assert!(
+        pictures.len() < 40 - usize::from(fx.rows),
+        "premise: history took pictures off ({} kept)",
+        pictures.len()
+    );
+    let restored = |t: &Terminal| {
+        let c = t.checkpoint_continuing()?;
+        let mut r = Terminal::replay_from_checkpoint(&c);
+        r.set_memory_budget(HISTORY_IMAGE_BUDGET).ok()?;
+        Some(r)
+    };
+    let fork = |t: &Terminal| t.replay_fork();
+    let replay = |t: &Terminal| {
+        let mut r = restored(t)?;
+        r.apply_replay_carry(&t.capture_replay_carry());
+        Some(r)
+    };
+    let pane = |t: &Terminal| {
+        let carry = crate::terminal::PaneStepCarry::capture(t, origin, usize::MAX);
+        let decoded = crate::terminal::PaneStepCarry::from_canonical(&carry.canonical())
+            .expect("PaneStepCarry canonical roundtrip");
+        let mut r = restored(t)?;
+        r.set_cell_pixel_size(8, 16);
+        r.apply_pane_step_carry(&decoded, origin);
+        Some(r)
+    };
+    let copies: [(&str, &dyn Fn(&Terminal) -> Option<Terminal>); 3] = [
+        ("a fork", &fork),
+        ("a ReplayCarry restore", &replay),
+        ("a PaneStepCarry restore", &pane),
+    ];
+    // The rows showing a picture: what a mismatch reports, not the payloads `Seen`'s Debug prints.
+    let shown = |s: &Seen| -> Vec<usize> {
+        s.images
+            .iter()
+            .enumerate()
+            .filter_map(|(row, layers)| (!layers.is_empty()).then_some(row))
+            .collect()
+    };
+    for (copy, make) in copies {
+        let (end, ends) = fx.at_every_boundary_from(|| tiered(&fx), make);
+        for (k, copy_end) in ends.iter().enumerate() {
+            let copy_end = copy_end
+                .as_ref()
+                .unwrap_or_else(|| panic!("{copy} refused after {} events", k + 1));
+            assert!(
+                copy_end == &end,
+                "{copy} after {} events shows pictures on rows {:?}, the straight fold on {:?}",
+                k + 1,
+                shown(copy_end),
+                shown(&end)
+            );
+        }
+    }
+    let (end, ends) = fx.at_every_boundary_from(
+        || tiered(&fx),
+        |t| {
+            t.replay_fork().map(|mut fork| {
+                fork.transient.history_image_room = 0;
+                fork
+            })
+        },
+    );
+    assert!(
+        ends.iter().flatten().any(|forked| forked != &end),
+        "negative control: a fork without the history-image room ends as the straight fold"
+    );
 }
 
 #[test]

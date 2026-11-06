@@ -291,7 +291,7 @@ pub fn stable(releases: &[Release]) -> Vec<&Release> {
         .iter()
         .filter(|r| !r.draft && !r.prerelease && r.version_key().is_some())
         .collect();
-    keep.sort_by_key(|r| std::cmp::Reverse(r.version_key()));
+    keep.sort_by_cached_key(|r| std::cmp::Reverse(r.version_key()));
     keep
 }
 

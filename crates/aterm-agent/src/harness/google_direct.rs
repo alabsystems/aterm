@@ -186,7 +186,7 @@ pub(super) fn approve(
                     Some(ctx.home),
                     ctx.mailbox,
                     started,
-                    deadline,
+                    super::login_drive::Deadline::waking(deadline, &std::time::Instant::now),
                     &mut seen,
                 )
                 .map_err(Error::Mail)?;

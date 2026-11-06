@@ -53,9 +53,9 @@ const MAX_SEAL_BYTES: u64 = 1024 * 1024;
 /// bin/lib trees and the macOS SDK by content, with the OS build, the model and the SDK's
 /// settings. The first call in a process adopts a handed or kept seal whose recheck holds, or
 /// takes one; each later call rechecks the seal by status and takes a new one only on a
-/// difference. Each call says on stderr what it did (`inputs: hashed …` or `inputs: rechecked by
-/// stat …`, and one `release-event:` line). Linux's native handoff has its own compiler
-/// provenance protocol.
+/// difference. Each call says on stderr, and in the log [`arm`] named, what it did (`inputs:
+/// hashed …` or `inputs: rechecked by stat …`, and one `release-event:` line). Linux's native
+/// handoff has its own compiler provenance protocol.
 /// # Errors
 /// A compiler or SDK cannot be resolved or read, an input changed while it was hashed, or this
 /// is not a macOS host.
@@ -72,12 +72,18 @@ pub fn current() -> Result<String, String> {
 
 /// Keep this process's seal under `state_dir` (the release's state) from its next call on, and
 /// look for a kept one there: the release's first step arms it, under its toolchain lease. A
-/// dry run arms nothing, so it keeps no seal and hands none on.
-pub fn arm(state_dir: &Path) {
+/// dry run arms nothing, so it keeps no seal and hands none on. Each later call's report also
+/// goes to `log` where one is named: the cutter names its transcript, as its stderr reaches no
+/// log, while a child's stderr is its step's log.
+pub fn arm(state_dir: &Path, log: Option<&Path>) {
     #[cfg(target_os = "macos")]
-    sealed().arm(state_dir.join("inputs-seal"));
+    {
+        let mut process = sealed();
+        process.arm(state_dir.join("inputs-seal"));
+        process.log = log.map(Path::to_path_buf);
+    }
     #[cfg(not(target_os = "macos"))]
-    let _ = state_dir;
+    let _ = (state_dir, log);
 }
 
 /// The file that holds this process's seal once it is kept, which a child is handed as
@@ -105,7 +111,7 @@ pub fn measure(recheck: bool) -> Result<(), String> {
         let home = std::env::var_os("HOME")
             .filter(|home| !home.is_empty())
             .ok_or("HOME is not set")?;
-        arm(&Path::new(&home).join(crate::release_steps::RELEASE_STATE));
+        arm(&crate::release_steps::release_state(Path::new(&home)), None);
         println!("{}", on_this_machine(!recheck)?);
         Ok(())
     }
@@ -134,8 +140,10 @@ fn on_this_machine(fresh: bool) -> Result<String, String> {
     let mut facts = machine_facts;
     let mut open = crate::durable::open_regular_file;
     let mut now = now_ns;
-    let mut say = |line: &str| eprintln!("{line}");
-    sealed().identity(
+    let mut process = sealed();
+    let log = process.log.clone();
+    let mut say = |line: &str| say_to(log.as_deref(), line);
+    process.identity(
         &mut Sources {
             roots: &mut roots,
             facts: &mut facts,
@@ -145,6 +153,18 @@ fn on_this_machine(fresh: bool) -> Result<String, String> {
         },
         fresh,
     )
+}
+
+/// Say a call's report `line` on stderr and, where [`arm`] named one, in `log`.
+#[cfg(any(test, target_os = "macos"))]
+fn say_to(log: Option<&Path>, line: &str) {
+    use std::io::Write as _;
+    eprintln!("{line}");
+    if let Some(log) = log
+        && let Ok(mut file) = crate::durable::open_append(log, true)
+    {
+        let _ = writeln!(file, "{line}");
+    }
 }
 
 /// The wall clock, in nanoseconds since the Unix epoch: the clock a status-change time is
@@ -369,7 +389,7 @@ impl Seal {
             .digest
             .ok_or("the build input walk read no content")?;
         let mut sorted = roots.to_vec();
-        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        sorted.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         let seal = Self {
             schema: SEAL_SCHEMA.into(),
             identity: identity_of(&digest, &facts),
@@ -396,7 +416,7 @@ impl Seal {
     /// the facts, and each root's status digest; no input file is read.
     fn recheck_by_stat(&self, roots: &[Root], src: &mut Sources<'_>) -> Rechecked {
         let mut sorted: Vec<_> = roots.iter().collect();
-        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        sorted.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         if self.roots.len() != sorted.len()
             || self
                 .roots
@@ -471,7 +491,7 @@ fn identity_under(schema: &[u8], digest: &str, facts: &Facts) -> String {
 #[cfg(any(test, target_os = "macos"))]
 fn kept_name(roots: &[Root]) -> String {
     let mut sorted: Vec<_> = roots.iter().collect();
-    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    sorted.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let mut sha = aterm_digest::Sha256::new();
     for (label, path) in sorted {
         field(&mut sha, label.as_bytes());
@@ -593,6 +613,9 @@ struct Process {
     finds: Option<PathBuf>,
     /// The file in `keeps` that holds `seal`.
     saved: Option<PathBuf>,
+    /// The log each call's report also goes to ([`arm`]'s).
+    #[cfg(target_os = "macos")]
+    log: Option<PathBuf>,
     /// Whether the environment has been read.
     started: bool,
 }
@@ -606,6 +629,8 @@ impl Process {
             keeps: None,
             finds: None,
             saved: None,
+            #[cfg(target_os = "macos")]
+            log: None,
             started: false,
         }
     }
@@ -622,11 +647,7 @@ impl Process {
             .filter(|path| path.is_absolute());
         let finds = std::env::var_os("HOME")
             .filter(|home| !home.is_empty())
-            .map(|home| {
-                Path::new(&home)
-                    .join(crate::release_steps::RELEASE_STATE)
-                    .join("inputs-seal")
-            });
+            .map(|home| crate::release_steps::release_state(Path::new(&home)).join("inputs-seal"));
         self.begin(handed, finds);
     }
 
@@ -901,7 +922,7 @@ fn machine_roots() -> Result<Vec<Root>, String> {
     // The usual five tools share one tree. Hash that tree once, retaining the
     // selected-tool associations without incorporating an installation path.
     for (root, mut names) in apple_roots {
-        names.sort();
+        names.sort_unstable();
         roots.push((format!("apple/{}", names.join("+")), root));
     }
     Ok(roots)
@@ -938,7 +959,7 @@ fn rust_library_roots(label: &str, root: &Path, targets: &[&str]) -> Result<Vec<
         }
         roots.push((format!("{label}/rustlib/{target}"), path));
     }
-    roots.sort_by(|a, b| a.0.cmp(&b.0));
+    roots.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     Ok(roots)
 }
 
@@ -1083,7 +1104,7 @@ fn walk_roots(roots: &[(&str, &Path)], reads: Option<Reads<'_>>) -> Result<Walke
         return Err("build input identity has no roots".into());
     }
     let mut roots = roots.to_vec();
-    roots.sort_by_key(|(label, _)| *label);
+    roots.sort_unstable_by_key(|(label, _)| *label);
     let mut content = reads.map(|reads| {
         let mut digest = aterm_digest::Sha256::new();
         field(&mut digest, SCHEMA);
@@ -1242,7 +1263,7 @@ fn walk(
             sink.stat.ancestor();
             return Ok(());
         }
-        let resolved_buf = resolved.into_owned();
+        let mut resolved_buf = resolved.into_owned();
         if !ancestors.insert(resolved_buf.clone()) {
             return Err(format!("build input directory cycle: {}", path.display()));
         }
@@ -1251,7 +1272,7 @@ fn walk(
             None => list_names(&resolved_buf),
         }
         .map_err(|e| format!("read build input {}: {e}", resolved_buf.display()))?;
-        names.sort_by(|a, b| a.as_encoded_bytes().cmp(b.as_encoded_bytes()));
+        names.sort_unstable_by(|a, b| a.as_encoded_bytes().cmp(b.as_encoded_bytes()));
         if sink.content.is_some() {
             let after = std::fs::metadata(&resolved_buf)
                 .map_err(|e| format!("inspect build input {}: {e}", resolved_buf.display()))?;
@@ -1267,14 +1288,10 @@ fn walk(
                 relative.push(b'/');
             }
             relative.extend_from_slice(name.as_encoded_bytes());
-            walk(
-                sink,
-                &resolved_buf.join(name),
-                relative,
-                ancestors,
-                depth + 1,
-                visits,
-            )?;
+            resolved_buf.push(name);
+            let step = walk(sink, &resolved_buf, relative, ancestors, depth + 1, visits);
+            resolved_buf.pop();
+            step?;
             relative.truncate(prefix_len);
         }
         ancestors.remove(&resolved_buf);
@@ -1311,6 +1328,42 @@ fn walk(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A call's report reaches the log [`arm`] named (the cutter's transcript, which `release
+    /// status` counts its `inputs` events from) line by line, and no file where none was named.
+    /// NEGATIVE CONTROL: without the append the transcript holds none of it.
+    #[test]
+    fn a_report_reaches_the_log_the_release_armed() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let log = dir.path().join(crate::release_timeline::TRANSCRIPT);
+        let event = "release-event: {\"schema\":1,\"event\":\"inputs\",\"mode\":\"adopted\",\
+                     \"entries\":9,\"secs\":0.5}";
+        say_to(Some(&log), "inputs: rechecked by stat 9 entries in 500 ms");
+        say_to(Some(&log), event);
+        say_to(None, "inputs: hashed 9 entries in 1.0 s");
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            format!("inputs: rechecked by stat 9 entries in 500 ms\n{event}\n")
+        );
+        let mut timeline = crate::release_timeline::Timeline::default();
+        timeline
+            .read(
+                crate::release_timeline::TRANSCRIPT,
+                std::fs::read(&log).unwrap().as_slice(),
+            )
+            .unwrap();
+        // The cutter's own call in its transcript makes the hash count known: none.
+        let value = timeline.value();
+        assert_eq!(
+            (
+                value["full_hashes"].as_u64(),
+                value["seal_rechecks"].as_u64()
+            ),
+            (Some(0), Some(1)),
+            "{value}"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 
     #[test]
     fn selected_rust_libraries_ignore_other_targets_but_bind_every_used_library() {
@@ -1658,6 +1711,7 @@ mod tests {
                 .read("01-cut.log", log.collect::<String>().as_bytes())
                 .unwrap();
             let timeline = timeline.value();
+            // A step log's records alone: a mode no call took is unknown, not 0.
             let some = |n: usize| (n > 0).then(|| u64::try_from(n).unwrap());
             assert_eq!(
                 (

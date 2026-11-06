@@ -505,8 +505,6 @@ pub(crate) enum TabHit {
         /// An update is staged ([`crate::menu::staged_for_version_menu`]).
         attention: bool,
     },
-    /// The window's needs pill, where this strip carries it ([`layout_segments_with_pill`]).
-    Pill(crate::presence::PillHit),
     /// One of the window's own buttons at the strip's far right.
     Caption(CaptionButton),
 }
@@ -1058,7 +1056,7 @@ impl VersionSlotCols {
     };
 }
 
-/// Lay out the strip without a pill and with fixed-width tabs.
+/// Lay out the strip with fixed-width tabs.
 #[cfg(test)]
 #[must_use]
 pub(crate) fn layout_segments_with_version(
@@ -1081,7 +1079,6 @@ pub(crate) fn layout_segments_with_version(
 }
 
 /// [`layout_segments_with_version`] with the Windows tabs sized by `sizing` ([`TabSizing`]).
-#[cfg(test)]
 #[must_use]
 pub(crate) fn layout_segments_with_version_sized(
     cols: u16,
@@ -1092,46 +1089,14 @@ pub(crate) fn layout_segments_with_version_sized(
     slot: VersionSlotCols,
     sizing: TabSizing<'_>,
 ) -> Vec<TabSegment> {
-    layout_segments_with_pill(
-        cols,
-        tab_count,
-        metadata,
-        active,
-        show_update,
-        slot,
-        None,
-        sizing,
-    )
-}
-
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the strip's layout inputs, each independent: width, tabs, chrome, \
-              selection, the update alert, the version label, the needs pill and \
-              the tabs' sizing"
-)]
-#[must_use]
-pub(crate) fn layout_segments_with_pill(
-    cols: u16,
-    tab_count: usize,
-    metadata: &[TabStripMetadata],
-    active: usize,
-    show_update: bool,
-    slot: VersionSlotCols,
-    pill: Option<&crate::presence::PillWords>,
-    sizing: TabSizing<'_>,
-) -> Vec<TabSegment> {
     let seat = strip_seat_cols(tab_count, metadata);
     let lone = if STRIP_WINDOWS_PAINT {
         sizing.cap
     } else {
         LONE_CHIP_COLS
     };
-    let pill = pill.and_then(|words| strip_pill_layout(cols, words));
-    let pill_w = pill.as_ref().map_or(0, strip_pill_cols);
-    let inner = cols - pill_w;
-    let version = version_rung_that_fits(inner, tab_count, seat, show_update, slot, lone);
-    let laid_cols = version.map_or(inner, |(_, w)| inner - w);
+    let version = version_rung_that_fits(cols, tab_count, seat, show_update, slot, lone);
+    let laid_cols = version.map_or(cols, |(_, w)| cols - w);
     let mut segments =
         layout_segments_seated(laid_cols, tab_count, active, show_update, seat, sizing);
     for segment in &mut segments {
@@ -1142,14 +1107,10 @@ pub(crate) fn layout_segments_with_pill(
             segment.close_col = None;
         }
     }
-    if let Some(layout) = pill.as_ref() {
-        push_pill_segments(&mut segments, layout, laid_cols);
-    }
     if let Some((rung, w)) = version {
-        let start = laid_cols + pill_w;
         segments.push(TabSegment {
-            start_col: start,
-            end_col: start + w,
+            start_col: laid_cols,
+            end_col: laid_cols + w,
             close_col: None,
             kind: TabHit::Version {
                 rung,
@@ -1161,77 +1122,9 @@ pub(crate) fn layout_segments_with_pill(
     segments
 }
 
-/// The window's needs pill as the in-grid strip carries it: what lit it and its words.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct StripPill<'a> {
-    /// What lit it: its glyph's tone.
-    pub(crate) kind: crate::presence::PillKind,
-    /// Its words, in the pieces the layout clips.
-    pub(crate) words: &'a crate::presence::PillWords,
-}
-
-/// The in-grid pill's share of a `cols`-wide strip, its pads included.
-fn strip_pill_share(cols: u16) -> u16 {
-    u16::try_from(u32::from(cols) * 2 / 5).unwrap_or(u16::MAX)
-}
-
-/// The in-grid pill laid out in its share of a `cols`-wide strip.
-#[must_use]
-pub(crate) fn strip_pill_layout(
-    cols: u16,
-    words: &crate::presence::PillWords,
-) -> Option<aterm_messages::presence::PillLayout> {
-    let inner = strip_pill_share(cols).checked_sub(2).filter(|w| *w > 0)?;
-    let layout = aterm_messages::presence::pill_layout(words, f64::from(inner), 1.0, |s| {
-        strip_display_cells(s) as f64
-    });
-    (layout.width >= 1.0 && layout.width <= f64::from(inner)).then_some(layout)
-}
-
-/// The columns a laid-out in-grid pill takes: its pieces and its two pads.
-fn strip_pill_cols(layout: &aterm_messages::presence::PillLayout) -> u16 {
-    cell_of(layout.width).saturating_add(2)
-}
-
-/// A whole-cell span edge of the in-grid pill's layout as a column offset.
-fn cell_of(x: f64) -> u16 {
-    x.round().clamp(0.0, f64::from(u16::MAX)) as u16
-}
-
-/// The pill's regions from column `start` on.
-fn push_pill_segments(
-    segments: &mut Vec<TabSegment>,
-    layout: &aterm_messages::presence::PillLayout,
-    start: u16,
-) {
-    let width = strip_pill_cols(layout);
-    let mut region = crate::presence::PillHit::Go;
-    let mut run_start = start;
-    for offset in 0..width {
-        let x = f64::from(offset) - 1.0 + 0.5;
-        let hit = layout.hit(x).unwrap_or(region);
-        if hit != region {
-            segments.push(pill_segment(run_start, start + offset, region));
-            region = hit;
-            run_start = start + offset;
-        }
-    }
-    segments.push(pill_segment(run_start, start + width, region));
-}
-
-const fn pill_segment(start_col: u16, end_col: u16, hit: crate::presence::PillHit) -> TabSegment {
-    TabSegment {
-        start_col,
-        end_col,
-        close_col: None,
-        kind: TabHit::Pill(hit),
-        solo: false,
-    }
-}
-
 const CAPTION_STRIP_FLOOR: u16 = NEW_TAB_W + 3;
 
-/// [`layout_segments_with_caption_sized`] with no needs pill and equal tabs.
+/// [`layout_segments_with_caption_sized`] with equal tabs.
 #[cfg(test)]
 #[must_use]
 pub(crate) fn layout_segments_with_caption(
@@ -1250,7 +1143,6 @@ pub(crate) fn layout_segments_with_caption(
         active,
         show_update,
         slot,
-        None,
         caption,
         TabSizing::FIXED,
     )
@@ -1259,8 +1151,8 @@ pub(crate) fn layout_segments_with_caption(
 #[allow(
     clippy::too_many_arguments,
     reason = "the strip's layout inputs, each independent: width, tabs, chrome, \
-              selection, the update alert, the version label, the needs pill, the \
-              window buttons and the tabs' sizing"
+              selection, the update alert, the version label, the window buttons \
+              and the tabs' sizing"
 )]
 #[must_use]
 pub(crate) fn layout_segments_with_caption_sized(
@@ -1270,7 +1162,6 @@ pub(crate) fn layout_segments_with_caption_sized(
     active: usize,
     show_update: bool,
     slot: VersionSlotCols,
-    pill: Option<&crate::presence::PillWords>,
     caption: CaptionSlot,
     sizing: TabSizing<'_>,
 ) -> Vec<TabSegment> {
@@ -1278,14 +1169,13 @@ pub(crate) fn layout_segments_with_caption_sized(
     let caption = caption.fit(cols, CAPTION_STRIP_FLOOR);
     let lead = caption.side_cols(Side::Left);
     let inner = cols.saturating_sub(caption.cols());
-    let mut segments = layout_segments_with_pill(
+    let mut segments = layout_segments_with_version_sized(
         inner,
         tab_count,
         metadata,
         active,
         show_update,
         slot,
-        pill,
         sizing,
     );
     if lead > 0 {
@@ -2670,7 +2560,7 @@ fn paint_strip_impl(
                 let mid = seg.start_col + seg.end_col.saturating_sub(seg.start_col) / 2;
                 put(row, mid, mark, role);
             }
-            TabHit::Close(_) | TabHit::Pill(_) => {}
+            TabHit::Close(_) => {}
         }
     }
     for (col, mark) in strip_overflow(segments, titles.len()).columns() {
@@ -2690,97 +2580,6 @@ fn status_mark_ink(
     ink: [u8; 3],
 ) -> [u8; 3] {
     if item.dirty { colors.accent } else { ink }
-}
-
-/// Paint the window's needs pill into the strip row `row`.
-pub(crate) fn paint_strip_pill(
-    row: &mut [RenderCell],
-    segments: &[TabSegment],
-    pill: StripPill<'_>,
-    palette: ChromePalette,
-) {
-    use crate::presence::{NeedSeverity, PillKind};
-    let Some(start) = segments
-        .iter()
-        .find(|seg| matches!(seg.kind, TabHit::Pill(_)))
-        .map(|seg| seg.start_col)
-    else {
-        return;
-    };
-    let captions = || {
-        segments
-            .iter()
-            .filter(|seg| matches!(seg.kind, TabHit::Caption(_)))
-    };
-    let end = captions()
-        .filter(|seg| seg.start_col >= start)
-        .map(|seg| seg.start_col)
-        .min()
-        .unwrap_or(u16::try_from(row.len()).unwrap_or(u16::MAX));
-    let lead = captions()
-        .filter(|seg| seg.end_col <= start)
-        .map(|seg| seg.end_col)
-        .max()
-        .unwrap_or(0);
-    let cols = end.saturating_sub(lead);
-    let Some(layout) = strip_pill_layout(cols, pill.words) else {
-        return;
-    };
-    let colors = strip_colors_for(palette);
-    let inks =
-        aterm_messages::presence::inks(crate::chrome_band::presence_tones(palette), colors.band_bg);
-    let tone = match pill.kind {
-        PillKind::Need(NeedSeverity::Stuck) => inks.stop,
-        PillKind::Need(NeedSeverity::Decide) => inks.wait,
-        PillKind::Yours => inks.yours,
-    };
-    let mut put = |span: aterm_messages::presence::Span, text: &str, fg: [u8; 3], button: bool| {
-        let from = start + 1 + cell_of(span.x);
-        let end = from + cell_of(span.w);
-        let text = truncate_title(text, usize::from(end - from));
-        let mut col = from;
-        for ch in text.chars() {
-            let ch = strip_char(ch);
-            let w = strip_char_cells(ch);
-            if col + w > end {
-                break;
-            }
-            if let Some(slot) = row.get_mut(usize::from(col)) {
-                let mut cell = strip_cell(ch, &colors, StripRole::Inactive);
-                cell.fg = fg;
-                cell.bold = button;
-                if button {
-                    cell.underline = UnderlineStyle::Single;
-                    cell.underline_color = Some(fg);
-                }
-                *slot = cell;
-            }
-            if w == 2
-                && let Some(slot) = row.get_mut(usize::from(col + 1))
-            {
-                let mut cell = strip_cell(' ', &colors, StripRole::Inactive);
-                cell.wide = true;
-                *slot = cell;
-            }
-            col += w;
-        }
-    };
-    let words = pill.words;
-    let mut glyph = [0u8; 4];
-    put(
-        layout.glyph,
-        words.glyph.encode_utf8(&mut glyph),
-        tone,
-        false,
-    );
-    put(layout.label, &words.label, colors.fg, false);
-    put(layout.words, &words.words, colors.fg, false);
-    if let Some((act, span)) = layout.act {
-        put(span, act.word(), colors.accent, true);
-    }
-    if let (Some(span), Some(more)) = (layout.more, words.more.as_deref()) {
-        put(span, more, colors.inactive_fg, false);
-    }
 }
 
 const ICON_RASTER_SIZE: u16 = 32;
@@ -4120,9 +3919,6 @@ pub(crate) mod pixel_band {
                 && !seg.solo
                 && matches!(seg.kind, TabHit::Select(i) if input.paint.hovered == Some(i));
             match seg.kind {
-                TabHit::Pill(_) => {
-                    fallback.push((seg.start_col, end));
-                }
                 TabHit::Select(i) if seg.solo => {
                     let _ = i;
                     fallback.push((seg.start_col, end));
@@ -11943,216 +11739,6 @@ mod tests {
                 }
             }
         }
-    }
-}
-
-/// The in-grid needs pill.
-#[cfg(test)]
-mod pill_strip_tests {
-    use super::*;
-    use crate::presence::{NeedSeverity, PillAct, PillHit, PillKind, PillWords};
-
-    fn words(label: &str, said: &str, act: Option<PillAct>, more: usize) -> PillWords {
-        PillWords {
-            glyph: '\u{25c6}',
-            label: label.to_string(),
-            words: said.to_string(),
-            room: said.to_string(),
-            act,
-            more: (more > 0).then(|| format!("+{more}")),
-        }
-    }
-
-    fn theme() -> Theme {
-        Theme::default()
-    }
-
-    fn strip(cols: u16, pill: &PillWords) -> (Vec<TabSegment>, Vec<RenderCell>) {
-        let metadata = [PLAIN_TAB; 3];
-        let segments = layout_segments_with_pill(
-            cols,
-            3,
-            &metadata,
-            0,
-            false,
-            VersionSlotCols::NONE,
-            Some(pill),
-            TabSizing::FIXED,
-        );
-        let theme = theme();
-        let titles: Vec<String> = ["one", "two", "three"].map(String::from).to_vec();
-        let mut row = vec![blank_cell(theme); usize::from(cols)];
-        let _ = paint_strip_with_metadata(
-            &mut row,
-            &segments,
-            &titles,
-            &metadata,
-            StripPaint::default(),
-            0,
-            theme,
-            None,
-        );
-        paint_strip_pill(
-            &mut row,
-            &segments,
-            StripPill {
-                kind: PillKind::Need(NeedSeverity::Stuck),
-                words: pill,
-            },
-            theme.into(),
-        );
-        (segments, row)
-    }
-
-    fn painted_at(row: &[RenderCell], text: &str) -> std::ops::Range<u16> {
-        let chars: Vec<char> = text.chars().collect();
-        let start = (0..row.len())
-            .find(|&at| {
-                chars
-                    .iter()
-                    .enumerate()
-                    .all(|(i, ch)| row.get(at + i).is_some_and(|c| c.ch == *ch))
-            })
-            .unwrap_or_else(|| panic!("{text:?} is painted"));
-        let start = u16::try_from(start).expect("a strip column");
-        start..start + u16::try_from(chars.len()).expect("short")
-    }
-
-    #[test]
-    fn each_painted_piece_of_the_pill_resolves_to_its_act() {
-        let pill = words("fmt (tab 4)", "never started", Some(PillAct::Restart), 2);
-        let (segments, row) = strip(120, &pill);
-        let at = |text: &str| painted_at(&row, text);
-        for (text, want) in [
-            ("\u{25c6}", PillHit::Go),
-            ("fmt (tab 4)", PillHit::Go),
-            ("never started", PillHit::Go),
-            ("Restart", PillHit::Act(PillAct::Restart)),
-            ("+2", PillHit::More),
-        ] {
-            for col in at(text) {
-                assert_eq!(
-                    hit_test(&segments, col),
-                    Some(TabHit::Pill(want)),
-                    "{text:?} at {col}"
-                );
-            }
-        }
-        let pill_cols: Vec<_> = segments
-            .iter()
-            .filter(|s| matches!(s.kind, TabHit::Pill(_)))
-            .collect();
-        let (from, to) = (pill_cols[0].start_col, pill_cols.last().unwrap().end_col);
-        assert!((from..to).all(|col| matches!(hit_test(&segments, col), Some(TabHit::Pill(_)))));
-        assert!(to - from <= 120 * 2 / 5, "{from}..{to}");
-        assert!(
-            segments
-                .iter()
-                .filter(|s| !matches!(s.kind, TabHit::Pill(_)))
-                .all(|s| s.end_col <= from)
-        );
-    }
-
-    #[test]
-    fn a_pills_age_moves_no_tab_within_its_unit() {
-        let t0 = std::time::Instant::now();
-        let pill = aterm_messages::presence::Pill {
-            kind: PillKind::Need(NeedSeverity::Stuck),
-            session: 1,
-            label: "fmt".into(),
-            tab: Some(4),
-            what: "never started".into(),
-            since: Some(t0),
-            act: None,
-            more: 0,
-        };
-        let at = |secs: u64| {
-            crate::presence::pill_words(&pill, t0 + std::time::Duration::from_secs(secs))
-        };
-        let (young, old) = (at(3), at(47));
-        assert_ne!(young.words, old.words, "the ages differ");
-        let metadata = [PLAIN_TAB; 3];
-        let lay = |w: &PillWords| {
-            layout_segments_with_pill(
-                120,
-                3,
-                &metadata,
-                0,
-                false,
-                VersionSlotCols::NONE,
-                Some(w),
-                TabSizing::FIXED,
-            )
-        };
-        assert_eq!(lay(&young), lay(&old), "the tabs hold still");
-        let (_, row) = strip(120, &old);
-        let _ = painted_at(&row, "47s");
-        let drawn = |w: &PillWords| PillWords {
-            room: w.words.clone(),
-            ..w.clone()
-        };
-        assert_ne!(lay(&drawn(&young)), lay(&drawn(&old)));
-    }
-
-    #[test]
-    fn a_narrow_strip_clips_the_words_then_the_label_never_the_glyph() {
-        let long = "a very long need sentence that will not fit anywhere at all";
-        let pill = words("a long tab label (tab 9)", long, Some(PillAct::Restart), 0);
-        let (segments, row) = strip(60, &pill);
-        assert!(
-            !painted_at(&row, "\u{25c6}").is_empty(),
-            "the glyph is drawn"
-        );
-        let act = painted_at(&row, "Restart");
-        assert_eq!(
-            hit_test(&segments, act.start),
-            Some(TabHit::Pill(PillHit::Act(PillAct::Restart)))
-        );
-        let text: String = row.iter().map(|c| c.ch).collect();
-        assert!(!text.contains(long), "the words were clipped");
-        let span: u16 = segments
-            .iter()
-            .filter(|s| matches!(s.kind, TabHit::Pill(_)))
-            .map(|s| s.end_col - s.start_col)
-            .sum();
-        assert!(span <= 60 * 2 / 5, "{span}");
-    }
-
-    #[test]
-    fn no_pill_is_the_pill_less_strip_and_the_version_label_stays_flush_right() {
-        let metadata = [PLAIN_TAB; 3];
-        let slot = VersionSlotCols {
-            full: 8,
-            short: 4,
-            attention: false,
-        };
-        assert_eq!(
-            layout_segments_with_pill(120, 3, &metadata, 1, false, slot, None, TabSizing::FIXED),
-            layout_segments_with_version(120, 3, &metadata, 1, false, slot)
-        );
-        let pill = words("", "frozen", None, 0);
-        let segs = layout_segments_with_pill(
-            120,
-            3,
-            &metadata,
-            1,
-            false,
-            slot,
-            Some(&pill),
-            TabSizing::FIXED,
-        );
-        let version = segs
-            .iter()
-            .find(|s| matches!(s.kind, TabHit::Version { .. }))
-            .expect("the label still fits");
-        assert_eq!(version.end_col, 120, "flush right");
-        let pill_end = segs
-            .iter()
-            .filter(|s| matches!(s.kind, TabHit::Pill(_)))
-            .map(|s| s.end_col)
-            .max()
-            .expect("the pill is laid out");
-        assert_eq!(pill_end, version.start_col, "the pill sits left of it");
     }
 }
 

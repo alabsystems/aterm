@@ -6,7 +6,7 @@
 //! rollback of both custody and data needs an external witness to detect.
 
 use super::{
-    Record, Scope, Session,
+    ReadBatch, Record, Scope, Session,
     conflict::{Conflict, MAX_CONFLICT, ProofKey},
 };
 use crate::{
@@ -28,6 +28,11 @@ use std::{
 #[cfg(test)]
 mod append_tests;
 pub mod custody;
+mod cutoff;
+#[cfg(all(test, unix))]
+pub(crate) use cutoff::Signing;
+#[cfg(unix)]
+pub use cutoff::cut_removed_writer;
 mod directory;
 mod held;
 #[cfg(test)]
@@ -64,6 +69,31 @@ pub(crate) fn with_replay_observer<T>(
     REPLAY_OBSERVER.with(|slot| assert!(slot.borrow_mut().replace(Box::new(observe)).is_none()));
     let _reset = Reset;
     read()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// While set, this thread's appends fail after the handle is poisoned and before the log is
+    /// written: an append whose outcome is uncertain.
+    pub(crate) static APPEND_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static PRIMARY_CHECKED: std::cell::RefCell<ReplayObserver> = const { std::cell::RefCell::new(None) };
+}
+
+/// `read`, with `observe` run once a combined store's check has checked its primary and before it
+/// reads its own claim: where a writer that primary's waiting check let in has written.
+#[cfg(test)]
+pub(super) fn with_primary_checked<T>(
+    observe: impl FnOnce() + 'static,
+    read: impl FnOnce() -> T,
+) -> T {
+    PRIMARY_CHECKED.with(|slot| assert!(slot.borrow_mut().replace(Box::new(observe)).is_none()));
+    let read = read();
+    PRIMARY_CHECKED.with(|slot| assert!(slot.borrow_mut().take().is_none(), "no primary checked"));
+    read
 }
 
 /// [`with_replay_observer`], with `observe` run at each replay `read` does, not only the first. A
@@ -289,6 +319,21 @@ struct Stored {
     header: Header,
     receipt: Receipt,
     quarantine: Option<(Digest, u64, u64)>,
+    /// The member-signed removal cutoff this operation is ([`cutoff`]), read once as it is
+    /// admitted.
+    cut: Option<cutoff::Cut>,
+}
+
+/// A member-signed cutoff a reader counts ([`Store::removal_cuts`]).
+struct CountedCut {
+    /// The cutoff's own operation.
+    id: Digest,
+    /// Its signer, and the operation's sequence in the signer's chain.
+    signer: Actor,
+    sequence: u64,
+    cut: cutoff::Cut,
+    /// Its signer's own seat is removed too.
+    signer_removed: bool,
 }
 
 struct StoredConflict {
@@ -321,6 +366,9 @@ pub struct MetadataEvidence {
     pub authored_ms: u64,
     pub record: Option<Record>,
     pub catalog_eligible: bool,
+    /// A member-signed removal cutoff ([`cutoff`]): a causal parent like any operation, whose
+    /// payload no application decodes and no reader counts as a refusal.
+    pub cutoff: bool,
 }
 
 /// A local handle for authenticated table data. Writers are exclusive;
@@ -434,7 +482,19 @@ impl Store {
         if !session.has_control_writer() {
             return Self::observe(session, dir, scope);
         }
-        Self::open_mode(session, dir, scope, false)
+        let mut store = Self::open_mode(session, dir, scope, false)?;
+        // A write a held `Remove` kept pending (M4) seals once its new epoch has arrived, when
+        // its table next opens for writing, not only at the table's next write. A seal refused
+        // before it appends (the pending set does not open, a merge is due) leaves the write
+        // pending and the open standing: the next write runs the same seal and returns its error
+        // to that write's caller. An append whose outcome is uncertain poisons the handle, so
+        // the open fails with that append's own error.
+        if let Err(error) = store.seal_pending(session)
+            && (store.poisoned || store.log.as_ref().is_some_and(Log::is_poisoned))
+        {
+            return Err(error);
+        }
+        Ok(store)
     }
 
     /// Read the independently witnessed committed prefix beside any live writer.
@@ -774,7 +834,7 @@ impl Store {
             index: Index::new(MAX_RECORDS * 2),
             records: BTreeMap::new(),
             conflicts: BTreeMap::new(),
-            observation: session.observation()?,
+            observation: session.access_observation(),
             observed_primary: None,
         };
         // The complete acknowledged prefix is verified before any opaque
@@ -833,8 +893,9 @@ impl Store {
                 Ok(())
             })?;
         }
-        session.context(scope)?;
+        // An observation finalizes nothing, and `check` below holds its context.
         if !read_only {
+            session.context(scope)?;
             session.mutation_guard()?;
         }
         if let Some(log) = &mut store.log {
@@ -905,7 +966,7 @@ impl Store {
     fn check(&self, session: &Session<'_>) -> Result<()> {
         session.context(self.scope)?;
         if self.actor != session.actor()
-            || self.observation != session.observation()?
+            || self.observation != session.access_observation()
             || self.poisoned
             || self.log.as_ref().is_some_and(Log::is_poisoned)
         {
@@ -913,16 +974,21 @@ impl Store {
                 "table custody changed or append is uncertain; reopen",
             ));
         }
-        directory::check(
+        // The primary first: its check can wait in a generation guard, and what a writer advanced
+        // during that wait is this check's to see.
+        if let Some(primary) = &self.observed_primary {
+            primary.check(session)?;
+            #[cfg(test)]
+            if let Some(observe) = PRIMARY_CHECKED.with(|slot| slot.borrow_mut().take()) {
+                observe();
+            }
+        }
+        let current = directory::check_and_read_claim(
             &self.data_dir,
             &self.claim_dir,
             &self.claim_name,
             &self.claim,
         )?;
-        if let Some(primary) = &self.observed_primary {
-            primary.check(session)?;
-        }
-        let current = private_file::read_private(&self.claim_dir, &self.claim_name, CLAIM_LEN).ok();
         if current.as_deref() == Some(&self.claim) {
             return Ok(());
         }
@@ -1035,13 +1101,21 @@ impl Store {
                 header: record.header().clone(),
                 receipt,
                 quarantine: None,
+                cut: cutoff::decode(record.payload()),
             },
         );
         self.poisoned = false;
         Ok(receipt)
     }
     // Publish the independently retained witness before returning any receipt, then hand the
-    // record to the append sink.
+    // record to the append sink. The witness is the journal's dependent write
+    // (`Log::append_then`), written only once the journal's commit made the record and its
+    // checkpoint durable: a lock-free reader that trusts it (`held_lengths`, `read_held`, the
+    // egress's catch-up) never relays a record a power loss can still take. Where the claim
+    // directory shares the log's device and astream serves the log Ordered it takes barriers
+    // only, durable with the next append's commit, so on stable media the log is at most this
+    // one record ahead of it, which a writing open adopts; elsewhere it is durable before the
+    // receipt.
     fn append(&mut self, subject: &str, wire: &[u8], id: Digest, via: Via) -> Result<Receipt> {
         let log = self
             .log
@@ -1053,12 +1127,33 @@ impl Store {
         body.extend_from_slice(&received_ms.to_le_bytes());
         body.extend_from_slice(wire);
         let witness = self.witness.advance(self.witness.count, id, received_ms)?;
+        let mut claim = self.claim.clone();
+        claim[WITNESS_AT..].copy_from_slice(&witness.bytes());
         self.poisoned = true;
-        let offset = log.append(subject, body)?.0;
-        if offset != self.witness.count {
-            return Err(Error::new("table log and custody witness diverged"));
+        #[cfg(test)]
+        if APPEND_FAILS.with(std::cell::Cell::get) {
+            return Err(Error::new("injected append failure"));
         }
-        self.publish_witness(witness)?;
+        let expected = self.witness.count;
+        let mut diverged = false;
+        let (claim_dir, claim_name) = (&self.claim_dir, &self.claim_name);
+        let offset = match log.append_then(subject, body, claim_dir, |offset, flush| {
+            if offset.0 != expected {
+                diverged = true;
+                return Err(std::io::Error::other(
+                    "table log and custody witness diverged",
+                ));
+            }
+            private_file::write_private_flushed(claim_dir, claim_name, &claim, flush)
+        }) {
+            Ok(offset) => offset.0,
+            Err(_) if diverged => {
+                return Err(Error::new("table log and custody witness diverged"));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        self.claim = claim;
+        self.witness = witness;
         appended(&Appended {
             table: self.scope.digest(),
             recovery: self.is_recovery(),
@@ -1648,7 +1743,7 @@ impl Store {
     /// The pending set does not open, or a write fails as a direct write would; the writes not
     /// yet sealed stay pending.
     pub fn seal_pending(&mut self, session: &Session<'_>) -> Result<usize> {
-        if session.waits_for_rotation() || !pending::path(&self.data_dir).exists() {
+        if !pending::path(&self.data_dir).exists() || session.waits_for_rotation() {
             return Ok(0);
         }
         let key = session.pending_key(&self.scope)?;
@@ -1845,6 +1940,201 @@ impl Store {
             payload,
         )
     }
+    /// The member-signed cutoffs of this table's removed writers ([`cutoff`]) that may count:
+    /// each one signed by a remover of the writer it cuts, as this session's log names them (the
+    /// signers of its effective `Remove`s). [`Self::catalog_projection`] counts each remover's
+    /// newest of them ([`Self::newest_cuts`]), a removed remover's only inside its own allowed
+    /// prefix. Off under the `table-cutoffs-off` negative control.
+    fn removal_cuts(&self, session: &Session<'_>, withheld: &BTreeSet<Digest>) -> Vec<CountedCut> {
+        #[cfg(any(test, debug_assertions))]
+        if super::table_cutoffs_off() {
+            return Vec::new();
+        }
+        let candidates: Vec<_> = self
+            .records
+            .iter()
+            .filter_map(|(id, stored)| {
+                let cut = stored.cut?;
+                let signer = stored.header.actor;
+                (cut.actor != signer && !withheld.contains(id) && stored.quarantine.is_none())
+                    .then_some((*id, signer, stored.header.sequence, cut))
+            })
+            .collect();
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        let removers = session.removers_of(
+            candidates
+                .iter()
+                .flat_map(|(_, signer, _, cut)| [cut.actor, *signer]),
+        );
+        candidates
+            .into_iter()
+            .filter(|(_, signer, _, cut)| {
+                removers
+                    .get(&cut.actor)
+                    .is_some_and(|by| by.contains(signer))
+            })
+            .map(|(id, signer, sequence, cut)| CountedCut {
+                id,
+                signer,
+                sequence,
+                cut,
+                signer_removed: removers.contains_key(&signer),
+            })
+            .collect()
+    }
+
+    /// Of `cuts`, each signer's newest cutoff of each writer: what a reader counts, so a cutoff
+    /// a refused or failed `Remove` left is replaced by the next attempt's.
+    fn newest_cuts<'c>(cuts: impl IntoIterator<Item = &'c CountedCut>) -> Vec<&'c CountedCut> {
+        let mut newest: BTreeMap<(Actor, Actor), &CountedCut> = BTreeMap::new();
+        for counted in cuts {
+            let slot = newest
+                .entry((counted.signer, counted.cut.actor))
+                .or_insert(counted);
+            if counted.sequence > slot.sequence {
+                *slot = counted;
+            }
+        }
+        newest.into_values().collect()
+    }
+
+    /// The cutoffs `cuts` name, by the writer each cuts, as [`Constraints::catalog_with`] takes
+    /// them.
+    fn cut_frontiers<'c>(
+        cuts: impl IntoIterator<Item = &'c &'c CountedCut>,
+    ) -> BTreeMap<Actor, Vec<Option<aterm_secrets::commons::constraints::Frontier>>> {
+        let mut frontiers: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        for counted in cuts {
+            frontiers
+                .entry(counted.cut.actor)
+                .or_default()
+                .push(counted.cut.through);
+        }
+        frontiers
+    }
+
+    /// Under [`super::TABLE_CUT_BY_EPOCH`] alone: each operation of another writer under the
+    /// epoch a counted cutoff (`counted`) was signed under that is not in that cutoff's causal
+    /// past, what a rule cutting by epoch would withhold.
+    #[cfg(any(test, debug_assertions))]
+    fn cut_by_epoch(&self, counted: &[Digest]) -> BTreeSet<Digest> {
+        let mut cut = BTreeSet::new();
+        if !super::TABLE_CUT_BY_EPOCH.with(std::cell::Cell::get) {
+            return cut;
+        }
+        for id in counted {
+            let Some(cutoff) = self.records.get(id) else {
+                continue;
+            };
+            let epoch = super::envelope_roster(&cutoff.wire);
+            let mut past = BTreeSet::new();
+            let mut walk = vec![*id];
+            while let Some(at) = walk.pop() {
+                if past.insert(at)
+                    && let Some(stored) = self.records.get(&at)
+                {
+                    walk.extend(stored.header.previous);
+                    walk.extend(stored.header.parents.iter().copied());
+                }
+            }
+            cut.extend(
+                self.records
+                    .iter()
+                    .filter(|(at, stored)| {
+                        !past.contains(*at)
+                            && stored.header.actor != cutoff.header.actor
+                            && super::envelope_roster(&stored.wire) == epoch
+                    })
+                    .map(|(at, _)| *at),
+            );
+        }
+        cut
+    }
+
+    /// `actor`'s last operation held here (the highest, the lowest digest among a fork's), or
+    /// `None` where this table holds none: what a cutoff of it signed now names.
+    pub(crate) fn last_of(
+        &self,
+        actor: Actor,
+    ) -> Option<aterm_secrets::commons::constraints::Frontier> {
+        self.records
+            .values()
+            .filter(|stored| stored.header.actor == actor && stored.quarantine.is_none())
+            .max_by(|a, b| {
+                a.header
+                    .sequence
+                    .cmp(&b.header.sequence)
+                    .then(b.header.id.cmp(&a.header.id))
+            })
+            .map(|stored| aterm_secrets::commons::constraints::Frontier {
+                sequence: stored.header.sequence,
+                digest: stored.header.id,
+            })
+    }
+
+    /// This Mac's newest cutoff of `actor` in this table, if it signed one.
+    fn own_cut_of(&self, actor: Actor) -> Option<cutoff::Cut> {
+        self.records
+            .values()
+            .filter(|stored| stored.header.actor == self.actor)
+            .filter_map(|stored| Some((stored.header.sequence, stored.cut?)))
+            .filter(|(_, cut)| cut.actor == actor)
+            .max_by_key(|(sequence, _)| *sequence)
+            .map(|(_, cut)| cut)
+    }
+
+    /// Sign this Mac's cutoff of `actor`, a writer it is removing, in this table ([`cutoff`]):
+    /// a table operation of its own naming `through`. Before the `Remove`
+    /// ([`cutoff::Signing::Fresh`]) that is [`Self::last_of`], signed again only when this Mac's
+    /// newest cutoff of `actor` here names another operation, since a reader counts only each
+    /// remover's newest. As the remover's repair ([`cutoff::Signing::Repair`]) it signs the
+    /// frontier saved before the `Remove` unless its newest cutoff names it already, and with none
+    /// saved only where this Mac holds no cutoff of `actor`, so a repair never moves a cutoff past
+    /// the removal. On a share ([`cutoff::Signing::Supersede`]) it only replaces a cutoff of its
+    /// own an earlier attempt left, at the writer's last operation held now: the first remover's
+    /// cutoff still bounds the writer, as cutoffs intersect. Whether it signed one; a
+    /// cutoff of this Mac itself is never signed.
+    ///
+    /// # Errors
+    /// As [`Self::commit_own`], except that it never waits on a rotation: it is signed before
+    /// the `Remove` that makes one due.
+    pub(crate) fn sign_cutoff(
+        &mut self,
+        session: &Session<'_>,
+        actor: Actor,
+        signing: cutoff::Signing,
+    ) -> Result<bool> {
+        if actor == self.actor {
+            return Ok(false);
+        }
+        let held = self.own_cut_of(actor);
+        let through = match signing {
+            cutoff::Signing::Fresh => {
+                let through = self.last_of(actor);
+                if held.is_some_and(|cut| cut.through == through) {
+                    return Ok(false);
+                }
+                through
+            }
+            // A frontier kept before the effective `Remove` replaces a cutoff an earlier,
+            // refused attempt left; with none kept, a held cutoff stands.
+            cutoff::Signing::Repair { saved } => match (held, saved) {
+                (Some(cut), Some(saved)) if cut.through == saved => return Ok(false),
+                (Some(_), None) => return Ok(false),
+                (_, Some(saved)) => saved,
+                (None, None) => self.last_of(actor),
+            },
+            cutoff::Signing::Supersede => match held {
+                Some(cut) if cut.through != self.last_of(actor) => self.last_of(actor),
+                _ => return Ok(false),
+            },
+        };
+        self.commit_own_now(session, &cutoff::encode(&cutoff::Cut { actor, through }))?;
+        Ok(true)
+    }
+
     fn catalog_projection(&self, session: &Session<'_>) -> Result<Projection> {
         self.check(session)?;
         // Peers cannot admit quarantine, so it and its withheld dependents do
@@ -1854,7 +2144,6 @@ impl Store {
         let index = self.replication_index_with(&withheld)?;
         let constraints = session_constraints(session)?;
         let table = self.scope.digest();
-        let allowed = constraints.catalog(table, &index);
         let writers: BTreeSet<_> = session
             .access
             .members()
@@ -1862,6 +2151,44 @@ impl Store {
             .filter(|m| m.role() == Role::Writer)
             .map(|m| m.binding().actor())
             .collect();
+        let is_log_backed = session.is_log_backed();
+        let mut historical: BTreeMap<(Digest, Actor), bool> = BTreeMap::new();
+        // A cutoff signed by a remover that is itself removed counts only inside that signer's
+        // own allowed prefix, so a removed Mac's later operation cuts nobody.
+        // A removed remover's cutoffs count only inside its own allowed prefix, which the
+        // cutoffs of its own removers bound, themselves perhaps removed: walk to a fixpoint, each
+        // round counting each signer's newest standing cutoff, so a removed Mac's later cutoff
+        // neither cuts nor un-cuts anyone. Bounded by one round per cutoff.
+        let cuts = self.removal_cuts(session, &withheld);
+        let mut standing = Self::newest_cuts(cuts.iter().filter(|cut| !cut.signer_removed));
+        let mut removals = Self::cut_frontiers(&standing);
+        let mut allowed = constraints.catalog_with(table, &index, &removals);
+        if cuts.iter().any(|cut| cut.signer_removed) {
+            for _ in 0..=cuts.len() {
+                let next = Self::newest_cuts(
+                    cuts.iter()
+                        .filter(|cut| !cut.signer_removed || allowed.permits(&cut.id)),
+                );
+                if next
+                    .iter()
+                    .map(|cut| cut.id)
+                    .eq(standing.iter().map(|cut| cut.id))
+                {
+                    break;
+                }
+                standing = next;
+                removals = Self::cut_frontiers(&standing);
+                allowed = constraints.catalog_with(table, &index, &removals);
+            }
+        }
+        let counted: Vec<Digest> = standing.iter().map(|cut| cut.id).collect();
+        #[cfg(any(test, debug_assertions))]
+        let by_epoch = self.cut_by_epoch(&counted);
+        #[cfg(not(any(test, debug_assertions)))]
+        let by_epoch = {
+            let _ = counted;
+            BTreeSet::<Digest>::new()
+        };
         let cutoffs: BTreeSet<_> = constraints
             .facts()
             .filter_map(|fact| match fact {
@@ -1870,9 +2197,8 @@ impl Store {
                 } if *t == table => Some(*actor),
                 _ => None,
             })
+            .chain(removals.keys().copied())
             .collect();
-        let is_log_backed = session.is_log_backed();
-        let mut historical: BTreeMap<(Digest, Actor), bool> = BTreeMap::new();
         let mut excluded: BTreeSet<_> = self
             .records
             .iter()
@@ -1880,6 +2206,7 @@ impl Store {
                 withheld.contains(*id)
                     || stored.quarantine.is_some()
                     || !allowed.permits(id)
+                    || by_epoch.contains(*id)
                     || !(writers.contains(&stored.header.actor)
                         || cutoffs.contains(&stored.header.actor)
                         || (is_log_backed
@@ -1907,6 +2234,7 @@ impl Store {
                 .catalog_projection(session)?
                 .ordered
                 .iter()
+                .filter(|id| self.records[*id].cut.is_none())
                 .map(|id| batch.authenticate(&self.records[id].wire))
                 .collect::<Result<Vec<_>>>()?;
             self.check(session)?;
@@ -1931,73 +2259,116 @@ impl Store {
         session.with_read_batch(self.scope, |batch| {
             let projection = self.catalog_projection(session)?;
             let append_bound = self.catalog_append_bound(&projection);
-            let eligible: BTreeSet<_> = projection.ordered.into_iter().collect();
-            let mut evidence = self
-                .records
-                .values()
-                .map(|stored| {
-                    let record = if stored.quarantine.is_none() {
-                        Some(batch.authenticate(&stored.wire)?)
-                    } else {
-                        None
-                    };
-                    let (roster, epoch, authored_ms) = match &record {
-                        Some(record) => (*record.roster(), record.epoch(), record.authored_ms()),
-                        None => stored
-                            .quarantine
-                            .expect("unavailable payload has witnessed quarantine metadata"),
-                    };
-                    Ok(MetadataEvidence {
-                        header: stored.header.clone(),
-                        receipt: stored.receipt,
-                        roster,
-                        epoch,
-                        authored_ms,
-                        record,
-                        catalog_eligible: eligible.contains(&stored.header.id),
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            for stored in self.conflicts.values() {
-                let Some(source) = stored.conflict.discarded() else {
-                    continue;
-                };
-                if self.records.contains_key(&source.header.id) {
-                    continue;
-                }
-                let record = if stored.conflict.active() {
-                    None
-                } else {
-                    let Some(record) = session.negative_record(
-                        self.scope,
-                        stored
-                            .conflict
-                            .source_for(&source.header.id)
-                            .ok_or_else(|| Error::new("discarded source is missing"))?,
-                    )?
-                    else {
-                        continue;
-                    };
-                    Some(record)
-                };
-                evidence.push(MetadataEvidence {
-                    header: source.header.clone(),
-                    receipt: stored.receipt,
-                    roster: source.roster,
-                    epoch: source.epoch,
-                    authored_ms: source.authored_ms,
-                    record,
-                    catalog_eligible: false,
-                });
-            }
+            let evidence = self.metadata_from(session, batch, projection)?;
             self.check(session)?;
             Ok((evidence, append_bound))
         })
     }
+    /// [`Self::catalog`] and [`Self::metadata_evidence`] from one projection and one read batch,
+    /// whose closing checks hold both answers. Positive catalog-eligible records are moved into
+    /// the returned `Vec<Record>` rather than decrypted twice.
+    pub(crate) fn catalog_and_evidence(
+        &self,
+        session: &Session<'_>,
+    ) -> Result<(Vec<Record>, Vec<MetadataEvidence>)> {
+        session.with_read_batch(self.scope, |batch| {
+            let projection = self.catalog_projection(session)?;
+            let ordered = projection.ordered.clone();
+            let mut evidence = self.metadata_from(session, batch, projection)?;
+            let positive = &mut evidence[..self.records.len()];
+            let records = ordered
+                .iter()
+                .filter(|id| self.records[*id].cut.is_none())
+                .map(|id| {
+                    let idx = positive
+                        .binary_search_by_key(id, |e| e.header.id)
+                        .expect("catalog projection id is in store records");
+                    positive[idx]
+                        .record
+                        .take()
+                        .ok_or_else(|| Error::new("table payload authentication failed"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            self.check(session)?;
+            Ok((records, evidence))
+        })
+    }
+    fn metadata_from(
+        &self,
+        session: &Session<'_>,
+        batch: &ReadBatch<'_, '_>,
+        projection: Projection,
+    ) -> Result<Vec<MetadataEvidence>> {
+        let eligible: BTreeSet<_> = projection.ordered.into_iter().collect();
+        let mut evidence = self
+            .records
+            .values()
+            .map(|stored| {
+                let record = if stored.quarantine.is_none() {
+                    Some(batch.authenticate(&stored.wire)?)
+                } else {
+                    None
+                };
+                let (roster, epoch, authored_ms) = match &record {
+                    Some(record) => (*record.roster(), record.epoch(), record.authored_ms()),
+                    None => stored
+                        .quarantine
+                        .expect("unavailable payload has witnessed quarantine metadata"),
+                };
+                Ok(MetadataEvidence {
+                    header: stored.header.clone(),
+                    receipt: stored.receipt,
+                    roster,
+                    epoch,
+                    authored_ms,
+                    record,
+                    catalog_eligible: eligible.contains(&stored.header.id),
+                    cutoff: stored.cut.is_some(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for stored in self.conflicts.values() {
+            let Some(source) = stored.conflict.discarded() else {
+                continue;
+            };
+            if self.records.contains_key(&source.header.id) {
+                continue;
+            }
+            let record = if stored.conflict.active() {
+                None
+            } else {
+                let Some(record) = session.negative_record(
+                    self.scope,
+                    stored
+                        .conflict
+                        .source_for(&source.header.id)
+                        .ok_or_else(|| Error::new("discarded source is missing"))?,
+                )?
+                else {
+                    continue;
+                };
+                Some(record)
+            };
+            evidence.push(MetadataEvidence {
+                header: source.header.clone(),
+                receipt: stored.receipt,
+                roster: source.roster,
+                epoch: source.epoch,
+                authored_ms: source.authored_ms,
+                record,
+                catalog_eligible: false,
+                cutoff: false,
+            });
+        }
+        Ok(evidence)
+    }
     /// Local operation inventory, including pending, forked and quarantined
     /// records. Certificates have a separate inventory. Neither is a claim of
     /// complete network history.
-    pub fn inventory(&self, session: &Session<'_>) -> Result<impl Iterator<Item = &Digest>> {
+    pub fn inventory(
+        &self,
+        session: &Session<'_>,
+    ) -> Result<impl ExactSizeIterator<Item = &Digest>> {
         self.check(session)?;
         Ok(self.records.keys())
     }

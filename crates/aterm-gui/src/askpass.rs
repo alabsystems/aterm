@@ -143,6 +143,7 @@ pub(crate) struct AskpassRequest {
     /// authorizes them alone, since that sudo runs with `-k`.
     pub exact: bool,
     pub command: String,
+    pub purpose: Option<String>,
     pub invoker: String,
     pub reply: Sender<AskpassAnswer>,
 }

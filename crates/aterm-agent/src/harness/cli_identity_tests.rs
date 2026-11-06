@@ -16,6 +16,7 @@ struct TerminalCodex {
     sign_in_program: Option<PathBuf>,
     snapshot_store: Option<(accounts::Store, i64)>,
     admitted: RefCell<Option<accounts::Logins>>,
+    driver_outcome: Option<crate::harness::login_drive::Outcome>,
 }
 impl TerminalCodex {
     fn new(reported: Option<&'static str>) -> Self {
@@ -31,6 +32,7 @@ impl TerminalCodex {
             sign_in_program: None,
             snapshot_store: None,
             admitted: RefCell::new(None),
+            driver_outcome: None,
         }
     }
 }
@@ -92,6 +94,12 @@ impl AccountsHost for TerminalCodex {
         req: &crate::harness::login_drive::Request<'_>,
     ) -> crate::harness::login_drive::Drove {
         self.vendor_login(req).unwrap();
+        if let Some(outcome) = &self.driver_outcome {
+            return crate::harness::login_drive::Drove {
+                outcome: outcome.clone(),
+                host: None,
+            };
+        }
         if self.driver_reports_identity
             && let Some(replacement) = &self.replacement
         {
@@ -229,6 +237,80 @@ fn command(line: &str, env: &Env, host: &dyn AccountsHost) -> (String, String, S
         String::from_utf8(out).unwrap(),
         String::from_utf8(err).unwrap(),
     )
+}
+
+#[test]
+fn completed_held_codex_renewal_keeps_its_staging_without_publishing_or_probing() {
+    use crate::harness::login_drive::Outcome;
+    for held in [false, true] {
+        let tmp = tmp_dir("codex-completed-held");
+        let env = env_at(&tmp);
+        assert_eq!(
+            run_line(
+                "accounts add account --cli codex --email owner@example.test",
+                &env
+            )
+            .0,
+            exit(0)
+        );
+        let store = env.accounts_store_for(Cli::Codex).unwrap();
+        let path = env.accounts_roster_for(Cli::Codex).unwrap();
+        let roster_before = std::fs::read(&path).unwrap();
+        let records = store.read_account_records(Some(&path), env.now).unwrap();
+        let own_dir = records.raw_roster.row("account").unwrap().dir.as_deref();
+        let mut host = TerminalCodex::new(Some("owner@example.test"));
+        host.snapshot_store = Some((store.clone(), env.now));
+        host.driver_outcome = Some(if held {
+            Outcome::CompletedHeld
+        } else {
+            Outcome::Failed
+        });
+        let renewal = renew_one_for(
+            Cli::Codex,
+            env.now,
+            &host,
+            &store,
+            (
+                records.roster.row("account").unwrap(),
+                &path,
+                &records.logins,
+            ),
+            (
+                own_dir,
+                crate::harness::sign_in_ladder::asked_fixture(Cli::Codex, "account"),
+            ),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert_eq!(
+            renewal,
+            if held {
+                Renewal::Deferred
+            } else {
+                Renewal::Failed
+            }
+        );
+        assert_eq!(host.homes.borrow().len(), 1);
+        assert!(host.probes.borrow().is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), roster_before);
+        let staging = host.homes.borrow()[0].clone();
+        if held {
+            assert_eq!(
+                std::fs::read(staging.join("auth.json")).unwrap(),
+                b"isolated fixture login"
+            );
+            assert!(!staging.join(accounts::RENEWAL_CHECKPOINT_FILE).exists());
+            assert_eq!(
+                store.load_logins(host.now()).unwrap().0,
+                *host.admitted.borrow().as_ref().unwrap()
+            );
+        } else {
+            assert!(
+                !staging.exists(),
+                "an ordinary failed attempt still discards staging"
+            );
+        }
+    }
 }
 
 #[test]

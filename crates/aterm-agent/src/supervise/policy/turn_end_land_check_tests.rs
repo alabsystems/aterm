@@ -1145,11 +1145,14 @@ fn an_answer_unsaid_past_its_take_window_audits_nothing() {
     assert!(st.land_check_owed(), "said again, owed its check: {st:?}");
 }
 
-/// ONLY THE LAND CHECK'S ANSWER WAITS FOR ITS WORDS: every other act's turn is judged by its shape,
-/// so Land's instruction answered with nothing drawn under it is judged where it ends, as before
-/// L19. Negative control: the unsaid hold on every act, which leaves the instruction awaited.
+/// EVERY ACT'S ANSWER WAITS FOR ITS WORDS (the 2026-11-06 review's E4: L19's frame one act
+/// earlier): Land's instruction answered with agy's idle frame and nothing under it stays awaited,
+/// its turn taken, so the defense agy draws 0.55 s later, nothing typed between, is the
+/// instruction's answer and gets the land check at once. Negative control: the hold scoped to the
+/// land check (07413254fe), which judges the empty frame a short turn and backs off 2 min, the
+/// defense then nudged instead of checked.
 #[test]
-fn an_unsaid_answer_to_another_act_is_judged_where_it_ends() {
+fn an_unsaid_answer_to_lands_instruction_waits_for_its_defense() {
     let t = t0();
     let mut st = TurnEndState::default();
     let work = on_agy(worked(
@@ -1159,14 +1162,156 @@ fn an_unsaid_answer_to_another_act_is_judged_where_it_ends() {
     let at_empty = t + Duration::from_secs(3);
     let a = at(&mut st, &unsaid_yield(), at_empty);
     assert!(
-        matches!(
+        waits_until(&a, at_empty + TurnEndTiming::default().take_within),
+        "the instruction's answer awaited: {a:?}"
+    );
+    assert!(!st.act_untaken(), "the turn that ran took the act: {st:?}");
+    let defense = TurnEndReading {
+        worked: None,
+        ..on_agy(short(DEFENSE_O))
+    };
+    let b = at(&mut st, &defense, at_empty + Duration::from_millis(550));
+    assert_eq!(
+        b.rule_id(),
+        Some(RULE_LAND_CHECK),
+        "the defense drawn late is the instruction's answer: {b:?} {st:?}"
+    );
+}
+
+/// A SEEDED CHECK ANSWER THAT SAYS NOTHING AUDITS NOTHING (the 2026-11-06 review's M4): a loop
+/// that follows, seeded at a land check's point that drew no words, rejudges it as no answer, so
+/// the defense the agent says again is owed its check. Negative control: the seeded (rejudged)
+/// arm reading no words as the check's answer, an empty list, which audits the defense, so said
+/// again it backs off 4 min.
+#[test]
+fn a_seeded_unsaid_check_answer_audits_nothing() {
+    let (st, then) = agy_checked(t0());
+    let now = then + Duration::from_secs(4);
+    let mut st = following(
+        RULE_LAND_CHECK,
+        0,
+        st.land_books(),
+        Duration::from_secs(1),
+        now,
+    );
+    let still = TurnEndReading {
+        worked: None,
+        ..unsaid_yield()
+    };
+    let (a, then) = decided(&mut st, &still, now);
+    assert_eq!(a.rule_id(), Some(RULE_LAND_NUDGE), "{a:?} {st:?}");
+    assert_eq!(
+        st.land.audited, [None; 3],
+        "no words audit no defense: {st:?}"
+    );
+    st.acted(&a, &still, then);
+    let b = at(
+        &mut st,
+        &on_agy(short(DEFENSE_O)),
+        then + Duration::from_secs(3),
+    );
+    assert_eq!(
+        b.rule_id(),
+        Some(RULE_LAND_CHECK),
+        "said again, owed its check: {b:?} {st:?}"
+    );
+    assert_eq!(st.land.audited, [None; 3], "{st:?}");
+}
+
+/// EACH RUN THAT STILL SAYS NOTHING COUNTS ITS WORK AND OPENS A NEW WINDOW (the 2026-11-06
+/// review's M5): a check whose turn ran 1.55 s and drew no words, then ran 150 s more and still
+/// drew none, then drew its list, is judged one turn of 151.55 s, past the work floor, so the
+/// short streak resets and Land's next prompt, quoting the list, goes at once. Negative controls:
+/// the later run's work dropped (judged 1.55 s, a short turn, backed off) and the window left
+/// counted from the first answer (the second unsaid end past it, the check judged unanswered).
+#[test]
+fn every_unsaid_run_of_a_checks_turn_counts() {
+    let (mut st, then) = agy_checked(t0());
+    let at_empty = then + Duration::from_secs(3);
+    let a = at(&mut st, &unsaid_yield(), at_empty);
+    assert!(!matches!(a, TurnEndAction::Type { .. }), "{a:?}");
+    let again = TurnEndReading {
+        worked: Some(Duration::from_secs(150)),
+        ..unsaid_yield()
+    };
+    let at_again = at_empty + Duration::from_secs(151);
+    let b = at(&mut st, &again, at_again);
+    assert!(
+        waits_until(&b, at_again + TurnEndTiming::default().take_within),
+        "the second unsaid end opens its own window: {b:?} {st:?}"
+    );
+    assert!(st.land_check_awaited(), "{st:?}");
+    let list = TurnEndReading {
+        worked: None,
+        ..on_agy(short(LIST))
+    };
+    let c = at(&mut st, &list, at_again + Duration::from_millis(550));
+    assert!(
+        matches!(&c, TurnEndAction::Type { text, .. } if text.contains(LIST)),
+        "the list quoted at once, no back-off: {c:?} {st:?}"
+    );
+    assert_eq!(st.short, 0, "151.55 s of work resets the streak: {st:?}");
+}
+
+/// A QUESTION BOX THAT SAYS NOTHING IS JUDGED WHERE IT IS READ (the 2026-11-06 review): it is
+/// drawn on purpose, never ahead of its words, so a land check answered so waits for no words,
+/// and, saying nothing, audits nothing. Negative control: the question phase admitted to the
+/// hold, which waits out the take window first.
+#[test]
+fn an_unsaid_question_box_answering_the_check_is_judged_at_once() {
+    let (mut st, then) = agy_checked(t0());
+    let at_box = then + Duration::from_secs(3);
+    let asked = TurnEndReading {
+        phase: Phase::Question,
+        said_tail: None,
+        ..unsaid_yield()
+    };
+    assert!(asked.unsaid(), "it says nothing: {asked:?}");
+    let a = at(&mut st, &asked, at_box);
+    assert!(
+        !matches!(
             a,
+            TurnEndAction::WaitUntil {
+                wait: WaitKind::Other,
+                ..
+            }
+        ),
+        "judged at once, not awaited: {a:?}"
+    );
+    assert!(!st.land_check_awaited(), "{st:?}");
+    assert_eq!(
+        st.land.audited, [None; 3],
+        "no words audit no defense: {st:?}"
+    );
+}
+
+/// UNDER CRUISE AN ACT'S ANSWER IS JUDGED BY ITS WORK WHERE IT ENDS: only a Land act, answered by
+/// its words, waits for them, so Cruise's continuation answered with agy's idle frame and nothing
+/// under it is a short turn there, on the ladder, as before L19. Negative control: the hold on
+/// every act, which leaves `continue@v1` awaited for its words.
+#[test]
+fn an_unsaid_answer_under_cruise_is_judged_where_it_ends() {
+    let t = t0();
+    let mut st = TurnEndState::default();
+    let work = under(
+        Autopilot::Cruise,
+        on_agy(idle(
+            "Implemented the parser module and its unit tests in this turn.",
+            Some(3 * MIN),
+        )),
+    );
+    let a = act(&mut st, &work, t);
+    assert_eq!(a.rule_id(), Some(RULE_CONTINUE), "{a:?}");
+    let at_empty = t + Duration::from_secs(3);
+    let b = at(&mut st, &under(Autopilot::Cruise, unsaid_yield()), at_empty);
+    assert!(
+        matches!(
+            b,
             TurnEndAction::WaitUntil {
                 wait: WaitKind::BackOff { short: 1 },
                 ..
             }
         ),
-        "judged a short turn where it ends, not awaited: {a:?}"
+        "judged a short turn where it ends, not awaited: {b:?}"
     );
-    assert!(!st.land_check_awaited(), "{st:?}");
 }

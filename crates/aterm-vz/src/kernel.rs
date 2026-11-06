@@ -95,7 +95,7 @@ pub fn gunzip_image(gz: impl Read, mut out: impl Write, expect: &Expect<'_>) -> 
     let mut hash = aterm_digest::Sha256::new();
     let mut head = [0u8; MAGIC_AT + MAGIC.len()];
     let mut written: u64 = 0;
-    let mut buf = vec![0u8; 1 << 16];
+    let mut buf = [0u8; 32 * 1024];
     loop {
         let n = match reader.read(&mut buf) {
             Ok(0) => break,
@@ -151,7 +151,7 @@ fn copy_checked(from: &Path, mut out: impl Write, expect: &Expect<'_>) -> Result
         .map_err(|e| Error::Input(format!("could not open {}: {e}", from.display())))?;
     let mut reader = file.take(expect.bytes.saturating_add(1));
     let mut hash = aterm_digest::Sha256::new();
-    let mut buf = vec![0u8; 1 << 16];
+    let mut buf = [0u8; 32 * 1024];
     let mut copied: u64 = 0;
     let written_out =
         |e: std::io::Error| Error::Io(format!("could not copy {}: {e}", from.display()));
@@ -193,10 +193,12 @@ fn whole(kernel: &Kernel, want: &Want<'_>) -> bool {
             .is_some_and(|dir| std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_dir()))
     };
     let sized = |path: &Path, bytes: u64| {
-        real_parent(path)
-            && std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && m.len() == bytes)
+        std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && m.len() == bytes)
     };
-    sized(&kernel.image, want.image.bytes) && sized(&kernel.initrd, want.initrd.bytes)
+    real_parent(&kernel.image)
+        && (kernel.initrd.parent() == kernel.image.parent() || real_parent(&kernel.initrd))
+        && sized(&kernel.image, want.image.bytes)
+        && sized(&kernel.initrd, want.initrd.bytes)
 }
 
 /// Write `path` through `write`, then flush it to stable media.

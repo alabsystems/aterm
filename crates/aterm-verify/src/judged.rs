@@ -58,18 +58,37 @@ pub fn command(root: &Path, args: &[&str]) -> Command {
     cmd
 }
 
-fn capture(cmd: &mut Command, input: Option<&[u8]>) -> Result<std::process::Output, String> {
+pub fn deadline() -> std::time::Instant {
+    std::time::Instant::now() + std::time::Duration::from_secs(60)
+}
+
+fn capture_until(
+    cmd: &mut Command,
+    input: Option<&[u8]>,
+    until: std::time::Instant,
+) -> Result<std::process::Output, String> {
+    if std::time::Instant::now() >= until {
+        return Err("journal operation exhausted its deadline".into());
+    }
     aterm_uds::deadline::output_with_input_until(
         cmd,
         aterm_uds::secret::Secret::new(input.unwrap_or_default()),
-        std::time::Instant::now() + std::time::Duration::from_secs(60),
+        until,
         512 * 1024 * 1024,
     )
     .map_err(|e| e.to_string())
 }
 
 pub fn output(cmd: &mut Command, input: Option<&[u8]>) -> Result<String, String> {
-    let out = capture(cmd, input)?;
+    output_until(cmd, input, deadline())
+}
+
+fn output_until(
+    cmd: &mut Command,
+    input: Option<&[u8]>,
+    until: std::time::Instant,
+) -> Result<String, String> {
+    let out = capture_until(cmd, input, until)?;
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).into_owned());
     }
@@ -80,8 +99,17 @@ pub fn git(root: &Path, args: &[&str]) -> Result<String, String> {
     output(&mut command(root, args), None).map(|s| s.trim().to_owned())
 }
 
+fn git_until(root: &Path, args: &[&str], until: std::time::Instant) -> Result<String, String> {
+    output_until(&mut command(root, args), None, until).map(|s| s.trim().to_owned())
+}
+
 /// Refresh only this private journal, never the checkout's branch or index.
-pub fn head(root: &Path, remote: &str) -> Result<Option<String>, String> {
+pub fn head(
+    root: &Path,
+    remote: &str,
+    until: std::time::Instant,
+) -> Result<Option<String>, String> {
+    let git = |root: &Path, args: &[&str]| git_until(root, args, until);
     let named = git(root, &["ls-remote", remote, REF])?;
     let Some(sha) = named.split_whitespace().next() else {
         return Ok(None);
@@ -90,7 +118,13 @@ pub fn head(root: &Path, remote: &str) -> Result<Option<String>, String> {
     Ok(Some(sha.to_owned()))
 }
 
-pub fn records(root: &Path, head: Option<&str>) -> Result<Vec<Record>, String> {
+pub fn records(
+    root: &Path,
+    head: Option<&str>,
+    until: std::time::Instant,
+) -> Result<Vec<Record>, String> {
+    let git = |root: &Path, args: &[&str]| git_until(root, args, until);
+    let output = |cmd: &mut Command, input: Option<&[u8]>| output_until(cmd, input, until);
     let Some(head) = head else {
         return Ok(Vec::new());
     };
@@ -108,7 +142,13 @@ pub fn records(root: &Path, head: Option<&str>) -> Result<Vec<Record>, String> {
     decode_objects(objects.as_bytes())
 }
 
-pub fn record(root: &Path, head: Option<&str>, tree: &str) -> Result<Option<Record>, String> {
+pub fn record(
+    root: &Path,
+    head: Option<&str>,
+    tree: &str,
+    until: std::time::Instant,
+) -> Result<Option<Record>, String> {
+    let git = |root: &Path, args: &[&str]| git_until(root, args, until);
     let Some(head) = head else {
         return Ok(None);
     };
@@ -156,7 +196,12 @@ pub fn append(
     remote: &str,
     parent: Option<&str>,
     record: &Record,
+    until: std::time::Instant,
 ) -> Result<bool, String> {
+    // One absolute deadline bounds the whole append, including CAS races and pruning.
+    let git = |root: &Path, args: &[&str]| git_until(root, args, until);
+    let output = |cmd: &mut Command, input: Option<&[u8]>| output_until(cmd, input, until);
+    let capture = |cmd: &mut Command, input: Option<&[u8]>| capture_until(cmd, input, until);
     let index = aterm_tempfile::tempdir().map_err(|e| e.to_string())?;
     let index_path = index.path().join("index");
     let mut read = command(root, &["read-tree", parent.unwrap_or("--empty")]);
@@ -167,7 +212,7 @@ pub fn append(
         .and_then(|s| s.parse::<u64>().ok());
     let prune = last_pruned.is_none_or(|day| day < record.updated / 86400);
     for old in if prune {
-        records(root, parent)?
+        records(root, parent, until)?
     } else {
         Vec::new()
     } {
@@ -255,7 +300,7 @@ pub fn append(
     }
     // A race is retryable only when the remote actually moved. Authentication/network failures
     // remain errors, rather than turning into a tight retry loop.
-    if head(root, remote)?.as_deref() != parent {
+    if head(root, remote, until)?.as_deref() != parent {
         return Ok(false);
     }
     Err(String::from_utf8_lossy(&pushed.stderr).into_owned())
@@ -314,8 +359,22 @@ mod tests {
             lease_until: 120,
             rows: vec![],
         };
-        assert!(append(&one, "origin", None, &r).unwrap());
-        let first = head(&one, "origin").unwrap().unwrap();
+        assert!(append(&one, "origin", None, &r, deadline()).unwrap());
+        let first = head(&one, "origin", deadline()).unwrap().unwrap();
+        assert!(
+            append(
+                &one,
+                "origin",
+                Some(&first),
+                &r,
+                std::time::Instant::now() - std::time::Duration::from_secs(1)
+            )
+            .is_err()
+        );
+        assert_eq!(
+            head(&one, "origin", deadline()).unwrap().as_deref(),
+            Some(first.as_str())
+        );
         let blob = git(&one, &["rev-parse", &format!("{first}:verdicts/t.toml")]).unwrap();
         let input = format!("{blob}\n").repeat(3000);
         let objects = output(
@@ -329,12 +388,15 @@ mod tests {
             "large journals must drain output while feeding more object requests"
         );
         r.token = "two".into();
-        assert!(!append(&one, "origin", None, &r).unwrap());
-        assert_eq!(records(&one, Some(&first)).unwrap()[0].token, "one");
+        assert!(!append(&one, "origin", None, &r, deadline()).unwrap());
+        assert_eq!(
+            records(&one, Some(&first), deadline()).unwrap()[0].token,
+            "one"
+        );
         r.tree = "new".into();
         r.updated = RETENTION + 2;
-        assert!(append(&one, "origin", Some(&first), &r).unwrap());
-        let last = head(&one, "origin").unwrap().unwrap();
-        assert_eq!(records(&one, Some(&last)).unwrap(), vec![r]);
+        assert!(append(&one, "origin", Some(&first), &r, deadline()).unwrap());
+        let last = head(&one, "origin", deadline()).unwrap().unwrap();
+        assert_eq!(records(&one, Some(&last), deadline()).unwrap(), vec![r]);
     }
 }

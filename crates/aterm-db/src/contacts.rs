@@ -223,13 +223,12 @@ pub fn validate(collection: &str, value: &Value) -> Result<()> {
             .get("address")
             .and_then(Value::as_str)
             .filter(|s| {
-                s.len() <= 254 && !s.chars().any(char::is_control) && s.split('@').count() == 2
+                s.len() <= 254
+                    && !s.chars().any(|c| c.is_control() || c.is_whitespace())
+                    && s.split('@').count() == 2
             })
             .ok_or_else(|| Error::new("invalid email address"))?;
-        if address.starts_with('@')
-            || address.ends_with('@')
-            || address.chars().any(char::is_whitespace)
-        {
+        if address.starts_with('@') || address.ends_with('@') {
             return Err(Error::new("invalid email address"));
         }
         for k in ["mailbox_id", "alias_of"] {

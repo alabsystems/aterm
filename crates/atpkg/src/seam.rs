@@ -4154,6 +4154,12 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_plain_view_moves_aside_only_when_it_is_laid_again() {
+        #[cfg(unix)]
+        if !crate::testdir::isolated_lifecycle(
+            "seam::tests::a_plain_view_moves_aside_only_when_it_is_laid_again",
+        ) {
+            return;
+        }
         let fx = Fixture::new("view-plain");
         fx.install_trust(9192);
         attach(&fx.layout, &fx.rustup, "trust").unwrap();
@@ -4191,7 +4197,7 @@ mod tests {
         let r = refresh_view_with(&fx.layout, "trust", &|| Some(Vec::new())).unwrap();
         assert!(matches!(r.deferred, Some(Deferred::Leased(_))), "{r:?}");
         assert!(is_real_dir(&view) && !aside.exists());
-        drop(lease);
+        lease.release();
 
         let r = refresh_view_with(&fx.layout, "trust", &|| Some(Vec::new())).unwrap();
         assert!(r.changed && r.deferred.is_none(), "{r:?}");
@@ -4400,6 +4406,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_leased_view_is_left_as_it_stands_until_the_run_ends() {
+        #[cfg(unix)]
+        if !crate::testdir::isolated_lifecycle(
+            "seam::tests::a_leased_view_is_left_as_it_stands_until_the_run_ends",
+        ) {
+            return;
+        }
         let fx = Fixture::new("view-leased");
         fx.install_trust(9178);
         refresh_view(&fx.layout, "trust").unwrap();
@@ -4422,7 +4434,7 @@ mod tests {
             "trustc of build 9178",
             "the run's compiler stays"
         );
-        drop(lease);
+        lease.release();
         let r = refresh_view_with(&fx.layout, "trust", &|| Some(Vec::new())).unwrap();
         assert!(r.changed && r.deferred.is_none(), "{r:?}");
         assert!(view_matches(&new, &view, Depth::Deep));
@@ -4432,6 +4444,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_view_a_flip_left_behind_is_recorded_and_due_once_its_run_ends() {
+        #[cfg(unix)]
+        if !crate::testdir::isolated_lifecycle(
+            "seam::tests::a_view_a_flip_left_behind_is_recorded_and_due_once_its_run_ends",
+        ) {
+            return;
+        }
         let fx = Fixture::new("view-left-due");
         fx.install_trust(100);
         let lines = reassert(&fx.layout, &fx.rustup);
@@ -4468,7 +4486,7 @@ mod tests {
             None,
             "nothing is due while the run holds the view"
         );
-        drop(lease);
+        lease.release();
         let due = crate::quiet::due_with(&fx.layout, t0, &quiet);
         assert_eq!(
             due.map(|d| d.why),

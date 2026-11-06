@@ -2926,7 +2926,6 @@ impl Wake {
             | Wake::SiblingScan(..)
             | Wake::FleetRead
             | Wake::FabricRead
-            | Wake::PillAct { .. }
             | Wake::CreateWindow
             | Wake::TabWindowCommand(_)
             | Wake::TabMenuAction { .. }
@@ -2991,10 +2990,6 @@ impl Wake {
             Wake::Members { .. } => None,
             #[cfg(target_os = "macos")]
             Wake::MemoryPressure { .. } => None,
-            #[cfg(target_os = "macos")]
-            Wake::LocalNetworkProbeReady => None,
-            #[cfg(target_os = "macos")]
-            Wake::LocalNetworkAlertWatch => None,
             #[cfg(target_os = "macos")]
             Wake::UpdateLaunchUnregistered { .. } => None,
             #[cfg(target_os = "macos")]

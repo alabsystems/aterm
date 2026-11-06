@@ -23,7 +23,7 @@ use aterm_effects::aos_momentum::search::{
 };
 
 use crate::instance::{take_flag, take_value};
-use crate::lab_build::{LAB_BUILD, check_build};
+use crate::lab_build::{check_build, lab_build};
 use crate::paths::{from_caller, paths};
 use crate::spread::{Phase, Stepped, Threads, available, say, say_built};
 use crate::{Fail, Res};
@@ -105,7 +105,7 @@ pub fn parse_args(args: &[String]) -> Result<Args, Fail> {
         ));
     }
     let out = out.ok_or_else(|| Fail::usage("aos-search: --out DIR is required"))?;
-    let toolchain = toolchain.unwrap_or_else(|| LAB_BUILD.to_owned());
+    let toolchain = toolchain.unwrap_or_else(|| lab_build().to_owned());
     if toolchain.trim().is_empty() {
         return Err(Fail::usage(
             "aos-search: --toolchain needs a non-empty line",
@@ -436,7 +436,7 @@ fn how(args: &Args, serial: usize) -> How {
 /// This lab's build names no commit (exit 1, before any evaluator is built), the pinned policy
 /// refused (exit 1), or the summary could not be written.
 pub fn run(args: &Args, plans_text: Option<&str>, out: &Path) -> Result<(i32, String), Fail> {
-    run_in(args, plans_text, out, LAB_BUILD)
+    run_in(args, plans_text, out, lab_build())
 }
 
 fn run_in(
@@ -1042,8 +1042,8 @@ pub fn cmd_aos_search(args: &[String]) -> Res {
         let path = from_caller(&file);
         let bytes = read_bounded(&path, MAX_BUNDLE_BYTES)
             .map_err(|why| Fail::usage(format!("aos-search: --verify {path}: {why}")))?;
-        let (code, report) = verify_bundle(&bytes, &path, LAB_BUILD, || {
-            Evaluator::v1(LAB_BUILD, Instant::now())
+        let (code, report) = verify_bundle(&bytes, &path, lab_build(), || {
+            Evaluator::v1(lab_build(), Instant::now())
         });
         print!("{report}");
         return Ok(code);
@@ -1093,7 +1093,7 @@ mod tests {
                 grid: true,
                 plans: None,
                 out: "/tmp/x".into(),
-                toolchain: LAB_BUILD.into(),
+                toolchain: lab_build().into(),
                 threads: None,
                 frames: false,
             }
@@ -1124,7 +1124,7 @@ mod tests {
         assert!(usage_of(&["--plans"]).contains("--plans needs a value"));
         assert!(usage_of(&["--grid", "--out", "o", "--toolchain", " "]).contains("non-empty"));
         assert!(usage_of(&["--grid", "--out", "o", "extra"]).contains("unexpected 'extra'"));
-        assert!(LAB_BUILD.starts_with("aterm-lab+g"));
+        assert!(lab_build().starts_with("aterm-lab+g"));
     }
 
     #[test]
@@ -1146,7 +1146,7 @@ not a plan
             threads: None,
             frames: false,
         };
-        let (code, summary) = run(&args, Some(text), dir.path()).expect("runs");
+        let (code, summary) = run_in(&args, Some(text), dir.path(), TEST_BUILD).expect("runs");
         assert_eq!(code, 0, "{summary}");
         assert_eq!(
             std::fs::read_to_string(dir.path().join("summary.txt")).expect("written"),
@@ -1172,7 +1172,7 @@ not a plan
             assert!(summary.contains(want), "{want:?} in:\n{summary}");
         }
         let bytes = std::fs::read(dir.path().join("plans.bundle")).expect("the bundle");
-        let ev = Evaluator::v1(LAB_BUILD, Instant::now()).expect("the pinned policy");
+        let ev = Evaluator::v1(TEST_BUILD, Instant::now()).expect("the pinned policy");
         let bundle = CandidateBundle::verify(&bytes, &ev).expect("the bundle verifies");
         assert_eq!(bundle.selection_provenance().name(), "declared");
         let parts = bundle.parts();
@@ -1183,9 +1183,9 @@ not a plan
             parts.publication.is_none(),
             "a lab search publishes nothing"
         );
-        let (version, commit) = LAB_BUILD
+        let (version, commit) = TEST_BUILD
             .rsplit_once("+g")
-            .expect("LAB_BUILD names its commit");
+            .expect("TEST_BUILD names its commit");
         let first = if commit.starts_with('0') { '1' } else { '0' };
         let other = format!("{version}+g{first}{}", commit.get(1..).unwrap_or_default());
         let ev = Evaluator::v1(&other, Instant::now()).expect("the pinned policy");
@@ -1199,8 +1199,13 @@ not a plan
         );
 
         let none = aterm_tempfile::tempdir().expect("an exclusive out dir");
-        let (code, summary) =
-            run(&args, Some("010001000000000000000000\n"), none.path()).expect("runs");
+        let (code, summary) = run_in(
+            &args,
+            Some("010001000000000000000000\n"),
+            none.path(),
+            TEST_BUILD,
+        )
+        .expect("runs");
         assert_eq!(code, 1, "{summary}");
         assert!(
             summary.contains("  no-outcome no outcome: none of 1 distinct"),
@@ -1569,7 +1574,8 @@ not a plan
         assert_eq!(
             cmd_aos_search(&words(&["--verify", &path])).expect("a report"),
             1,
-            "a bundle of TEST_BUILD is foreign to this lab's build {LAB_BUILD}"
+            "a bundle of TEST_BUILD is foreign to this lab's build {}",
+            lab_build()
         );
         let missing = dir.path().join("none.bundle").display().to_string();
         let f = cmd_aos_search(&words(&["--verify", &missing])).expect_err("usage");

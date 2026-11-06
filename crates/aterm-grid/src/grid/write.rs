@@ -6,52 +6,53 @@
 
 use super::{Cell, CellCoord, CellFlags, Grid, PackedColors};
 
-/// The extras-map entries a write over `start, end)` of `row` is about to leave without a cell to claim them, probed before it lands (the write clears the HAS_EXTRAS bits this reads).
+#[cfg(test)]
+mod stale_span_tests {
+    use super::*;
+
+    #[test]
+    fn unrelated_wide_cells_do_not_schedule_an_empty_extras_removal() {
+        let mut grid = Grid::new(2, 80);
+        grid.write_wide_run_autowrap(&['日'; 40], PackedColors::new(), CellFlags::empty());
+        grid.cell_extra_mut(0, 79).add_combining('\u{0301}');
+        let row = grid.row(0).unwrap();
+        assert!(row.flags().contains(crate::row::RowFlags::HAS_WIDE_CHARS));
+        assert!(!row.any_has_extras_in_range(0, 20));
+        assert!(StaleExtras::probe(row, 0, 20).is_empty());
+    }
+}
+
+/// The overwritten map span and boundary-wide halves, captured before the write
+/// clears the HAS_EXTRAS bits this probe reads.
 #[derive(Debug, Default)]
 pub(super) struct StaleExtras {
-    overwritten: Vec<u16>,
+    overwritten: core::ops::Range<u16>,
     halves: [Option<u16>; 2],
 }
 
 impl StaleExtras {
-    /// Nothing to remove: the extras map is empty.
+    /// No overwritten span or orphaned halves to remove.
     pub(super) const NONE: Self = Self {
-        overwritten: Vec::new(),
+        overwritten: 0..0,
         halves: [None, None],
     };
 
     /// Probe `row` before a write over `start, end)`.
     #[inline]
     pub(super) fn probe(row: &crate::Row, start: u16, end: u16) -> Self {
-        if !row.any_has_extras_in_range(start, end)
-            && !row.flags().contains(crate::row::RowFlags::HAS_WIDE_CHARS)
-        {
+        let span_has_extras = row.any_has_extras_in_range(start, end);
+        if !span_has_extras && !row.flags().contains(crate::row::RowFlags::HAS_WIDE_CHARS) {
             return Self::NONE;
         }
-        Self::probe_cold(row, start, end)
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn probe_cold(row: &crate::Row, start: u16, end: u16) -> Self {
-        let mut overwritten = Vec::new();
-        for col in start..end {
-            if row.get(col).is_some_and(Cell::has_extras) {
-                if overwritten.is_empty() {
-                    overwritten.reserve_exact(usize::from(end.saturating_sub(col)));
-                }
-                overwritten.push(col);
-            }
-        }
         Self {
-            overwritten,
+            overwritten: if span_has_extras { start..end } else { 0..0 },
             halves: orphan_halves_with_extras(row, start, end),
         }
     }
 
     #[inline]
     const fn is_empty(&self) -> bool {
-        self.overwritten.is_empty() && matches!(self.halves, [None, None])
+        self.overwritten.start >= self.overwritten.end && matches!(self.halves, [None, None])
     }
 }
 
@@ -119,7 +120,7 @@ pub(crate) struct StaleGlyph {
 }
 
 impl Grid {
-    /// Remove what [`StaleExtras::probe`] found for a row that has just been overwritten, so a later styled write's `get_or_create` there cannot merge a stale entry (an old hyperlink, combining mark, underline colour, RGB overflow) into the new cell.
+    /// Remove the overwritten map span and orphaned wide halves found by [`StaleExtras::probe`], so a later styled write cannot merge a stale entry (an old hyperlink, combining mark, underline colour, RGB overflow) into the new cell. Nonclaiming entries inside the overwritten span are obsolete too.
     #[inline]
     pub(super) fn remove_stale_extras(&mut self, row: u16, stale: StaleExtras) {
         if !stale.is_empty() {
@@ -130,9 +131,11 @@ impl Grid {
     #[cold]
     #[inline(never)]
     fn remove_stale_extras_cold(&mut self, row: u16, stale: StaleExtras) {
-        for col in stale.overwritten {
-            self.storage.extras.remove(CellCoord::new(row, col));
-        }
+        self.storage.extras.clear_map_range_retaining_capacity(
+            row,
+            stale.overwritten.start,
+            stale.overwritten.end,
+        );
         for col in stale.halves.into_iter().flatten() {
             self.drop_unclaimed_extras(row, col..col.saturating_add(1));
         }

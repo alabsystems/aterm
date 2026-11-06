@@ -154,9 +154,11 @@ fn public_http_reads_refuse_inherited_headers_without_changing_private_authentic
         let count = usize::from(command_config.is_some()).to_string();
         let keys = public_header_keys(config_context(&root, &config, &parent, &[])).unwrap();
         let reads = public_reads(Some(std::ffi::OsStr::new(&count)), &keys, None).unwrap();
-        let real = Real::new(&root, Some(&root), true, false).unwrap();
-        let (stage, _) =
-            real.dry_run_command(&root.join("engine"), "c0ffee", &root.join("clone"), &reads);
+        let mut real = Real::new(&root, Some(&root), true, false).unwrap();
+        real.prerequisites = Some(crate::managed_prerequisites::Tools::Simulated);
+        let (stage, _) = real
+            .dry_run_command(&root.join("engine"), "c0ffee", &root.join("clone"), &reads)
+            .unwrap();
         let reads: Vec<(String, std::ffi::OsString)> = stage
             .get_envs()
             .filter_map(|(key, value)| {
@@ -233,9 +235,11 @@ fn public_reads_override_inherited_git_parameters_and_preserve_private_authentic
     let parent = vec![("GIT_CONFIG_PARAMETERS".into(), parameters.into())];
     let keys = public_header_keys(config_context(&root, &config, &parent, &[])).unwrap();
     let reads = public_reads(None, &keys, Some(std::ffi::OsStr::new(parameters))).unwrap();
-    let real = Real::new(&root, Some(&root), true, false).unwrap();
-    let (stage, _) =
-        real.dry_run_command(&root.join("engine"), "c0ffee", &root.join("clone"), &reads);
+    let mut real = Real::new(&root, Some(&root), true, false).unwrap();
+    real.prerequisites = Some(crate::managed_prerequisites::Tools::Simulated);
+    let (stage, _) = real
+        .dry_run_command(&root.join("engine"), "c0ffee", &root.join("clone"), &reads)
+        .unwrap();
     let reads: Vec<(String, std::ffi::OsString)> = stage
         .get_envs()
         .filter_map(|(key, value)| {

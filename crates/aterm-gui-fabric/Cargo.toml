@@ -24,6 +24,10 @@ dev-seams = ["aterm-types/dev-seams"]
 astream-wire = { path = "../../vendor/astream/crates/astream-wire" }
 # The wire's percent escape and the blocking verbs' caller-hangup check.
 aterm-control = { workspace = true }
+# The one mesh's decision kernels: whether a delivery is shown anew, its offset and the offset a
+# moved copy was first moved from remembered or not (§11 C3b, `inbox_move::shows_anew`).
+# Dependency-free, every target.
+aterm-mesh-core = { path = "../aterm-mesh-core" }
 # The fence and notice waits' one timing value, and the process clock.
 aterm-gui-timing = { workspace = true }
 aterm-log = { workspace = true }

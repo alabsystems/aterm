@@ -28,7 +28,7 @@ pub(super) fn observe(
     let expected = row
         .expected_identity_email()
         .ok_or("default account has no expected identity")?;
-    let deadline = std::time::Instant::now() + AUTH_CHECK_BUDGET;
+    let deadline = crate::harness::wake_deadline::WakeDeadline::after(AUTH_CHECK_BUDGET);
     match cli {
         Cli::Kimi => shared_provider::verify_native_kimi_classified(
             home,
@@ -37,14 +37,16 @@ pub(super) fn observe(
                 .ok_or("default Kimi account has no region")?,
             expected,
             now,
-            deadline,
+            crate::harness::login_drive::Deadline::waking(deadline, &std::time::Instant::now),
         )
         .map_err(|error| error.to_string())?
         .map(|proof| Box::new(proof) as Box<dyn shared_provider::LoginProof>)
         .ok_or_else(|| "default Kimi credential is absent".into()),
-        Cli::Agy => super::super::agy_signin::read_native_profile(home, expected, deadline)
-            .map(|proof| Box::new(proof) as Box<dyn shared_provider::LoginProof>)
-            .map_err(|error| error.to_string()),
+        Cli::Agy => {
+            super::super::agy_signin::read_native_profile(home, expected, deadline.instant())
+                .map(|proof| Box::new(proof) as Box<dyn shared_provider::LoginProof>)
+                .map_err(|error| error.to_string())
+        }
         _ => Err("provider has no native default observation".into()),
     }
 }

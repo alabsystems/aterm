@@ -6,6 +6,8 @@
 
 use std::time::{Duration, Instant};
 
+use aterm_types::control_verbs::TURN_SUBMIT_BUSY_REPLY;
+
 use super::super::config::{Autopilot, SupervisorConfig};
 use super::super::policy::cruise_carry::{
     BackgroundCarries, RULE_BACKGROUND, carry_words, recovery_words,
@@ -29,15 +31,24 @@ pub(super) struct CarryWatch {
     /// The turn read live since the last settled break or point, which the next settled break
     /// judges ([`Self::at_break`]).
     opened: Option<Opened>,
-    /// When the last carry was typed, until a settled break judges a turn: the turn it opens is
-    /// its answer, its work counted from the typing.
+    /// When the last carry was typed, until the next settled break: a turn read live before then
+    /// is its answer, its work counted from the typing.
     carried: Option<Instant>,
     /// The person's count (`human_seq`, the `if-human=` fence) the last carry was typed under.
     count: Option<u64>,
     /// The session's submissions (`submits`) where the last turn was judged or the last carry
-    /// typed, whichever came later: a submission past them but the harness's own line's is
-    /// someone else's message.
+    /// typed, whichever came later: a submission past them but the harness's own is someone
+    /// else's message.
     submits: Option<u64>,
+    /// The harness's own submissions since [`Self::submits`] was read: the loop's
+    /// ([`Self::wrote`]), its lines' and its answers to the boxes a turn raised, and the host's
+    /// lines ([`Self::host_typed`]).
+    keyed: u64,
+    /// A key the loop wrote since its own last Enter, which that Enter submits ([`submits_of`]).
+    /// Another hand's keys and Enters move the host's own unseen: its Enter between the loop's key
+    /// and the loop's Enter leaves the loop's submitting nothing, so one message beside it goes
+    /// unseen.
+    composed: bool,
     /// What the journal last said of a carry not typed: once a change.
     said: Option<CarrySaid>,
     /// When the last carry of a loop before this one was typed ([`Self::seed`]), until this loop's
@@ -111,10 +122,15 @@ struct TurnWords {
 struct Opened {
     /// The harness's own line opened it (`TurnEndState::typed_untaken`).
     ours: bool,
+    /// It opened and counts from the carry's typing ([`CarryWatch::carried`]) until its first
+    /// read, which may draw a wake that opened it ([`CarryWatch::read`]).
+    from_typing: bool,
     /// A read of it drew someone else's prompt row newest ([`newest_prompt_ours`]): a message no
     /// key in this window typed (Claude Code's Remote Control, another driver) or a person's.
     theirs: bool,
-    /// When it opened: the carry's typing, for the carry's answer, else its first live read.
+    /// When it opened: the carry's typing, for the carry's answer, the first read of the
+    /// program's own wake that opened it in the answer's place ([`CarryWatch::read`]), else its
+    /// first live read.
     from: Instant,
     /// Its live stretches' busy time so far, each from its live edge (the carry's typing, for the
     /// carry's answer) to the start of the break it reached.
@@ -152,6 +168,7 @@ impl CarryWatch {
                 let from = self.carried.unwrap_or_else(at);
                 self.opened = Some(Opened {
                     ours,
+                    from_typing: self.carried.is_some(),
                     theirs: false,
                     from,
                     busy: Duration::ZERO,
@@ -178,17 +195,20 @@ impl CarryWatch {
         self.owed = Some(last);
     }
 
-    /// A busy read on `screen`, at `at` (read only for the first after a seed): an open turn whose
-    /// newest prompt row is not the harness's has someone else's message in it. The first after a
-    /// seed stands for the counts the last carry was typed under, but not where the person's last
-    /// gesture the host reports came after that carry: the seeded books start again even if
-    /// their turn already reached its break before the restart, so no live edge was read. The
-    /// counts stay unknown and a live turn not the harness's is a person's ([`Self::at_break`]).
+    /// A busy read on `screen`, at `at` (read only for the first after a seed, or of a turn): an
+    /// open turn whose newest prompt row is not the harness's has someone else's message in it.
+    /// The first read of a turn counted from the carry's typing that draws the program's own wake
+    /// newest ([`opened_by_wake`]) opens it there and counts it from there: the carry's answer was
+    /// over unseen. The first after a seed stands for the counts the last carry was typed under,
+    /// but not where the person's last gesture the host reports came after that carry: the seeded
+    /// books start again even if their turn already reached its break before the restart, so no
+    /// live edge was read. The counts stay unknown and a live turn not the harness's is a person's
+    /// ([`Self::at_break`]).
     pub(super) fn read(
         &mut self,
         reader: &dyn ScreenReader,
         screen: &Screen,
-        at: impl FnOnce() -> Instant,
+        at: impl Fn() -> Instant,
     ) {
         if let Some(last) = self.owed.take() {
             let touched = match screen.human {
@@ -202,25 +222,35 @@ impl CarryWatch {
             } else {
                 self.count = screen.human_seq;
                 self.submits = screen.submits;
+                self.keyed = 0;
             }
         }
-        if let Some(opened) = self.opened.as_mut()
-            && !opened.theirs
-        {
-            opened.theirs = newest_prompt_ours(reader, &screen.rows) == Some(false);
+        if let Some(opened) = self.opened.as_mut() {
+            if std::mem::take(&mut opened.from_typing) && opened_by_wake(reader, &screen.rows) {
+                let woke = at();
+                opened.from = woke;
+                opened.since = Some(woke);
+            }
+            if !opened.theirs {
+                opened.theirs = newest_prompt_ours(reader, &screen.rows) == Some(false);
+            }
         }
     }
 
     /// A TURN ENDS ONLY AT A SETTLED BREAK: a read on `screen` of a break of the agent's own
     /// background work that began at `began` ends the open turn's stretch there. Unsettled, it is
     /// a pause inside the turn (a reply's text drawn between tool calls under a status line), and
-    /// the pause is no work. Settled ([`background_settle`]), it ends the turn, which is judged:
+    /// the pause is no work. Settled ([`background_settle`]) with no turn open, it ends the last
+    /// carry's claim: an answer no read saw is over, and the next turn counts from its own live
+    /// edge. Settled with one open, it ends the turn, which is judged:
     /// - SOMEONE ELSE'S MESSAGE starts the books again, whoever opened the turn: a submission
-    ///   since the last judged turn or carry that is not the harness's own line (a person's
-    ///   Enter, another driver's `send`), or a prompt row not the harness's ([`Opened::theirs`]:
-    ///   Remote Control's). A scroll, a click or a key that submits nothing is no message. Where
-    ///   a submission count is unknown, the person's count (any gesture) moved since the last
-    ///   carry, or unknown on a turn not the harness's, is a person's turn.
+    ///   since the last judged turn or carry that is not the harness's own (a person's Enter,
+    ///   another driver's `send`; not one the harness submitted, [`Self::keyed`]: an Enter the
+    ///   loop wrote over a key it pressed, its answer to a box the turn raised among them, or the
+    ///   host's line), or a prompt row not the harness's ([`Opened::theirs`]: Remote Control's).
+    ///   A scroll, a click or a key that submits nothing is no message. Where a submission count
+    ///   is unknown, the person's count (any gesture) moved since the last carry, or unknown on a
+    ///   turn not the harness's, is a person's turn.
     /// - A turn whose stretch's end went unread starts them again: unsure.
     /// - THE PROGRAM'S OWN WAKE keeps them, as the harness's own line does: REAL WORK IS BUSY
     ///   TIME, the turn's stretches summed, and a turn of real work starts them again while a
@@ -239,7 +269,12 @@ impl CarryWatch {
         began: Instant,
         settled: bool,
     ) -> Option<(Instant, Duration)> {
-        let mut turn = self.opened.take()?;
+        let Some(mut turn) = self.opened.take() else {
+            if settled {
+                self.carried = None;
+            }
+            return None;
+        };
         if let Some(since) = turn.since.take() {
             turn.unread |= began < since;
             turn.busy = turn
@@ -250,15 +285,15 @@ impl CarryWatch {
             self.opened = Some(turn);
             return None;
         }
-        let carried = self.carried.take().is_some();
-        let own = u64::from(turn.ours || carried);
+        self.carried = None;
         let someone = turn.theirs
             || match (screen.submits, self.submits, screen.human_seq, self.count) {
-                (Some(now), Some(then), ..) => now > then.saturating_add(own),
+                (Some(now), Some(then), ..) => now > then.saturating_add(self.keyed),
                 (.., Some(now), Some(then)) => now != then,
                 _ => !turn.ours,
             };
         self.submits = screen.submits;
+        self.keyed = 0;
         if someone || turn.unread {
             self.books.reset();
         } else {
@@ -277,14 +312,85 @@ impl CarryWatch {
         self.turn_read = None;
     }
 
-    /// The carry was typed at `now` at a break read on `screen`.
-    fn typed(&mut self, now: Instant, screen: &Screen) {
+    /// A write the loop made, `args`, answered `reply`: an Enter the server took over a key the
+    /// loop pressed since its last is the harness's own submission ([`submits_of`]).
+    pub(super) fn wrote(&mut self, args: &[&str], reply: &CtlReply) {
+        let (submitted, composed) = submits_of(args, reply, self.composed);
+        self.keyed = self.keyed.saturating_add(submitted);
+        self.composed = composed;
+    }
+
+    /// The host typed a line of its own and submitted it, apart from the loop's writes
+    /// (`IdleHost::at_background`, a fact's or a point's step, a relaunch's carry-on): the
+    /// harness's own submission.
+    pub(super) fn host_typed(&mut self) {
+        self.keyed = self.keyed.saturating_add(1);
+        self.composed = false;
+    }
+
+    /// The carry was typed at `now` at a break read on `screen`, the harness's submissions
+    /// `before` it ([`Self::keyed`]): those since are the carry's.
+    fn typed(&mut self, now: Instant, screen: &Screen, before: u64) {
         self.books.typed(now);
         self.carried = Some(now);
         self.count = screen.human_seq;
         self.submits = screen.submits;
+        self.keyed = self.keyed.saturating_sub(before);
         self.said = None;
         self.turn_read = None;
+    }
+}
+
+/// What a write of the loop's (`args`, answered `reply`) adds to the session's submissions as the
+/// host counts them (`submits`: an Enter over a key pressed since the last), `composed` whether
+/// the loop pressed one since its own last Enter; returns that and whether one stands pressed
+/// after it. A `key` the server took is an Enter or a key pressed; a `send` it took is its text,
+/// a newline at its end an Enter; a `turn` that pressed its Enter submits its text, and one that
+/// typed it and pressed none leaves it pressed. Anything else, a write refused or skipped among
+/// them, changes nothing.
+pub(super) fn submits_of(args: &[&str], reply: &CtlReply, composed: bool) -> (u64, bool) {
+    let took = reply.ok() && !reply.skipped();
+    let last = args.last().copied().unwrap_or_default();
+    match args.iter().find(|a| !a.starts_with('@')).copied() {
+        Some("key") if took && last == "enter" => (u64::from(composed), false),
+        Some("key") if took => (0, true),
+        Some("send") if took => {
+            let line = last.strip_suffix("\\n").or_else(|| last.strip_suffix('\n'));
+            // Each CR submits what was pressed since the last, as the host counts raw bytes.
+            line.unwrap_or(last)
+                .bytes()
+                .chain(line.map(|_| b'\r'))
+                .fold((0, composed), |(n, composed), b| {
+                    if b == b'\r' {
+                        (n.saturating_add(u64::from(composed)), false)
+                    } else {
+                        (n, true)
+                    }
+                })
+        }
+        Some("turn") if reply.submitted() || reply.pressed_unverified() => (1, false),
+        Some("turn")
+            if reply.turn_verdict().is_some()
+                || reply.err_text().starts_with(TURN_SUBMIT_BUSY_REPLY) =>
+        {
+            (0, true)
+        }
+        _ => (0, composed),
+    }
+}
+
+/// Whether the program's own wake opened the turn drawn last on `rows` (Claude Code's
+/// `⏺ Background command "…" completed` or a monitor's event under the newest prompt row,
+/// [`aterm_phase::opened_by_own_wake`]): never for another program.
+fn opened_by_wake(reader: &dyn ScreenReader, rows: &[String]) -> bool {
+    match reader.program() {
+        Program::Claude => aterm_phase::opened_by_own_wake(rows) == Some(true),
+        Program::Codex
+        | Program::Grok
+        | Program::Kimi
+        | Program::Agy
+        | Program::Muse
+        | Program::Generic => false,
     }
 }
 
@@ -353,7 +459,9 @@ impl<C: Ctl> Session<'_, C> {
     /// nothing here, by the mode the loop last read and again by the one read just before the
     /// write ([`Self::autopilot_at_busy`]). A `/compact`'s continuation owed is no act untaken:
     /// it is typed in the carry's place, as the policy's act
-    /// ([`super::super::policy::turn_end::TurnEndState::owed_at_break`]). Else, where the break's
+    /// ([`super::super::policy::turn_end::TurnEndState::owed_at_break`]), ahead of the go-ahead
+    /// and of a spent go-ahead's change of approach, which wait for a later break
+    /// ([`BreakPark::answers`], [`BreakPark::verdict`]). Else, where the break's
     /// turn parks its own reversible work on a person's go-ahead (read as a turn end reads it,
     /// [`super::super::policy::turn_end::TurnEndState::go_ahead_at_break`]) and answers are on,
     /// the owner's standing go-ahead ([`RULE_GO_AHEAD`]) goes in the carry's place, on the
@@ -361,7 +469,8 @@ impl<C: Ctl> Session<'_, C> {
     /// turn holds it
     /// ([`super::super::policy::turn_end::TurnEndState::go_ahead_held`]); once its bound is spent
     /// the carry changes approach without asking the person. With answers
-    /// off the carry goes without its sentence that the go-ahead is no need. The go-ahead is the
+    /// off the carry, or the continuation owed in its place, goes without its sentence that the
+    /// go-ahead is no need over the park the person answers themselves. The go-ahead is the
     /// one the read judged before any of the break's lines ([`Self::break_go_ahead`]). Returns
     /// whether it typed.
     pub(super) fn cruise_carry(
@@ -474,7 +583,9 @@ impl<C: Ctl> Session<'_, C> {
         // The owed continuation is the policy's act, typed on one line as a point types it.
         let (text, rule, act, why) = match (owed, &park) {
             (Some(rule), _) => {
-                let words = self.turn_end.owed_words(rule, cfg, rules.as_deref(), now);
+                let words =
+                    self.turn_end
+                        .owed_words(rule, cfg, rules.as_deref(), parked.is_some(), now);
                 let text = super::turn_end_loop::one_turn(&words);
                 let act = TurnEndAction::Type {
                     text: words,
@@ -513,13 +624,14 @@ impl<C: Ctl> Session<'_, C> {
             ),
         };
         let point = self.turn_of(screen.clone());
+        let keyed = self.cruise_carry.keyed;
         let written = self.type_text_written(&point, &text, rule, review)?;
         if written != Written::Submitted {
             self.turn_end.go_ahead_unwritten();
             return Ok(false);
         }
         let typed_at = self.fx.mono();
-        self.cruise_carry.typed(typed_at, screen);
+        self.cruise_carry.typed(typed_at, screen, keyed);
         // The act's answer is a new yield, as `Session::turn_end_write`'s is: the host's
         // repository and left reads of the one before it are spent.
         self.repo_seen = None;
@@ -556,7 +668,7 @@ impl<C: Ctl> Session<'_, C> {
     /// THE NEEDS A BREAK'S REPORT NAMES: a turn that ends with the agent's own background work
     /// running reaches no point, where needs are read, so its `NEEDS YOU:` lines, in every message
     /// of the turn, are read here at the settled break, before any line the break types, and put
-    /// on the menu bar and the border as a point puts them once its lines went
+    /// on the menu bar as a point puts them once its lines went
     /// ([`Self::break_needs`]), and the work goes on. Where the turn names no need the fold
     /// answers the lines a go-ahead decided at an earlier read held back, as the agent went on
     /// past them; then the read judges the go-ahead again, before any line the break types
@@ -713,8 +825,8 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// THE NEEDS THE BREAK READ ([`Self::break_fold`], which returned `before`), told once its
-    /// lines went, whatever they returned: on the menu bar and the border where what it shows
-    /// moved ([`Self::sync_needs_under`]), so a line the carry's go-ahead answers never goes up,
+    /// lines went, whatever they returned: on the menu bar where what it shows moved
+    /// ([`Self::sync_needs_under`]), so a line the carry's go-ahead answers never goes up,
     /// or where the entry is still owed what it shows ([`Self::needs_owed`]): a tell lost or
     /// refused at an earlier read is made again here, as no retry of the loop's own runs inside
     /// the agent's background work.

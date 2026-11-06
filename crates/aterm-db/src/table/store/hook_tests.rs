@@ -341,3 +341,49 @@ fn read_held_reads_another_process_append_and_never_past_the_witness() {
     );
     assert_eq!(held_lengths(paths).unwrap(), [(table, false, 2)]);
 }
+
+/// A reader that takes no lock (`held_lengths`, whose witness lengths the egress's catch-up
+/// relays up to) never finds a witness of a record its journal has yet to commit: at the
+/// commit's full flush the claim still witnesses the store's old length, and the receipt's once
+/// the commit returned, so no record leaves the Mac that a power loss can still take.
+/// NEGATIVE CONTROL: with the witness written ahead of the commit (`Mutant::WitnessFirst`),
+/// the reader at the commit finds the new length.
+#[test]
+fn a_lock_free_reader_finds_no_witness_ahead_of_its_commit() {
+    let lab = Lab::new(&[Role::Writer]);
+    let paths = &lab.paths[0];
+    let bootstrap = lab.bootstrap(0);
+    let directory = crate::catalog::Directory::new(paths, bootstrap.trust());
+    let session = Session::open(&bootstrap).unwrap();
+    let scope = session.scope().unwrap();
+    let dir = directory.path(scope).unwrap();
+    aterm_journal::create_private_dir_durable(dir.parent().unwrap()).unwrap();
+    let mut store = Store::join(&session, &dir, scope).unwrap();
+    store.commit_catalog(&session, b"first").unwrap();
+    let table = scope.digest();
+    for mutant in [
+        aterm_journal::seam::Mutant::None,
+        aterm_journal::seam::Mutant::WitnessFirst,
+    ] {
+        let length = store.witness.count;
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let (readings, reader) = (Rc::clone(&seen), paths.clone());
+        let hook = aterm_journal::seam::before_each_commit(move || {
+            readings.borrow_mut().push(held_lengths(&reader).unwrap());
+        });
+        let mutate = aterm_journal::seam::mutate(mutant);
+        store.commit_catalog(&session, b"next").unwrap();
+        drop((mutate, hook));
+        let at_commit = if mutant == aterm_journal::seam::Mutant::WitnessFirst {
+            length + 1
+        } else {
+            length
+        };
+        assert_eq!(
+            *seen.borrow(),
+            [vec![(table, false, at_commit)]],
+            "{mutant:?}"
+        );
+        assert_eq!(held_lengths(paths).unwrap(), [(table, false, length + 1)]);
+    }
+}

@@ -11,19 +11,21 @@
 //!
 //! A mailbox's login is an address row like any other (docs/DESIGN-alab-one-mesh-2026-11-05.md
 //! §4.7), so the observation lists every receiving address the registry already holds, the
-//! login and the account's own addresses among them. Only addresses the registry already holds
-//! are listed, and only the address being signed in is born, so the owner's other aliases stay
-//! out of a lab-wide table that never compacts. Which mailbox row the open mailbox is comes from
-//! its login (a mailbox's key derives from its login's address key, `keys::mailbox_pk`) or,
-//! failing that, from the owner's `mailbox` cell on a listed address; an address text never
-//! reaches a key, a finding or a log line.
+//! login and the account's own addresses among them. An address is held by the rows whose `addr`
+//! says it now ([`AddressIndex`]), not by the key it derives: a rename keeps a row's birth key,
+//! so a renamed row is listed by its new address and never born again under it. Only addresses
+//! the registry already holds are listed, and only the address being signed in is born, so the
+//! owner's other aliases stay out of a lab-wide table that never compacts. Which mailbox row the
+//! open mailbox is comes from its login (a mailbox's key derives from its login row's key,
+//! `keys::mailbox_pk`) or, failing that, from the owner's `mailbox` cell on a listed address; an
+//! address text never reaches a key, a finding or a log line.
 //!
 //! [`plan`] is pure over the registry; `Registry::observe_mailbox` runs it under the writer.
 
 use super::{
     checks::Finding,
     register::day_of,
-    registry::{ADDRESS, MAILBOX, MAILBOX_OBS},
+    registry::{ADDRESS, AddressHolder, AddressIndex, MAILBOX, MAILBOX_OBS},
 };
 use crate::{
     Result,
@@ -36,7 +38,7 @@ use crate::{
     },
 };
 use aterm_json::{Map, Value};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 /// The most addresses one observation lists (`mailbox-obs.addresses`).
 pub const MAX_LISTED: usize = 512;
@@ -149,28 +151,25 @@ pub struct Input<'a> {
     /// This Mac's Commons uuid, 32 hex: the suffix of every observation it writes.
     pub uuid: &'a str,
     pub listing: &'a Listing,
-    /// The mailbox key the login derives (`keys::mailbox_pk`), where it is an address.
-    pub keyed: Option<&'a str>,
     pub now_ms: u64,
 }
 
-/// The addresses the list receives, by key, each in the claims spelling.
-fn receiving(listing: &Listing) -> BTreeMap<String, String> {
+/// The addresses the list receives, each in the claims spelling.
+fn receiving(listing: &Listing) -> BTreeSet<String> {
     listing
         .listed
         .iter()
         .filter(|listed| listed.receives)
         .filter_map(|listed| keys::address(&listed.addr).ok())
-        .filter_map(|addr| Some((keys::address_pk(&addr).ok()?, addr)))
         .collect()
 }
 
-/// The mailbox row the open mailbox is: its login's derived key when that row is live, else the one
-/// live mailbox the owner linked a listed address to. `Err` holds the candidates when the links
-/// name several.
+/// The mailbox row the open mailbox is: the key its login names when that row is live, else the
+/// one live mailbox the owner linked a listed address (one of `held`, the rows saying a received
+/// address) to. `Err` holds the candidates when the links name several.
 fn identify(
     keyed: Option<&str>,
-    received: &BTreeMap<String, String>,
+    held: &BTreeSet<String>,
     addresses: &Projection,
     mailboxes: &Projection,
 ) -> std::result::Result<Option<String>, Vec<String>> {
@@ -178,8 +177,8 @@ fn identify(
     if let Some(pk) = keyed.filter(|pk| live(pk)) {
         return Ok(Some(pk.to_owned()));
     }
-    let linked: BTreeSet<&str> = received
-        .keys()
+    let linked: BTreeSet<&str> = held
+        .iter()
         .filter_map(|pk| addresses.rows.get(pk)?.fields.get("mailbox"))
         .filter(|field| !field.conflicted())
         .filter_map(|field| field.value()?.as_str())
@@ -241,18 +240,26 @@ fn observation(
     }
 }
 
-/// One pass over the registry this Mac holds: this Mac's observation of the open mailbox, and the
-/// birth of the address being signed in where the list receives it and no row, live or ended,
-/// holds it. A row is rewritten only when what it says changes: at once for a birth, otherwise
-/// once its last rewrite is [`REWRITE_DAYS`] UTC days old.
+/// One pass over the registry this Mac holds: this Mac's observation of the open mailbox, listing
+/// every row, live or ended, whose `addr` says an address the list receives; and the birth of the
+/// address being signed in where the list receives it, no row says it and no row holds the key
+/// it derives ([`AddressHolder::Free`]). A row is rewritten only when what it says changes: at
+/// once for a birth, otherwise once its last rewrite is [`REWRITE_DAYS`] UTC days old.
 ///
 /// # Errors
 /// A change does not fit its column.
 pub fn plan(input: &Input<'_>, cells: &Cells, obs: &OwnedRead) -> Result<Plan> {
     let received = receiving(input.listing);
     let addresses = cell::project(&ADDRESS, cells);
+    let index = AddressIndex::of(&addresses);
     let mailboxes = cell::project(&MAILBOX, cells);
-    let mailbox = match identify(input.keyed, &received, &addresses, &mailboxes) {
+    let held: BTreeSet<String> = received
+        .iter()
+        .flat_map(|addr| index.saying(addr))
+        .map(str::to_owned)
+        .collect();
+    let keyed = super::mail::login_mailbox(&index, &input.listing.login);
+    let mailbox = match identify(keyed.as_deref(), &held, &addresses, &mailboxes) {
         Ok(Some(mailbox)) => mailbox,
         Ok(None) => return Ok(Plan::quiet(Outcome::Unknown)),
         Err(candidates) => {
@@ -267,11 +274,7 @@ pub fn plan(input: &Input<'_>, cells: &Cells, obs: &OwnedRead) -> Result<Plan> {
             });
         }
     };
-    let mut listed: BTreeSet<String> = received
-        .keys()
-        .filter(|pk| addresses.rows.contains_key(*pk))
-        .cloned()
-        .collect();
+    let mut listed = held;
     let mut changes = Vec::new();
     let mut born_pk: Option<String> = None;
     if let Some(addr) = input
@@ -279,9 +282,11 @@ pub fn plan(input: &Input<'_>, cells: &Cells, obs: &OwnedRead) -> Result<Plan> {
         .target
         .as_deref()
         .and_then(|target| keys::address(target).ok())
-        && let Ok(pk) = keys::address_pk(&addr)
-        && received.contains_key(&pk)
-        && !addresses.rows.contains_key(&pk)
+        && received.contains(&addr)
+        && let Ok(AddressHolder::Free {
+            derived: pk,
+            taken: false,
+        }) = index.holder(&addr)
     {
         changes.extend(birth(&pk, &addr)?);
         listed.insert(pk.clone());
@@ -298,7 +303,7 @@ pub fn plan(input: &Input<'_>, cells: &Cells, obs: &OwnedRead) -> Result<Plan> {
             .take(MAX_LISTED - 1)
             .collect();
         kept.push(keep);
-        kept.sort();
+        kept.sort_unstable();
         kept
     } else {
         listed.into_iter().take(MAX_LISTED).collect()

@@ -1524,7 +1524,7 @@ pub fn bundle_command(row: &Row) -> Vec<String> {
             programs::RUSTC_GROUP
         ));
         out.push(format!(
-            "atpkg-publish publish-group {} --seal <the staged copy of the seal> --upload",
+            "atpkg-publish publish-group {} --seal <the staged copy of the seal> --stage-upload",
             programs::RUSTC_GROUP
         ));
     } else {

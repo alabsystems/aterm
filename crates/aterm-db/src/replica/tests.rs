@@ -22,6 +22,7 @@ mod clock;
 mod compatibility;
 mod policy;
 mod recovery;
+pub(crate) mod witness;
 pub(super) use policy::session_boundary;
 
 #[test]
@@ -882,6 +883,8 @@ fn new_peers_start_on_different_tables_and_resume_their_own_scan() {
             .commit_catalog(&session, b"first-contact backfill")
             .unwrap();
     }
+    // This pins the scan alone; the order a first round's witnesses put over it is pinned in
+    // `witness`.
     let endpoints: Vec<_> = (0..4)
         .map(|node| {
             Endpoint::from_bootstrap(&lab.bootstrap(node))
@@ -895,6 +898,7 @@ fn new_peers_start_on_different_tables_and_resume_their_own_scan() {
                         .collect(),
                 )
                 .unwrap()
+                .with_witnesses(false)
         })
         .collect();
     let mut outbound: [PeerRepair; 3] = std::array::from_fn(|_| PeerRepair::default());
@@ -1413,6 +1417,8 @@ fn table_scan_case(rebuild: bool, retain_hints: bool) {
         .unwrap()
         .id;
     drop(session);
+    // This pins the scan alone; the order a first round's witnesses put over it (where the
+    // last table, which differs, comes first) is pinned in `witness`.
     let endpoint = |node| {
         Endpoint::from_bootstrap(&p.lab.bootstrap(node))
             .unwrap()
@@ -1425,6 +1431,7 @@ fn table_scan_case(rebuild: bool, retain_hints: bool) {
                     .collect(),
             )
             .unwrap()
+            .with_witnesses(false)
     };
     let cache = crate::control::PeerCache::default();
     let sender = || {
@@ -1712,9 +1719,10 @@ fn damaged_neighbor_case(case: usize) -> [i64; 4] {
     observed[1] &= i64::from(acknowledged == records);
 
     // A restarted caller may lose its volatile cursors. It visits the damaged
-    // table again, then the already repaired one without duplicating records.
+    // table again (its witness is unknown, so it differs), takes it once more
+    // after it defers, then the already repaired one without duplicating records.
     let (mut ra, mut rb) = (PeerRepair::default(), PeerRepair::default());
-    for selected in [damaged, healthy] {
+    for selected in [damaged, damaged, healthy] {
         p.round(
             &endpoint(initiator),
             &endpoint(1 - initiator),

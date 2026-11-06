@@ -630,7 +630,7 @@ fn the_limits_hint_promises_no_sign_in_of_another_macs_account() {
     let home = f.env.home.as_deref().unwrap();
     let config = f.env.config.as_deref().unwrap();
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
-    std::fs::write(config, "[fleet]\nmachine = \"m16\"\n").unwrap();
+    aterm_uds::atomic_file::write(config, b"[fleet]\nmachine = \"m16\"\n", 0o600).unwrap();
     std::fs::write(
         &f.roster,
         format!(

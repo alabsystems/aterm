@@ -1682,7 +1682,9 @@ fn a_run_of_marks_on_one_base_propagates_in_linear_work() {
             [(x_offset, 400); 3_000],
             "{base:?}: every mark sits on the base"
         );
-        // Adding up the advances between each mark and the base takes 4.5M steps.
+        // Propagation counts every advance it reads and every link it applies. Running sums read
+        // the 3,001 advances once and each mark's link is one more, 6,001 steps; adding up, mark
+        // by mark, the advances between it and the base reads 4,501,500 more.
         assert!(
             steps < 4 * 3_001,
             "{base:?}: propagation took {steps} steps"

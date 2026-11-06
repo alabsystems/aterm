@@ -1860,7 +1860,7 @@ fn a_page_wanting_a_persons_sign_in_ends_needs_sign_in_and_a_browser_that_never_
         sign_in_once: Some(SIGN_IN_ONCE),
         ..device_gate()
     };
-    let deadline = WakeDeadline::after(Duration::from_secs(60));
+    let deadline = super::super::login_drive::Deadline::after(Duration::from_secs(60));
     let no_mail = |_: &mut CdpClient, _: Option<&str>| Err("no mailbox in a test");
     let (mut cdp, browser) = fake_cdp(google.clone(), false);
     let got = drive_cdp_vendor(&mut cdp, KIMI_CARD_URL, gate, &|| false, deadline, no_mail);
@@ -2293,7 +2293,7 @@ fn kimi_card_value(url: &str) -> Value {
 #[test]
 fn the_drive_presses_kimis_card_once_and_never_one_naming_another_code() {
     use super::super::login_drive::Approval;
-    let deadline = WakeDeadline::after(Duration::from_secs(60));
+    let deadline = super::super::login_drive::Deadline::after(Duration::from_secs(60));
     let no_mail = |_: &mut CdpClient, _: Option<&str>| Err("no mailbox in a test");
     let presses_of = |url: &str| {
         let reads = Arc::new(AtomicUsize::new(0));
@@ -2343,7 +2343,10 @@ fn a_page_that_stalls_ends_the_drive_needs_sign_in() {
             &mut cdp,
             KIMI_CARD_URL,
             gate,
-            (&|| false, WakeDeadline::after(budget)),
+            (
+                &|| false,
+                super::super::login_drive::Deadline::after(budget),
+            ),
             PageStall::within(stall),
             no_mail,
         );
@@ -2416,7 +2419,13 @@ fn a_vendor_drive_its_host_slept_past_ends_at_its_next_look() {
             &mut cdp,
             KIMI_CARD_URL,
             device_gate(),
-            (&finished, WakeDeadline::after(HOUR)),
+            (
+                &finished,
+                super::super::login_drive::Deadline::waking(
+                    WakeDeadline::after(HOUR),
+                    &Instant::now,
+                ),
+            ),
             PageStall::within(HOUR),
             |_: &mut CdpClient, _: Option<&str>| Err("no mailbox in a test"),
         );
@@ -2466,7 +2475,13 @@ fn a_device_pages_wait_for_its_cli_ends_once_its_host_slept_past_it() {
             &mut cdp,
             KIMI_CARD_URL,
             device_gate(),
-            (&finished, WakeDeadline::after(HOUR)),
+            (
+                &finished,
+                super::super::login_drive::Deadline::waking(
+                    WakeDeadline::after(HOUR),
+                    &Instant::now,
+                ),
+            ),
             PageStall::within(HOUR),
             |_: &mut CdpClient, _: Option<&str>| Err("no mailbox in a test"),
         );
@@ -2501,7 +2516,13 @@ fn a_devtools_call_its_host_slept_through_ends_within_a_tick() {
             &mut cdp,
             KIMI_CARD_URL,
             device_gate(),
-            (&|| false, WakeDeadline::after(HOUR)),
+            (
+                &|| false,
+                super::super::login_drive::Deadline::waking(
+                    WakeDeadline::after(HOUR),
+                    &Instant::now,
+                ),
+            ),
             PageStall::within(HOUR),
             |_: &mut CdpClient, _: Option<&str>| Err("no mailbox in a test"),
         );
@@ -2542,7 +2563,7 @@ fn the_approver_opens_nothing_on_a_profile_another_launch_holds() {
         hosts: KIMI_GLOBAL,
         email: Some(email),
         finished: &|| false,
-        deadline: WakeDeadline::after(Duration::from_secs(60)),
+        deadline: super::super::login_drive::Deadline::after(Duration::from_secs(60)),
     };
     match approver.approve(&handoff) {
         Approval::NotRun(why) => assert!(
@@ -2585,18 +2606,22 @@ fn vendor_browser_preparation_obeys_the_login_lifetime() {
             hosts: &["auth.openai.com"],
             email: Some("codex-one@example.com"),
             finished: &|| finished,
-            deadline: if finished {
-                WakeDeadline::after(Duration::from_secs(60))
+            deadline: super::super::login_drive::Deadline::after(if finished {
+                Duration::from_secs(60)
             } else {
-                WakeDeadline::after(Duration::ZERO)
-            },
+                Duration::ZERO
+            }),
         };
         assert_eq!(
             approver.approve(&handoff),
-            Approval::NotRun(format!(
-                "headless browser preparation stopped: {}",
-                super::super::headless_fetch::STOPPED
-            ))
+            if finished {
+                Approval::NotRun(format!(
+                    "headless browser preparation stopped: {}",
+                    super::super::headless_fetch::STOPPED
+                ))
+            } else {
+                Approval::NotRun("native sign-in deadline expired".into())
+            }
         );
         assert!(
             !home.exists(),
@@ -2629,7 +2654,7 @@ fn vendor_aterm_profile_contention_and_spawn_failure_report_not_run_while_extern
         hosts: &["auth.openai.com"],
         email: Some("codex-one@example.invalid"),
         finished: &|| false,
-        deadline: WakeDeadline::after(Duration::from_secs(60)),
+        deadline: super::super::login_drive::Deadline::after(Duration::from_secs(60)),
     };
     let profile_dir = approver.profile_dir(handoff.email);
     std::fs::create_dir_all(&profile_dir).unwrap();
@@ -3347,7 +3372,7 @@ fn cjk_punctuated_emails_readonly_inputs_and_vendor_otp_retry_work() {
         otp_gate,
         (
             &|| false,
-            WakeDeadline::after(aterm_spec::wait::MUST_HAPPEN),
+            super::super::login_drive::Deadline::after(aterm_spec::wait::MUST_HAPPEN),
         ),
         PageStall::within(aterm_spec::wait::MUST_HAPPEN),
         |_, _| {
@@ -4225,7 +4250,7 @@ fn a_drive_on_a_bot_check_ends_bot_check_and_one_that_clears_goes_on() {
             gate,
             (
                 &|| false,
-                WakeDeadline::after(aterm_spec::wait::MUST_HAPPEN),
+                super::super::login_drive::Deadline::after(aterm_spec::wait::MUST_HAPPEN),
             ),
             PageStall::within(stall),
             no_mail,

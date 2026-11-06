@@ -429,8 +429,8 @@ pub(crate) fn window(session: &Session<'_>, directory: &Directory, now: u64) -> 
         let Some(store) = Store::observe_if_exists(session, &directory.path(scope)?, scope)? else {
             continue;
         };
-        used.insert(epoch, store.retained_use(session, session.actor())?);
         let log = Log::read_with(session, &store, scope, att::decode)?;
+        used.insert(epoch, log.local_use());
         ops.extend(
             log.eligible()
                 .into_iter()

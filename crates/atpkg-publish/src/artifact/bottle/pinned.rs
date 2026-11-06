@@ -16,6 +16,7 @@ use crate::error::{Error, Result};
 use crate::triple::{Arch, Os, Triple};
 
 mod lean;
+mod node;
 mod openssl;
 
 fn platform(triple: Triple) -> &'static str {
@@ -32,7 +33,7 @@ fn platform(triple: Triple) -> &'static str {
 pub(super) fn can_pack(recipe: &PinnedTool, triple: Triple) -> Result<()> {
     if !matches!(
         recipe.name,
-        "gitleaks" | "cpython" | "openssl-signing" | "lean4"
+        "gitleaks" | "cpython" | "openssl-signing" | "lean4" | "node"
     ) {
         return Err(Error::cannot_run(format!(
             "{} has no pinned runtime qualifier",
@@ -299,6 +300,7 @@ fn qualify(result: &BottleOutcome, recipe: &PinnedTool) -> Result<()> {
         "cpython" => qualify_python(&program, &result.version, &stage, work.path(), &run),
         "openssl-signing" => openssl::qualify(&program, &result.version, work.path(), &run),
         "lean4" => lean::qualify(&program, &result.version, work.path(), &run),
+        "node" => node::qualify(&program, &result.version, work.path(), &run),
         _ => Err(Error::refused("pinned tool has no runtime qualifier")),
     }?;
     let after = atpkg::tree::tree_root(&stage)

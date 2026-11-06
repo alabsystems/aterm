@@ -27,7 +27,11 @@ fn anchor(claim: &[u8]) -> [u8; 32] {
 }
 
 pub(super) fn witness(dir: &Path, claim_name: &str) -> Result<Option<Vec<u8>>> {
-    match private_file::read_private(dir, &name(claim_name), LEN) {
+    witness_read(private_file::read_private(dir, &name(claim_name), LEN))
+}
+
+fn witness_read(read: std::result::Result<Vec<u8>, PrivateFileError>) -> Result<Option<Vec<u8>>> {
+    match read {
         Ok(bytes) => Ok(Some(bytes)),
         Err(PrivateFileError::Missing) => Ok(None),
         Err(_) => Err(Error::new("table volume witness is unreadable")),
@@ -89,12 +93,37 @@ pub(super) fn check_observed(
 }
 
 pub(super) fn check(dir: &Path, claim_dir: &Path, claim_name: &str, claim: &[u8]) -> Result<()> {
+    checked(dir, claim_dir, claim_name, claim).map(drop)
+}
+
+/// [`check`], and the claim now at `claim_name`, none where it cannot be read: one verdict on
+/// `claim_dir` for both files, each still opened and judged on its descriptor.
+pub(super) fn check_and_read_claim(
+    dir: &Path,
+    claim_dir: &Path,
+    claim_name: &str,
+    claim: &[u8],
+) -> Result<Option<Vec<u8>>> {
+    Ok(checked(dir, claim_dir, claim_name, claim)?
+        .read(claim_name, CLAIM_LEN)
+        .ok())
+}
+
+fn checked<'d>(
+    dir: &Path,
+    claim_dir: &'d Path,
+    claim_name: &str,
+    claim: &[u8],
+) -> Result<private_file::JudgedDir<'d>> {
     if claim.len() != CLAIM_LEN {
         return Err(Error::new("table directory claim has an invalid length"));
     }
     let identity = read(dir)?;
-    let witness = witness(claim_dir, claim_name)?;
-    check_observed(&identity, witness.as_deref(), claim)
+    let claims = private_file::JudgedDir::judge(claim_dir)
+        .map_err(|_| Error::new("table volume witness is unreadable"))?;
+    let witness = witness_read(claims.read(&name(claim_name), LEN))?;
+    check_observed(&identity, witness.as_deref(), claim)?;
+    Ok(claims)
 }
 
 /// Called only from a writable open, after the ready claim and complete prefix checked.

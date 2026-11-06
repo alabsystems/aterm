@@ -12,6 +12,26 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
+#[cfg(unix)]
+#[test]
+fn a_private_name_read_never_consumes_the_process_registry_source() {
+    use crate::machine_name::{
+        Origin, ensure,
+        tests::{NOW, state},
+    };
+    let root = state();
+    let lab = Lab {
+        machine_name: Some(Err("the live registry has a conflicted name".into())),
+        ..Lab::default()
+    };
+    with_lab(lab, || {
+        let (name, origin) = ensure(root.path(), || Ok(Some("m7".into())), |_| false, NOW)
+            .expect("a private read uses its own sources");
+        assert_eq!(name.name(), "m7");
+        assert_eq!(origin, Origin::Evidence);
+    });
+}
+
 fn email(local: &str) -> String {
     format!("{local}@example.test")
 }
@@ -57,6 +77,87 @@ fn row(label: &str, dir: Option<&Path>, local: &str, cli: Cli) -> Row {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn a_bound_registry_name_snapshot_keeps_its_exact_value_over_pending_state() {
+    use crate::machine_name::{RegistryName, RegistryNameRead};
+    use aterm_net::fleet_member::name_record::NickClass;
+    use aterm_types::machine_name::{Nickname, Number};
+
+    let name = RegistryName {
+        num: Number::new(86).expect("a number"),
+        nick: Some((
+            Nickname::parse("MissBunny").expect("a nickname"),
+            NickClass::Chosen,
+        )),
+    };
+    let lab = Lab {
+        me: Some("m86".to_owned()),
+        machine_name: Some(Ok(name.clone())),
+        ..Lab::default()
+    };
+    with_lab(lab, || {
+        assert!(names_this_mac());
+        assert_eq!(machine_name(), RegistryNameRead::Bound(Ok(name.clone())));
+        while_pending(|| {
+            assert_eq!(
+                machine_name(),
+                RegistryNameRead::Bound(Ok(name.clone())),
+                "a retained verified projection remains usable while a later read is pending"
+            );
+        });
+        while_turned_off(|| assert_eq!(machine_name(), RegistryNameRead::Unbound));
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn a_bound_name_conflict_stays_bound_without_a_display_label() {
+    use crate::machine_name::RegistryNameRead;
+
+    let why = "synthetic conflicting registry number".to_owned();
+    let lab = Lab {
+        me: None,
+        machine_name: Some(Err(why.clone())),
+        ..Lab::default()
+    };
+    with_lab(lab, || {
+        assert!(
+            names_this_mac(),
+            "a missing label does not erase its facts binding"
+        );
+        assert_eq!(machine_name(), RegistryNameRead::Bound(Err(why.clone())));
+        while_pending(|| {
+            assert_eq!(
+                machine_name(),
+                RegistryNameRead::Bound(Err(why.clone())),
+                "a bound conflict must not become an apparently unbound machine"
+            );
+        });
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn registry_name_fallback_distinguishes_unbound_pending_and_explicitly_disabled() {
+    use crate::machine_name::RegistryNameRead;
+
+    with_lab(Lab::default(), || {
+        assert!(!names_this_mac());
+        assert_eq!(machine_name(), RegistryNameRead::Unbound);
+    });
+    while_pending(|| {
+        assert_eq!(machine_name(), RegistryNameRead::Pending);
+        while_turned_off(|| assert_eq!(machine_name(), RegistryNameRead::Unbound));
+        assert_eq!(
+            machine_name(),
+            RegistryNameRead::Pending,
+            "disabling a source within a scope does not clear pending history"
+        );
+    });
+    assert_eq!(machine_name(), RegistryNameRead::Unbound);
+}
+
 /// A Mac's preferred accounts join in rank order with an unranked one last; an account this Mac
 /// does not prefer, or one that may not join (paused), is not added; an account the roster already
 /// has keeps the label the roster gives it, since only [`migrate`] renames; and a lab that names
@@ -86,6 +187,8 @@ fn the_lab_fleet_adds_this_macs_preferred_accounts_in_rank_order() {
         ],
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),
+        #[cfg(unix)]
+        machine_name: None,
         places: Default::default(),
     };
     let existing = Roster {
@@ -127,6 +230,8 @@ fn a_preference_never_drops_a_row() {
         ],
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),
+        #[cfg(unix)]
+        machine_name: None,
         places: Default::default(),
     };
     let mut kept = row("kept", Some(Path::new("/scratch/kept")), "dee", Cli::Claude);
@@ -271,6 +376,8 @@ impl Home {
             ],
             aliases: BTreeMap::new(),
             mailboxes: BTreeMap::new(),
+            #[cfg(unix)]
+            machine_name: None,
             places: Default::default(),
         }
     }
@@ -471,6 +578,8 @@ fn a_label_another_account_holds_stays_with_its_row() {
         ],
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),
+        #[cfg(unix)]
+        machine_name: None,
         places: Default::default(),
     };
     let mut work = row("work", Some(Path::new("/scratch/work")), "ann", Cli::Claude);
@@ -524,6 +633,8 @@ fn a_source_the_owner_set_wins_over_the_lab() {
         ],
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),
+        #[cfg(unix)]
+        machine_name: None,
         places: Default::default(),
     };
     with_lab(lab, || {
@@ -649,6 +760,8 @@ fn preference_bed(state: &aterm_spec::interp::State) -> (Lab, Roster) {
         accounts: vec![x],
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),
+        #[cfg(unix)]
+        machine_name: None,
         places: Default::default(),
     };
     let mut rows = Vec::new();
@@ -802,6 +915,8 @@ fn an_account_asked_for_by_name_joins_with_no_preference() {
         ],
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),
+        #[cfg(unix)]
+        machine_name: None,
         places: Default::default(),
     };
     let before = lab.clone();
@@ -874,6 +989,8 @@ fn an_empty_lab_roster_stays_empty_and_keeps_every_row() {
         )],
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),
+        #[cfg(unix)]
+        machine_name: None,
         places: Default::default(),
     };
     with_lab(lab.clone(), || {
@@ -932,6 +1049,8 @@ fn a_sync_is_due_only_when_the_lab_would_change_the_roster() {
         ],
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),
+        #[cfg(unix)]
+        machine_name: None,
         places: Default::default(),
     };
     let mut pool = row(

@@ -118,7 +118,7 @@ pub fn groups(group: &str, user: &User) -> Vec<u32> {
         let Some(gid) = parse_u32(f[2]) else {
             continue;
         };
-        if f[3].split(',').any(|m| m.trim() == user.name) && !out.contains(&gid) {
+        if !out.contains(&gid) && f[3].split(',').any(|m| m.trim() == user.name) {
             out.push(gid);
         }
     }

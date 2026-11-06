@@ -31,6 +31,13 @@ pub const WARM: u64 = 30 * GIB;
 /// The least a release claims where its clone's build is cold.
 pub const COLD: u64 = 39 * GIB;
 
+/// What a stage claims outside the release's claim, for itself alone (a stage again before the
+/// publish, or a stage of a candidate verified earlier): the free space a release that verified
+/// was always held to ([`crate::gates::MIN_FREE_DISK_GIB`]), as no build or `verify release`
+/// follows it. Measured on m3 (2026-11-06), a stage's compiles wrote 1077 MiB (0.157.0) and
+/// 365 MiB (v0.156.0), and 0.157.0's stage again before its publish wrote none.
+pub const STAGE: u64 = crate::gates::MIN_FREE_DISK_GIB * GIB;
+
 /// The file under the release's state directory (`~/.local/state/aterm-release`) keeping what
 /// this machine's last releases wrote (`aterm_capacity::Footprints`, [`aterm_capacity::footprint::KEPT`]
 /// runs): a record of what a release writes, not a cache.

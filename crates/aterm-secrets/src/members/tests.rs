@@ -117,6 +117,52 @@ fn ask(desk: &Mutex<Desk>, from: IpAddr, joining: &Joining<'_>) -> Answer {
     .expect("asked")
 }
 
+#[test]
+fn an_admitted_ask_rechecks_after_the_real_member_greeting() {
+    use super::join;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for withdraw in [false, true] {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let desk = member(root.path(), "member");
+        let (_, device) = mac(root.path(), "joining");
+        let joining = joining(&device, [7; 32], "joining");
+        let checks = AtomicUsize::new(0);
+        let current = || {
+            let check = checks.fetch_add(1, Ordering::SeqCst);
+            if withdraw && check > 0 {
+                Err(crate::Error::new("setup stopped after greeting"))
+            } else {
+                Ok(())
+            }
+        };
+        std::thread::scope(|scope| {
+            let dial = |_: &str| -> Result<Box<dyn join::Stream>> {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+                let ours = std::net::TcpStream::connect(listener.local_addr()?)?;
+                let (mut theirs, from) = listener.accept()?;
+                for stream in [&ours, &theirs] {
+                    stream.set_read_timeout(Some(Duration::from_secs(60)))?;
+                    stream.set_write_timeout(Some(Duration::from_secs(60)))?;
+                }
+                let desk = &desk;
+                scope.spawn(move || {
+                    let _ = desk::serve(desk, &mut theirs, from.ip(), &bundle_of(""));
+                });
+                Ok(Box::new(ours))
+            };
+            let (heard, missed) =
+                join::ask_all_admitted(&dial, &joining, &["member".into()], &current);
+            assert_eq!(heard.len(), usize::from(!withdraw));
+            assert_eq!(missed.len(), usize::from(withdraw));
+        });
+        assert_eq!(
+            states(&desk).len(),
+            usize::from(!withdraw),
+            "a greeting alone must create no admission request"
+        );
+    }
+}
+
 fn run(
     desk: &Mutex<Desk>,
     from: IpAddr,

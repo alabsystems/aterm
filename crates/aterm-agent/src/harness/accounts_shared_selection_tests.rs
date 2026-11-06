@@ -41,11 +41,7 @@ impl Bed {
         )
         .unwrap();
         // A selection saved before this installation learned the shared source.
-        let accounts::PinSelection::Renew(request) =
-            store.select_account(&raw, &path, "work", NOW).unwrap()
-        else {
-            panic!("fixture requires sign-in")
-        };
+        let request = store.request_pin("work", NOW).unwrap();
         Self {
             _root: root,
             home,
@@ -149,6 +145,7 @@ impl Bed {
                 Ok(())
             },
             None,
+            None,
         );
         (result, workers.load(std::sync::atomic::Ordering::SeqCst))
     }
@@ -162,20 +159,17 @@ fn shared_selection_needing_login_preserves_the_previous_request() {
     ] {
         let bed = Bed::new();
         bed.shared(outcome);
-        let accounts::PinSelection::Renew(previous) = bed
-            .store
-            .select_account(&bed.raw, &bed.path, "other", NOW)
-            .unwrap()
-        else {
-            panic!("other requires sign-in")
-        };
+        let previous = bed.store.request_pin("other", NOW).unwrap();
         let before = bed.store.load_logins(NOW).unwrap().0;
         assert!(
             bed.store
                 .select_account(&bed.raw, &bed.path, "work", NOW)
                 .is_err()
         );
-        assert_eq!(bed.store.load(NOW).unwrap().0.pending_pin, Some(previous));
+        assert_eq!(
+            bed.store.load(NOW).unwrap().0.pending_pin,
+            Some(previous.into())
+        );
         assert_eq!(bed.store.load_logins(NOW).unwrap().0, before);
     }
 }
@@ -202,7 +196,7 @@ fn a_saved_shared_selection_is_retired_before_spawning_a_worker() {
                 .unwrap();
         }
         let before = bed.store.load_logins(NOW).unwrap().0;
-        assert_eq!(bed.dispatch(&bed.request), RenewalDispatch::Failed);
+        assert_eq!(bed.dispatch(&bed.request), RenewalDispatch::Retired);
         assert!(bed.store.load(NOW).unwrap().0.pending_pin.is_none());
         assert_eq!(bed.store.load_logins(NOW).unwrap().0, before);
         assert_eq!(
@@ -229,7 +223,7 @@ fn a_renamed_shared_identity_needing_login_cannot_queue_ordinary_renewal() {
     );
     assert_eq!(
         bed.store.load(NOW).unwrap().0.pending_pin,
-        Some(bed.request)
+        Some(bed.request.into())
     );
 }
 
@@ -237,10 +231,7 @@ fn a_renamed_shared_identity_needing_login_cannot_queue_ordinary_renewal() {
 fn a_usable_shared_account_is_selectable_and_supersedes_a_pending_request() {
     let bed = Bed::new();
     bed.shared(accounts::shared::Outcome::Published { generation: 0 });
-    let _ = bed
-        .store
-        .select_account(&bed.raw, &bed.path, "other", NOW)
-        .unwrap();
+    let _ = bed.store.request_pin("other", NOW).unwrap();
     let before = bed.store.load_logins(NOW).unwrap().0;
     assert_eq!(
         bed.store
@@ -258,15 +249,12 @@ fn a_usable_shared_account_is_selectable_and_supersedes_a_pending_request() {
 fn stale_shared_dispatch_preserves_a_newer_request_and_unreadable_state() {
     let bed = Bed::new();
     bed.shared(accounts::shared::Outcome::Unknown);
-    let accounts::PinSelection::Renew(newer) = bed
-        .store
-        .select_account(&bed.raw, &bed.path, "other", NOW)
-        .unwrap()
-    else {
-        panic!("other requires sign-in")
-    };
+    let newer = bed.store.request_pin("other", NOW).unwrap();
     assert_eq!(bed.dispatch(&bed.request), RenewalDispatch::Superseded);
-    assert_eq!(bed.store.load(NOW).unwrap().0.pending_pin, Some(newer));
+    assert_eq!(
+        bed.store.load(NOW).unwrap().0.pending_pin,
+        Some(newer.into())
+    );
     let before = fs::read(bed.store.state_file()).unwrap();
     fs::write(bed.store.state_file(), b"{").unwrap();
     assert_eq!(bed.dispatch(&bed.request), RenewalDispatch::Fenced);
@@ -274,7 +262,7 @@ fn stale_shared_dispatch_preserves_a_newer_request_and_unreadable_state() {
     fs::write(bed.store.state_file(), before).unwrap();
 }
 
-/// One upkeep's sign-in pass on `bed`: whether a sign-in started, and how many runs were handed
+/// Settled upkeep passes on `bed`: whether a sign-in started, and how many runs were handed
 /// a browser. Off Unix aterm links no opener for a run's page (`cli::opener_link`), so a run
 /// that starts is handed none ([`RUNS_HANDED`]).
 fn progress(bed: &Bed) -> (bool, usize) {
@@ -311,8 +299,9 @@ fn progress(bed: &Bed) -> (bool, usize) {
     let cooldown = Mutex::new(None);
     let rediscovery = Mutex::new(Rediscovery::default());
     let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let lifetime = crate::harness::account_work::Lifetime::default();
     let fx = UpkeepEffects {
-        scope: None,
+        scope: lifetime.enter(),
         fetch: &|_, _| panic!("no external source in this fixture"),
         spawn_renewal: &|work| {
             work();
@@ -335,10 +324,29 @@ fn progress(bed: &Bed) -> (bool, usize) {
             super::super::cli::Renewal::AuthFailed
         })),
     };
-    (
-        auto_renew_next_account(&bed.home, &bed.state, &bed.path, NOW, &fx),
-        calls.load(std::sync::atomic::Ordering::SeqCst),
-    )
+    let first = auto_renew_next_account(&bed.home, &bed.state, &bed.path, NOW, &fx);
+    // A detached manual owner cannot make the initiating upkeep synchronously
+    // observe its result. Its settled wake permits a separate next pass.
+    let second = if bed.store.load(NOW).unwrap().0.pending_pin.is_none()
+        && bed.store.wake_path().exists()
+        && calls.load(std::sync::atomic::Ordering::SeqCst) == 0
+    {
+        assert!(
+            bed.store.signin_now().unwrap().is_some(),
+            "the woken pass owns no old signer"
+        );
+        auto_renew_next_account(&bed.home, &bed.state, &bed.path, NOW, &fx)
+    } else {
+        false
+    };
+    let runs = calls.load(std::sync::atomic::Ordering::SeqCst);
+    drop(fx);
+    lifetime
+        .pause()
+        .unwrap()
+        .try_wait()
+        .expect("all manual and provider scopes retired");
+    (first || second, runs)
 }
 
 /// The runs a started sign-in is handed a browser for: one on Unix, none elsewhere, where aterm
@@ -353,7 +361,7 @@ const RUNS_HANDED: usize = 1;
 const RUNS_HANDED: usize = 0;
 
 #[test]
-fn retiring_a_shared_selection_allows_another_account_in_the_same_upkeep() {
+fn retiring_a_shared_selection_wakes_a_settled_upkeep_for_another_account() {
     let bed = Bed::new();
     bed.shared(accounts::shared::Outcome::Unknown);
     let before = bed.store.load_logins(NOW).unwrap().0.shared;
@@ -375,9 +383,7 @@ pub(super) fn selection_transition(
         });
     }
     if state["pending"] == 2 {
-        bed.store
-            .select_account(&bed.raw, &bed.path, "other", NOW)
-            .unwrap();
+        bed.store.request_pin("other", NOW).unwrap();
     }
     if state["phase"] >= 3 {
         bed.dispatch(&bed.request);
@@ -408,9 +414,7 @@ pub(super) fn selection_transition(
             next.insert("ready", 1);
         }
         "Replace" => {
-            bed.store
-                .select_account(&bed.raw, &bed.path, "other", NOW)
-                .unwrap();
+            bed.store.request_pin("other", NOW).unwrap();
             next.insert("newer", 1);
         }
         "Resolve" => {
@@ -429,6 +433,7 @@ pub(super) fn selection_transition(
     let pending = after
         .pending_pin
         .as_ref()
+        .and_then(accounts::PendingSelection::account)
         .map(|request| if request.label() == "work" { 1 } else { 2 })
         .unwrap_or(0);
     next.insert("pending", pending);

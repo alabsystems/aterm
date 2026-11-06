@@ -597,7 +597,7 @@ fn the_write_lock_waits_refuses_past_its_wait_and_is_let_go() {
     assert_eq!(mode_of(&lock), 0o600);
 
     #[cfg(any(target_vendor = "apple", target_os = "linux"))]
-    let parked = crate::ownerlock::tests::Parked::park();
+    let parked = crate::fork_window::Parked::park();
     drop(taken);
     #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     {

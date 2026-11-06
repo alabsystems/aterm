@@ -326,6 +326,14 @@ impl SourceBook {
 
     /// ONE READ at `at_ms` ([module docs](self)). An instant before the last good read is
     /// taken as that read's.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "SourceEpisode",
+            action = "Look",
+            project = "conformance_sources::project_book"
+        )
+    )]
     pub fn look(
         &mut self,
         value: Result<SourceValue, ReadWord>,
@@ -385,6 +393,14 @@ impl SourceBook {
     /// kept for another target or its last good read is older than [`STALE_MS`]
     /// ([module docs](self)).
     #[must_use]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "SourceEpisode",
+            action = "Up",
+            project = "conformance_sources::project_book"
+        )
+    )]
     pub fn restore(
         name: OwnerName,
         target: u64,

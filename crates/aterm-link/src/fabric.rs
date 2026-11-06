@@ -82,7 +82,7 @@ file `fabric.toml` that `on` writes, else in a running instance's bridge command
                    over the last --window records (default 65536); `@<sid>[@<node>]`
                    picks one session
   on               provision (idempotently) the fabric root `~/.local/share/aterm-fabric`
-                   (0700), node id, mint secret and the node's 6 grants; install and start
+                   (0700), node id, mint secret and the node's 8 grants; install and start
                    the broker under launchd (macOS) or systemd --user (Linux); write
                    `[fabric] command` to aterm.toml (keeping `.bak`) and `fabric.toml`
                    (0600); attach running instances; prove delivery with a note a session
@@ -125,7 +125,10 @@ file `fabric.toml` that `on` writes, else in a running instance's bridge command
   --expires <N>d|<N>h
                    mint-for: stamp each grant `exp=` so the broker refuses it after that
   halt <reason>    as a human's cap: hold every session on the fleet (`hold=1
-                   origin=fleet`); `halt off` withdraws this human's halt
+                   origin=fleet`); `halt off` withdraws this human's halt. With the
+                   mesh on a halt reaches every Mac under an id; `halt off <id>` lifts it
+                   on every Mac, from any member's person (`--here`: on this Mac alone),
+                   and `halt off` lifts every halt that stands here
   inbox            as a person's cap: print its unread mail and mark it read (`--peek`
                    leaves it unread)
   post             as a person's cap: send to `@<sid>@<node>` with `kind=ask|answer|task|
@@ -3142,7 +3145,11 @@ pub fn gather() -> Result<Report, Off> {
                 format!("the traffic could not be read: {e}"),
             )),
         }
-        halts = fleet_halts(&mut conn, &report.cfg.fleet);
+        halts = if report.broker.mesh {
+            mesh_halts_here(&report.cfg.state_dir)
+        } else {
+            fleet_halts(&mut conn, &report.cfg.fleet)
+        };
         match overdue_work(&mut conn, &report.cfg.fleet, faces.as_deref(), head, now_ms) {
             Ok(d) => {
                 report.overdue = d.overdue;
@@ -3223,6 +3230,35 @@ fn fleet_halts(conn: &mut Conn, fleet: &str) -> Vec<(String, String)> {
         Ok(())
     });
     out
+}
+
+/// With the mesh on, every halt this Mac's bridge applied and holds its sessions under (§11 C4),
+/// as `(who, reason)`: the person, the Mac whose bridge said it, and its id, which `aterm fabric
+/// halt off <id>` lifts on every Mac.
+fn mesh_halts_here(state_dir: &str) -> Vec<(String, String)> {
+    if state_dir.is_empty() {
+        return Vec::new();
+    }
+    let Some(text) = crate::state::StateDir::peek(state_dir).mesh_halts() else {
+        return Vec::new();
+    };
+    let Ok((halts, _)) = crate::halt::Halts::parse(&text) else {
+        return Vec::new();
+    };
+    halts
+        .standing()
+        .iter()
+        .map(|(id, halt)| {
+            (
+                format!(
+                    "{} on {} (halt {id}; `aterm fabric halt off {id}` lifts it)",
+                    safe(&halt.by, 64),
+                    safe(&halt.origin, 64)
+                ),
+                crate::pct::decode(&halt.reason),
+            )
+        })
+        .collect()
 }
 
 const GONE_SHOW_MS: u64 = 60 * 60 * 1000;
@@ -9271,6 +9307,8 @@ mod tests {
             faces,
             [
                 "/f/lab/fleet/>",
+                "/f/lab/halt/>",
+                "/f/lab/halt/n-a",
                 "/f/lab/in/*/*/n-a/*",
                 "/f/lab/in/n-a/>",
                 "/f/lab/pub/>",

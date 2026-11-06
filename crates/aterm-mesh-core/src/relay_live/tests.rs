@@ -5,17 +5,19 @@
 //! island's runs refute, and the codes the callers match on.
 
 use super::{
-    ASK_LINEAGE, ASK_NEW_LINK, ASK_NONE, GONE, KEPT, MOVED, cursor, requests, runs, start_repair,
+    ASK_LINEAGE, ASK_NEW_LINK, ASK_NONE, GONE, KEPT, MOVED, asks_again, cursor, requests, runs,
+    start_repair,
 };
 
 const ISLAND: &str = include_str!("../relay_live_island.rs");
 
-/// The four decisions, as the sheet reads them.
+/// The five decisions, as the sheet reads them.
 struct Kernels {
     cursor: fn(bool, bool, bool, bool) -> u8,
     start_repair: fn(u8) -> u8,
     requests: fn(bool, bool) -> bool,
     runs: fn(bool, bool) -> bool,
+    asks_again: fn(bool, bool) -> bool,
 }
 
 const DECISION: Kernels = Kernels {
@@ -23,6 +25,7 @@ const DECISION: Kernels = Kernels {
     start_repair,
     requests,
     runs,
+    asks_again,
 };
 
 /// Bit `i` of `k` (the island's `bit`).
@@ -31,7 +34,7 @@ const fn bit(k: u8, i: u8) -> bool {
 }
 
 /// The island's `sheet`: the cursor over (has, fresh, same, continues) as bits 3..0 of 0..15,
-/// the start over the codes 0..3, then requests and runs over bits 1..0 of 0..3.
+/// the start over the codes 0..3, then requests, runs and asks_again over bits 1..0 of 0..3.
 fn sheet(k: &Kernels) -> Vec<u8> {
     let mut out = Vec::new();
     for c in 0..16 {
@@ -45,6 +48,9 @@ fn sheet(k: &Kernels) -> Vec<u8> {
     }
     for c in 0..4 {
         out.push(u8::from((k.runs)(bit(c, 1), bit(c, 0))));
+    }
+    for c in 0..4 {
+        out.push(u8::from((k.asks_again)(bit(c, 1), bit(c, 0))));
     }
     out
 }
@@ -62,7 +68,7 @@ fn the_island_states_its_grid() {
     for range in ["(List.range 16)", "(List.range 4)"] {
         assert!(ISLAND.contains(range), "the island's grid names {range}");
     }
-    assert_eq!(island_sheet().map(|s| s.len()), Some(16 + 4 + 4 + 4));
+    assert_eq!(island_sheet().map(|s| s.len()), Some(16 + 4 + 4 + 4 + 4));
 }
 
 #[test]
@@ -99,12 +105,17 @@ fn the_sheet_sees_every_mutant() {
         runs: |remembers, _| !remembers,
         ..DECISION
     };
+    let no_second_ask = Kernels {
+        asks_again: |_, _| false,
+        ..DECISION
+    };
     for (name, mutant) in [
         ("keptOnMove", kept_on_move),
         ("movedAsksNothing", moved_asks_nothing),
         ("gapDeaf", gap_deaf),
         ("gap blind to its control", gap_blind_to_control),
         ("quietBlind", quiet_blind),
+        ("noSecondAsk", no_second_ask),
     ] {
         assert_ne!(sheet(&mutant), island, "the sheet misses the mutant {name}");
     }

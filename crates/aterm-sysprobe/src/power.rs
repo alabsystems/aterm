@@ -10,7 +10,8 @@
 //! the bits are `IOPMSystemCapabilities`'s, the ones `IOPMIsADarkWake` and `IOPMIsAUserWake` read).
 //! The calls that return them directly are not in the public SDK, so the registry is read.
 //!
-//! Which power assertions a process holds ([`assertions_of`]), as the power manager lists them.
+//! Which power assertions a process holds ([`assertions_of`]), as the power manager lists them;
+//! one of this process's own to hold ([`hold`]); and whether the lid is closed ([`lid_closed`]).
 
 /// The machine's wake, as its power manager says it now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,6 +82,57 @@ pub fn assertions_of(pid: u32) -> Result<Vec<Assertion>, String> {
     }
 }
 
+/// Whether this Mac's lid is closed now, as the power manager's root domain publishes it
+/// (`AppleClamshellState`): `None` on a Mac with no lid, where the registry has no answer, and
+/// off macOS. A read of the registry: no window server, no child process.
+#[must_use]
+pub fn lid_closed() -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos::clamshell_closed()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// The power assertion type that keeps the system from sleeping at all, the lid's close
+/// included, while the Mac runs on AC power (`kIOPMAssertionTypePreventSystemSleep`; on battery
+/// macOS does not honour it).
+pub const PREVENT_SYSTEM_SLEEP: &str = "PreventSystemSleep";
+
+/// A power assertion this process holds ([`hold`]); dropping it releases it.
+#[derive(Debug)]
+pub struct Hold {
+    /// The power manager's id for it.
+    #[cfg(target_os = "macos")]
+    id: u32,
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        crate::macos::release_assertion(self.id);
+    }
+}
+
+/// Hold a power assertion of type `kind` ([`PREVENT_SYSTEM_SLEEP`], say) named `name`, which
+/// `pmset -g assertions` and [`assertions_of`] list it by, until the [`Hold`] is dropped; `None`
+/// when the power manager refused it, and off macOS.
+#[must_use]
+pub fn hold(kind: &str, name: &str) -> Option<Hold> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos::create_assertion(kind, name).map(|id| Hold { id })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (kind, name);
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,42 +178,42 @@ mod tests {
         assert_eq!(wake(), None);
     }
 
-    /// An assertion this test holds is listed under its pid, with its type and name, until it is
-    /// released; the pid after this one lists none of it.
+    /// An assertion this test holds ([`hold`]) is listed under its pid, with its type and name,
+    /// until it is released; the pid after this one lists none of it.
     #[cfg(target_os = "macos")]
     #[test]
     fn an_assertion_held_is_listed_under_its_pid_until_released() {
-        use crate::iokit;
-        use crate::macos::Cf;
         let name = format!("aterm-sysprobe assertion test {}", std::process::id());
-        let name_c = std::ffi::CString::new(name.clone()).expect("no NUL");
-        let kind = Cf::string(c"PreventUserIdleSystemSleep").expect("type string");
-        let named = Cf::string(&name_c).expect("name string");
-        let mut id = 0u32;
-        // SAFETY: Two live CFStrings and a writable id; level 255 is kIOPMAssertionLevelOn.
-        let rc = unsafe {
-            iokit::IOPMAssertionCreateWithName(kind.0.cast(), 255, named.0.cast(), &raw mut id)
-        };
-        assert_eq!(rc, 0, "IOPMAssertionCreateWithName");
         let ours = |list: Vec<Assertion>| -> Vec<String> {
             list.into_iter()
                 .filter(|a| a.name.as_deref() == Some(name.as_str()))
                 .map(|a| a.kind)
                 .collect()
         };
-        let while_held = ours(assertions_of(std::process::id()).expect("listed"));
-        let elsewhere = ours(assertions_of(std::process::id() + 1).expect("listed"));
-        // SAFETY: The id the create above wrote, released once.
-        assert_eq!(unsafe { iokit::IOPMAssertionRelease(id) }, 0, "released");
-        let after = ours(assertions_of(std::process::id()).expect("listed"));
-        assert_eq!(while_held, ["PreventUserIdleSystemSleep"]);
-        assert!(elsewhere.is_empty(), "{elsewhere:?}");
-        assert!(after.is_empty(), "{after:?}");
+        for kind in ["PreventUserIdleSystemSleep", PREVENT_SYSTEM_SLEEP] {
+            let held = hold(kind, &name).expect("the power manager takes it");
+            let while_held = ours(assertions_of(std::process::id()).expect("listed"));
+            let elsewhere = ours(assertions_of(std::process::id() + 1).expect("listed"));
+            drop(held);
+            let after = ours(assertions_of(std::process::id()).expect("listed"));
+            assert_eq!(while_held, [kind]);
+            assert!(elsewhere.is_empty(), "{elsewhere:?}");
+            assert!(after.is_empty(), "{kind}: {after:?}");
+        }
+    }
+
+    /// A name with a NUL is no assertion, and holds nothing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_name_with_a_nul_holds_nothing() {
+        assert!(hold(PREVENT_SYSTEM_SLEEP, "a\0b").is_none());
     }
 
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn off_macos_no_assertion_is_listed() {
         assert!(assertions_of(1).is_err());
+        assert!(hold(PREVENT_SYSTEM_SLEEP, "aterm-sysprobe").is_none());
+        assert_eq!(lid_closed(), None);
     }
 }

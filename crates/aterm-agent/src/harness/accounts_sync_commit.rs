@@ -171,10 +171,19 @@ pub(super) fn usage_target(path: Option<&Path>) -> Result<Option<PathBuf>, Strin
     .transpose()
 }
 
-fn durable_ancestry(dir: &Path) -> Result<(), String> {
-    for ancestor in absolute(dir)?.ancestors() {
-        aterm_durable::durable_dir(ancestor)
-            .map_err(|why| format!("{}: {why}", ancestor.display()))?;
+/// Flush every directory on the way from the root to each of `dirs`, each one once: nothing here
+/// changes an entry between two flushes of it, and an ancestor already flushed had its own
+/// ancestors flushed after it, so the walk up from a later directory stops there.
+fn durable_ancestry<'a>(dirs: impl IntoIterator<Item = &'a Path>) -> Result<(), String> {
+    let mut flushed = BTreeSet::new();
+    for dir in dirs {
+        for ancestor in absolute(dir)?.ancestors() {
+            if !flushed.insert(ancestor.to_path_buf()) {
+                break;
+            }
+            aterm_durable::durable_dir(ancestor)
+                .map_err(|why| format!("{}: {why}", ancestor.display()))?;
+        }
     }
     Ok(())
 }
@@ -313,10 +322,11 @@ impl Store {
         note: &mut Option<String>,
         edit: impl FnOnce(&mut State) -> Result<Vec<Event>, String>,
     ) -> Result<Vec<Event>, String> {
+        // The recovery left no pending receipt, and the writer lock keeps it so through this read.
         self.recover_sync_at(held, None, &mut |_| Ok(()))?;
-        let (mut state, read_note) = self.load(now)?;
+        let (mut state, read_note, machine_kept) = self.state_as_stored(now)?;
         *note = read_note;
-        if let Ok(id) = self.machine_id(&state.machine) {
+        if !machine_kept && let Ok(id) = self.machine_id(&state.machine) {
             state.machine = id;
         }
         let before = state.clone();
@@ -747,17 +757,32 @@ impl Store {
 
     fn recover_sync_at(
         &self,
-        _held: &Lock,
+        held: &Lock,
         roster: Option<&Path>,
         progress: &mut dyn FnMut(usize) -> Result<(), String>,
     ) -> Result<bool, String> {
-        let Some(mut receipt) = self.receipt()? else {
+        let Some(receipt) = self.receipt()? else {
             return Ok(false);
         };
         let Some(plan) = &receipt.plan else {
             return Ok(false);
         };
         plan.validate(self, roster)?;
+        self.replay(held, receipt, roster, progress)?;
+        Ok(true)
+    }
+
+    /// Install the admitted images of `receipt`'s validated plan and complete it.
+    fn replay(
+        &self,
+        _held: &Lock,
+        mut receipt: Receipt,
+        roster: Option<&Path>,
+        progress: &mut dyn FnMut(usize) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let Some(plan) = receipt.plan.take() else {
+            return Ok(());
+        };
         let paths = plan.paths(self, roster)?;
         let images = [&plan.state, &plan.logins, &plan.ledger, &plan.roster];
         let limits = [
@@ -821,9 +846,7 @@ impl Store {
         }
         aterm_durable::durable_dir(&self.dir).map_err(|why| why.to_string())?;
         progress(5)?;
-        receipt.plan = None;
-        self.save_receipt(&receipt)?;
-        Ok(true)
+        self.save_receipt(&receipt)
     }
 
     /// Prepare all authority and generations before auxiliary publication. Once admitted,
@@ -837,6 +860,8 @@ impl Store {
         edit: impl FnOnce(&mut State, &mut Logins) -> Result<Vec<Event>, String>,
         auxiliary: impl FnOnce() -> Result<(), String>,
     ) -> Result<Vec<Event>, String> {
+        // This path runs no recovery of its own: a pending or damaged receipt refuses it here.
+        self.sync_read_receipt()?;
         self.transact_images_held(
             held,
             now,
@@ -850,6 +875,9 @@ impl Store {
         )
     }
 
+    /// The edit and publication of one transaction, whose caller has seen no pending receipt
+    /// under the writer lock `held`: no receipt can change while it holds that lock, so the
+    /// snapshots below read with no receipt check of their own.
     fn transact_images_held(
         &self,
         held: &Lock,
@@ -860,10 +888,10 @@ impl Store {
         auxiliary: impl FnOnce() -> Result<(), String>,
     ) -> Result<Vec<Event>, String> {
         let Publication { target, wake } = publication;
-        let (mut state, state_note) = self.load(now)?;
-        let (mut logins, login_note) = self.load_logins(now)?;
+        let (mut state, state_note, machine_kept) = self.state_as_stored(now)?;
+        let (mut logins, login_note) = self.logins_as_stored(now)?;
         *note = state_note.or(login_note);
-        if let Ok(id) = self.machine_id(&state.machine) {
+        if !machine_kept && let Ok(id) = self.machine_id(&state.machine) {
             state.machine = id;
         }
         let before = (state.clone(), logins.clone());
@@ -1028,14 +1056,14 @@ impl Store {
             };
             self.save_receipt(&clean)?;
         }
-        durable_ancestry(&self.dir)?;
-        if let Some(roster) = roster {
-            let absent = receipt
-                .plan
-                .as_ref()
-                .is_some_and(|plan| plan.roster.after.is_none());
-            durable_ancestry(publication_parent(roster, absent))?;
-        }
+        let absent = receipt
+            .plan
+            .as_ref()
+            .is_some_and(|plan| plan.roster.after.is_none());
+        durable_ancestry(
+            std::iter::once(self.dir.as_path())
+                .chain(roster.map(|roster| publication_parent(roster, absent))),
+        )?;
         self.retain_witness(&self.dir.join(WITNESS))
             .map_err(|why| why.to_string())?;
         self.save_receipt(&receipt)?;
@@ -1043,14 +1071,15 @@ impl Store {
         let cut = CUT.with(std::cell::Cell::take);
         #[cfg(not(test))]
         let cut: Option<usize> = None;
-        self.recover_sync_at(held, roster, &mut |step| {
+        // The plan was validated above and is the receipt just saved, under the lock nothing else
+        // replaces a receipt without, so it is neither read back nor validated again.
+        self.replay(held, receipt, roster, &mut |step| {
             if cut == Some(step) {
                 Err("injected interruption".to_owned())
             } else {
                 Ok(())
             }
-        })?;
-        Ok(())
+        })
     }
 }
 

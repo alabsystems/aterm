@@ -296,11 +296,43 @@ fn name_machine(places: &Places, args: &[String]) -> Result<String, Failure> {
     }
 }
 
+/// Publish an explicitly chosen machine number as the fleet name in `state` through the same
+/// checked writer as `fleet name set` ([`set_primary_name`]), while `state`'s machine name still
+/// holds `number`, which it reads again under the fleet writer's lock. Existing signed and
+/// registered holders are never overwritten. `config` is the aterm.toml whose `[[fleet.peers]]`
+/// hosts are read, beside the swarm roster, the book and its copy of the issuer's book, among the
+/// machines that may already answer to the name; it is read for nothing else, and one that
+/// cannot be read lists none. The
+/// roster is the vault's beside `state`, or the live one where `state` is the live account's
+/// ([`crate::fleet_vault::vault_paths_for`]); with neither it names no machine.
+///
+/// # Errors
+/// `state` cannot be made private or its node identity read; the swarm roster is unread; another
+/// registered machine, a peer in either book or a `[[fleet.peers]]` host answers to the name; the
+/// name file no longer holds `number` or cannot be read; or the book cannot be locked or read,
+/// or the fleet name cannot be written.
+#[cfg(unix)]
+pub(crate) fn choose_machine_name_at(
+    state: &Path,
+    config: &Path,
+    number: aterm_types::machine_name::Number,
+) -> Result<String, String> {
+    let places = Places {
+        state: state.to_owned(),
+        config: config.to_owned(),
+    };
+    set_primary_name(&places, &number.to_string(), &Writer::Canonical(number))
+        .map_err(Failure::into_text)
+}
+
 /// Who writes the fleet name, and so what the write records.
 enum Writer<'a> {
     /// The person (`aterm fleet name set`): the name is theirs, and no follow replaces it, unless
     /// it is a swarm label (`m<N>`) the roster gives this Mac no more ([`FleetName::Due`]).
     Person,
+    /// The canonical number must still match under the fleet writer lock.
+    #[cfg(unix)]
+    Canonical(aterm_types::machine_name::Number),
     /// `sync.identity`'s follow, which read the fleet name as `saw`: it writes only if the name
     /// is still that once the write lock is held, and records the name as its own
     /// ([`FOLLOWED_FILE`]).
@@ -338,6 +370,13 @@ fn set_primary_name(places: &Places, name: &str, writer: &Writer<'_>) -> Result<
         )));
     }
     member::write_held(&places.state, Began::Here, |_held| {
+        #[cfg(unix)]
+        if let Writer::Canonical(number) = writer {
+            let current = crate::machine_name::file::read(&places.state).map_err(failed)?;
+            if current.is_none_or(|current| current.num != Some(*number)) {
+                return Err(failed("the canonical machine number changed before fleet publication"));
+            }
+        }
         if let Writer::Follow { saw } = writer {
             let now = member::read_primary_name(&places.state).map_err(failed)?;
             if now.as_deref() != *saw {
@@ -363,6 +402,11 @@ fn set_primary_name(places: &Places, name: &str, writer: &Writer<'_>) -> Result<
         .map_err(|e| failed(e.to_string()))?;
         match writer {
             Writer::Person => {
+                aterm_uds::private_file::remove_private(&places.state, FOLLOWED_FILE)
+                    .map_err(|e| failed(e.to_string()))?;
+            }
+            #[cfg(unix)]
+            Writer::Canonical(_) => {
                 aterm_uds::private_file::remove_private(&places.state, FOLLOWED_FILE)
                     .map_err(|e| failed(e.to_string()))?;
             }
@@ -2422,8 +2466,7 @@ fn join_with_denial_deadline(
         );
     }
     out.push_str(&format!(
-        "  issuer     {} at {issuer_at} recorded this machine as {} ({} peer{} in its book){}\n\
-         {}\n",
+        "  issuer     {} at {issuer_at} recorded this machine as {} ({} peer{} in its book){}\n",
         aterm_codec::tty::one_line(&joined.issuer.host, 80),
         member::host_port(&registration.host, registration.port),
         joined.peers,
@@ -2435,12 +2478,11 @@ fn join_with_denial_deadline(
              has one (`aterm fleet init` there mints it, after an update if its aterm is \
              older; a join before then binds nothing)"
         },
-        follows(
-            unserved.as_deref(),
-            "\nOn a Mac, the local-network consent macOS asks for at aterm's first connection \
-             into the LAN covers the survey's reads too."
-        ),
     ));
+    if unserved.is_none() {
+        out.push_str(FOLLOWS);
+        out.push('\n');
+    }
     if let Some(granted) = granted {
         out.push('\n');
         out.push_str(&granted);
@@ -2627,7 +2669,7 @@ enum Advice {
     /// This process may not connect at all (a sandbox, a firewall).
     Sandbox,
     /// No route to the issuer's host.
-    LocalNetwork,
+    NoRoute,
     /// No route to the issuer's network.
     NoNetwork,
     /// The machine that answered claims a node this machine binds to a key.
@@ -2674,7 +2716,7 @@ impl JoinFailed {
             Self::OtherKey(_) | Self::Unproved(_) | Self::Denied(_) => Advice::IssuerKey,
             Self::Dial(Unreached::NotFleet(_)) => Advice::PastTheLan,
             Self::Dial(e) if e.not_permitted() => Advice::Sandbox,
-            Self::Dial(e) if e.no_route() => Advice::LocalNetwork,
+            Self::Dial(e) if e.no_route() => Advice::NoRoute,
             Self::Dial(e) if e.no_network() => Advice::NoNetwork,
             Self::Dial(Unreached::Handshake(_, FleetError::ListenerWrongSecret)) => {
                 Advice::OtherSecret
@@ -2693,7 +2735,8 @@ impl JoinFailed {
 struct Placing {
     /// Whether `host` names this machine ([`this_machine_is`]).
     here: fn(&str) -> bool,
-    /// The first completed nonempty address batch for `host` ([`member::addresses_within`]).
+    /// The addresses `host` resolves to (`aterm_uds::lan::resolve`, through the root LAN broker
+    /// for a `.local` or single-label name on macOS); none where it does not resolve.
     lookup: fn(&str) -> Vec<IpAddr>,
     /// The LAN address an automatic join registers this machine at ([`automatic_host`]).
     lan: fn() -> Option<String>,
@@ -2705,14 +2748,15 @@ const OWN_NAME_LOOKUP_WITHIN: Duration = Duration::from_secs(2);
 
 const LIVE_PLACING: Placing = Placing {
     here: this_machine_is,
-    lookup: |host| member::addresses_within(host, OWN_NAME_LOOKUP_WITHIN),
+    lookup: |host| aterm_uds::lan::resolve(host, OWN_NAME_LOOKUP_WITHIN).unwrap_or_default(),
     lan: || automatic_host(aterm_secrets::server::route_sources()),
 };
 
 /// Where `host`, a name of this machine's own, answers when no address of this machine does: the
-/// IPv4 fleet addresses in its first completed lookup batch (a fleet listener answers IPv4
-/// alone), each another machine's. `None` for an address or `localhost`, another machine's name,
-/// or a batch that names an address of this machine or no IPv4 fleet address.
+/// IPv4 fleet addresses `lookup` resolves it to (a fleet listener answers IPv4 alone), each
+/// another machine's. `None` for an address or `localhost`, another machine's name, or addresses
+/// that include one of this machine's or no IPv4 fleet address; a resolve that failed (the LAN
+/// broker unavailable for a `.local` name included) resolves to none, so it is `None` too.
 fn own_name_answered_elsewhere(host: &str, placing: &Placing) -> Option<Vec<IpAddr>> {
     if host.parse::<IpAddr>().is_ok() || same_host(host, "localhost") || !(placing.here)(host) {
         return None;
@@ -2817,11 +2861,10 @@ fn not_recorded_with(
             "the issuer at {issuer_at} was not reached: {why}\n  {nothing} Run `aterm fleet join` \
              where it may open network connections (outside the sandbox), and join again."
         ),
-        Advice::LocalNetwork => format!(
-            "the issuer at {issuer_at} was not reached: {why}\n  {nothing} On a Mac that is \
-             local-network privacy, which refuses an app's connections into the LAN until they \
-             are allowed (System Settings › Privacy & Security › Local Network: aterm, or the \
-             terminal this runs in); allow it, then join again."
+        Advice::NoRoute => format!(
+            "the issuer at {issuer_at} was not reached: {why}\n  {nothing} No route reaches the \
+             issuer's host: it is off or asleep, or no longer on this network. Join again once it \
+             answers there."
         ),
         Advice::NoNetwork => format!(
             "the issuer at {issuer_at} was not reached: {why}\n  {nothing} This machine is not \
@@ -2904,21 +2947,10 @@ fn not_recorded_with(
              cause. Once that is put right on the issuer (`aterm fleet peers` there lists its \
              book), join again."
         ),
-        Advice::CheckTheIssuer => {
-            let loopback = member::parse_host_port(issuer_at, None)
-                .is_ok_and(|(host, _)| same_host(&host, "localhost"));
-            format!(
-                "the issuer at {issuer_at} did not record this machine: {why}\n  {nothing} \
-                 Check the host and port the code names, start aterm on the issuer, and join \
-                 again.{}",
-                if loopback {
-                    ""
-                } else {
-                    "\n  On a Mac, a first connection into the LAN asks to let aterm find \
-                     devices on the local network: allow it, then join again."
-                }
-            )
-        }
+        Advice::CheckTheIssuer => format!(
+            "the issuer at {issuer_at} did not record this machine: {why}\n  {nothing} Check \
+             the host and port the code names, start aterm on the issuer, and join again."
+        ),
     }
 }
 
@@ -5313,8 +5345,7 @@ fn list_peers(places: &Places, within: Duration) -> Result<String, Failure> {
 
 /// `fleet peers` with this Mac's network place `place` said under its first line
 /// (`aterm_netplace::words::header`); with no member reached and some dialled while on another
-/// network, why (`words::why_away`), and no Local Network privacy blame for a no-route read
-/// there: being elsewhere explains it.
+/// network, why (`words::why_away`).
 #[cfg(test)]
 fn list_peers_at(
     places: &Places,
@@ -5363,8 +5394,8 @@ fn format_peer_listing(
     let now_ms = aterm_time::unix_millis().unwrap_or(0);
     let listed: Vec<Peer> = listing.rows.iter().map(|row| row.peer.clone()).collect();
     let minted = code_minted(places);
-    // The on-link rule over this read's dials: a no-route on this network is this Mac's privacy
-    // only while no member here answered, else that member's own (off the link now).
+    // The on-link rule over this read's dials: a no-route to a member on this network is that
+    // member's own (off the link now).
     let on_link = place.map(|place| {
         on_link_of(
             place,
@@ -5383,9 +5414,8 @@ fn format_peer_listing(
             }),
         )
     });
-    let mut no_route = 0;
-    // No-route failures to addresses on the network this Mac is on: this Mac's own Local
-    // Network privacy refused them, which being away explains nothing of.
+    // No-route failures to addresses on the network this Mac is on, which being away explains
+    // nothing of.
     let mut no_route_here = 0;
     let mut unreached = 0;
     let mut reached = 0;
@@ -5444,9 +5474,6 @@ fn format_peer_listing(
                 if why.dialled() {
                     unreached += 1;
                     last_heard_ms = last_heard_ms.max(peer.seen_ms);
-                }
-                if why.no_route() {
-                    no_route += 1;
                 }
                 if no_route_on_this_network(why, place) {
                     no_route_here += 1;
@@ -5515,12 +5542,6 @@ fn format_peer_listing(
         out.push_str(why);
         out.push('\n');
     }
-    if why_away.is_none()
-        && let Some(note) = privacy_note(on_link.as_ref(), (no_route, unreached))
-    {
-        out.push_str(note);
-        out.push('\n');
-    }
     if let Some(note) = &listing.note {
         out.push_str(note);
         out.push('\n');
@@ -5551,30 +5572,8 @@ fn void_grants(places: &Places) -> Option<String> {
     ))
 }
 
-/// The note `fleet peers` gives for a read's no-route dials: with this Mac's place read, the
-/// on-link rule's ([`aterm_netplace::words::OnLink::privacy`]: a member on this network refused
-/// with none there answering is this Mac's own Local Network privacy, and nothing else is); with
-/// no place, every peer not reached having had no route (`no_route` of `unreached`) still says
-/// that privacy.
-fn privacy_note(
-    on_link: Option<&aterm_netplace::words::OnLink>,
-    (no_route, unreached): (usize, usize),
-) -> Option<&'static str> {
-    match on_link {
-        Some(on_link) => {
-            (on_link.privacy > 0).then_some(aterm_netplace::words::ON_LINK_PRIVACY_NOTE)
-        }
-        None => (no_route > 0 && no_route == unreached).then_some(
-            "Every peer not reached had no route: on a Mac that is local-network privacy, \
-             which refuses an app's connections into the LAN until they are allowed (System \
-             Settings › Privacy & Security › Local Network: aterm, or the terminal this runs \
-             in).",
-        ),
-    }
-}
-
 /// The on-link rule's verdict on one fleet read (`aterm_netplace::words::on_link`) over its
-/// `dials`: each member's answer by the address it answered from, each failure as it came.
+/// `dials`: each member's answer, each failure as it came.
 fn on_link_of<'a>(
     place: &aterm_netplace::Place,
     dials: impl IntoIterator<Item = Result<IpAddr, &'a Unreached>>,
@@ -5583,17 +5582,16 @@ fn on_link_of<'a>(
     aterm_netplace::words::on_link(
         place,
         dials.into_iter().map(|dial| match dial {
-            Ok(addr) => Dial::Answered(addr),
             Err(why) if why.no_route() => Dial::NoRoute(why.at().map(|at| at.ip())),
-            Err(why) => met_host(why).map_or(Dial::Other, Dial::Reached),
+            Ok(_) | Err(_) => Dial::Other,
         }),
     )
 }
 
-/// Whether `why` is a no-route to a member on this Mac's network while another member there
-/// answered the same read ([`aterm_netplace::words::OnLink::gone_at`]): that member's own error,
+/// Whether `why` is a no-route to a member on this Mac's network
+/// ([`aterm_netplace::words::OnLink::gone_at`]): that member's own error,
 /// off the link now, which its row says ([`aterm_netplace::words::GONE_FROM_THE_LINK`]) in
-/// place of the privacy blame or the away why.
+/// place of the dial's own words.
 fn gone_off_the_link(
     why: &Unreached,
     place: Option<&aterm_netplace::Place>,
@@ -5622,9 +5620,8 @@ fn window_version(check: Option<&Result<member::Checked, Unreached>>) -> &str {
 }
 
 /// Whether `why` found no route to an address on the network this Mac is on (`place`'s route,
-/// [`aterm_netplace::words::on_this_network`]): this Mac's own Local Network privacy refused a
-/// member there, so `fleet peers` blames that setting wherever this Mac is, a member on the same
-/// phone hotspot included, rather than saying it is away.
+/// [`aterm_netplace::words::on_this_network`]): a member there, a member on the same phone
+/// hotspot included, so `fleet peers` does not say this Mac is away.
 fn no_route_on_this_network(why: &Unreached, place: Option<&aterm_netplace::Place>) -> bool {
     match (why, place) {
         (Unreached::Connect(at, _), Some(place)) if why.no_route() => {
@@ -8788,8 +8785,7 @@ fn fault_of(why: &Unreached) -> aterm_ctl::PeerFault {
 
 /// The address of a host that answered `why`'s dial though no member's answer came back: it
 /// refused the connect (no aterm listening there), or the handshake, a proof or the reply failed.
-/// Local Network privacy refuses a connect with no route, so a dial this far reached the link
-/// (`aterm_netplace::words::Dial::Reached`). `None` for silence (a timeout, no route, no
+/// A dial this far reached the link ([`aterm_ctl::PeerFault::HostAnswered`]). `None` for silence (a timeout, no route, no
 /// network, a dial never made) and for a deadline past the connect, which keeps no address.
 fn met_host(why: &Unreached) -> Option<IpAddr> {
     match why {

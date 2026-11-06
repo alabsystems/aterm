@@ -16,6 +16,99 @@ fn retire(pause: Pause) -> Drained {
 }
 
 #[test]
+fn a_reply_received_after_waking_cannot_outlive_its_original_budget() {
+    let (send, receive) = std::sync::mpsc::channel();
+    send.send(true).unwrap();
+    let slept = std::cell::Cell::new(0);
+    let continuous = || Some(slept.get());
+    let deadline = Deadline::with_clocks(Duration::from_secs(3600), &Instant::now, &continuous);
+    let result = receive_cdp_observed(&receive, deadline, None, || slept.set(7200 * 1_000_000_000));
+    assert!(matches!(result, Err(CdpReceiveError::Timeout)));
+    assert!(
+        matches!(
+            receive.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ),
+        "the real value was received before the post-wake budget veto"
+    );
+    let live = Deadline::after(aterm_spec::wait::MUST_HAPPEN);
+    send.send(true).unwrap();
+    assert!(matches!(receive_cdp(&receive, live, None), Ok(true)));
+}
+
+#[test]
+fn sleep_ends_a_real_cdp_wait_without_releasing_its_blocked_reader() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    for tidy in [false, true] {
+        let profile = aterm_tempfile::tempdir().unwrap();
+        if tidy {
+            super::super::browser_window::mark_untidied(profile.path()).unwrap();
+        }
+        let profile_path = profile.path().to_owned();
+        let lifetime = Lifetime::default();
+        let (mut command_read, command_write) = std::io::pipe().unwrap();
+        let (output_read, output_write) = std::io::pipe().unwrap();
+        let mut client =
+            CdpClient::new_scoped(command_write, output_read, lifetime.enter()).unwrap();
+        let slept = std::sync::Arc::new(AtomicU64::new(0));
+        let clock = slept.clone();
+        let (done, result) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let continuous = || Some(clock.load(Ordering::Acquire));
+            let deadline =
+                Deadline::with_clocks(Duration::from_secs(3600), &Instant::now, &continuous);
+            let answer = if tidy {
+                super::super::browser_window::make_up_tidy_until(
+                    &mut client,
+                    &profile_path,
+                    deadline,
+                )
+                .expect("marked profile takes the actual make-up path")
+                .map(|_| Value::Null)
+                .map_err(|_| "make-up failed")
+            } else {
+                client.call_by(None, "Browser.getVersion", json!({}), deadline)
+            };
+            drop(client);
+            let _ = done.send(answer);
+        });
+        let ready = aterm_uds::ready::any_until(
+            &[command_read.as_fd()],
+            Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        )
+        .is_ok_and(|ready| !ready.is_empty());
+        let entered = ready && command_read.read_exact(&mut [0]).is_ok();
+        slept.store(7200 * 1_000_000_000, Ordering::Release);
+        let answer = result.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+        let held = lifetime.pause().unwrap().try_wait();
+        let pending = held.is_err();
+        // Always release the actual pipes and join before asserting; no PID reconstruction.
+        drop(output_write);
+        drop(command_read);
+        worker.join().unwrap();
+        let drained = match held {
+            Ok(drained) => drained,
+            Err(pause) => retire(pause),
+        };
+        assert!(entered, "the actual CDP command reached its pipe");
+        assert!(answer.unwrap().is_err());
+        if tidy {
+            assert!(
+                profile
+                    .path()
+                    .join(super::super::browser_window::UNTIDIED_MARK)
+                    .is_file()
+            );
+        }
+        assert!(
+            pending,
+            "a timed-out call cannot retire the still-blocked real reader"
+        );
+        assert!(drained.resume().is_ok());
+    }
+}
+
+#[test]
 fn a_detached_cdp_reader_retains_the_scope_until_its_real_pipe_closes() {
     let lifetime = Lifetime::default();
     let (command_read, command_write) = std::io::pipe().unwrap();

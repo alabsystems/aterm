@@ -4180,6 +4180,9 @@ struct SceneControls {
     /// A typed light lives its tuned life times the duration's share of the default
     /// (`CursorGlow::set_typed_life_scaled`); off, its tuned life whatever the duration.
     typed_life_scaled: bool,
+    /// The letter guard passes by a step the card does not keep
+    /// (`CursorGlow::set_frame_unseen`); off, it judges every step, as a window's frames.
+    unseen_steps_unguarded: bool,
 }
 
 #[cfg(test)]
@@ -4195,6 +4198,7 @@ thread_local! {
             thin_caret_fill: true,
             observe_body: false,
             typed_life_scaled: true,
+            unseen_steps_unguarded: true,
         })
     };
 }
@@ -5116,6 +5120,11 @@ impl CursorScene {
         #[cfg(test)]
         fx.glow
             .set_typed_life_scaled(self.controls.typed_life_scaled);
+        #[cfg(test)]
+        let unseen = !keep && self.controls.unseen_steps_unguarded;
+        #[cfg(not(test))]
+        let unseen = !keep;
+        fx.glow.set_frame_unseen(unseen);
         fx.glow.observe_frame_text_at(
             Some((row as u16, caret)),
             text,
@@ -11488,6 +11497,131 @@ mod tests {
             input: lit_input,
             cell,
             without_body,
+        }
+    }
+
+    /// A card of style `raw` on `theme` at `phase` in the face `prepared`, drawn at scale 1, with
+    /// the input it published.
+    fn observed_card(
+        raw: &str,
+        theme: PreviewTerminalTheme,
+        phase: u64,
+        prepared: &crate::tray_raster::PreparedSemanticFont,
+    ) -> crate::tray_raster::ObservedSpecimen {
+        let spec = SettingsPreviewSpec::cursor(CursorPreviewSpec {
+            blink: false,
+            trail_style: PreviewTrailStyle::parse(raw),
+            trail_style_raw: Arc::from(raw),
+            ..CursorPreviewSpec::default()
+        })
+        .with_terminal_theme(theme)
+        .with_phase(phase)
+        .with_prepared_font(prepared.clone())
+        .normalized();
+        let specimen = spec.terminal_specimen(theme.into_theme(), Some(7));
+        crate::tray_raster::render_specimen_observed_for_test(&specimen, 1.0)
+            .expect("the lit card and its published input")
+    }
+
+    /// Whether a card's guard reads the steps it does not keep (`guarded`), for a test to compare.
+    fn set_unseen_steps_guarded(guarded: bool) {
+        SCENE_CONTROLS.with(|controls| {
+            controls.set(SceneControls {
+                unseen_steps_unguarded: !guarded,
+                ..controls.get()
+            });
+        });
+    }
+
+    /// A CARD IS THE FRAME IT WOULD BE WITH EVERY STEP BEFORE IT GUARDED: the letter guard spends
+    /// nothing on a step the card does not keep (`CursorGlow::set_frame_unseen`), and on every
+    /// listed style, on dark and on paper, at two phases of one replay, the kept frame's pixels and
+    /// lights are the very ones a replay guarding each step gives.
+    /// NEGATIVE CONTROL (2026-11-05): with the guard also passing by the kept step this fired "the
+    /// kept frame moved: rainbow kitty pet on 111318 at 4472 ms"; with its frame memo answering
+    /// whatever the frame's lights, "the kept frame moved: off on 111318 at 2262 ms".
+    #[test]
+    fn a_card_is_the_frame_it_would_be_with_every_step_before_it_guarded() {
+        let _ = compiled(SettingsPreviewSpec::default());
+        let prepared = crate::tray_raster::prepared_semantic_font_for_direct_view_test(
+            &SemanticFontCandidate::default(),
+        );
+        let themes = [
+            PreviewTerminalTheme::from_scheme(&aterm_types::ColorScheme::default()),
+            PreviewTerminalTheme::from_scheme(
+                &aterm_types::scheme::builtin("GitHub Light").expect("built-in light theme"),
+            ),
+        ];
+        let phases = [
+            CURSOR_SCENE_CYCLE_MS / 2,
+            CURSOR_SCENE_CYCLE_MS - MOTION_STEP_MS,
+        ];
+        let mut judged = 0;
+        for raw in crate::native_settings::listed_cursor_style_values() {
+            for theme in themes {
+                // One replay a side, each phase playing on from the one before as a card's does.
+                let kept = phases.map(|phase| observed_card(raw, theme, phase, &prepared));
+                set_unseen_steps_guarded(true);
+                let whole = phases.map(|phase| observed_card(raw, theme, phase, &prepared));
+                set_unseen_steps_guarded(false);
+                for ((kept, whole), phase) in kept.iter().zip(&whole).zip(phases) {
+                    let at = format!("{raw} on {:06x} at {phase} ms", theme.into_theme().bg);
+                    assert!(
+                        kept.frame.pixels == whole.frame.pixels,
+                        "the kept frame moved: {at}"
+                    );
+                    assert_eq!(
+                        (&kept.input.cursor_glow_add, &kept.input.glow_under),
+                        (&whole.input.cursor_glow_add, &whole.input.glow_under),
+                        "the kept frame's lights moved: {at}"
+                    );
+                    judged += usize::from(
+                        !(kept.input.cursor_glow_add.is_empty()
+                            && kept.input.glow_under.is_empty()),
+                    );
+                }
+            }
+        }
+        assert!(judged > 0, "some frame holds a light to judge");
+    }
+
+    /// The same in the host's own face, comet on Solarized Light, a card playing on at five motion
+    /// steps a frame: a share the guard lowers on a frame it reads (`CursorGlow::verify_cuts`) stays
+    /// that frame's, so a replay that read more frames carries nothing over into the one shown.
+    /// NEGATIVE CONTROL (2026-11-05): `verify_cuts` writing its lowered share back over the kept
+    /// verdict, as it did from 39ba2aa319, fired "the kept frame moved at 3640 ms". The wider sweep
+    /// this case came from (the host's face and the embedded one, at scales 1 and 2; five themes,
+    /// every style, three companion looks, six strides; 13,750 frames a face and scale, kept, whole
+    /// and judged afresh) moved no frame once that write was gone. It was run once and not kept.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_card_in_the_host_s_face_carries_nothing_over_from_a_step_it_guarded() {
+        let _ = compiled(SettingsPreviewSpec::default());
+        let prepared = host_card_face();
+        let theme = PreviewTerminalTheme::from_scheme(
+            &aterm_types::scheme::builtin("Solarized Light").expect("a built-in theme"),
+        );
+        let phases: Vec<u64> = (0..=3640).step_by((5 * MOTION_STEP_MS) as usize).collect();
+        let replay = |phases: &[u64]| -> Vec<_> {
+            phases
+                .iter()
+                .map(|&phase| observed_card("comet", theme, phase, &prepared))
+                .collect()
+        };
+        let kept = replay(&phases);
+        set_unseen_steps_guarded(true);
+        let whole = replay(&phases);
+        set_unseen_steps_guarded(false);
+        for ((kept, whole), phase) in kept.iter().zip(&whole).zip(&phases) {
+            assert!(
+                kept.frame.pixels == whole.frame.pixels,
+                "the kept frame moved at {phase} ms"
+            );
+            assert_eq!(
+                (&kept.input.cursor_glow_add, &kept.input.glow_under),
+                (&whole.input.cursor_glow_add, &whole.input.glow_under),
+                "the kept frame's lights moved at {phase} ms"
+            );
         }
     }
 

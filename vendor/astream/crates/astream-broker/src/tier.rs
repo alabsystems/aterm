@@ -1113,7 +1113,11 @@ impl Tier {
     /// The indices of the records in `lo..hi` (clamped to the records held) whose subject is
     /// `subject`, in offset order. A page whose ids do not name it is passed whole, and a
     /// subject no retained record names reads no page, so a walk for a subject few records
-    /// name (the wills) reads only the pages that hold one.
+    /// name reads only the pages that hold one. A test build's: the wills it found for
+    /// `stats` come from the log's latest-will map since aterm F19, and its walk is the
+    /// read-back the map is held to (`BrokerLog::latest_wills_read_back`). The `TierTally`
+    /// does not count it: it counts the readers a debug build runs, and this is none.
+    #[cfg(test)]
     pub(crate) fn naming<'a>(
         &'a self,
         subject: &str,
@@ -1124,7 +1128,6 @@ impl Tier {
         let lo = lo.min(hi);
         let (from, to) = (self.head.saturating_add(lo), self.head.saturating_add(hi));
         let id = self.subjects.ids.get(subject).copied();
-        count!(self, Naming, 1);
         let pages = match id {
             Some(_) if from < to => {
                 (from >> self.shift)..((to - 1) >> self.shift).saturating_add(1)
@@ -1139,10 +1142,7 @@ impl Tier {
             let start = (p << self.shift).max(from);
             let end = (p.saturating_add(1) << self.shift).min(to);
             let places = match local {
-                Some(_) => {
-                    count!(self, NamedPage, 1);
-                    start..end
-                }
+                Some(_) => start..end,
                 None => start..start,
             };
             places
@@ -2477,17 +2477,6 @@ mod tally_tests {
             (2, 605, 0),
             "a walk counts the rows it read"
         );
-
-        let before = t.tally();
-        let wills: Vec<usize> = t.naming("w", 0, t.len()).collect();
-        assert_eq!(wills, vec![50, 150, 250, 350, 450, 550]);
-        assert_eq!(t.naming("nobody", 0, t.len()).count(), 0);
-        let d = t.tally().since(before);
-        assert_eq!(
-            (d.namings, d.named_pages, d.rows),
-            (2, 3, 0),
-            "a subject walk counts the pages naming it, and a subject no record names reads none"
-        );
     }
 
     /// A filtered read's pass over records of subjects it does not want passes every page whole
@@ -2588,8 +2577,8 @@ mod tally_tests {
             (after.wide, before.wide),
             (after.walks, before.walks),
             (after.rows, before.rows),
-            (after.namings, before.namings),
-            (after.named_pages, before.named_pages),
+            (after.passed_pages, before.passed_pages),
+            (after.verdicts, before.verdicts),
         ] {
             assert!(
                 now >= was,

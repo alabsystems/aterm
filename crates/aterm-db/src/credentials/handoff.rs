@@ -95,7 +95,7 @@ impl Round<'_> {
                     && eligible.iter().any(|&(operation, command)| {
                         operation.header.id == offer
                             && operation.header.actor == holder
-                            && record_of(command).is_ok_and(|record| {
+                            && decoded_record(command).is_some_and(|record| {
                                 record.kind == "offer"
                                     && ids(&record.key).is_ok_and(|key| key == request)
                             })
@@ -153,7 +153,9 @@ impl Round<'_> {
                     {
                         continue;
                     }
-                    let record = record_of(command)?;
+                    let Some(record) = decoded_record(command) else {
+                        continue;
+                    };
                     let request = ids(&record.key)?;
                     if book.threads.get(&request).is_some_and(|thread| {
                         !thread.ended()
@@ -410,7 +412,7 @@ fn publish(
     }
     let mut admin = client::admin_cached(paths).map_err(crate::table::failure)?;
     let facts = facts(paths, now_ms())?;
-    let (network, recipient) = with_store(paths, |session, store, scope| {
+    let (network, recipient) = open(paths, round, |session, store, scope| {
         session.writer()?;
         if let Some(contributor) = contributor {
             session.peer_writer(contributor)?;
@@ -461,7 +463,7 @@ fn publish(
     }
     let record = Record::new("published", &thread.id, body)
         .attest(&|record| admin.attest_credential_record(&network, record))?;
-    with_store(paths, |session, store, scope| {
+    open(paths, round, |session, store, scope| {
         session.writer()?;
         let log = Log::read_with(session, store, scope, decode)?;
         log.writable(session.actor())?;
@@ -469,6 +471,20 @@ fn publish(
         Ok(())
     })?;
     Ok(published.seq)
+}
+
+/// The table open for a publication. A pass ([`publish_given`]) waits out the window's journal
+/// writer as every pass does ([`with_store`]); a round runs inside the window's own repair
+/// exchange, so it takes the ordinary admission rather than hold that exchange up.
+fn open<T>(
+    paths: &Paths,
+    round: Option<&Round<'_>>,
+    action: impl FnOnce(&Session<'_>, &mut Store, Scope) -> Result<T>,
+) -> Result<T> {
+    match round {
+        Some(_) => crate::documents::application::with_store(paths, true, descriptor, action),
+        None => with_store(paths, action),
+    }
 }
 
 pub(super) fn publish_given(paths: &Paths, thread: &Thread, values: &Values) -> Result<u64> {

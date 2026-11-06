@@ -44,8 +44,8 @@ const REMOVE_IN_BACKGROUND: &str =
 pub enum Projects {
     /// Search, and note what Spotlight indexes.
     Noted,
-    /// Search nothing, and note none: a run nobody asked for
-    /// ([`crate::init::Decider::Aterm`]), which puts no question of macOS's on the screen.
+    /// Search nothing, and note none: automatic runs and runs without the person at the
+    /// console do not discover paths whose first read can raise a macOS privacy question.
     Unread,
 }
 

@@ -91,6 +91,7 @@ pub fn run(args: &[String], ctx: &mut Ctx) -> u8 {
     ctx.github = None;
     ctx.adoption = None;
     ctx.anonymous = false;
+    ctx.no_anonymous_api = false;
     match args::parse(args) {
         Err(ParseError { verb, error }) => out::fail(ctx, &verb, &error),
         Ok(Parsed::Bare) => out::write_stdout(ctx, help::brief().as_bytes(), 0),
@@ -160,6 +161,7 @@ fn run_verb(
     }
     ctx.timeout = inv.global.timeout;
     ctx.anonymous = inv.global.anonymous;
+    ctx.no_anonymous_api = inv.global.no_anonymous_api;
     let t0 = ctx.fx.mono();
     let (exit, replay_failed) = match (verb.run)(ctx, inv) {
         Ok(mut outcome) => {
@@ -178,7 +180,16 @@ fn run_verb(
             ctx.vault_next(&mut e);
             let replay_failed = matches!(e.sub, Sub::Replay(_));
             let e = out::with_verb_help(e, &name);
-            (out::fail(ctx, &name, &e), replay_failed)
+            let exit = out::fail(ctx, &name, &e);
+            if opts.meta
+                && let Some(gh) = &ctx.github
+            {
+                let receipt = Receipt::new(&name).metered(&gh.meter());
+                let line =
+                    out::receipt_line(&receipt, &ctx.redactor).replacen("agh: ok", "agh: meter", 1);
+                out::note(ctx, &line);
+            }
+            (exit, replay_failed)
         }
     };
     if taped {
@@ -240,6 +251,7 @@ pub struct Ctx {
     /// `--anonymous`, which `run` sets before the verb runs: adoption then asks GitHub nothing,
     /// because learning a login sends the token.
     anonymous: bool,
+    no_anonymous_api: bool,
 }
 
 /// stdout through the door: each write is written whole and flushed.
@@ -311,6 +323,7 @@ impl Ctx {
             github: None,
             adoption: None,
             anonymous: false,
+            no_anonymous_api: false,
         }
     }
 
@@ -346,6 +359,7 @@ impl Ctx {
             github: None,
             adoption: None,
             anonymous: false,
+            no_anonymous_api: false,
         };
         (ctx, captured)
     }
@@ -494,6 +508,7 @@ impl Ctx {
             .retry(self.retry)
             .redactor(self.redactor.clone())
             .backstop(self.timeout)
+            .refuse_anonymous_api(self.no_anonymous_api)
             .notifier(self.notifier.clone());
         if let Some(dirs) = &self.dirs {
             builder = builder.journal(dirs.clone());
@@ -739,6 +754,9 @@ impl Receipt {
     #[must_use]
     pub fn metered(mut self, meter: &Meter) -> Receipt {
         self.requests = meter.requests;
+        if let Ok(counts) = aterm_json::to_string(&meter.rest_requests) {
+            self.notes.push(("rest".into(), counts));
+        }
         self.as_.clone_from(&meter.as_);
         self.rate.clone_from(&meter.rate);
         if let Some((old, new)) = &meter.moved {

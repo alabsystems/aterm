@@ -2335,7 +2335,7 @@ fn go_aheads_typed(m: &Mock) -> usize {
 
 /// A LINE THE GO-AHEAD ANSWERS NEVER GOES UP (§15.6): the agent parks its own reversible work on
 /// the person's go-ahead, Cruise types the owner's standing go-ahead, and the line is kept off
-/// the menu bar, the border and the window's host from the decision that types it: no entry is
+/// the menu bar and the window's host from the decision that types it: no entry is
 /// set, and the host hears no set. The control: with answers off the go-ahead is not typed and
 /// the line goes up, named.
 #[test]

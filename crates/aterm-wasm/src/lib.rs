@@ -85,6 +85,13 @@ fn registered_font(handle: u32) -> Result<std::sync::Arc<Vec<u8>>, String> {
     })
 }
 
+/// This module's identity record: compiled in unstamped, rewritten after the link by `ship site`
+/// with the version and commit of the source it builds the module from
+/// (`aterm_stamp::rewrite`), and installed by the first terminal, so the engine reports that
+/// version (XTVERSION) rather than `0.0.0`.
+#[cfg(target_arch = "wasm32")]
+static STAMP: [u8; aterm_stamp::LEN] = aterm_stamp::UNSTAMPED_RECORD;
+
 /// Terminal state machine and CPU RGBA8 framebuffer renderer.
 #[cfg_attr(target_arch = "wasm32", export)]
 pub struct AtermTerminal {
@@ -219,6 +226,8 @@ impl AtermTerminal {
     ) -> Result<AtermTerminal, String> {
         #[cfg(target_arch = "wasm32")]
         aterm_wasm_abi::panic_hook::set_once(host::CONSOLE);
+        #[cfg(target_arch = "wasm32")]
+        aterm_stamp::install(&STAMP, aterm_stamp::Stamp::UNSTAMPED);
         let theme = Theme {
             fg,
             bg,

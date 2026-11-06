@@ -8,12 +8,13 @@
 //! writer, its origin, so a reader keeps per subject the row with the highest sequence its
 //! origin gave it: a late relayed copy never replaces a newer row, whatever order the
 //! neighbours deliver in (on the broker, AS1's monotone `Last` already holds this for these
-//! classes; [`crate::rules`]). Readings never add up. For each window of an account, the fleet
-//! figure is the most used *current* reading across the Macs that hold one, with that
-//! reading's Mac and time, by the rule the journal's reader keeps today (`aterm-db`
+//! classes; [`crate::rules`]). Readings never add up, and a Mac's row that says its roster no
+//! longer lists the account ([`QuotaRow::removed`]) is no reading. For each window of an
+//! account, the fleet figure is the most used *current* reading across the Macs that hold one,
+//! with that reading's Mac and time, by the rule the journal's reader keeps today (`aterm-db`
 //! `alab::journal::seen`, `usage`): readings are grouped by their reset, a group a whole window
-//! older than the newest is the window that ended, and once every reset has passed with
-//! nothing read since the view says "reset at T, not read since", never a guessed 0.
+//! older than the newest is the window that ended, and once every reset has passed with nothing
+//! read since the view says "reset at T, not read since", never a guessed 0.
 //!
 //! **Counters** (window records: [`Counters`]). Each (origin, metric, window) keeps its highest
 //! revision only (astream's [`Rollup`]), then summaries add across origins. A window's
@@ -300,7 +301,7 @@ fn usage(length: u64, readings: &[Reading], now: u64) -> Option<Usage> {
     }
     // Group by window identity: sorted by reset, a reading joins the group before it when the
     // two resets lie within the tolerance.
-    current.sort_by_key(|r| (r.reset, r.t, r.by));
+    current.sort_unstable_by_key(|r| (r.reset, r.t, r.by));
     let mut groups: Vec<&[&Reading]> = Vec::new();
     let mut group_start = 0;
     for i in 1..current.len() {
@@ -388,13 +389,17 @@ fn age(at: u64, now: u64) -> u64 {
 }
 
 impl Snapshots {
-    /// Every account any Mac holds a row of, merged at `now` (Unix seconds), by CLI then key.
+    /// Every account any Mac holds a row of, merged at `now` (Unix seconds), by CLI then key. A
+    /// Mac's row that says its roster no longer lists the account ([`QuotaRow::removed`]) is
+    /// left out, so an account every Mac removed is not listed.
     #[must_use]
     pub fn accounts(&self, now: u64) -> Vec<AccountView<'_>> {
         let mut by_account: BTreeMap<(Cli, AccountKey), Vec<MacRow<'_, QuotaRow>>> =
             BTreeMap::new();
         for (subject, row) in self.rows() {
-            if let (Subject::Quota { node, cli, account }, Row::Quota(q)) = (subject, row) {
+            if let (Subject::Quota { node, cli, account }, Row::Quota(q)) = (subject, row)
+                && !q.removed()
+            {
                 by_account
                     .entry((*cli, *account))
                     .or_default()

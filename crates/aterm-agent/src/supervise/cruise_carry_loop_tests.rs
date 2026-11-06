@@ -868,10 +868,21 @@ enum Read {
     /// A message no key in this window typed (Claude Code's Remote Control) opens a turn, its
     /// prompt row drawn above the live turn and the person's count standing.
     Remote,
+    /// The turn running asks a question the harness answers ([`answer_the_box`]), and runs on,
+    /// drawn live: the host counts the answer's Enter a submission, as it counts any Enter over a
+    /// key pressed since the last.
+    Asked,
+    /// As [`Read::Asked`], the recommended option focused as drawn, so the answer is an Enter
+    /// alone: over nothing pressed since the last Enter, the host counts no submission.
+    Focused,
+    /// As [`Read::Asked`], and the break the turn ends on is drawn before any read sees it run.
+    Unseen,
+    /// A break where the host types its own line (`IdleHost::at_background`).
+    Hosted,
 }
 
 /// One read of [`carried_by`]: when (in seconds), what it draws, how the loop steps it, and the
-/// session's submissions served on it (none served at `None`).
+/// session's submissions served on it, past those a box's answer adds (none served at `None`).
 type Then = (i64, Read, Step, Option<u64>);
 
 /// A MEASURED OUTAGE HOLDS THE CARRY: the host's reach, read afresh at the write (the loop's own
@@ -1086,6 +1097,106 @@ fn live_under(prompts: &[&str], said: &str) -> Vec<String> {
     r
 }
 
+/// The harness answers the question box the turn raised, as the loop answers a box read up
+/// ([`Session::auto_read`]): Claude Code's AskUserQuestion, its recommended option the second row,
+/// so a Down and then Enter on that row, or with `focused` the first, focused as drawn, so Enter
+/// alone. Each screen it reads is served `submits`, and the person's last key as the run stamps
+/// it, as never where it stamps none (a host stamps every read); returns the submissions the host
+/// counts of its keys, an Enter over a key pressed since the last (the carry's own Enter the last
+/// before them).
+fn answer_the_box(
+    s: &mut Session<'_, Logged<'_>>,
+    cfg: &SupervisorConfig,
+    submits: Option<u64>,
+    focused: bool,
+) -> u64 {
+    use aterm_phase::prompt::fixtures as f;
+    let asked = f::screen(if focused {
+        f::QUESTION_ONE
+    } else {
+        f::QUESTION_RECOMMENDED_SECOND
+    });
+    let moved: Vec<String> = asked
+        .iter()
+        .map(|row| match row.as_str() {
+            "❯ 1. Built-in runner" => "  1. Built-in runner".to_string(),
+            "  2. Nextest (Recommended)" => "❯ 2. Nextest (Recommended)".to_string(),
+            _ => row.clone(),
+        })
+        .collect();
+    assert_eq!(
+        asked == moved,
+        focused,
+        "PRECONDITION: the focus moves to the second row, or stands on the first"
+    );
+    let opts = SuperviseOpts {
+        policy: SupervisorConfig {
+            answer_questions: true,
+            ..cfg.clone()
+        },
+        ..auto(30)
+    };
+    s.ctl.m.screens = if focused {
+        vec![asked, live_turn()]
+    } else {
+        vec![asked, moved, live_turn()]
+    };
+    s.ctl.m.served = 0;
+    s.ctl.m.submits_on = submits
+        .map(|n| (0..3).map(|k| (k, n)).collect())
+        .unwrap_or_default();
+    s.set_box_settle(Duration::ZERO);
+    let stamped = s.ctl.m.human.clone();
+    if stamped.is_empty() {
+        s.ctl.m.human = vec!["null"];
+    }
+    let from = s.ctl.seen.len();
+    let screen = s.screen().expect("the box's read");
+    let turn = s.turn_of(screen);
+    assert_eq!(turn.phase, Phase::Prompt, "PRECONDITION: a box is up");
+    let deadline = s.fx.mono() + Duration::from_secs(60);
+    let mut heard = Heard::default();
+    let step = s
+        .auto_read(turn, &opts, &[], &mut Vec::new(), deadline, &mut heard)
+        .expect("the box's answer");
+    s.ctl.m.human = stamped;
+    let requests: Vec<&str> = s.ctl.seen[from..].iter().map(|(r, _)| r.as_str()).collect();
+    assert!(
+        matches!(step, crate::supervise::run::Step::Again { .. }),
+        "PRECONDITION: answered, the loop reads again: {requests:#?} {:#?}",
+        heard.noted
+    );
+    let keys: Vec<&str> = requests
+        .iter()
+        .copied()
+        .filter(|r| r.starts_with("key "))
+        .collect();
+    let pressed: Vec<&str> = keys
+        .iter()
+        .map(|k| k.rsplit_once(' ').map_or(*k, |(_, key)| key))
+        .collect();
+    let expected: &[&str] = if focused {
+        &["enter"]
+    } else {
+        &["down", "enter"]
+    };
+    assert_eq!(
+        pressed, expected,
+        "PRECONDITION: the answer's keys: {requests:#?} {:#?}",
+        heard.noted
+    );
+    let mut composed = false;
+    let mut submitted = 0;
+    for key in pressed {
+        if key == "enter" {
+            submitted += u64::from(std::mem::take(&mut composed));
+        } else {
+            composed = true;
+        }
+    }
+    submitted
+}
+
 /// The carries Cruise typed at each of the `reads` (when, in seconds, and what it drew), and what
 /// the run noted, the break's settle `settle` long ([`carried_by`], each read stepped and served
 /// no submissions).
@@ -1113,10 +1224,11 @@ struct Earlier {
 
 /// The carries Cruise typed at each of the `reads`, and what the run noted, the break's settle
 /// `settle` long, by a loop that starts on the books `earlier` left, seeded as a loop's start
-/// seeds them. A turn opened (any but [`Read::Break`], [`Read::Uncounted`] and
-/// [`Read::Scrolled`]) is read running (`Session::took`) before its read, and a turn drawn live
-/// ends the break before it, as in the loop. Each read is served the screen drawn for it, whatever
-/// reads a carry made.
+/// seeds them. A turn opened (any but [`Read::Break`], [`Read::Uncounted`], [`Read::Scrolled`],
+/// [`Read::Unseen`] and [`Read::Hosted`]) is read running (`Session::took`) before its read, and a
+/// turn drawn live ends the break before it, as in the loop. Each read is served the screen drawn
+/// for it, whatever reads a carry made, and its submissions past those, each a box's answer made
+/// or the host's line typed before it, as the host counts them.
 fn carried_after(
     tag: &str,
     settle: Duration,
@@ -1127,18 +1239,21 @@ fn carried_after(
     let at_s: Vec<i64> = reads.iter().map(|&(at, ..)| at).collect();
     let mut typed = Vec::new();
     let mut gestured: Option<i64> = earlier.and_then(|e| e.touched);
+    let mut pressed = 0;
+    let mut lined = 0;
     let drawn = |_| waiting(PLAIN);
     let steps = |i: usize| reads[i].2;
     // No earlier tab's books and no journal beside them.
     let books = crate::supervise::test_scratch_path("carry-books", tag).join("s-1.jsonl");
+    let host = Arc::new(DoorHost {
+        launch: earlier.and_then(|e| e.launch),
+        ..DoorHost::default()
+    });
     let run = Script {
         policy: under(Autopilot::Cruise),
         drawn: &drawn,
         steps: &steps,
-        host: Arc::new(DoorHost {
-            launch: earlier.and_then(|e| e.launch),
-            ..DoorHost::default()
-        }),
+        host: Arc::clone(&host),
         seed: earlier.map(|e| (e.ledger.clone(), T0)),
         ..Script::new(tag, Occupancy::Observe, &at_s)
     }
@@ -1151,10 +1266,21 @@ fn carried_after(
         s.setup.background_settle = settle;
         typed.push(s.ctl.seen.iter().filter(|(r, _)| is_carry(r)).count());
         let (at, read, _, submits) = reads[i];
+        pressed += std::mem::take(&mut lined);
+        host.wants.store(read == Read::Hosted, Ordering::SeqCst);
+        if read == Read::Hosted {
+            *host.notice.lock().expect("notice") = Some("[harness] the host's own line".into());
+            lined = 1;
+        }
         let carry = carry_row();
         s.ctl.m.screens = vec![match read {
-            Read::Break | Read::Uncounted | Read::Taken | Read::Scrolled => waiting(PLAIN),
-            Read::Live | Read::Theirs => live_turn(),
+            Read::Break
+            | Read::Uncounted
+            | Read::Taken
+            | Read::Scrolled
+            | Read::Unseen
+            | Read::Hosted => waiting(PLAIN),
+            Read::Live | Read::Theirs | Read::Asked | Read::Focused => live_turn(),
             Read::Woke => live_under(
                 &[&carry],
                 "⏺ Background command \"Watch the release\" completed (exit code 0)",
@@ -1162,7 +1288,7 @@ fn carried_after(
             Read::Remote => live_under(&[&carry, "❯ what's the status?"], "⏺ Checking."),
         }];
         s.ctl.m.served = 0;
-        s.ctl.m.submits_on = submits.map(|n| (0, n)).into_iter().collect();
+        s.ctl.m.submits_on = submits.map(|n| (0, n + pressed)).into_iter().collect();
         if matches!(read, Read::Theirs | Read::Scrolled) {
             gestured = Some(at);
         }
@@ -1178,10 +1304,33 @@ fn carried_after(
             let stamp: &'static str = Box::leak(ms.to_string().into_boxed_str());
             s.ctl.m.human = vec![stamp];
         }
-        if !matches!(read, Read::Break | Read::Uncounted | Read::Scrolled) {
+        if matches!(read, Read::Asked | Read::Focused | Read::Unseen) {
+            pressed += answer_the_box(s, &cfg, submits.map(|n| n + pressed), read == Read::Focused);
+            s.ctl.m.screens = vec![if read == Read::Unseen {
+                waiting(PLAIN)
+            } else {
+                live_turn()
+            }];
+            s.ctl.m.served = 0;
+            s.ctl.m.submits_on = submits.map(|n| (0, n + pressed)).into_iter().collect();
+        }
+        if !matches!(
+            read,
+            Read::Break | Read::Uncounted | Read::Scrolled | Read::Unseen | Read::Hosted
+        ) {
             s.took(7, Some(&cfg), &mut Heard::default());
         }
     });
+    let hosted = reads.iter().filter(|r| r.1 == Read::Hosted).count();
+    assert_eq!(
+        host.calls()
+            .iter()
+            .filter(|c| *c == "at_background")
+            .count(),
+        hosted,
+        "PRECONDITION: the host typed its line at each break it was offered: {:#?}",
+        run.noted
+    );
     typed.push(carries(&run));
     let at = typed.windows(2).map(|w| w[1] - w[0]).collect();
     (at, run.noted)
@@ -1365,6 +1514,115 @@ fn a_pause_inside_a_turn_ends_no_turn() {
     assert_eq!(paused, [0, 1, 0, 0, 1, 0, 0, 0, 0, 1], "{noted:#?}");
 }
 
+/// A CARRY'S ANSWER NO READ SAW ENDS AT THE SETTLED BREAK AFTER IT: the agent that answers the
+/// carry before the loop's next read leaves a break there, and the wake that opens a turn later
+/// is measured from its own live edge, never from the carry's typing. A break short of its
+/// settle before the answer is drawn live ends no claim: that answer still counts from the typing,
+/// but a wake the first read of the turn draws under the carry's prompt row counts from that read.
+#[test]
+fn a_carrys_answer_no_read_saw_ends_at_its_settled_break() {
+    let settle = Duration::from_secs(20);
+    let lead = [
+        (0, Read::Break),
+        (30, Read::Break),
+        (40, Read::Taken),
+        (60, Read::Break),
+        // The second carry at 150 waits 4 minutes for 390.
+        (150, Read::Break),
+        (153, Read::Break),
+    ];
+    // Its answer is over by the read at 153, and the break settles at 173. The wake at 330 runs
+    // 10 s, 180 s and more after the carry, and its break at 340 settles at 360: a short answer,
+    // so the carry waits there and goes on the ladder at 390.
+    let mut unseen = lead.to_vec();
+    unseen.extend([
+        (173, Read::Break),
+        (330, Read::Woke),
+        (340, Read::Break),
+        (360, Read::Break),
+        (390, Read::Break),
+    ]);
+    let (wake, wake_noted) = carried_over("carry-unseen-answer", settle, &unseen);
+    assert_eq!(wake, [0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 1], "{wake_noted:#?}");
+    assert_eq!(
+        waits(&wake_noted).last().map(String::as_str),
+        Some("2 short answer(s) in a row"),
+        "{wake_noted:#?}"
+    );
+    // The answer is drawn live at 160, short of the break's settle, and runs to 275: 125 s from
+    // the typing, 115 s from its live edge. That is real work, and its break goes at its settle.
+    let mut seen = lead.to_vec();
+    seen.extend([
+        (160, Read::Live),
+        (275, Read::Break),
+        (295, Read::Break),
+        (390, Read::Break),
+    ]);
+    let (answer, answer_noted) = carried_over("carry-late-answer", settle, &seen);
+    assert_eq!(answer, [0, 1, 0, 0, 1, 0, 0, 0, 1, 0], "{answer_noted:#?}");
+    // The program's own wake drawn at 160 instead, the answer over unseen: 115 s of its own, a
+    // short answer, so the carry goes on the ladder at 390.
+    let mut woke = seen;
+    woke[6].1 = Read::Woke;
+    let (wake, wake_noted) = carried_over("carry-wake-in-settle", settle, &woke);
+    assert_eq!(wake, [0, 1, 0, 0, 1, 0, 0, 0, 0, 1], "{wake_noted:#?}");
+}
+
+/// A WAKE IN THE ANSWER'S PLACE OPENS ITS TURN AT ITS FIRST READ: the turn a settled break ends
+/// bounds the person's key it holds the go-ahead for by when it opened
+/// (`TurnEndState::break_keyed`), so the program's own wake drawn under the carry's prompt row
+/// at the first read after the carry (its answer over unseen) opens the turn at that read, as its
+/// busy time counts from there, and a key between the carry and the wake is no hand in it. The
+/// control: an answer drawn live opens the turn at the carry's typing.
+#[test]
+fn a_wake_in_the_answers_place_opens_its_turn_at_its_first_read() {
+    let opened = |tag: &str, rows: Vec<String>| -> Option<Duration> {
+        let cfg = under(Autopilot::Cruise);
+        let drawn = |_| waiting(PLAIN);
+        let mut ago = None;
+        let ran = Script {
+            policy: cfg,
+            drawn: &drawn,
+            ..Script::new(tag, Occupancy::Observe, &[0, 30, 40])
+        }
+        .run(&mut |s, i| {
+            s.setup.background_settle = Duration::from_secs(20);
+            if i != 2 {
+                return;
+            }
+            assert_eq!(
+                s.ctl.seen.iter().filter(|(r, _)| is_carry(r)).count(),
+                1,
+                "PRECONDITION: the carry went at 30"
+            );
+            s.ctl.m.screens = vec![rows.clone()];
+            s.ctl.m.served = 0;
+            let screen = s.screen().expect("the turn's first read");
+            let now = s.fx.mono();
+            s.cruise_carry.live(false, || now);
+            let reader = s.reader(&screen.rows);
+            s.cruise_carry.read(reader, &screen, || now);
+            let turn = s
+                .cruise_carry
+                .at_break(&s.turn_end.timing, &screen, now, true);
+            ago = turn.map(|(from, _)| now.saturating_duration_since(from));
+            s.ctl.m.screens = vec![waiting(PLAIN)];
+            s.ctl.m.served = 0;
+        });
+        assert_eq!(carries(&ran), 1, "{:#?}", ran.noted);
+        ago
+    };
+    let woke = live_under(
+        &[&carry_row()],
+        "⏺ Background command \"Watch the release\" completed (exit code 0)",
+    );
+    assert_eq!(opened("carry-wake-opens", woke), Some(Duration::ZERO));
+    assert_eq!(
+        opened("carry-answer-opens", live_turn()),
+        Some(Duration::from_secs(10))
+    );
+}
+
 /// REAL WORK IS STICKY: a wake that ran real work ends on a break whose carry a halt holds; a
 /// short wake after it, the halt lifted, still goes at once and starts the ladder at one, never
 /// on the ladder the work had reset.
@@ -1535,6 +1793,318 @@ fn a_scroll_is_no_message_and_a_submission_not_the_harnesss_is() {
     }
     let (sent, sent_noted) = carried_by("carry-submitted", Duration::ZERO, &message);
     assert_eq!(sent, [1, 0, 1, 0, 0, 0, 1, 0], "{sent_noted:#?}");
+}
+
+/// THE HARNESS'S OWN ANSWER IS NO ONE ELSE'S MESSAGE: the host counts the Enter the harness
+/// answers a box with inside a turn (a Down, then Enter) a submission, so a wake whose question
+/// the harness answered, and the carry's answer with one in it, keep the carry on the ladder.
+/// Another driver's Enter there starts the books again, beside the harness's answer or alone.
+#[test]
+fn a_box_the_harness_answers_inside_a_turn_keeps_the_ladder() {
+    let settle = Duration::from_secs(20);
+    let then = |reads: &[(i64, Read, u64)]| -> Vec<Then> {
+        reads
+            .iter()
+            .map(|&(at, read, n)| (at, read, Step::Stepped, Some(n)))
+            .collect()
+    };
+    // The carries at 30 and 150 each submit one; the second, answered short at 160, waits 4
+    // minutes for 390. The program's own wake at 330 asks a question at 335, which the harness
+    // answers; its turn ends on the work at 345, settled at 365.
+    let ladder = [
+        (0, Read::Break, 3),
+        (30, Read::Break, 3),
+        (40, Read::Taken, 4),
+        (60, Read::Break, 4),
+        (150, Read::Break, 4),
+        (160, Read::Taken, 5),
+        (180, Read::Break, 5),
+        (330, Read::Woke, 5),
+        (335, Read::Asked, 5),
+        (345, Read::Break, 5),
+        (365, Read::Break, 5),
+        (390, Read::Break, 5),
+    ];
+    let (woke, woke_noted) = carried_by("carry-asked-wake", settle, &then(&ladder));
+    assert_eq!(
+        woke,
+        [0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1],
+        "{woke_noted:#?}"
+    );
+    assert_eq!(
+        waits(&woke_noted).last().map(String::as_str),
+        Some("2 short answer(s) in a row"),
+        "{woke_noted:#?}"
+    );
+    // The second carry's own answer asks the question at 165: its turn ends at 180, settled at
+    // 200, the carry's Enter and the answer's both the harness's.
+    let carried = [
+        (0, Read::Break, 3),
+        (30, Read::Break, 3),
+        (40, Read::Taken, 4),
+        (60, Read::Break, 4),
+        (150, Read::Break, 4),
+        (160, Read::Live, 5),
+        (165, Read::Asked, 5),
+        (180, Read::Break, 5),
+        (200, Read::Break, 5),
+        (390, Read::Break, 5),
+    ];
+    let (answer, answer_noted) = carried_by("carry-asked-answer", settle, &then(&carried));
+    assert_eq!(answer, [0, 1, 0, 0, 1, 0, 0, 0, 0, 1], "{answer_noted:#?}");
+    // Its question asked at 152, before any read sees the answer run: the carry's Enter still
+    // counts from the break it was typed at, the turn opened on both Enters.
+    let mut early = carried;
+    early[5] = (152, Read::Asked, 5);
+    early[6] = (165, Read::Live, 5);
+    let (answer, answer_noted) = carried_by("carry-asked-early", settle, &then(&early));
+    assert_eq!(answer, [0, 1, 0, 0, 1, 0, 0, 0, 0, 1], "{answer_noted:#?}");
+    // Another driver's Enter where the harness answered, beside its answer or in place of it:
+    // someone else's message, so the carry goes at the turn's settle, the wake's and the carry's
+    // answer's alike.
+    let theirs = |tag: &str, reads: &[(i64, Read, u64)], at: usize, read: Read| {
+        let mut reads = reads.to_vec();
+        for r in &mut reads[at..] {
+            r.2 += 1;
+        }
+        reads[at].1 = read;
+        carried_by(tag, settle, &then(&reads))
+    };
+    for read in [Read::Asked, Read::Live] {
+        let (woke, noted) = theirs(&format!("carry-theirs-wake-{read:?}"), &ladder, 8, read);
+        assert_eq!(
+            woke,
+            [0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0],
+            "{read:?}: {noted:#?}"
+        );
+        let (answer, noted) = theirs(&format!("carry-theirs-answer-{read:?}"), &carried, 6, read);
+        assert_eq!(
+            answer,
+            [0, 1, 0, 0, 1, 0, 0, 0, 1, 0],
+            "{read:?}: {noted:#?}"
+        );
+    }
+}
+
+/// AN ENTER OVER NOTHING PRESSED IS NO SUBMISSION: the host counts an Enter only over a key pressed
+/// since the last, so the harness's answer to a box whose option has the focus as drawn (Enter
+/// alone, as a focused recommendation or a Muse Code approval is answered) submits nothing, and
+/// another driver's Enter beside it is still someone else's message: the carry goes at the turn's
+/// settle. Alone, the answer keeps the ladder, as the Down and Enter does
+/// (`a_box_the_harness_answers_inside_a_turn_keeps_the_ladder`).
+#[test]
+fn an_enter_over_nothing_pressed_hides_no_one_elses_message() {
+    let settle = Duration::from_secs(20);
+    let then = |reads: &[(i64, Read, u64)]| -> Vec<Then> {
+        reads
+            .iter()
+            .map(|&(at, read, n)| (at, read, Step::Stepped, Some(n)))
+            .collect()
+    };
+    // The second carry, answered short at 160, waits 4 minutes for 390. The program's own wake
+    // at 330 asks at 335; its turn ends on the work at 345, settled at 365.
+    let wake = [
+        (0, Read::Break, 3),
+        (30, Read::Break, 3),
+        (40, Read::Taken, 4),
+        (60, Read::Break, 4),
+        (150, Read::Break, 4),
+        (160, Read::Taken, 5),
+        (180, Read::Break, 5),
+        (330, Read::Woke, 5),
+        (335, Read::Focused, 5),
+        (345, Read::Break, 5),
+        (365, Read::Break, 5),
+        (390, Read::Break, 5),
+    ];
+    // The second carry's own answer asks at 165; its turn ends at 180, settled at 200.
+    let answer = [
+        (0, Read::Break, 3),
+        (30, Read::Break, 3),
+        (40, Read::Taken, 4),
+        (60, Read::Break, 4),
+        (150, Read::Break, 4),
+        (160, Read::Live, 5),
+        (165, Read::Focused, 5),
+        (180, Read::Break, 5),
+        (200, Read::Break, 5),
+        (390, Read::Break, 5),
+    ];
+    for (tag, reads, at, ladder, settled) in [
+        (
+            "wake",
+            &wake[..],
+            8,
+            &[0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1][..],
+            &[0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0][..],
+        ),
+        (
+            "answer",
+            &answer[..],
+            6,
+            &[0, 1, 0, 0, 1, 0, 0, 0, 0, 1],
+            &[0, 1, 0, 0, 1, 0, 0, 0, 1, 0],
+        ),
+    ] {
+        let (alone, noted) = carried_by(&format!("carry-focused-{tag}"), settle, &then(reads));
+        assert_eq!(alone, ladder, "{tag}: {noted:#?}");
+        let mut theirs = reads.to_vec();
+        for r in &mut theirs[at..] {
+            r.2 += 1;
+        }
+        let (beside, noted) = carried_by(
+            &format!("carry-focused-theirs-{tag}"),
+            settle,
+            &then(&theirs),
+        );
+        assert_eq!(beside, settled, "{tag}: {noted:#?}");
+    }
+}
+
+/// THE HOST'S OWN LINE IS THE HARNESS'S: the host types its line at a break, apart from the loop's
+/// writes, and the turn it opens keeps the ladder though the loop answered a box no read saw run
+/// before it (that Enter in the count beside the line's). Another driver's Enter in the line's
+/// turn still starts the books again.
+#[test]
+fn the_hosts_line_after_an_answer_no_read_saw_is_the_harnesss() {
+    let settle = Duration::from_secs(20);
+    // The second carry, answered short at 160, settled at 200, waits 4 minutes for 390. A wake's
+    // question the harness answers is up at 210, its work back on the break there, read afresh;
+    // the break settles at 230, where the host types its line. Its turn runs from 240 to 250,
+    // settled at 270.
+    let reads = [
+        (0, Read::Break, 3),
+        (30, Read::Break, 3),
+        (40, Read::Taken, 4),
+        (60, Read::Break, 4),
+        (150, Read::Break, 4),
+        (160, Read::Taken, 5),
+        (180, Read::Break, 5),
+        (200, Read::Break, 5),
+        (210, Read::Unseen, 5),
+        (230, Read::Hosted, 5),
+        (240, Read::Live, 5),
+        (250, Read::Break, 5),
+        (270, Read::Break, 5),
+        (390, Read::Break, 5),
+    ];
+    let then = |reads: &[(i64, Read, u64)]| -> Vec<Then> {
+        reads
+            .iter()
+            .map(|&(at, read, n)| {
+                let step = if read == Read::Unseen {
+                    Step::Again
+                } else {
+                    Step::Stepped
+                };
+                (at, read, step, Some(n))
+            })
+            .collect()
+    };
+    let (lined, noted) = carried_by("carry-host-line", settle, &then(&reads));
+    assert_eq!(
+        lined,
+        [0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "{noted:#?}"
+    );
+    let mut theirs = reads;
+    for r in &mut theirs[10..] {
+        r.2 += 1;
+    }
+    let (beside, noted) = carried_by("carry-host-line-theirs", settle, &then(&theirs));
+    assert_eq!(
+        beside,
+        [0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0],
+        "{noted:#?}"
+    );
+}
+
+/// An Enter the server took submits only over a key pressed since the last, as the host counts
+/// them: a `key` Enter over the loop's own key, a `turn` that pressed one, a `send` ending in a
+/// newline over its text. An Enter over nothing pressed submits nothing; a key that is no Enter,
+/// text with no newline, and a `turn` that typed and pressed none leave a key pressed. An Enter
+/// skipped or refused, a `turn` refused before it typed, and a read change nothing.
+#[test]
+fn an_enter_submits_only_over_a_key_pressed_since_the_last() {
+    use crate::supervise::run::cruise_carry_loop::submits_of;
+    let took = ok("OK seq=9\n");
+    let skipped = ok("OK skipped reason=changed seq=9\n");
+    let halted = err("halted");
+    let turned = ok("OK id=1 submitted=1 status=settled seq=9 dur_ms=600 hash=0\n");
+    let pressed = ok("OK id=1 submitted=0 pressed=1 status=settled seq=9 dur_ms=600 hash=0\n");
+    let unpressed = ok("OK id=1 submitted=0 pressed=0 status=settled seq=9 dur_ms=600 hash=0\n");
+    let unsent = err(aterm_types::control_verbs::TURN_SUBMIT_BUSY_REPLY
+        .strip_prefix("ERR ")
+        .expect("an ERR reply"));
+    let enter = &["key", "if-gen=1.9", "if=x", "enter"][..];
+    let turn = &["turn", "idle=600", "go on"][..];
+    for (args, reply, composed, after) in [
+        (enter, &took, true, (1, false)),
+        (enter, &took, false, (0, false)),
+        (
+            &["@s-1", "key", "act=answer", "if=x", "enter"],
+            &took,
+            true,
+            (1, false),
+        ),
+        (
+            &["key", "if-gen=1.9", "if=x", "down"],
+            &took,
+            false,
+            (0, true),
+        ),
+        (&["key", "if-gen=1.9", "if=x", "1"], &took, false, (0, true)),
+        (enter, &skipped, true, (0, true)),
+        (enter, &halted, true, (0, true)),
+        (turn, &turned, false, (1, false)),
+        (turn, &pressed, false, (1, false)),
+        (turn, &unpressed, false, (0, true)),
+        (turn, &unsent, false, (0, true)),
+        (turn, &halted, false, (0, false)),
+        (
+            &["send", "if-gen=1.9", "--", "go on\\n"],
+            &took,
+            false,
+            (1, false),
+        ),
+        (
+            &["send", "if-gen=1.9", "--", "go on\n"],
+            &took,
+            false,
+            (1, false),
+        ),
+        (
+            &["send", "if-gen=1.9", "--", "\\n"],
+            &took,
+            false,
+            (0, false),
+        ),
+        (
+            &["send", "if-gen=1.9", "--", "\\n"],
+            &took,
+            true,
+            (1, false),
+        ),
+        (
+            &["send", "if-gen=1.9", "--", "go on"],
+            &took,
+            false,
+            (0, true),
+        ),
+        (
+            &["send", "if-gen=1.9", "--", "go on"],
+            &skipped,
+            false,
+            (0, false),
+        ),
+        (&["text", "--json", "tail=40"], &took, true, (0, true)),
+    ] {
+        assert_eq!(
+            submits_of(args, reply, composed),
+            after,
+            "{args:?} {reply:?} over {composed}"
+        );
+    }
 }
 
 /// A turn whose end the loop did not read is unsure: under Off the loop takes a live turn but
@@ -1966,12 +2536,23 @@ fn a_limit_episode_past_its_reset_holds_no_carry() {
 /// place, under its own rule, recorded as the policy's act, and once the agent takes it the carry
 /// follows on the ladder. Where the host wants the break, its step (an upgrade's notice) waits
 /// behind the continuation, to the next break. Before, the owed continuation read as an act
-/// untaken and held every line at every break. NEGATIVE CONTROLS: a `/compact` the agent has not
-/// taken yet holds the break (`held:act-untaken`), and so do a wake's settle and a credits hold
-/// with the continuation owed.
+/// untaken and held every line at every break. The continuation also goes ahead of a go-ahead
+/// over the break's park and of a spent park's change of approach (`BreakPark::answers`,
+/// `BreakPark::verdict`): the park's line stays up, as no go-ahead answers it at that break, no
+/// refusal is recorded there, and a park still spent at a later break gets the change of approach
+/// and the refusal (`recovering:go-ahead-refused`). With answers off the continuation over a park
+/// leaves out its sentence that the go-ahead is no need, as the carry does there. NEGATIVE
+/// CONTROLS: a `/compact` the agent has not taken yet holds the break (`held:act-untaken`), and so
+/// do a wake's settle and a credits hold with the continuation owed; the run that stops at the
+/// continuation records no refusal; with answers off a break that parks nothing keeps the whole
+/// continuation. (These combined rows were first written in fab2c44f2f, ca72930fc1 and
+/// 7ab54b4e39, and lost in the merge ff6b099179.)
 #[test]
 fn a_compactions_owed_continuation_is_typed_at_the_break() {
-    use crate::supervise::policy::turn_end::{RULE_COMPACT, Then, continuation_text};
+    use crate::supervise::policy::go_ahead::{NEVER_A_NEED, unless_held};
+    use crate::supervise::policy::turn_end::{
+        GO_AHEAD_ACTS, RULE_COMPACT, Then, continuation_text,
+    };
     /// What else the break holds.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Also {
@@ -1983,23 +2564,43 @@ fn a_compactions_owed_continuation_is_typed_at_the_break() {
         /// The agent is spending usage credits, which the policy keeps off.
         Credits,
     }
-    let cfg = under(Autopilot::Cruise);
-    let continuation = continuation_text(&cfg, None);
+    /// One run: the agent took the `/compact` before the first read, the host wants the break,
+    /// what else holds it, the reads, each read's report ([`PLAIN`] past the last given), the
+    /// go-ahead spent on [`PARKED`]'s park before the first read, and answers on.
+    #[derive(Debug, Clone, Copy)]
+    struct Run {
+        compacted: bool,
+        wants: bool,
+        also: Also,
+        at_s: &'static [i64],
+        said: &'static [&'static [&'static str]],
+        spent: bool,
+        answers: bool,
+    }
+    // The shipped continuation, which says the go-ahead is no need (this harness's own is short).
+    let cruise = |answers: bool| SupervisorConfig {
+        answer_questions: answers,
+        continue_text: crate::supervise::config::CONTINUE_TEXT.to_string(),
+        ..under(Autopilot::Cruise)
+    };
+    let continuation = continuation_text(&cruise(true), None);
+    assert!(continuation.contains(NEVER_A_NEED), "{continuation}");
     let owed = format!(" -- {continuation}");
-    let run = |compacted: bool, wants: bool, also: Also, at_s: &[i64]| {
+    let run = |r: Run| {
+        let cfg = cruise(r.answers);
         let host = Arc::new(DoorHost::default());
-        host.wants.store(wants, Ordering::SeqCst);
-        if also == Also::Notice {
+        host.wants.store(r.wants, Ordering::SeqCst);
+        if r.also == Also::Notice {
             *host.notice.lock().expect("notice") = Some("the upgrade's notice".to_string());
         }
-        let drawn = move |_| {
-            let mut r = waiting(PLAIN);
-            if also == Also::Credits {
-                let mode = r.last_mut().expect("the mode row");
+        let drawn = move |i: usize| {
+            let mut rows = waiting(r.said.get(i).copied().unwrap_or(PLAIN));
+            if r.also == Also::Credits {
+                let mode = rows.last_mut().expect("the mode row");
                 *mode =
                     aterm_phase::prompt::fixtures::right_aligned(mode, "Now using usage credits");
             }
-            r
+            rows
         };
         Script {
             policy: cfg.clone(),
@@ -2007,7 +2608,7 @@ fn a_compactions_owed_continuation_is_typed_at_the_break() {
             host,
             // The compaction ran before 0 s; the agent takes the continuation at 10 s and its turn
             // ends on the work again; the carry is due 2 minutes after the continuation.
-            ..Script::new("carry-owed", Occupancy::Observe, at_s)
+            ..Script::new("carry-owed", Occupancy::Observe, r.at_s)
         }
         .run(&mut |s, i| {
             if i == 0 {
@@ -2018,11 +2619,19 @@ fn a_compactions_owed_continuation_is_typed_at_the_break() {
                     then: Then::Continue,
                 };
                 s.turn_end.acted(&compact, &reading, s.fx.mono());
-                if also == Also::Wake {
+                if r.spent {
+                    let park = crate::supervise::policy::go_ahead::parked("", &PARKED.join("\n"))
+                        .expect("the existing positive go-ahead fixture");
+                    for _ in 0..GO_AHEAD_ACTS {
+                        s.turn_end.go_ahead_typed(&park, s.fx.mono());
+                    }
+                    assert!(s.turn_end.go_ahead_spent(s.fx.mono()));
+                }
+                if r.also == Also::Wake {
                     s.clock_marks = Some((s.fx.mono(), T0 - 8 * 3_600_000));
                 }
             }
-            if compacted && i < 2 {
+            if r.compacted && i < 2 {
                 s.took(7, Some(&cfg), &mut Heard::default());
             }
         })
@@ -2033,8 +2642,26 @@ fn a_compactions_owed_continuation_is_typed_at_the_break() {
             .filter(|r| r.starts_with("send "))
             .collect()
     };
+    let refused = |ran: &Ran| {
+        ran.noted
+            .iter()
+            .any(|l| l.contains("recovering:go-ahead-refused"))
+    };
+    let base = Run {
+        compacted: true,
+        wants: false,
+        also: Also::Nothing,
+        at_s: &[0, 10, 200],
+        said: &[PLAIN],
+        spent: false,
+        answers: true,
+    };
     // The host's own step at the break goes at the next one, once the continuation is in.
-    let ran = run(true, true, Also::Notice, &[0, 10, 200]);
+    let ran = run(Run {
+        wants: true,
+        also: Also::Notice,
+        ..base
+    });
     let sent = sends(&ran);
     assert!(
         sent.first().is_some_and(|s| s.ends_with(&owed)),
@@ -2058,12 +2685,25 @@ fn a_compactions_owed_continuation_is_typed_at_the_break() {
         "{:#?}",
         ran.noted
     );
-    for wants in [false, true] {
-        let ran = run(true, wants, Also::Nothing, &[0, 10, 200]);
+    for (wants, said, spent) in [
+        (false, &[PLAIN], false),
+        (true, &[PLAIN], false),
+        (false, &[PARKED], false),
+        (true, &[PARKED], false),
+        (false, &[PARKED], true),
+        (true, &[PARKED], true),
+    ] {
+        let row = Run {
+            wants,
+            said,
+            spent,
+            ..base
+        };
+        let ran = run(row);
         let sent = sends(&ran);
         assert!(
             sent.len() == 2 && sent[0].ends_with(&owed) && is_carry(&sent[1]),
-            "wants={wants}: the continuation, then the carry: {sent:#?}\n{:#?}",
+            "{row:?}: the continuation, then the carry: {sent:#?}\n{:#?}",
             ran.noted
         );
         let typed_compact = ran
@@ -2075,36 +2715,99 @@ fn a_compactions_owed_continuation_is_typed_at_the_break() {
                 text("rule_id") == Some(RULE_COMPACT) && text("decision") == Some("typed")
             })
             .count();
-        assert_eq!(typed_compact, 1, "wants={wants}: {}", ran.ledger);
-        let untaken = run(false, wants, Also::Nothing, &[0, 10, 200]);
+        assert_eq!(typed_compact, 1, "{row:?}: {}", ran.ledger);
+        assert!(
+            !ran.calls.iter().any(|c| c == "at_background"),
+            "{row:?}: {:?}",
+            ran.calls
+        );
+        // No go-ahead answers the park at the continuation's break, so its line goes up there;
+        // the continuation records no refusal, spent park or not.
+        if said[0] == PARKED {
+            let up = raised(&ran);
+            assert!(
+                up.iter().any(|u| u.contains("rerun the checks")),
+                "{row:?}: {up:#?}"
+            );
+        }
+        assert!(!refused(&ran), "{row:?}: {:#?}", ran.noted);
+        let untaken = run(Run {
+            compacted: false,
+            ..row
+        });
         assert!(
             untaken.writes().is_empty(),
-            "wants={wants}: {:#?}",
+            "{row:?}: {:#?}",
             untaken.writes()
         );
         assert!(
             untaken.noted.iter().any(|l| l.contains("act-untaken")),
-            "wants={wants}: {:#?}",
+            "{row:?}: {:#?}",
             untaken.noted
         );
         for (also, held) in [
             (Also::Wake, "held:wake-settle"),
             (Also::Credits, "held:credits"),
         ] {
-            let ran = run(true, wants, also, &[0, 10]);
+            let ran = run(Run {
+                also,
+                at_s: &[0, 10],
+                ..row
+            });
             assert!(
                 ran.writes().is_empty(),
-                "wants={wants} {also:?}: {:#?}",
+                "{row:?} {also:?}: {:#?}",
                 ran.writes()
             );
             assert!(
                 ran.noted
                     .iter()
                     .any(|l| l.starts_with("DEFERRED ") && l.ends_with(held)),
-                "wants={wants} {also:?}: {:#?}",
+                "{row:?} {also:?}: {:#?}",
                 ran.noted
             );
         }
+    }
+    // A park still spent after the continuation: the next due break changes approach and records
+    // the refusal. NEGATIVE CONTROL: stopped at the continuation's break, nothing is refused.
+    let spent = Run {
+        said: &[PARKED, PARKED, PARKED],
+        spent: true,
+        ..base
+    };
+    let ran = run(spent);
+    let sent = sends(&ran);
+    assert!(
+        sent.len() == 2 && sent[0].ends_with(&owed) && sent[1].contains("different safe approach"),
+        "{sent:#?}\n{:#?}",
+        ran.noted
+    );
+    assert!(refused(&ran), "{:#?}", ran.noted);
+    let first = run(Run {
+        at_s: &[0],
+        ..spent
+    });
+    assert!(
+        sends(&first).len() == 1 && !refused(&first),
+        "NEGATIVE CONTROL: {:#?}\n{:#?}",
+        first.requests(),
+        first.noted
+    );
+    // Answers off: the continuation over the park leaves its go-ahead sentence out, and the carry
+    // follows. NEGATIVE CONTROL: a break that parks nothing keeps the whole continuation.
+    let cut = format!(" -- {}", unless_held(&continuation, true));
+    for (said, want) in [(&[PARKED], &cut), (&[PLAIN], &owed)] {
+        let ran = run(Run {
+            said,
+            answers: false,
+            ..base
+        });
+        let sent = sends(&ran);
+        assert!(
+            sent.len() == 2 && sent[0].ends_with(want.as_str()) && is_carry(&sent[1]),
+            "answers off, {said:?}: {sent:#?}\n{:#?}",
+            ran.noted
+        );
     }
 }
 
@@ -2873,7 +3576,7 @@ fn a_line_held_for_the_go_ahead_stays_off_behind_the_hosts_line() {
 /// A BREAK WHOSE TURN PARKS NOTHING ENDS THE PARK (2026-10-29 review 3): the go-ahead's count
 /// starts again there, as it does at a turn end, so a park the agent takes up again after it
 /// gets the go-ahead anew, past the bound one unbroken park gets
-/// ([`a_park_at_breaks_gets_the_go_ahead_its_limit_of_times`], the negative control), and the
+/// ([`a_park_at_breaks_recovers_after_its_routine_answer_limit`], the negative control), and the
 /// carry goes at the break between.
 #[test]
 fn a_break_that_parks_nothing_starts_the_go_ahead_count_again() {

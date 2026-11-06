@@ -200,7 +200,7 @@ pub struct Making {
     pub test_binary: bool,
     /// It was built with debug assertions on.
     pub debug_build: bool,
-    /// A lab lane marked it (`ATERM_LAB_MEMBER_SERVICE` is set).
+    /// A lab lane marked it (`ATERM_LAB_MEMBER_SERVICE` or `ATERM_LAB_VAULT_SERVICE` is set).
     pub lab_lane: bool,
     /// It runs inside a virtual machine.
     pub virtual_machine: bool,
@@ -266,15 +266,6 @@ pub enum ErrorKind {
     /// A locally retained causal frontier is not yet covered by complete raw records.
     /// Credential authority is unavailable; record intake may repair the missing history.
     MembershipHistoryUnavailable,
-    /// A connect to a private or link-local address (a vault on this LAN) found no route:
-    /// what macOS answers while aterm may not yet reach the local network (its Local Network
-    /// question is open, or was answered Don't Allow), and also what a LAN host that is down
-    /// gives, which nothing here tells apart. Asked again shortly, it may answer; it is no
-    /// evidence that no vault is there. Only on macOS, and only until a look heard the switch
-    /// on (`transport::set_local_network_granted`): elsewhere nothing gates the local network,
-    /// and once the switch is known on the host did not answer; either way the same failure is
-    /// [`ErrorKind::Other`].
-    LocalNetworkPending,
     /// A request that ran past its deadline: a long-poll the server still held, a lookup with
     /// no answer, a slow network or a host that sleeps, which nothing here tells apart.
     TimedOut,

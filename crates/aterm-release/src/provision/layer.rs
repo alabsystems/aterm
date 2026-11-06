@@ -63,9 +63,6 @@ pub(crate) trait ReleaseHost: Send + Sync {
     /// The need ledger cannot be read or written.
     fn site_key_need(&self, step: NeedStep) -> Result<Option<String>, String>;
 
-    /// The program `name` as aterm's resolver finds it (`aterm_uds::host::find_tool`).
-    fn find(&self, name: &str) -> Option<PathBuf>;
-
     /// This machine's git lists `url`'s `HEAD`, with no prompt, as the engine's fetches and
     /// pushes reach it.
     /// # Errors
@@ -256,26 +253,15 @@ impl LayerItem {
                 how: format!("no publication engine at {shown} (a checkout with bin/pub)"),
             };
         }
-        match self.host.find("gitleaks") {
-            Some(gitleaks) => match self.host.publication_bootstrap() {
-                Ok(()) => Probe::Ok {
-                    now: format!("{shown}/bin/pub, gitleaks {}", gitleaks.display()),
-                },
-                // The interpreter is a pinned `verify provision --release` row, so its absence
-                // is a gap with a fix, never a check that could not run.
-                Err(Bootstrap::NoPython(why)) => Probe::Change {
-                    from: why,
-                    to: "the pinned cpython first on the publication PATH".into(),
-                },
-                Err(Bootstrap::Failed(why)) => Probe::Unusable { why },
+        match self.host.publication_bootstrap() {
+            Ok(()) => Probe::Ok {
+                now: format!("{shown}/bin/pub with signed, leased publication prerequisites"),
             },
-            None => Probe::Person {
-                step: self.id.into(),
-                how: format!(
-                    "the publication engine at {shown} has no gitleaks where `pub stage` finds \
-                     it (its own dependency)"
-                ),
+            Err(Bootstrap::Prerequisites(why)) => Probe::Change {
+                from: why,
+                to: "signed cpython, gitleaks, openssl-signing and lean4 packages".into(),
             },
+            Err(Bootstrap::Failed(why)) => Probe::Unusable { why },
         }
     }
 
@@ -398,13 +384,12 @@ impl LayerItem {
             Kind::Openssl => Remedy::None,
             Kind::Publication => Remedy::Command(
                 "clone the publication engine at ~/publication (or name one: \
-                 PUBLICATION_ENGINE), with gitleaks on PATH"
+                 PUBLICATION_ENGINE), with its signed atpkg prerequisites installed"
                     .into(),
             ),
             Kind::SourceSigning => Remedy::Command(
                 "build atpkg-keys with `targo --unverified build --profile gate -p atpkg-keys`, and \
-                 provide OpenSSL 3 with `targo --unverified verify provision --release` (or name \
-                 one: PUBLISH_OPENSSL)"
+                 install its signed verifier with `aterm pkg install openssl-signing`"
                     .into(),
             ),
             Kind::EngineReach => Remedy::Command(
@@ -510,9 +495,9 @@ impl Item for LayerItem {
             (Kind::Base, Probe::Blocked { .. }) => Remedy::Command(
                 "install aterm (tools/install.sh), then `aterm init --only base`".into(),
             ),
-            (Kind::Publication, Probe::Change { .. }) => Remedy::Provision {
-                args: "--release".into(),
-            },
+            (Kind::Publication, Probe::Change { .. }) => {
+                Remedy::Command(crate::managed_prerequisites::REMEDY.into())
+            }
             (Kind::SourceSigning, Probe::Change { .. }) => Remedy::Command(format!(
                 "{} provision --id <this machine's roster id>",
                 crate::publish::SHIP_COMMAND
@@ -898,10 +883,6 @@ impl ReleaseHost for System {
             .map_err(|e| e.to_string())
     }
 
-    fn find(&self, name: &str) -> Option<PathBuf> {
-        aterm_uds::host::find_tool(name)
-    }
-
     fn reach(&self, url: &str) -> Result<(), String> {
         let mut cmd = aterm_uds::spawnfd::command("git");
         cmd.args(["ls-remote", url, "HEAD"])
@@ -938,7 +919,6 @@ mod tests {
         openssl: Option<String>,
         site: Option<PathBuf>,
         site_key: Option<PathBuf>,
-        tools: Vec<&'static str>,
         bootstrap_error: Option<Bootstrap>,
         source_signing_error: Option<SigningGap>,
         source_signing_calls: std::sync::atomic::AtomicUsize,
@@ -988,11 +968,6 @@ mod tests {
                 NeedStep::Satisfied if raised => Some("fulfilled".into()),
                 NeedStep::Read | NeedStep::Satisfied => None,
             })
-        }
-        fn find(&self, name: &str) -> Option<PathBuf> {
-            self.tools
-                .contains(&name)
-                .then(|| PathBuf::from(format!("/fake/bin/{name}")))
         }
         fn reach(&self, url: &str) -> Result<(), String> {
             if self.unreached.contains(&url) {
@@ -1086,15 +1061,15 @@ mod tests {
             line_of(fake, "release.publication"),
             Check::CouldNotRun(why) if why.contains("launcher runtime unavailable")
         ));
-        // m58: pub-python found no 3.11+, which the pinned cpython row provides.
+        // A PATH interpreter does not satisfy signed package admission.
         let mut fake = whole(dir.path());
-        fake.bootstrap_error = Some(Bootstrap::NoPython(
-            "pub: no Python 3.11 or newer (with tomllib) on PATH".into(),
+        fake.bootstrap_error = Some(Bootstrap::Prerequisites(
+            "cpython has no signed package".into(),
         ));
         match line_of(fake, "release.publication") {
             Check::Fail { what, fix } => {
-                assert!(what.contains("no Python 3.11"), "{what}");
-                assert_eq!(fix, "targo --unverified verify provision --release");
+                assert!(what.contains("cpython has no signed package"), "{what}");
+                assert_eq!(fix, crate::managed_prerequisites::REMEDY);
             }
             other => panic!("{other:?}"),
         }
@@ -1110,9 +1085,13 @@ mod tests {
         let home = dir.path();
 
         let mut fake = whole(home);
-        fake.tools = Vec::new();
+        fake.bootstrap_error = Some(Bootstrap::Prerequisites(
+            "gitleaks has no signed package".into(),
+        ));
         match line_of(fake, "release.publication") {
-            Check::Fail { what, .. } => assert!(what.contains("no gitleaks"), "{what}"),
+            Check::Fail { what, .. } => {
+                assert!(what.contains("gitleaks has no signed package"), "{what}")
+            }
             other => panic!("{other:?}"),
         }
 
@@ -1162,7 +1141,6 @@ mod tests {
             openssl: Some("LibreSSL 3.3.6".into()),
             site: Some(home.join("site")),
             site_key: Some(home.join("deployer.json")),
-            tools: vec!["gitleaks"],
             bootstrap_error: None,
             source_signing_error: None,
             source_signing_calls: std::sync::atomic::AtomicUsize::new(0),

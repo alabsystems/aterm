@@ -1001,7 +1001,7 @@ fn the_bundle_lane_prints_the_bundle_packs_never_runs_them() {
     let trust = alab::bundle_command(row(&o, "trust"));
     assert!(
         trust.iter().any(|l| l
-            == "atpkg-publish publish-group rustc --seal <the staged copy of the seal> --upload")
+            == "atpkg-publish publish-group rustc --seal <the staged copy of the seal> --stage-upload")
     );
     assert!(
         !trust.iter().any(|l| l.contains("pack-bundle")),

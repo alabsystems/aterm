@@ -1,24 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! System State's access steps: the Local Network trigger's target, the menu
-//! line, the step gating and a Needs-you row's press. Nothing reaches a LAN, a
-//! person's state directory or System Settings. The dialog-ownership regressions use
+//! System State's access steps: the menu line, the step gating and a Needs-you
+//! row's press. Nothing reaches a person's state directory or System Settings. The dialog-ownership regressions use
 //! the real process-wide guard, without raising a dialog.
 
 use std::cell::RefCell;
-use std::net::Ipv4Addr;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aterm_types::macos_setup::{
     Access, AccessOutcome, Observation, Plan, Selection, Setting, Standing, Subject,
 };
 
-use super::{
-    JOIN_PENDING_KEY, LOCAL_NETWORK_ALERT_HOLD, LanHere, LanInterface, RETIRED_KEYS, StepsReach,
-    lan_target, menu_line, setup_field, watch_network_moves,
-};
+use super::{JOIN_PENDING_KEY, RETIRED_KEYS, StepsReach, menu_line, setup_field};
 use crate::status_item::SystemStateLine;
 use crate::{App, InitialSetupPermissionPolicy, SetupStatus};
 
@@ -42,149 +36,6 @@ fn ended_as(app: &App, key: &str) -> Option<aterm_messages::Retired> {
         .rev()
         .find(|r| r.key.as_deref() == Some(key))
         .and_then(|r| r.retired().cloned())
-}
-
-fn ip(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
-    Ipv4Addr::new(a, b, c, d)
-}
-
-/// A broadcast-capable interface (a LAN segment).
-fn lan(address: Ipv4Addr, mask: Ipv4Addr) -> LanInterface {
-    LanInterface {
-        address,
-        mask,
-        broadcast: true,
-    }
-}
-
-/// The Local Network target: an attached subnet's first host (its second when the first is this
-/// Mac), private first, then link-local, then any other (a public one), and none on a subnet
-/// with no room for another host, a mask outside /8–/30 or a tunnel (no broadcast: a VPN's
-/// `utun`).
-#[test]
-fn the_lan_target_is_an_attached_subnets_other_host_private_first() {
-    let slash24 = ip(255, 255, 255, 0);
-    assert_eq!(
-        lan_target(&[lan(ip(192, 168, 1, 23), slash24)]),
-        Some(ip(192, 168, 1, 1))
-    );
-    assert_eq!(
-        lan_target(&[lan(ip(192, 168, 1, 1), slash24)]),
-        Some(ip(192, 168, 1, 2)),
-        "the first host is this Mac"
-    );
-    assert_eq!(
-        lan_target(&[
-            lan(ip(17, 5, 7, 8), slash24),
-            lan(ip(10, 0, 0, 9), ip(255, 0, 0, 0))
-        ]),
-        Some(ip(10, 0, 0, 1)),
-        "private before public"
-    );
-    assert_eq!(
-        lan_target(&[
-            lan(ip(169, 254, 3, 4), ip(255, 255, 0, 0)),
-            lan(ip(172, 16, 5, 5), ip(255, 240, 0, 0))
-        ]),
-        Some(ip(172, 16, 0, 1)),
-        "private before link-local"
-    );
-    assert_eq!(
-        lan_target(&[
-            lan(ip(17, 5, 7, 8), slash24),
-            lan(ip(169, 254, 3, 4), ip(255, 255, 0, 0))
-        ]),
-        Some(ip(169, 254, 0, 1)),
-        "link-local before public"
-    );
-    assert_eq!(
-        lan_target(&[lan(ip(169, 254, 3, 4), ip(255, 255, 0, 0))]),
-        Some(ip(169, 254, 0, 1))
-    );
-    assert_eq!(
-        lan_target(&[lan(ip(10, 0, 0, 5), ip(255, 255, 255, 252))]),
-        Some(ip(10, 0, 0, 6)),
-        "a /30 has room for one other host"
-    );
-    let tunnel = LanInterface {
-        broadcast: false,
-        ..lan(ip(10, 8, 0, 2), slash24)
-    };
-    assert_eq!(
-        lan_target(&[tunnel, lan(ip(192, 168, 1, 23), slash24)]),
-        Some(ip(192, 168, 1, 1)),
-        "a VPN's tunnel is passed over"
-    );
-    for (interface, why) in [
-        (lan(ip(10, 0, 0, 4), ip(255, 255, 255, 254)), "/31"),
-        (lan(ip(10, 0, 0, 4), ip(255, 255, 255, 255)), "/32"),
-        (lan(ip(10, 0, 0, 4), ip(0, 0, 0, 0)), "an empty mask (/0)"),
-        (lan(ip(10, 0, 0, 4), ip(254, 0, 0, 0)), "/7"),
-        (
-            lan(ip(10, 0, 0, 4), ip(255, 0, 255, 0)),
-            "a mask with holes",
-        ),
-        (tunnel, "a tunnel only"),
-    ] {
-        assert_eq!(lan_target(&[interface]), None, "{why}");
-    }
-    assert_eq!(lan_target(&[]), None);
-}
-
-/// TN3179 counts any host on a subnet attached to one of the Mac's interfaces as local network,
-/// private or not: a campus LAN that hands out public IPv4 addresses is a network the step asks
-/// macOS about with a connect to its subnet, not one with "nothing to ask".
-#[test]
-fn a_public_ipv4_lan_is_still_a_local_network_to_ask_about() {
-    use super::{LanAsk, lan_ask};
-    let campus = LanInterface {
-        address: ip(128, 30, 2, 17),
-        mask: ip(255, 255, 255, 0),
-        broadcast: true,
-    };
-    assert_eq!(
-        lan_target(&[campus]),
-        Some(ip(128, 30, 2, 1)),
-        "a broadcast LAN on a public /24 is a local network to macOS"
-    );
-    assert_eq!(
-        lan_ask(&[campus], false),
-        Some(LanAsk::Connect(ip(128, 30, 2, 1)))
-    );
-    assert_eq!(
-        lan_ask(&[campus], true),
-        Some(LanAsk::Connect(ip(128, 30, 2, 1))),
-        "an IPv6 network beside it changes nothing"
-    );
-}
-
-/// A network with no IPv4 subnet to name (IPv6 alone, a /31 or /32 link, an IPv6 network under
-/// a VPN's tunnel) still has macOS's Local Network question to ask: the step asks it through a
-/// short Bonjour browse of its own. Only a Mac on no network at all has nothing to ask with.
-#[test]
-fn an_ipv6_only_network_asks_through_a_bonjour_browse_of_the_steps_own() {
-    use super::{LanAsk, lan_ask};
-    let tunnel = LanInterface {
-        broadcast: false,
-        ..lan(ip(10, 8, 0, 2), ip(255, 255, 255, 0))
-    };
-    let point = lan(ip(10, 0, 0, 4), ip(255, 255, 255, 254));
-    let browse: [(&[LanInterface], bool, &str); 4] = [
-        (&[], true, "an IPv6-only network"),
-        (&[tunnel], true, "an IPv6 network under a VPN's tunnel"),
-        (&[point], false, "a /31 link"),
-        (&[point], true, "a /31 link beside IPv6"),
-    ];
-    for (interfaces, ipv6, why) in browse {
-        assert_eq!(lan_ask(interfaces, ipv6), Some(LanAsk::Browse), "{why}");
-    }
-    let none: [(&[LanInterface], &str); 2] = [
-        (&[], "no network at all"),
-        (&[tunnel], "a VPN's tunnel and no network"),
-    ];
-    for (interfaces, why) in none {
-        assert_eq!(lan_ask(interfaces, false), None, "{why}");
-    }
 }
 
 fn observed(subject: Subject, standing: Standing, note: Option<&str>) -> Observation {
@@ -230,6 +81,106 @@ fn fully_observed_setup(selection: Selection, changes: Vec<Observation>) -> Setu
         *slot = change;
     }
     status(selection, all)
+}
+
+#[test]
+fn background_workstation_scope_comes_from_selected_current_verified_rows() {
+    let scope = |status: &SetupStatus| {
+        let fields = super::background_setup_fields(status);
+        let bits = fields
+            .split_ascii_whitespace()
+            .find_map(|word| word.strip_prefix("verified="))
+            .unwrap()
+            .parse::<u16>()
+            .unwrap();
+        Selection::from_bits(bits).unwrap()
+    };
+    // This real producer case legitimately says done while every private group is off.
+    let cancelled = crate::system_state::fixture_status("older-cancel").unwrap();
+    assert_eq!(setup_field(&cancelled), "done");
+    assert!(
+        scope(&cancelled).is_empty(),
+        "an opt-out proves no private preference"
+    );
+    let off = fully_observed_setup(Selection::none(), Vec::new());
+    assert!(
+        scope(&off).is_empty(),
+        "an unmanaged reading is outside the coordinator's scope"
+    );
+
+    let caps = Subject::Setting(Setting::CapsLock);
+    let dock = Subject::Setting(Setting::Dock);
+    let mut partial = Selection::none();
+    partial.set(Setting::CapsLock, true);
+    let partial_status = status(partial, vec![observed(caps, Standing::InPlace, None)]);
+    assert_eq!(setup_field(&partial_status), "done");
+    assert_eq!(scope(&partial_status), partial);
+
+    let full = fully_observed_setup(Selection::all(), Vec::new());
+    assert_eq!(scope(&full), Selection::all().workstation());
+    let personal = fully_observed_setup(
+        Selection::all(),
+        vec![observed(
+            dock,
+            Standing::Differs,
+            Some(aterm_types::macos_setup::CHANGED_BY_YOU),
+        )],
+    );
+    assert_eq!(
+        setup_field(&personal),
+        "done",
+        "a personal choice is settled for its own plan"
+    );
+    assert!(
+        !scope(&personal).contains(Setting::Dock),
+        "it does not verify an explicit requested default"
+    );
+    for standing in [Standing::Unknown, Standing::Differs] {
+        let deferred = fully_observed_setup(Selection::all(), vec![observed(dock, standing, None)]);
+        assert!(
+            !scope(&deferred).contains(Setting::Dock),
+            "{standing:?} is not a verified current value"
+        );
+    }
+    let after_login = fully_observed_setup(
+        Selection::all(),
+        vec![observed(
+            Subject::Setting(Setting::TrackpadScrolling),
+            Standing::AtLogin,
+            None,
+        )],
+    );
+    assert_eq!(setup_field(&after_login), "done");
+    assert!(
+        !scope(&after_login).contains(Setting::TrackpadScrolling),
+        "a saved-only value awaiting login is not a verified current preference"
+    );
+    let not_needed = fully_observed_setup(
+        Selection::all(),
+        vec![observed(caps, Standing::NotNeeded, None)],
+    );
+    assert!(scope(&not_needed).contains(Setting::CapsLock));
+
+    for changed in 0..6 {
+        let mut ambiguous = full.clone();
+        match changed {
+            0 => ambiguous.busy = true,
+            1 => ambiguous.changing = true,
+            2 => ambiguous.queued = true,
+            3 => ambiguous.running = vec![Setting::Dock],
+            4 => ambiguous.plan = None,
+            _ => ambiguous.observed.clear(),
+        }
+        assert!(
+            scope(&ambiguous).is_empty(),
+            "ambiguous or absent evidence cannot verify values"
+        );
+    }
+    let mut duplicate = full;
+    duplicate
+        .observed
+        .push(observed(dock, Standing::Unknown, None));
+    assert!(!scope(&duplicate).contains(Setting::Dock));
 }
 
 /// `status`'s `setup=` names every managed row whose current evidence is unfinished. A personal
@@ -750,13 +701,8 @@ fn a_failure_the_run_still_retries_stays_off_the_menu_line() {
 }
 
 thread_local! {
-    static TRIGGERS: RefCell<u32> = const { RefCell::new(0) };
     static RECORDS: RefCell<Vec<(u64, Access, AccessOutcome)>> = const { RefCell::new(Vec::new()) };
     static DIALOG_AVAILABLE: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
-}
-
-fn triggers() -> u32 {
-    TRIGGERS.with(|t| *t.borrow())
 }
 
 fn records() -> Vec<(u64, Access, AccessOutcome)> {
@@ -770,14 +716,10 @@ fn note_dialog_available() {
 
 static DIALOG_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Steps whose trigger and record are counted on this thread, with System State
-/// frontmost and a quiet moment.
+/// Steps whose record is counted on this thread, with System State frontmost and a quiet
+/// moment.
 fn stepping() -> StepsReach {
     StepsReach {
-        trigger_local_network: || {
-            TRIGGERS.with(|t| *t.borrow_mut() += 1);
-            true
-        },
         record: |revision, access, outcome| {
             RECORDS.with(|r| r.borrow_mut().push((revision, access, outcome)));
             Ok(())
@@ -902,657 +844,20 @@ fn a_verified_fda_grant_recovers_a_waiting_restore_with_permissions_held() {
     assert!(!held.permission_steps_admitted());
 }
 
-/// The Local Network step: nothing before an approved revision; then once per revision, first,
-/// recorded `triggered`, its alert counted as up for its hold, the person's 30 s with it from the
-/// first look after the ask (no later step meanwhile); a new revision asks again.
+/// The `[privacy]` switches that hold System State's steps: each switch off holds them;
+/// `[swarm] enabled = false` and the defaults hold nothing.
 #[test]
-fn the_local_network_step_runs_first_and_once_per_approved_revision() {
-    let mut app = App::headless_for_test();
-    app.access_steps.set_reach(stepping());
-    // The person at the Mac throughout.
-    app.user_input_recent = |_| true;
-    let now = Instant::now();
-    let (fired, recorded) = (triggers(), records().len());
-
-    app.tick_local_network_step(now);
-    assert_eq!(triggers(), fired, "no approved revision");
-    assert!(!app.access_step_moment(now));
-    assert_eq!(app.system_state_access_step(), None);
-
-    approve(&mut app, 3);
-    assert_eq!(app.access_revision(), Some(3));
-    assert_eq!(
-        app.system_state_access_step(),
-        None,
-        "a step that has not asked macOS is not a request for a person"
-    );
-    assert!(!app.access_step_moment(now), "Local Network goes first");
-    app.tick_local_network_step(now);
-    assert_eq!(triggers(), fired + 1);
-    assert_eq!(
-        records()[recorded..],
-        [(3, Access::LocalNetwork, AccessOutcome::Triggered)]
-    );
-    assert_eq!(app.system_state_access_step(), Some(Access::LocalNetwork));
-    // The host fills the step into each publication (the worker's status
-    // arrives about once a second), so the page's headline names it.
-    app.publish_system_state(crate::system_state::SetupStatus::default());
-    assert_eq!(
-        app.published_system_state_access_step(),
-        Some(Access::LocalNetwork),
-        "the page is told which step is up"
-    );
-    assert!(!app.access_step_moment(now), "its alert is up");
-    assert_eq!(
-        app.next_access_step_deadline(now),
-        Some(now + crate::devtools_helper::RECHECK_EVERY),
-        "a look to find the person since the ask"
-    );
-    app.tick_local_network_step(now);
-    assert_eq!(
-        app.next_access_step_deadline(now),
-        Some(now + LOCAL_NETWORK_ALERT_HOLD),
-        "the person's time with the alert counts from that look"
-    );
-
-    let later = now + LOCAL_NETWORK_ALERT_HOLD + Duration::from_secs(1);
-    app.tick_local_network_step(later);
-    assert_eq!(triggers(), fired + 1, "once per revision");
-    assert!(app.access_step_moment(later), "the next step's moment");
-    assert_eq!(app.next_access_step_deadline(later), None);
-
-    approve(&mut app, 4);
-    app.tick_local_network_step(later);
-    assert_eq!(triggers(), fired + 2, "a new revision asks again");
-}
-
-#[test]
-fn a_recorded_lan_ask_rechecks_and_recovers_without_system_state_or_focus() {
-    use super::{LOCAL_NETWORK_RETRY, LocalNetworkProbe};
-    use std::cell::Cell;
-    thread_local! {
-        static PRIOR: Cell<Option<AccessOutcome>> = const { Cell::new(None) };
-        static CURRENT: Cell<Option<AccessOutcome>> = const { Cell::new(None) };
-        static STARTS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
-        static OUTCOME: Cell<Option<(u64, LocalNetworkProbe)>> = const { Cell::new(None) };
-    }
-    for (current, prior) in [
-        (None, Some(AccessOutcome::Triggered)),
-        (None, Some(AccessOutcome::Granted)),
-        (Some(AccessOutcome::Triggered), None),
-        (Some(AccessOutcome::Granted), None),
-        (None, None),
-    ] {
-        PRIOR.with(|slot| slot.set(prior));
-        CURRENT.with(|slot| slot.set(current));
-        STARTS.with(|slot| slot.borrow_mut().clear());
-        OUTCOME.with(|slot| slot.set(None));
-        let mut app = App::headless_for_test();
-        app.access_steps.set_reach(StepsReach {
-            local_network_recorded_before: || PRIOR.with(Cell::get),
-            recorded: |_, access| {
-                (access == Access::LocalNetwork)
-                    .then(|| CURRENT.with(Cell::get))
-                    .flatten()
-            },
-            start_local_network_probe: |revision| {
-                STARTS.with(|slot| slot.borrow_mut().push(revision))
-            },
-            take_local_network_probe: || OUTCOME.with(Cell::take),
-            frontmost: |_| false,
-            quiet: |_, _| false,
-            ..stepping()
-        });
-        focus(&mut app, false);
-        approve(&mut app, 91);
-        let before = triggers();
-        let now = Instant::now();
-        if prior.is_none() && current.is_none() {
-            app.tick_local_network_step(now);
-            assert!(STARTS.with(|slot| slot.borrow().is_empty()));
-            // A grant arriving after a cached negative record read must wake progress too.
-            app.publish_system_state(SetupStatus {
-                observed: vec![observed(
-                    Subject::Access(Access::LocalNetwork),
-                    Standing::InPlace,
-                    None,
-                )],
-                ..SetupStatus::default()
-            });
-        }
-        app.tick_local_network_step(now);
-        app.tick_local_network_step(now);
-        assert_eq!(STARTS.with(|slot| slot.borrow().clone()), [91]);
-        assert_eq!(triggers(), before, "no new OS question");
-        assert!(!app.local_network_pending());
-        assert_eq!(app.system_state_access_step(), None);
-        assert!(app.access_steps.local_network_alert.is_none());
-
-        // No peer answered the first bounded check. Its retry must wake without focus.
-        OUTCOME.with(|slot| slot.set(Some((91, LocalNetworkProbe::Unanswered))));
-        app.on_local_network_probe_ready(now);
-        assert_eq!(
-            app.next_access_step_deadline(now),
-            Some(now + LOCAL_NETWORK_RETRY)
-        );
-        app.tick_local_network_step(now + LOCAL_NETWORK_RETRY);
-        assert_eq!(STARTS.with(|slot| slot.borrow().clone()), [91, 91]);
-        assert_eq!(triggers(), before);
-        OUTCOME.with(|slot| slot.set(Some((91, LocalNetworkProbe::Granted))));
-        app.on_local_network_probe_ready(now + LOCAL_NETWORK_RETRY);
-        assert_eq!(
-            records().last(),
-            Some(&(91, Access::LocalNetwork, AccessOutcome::Granted))
-        );
-        assert!(app.access_steps.local_network_recheck.is_none());
-        assert_eq!(app.system_state_access_step(), None);
-    }
-}
-
-#[test]
-fn an_unfocused_unasked_lan_step_does_not_raise_or_claim_a_permission_question() {
-    let mut app = App::headless_for_test();
-    app.access_steps.set_reach(StepsReach {
-        start_local_network_probe: |_| panic!("no prior ask authorizes a probe"),
-        frontmost: |_| false,
-        quiet: |_, _| false,
-        ..stepping()
-    });
-    focus(&mut app, false);
-    approve(&mut app, 92);
-    let before = triggers();
-    app.tick_local_network_step(Instant::now());
-    assert_eq!(triggers(), before);
-    assert!(app.local_network_pending());
-    assert_eq!(app.system_state_access_step(), None);
-}
-
-#[test]
-fn a_background_lan_recheck_respects_privacy_holds_and_a_refused_answer() {
-    use super::LocalNetworkProbe;
-    use std::cell::Cell;
-    thread_local! {
-        static STARTS: Cell<usize> = const { Cell::new(0) };
-        static OUTCOME: Cell<Option<(u64, LocalNetworkProbe)>> = const { Cell::new(None) };
-    }
-    for off in SWITCHES {
-        STARTS.with(|slot| slot.set(0));
-        OUTCOME.with(|slot| slot.set(None));
-        let mut app = App::headless_for_test();
-        app.access_steps.set_reach(StepsReach {
-            local_network_recorded_before: || Some(AccessOutcome::Triggered),
-            start_local_network_probe: |_| STARTS.with(|slot| slot.set(slot.get() + 1)),
-            take_local_network_probe: || OUTCOME.with(Cell::take),
-            frontmost: |_| false,
-            quiet: |_, _| false,
-            ..stepping()
-        });
-        app.config.privacy = Some(switches(Some(off)));
-        approve(&mut app, 93);
-        let now = Instant::now();
-        let before = records().len();
-        app.tick_local_network_step(now);
-        assert_eq!(STARTS.with(Cell::get), 0, "{off} holds the check");
-        assert_eq!(records().len(), before);
-        assert_eq!(app.next_access_step_deadline(now), None);
-        app.config.privacy = Some(switches(None));
-        let resumed = Instant::now() + Duration::from_secs(1);
-        app.tick_local_network_step(resumed);
-        assert_eq!(STARTS.with(Cell::get), 1, "resumes without focus");
-        OUTCOME.with(|slot| slot.set(Some((93, LocalNetworkProbe::Refused))));
-        app.on_local_network_probe_ready(resumed);
-        assert_eq!(records().len(), before, "a refusal never records Granted");
-        assert_eq!(app.next_access_step_deadline(resumed), None);
-        app.tick_local_network_step(resumed + Duration::from_secs(300));
-        assert_eq!(STARTS.with(Cell::get), 1, "no retry against a refusal");
-    }
-}
-
-/// Once macOS's step started, a failed record write is still owed after the disk recovers:
-/// normal turns save that same outcome without starting another macOS step.
-#[test]
-fn a_local_network_step_recovers_its_record_without_triggering_again() {
-    use aterm_types::macos_setup::access_record;
-
-    access_record::code_subject_from(|| Some([0x54; 32]));
-
-    struct Writes {
-        dir: std::path::PathBuf,
-        attempted: usize,
-        failed: usize,
-    }
-    thread_local! {
-        static WRITES: RefCell<Option<Writes>> = const { RefCell::new(None) };
-    }
-    let root = aterm_tempfile::tempdir().expect("scratch access record");
-    let revision = 8_210;
-    access_record::append(
-        root.path(),
-        revision - 1,
-        Access::LocalNetwork,
-        AccessOutcome::Triggered,
-    )
-    .unwrap();
-    access_record::append(
-        root.path(),
-        revision,
-        Access::DeveloperTools,
-        AccessOutcome::Granted,
-    )
-    .unwrap();
-    let record = root.path().join(access_record::FILE);
-    let retained = root.path().join("retained-access-record");
-    std::fs::rename(&record, &retained).unwrap();
-    std::fs::create_dir(&record).unwrap();
-    WRITES.with(|writes| {
-        *writes.borrow_mut() = Some(Writes {
-            dir: root.path().to_owned(),
-            attempted: 0,
-            failed: 0,
-        });
-    });
-    let mut app = App::headless_for_test();
-    app.access_steps.set_reach(StepsReach {
-        record: |revision, access, outcome| {
-            let dir = WRITES.with(|writes| writes.borrow().as_ref().unwrap().dir.clone());
-            let saved = access_record::append(&dir, revision, access, outcome);
-            WRITES.with(|writes| {
-                let mut writes = writes.borrow_mut();
-                let writes = writes.as_mut().unwrap();
-                writes.attempted += 1;
-                writes.failed += usize::from(saved.is_err());
-            });
-            saved
-        },
-        recorded: |revision, access| {
-            let dir = WRITES.with(|writes| writes.borrow().as_ref().unwrap().dir.clone());
-            access_record::latest(&dir, revision, access)
-        },
-        ..stepping()
-    });
-    let now = Instant::now();
-    let fired = triggers();
-    approve(&mut app, revision);
-    app.tick_local_network_step(now);
-    assert_eq!(triggers(), fired + 1);
-    WRITES.with(|writes| {
-        let writes = writes.borrow();
-        let writes = writes.as_ref().unwrap();
-        assert_eq!((writes.attempted, writes.failed), (1, 1));
-    });
-    assert_eq!(
-        access_record::latest(root.path(), revision, Access::LocalNetwork),
-        None
-    );
-    std::fs::remove_dir(&record).unwrap();
-    std::fs::rename(&retained, &record).unwrap();
-
-    let later = now + LOCAL_NETWORK_ALERT_HOLD + super::LOCAL_NETWORK_RETRY;
-    app.tick_local_network_step(later);
-    app.settle_access_steps(later);
-    app.tick_local_network_step(later + super::LOCAL_NETWORK_RETRY);
-    app.settle_access_steps(later + super::LOCAL_NETWORK_RETRY);
-    assert_eq!(triggers(), fired + 1, "only the record is retried");
-    assert_eq!(
-        access_record::latest(root.path(), revision, Access::LocalNetwork),
-        Some(AccessOutcome::Triggered)
-    );
-    assert_eq!(
-        access_record::read(root.path(), revision),
-        [
-            (Access::DeveloperTools, AccessOutcome::Granted),
-            (Access::LocalNetwork, AccessOutcome::Triggered),
-        ]
-    );
-    assert_eq!(
-        access_record::read(root.path(), revision - 1),
-        [(Access::LocalNetwork, AccessOutcome::Triggered)]
-    );
-    WRITES.with(|writes| *writes.borrow_mut() = None);
-}
-
-/// The worker cannot acquire the shared dialog slot in either the trigger or
-/// its record's wake. The slot stays owned for the alert hold, a failed trigger
-/// releases it for the next step, and an inert headless lane never takes it.
-#[test]
-fn the_local_network_trigger_and_record_own_the_dialog_slot() {
-    use aterm_types::macos_setup::{MacosDialog, macos_dialog_up};
-
-    let _serial = DIALOG_TEST
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // Our dialog fixtures share this guard, but no callback opens anything
-    // outside the process.
-    assert!(!macos_dialog_up());
-    let now = Instant::now();
-    let reach = StepsReach {
-        trigger_local_network: || {
-            note_dialog_available();
-            true
-        },
-        record: |_, _, _| {
-            note_dialog_available();
-            Ok(())
-        },
-        dialog_up: macos_dialog_up,
-        holds_dialog: true,
-        ..stepping()
-    };
-    let mut app = App::headless_for_test();
-    app.access_steps.set_reach(reach);
-    approve(&mut app, 41);
-    DIALOG_AVAILABLE.with(|read| read.borrow_mut().clear());
-    let worker = MacosDialog::when_none_up(Duration::ZERO).expect("the worker takes the slot");
-    app.tick_local_network_step(now);
-    assert!(DIALOG_AVAILABLE.with(|read| read.borrow().is_empty()));
-    assert!(app.access_steps.dialog.is_none(), "the worker owns it");
-    drop(worker);
-    app.tick_local_network_step(now);
-    assert_eq!(
-        DIALOG_AVAILABLE.with(|read| read.borrow().clone()),
-        [false, false],
-        "the worker cannot start a prompt from the trigger or record wake"
-    );
-    assert!(app.access_steps.dialog.is_some());
-    assert!(MacosDialog::when_none_up(Duration::ZERO).is_none());
-    app.settle_access_steps(now);
-    assert!(macos_dialog_up(), "end-of-turn bookkeeping keeps ownership");
-    // The person at the Mac throughout: their time with the alert counts from the first look
-    // after the ask.
-    app.user_input_recent = |_| true;
-    app.tick_local_network_step(now);
-    let later = now + LOCAL_NETWORK_ALERT_HOLD;
-    app.tick_local_network_step(later - Duration::from_secs(1));
-    app.settle_access_steps(later - Duration::from_secs(1));
-    assert!(macos_dialog_up(), "the hold stands for the person's 30 s");
-    app.tick_local_network_step(later);
-    app.settle_access_steps(later);
-    assert!(!macos_dialog_up(), "the expired hold releases ownership");
-    drop(app);
-
-    let mut app = App::headless_for_test();
-    app.access_steps.set_reach(StepsReach {
-        trigger_local_network: || {
-            note_dialog_available();
-            false
-        },
-        ..reach
-    });
-    approve(&mut app, 42);
-    DIALOG_AVAILABLE.with(|read| read.borrow_mut().clear());
-    app.tick_local_network_step(now);
-    assert_eq!(DIALOG_AVAILABLE.with(|read| read.borrow().clone()), [false]);
-    assert!(app.access_steps.dialog.is_none());
-    assert!(
-        !macos_dialog_up(),
-        "nothing was raised by the failed trigger"
-    );
-    assert!(app.access_steps.local_network_retry.is_some());
-    drop(app);
-
-    let mut app = App::headless_for_test();
-    app.access_steps.set_reach(StepsReach {
-        holds_dialog: false,
-        ..reach
-    });
-    approve(&mut app, 43);
-    DIALOG_AVAILABLE.with(|read| read.borrow_mut().clear());
-    app.tick_local_network_step(now);
-    assert_eq!(
-        DIALOG_AVAILABLE.with(|read| read.borrow().clone()),
-        [true, true],
-        "the inert lane takes no process-wide slot"
-    );
-    assert!(app.access_steps.dialog.is_none());
-    drop(app);
-    assert!(!macos_dialog_up());
-}
-
-thread_local! {
-    /// Each hand-over of the LAN to the Commons runtime: its revision, and whether a macOS dialog
-    /// of this process counted as up then.
-    static HANDED: RefCell<Vec<(u64, bool)>> = const { RefCell::new(Vec::new()) };
-}
-
-fn handed() -> Vec<(u64, bool)> {
-    HANDED.with(|handed| handed.borrow().clone())
-}
-
-/// The Local Network step hands this process's LAN to the Commons runtime once its trigger asked
-/// macOS, while its own dialog slot is held (`docs/DESIGN-system-state-2026-10-21.md` §6, step 1),
-/// so Commons' first LAN use never raises the question first: never before the step's moment,
-/// never twice, never for a trigger that asked nothing (only for the look once the network moved
-/// that does), and never for a revision the record already holds.
-#[test]
-fn the_local_network_step_hands_the_lan_to_commons_under_its_slot() {
-    use aterm_types::macos_setup::macos_dialog_up;
-
-    let _serial = DIALOG_TEST
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    assert!(!macos_dialog_up());
-    HANDED.with(|handed| handed.borrow_mut().clear());
-    let reach = StepsReach {
-        hand_lan_over: |revision| {
-            HANDED.with(|handed| handed.borrow_mut().push((revision, macos_dialog_up())));
-        },
-        dialog_up: macos_dialog_up,
-        holds_dialog: true,
-        ..stepping()
-    };
-    let now = Instant::now();
-    let mut app = App::headless_for_test();
-    app.access_steps.set_reach(StepsReach {
-        quiet: |_, _| false,
-        ..reach
-    });
-    approve(&mut app, 51);
-    app.tick_local_network_step(now);
-    assert_eq!(handed(), [], "not before the step's moment");
-
-    app.access_steps.set_reach(reach);
-    let recorded = records().len();
-    app.tick_local_network_step(now);
-    assert_eq!(handed(), [(51, true)], "handed over under the step's slot");
-    assert_eq!(
-        records()[recorded..],
-        [(51, Access::LocalNetwork, AccessOutcome::Triggered)]
-    );
-    app.settle_access_steps(now);
-    let later = now + LOCAL_NETWORK_ALERT_HOLD;
-    app.tick_local_network_step(later);
-    app.settle_access_steps(later);
-    app.tick_local_network_step(later + super::LOCAL_NETWORK_RETRY);
-    assert_eq!(handed(), [(51, true)], "once");
-    drop(app);
-    assert!(!macos_dialog_up());
-
-    // A trigger that asked nothing hands nothing over; the look once the network moved, which
-    // finds a LAN, does, once.
-    HANDED.with(|handed| handed.borrow_mut().clear());
-    NETWORK_WATCHES.with(|watches| watches.borrow_mut().clear());
-    let mut app = App::headless_for_test();
-    app.access_steps.set_reach(StepsReach {
-        trigger_local_network: no_lan,
-        watch_network: watching,
-        ..reach
-    });
-    approve(&mut app, 52);
-    app.tick_local_network_step(now);
-    assert_eq!(handed(), [], "no LAN was named");
-    assert!(!macos_dialog_up());
-    app.access_steps.set_reach(reach);
-    network_moves();
-    let retry = now + crate::devtools_helper::RECHECK_EVERY;
-    app.tick_local_network_step(retry);
-    assert_eq!(handed(), [(52, true)], "the look after the move asked");
-    app.settle_access_steps(retry);
-    let after = retry + LOCAL_NETWORK_ALERT_HOLD;
-    app.tick_local_network_step(after);
-    app.settle_access_steps(after);
-    app.tick_local_network_step(after + super::LOCAL_NETWORK_RETRY);
-    assert_eq!(handed(), [(52, true)], "once");
-    drop(app);
-    assert!(!macos_dialog_up());
-
-    // A revision the record holds is done: nothing asked, nothing handed over.
-    HANDED.with(|handed| handed.borrow_mut().clear());
-    let mut app = App::headless_for_test();
-    app.access_steps.set_reach(StepsReach {
-        recorded: |_, _| Some(AccessOutcome::Triggered),
-        ..reach
-    });
-    approve(&mut app, 53);
-    app.tick_local_network_step(now);
-    assert_eq!(handed(), [], "on record");
-    drop(app);
-    assert!(!macos_dialog_up());
-}
-
-/// A first LAN use of this window asked macOS through the door past the wait for the step
-/// (System State behind a terminal tab for a minute of the person's time): the step reads that
-/// ask as its question, whether or not it is the step's moment. It records `triggered`, raises
-/// nothing, hands nothing over and holds no alert of its own, since the door holds the dialog
-/// slot for the question's hold: one question, one hold. NEGATIVE CONTROL: with no door ask the
-/// step outside its moment does nothing.
-#[test]
-fn the_local_network_step_reads_a_door_ask_as_its_question() {
-    use aterm_types::macos_setup::macos_dialog_up;
-
-    let _serial = DIALOG_TEST
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    HANDED.with(|handed| handed.borrow_mut().clear());
-    let reach = StepsReach {
-        hand_lan_over: |revision| {
-            HANDED.with(|handed| handed.borrow_mut().push((revision, macos_dialog_up())));
-        },
-        dialog_up: macos_dialog_up,
-        holds_dialog: true,
-        quiet: |_, _| false,
-        ..stepping()
-    };
-    let now = Instant::now();
-    let mut app = App::headless_for_test();
-    app.access_steps.set_reach(reach);
-    approve(&mut app, 61);
-    let (recorded, triggered) = (records().len(), triggers());
-    app.tick_local_network_step(now);
-    assert_eq!(
-        records().len(),
-        recorded,
-        "not the step's moment, nothing asked"
-    );
-    assert_eq!(app.access_steps.local_network_done, None);
-
-    app.access_steps.set_reach(StepsReach {
-        door_asked: || true,
-        ..reach
-    });
-    app.tick_local_network_step(now);
-    assert_eq!(
-        records()[recorded..],
-        [(61, Access::LocalNetwork, AccessOutcome::Triggered)],
-        "the door's ask is the step's question"
-    );
-    assert_eq!(
-        triggers(),
-        triggered,
-        "the step raised no question of its own"
-    );
-    assert_eq!(handed(), [], "and handed nothing over");
-    assert!(
-        app.access_steps.local_network_alert.is_none(),
-        "no hold beside the door's"
-    );
-    assert!(!macos_dialog_up(), "the step took no slot");
-    assert_eq!(app.access_steps.local_network_done, Some(61));
-    app.tick_local_network_step(now + LOCAL_NETWORK_ALERT_HOLD);
-    assert_eq!(records().len(), recorded + 1, "once");
-}
-
-/// A first LAN use asked macOS through the door, and the step, reading that ask as its question,
-/// started the LAN re-probe: once the re-probe hears the answer (a LAN server answered, or macOS
-/// refused a `.local` lookup), the door's hold of the question ends, so a walk waiting on the
-/// dialog slot goes on. A re-probe that heard nothing in its 30 s, or another revision's, ends
-/// nothing: the hold is left to the person's time or the door's watch. NEGATIVE CONTROLS: with
-/// the `end_door_hold` call taken out of `on_local_network_probe_ready` no answer ends the
-/// door's hold; with it moved out of the `probe_heard_an_answer` branch an unanswered re-probe
-/// ends it.
-#[test]
-fn the_re_probe_hearing_the_answer_ends_the_doors_hold() {
-    use super::LocalNetworkProbe;
-    use std::cell::Cell;
-
-    type Heard = Option<(u64, LocalNetworkProbe)>;
-    thread_local! {
-        static OUTCOME: Cell<Heard> = const { Cell::new(None) };
-        static PROBES: Cell<u32> = const { Cell::new(0) };
-        static ENDED: Cell<u32> = const { Cell::new(0) };
-    }
-    let reach = StepsReach {
-        door_asked: || true,
-        start_local_network_probe: |_| PROBES.with(|probes| probes.set(probes.get() + 1)),
-        take_local_network_probe: || OUTCOME.with(Cell::take),
-        end_door_hold: || {
-            ENDED.with(|ended| ended.set(ended.get() + 1));
-            true
-        },
-        ..stepping()
-    };
-    let now = Instant::now();
-    for (probe, ends) in [
-        (LocalNetworkProbe::Granted, 1),
-        (LocalNetworkProbe::Refused, 1),
-        (LocalNetworkProbe::Unanswered, 0),
-    ] {
-        let mut app = App::headless_for_test();
-        app.access_steps.set_reach(reach);
-        approve(&mut app, 71);
-        PROBES.with(|probes| probes.set(0));
-        ENDED.with(|ended| ended.set(0));
-        app.tick_local_network_step(now);
-        assert_eq!(
-            PROBES.with(Cell::get),
-            1,
-            "{probe:?}: the step read the door's ask and started the re-probe"
-        );
-        OUTCOME.with(|outcome| outcome.set(Some((70, probe))));
-        app.on_local_network_probe_ready(now + Duration::from_secs(1));
-        assert_eq!(ENDED.with(Cell::get), 0, "{probe:?}: another revision's");
-        OUTCOME.with(|outcome| outcome.set(Some((71, probe))));
-        app.on_local_network_probe_ready(now + Duration::from_secs(31));
-        assert_eq!(ENDED.with(Cell::get), ends, "{probe:?}");
-    }
-}
-
-/// The `[privacy]` switches that hold System State's steps, and the Local Network step's reason
-/// not to run that the Commons runtime reads: each switch off holds them; `[swarm] enabled =
-/// false` holds only the Local Network step; the defaults hold nothing.
-#[test]
-fn a_privacy_switch_or_swarm_off_says_why_the_local_network_step_will_not_run() {
-    use crate::app_config::{Config, LOCAL_NETWORK_STEP_PRIVACY_OFF, LOCAL_NETWORK_STEP_SWARM_OFF};
+fn a_privacy_switch_off_holds_the_steps() {
+    use crate::app_config::Config;
     let read = |text: &str| aterm_toml::from_str::<Config>(text).unwrap();
-    let defaults = read("");
-    assert!(defaults.access_steps_allowed());
-    assert_eq!(defaults.local_network_step_off(), None);
+    assert!(read("").access_steps_allowed());
     for switch in ["enabled", "check", "notice"] {
         let config = read(&format!("[privacy]\n{switch} = false\n"));
         assert!(!config.access_steps_allowed(), "{switch}");
-        assert_eq!(
-            config.local_network_step_off(),
-            Some(LOCAL_NETWORK_STEP_PRIVACY_OFF),
-            "{switch}"
-        );
         let on = read(&format!("[privacy]\n{switch} = true\n"));
         assert!(on.access_steps_allowed(), "{switch} on");
     }
-    let swarm_off = read("[swarm]\nenabled = false\n");
-    assert!(swarm_off.access_steps_allowed());
-    assert_eq!(
-        swarm_off.local_network_step_off(),
-        Some(LOCAL_NETWORK_STEP_SWARM_OFF)
-    );
+    assert!(read("[swarm]\nenabled = false\n").access_steps_allowed());
 }
 
 #[cfg(target_os = "macos")]
@@ -1827,7 +1132,7 @@ fn a_security_pages_person_press_transfers_its_dialog_before_recording() {
         app.devtools_helper.panel().is_none(),
         "the ordinary notification has not drained"
     );
-    app.tick_local_network_step(now + super::PANE_HOLD);
+    app.end_lapsed_access_pane(now + super::PANE_HOLD);
     app.settle_access_steps(now + super::PANE_HOLD);
     assert!(!macos_dialog_up(), "the pane's bounded hold still ends");
     drop(app);
@@ -1882,7 +1187,6 @@ fn queued_access_panes_own_the_dialog_slot_before_opening() {
             ..stepping()
         });
         approve(&mut app, 1);
-        app.access_steps.local_network_done = Some(1);
         show_accessibility_needs_you(&mut app);
         app.access_steps.pane_act = Some((Access::Accessibility, now));
         let worker = MacosDialog::when_none_up(Duration::ZERO).unwrap();
@@ -1898,7 +1202,7 @@ fn queued_access_panes_own_the_dialog_slot_before_opening() {
         assert_eq!(DIALOG_AVAILABLE.with(|read| read.borrow().clone()), [false]);
         assert_eq!(macos_dialog_up(), opened);
         if opened {
-            app.tick_local_network_step(now + super::PANE_HOLD);
+            app.end_lapsed_access_pane(now + super::PANE_HOLD);
             app.settle_access_steps(now + super::PANE_HOLD);
             assert!(!macos_dialog_up(), "the pane's bounded hold ended");
         }
@@ -1906,7 +1210,7 @@ fn queued_access_panes_own_the_dialog_slot_before_opening() {
         assert!(!macos_dialog_up());
     }
 
-    for access in [Access::LocalNetwork, Access::Accessibility] {
+    {
         let mut app = App::headless_for_test();
         app.headless = false;
         app.access_steps.set_reach(StepsReach {
@@ -1916,7 +1220,7 @@ fn queued_access_panes_own_the_dialog_slot_before_opening() {
         });
         let worker = MacosDialog::when_none_up(Duration::ZERO).unwrap();
         assert!(
-            app.open_access_from_system_state(access, true),
+            app.open_access_from_system_state(Access::Accessibility, true),
             "a person's own press stays immediate"
         );
         assert!(app.access_steps.dialog.is_some());
@@ -1987,453 +1291,15 @@ fn folder_worker_owns_the_dialog_slot_before_its_first_probe() {
     );
 }
 
-/// Recorded already (an earlier process of this revision): not asked again. Not
-/// frontmost, or a `[privacy]` switch off: not asked at all.
+/// System State's steps read only aterm's own keys for their quiet moment, so macOS's idle time
+/// that cannot be read (the live input reading answers "input just now" when `HIDIdleTime` cannot
+/// be read) holds no step, with or without a click in aterm.
+/// NEGATIVE CONTROL: a moment that read macOS's idle time would hold the step here.
 #[test]
-fn the_local_network_step_waits_for_its_moment_and_honours_the_opt_outs() {
-    let now = Instant::now();
-    let fired = triggers();
-
-    let mut app = App::headless_for_test();
-    app.access_steps.set_reach(StepsReach {
-        recorded: |_, _| Some(AccessOutcome::Triggered),
-        ..stepping()
-    });
-    approve(&mut app, 5);
-    app.tick_local_network_step(now);
-    assert_eq!(triggers(), fired, "on record for this revision");
-    assert!(app.access_step_moment(now));
-
-    let mut app = App::headless_for_test();
-    app.access_steps.set_reach(StepsReach {
-        frontmost: |_| false,
-        ..stepping()
-    });
-    approve(&mut app, 5);
-    app.tick_local_network_step(now);
-    assert_eq!(
-        triggers(),
-        fired + 1,
-        "the step starts without System State in front"
-    );
-    let fired = triggers();
-
-    for privacy in [
-        crate::app_config::PrivacyConfig {
-            enabled: Some(false),
-            ..Default::default()
-        },
-        crate::app_config::PrivacyConfig {
-            check: Some(false),
-            ..Default::default()
-        },
-        crate::app_config::PrivacyConfig {
-            notice: Some(false),
-            ..Default::default()
-        },
-    ] {
-        let mut app = App::headless_for_test();
-        app.access_steps.set_reach(stepping());
-        app.config.privacy = Some(privacy);
-        approve(&mut app, 5);
-        app.tick_local_network_step(now);
-        assert_eq!(triggers(), fired, "a switch is off");
-        assert!(!app.access_step_moment(now));
-    }
-
-    let mut app = App::headless_for_test();
-    app.access_steps.set_reach(StepsReach {
-        dialog_up: || true,
-        ..stepping()
-    });
-    approve(&mut app, 5);
-    app.tick_local_network_step(now);
-    assert_eq!(triggers(), fired, "another macOS dialog is up");
-}
-
-/// The Local Network step lets the Mac Setup tab go first, as the walk that starts by itself
-/// does: while the launch's reading of the elevation's steps is out, while the want it brings is
-/// due, while the tab's shell is booked (E3's clock-back row, 2026-11-05: the alert took the
-/// dialog slot 193 ms after the booking and deferred the tab's landing, so setup's one Mac
-/// password stood owed behind an alert nobody answered) and while the tab runs, the step asks
-/// nothing and names what holds it; it asks at the first look after the tab ended, or after the
-/// reading said nothing is owed. The yield is the one-gesture rule's, which a control verb's page
-/// reads too (`App::control_ask_moment`). The tab itself does not open here (a headless App), so nothing but the yield holds the step.
-/// NEGATIVE CONTROL: with no reading out and no want, the first look asks.
-#[cfg(target_os = "macos")]
-#[test]
-fn the_local_network_step_lets_the_mac_setup_tab_go_first() {
-    use crate::clt_install::{Install, LAUNCH_WANT};
-    const FIRST: &str = "the Mac Setup tab goes first (setup's one Mac password)";
-    let now = Instant::now();
-    let cold = |awaited| {
-        let mut app = App::headless_for_test();
-        app.access_steps.set_reach(stepping());
-        app.workstation_setup.root_steps_awaited = awaited;
-        approve(&mut app, 5);
-        app
-    };
-    let fired = triggers();
-    let mut control = cold(false);
-    assert!(
-        control.no_gesture_up(now),
-        "precondition: the one-gesture rule holds"
-    );
-    control.tick_local_network_step(now);
-    assert_eq!(triggers(), fired + 1, "nothing to yield to: the step asks");
-
-    let fired = triggers();
-    let mut app = cold(true);
-    app.tick_local_network_step(now);
-    assert_eq!(
-        triggers(),
-        fired,
-        "the elevation's reading is out: nothing asked"
-    );
-    assert_eq!(app.local_network_holds(now), [FIRST]);
-    app.root_steps_owed(true);
-    assert_eq!(
-        app.workstation_setup.developer_tools,
-        Install::Wanted(LAUNCH_WANT),
-        "precondition: a root step owed wants the tab"
-    );
-    app.tick_local_network_step(now);
-    assert_eq!(triggers(), fired, "the tab is due: nothing asked");
-    app.workstation_setup.developer_tools = Install::Opening {
-        wanted: Some(LAUNCH_WANT),
-    };
-    app.tick_local_network_step(now);
-    assert_eq!(triggers(), fired, "its shell is booked: nothing asked");
-    assert_eq!(app.local_network_holds(now), [FIRST]);
-    assert!(
-        !app.no_gesture_up(now),
-        "the one-gesture rule, which a control verb's page reads too, waits for the booked tab"
-    );
-    app.workstation_setup.developer_tools = Install::Opened;
-    app.land_install_session_for_test(7);
-    app.tick_local_network_step(now);
-    assert_eq!(triggers(), fired, "the tab runs: nothing asked");
-    assert_eq!(
-        app.local_network_holds(now),
-        ["the Developer Tools installer is up"],
-        "a landed tab is the installer's hold, not the yield"
-    );
-    assert!(app.finish_developer_tools_install(7));
-    app.tick_local_network_step(now);
-    assert_eq!(triggers(), fired + 1, "the step follows the tab");
-
-    let fired = triggers();
-    let mut nothing_owed = cold(true);
-    nothing_owed.tick_local_network_step(now);
-    assert_eq!(triggers(), fired, "the reading is out");
-    nothing_owed.root_steps_owed(false);
-    nothing_owed.tick_local_network_step(now);
-    assert_eq!(triggers(), fired + 1, "nothing owed: the step asks");
-}
-
-/// A Local Network step held from its moment says in aterm.log what holds it, once per change of
-/// that set and never once per look, on an instance whose step can run: the revision, which part
-/// of System State in front fails, and, with System State in front, which part of the quiet
-/// moment. A lasting hold (no approved revision) is said alone, and System State out of view in
-/// the window last focused is said alone too, so keys typed and focus moved meanwhile say nothing
-/// more. Its moment coming clears it, so a later hold is said again.
-/// NEGATIVE CONTROL: the same App with an instance's inert arms says nothing at all.
-#[test]
-fn a_held_local_network_step_names_its_hold_once_per_change() {
-    let fired = triggers();
-    let mut app = App::headless_for_test();
-    app.devtools_helper.note_cold_start();
-    let now = Instant::now() + crate::devtools_helper::COLD_START_SETTLE;
-    let names = StepsReach {
-        frontmost: App::system_state_frontmost,
-        quiet: App::step_moment_is_quiet,
-        names_holds: true,
-        ..stepping()
-    };
-    app.access_steps.set_reach(StepsReach {
-        names_holds: false,
-        ..names
-    });
-    focus(&mut app, false);
-    app.user_input_recent = |_| true;
-    app.last_keystroke_at = Some(now);
-    app.tick_local_network_step(now);
-    assert_eq!(
-        app.note_local_network_hold(now, None),
-        None,
-        "control: an instance whose step cannot run says nothing"
-    );
-    assert_eq!(app.access_steps.local_network_held, None);
-
-    app.access_steps.set_reach(names);
-    let line = app
-        .note_local_network_hold(now, None)
-        .expect("a step with no approved revision waits");
-    assert_eq!(
-        line,
-        "system state: the Local Network step waits: no approved setup revision admits the \
-         Permissions group",
-        "a lasting hold is said alone"
-    );
-    focus(&mut app, true);
-    app.last_keystroke_at = None;
-    assert_eq!(
-        app.note_local_network_hold(now, None),
-        None,
-        "the same hold is said once, whatever the keys and focus do meanwhile"
-    );
-
-    approve(&mut app, 5);
-    app.last_keystroke_at = Some(now);
-    assert!(app.open_system_state_tab_quietly(), "System State behind");
-    app.tick_local_network_step(now);
-    assert_eq!(triggers(), fired, "held: nothing asked");
-    assert_eq!(
-        app.access_steps.local_network_held.as_deref(),
-        Some(&["a key was typed into aterm in the last 10 s".to_owned()][..]),
-        "the keyboard rest is reported even with System State out of view"
-    );
-    for (focused, typed) in [(false, Some(now)), (true, Some(now)), (false, Some(now))] {
-        focus(&mut app, focused);
-        app.last_keystroke_at = typed;
-        assert_eq!(
-            app.note_local_network_hold(now, Some(5)),
-            None,
-            "typing and focus elsewhere say nothing: focused {focused}, typed {typed:?}"
-        );
-    }
-
-    assert_eq!(
-        app.note_local_network_hold(now, Some(5)),
-        None,
-        "a look that finds the same says nothing"
-    );
-
-    app.last_keystroke_at = None;
-    app.tick_local_network_step(now);
-    assert_eq!(triggers(), fired + 1, "its moment came");
-    assert_eq!(
-        app.access_steps.local_network_held, None,
-        "the moment clears the hold"
-    );
-}
-
-/// System State out of view in the aterm window last focused holds the Local Network step with
-/// those words alone: behind another tab, a macOS dialog of this process counting up adds
-/// nothing, and laid out beside the active view of a split, the person switching apps adds no
-/// line, focused or not. NEGATIVE CONTROL: with System State that window's active view, the
-/// focus it lacks is named.
-#[test]
-fn system_state_out_of_view_is_the_local_network_steps_one_hold() {
-    use crate::native_settings::{SettingsRoute, SettingsViewState};
-    let reach = StepsReach {
-        frontmost: App::system_state_frontmost,
-        quiet: App::step_moment_is_quiet,
-        names_holds: true,
-        dialog_up: || true,
-        ..stepping()
-    };
-    let fresh = || {
-        let mut app = App::headless_for_test();
-        app.devtools_helper.note_cold_start();
-        app.access_steps.set_reach(reach);
-        app.user_input_recent = |_| true;
-        approve(&mut app, 5);
-        app
-    };
-    let said = |app: &App| {
-        app.local_network_holds(
-            Instant::now() + crate::devtools_helper::COLD_START_SETTLE + Duration::from_secs(1),
-        )
-    };
-
-    let mut behind = fresh();
-    assert!(
-        behind.open_system_state_tab_quietly(),
-        "System State behind"
-    );
-    for focused in [false, true] {
-        focus(&mut behind, focused);
-        assert_eq!(
-            said(&behind),
-            ["a macOS dialog or page this process started counts as up"],
-            "behind, a dialog counting up, focused {focused}"
-        );
-    }
-
-    let mut split = fresh();
-    let wid = split.frontmost_window.expect("a window");
-    assert!(split.open_settings_tab(SettingsRoute::Home));
-    let (settings, _) = split.active_native_view(wid).expect("Settings' view");
-    assert!(split.open_system_state_tab(), "System State in front");
-    let state = SettingsViewState::new(&split.config);
-    split
-        .split_active_with_native(
-            wid,
-            crate::tab_model::SplitAxis::Horizontal,
-            settings,
-            crate::native_app::AppViewState::Settings(Box::new(state)),
-        )
-        .expect("split");
-    for focused in [false, true, false] {
-        focus(&mut split, focused);
-        assert_eq!(
-            said(&split),
-            ["a macOS dialog or page this process started counts as up"],
-            "laid out beside the active pane, focused {focused}"
-        );
-    }
-
-    let mut active = fresh();
-    assert!(active.open_system_state_tab(), "System State in front");
-    focus(&mut active, false);
-    assert_eq!(
-        said(&active),
-        ["a macOS dialog or page this process started counts as up"]
-    );
-}
-
-/// While System State's Local Network step is still to run and nothing but a lasting reason
-/// holds it, a `[privacy]` switch off, aterm.log says that reason alone, once, however the person
-/// types or moves between windows meanwhile.
-#[test]
-fn a_privacy_switch_off_is_the_local_network_steps_one_hold() {
-    let mut app = App::headless_for_test();
-    app.devtools_helper.note_cold_start();
-    let now = Instant::now() + crate::devtools_helper::COLD_START_SETTLE;
-    app.access_steps.set_reach(StepsReach {
-        quiet: App::step_moment_is_quiet,
-        names_holds: true,
-        ..stepping()
-    });
-    app.user_input_recent = |_| true;
-    app.set_privacy_for_test(switches(Some("notice")));
-    approve(&mut app, 5);
-    focus(&mut app, false);
-    app.tick_local_network_step(now);
-    assert_eq!(
-        app.access_steps.local_network_held.as_deref(),
-        Some(&["a [privacy] switch (enabled, check or notice) is off".to_owned()][..])
-    );
-    for (focused, typed) in [(true, Some(now)), (true, None), (false, None)] {
-        focus(&mut app, focused);
-        app.last_keystroke_at = typed;
-        assert_eq!(
-            app.note_local_network_hold(now, Some(5)),
-            None,
-            "focused {focused}, typed {typed:?}"
-        );
-    }
-}
-
-/// System State's steps' quiet moment reads aterm's own keys at rest, not the pointer: with the
-/// person at the Mac moving the pointer every few seconds (macOS's idle time never past
-/// `QUIET_FOR`, as the lab's person nudges it every 5 s), the Local Network step asks once no key
-/// was typed into aterm for `QUIET_FOR`, and a key typed within it holds the step and is named.
-/// NEGATIVE CONTROL: the control verb's moment, keyboard and pointer both, reads that person as
-/// busy, as the steps' moment did.
-#[test]
-fn the_local_network_step_asks_while_the_person_moves_the_pointer() {
-    use crate::devtools_helper::{COLD_START_SETTLE, QUIET_FOR};
-    let fired = triggers();
+fn the_steps_moment_holds_no_step_while_macos_idle_time_cannot_be_read() {
     let mut app = App::headless_for_test();
     app.access_steps.set_reach(StepsReach {
         quiet: StepsReach::live().quiet,
-        names_holds: true,
-        ..stepping()
-    });
-    app.devtools_helper.note_cold_start();
-    focus(&mut app, true);
-    app.user_input_recent = |_| true;
-    approve(&mut app, 5);
-    let now = Instant::now() + COLD_START_SETTLE + Duration::from_secs(1);
-    app.last_keystroke_at = Some(now - Duration::from_secs(3));
-    assert!(
-        !app.devtools_moment_is_quiet(now),
-        "control: the pointer moves, so the keyboard-and-pointer moment never comes"
-    );
-    app.tick_local_network_step(now);
-    assert_eq!(triggers(), fired, "a key 3 s ago holds the step");
-    assert_eq!(
-        app.access_steps.local_network_held.as_deref(),
-        Some(&["a key was typed into aterm in the last 10 s".to_owned()][..])
-    );
-    let later = now + QUIET_FOR;
-    assert!(!app.devtools_moment_is_quiet(later));
-    app.tick_local_network_step(later);
-    assert_eq!(
-        triggers(),
-        fired + 1,
-        "keys at rest, the pointer still moving: the step asks"
-    );
-}
-
-/// The quiet moment's parts in aterm.log's words, the control verb's and the steps', are empty
-/// exactly when that moment is quiet, over focus, input, keys, a focus taken back, and macOS's
-/// idle time read or not.
-#[test]
-fn the_quiet_moments_gaps_are_empty_only_when_it_is_quiet() {
-    let inputs: [fn(Duration) -> bool; 3] = [
-        |_| true,
-        |_| false,
-        |within| within > crate::devtools_helper::QUIET_FOR,
-    ];
-    let readings: [fn() -> bool; 2] = [|| true, || false];
-    let mut quiet_seen = false;
-    for focused in [false, true] {
-        for input in inputs {
-            for readable in readings {
-                let mut app = App::headless_for_test();
-                // A second past each app's own settling, however long the apps before it took
-                // to make: a clock read once, before them all, left a slow host's later apps
-                // unsettled, and then no case was quiet.
-                let now = Instant::now()
-                    + crate::devtools_helper::COLD_START_SETTLE
-                    + Duration::from_secs(1);
-                app.devtools_helper.note_cold_start();
-                focus(&mut app, focused);
-                app.user_input_recent = input;
-                app.user_input_readable = readable;
-                let quiet = app.devtools_moment_is_quiet(now);
-                quiet_seen |= quiet;
-                assert_eq!(
-                    app.quiet_gaps(now, false).is_empty(),
-                    quiet,
-                    "focused {focused}: {:?}",
-                    app.quiet_gaps(now, false)
-                );
-                for typed in [None, Some(now), Some(now - Duration::from_secs(11))] {
-                    for back in [None, Some(now - Duration::from_secs(1))] {
-                        app.last_keystroke_at = typed;
-                        app.keyboard_focus_back_at = back;
-                        let quiet = app.step_moment_is_quiet(now);
-                        quiet_seen |= quiet;
-                        assert_eq!(
-                            app.step_quiet_gaps(now).is_empty(),
-                            quiet,
-                            "steps, focused {focused}, typed {typed:?}, back {back:?}: {:?}",
-                            app.step_quiet_gaps(now)
-                        );
-                    }
-                }
-            }
-        }
-    }
-    assert!(quiet_seen, "one case is quiet");
-}
-
-/// System State's steps never take macOS's unreadable idle time for a person at the Mac: the live
-/// input reading answers "input just now" when `HIDIdleTime` cannot be read, which holds no step
-/// that reads only aterm's keys, so the step holds and names it until the person is seen in aterm
-/// (a click in an aterm window within `PRESENT_WITHIN`, which aterm sees itself), never for good.
-/// NEGATIVE CONTROL: the idle time read again lets the step ask with no click.
-#[test]
-fn the_steps_wait_while_macos_idle_time_cannot_be_read() {
-    let fired = triggers();
-    let mut app = App::headless_for_test();
-    app.access_steps.set_reach(StepsReach {
-        quiet: StepsReach::live().quiet,
-        names_holds: true,
         ..stepping()
     });
     app.devtools_helper.note_cold_start();
@@ -2443,45 +1309,26 @@ fn the_steps_wait_while_macos_idle_time_cannot_be_read() {
     approve(&mut app, 5);
     let now = Instant::now() + crate::devtools_helper::COLD_START_SETTLE + Duration::from_secs(1);
     app.last_person_input_at = now.checked_sub(crate::devtools_helper::PRESENT_WITHIN);
-    app.tick_local_network_step(now);
-    assert_eq!(
-        triggers(),
-        fired + 1,
+    assert!(
+        app.access_step_moment(now),
         "an unavailable idle clock does not block setup"
     );
-    assert_eq!(app.access_steps.local_network_held, None);
     let clicked = now + Duration::from_secs(1);
     app.last_person_input_at = Some(clicked);
-    app.tick_local_network_step(clicked);
-    assert_eq!(triggers(), fired + 1, "a click in aterm: the step asks");
-
-    let mut read = App::headless_for_test();
-    read.access_steps.set_reach(app.access_steps.reach);
-    read.devtools_helper.note_cold_start();
-    focus(&mut read, true);
-    read.user_input_recent = |_| true;
-    approve(&mut read, 5);
-    read.tick_local_network_step(now);
-    assert_eq!(
-        triggers(),
-        fired + 2,
-        "control: the idle time read, no click"
-    );
+    assert!(app.access_step_moment(clicked), "a click in aterm");
 }
 
 /// Keys typed while no aterm window had keyboard focus (into another app before a click brought
-/// aterm's System State to the front) are not seen as aterm's keys, so the steps' key rest counts
-/// from the window taking focus back: the Local Network step waits `QUIET_FOR` after that return
-/// and names it. NEGATIVE CONTROL: focus passing for a moment (shorter than `FOCUS_AWAY_FOR`)
-/// holds nothing.
+/// aterm's System State to the front) are not aterm's keys, and a focus change does not restart
+/// the steps' key rest: the step's moment stands at the return. A flick of focus (shorter than
+/// `FOCUS_AWAY_FOR`) is no return at all.
+/// NEGATIVE CONTROL: a key rest counted from the return holds the moment there.
 #[test]
-fn the_steps_key_rest_counts_from_aterm_taking_focus_back() {
-    use crate::devtools_helper::{COLD_START_SETTLE, QUIET_FOR};
-    let fired = triggers();
+fn the_steps_key_rest_is_not_restarted_by_aterm_taking_focus_back() {
+    use crate::devtools_helper::COLD_START_SETTLE;
     let mut app = App::headless_for_test();
     app.access_steps.set_reach(StepsReach {
         quiet: StepsReach::live().quiet,
-        names_holds: true,
         ..stepping()
     });
     app.devtools_helper.note_cold_start();
@@ -2513,19 +1360,9 @@ fn the_steps_key_rest_counts_from_aterm_taking_focus_back() {
     let back = app
         .keyboard_focus_back_at
         .expect("back after 20 s away: the return is noted");
-    let now = back.max(settled);
-    app.tick_local_network_step(now);
-    assert_eq!(
-        triggers(),
-        fired + 1,
+    assert!(
+        app.access_step_moment(back.max(settled)),
         "a focus change does not restart automatic setup's keyboard rest"
-    );
-    assert_eq!(app.access_steps.local_network_held.as_deref(), None);
-    app.tick_local_network_step(back + QUIET_FOR);
-    assert_eq!(
-        triggers(),
-        fired + 1,
-        "at rest since the return: the step asks"
     );
 }
 
@@ -2575,7 +1412,6 @@ fn pending_access_records_keep_the_latest_outcome_and_retry_while_the_page_is_cl
         ..stepping()
     });
     let before = records().len();
-    let fired = triggers();
     app.record_access_at(70, Access::Debugger, AccessOutcome::Granted);
     approve(&mut app, 71);
     assert!(app.open_system_state_tab());
@@ -2626,7 +1462,6 @@ fn pending_access_records_keep_the_latest_outcome_and_retry_while_the_page_is_cl
     assert_eq!(app.next_access_step_deadline(due), None);
     app.settle_access_steps(due + super::ACCESS_RECORD_RETRY);
     assert_eq!(records(), recovered, "saved outcomes are not replayed");
-    assert_eq!(triggers(), fired, "history repair starts no macOS step");
 }
 
 /// A later Not now wins over a grant in the same approval. The helper's real
@@ -2723,19 +1558,6 @@ fn an_access_panels_second_decline_after_a_grant_is_the_current_outcome() {
     grant(&mut app);
     assert_eq!(latest(2, access), Some(AccessOutcome::Granted));
 
-    app.tick_local_network_step(now);
-    assert_eq!(
-        latest(2, Access::LocalNetwork),
-        Some(AccessOutcome::Triggered)
-    );
-    let independent = records();
-    app.tick_local_network_step(now);
-    assert_eq!(
-        records(),
-        independent,
-        "the independent trigger is taken once"
-    );
-
     decline(&mut app);
     assert_eq!(
         latest(2, access),
@@ -2743,10 +1565,6 @@ fn an_access_panels_second_decline_after_a_grant_is_the_current_outcome() {
         "the latest Not now must replace the earlier grant in this approval"
     );
     assert_eq!(latest(1, access), Some(AccessOutcome::Granted));
-    assert_eq!(
-        latest(2, Access::LocalNetwork),
-        Some(AccessOutcome::Triggered)
-    );
     let declined = records();
     app.settle_access_steps(now);
     assert_eq!(records(), declined, "the new helper answer is taken once");
@@ -2775,7 +1593,6 @@ fn an_access_panels_second_decline_after_a_grant_is_the_current_outcome() {
     assert_eq!(latest(2, access), Some(AccessOutcome::Handed));
     assert!(app.devtools_helper.panel().is_none());
     let opened = test_arms::opens();
-    let fired = triggers();
     let due = app
         .next_access_step_deadline(Instant::now())
         .expect("the taken helper answer still needs its record");
@@ -2783,15 +1600,10 @@ fn an_access_panels_second_decline_after_a_grant_is_the_current_outcome() {
     app.settle_access_steps(due);
     assert_eq!(latest(2, access), Some(AccessOutcome::Declined));
     assert_eq!(latest(1, access), Some(AccessOutcome::Granted));
-    assert_eq!(
-        latest(2, Access::LocalNetwork),
-        Some(AccessOutcome::Triggered)
-    );
     let recovered = records();
     app.settle_access_steps(due + super::ACCESS_RECORD_RETRY);
     assert_eq!(records(), recovered);
     assert_eq!(test_arms::opens(), opened, "no new helper page");
-    assert_eq!(triggers(), fired, "no new Local Network step");
 }
 
 /// The marker words bind to the approved revision; with none they keep the
@@ -2856,6 +1668,39 @@ fn a_regressed_grant_lights_the_menu_line() {
         ended_as(&app, "privacy.fda.needed"),
         Some(aterm_messages::Retired::Withdrawn),
         "never filed as fixed"
+    );
+}
+
+/// The fleet's no-route entry an older aterm filed, which told the person to allow Local
+/// Network, is withdrawn at the first settle, never ended as fixed. Negative control: before the
+/// settle it stands.
+#[test]
+fn an_older_fleet_no_route_entry_is_withdrawn() {
+    use aterm_messages::exceptions::{Entry, Family};
+    use aterm_messages::need::{Reason, Then, Why};
+    const KEY: &str = "fleet.unreadable.no-route";
+    let mut app = App::headless_for_test();
+    // A level family's entry, filed as the older fleet glance's pass filed it.
+    app.except_replace(
+        Family::FleetUnreadable,
+        &[Entry::new(
+            Family::FleetUnreadable,
+            "",
+            "no-route",
+            "No route to any fleet Mac",
+            Why::OnlyYou(Reason::new(
+                "every peer refused at once with no route: local-network privacy",
+            )),
+            Then::step("Allow aterm in System Settings ▸ Privacy & Security ▸ Local Network"),
+        )],
+    );
+    let open = |app: &App| app.messages.digest().entries.iter().any(|e| e.key == KEY);
+    assert!(open(&app), "the control: the older entry stands");
+    app.settle_access_steps(Instant::now());
+    assert!(!open(&app), "withdrawn at the settle");
+    assert_eq!(
+        ended_as(&app, KEY),
+        Some(aterm_messages::Retired::Withdrawn)
     );
 }
 
@@ -2949,8 +1794,7 @@ fn a_retired_key_the_person_filed_stays_filed() {
 const ACCESSIBILITY_PANE: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
 
-/// A Needs-you row's press: a person's opens the Local Network and
-/// Accessibility panes at once; a client's act opens nothing at once (it is
+/// A Needs-you row's press: a person's opens the Accessibility pane at once; a client's act opens nothing at once (it is
 /// queued for the step moment), and with no approved revision it is not even
 /// queued (it never mints the yes); the debugger's is the consent track's and
 /// opens nothing here.
@@ -2972,12 +1816,8 @@ fn a_persons_press_opens_its_pane_at_once() {
     );
     assert_eq!(app.access_steps.pane_act, None, "and waits for nothing");
     approve(&mut app, 1);
-    assert!(app.open_access_from_system_state(Access::LocalNetwork, true));
     assert!(app.open_access_from_system_state(Access::Accessibility, true));
-    assert_eq!(
-        crate::platform::take_opened_urls(),
-        [crate::fleet_glance::LOCAL_NETWORK_PANE, ACCESSIBILITY_PANE]
-    );
+    assert_eq!(crate::platform::take_opened_urls(), [ACCESSIBILITY_PANE]);
     assert!(!app.open_access_from_system_state(Access::Accessibility, false));
     assert!(
         crate::platform::take_opened_urls().is_empty(),
@@ -2985,7 +1825,7 @@ fn a_persons_press_opens_its_pane_at_once() {
     );
     assert!(!app.open_access_from_system_state(Access::Debugger, true));
     let mut headless = App::headless_for_test();
-    assert!(!headless.open_access_from_system_state(Access::LocalNetwork, true));
+    assert!(!headless.open_access_from_system_state(Access::Accessibility, true));
 }
 
 /// Full Disk Access from its row: a person's press opens the page with the
@@ -3016,50 +1856,6 @@ fn a_persons_press_passes_not_now_and_a_clients_act_does_not() {
         app.system_state_access_step(),
         Some(Access::FullDiskAccess),
         "the panel is the step that is up"
-    );
-}
-
-/// A Local Network trigger that attempted nothing (here a LAN named but no socket; no LAN to name
-/// is `a_trigger_that_found_no_lan_looks_again_once_the_network_moves_at_its_moment`) records
-/// nothing and takes no hold: the steps after it go on.
-#[test]
-fn a_trigger_that_asked_nothing_records_nothing_and_looks_again() {
-    let mut app = App::headless_for_test();
-    app.access_steps.set_reach(StepsReach {
-        trigger_local_network: || false,
-        lan_here: || super::LanHere::Lan,
-        ..stepping()
-    });
-    let before = records().len();
-    approve(&mut app, 6);
-    let now = Instant::now();
-    app.tick_local_network_step(now);
-    assert_eq!(records().len(), before, "nothing recorded");
-    assert!(
-        app.access_step_moment(now),
-        "no hold: the next step may run"
-    );
-    let retry = now + super::LOCAL_NETWORK_RETRY;
-    focus(&mut app, true);
-    assert_eq!(
-        app.next_access_step_deadline(now),
-        Some(retry),
-        "it looks again for a LAN, so the run's Permissions stage is not left waiting"
-    );
-    // Not before the retry is due.
-    app.access_steps.set_reach(stepping());
-    let fired = triggers();
-    app.tick_local_network_step(now);
-    assert_eq!(triggers(), fired);
-    // The socket came up: the retry asks, and records it.
-    app.tick_local_network_step(retry);
-    assert_eq!(triggers(), fired + 1);
-    assert!(records().contains(&(6, Access::LocalNetwork, AccessOutcome::Triggered)));
-    app.tick_local_network_step(retry + super::LOCAL_NETWORK_RETRY);
-    assert_eq!(
-        triggers(),
-        fired + 1,
-        "once recorded, never again this revision"
     );
 }
 
@@ -3312,7 +2108,7 @@ fn probe(state: aterm_containment::consent::FdaState) -> aterm_containment::cons
 }
 
 /// A new Mac at revision 1: the probe reads Full Disk Access off, the pages and
-/// panels are counted stand-ins (`reach`, `fda`), Local Network is on record,
+/// panels are counted stand-ins (`reach`, `fda`), every row reads as on record (`recorded`),
 /// and System State is frontmost while [`FRONT`] says so, at a quiet moment.
 /// Nothing reaches the OS.
 #[cfg(target_os = "macos")]
@@ -3335,7 +2131,7 @@ fn new_mac(reach: crate::devtools_helper::Reach, fda: crate::devtools_helper::Fd
         ..LaunchReach::inert()
     });
     app.access_steps.set_reach(StepsReach {
-        recorded: |_, _| Some(AccessOutcome::Triggered),
+        recorded: |_, _| Some(AccessOutcome::Handed),
         frontmost: front,
         // AppRt's unit-test arm records URLs without starting a process.
         open_pane: super::live_open_access_pane,
@@ -3616,7 +2412,7 @@ fn a_debugger_turned_off_on_record_is_the_rows_opt_out_at_launch() {
         assert!(!app.permission_steps_admitted(), "{name}: no admission");
         assert_eq!(
             app.access_opt_outs(),
-            [None, None, want, None],
+            [None, None, want],
             "{name}: the Debugger row alone"
         );
     }
@@ -3627,572 +2423,22 @@ fn a_debugger_turned_off_on_record_is_the_rows_opt_out_at_launch() {
     });
     assert_eq!(
         app.access_opt_outs(),
-        [Some(OptOut::Always(PRIVACY_OFF)); 4],
+        [Some(OptOut::Always(PRIVACY_OFF)); 3],
         "privacy off"
-    );
-}
-
-thread_local! {
-    static FAILED_TRIGGERS: RefCell<u32> = const { RefCell::new(0) };
-}
-
-/// A trigger that finds no LAN to name, counted on this thread.
-fn no_lan() -> bool {
-    FAILED_TRIGGERS.with(|t| *t.borrow_mut() += 1);
-    false
-}
-
-fn failed_triggers() -> u32 {
-    FAILED_TRIGGERS.with(|t| *t.borrow())
-}
-
-thread_local! {
-    /// The wakes the Local Network step's network watch was started with on this thread
-    /// (`StepsReach::watch_network`).
-    static NETWORK_WATCHES: RefCell<Vec<crate::devtools_helper::Wake>> =
-        const { RefCell::new(Vec::new()) };
-}
-
-/// A network watch that keeps its wake for [`network_moves`].
-fn watching(wake: crate::devtools_helper::Wake) {
-    NETWORK_WATCHES.with(|watches| watches.borrow_mut().push(wake));
-}
-
-/// How many network watches were started on this thread.
-fn watches() -> usize {
-    NETWORK_WATCHES.with(|watches| watches.borrow().len())
-}
-
-/// This Mac's network moves: every watch started on this thread hears it.
-fn network_moves() {
-    for wake in NETWORK_WATCHES.with(|watches| watches.borrow().clone()) {
-        wake();
-    }
-}
-
-/// The initial subscription must reconcile current local state: a Route already included in
-/// the watch's starting generation cannot require a second event to release the no-LAN retry.
-#[test]
-fn a_network_retry_reconciles_a_lan_returned_before_subscription() {
-    use crate::network_moved::{Moved, Woke};
-    use std::cell::Cell;
-    let signal = Arc::new(Moved::new());
-    let mut watch = signal.watch();
-    let calls = Cell::new(0);
-    let baseline = Cell::new(0);
-    let moves = std::iter::once_with(|| {
-        baseline.set(calls.get());
-        signal.tell(Woke::Route);
-        watch.wait(Duration::ZERO)
-    })
-    .chain(std::iter::once(Woke::Timer));
-    watch_network_moves(moves, || calls.set(calls.get() + 1));
-    assert_eq!(
-        calls.get() - baseline.get(),
-        1,
-        "an ordinary route tells once after any startup reconciliation; Timer tells nothing"
-    );
-
-    let signal = Arc::new(Moved::new());
-    signal.tell(Woke::Route);
-    let mut watch = signal.watch();
-    let wake = watch.wait(Duration::ZERO);
-    assert_eq!(
-        wake,
-        Woke::Timer,
-        "the starting generation includes that route"
-    );
-    let calls = Cell::new(0);
-    watch_network_moves([wake], || calls.set(calls.get() + 1));
-    assert_eq!(
-        calls.get(),
-        1,
-        "a LAN that returned before subscription needs no second route"
-    );
-}
-
-/// The real signal coalesces by generation, and a route move told before a later source still
-/// wakes the watcher as a Route (`network_moved::Moved` keeps a route-moved bit), so the retry
-/// requests one fresh reading of the current local state.
-#[test]
-fn a_network_retry_keeps_a_route_coalesced_under_another_source() {
-    use crate::network_moved::{Moved, Woke};
-    use std::cell::Cell;
-    let mut missed = Vec::new();
-    for last in [Woke::Beacon, Woke::Browse, Woke::LocalNetwork] {
-        let signal = Arc::new(Moved::new());
-        let mut watch = signal.watch();
-        let calls = Cell::new(0);
-        let baseline = Cell::new(0);
-        let moves = std::iter::once_with(|| {
-            baseline.set(calls.get());
-            signal.tell(Woke::Route);
-            signal.tell(last);
-            let wake = watch.wait(Duration::ZERO);
-            assert_eq!(
-                wake,
-                Woke::Route,
-                "the route move outlives the later source"
-            );
-            wake
-        });
-        watch_network_moves(moves, || calls.set(calls.get() + 1));
-        if calls.get() - baseline.get() != 1 {
-            missed.push(last);
-        }
-    }
-    assert!(
-        missed.is_empty(),
-        "coalesced recoveries were lost: {missed:?}"
-    );
-}
-
-/// Every move requests a fresh App reading, including an Offline status change. Timer
-/// does not. The same observer stays usable through later flaps; startup is one level wake.
-#[test]
-fn the_network_retry_observer_ignores_timeouts_and_survives_a_lan_flap() {
-    use crate::network_moved::Woke;
-    use std::cell::Cell;
-    let here = Cell::new(LanHere::Offline);
-    let observed = RefCell::new(Vec::new());
-    let stages = [
-        (LanHere::Offline, Woke::Timer),
-        (LanHere::Offline, Woke::Beacon),
-        (LanHere::Lan, Woke::Route),
-        (LanHere::Offline, Woke::Beacon),
-        (LanHere::Offline, Woke::Timer),
-        (LanHere::Lan, Woke::Route),
-    ];
-    let moves = stages.into_iter().map(|(next, wake)| {
-        here.set(next);
-        wake
-    });
-    watch_network_moves(moves, || observed.borrow_mut().push(here.get()));
-    assert_eq!(
-        observed.into_inner(),
-        [
-            LanHere::Offline,
-            LanHere::Offline,
-            LanHere::Lan,
-            LanHere::Offline,
-            LanHere::Lan
-        ],
-        "startup and state-only changes reach the App; timeouts do not"
-    );
-}
-
-/// A Local Network trigger on no network at all never spins the loop and never looks on a
-/// timer: it starts one network watch and its row reads calm until this Mac's network moves;
-/// then the move's fresh look reads the network it joined, the row is calm no more, and a
-/// network it could not ask on (no socket) looks again a retry later.
-#[test]
-fn network_reconciliation_refreshes_the_offline_row() {
-    use super::{LOCAL_NETWORK_NOTHING_TO_ASK, LOCAL_NETWORK_RETRY, OPT_OUT_ROWS};
-    use crate::network_moved::{Moved, Woke};
-    use aterm_types::macos_setup::opt_out::OptOut;
-    use std::cell::Cell;
-
-    let row = OPT_OUT_ROWS
-        .iter()
-        .position(|access| *access == Access::LocalNetwork)
-        .expect("Local Network row");
-    let calm = Some(OptOut::Always(LOCAL_NETWORK_NOTHING_TO_ASK));
-    NETWORK_WATCHES.with(|watches| watches.borrow_mut().clear());
-    RECORDS.with(|records| records.borrow_mut().clear());
-    let reach = StepsReach {
-        trigger_local_network: no_lan,
-        lan_here: || LanHere::Offline,
-        watch_network: watching,
-        ..stepping()
-    };
-    let mut app = App::headless_for_test();
-    app.access_steps.set_reach(reach);
-    focus(&mut app, true);
-    approve(&mut app, 9);
-    let t0 = Instant::now();
-    let asked = triggers();
-    app.tick_local_network_step(t0);
-    assert_eq!(app.access_opt_outs()[row], calm);
-    assert_eq!(watches(), 1);
-
-    let wake = NETWORK_WATCHES.with(|watches| watches.borrow()[0].clone());
-    let signal = Arc::new(Moved::new());
-    let mut watch = signal.watch();
-    let baseline = Cell::new(0);
-    let moves = std::iter::once_with(|| {
-        // Consume startup reconciliation before changing the state, so only the
-        // following actual Route can make the final status assertion pass.
-        app.tick_local_network_step(t0 + Duration::from_secs(1));
-        assert_eq!(app.access_opt_outs()[row], calm);
-        baseline.set(failed_triggers());
-        app.access_steps.set_reach(StepsReach {
-            lan_here: || LanHere::Lan,
-            ..reach
-        });
-        signal.tell(Woke::Route);
-        let woke = watch.wait(Duration::ZERO);
-        assert_eq!(woke, Woke::Route, "actual private signal");
-        woke
-    });
-    watch_network_moves(moves, || wake());
-
-    let now = t0 + Duration::from_secs(2);
-    app.tick_local_network_step(now);
-    assert_eq!(
-        failed_triggers(),
-        baseline.get() + 1,
-        "the move reached the App"
-    );
-    assert_eq!(app.access_opt_outs()[row], None, "calm no more");
-    assert_eq!(
-        app.next_access_step_deadline(now),
-        Some(now + LOCAL_NETWORK_RETRY),
-        "a network with no socket looks again a retry later"
-    );
-    assert_eq!(watches(), 1, "no watcher restart");
-    assert_eq!(triggers(), asked, "no prompt-capable trigger");
-    assert!(
-        records()
-            .iter()
-            .all(|(_, access, _)| *access != Access::LocalNetwork)
-    );
-}
-
-/// A Local Network trigger that found no LAN to name never spins the loop and never looks on a
-/// timer: it starts one network watch and arms nothing, hours on, until this Mac's network moves;
-/// then it looks again at the step's moment only. A move heard while System State is away waits
-/// for it: an unfocused window arms nothing, a focused one the next look for the moment, never a
-/// deadline due now. A new approval drops an earlier revision's retry, and with none approved it
-/// is kept but arms nothing, a move or not.
-#[test]
-fn a_trigger_that_found_no_lan_looks_again_once_the_network_moves_at_its_moment() {
-    use crate::devtools_helper::RECHECK_EVERY;
-    NETWORK_WATCHES.with(|watches| watches.borrow_mut().clear());
-    let reach = StepsReach {
-        trigger_local_network: no_lan,
-        watch_network: watching,
-        ..stepping()
-    };
-    let mut app = App::headless_for_test();
-    app.access_steps.set_reach(reach);
-    focus(&mut app, true);
-    approve(&mut app, 7);
-    let t0 = Instant::now();
-    let tried = failed_triggers();
-    app.tick_local_network_step(t0);
-    assert_eq!(failed_triggers(), tried + 1, "System State in front: tried");
-    assert_eq!(watches(), 1, "the network watch starts");
-    for hour in 1..=3 {
-        let now = t0 + Duration::from_secs(3600 * hour);
-        app.tick_local_network_step(now);
-        assert_eq!(
-            app.next_access_step_deadline(now),
-            None,
-            "hour {hour}: no timer"
-        );
-    }
-    assert_eq!(failed_triggers(), tried + 1, "no look without a move");
-
-    // The network moves while the person is in a terminal tab, then in another app.
-    network_moves();
-    app.access_steps.set_reach(StepsReach {
-        frontmost: |_| false,
-        ..reach
-    });
-    let moved = t0 + Duration::from_secs(4 * 3600);
-    focus(&mut app, false);
-    for park in 0..3 {
-        let now = moved + Duration::from_millis(park);
-        app.tick_local_network_step(now);
-        assert_eq!(
-            app.next_access_step_deadline(now),
-            None,
-            "park {park}: an unfocused window arms nothing"
-        );
-    }
-    focus(&mut app, true);
-    app.tick_local_network_step(moved);
-    assert_eq!(
-        app.next_access_step_deadline(moved),
-        None,
-        "the network move was consumed while aterm was in the background"
-    );
-    assert_eq!(
-        failed_triggers(),
-        tried + 2,
-        "retried without waiting for focus"
-    );
-
-    // Back at System State: it looks, finds no LAN again, and waits for the next move.
-    app.access_steps.set_reach(reach);
-    let back = moved + RECHECK_EVERY;
-    app.tick_local_network_step(back);
-    assert_eq!(failed_triggers(), tried + 2, "the move's look");
-    assert_eq!(
-        app.next_access_step_deadline(back),
-        None,
-        "and no timer after it"
-    );
-    app.tick_local_network_step(back + RECHECK_EVERY);
-    assert_eq!(failed_triggers(), tried + 2, "one look per move");
-    assert_eq!(watches(), 1, "one watch per process");
-
-    // A new approval drops the old revision's retry.
-    app.access_steps.set_reach(StepsReach {
-        frontmost: |_| false,
-        ..reach
-    });
-    approve(&mut app, 8);
-    app.tick_local_network_step(back);
-    assert_eq!(app.access_steps.local_network_retry, Some((8, None)));
-    assert!(
-        app.next_access_step_deadline(back)
-            .is_none_or(|at| at > back),
-        "nothing due at once for a revision no longer approved"
-    );
-    // The approval going away (an Apply holds the gate) keeps revision 8's retry, which arms
-    // nothing meanwhile, whatever moves.
-    app.access_steps.set_reach(reach);
-    app.tick_local_network_step(back);
-    assert_eq!(failed_triggers(), tried + 3, "revision 8 tried");
-    app.hold_initial_setup_permissions();
-    network_moves();
-    let later = back + Duration::from_secs(3600);
-    app.tick_local_network_step(later);
-    assert_eq!(
-        app.access_steps
-            .local_network_retry
-            .map(|(failed, _)| failed),
-        Some(8),
-        "kept while no revision is approved"
-    );
-    assert_eq!(
-        app.next_access_step_deadline(later),
-        None,
-        "nothing armed while no revision is approved"
-    );
-    assert_eq!(failed_triggers(), tried + 3);
-}
-
-/// A trigger that named a LAN but could not make its socket looks again a minute later, at the
-/// step's moment only: a retry due while System State is away is moved on a minute (left due, it
-/// would wake the loop on every park).
-#[test]
-fn a_trigger_with_no_socket_looks_again_a_minute_later_at_its_moment() {
-    let retry = super::LOCAL_NETWORK_RETRY;
-    NETWORK_WATCHES.with(|watches| watches.borrow_mut().clear());
-    let reach = StepsReach {
-        trigger_local_network: no_lan,
-        lan_here: || super::LanHere::Lan,
-        watch_network: watching,
-        ..stepping()
-    };
-    let mut app = App::headless_for_test();
-    app.access_steps.set_reach(reach);
-    focus(&mut app, true);
-    approve(&mut app, 7);
-    let t0 = Instant::now();
-    let tried = failed_triggers();
-    app.tick_local_network_step(t0);
-    assert_eq!(failed_triggers(), tried + 1);
-    assert_eq!(watches(), 0, "a LAN was named: no watch");
-    assert_eq!(app.next_access_step_deadline(t0), Some(t0 + retry));
-
-    app.access_steps.set_reach(StepsReach {
-        frontmost: |_| false,
-        ..reach
-    });
-    let due = t0 + retry;
-    app.tick_local_network_step(due);
-    assert_eq!(
-        app.next_access_step_deadline(due),
-        Some(due + retry),
-        "focused on a terminal tab: the retry was moved on a minute"
-    );
-    assert_eq!(
-        failed_triggers(),
-        tried + 2,
-        "retried while System State was in the background"
-    );
-    app.access_steps.set_reach(reach);
-    app.tick_local_network_step(due + retry);
-    assert_eq!(
-        failed_triggers(),
-        tried + 3,
-        "back at its moment: it looks again"
-    );
-}
-
-/// A Local Network retry outlives an Apply to another group, which holds the Permissions gate
-/// until its fresh status names the same access revision: kept and arming nothing through the
-/// gap, a network move told in it included, then looking at once once the revision stands again,
-/// so the Permissions stage does not wait on Local Network until a relaunch.
-#[test]
-fn a_retry_outlives_an_apply_that_keeps_the_access_revision() {
-    use crate::devtools_helper::RECHECK_EVERY;
-    NETWORK_WATCHES.with(|watches| watches.borrow_mut().clear());
-    let mut app = App::headless_for_test();
-    app.access_steps.set_reach(StepsReach {
-        trigger_local_network: no_lan,
-        watch_network: watching,
-        ..stepping()
-    });
-    focus(&mut app, true);
-    approve(&mut app, 7);
-    let t0 = Instant::now();
-    let tried = failed_triggers();
-    app.tick_local_network_step(t0);
-    assert_eq!(failed_triggers(), tried + 1, "no LAN yet");
-
-    // Keyboard & Trackpad → Set up: the Apply holds the gate, and the Wi-Fi joins meanwhile.
-    app.hold_initial_setup_permissions();
-    assert_eq!(app.access_revision(), None);
-    let gap = t0 + Duration::from_secs(1);
-    network_moves();
-    app.tick_local_network_step(gap);
-    assert_eq!(
-        app.next_access_step_deadline(gap),
-        None,
-        "nothing armed while no revision is approved"
-    );
-    assert_eq!(failed_triggers(), tried + 1);
-
-    // The fresh status names the same access revision.
-    app.accepted_initial_setup_apply();
-    approve(&mut app, 7);
-    assert_eq!(app.access_revision(), Some(7));
-    assert_eq!(
-        app.next_access_step_deadline(gap),
-        Some(gap + RECHECK_EVERY),
-        "the retry is armed again for revision 7"
-    );
-    app.tick_local_network_step(gap);
-    assert_eq!(failed_triggers(), tried + 2, "it looks for a LAN again");
-    assert_eq!(app.next_access_step_deadline(gap), None);
-}
-
-/// On no network at all its row reads calm for the Permissions stage, an opt-out that says
-/// there is nothing to ask yet ([`super::LOCAL_NETWORK_NOTHING_TO_ASK`]), and nothing is
-/// recorded; once this Mac joins a network, the step asks, records it, and the row is no longer
-/// calm. NEGATIVE CONTROL: a network the step could not ask on (no socket) reads no such row:
-/// it looks again a retry later.
-#[test]
-fn no_network_settles_the_local_network_row_calm_until_this_mac_joins_one() {
-    use super::{LOCAL_NETWORK_NOTHING_TO_ASK, LanHere, OPT_OUT_ROWS};
-    use aterm_types::macos_setup::opt_out::OptOut;
-    let lan = OPT_OUT_ROWS
-        .iter()
-        .position(|access| *access == Access::LocalNetwork)
-        .expect("the Local Network row");
-    NETWORK_WATCHES.with(|watches| watches.borrow_mut().clear());
-    RECORDS.with(|records| records.borrow_mut().clear());
-    let mut app = App::headless_for_test();
-    app.access_steps.set_reach(StepsReach {
-        trigger_local_network: no_lan,
-        lan_here: || LanHere::Offline,
-        watch_network: watching,
-        ..stepping()
-    });
-    focus(&mut app, true);
-    approve(&mut app, 9);
-    assert_eq!(app.access_opt_outs()[lan], None, "before the step looks");
-    let t0 = Instant::now();
-    app.tick_local_network_step(t0);
-    assert_eq!(
-        app.access_opt_outs()[lan],
-        Some(OptOut::Always(LOCAL_NETWORK_NOTHING_TO_ASK)),
-        "nothing to ask on no network: the row reads calm"
-    );
-    assert!(
-        records()
-            .iter()
-            .all(|(_, access, _)| *access != Access::LocalNetwork),
-        "nothing recorded"
-    );
-    let hour = t0 + Duration::from_secs(3600);
-    app.tick_local_network_step(hour);
-    assert_eq!(
-        app.access_opt_outs()[lan],
-        Some(OptOut::Always(LOCAL_NETWORK_NOTHING_TO_ASK)),
-        "an hour on, still calm"
-    );
-
-    // The Mac joins a network.
-    app.access_steps.set_reach(StepsReach {
-        lan_here: || LanHere::Lan,
-        watch_network: watching,
-        ..stepping()
-    });
-    let asked = triggers();
-    network_moves();
-    app.tick_local_network_step(hour);
-    assert_eq!(triggers(), asked + 1, "the move's look asks");
-    assert!(
-        records().contains(&(9, Access::LocalNetwork, AccessOutcome::Triggered)),
-        "and records it: {:?}",
-        records()
-    );
-    assert_eq!(
-        app.access_opt_outs()[lan],
-        None,
-        "the row is no longer calm"
-    );
-
-    let mut no_socket = App::headless_for_test();
-    no_socket.access_steps.set_reach(StepsReach {
-        trigger_local_network: no_lan,
-        lan_here: || LanHere::Lan,
-        watch_network: watching,
-        ..stepping()
-    });
-    focus(&mut no_socket, true);
-    approve(&mut no_socket, 9);
-    no_socket.tick_local_network_step(t0);
-    assert_eq!(
-        no_socket.access_opt_outs()[lan],
-        None,
-        "on a network the step could not ask on yet, the row waits for it"
-    );
-
-    // An earlier revision's calm opt-out is dropped when a later revision is already on record.
-    let mut next_rev = App::headless_for_test();
-    next_rev.access_steps.set_reach(StepsReach {
-        trigger_local_network: no_lan,
-        lan_here: || LanHere::Offline,
-        watch_network: watching,
-        recorded: |rev, access| {
-            (rev == 10 && access == Access::LocalNetwork).then_some(AccessOutcome::Triggered)
-        },
-        ..stepping()
-    });
-    focus(&mut next_rev, true);
-    approve(&mut next_rev, 9);
-    next_rev.tick_local_network_step(t0);
-    assert_eq!(
-        next_rev.access_opt_outs()[lan],
-        Some(OptOut::Always(LOCAL_NETWORK_NOTHING_TO_ASK)),
-        "revision 9 reads calm on no network"
-    );
-    approve(&mut next_rev, 10);
-    next_rev.tick_local_network_step(t0);
-    assert_eq!(
-        next_rev.access_opt_outs()[lan],
-        None,
-        "a later revision already on record clears the old revision's calm opt-out"
     );
 }
 
 /// A control client's act on a System State row is queued and comes up only at the step moment
 /// (System State the visible view of the focused window, no other macOS dialog up), never at a
 /// control verb's quiet moment with a terminal tab in front. Developer Tools goes through the
-/// hand-over lane (`Origin::SystemStateAct`); a Local Network or Accessibility pane then counts
+/// hand-over lane (`Origin::SystemStateAct`); an Accessibility pane then counts
 /// as up for its hold, and an act still waiting after the lapse is dropped.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_clients_act_on_a_row_waits_for_the_step_moment() {
     use crate::devtools_helper::{ASKED_LAPSE, Origin, RECHECK_EVERY, test_arms};
     let with_dialog_up = StepsReach {
-        recorded: |_, _| Some(AccessOutcome::Triggered),
+        recorded: |_, _| Some(AccessOutcome::Handed),
         frontmost: front,
         open_pane: super::live_open_access_pane,
         dialog_up: || true,
@@ -4231,7 +2477,7 @@ fn a_clients_act_on_a_row_waits_for_the_step_moment() {
     app.tick_consent_lanes(t1 + RECHECK_EVERY);
     assert_eq!(test_arms::opens(), opens + 1, "the page at the step moment");
 
-    // Local Network and Accessibility.
+    // Accessibility.
     set_front(false);
     let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
     show_accessibility_needs_you(&mut app);
@@ -4280,7 +2526,7 @@ fn a_clients_act_on_a_row_waits_for_the_step_moment() {
     // An act whose dialog slot never becomes available lapses.
     set_front(false);
     app.access_steps.set_reach(with_dialog_up);
-    assert!(!app.open_access_from_system_state(Access::LocalNetwork, false));
+    assert!(!app.open_access_from_system_state(Access::Accessibility, false));
     let asked = t2 + super::PANE_HOLD;
     app.tick_consent_lanes(asked + ASKED_LAPSE);
     set_front(true);
@@ -4342,7 +2588,7 @@ fn the_access_cards_not_now_is_spent_on_the_first_revision_it_meets() {
     let fda = Access::FullDiskAccess;
     let now = Instant::now();
     let unrecorded = StepsReach {
-        recorded: |_, access| (access == Access::LocalNetwork).then_some(AccessOutcome::Triggered),
+        recorded: |_, _| None,
         ..stepping()
     };
 
@@ -4420,7 +2666,7 @@ fn the_access_cards_not_now_holds_its_revision_and_a_new_one_asks_again() {
     use crate::devtools_helper::test_arms;
     let fda = Access::FullDiskAccess;
     let on_record_but_lan = StepsReach {
-        recorded: |_, access| (access == Access::LocalNetwork).then_some(AccessOutcome::Triggered),
+        recorded: |_, _| None,
         frontmost: front,
         ..stepping()
     };
@@ -4658,7 +2904,7 @@ fn a_press_while_no_revision_stands_keeps_the_full_disk_access_page_shown_for_it
         |word| MARK.with(|mark| *mark.borrow_mut() = Some(word.to_owned())),
     );
     let on_record = StepsReach {
-        recorded: |_, access| (access == Access::LocalNetwork).then_some(AccessOutcome::Triggered),
+        recorded: |_, _| None,
         frontmost: front,
         ..stepping()
     };
@@ -4978,7 +3224,7 @@ fn an_ask_the_waiting_full_disk_access_step_carried_is_judged_when_the_step_is_r
     use aterm_containment::consent::FdaState;
     let shown = test_arms::fda_marking(|_| Some((atpkg::devtools::revision_key(1), 1)), |_| {});
     let on_record = StepsReach {
-        recorded: |_, access| (access == Access::LocalNetwork).then_some(AccessOutcome::Triggered),
+        recorded: |_, _| None,
         frontmost: front,
         ..stepping()
     };
@@ -5138,145 +3384,6 @@ fn the_control_verbs_ask_that_rides_the_step_keeps_its_own_quiet_moment() {
     }
 }
 
-/// A control verb's Developer Tools ask, queued alone or riding the window's own step, waits
-/// while the Local Network alert the window raised holds the screen: its moment keeps the steps'
-/// one-gesture rule (`App::control_ask_moment`), so its page does not come up during the alert's
-/// hold, and comes up once the hold is over: the person at the Mac for
-/// [`LOCAL_NETWORK_ALERT_HOLD`] from the first look that reads a touch since the ask.
-#[cfg(target_os = "macos")]
-#[test]
-fn a_control_verbs_ask_waits_out_the_local_network_alert() {
-    use crate::devtools_helper::{
-        DevToolsHelperArm, HandOver, Lane, Origin, RECHECK_EVERY, test_arms,
-    };
-    use aterm_containment::DevToolGrant;
-    set_front(true);
-    for riding in [false, true] {
-        let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
-        app.access_steps.set_reach(StepsReach {
-            recorded: |_, _| None,
-            ..app.access_steps.reach
-        });
-        app.consent = reread(aterm_containment::consent::FdaState::Granted);
-        test_arms::stand_in(&mut app, test_arms::opening());
-        app.devtools_helper =
-            Lane::windowed_for_test(test_arms::opening(), DevToolsHelperArm::inert());
-        app.devtools_helper.note_reading(
-            test_arms::reading(DevToolGrant::NotGranted, test_arms::absent(2)),
-            Instant::now(),
-        );
-        focus(&mut app, true);
-        // The last touch reads just over the verb's key rest old at every look: none since the
-        // ask until that long after it.
-        app.user_input_recent = |within| within > crate::devtools_helper::QUIET_FOR;
-        let t0 = Instant::now() + crate::consent_card::LAUNCH_SETTLE;
-        assert!(
-            app.devtools_moment_is_quiet(t0),
-            "precondition: the verb's quiet moment"
-        );
-        if riding {
-            assert_eq!(
-                app.hand_devtools_to_owner(Origin::Automatic),
-                HandOver::Queued
-            );
-        }
-        assert_eq!(app.hand_devtools_to_owner(Origin::Ctl), HandOver::Queued);
-        let (opens, asked) = (test_arms::opens(), triggers());
-        app.tick_consent_lanes(t0);
-        let touched = t0 + crate::devtools_helper::QUIET_FOR + Duration::from_secs(1);
-        let hold = LOCAL_NETWORK_ALERT_HOLD;
-        let mut park = Duration::ZERO;
-        while park < hold {
-            app.tick_consent_lanes(touched + park);
-            park += RECHECK_EVERY;
-        }
-        assert_eq!(
-            (triggers(), test_arms::opens()),
-            (asked + 1, opens),
-            "riding {riding}: the alert first, and no page beside it"
-        );
-        app.tick_consent_lanes(touched + hold);
-        assert_eq!(
-            test_arms::opens(),
-            opens + 1,
-            "riding {riding}: the page once the alert's hold is over"
-        );
-    }
-}
-
-/// [`a_control_verbs_ask_waits_out_the_local_network_alert`] for an ask whose own `spctl` run
-/// ends while the alert's hold is up: judged again at the run's end
-/// (`App::devtools_hand_over_after_listing`), it waits, and brings the page up with that run's
-/// answer once the hold is over.
-#[cfg(target_os = "macos")]
-#[test]
-fn a_control_verbs_run_that_ends_under_the_local_network_alert_waits_it_out() {
-    use crate::devtools_helper::{DevToolsHelperArm, HandOver, Lane, Moment, Origin, test_arms};
-    use aterm_containment::DevToolGrant;
-    use std::sync::atomic::{AtomicU32, Ordering};
-    // `spctl` runs on the lane's worker thread.
-    static RUNS: AtomicU32 = AtomicU32::new(0);
-    let mut counted = test_arms::opening();
-    counted.list_terminal = || {
-        RUNS.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    };
-    let run_out = |app: &mut App, at: Instant| {
-        let start = Instant::now();
-        while app.devtools_helper.listing().is_some() {
-            assert!(start.elapsed() < Duration::from_secs(60), "hang");
-            app.tick_devtools_hand_over(at);
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    };
-    set_front(true);
-    let mut app = new_mac(counted, test_arms::fda_opening());
-    app.access_steps.set_reach(StepsReach {
-        recorded: |_, _| None,
-        ..app.access_steps.reach
-    });
-    app.consent = reread(aterm_containment::consent::FdaState::Granted);
-    test_arms::stand_in(&mut app, counted);
-    app.devtools_helper = Lane::windowed_for_test(counted, DevToolsHelperArm::inert());
-    app.devtools_helper.note_reading(
-        test_arms::reading(DevToolGrant::NotGranted, test_arms::absent(0)),
-        Instant::now(),
-    );
-    focus(&mut app, true);
-    // The last touch reads just over the verb's key rest old at every look.
-    app.user_input_recent = |within| within > crate::devtools_helper::QUIET_FOR;
-    let t0 = Instant::now() + crate::consent_card::LAUNCH_SETTLE;
-    assert_eq!(
-        app.devtools_hand_over(Origin::Ctl, Moment::Quiet),
-        HandOver::Listing
-    );
-    let asked = triggers();
-    app.tick_local_network_step(t0);
-    assert_eq!(
-        triggers(),
-        asked + 1,
-        "the alert comes up while the run is out"
-    );
-    let opens = test_arms::opens();
-    run_out(&mut app, t0);
-    assert_eq!(
-        (test_arms::opens(), app.devtools_helper.queued()),
-        (opens, Some(Origin::Ctl)),
-        "the run's end finds the alert up: the ask waits"
-    );
-    // The first look that reads a touch since the ask starts the person's time with the alert.
-    let touched = t0 + crate::devtools_helper::QUIET_FOR + Duration::from_secs(1);
-    app.tick_consent_lanes(touched);
-    assert_eq!(test_arms::opens(), opens, "the hold stands");
-    app.tick_consent_lanes(touched + LOCAL_NETWORK_ALERT_HOLD);
-    run_out(&mut app, touched + LOCAL_NETWORK_ALERT_HOLD);
-    assert_eq!(
-        (test_arms::opens(), RUNS.load(Ordering::SeqCst)),
-        (opens + 1, 1),
-        "its page once the hold is over, with its own run's answer"
-    );
-}
-
 /// A Developer Tools reading made while no revision stands (the launch read before the first
 /// setup status) takes no version-keyed marker (`aterm doctor`'s) for a revision's page:
 /// it asks, the window's own step waits queued for the revision, and its page comes up at the
@@ -5346,7 +3453,7 @@ fn the_panels_show_it_puts_its_page_on_record() {
     }
     fn recorded(revision: u64, access: Access) -> Option<AccessOutcome> {
         if access != Access::DeveloperTools {
-            return Some(AccessOutcome::Triggered);
+            return Some(AccessOutcome::Handed);
         }
         records()
             .into_iter()
@@ -5431,7 +3538,7 @@ fn the_panels_show_it_with_no_revision_marks_its_page_and_leaves_the_step() {
     }
     fn recorded(revision: u64, access: Access) -> Option<AccessOutcome> {
         if access != Access::DeveloperTools {
-            return Some(AccessOutcome::Triggered);
+            return Some(AccessOutcome::Handed);
         }
         records()
             .into_iter()
@@ -5677,9 +3784,7 @@ fn a_press_with_no_revision_leaves_the_full_disk_access_step_waiting_for_it() {
             DevToolsHelperArm::inert(),
         );
         app.access_steps.set_reach(StepsReach {
-            recorded: |_, access| {
-                (access == Access::LocalNetwork).then_some(AccessOutcome::Triggered)
-            },
+            recorded: |_, _| None,
             frontmost: front,
             ..stepping()
         });
@@ -6015,7 +4120,7 @@ fn an_ask_the_full_disk_access_step_carried_waits_with_it_when_it_waits_again() 
         |_| {},
     );
     let on_record = StepsReach {
-        recorded: |_, access| (access == Access::LocalNetwork).then_some(AccessOutcome::Triggered),
+        recorded: |_, _| None,
         frontmost: front,
         ..stepping()
     };
@@ -6054,11 +4159,13 @@ fn an_ask_the_full_disk_access_step_carried_waits_with_it_when_it_waits_again() 
 }
 
 /// The `[privacy]` switches each test below turns off, one at a time.
+#[cfg(target_os = "macos")]
 const SWITCHES: [&str; 3] = ["enabled", "check", "notice"];
 
 /// `[privacy]` with the switch `off` turned off (none: every switch on), a probe
 /// planted for an hour, and no folder pass (its dialogs would hold the step
 /// moment).
+#[cfg(target_os = "macos")]
 fn switches(off: Option<&str>) -> crate::app_config::PrivacyConfig {
     let mut privacy = crate::app_config::PrivacyConfig {
         probe_interval_ms: Some(3_600_000),
@@ -6072,61 +4179,6 @@ fn switches(off: Option<&str>) -> crate::app_config::PrivacyConfig {
         _ => {}
     }
     privacy
-}
-
-/// A `[privacy]` switch off pauses the Local Network step, never answers it: the trigger runs for
-/// the same revision once the switch is on, and a timed retry (a LAN named but no socket) that
-/// fell due meanwhile is moved on (never left due) and looks again when it next falls due.
-#[test]
-fn a_privacy_switch_off_pauses_the_local_network_step() {
-    let retry = super::LOCAL_NETWORK_RETRY;
-    for off in SWITCHES {
-        let t0 = Instant::now();
-        let mut app = App::headless_for_test();
-        app.access_steps.set_reach(stepping());
-        app.config.privacy = Some(switches(Some(off)));
-        approve(&mut app, 5);
-        let (fired, recorded) = (triggers(), records().len());
-        app.tick_local_network_step(t0);
-        assert_eq!(triggers(), fired, "{off} off: nothing asked");
-        assert_eq!(records().len(), recorded, "{off} off: nothing recorded");
-        app.config.privacy = Some(switches(None));
-        app.tick_local_network_step(t0);
-        assert_eq!(triggers(), fired + 1, "{off} on again: asked");
-        assert_eq!(
-            records()[recorded..],
-            [(5, Access::LocalNetwork, AccessOutcome::Triggered)]
-        );
-
-        let mut app = App::headless_for_test();
-        app.access_steps.set_reach(StepsReach {
-            trigger_local_network: no_lan,
-            lan_here: || super::LanHere::Lan,
-            ..stepping()
-        });
-        focus(&mut app, true);
-        approve(&mut app, 7);
-        let tried = failed_triggers();
-        app.tick_local_network_step(t0);
-        assert_eq!(failed_triggers(), tried + 1, "PRECONDITION: no socket yet");
-        app.config.privacy = Some(switches(Some(off)));
-        let due = t0 + retry;
-        app.tick_local_network_step(due);
-        assert_eq!(failed_triggers(), tried + 1, "{off} off: not looked for");
-        assert_eq!(
-            app.next_access_step_deadline(due),
-            None,
-            "{off} off: nothing armed"
-        );
-        app.config.privacy = Some(switches(None));
-        assert_eq!(
-            app.next_access_step_deadline(due),
-            Some(due + retry),
-            "{off} on again: the retry was moved on, never left due"
-        );
-        app.tick_local_network_step(due + retry);
-        assert_eq!(failed_triggers(), tried + 2, "{off} on again: looked for");
-    }
 }
 
 /// `n` parks of the consent lanes, each [`crate::devtools_helper::RECHECK_EVERY`]
@@ -6543,7 +4595,7 @@ fn a_spent_card_not_now_keeps_the_menu_line_dark_in_its_own_revision() {
     use crate::consent_card::{self, AccessRecord, DecideWhy, Marker, PendingDecision};
     use crate::devtools_helper::test_arms;
     let on_record_but_lan = StepsReach {
-        recorded: |_, access| (access == Access::LocalNetwork).then_some(AccessOutcome::Triggered),
+        recorded: |_, _| None,
         frontmost: front,
         ..stepping()
     };
@@ -7218,1497 +5270,4 @@ fn a_switch_toggled_twice_brings_the_page_once() {
         assert_eq!(test_arms::fda_counts().0 - opens, 1, "{off}: one page");
         assert!(!app.consent_card_host.launch_held, "{off}: nothing held");
     }
-}
-
-#[test]
-fn local_network_grant_probe_frees_the_dialog_slot_before_recording_granted() {
-    use super::LocalNetworkProbe;
-    use aterm_types::macos_setup::{MacosDialog, macos_dialog_up};
-
-    thread_local! {
-        static PROBE_STARTED: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
-        static PROBE_OUTCOME: std::cell::Cell<Option<(u64, LocalNetworkProbe)>> = const { std::cell::Cell::new(None) };
-        static RECORDED_WITH_DIALOG_FREE: std::cell::RefCell<Vec<(u64, Access, AccessOutcome, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
-    }
-
-    let _serial = DIALOG_TEST
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    assert!(!macos_dialog_up());
-
-    let reach = StepsReach {
-        start_local_network_probe: |revision| {
-            PROBE_STARTED.with(|v| v.borrow_mut().push(revision));
-        },
-        take_local_network_probe: || PROBE_OUTCOME.with(|c| c.take()),
-        record: |revision, access, outcome| {
-            let dialog_free = MacosDialog::when_none_up(Duration::ZERO).is_some();
-            RECORDED_WITH_DIALOG_FREE.with(|v| {
-                v.borrow_mut()
-                    .push((revision, access, outcome, dialog_free))
-            });
-            Ok(())
-        },
-        dialog_up: macos_dialog_up,
-        holds_dialog: true,
-        ..stepping()
-    };
-
-    PROBE_STARTED.with(|v| v.borrow_mut().clear());
-    PROBE_OUTCOME.with(|c| c.set(None));
-    RECORDED_WITH_DIALOG_FREE.with(|v| v.borrow_mut().clear());
-
-    let now = Instant::now();
-    let mut app = App::headless_for_test();
-    app.access_steps.set_reach(reach);
-    approve(&mut app, 91);
-
-    app.tick_local_network_step(now);
-    assert_eq!(PROBE_STARTED.with(|v| v.borrow().clone()), [91]);
-    assert!(macos_dialog_up(), "Triggered holds the alert dialog slot");
-
-    // When the 1 s re-probe hears a LAN server (Allow), the dialog slot is freed BEFORE
-    // AccessOutcome::Granted is recorded so the worker's Secrets lane can start immediately.
-    PROBE_OUTCOME.with(|c| c.set(Some((91, LocalNetworkProbe::Granted))));
-    app.on_local_network_probe_ready(now + Duration::from_secs(2));
-    assert!(!macos_dialog_up(), "Granted releases the alert dialog slot");
-    assert_eq!(
-        RECORDED_WITH_DIALOG_FREE.with(|v| v.borrow().clone()),
-        [
-            (91, Access::LocalNetwork, AccessOutcome::Triggered, false),
-            (91, Access::LocalNetwork, AccessOutcome::Granted, true),
-        ]
-    );
-    drop(app);
-
-    // Negative control: Refused (or a stale revision) releases the hold without recording
-    // AccessOutcome::Granted, and Unanswered leaves it to the person's time with the alert.
-    PROBE_STARTED.with(|v| v.borrow_mut().clear());
-    RECORDED_WITH_DIALOG_FREE.with(|v| v.borrow_mut().clear());
-    let mut control = App::headless_for_test();
-    control.access_steps.set_reach(reach);
-    approve(&mut control, 92);
-    control.tick_local_network_step(now);
-    assert!(macos_dialog_up());
-
-    PROBE_OUTCOME.with(|c| c.set(Some((91, LocalNetworkProbe::Granted))));
-    control.on_local_network_probe_ready(now + Duration::from_secs(1));
-    assert!(macos_dialog_up(), "stale revision is ignored");
-
-    PROBE_OUTCOME.with(|c| c.set(Some((92, LocalNetworkProbe::Refused))));
-    control.on_local_network_probe_ready(now + Duration::from_secs(2));
-    assert!(!macos_dialog_up(), "Refused releases the dialog hold");
-    assert_eq!(
-        RECORDED_WITH_DIALOG_FREE.with(|v| v.borrow().clone()),
-        [(92, Access::LocalNetwork, AccessOutcome::Triggered, false)]
-    );
-    drop(control);
-
-    RECORDED_WITH_DIALOG_FREE.with(|v| v.borrow_mut().clear());
-    let mut unanswered = App::headless_for_test();
-    unanswered.access_steps.set_reach(reach);
-    approve(&mut unanswered, 93);
-    unanswered.tick_local_network_step(now);
-    assert!(macos_dialog_up());
-
-    // A re-probe that heard nothing says nothing of the alert: raised while nobody was at the
-    // Mac, it is still up for them, so the hold and its slot stand for the person's time.
-    PROBE_OUTCOME.with(|c| c.set(Some((93, LocalNetworkProbe::Unanswered))));
-    let ended = now + Duration::from_secs(30);
-    unanswered.on_local_network_probe_ready(ended);
-    unanswered.settle_access_steps(ended);
-    assert!(
-        macos_dialog_up(),
-        "Unanswered leaves the hold to the person"
-    );
-    unanswered.user_input_recent = |_| true;
-    let back = ended + Duration::from_secs(1);
-    unanswered.tick_local_network_step(back);
-    unanswered.settle_access_steps(back);
-    assert!(
-        macos_dialog_up(),
-        "the person back: their time with the alert starts"
-    );
-    unanswered.tick_local_network_step(back + LOCAL_NETWORK_ALERT_HOLD);
-    unanswered.settle_access_steps(back + LOCAL_NETWORK_ALERT_HOLD);
-    assert!(
-        !macos_dialog_up(),
-        "the person's time with the alert releases the dialog hold"
-    );
-    assert_eq!(
-        RECORDED_WITH_DIALOG_FREE.with(|v| v.borrow().clone()),
-        [(93, Access::LocalNetwork, AccessOutcome::Triggered, false)]
-    );
-}
-
-/// Local Network's step tells the LAN readers (the converge lane, whose `sync.peers` read "macOS
-/// has not asked" before) each time the answer moves as the window hears it: once as its question
-/// goes up, after the record says `triggered` (which the access record keeps as asked, so a look
-/// from then on reads past "has not asked"), and once as the re-probe ends, whatever it heard: a
-/// grant, a Don't Allow, or nothing in its 30 s (no ALab vault on this network, as on e2e145, or
-/// an answer after the probe gave up). Another revision's probe tells nothing, and so does a
-/// recheck that hears nothing after a probe that heard nothing (E3, 2026-11-05: a guest whose
-/// question nobody answered ran its converge pass and account upkeep every 90 s on it); an
-/// answer a later recheck hears tells again.
-/// NEGATIVE CONTROL: the rule before this (a nudge only for a heard grant or refusal) fails the
-/// question's case, and the probe's end that heard nothing, the one e2e145 met; a nudge at every
-/// probe's end fails the silent recheck's.
-#[test]
-fn local_network_steps_tell_the_lan_readers_each_time_the_answer_moves() {
-    use super::LocalNetworkProbe;
-
-    type Heard = Option<(u64, LocalNetworkProbe)>;
-    thread_local! {
-        static OUTCOME: std::cell::Cell<Heard> = const { std::cell::Cell::new(None) };
-        static NUDGES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-        static ASKED_FIRST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    let reach = StepsReach {
-        take_local_network_probe: || OUTCOME.with(std::cell::Cell::take),
-        lan_answer_moved: || {
-            NUDGES.with(|count| count.set(count.get() + 1));
-            let asked = RECORDS.with(|records| {
-                records
-                    .borrow()
-                    .contains(&(91, Access::LocalNetwork, AccessOutcome::Triggered))
-            });
-            ASKED_FIRST.with(|first| first.set(asked));
-        },
-        ..stepping()
-    };
-    let now = Instant::now();
-    for probe in [
-        LocalNetworkProbe::Granted,
-        LocalNetworkProbe::Refused,
-        LocalNetworkProbe::Unanswered,
-    ] {
-        let mut app = App::headless_for_test();
-        app.access_steps.set_reach(reach);
-        approve(&mut app, 91);
-        RECORDS.with(|records| records.borrow_mut().clear());
-        NUDGES.with(|count| count.set(0));
-        ASKED_FIRST.with(|first| first.set(false));
-
-        app.tick_local_network_step(now);
-        assert_eq!(
-            NUDGES.with(std::cell::Cell::get),
-            1,
-            "{probe:?}: the question went up"
-        );
-        assert!(
-            ASKED_FIRST.with(std::cell::Cell::get),
-            "{probe:?}: told once the record says asked"
-        );
-
-        OUTCOME.with(|outcome| outcome.set(Some((90, probe))));
-        app.on_local_network_probe_ready(now + Duration::from_secs(1));
-        assert_eq!(
-            NUDGES.with(std::cell::Cell::get),
-            1,
-            "{probe:?}: another revision's"
-        );
-
-        OUTCOME.with(|outcome| outcome.set(Some((91, probe))));
-        app.on_local_network_probe_ready(now + Duration::from_secs(31));
-        assert_eq!(
-            NUDGES.with(std::cell::Cell::get),
-            2,
-            "{probe:?}: the re-probe ended"
-        );
-
-        if probe == LocalNetworkProbe::Unanswered {
-            OUTCOME.with(|outcome| outcome.set(Some((91, LocalNetworkProbe::Unanswered))));
-            app.on_local_network_probe_ready(now + Duration::from_secs(121));
-            assert_eq!(
-                NUDGES.with(std::cell::Cell::get),
-                2,
-                "a recheck that heard nothing again moved nothing"
-            );
-            OUTCOME.with(|outcome| outcome.set(Some((91, LocalNetworkProbe::Granted))));
-            app.on_local_network_probe_ready(now + Duration::from_secs(211));
-            assert_eq!(
-                NUDGES.with(std::cell::Cell::get),
-                3,
-                "a later recheck's answer moved it"
-            );
-        }
-    }
-}
-
-#[test]
-fn swarm_off_starts_no_local_network_probe_and_discards_a_ready_grant() {
-    use super::LocalNetworkProbe;
-    use aterm_types::macos_setup::{MacosDialog, macos_dialog_up};
-
-    thread_local! {
-        static STARTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-        static RECORDED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    }
-    let _serial = DIALOG_TEST
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let now = Instant::now();
-    let mut app = App::headless_for_test();
-    app.access_steps.set_reach(StepsReach {
-        start_local_network_probe: |_| STARTED.with(|count| count.set(count.get() + 1)),
-        take_local_network_probe: || Some((91, LocalNetworkProbe::Granted)),
-        record: |_, _, _| {
-            RECORDED.with(|count| count.set(count.get() + 1));
-            Ok(())
-        },
-        holds_dialog: true,
-        ..stepping()
-    });
-    approve(&mut app, 91);
-    app.config.swarm = Some(crate::app_config::SwarmConfig {
-        enabled: Some(false),
-    });
-    STARTED.with(|count| count.set(0));
-    RECORDED.with(|count| count.set(0));
-    app.tick_local_network_step(now);
-    assert_eq!(STARTED.with(std::cell::Cell::get), 0);
-    assert_eq!(RECORDED.with(std::cell::Cell::get), 0);
-    assert!(
-        app.access_step_moment(now),
-        "independent access steps remain eligible while swarm is Off"
-    );
-
-    // Turning Off while a grant is ready releases the old dialog hold without publishing the
-    // grant that would wake the automatic Secrets lane.
-    app.access_steps.local_network_done = Some(91);
-    app.access_steps.alert_seen_at_for_test(now);
-    app.access_steps.dialog = MacosDialog::when_none_up(Duration::ZERO);
-    assert!(macos_dialog_up());
-    app.on_local_network_probe_ready(now);
-    assert!(!macos_dialog_up());
-    assert_eq!(RECORDED.with(std::cell::Cell::get), 0);
-}
-
-/// With `[swarm] enabled = false` the window takes no Local Network step, so it tells the setup
-/// worker the row is settled: an opt-out naming the switch calmly, which the Permissions stage
-/// reads as not needed instead of waiting on a step that never runs. It claims no answer to
-/// macOS's question. With the switch on, the row has no opt-out and the step runs.
-/// NEGATIVE CONTROL: an `access_opt_outs` that publishes nothing for Local Network leaves the
-/// stage waiting for good, and a System State tab reopening at each launch.
-#[test]
-fn swarm_off_settles_the_local_network_row_for_the_permissions_stage() {
-    use super::SHARING_OFF_LAN;
-    use aterm_types::macos_setup::opt_out::OptOut;
-    let now = Instant::now();
-    let lan = super::OPT_OUT_ROWS
-        .iter()
-        .position(|access| *access == Access::LocalNetwork)
-        .unwrap();
-    let mut app = App::headless_for_test();
-    app.access_steps.set_reach(stepping());
-    approve(&mut app, 92);
-    assert_eq!(
-        app.access_opt_outs()[lan],
-        None,
-        "the switch on: no opt-out"
-    );
-    assert!(app.local_network_pending(), "the switch on: the step runs");
-    app.config.swarm = Some(crate::app_config::SwarmConfig {
-        enabled: Some(false),
-    });
-    RECORDS.with(|r| r.borrow_mut().clear());
-    for minute in 0..5 {
-        app.tick_local_network_step(now + Duration::from_secs(60 * minute));
-    }
-    assert!(
-        !records()
-            .iter()
-            .any(|(_, access, _)| *access == Access::LocalNetwork),
-        "the switch off: no step"
-    );
-    assert_eq!(
-        app.access_opt_outs()[lan],
-        Some(OptOut::Always(SHARING_OFF_LAN)),
-        "the switch off: the row's opt-out says why"
-    );
-}
-
-/// The door a window's first LAN uses go through past their wait for the Local Network step reads
-/// the window's keys at rest as the steps read their quiet moment: an aterm window has keyboard
-/// focus, and no key went to aterm, nor did focus come back, within the steps' key rest.
-#[test]
-fn the_doors_key_rest_needs_focus_and_the_steps_quiet_seconds() {
-    use crate::devtools_helper::QUIET_FOR;
-    let now = Instant::now() + Duration::from_secs(3600);
-    assert!(crate::keys_rest_at(true, None, now), "no key yet");
-    assert!(crate::keys_rest_at(true, Some(now - QUIET_FOR), now));
-    assert!(
-        !crate::keys_rest_at(true, Some(now - QUIET_FOR + Duration::from_secs(1)), now),
-        "a key within the rest"
-    );
-    assert!(
-        !crate::keys_rest_at(false, None, now),
-        "no aterm window has keyboard focus"
-    );
-}
-
-/// When the window stops a Local Network alert watch that [`watch_through`] drives, as a time
-/// since its first read: the hold it may end ended another way (the person's time, the
-/// re-probe's answer), which stops the watch, as an alert never answered leaves it. It comes
-/// past the watch's first looks ([`super::LOCAL_NETWORK_ALERT_FIRST_LOOKS`]), so a watch that
-/// finds the person away reads at the away pace before it.
-const WATCH_STOPPED: Duration = Duration::from_secs(60);
-
-/// Windows of the alert's owner, each on screen.
-fn on(numbers: &[u32]) -> Vec<super::AlertWindow> {
-    numbers
-        .iter()
-        .map(|&number| super::AlertWindow {
-            number,
-            on_screen: true,
-        })
-        .collect()
-}
-
-/// Windows of the alert's owner, each listed off screen (ordered out).
-fn off(numbers: &[u32]) -> Vec<super::AlertWindow> {
-    numbers
-        .iter()
-        .map(|&number| super::AlertWindow {
-            number,
-            on_screen: false,
-        })
-        .collect()
-}
-
-/// One Local Network alert watch ([`super::watch_alert`]) driven by explicit times: its first
-/// read, the baseline the trigger waits for, at `t0`, with the trigger arming it then; then, as
-/// the live worker paces its reads, one every [`super::LOCAL_NETWORK_ALERT_LOOK`] after a read
-/// within [`super::LOCAL_NETWORK_ALERT_FIRST_LOOKS`] of `t0` or one that found the person
-/// present, and every [`super::LOCAL_NETWORK_ALERT_AWAY_LOOK`] after a later one that found them
-/// away, while that look comes before `t0 + WATCH_STOPPED`, as the live worker's look ends once
-/// the window stops the watch. Each read is `listed` at its time since `t0` (`None`: a window list that could not be
-/// read), and the person is `present` at it. How the watch ended, and the times since `t0` it
-/// read at.
-fn watch_with(
-    t0: Instant,
-    listed: impl Fn(Duration) -> Option<Vec<super::AlertWindow>>,
-    present: impl Fn(Duration) -> bool,
-) -> (super::AlertWatchEnd, Vec<Duration>) {
-    let at = std::cell::Cell::new(t0);
-    let reads = RefCell::new(Vec::new());
-    let end = super::watch_alert(
-        || {
-            let since = at.get().duration_since(t0);
-            reads.borrow_mut().push(since);
-            listed(since)
-        },
-        || present(at.get().duration_since(t0)),
-        |here| {
-            let first = at.get().duration_since(t0) < super::LOCAL_NETWORK_ALERT_FIRST_LOOKS;
-            let next = at.get()
-                + if here || first {
-                    super::LOCAL_NETWORK_ALERT_LOOK
-                } else {
-                    super::LOCAL_NETWORK_ALERT_AWAY_LOOK
-                };
-            if next >= t0 + WATCH_STOPPED {
-                return false;
-            }
-            at.set(next);
-            true
-        },
-    );
-    (end, reads.into_inner())
-}
-
-/// [`watch_with`] with the person at the Mac throughout.
-fn watch_through(
-    t0: Instant,
-    listed: impl Fn(Duration) -> Option<Vec<super::AlertWindow>>,
-) -> (super::AlertWatchEnd, Vec<Duration>) {
-    watch_with(t0, listed, |_| true)
-}
-
-/// The last look before the window stops the watch, as a time since its first read.
-fn last_look() -> Duration {
-    WATCH_STOPPED - super::LOCAL_NETWORK_ALERT_LOOK
-}
-
-/// macOS's Local Network alert seen on screen after the trigger ends the watch `Answered` at the
-/// first read that lists no window of the alert's owner at all, and not before: a window of the
-/// owner that was up at the first read and stays holds it after the seen window is gone, since
-/// it may be the alert itself, and a read that could not see the list ends nothing. NEGATIVE
-/// CONTROL: a watch that ends once every seen window is gone, whatever the first read's windows
-/// do (`listed.is_empty()` read as `seen.iter().all(|n| !listed.iter().any(|w| w.number == *n))`),
-/// ends at 2 s, with window 7 still up.
-#[test]
-fn the_alert_watch_ends_at_the_read_that_lists_no_window_of_its_owner() {
-    use super::AlertWatchEnd;
-    let t0 = Instant::now();
-    let (end, reads) = watch_through(t0, |at| match at.as_millis() {
-        0..1000 => Some(on(&[7])),
-        1000..1500 => Some(on(&[7, 48])),
-        1500 => None,
-        1750 => Some(on(&[48, 7])),
-        2000..3000 => Some(on(&[7])),
-        _ => Some(Vec::new()),
-    });
-    assert_eq!(end, AlertWatchEnd::Answered);
-    assert_eq!(
-        reads.last(),
-        Some(&Duration::from_millis(3000)),
-        "it ends at the read that lists no window of the owner"
-    );
-    assert_eq!(reads.len(), 13, "a read every quarter second until then");
-}
-
-/// A seen window that leaves the screen but stays in the window list (ordered out: a Space
-/// switch, or a CFUserNotification taken down by its client, which stays listed off screen for
-/// about 8 s, `docs/measured/unc-alert-window-list-2026-11-03.md`) ends nothing; the watch ends
-/// `Answered` at the first read that lists no window of the owner, on screen or off. NEGATIVE
-/// CONTROL: a watch that reads only the screen (`listed.is_empty()` read as
-/// `listed.iter().all(|w| !w.on_screen)`) ends at 1 s, with window 48 still listed.
-#[test]
-fn a_seen_window_ordered_out_ends_the_alert_watch_only_once_it_leaves_the_list() {
-    use super::AlertWatchEnd;
-    let t0 = Instant::now();
-    let (end, reads) = watch_through(t0, |at| match at.as_millis() {
-        0..250 => Some(Vec::new()),
-        250..1000 => Some(on(&[48])),
-        1000..3000 => Some(off(&[48])),
-        _ => Some(Vec::new()),
-    });
-    assert_eq!(end, AlertWatchEnd::Answered);
-    assert_eq!(
-        reads.last(),
-        Some(&Duration::from_millis(3000)),
-        "it ends once the window leaves the list"
-    );
-}
-
-/// A window listed off screen at the first read (an alert taken down just before, still
-/// listed) is not taken for one up before the trigger: drawn on screen after the trigger, it is
-/// seen, and its going ends the watch `Answered`. NEGATIVE CONTROL: a baseline of every window
-/// the first read lists (its `.filter(|window| window.on_screen)` taken out) never sees window 48
-/// and ends `NeverSeen`.
-#[test]
-fn a_window_listed_off_screen_before_the_trigger_is_seen_once_drawn_after_it() {
-    use super::AlertWatchEnd;
-    let t0 = Instant::now();
-    let (end, reads) = watch_through(t0, |at| match at.as_millis() {
-        0 => Some(off(&[48])),
-        250..1000 => Some(on(&[48])),
-        _ => Some(Vec::new()),
-    });
-    assert_eq!(end, AlertWatchEnd::Answered);
-    assert_eq!(reads.last(), Some(&Duration::from_millis(1000)));
-}
-
-/// A seen window's going ends nothing while the person is away (no touch within a minute, or
-/// the screen locked or switched away for another login): an alert stands, unanswered, while
-/// nobody is there, and its window going then is not known to be an answer. The watch reads
-/// every quarter second for its first looks ([`super::LOCAL_NETWORK_ALERT_FIRST_LOOKS`]), then
-/// every [`super::LOCAL_NETWORK_ALERT_AWAY_LOOK`] while the person is away, and ends `Answered`
-/// at the first read that finds them back with no window of the owner listed. NEGATIVE
-/// CONTROLS: a watch that ends whether or not the person is there (`&& here` taken out) ends at
-/// 1 s; one that reads every quarter second while they are away (`look_again` given `true`
-/// whatever the person) reads 181 times and ends at 45 s.
-#[test]
-fn an_alert_gone_while_the_person_is_away_ends_the_watch_only_once_they_are_back() {
-    use super::AlertWatchEnd;
-    let t0 = Instant::now();
-    let (end, reads) = watch_with(
-        t0,
-        |at| match at.as_millis() {
-            0..250 => Some(Vec::new()),
-            250..1000 => Some(on(&[48])),
-            _ => Some(Vec::new()),
-        },
-        |at| at < Duration::from_secs(1) || at >= Duration::from_secs(45),
-    );
-    assert_eq!(end, AlertWatchEnd::Answered);
-    let ms: Vec<u128> = reads.iter().map(Duration::as_millis).collect();
-    let paced: Vec<u128> = (0..=120)
-        .map(|look| look * 250)
-        .chain([35_000, 40_000, 45_000])
-        .collect();
-    assert_eq!(
-        ms, paced,
-        "a quarter second apart for the first 30 s, then five seconds apart while away"
-    );
-}
-
-/// A seen window gone while the person is away, and the watch stopped before they come back,
-/// ends it `GoneWhileAway`, never `Answered`. NEGATIVE CONTROL: an end that reads the last read
-/// as `StillUp` whatever it listed (its `(false, true)` arm taken out) ends `StillUp`.
-#[test]
-fn an_alert_watch_stopped_while_the_person_is_away_ends_gone_while_away() {
-    use super::AlertWatchEnd;
-    let t0 = Instant::now();
-    let (end, _) = watch_with(
-        t0,
-        |at| match at.as_millis() {
-            0..250 => Some(Vec::new()),
-            250..1000 => Some(on(&[48])),
-            _ => Some(Vec::new()),
-        },
-        |at| at < Duration::from_secs(1),
-    );
-    assert_eq!(end, AlertWatchEnd::GoneWhileAway);
-}
-
-/// A Local Network alert already up at the watch's first read (an earlier LAN use raised it, and
-/// macOS draws no second one) while another window of the same owner comes and is answered (a
-/// tccd consent prompt): the first read's window 7 is still up, so the watch never ends
-/// `Answered` and reads on until the window stops it, `StillUp`. NEGATIVE CONTROL: a watch that
-/// ends once every seen window is gone (`listed.is_empty()` read as
-/// `seen.iter().all(|n| !listed.iter().any(|w| w.number == *n))`) ends `Answered` as window 90
-/// goes, with the alert still on screen.
-#[test]
-fn another_alert_of_the_owner_answered_while_the_first_reads_window_stays_ends_nothing() {
-    use super::AlertWatchEnd;
-    let t0 = Instant::now();
-    let (end, reads) = watch_through(t0, |at| match at.as_millis() {
-        0..1000 => Some(on(&[7])),
-        1000..4000 => Some(on(&[7, 90])),
-        _ => Some(on(&[7])),
-    });
-    assert_eq!(end, AlertWatchEnd::StillUp);
-    assert_eq!(
-        reads.last(),
-        Some(&last_look()),
-        "it reads until it is stopped"
-    );
-}
-
-/// With no window of the alert's owner coming up after the trigger (macOS asked aterm before and
-/// raises no alert), the watch reads every quarter second until the window stops it and ends
-/// `NeverSeen`, so the hold ends only by the re-probe's answer or the person's time; it reads
-/// nothing once stopped. NEGATIVE CONTROL: a watch that takes "no seen window is up" for the
-/// answer (its `!seen.is_empty()` taken out) ends `Answered` at its first look.
-#[test]
-fn an_alert_watch_that_sees_no_alert_reads_until_it_is_stopped() {
-    use super::AlertWatchEnd;
-    let t0 = Instant::now();
-    let (end, reads) = watch_through(t0, |_| Some(Vec::new()));
-    assert_eq!(end, AlertWatchEnd::NeverSeen);
-    assert_eq!(
-        reads.len(),
-        240,
-        "the trigger's read and one each quarter second"
-    );
-    assert_eq!(reads.last(), Some(&last_look()), "none once it is stopped");
-}
-
-/// A window of the alert's owner already up at the first read (another app's alert, or one an
-/// earlier ask left up) going away, with no new window seen, ends nothing: the trigger's alert may
-/// still come, so the watch reads until it is stopped and ends `NeverSeen`. NEGATIVE CONTROL: a
-/// watch that counts the first read's windows as seen (its `!baseline.contains(..)` taken out)
-/// ends `Answered` as that window goes.
-#[test]
-fn a_window_up_before_the_trigger_going_away_does_not_end_the_alert_watch() {
-    use super::AlertWatchEnd;
-    let t0 = Instant::now();
-    let (end, reads) = watch_through(t0, |at| {
-        Some(if at < Duration::from_secs(1) {
-            on(&[7])
-        } else {
-            Vec::new()
-        })
-    });
-    assert_eq!(end, AlertWatchEnd::NeverSeen);
-    assert_eq!(
-        reads.last(),
-        Some(&last_look()),
-        "it reads until it is stopped"
-    );
-}
-
-/// macOS's alert seen after the trigger and still up when the window stops the watch ends it
-/// `StillUp` at its last look; one of two seen windows going while the other stays ends nothing.
-/// NEGATIVE CONTROL: a watch that takes any seen window gone for the answer
-/// (`listed.is_empty()` read as `seen.iter().any(|n| !listed.iter().any(|w| w.number == *n))`)
-/// ends `Answered` as the second goes.
-#[test]
-fn an_alert_still_up_when_its_watch_is_stopped_ends_it_still_up() {
-    use super::AlertWatchEnd;
-    let t0 = Instant::now();
-    let (end, reads) = watch_through(t0, |at| match at.as_millis() {
-        0..250 => Some(Vec::new()),
-        250..500 => Some(on(&[48, 49])),
-        _ => Some(on(&[48])),
-    });
-    assert_eq!(end, AlertWatchEnd::StillUp);
-    assert_eq!(
-        reads.last(),
-        Some(&last_look()),
-        "it reads until it is stopped"
-    );
-}
-
-/// A window list the watch could not read before the trigger leaves nothing to tell the alert
-/// from: the watch ends `Blind` after that one read, whatever comes up later, so the hold ends
-/// only by the re-probe's answer or the person's time. NEGATIVE CONTROL: a watch that takes the
-/// failed read for an empty list (`unwrap_or_default` in place of its `Blind` arm) ends
-/// `Answered` once a window came and went.
-#[test]
-fn an_alert_watch_that_cannot_read_the_list_at_the_trigger_ends_blind() {
-    use super::AlertWatchEnd;
-    let t0 = Instant::now();
-    let (end, reads) = watch_through(t0, |at| match at.as_millis() {
-        0 => None,
-        250..1000 => Some(on(&[48])),
-        _ => Some(Vec::new()),
-    });
-    assert_eq!(end, AlertWatchEnd::Blind);
-    assert_eq!(reads, [Duration::ZERO], "one read, at the trigger");
-}
-
-/// The alert watch starts only on a macOS whose Local Network alert was measured as a window of
-/// UserNotificationCenter, Tahoe 26 and Golden Gate 27; on any other, or an unknown version, no
-/// watch starts and the hold ends only by the re-probe's answer or the person's time. NEGATIVE
-/// CONTROL: with `alert_host_measured` answering `true` whatever the version, 28.0, 15.7.1 and an
-/// unknown version start a watch.
-#[test]
-fn the_alert_watch_starts_only_where_its_alerts_host_was_measured() {
-    use super::alert_host_measured;
-    for measured in ["26.6.2", "26.0", "27.0", "27.0.1"] {
-        assert!(alert_host_measured(Some(measured)), "{measured}");
-    }
-    for other in ["28.0", "15.7.1", "2", "", "27x"] {
-        assert!(!alert_host_measured(Some(other)), "{other}");
-    }
-    assert!(!alert_host_measured(None), "an unknown version");
-}
-
-/// Every end of an alert watch makes one log record of its own kind, a watch the window stopped
-/// first included (the hold's end by the person's time or the re-probe's answer, a later
-/// start), with its revision and what its first read found; a watch that never read after its
-/// first is told apart from one that read and saw nothing. Only an answer from the watch still
-/// the window's is left and wakes the window. Each kind's aterm.log line differs from every
-/// other's and names the revision. NEGATIVE CONTROLS: a worker that leaves before its record
-/// once the watch is no longer the window's (an `if !live { return; }` after `settle`) logs
-/// nothing for a stopped watch; a `NeverSeen` that ignores its looks logs `NeverSeen` for a watch
-/// that never read again; a line for `AnsweredOnceStopped` that is `Answered`'s fails the check
-/// that the kinds' lines differ.
-#[test]
-fn every_end_of_an_alert_watch_makes_one_record_of_its_kind() {
-    use super::{
-        AlertWatchEnd as End, AlertWatchEnded as Ended, AlertWatchLooks as Looks, BaselineRead,
-        finish_alert_watch,
-    };
-    let cases = [
-        (End::Answered, Looks::Read, true, Ended::Answered),
-        (
-            End::Answered,
-            Looks::Read,
-            false,
-            Ended::AnsweredOnceStopped,
-        ),
-        (End::StillUp, Looks::Read, true, Ended::StillUp),
-        (End::StillUp, Looks::Read, false, Ended::StillUp),
-        (End::GoneWhileAway, Looks::Read, false, Ended::GoneWhileAway),
-        (End::NeverSeen, Looks::Read, false, Ended::NeverSeen),
-        (End::NeverSeen, Looks::Stopped, false, Ended::StoppedUnarmed),
-        (
-            End::NeverSeen,
-            Looks::ArmWaitRanOut,
-            true,
-            Ended::ArmWaitRanOut,
-        ),
-        (End::Blind, Looks::Stopped, true, Ended::Blind),
-        (End::Blind, Looks::Stopped, false, Ended::Blind),
-    ];
-    let mut lines: Vec<(Ended, String)> = Vec::new();
-    for (end, looks, live, ended) in cases {
-        let baseline = Some(BaselineRead {
-            after: Duration::from_millis(12),
-            windows: (end != End::Blind).then_some(1),
-        });
-        let left = std::cell::Cell::new(false);
-        let woke = std::cell::Cell::new(false);
-        let records = RefCell::new(Vec::new());
-        finish_alert_watch(
-            end,
-            looks,
-            super::Watched::Step(9),
-            baseline,
-            |answered| {
-                left.set(answered && live);
-                live
-            },
-            || woke.set(true),
-            |report| records.borrow_mut().push(report),
-        );
-        let records = records.into_inner();
-        assert_eq!(
-            records,
-            [super::AlertWatchReport {
-                watched: super::Watched::Step(9),
-                ended,
-                baseline,
-            }],
-            "{end:?} after {looks:?} (live {live}): one record of its kind"
-        );
-        let answers = live && end == End::Answered;
-        assert_eq!(
-            left.get(),
-            answers,
-            "{end:?} (live {live}): the answer left"
-        );
-        assert_eq!(
-            woke.get(),
-            answers,
-            "{end:?} (live {live}): the window woken"
-        );
-        let line = records[0].to_string();
-        assert!(line.contains("revision 9"), "{line}");
-        if lines.iter().all(|(kind, _)| *kind != ended) {
-            lines.push((ended, line));
-        }
-    }
-    assert_eq!(lines.len(), 8, "every kind of end is reached");
-    for (i, (kind, line)) in lines.iter().enumerate() {
-        for (other, other_line) in &lines[i + 1..] {
-            assert_ne!(line, other_line, "{kind:?} and {other:?} log one line");
-        }
-    }
-}
-
-/// How long a test waits for an alert watch's worker to do what it must: a hang detector.
-const WATCH_HANG: Duration = Duration::from_secs(60);
-
-/// A pace for a scripted alert watch's worker whose looks come at once, both with the person
-/// there and away, and whose wait for its arm outlasts [`WATCH_HANG`], so a worker the window
-/// does not wake shows as a hang.
-const AT_ONCE: super::AlertWatchPace = super::AlertWatchPace {
-    look: Duration::ZERO,
-    away: Duration::ZERO,
-    first: Duration::ZERO,
-    arm_wait: Duration::from_secs(600),
-};
-
-/// What a scripted alert watch's worker did.
-#[derive(Debug, PartialEq)]
-enum WatchEvent {
-    /// It asked for a read of the window list; it waits for [`ScriptedWatch::answer`].
-    Read,
-    /// It woke the window.
-    Woke,
-    /// It ended, with this record.
-    Logged(super::AlertWatchReport),
-    /// A door's watch told the door's hold that this pass's question was answered.
-    Answered(u64),
-}
-
-/// A live alert watch's worker ([`super::run_alert_watch`]) driven through a scripted window
-/// list: each read waits for the test's answer, the list and whether the person is at the Mac.
-struct ScriptedWatch {
-    events: std::sync::mpsc::Receiver<WatchEvent>,
-    lists: std::sync::mpsc::Sender<(Option<Vec<super::AlertWindow>>, bool)>,
-}
-
-impl ScriptedWatch {
-    /// The worker's reach, wired to a new script, with `pace`.
-    fn new(pace: super::AlertWatchPace) -> (super::AlertWatchIo, Self) {
-        let (io, watch, _) = Self::wired(pace);
-        (io, watch)
-    }
-
-    /// [`Self::new`], and what a door's watch tells the door's hold
-    /// ([`super::start_door_alert_watch`]'s `answered`), which the script hears as
-    /// [`WatchEvent::Answered`].
-    fn for_door(
-        pace: super::AlertWatchPace,
-    ) -> (super::AlertWatchIo, Self, impl Fn(u64) + Send + 'static) {
-        let (io, watch, sent) = Self::wired(pace);
-        (io, watch, move |pass| {
-            let _ = sent.send(WatchEvent::Answered(pass));
-        })
-    }
-
-    /// [`Self::new`], and a sender of the script's events.
-    fn wired(
-        pace: super::AlertWatchPace,
-    ) -> (
-        super::AlertWatchIo,
-        Self,
-        std::sync::mpsc::Sender<WatchEvent>,
-    ) {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let (sent, events) = std::sync::mpsc::channel();
-        let (lists, listed) = std::sync::mpsc::channel();
-        let here = Arc::new(AtomicBool::new(true));
-        let read_here = Arc::clone(&here);
-        let read_sent = sent.clone();
-        let wake_sent = sent.clone();
-        let door_sent = sent.clone();
-        let io = super::AlertWatchIo {
-            read: Box::new(move || {
-                let _ = read_sent.send(WatchEvent::Read);
-                let (list, present) = listed.recv_timeout(WATCH_HANG).ok()?;
-                read_here.store(present, Ordering::SeqCst);
-                list
-            }),
-            present: Box::new(move || here.load(Ordering::SeqCst)),
-            wake: Box::new(move || {
-                let _ = wake_sent.send(WatchEvent::Woke);
-            }),
-            log: Box::new(move |report| {
-                let _ = sent.send(WatchEvent::Logged(report));
-            }),
-            pace,
-        };
-        (io, Self { events, lists }, door_sent)
-    }
-
-    /// The worker's next act, within the hang detector.
-    fn next(&self) -> WatchEvent {
-        self.events
-            .recv_timeout(WATCH_HANG)
-            .expect("hang detector: the alert watch's worker did nothing within a minute")
-    }
-
-    /// Answer the read the worker asked for: `list`, with the person `present`.
-    fn answer(&self, list: Option<Vec<super::AlertWindow>>, present: bool) {
-        self.lists
-            .send((list, present))
-            .expect("the worker is still reading");
-    }
-
-    /// The worker's end, which must be its next act: its record.
-    fn ended(&self) -> super::AlertWatchReport {
-        match self.next() {
-            WatchEvent::Logged(report) => report,
-            other => panic!("the worker went on: {other:?}"),
-        }
-    }
-}
-
-/// Wait until a worker on `slot` has begun its `nth` wait on the window's moves: once that count
-/// is read, a stop or an arm, which takes the slot's lock, finds the worker asleep, so only its
-/// wake gets it going again. A hang detector, not a latency budget.
-fn await_worker_asleep(slot: &super::AlertWatchSlot, nth: usize) {
-    let since = Instant::now();
-    while slot.waits() < nth {
-        assert!(
-            since.elapsed() < WATCH_HANG,
-            "hang detector: the alert watch's worker never began wait {nth}"
-        );
-        std::thread::sleep(Duration::from_millis(1));
-    }
-}
-
-/// A live alert watch's first read, which its trigger waits for, marks the baseline in only once
-/// it has come back, and wakes the window; a stop then ends its worker, which logs that it never
-/// read again. NEGATIVE CONTROL: a worker that never marks the baseline in (`mark_baseline_in`'s
-/// body taken out) leaves `baseline_in` false after its wake.
-#[test]
-fn a_live_alert_watchs_first_read_lets_its_trigger_go_and_wakes_the_window() {
-    static SLOT: super::AlertWatchSlot = super::AlertWatchSlot::new();
-    let (io, watch) = ScriptedWatch::new(AT_ONCE);
-    assert!(super::start_alert_watch(
-        &SLOT,
-        super::Watched::Step(4),
-        Some("27.0.1"),
-        io
-    ));
-    assert_eq!(
-        watch.next(),
-        WatchEvent::Read,
-        "its first read goes at once"
-    );
-    assert!(!SLOT.baseline_in(), "not in before that read comes back");
-    watch.answer(Some(Vec::new()), true);
-    assert_eq!(watch.next(), WatchEvent::Woke);
-    assert!(SLOT.baseline_in(), "in once it came back");
-    SLOT.cancel();
-    let report = watch.ended();
-    assert_eq!(
-        (report.watched, report.ended),
-        (
-            super::Watched::Step(4),
-            super::AlertWatchEnded::StoppedUnarmed
-        )
-    );
-    assert!(!SLOT.baseline_in(), "a stop takes the baseline back");
-}
-
-/// Arming a live alert watch wakes its worker at once: it reads in the arm's turn, not when its
-/// wait for the arm runs out. NEGATIVE CONTROL: an arm that does not wake the worker (its
-/// `notify_all` taken out) leaves it asleep for its 600 s wait, past the hang detector.
-#[test]
-fn arming_a_live_alert_watch_wakes_its_worker_at_once() {
-    static SLOT: super::AlertWatchSlot = super::AlertWatchSlot::new();
-    let (io, watch) = ScriptedWatch::new(AT_ONCE);
-    assert!(super::start_alert_watch(
-        &SLOT,
-        super::Watched::Step(5),
-        Some("26.6.2"),
-        io
-    ));
-    assert_eq!(watch.next(), WatchEvent::Read);
-    watch.answer(Some(Vec::new()), true);
-    assert_eq!(watch.next(), WatchEvent::Woke);
-    await_worker_asleep(&SLOT, 1);
-    SLOT.arm();
-    assert_eq!(watch.next(), WatchEvent::Read, "the arm wakes it to read");
-    SLOT.cancel();
-    watch.answer(Some(Vec::new()), true);
-    assert_eq!(watch.ended().ended, super::AlertWatchEnded::NeverSeen);
-}
-
-/// Stopping a live alert watch wakes its worker at once, whether it waits for its arm or for its
-/// next look, and drops an answer it left that the window has not drained. NEGATIVE CONTROLS: a
-/// stop that does not wake the worker (`cancel`'s `notify_all` taken out) leaves it asleep past
-/// the hang detector; one that keeps the answer (`state.answer = None` taken out) lets the
-/// window drain an answer for a hold that already ended.
-#[test]
-fn stopping_a_live_alert_watch_wakes_its_worker_and_drops_its_answer() {
-    let slow = super::AlertWatchPace {
-        look: Duration::from_secs(600),
-        away: Duration::from_secs(600),
-        first: Duration::ZERO,
-        arm_wait: Duration::from_secs(600),
-    };
-    static FOR_ARM: super::AlertWatchSlot = super::AlertWatchSlot::new();
-    let (io, watch) = ScriptedWatch::new(slow);
-    assert!(super::start_alert_watch(
-        &FOR_ARM,
-        super::Watched::Step(6),
-        Some("27.0"),
-        io
-    ));
-    assert_eq!(watch.next(), WatchEvent::Read);
-    watch.answer(Some(Vec::new()), true);
-    assert_eq!(watch.next(), WatchEvent::Woke);
-    await_worker_asleep(&FOR_ARM, 1);
-    FOR_ARM.cancel();
-    assert_eq!(
-        watch.ended().ended,
-        super::AlertWatchEnded::StoppedUnarmed,
-        "a stop wakes a worker waiting for its arm"
-    );
-
-    static FOR_LOOK: super::AlertWatchSlot = super::AlertWatchSlot::new();
-    let (io, watch) = ScriptedWatch::new(slow);
-    assert!(super::start_alert_watch(
-        &FOR_LOOK,
-        super::Watched::Step(7),
-        Some("27.0"),
-        io
-    ));
-    assert_eq!(watch.next(), WatchEvent::Read);
-    watch.answer(Some(Vec::new()), true);
-    assert_eq!(watch.next(), WatchEvent::Woke);
-    await_worker_asleep(&FOR_LOOK, 1);
-    FOR_LOOK.arm();
-    await_worker_asleep(&FOR_LOOK, 2);
-    FOR_LOOK.cancel();
-    assert_eq!(
-        watch.ended().watched,
-        super::Watched::Step(7),
-        "a stop wakes a worker waiting out its look"
-    );
-
-    static ANSWERED: super::AlertWatchSlot = super::AlertWatchSlot::new();
-    let (io, watch) = ScriptedWatch::new(AT_ONCE);
-    assert!(super::start_alert_watch(
-        &ANSWERED,
-        super::Watched::Step(8),
-        Some("27.0"),
-        io
-    ));
-    assert_eq!(watch.next(), WatchEvent::Read);
-    watch.answer(Some(Vec::new()), true);
-    assert_eq!(watch.next(), WatchEvent::Woke);
-    ANSWERED.arm();
-    assert_eq!(watch.next(), WatchEvent::Read);
-    watch.answer(Some(on(&[48])), true);
-    assert_eq!(watch.next(), WatchEvent::Read);
-    watch.answer(Some(Vec::new()), true);
-    assert_eq!(
-        watch.next(),
-        WatchEvent::Woke,
-        "its answer wakes the window"
-    );
-    assert_eq!(watch.ended().ended, super::AlertWatchEnded::Answered);
-    assert_eq!(
-        ANSWERED.state().answer,
-        Some(super::Watched::Step(8)),
-        "the answer is left"
-    );
-    ANSWERED.cancel();
-    assert_eq!(ANSWERED.take_answer(), None, "a stop drops it");
-}
-
-/// A later start of the live alert watch begins from nothing: the last watch's first read,
-/// arm and answer are gone before the new watch's first read is in. NEGATIVE CONTROL: a start
-/// that keeps them (`*state = AlertWatchState { id, last_id: id, ..*state }`) leaves the last
-/// watch's answer for the window to drain beside a hold whose own alert was never seen.
-#[test]
-fn a_later_start_of_the_live_alert_watch_resets_what_the_last_one_left() {
-    static SLOT: super::AlertWatchSlot = super::AlertWatchSlot::new();
-    let (io, first) = ScriptedWatch::new(AT_ONCE);
-    assert!(super::start_alert_watch(
-        &SLOT,
-        super::Watched::Step(1),
-        Some("27.0"),
-        io
-    ));
-    assert_eq!(first.next(), WatchEvent::Read);
-    first.answer(Some(Vec::new()), true);
-    assert_eq!(first.next(), WatchEvent::Woke);
-    SLOT.arm();
-    assert_eq!(first.next(), WatchEvent::Read);
-    first.answer(Some(on(&[48])), true);
-    assert_eq!(first.next(), WatchEvent::Read);
-    first.answer(Some(Vec::new()), true);
-    assert_eq!(first.next(), WatchEvent::Woke);
-    assert_eq!(first.ended().ended, super::AlertWatchEnded::Answered);
-
-    let (io, second) = ScriptedWatch::new(AT_ONCE);
-    assert!(super::start_alert_watch(
-        &SLOT,
-        super::Watched::Step(2),
-        Some("27.0"),
-        io
-    ));
-    assert_eq!(second.next(), WatchEvent::Read);
-    assert_eq!(
-        SLOT.state(),
-        super::AlertWatchState {
-            id: 2,
-            last_id: 2,
-            watched: Some(super::Watched::Step(2)),
-            baseline_in: false,
-            blind: false,
-            armed: None,
-            answer: None,
-        },
-        "nothing the first watch left stands for the second"
-    );
-    assert_eq!(SLOT.take_answer(), None);
-    second.answer(Some(Vec::new()), true);
-    assert_eq!(second.next(), WatchEvent::Woke);
-    SLOT.cancel();
-    assert_eq!(second.ended().ended, super::AlertWatchEnded::StoppedUnarmed);
-}
-
-/// A later start wakes the worker of the watch it replaces, asleep in its wait for the arm,
-/// which then stops at once and logs that it never read again. NEGATIVE CONTROL: a start that
-/// does not wake it (`begin`'s `notify_all` taken out) leaves it asleep for its 600 s wait,
-/// past the hang detector.
-#[test]
-fn a_later_start_wakes_the_worker_of_the_watch_it_replaces() {
-    static SLOT: super::AlertWatchSlot = super::AlertWatchSlot::new();
-    let slow = super::AlertWatchPace {
-        look: Duration::from_secs(600),
-        away: Duration::from_secs(600),
-        first: Duration::ZERO,
-        arm_wait: Duration::from_secs(600),
-    };
-    let (io, first) = ScriptedWatch::new(slow);
-    assert!(super::start_alert_watch(
-        &SLOT,
-        super::Watched::Step(1),
-        Some("27.0"),
-        io
-    ));
-    assert_eq!(first.next(), WatchEvent::Read);
-    first.answer(Some(Vec::new()), true);
-    assert_eq!(first.next(), WatchEvent::Woke);
-    await_worker_asleep(&SLOT, 1);
-    let (io, second) = ScriptedWatch::new(slow);
-    assert!(super::start_alert_watch(
-        &SLOT,
-        super::Watched::Step(2),
-        Some("27.0"),
-        io
-    ));
-    let report = first.ended();
-    assert_eq!(
-        (report.watched, report.ended),
-        (
-            super::Watched::Step(1),
-            super::AlertWatchEnded::StoppedUnarmed
-        ),
-        "the replaced worker stops at the start"
-    );
-    assert_eq!(second.next(), WatchEvent::Read);
-    second.answer(Some(Vec::new()), true);
-    assert_eq!(second.next(), WatchEvent::Woke);
-    SLOT.cancel();
-    assert_eq!(second.ended().ended, super::AlertWatchEnded::StoppedUnarmed);
-}
-
-/// An answer a replaced watch's worker sees once a later start took the slot is never left: the
-/// window drains nothing for the new watch, and the old watch logs its answer as one a stop
-/// overtook. NEGATIVE CONTROL: a settle that leaves the answer whatever the live watch is
-/// (`let live = state.id == id;` read as `let live = true;`) leaves revision 1's answer for
-/// revision 2's hold.
-#[test]
-fn an_answer_a_replaced_live_alert_watch_saw_is_never_left_for_the_next() {
-    static SLOT: super::AlertWatchSlot = super::AlertWatchSlot::new();
-    let (io, first) = ScriptedWatch::new(AT_ONCE);
-    assert!(super::start_alert_watch(
-        &SLOT,
-        super::Watched::Step(1),
-        Some("27.0"),
-        io
-    ));
-    assert_eq!(first.next(), WatchEvent::Read);
-    first.answer(Some(Vec::new()), true);
-    assert_eq!(first.next(), WatchEvent::Woke);
-    SLOT.arm();
-    assert_eq!(first.next(), WatchEvent::Read);
-    first.answer(Some(on(&[48])), true);
-    assert_eq!(first.next(), WatchEvent::Read, "the first worker reads on");
-
-    let (io, second) = ScriptedWatch::new(AT_ONCE);
-    assert!(super::start_alert_watch(
-        &SLOT,
-        super::Watched::Step(2),
-        Some("27.0"),
-        io
-    ));
-    assert_eq!(second.next(), WatchEvent::Read);
-    first.answer(Some(Vec::new()), true);
-    assert_eq!(
-        first.ended().ended,
-        super::AlertWatchEnded::AnsweredOnceStopped,
-        "its answer came once a later start took the slot: no wake, nothing left"
-    );
-    assert_eq!(SLOT.take_answer(), None);
-    second.answer(Some(Vec::new()), true);
-    assert_eq!(second.next(), WatchEvent::Woke);
-    SLOT.cancel();
-    assert_eq!(second.ended().ended, super::AlertWatchEnded::StoppedUnarmed);
-}
-
-/// No live alert watch starts on a macOS whose alert's host was not measured, or whose version is
-/// unknown: no worker reads, and the slot is untouched. NEGATIVE CONTROL: a start without its
-/// `alert_host_measured` gate starts a worker, whose first read comes.
-#[test]
-fn no_live_alert_watch_starts_where_its_alerts_host_was_not_measured() {
-    static SLOT: super::AlertWatchSlot = super::AlertWatchSlot::new();
-    for version in [Some("28.0"), Some("15.7.1"), None] {
-        let (io, watch) = ScriptedWatch::new(AT_ONCE);
-        assert!(
-            !super::start_alert_watch(&SLOT, super::Watched::Step(3), version, io),
-            "{version:?}"
-        );
-        assert!(
-            matches!(
-                watch.events.recv_timeout(WATCH_HANG),
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
-            ),
-            "{version:?}: no worker, its reach dropped unread"
-        );
-        assert_eq!(
-            SLOT.state().last_id,
-            0,
-            "{version:?}: the slot is untouched"
-        );
-    }
-}
-
-/// Past its first looks (none here), the live worker hands the person's presence to its pace and
-/// its end: after a read that found the person away it looks again after the away pace, after
-/// one that found them there after the present pace, and a window gone while they are away ends
-/// nothing until a read finds them back. Each pace here is either at once or past the hang
-/// detector, so a worker that picks the wrong one hangs. NEGATIVE CONTROLS: a worker that looks
-/// at the present pace whatever the person (`if here || …` read as `if true`) hangs after its
-/// away first read; one at the away pace whatever the person (`if false`) hangs in the second
-/// watch; a watch that ends whether or not the person is there (`&& here` taken out of
-/// `watch_alert`) ends at the away read.
-#[test]
-fn a_live_alert_watch_paces_and_ends_by_the_persons_presence() {
-    static AWAY: super::AlertWatchSlot = super::AlertWatchSlot::new();
-    let (io, watch) = ScriptedWatch::new(super::AlertWatchPace {
-        look: Duration::from_secs(600),
-        away: Duration::ZERO,
-        first: Duration::ZERO,
-        arm_wait: Duration::from_secs(600),
-    });
-    assert!(super::start_alert_watch(
-        &AWAY,
-        super::Watched::Step(1),
-        Some("27.0"),
-        io
-    ));
-    assert_eq!(watch.next(), WatchEvent::Read);
-    watch.answer(Some(Vec::new()), false);
-    assert_eq!(watch.next(), WatchEvent::Woke);
-    AWAY.arm();
-    assert_eq!(
-        watch.next(),
-        WatchEvent::Read,
-        "the away pace after an away read"
-    );
-    watch.answer(Some(on(&[48])), false);
-    assert_eq!(watch.next(), WatchEvent::Read);
-    watch.answer(Some(Vec::new()), false);
-    assert_eq!(
-        watch.next(),
-        WatchEvent::Read,
-        "no window left, with the person away: it reads on"
-    );
-    watch.answer(Some(Vec::new()), true);
-    assert_eq!(
-        watch.next(),
-        WatchEvent::Woke,
-        "the person back: it answers"
-    );
-    assert_eq!(watch.ended().ended, super::AlertWatchEnded::Answered);
-    assert_eq!(AWAY.take_answer(), Some(super::Watched::Step(1)));
-    AWAY.cancel();
-
-    static HERE: super::AlertWatchSlot = super::AlertWatchSlot::new();
-    let (io, watch) = ScriptedWatch::new(super::AlertWatchPace {
-        look: Duration::ZERO,
-        away: Duration::from_secs(600),
-        first: Duration::ZERO,
-        arm_wait: Duration::from_secs(600),
-    });
-    assert!(super::start_alert_watch(
-        &HERE,
-        super::Watched::Step(2),
-        Some("27.0"),
-        io
-    ));
-    assert_eq!(watch.next(), WatchEvent::Read);
-    watch.answer(Some(Vec::new()), true);
-    assert_eq!(watch.next(), WatchEvent::Woke);
-    HERE.arm();
-    assert_eq!(
-        watch.next(),
-        WatchEvent::Read,
-        "the present pace after a present read"
-    );
-    watch.answer(Some(on(&[48])), true);
-    assert_eq!(watch.next(), WatchEvent::Read);
-    watch.answer(Some(Vec::new()), true);
-    assert_eq!(watch.next(), WatchEvent::Woke);
-    assert_eq!(watch.ended().ended, super::AlertWatchEnded::Answered);
-    HERE.cancel();
-}
-
-/// For its first looks after the arm the live worker reads at the present pace whatever the
-/// person, so an alert drawn after the trigger is seen though the person, admitted to the step's
-/// moment by a touch minutes before, reads as away; the alert's going still ends nothing until a
-/// read finds them there. The away pace is past the hang detector and the first looks outlast
-/// it, so a worker that paces its first looks by the person hangs. NEGATIVE CONTROL: a worker
-/// whose pace leaves out its first looks (`|| armed.elapsed() < pace.first` taken out of
-/// `run_alert_watch`) waits out the away pace after its away first read and hangs.
-#[test]
-fn a_live_alert_watch_reads_at_the_present_pace_for_its_first_looks_whatever_the_person() {
-    static SLOT: super::AlertWatchSlot = super::AlertWatchSlot::new();
-    let (io, watch) = ScriptedWatch::new(super::AlertWatchPace {
-        look: Duration::ZERO,
-        away: Duration::from_secs(600),
-        first: Duration::from_secs(600),
-        arm_wait: Duration::from_secs(600),
-    });
-    assert!(super::start_alert_watch(
-        &SLOT,
-        super::Watched::Step(3),
-        Some("27.0.1"),
-        io
-    ));
-    assert_eq!(watch.next(), WatchEvent::Read);
-    watch.answer(Some(Vec::new()), false);
-    assert_eq!(watch.next(), WatchEvent::Woke);
-    SLOT.arm();
-    assert_eq!(
-        watch.next(),
-        WatchEvent::Read,
-        "the present pace after the arm, the person away"
-    );
-    watch.answer(Some(on(&[48])), false);
-    assert_eq!(
-        watch.next(),
-        WatchEvent::Read,
-        "the present pace after a read that saw the alert, the person away"
-    );
-    watch.answer(Some(Vec::new()), false);
-    assert_eq!(
-        watch.next(),
-        WatchEvent::Read,
-        "no window left, with the person away: it reads on"
-    );
-    watch.answer(Some(Vec::new()), true);
-    assert_eq!(
-        watch.next(),
-        WatchEvent::Woke,
-        "the person there: it answers"
-    );
-    assert_eq!(watch.ended().ended, super::AlertWatchEnded::Answered);
-    assert_eq!(
-        SLOT.take_answer().and_then(super::Watched::revision),
-        Some(3),
-        "the step's drain reads its revision"
-    );
-    SLOT.cancel();
-}
-
-/// The door's alert watch ([`super::start_door_alert_watch`]): its first read, which the door's
-/// use waits for before it asks, is in when the start returns, and the watch, armed then, reads
-/// on with no wake of the window for that read. Once it saw a new window of the alert's owner
-/// come and then, with the person at the Mac, no window of that owner left, it tells the door's
-/// hold of its own pass, which ends it, and only then wakes the window, so the window's turn
-/// finds the dialog slot free; nothing is left for the step's drain, and its record is the
-/// door's. NEGATIVE CONTROLS: a start that does not arm the watch (`slot.arm_of(watched)` taken
-/// out of `start_door_alert_watch`) leaves its worker waiting for an arm past the hang detector;
-/// a wake that does not tell the hold (`answered(pass)` taken out) wakes the window with the
-/// hold still standing.
-#[test]
-fn the_doors_alert_watch_ends_its_hold_once_the_question_is_answered() {
-    use super::{AlertWatchEnded, Watched};
-    static SLOT: super::AlertWatchSlot = super::AlertWatchSlot::new();
-    let (io, watch, answered) = ScriptedWatch::for_door(AT_ONCE);
-    // The first read's list is there before the use's thread waits for it.
-    watch.answer(Some(on(&[17])), true);
-    assert!(super::start_door_alert_watch(
-        &SLOT,
-        3,
-        Some("27.0.1"),
-        io,
-        answered,
-        WATCH_HANG
-    ));
-    assert_eq!(watch.next(), WatchEvent::Read, "its first read");
-    assert!(SLOT.baseline_in(), "in when the start returned");
-    assert!(
-        SLOT.state().armed.is_some(),
-        "and armed, so the use asks into a watch that reads on"
-    );
-    assert_eq!(
-        watch.next(),
-        WatchEvent::Read,
-        "it reads on, with no wake for its first read"
-    );
-    watch.answer(Some(on(&[17, 48])), true);
-    assert_eq!(watch.next(), WatchEvent::Read);
-    watch.answer(Some(Vec::new()), true);
-    assert_eq!(
-        watch.next(),
-        WatchEvent::Answered(3),
-        "the door's hold of its pass is told"
-    );
-    assert_eq!(watch.next(), WatchEvent::Woke, "then the window wakes");
-    let report = watch.ended();
-    assert_eq!(
-        (report.watched, report.ended),
-        (Watched::Door(3), AlertWatchEnded::Answered)
-    );
-    assert!(report.to_string().contains("door pass 3"), "{report}");
-    assert_eq!(
-        SLOT.take_answer(),
-        None,
-        "nothing left for the window's drain"
-    );
-    SLOT.cancel_of(Watched::Door(3));
-}
-
-/// A door's watch whose first read is not back within its wait is stopped and gives `false`, so
-/// its use asks unwatched and the door's hold runs its bound; its worker, once that read comes
-/// back, finds itself stopped, reads nothing more and records that it was stopped before it read
-/// again, as the door's. One whose first read could not read the window list gives `false` too:
-/// its worker ended at that read, recording it blind, so nothing reads on and the watch is not
-/// left armed. On a macOS whose alert host was not measured no worker starts at all.
-/// NEGATIVE CONTROLS: a start that keeps a late watch (`slot.cancel_of(watched)` taken out of
-/// `start_door_alert_watch`) leaves its worker waiting for an arm past the hang detector; one
-/// that gives `true` whatever came back reads the late watch as watching; a worker that marks
-/// every first read as read (`listed.is_some()` replaced by `true` in `run_alert_watch`) reads
-/// the blind watch as watching.
-#[test]
-fn a_doors_alert_watch_whose_first_read_is_late_lets_its_use_ask_unwatched() {
-    use super::{AlertWatchEnded, Watched};
-    static SLOT: super::AlertWatchSlot = super::AlertWatchSlot::new();
-    let (io, watch, answered) = ScriptedWatch::for_door(AT_ONCE);
-    assert!(
-        !super::start_door_alert_watch(&SLOT, 4, Some("27.0"), io, answered, Duration::ZERO),
-        "no first read back: unwatched"
-    );
-    assert_eq!(watch.next(), WatchEvent::Read, "its first read went");
-    assert!(!SLOT.baseline_in());
-    assert_eq!(SLOT.state().armed, None, "never armed");
-    watch.answer(Some(Vec::new()), true);
-    let report = watch.ended();
-    assert_eq!(
-        (report.watched, report.ended),
-        (Watched::Door(4), AlertWatchEnded::StoppedUnarmed)
-    );
-
-    static BLIND: super::AlertWatchSlot = super::AlertWatchSlot::new();
-    let (io, watch, answered) = ScriptedWatch::for_door(AT_ONCE);
-    // The first read's answer is there before the use's thread waits for it: no list.
-    watch.answer(None, true);
-    assert!(
-        !super::start_door_alert_watch(&BLIND, 6, Some("27.0"), io, answered, WATCH_HANG),
-        "the window list unreadable at the first read: unwatched"
-    );
-    assert_eq!(watch.next(), WatchEvent::Read, "its first read went");
-    let report = watch.ended();
-    assert_eq!(
-        (report.watched, report.ended),
-        (Watched::Door(6), AlertWatchEnded::Blind)
-    );
-    assert_eq!(
-        (BLIND.state().id, BLIND.state().armed),
-        (0, None),
-        "stopped, never armed"
-    );
-
-    static UNMEASURED: super::AlertWatchSlot = super::AlertWatchSlot::new();
-    let (io, watch, answered) = ScriptedWatch::for_door(AT_ONCE);
-    assert!(!super::start_door_alert_watch(
-        &UNMEASURED,
-        5,
-        Some("28.0"),
-        io,
-        answered,
-        WATCH_HANG
-    ));
-    assert!(
-        matches!(
-            watch.events.recv_timeout(WATCH_HANG),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
-        ),
-        "no worker, its reach dropped unread"
-    );
-    assert_eq!(UNMEASURED.state().last_id, 0, "the slot is untouched");
-}
-
-/// The door's hold arms and stops only its own pass's watch: an arm or a stop for another pass
-/// leaves the watch as it was, so a hold's late stop never stops a later pass's watch.
-/// NEGATIVE CONTROLS: a `cancel_of` that stops whichever watch is live (its `watched` check taken
-/// out of `cancel_where`) stops the watch at the other pass's stop; an `arm_of` that arms
-/// whichever (its check taken out of `arm_where`) arms it for another pass.
-#[test]
-fn the_doors_hold_arms_and_stops_only_its_own_passs_watch() {
-    use super::{AlertWatchEnded, Watched};
-    static SLOT: super::AlertWatchSlot = super::AlertWatchSlot::new();
-    let (io, watch) = ScriptedWatch::new(AT_ONCE);
-    assert!(super::start_alert_watch(
-        &SLOT,
-        Watched::Door(6),
-        Some("27.0"),
-        io
-    ));
-    assert_eq!(watch.next(), WatchEvent::Read);
-    watch.answer(Some(Vec::new()), true);
-    assert_eq!(watch.next(), WatchEvent::Woke);
-    SLOT.arm_of(Watched::Door(7));
-    assert_eq!(SLOT.state().armed, None, "another pass's arm arms nothing");
-    SLOT.arm_of(Watched::Door(6));
-    assert!(SLOT.state().armed.is_some());
-    assert_eq!(watch.next(), WatchEvent::Read);
-    SLOT.cancel_of(Watched::Door(7));
-    watch.answer(Some(Vec::new()), true);
-    assert_eq!(
-        watch.next(),
-        WatchEvent::Read,
-        "another pass's stop: it reads on"
-    );
-    SLOT.cancel_of(Watched::Door(6));
-    watch.answer(Some(Vec::new()), true);
-    assert_eq!(watch.ended().ended, AlertWatchEnded::NeverSeen);
 }

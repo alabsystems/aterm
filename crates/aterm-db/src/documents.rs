@@ -71,7 +71,10 @@ pub(crate) fn apply(
                 operation,
                 value: change.value.clone().unwrap_or(Value::Null),
             });
-            cell.candidates.sort_by_key(|candidate| candidate.operation);
+            if cell.candidates.len() > 1 {
+                cell.candidates
+                    .sort_unstable_by_key(|candidate| candidate.operation);
+            }
         }
     }
 }

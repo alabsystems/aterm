@@ -2,6 +2,10 @@
 // Copyright 2026 Andrew Yates
 
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    all(unix, anchor_rules, any(test, debug_assertions)),
+    feature(macro_attr)
+)]
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
 
@@ -54,6 +58,9 @@ pub mod federate;
 /// jitter and state-dir writes, in one place a simulation can stand in for.
 mod fx;
 pub mod glance;
+/// Fleet-wide halts over the mesh: a person's request, the origin's relayed record, and the ids
+/// each Mac applied.
+pub mod halt;
 pub mod mailbox;
 pub mod mirror;
 pub mod notify;

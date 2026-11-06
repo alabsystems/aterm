@@ -3,7 +3,7 @@
 
 //! The three pages that name a download.
 
-use std::fmt;
+use std::fmt::{self, Write as _};
 
 use super::html_escape;
 use super::releases::{Facts, LINUX_ARCHES, LinuxKind};
@@ -336,7 +336,7 @@ fn with_platform_attributes(
         }
         if let Some(v) = value.as_deref().filter(|v| !v.is_empty()) {
             tag.pop();
-            tag.push_str(&format!(" {attr}=\"{}\">", html_escape(v)));
+            let _ = write!(tag, " {attr}=\"{}\">", html_escape(v));
         }
     }
     Ok(tag)

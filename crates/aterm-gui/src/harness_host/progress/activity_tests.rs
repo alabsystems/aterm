@@ -36,6 +36,7 @@ fn fixture() -> (HostHandle, Arc<Mutex<Kept>>, accounts::Row) {
 
 fn activity(row: &accounts::Row, active: bool) -> LoginActivity {
     LoginActivity {
+        queued: None,
         label: row.label.clone(),
         identity: Some(LoginIdentity::for_test(row)),
         route: Some("mailbox".into()),

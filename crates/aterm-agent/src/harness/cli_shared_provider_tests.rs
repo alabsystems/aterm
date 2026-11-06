@@ -94,6 +94,10 @@ fn shared_provider_keychain_proof_retains_exact_bytes_and_backend_absence() {
 fn shared_provider_retry_requires_typed_no_start_not_a_failure_string() {
     use crate::harness::login_drive::Outcome;
     assert!(matches!(
+        codex_execution(Outcome::CompletedHeld),
+        Execution::Deferred(_)
+    ));
+    assert!(matches!(
         codex_execution(Outcome::NotRun("not started".into())),
         Execution::NotStarted(_)
     ));

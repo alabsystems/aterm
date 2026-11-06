@@ -261,7 +261,15 @@ fn node<'a>(
 
 #[test]
 fn the_harness_route_renders_its_cards_and_controls() {
-    let (mut runtime, instance, view) = harness_route(fixture());
+    let state = fixture();
+    let partial = state
+        .projection()
+        .did_rows
+        .into_iter()
+        .find(|(label, _)| label == "Partial")
+        .map(|(label, value)| format!("{label}: {value}"))
+        .expect("partial metadata in the projection");
+    let (mut runtime, instance, view) = harness_route(state);
     let pages = every_page(&mut runtime, instance, view, &view_cx());
     assert_eq!(
         node(&pages, "settings/page-heading/coding-agent-harness").label,
@@ -400,10 +408,7 @@ fn the_harness_route_renders_its_cards_and_controls() {
         node(&pages, "harness/did/row/waited-for-you").label,
         "Waited for you: 0 today, 2m \u{b7} 0 in 7 days, 2h 5m"
     );
-    assert_eq!(
-        node(&pages, "harness/did/row/partial").label,
-        "Partial: only the last 1024 actions are kept"
-    );
+    assert_eq!(node(&pages, "harness/did/row/partial").label, partial);
     assert_eq!(
         node(&pages, "harness/did/row/checked").label,
         "Checked: at 13:46"
@@ -1940,7 +1945,7 @@ fn todays_lines_give_way_hero_then_plain_then_the_second_line() {
 
 #[test]
 fn todays_notes_are_drawn_in_the_pages_plain_type() {
-    use crate::harness_screen::{TODAY_NOTHING_YET, TODAY_READING};
+    use crate::harness_screen::{TODAY_NOTHING_YET, TODAY_READING, TODAY_UNKNOWN};
     use crate::native_settings::harness_page::today_block;
     use crate::native_ui::{StyleRef, UiContent};
     let drawn = |first: &str, inner: f32, budget: f32| {
@@ -2002,7 +2007,7 @@ fn todays_notes_are_drawn_in_the_pages_plain_type() {
             [(SemanticRole::Heading, StyleRef::Hero, hero_height)],
             "control"
         );
-        for note in [TODAY_NOTHING_YET, TODAY_READING] {
+        for note in [TODAY_NOTHING_YET, TODAY_READING, TODAY_UNKNOWN] {
             let (styles, height) = drawn(note, 1_000.0, 400.0);
             assert_eq!(
                 styles,
@@ -4078,7 +4083,11 @@ fn the_page_draws_its_plain_counts() {
     use crate::harness_screen::{
         DONE_CHECKED_OF_KEPT_GOING, NEEDED_YOU, NEEDS_TOLD, NONE_IN_7_DAYS, UNPROVEN_OF_APPROVED,
     };
-    for state in [fixture(), fixture_landings()] {
+    for mut state in [fixture(), fixture_landings()] {
+        // This is the complete-history control for known zero counts.
+        std::sync::Arc::make_mut(state.stats.report.as_mut().unwrap())
+            .week
+            .cut = false;
         let (mut runtime, instance, view) = harness_route(state.clone());
         let pages = every_page(&mut runtime, instance, view, &view_cx());
         let rows = state.projection().did_rows;

@@ -47,6 +47,11 @@ pub struct Lab {
     /// This Mac's machine label (`m22`), the machine its own facts row binds; `None` where this
     /// Mac has no live binding yet, which leaves every sync on the sources it always read.
     pub me: Option<String>,
+    /// The live facts-bound machine's naming projection: no binding, a validated name, or a
+    /// bound row whose name is conflicted or invalid. Kept separately from `me` so a missing
+    /// display label never becomes permission to invent another name.
+    #[cfg(unix)]
+    pub machine_name: Option<Result<crate::machine_name::RegistryName, String>>,
     /// This Mac's registry inventory has equalled an authenticated peer's: until then the
     /// registry here may be a part of the lab's, so the lab adds rows and renames none.
     pub settled: bool,
@@ -213,6 +218,14 @@ pub trait Source: Send + Sync {
     /// registry is not held here, current local policy is unavailable, or the source is off.
     fn lab(&self) -> Option<Arc<Lab>>;
 
+    /// One naming decision from a consistent source snapshot, including unavailable policy
+    /// or a pending read. Sources without a naming projection leave first-name creation on
+    /// its existing fallback.
+    #[cfg(unix)]
+    fn machine_name(&self) -> crate::machine_name::RegistryNameRead {
+        crate::machine_name::RegistryNameRead::Unbound
+    }
+
     /// Whether current local policy is unavailable, or no projection is held because reading
     /// the registry failed, where a projection
     /// named this Mac before: the lab may still name it, so nothing reads the sheet or labels a row after a machine until
@@ -324,7 +337,39 @@ pub(crate) fn while_turned_off<T>(f: impl FnOnce() -> T) -> T {
 /// it does, the harness reads no sheet (§0: the sheet is the importer's input alone).
 #[must_use]
 pub fn names_this_mac() -> bool {
-    current().is_some_and(|lab| lab.me.is_some())
+    current().is_some_and(|lab| {
+        #[cfg(unix)]
+        if lab.machine_name.is_some() {
+            return true;
+        }
+        lab.me.is_some()
+    })
+}
+
+/// The registry's first-name source, taken in one call so a concurrent refresh cannot turn a
+/// pending or conflicted binding into an apparently unbound machine.
+#[must_use]
+#[cfg(unix)]
+pub fn machine_name() -> crate::machine_name::RegistryNameRead {
+    use crate::machine_name::RegistryNameRead;
+    #[cfg(test)]
+    {
+        if TURNED_OFF.with(std::cell::Cell::get) {
+            return RegistryNameRead::Unbound;
+        }
+        if let Some(lab) = OVERRIDE.with(|cell| cell.borrow().clone()) {
+            return lab
+                .machine_name
+                .clone()
+                .map_or(RegistryNameRead::Unbound, RegistryNameRead::Bound);
+        }
+        if PENDING.with(std::cell::Cell::get) {
+            return RegistryNameRead::Pending;
+        }
+    }
+    INSTALLED
+        .get()
+        .map_or(RegistryNameRead::Unbound, |source| source.machine_name())
 }
 
 /// The lab as this process holds it now.

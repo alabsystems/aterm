@@ -531,6 +531,50 @@ pub fn tempdir() -> io::Result<TempDir> {
     TempDir::new()
 }
 
+/// Clone the directory `src` to the new name `dst`, each file and directory under it with its
+/// mode: on APFS one call whatever the tree holds, every block shared until a side writes it.
+/// # Errors
+/// `dst` exists, its parent does not, the two are on different volumes, the volume cannot clone,
+/// or this is not macOS (`Unsupported`).
+#[cfg(target_os = "macos")]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn clone_tree(src: &Path, dst: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    /// `<sys/clonefile.h>`: do not follow a link at the source.
+    const CLONE_NOFOLLOW: u32 = 0x0001;
+
+    unsafe extern "C" {
+        /// `<sys/clonefile.h>`: `int clonefile(const char *src, const char *dst, uint32_t flags)`.
+        fn clonefile(src: *const std::ffi::c_char, dst: *const std::ffi::c_char, flags: u32)
+        -> i32;
+    }
+
+    let c_path = |path: &Path| {
+        std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a path holds a NUL"))
+    };
+    let (from, to) = (c_path(src)?, c_path(dst)?);
+    // SAFETY: both pointers are NUL-terminated strings that outlive the call, which reads them
+    // and writes nothing of ours.
+    if unsafe { clonefile(from.as_ptr(), to.as_ptr(), CLONE_NOFOLLOW) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// [`clone_tree`] off macOS, where no call clones a tree.
+/// # Errors
+/// Always (`Unsupported`).
+#[cfg(not(target_os = "macos"))]
+pub fn clone_tree(_src: &Path, _dst: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "only APFS clones a directory tree",
+    ))
+}
+
 /// The name, before the user id, of the folder in the temporary directory's quiet folder that
 /// holds a user's shared stand-ins ([`shared_stand_in`]). aterm-verify's stand-ins made it
 /// first; the name stays, so every stand-in shares the files they made.
@@ -845,6 +889,51 @@ mod tests {
         for bytes in inputs {
             assert_eq!(fnv1a(bytes), aterm_hash::fnv1a_64(bytes), "{bytes:02x?}");
         }
+    }
+
+    /// NEGATIVE CONTROL (2026-11-05): with [`clone_tree`] linking `dst` to `src` instead of cloning
+    /// it, a write to the clone reaches the source (`left: "changed"`, `right: "first"`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_cloned_tree_holds_what_its_source_held_and_shares_nothing_after() {
+        use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
+        let dir = tempdir().unwrap();
+        let (src, dst) = (dir.path().join("src"), dir.path().join("dst"));
+        fs::DirBuilder::new().mode(0o700).create(&src).unwrap();
+        fs::DirBuilder::new()
+            .mode(0o711)
+            .create(src.join("sub"))
+            .unwrap();
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o640)
+            .open(src.join("sub/file"))
+            .unwrap();
+        io::Write::write_all(&mut file, b"first").unwrap();
+        drop(file);
+
+        match clone_tree(&src, &dst) {
+            // A scratch volume that cannot clone has nothing to judge here.
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => return,
+            cloned => cloned.unwrap(),
+        }
+
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode(&dst), 0o700);
+        assert_eq!(mode(&dst.join("sub")), 0o711);
+        assert_eq!(mode(&dst.join("sub/file")), 0o640);
+        assert_eq!(fs::read(dst.join("sub/file")).unwrap(), b"first");
+
+        fs::write(dst.join("sub/file"), b"changed").unwrap();
+        assert_eq!(
+            String::from_utf8(fs::read(src.join("sub/file")).unwrap()).unwrap(),
+            "first"
+        );
+        assert_eq!(
+            clone_tree(&src, &dst).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
     }
 
     #[test]

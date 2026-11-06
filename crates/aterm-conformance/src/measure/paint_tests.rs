@@ -725,3 +725,24 @@ fn a_companion_row_is_red_for_a_companion_too_short_or_too_tall() {
         );
     }
 }
+
+/// The subject's GPU frame times come off its `ctl metrics` reply as the take's report says them;
+/// a subject that reports none leaves each unread, never zero.
+#[test]
+fn the_subjects_gpu_frames_are_read_off_its_metrics() {
+    let line = "OK n_present=40 n_gpu_time=565 gpu_time_p50_ms=0.62 gpu_time_p99_ms=1.44 \
+                last_gpu_time_ms=0.70 max_gpu_time_ms=40.64";
+    assert_eq!(
+        SubjectGpu::of_metrics(line),
+        SubjectGpu {
+            frames: Some(565),
+            p99_us: Some(1440),
+            max_us: Some(40_640),
+        }
+    );
+    assert_eq!(
+        SubjectGpu::of_metrics("OK n_present=40"),
+        SubjectGpu::default(),
+        "unread"
+    );
+}

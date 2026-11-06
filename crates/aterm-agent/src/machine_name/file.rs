@@ -4,21 +4,18 @@
 //! `<state>/machine-name.toml` (`docs/DESIGN-machine-names-2026-11-04.md` §3.3): this machine's
 //! NAME, its claim's fields, the nickname, `was`, `by`, `undo`, a pending migration and the claim
 //! it last held in each of its newest four fleets. It is the title's only source (`m8 Heron`,
-//! or `m0 Otter` while unnumbered), so the menu, the ❯ item and Settings read it, never the
-//! published record, which may carry no NAME (§7.1).
+//! or `m0 Otter` while unnumbered), so the menu, the ❯ item and Settings read it.
 //!
 //! The first reader to find none creates it under its own `machine-name.lock` from what the
-//! caller computes (the drawn noun, a NAME seeded from this node's own newest verified record or
-//! the older `fleet-name`); every other reader reads it back. A change replaces it atomically
-//! under that lock, which a fleet writer takes after the book lock.
+//! caller computes from the bound registry row, roster or older `fleet-name`, else a drawn
+//! noun; every other reader reads it back. A change replaces it atomically under that lock.
+//! A number change takes the book lock first while it checks other nodes' claims.
 
 use std::io;
 use std::path::Path;
 use std::time::Duration;
 
-use aterm_net::fleet_member::name_record::{
-    By, ByKind, NameRecord, NickClass, ZERO_DIGEST, node_of, node_word,
-};
+use aterm_net::fleet_member::name_record::{By, ByKind, NickClass, node_of, node_word};
 use aterm_types::machine_name::{
     Cap, Class, Nickname, NodeId, Number, UNNUMBERED, WAS_MAX, Was, nouns,
 };
@@ -122,8 +119,7 @@ pub struct MachineName {
 }
 
 impl MachineName {
-    /// A machine never numbered: `m0` and `nick`, drawn (`auto`), at `rev` 0, below every
-    /// record this node can have signed, so Floor adopts any of its own it finds later (§3.2).
+    /// A machine never numbered: `m0` and `nick`, drawn (`auto`), at revision zero.
     #[must_use]
     pub const fn unnumbered(nick: Nickname, now_ms: u64) -> Self {
         Self {
@@ -145,61 +141,6 @@ impl MachineName {
             undo: None,
             fleets: Vec::new(),
         }
-    }
-
-    /// Take this node's own verified `record`, signed under seed digest `digest`, as Floor does
-    /// (§3.2): its NAME, else the NAME it kept as `prev` (a waiting, displaced or second node's,
-    /// which the title keeps, §5.1; a waiting one pending as [`Migration::Waiting`]), class,
-    /// since, `prev`, `base`, `tgen`, `sgen`, `act`, `cap`, `was`, `by`, nickname and `rev`, and,
-    /// under a fleet's digest, that fleet's claim (the NAME it published, or a waiting one's) and
-    /// `top` at the head of `fleets`. A record that carries no nickname keeps the one here.
-    pub fn adopt(&mut self, record: &NameRecord, digest: [u8; 8]) {
-        let claim = &record.claim;
-        (self.num, self.prev) = match claim.num {
-            Some(num) => (Some(num), claim.prev),
-            None => (claim.prev, None),
-        };
-        self.migration = claim.waits.then_some(Migration::Waiting);
-        self.class = claim.class;
-        self.since = claim.since;
-        self.rev = record.rev;
-        self.base = claim.base;
-        self.tgen = claim.tgen;
-        self.sgen = claim.sgen;
-        self.act = claim.act;
-        self.cap = claim.cap;
-        self.was.clone_from(&claim.was);
-        self.by = Some(record.by);
-        if let Some(nick) = &record.nick {
-            self.nick = nick.clone();
-            self.nick_class = record.nick_class;
-        }
-        if digest == ZERO_DIGEST {
-            return;
-        }
-        let synced = self
-            .fleets
-            .iter()
-            .position(|fleet| fleet.digest == digest)
-            .is_some_and(|at| self.fleets.remove(at).synced);
-        self.fleets.insert(
-            0,
-            FleetClaim {
-                digest,
-                top: claim.top,
-                claim: Held {
-                    num: if claim.waits { claim.prev } else { claim.num },
-                    class: claim.class,
-                    since: claim.since,
-                    base: claim.base,
-                    tgen: claim.tgen,
-                    sgen: claim.sgen,
-                },
-                lost: claim.lost().collect(),
-                synced,
-            },
-        );
-        self.fleets.truncate(FLEETS_MAX);
     }
 
     /// The NAME: `m8`, or `m0` while unnumbered.

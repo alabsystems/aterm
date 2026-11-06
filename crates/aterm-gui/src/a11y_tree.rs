@@ -201,8 +201,6 @@ pub(crate) enum ChromeMessage {
         /// Capsule slot index ([`capsule_index`] / [`capsule_action`]).
         index: u8,
     },
-    /// Needs pill status (`crate::presence`).
-    PresenceStatus,
 }
 
 /// Capsule slot index for the implicit `Details ›` action.
@@ -230,8 +228,7 @@ pub(crate) const fn capsule_action(index: u8) -> aterm_messages::ActionIndex {
 
 impl ChromeMessage {
     /// Row-level messages in top-down publish order.
-    pub(crate) const ORDER: [Self; 7] = [
-        Self::PresenceStatus,
+    pub(crate) const ORDER: [Self; 6] = [
         Self::BandRow0,
         Self::BandRow1,
         Self::BandRow2,
@@ -265,7 +262,6 @@ impl ChromeMessage {
             Self::PasteConfirm => 1,
             Self::BandRow0 => 3,
             Self::BandRow1 => 4,
-            Self::PresenceStatus => 5,
             Self::BandRow2 => 6,
             Self::BandOverflow => 7,
             Self::CloseConfirm => 8,
@@ -302,8 +298,7 @@ impl ChromeMessage {
             | Self::BandRow1
             | Self::BandRow2
             | Self::BandOverflow
-            | Self::BandCapsule { .. }
-            | Self::PresenceStatus => Live::Polite,
+            | Self::BandCapsule { .. } => Live::Polite,
         }
     }
 
@@ -321,7 +316,6 @@ impl ChromeMessage {
             }
             Self::BandOverflow => Role::Link,
             Self::BandCapsule { .. } => Role::Button,
-            Self::PresenceStatus => Role::Status,
         }
     }
 }
@@ -2471,6 +2465,7 @@ mod tests {
         for (retired, what) in [
             (0, "retired Notice slot"),
             (2, "retired ConfigWarning slot"),
+            (5, "retired PresenceStatus slot"),
         ] {
             assert_eq!(
                 ChromeMessage::from_node(NodeId(MESSAGE_BASE + retired)),
@@ -2507,8 +2502,8 @@ mod tests {
         );
         assert_eq!(capsule_index(aterm_messages::ActionIndex(1)), 1);
         assert_eq!(
-            ChromeMessage::from_node(NodeId(MESSAGE_BASE + ChromeMessage::PresenceStatus.slot())),
-            Some(ChromeMessage::PresenceStatus),
+            ChromeMessage::from_node(NodeId(MESSAGE_BASE + ChromeMessage::BandRow2.slot())),
+            Some(ChromeMessage::BandRow2),
             "the band's slot round-trips"
         );
         assert_eq!(

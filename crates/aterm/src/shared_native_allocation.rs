@@ -11,7 +11,7 @@ use native_keys::policy::Allocator;
 
 const FILE: &str = "native-allocation-queue.json";
 const COOLDOWN: Duration = Duration::from_secs(60);
-static DUE: OnceLock<Mutex<BTreeMap<(PathBuf, String), Instant>>> = OnceLock::new();
+static DUE: OnceLock<Mutex<BTreeMap<(PathBuf, &'static str), Instant>>> = OnceLock::new();
 
 fn target(subject: Subject, grant: [u8; 16]) -> Target {
     Target {
@@ -279,9 +279,10 @@ fn choose(
             let (_, member) = candidates
                 .iter()
                 .find(|(candidate, member)| candidate == actor && !kept.contains(member))?;
-            Some((ticket["order"].as_u64()?, actor.to_owned(), member.clone()))
+            Some((ticket["order"].as_u64()?, actor, member.as_str()))
         })
-        .min();
+        .min()
+        .map(|(order, actor, member)| (order, actor.to_owned(), member));
     if let Some((_, actor, member)) = waiting {
         if kept.len() == 3 {
             let oldest = row["grants"]
@@ -297,7 +298,7 @@ fn choose(
             items_mut(row, "grants")
                 .retain(|grant| grant["member"].as_str() != Some(oldest.as_str()));
         }
-        kept.push(member.clone());
+        kept.push(member.to_owned());
         let order = next(row)?;
         items_mut(row, "grants").push(json!({"member":member,"order":order}));
         for ticket in items_mut(row, "tickets") {
@@ -370,11 +371,11 @@ pub(super) fn step_at(
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| "native allocation roster is unavailable".into())
         })?;
-        let fixed: std::collections::BTreeSet<_> = policy
+        let fixed: std::collections::BTreeSet<&str> = policy
             .assignments
             .iter()
             .filter(|row| row.subject.provider == provider && row.automatic.is_none())
-            .flat_map(|row| row.warm.iter().cloned())
+            .flat_map(|row| row.warm.iter().map(String::as_str))
             .collect();
         let mut valid = std::collections::BTreeSet::new();
         let mut actors = std::collections::BTreeSet::new();
@@ -382,7 +383,9 @@ pub(super) fn step_at(
             if !prepared.contains(member) {
                 continue;
             }
-            if let Some(label) = label(&roster, member).filter(|label| !fixed.contains(label)) {
+            if let Some(label) =
+                label(&roster, member).filter(|label| !fixed.contains(label.as_str()))
+            {
                 valid.insert(label);
                 actors.insert(aterm_codec::hex::encode_lower(&member.actor()));
             }
@@ -424,7 +427,7 @@ pub(super) fn step_at(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let at_time = due
-                .entry((paths.dir.clone(), provider.name().into()))
+                .entry((paths.dir.clone(), provider.name()))
                 .or_insert_with(|| now + COOLDOWN);
             now >= *at_time
         };
@@ -497,7 +500,7 @@ pub(super) fn step_at(
         DUE.get_or_init(|| Mutex::new(BTreeMap::new()))
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert((paths.dir.clone(), provider.name().into()), now + COOLDOWN);
+            .insert((paths.dir.clone(), provider.name()), now + COOLDOWN);
         save(paths, &rows)?;
         return Ok(1);
     }

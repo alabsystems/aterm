@@ -230,10 +230,10 @@ fn parse_source(src: &str, path: &Path, module: &[String]) -> Result<Vec<Item>> 
         let start = i;
         let mut depth = 0i32;
         loop {
-            for c in codes[i].chars() {
-                if "([{ ".contains(c) && c != ' ' {
+            for b in codes[i].bytes() {
+                if matches!(b, b'(' | b'[' | b'{') {
                     depth += 1
-                } else if ")] }".contains(c) && c != ' ' {
+                } else if matches!(b, b')' | b']' | b'}') {
                     depth -= 1
                 }
             }
@@ -505,12 +505,16 @@ impl Upstream {
         for text in std::iter::once(&item.text).chain(item.impls.iter().map(|(_, t)| t)) {
             for segs in paths(text) {
                 let key = if segs.len() == 1 {
-                    Some((item.module.clone(), segs[0].clone()))
+                    if segs[0] == item.name {
+                        None
+                    } else {
+                        Some((item.module.clone(), segs.into_iter().next().unwrap()))
+                    }
                 } else {
                     self.resolve(&item.module, &segs)
                 };
                 if let Some(key) = key
-                    && key != item.key()
+                    && (key.0 != item.module || key.1 != item.name)
                     && self.items.contains_key(&key)
                 {
                     out.insert(key);

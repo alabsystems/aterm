@@ -210,6 +210,13 @@ pub mod account;
 ))]
 pub mod asleep;
 
+/// Test support (test and debug builds, Apple platforms and Linux): a child parked between `fork` and `exec` ([`fork_window::Parked`]), holding a copy of every descriptor, for a test of what a closed descriptor's lock leaves held.
+#[cfg(all(
+    any(test, debug_assertions),
+    any(target_vendor = "apple", target_os = "linux")
+))]
+pub mod fork_window;
+
 #[cfg(target_os = "macos")]
 mod darwin_loader;
 
@@ -218,6 +225,9 @@ pub mod childwake;
 /// A deadline on a call that can block forever: in this process ([`deadline::Gate`], the shared [`deadline::TRUST`] gate) or in a child ([`deadline::output_until`]).
 #[cfg(not(target_arch = "wasm32"))]
 pub mod deadline;
+/// A debug build's journal of the children it reaps that a signal ended (`ATERM_DEBUG_DEATH_JOURNAL`), the lab's witness of a helper a jail killed.
+#[cfg(unix)]
+pub mod deaths;
 /// Unix directory identities read from one descriptor, with a persistent volume UUID where supported.
 #[cfg(unix)]
 pub mod directory_identity;
@@ -240,6 +250,9 @@ pub mod hangup;
 /// Which live processes of this uid hold a descriptor for one device (the PTY keeper's holder scan), or use a path under a set of directories (the disk watch's check before it removes a build directory whole).
 pub mod holders;
 pub mod host;
+/// aterm's own LAN traffic, through the root LAN broker on macOS (`docs/DESIGN-lan-broker-2026-11-05.md`).
+#[cfg(unix)]
+pub mod lan;
 pub mod latest;
 /// Unix-only: the descriptor a throwaway `--headless` instance watches so it ends with the process that started it — both ends.
 #[cfg(unix)]

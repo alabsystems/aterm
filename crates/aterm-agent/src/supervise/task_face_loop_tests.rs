@@ -1474,8 +1474,8 @@ fn an_off_no_person_set_keeps_lands_rest_at_the_loop() {
 }
 
 /// THE NEEDS ENTRY SAYS THE WORK WAITS ON YOU WHERE NOTHING CARRIES ON (the second review,
-/// 2026-11-01): where Land rests on the check's answer, a need alone, the menu bar's and the
-/// border's entry ends `— waits on you`; a need the defense said stands beside the check's
+/// 2026-11-01): where Land rests on the check's answer, a need alone, the menu bar's entry ends
+/// `— waits on you`; a need the defense said stands beside the check's
 /// `LANDED`, and the entry that said `— carrying on` while the check was out is told again with
 /// the same need, ending `— waits on you`. Negative control: the tail kept at carrying on
 /// (`Session::need_tail`) says the loop carries on beside a rest and a landing.

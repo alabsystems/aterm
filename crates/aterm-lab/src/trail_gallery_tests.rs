@@ -1111,8 +1111,12 @@ fn a_split_is_judged_on_the_caret_s_pane() {
 /// `split`'s burst frames are its own (none is a typing frame's label, so a
 /// measure tells the two lines apart), and `move-up`'s program moves the
 /// caret up [`MOVE_UP_ROWS`] rows in the same write as its mark, over
-/// lettered rows its paint draws above the prompt. NEGATIVE CONTROL: every
-/// other paint carries no such program.
+/// lettered rows its paint draws above the prompt, and holds it there until
+/// its terminal goes. NEGATIVE CONTROLS: every other paint carries no such
+/// program; with `sleep 4` back in `./k` (2026-11-05) this fired "the program
+/// holds the move by reading its terminal, not by a clock", and a whole
+/// gallery of that program with `u470` delayed to 6 s took the prompt's line
+/// into that frame's sidecars, where this program's frame kept the page.
 #[test]
 fn the_widened_scenarios_name_their_frames_and_paint_their_page() {
     assert_eq!(
@@ -1132,6 +1136,11 @@ fn the_widened_scenarios_name_their_frames_and_paint_their_page() {
     let page = paint(Scenario::MoveUp, Theme::Light);
     let program = format!("printf '[vim] {MOVE_UP_MARK}\\033[{MOVE_UP_ROWS}A");
     assert!(page.contains(&program), "{page}");
+    let held = &page[page.find(&program).expect("the move")..];
+    assert!(
+        held.contains("read -r held") && !held.contains("sleep"),
+        "the program holds the move by reading its terminal, not by a clock: {held}"
+    );
     let prompt_at = page.find("printf '\\033[8H'").expect("the prompt's row");
     let lettered = page[..prompt_at].matches("\\r\\n'").count();
     assert!(

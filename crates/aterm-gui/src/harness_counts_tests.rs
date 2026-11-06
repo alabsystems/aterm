@@ -86,6 +86,77 @@ fn every_count(n: u64) -> HarnessStats {
     s
 }
 
+#[test]
+fn partial_history_status_does_not_claim_absence() {
+    let empty = HarnessStats::new(0);
+    let complete_empty = read(&empty, &empty).today_lines().unwrap();
+    let mut some = empty.clone();
+    some.rows = 1;
+    some.continued = 1;
+    let complete_some = read(&some, &some).today_lines().unwrap();
+    for (cut, bad) in [(true, 0), (false, 1)] {
+        let mut partial = empty.clone();
+        partial.cut = cut;
+        partial.bad = bad;
+        let unknown = read(&partial, &partial).today_lines().unwrap();
+        assert_ne!(unknown.0, complete_empty.0, "incomplete is not known empty");
+        assert!(
+            !today_counts(&unknown.0),
+            "uncertainty is a plain status note"
+        );
+
+        let mut partial_some = some.clone();
+        partial_some.cut = cut;
+        partial_some.bad = bad;
+        let observed = read(&partial_some, &partial_some).today_lines().unwrap();
+        assert_eq!(observed.0, complete_some.0);
+        assert_ne!(
+            observed.1, complete_some.1,
+            "known counts need partial context"
+        );
+    }
+}
+
+#[test]
+fn partial_history_does_not_claim_absence() {
+    let empty = HarnessStats::new(0);
+    let complete_empty = did(&empty, &empty);
+    let active = every_count(1);
+    let complete_active = did(&active, &active);
+    let absence_rows: Vec<_> = complete_empty
+        .iter()
+        .filter(|row| !complete_active.contains(row))
+        .collect();
+    assert!(
+        !absence_rows.is_empty(),
+        "known empty history has its own status"
+    );
+    let mut some = HarnessStats::new(0);
+    some.rows = 1;
+    some.continued = 1;
+    let complete_some = did(&some, &some);
+    assert!(at(&complete_some, NONE_IN_7_DAYS).is_some());
+    for (cut, bad) in [(true, 0), (false, 1)] {
+        let mut partial = empty.clone();
+        partial.cut = cut;
+        partial.bad = bad;
+        let unknown = did(&partial, &partial);
+        assert!(absence_rows.iter().all(|row| !unknown.contains(row)));
+        assert!(words_of(&unknown, "Partial").is_some());
+
+        let mut partial_some = some.clone();
+        partial_some.cut = cut;
+        partial_some.bad = bad;
+        let partial_rows = did(&partial_some, &partial_some);
+        assert!(at(&partial_rows, NONE_IN_7_DAYS).is_none());
+        assert_eq!(
+            words_of(&partial_rows, KEPT_GOING.label),
+            words_of(&complete_some, KEPT_GOING.label),
+            "observed activity remains visible"
+        );
+    }
+}
+
 /// THE DONE-CHECK ROW READS ITS COUNTS ALONE (§14.6, §14.17 item 2): right under `Kept going`,
 /// labelled as a part of it (`Forced continues  3 today · 3 in 7 days`), only where the week had
 /// one; and the unproven row under Approved reads `no safe rule` the same way. The two parts keep

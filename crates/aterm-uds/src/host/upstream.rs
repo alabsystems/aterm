@@ -70,6 +70,112 @@ pub enum Build {
     OpenSsl,
 }
 
+/// One locally built reference artifact qualified for a particular cohort and host.
+/// A later rebuild gets its own qualification and digest, even at the same source revision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReferenceArtifact {
+    /// The qualified `<os>-<arch>` host.
+    pub platform: &'static str,
+    /// SHA-256 of the executable before package relocation and signing.
+    pub sha256: &'static str,
+    /// Exact executable length.
+    pub bytes: u64,
+    /// Trust compiler revision used by this qualified unverified release build.
+    pub compiler: &'static str,
+    /// The retained Cargo compiler-query output associated with this build.
+    pub compiler_query_sha256: &'static str,
+    /// Exact retained compiler-query text length.
+    pub compiler_query_bytes: u64,
+    /// Trust build selecting this artifact's compiler.
+    pub trust_build: u64,
+}
+
+/// An original license text retained alongside the complete corresponding source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReferenceLicense {
+    /// Package-relative file name.
+    pub path: &'static str,
+    /// Original text's SHA-256.
+    pub sha256: &'static str,
+    /// Exact text length.
+    pub bytes: u64,
+}
+
+/// A source-derived reference tool prepared through the ordinary bottle install-tree path.
+/// This is not an upstream prebuilt archive or a claim of checker soundness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReferenceTool {
+    /// Package and executable name.
+    pub name: &'static str,
+    /// Upstream version.
+    pub version: &'static str,
+    /// Public source repository.
+    pub repository: &'static str,
+    /// Exact Git commit used by the qualified build.
+    pub revision: &'static str,
+    /// Exact Git tree used by the qualified build.
+    pub source_tree: &'static str,
+    /// SHA-256 of the unchanged source lockfile.
+    pub lock_sha256: &'static str,
+    /// The complete corresponding-source archive, including dependencies and rebuild materials.
+    pub source_kit_sha256: &'static str,
+    /// Exact corresponding-source archive length.
+    pub source_kit_bytes: u64,
+    /// Readily accessible original license texts; other notices remain in the complete kit.
+    pub licenses: &'static [ReferenceLicense],
+    /// Qualified artifacts; this does not admit other hosts or future rebuilds.
+    pub artifacts: &'static [ReferenceArtifact],
+}
+
+/// The pinned independent Carcara reference used by AY's guarded comparison lane.
+pub const CARCARA: ReferenceTool = ReferenceTool {
+    name: "carcara",
+    version: "1.1.0",
+    repository: "ufmg-smite/carcara",
+    revision: "9a352eea6c935ad35cb8ec22e521a7620ec5d474",
+    source_tree: "80e8ca1f905ccd843ab784f6f9669d995010a505",
+    lock_sha256: "55f48e70a8c943437b0d56cc4848ce4e86dfe6194a3c9f7a5f052c0c0788b6a4",
+    source_kit_sha256: "eb69f57363031e8ba97e1936807434a0be31f9679685b53948f61afd315621a6",
+    source_kit_bytes: 55_315_355,
+    licenses: &[
+        ReferenceLicense {
+            path: "share/licenses/carcara/LICENSE-APACHE.txt",
+            sha256: "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+            bytes: 9_723,
+        },
+        ReferenceLicense {
+            path: "share/licenses/carcara/LICENSE-LGPL.txt",
+            sha256: "1e950a32358912876fcd3ea0bdd975c9ea8a7822eddc3cda662817c3abe99b1c",
+            bytes: 7_642,
+        },
+        ReferenceLicense {
+            path: "share/licenses/carcara/LICENSE-GPL.txt",
+            sha256: "33bc26d4498c183b703d1760ee45b8774d21d6e0178ca393dc715271840c7a21",
+            bytes: 34_916,
+        },
+    ],
+    artifacts: &[
+        ReferenceArtifact {
+            platform: "macos-aarch64",
+            sha256: "e27cb05e4119ac8ece1b3ba70cab2b7aae710fae70ad2252d0086be8d3b363a9",
+            bytes: 4_658_712,
+            compiler: "29ebb403de7a102850d6cb10a62d5cc3baf723ed",
+            compiler_query_sha256: "c8c019cab02c90d11961e41e1cace4ef5dcf9181babfb0866c6517fd038c6897",
+            compiler_query_bytes: 255,
+            trust_build: 16_387,
+        },
+        ReferenceArtifact {
+            platform: "macos-x86_64",
+            sha256: "db27f7fe19c26ee14e53981e333b159dd216a757972ff4fc24d6c8c01703a532",
+            bytes: 6_081_424,
+            compiler: "3d7768caf6dcba0e4f5083a854bb77805ea1aafd",
+            compiler_query_sha256: "cbb2ecb561be3c70df9c4448a4b1827bcfb8456b6ef06f9147b335a27be39bce",
+            compiler_query_bytes: 228,
+            trust_build: 6_808,
+        },
+    ],
+};
+
 impl PinnedTool {
     /// The archive this recipe admits on `platform`.
     #[must_use]
@@ -202,6 +308,35 @@ pub const OPENSSL_SIGNING: PinnedTool = PinnedTool {
     darwin_omit: &[],
     hosts: &["macos-aarch64", "macos-x86_64"],
     archives: &[OPENSSL_SIGNING_SOURCE],
+};
+
+/// Official self-contained Node runtime for JavaScript/WebAssembly reference checks.
+/// This package exposes Node alone; npm is not part of its runtime contract.
+pub const NODE: PinnedTool = PinnedTool {
+    name: "node",
+    version: "22.23.4",
+    executable: "bin/node",
+    layout: Layout::Executable,
+    build: Build::Prebuilt,
+    strip: 1,
+    max_extract_bytes: 256 * 1024 * 1024,
+    licenses: &["LICENSE"],
+    darwin_omit: &[],
+    hosts: &["macos-aarch64", "macos-x86_64"],
+    archives: &[
+        Archive {
+            platform: "macos-aarch64",
+            url: "https://nodejs.org/dist/v{v}/node-v{v}-darwin-arm64.tar.xz",
+            sha256: "037650d0839f457747396f052073fb48333d31bf5abd3c98b74da20d89ebb1ad",
+            bytes: 25_898_024,
+        },
+        Archive {
+            platform: "macos-x86_64",
+            url: "https://nodejs.org/dist/v{v}/node-v{v}-darwin-x64.tar.xz",
+            sha256: "f42abca7aaac61efc57d49fb42ea84fc53bbeba9a749cb03a291ce6e4e7a69c1",
+            bytes: 27_483_128,
+        },
+    ],
 };
 
 const LEAN4_ARCHIVES: [Archive; 2] = [

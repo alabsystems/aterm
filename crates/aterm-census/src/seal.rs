@@ -11,6 +11,7 @@
 //! output if it formats, and then calls [`stamp`] on what it will write; the `generated-seal`
 //! guard calls [`check`] on every file `.gitattributes` marks `linguist-generated`.
 
+use std::fmt::Write as _;
 use std::ops::Range;
 
 /// The word every seal line carries.
@@ -45,8 +46,7 @@ pub enum Seal {
 #[must_use]
 pub fn line(comment: &str, generator: &str) -> String {
     format!(
-        "{comment} {MARK} by {generator} ({SEAL}{zeros}); rerun it, never edit by hand.",
-        zeros = "0".repeat(DIGITS)
+        "{comment} {MARK} by {generator} ({SEAL}0000000000000000); rerun it, never edit by hand."
     )
 }
 
@@ -60,7 +60,7 @@ pub fn stamp(text: &str) -> Result<String, String> {
     })?;
     let mut out = String::with_capacity(text.len());
     out.push_str(&text[..digits.start]);
-    out.push_str(&format!("{:016x}", digest(text, &digits)));
+    let _ = write!(out, "{:016x}", digest(text, &digits));
     out.push_str(&text[digits.end..]);
     Ok(out)
 }
@@ -108,9 +108,19 @@ fn locate(text: &str) -> Option<(usize, Range<usize>)> {
 /// FNV-1a 64 of `text` with the bytes at `digits` read as `0`: `aterm_hash`'s fold with a mask, so
 /// its step stays spelled out here. A file's seal holds this value, so it must not move.
 fn digest(text: &str, digits: &Range<usize>) -> u64 {
+    let bytes = text.as_bytes();
+    let start = digits.start.min(bytes.len());
+    let end = digits.end.min(bytes.len()).max(start);
     let mut hash = aterm_hash::FNV64_OFFSET;
-    for (at, byte) in text.bytes().enumerate() {
-        let byte = if digits.contains(&at) { b'0' } else { byte };
+    for &byte in &bytes[..start] {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(aterm_hash::FNV64_PRIME);
+    }
+    for _ in start..end {
+        hash ^= u64::from(b'0');
+        hash = hash.wrapping_mul(aterm_hash::FNV64_PRIME);
+    }
+    for &byte in &bytes[end..] {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(aterm_hash::FNV64_PRIME);
     }

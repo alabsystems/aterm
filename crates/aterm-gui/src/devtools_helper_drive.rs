@@ -623,11 +623,7 @@ fn payload(findings: &mut Findings) {
 }
 
 fn symbols(findings: &mut Findings) {
-    for name in live::WINDOW_KEYS
-        .iter()
-        .chain(live::OWNER_KEYS.iter())
-        .chain(live::WORKSPACE_NAMES.iter())
-    {
+    for name in live::WINDOW_KEYS.iter().chain(live::WORKSPACE_NAMES.iter()) {
         let Ok(symbol) = std::ffi::CString::new(*name) else {
             continue;
         };

@@ -786,12 +786,9 @@ pub struct Entry {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub projected: Vec<Projected>,
     /// The volume's disk worker ([`worker_step`]): claimed, running, or over this episode. Kept
-    /// across [`Entry::close`] while claimed or running; one an older or newer build wrote in a
-    /// shape this one cannot read is read as none, and the cooldown still stands.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "worker_or_none"
-    )]
+    /// across [`Entry::close`] while claimed or running. An unrecognized shape makes the lease
+    /// unreadable, so this build cannot discard a worker it does not understand.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub worker: Option<Worker>,
     /// The volume's last worker claim (unix ms), across episodes ([`WORKER_COOLDOWN_MS`]).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -928,31 +925,43 @@ pub enum WorkerState {
     },
 }
 
-/// [`Entry::worker`] as the lease holds it, or none where its shape is not this build's.
-fn worker_or_none<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Worker>, D::Error> {
-    Ok(Option::<Value>::deserialize(d)?.and_then(|v| aterm_json::from_value::<Worker>(v).ok()))
-}
-
 /// The machine-wide lease ([`LEASE_FILE`]).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(default)]
 pub struct Lease {
     pub schema: u64,
     pub volumes: Vec<Entry>,
 }
 
 impl Lease {
-    /// The lease `text` holds; an empty one where it is not this schema's.
-    #[must_use]
-    pub fn decode(text: &str) -> Lease {
-        aterm_json::from_str::<Lease>(text)
-            .ok()
-            .filter(|l| l.schema == SCHEMA)
-            .map(|mut l| {
-                l.volumes.truncate(MAX_VOLUMES);
-                l
-            })
-            .unwrap_or_default()
+    /// The lease `text` holds, without discarding unrecognized coordination state.
+    /// # Errors
+    /// The text exceeds the lease byte limit, is malformed, has an unsupported schema or worker
+    /// shape, or holds more than [`MAX_VOLUMES`] volumes.
+    pub fn decode(text: &str) -> io::Result<Lease> {
+        check_lease_bytes(text)?;
+        let lease: Lease = aterm_json::from_str(text)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if lease.schema != SCHEMA {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported lease schema {} (expected {SCHEMA})",
+                    lease.schema
+                ),
+            ));
+        }
+        lease.check_volumes()?;
+        Ok(lease)
+    }
+
+    fn check_volumes(&self) -> io::Result<()> {
+        if self.volumes.len() > MAX_VOLUMES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("lease holds more than {MAX_VOLUMES} volumes"),
+            ));
+        }
+        Ok(())
     }
 
     /// The lease as its file holds it.
@@ -3038,15 +3047,25 @@ pub fn lock_within(dir: &Path, ladder: &[Duration]) -> io::Result<Option<LeaseLo
     }
 }
 
-/// `dir`'s lease as its file holds it, read without the lock (a reader's view); an empty lease
-/// where there is none or it cannot be read.
-#[must_use]
-pub fn read(dir: &Path) -> Lease {
-    super::super::accounts::read_bounded(&dir.join(LEASE_FILE), LEASE_MAX_BYTES)
-        .ok()
-        .flatten()
-        .map(|t| Lease::decode(&t))
-        .unwrap_or_default()
+fn check_lease_bytes(text: &str) -> io::Result<()> {
+    if text.len() as u64 > LEASE_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            format!("lease is larger than {LEASE_MAX_BYTES} bytes"),
+        ));
+    }
+    Ok(())
+}
+
+/// `dir`'s lease as its file holds it, read without the lock (a reader's view). Only a proven
+/// missing file yields an empty lease.
+/// # Errors
+/// The existing file cannot be read as bounded UTF-8 text or decoded by [`Lease::decode`].
+pub fn read(dir: &Path) -> io::Result<Lease> {
+    match super::super::accounts::read_bounded(&dir.join(LEASE_FILE), LEASE_MAX_BYTES)? {
+        Some(text) => Lease::decode(&text),
+        None => Ok(Lease::default()),
+    }
 }
 
 /// Edit `dir`'s lease under its lock ([`lock_within`] over `ladder`): read, `edit`, and write it
@@ -3055,8 +3074,9 @@ pub fn read(dir: &Path) -> Lease {
 ///
 /// # Errors
 ///
-/// The lock could not be taken, or the changed lease could not be written (a full disk): the
-/// edit is then lost, and the next look steps again.
+/// The lock or lease read failed, the edited lease exceeds its volume or byte bound, or its
+/// replacement could not be written (a full disk). A failed read never invokes `edit`; the
+/// existing lease is preserved, and the next look tries again.
 pub fn transact<R>(
     dir: &Path,
     ladder: &[Duration],
@@ -3065,11 +3085,14 @@ pub fn transact<R>(
     let Some(_held) = lock_within(dir, ladder)? else {
         return Ok(None);
     };
-    let mut lease = read(dir);
+    let mut lease = read(dir)?;
     let before = lease.clone();
     let out = edit(&mut lease);
     if lease != before {
-        super::super::upgrade_models::write_atomic_ordered(&dir.join(LEASE_FILE), &lease.encode())?;
+        lease.check_volumes()?;
+        let text = lease.encode();
+        check_lease_bytes(&text)?;
+        super::super::upgrade_models::write_atomic_ordered(&dir.join(LEASE_FILE), &text)?;
     }
     Ok(Some(out))
 }

@@ -18,6 +18,7 @@ pub mod firewall;
 pub mod github;
 pub mod homebrew;
 pub mod keyboard;
+pub mod lan;
 pub mod names;
 pub mod person;
 pub mod power;
@@ -218,6 +219,11 @@ pub fn expand(baseline: &Baseline, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, Stri
         ctx,
         &relaunches,
     )?);
+    // The broker before the developer table's Command Line Tools: their download can take
+    // minutes, and the vault look waits on the broker.
+    if let Some(t) = &baseline.lan {
+        items.extend(lan::expand(t, ctx)?);
+    }
     if let Some(t) = &baseline.developer {
         items.extend(developer::expand(t, ctx)?);
     }

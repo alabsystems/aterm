@@ -131,6 +131,12 @@ impl Paths {
         self.state_dir.join("acaffeine.state")
     }
 
+    /// Keep Awake with Lid Closed, the person's opt-in ([`crate::state::load_lid`]).
+    #[must_use]
+    pub fn lid_file(&self) -> PathBuf {
+        self.state_dir.join("acaffeine.lid")
+    }
+
     /// The lock a running mug holds for its whole life, with its pid inside
     /// ([`crate::instance`]).
     #[must_use]
@@ -211,6 +217,7 @@ mod tests {
         assert_eq!(paths.state_file(), PathBuf::from("/s/acaffeine.state"));
         assert_eq!(paths.lock_file(), PathBuf::from("/s/acaffeine.lock"));
         assert_eq!(paths.bridge_file(), PathBuf::from("/s/acaffeine.bridge"));
+        assert_eq!(paths.lid_file(), PathBuf::from("/s/acaffeine.lid"));
         assert_eq!(paths.code_dir(), PathBuf::from("/s/acaffeine-code.noindex"));
         assert_eq!(
             paths.session_plist("x.y"),

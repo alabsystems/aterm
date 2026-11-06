@@ -2210,6 +2210,7 @@ fn what_the_owner_was_told_and_has_seen_crosses_the_update() {
         what: None,
         claim: None,
         carries_on: false,
+        ids: Vec::new(),
     };
     let fleet = crate::fleet_glance::escalation(&mac, &need);
     app.herald_deliver(fleet.session, Some(&fleet), false);

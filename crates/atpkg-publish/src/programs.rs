@@ -110,8 +110,19 @@ pub struct BottleDef {
     pub darwin: &'static [Triple],
     /// The GNU/Linux targets an upstream install archive may carry.
     pub linux: &'static [Triple],
-    /// A shared pinned tool recipe; absent for formula-derived packages.
-    pub pinned: Option<&'static aterm_uds::host::upstream::PinnedTool>,
+    /// Where the bottle's admitted runtime comes from.
+    pub origin: BottleOrigin,
+}
+
+/// The mutually exclusive origin of an upstream package.
+#[derive(Clone, Copy, Debug)]
+pub enum BottleOrigin {
+    /// Official formula metadata and bottles.
+    Formula,
+    /// A shared pinned upstream archive or native source build.
+    Pinned(&'static aterm_uds::host::upstream::PinnedTool),
+    /// An independently qualified local source build with its corresponding source.
+    Reference(&'static aterm_uds::host::upstream::ReferenceTool),
 }
 
 /// How a sysroot bundle is packed and proven.
@@ -256,7 +267,7 @@ pub static PROGRAMS: &[ProgramDef] = &[
             exposes: &["gh"],
             darwin: DUAL_DARWIN,
             linux: &[],
-            pinned: None,
+            origin: BottleOrigin::Formula,
         }),
     },
     ProgramDef {
@@ -269,7 +280,7 @@ pub static PROGRAMS: &[ProgramDef] = &[
             exposes: &["git"],
             darwin: DUAL_DARWIN,
             linux: &[X86_64_UNKNOWN_LINUX_GNU, AARCH64_UNKNOWN_LINUX_GNU],
-            pinned: None,
+            origin: BottleOrigin::Formula,
         }),
     },
     ProgramDef {
@@ -282,7 +293,7 @@ pub static PROGRAMS: &[ProgramDef] = &[
             exposes: &["gitleaks"],
             darwin: DUAL_DARWIN,
             linux: &[X86_64_UNKNOWN_LINUX_GNU, AARCH64_UNKNOWN_LINUX_GNU],
-            pinned: Some(&aterm_uds::host::upstream::GITLEAKS),
+            origin: BottleOrigin::Pinned(&aterm_uds::host::upstream::GITLEAKS),
         }),
     },
     ProgramDef {
@@ -295,7 +306,7 @@ pub static PROGRAMS: &[ProgramDef] = &[
             exposes: &["python3.14"],
             darwin: DUAL_DARWIN,
             linux: &[],
-            pinned: Some(&aterm_uds::host::upstream::CPYTHON),
+            origin: BottleOrigin::Pinned(&aterm_uds::host::upstream::CPYTHON),
         }),
     },
     ProgramDef {
@@ -308,7 +319,7 @@ pub static PROGRAMS: &[ProgramDef] = &[
             exposes: &["openssl-signing"],
             darwin: DUAL_DARWIN,
             linux: &[],
-            pinned: Some(&aterm_uds::host::upstream::OPENSSL_SIGNING),
+            origin: BottleOrigin::Pinned(&aterm_uds::host::upstream::OPENSSL_SIGNING),
         }),
     },
     ProgramDef {
@@ -321,7 +332,33 @@ pub static PROGRAMS: &[ProgramDef] = &[
             exposes: &["lake"],
             darwin: DUAL_DARWIN,
             linux: &[],
-            pinned: Some(&aterm_uds::host::upstream::LEAN4),
+            origin: BottleOrigin::Pinned(&aterm_uds::host::upstream::LEAN4),
+        }),
+    },
+    ProgramDef {
+        name: "carcara",
+        repo: "aterm",
+        group: None,
+        system: None,
+        unavailable_hint: Some("The qualified Carcara reference is available for macOS only"),
+        shape: Shape::Bottle(BottleDef {
+            exposes: &["carcara"],
+            darwin: DUAL_DARWIN,
+            linux: &[],
+            origin: BottleOrigin::Reference(&aterm_uds::host::upstream::CARCARA),
+        }),
+    },
+    ProgramDef {
+        name: "node",
+        repo: "aterm",
+        group: None,
+        system: None,
+        unavailable_hint: Some("The qualified Node reference runtime is available for macOS only"),
+        shape: Shape::Bottle(BottleDef {
+            exposes: &["node"],
+            darwin: DUAL_DARWIN,
+            linux: &[],
+            origin: BottleOrigin::Pinned(&aterm_uds::host::upstream::NODE),
         }),
     },
 ];

@@ -633,10 +633,12 @@ VERBS:
     named as a source is refused: the sheet is the lab importer's input. It waits at most
     10 s for the accounts lock, then fails and syncs nothing. Where the default row is on
     record signed out from before the default login moved onto it (a `displaced` event
-    after that sign-out), it then checks the default login once with `claude auth status
-    --json` (20 s cap; it signs nothing in) and, signed in, records the login the move made
-    and moves the default login's sessions to the row; a window's upkeep does the same once
-    per such sign-out.
+    after that sign-out), it then reads the default login's stored file
+    (`~/.claude/.credentials.json`) once, running no process and reading no keychain; where
+    that file holds a login it records the login the move made and moves the default login's
+    sessions to the row, and with no file, or on macOS (whose default login is in the
+    keychain, so the file is not it), the sign-out stands. A window's upkeep does the same
+    once per such sign-out.
   - `accounts serve [<source>] [--bind <addr:port>] [--machine <mN>]`
     Serves the account rotation dashboard and `fleet-accounts.toml` from the same source,
     on `127.0.0.1:8741` unless `--bind` names another address (a LAN one shares it).
@@ -1196,10 +1198,13 @@ impl Env {
         accounts::roster_beside(self.config.as_deref()?)
     }
 
-    /// The accounts store: `<state>/accounts` (the state file, its ledger, the lock, and the login directories `accounts add` makes).
+    /// The accounts store: `<state>/accounts` (the state file, its ledger, the lock, and the login directories `accounts add` makes), reading its default login under [`Env::home`] where one is known ([`accounts::Store::default_login_home`]).
     #[must_use]
     pub fn accounts_store(&self) -> accounts::Store {
-        accounts::Store::at(&self.state)
+        match self.home.as_deref() {
+            Some(home) => accounts::Store::at_for(&self.state, Cli::Claude, home),
+            None => accounts::Store::at(&self.state),
+        }
     }
 
     /// `cli`'s roster beside [`Env::config`] ([`accounts::roster_beside_for`]): Claude Code's is [`Env::accounts_roster`].
@@ -3404,7 +3409,7 @@ fn spaced_words(sign_in: &SignIn, store: &accounts::Store, now: i64) -> Option<S
 fn begin_sign_in(
     sign_in: SignIn,
     (cli, label): (Cli, &str),
-    (store, signin): (&accounts::Store, accounts::Lock),
+    (store, signin): (&accounts::Store, accounts::SigninTurn),
     now: i64,
     (verb, err): (&str, &mut dyn Write),
 ) -> Result<Begun, Renewal> {
@@ -3437,28 +3442,22 @@ fn agy_store(env: &Env) -> super::agy_quota_store::Store {
 
 /// Starts a person's sign-in of `cli`'s `label` ([`SignIn::begin`]) for a command that names
 /// the account (`harness agy login <account>`, `signin --cli grok`): their [`SignIn`], under the
-/// machine's sign-in lock, which the returned [`Begun`] holds. While another sign-in holds the
-/// lock, `again(tried)` says whether to wait ([`accounts::Store::signin_within`]) once more;
-/// where it does not, nothing is run.
+/// machine's sign-in lock, which the returned [`Begun`] holds. Waiting owns one
+/// manual FIFO ticket and is cancellable independently of terminal/agent markers.
 fn person_begin(
     store: &accounts::Store,
     (cli, label): (Cli, &str),
-    now: i64,
-    again: &dyn Fn(u32) -> bool,
+    now: &dyn Fn() -> i64,
+    stopped: &dyn Fn() -> bool,
+    queued: &mut dyn FnMut(accounts::SigninPosition),
 ) -> Result<Begun, String> {
-    let taken = |taken: io::Result<Option<accounts::Lock>>| {
-        taken.map_err(|e| format!("the sign-in lock could not be taken ({e}); nothing was run"))
-    };
-    let mut lock = taken(store.signin_now())?;
-    let mut tried = 0;
-    while lock.is_none() && again(tried) {
-        lock = taken(store.signin_within())?;
-        tried += 1;
-    }
-    let lock = lock.ok_or_else(|| format!("held: {}; nothing was run", accounts::SIGNIN_HELD))?;
+    let (lock, _) = store
+        .manual_signin_while(|| !stopped(), queued)
+        .map_err(|why| format!("manual sign-in admission is unavailable ({why}); nothing was run"))?
+        .ok_or_else(|| "manual sign-in cancelled; nothing was run".to_owned())?;
     person_sign_in(cli, label)
-        .begin(cli, label, lock, store, now)
-        .map_err(|refused| format!("not run: {}", refused.words(now)))
+        .begin(cli, label, lock, store, now())
+        .map_err(|refused| format!("not run: {}", refused.words(now())))
 }
 
 fn run_agy_login(_env: &Env, account: &str, json: bool, out: &mut dyn Write) -> ExitCode {
@@ -3476,7 +3475,17 @@ fn run_agy_login(_env: &Env, account: &str, json: bool, out: &mut dyn Write) -> 
             .accounts_store_for(Cli::Agy)
             .ok_or("Google login home is unavailable")?;
         // The person's sign-in of the account they named, held until the provider flow ends.
-        let _begun = person_begin(&store, (Cli::Agy, account), env.now, &|_| false)?;
+        let _ends = WindowEnds::hold();
+        let now = || limit::unix_now().max(env.now);
+        let _begun = person_begin(
+            &store,
+            (Cli::Agy, account),
+            &now,
+            &window_end_noted,
+            &mut |position| {
+                let _ = writeln!(io::stderr(), "{account}: {}", signin_queue_words(position));
+            },
+        )?;
         let deadline =
             super::wake_deadline::WakeDeadline::after(std::time::Duration::from_secs(180));
         let grant =
@@ -5494,16 +5503,33 @@ fn run_disk_why(env: &Env, json: bool, out: &mut dyn Write, err: &mut dyn Write)
         .cloned()
         .collect();
     rows.drain(..rows.len().saturating_sub(DISK_WHY_ROWS));
-    let lease = disk::ask::read(&env.state);
-    if json {
-        let _ = writeln!(out, "{}", lease.encode());
-        for row in &rows {
-            let _ = writeln!(out, "{row}");
+    let lease = match disk::ask::read(&env.state) {
+        Ok(lease) => lease,
+        Err(e) => {
+            let path = env.state.join(disk::ask::LEASE_FILE);
+            let _ = writeln!(err, "aterm harness disk why: {}: {e}", path.display());
+            return ExitCode::from(1);
         }
-    } else {
-        for line in disk::ask::why_lines(&lease, &rows, &ledger, env.now.saturating_mul(1000)) {
-            let _ = writeln!(out, "{line}");
+    };
+    let written = (|| -> io::Result<()> {
+        if json {
+            writeln!(out, "{}", lease.encode())?;
+            for row in &rows {
+                writeln!(out, "{row}")?;
+            }
+        } else {
+            for line in disk::ask::why_lines(&lease, &rows, &ledger, env.now.saturating_mul(1000)) {
+                writeln!(out, "{line}")?;
+            }
         }
+        out.flush()
+    })();
+    if let Err(error) = written {
+        let _ = writeln!(
+            err,
+            "aterm harness disk why: could not write results: {error}"
+        );
+        return ExitCode::from(1);
     }
     ExitCode::SUCCESS
 }
@@ -5649,7 +5675,7 @@ pub struct DiskWatchStatus {
     pub json: Value,
 }
 
-/// The disk watch as it stands for the volume `volume`: the thresholds in force there ([`disk::Config::thresholds`], the knob or the volume's share), where the volume stands against them, the reserve ([`disk::reserve`] under `home`), the last `poke` and `reserve` rows of the ledger at `ledger`, and how many build-cache removals the ledger's last [`DISK_LEDGER_KEEP_ROWS`] rows hold in flight (`sweep_in_flight`, [`disk::sweep_in_flight`]: intent rows, `removing`, that no `removed` or `kept` row followed; the line says it only when there is one).
+/// The disk watch as it stands for the volume `volume`: the thresholds in force there ([`disk::Config::thresholds`], the knob or the volume's share), where the volume stands against them, the reserve ([`disk::reserve`] under `home`), the last `poke` and `reserve` rows of the ledger at `ledger`, and how many build-cache removals the ledger's last [`DISK_LEDGER_KEEP_ROWS`] rows hold in flight (`sweep_in_flight`, [`disk::sweep_in_flight`]: intent rows, `removing`, that no `removed` or `kept` row followed; the line says it only when there is one). A ledger read failure leaves that count null, records `ledger_error`, and says `sweep_in_flight=unknown`; other observations remain available.
 #[must_use]
 pub fn disk_watch_status(
     ledger: &Path,
@@ -5678,8 +5704,13 @@ pub fn disk_watch_status(
     };
     let mut last_poke = Value::Null;
     let mut last_reserve = Value::Null;
-    let rows = tail_lines(ledger, DISK_LEDGER_KEEP_ROWS).unwrap_or_default();
-    let in_flight = disk::sweep_in_flight(rows.iter().map(String::as_str));
+    let (rows, ledger_error) = match tail_lines(ledger, DISK_LEDGER_KEEP_ROWS) {
+        Ok(rows) => (rows, None),
+        Err(error) => (Vec::new(), Some(error.to_string())),
+    };
+    let in_flight = ledger_error.is_none().then(|| {
+        u64::try_from(disk::sweep_in_flight(rows.iter().map(String::as_str))).unwrap_or(u64::MAX)
+    });
     for line in rows.into_iter().rev() {
         let Ok(row) = aterm_json::from_str::<Value>(&line) else {
             continue;
@@ -5708,10 +5739,10 @@ pub fn disk_watch_status(
             .and_then(|s| s.files_free)
             .map_or_else(String::new, |f| format!(" inodes_free={f}")),
         reserve_state,
-        if in_flight > 0 {
-            format!(" sweep_in_flight={in_flight}")
-        } else {
-            String::new()
+        match in_flight {
+            Some(0) => String::new(),
+            Some(count) => format!(" sweep_in_flight={count}"),
+            None => " sweep_in_flight=unknown".to_owned(),
         },
     );
     let mut o = Map::new();
@@ -5738,9 +5769,10 @@ pub fn disk_watch_status(
     );
     o.insert("last_poke".to_owned(), last_poke);
     o.insert("last_reserve".to_owned(), last_reserve);
+    o.insert("sweep_in_flight".to_owned(), num(in_flight));
     o.insert(
-        "sweep_in_flight".to_owned(),
-        Value::from(u64::try_from(in_flight).unwrap_or(u64::MAX)),
+        "ledger_error".to_owned(),
+        ledger_error.map_or(Value::Null, Value::from),
     );
     DiskWatchStatus {
         line,
@@ -5885,6 +5917,9 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+#[path = "cli_disk_output.rs"]
+mod disk_output;
+
 fn run_disk(
     env: &Env,
     targets: &[PathBuf],
@@ -5979,182 +6014,15 @@ fn run_disk(
         written,
         env.now,
     );
-    if json {
-        let _ = writeln!(out, "{}", rep.to_json());
-        let _ = writeln!(
-            out,
-            "{}",
-            aterm_json::to_string(&watch.json).unwrap_or_default()
-        );
-        if let Some(done) = &done {
-            let mut o = Map::new();
-            o.insert("schema".to_owned(), Value::from(1u64));
-            o.insert("kind".to_owned(), Value::from("disk-apply".to_owned()));
-            o.insert(
-                "removed".to_owned(),
-                Value::from(u64::try_from(done.removed.len()).unwrap_or(u64::MAX)),
-            );
-            o.insert("freed_bytes".to_owned(), Value::from(done.freed_bytes));
-            let texts = |items: Vec<String>| {
-                Value::Array(items.into_iter().map(Value::from).collect::<Vec<_>>())
-            };
-            o.insert(
-                "rows".to_owned(),
-                Value::Array(
-                    done.removed
-                        .iter()
-                        .map(|(row, removed)| {
-                            let mut r = Map::new();
-                            r.insert(
-                                "path".to_owned(),
-                                Value::from(row.path.display().to_string()),
-                            );
-                            r.insert("freed_bytes".to_owned(), Value::from(removed.bytes));
-                            r.insert(
-                                "units".to_owned(),
-                                texts(
-                                    removed
-                                        .units
-                                        .iter()
-                                        .map(|p| p.display().to_string())
-                                        .collect(),
-                                ),
-                            );
-                            r.insert(
-                                "skipped".to_owned(),
-                                texts(
-                                    removed
-                                        .skipped
-                                        .iter()
-                                        .map(|(p, why)| format!("{}: {why}", p.display()))
-                                        .collect(),
-                                ),
-                            );
-                            r.insert("trouble".to_owned(), texts(removed.trouble.clone()));
-                            Value::Object(r)
-                        })
-                        .collect(),
-                ),
-            );
-            o.insert(
-                "denials".to_owned(),
-                Value::Array(
-                    done.denials
-                        .iter()
-                        .map(|d| Value::from(d.describe()))
-                        .collect(),
-                ),
-            );
-            o.insert(
-                "stopped".to_owned(),
-                done.stopped
-                    .as_ref()
-                    .map_or(Value::Null, |s| Value::from(s.describe())),
-            );
-            let _ = writeln!(
-                out,
-                "{}",
-                aterm_json::to_string(&Value::Object(o)).unwrap_or_default()
-            );
-        }
-        return ExitCode::SUCCESS;
+    disk_output::DiskOutput {
+        report: &rep,
+        watch: &watch,
+        applied: done.as_ref(),
+        json,
+        config_path: env.config.as_deref(),
+        off_by_fault,
     }
-
-    let _ = writeln!(out, "{}", rep.headline());
-    let _ = writeln!(out, "  {}", watch.line);
-    for row in &rep.rows {
-        let _ = writeln!(out, "  {}", row.line());
-    }
-    if rep
-        .rows
-        .iter()
-        .any(|r| matches!(r.witness, disk::Witness::LeastRecentlyUsed { .. }))
-    {
-        let _ = writeln!(
-            out,
-            "  under pressure: the least-recently-used rows go in the order listed, until free space is back or what they freed covers the shortfall; under_pressure_up_to= is the most they would free"
-        );
-    }
-    for note in &rep.notes {
-        let _ = writeln!(out, "  note: {}", disk::shown(note));
-    }
-    if rep.rows.is_empty() {
-        let _ = writeln!(out, "  nothing to reclaim");
-    }
-    if !rep.hogs.is_empty() {
-        let _ = writeln!(out, "  the largest it cannot reclaim:");
-        for hog in &rep.hogs {
-            let _ = writeln!(out, "    {}", hog.line(rep.home.as_deref()));
-        }
-    }
-    let config_file = env
-        .config
-        .as_deref()
-        .map_or_else(|| "aterm.toml".to_string(), |p| p.display().to_string());
-    let remedy = if off_by_fault {
-        format!("fix what the stderr note names in {config_file}")
-    } else {
-        format!("set `[disk] apply = true` in {config_file}")
-    };
-    match &done {
-        None => {
-            let classes: Vec<&str> = disk::Class::ALL
-                .iter()
-                .filter(|c| rep.rows.iter().any(|r| r.class == **c && r.removable))
-                .map(|c| c.as_str())
-                .collect();
-            if !classes.is_empty() {
-                let config = if rep.config.apply {
-                    String::new()
-                } else {
-                    format!("; also {remedy}")
-                };
-                let _ = writeln!(
-                    out,
-                    "report only: to remove, add --apply <class> ({}){config}",
-                    classes.join(", ")
-                );
-            }
-        }
-        Some(done) => {
-            let _ = writeln!(out, "{}", done.headline());
-            for (row, removed) in &done.removed {
-                let line = format!(
-                    "  removed {} — {}; counted {} of file allocation",
-                    row.path.display(),
-                    row.witness.describe(),
-                    disk::human_bytes(removed.bytes)
-                );
-                let _ = writeln!(out, "{}", disk::shown(&line));
-                for unit in &removed.units {
-                    let _ = writeln!(
-                        out,
-                        "    went: {}",
-                        disk::shown(&unit.display().to_string())
-                    );
-                }
-                for (unit, why) in &removed.skipped {
-                    let line = format!("    kept: {} — {why}", unit.display());
-                    let _ = writeln!(out, "{}", disk::shown(&line));
-                }
-                for trouble in &removed.trouble {
-                    let _ = writeln!(out, "    trouble: {}", disk::shown(trouble));
-                }
-            }
-            for refusal in &done.denials {
-                let fix = if matches!(refusal, disk::Refusal::ApplyOff(_)) {
-                    format!("; {remedy}")
-                } else {
-                    String::new()
-                };
-                let _ = writeln!(out, "  denied: {}{fix}", disk::shown(&refusal.describe()));
-            }
-            if let Some(stop) = &done.stopped {
-                let _ = writeln!(out, "  stopped: {}", disk::shown(&stop.describe()));
-            }
-        }
-    }
-    ExitCode::SUCCESS
+    .print(out, err)
 }
 
 /// The newest `max` nonblank lines at `path`, retaining at most [`READ_MAX_ROWS`] rows
@@ -7142,34 +7010,8 @@ pub const AUTH_CHECK_BUDGET: std::time::Duration = std::time::Duration::from_sec
 pub(super) const UNATTENDED_RENEWAL_BUDGET: std::time::Duration =
     std::time::Duration::from_secs(300);
 
-/// The longest one sign-in holds the machine's sign-in lock by itself, in seconds: Claude Code's
-/// unattended renewal ends within [`UNATTENDED_RENEWAL_BUDGET`], and another CLI's within its hang
-/// detector ([`super::login_drive::HANG`]), since the lock is one for every CLI.
-const LONGEST_SIGN_IN_S: u64 = {
-    let claude = UNATTENDED_RENEWAL_BUDGET.as_secs();
-    let other = super::login_drive::HANG.as_secs();
-    if claude > other { claude } else { other }
-};
-
 /// What a person who waited for a sign-in is told where it renewed their row ([`renewed_since`]).
 const RENEWED_WHILE_WAITING: &str = "renewed by the sign-in you waited for; nothing was run";
-
-/// How long one try of the machine's sign-in lock waits: [`accounts::LOCK_LADDER`] added up, in
-/// seconds.
-#[allow(clippy::cast_possible_truncation)]
-const LOCK_TRY_S: u64 = {
-    let (mut ms, mut step) = (0, 0);
-    while step < accounts::LOCK_LADDER.len() {
-        ms += accounts::LOCK_LADDER[step].as_millis() as u64;
-        step += 1;
-    }
-    ms / 1000
-};
-
-/// How many times a person's sign-in tries the machine's sign-in lock ([`signin_guard`]), which
-/// together outlast [`LONGEST_SIGN_IN_S`].
-#[allow(clippy::cast_possible_truncation)]
-const PERSON_LOCK_TRIES: u32 = (LONGEST_SIGN_IN_S / LOCK_TRY_S) as u32 + 15;
 
 /// The most of that command's stdout that is read.
 pub const MAX_AUTH_STDOUT: usize = 64 * 1024;
@@ -7203,7 +7045,7 @@ pub trait AccountsHost {
         _expected: &str,
         _now: i64,
         _deadline: std::time::Instant,
-        _guard: std::sync::Arc<dyn aterm_http::Guard>,
+        _guard: std::sync::Arc<dyn shared_provider::KimiRefreshAuthority>,
     ) -> Result<Option<Box<dyn shared_provider::LoginProof>>, shared_provider::ObservationError>
     {
         Ok(None)
@@ -7231,11 +7073,10 @@ pub trait AccountsHost {
     fn native_credential_setup(&self) -> bool {
         false
     }
-    /// Whether a person's sign-in that has tried the machine's sign-in lock `tried` times tries
-    /// again ([`signin_guard`]).
-    fn retries_sign_in_lock(&self, tried: u32) -> bool {
-        let _ = tried;
-        false
+    /// Observe an actual manual FIFO wait after its gate has been released.
+    /// This is a position observation, never authority to start or an ETA.
+    fn signin_queued(&self, position: accounts::SigninPosition) {
+        let _ = position;
     }
     /// Whether stdin is a terminal.
     fn stdin_is_terminal(&self) -> bool;
@@ -7620,16 +7461,37 @@ impl RenewalObservation {
 #[derive(Debug, Clone, Default)]
 pub struct LiveAccounts {
     work: Option<super::account_work::Scope>,
+    automatic: bool,
 }
 
 impl LiveAccounts {
     /// Retains an explicit automatic operation through every provider effect.
     pub fn with_work(scope: super::account_work::Scope) -> Self {
-        Self { work: Some(scope) }
+        Self::background(Some(scope))
+    }
+
+    /// An explicitly requested native management operation uses the existing
+    /// manual FIFO while retaining cancellation through its provider effects.
+    pub fn manual_work(scope: super::account_work::Scope) -> Self {
+        Self {
+            work: Some(scope),
+            automatic: false,
+        }
+    }
+
+    /// A background call stays nonqueueing even in a standalone process.
+    pub(in crate::harness) fn background(work: Option<super::account_work::Scope>) -> Self {
+        Self {
+            work,
+            automatic: true,
+        }
     }
 }
 
 impl AccountsHost for LiveAccounts {
+    fn automatic_sign_in(&self) -> bool {
+        self.automatic
+    }
     fn work_scope(&self) -> Option<super::account_work::Scope> {
         self.work.clone()
     }
@@ -7652,12 +7514,19 @@ impl AccountsHost for LiveAccounts {
         expected: &str,
         now: i64,
         deadline: std::time::Instant,
-        guard: std::sync::Arc<dyn aterm_http::Guard>,
+        guard: std::sync::Arc<dyn shared_provider::KimiRefreshAuthority>,
     ) -> Result<Option<Box<dyn shared_provider::LoginProof>>, shared_provider::ObservationError>
     {
-        shared_provider::verify_or_refresh_kimi(home, region, expected, now, deadline, guard)
-            .map(|proof| proof.map(|proof| Box::new(proof) as Box<dyn shared_provider::LoginProof>))
-            .map_err(shared_provider::kimi_observation_error)
+        shared_provider::verify_or_refresh_kimi(
+            home,
+            region,
+            expected,
+            now,
+            super::login_drive::Deadline::until(deadline),
+            guard,
+        )
+        .map(|proof| proof.map(|proof| Box::new(proof) as Box<dyn shared_provider::LoginProof>))
+        .map_err(shared_provider::kimi_observation_error)
     }
 
     #[cfg(all(unix, not(test)))]
@@ -7716,10 +7585,6 @@ impl AccountsHost for LiveAccounts {
     fn stdin_is_terminal(&self) -> bool {
         use std::io::IsTerminal as _;
         io::stdin().is_terminal()
-    }
-
-    fn retries_sign_in_lock(&self, tried: u32) -> bool {
-        tried < PERSON_LOCK_TRIES
     }
 
     fn auth_status(&self, login: &str) -> Result<Captured, String> {
@@ -8476,7 +8341,7 @@ fn capture_unattended_renewal_for(
                 cmd,
                 within,
                 MAX_AUTH_STDOUT,
-                |child| {
+                |input| {
                     observed = if scope.is_some_and(super::account_work::Scope::cancelled) {
                         Some(CaptureStop::Cancelled)
                     } else {
@@ -8496,10 +8361,17 @@ fn capture_unattended_renewal_for(
                         return false;
                     };
                     match super::open_url::take_oauth_code(outcome.with_extension("code")) {
-                        Ok(Some(code)) => child
-                            .stdin
-                            .as_mut()
-                            .is_none_or(|stdin| writeln!(stdin, "{code}").is_err()),
+                        Ok(Some(mut code)) => {
+                            code.push('\n');
+                            let written = input.write_all(code.as_bytes(), || {
+                                scope.is_some_and(super::account_work::Scope::cancelled)
+                            });
+                            if scope.is_some_and(super::account_work::Scope::cancelled) {
+                                observed = Some(CaptureStop::Cancelled);
+                                return true;
+                            }
+                            written.is_err()
+                        }
                         Ok(None) => false,
                         Err(_) => true,
                     }
@@ -9172,6 +9044,8 @@ pub struct SurveyAccount {
     pub condition: accounts::Condition,
     /// The five-hour window used, in percent, while it runs.
     pub five_hour_pct: Option<u32>,
+    /// When the five-hour window resets, while it runs, Unix seconds.
+    pub five_hour_reset: Option<i64>,
     /// The week used, in percent, while it runs.
     pub seven_day_pct: Option<u32>,
     /// When the week resets, while it runs, Unix seconds.
@@ -9181,6 +9055,16 @@ pub struct SurveyAccount {
     pub used_at: Option<i64>,
     /// When its figures were last read, Unix seconds ([`RowReading::read_at`]).
     pub read_at: Option<i64>,
+    /// The lab registry's key for the account (`ac-<16 hex>`): the key the journal names it by
+    /// ([`accounts::Account::pk`]), else its row's claims key ([`super::journal::account_key`]).
+    /// `None` for a row with no claims email to key, such as the own login an empty roster lists.
+    pub pk: Option<String>,
+    /// Its plan's word as `aterm harness accounts` names it, lower case (`max`, `pro`, `plus`):
+    /// for Claude Code's rows the stats series' newest `plan` row (what its profile showed),
+    /// else the `subscriptionType` its login's last renewal read ([`super::outlook::plans_seen`]).
+    pub plan: Option<String>,
+    /// The plan's tier, where the profile named one (`20x`).
+    pub plan_tier: Option<String>,
 }
 
 /// How old a row's figures may be for a survey to call it `usable` ([`survey_condition`]): as long
@@ -9356,23 +9240,24 @@ impl PoolMoves {
 
 /// `cli`'s pool as `aterm harness accounts --json` lists it, for a survey's facts: the roster
 /// beside `config` (`accounts.toml`, `accounts-<cli>.toml`) bound to its logins, the store under
-/// `state` (another CLI's keeps its logins under `home`), the own login alone where Claude Code's
+/// `harness` (another CLI's keeps its logins under `home`), the own login alone where Claude Code's
 /// roster lists none and its tap read it, and each row's condition ([`survey_condition`]), windows
 /// and last use at `now`. Reads no provider's usage: what it holds beside the records is what the
-/// sessions of the one login enrolled here wrote ([`row_rollout_sample`]).
+/// sessions of the one login enrolled here wrote ([`row_rollout_sample`]). Each row's plan is
+/// the one the report names, from the stats series and the logins beside the records.
 /// # Errors
 /// The roster path is unknown, another CLI's `home` is, or the roster or account records could
 /// not be read.
 pub fn survey_accounts(
     cli: Cli,
-    (config, state, home): (&Path, &Path, Option<&Path>),
+    (config, harness, home): (&Path, &Path, Option<&Path>),
     now: i64,
 ) -> Result<SurveyPool, String> {
     let path = accounts::roster_beside_for(config, cli)
         .ok_or_else(|| "the account roster path is unknown".to_owned())?;
     let store = match (cli, home) {
-        (Cli::Claude, _) => accounts::Store::at(state),
-        (_, Some(home)) => accounts::Store::at_for(state, cli, home),
+        (_, Some(home)) => accounts::Store::at_for(harness, cli, home),
+        (Cli::Claude, None) => accounts::Store::at(harness),
         (_, None) => return Err(no_home_for(cli)),
     };
     let accounts::AccountRecords {
@@ -9402,6 +9287,18 @@ pub fn survey_accounts(
     let enrolled = accounts::enrolled_for(cli, &roster);
     let is_here = |row: &accounts::Row| row.dir.is_none() || enrolled.contains(&row.label);
     let alone = roster.rows.iter().filter(|row| is_here(row)).count() == 1;
+    // The stats series is Claude Code's alone (its footer writes the `plan` rows), and its files
+    // are named by label, which another CLI's roster may share.
+    let series = if cli == Cli::Claude {
+        super::outlook::series_of(harness, &roster, &state.machine)
+    } else {
+        BTreeMap::new()
+    };
+    let plans = super::outlook::plans_seen(
+        &roster,
+        &series,
+        &super::outlook::renewals_of(&roster, &logins),
+    );
     let rows = roster
         .rows
         .iter()
@@ -9439,16 +9336,23 @@ pub fn survey_accounts(
                 .as_ref()
                 .map_or(held, |sample| held.with_newer(sample, now));
             let base = accounts::condition(row, &state, here, now);
+            let plan = plans.get(&row.label);
             SurveyAccount {
                 label: row.label.clone(),
                 class: row.class,
                 enrolled: here,
                 condition: survey_condition(base, &reading, now),
                 five_hour_pct: reading.five_hour.map(|(pct, _)| pct),
+                five_hour_reset: reading.five_hour.map(|(_, reset)| reset),
                 seven_day_pct: reading.week.map(|(pct, _)| pct),
                 week_reset: reading.week.map(|(_, reset)| reset),
                 used_at: account.ran_at,
                 read_at: reading.read_at,
+                pk: account.pk.clone().or_else(|| {
+                    super::journal::account_key(cli, row).map(|key| key.as_str().to_owned())
+                }),
+                plan: plan.and_then(|plan| plan.word.clone()),
+                plan_tier: plan.and_then(|plan| plan.tier.clone()),
             }
         })
         .collect();
@@ -11149,7 +11053,8 @@ fn accounts_text(
     text
 }
 
-/// The login state the report says of `row`: the records', but a row on this machine's own login
+/// The login state the report says of `row` ([`accounts::login_state`]: expired where its records
+/// or its own credential file say it is signed out here), but a row on this machine's own login
 /// with no login there has none to be well or due ([`reported_enrolled`]).
 fn reported_login_state(
     row: &accounts::Row,
@@ -12220,7 +12125,10 @@ fn run_accounts_add(
     };
     let asked = from_lab.as_ref().unwrap_or(asked);
     let (label, class) = (asked.label.as_str(), asked.class);
-    match accounts_add(cli, env, asked) {
+    let _ends = WindowEnds::hold();
+    match accounts_add(cli, env, asked, &|| !window_end_noted(), &mut |position| {
+        let _ = writeln!(out, "{}: {}", asked.label, signin_queue_words(position));
+    }) {
         Ok(added) => {
             if added.listed_own {
                 let _ = writeln!(
@@ -12326,7 +12234,13 @@ pub(super) fn roster_target(path: &Path) -> Result<(PathBuf, Option<u32>), Strin
         project = "aterm_agent::harness::cli::tests::label_retention::creation_transition"
     )
 )]
-fn accounts_add(cli: Cli, env: &Env, asked: &accounts::Row) -> Result<Added, String> {
+fn accounts_add(
+    cli: Cli,
+    env: &Env,
+    asked: &accounts::Row,
+    current: &dyn Fn() -> bool,
+    queued: &mut dyn FnMut(accounts::SigninPosition),
+) -> Result<Added, String> {
     let label = asked.label.as_str();
     if let Some(why) = accounts::label_refusal(label) {
         return Err(format!(
@@ -12360,7 +12274,7 @@ fn accounts_add(cli: Cli, env: &Env, asked: &accounts::Row) -> Result<Added, Str
             dir.display()
         ));
     }
-    let _signing = creation_signin_guard(&store)?;
+    let _signing = creation_signin_guard(&store, current, queued)?;
     let _held = store
         .acquire_bounded()
         .map_err(|e| format!("{}: {e}", store.dir.display()))?
@@ -12469,11 +12383,16 @@ fn wake_for_roster(store: &accounts::Store) -> Option<String> {
 
 /// Take the sign-in lock before the writer lock, as a managed renewal does.
 /// New rows cannot reuse a label while an earlier sign-in is still in flight.
-fn creation_signin_guard(store: &accounts::Store) -> Result<accounts::Lock, String> {
+fn creation_signin_guard(
+    store: &accounts::Store,
+    current: &dyn Fn() -> bool,
+    queued: &mut dyn FnMut(accounts::SigninPosition),
+) -> Result<accounts::SigninTurn, String> {
     store
-        .signin_within()
+        .manual_signin_while(current, queued)
         .map_err(|why| format!("{}: {why}", store.shared_dir().display()))?
-        .ok_or_else(|| format!("{}; account metadata is unchanged", accounts::SIGNIN_HELD))
+        .map(|(turn, _)| turn)
+        .ok_or_else(|| "manual sign-in cancelled; account metadata is unchanged".to_owned())
 }
 
 /// Where `accounts add` or `adopt-default` lists `asked` beside the roster at `path` so that the next sync keeps it
@@ -12598,10 +12517,9 @@ fn signin_records_ready(
     }
 }
 
-/// The machine's sign-in lock for `label`, or why not. A person at a terminal
-/// retries its bounded take within the existing sign-in budget; other callers
-/// keep their one bounded take. The second value says the immediate take was
-/// contended, regardless of who called: the sign-in that ended can have moved
+/// The machine's sign-in turn for `label`, or why not. Explicit manual calls
+/// wait in the shared FIFO; automatic calls keep their bounded take. The second
+/// value says admission was contended: the sign-in that ended can have moved
 /// the records, so the caller reads them again and retains its policy checks.
 /// An uncontended capture stands, as does a policy refusal after the reread.
 fn signin_guard(
@@ -12611,8 +12529,9 @@ fn signin_guard(
     verb: &str,
     out: &mut dyn Write,
     err: &mut dyn Write,
-) -> Result<(accounts::Lock, bool), Renewal> {
+) -> Result<(accounts::SigninTurn, bool), Renewal> {
     match signin_lock(store, host, label, out) {
+        Ok(_) if host.work_cancelled() => Err(Renewal::Deferred),
         Ok(Some(taken)) => Ok(taken),
         Ok(None) => {
             let _ = writeln!(
@@ -12620,7 +12539,7 @@ fn signin_guard(
                 "{label}: held: {}; nothing was run",
                 accounts::SIGNIN_HELD
             );
-            Err(Renewal::Busy)
+            Err(Renewal::SigninHeld)
         }
         Err(why) => {
             let _ = writeln!(
@@ -12632,36 +12551,48 @@ fn signin_guard(
     }
 }
 
-/// [`accounts::Store::signin_within`], tried again for a person at a terminal for as long as the
-/// sign-in that holds the lock can run, with whether the immediate take was contended
-/// ([`signin_guard`]).
+/// Manual calls wait in the shared FIFO, including nonterminal callers. Automatic
+/// calls make the existing bounded background take and never queue behind one another.
+/// Cancellation retires the caller's ticket without starting provider work.
 fn signin_lock(
     store: &accounts::Store,
     host: &dyn AccountsHost,
     label: &str,
     out: &mut dyn Write,
-) -> io::Result<Option<(accounts::Lock, bool)>> {
-    if let Some(lock) = store.signin_now()? {
-        return Ok(Some((lock, false)));
+) -> io::Result<Option<(accounts::SigninTurn, bool)>> {
+    if host.work_cancelled() {
+        return Ok(None);
     }
-    let person = person_at_terminal(host);
-    for tried in 0.. {
-        match store.signin_within() {
-            Ok(None) if person && host.retries_sign_in_lock(tried) => {
-                if tried == 0 {
-                    let minutes = u64::from(PERSON_LOCK_TRIES) * LOCK_TRY_S / 60 + 1;
-                    let _ = writeln!(
-                        out,
-                        "{label}: {}; waiting for it to end, about {minutes} minutes at most \
-                         (Ctrl-C stops this)",
-                        accounts::SIGNIN_HELD
-                    );
-                }
-            }
-            taken => return taken.map(|lock| lock.map(|lock| (lock, true))),
+    if host.automatic_sign_in() {
+        if let Some(lock) = store.signin_now()? {
+            return Ok(Some((lock, false)));
         }
+        return store
+            .signin_within()
+            .map(|lock| lock.map(|lock| (lock, true)));
     }
-    Ok(None)
+    let mut last = None;
+    store.manual_signin_while(
+        || !host.work_cancelled(),
+        |position| {
+            host.signin_queued(position);
+            if last == Some(position) {
+                return;
+            }
+            last = Some(position);
+            let _ = writeln!(out, "{label}: {}", signin_queue_words(position));
+            let _ = out.flush();
+        },
+    )
+}
+
+pub(super) fn signin_queue_words(position: accounts::SigninPosition) -> String {
+    let blocker = match position.blocker {
+        accounts::SigninBlocker::ManualAhead => "earlier manual sign-in",
+        accounts::SigninBlocker::UnscheduledSignin => "active sign-in",
+        accounts::SigninBlocker::None => "sign-in admission",
+    };
+    format!("queued: {} ahead; waiting for {blocker}", position.ahead)
 }
 
 /// Whether the sign-in a person waited for renewed `label`, as `before` and `current` read it:
@@ -12826,6 +12757,11 @@ fn run_accounts_login(
         Ok(guard) => guard,
         Err(_) => return ExitCode::from(1),
     };
+    let refreshed = Env {
+        now: host.now().max(env.now),
+        ..env.clone()
+    };
+    let env = &refreshed;
     let logins = if waited {
         let current = match store.load_logins(env.now) {
             Ok((current, _)) => current,
@@ -13324,6 +13260,7 @@ fn run_accounts_adopt(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
+    let _ends = WindowEnds::hold();
     let done = (|| -> Result<(PathBuf, Option<String>), String> {
         let path = env.accounts_roster_for(cli).ok_or_else(|| {
             format!(
@@ -13374,7 +13311,14 @@ fn run_accounts_adopt(
                 );
             }
         }
-        let _signing = creation_signin_guard(&store)?;
+        let _signing = creation_signin_guard(
+            &store,
+            &|| !host.work_cancelled() && !window_end_noted(),
+            &mut |position| {
+                host.signin_queued(position);
+                let _ = writeln!(out, "{}: {}", row.label, signin_queue_words(position));
+            },
+        )?;
         let _held = store
             .acquire_bounded()
             .map_err(|e| format!("{}: {e}", store.dir.display()))?
@@ -13535,8 +13479,9 @@ pub(super) enum Renewal {
     AuthFailed,
     WrongAccount,
     Failed,
-    /// Another sign-in held `signin.lock` past `signin_within`, so nothing ran.
-    Busy,
+    /// A queued manual owner or active signer held bounded background admission;
+    /// Begin and provider work did not run.
+    SigninHeld,
     /// Local admission, shared authority or captured state became unavailable; retain a
     /// saved selection for a fresh attempt rather than interpreting this as an authentication failure.
     Deferred,
@@ -14280,6 +14225,14 @@ fn accounts_observe_signin(
 #[allow(dead_code)]
 fn signin_observation_environment() {}
 
+/// The signer custody available to a scheduling reread.
+#[derive(Clone, Copy)]
+enum RenewalRecovery<'a> {
+    None,
+    Fresh,
+    Held(&'a accounts::SigninTurn),
+}
+
 /// The scheduling image of a manual renewal. Later attempts still capture their
 /// own login generation and validate the original raw policy before authenticating.
 fn read_renewal_records(
@@ -14287,19 +14240,44 @@ fn read_renewal_records(
     store: &accounts::Store,
     path: &Path,
     now: i64,
-    recover_staging: bool,
+    recovery: RenewalRecovery<'_>,
     home: Option<&Path>,
     err: &mut dyn Write,
 ) -> Option<accounts::AccountRecords> {
-    let mut read = store.read_account_records(Some(path), now);
-    if recover_staging && read.is_ok() {
-        let _ = super::accounts_sync::recover_staging_renewals_for(
-            cli,
-            store,
-            path,
-            now,
-            super::accounts_sync::shared_renewal::CheckpointAuthority::live(home, path),
+    if let RenewalRecovery::Held(turn) = recovery
+        && turn.check_store(store).is_err()
+    {
+        let _ = writeln!(
+            err,
+            "renewal recovery: the admitted sign-in lock changed; nothing was run"
         );
+        return None;
+    }
+    let mut read = store.read_account_records(Some(path), now);
+    if !matches!(recovery, RenewalRecovery::None) && read.is_ok() {
+        let authority = super::accounts_sync::shared_renewal::CheckpointAuthority::live(home, path);
+        match recovery {
+            RenewalRecovery::None => {}
+            RenewalRecovery::Fresh => {
+                let _ = super::accounts_sync::recover_staging_renewals_for(
+                    cli, store, path, now, authority,
+                );
+            }
+            RenewalRecovery::Held(turn) => {
+                let _ = super::accounts_sync::recover_staging_renewals_held(
+                    cli, store, path, now, authority, turn,
+                );
+            }
+        }
+        if let RenewalRecovery::Held(turn) = recovery
+            && turn.check_store(store).is_err()
+        {
+            let _ = writeln!(
+                err,
+                "renewal recovery: the admitted sign-in lock changed; nothing was run"
+            );
+            return None;
+        }
         // Even a failed staging publication may have admitted a pending receipt.
         // Never schedule from the earlier image after the recovery pass ran.
         read = store.read_account_records(Some(path), now);
@@ -14375,7 +14353,11 @@ fn run_accounts_renew(
         &store,
         &path,
         now,
-        due && labels.is_empty(),
+        if due && labels.is_empty() {
+            RenewalRecovery::Fresh
+        } else {
+            RenewalRecovery::None
+        },
         env.home.as_deref(),
         err,
     ) else {
@@ -14550,7 +14532,7 @@ fn run_accounts_renew(
             &file_roster,
             &attempt_logins,
         );
-        let Some(sign_in) = renew_sign_in(
+        let Some(mut sign_in) = renew_sign_in(
             Cli::Claude,
             label,
             labels.contains(label),
@@ -14572,16 +14554,63 @@ fn run_accounts_renew(
                 continue;
             }
         };
+        let refreshed = Env {
+            now: host.now().max(now),
+            ..env.clone()
+        };
+        let env = &refreshed;
+        let now = env.now;
         if waited {
-            let Some(current) = load(err) else {
+            let Some(current) = read_renewal_records(
+                Cli::Claude,
+                &store,
+                &path,
+                now,
+                if due && labels.is_empty() {
+                    RenewalRecovery::Held(&signin)
+                } else {
+                    RenewalRecovery::None
+                },
+                env.home.as_deref(),
+                err,
+            ) else {
                 ok = false;
                 continue;
             };
-            if renewed_since(&attempt_logins, &current, label) {
+            if current.raw_roster != file_roster {
+                let _ = writeln!(
+                    err,
+                    "aterm harness accounts renew: the roster changed while waiting; nothing was run"
+                );
+                ok = false;
+                continue;
+            }
+            if renewed_since(&attempt_logins, &current.logins, label) {
                 let _ = writeln!(out, "{label}: {RENEWED_WHILE_WAITING}");
                 continue;
             }
-            attempt_logins = current;
+            let others = super::accounts_sync::rows_of_other_macs(
+                Cli::Claude,
+                env,
+                &current.raw_roster,
+                &current.logins,
+            );
+            let Some(current_sign_in) = renew_sign_in(
+                Cli::Claude,
+                label,
+                labels.contains(label),
+                (&current.roster, &current.logins, &current.state, &others),
+                now,
+            ) else {
+                let _ = writeln!(
+                    out,
+                    "{label}: {}",
+                    no_longer_due(current.roster.row(label), &current.state, &others, now)
+                );
+                continue;
+            };
+            sign_in = current_sign_in;
+            attempt_logins = current.logins;
         }
         let attempt_rows = accounts::bound(&file_roster, &attempt_logins);
         let Some(row) = attempt_rows.row(label) else {
@@ -14779,6 +14808,9 @@ fn drove_words(outcome: &super::login_drive::Outcome) -> String {
     use super::login_drive::Outcome;
     match outcome {
         Outcome::SignedIn { .. } => "it signed in".to_string(),
+        Outcome::CompletedHeld => {
+            "its completed native response was retained without publishing a sign-in".to_string()
+        }
         Outcome::Exited(Some(code)) => {
             format!("the sign-in exited {code} without saying it signed in")
         }
@@ -14825,6 +14857,7 @@ struct SignInPolicy<'a> {
 
 /// The route, pinned hosts and staging directory one of `cli`'s sign-ins of `row` runs with, under the machine's sign-in lock ([`accounts::Store::signin_within`]); `Err` is the renewal's end, already told.
 struct SignInPlan {
+    enrollment: Option<super::codex_enrollment::Request>,
     route: &'static crate::ai::connector::Route,
     hosts: &'static [&'static str],
     staging: PathBuf,
@@ -14851,6 +14884,9 @@ impl SignInPlan {
         label: &str,
     ) -> Result<(), String> {
         self.parent.require_current(logins, label)?;
+        if let Some(request) = &self.enrollment {
+            logins.enrollment.require_running(request)?;
+        }
         if !raw
             .row(label)
             .is_some_and(|row| accounts::workflow_token_current(row, logins, self.workflow))
@@ -15032,7 +15068,7 @@ fn sign_in_plan(
         roster_path,
         own_dir,
         codex_program,
-        sign_in,
+        mut sign_in,
     } = policy;
     let label = row.label.as_str();
     let say = |err: &mut dyn Write, what: &str| {
@@ -15110,7 +15146,22 @@ fn sign_in_plan(
         );
         return Err(Renewal::Failed);
     };
-    let (lock, waited) = signin_guard(store, host, label, verb, out, err)?;
+    let (lock, waited) = match sign_in.take_turn() {
+        Some(turn) => (turn, true),
+        None => signin_guard(store, host, label, verb, out, err)?,
+    };
+    let now = if waited { host.now().max(now) } else { now };
+    if let Some(selection) = sign_in.selection()
+        && !store
+            .load(now)
+            .is_ok_and(|(state, _)| state.pending_pin.as_ref() == Some(selection))
+    {
+        say(
+            err,
+            "the manual selection changed while waiting; nothing was run",
+        );
+        return Err(Renewal::Deferred);
+    }
     let current;
     let parent_logins = if waited {
         current = match store.load_logins(now) {
@@ -15172,6 +15223,12 @@ fn sign_in_plan(
         now,
         &mut None,
         |raw, state, current| {
+            if sign_in
+                .selection()
+                .is_some_and(|selection| state.pending_pin.as_ref() != Some(selection))
+            {
+                return Err("the manual selection changed before sign-in admission".into());
+            }
             shared_renewal::unmanaged(current, row, None, false)?;
             parent.require_current(current, label)?;
             signin_policy_matches(row, raw, own_dir)?;
@@ -15269,6 +15326,7 @@ fn sign_in_plan(
         }
     };
     Ok(SignInPlan {
+        enrollment: None,
         route,
         hosts,
         staging,
@@ -15722,7 +15780,16 @@ fn bind_signed_in(
                 return Err(RenewalFailure::cancelled().to_string());
             }
             if !email.is_empty() {
-                let checkpoint = if cli == Cli::Agy {
+                let checkpoint = if let Some(request) = &plan.enrollment {
+                    accounts::write_enrollment_checkpoint(
+                        request,
+                        email,
+                        &plan.staging_text,
+                        proof,
+                        now,
+                        logins,
+                    )
+                } else if cli == Cli::Agy {
                     #[cfg(unix)]
                     {
                         accounts::write_google_renewal_checkpoint(
@@ -15774,6 +15841,9 @@ fn bind_signed_in(
                     .as_ref()
                     .ok_or("canonical Google proof is unavailable")?;
                 accounts::note_google_identity(logins, label, email, grant.profile().principal);
+            }
+            if let Some(request) = &plan.enrollment {
+                logins.enrollment.publishing(request)?;
             }
             Ok(events)
         },
@@ -15915,6 +15985,36 @@ pub(super) fn renew_one_for(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Renewal {
+    renew_one_for_operation(
+        cli,
+        floor,
+        host,
+        store,
+        (row, roster_path, captured_logins),
+        (own_dir, sign_in),
+        None,
+        None,
+        out,
+        err,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the existing renewal policy and optional durable operation stay explicit"
+)]
+fn renew_one_for_operation(
+    cli: Cli,
+    floor: i64,
+    host: &dyn AccountsHost,
+    store: &accounts::Store,
+    (row, roster_path, captured_logins): (&accounts::Row, &Path, &accounts::Logins),
+    (own_dir, sign_in): (Option<&str>, SignIn),
+    enrollment: Option<&super::codex_enrollment::Request>,
+    provider_attempted: Option<&std::cell::Cell<bool>>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Renewal {
     use super::login_drive::Outcome;
     if host.work_cancelled() {
         return Renewal::Deferred;
@@ -15943,222 +16043,262 @@ pub(super) fn renew_one_for(
         Ok(plan) => plan,
         Err(renewal) => return renewal,
     };
-    let records = match store.read_account_records(Some(roster_path), floor) {
-        Ok(records) => records,
-        Err(_) => return Renewal::Deferred,
-    };
-    let workflow = records
-        .raw_roster
-        .row(label)
-        .and_then(|raw| accounts::current_workflow(raw, &records.logins));
-    let (true, Some(workflow)) = (
-        signin_policy_matches(row, &records.raw_roster, own_dir).is_ok()
-            && plan
-                .require_workflow(&records.raw_roster, &records.logins, label)
-                .is_ok(),
-        workflow,
-    ) else {
-        let _ = writeln!(
-            err,
-            "aterm harness accounts renew: {label}: what is on record of this row no longer \
-             matches it, so no sign-in started and nothing changed"
-        );
-        return Renewal::Failed;
-    };
-    #[cfg(unix)]
-    if cli == Cli::Kimi {
-        let attempt = pool_kimi::Attempt {
-            plan: &plan,
-            store,
-            row,
-            roster: roster_path,
-            own_dir,
-            now: floor,
+    plan.enrollment = enrollment.cloned();
+    let renewal = (|| {
+        let records = match store.read_account_records(Some(roster_path), floor) {
+            Ok(records) => records,
+            Err(_) => return Renewal::Deferred,
         };
-        match attempt.renew(host) {
-            Ok(Some(pool_kimi::Outcome::Renewed)) => {
-                drop_staging(&plan.staging, err);
-                let _ = writeln!(out, "{label}: renewed native profile");
-                return Renewal::Renewed;
-            }
-            Ok(Some(pool_kimi::Outcome::Reauthenticate(snapshot))) => {
-                if let Err(why) = plan.reauthenticate(snapshot) {
+        let workflow = records
+            .raw_roster
+            .row(label)
+            .and_then(|raw| accounts::current_workflow(raw, &records.logins));
+        let (true, Some(workflow)) = (
+            signin_policy_matches(row, &records.raw_roster, own_dir).is_ok()
+                && plan
+                    .require_workflow(&records.raw_roster, &records.logins, label)
+                    .is_ok(),
+            workflow,
+        ) else {
+            let _ = writeln!(
+                err,
+                "aterm harness accounts renew: {label}: what is on record of this row no longer \
+             matches it, so no sign-in started and nothing changed"
+            );
+            return Renewal::Failed;
+        };
+        #[cfg(unix)]
+        if cli == Cli::Kimi {
+            let attempt = pool_kimi::Attempt {
+                plan: &plan,
+                store,
+                row,
+                roster: roster_path,
+                own_dir,
+                now: floor,
+            };
+            match attempt.renew(host) {
+                Ok(Some(pool_kimi::Outcome::Renewed)) => {
+                    drop_staging(&plan.staging, err);
+                    let _ = writeln!(out, "{label}: renewed native profile");
+                    return Renewal::Renewed;
+                }
+                Ok(Some(pool_kimi::Outcome::Reauthenticate(snapshot))) => {
+                    if let Err(why) = plan.reauthenticate(snapshot) {
+                        drop_staging(&plan.staging, err);
+                        let _ = writeln!(err, "aterm harness accounts renew: {label}: {why}");
+                        return Renewal::Deferred;
+                    }
+                }
+                Ok(None) => {}
+                Err(why) => {
                     drop_staging(&plan.staging, err);
                     let _ = writeln!(err, "aterm harness accounts renew: {label}: {why}");
-                    return Renewal::Deferred;
-                }
-            }
-            Ok(None) => {}
-            Err(why) => {
-                drop_staging(&plan.staging, err);
-                let _ = writeln!(err, "aterm harness accounts renew: {label}: {why}");
-                return if matches!(why, shared_provider::ObservationError::Unavailable(_)) {
-                    Renewal::Deferred
-                } else {
-                    Renewal::AuthFailed
-                };
-            }
-        }
-    }
-    let _ = writeln!(
-        out,
-        "renewing `{label}`: {}",
-        sign_in_words(cli, label, plan.route, plan.hosts)
-    );
-    let _ = out.flush();
-    if host.work_cancelled() {
-        return Renewal::Deferred;
-    }
-    let drove = plan.drive(cli, host, row, store);
-    if host.work_cancelled() {
-        return Renewal::Deferred;
-    }
-    let now = host.now().max(floor);
-    let policy_unchanged = || signin_policy_current(cli, row, roster_path, own_dir);
-    if let Err(why) = policy_unchanged() {
-        let _ = writeln!(
-            err,
-            "aterm harness accounts renew: {label}: {why}; no binding changed; the login is kept at {}",
-            plan.staging.display()
-        );
-        return Renewal::Failed;
-    }
-    let record = |err: &mut dyn Write, kind: accounts::Kind| {
-        let mut event = accounts::Event::new(now, kind, label).because(&drove.why(plan.route.flow));
-        event.workflow = Some(workflow);
-        accounts_observe_signin(store, roster_path, now, err, |raw, _, logins| {
-            plan.require_workflow(raw, logins, label)?;
-            signin_policy_matches(row, raw, own_dir)?;
-            if kind == accounts::Kind::SignIn {
-                accounts::admit_workflow(logins, label)?;
-            }
-            if let Some(action) = person_step(cli, &drove.outcome) {
-                accounts::note_sign_in_task(logins, label, action, now);
-            }
-            Ok(vec![event])
-        })
-        .is_ok()
-    };
-    let proof = match &drove.outcome {
-        Outcome::SignedIn {
-            email: Some(said), ..
-        } if accounts::email_matches(email, said) => accounts::Proof::Status,
-        Outcome::SignedIn { email: Some(_), .. } => {
-            let _ = writeln!(out, "{label}: REFUSED: wrong account");
-            let recorded =
-                accounts_observe_signin(store, roster_path, now, err, |raw, _, logins| {
-                    plan.require_workflow(raw, logins, label)?;
-                    signin_policy_matches(row, raw, own_dir)?;
-                    Ok(accounts::note_wrong_account(logins, label, now))
-                });
-            if cli != Cli::Codex && recorded.is_ok() {
-                drop_staging(&plan.staging, err);
-            }
-            let _ = writeln!(
-                err,
-                "aterm harness accounts renew: {label}: {} signed in ANOTHER account than this \
-                 row's, so nothing live changed{}; sign in as the row's account and run `aterm \
-                 harness accounts {} {label} --cli {}` again",
-                c.product,
-                if recorded.is_ok() {
-                    ""
-                } else {
-                    " (and the attempt was not recorded)"
-                },
-                cli.sign_in_verb(true),
-                cli.id()
-            );
-            if cli == Cli::Codex {
-                let _ = writeln!(
-                    err,
-                    "the completed login is kept at {}",
-                    plan.staging.display()
-                );
-            }
-            return if recorded.is_ok() {
-                Renewal::WrongAccount
-            } else {
-                Renewal::Failed
-            };
-        }
-        Outcome::SignedIn { page: true, .. } => accounts::Proof::Page,
-        Outcome::SignedIn { .. } => accounts::Proof::Unchecked,
-        other => {
-            let recorded = record(err, accounts::Kind::SignIn);
-            if recorded {
-                drop_staging(&plan.staging, err);
-            }
-            let _ = writeln!(
-                err,
-                "aterm harness accounts renew: {label}: {}; nothing was recorded but the \
-                 attempt{}, and nothing live changed",
-                drove_words(other),
-                if recorded { "" } else { " (not even that)" }
-            );
-            if !recorded {
-                // A bot check is held in the background on its end, on record or not.
-                return if matches!(other, Outcome::BotCheck(_)) {
-                    Renewal::BotCheck
-                } else {
-                    if host.work_cancelled() {
+                    return if matches!(why, shared_provider::ObservationError::Unavailable(_)) {
                         Renewal::Deferred
                     } else {
-                        Renewal::Failed
-                    }
+                        Renewal::AuthFailed
+                    };
+                }
+            }
+        }
+        let _ = writeln!(
+            out,
+            "renewing `{label}`: {}",
+            sign_in_words(cli, label, plan.route, plan.hosts)
+        );
+        let _ = out.flush();
+        if host.work_cancelled() {
+            return Renewal::Deferred;
+        }
+        if let Some(attempted) = provider_attempted {
+            attempted.set(true);
+        }
+        let drove = plan.drive(cli, host, row, store);
+        if matches!(&drove.outcome, Outcome::CompletedHeld) {
+            let _ = writeln!(
+                err,
+                "aterm harness accounts renew: {label}: the completed native login is kept at {}; no binding changed",
+                plan.staging.display()
+            );
+            return Renewal::Deferred;
+        }
+        // This exact native outcome promises no provider action or retained
+        // completion. PageNotOpened and generic failure make no such promise.
+        if matches!(&drove.outcome, Outcome::NotRun(_))
+            && let Some(attempted) = provider_attempted
+        {
+            attempted.set(false);
+        }
+        if host.work_cancelled() {
+            return Renewal::Deferred;
+        }
+        let now = host.now().max(floor);
+        let policy_unchanged = || signin_policy_current(cli, row, roster_path, own_dir);
+        if let Err(why) = policy_unchanged() {
+            let _ = writeln!(
+                err,
+                "aterm harness accounts renew: {label}: {why}; no binding changed; the login is kept at {}",
+                plan.staging.display()
+            );
+            return Renewal::Failed;
+        }
+        let record = |err: &mut dyn Write, kind: accounts::Kind| {
+            let mut event =
+                accounts::Event::new(now, kind, label).because(&drove.why(plan.route.flow));
+            event.workflow = Some(workflow);
+            accounts_observe_signin(store, roster_path, now, err, |raw, _, logins| {
+                plan.require_workflow(raw, logins, label)?;
+                signin_policy_matches(row, raw, own_dir)?;
+                if kind == accounts::Kind::SignIn {
+                    accounts::admit_workflow(logins, label)?;
+                }
+                if let Some(action) = person_step(cli, &drove.outcome) {
+                    accounts::note_sign_in_task(logins, label, action, now);
+                }
+                Ok(vec![event])
+            })
+            .is_ok()
+        };
+        let proof = match &drove.outcome {
+            Outcome::SignedIn {
+                email: Some(said), ..
+            } if accounts::email_matches(email, said) => accounts::Proof::Status,
+            Outcome::SignedIn { email: Some(_), .. } => {
+                let _ = writeln!(out, "{label}: REFUSED: wrong account");
+                let recorded =
+                    accounts_observe_signin(store, roster_path, now, err, |raw, _, logins| {
+                        plan.require_workflow(raw, logins, label)?;
+                        signin_policy_matches(row, raw, own_dir)?;
+                        Ok(accounts::note_wrong_account(logins, label, now))
+                    });
+                if cli != Cli::Codex && recorded.is_ok() {
+                    drop_staging(&plan.staging, err);
+                }
+                let _ = writeln!(
+                    err,
+                    "aterm harness accounts renew: {label}: {} signed in ANOTHER account than this \
+                 row's, so nothing live changed{}; sign in as the row's account and run `aterm \
+                 harness accounts {} {label} --cli {}` again",
+                    c.product,
+                    if recorded.is_ok() {
+                        ""
+                    } else {
+                        " (and the attempt was not recorded)"
+                    },
+                    cli.sign_in_verb(true),
+                    cli.id()
+                );
+                if cli == Cli::Codex {
+                    let _ = writeln!(
+                        err,
+                        "the completed login is kept at {}",
+                        plan.staging.display()
+                    );
+                }
+                return if recorded.is_ok() {
+                    Renewal::WrongAccount
+                } else {
+                    Renewal::Failed
                 };
             }
-            match person_step(cli, other) {
-                Some(_) if matches!(other, Outcome::BotCheck(_)) => {
-                    human_challenge_step(cli, label, out);
+            Outcome::SignedIn { page: true, .. } => accounts::Proof::Page,
+            Outcome::SignedIn { .. } => accounts::Proof::Unchecked,
+            other => {
+                let recorded = record(err, accounts::Kind::SignIn);
+                if recorded {
+                    drop_staging(&plan.staging, err);
                 }
-                Some(accounts::SignInAction::Browser) => {
-                    let _ = writeln!(
-                        out,
-                        "NEEDS YOU: sign `{label}` in once in its own browser profile at this \
+                let _ = writeln!(
+                    err,
+                    "aterm harness accounts renew: {label}: {}; nothing was recorded but the \
+                 attempt{}, and nothing live changed",
+                    drove_words(other),
+                    if recorded { "" } else { " (not even that)" }
+                );
+                if !recorded {
+                    // A bot check is held in the background on its end, on record or not.
+                    return if matches!(other, Outcome::BotCheck(_)) {
+                        Renewal::BotCheck
+                    } else {
+                        if host.work_cancelled() {
+                            Renewal::Deferred
+                        } else {
+                            Renewal::Failed
+                        }
+                    };
+                }
+                match person_step(cli, other) {
+                    Some(_) if matches!(other, Outcome::BotCheck(_)) => {
+                        human_challenge_step(cli, label, out);
+                    }
+                    Some(accounts::SignInAction::Browser) => {
+                        let _ = writeln!(
+                            out,
+                            "NEEDS YOU: sign `{label}` in once in its own browser profile at this \
                          machine's desk (`aterm harness accounts browser {label} --cli {id}` \
                          opens it); aterm's later renewals approve its sign-in there by themselves",
-                        id = cli.id()
-                    );
-                }
-                Some(accounts::SignInAction::Login) => {
-                    let _ = writeln!(
-                        out,
-                        "NEEDS YOU: approve the {} sign-in for {label}: run `aterm harness \
+                            id = cli.id()
+                        );
+                    }
+                    Some(accounts::SignInAction::Login) => {
+                        let _ = writeln!(
+                            out,
+                            "NEEDS YOU: approve the {} sign-in for {label}: run `aterm harness \
                          accounts login {label} --cli {}`",
-                        c.product,
-                        cli.id()
-                    );
+                            c.product,
+                            cli.id()
+                        );
+                    }
+                    None => {}
                 }
-                None => {}
+                // A bot check keeps its own outcome and backoff. Its human task is a quiet
+                // account record, not a prompt repeated into working agent sessions.
+                return match other {
+                    Outcome::Exited(code) => Renewal::authentication_failed(*code),
+                    Outcome::NeedsYou(_) | Outcome::NeedsSignIn(_) | Outcome::Hung => {
+                        Renewal::NeedsPerson
+                    }
+                    Outcome::BotCheck(_) => Renewal::BotCheck,
+                    _ => Renewal::Failed,
+                };
             }
-            // A bot check keeps its own outcome and backoff. Its human task is a quiet
-            // account record, not a prompt repeated into working agent sessions.
-            return match other {
-                Outcome::Exited(code) => Renewal::authentication_failed(*code),
-                Outcome::NeedsYou(_) | Outcome::NeedsSignIn(_) | Outcome::Hung => {
-                    Renewal::NeedsPerson
-                }
-                Outcome::BotCheck(_) => Renewal::BotCheck,
-                _ => Renewal::Failed,
-            };
+        };
+        if host.work_cancelled() {
+            return Renewal::Deferred;
         }
-    };
-    if host.work_cancelled() {
+        bind_signed_in(
+            cli,
+            floor,
+            host,
+            store,
+            (row, roster_path),
+            own_dir,
+            &plan,
+            proof,
+            "renew",
+            out,
+            err,
+        )
+    })();
+    finish_manual_next_attempt(store, &plan._begun, host.now().max(floor), renewal)
+}
+
+/// Retire an exact terminal next-selection while its actual signer is still held.
+/// Deferred/uncertain results remain recoverable, and never authorize a fresh replay.
+pub(super) fn finish_manual_next_attempt(
+    store: &accounts::Store,
+    signin: &Begun,
+    now: i64,
+    renewal: Renewal,
+) -> Renewal {
+    if !matches!(renewal, Renewal::SigninHeld | Renewal::Deferred)
+        && let Some(accounts::PendingSelection::Next(request)) = signin.selection()
+        && store.cancel_next_request(request, now).is_err()
+    {
         return Renewal::Deferred;
     }
-    bind_signed_in(
-        cli,
-        floor,
-        host,
-        store,
-        (row, roster_path),
-        own_dir,
-        &plan,
-        proof,
-        "renew",
-        out,
-        err,
-    )
+    renewal
 }
 
 /// The refusal of `accounts renew` for a row with no email, whose sign-in could not be checked,
@@ -16246,7 +16386,11 @@ fn run_accounts_renew_for(
         &store,
         &path,
         now,
-        due && labels.is_empty(),
+        if due && labels.is_empty() {
+            RenewalRecovery::Fresh
+        } else {
+            RenewalRecovery::None
+        },
         env.home.as_deref(),
         err,
     ) else {
@@ -16704,6 +16848,9 @@ fn run_accounts_browser_with(
     };
     let (_lock, waited) = match signin_lock(&store, host, label, out) {
         Ok(Some(taken)) => taken,
+        Ok(None) if host.work_cancelled() => {
+            return refuse(err, "manual browser sign-in cancelled; nothing was opened");
+        }
         Ok(None) => return refuse(err, &format!("{label}: held: {}", accounts::SIGNIN_HELD)),
         Err(e) => {
             return refuse(
@@ -16712,6 +16859,11 @@ fn run_accounts_browser_with(
             );
         }
     };
+    let refreshed = Env {
+        now: host.now().max(env.now),
+        ..env.clone()
+    };
+    let env = &refreshed;
     let logins = if waited {
         match store.load_logins(env.now) {
             Ok((logins, _)) => logins,
@@ -17147,9 +17299,17 @@ pub fn run_accounts_of(
                     vendor: of.vendor,
                     ..accounts::Row::default()
                 };
-                match default_completion::complete(env, Some(&asked), |home| {
-                    host.codex_account(home)
-                }) {
+                let _ends = WindowEnds::hold();
+                match default_completion::complete_manual(
+                    env,
+                    &asked,
+                    |home| host.codex_account(home),
+                    &|| !host.work_cancelled() && !window_end_noted(),
+                    &mut |position| {
+                        host.signin_queued(position);
+                        let _ = writeln!(out, "{label}: {}", signin_queue_words(position));
+                    },
+                ) {
                     Ok(Some(label)) => {
                         let _ = writeln!(
                             out,
@@ -17932,11 +18092,17 @@ fn run_signin(
     // THE SIGN-IN DOOR (`DESIGN-alab-one-mesh-2026-11-05.md` §4.15): a person's launch or
     // command signs the default home in, and grok's device code goes to that person, so it is
     // their sign-in ([`person_sign_in`]). It starts on the machine's sign-in lock, waited for as a
-    // person waits where this caller waits, and stamps the Mac's spacing clock; grok's own lock
-    // then carries the flow, and its automatic rung takes the machine's lock again.
-    let again = |tried: u32| wait && tried < PERSON_LOCK_TRIES && !stopped();
-    let begin =
-        |at: i64| person_begin(&store, (Cli::Grok, gate::LEDGER_ACCOUNT), at, &again).map(drop);
+    // manual FIFO waits and stamps the Mac's spacing clock. The gate retains that
+    // same machine turn through its actual automatic rung and provider cleanup.
+    let begin = |at: i64, queued: &mut dyn FnMut(accounts::SigninPosition)| {
+        person_begin(
+            &store,
+            (Cli::Grok, gate::LEDGER_ACCOUNT),
+            &|| now().max(at),
+            &stopped,
+            queued,
+        )
+    };
     let ended = gate::run(
         &gate::Gate {
             state: &env.state,
@@ -18336,9 +18502,12 @@ pub const LAUNCH_FLAG: &str = "--launch";
 /// `<args>` in this process's directory and environment carries from its start
 /// ([`super::tap::launch_value`]), or `None`. atpkg's managed twin asks it inside an aterm tab and
 /// puts `--settings <value>` ahead of the launch's own arguments; the verb reads no stdin and
-/// always exits 0, so a launch never waits on it or fails for it.
+/// always exits 0, so a launch never waits on it or fails for it. First, on Unix, it notes the
+/// Claude home the launch serves from (`note_launch_home`).
 fn launch_tap_value(args: &[String]) -> Option<String> {
     let env = Env::from_process().ok()?;
+    #[cfg(unix)]
+    note_launch_home(&env);
     let (policy, _) = SupervisorConfig::from_path(env.config.as_deref());
     let armed = super::tap::Armed::arm(
         policy.usage_tap_on(),
@@ -18372,6 +18541,24 @@ fn launch_tap_value(args: &[String]) -> Option<String> {
         user_settings: Some(&user),
         profile_store: super::upgrade_drive::tap_profile_store_at(&home),
     })
+}
+
+/// Note the Claude home this launch serves from ([`super::claude_homes`]), before it serves
+/// anything and whatever the tap decides, so the node service's metrics publisher folds it even
+/// when the run ends before its next pass. The note is advisory and takes no flush; one that
+/// cannot be written is skipped, and the launch goes on.
+#[cfg(unix)]
+fn note_launch_home(env: &Env) {
+    let config = std::env::var(accounts::HOME_ENV).ok();
+    let home = std::env::var(accounts::HOMEDIR_ENV).ok();
+    let cwd = std::env::current_dir().ok();
+    if let Some(dir) = super::claude_homes::launched(
+        (config.as_deref(), home.as_deref()),
+        cwd.as_deref(),
+        env.home.as_deref(),
+    ) {
+        let _ = super::claude_homes::note(&env.state, &dir, env.now);
+    }
 }
 
 /// The front door's entry point (`aterm harness …`).
@@ -18452,6 +18639,196 @@ pub fn main_entry(argv: Vec<OsString>) -> ExitCode {
     let mut out = stdout.lock();
     let mut err = stderr.lock();
     run(&cmd, &env, &mut out, &mut err)
+}
+
+/// Typed native enrollment entry. The authenticated owner has resolved the row;
+/// operation custody is committed before the existing sign-in route can run.
+pub(super) fn enroll_codex_operation(
+    env: &Env,
+    host: &dyn AccountsHost,
+    request: &super::codex_enrollment::Request,
+) -> Result<super::codex_enrollment::Status, String> {
+    enroll_codex_operation_admitted(env, host, request, &|| {})
+}
+
+pub(super) fn enroll_codex_operation_admitted(
+    env: &Env,
+    host: &dyn AccountsHost,
+    request: &super::codex_enrollment::Request,
+    admitted_work: &dyn Fn(),
+) -> Result<super::codex_enrollment::Status, String> {
+    use super::codex_enrollment::Phase;
+    if !request.valid() {
+        return Err("invalid enrollment request".into());
+    }
+    let mut quiet = io::sink();
+    let path = accounts_roster_path_for(Cli::Codex, env, &mut quiet)
+        .ok_or("account roster unavailable")?;
+    let store = env
+        .accounts_store_for(Cli::Codex)
+        .ok_or("account store unavailable")?;
+    let records = store
+        .read_account_records(Some(&path), env.now)
+        .map_err(|_| "account records unavailable")?;
+    if let Some(status) = records.logins.enrollment.lookup(request)? {
+        return Ok(status);
+    }
+    let row = records
+        .roster
+        .row(&request.label)
+        .ok_or("account is not in the roster")?;
+    let raw = records
+        .raw_roster
+        .row(&request.label)
+        .ok_or("account is not in the source roster")?;
+    if row.held_by.is_some() || row.expected_identity_email().is_none() {
+        return Err("account is held or has no expected identity".into());
+    }
+    if accounts::pool_authority_revision(&records.raw_roster, &records.logins)? != request.revision
+    {
+        return Err("account enrollment revision changed".into());
+    }
+    let mut admitted = false;
+    store.transact_renewal_within(
+        &accounts::LOCK_LADDER,
+        env.now,
+        &mut None,
+        accounts::RenewalPolicy {
+            roster_path: &path,
+            roster: &records.raw_roster,
+            row,
+            logins: &records.logins,
+        },
+        |_, logins| {
+            admitted = logins.enrollment.admit(request)?;
+            Ok(Vec::new())
+        },
+    )?;
+    if !admitted {
+        return store
+            .load_logins(env.now)
+            .map_err(|_| "account records unavailable")?
+            .0
+            .enrollment
+            .lookup(request)?
+            .ok_or("enrollment operation disappeared".into());
+    }
+    // Only the driver whose new admission reached durable commit receives the
+    // work-retirement capability. Replayed requests never reach this callback.
+    admitted_work();
+    let provider_attempted = std::cell::Cell::new(false);
+    let result = renew_one_for_operation(
+        Cli::Codex,
+        env.now,
+        host,
+        &store,
+        (row, &path, &records.logins),
+        (raw.dir.as_deref(), person_sign_in(Cli::Codex, &row.label)),
+        Some(request),
+        Some(&provider_attempted),
+        &mut quiet,
+        &mut io::sink(),
+    );
+    // An uncertain failure stays Running and cannot trigger a second provider
+    // attempt. A proven pre-dispatch refusal is terminal too; a timeout or
+    // error after entering the provider route never supplies that evidence.
+    let phase = match result {
+        Renewal::NeedsPerson | Renewal::BotCheck => Some(Phase::AuthenticationRequired),
+        Renewal::WrongAccount | Renewal::AuthFailed => Some(Phase::Refused),
+        _ if !provider_attempted.get() => Some(Phase::Refused),
+        _ => None,
+    };
+    if let Some(phase) = phase {
+        store.transact_roster_logins_within(
+            &accounts::LOCK_LADDER,
+            &path,
+            env.now,
+            &mut None,
+            |_, _, logins| {
+                if logins.enrollment.require_running(request).is_ok() {
+                    logins.enrollment.finish(request, phase)?;
+                }
+                Ok(Vec::new())
+            },
+        )?;
+    }
+    store
+        .load_logins(env.now)
+        .map_err(|_| "account records unavailable")?
+        .0
+        .enrollment
+        .lookup(request)?
+        .ok_or_else(|| "enrollment operation disappeared".into())
+}
+
+/// Cancels only the exact retained operation; publication rechecks this record
+/// under the same account writer before creating its completion checkpoint.
+pub(super) fn cancel_codex_operation(
+    env: &Env,
+    request: &super::codex_enrollment::Request,
+) -> Result<super::codex_enrollment::Status, String> {
+    let mut quiet = io::sink();
+    let path = accounts_roster_path_for(Cli::Codex, env, &mut quiet)
+        .ok_or("account roster unavailable")?;
+    let store = env
+        .accounts_store_for(Cli::Codex)
+        .ok_or("account store unavailable")?;
+    store.transact_roster_logins_within(
+        &accounts::LOCK_LADDER,
+        &path,
+        env.now,
+        &mut None,
+        |_, _, logins| {
+            if logins.enrollment.require_running(request).is_ok() {
+                logins
+                    .enrollment
+                    .finish(request, super::codex_enrollment::Phase::CancelRequested)?;
+            } else {
+                logins
+                    .enrollment
+                    .lookup(request)?
+                    .ok_or("unknown enrollment operation")?;
+            }
+            Ok(Vec::new())
+        },
+    )?;
+    store
+        .load_logins(env.now)
+        .map_err(|_| "account records unavailable")?
+        .0
+        .enrollment
+        .lookup(request)?
+        .ok_or_else(|| "unknown enrollment operation".into())
+}
+
+/// Release only the exact cancellation whose admitted work has retired.
+pub(super) fn retire_codex_operation(
+    env: &Env,
+    proof: &super::codex_enrollment::Retired,
+) -> Result<super::codex_enrollment::Status, String> {
+    let mut quiet = io::sink();
+    let path = accounts_roster_path_for(Cli::Codex, env, &mut quiet)
+        .ok_or("account roster unavailable")?;
+    let store = env
+        .accounts_store_for(Cli::Codex)
+        .ok_or("account store unavailable")?;
+    store.transact_roster_logins_within(
+        &accounts::LOCK_LADDER,
+        &path,
+        env.now,
+        &mut None,
+        |_, _, logins| {
+            logins.enrollment.retire(proof)?;
+            Ok(Vec::new())
+        },
+    )?;
+    store
+        .load_logins(env.now)
+        .map_err(|_| "account records unavailable")?
+        .0
+        .enrollment
+        .lookup(proof.request())?
+        .ok_or_else(|| "unknown enrollment operation".into())
 }
 
 #[path = "cli_tests.rs"]

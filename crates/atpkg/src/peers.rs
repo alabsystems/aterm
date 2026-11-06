@@ -72,8 +72,8 @@ pub struct Fleet {
     pub members: usize,
     /// The members a download dials, each as `host:port`, the most recently heard first.
     pub dial: Vec<String>,
-    /// Why `dial` leaves members out, when something other than the fleet book does (macOS's
-    /// Local Network permission, say), as a clause the doctor's row carries.
+    /// Why `dial` leaves members out, when something other than the fleet book does (sharing
+    /// off, this Mac off the ALab LAN), as a clause the doctor's row carries.
     pub held: Option<String>,
 }
 

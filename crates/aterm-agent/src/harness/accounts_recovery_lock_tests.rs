@@ -273,6 +273,169 @@ struct Bed {
     store: accounts::Store,
 }
 
+#[cfg(unix)]
+#[test]
+fn completed_recovery_borrows_the_original_signer_and_refuses_another_namespace() {
+    let bed = Bed::new(Cli::Codex);
+    let staging = bed.checkpoint("work");
+    fs::write(staging.join("auth.json"), b"{}").unwrap();
+    let guard = bed.guard();
+    let other = Bed::new(Cli::Codex);
+    let foreign = other.store.signin_now().unwrap().unwrap();
+    let authority = shared_renewal::CheckpointAuthority::Unavailable;
+    let before = bed.store.load_logins(NOW).unwrap().0;
+    assert!(!recover_interrupted_staging_renewals_checked(
+        Cli::Codex,
+        &bed.store,
+        &bed.path,
+        &guard,
+        NOW,
+        (&[], &authority, Some(&foreign)),
+        || panic!("foreign turn admitted recovery"),
+    ));
+    assert_eq!(bed.store.load_logins(NOW).unwrap().0, before);
+    let turn = bed.store.signin_now().unwrap().unwrap();
+    assert!(recover_interrupted_staging_renewals_checked(
+        Cli::Codex,
+        &bed.store,
+        &bed.path,
+        &guard,
+        NOW,
+        (&[], &authority, Some(&turn)),
+        || {
+            assert!(
+                bed.store.signin_now().unwrap().is_none(),
+                "original signer stays held"
+            );
+        },
+    ));
+    let recovered = bed.store.load_logins(NOW).unwrap().0;
+    assert_eq!(
+        recovered.get("work").unwrap().dir.as_deref(),
+        staging.to_str()
+    );
+    let _ = recover_interrupted_staging_renewals_checked(
+        Cli::Codex,
+        &bed.store,
+        &bed.path,
+        &guard,
+        NOW,
+        (&[], &authority, Some(&turn)),
+        || {},
+    );
+    assert_eq!(
+        bed.store.load_logins(NOW).unwrap().0,
+        recovered,
+        "receipt cannot replay"
+    );
+    assert!(bed.store.signin_now().unwrap().is_none());
+    drop(turn);
+    assert!(bed.store.signin_now().unwrap().is_some());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_manual_next_recovers_completed_login_under_its_original_turn_before_selection() {
+    let bed = Bed::new(Cli::Codex);
+    let staging = bed.checkpoint("work");
+    fs::write(staging.join("auth.json"), b"{}").unwrap();
+    let request = bed.store.request_next(NOW).unwrap();
+    let lifetime = crate::harness::account_work::Lifetime::default();
+    let spawn = |_: Box<dyn FnOnce() + Send>| -> io::Result<()> {
+        panic!("a completed checkpoint needs no provider work")
+    };
+    let mut fx = live_effects();
+    fx.scope = lifetime.enter();
+    fx.spawn_renewal = &spawn;
+    let _ = manual_selection_with(
+        Cli::Codex,
+        &bed.home,
+        &bed.state,
+        &bed.path,
+        accounts::PendingSelection::Next(request),
+        NOW,
+        &fx,
+    );
+    assert_eq!(
+        bed.store
+            .load_logins(NOW)
+            .unwrap()
+            .0
+            .get("work")
+            .unwrap()
+            .dir
+            .as_deref(),
+        staging.to_str()
+    );
+    assert!(bed.store.signin_now().unwrap().is_some());
+    drop(fx);
+    lifetime
+        .pause()
+        .unwrap()
+        .try_wait()
+        .expect("completed Next resources retired");
+}
+
+#[cfg(unix)]
+#[test]
+fn manual_account_recovery_refuses_foreign_or_replaced_turn_before_any_effect() {
+    for replaced in [false, true] {
+        let bed = Bed::new(Cli::Codex);
+        bed.checkpoint("work");
+        let guard = bed.guard();
+        let request = bed.store.request_pin("work", NOW).unwrap();
+        let owner = ManualSelectionOwner::claim(
+            &guard,
+            &bed.store,
+            Cli::Codex,
+            request.clone().into(),
+            None,
+            NOW,
+        )
+        .unwrap();
+        let other = Bed::new(Cli::Codex);
+        let turn = if replaced {
+            bed.store.signin_now()
+        } else {
+            other.store.signin_now()
+        }
+        .unwrap()
+        .unwrap();
+        if replaced {
+            let lock = bed.store.shared_dir().join(accounts::SIGNIN_LOCK_FILE);
+            fs::rename(&lock, lock.with_extension("retained")).unwrap();
+            drop(bed.store.signin_now().unwrap().unwrap());
+        }
+        let state_before = fs::read(bed.store.state_file()).unwrap();
+        let logins_before = bed.store.load_logins(NOW).unwrap().0;
+        let scope_owner = crate::harness::account_work::Lifetime::default();
+        let scope = scope_owner.enter().unwrap();
+        assert_eq!(
+            renew_requested_pin_for(
+                Cli::Codex,
+                &bed.home,
+                &bed.state,
+                &bed.path,
+                request,
+                NOW,
+                &guard,
+                &|_| panic!("invalid signer cannot dispatch provider"),
+                Some(&scope),
+                Some((turn, owner))
+            ),
+            RenewalDispatch::Fenced
+        );
+        assert_eq!(fs::read(bed.store.state_file()).unwrap(), state_before);
+        assert_eq!(bed.store.load_logins(NOW).unwrap().0, logins_before);
+        drop(scope);
+        scope_owner
+            .pause()
+            .unwrap()
+            .try_wait()
+            .expect("refused admission retired");
+    }
+}
+
 impl Bed {
     fn new(cli: Cli) -> Self {
         let root = aterm_tempfile::TempDir::new().unwrap();
@@ -1091,7 +1254,8 @@ fn shared_recovery_uses_observed_identity_for_first_and_pinned_checkpoints() {
                         NOW,
                         (
                             &[],
-                            &shared_renewal::CheckpointAuthority::Explicit(&approval)
+                            &shared_renewal::CheckpointAuthority::Explicit(&approval),
+                            None,
                         ),
                         || {}
                     ),

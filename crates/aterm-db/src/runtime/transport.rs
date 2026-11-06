@@ -5,7 +5,7 @@
 //! lease can be released, including a dial still awaiting its first SYN reply.
 
 use super::{
-    discovery::{Hints, Outcome},
+    discovery::{Hints, MemoryScope, Outcome, REMEMBERED_MAX, REMEMBERED_NAME, Remembered},
     report::{AuthenticatedConnection, RepairRound, bounded_error},
 };
 use crate::{
@@ -25,7 +25,7 @@ use std::{
 };
 
 const GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 31, 84);
-const PORT: u16 = 41384;
+const PORT: u16 = aterm_uds::lan::here::COMMONS_PORT;
 const WORKERS: usize = 4;
 /// How often every link sends its beacon, after the first one each sends as it opens.
 const BEACON: Duration = Duration::from_secs(5);
@@ -248,31 +248,71 @@ struct Link {
     source: IpAddr,
     listener: Option<Listener>,
     hints: Multicast,
-    /// An isolated attachment's stand-in for the OS's Local Network permission (tests): while it
-    /// reads false, this link's beacon fails as a refused app's LAN send does ([`Self::beacon`]).
+    /// An isolated attachment's stand-in for a network that delivers this link's sends (tests):
+    /// while it reads false, its beacon fails as a send to an unreachable network does
+    /// ([`Self::beacon`]).
     #[cfg(test)]
-    permission: Option<Arc<std::sync::atomic::AtomicBool>>,
+    delivering: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 impl Link {
     /// Send this link's beacon to its group: its listener's port where it serves repair, else
     /// opaque presence.
     fn beacon(&self, hints: &Hints) -> io::Result<()> {
-        // macOS fails a refused app's LAN send with EHOSTUNREACH ("No route to host").
         #[cfg(test)]
         if self
-            .permission
+            .delivering
             .as_ref()
-            .is_some_and(|allowed| !allowed.load(std::sync::atomic::Ordering::Acquire))
+            .is_some_and(|delivering| !delivering.load(std::sync::atomic::Ordering::Acquire))
         {
             return Err(io::Error::new(
                 io::ErrorKind::HostUnreachable,
-                "the isolated attachment's Local Network permission is withheld",
+                "the isolated attachment delivers no send",
             ));
         }
         match &self.listener {
             Some(listener) => self.hints.send(&hints.wire(listener.local_addr()?.port())),
             None => self.hints.send(&hints.presence_wire()),
         }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// MUTANT of CR1, on for one test thread: an inbound round tells discovery nothing, as before.
+    static UNVOUCHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Where a transport keeps the endpoints it verified across restarts ([`Hints::remember`]): a
+/// private file in its endpoint's Commons custody directory, read only where it names the same
+/// trust and seat. A file that is missing, damaged or another's reads as none, and a write that
+/// fails stops nothing: the next start reads what it finds.
+struct Memory {
+    dir: std::path::PathBuf,
+    scope: MemoryScope,
+}
+impl Memory {
+    fn of(endpoint: &Endpoint) -> Option<Self> {
+        let (dir, trust, actor) = endpoint.discovery_memory()?;
+        let mut scope: MemoryScope = [0; std::mem::size_of::<MemoryScope>()];
+        scope[..16].copy_from_slice(&trust.network);
+        scope[16..48].copy_from_slice(&trust.authority);
+        scope[48..80].copy_from_slice(&trust.genesis);
+        scope[80..].copy_from_slice(&actor);
+        Some(Self {
+            dir: dir.to_owned(),
+            scope,
+        })
+    }
+    fn read(&self) -> Vec<Remembered> {
+        aterm_uds::private_file::read_private(&self.dir, REMEMBERED_NAME, REMEMBERED_MAX)
+            .ok()
+            .and_then(|bytes| Remembered::decode(&self.scope, &bytes))
+            .unwrap_or_default()
+    }
+    fn write(&self, entries: &[Remembered]) {
+        let bytes = Remembered::encode(&self.scope, entries);
+        // One that fails is kept again at the next change or refresh ([`Hints::remembered`]).
+        let _kept = aterm_uds::private_file::write_private(&self.dir, REMEMBERED_NAME, &bytes);
     }
 }
 
@@ -352,6 +392,8 @@ pub(super) struct Transport {
     endpoint: Option<Arc<Endpoint>>,
     links: Vec<Link>,
     hints: Hints,
+    /// Where it keeps the endpoints it verified across restarts, if it serves a seat.
+    memory: Option<Memory>,
     workers: Vec<Worker>,
     beacon: Instant,
     dial: Instant,
@@ -368,17 +410,15 @@ pub(super) struct Transport {
     push: Option<Push>,
     /// The latest failed local link operation since the last refresh, bounded like a repair error.
     failure: Option<String>,
-    /// A listener or multicast socket of this transport reached the LAN ([`Self::bound`]).
-    bound: bool,
     /// A LAN attachment's stand-in (tests): while it reads false each address refreshed is one no
     /// bind reaches (its checks refuse it, as an attachment that changed since its address was
     /// read), and once it reads true it is the loopback ([`Self::standing_in`]).
     #[cfg(test)]
     stand_in: Option<Arc<std::sync::atomic::AtomicBool>>,
-    /// What each new link's permission reads on an isolated test attachment
-    /// ([`Link::permission`]).
+    /// What each new link's delivery reads on an isolated test attachment
+    /// ([`Link::delivering`]).
     #[cfg(test)]
-    permission: Option<Arc<std::sync::atomic::AtomicBool>>,
+    delivering: Option<Arc<std::sync::atomic::AtomicBool>>,
     #[cfg(test)]
     observed: std::collections::BTreeMap<astream_wire::sync::Digest, usize>,
     /// Application rounds that completed since [`Self::take_finished_rounds`] (tests), including
@@ -388,16 +428,16 @@ pub(super) struct Transport {
 }
 impl Transport {
     /// A transport on an isolated loopback attachment at `port` (tests), opened as a LAN one is:
-    /// its one link binds and sends its first beacon while `permission` (the OS's Local Network
-    /// permission's stand-in) reads true, and fails its sends while it reads false.
+    /// its one link binds and sends its first beacon while `delivering` reads true, and fails its
+    /// sends while it reads false.
     #[cfg(test)]
     pub(super) fn isolated(
         endpoint: Option<Endpoint>,
         port: u16,
-        permission: Option<Arc<std::sync::atomic::AtomicBool>>,
+        delivering: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<Self> {
         let mut transport = Self::unopened(endpoint, Scope::Loopback, port)?;
-        transport.permission = permission;
+        transport.delivering = delivering;
         transport.refresh(&[SocketAddr::from((Ipv4Addr::LOCALHOST, 0))]);
         Ok(transport)
     }
@@ -478,10 +518,19 @@ impl Transport {
             .fill(&mut token)
             .map_err(|_| crate::Error::new("discovery randomness unavailable"))?;
         let now = Instant::now();
+        // What it verified before a restart is dialled first ([`Hints::remember`]).
+        let memory = endpoint.as_ref().and_then(Memory::of);
+        let mut hints = Hints::new(token);
+        if let Some(memory) = &memory
+            && let Some(now_ms) = aterm_time::unix_millis()
+        {
+            hints.remember(memory.read(), now, now_ms);
+        }
         Ok(Self {
             endpoint: endpoint.map(Arc::new),
             links: Vec::new(),
-            hints: Hints::new(token),
+            hints,
+            memory,
             workers: Vec::new(),
             // Each link sends its first beacon as it opens ([`Self::refresh`]).
             beacon: now + BEACON,
@@ -495,11 +544,10 @@ impl Transport {
             completed: VecDeque::new(),
             push: None,
             failure: None,
-            bound: false,
             #[cfg(test)]
             stand_in: None,
             #[cfg(test)]
-            permission: None,
+            delivering: None,
             #[cfg(test)]
             observed: std::collections::BTreeMap::new(),
             #[cfg(test)]
@@ -507,9 +555,9 @@ impl Transport {
         })
     }
     /// Open a link on each address in `addresses` that has none. A link counts once its first
-    /// beacon went out: under the OS's refusal (macOS's Local Network switch off for aterm) its
-    /// sockets bind and its sends fail (EHOSTUNREACH), so a refused link is dropped here, failed,
-    /// before any observation or peer's reachability counts it, and the next refresh tries again.
+    /// beacon went out: where the network fails its sends (EHOSTUNREACH) though its sockets bound,
+    /// the link is dropped here, failed, before any observation or peer's reachability counts it,
+    /// and the next refresh tries again.
     pub(super) fn refresh(&mut self, addresses: &[SocketAddr]) {
         #[cfg(test)]
         let stood_in = self.stood_in(addresses);
@@ -530,31 +578,27 @@ impl Transport {
             {
                 None
             } else {
-                match Listener::try_bind(*address, self.scope) {
+                match Listener::bind(*address, self.scope) {
                     Ok(listener) => Some(listener),
-                    Err(failure) => {
-                        self.bound |= failure.reached;
-                        self.fail_link(address.ip(), "listener bind", failure.error);
+                    Err(error) => {
+                        self.fail_link(address.ip(), "listener bind", error);
                         continue;
                     }
                 }
             };
-            self.bound |= listener.is_some();
-            let hints = match Multicast::try_bind(source, GROUP, self.port, self.scope) {
+            let hints = match Multicast::bind(source, GROUP, self.port, self.scope) {
                 Ok(hints) => hints,
-                Err(failure) => {
-                    self.bound |= failure.reached;
-                    self.fail_link(source.into(), "multicast bind", failure.error);
+                Err(error) => {
+                    self.fail_link(source.into(), "multicast bind", error);
                     continue;
                 }
             };
-            self.bound = true;
             let link = Link {
                 source: address.ip(),
                 listener,
                 hints,
                 #[cfg(test)]
-                permission: self.permission.clone(),
+                delivering: self.delivering.clone(),
             };
             match link.beacon(&self.hints) {
                 Ok(()) => self.links.push(link),
@@ -565,15 +609,6 @@ impl Transport {
 
     fn fail_link(&mut self, source: IpAddr, operation: &str, error: io::Error) {
         self.failure = Some(bounded_error(format!("{operation} on {source}: {error}")));
-    }
-    /// Whether a listener or multicast socket of this transport reached the LAN since it opened:
-    /// it bound, whatever its beacon then did (a refused app's binds succeed and its sends fail),
-    /// or it failed only once its socket was made ([`aterm_net::lan::BindFailure`]), after a
-    /// bind, join or listen at which the OS may have asked. That is its LAN use. A transport whose
-    /// binds all refused at their checks, before any socket (an attachment that changed since its
-    /// address was read), made none, and the OS asked nothing.
-    pub(super) const fn bound(&self) -> bool {
-        self.bound
     }
     pub(super) fn interfaces(&self) -> usize {
         self.links.len()
@@ -636,6 +671,10 @@ impl Transport {
     }
 
     fn finish(&mut self, worker: Worker, now: Instant) {
+        #[cfg(test)]
+        let unvouched = || UNVOUCHED.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let unvouched = || false;
         let started = worker.started;
         match worker.task.join() {
             Ok((target, repair, success, report)) => {
@@ -674,6 +713,14 @@ impl Transport {
                     let outcome =
                         Outcome::of(success, &repair, report.control.as_ref().ok().copied());
                     self.hints.finish(address, repair, outcome, now);
+                } else if let Some(actor) = repair.authenticated_actor().filter(|_| success)
+                    && let Some(connection) = &report.connection
+                    && !unvouched()
+                {
+                    // A peer that dialled in and completed a round is up: its endpoints here
+                    // drop their backoff as one this side dialled would, and its address leads
+                    // its beacons (`Hints::vouch`).
+                    self.hints.vouch(connection.peer.ip(), actor, now);
                 }
                 self.retain_report(report);
             }
@@ -766,6 +813,12 @@ impl Transport {
             } else {
                 index += 1;
             }
+        }
+        if let Some(memory) = &self.memory
+            && let Some(now_ms) = aterm_time::unix_millis()
+            && let Some(remembered) = self.hints.remembered(now, now_ms)
+        {
+            memory.write(&remembered);
         }
         let mut index = 0;
         let mut after_accept = None;

@@ -2130,15 +2130,24 @@ pub fn run_hidden(argv: &[std::ffi::OsString]) -> std::process::ExitCode {
         && let Ok(cwd) = std::env::current_dir()
     {
         let tool = shim.map_or_else(|| tool_of(target), |(tool, _)| tool);
+        // Registration above consumes the shim's original leading placement pair. The
+        // compiler then gets every config in one parser, past its command boundary.
+        let args = if tool == Tool::Targo {
+            crate::build_cache::configs_after_subcommand(&args)
+        } else {
+            args
+        };
         let seat = Seat::live();
         let possible_lock = || {
             let me = seat.pid;
             possible_build_lock(
                 &|| {
-                    seat.machine
+                    let line = seat
+                        .machine
                         .lineage(me)
                         .map(|line| line.ancestors(me))
-                        .unwrap_or_default()
+                        .unwrap_or_default();
+                    in_session(line, session_of(me), &session_of)
                 },
                 &|pid| aterm_uds::holders::open_files(pid).unwrap_or_default(),
                 &|file| aterm_uds::ownerlock::probe(file) == aterm_uds::ownerlock::Owner::Live,
@@ -2157,11 +2166,12 @@ pub fn run_hidden(argv: &[std::ffi::OsString]) -> std::process::ExitCode {
 /// cargo 1.95.0 holds `.cargo-lock` while a build script runs and none while a test runs.
 pub const CARGO_LOCKS: &[&str] = &[".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"];
 
-/// A POSSIBLE WAIT CYCLE, NOT ADMISSION AUTHORITY: an ancestor has a Cargo-lock-named file
-/// open and a kernel probe says a lock is held there. Neither proves it owns that lock. A
-/// verified covering/own/credited claim still answers first; otherwise Wait gets one ordinary
-/// admission look and a named refusal if it cannot run, rather than force a claim or deadlock.
-/// An unlocked file, an unknown probe, and Cargo's environment words imply no exception.
+/// A POSSIBLE WAIT CYCLE, NOT ADMISSION AUTHORITY: an ancestor (the front's, [`in_session`] of
+/// its lineage) has a Cargo-lock-named file open and a kernel probe says a lock is held there.
+/// Neither proves it owns that lock. A verified covering/own/credited claim still answers first;
+/// otherwise Wait gets one ordinary admission look and a named refusal if it cannot run, rather
+/// than force a claim or deadlock. An unlocked file, an unknown probe, and Cargo's environment
+/// words imply no exception.
 #[must_use]
 pub fn possible_build_lock(
     ancestors: &dyn Fn() -> Vec<u32>,
@@ -2176,6 +2186,38 @@ pub fn possible_build_lock(
                 && held(file)
         })
     })
+}
+
+/// The ancestors in `line` (its parent first) that share the front's session `own`, as
+/// `session_of` reads each: the walk ends at the first one outside it, or whose session is unread
+/// (it ended), since no ancestor of a session's leader is in that session. What hosts a session
+/// (the terminal app that started its shell, `sshd`, `launchd`) is no build that waits on the
+/// front, so it can close no wait cycle ([`possible_build_lock`]); and aterm, which hosts every
+/// tab's session, holds a profile's Cargo locks while its disk watch reclaims that profile's
+/// `incremental/`, which, read as an outer build's, refused every front in every tab whose
+/// admission would wait. Cargo starts its build scripts and tests in its own session, so an outer
+/// build stays in the walk. Empty where `own` is unread.
+#[cfg(unix)]
+#[must_use]
+fn in_session(
+    line: Vec<u32>,
+    own: Option<u32>,
+    session_of: &dyn Fn(u32) -> Option<u32>,
+) -> Vec<u32> {
+    let Some(own) = own else {
+        return Vec::new();
+    };
+    line.into_iter()
+        .take_while(|&pid| session_of(pid) == Some(own))
+        .collect()
+}
+
+/// The session `pid` is in (`getsid`); `None` where the kernel names none (no such process).
+#[cfg(unix)]
+fn session_of(pid: u32) -> Option<u32> {
+    let pid = libc::pid_t::try_from(pid).ok()?;
+    // SAFETY: `getsid` reads the process table; any pid is a valid argument.
+    u32::try_from(unsafe { libc::getsid(pid) }).ok()
 }
 
 /// The verb's usage, said: 2.

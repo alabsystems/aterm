@@ -23,11 +23,18 @@ use aterm_secrets::membership_log::{Body, Entrant, Log, NodeStanding, Record, en
 
 use super::{
     NodeBoot, NodeMesh, NodeServeConfig, NodeUpdater, NodeUpdates, RETRY_LEFT_AFTER, RelayHeader,
-    WindowLauncher, a_window_relay_answers, apply_at_node_boot, arm_claims_off_on_quit,
-    claims_off_on_quit, claims_upkeep, has_live_window_relay, keeps_port_after, mind_node_checker,
-    own_node_job, query_window_survey_facts, read_line_raw, relay_ask, relay_socket_path,
-    restart_for, run_node_serve_with, serve_window_relay_at, wanted_for_node, why_the_run_ends,
+    WindowLauncher, WindowRelays, a_window_relay_answers, apply_at_node_boot,
+    arm_claims_off_on_quit, claims_off_on_quit, claims_upkeep, has_live_window_relay,
+    keeps_port_after, mind_node_checker, own_node_job, query_window_survey_facts, read_line_raw,
+    relay_ask, relay_socket_path, restart_for, run_node_serve_with, serve_window_relay_at,
+    wanted_for_node, why_the_run_ends,
 };
+use aterm_session::SessionId;
+
+/// A test window that stands for this Mac's only one: it hosts every session a drive names.
+fn hosts_every(_: &SessionId) -> bool {
+    true
+}
 
 const SECRET_BYTES: [u8; 24] = [0x5a; 24];
 /// The node job each test dials is its own, which serves: a dial waits the hang detector.
@@ -74,8 +81,15 @@ mod fresh_enrollment;
 mod held_logs;
 #[path = "node_serve_tests/mesh_links.rs"]
 mod mesh_links;
+#[path = "node_serve_tests/needs.rs"]
+mod needs;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[path = "node_serve_tests/ports.rs"]
+mod ports;
 #[path = "node_serve_tests/presence.rs"]
 mod presence;
+#[path = "node_serve_tests/two_windows.rs"]
+mod two_windows;
 #[path = "node_serve_tests/vault_pass.rs"]
 mod vault_pass;
 
@@ -104,6 +118,10 @@ impl WindowLauncher for MockWindowLauncher {
         self.logged_in.load(Ordering::Acquire)
     }
 
+    fn runs_this_app(&self, pid: u32) -> bool {
+        pid == self.relay_pid
+    }
+
     fn launch_window(&self, _state_dir: &Path, relay_dir: &Path) -> Result<(), String> {
         self.launches.fetch_add(1, Ordering::AcqRel);
         if !self.spawn_relay {
@@ -115,43 +133,49 @@ impl WindowLauncher for MockWindowLauncher {
         std::thread::Builder::new()
             .name("test-mock-window-relay".to_owned())
             .spawn(move || {
-                let _ = serve_window_relay_at(&dir, pid, Some(&stop), |header, mut stream| {
-                    std::thread::spawn(move || match header {
-                        RelayHeader::Survey { .. } => {
-                            while let Ok(Some(line)) = read_line_raw(&mut stream, 4096) {
-                                if line.trim().starts_with("survey") {
-                                    let _ = stream.write_all(
-                                        b"OK 1\ninstance pid=99 host=m7.local version=0.146.0 \
+                let _ = serve_window_relay_at(
+                    &dir,
+                    pid,
+                    Some(&stop),
+                    hosts_every,
+                    |header, mut stream| {
+                        std::thread::spawn(move || match header {
+                            RelayHeader::Survey { .. } => {
+                                while let Ok(Some(line)) = read_line_raw(&mut stream, 4096) {
+                                    if line.trim().starts_with("survey") {
+                                        let _ = stream.write_all(
+                                            b"OK 1\ninstance pid=99 host=m7.local version=0.146.0 \
                                           sessions=1 level=content cut=0 at_ms=1793160000000 \
                                           node=11111111111111111111111111111111 instances=1 \
                                           label=m7 window=1 window_last=1793160000 \
                                           ssh_host_key=-\n",
-                                    );
-                                    let _ = stream.flush();
+                                        );
+                                        let _ = stream.flush();
+                                    }
                                 }
                             }
-                        }
-                        RelayHeader::Ask { .. } => {}
-                        RelayHeader::Drive { driver, .. } => {
-                            let Ok(Some(head)) = read_line_raw(&mut stream, 4096) else {
-                                return;
-                            };
-                            assert!(
-                                head.starts_with("spawn "),
-                                "expected forwarded spawn line, got {head:?}"
-                            );
-                            let _ = stream.write_all(b"GO 11\n");
-                            let _ = stream.flush();
-                            let mut task = [0u8; 11];
-                            stream.read_exact(&mut task).expect("read 11 task bytes");
-                            assert_eq!(&task, b"hello world");
-                            let reply = format!("OK 1\nsid=s-woken driver={}\n", driver.node);
-                            let _ = stream.write_all(reply.as_bytes());
-                            let _ = stream.flush();
-                        }
-                    });
-                    true
-                });
+                            RelayHeader::Ask { .. } | RelayHeader::Needs => {}
+                            RelayHeader::Drive { driver, .. } => {
+                                let Ok(Some(head)) = read_line_raw(&mut stream, 4096) else {
+                                    return;
+                                };
+                                assert!(
+                                    head.starts_with("spawn "),
+                                    "expected forwarded spawn line, got {head:?}"
+                                );
+                                let _ = stream.write_all(b"GO 11\n");
+                                let _ = stream.flush();
+                                let mut task = [0u8; 11];
+                                stream.read_exact(&mut task).expect("read 11 task bytes");
+                                assert_eq!(&task, b"hello world");
+                                let reply = format!("OK 1\nsid=s-woken driver={}\n", driver.node);
+                                let _ = stream.write_all(reply.as_bytes());
+                                let _ = stream.flush();
+                            }
+                        });
+                        true
+                    },
+                );
             })
             .map_err(|e| e.to_string())?;
         Ok(())
@@ -194,19 +218,42 @@ fn relay_header_roundtrips_and_rejects_malformed_frames() {
         driver: driver.clone(),
         key: Some(aterm_net::fleet::NodeKey::from_bytes([0xcd; 32])),
         peer: None,
+        sids: Vec::new(),
     };
     assert_eq!(
         RelayHeader::parse(&drive.encode()).expect("parse drive"),
         drive
     );
     let drive_no_key = RelayHeader::Drive {
-        driver,
+        driver: driver.clone(),
         key: None,
         peer: None,
+        sids: Vec::new(),
     };
     assert_eq!(
         RelayHeader::parse(&drive_no_key.encode()).expect("parse drive without key"),
         drive_no_key
+    );
+    // A drive naming sessions carries them, so the window that hosts them takes it.
+    let naming = RelayHeader::Drive {
+        driver,
+        key: Some(aterm_net::fleet::NodeKey::from_bytes([0xcd; 32])),
+        peer: Some(peer),
+        sids: vec![
+            SessionId::new("s-4c56f539e92639ba37ae"),
+            SessionId::new("s-b"),
+        ],
+    };
+    assert!(
+        naming
+            .encode()
+            .ends_with(" sids=s-4c56f539e92639ba37ae,s-b\n"),
+        "{}",
+        naming.encode()
+    );
+    assert_eq!(
+        RelayHeader::parse(&naming.encode()).expect("parse drive naming sessions"),
+        naming
     );
     let ask = RelayHeader::Ask { peer };
     assert_eq!(RelayHeader::parse(&ask.encode()).expect("parse ask"), ask);
@@ -226,6 +273,12 @@ fn relay_header_roundtrips_and_rejects_malformed_frames() {
         "DRIVE node=abcd node=efgh host=x peer=-\n",
         "DRIVE node=ab%0acd host=x peer=-\n",
         "DRIVE node=abcd host=x%00y peer=-\n",
+        "DRIVE node=abcd host=x peer=- sids=\n",
+        "DRIVE node=abcd host=x peer=- sids=-\n",
+        "DRIVE node=abcd host=x peer=- sids=s-a,,s-b\n",
+        "DRIVE node=abcd host=x peer=- sids=s-a,x-b\n",
+        "DRIVE node=abcd host=x peer=- sids=s-\n",
+        "DRIVE node=abcd host=x peer=- sids=s-a sids=s-b\n",
         "ASK peer=-\n",
         "ASK\n",
         "ASK peer=127.0.0.1:1 more=1\n",
@@ -307,19 +360,25 @@ fn query_window_survey_facts_reads_large_account_rosters_beyond_sixty_four_lines
     let dir_clone = relay_dir.clone();
     let stop_clone = Arc::clone(&stop);
     let handle = std::thread::spawn(move || {
-        let _ = serve_window_relay_at(&dir_clone, pid, Some(&stop_clone), move |header, mut s| {
-            let payload = full_wire.clone();
-            std::thread::spawn(move || {
-                if matches!(header, RelayHeader::Survey { .. })
-                    && let Ok(Some(line)) = read_line_raw(&mut s, 4096)
-                    && line.trim() == "survey"
-                {
-                    let _ = s.write_all(payload.as_bytes());
-                    let _ = s.flush();
-                }
-            });
-            true
-        });
+        let _ = serve_window_relay_at(
+            &dir_clone,
+            pid,
+            Some(&stop_clone),
+            hosts_every,
+            move |header, mut s| {
+                let payload = full_wire.clone();
+                std::thread::spawn(move || {
+                    if matches!(header, RelayHeader::Survey { .. })
+                        && let Ok(Some(line)) = read_line_raw(&mut s, 4096)
+                        && line.trim() == "survey"
+                    {
+                        let _ = s.write_all(payload.as_bytes());
+                        let _ = s.flush();
+                    }
+                });
+                true
+            },
+        );
     });
 
     let sock_path = relay_socket_path(&relay_dir, pid);
@@ -332,7 +391,8 @@ fn query_window_survey_facts_reads_large_account_rosters_beyond_sixty_four_lines
         std::thread::sleep(Duration::from_millis(5));
     }
 
-    let parsed = query_window_survey_facts(&relay_dir).expect("full 89-line survey facts");
+    let windows = WindowRelays::new(relay_dir.clone(), idle_launcher());
+    let parsed = query_window_survey_facts(&windows).expect("full 89-line survey facts");
     assert_eq!(parsed.accounts.len(), 75);
     assert_eq!(parsed.server_heard.len(), 1);
     assert_eq!(parsed, expected);
@@ -382,7 +442,7 @@ fn windowless_node_answers_survey_and_wakes_window_on_spawn_or_refuses_when_logg
         prebound_listener: Some(prebound),
         tick_every: Duration::from_millis(40),
         wake_timeout: aterm_spec::wait::MUST_HAPPEN,
-        lan_may_go: aterm_types::macos_setup::lan_first_use::may_use,
+        lan_unavailable: || None,
         stop: Arc::clone(&stop),
         launcher: Arc::clone(&launcher) as Arc<dyn WindowLauncher>,
         members: None,
@@ -704,7 +764,7 @@ fn serve_node_reading(
         prebound_listener: Some(prebound),
         tick_every: Duration::from_millis(40),
         wake_timeout: Duration::from_secs(1),
-        lan_may_go: aterm_types::macos_setup::lan_first_use::may_use,
+        lan_unavailable: || None,
         stop: Arc::clone(&stop),
         launcher: Arc::new(MockWindowLauncher::new(
             false,
@@ -1094,10 +1154,7 @@ fn a_moved_member_is_found_by_its_alab_tcp_advert() {
             })
         },
     ));
-    browse.feed("Browsing for _alab._tcp.local.\n");
-    browse.feed(
-        "16:02:11.123  Add        3   1 local.               _alab._tcp.          alab-moved\n",
-    );
+    browse.hear(true, 1, "alab-moved");
 
     let prebound = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind this Mac");
     let addr = prebound.local_addr().unwrap();
@@ -1118,7 +1175,7 @@ fn a_moved_member_is_found_by_its_alab_tcp_advert() {
         prebound_listener: Some(prebound),
         tick_every: Duration::from_millis(40),
         wake_timeout: Duration::from_secs(1),
-        lan_may_go: aterm_types::macos_setup::lan_first_use::may_use,
+        lan_unavailable: || None,
         stop: Arc::clone(&stop),
         launcher: Arc::new(MockWindowLauncher::new(
             false,
@@ -1202,7 +1259,7 @@ fn an_ask_on_the_node_jobs_port_reaches_the_windows_desk_or_is_refused_with_none
         prebound_listener: Some(prebound),
         tick_every: Duration::from_millis(30),
         wake_timeout: Duration::from_secs(1),
-        lan_may_go: aterm_types::macos_setup::lan_first_use::may_use,
+        lan_unavailable: || None,
         stop: Arc::clone(&stop),
         members: None,
         alab_browse: None,
@@ -1259,6 +1316,7 @@ fn an_ask_on_the_node_jobs_port_reaches_the_windows_desk_or_is_refused_with_none
                 &dir,
                 std::process::id(),
                 Some(&relay_stop),
+                hosts_every,
                 move |header, stream| match header {
                     RelayHeader::Ask { peer } => crate::members_desk::attach_relayed_to(
                         Some(Arc::clone(&member)),
@@ -1295,24 +1353,11 @@ fn an_ask_on_the_node_jobs_port_reaches_the_windows_desk_or_is_refused_with_none
     assert_eq!(server.join().expect("join"), ExitCode::SUCCESS);
 }
 
-/// A loopback listener whose port no other socket can take once it is closed, so a test can
-/// bind that port again to show it was let go. Its port is below the range the kernel hands a
-/// bind of port 0 (49152 and up on macOS, 32768 and up on Linux), so another test's ephemeral
-/// bind never lands on it; and it is made under [`aterm_uds::kept_out`], as the node job's own
-/// sockets are, so no concurrent spawn's child holds a copy of it. A port another process holds
-/// is passed over, so the first free one from a start this process's id picks is taken.
-fn listener_no_port_zero_bind_takes() -> TcpListener {
-    const FIRST: u32 = 20_000;
-    const SPAN: u32 = 12_000;
-    let start = std::process::id() % SPAN;
-    (0..256)
-        .filter_map(|step| u16::try_from(FIRST + (start + step) % SPAN).ok())
-        .find_map(|port| {
-            aterm_uds::kept_out(|| TcpListener::bind((Ipv4Addr::LOCALHOST, port))).ok()
-        })
-        .expect("a free loopback port below the ephemeral range")
-}
-
+/// THE NODE JOB HOLDS ITS PORT AND LETS IT GO: while it runs, `node-job.lock` is held and a
+/// second bind of its port is refused; once it stops, the lock is free and the GUI binds the
+/// port. The test claims the port for its whole run ([`ports::PortClaim`]), so no other pick, in
+/// this binary or another, takes it in the moment between the job letting it go and that bind.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn node_job_lock_prevents_dual_bind_and_releases_when_node_serve_stops() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -1320,7 +1365,7 @@ fn node_job_lock_prevents_dual_bind_and_releases_when_node_serve_stops() {
     let state_dir = root.path().join("state");
     let _ = seed_fleet_node(&state_dir);
 
-    let prebound = listener_no_port_zero_bind_takes();
+    let (prebound, _claim) = ports::listener_no_port_zero_bind_takes();
     let addr = prebound.local_addr().unwrap();
     let config_path = root.path().join("aterm.toml");
     crate::test_scratch::write_config(
@@ -1340,7 +1385,7 @@ fn node_job_lock_prevents_dual_bind_and_releases_when_node_serve_stops() {
         prebound_listener: Some(prebound),
         tick_every: Duration::from_millis(30),
         wake_timeout: Duration::from_secs(1),
-        lan_may_go: aterm_types::macos_setup::lan_first_use::may_use,
+        lan_unavailable: || None,
         stop: Arc::clone(&stop),
         launcher: Arc::new(MockWindowLauncher::new(
             false,
@@ -1379,7 +1424,7 @@ fn node_job_lock_prevents_dual_bind_and_releases_when_node_serve_stops() {
         prebound_listener: None,
         tick_every: Duration::from_millis(30),
         wake_timeout: Duration::from_secs(1),
-        lan_may_go: aterm_types::macos_setup::lan_first_use::may_use,
+        lan_unavailable: || None,
         stop: Arc::new(AtomicBool::new(false)),
         launcher: Arc::new(MockWindowLauncher::new(
             false,
@@ -1422,7 +1467,12 @@ fn query_window_survey_facts_reads_live_window_session_counts_unlike_zero_fallba
     let live_facts = aterm_spec::wait::within(
         aterm_spec::wait::MUST_HAPPEN,
         Duration::from_millis(15),
-        || query_window_survey_facts(relay_scratch.path()),
+        || {
+            query_window_survey_facts(&WindowRelays::new(
+                relay_scratch.path().to_path_buf(),
+                idle_launcher(),
+            ))
+        },
     )
     .expect("live window relay must answer survey facts");
     assert_eq!(
@@ -1471,7 +1521,7 @@ fn member_node_with_identity_only_aterm_toml_preserves_default_drive_grant() {
         prebound_listener: Some(prebound),
         tick_every: Duration::from_millis(30),
         wake_timeout: aterm_spec::wait::MUST_HAPPEN,
-        lan_may_go: aterm_types::macos_setup::lan_first_use::may_use,
+        lan_unavailable: || None,
         stop: Arc::clone(&stop),
         launcher: Arc::clone(&launcher) as Arc<dyn WindowLauncher>,
         members: None,
@@ -1548,7 +1598,7 @@ fn the_port_lock_is_held_only_while_the_node_serves_the_port() {
         prebound_listener: Some(prebound),
         tick_every: tick,
         wake_timeout: Duration::from_secs(1),
-        lan_may_go: aterm_types::macos_setup::lan_first_use::may_use,
+        lan_unavailable: || None,
         stop: Arc::clone(&stop),
         members: None,
         alab_browse: None,
@@ -1580,15 +1630,16 @@ fn the_port_lock_is_held_only_while_the_node_serves_the_port() {
     assert!(!node_port_holds_lock(&state_dir) && !node_job_holds_lock(&state_dir));
 }
 
-/// THE NODE JOB WAITS FOR THE STEP: while System State's Local Network step is still to come
-/// (`lan_may_go` says no), the job, whose fleet key and listener are ready, takes no port and
-/// so advertises, listens and dials nothing on the LAN; once the step asked macOS, it serves.
+/// THE NODE JOB WAITS FOR THE LAN BROKER: while the root LAN broker does not answer
+/// (`lan_unavailable` gives its words), the job, whose fleet key and listener are ready, takes no
+/// port and so advertises, listens and dials nothing on the LAN; once the broker answers, it
+/// serves.
 #[test]
-fn the_node_job_waits_for_the_local_network_step_before_it_serves_the_lan() {
-    static STEP_ASKED: AtomicBool = AtomicBool::new(false);
+fn the_node_job_waits_for_the_lan_broker_before_it_serves_the_lan() {
+    static BROKER_ANSWERS: AtomicBool = AtomicBool::new(false);
     static LOOKS: AtomicUsize = AtomicUsize::new(0);
     let root = aterm_tempfile::tempdir().expect("tempdir");
-    let relay_scratch = crate::test_scratch::short_dir("node-serve-lan-step");
+    let relay_scratch = crate::test_scratch::short_dir("node-serve-lan-broker");
     let state_dir = root.path().join("state");
     let _ = seed_fleet_node(&state_dir);
     let prebound = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
@@ -1608,9 +1659,10 @@ fn the_node_job_waits_for_the_local_network_step_before_it_serves_the_lan() {
         prebound_listener: Some(prebound),
         tick_every: Duration::from_millis(20),
         wake_timeout: Duration::from_secs(1),
-        lan_may_go: || {
+        lan_unavailable: || {
             LOOKS.fetch_add(1, Ordering::AcqRel);
-            STEP_ASKED.load(Ordering::Acquire)
+            (!BROKER_ANSWERS.load(Ordering::Acquire))
+                .then(|| "no root LAN broker answers".to_owned())
         },
         stop: Arc::clone(&stop),
         members: None,
@@ -1622,17 +1674,17 @@ fn the_node_job_waits_for_the_local_network_step_before_it_serves_the_lan() {
     let server = std::thread::spawn(move || run_node_serve_with(cfg));
     aterm_spec::wait::until_within(
         aterm_spec::wait::MUST_HAPPEN,
-        "the job looks at the step three times",
+        "the job looks for the broker three times",
         || (LOOKS.load(Ordering::Acquire) >= 3).then_some(()),
     );
     assert!(
         !node_port_holds_lock(&state_dir),
-        "the job served the LAN before System State's Local Network step asked macOS"
+        "the job served the LAN before the broker answered"
     );
-    STEP_ASKED.store(true, Ordering::Release);
+    BROKER_ANSWERS.store(true, Ordering::Release);
     aterm_spec::wait::until_within(
         aterm_spec::wait::MUST_HAPPEN,
-        "the job serves the port once the step asked",
+        "the job serves the port once the broker answers",
         || node_port_holds_lock(&state_dir).then_some(()),
     );
     stop.store(true, Ordering::Release);
@@ -1669,7 +1721,7 @@ fn an_aterm_toml_the_node_cannot_read_starts_no_listener() {
         prebound_listener: None,
         tick_every: Duration::from_millis(20),
         wake_timeout: Duration::from_secs(1),
-        lan_may_go: aterm_types::macos_setup::lan_first_use::may_use,
+        lan_unavailable: || None,
         stop: Arc::new(AtomicBool::new(false)),
         members: None,
         alab_browse: None,
@@ -1718,7 +1770,13 @@ fn a_running_window_that_takes_no_hand_over_is_answered_busy() {
         let dir = relay_scratch.path().to_path_buf();
         let stop = Arc::clone(&relay_stop);
         std::thread::spawn(move || {
-            let _ = serve_window_relay_at(&dir, std::process::id(), Some(&stop), |_, _| false);
+            let _ = serve_window_relay_at(
+                &dir,
+                std::process::id(),
+                Some(&stop),
+                hosts_every,
+                |_, _| false,
+            );
         })
     };
     aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the window's relay", || {
@@ -1739,7 +1797,7 @@ fn a_running_window_that_takes_no_hand_over_is_answered_busy() {
         prebound_listener: Some(prebound),
         tick_every: Duration::from_millis(40),
         wake_timeout: Duration::from_secs(1),
-        lan_may_go: aterm_types::macos_setup::lan_first_use::may_use,
+        lan_unavailable: || None,
         stop: Arc::clone(&stop),
         members: None,
         alab_browse: None,
@@ -1824,7 +1882,8 @@ impl std::io::Write for AskSide {
 fn an_ask_a_busy_window_takes_no_hand_over_of_is_refused_as_busy() {
     let relay_scratch = crate::test_scratch::short_dir("node-serve-ask-busy");
     let peer: std::net::SocketAddr = "127.0.0.1:7100".parse().unwrap();
-    let ask = relay_ask(relay_scratch.path().to_path_buf(), None);
+    let windows = WindowRelays::new(relay_scratch.path().to_path_buf(), idle_launcher());
+    let ask = relay_ask(windows.clone(), None);
     let mut nobody = AskSide(Vec::new());
     ask(&mut nobody, peer).expect("ask");
     let nobody = aterm_codec::pct::decode(&String::from_utf8_lossy(&nobody.0));
@@ -1835,7 +1894,13 @@ fn an_ask_a_busy_window_takes_no_hand_over_of_is_refused_as_busy() {
         let dir = relay_scratch.path().to_path_buf();
         let stop = Arc::clone(&relay_stop);
         std::thread::spawn(move || {
-            let _ = serve_window_relay_at(&dir, std::process::id(), Some(&stop), |_, _| false);
+            let _ = serve_window_relay_at(
+                &dir,
+                std::process::id(),
+                Some(&stop),
+                hosts_every,
+                |_, _| false,
+            );
         })
     };
     aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the window's relay", || {
@@ -1847,7 +1912,7 @@ fn an_ask_a_busy_window_takes_no_hand_over_of_is_refused_as_busy() {
         attempted.fetch_add(1, Ordering::SeqCst);
         Ok(())
     });
-    let ask = relay_ask(relay_scratch.path().to_path_buf(), Some(automatic));
+    let ask = relay_ask(windows, Some(automatic));
     let mut busy = AskSide(Vec::new());
     ask(&mut busy, peer).expect("ask");
     let busy = aterm_codec::pct::decode(&String::from_utf8_lossy(&busy.0));
@@ -1874,7 +1939,10 @@ fn a_windowless_node_serves_its_automatic_ask_handler() {
         callback.fetch_add(1, Ordering::SeqCst);
         stream.write_all(b"automatic admission handler\n")
     });
-    let ask = relay_ask(root.path().to_path_buf(), Some(automatic));
+    let ask = relay_ask(
+        WindowRelays::new(root.path().to_path_buf(), idle_launcher()),
+        Some(automatic),
+    );
     let mut reply = AskSide(Vec::new());
     ask(&mut reply, peer).unwrap();
     assert_eq!(reply.0, b"automatic admission handler\n");
@@ -2218,7 +2286,7 @@ fn node_open_table_cut_marks_wake_drive_cut_and_hangs_up_attached_window_stream(
 
 /// An `aterm.toml` whose `[swarm]` cannot be read holds sharing off
 /// (`docs/DESIGN-alab-swarm-2026-10-27.md` §9: "a file that cannot be read holds sharing off"),
-/// as `lan_first_use::sharing_on` and the advert's `should_advertise_alab_tcp_with` read it. So
+/// as the advert's `should_advertise_alab_tcp_with` reads it. So
 /// the node job's watch ends a generation already serving, its heartbeats and facts pushes with
 /// it, unless the switch reads on: never only on a clean `false`. Reads files only; dials
 /// nothing.
@@ -2238,7 +2306,7 @@ fn an_unreadable_swarm_switch_ends_the_node_jobs_generation() {
         prebound_listener: None,
         tick_every: Duration::from_millis(20),
         wake_timeout: Duration::from_secs(1),
-        lan_may_go: || false,
+        lan_unavailable: || Some("no root LAN broker answers".to_owned()),
         stop: Arc::new(AtomicBool::new(false)),
         members: None,
         alab_browse: None,
@@ -2339,6 +2407,9 @@ fn the_node_job_raises_launchds_descriptor_limit_to_serve_every_fleet_slot() {
             crate::fleet_listen::fleet_slots() < aterm_net::fleet::MAX_SLOTS,
             "CONTROL: launchd's limit serves fewer"
         );
+        // The test binary has no root LAN broker: the broker answers, as it does on a Mac
+        // with aterm installed.
+        let _ = super::NODE_LAN_GATE_FOR_TEST.set(|| None);
         let server = std::thread::spawn(|| super::run_node_serve_owning(|| {}));
         let mut reader = JobsReader::new();
         let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
@@ -2486,7 +2557,10 @@ struct ScriptedUpdater {
     confirms_land: AtomicBool,
     looks: AtomicUsize,
     applies: AtomicUsize,
+    recoveries: AtomicUsize,
     confirms: AtomicUsize,
+    trial_pending: AtomicBool,
+    trial_reads: AtomicUsize,
     restarts: std::sync::Mutex<Vec<String>>,
     stop: Arc<AtomicBool>,
     started: Instant,
@@ -2506,7 +2580,10 @@ impl ScriptedUpdater {
             confirms_land: AtomicBool::new(true),
             looks: AtomicUsize::new(0),
             applies: AtomicUsize::new(0),
+            recoveries: AtomicUsize::new(0),
             confirms: AtomicUsize::new(0),
+            trial_pending: AtomicBool::new(true),
+            trial_reads: AtomicUsize::new(0),
             restarts: std::sync::Mutex::new(Vec::new()),
             stop: Arc::new(AtomicBool::new(false)),
             started: Instant::now(),
@@ -2555,9 +2632,23 @@ impl NodeUpdater for ScriptedUpdater {
         "scripted: nothing swapped".to_owned()
     }
 
+    fn recover_trial_at_boot(&self) -> String {
+        self.recoveries.fetch_add(1, Ordering::AcqRel);
+        "scripted: trial counted".to_owned()
+    }
+
     fn confirm_trial(&self) -> bool {
         self.confirms.fetch_add(1, Ordering::AcqRel);
-        self.confirms_land.load(Ordering::Acquire)
+        let lands = self.confirms_land.load(Ordering::Acquire);
+        if lands {
+            self.trial_pending.store(false, Ordering::Release);
+        }
+        lands
+    }
+
+    fn trial_pending(&self) -> bool {
+        self.trial_reads.fetch_add(1, Ordering::AcqRel);
+        self.trial_pending.load(Ordering::Acquire)
     }
 
     fn older_build_installed(&self) -> Option<u64> {
@@ -2600,7 +2691,13 @@ impl WindowRelay {
             let dir = relay_dir.to_path_buf();
             let stop = Arc::clone(&stop);
             std::thread::spawn(move || {
-                let _ = serve_window_relay_at(&dir, std::process::id(), Some(&stop), |_, _| true);
+                let _ = serve_window_relay_at(
+                    &dir,
+                    std::process::id(),
+                    Some(&stop),
+                    hosts_every,
+                    |_, _| true,
+                );
             })
         };
         aterm_spec::wait::until_within(
@@ -2677,9 +2774,12 @@ fn a_stale_relay_listener_is_not_kept_alive_by_a_neighbours_fork() {
         }
     }
     fn park() -> Parked {
+        // Held across the fork alone, as every spawn holds it, so no descriptor another test is
+        // making through `aterm_uds::kept_out` is between its creation and its close-on-fork mark
+        // when the table is copied. The child never releases its copy.
+        let spawning = aterm_uds::spawn_lock::spawning();
         // SAFETY: the child calls only async-signal-safe raise and _exit, with no unwinding.
         let pid = unsafe { libc::fork() };
-        assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
         if pid == 0 {
             // SAFETY: the child parks until its parent's SIGKILL, without running Rust code.
             unsafe {
@@ -2691,6 +2791,8 @@ fn a_stale_relay_listener_is_not_kept_alive_by_a_neighbours_fork() {
                 libc::_exit(0);
             }
         }
+        assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+        drop(spawning);
         Parked(Some(pid))
     }
     let answered = |fixture| {
@@ -2857,52 +2959,64 @@ fn a_relay_file_answers_while_a_copy_of_its_listener_lives() {
 /// relay answers, a stale relay file included, and auto-apply is on, whether or not its own look
 /// found a build waiting (the apply reads the stage itself, and with nothing waiting it counts
 /// the start against its build's boot trial, so a build that crash-loops under launchd is
-/// reverted). While a window runs, or with auto-apply off, it never runs it. A build it found
-/// and the apply did not run is the boot's left build.
+/// reverted). While a window runs it neither applies nor counts. With auto-apply off, it only
+/// recovers an existing trial. A build it found and the apply did not run is the boot's left build.
 #[test]
 fn the_node_boot_applies_only_with_no_window_here() {
     let relay = crate::test_scratch::short_dir("node-update-boot");
     let boot_with = |updater: &ScriptedUpdater| {
         let before = updater.applies.load(Ordering::Acquire);
+        let recoveries_before = updater.recoveries.load(Ordering::Acquire);
         let boot = apply_at_node_boot(updater, relay.path());
-        (updater.applies.load(Ordering::Acquire) - before, boot.left)
+        (
+            updater.applies.load(Ordering::Acquire) - before,
+            updater.recoveries.load(Ordering::Acquire) - recoveries_before,
+            boot.left,
+        )
     };
     let updater = ScriptedUpdater::new(None);
     assert_eq!(
         boot_with(&updater),
-        (1, None),
+        (1, 0, None),
         "with nothing waiting the boot apply still counts the start"
     );
     let window = WindowRelay::open(relay.path());
     assert_eq!(
         boot_with(&updater),
-        (0, None),
+        (0, 0, None),
         "a window runs: no boot apply, which could swap a stage under it"
     );
     updater.stage(2);
     assert_eq!(
         boot_with(&updater),
-        (0, None),
+        (0, 0, None),
         "a window runs: build 2 is left to it"
     );
     drop(window);
     assert_eq!(
         boot_with(&updater),
-        (1, Some(2)),
+        (1, 0, Some(2)),
         "build 2 waits and no window runs: the boot applies it (the real apply execs it; the \
          scripted one returns, so the boot records it as left)"
     );
     updater.auto_apply.store(false, Ordering::Release);
     assert_eq!(
         boot_with(&updater),
-        (0, None),
-        "auto-apply off: left for Install"
+        (0, 1, None),
+        "auto-apply off: recover the armed build without admitting the stage"
     );
+    let window = WindowRelay::open(relay.path());
+    assert_eq!(
+        boot_with(&updater),
+        (0, 0, None),
+        "a live window owns its trial even when automatic installation is off"
+    );
+    drop(window);
     updater.auto_apply.store(true, Ordering::Release);
     let _stale = stale_relay_file(relay.path());
     assert_eq!(
         boot_with(&updater),
-        (1, Some(2)),
+        (1, 0, Some(2)),
         "a relay file that does not answer is no window"
     );
 }
@@ -2927,7 +3041,7 @@ fn serve_updating(
         prebound_listener: prebound,
         tick_every: Duration::from_millis(20),
         wake_timeout: Duration::from_secs(1),
-        lan_may_go: || true,
+        lan_unavailable: || None,
         stop: Arc::clone(&updater.stop),
         members: None,
         alab_browse: None,
@@ -3199,9 +3313,9 @@ fn the_node_job_replaces_a_stalled_checker_once_and_a_fresh_one_never() {
     assert_eq!(*lock(&respawned), [1]);
 }
 
-/// THE BOOT TRIAL IS CONFIRMED ONCE THE NODE JOB IS UP (§4.13): serving, once its listener has
-/// answered for a tick; holding the LAN as its configuration says, once it has held a tick. A
-/// confirmation that does not land is asked again, and one that lands is not.
+/// The node confirms an admitted listener only after its authenticated Census response, or a
+/// definite policy hold after a tick. A confirmation that does not land is asked again, and
+/// one that lands is not.
 #[test]
 fn the_node_job_confirms_its_boot_trial_once_it_serves_or_holds_the_lan() {
     for (serves, lands) in [(true, true), (false, true), (false, false)] {
@@ -3249,6 +3363,291 @@ fn the_node_job_confirms_its_boot_trial_once_it_serves_or_holds_the_lan() {
                 "serves = {serves}: a confirmed trial was asked again"
             );
         }
+    }
+}
+
+#[test]
+fn an_admitted_node_with_invalid_key_or_failed_bind_cannot_confirm_its_trial() {
+    for (failure, active) in [
+        ("key", true),
+        ("bind", true),
+        ("lock", true),
+        ("key", false),
+        ("bind", false),
+        ("lock", false),
+    ] {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let relay = crate::test_scratch::short_dir("node-unproven-trial");
+        let state = root.path().join("state");
+        seed_fleet_node(&state);
+        let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = occupied.local_addr().unwrap();
+        if failure == "key" {
+            std::fs::write(state.join("fleet.key"), "invalid key").unwrap();
+        }
+        let _custody = (failure == "lock").then(|| {
+            aterm_agent::node_service::NodeJobLock::try_acquire_port(&state)
+                .unwrap()
+                .unwrap()
+        });
+        let updater = Arc::new(ScriptedUpdater::new(None));
+        updater.trial_pending.store(active, Ordering::Release);
+        let config = format!("[fleet]\nlisten = \"{addr}\"\nallow = \"facts\"\n");
+        let server = serve_updating(root.path(), &state, relay.path(), &updater, (&config, None));
+        let until = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        while updater.confirms.load(Ordering::Acquire) == 0
+            && updater.restarts().is_empty()
+            && (active || updater.trial_reads.load(Ordering::Acquire) == 0)
+            && Instant::now() < until
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        updater.stop.store(true, Ordering::Release);
+        assert_eq!(server.join().unwrap(), ExitCode::SUCCESS);
+        assert_eq!(
+            updater.confirms.load(Ordering::Acquire),
+            0,
+            "{failure}: an admitted node that cannot serve supplied no health evidence"
+        );
+        assert_eq!(
+            updater.restarts().len(),
+            usize::from(active),
+            "{failure}: only the active trial requests its next recovery boot"
+        );
+    }
+}
+
+#[test]
+fn an_owned_port_is_delegated_only_while_a_window_relay_answers() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let relay = crate::test_scratch::short_dir("node-window-health-hold");
+    let state = root.path().join("state");
+    seed_fleet_node(&state);
+    let _custody = aterm_agent::node_service::NodeJobLock::try_acquire_port(&state)
+        .unwrap()
+        .unwrap();
+    let _window = WindowRelay::open(relay.path());
+    let updater = Arc::new(ScriptedUpdater::new(None));
+    let server = serve_updating(
+        root.path(),
+        &state,
+        relay.path(),
+        &updater,
+        (
+            "[fleet]\nlisten = \"127.0.0.1:0\"\nallow = \"facts\"\n",
+            None,
+        ),
+    );
+    let until = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    while updater.confirms.load(Ordering::Acquire) == 0
+        && updater.restarts().is_empty()
+        && Instant::now() < until
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    updater.stop.store(true, Ordering::Release);
+    assert_eq!(server.join().unwrap(), ExitCode::SUCCESS);
+    assert_eq!(updater.confirms.load(Ordering::Acquire), 1);
+    assert!(updater.restarts().is_empty());
+}
+
+#[test]
+fn node_health_rechecks_trial_custody_after_delegation_and_confirmation() {
+    let updater = Arc::new(ScriptedUpdater::new(None));
+    let updates = NodeUpdates::new(
+        Arc::clone(&updater) as Arc<dyn NodeUpdater>,
+        NodeBoot::nothing_at(updater.started),
+    );
+    // A window owns this trial now. Its wait can later lapse without restarting
+    // this node process; the new headless obligation must not be cached away.
+    updater.trial_pending.store(false, Ordering::Release);
+    updates.confirm_checkpoint(&updater.stop);
+    assert_eq!(updater.confirms.load(Ordering::Acquire), 0);
+    updater.trial_pending.store(true, Ordering::Release);
+    updates.confirm_checkpoint(&updater.stop);
+    assert_eq!(updater.confirms.load(Ordering::Acquire), 1);
+    assert!(!updater.trial_pending.load(Ordering::Acquire));
+
+    // The canonical confirmation can also return true while delegating to a
+    // window. Even a prior successful callback cannot replace later custody.
+    updater.trial_pending.store(true, Ordering::Release);
+    updates.confirm_checkpoint(&updater.stop);
+    assert_eq!(updater.confirms.load(Ordering::Acquire), 2);
+    updates.confirm_checkpoint(&updater.stop);
+    assert_eq!(updater.confirms.load(Ordering::Acquire), 2);
+
+    updater.stop.store(true, Ordering::Release);
+    updater.trial_pending.store(true, Ordering::Release);
+    updates.confirm_checkpoint(&updater.stop);
+    assert_eq!(updater.confirms.load(Ordering::Acquire), 2);
+}
+
+#[test]
+fn node_health_rechecks_inputs_after_a_window_relay_answers_or_refuses() {
+    for cut in ["policy", "key", "stop"] {
+        for answers in [false, true] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let state = root.path().join("state");
+            seed_fleet_node(&state);
+            let config = root.path().join("aterm.toml");
+            crate::test_scratch::write_config(
+                &config,
+                "[fleet]\nlisten = \"127.0.0.1:1\"\nallow = \"facts\"\n",
+            );
+            let updater = Arc::new(ScriptedUpdater::new(None));
+            let cfg = NodeServeConfig {
+                state_dir: state.clone(),
+                relay_dir: root.path().join("relay"),
+                home_dir: None,
+                config_path: Some(config.clone()),
+                vault_paths: None,
+                members: None,
+                alab_browse: None,
+                prebound_listener: None,
+                tick_every: Duration::from_millis(20),
+                wake_timeout: Duration::from_secs(1),
+                stop: Arc::clone(&updater.stop),
+                launcher: idle_launcher(),
+                lan_unavailable: || None,
+                updates: Some(NodeUpdates::new(
+                    Arc::clone(&updater) as Arc<dyn NodeUpdater>,
+                    NodeBoot::nothing_at(updater.started),
+                )),
+                mesh: NodeMesh::off(),
+            };
+            super::checkpoint_idle_with(&cfg, super::IdleCheckpoint::PortOwnedElsewhere, || {
+                match cut {
+                    "policy" => {
+                        crate::test_scratch::write_config(&config, "[swarm]\nenabled = false\n")
+                    }
+                    "key" => std::fs::write(state.join("fleet.key"), "ab".repeat(24)).unwrap(),
+                    "stop" => updater.stop.store(true, Ordering::Release),
+                    _ => unreachable!(),
+                }
+                answers
+            });
+            assert_eq!(
+                updater.confirms.load(Ordering::Acquire),
+                0,
+                "{cut}/{answers}"
+            );
+            assert!(updater.restarts().is_empty(), "{cut}/{answers}");
+        }
+    }
+}
+
+#[test]
+fn node_health_fences_probes_and_preserves_only_definite_holds() {
+    use std::os::unix::fs::PermissionsExt as _;
+    for cut in [
+        "stop",
+        "policy",
+        "key",
+        "unchanged",
+        "swarm-off",
+        "missing-key",
+        "missing-node",
+        "broker",
+        "invalid-config",
+        "unread-config",
+    ] {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        let (secret, node) = seed_fleet_node(&state);
+        let config = root.path().join("aterm.toml");
+        let listen = "127.0.0.1:1";
+        crate::test_scratch::write_config(
+            &config,
+            format!("[fleet]\nlisten = \"{listen}\"\nallow = \"facts\"\n"),
+        );
+        let updater = Arc::new(ScriptedUpdater::new(None));
+        let mut cfg = NodeServeConfig {
+            state_dir: state.clone(),
+            relay_dir: root.path().join("relay"),
+            home_dir: None,
+            config_path: Some(config.clone()),
+            vault_paths: None,
+            members: None,
+            alab_browse: None,
+            prebound_listener: None,
+            tick_every: Duration::from_millis(20),
+            wake_timeout: Duration::from_secs(1),
+            stop: Arc::clone(&updater.stop),
+            launcher: idle_launcher(),
+            lan_unavailable: || None,
+            updates: None,
+            mesh: NodeMesh::off(),
+        };
+        let held = match cut {
+            "swarm-off" => {
+                crate::test_scratch::write_config(&config, "[swarm]\nenabled = false\n");
+                Some(true)
+            }
+            "missing-key" => {
+                std::fs::remove_file(state.join("fleet.key")).unwrap();
+                Some(true)
+            }
+            "missing-node" => {
+                std::fs::remove_file(state.join(aterm_net::fleet_member::NODE_KEY_FILE)).unwrap();
+                Some(true)
+            }
+            "broker" => {
+                cfg.lan_unavailable = || Some("controlled unavailable broker".into());
+                Some(true)
+            }
+            "invalid-config" => {
+                crate::test_scratch::write_config(&config, "invalid TOML [");
+                Some(false)
+            }
+            "unread-config" => {
+                std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o666)).unwrap();
+                Some(false)
+            }
+            _ => None,
+        };
+        if let Some(held) = held {
+            cfg.updates = Some(NodeUpdates::new(
+                Arc::clone(&updater) as Arc<dyn NodeUpdater>,
+                NodeBoot::nothing_at(updater.started),
+            ));
+            super::checkpoint_idle(&cfg, super::IdleCheckpoint::Waiting);
+            assert_eq!(
+                updater.confirms.load(Ordering::Acquire),
+                usize::from(held),
+                "{cut}"
+            );
+            assert_eq!(updater.restarts().len(), usize::from(!held), "{cut}");
+            continue;
+        }
+        let updates = NodeUpdates::new(
+            Arc::clone(&updater) as Arc<dyn NodeUpdater>,
+            NodeBoot::nothing_at(updater.started),
+        );
+        let proved = Some((node.node().to_owned(), node.key()));
+        let result = updates.settle_service_with(
+            &super::health::Inputs::of(&cfg),
+            (listen.parse().unwrap(), &secret, &proved, listen),
+            &cfg.stop,
+            |_| {
+                match cut {
+                    "stop" => cfg.stop.store(true, Ordering::Release),
+                    "policy" => crate::test_scratch::write_config(
+                        &config,
+                        format!("[fleet]\nlisten = \"{listen}\"\nallow = \"content\"\n"),
+                    ),
+                    "key" => std::fs::write(state.join("fleet.key"), "ab".repeat(24)).unwrap(),
+                    _ => {}
+                }
+                Err("controlled probe failure after its input capture".to_owned())
+            },
+        );
+        assert!(!result);
+        assert_eq!(updater.confirms.load(Ordering::Acquire), 0);
+        assert_eq!(
+            updater.restarts().len(),
+            usize::from(cut == "unchanged"),
+            "{cut}"
+        );
     }
 }
 
@@ -3303,6 +3702,14 @@ impl NodeUpdater for FixtureStage {
         true
     }
 
+    fn trial_pending(&self) -> bool {
+        false
+    }
+
+    fn recover_trial_at_boot(&self) -> String {
+        panic!("this fixture leaves automatic installation on")
+    }
+
     fn older_build_installed(&self) -> Option<u64> {
         None
     }
@@ -3350,7 +3757,7 @@ fn run_staging_node_job(scratch: &Path) {
         prebound_listener: None,
         tick_every: Duration::from_millis(20),
         wake_timeout: Duration::from_secs(1),
-        lan_may_go: || false,
+        lan_unavailable: || Some("no root LAN broker answers".to_owned()),
         stop: Arc::clone(&updater.stop),
         members: None,
         alab_browse: None,

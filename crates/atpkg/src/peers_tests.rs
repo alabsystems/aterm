@@ -623,7 +623,7 @@ fn the_doctor_counts_the_members_a_server_answers_apart_from_those_a_download_di
     let held = Fleet {
         members: 3,
         dial: Vec::new(),
-        held: Some("Local Network is off".to_owned()),
+        held: Some("sharing is off".to_owned()),
     };
     let read = with_fleet(held, || sharing(&layout, None));
     assert_eq!(
@@ -692,7 +692,7 @@ fn the_doctor_says_off_first_then_a_live_server_then_whether_there_is_a_member()
     assert_eq!(
         with(&|read: &mut Sharing| {
             read.dials = 0;
-            read.held = Some("Local Network is off".to_owned());
+            read.held = Some("sharing is off".to_owned());
         })
         .1,
         Takes::Held

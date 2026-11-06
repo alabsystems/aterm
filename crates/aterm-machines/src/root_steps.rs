@@ -13,17 +13,33 @@
 //!   set this Mac's ComputerName, LocalHostName and HostName to a swarm label (`m` and a number)
 //!   with Apple's own `scutil`, and nothing else ([`NameRule`]), so the name the vault's roster
 //!   gives the Mac at an admission that comes after the elevation applies with no second
-//!   password ([`name_by_rule`]).
+//!   password ([`name_by_rule`]);
+//! - the root LAN broker ([`crate::items::lan::LanBroker`]), a resident root LaunchDaemon through
+//!   which all of aterm's own outbound LAN traffic goes, so macOS never asks its Local Network
+//!   question about aterm (`docs/DESIGN-lan-broker-2026-11-05.md`).
 //!
-//! Why a sudoers rule, and not a privileged helper or a second password: a second password is a
-//! second prompt, which the ruling rules out. A helper (a launchd daemon, a setuid tool) is root
-//! code of aterm's that stays resident or callable, whose every input the person's account (and
-//! so anything running as it) controls, and whose binary must itself stay root-owned beside an
-//! app the person updates: a broad foothold to keep safe. The rule runs no code of aterm's as
-//! root: sudo matches the whole argument string against `^--set <Pref> m<digits>$` and runs
-//! SIP-protected `/usr/sbin/scutil`, so the most the account can do with it is rename this Mac to
-//! another swarm label. `visudo -c` checks the rule before it goes live, so a sudo that cannot
-//! read it leaves none, and the name then waits for the next elevation.
+//! Why a sudoers rule for the name, and not a privileged helper or a second password: a second
+//! password is a second prompt, which the ruling rules out, and a helper would put root code of
+//! aterm's behind an input the person's account controls where a rule needs none. The rule runs no
+//! code of aterm's as root: sudo matches the whole argument string against
+//! `^--set <Pref> m<digits>$` and runs SIP-protected `/usr/sbin/scutil`, so the most the account
+//! can do with it is rename this Mac to another swarm label. `visudo -c` checks the rule before it
+//! goes live, so a sudo that cannot read it leaves none, and the name then waits for the next
+//! elevation.
+//!
+//! The broker reverses this module's earlier refusal of any resident root helper, for LAN access
+//! alone, because nothing else works: macOS exempts from Local Network privacy only a process
+//! running as root (`docs/measured/local-network-exemption-2026-11-05.md`), and its question is an
+//! alert the rulings exclude. The foothold that refusal named (root code whose inputs the person's
+//! account controls, whose binary must stay root-owned beside an app the person updates) is kept
+//! narrow: launchd runs a `root:wheel` clone of the app with no shared write bit, never the
+//! person-owned bundle; the broker adopts an update only when its static signature meets the
+//! running image's own team requirement (an ad-hoc image adopts nothing, and the next elevation
+//! renews it); its surface is one Unix socket that opens sockets to local-network destinations and
+//! makes `DNSService*` calls, running no code, opening no file and binding nothing a client names;
+//! and it admits a client only by that client's code signature. A compromised aterm process gains
+//! LAN sockets from it, which the app had whenever a person pressed Allow, and nothing that runs as
+//! root.
 //!
 //! What the person's account can read of each step without root ([`owed`]) decides whether the
 //! elevation is owed on a Mac that already has the tools: an unreadable step is not owed, so no
@@ -76,6 +92,10 @@ pub enum Owed {
     Debugger,
     /// The rule that names the Mac after admission is not in place.
     NameRule,
+    /// The root LAN broker's image or plist is missing or not this build's, save an image of the
+    /// source's own signing team, which the running broker adopts by itself
+    /// ([`crate::items::lan::reading`], [`aterm_uds::lan::install::Part::Adopting`]).
+    LanBroker,
 }
 
 impl Owed {
@@ -85,6 +105,10 @@ impl Owed {
         match self {
             Self::Debugger => "authorizes this account to debug without a password",
             Self::NameRule => "lets aterm give this Mac the name its swarm admits it by",
+            Self::LanBroker => {
+                "installs the helper that lets aterm reach this network's Macs without macOS \
+                 asking"
+            }
         }
     }
 }
@@ -205,6 +229,9 @@ pub fn owed(sys: &dyn System) -> Vec<Owed> {
     }
     if rule_in_place(sys) == Some(false) && sys.stat(Path::new(REFUSED_RULE)).is_err() {
         owed.push(Owed::NameRule);
+    }
+    if crate::items::lan::reading(sys).is_some_and(|reading| reading.is_ok_and(|r| r.owed())) {
+        owed.push(Owed::LanBroker);
     }
     owed
 }
@@ -732,6 +759,75 @@ mod tests {
                 "an enabled mode does not prove the account has authorization"
             );
         }
+    }
+
+    /// The broker is owed, as the account reads it, while its clone is missing or another
+    /// build's, or its plist is missing or another source's; nothing is owed once both are this
+    /// build's. NEGATIVE CONTROLS: a clone and a plist the account cannot read owe nothing, and
+    /// neither does a development build outside a bundle, nor any of it off macOS.
+    #[test]
+    fn the_broker_is_owed_by_its_image_and_plist_and_an_unreadable_one_owes_nothing() {
+        use aterm_uds::lan::{IMAGE_EXECUTABLE, PLIST_PATH, install};
+        const SOURCE: &str = "/Applications/aterm.app";
+        let ours = install::test_image(0x0100_000c, &[b"this build"]);
+        let plist = install::plist_text(Path::new(SOURCE));
+        let reading = |image: Option<&[u8]>, daemon: Option<&str>, denied: bool, linux: bool| {
+            let mut sys = Fake::root();
+            sys.running_app = Some(SOURCE.into());
+            sys.linux = linux;
+            sys.on(STATUS, Ran::ok("Developer mode is currently enabled.\n"))
+                .stat_of(ADMITTED_NAME_RULE, rule_stat(0, 0o440))
+                .file("/Applications/aterm.app/Contents/MacOS/aterm", &ours);
+            if let Some(image) = image {
+                sys.file(IMAGE_EXECUTABLE, image);
+            }
+            if let Some(daemon) = daemon {
+                sys.file(PLIST_PATH, daemon.as_bytes());
+            }
+            if denied {
+                sys.stat_fails(IMAGE_EXECUTABLE, std::io::ErrorKind::PermissionDenied)
+                    .stat_fails(PLIST_PATH, std::io::ErrorKind::PermissionDenied);
+            }
+            owed(&sys)
+        };
+        let theirs = install::test_image(0x0100_000c, &[b"another build"]);
+        let elsewhere = install::plist_text(Path::new("/Users//a/Applications/aterm.app"));
+        let broker = vec![Owed::LanBroker];
+        assert_eq!(
+            reading(None, Some(&plist), false, false),
+            broker,
+            "no image"
+        );
+        assert_eq!(
+            reading(Some(&theirs), Some(&plist), false, false),
+            broker,
+            "cdhash differs"
+        );
+        assert_eq!(reading(Some(&ours), None, false, false), broker, "no plist");
+        assert_eq!(
+            reading(Some(&ours), Some(&elsewhere), false, false),
+            broker,
+            "plist differs"
+        );
+        assert_eq!(
+            reading(Some(&ours), Some(&plist), false, false),
+            Vec::<Owed>::new()
+        );
+        assert_eq!(
+            reading(Some(&ours), Some(&plist), true, false),
+            Vec::<Owed>::new(),
+            "unread"
+        );
+        assert_eq!(
+            reading(None, None, false, true),
+            Vec::<Owed>::new(),
+            "linux"
+        );
+
+        let dev = Fake::root();
+        dev.on(STATUS, Ran::ok("Developer mode is currently enabled.\n"))
+            .stat_of(ADMITTED_NAME_RULE, rule_stat(0, 0o440));
+        assert_eq!(owed(&dev), Vec::<Owed>::new(), "a development build");
     }
 
     /// The rule names Apple's `scutil` alone, anchored on both ends, one line per name, with no

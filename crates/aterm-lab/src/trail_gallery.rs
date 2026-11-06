@@ -427,7 +427,12 @@ export PS1
 /// program that, a second after its Return, moves the caret up
 /// [`MOVE_UP_ROWS`] rows into them and holds it there, as vim's `k` does.
 /// It writes [`MOVE_UP_MARK`] on its row in the same write as the move, the
-/// mark the gallery awaits (`@UP@` is the move's row count).
+/// mark the gallery awaits (`@UP@` is the move's row count). It holds by
+/// reading its terminal, which the gallery never writes to again, and not by
+/// a clock: under load a program that exits lets the shell's prompt write
+/// over the moved-to line between a frame's image and its sidecars, and
+/// `trail-contrast` reads the mismatch as a letter the effects took under
+/// its bar.
 const PAINT_MOVE_UP: &str = r#"printf '\033[2J\033[H'
 printf 'Above: Typography jumps; quick brown gyps (qwerty) _gy|\r\n'
 printf 'fn main() {\r\n'
@@ -439,7 +444,7 @@ printf '\033[8H'
 cat > ./k <<'K'
 sleep 1
 printf '[vim] NORMAL\033[@UP@A\033[12G'
-sleep 4
+read -r held
 K
 chmod +x ./k
 "#;

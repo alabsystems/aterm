@@ -819,8 +819,9 @@ fn read_capped(path: &Path, what: &str) -> Result<String> {
 }
 
 /// `apply <file>`: read an exported file against its baseline and write its changed cells. On
-/// problems nothing is written; after a write both files are rewritten from the table as it is
-/// now, with any cell that changed meanwhile showing `⚠ mine ‖ theirs`.
+/// problems, a save the table's rules refuse among them, nothing is written; after a write both
+/// files are rewritten from the table as it is now, with any cell that changed meanwhile showing
+/// `⚠ mine ‖ theirs`.
 fn apply(paths: &Paths, file: &Path) -> Result<Output> {
     let base = Base::from_json(
         &aterm_json::from_str::<Value>(&read_capped(&baseline_path(file), "grid baseline")?)
@@ -832,16 +833,20 @@ fn apply(paths: &Paths, file: &Path) -> Result<Output> {
     let text = read_capped(file, "grid file")?;
     let view = handle.view()?;
     let birth = |c: &Collection, values: &_| compiled.born(c, values, &view.cells);
+    let problems = |problems: &[grid::Problem]| {
+        Output::Json(json!({"written": 0, "problems": problems
+            .iter()
+            .map(|p| json!({"at": edit::place(&base, p), "line": p.line, "rule": p.rule}))
+            .collect::<Vec<_>>()}))
+    };
     let plan = match grid::plan(compiled.table, collection, &base, &text, &birth) {
         Ok(plan) => plan,
-        Err(problems) => {
-            return Ok(Output::Json(json!({"written": 0, "problems": problems
-                .iter()
-                .map(|p| json!({"at": edit::place(&base, p), "line": p.line, "rule": p.rule}))
-                .collect::<Vec<_>>()})));
-        }
+        Err(found) => return Ok(problems(&found)),
     };
     let applied = handle.apply(collection, &plan)?;
+    if let Some(refused) = &applied.refused {
+        return Ok(problems(&[edit::refused_problem(&plan, refused)]));
+    }
     let fresh = grid::export(
         compiled.table,
         collection,

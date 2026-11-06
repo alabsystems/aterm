@@ -53,11 +53,9 @@ fn transport_result(
             Some(3),
             subscriber.as_deref(),
         );
-        return match observed.and_then(|answer| {
-            answer
-                .fetched()
-                .map_err(|why| transport::Unheard { why, held: false })
-        }) {
+        return match observed
+            .and_then(|answer| answer.fetched().map_err(|why| transport::Unheard { why }))
+        {
             Ok(observed) => (observed.http204, Some(observed.fetched)),
             Err(_) => (None, None),
         };
@@ -120,7 +118,10 @@ fn transport_result(
                 (None, None)
             }
             _ => {
-                assert!(!result.unwrap_err().held, "the server answered HTTP 500");
+                assert!(
+                    result.unwrap_err().why.0.contains("500"),
+                    "the server answered HTTP 500"
+                );
                 (None, None)
             }
         };

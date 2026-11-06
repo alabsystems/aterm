@@ -7459,29 +7459,67 @@ fn run_vault_sync(
     }
 }
 
-/// The live [`UpkeepEffects::default_check`]: one `claude auth status --json` of this machine's
-/// own login, run as `accounts login`'s check runs it ([`super::cli::auth_status_of`] with an
-/// empty [`accounts::LOGIN_ENV`]: the default home), read as [`super::cli::login_check`] reads it.
-/// It only asks; it never signs in.
+/// The live [`UpkeepEffects::default_check`]: this machine's own default login, answered by its
+/// default home's stored login file alone (`~/.claude/.credentials.json`,
+/// [`crate::ai::connector::stored_login_held`]). It runs no process and reads no keychain,
+/// network or browser, so it contacts no provider and takes no [`super::provider_read::Use`]:
+/// local state answers whether an account is signed in here, and a process probe is no local
+/// answer (`DESIGN-alab-one-mesh-2026-11-05.md` §4.15 rule 6). The window's upkeep makes this
+/// check on a timer, which holds no account in use, so no door could mint a token for a probe
+/// here either. A file holding a token is signed in; one holding neither is signed out; no
+/// readable file is no answer, which records nothing, so the sign-out on record stands until the
+/// login's own use shows otherwise. Where Claude Code keeps the default login in the keychain
+/// (macOS, [`crate::ai::connector::claude_default_login_in_file`]) the file is not that login, as
+/// [`accounts::Store::default_login_home`] reads it too, so a stale file there is no answer
+/// either and never heals a sign-out the keychain-held login may still have.
 fn default_login_check_live(home: &Path) -> super::cli::LoginCheck {
-    default_login_check_scoped(home, None)
+    use super::cli::LoginCheck;
+    if !crate::ai::connector::claude_default_login_in_file() {
+        return LoginCheck::CouldNotRun(DEFAULT_LOGIN_IN_KEYCHAIN.to_owned());
+    }
+    match crate::ai::connector::stored_login_held(Cli::Claude.connector(), &home.join(".claude")) {
+        Some(true) => LoginCheck::SignedIn,
+        Some(false) => LoginCheck::SignedOut,
+        None => LoginCheck::CouldNotRun(DEFAULT_LOGIN_UNREAD.to_owned()),
+    }
 }
 
-fn default_login_check_scoped(
+/// Why [`default_login_check_live`] had no answer.
+const DEFAULT_LOGIN_UNREAD: &str =
+    "the default home keeps no login file it can read; its keychain is never read";
+
+/// Why [`default_login_check_live`] had no answer where the default login is the keychain's.
+const DEFAULT_LOGIN_IN_KEYCHAIN: &str =
+    "the default login is in the keychain, which is never read, and its home's file is not it";
+
+/// Lab seam: whether the default login's heal is due in the world at `home`, `state_dir` and
+/// `roster_path` ([`default_login_heal_due`]), with the row it is due for.
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn default_login_heal_due_for_lab(
     home: &Path,
-    scope: Option<&super::account_work::Scope>,
-) -> super::cli::LoginCheck {
-    let program = resolve_claude_program(home);
-    let got = match scope {
-        Some(scope) => super::cli::auth_status_of_scoped(
-            program.as_os_str(),
-            "",
-            &|name| std::env::var_os(name),
-            scope,
-        ),
-        None => super::cli::auth_status_of(program.as_os_str(), "", &|name| std::env::var_os(name)),
-    };
-    super::cli::login_check(got)
+    state_dir: &Path,
+    roster_path: &Path,
+    now: i64,
+) -> Option<String> {
+    let roster = Roster::load(roster_path).ok()?;
+    let store = accounts::Store::at(state_dir);
+    default_login_heal_due(home, &store, &roster, now).map(|heal| heal.label)
+}
+
+/// Lab seam: the default login's heal as `accounts sync` makes it ([`heal_default_login_now`]
+/// with the live check, [`default_login_check_live`]) on the caller's thread: whether it healed
+/// and its log line, where it was due.
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn heal_default_login_for_lab(
+    home: &Path,
+    state_dir: &Path,
+    roster_path: &Path,
+    now: i64,
+) -> Option<(bool, String)> {
+    let store = accounts::Store::at(state_dir);
+    heal_default_login_now(home, &store, roster_path, now, default_login_check_live)
 }
 
 /// How many of the ledger's newest events [`default_login_heal_due`] reads for the default
@@ -7971,7 +8009,7 @@ fn live_effects<'a>() -> UpkeepEffects<'a> {
         find_browser: &browser_installed,
         vault_sync: run_vault_sync,
         spawn_vault: &spawn_vault_thread,
-        default_check: default_login_check_scoped,
+        default_check: |home, _scope| default_login_check_live(home),
         mailbox: &ladder_mailbox_live,
         log: std::sync::Arc::new(log_sign_in),
         run_attempt: None,
@@ -12001,6 +12039,7 @@ fn renew_pool_due(
             fx.spawn_renewal,
             None,
             fx.scope.as_ref(),
+            &mut None,
         )
         .progressed()
         {
@@ -12095,6 +12134,8 @@ struct AutoRenewGuard {
     activity_owners: BTreeMap<String, LoginOwner>,
     ladder_owners: BTreeMap<String, LoginOwner>,
     active_login: Option<ActiveLogin>,
+    /// Manual operation observations, partitioned by exact account namespace and subject.
+    manual_selections: BTreeMap<(PathBuf, Cli, ManualSubject), QueuedOwner>,
 }
 
 #[derive(Clone, Debug)]
@@ -12197,6 +12238,65 @@ pub struct LoginActivity {
     pub diagnostic: Option<LoginDiagnostic>,
     /// Exact observed roster identity; absent means the label alone is unconfirmed.
     pub identity: Option<LoginIdentity>,
+    /// The current manual request's observed FIFO place, never provider activity or an ETA.
+    pub queued: Option<QueuedSignin>,
+}
+
+/// A queue observation fenced to one exact persisted manual selection.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct QueuedSignin {
+    selection: accounts::PendingSelection,
+    position: accounts::SigninPosition,
+}
+
+impl QueuedSignin {
+    /// Whether this observation belongs to the exact currently persisted intent.
+    #[must_use]
+    pub fn matches_selection(&self, selection: &accounts::PendingSelection) -> bool {
+        self.selection == *selection
+    }
+
+    /// Live owners ahead and the observed blocker. Zero ahead is not a grant.
+    #[must_use]
+    pub const fn position(&self) -> accounts::SigninPosition {
+        self.position
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn for_test(
+        selection: accounts::PendingSelection,
+        position: accounts::SigninPosition,
+    ) -> Self {
+        Self {
+            selection,
+            position,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct QueuedOwner {
+    selection: accounts::PendingSelection,
+    token: std::sync::Arc<()>,
+    position: Option<accounts::SigninPosition>,
+    identity: Option<LoginIdentity>,
+    observed_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ManualSubject {
+    Account(String),
+    Next,
+}
+
+impl QueuedOwner {
+    fn observation(&self) -> Option<QueuedSignin> {
+        self.position.map(|position| QueuedSignin {
+            selection: self.selection.clone(),
+            position,
+        })
+    }
 }
 
 /// The complete roster row captured by an activity owner. Its contents are not
@@ -12316,9 +12416,39 @@ struct ScopedLoginActivity {
     store: PathBuf,
     cli: Cli,
     rows: Vec<LoginActivity>,
+    queued_next: Option<QueuedSignin>,
 }
 
 impl LoginActivityBatch {
+    /// A next-selection queue observation in this exact requested namespace.
+    #[must_use]
+    pub fn queued_next_for(&self, store: &accounts::Store, cli: Cli) -> Option<&QueuedSignin> {
+        self.scopes
+            .iter()
+            .flatten()
+            .find(|scope| scope.store == store.dir && scope.cli == cli)
+            .and_then(|scope| scope.queued_next.as_ref())
+    }
+
+    /// Attach an exact next-selection observation to an already requested fixture namespace.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn with_queued_next_for_test(
+        mut self,
+        store: &accounts::Store,
+        cli: Cli,
+        queued: QueuedSignin,
+    ) -> Self {
+        if let Some(scope) = self
+            .scopes
+            .iter_mut()
+            .flatten()
+            .find(|scope| scope.store == store.dir && scope.cli == cli)
+        {
+            scope.queued_next = Some(queued);
+        }
+        self
+    }
     /// The requested namespace's observation. An unrequested namespace is `None`,
     /// distinct from a requested namespace with no attributed records.
     #[must_use]
@@ -12356,6 +12486,7 @@ impl LoginActivityBatch {
                 store: store.dir.clone(),
                 cli,
                 rows,
+                queued_next: None,
             });
         }
         batch
@@ -12410,6 +12541,10 @@ fn login_activity_batch_of(
             store: store.dir.clone(),
             cli,
             rows: login_activity_of(guard, store, cli, now, clock),
+            queued_next: guard
+                .manual_selections
+                .get(&(store.dir.clone(), cli, ManualSubject::Next))
+                .and_then(QueuedOwner::observation),
         });
     }
     batch
@@ -12476,6 +12611,19 @@ fn login_activity_of(
     for (key, owner) in &guard.ladder_owners {
         add(owner, guard.ladder.retry_at(key, clock));
     }
+    for ((directory, provider, subject), queued) in &guard.manual_selections {
+        if directory != &store.dir || *provider != cli {
+            continue;
+        }
+        let ManualSubject::Account(label) = subject else {
+            continue;
+        };
+        if let Some(observation) = queued.observation() {
+            let mut owner = LoginOwner::new(store, cli, label, queued.observed_at);
+            owner.identity.clone_from(&queued.identity);
+            activity_row(&mut rows, &owner).queued = Some(observation);
+        }
+    }
     if let Some(active) = &guard.active_login
         && active.owner.matches(store, cli)
     {
@@ -12503,10 +12651,141 @@ fn activity_row<'a>(rows: &'a mut Vec<LoginActivity>, owner: &LoginOwner) -> &'a
                 next_at: None,
                 diagnostic: None,
                 identity: owner.identity.clone(),
+                queued: None,
             });
             rows.len() - 1
         });
     &mut rows[at]
+}
+
+/// One process's exact manual-selection owner. The kernel ticket orders work;
+/// this token only prevents duplicate local workers and fences activity updates.
+pub(in crate::harness) struct ManualSelectionOwner {
+    guard: std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+    key: (PathBuf, Cli, ManualSubject),
+    selection: accounts::PendingSelection,
+    token: std::sync::Arc<()>,
+}
+
+impl std::fmt::Debug for ManualSelectionOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManualSelectionOwner")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ManualSelectionOwner {
+    fn claim(
+        guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+        store: &accounts::Store,
+        cli: Cli,
+        selection: accounts::PendingSelection,
+        row: Option<&accounts::Row>,
+        now: i64,
+    ) -> Result<Self, RenewalDispatch> {
+        let subject = selection.account().map_or(ManualSubject::Next, |request| {
+            ManualSubject::Account(request.label().to_owned())
+        });
+        if selection
+            .account()
+            .is_some_and(|request| row.is_some_and(|row| row.label != request.label()))
+        {
+            return Err(RenewalDispatch::Fenced);
+        }
+        let token = std::sync::Arc::new(());
+        let key = (store.dir.clone(), cli, subject);
+        let owned = Self {
+            guard: guard.clone(),
+            key: key.clone(),
+            selection: selection.clone(),
+            token: token.clone(),
+        };
+        let mut result = Err(RenewalDispatch::Superseded);
+        // The writer serializes this observation with selection replacement. No
+        // queue gate or provider work is held while the local owner book is read.
+        store
+            .transact_within(&accounts::LOCK_LADDER, now, &mut None, |state| {
+                if state.pending_pin.as_ref() != Some(&selection) {
+                    return Ok(Vec::new());
+                }
+                let mut state = guard
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state
+                    .manual_selections
+                    .get(&key)
+                    .is_some_and(|owner| owner.selection == selection)
+                {
+                    result = Err(RenewalDispatch::Held);
+                    return Ok(Vec::new());
+                }
+                let queued = QueuedOwner {
+                    selection: selection.clone(),
+                    token: token.clone(),
+                    position: None,
+                    identity: row.map(LoginIdentity::of),
+                    observed_at: now,
+                };
+                state.manual_selections.insert(key.clone(), queued);
+                result = Ok(());
+                Ok(Vec::new())
+            })
+            .map_err(|why| RenewalDispatch::store_refusal(&why))?;
+        result?;
+        Ok(owned)
+    }
+
+    fn observation_mut<'a>(&self, state: &'a mut AutoRenewGuard) -> Option<&'a mut QueuedOwner> {
+        let owner = state.manual_selections.get_mut(&self.key)?;
+        std::sync::Arc::ptr_eq(&owner.token, &self.token).then_some(owner)
+    }
+
+    fn position(&self, position: Option<accounts::SigninPosition>) {
+        let mut state = self
+            .guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let changed = self.observation_mut(&mut state).is_some_and(|owner| {
+            let changed = owner.position != position;
+            owner.position = position;
+            changed
+        });
+        drop(state);
+        if changed {
+            login_activity_moved();
+        }
+    }
+
+    fn owns(&self) -> bool {
+        self.observation_mut(
+            &mut self
+                .guard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .is_some()
+    }
+
+    pub(in crate::harness) fn selection(&self) -> &accounts::PendingSelection {
+        &self.selection
+    }
+}
+
+impl Drop for ManualSelectionOwner {
+    fn drop(&mut self) {
+        let mut state = self
+            .guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.observation_mut(&mut state).is_none() {
+            return;
+        }
+        state.manual_selections.remove(&self.key);
+        drop(state);
+        if !std::thread::panicking() {
+            login_activity_moved();
+        }
+    }
 }
 
 struct LoginActivityGuard {
@@ -12959,6 +13238,10 @@ impl Drop for LoginActivityGuard {
 #[cfg(test)]
 #[path = "accounts_sync_activity_batch_tests.rs"]
 mod login_activity_batch_tests;
+
+#[cfg(all(test, unix))]
+#[path = "accounts_manual_queue_tests.rs"]
+mod manual_queue_tests;
 
 #[cfg(test)]
 mod login_activity_tests {
@@ -13621,7 +13904,7 @@ fn apply_background_end(
             guard.parked.remove(label);
             guard.bot_checked.insert(label.to_owned(), now);
         }
-        Renewal::Busy | Renewal::Deferred => {}
+        Renewal::SigninHeld | Renewal::Deferred => {}
         Renewal::Renewed
         | Renewal::OtherRenewed
         | Renewal::AuthFailed
@@ -15057,7 +15340,7 @@ fn recover_interrupted_staging_renewals_for(
         roster_path,
         renew_guard,
         now,
-        (&accounts::LOCK_LADDER, &authority),
+        (&accounts::LOCK_LADDER, &authority, None),
         || {},
     )
 }
@@ -15078,7 +15361,11 @@ fn recover_interrupted_staging_renewals_with(
         roster_path,
         renew_guard,
         now,
-        (ladder, &shared_renewal::CheckpointAuthority::Unavailable),
+        (
+            ladder,
+            &shared_renewal::CheckpointAuthority::Unavailable,
+            None,
+        ),
         on_locked,
     )
 }
@@ -15257,9 +15544,16 @@ fn recover_interrupted_staging_renewals_checked(
     roster_path: &Path,
     renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
     now: i64,
-    (ladder, authority): (&[Duration], &shared_renewal::CheckpointAuthority<'_>),
+    (ladder, authority, admitted): (
+        &[Duration],
+        &shared_renewal::CheckpointAuthority<'_>,
+        Option<&accounts::SigninTurn>,
+    ),
     mut on_locked: impl FnMut(),
 ) -> bool {
+    if admitted.is_some_and(|turn| turn.check_store(store).is_err()) {
+        return false;
+    }
     // Snapshot while observing idle, before scanning or waiting. A worker that
     // starts after this observation must retain its newer retry claims.
     let claims = {
@@ -15290,8 +15584,17 @@ fn recover_interrupted_staging_renewals_checked(
     // Recovery publishes a sign-in too. Keep the machine-wide guard until every
     // candidate transaction ends, including when the lock file did not exist.
     // The account writer is acquired below, in the same order as fresh sign-ins.
-    let Ok(Some(_signin)) = store.signin_now() else {
-        return any_recovered;
+    let _signin = match admitted {
+        Some(turn) => {
+            if turn.check_store(store).is_err() {
+                return any_recovered;
+            }
+            None
+        }
+        None => match store.signin_now() {
+            Ok(Some(held)) => Some(held),
+            _ => return any_recovered,
+        },
     };
     on_locked();
     // The unlocked scan is only a hint. Refresh proofs after admission so a
@@ -15328,6 +15631,9 @@ fn recover_interrupted_staging_renewals_checked(
         ..
     } in candidates
     {
+        if admitted.is_some_and(|turn| turn.check_store(store).is_err()) {
+            break;
+        }
         if recovered_labels.contains(&proof.label) {
             continue;
         }
@@ -15347,7 +15653,8 @@ fn recover_interrupted_staging_renewals_checked(
                 |current, state, logins| {
                     // A prior candidate's transaction or this writer wait may outlive
                     // the refreshed proof. Keep the selected path and proof together.
-                    if fs::canonicalize(&dir).ok().as_ref() != Some(&actual_dir)
+                    if admitted.is_some_and(|turn| turn.check_store(store).is_err())
+                        || fs::canonicalize(&dir).ok().as_ref() != Some(&actual_dir)
                         || !staged_login_present(cli, &actual_dir)
                         || accounts::read_renewal_checkpoint_for(cli, &dir, &actual_dir, now)
                             .as_ref()
@@ -15479,6 +15786,9 @@ fn recover_interrupted_staging_renewals_checked(
                         proof.subscription.as_deref(),
                         proof.checked_at,
                     );
+                    if let Some(request) = &proof.enrollment {
+                        logins.enrollment.publishing(request)?;
+                    }
                     if !events.is_empty()
                         && let Some(proved_by) = proof.proved_by
                     {
@@ -15624,6 +15934,7 @@ fn auto_renew_next_account(
             fx.spawn_renewal,
             Some(&ladder),
             fx.scope.as_ref(),
+            &mut None,
         )
         .progressed()
         {
@@ -15647,6 +15958,25 @@ pub(super) fn recover_staging_renewals_for(
         &AUTO_RENEW_GUARD,
         now,
         authority,
+    )
+}
+
+pub(super) fn recover_staging_renewals_held(
+    cli: Cli,
+    store: &accounts::Store,
+    roster_path: &Path,
+    now: i64,
+    authority: shared_renewal::CheckpointAuthority<'_>,
+    turn: &accounts::SigninTurn,
+) -> bool {
+    recover_interrupted_staging_renewals_checked(
+        cli,
+        store,
+        roster_path,
+        &AUTO_RENEW_GUARD,
+        now,
+        (&accounts::LOCK_LADDER, &authority, Some(turn)),
+        || {},
     )
 }
 
@@ -15764,6 +16094,7 @@ fn auto_renew_next_account_interactive_with(
             fx.spawn_renewal,
             None,
             fx.scope.as_ref(),
+            &mut None,
         )
         .progressed()
         {
@@ -15776,10 +16107,12 @@ fn auto_renew_next_account_interactive_with(
 /// Admission or completion of a saved account selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenewalDispatch {
-    /// A worker owns the renewal permit.
+    /// A counted worker owns the request; provider admission remains separate.
     Started,
-    /// The selected account was already eligible and the exact saved request was pinned.
+    /// The saved selection completed without a new provider invocation.
     Recovered,
+    /// This exact refused selection was durably retired; no authentication succeeded.
+    Retired,
     /// Another renewal or account writer owns admission; keep the request for a later upkeep.
     Held,
     /// Definite startup, authentication or policy failure; this attempt cannot proceed.
@@ -15789,6 +16122,8 @@ pub enum RenewalDispatch {
     Fenced,
     /// A newer selection or an explicit cancellation replaced this request.
     Superseded,
+    /// The platform has no admitted private manual FIFO implementation.
+    Unavailable,
 }
 
 impl RenewalDispatch {
@@ -15813,7 +16148,9 @@ impl RenewalDispatch {
         project = "aterm_agent::harness::accounts_sync::request_admission_tests::admission_transition"
     )
 )]
-fn renewal_signin_admission(store: &accounts::Store) -> Result<accounts::Lock, RenewalDispatch> {
+fn renewal_signin_admission(
+    store: &accounts::Store,
+) -> Result<accounts::SigninTurn, RenewalDispatch> {
     match store.signin_now() {
         Ok(Some(lock)) => Ok(lock),
         Ok(None) => Err(RenewalDispatch::Held),
@@ -15874,8 +16211,14 @@ fn queued_pin_admitted(
     store: &accounts::Store,
     policy: accounts::RenewalPolicy<'_>,
     request: Option<&accounts::PinRequest>,
+    selection: Option<&accounts::PendingSelection>,
     now: i64,
 ) -> bool {
+    if let Some(selection) = selection {
+        return store
+            .admit_manual_renewal_attempt(policy, selection, now)
+            .unwrap_or(false);
+    }
     request.is_none_or(|_| {
         store
             .admit_renewal_attempt(policy, request, now)
@@ -15935,21 +16278,9 @@ fn resume_pending_pin_for(
         Ok((state, _)) => state.pending_pin?,
         Err(why) => return Some(RenewalDispatch::store_refusal(&why)),
     };
-    let result = renew_requested_pin_for(
-        cli,
-        home,
-        state_dir,
-        roster_path,
-        request.clone(),
-        now,
-        fx.renew_guard,
-        fx.spawn_renewal,
-        fx.scope.as_ref(),
-    );
-    if result == RenewalDispatch::Failed {
-        if let Err(why) = store.cancel_pin_request(&request, now) {
-            return Some(RenewalDispatch::store_refusal(&why));
-        }
+    let result =
+        reattach_manual_selection(cli, home, state_dir, roster_path, request.clone(), now, fx);
+    if result == RenewalDispatch::Retired {
         // A definite refusal may have retired an obsolete shared-account
         // selection. Continue useful work in this pass only after observing
         // that no newer selection took its place. Read failures stay fenced.
@@ -16011,8 +16342,412 @@ pub fn auto_renew_account_by_label_for_scoped(
             fx.renew_guard,
             fx.spawn_renewal,
             fx.scope.as_ref(),
+            None,
         )
     })
+}
+
+/// Queue an explicit saved menu choice on its existing App-owned worker.
+/// Waiting starts no provider/preparation work and never holds the account writer.
+pub fn manual_renew_account_for_scoped(
+    scope: super::account_work::Scope,
+    cli: Cli,
+    home: &Path,
+    state_dir: &Path,
+    roster_path: &Path,
+    request: accounts::PinRequest,
+    now: i64,
+) -> RenewalDispatch {
+    with_live_scope(scope, |fx| {
+        manual_selection_with(cli, home, state_dir, roster_path, request.into(), now, fx)
+    })
+}
+
+/// Queue the exact saved next-account intent. Its row is chosen only after the turn.
+pub fn manual_renew_next_for_scoped(
+    scope: super::account_work::Scope,
+    cli: Cli,
+    home: &Path,
+    state_dir: &Path,
+    roster_path: &Path,
+    request: accounts::NextRequest,
+    now: i64,
+) -> RenewalDispatch {
+    with_live_scope(scope, |fx| {
+        manual_selection_with(
+            cli,
+            home,
+            state_dir,
+            roster_path,
+            accounts::PendingSelection::Next(request),
+            now,
+            fx,
+        )
+    })
+}
+
+fn manual_owner_for(
+    cli: Cli,
+    store: &accounts::Store,
+    roster_path: &Path,
+    selection: accounts::PendingSelection,
+    now: i64,
+    fx: &UpkeepEffects<'_>,
+) -> Result<ManualSelectionOwner, RenewalDispatch> {
+    if fx
+        .scope
+        .as_ref()
+        .is_none_or(super::account_work::Scope::cancelled)
+    {
+        return Err(RenewalDispatch::Held);
+    }
+    let row = match selection.account() {
+        Some(request) => {
+            let records = store
+                .read_account_records(Some(roster_path), now)
+                .map_err(|_| RenewalDispatch::Fenced)?;
+            records.roster.row(request.label()).cloned()
+        }
+        None => None,
+    };
+    ManualSelectionOwner::claim(fx.renew_guard, store, cli, selection, row.as_ref(), now)
+}
+
+fn manual_selection_with(
+    cli: Cli,
+    home: &Path,
+    state_dir: &Path,
+    roster_path: &Path,
+    selection: accounts::PendingSelection,
+    now: i64,
+    fx: &UpkeepEffects<'_>,
+) -> RenewalDispatch {
+    let store = accounts::Store::at_for(state_dir, cli, home);
+    let owner = match manual_owner_for(cli, &store, roster_path, selection, now, fx) {
+        Ok(owner) => owner,
+        Err(disposition) => return disposition,
+    };
+    manual_selection_owned(cli, home, state_dir, roster_path, owner, now, fx)
+}
+
+fn manual_selection_owned(
+    cli: Cli,
+    home: &Path,
+    state_dir: &Path,
+    roster_path: &Path,
+    owner: ManualSelectionOwner,
+    now: i64,
+    fx: &UpkeepEffects<'_>,
+) -> RenewalDispatch {
+    let store = accounts::Store::at_for(state_dir, cli, home);
+    let refusal = std::cell::Cell::new(RenewalDispatch::Held);
+    let current = || {
+        if fx
+            .scope
+            .as_ref()
+            .is_none_or(super::account_work::Scope::cancelled)
+        {
+            return false;
+        }
+        if !owner.owns() {
+            refusal.set(RenewalDispatch::Superseded);
+            return false;
+        }
+        match store.load(now) {
+            Ok((state, _)) if state.pending_pin.as_ref() == Some(owner.selection()) => true,
+            Ok(_) => {
+                refusal.set(RenewalDispatch::Superseded);
+                false
+            }
+            Err(_) => {
+                refusal.set(RenewalDispatch::Fenced);
+                false
+            }
+        }
+    };
+    let acquired = store.manual_signin_while(&current, |position| owner.position(Some(position)));
+    let turn = match acquired {
+        Ok(Some((turn, _))) => turn,
+        Ok(None) => return refusal.get(),
+        Err(error) => return manual_queue_refused(&store, owner.selection(), error, now),
+    };
+    owner.position(None);
+    // A prior worker may be retiring its permit after releasing the signer. Keep
+    // the actual turn while it finishes; no account mutex is held during this wait.
+    while fx
+        .renew_guard
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .in_flight
+    {
+        if !current() {
+            return refusal.get();
+        }
+        std::thread::sleep(accounts::LOCK_LADDER[0]);
+    }
+    if !current() {
+        return refusal.get();
+    }
+    let now = crate::supervise::limit::unix_now().max(now);
+    let selection = owner.selection().clone();
+    match selection {
+        accounts::PendingSelection::Account(request) => renew_requested_pin_for(
+            cli,
+            home,
+            state_dir,
+            roster_path,
+            request,
+            now,
+            fx.renew_guard,
+            fx.spawn_renewal,
+            fx.scope.as_ref(),
+            Some((turn, owner)),
+        ),
+        accounts::PendingSelection::Next(request) => manual_next_after_turn(
+            cli,
+            (home, state_dir, roster_path),
+            request,
+            now,
+            turn,
+            owner,
+            fx,
+        ),
+    }
+}
+
+fn manual_queue_refused(
+    store: &accounts::Store,
+    selection: &accounts::PendingSelection,
+    error: io::Error,
+    now: i64,
+) -> RenewalDispatch {
+    if error.kind() != io::ErrorKind::Unsupported {
+        return RenewalDispatch::Fenced;
+    }
+    // This platform cannot execute the intent and no provider was admitted.
+    // Retire only that exact Next, so it cannot block background selection forever.
+    // Account's durable preferred pin is independent of this unavailable queue.
+    if let accounts::PendingSelection::Next(request) = selection
+        && store.cancel_next_request(request, now).is_err()
+    {
+        return RenewalDispatch::Fenced;
+    }
+    RenewalDispatch::Unavailable
+}
+
+fn manual_next_after_turn(
+    cli: Cli,
+    (home, state_dir, roster_path): (&Path, &Path, &Path),
+    request: accounts::NextRequest,
+    now: i64,
+    turn: accounts::SigninTurn,
+    owner: ManualSelectionOwner,
+    fx: &UpkeepEffects<'_>,
+) -> RenewalDispatch {
+    let store = accounts::Store::at_for(state_dir, cli, home);
+    let config = config_beside(roster_path);
+    if turn.check_store(&store).is_err() {
+        return RenewalDispatch::Fenced;
+    }
+    if accounts_sync_off(Some(&config)) || !sign_ins_on(&config, cli) {
+        return RenewalDispatch::Held;
+    }
+    if store.check_signin_state(now).is_err() {
+        return RenewalDispatch::Fenced;
+    }
+    recover_interrupted_staging_renewals_checked(
+        cli,
+        &store,
+        roster_path,
+        fx.renew_guard,
+        now,
+        (
+            &accounts::LOCK_LADDER,
+            &shared_renewal::CheckpointAuthority::live(Some(home), roster_path),
+            Some(&turn),
+        ),
+        || {},
+    );
+    if turn.check_store(&store).is_err() {
+        return RenewalDispatch::Fenced;
+    }
+    if fx
+        .scope
+        .as_ref()
+        .is_none_or(super::account_work::Scope::cancelled)
+    {
+        return RenewalDispatch::Held;
+    }
+    let candidates = match read_renewal_candidates(cli, &store, (home, state_dir), roster_path, now)
+    {
+        Ok(candidates) => candidates,
+        Err(_) => return RenewalDispatch::Fenced,
+    };
+    if candidates
+        .records
+        .state
+        .pending_pin
+        .as_ref()
+        .and_then(accounts::PendingSelection::next)
+        != Some(&request)
+    {
+        return RenewalDispatch::Superseded;
+    }
+    let mut admission = Some((turn, owner));
+    let mut held = false;
+    for (_, row) in candidates.tiered {
+        if fx
+            .scope
+            .as_ref()
+            .is_none_or(super::account_work::Scope::cancelled)
+        {
+            return RenewalDispatch::Held;
+        }
+        let Some(sign_in) =
+            upkeep_sign_in(cli, (&candidates.records, &candidates.others), &row, now)
+        else {
+            continue;
+        };
+        let result = spawn_row_renewal(
+            cli,
+            home,
+            state_dir,
+            roster_path,
+            candidates.records.raw_roster.clone(),
+            &candidates.records.logins,
+            (row, sign_in),
+            (None, true),
+            now,
+            fx.renew_guard,
+            fx.spawn_renewal,
+            None,
+            fx.scope.as_ref(),
+            &mut admission,
+        );
+        // Once an actual attempt owns admission it alone completes/retains the
+        // intent. A preflight-only refusal leaves the SAME ticket for the next row.
+        if admission.is_none() || result.progressed() {
+            return if result == RenewalDispatch::Failed {
+                RenewalDispatch::Held
+            } else {
+                result
+            };
+        }
+        if result == RenewalDispatch::Fenced {
+            return result;
+        }
+        held |= result == RenewalDispatch::Held;
+    }
+    if held {
+        return RenewalDispatch::Held;
+    }
+    let Some((turn, _)) = admission.as_ref() else {
+        return RenewalDispatch::Held;
+    };
+    let Some(scope) = fx.scope.as_ref() else {
+        return RenewalDispatch::Held;
+    };
+    retire_manual_selection(
+        &store,
+        &accounts::PendingSelection::Next(request),
+        turn,
+        scope,
+        now,
+        #[cfg(test)]
+        None,
+    )
+}
+
+fn reattach_manual_selection(
+    cli: Cli,
+    home: &Path,
+    state_dir: &Path,
+    roster_path: &Path,
+    selection: accounts::PendingSelection,
+    now: i64,
+    fx: &UpkeepEffects<'_>,
+) -> RenewalDispatch {
+    let Some(scope) = fx.scope.clone().filter(|scope| !scope.cancelled()) else {
+        return RenewalDispatch::Held;
+    };
+    let store = accounts::Store::at_for(state_dir, cli, home);
+    let owner = match manual_owner_for(cli, &store, roster_path, selection, now, fx) {
+        Ok(owner) => owner,
+        Err(disposition) => return disposition,
+    };
+    let (home, state_dir, roster_path) = (
+        home.to_path_buf(),
+        state_dir.to_path_buf(),
+        roster_path.to_path_buf(),
+    );
+    let guard = fx.renew_guard.clone();
+    let work_scope = scope.clone();
+    let settlement_scope = scope.clone();
+    let work = scope.wrap(move || {
+        let mut inner = live_effects();
+        inner.renew_guard = &guard;
+        let result = with_scope_effects(work_scope, inner, |fx| {
+            manual_selection_owned(cli, &home, &state_dir, &roster_path, owner, now, fx)
+        });
+        // A non-started result has retired the original owner and signer. A
+        // started provider retains them in its permit and publishes its own wake.
+        if !settlement_scope.cancelled()
+            && matches!(
+                result,
+                RenewalDispatch::Retired | RenewalDispatch::Recovered
+            )
+        {
+            let _ = store.touch_wake();
+            if cli != Cli::Claude {
+                let _ = accounts::Store::at(&state_dir).touch_wake();
+            }
+        }
+    });
+    match (fx.spawn_renewal)(Box::new(work)) {
+        Ok(()) => RenewalDispatch::Started,
+        Err(_) => RenewalDispatch::Held,
+    }
+}
+
+fn retire_manual_selection(
+    store: &accounts::Store,
+    selection: &accounts::PendingSelection,
+    turn: &accounts::SigninTurn,
+    scope: &super::account_work::Scope,
+    now: i64,
+    #[cfg(test)] observe_writer: Option<&dyn Fn(bool)>,
+) -> RenewalDispatch {
+    if scope.cancelled() {
+        return RenewalDispatch::Held;
+    }
+    if turn.check_store(store).is_err() {
+        return RenewalDispatch::Fenced;
+    }
+    #[cfg(test)]
+    if let Some(observe) = observe_writer {
+        observe(false);
+    }
+    let mut disposition = RenewalDispatch::Superseded;
+    let published = store.transact_within(&accounts::LOCK_LADDER, now, &mut None, |state| {
+        #[cfg(test)]
+        if let Some(observe) = observe_writer {
+            observe(true);
+        }
+        if scope.cancelled() {
+            disposition = RenewalDispatch::Held;
+        } else if turn.check_store(store).is_err() {
+            disposition = RenewalDispatch::Fenced;
+        } else if state.pending_pin.as_ref() == Some(selection) {
+            state.pending_pin = None;
+            disposition = RenewalDispatch::Retired;
+        }
+        Ok(Vec::new())
+    });
+    if published.is_ok() {
+        disposition
+    } else {
+        RenewalDispatch::Fenced
+    }
 }
 
 #[cfg(test)]
@@ -16034,6 +16769,7 @@ fn renew_requested_pin(
         now,
         renew_guard,
         spawn_renewal,
+        None,
         None,
     )
 }
@@ -16060,27 +16796,52 @@ fn renew_requested_pin_for(
     renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
     spawn_renewal: &SpawnRenewal<'_>,
     scope: Option<&super::account_work::Scope>,
+    mut admission: Option<(accounts::SigninTurn, ManualSelectionOwner)>,
 ) -> RenewalDispatch {
     if scope.is_some_and(super::account_work::Scope::cancelled) {
         return RenewalDispatch::Held;
     }
     let store = accounts::Store::at_for(state_dir, cli, home);
+    if admission
+        .as_ref()
+        .is_some_and(|(turn, _)| turn.check_store(&store).is_err())
+    {
+        return RenewalDispatch::Fenced;
+    }
     if let Err(why) = store.recover_sync_within(&accounts::LOCK_LADDER, roster_path) {
         return RenewalDispatch::store_refusal(&why);
     }
     match store.load(now) {
-        Ok((state, _)) if state.pending_pin.as_ref() == Some(&request) => {}
+        Ok((state, _))
+            if state
+                .pending_pin
+                .as_ref()
+                .and_then(accounts::PendingSelection::account)
+                == Some(&request) => {}
         Ok(_) => return RenewalDispatch::Superseded,
         Err(why) => return RenewalDispatch::store_refusal(&why),
     }
-    recover_interrupted_staging_renewals_for(
+    // A manual continuation already owns the machine signer. Recovery must
+    // retain that same turn through publication rather than contend with itself.
+    recover_interrupted_staging_renewals_checked(
         cli,
         &store,
         roster_path,
         renew_guard,
         now,
-        shared_renewal::CheckpointAuthority::live(Some(home), roster_path),
+        (
+            &accounts::LOCK_LADDER,
+            &shared_renewal::CheckpointAuthority::live(Some(home), roster_path),
+            admission.as_ref().map(|(turn, _)| turn),
+        ),
+        || {},
     );
+    if admission
+        .as_ref()
+        .is_some_and(|(turn, _)| turn.check_store(&store).is_err())
+    {
+        return RenewalDispatch::Fenced;
+    }
     let mut disposition = RenewalDispatch::Superseded;
     let mut target = None;
     if let Err(why) = store.transact_pool_logins_within(
@@ -16089,7 +16850,12 @@ fn renew_requested_pin_for(
         now,
         &mut None,
         |raw, st, logins| {
-            if st.pending_pin.as_ref() != Some(&request) {
+            if st
+                .pending_pin
+                .as_ref()
+                .and_then(accounts::PendingSelection::account)
+                != Some(&request)
+            {
                 return Ok(Vec::new());
             }
             let roster = accounts::bound(raw, logins);
@@ -16097,8 +16863,12 @@ fn renew_requested_pin_for(
             // `Store::complete_requested_pin_at` reads it; with none, the row is signed in.
             let enrolled = accounts::enrolled_in(cli, &roster, home);
             let Some(next_row) = roster.row(request.label()).cloned() else {
+                if scope.is_some_and(super::account_work::Scope::cancelled) {
+                    disposition = RenewalDispatch::Held;
+                    return Ok(Vec::new());
+                }
                 st.pending_pin = None;
-                disposition = RenewalDispatch::Failed;
+                disposition = RenewalDispatch::Retired;
                 return Ok(Vec::new());
             };
             let mut probe = st.clone();
@@ -16106,8 +16876,12 @@ fn renew_requested_pin_for(
                 if logins.shared.required(&next_row)?.is_some() {
                     // This exact request predates shared custody (or an older
                     // writer queued it). An ordinary worker cannot service it.
+                    if scope.is_some_and(super::account_work::Scope::cancelled) {
+                        disposition = RenewalDispatch::Held;
+                        return Ok(Vec::new());
+                    }
                     st.pending_pin = None;
-                    disposition = RenewalDispatch::Failed;
+                    disposition = RenewalDispatch::Retired;
                     return Ok(Vec::new());
                 }
                 let Some(sign_in) = selection_sign_in(cli, &request, st) else {
@@ -16129,7 +16903,8 @@ fn renew_requested_pin_for(
     let Some((file_roster, next_row, logins, sign_in)) = target else {
         return disposition;
     };
-    spawn_row_renewal(
+    let manual = admission.is_some();
+    let result = spawn_row_renewal(
         cli,
         home,
         state_dir,
@@ -16137,13 +16912,30 @@ fn renew_requested_pin_for(
         file_roster,
         &logins,
         (next_row, sign_in),
-        (Some(request), true),
+        (Some(request.clone()), true),
         now,
         renew_guard,
         spawn_renewal,
         None,
         scope,
-    )
+        &mut admission,
+    );
+    if manual && result == RenewalDispatch::Failed {
+        match (admission.as_ref(), scope) {
+            (Some((turn, _)), Some(scope)) => retire_manual_selection(
+                &store,
+                &request.into(),
+                turn,
+                scope,
+                now,
+                #[cfg(test)]
+                None,
+            ),
+            _ => RenewalDispatch::Held,
+        }
+    } else {
+        result
+    }
 }
 
 /// What the automatic ladder of [`spawn_row_renewal`] reaches with ([`UpkeepEffects`]' seams).
@@ -16891,13 +17683,14 @@ fn spawn_row_renewal(
     roster_path: &Path,
     file_roster: Roster,
     logins: &accounts::Logins,
-    (next_row, sign_in): (accounts::Row, SignIn),
+    (next_row, mut sign_in): (accounts::Row, SignIn),
     (pin_request, allow_default_browser): (Option<accounts::PinRequest>, bool),
     now: i64,
     renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
     spawn_renewal: &SpawnRenewal<'_>,
     ladder: Option<&LadderCtx<'_>>,
     scope: Option<&super::account_work::Scope>,
+    admission: &mut Option<(accounts::SigninTurn, ManualSelectionOwner)>,
 ) -> RenewalDispatch {
     if scope.is_some_and(super::account_work::Scope::cancelled) {
         return RenewalDispatch::Held;
@@ -16919,6 +17712,7 @@ fn spawn_row_renewal(
             renew_guard,
             spawn_renewal,
             scope,
+            admission,
         );
     }
     let store = accounts::Store::at(state_dir);
@@ -17090,9 +17884,13 @@ fn spawn_row_renewal(
     // sign-in (a vendor's renewal, `accounts browser`'s window, another process's) holds it this
     // renewal is Held, so a pin request stays pending for a later upkeep, with no cooldown
     // started and nothing woken, and the lock taken here is held by the work it starts.
-    let signin = match renewal_signin_admission(&store) {
-        Ok(signin) => signin,
-        Err(disposition) => return disposition,
+    let background_signin = if !sign_in.has_turn() && admission.is_none() {
+        match renewal_signin_admission(&store) {
+            Ok(signin) => Some(signin),
+            Err(disposition) => return disposition,
+        }
+    } else {
+        None
     };
     if let Err(disposition) = spacing_admits(&sign_in, &store, now) {
         return disposition;
@@ -17120,6 +17918,15 @@ fn spawn_row_renewal(
     if scope.is_some_and(super::account_work::Scope::cancelled) {
         return RenewalDispatch::Held;
     }
+    if let Some((turn, owner)) = admission.take() {
+        sign_in = match sign_in.admitted(turn, owner) {
+            Ok(sign_in) => sign_in,
+            Err(_) => return RenewalDispatch::Fenced,
+        };
+    }
+    let Some(signin) = sign_in.take_turn().or(background_signin) else {
+        return RenewalDispatch::Fenced;
+    };
     let signin = match sign_in.begin(cli, &next_label, signin, &store, now) {
         Ok(begun) => begun,
         Err(refused) => return spacing_refusal(&refused),
@@ -17164,6 +17971,7 @@ fn spawn_row_renewal(
                     logins: &captured_logins,
                 },
                 pin_request.as_ref(),
+                _signin.selection(),
                 now,
             ) {
                 return;
@@ -17387,7 +18195,7 @@ fn spawn_row_renewal(
                         );
                     }
                     shared_observation.replace(result.observation);
-                    if matches!(result.renewal, Renewal::Busy | Renewal::Deferred) {
+                    if matches!(result.renewal, Renewal::SigninHeld | Renewal::Deferred) {
                         deferred.set(true);
                     }
                     return result.renewal;
@@ -17435,7 +18243,7 @@ fn spawn_row_renewal(
                     deferred.set(true);
                     return Renewal::Deferred;
                 }
-                if matches!(result, Renewal::Busy | Renewal::Deferred) {
+                if matches!(result, Renewal::SigninHeld | Renewal::Deferred) {
                     deferred.set(true);
                     return result;
                 }
@@ -17537,6 +18345,13 @@ fn spawn_row_renewal(
             let renewed = matches!(&ran, Ok(Renewal::Renewed));
             let published = ran.is_ok();
             let now_done = crate::supervise::limit::unix_now().max(now);
+            let terminal = ran.as_ref().copied().unwrap_or(Renewal::Failed);
+            if super::cli::finish_manual_next_attempt(&store, &_signin, now_done, terminal)
+                == Renewal::Deferred
+                && terminal != Renewal::Deferred
+            {
+                return;
+            }
             if let Some((route, read, inputs, log)) = &unattended {
                 let failed = if met
                     .borrow()
@@ -17678,6 +18493,7 @@ fn spawn_vendor_renewal(
         renew_guard,
         spawn_renewal,
         None,
+        &mut None,
     )
 }
 
@@ -17706,12 +18522,13 @@ fn spawn_vendor_renewal_with(
     roster_path: &Path,
     file_roster: Roster,
     logins: &accounts::Logins,
-    (next_row, sign_in): (accounts::Row, SignIn),
+    (next_row, mut sign_in): (accounts::Row, SignIn),
     pin_request: Option<accounts::PinRequest>,
     now: i64,
     renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
     spawn_renewal: &SpawnRenewal<'_>,
     scope: Option<&super::account_work::Scope>,
+    admission: &mut Option<(accounts::SigninTurn, ManualSelectionOwner)>,
 ) -> RenewalDispatch {
     if scope.is_some_and(super::account_work::Scope::cancelled) {
         return RenewalDispatch::Held;
@@ -17807,15 +18624,17 @@ fn spawn_vendor_renewal_with(
         return RenewalDispatch::Held;
     }
     // The spacing clock is read under the lock, which the worker takes again to start.
-    match renewal_signin_admission(&store) {
-        Ok(probe) => {
-            let spaced = spacing_admits(&sign_in, &store, now);
-            drop(probe);
-            if let Err(disposition) = spaced {
-                return disposition;
+    if !sign_in.has_turn() && admission.is_none() {
+        match renewal_signin_admission(&store) {
+            Ok(probe) => {
+                let spaced = spacing_admits(&sign_in, &store, now);
+                drop(probe);
+                if let Err(disposition) = spaced {
+                    return disposition;
+                }
             }
+            Err(disposition) => return disposition,
         }
-        Err(disposition) => return disposition,
     }
     let key = format!("{}:{}", cli.id(), next_row.label);
     reconcile_browser_window_unpark(
@@ -17836,6 +18655,12 @@ fn spawn_vendor_renewal_with(
         return RenewalDispatch::Held;
     };
     let completion = permit.follow_scope(scope);
+    if let Some((turn, owner)) = admission.take() {
+        sign_in = match sign_in.admitted(turn, owner) {
+            Ok(sign_in) => sign_in,
+            Err(_) => return RenewalDispatch::Fenced,
+        };
+    }
     permit.wake_pending = Some(state_dir.to_path_buf());
     permit.attribute_row(&store, cli, &next_row, &raw_workflow, now, logins);
     let own_dir = file_roster.row(&next_row.label).and_then(|r| r.dir.clone());
@@ -17862,6 +18687,7 @@ fn spawn_vendor_renewal_with(
                     logins: &captured_logins,
                 },
                 pin_request.as_ref(),
+                sign_in.selection(),
                 now,
             ) {
                 return;
@@ -17870,10 +18696,7 @@ fn spawn_vendor_renewal_with(
             let renewal = {
                 let _activity =
                     LoginActivityGuard::begin_row(&parker, &store, cli, &next_row, None);
-                let host = scope.clone().map_or_else(
-                    super::cli::LiveAccounts::default,
-                    super::cli::LiveAccounts::with_work,
-                );
+                let host = super::cli::LiveAccounts::background(scope.clone());
                 super::cli::renew_one_for(
                     cli,
                     now,
@@ -17885,6 +18708,12 @@ fn spawn_vendor_renewal_with(
                     &mut io::sink(),
                 )
             };
+            if renewal == super::cli::Renewal::SigninHeld {
+                // This typed result is produced before Begin/provider work. The
+                // bounded background loser must not stamp a new retry cooldown.
+                completion.defer();
+                return;
+            }
             if renewal.published() {
                 completion.complete();
             }
@@ -17915,7 +18744,7 @@ fn spawn_vendor_renewal_with(
                             now_done,
                         );
                     }
-                    super::cli::Renewal::Busy | super::cli::Renewal::Deferred => {}
+                    super::cli::Renewal::SigninHeld | super::cli::Renewal::Deferred => {}
                     _ => {
                         let _ = store.cancel_pin_request(request, now_done);
                     }
@@ -20060,7 +20889,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         use std::sync::{Arc, Mutex};
 
         struct HeldWork {
-            _signin: accounts::Lock,
+            _signin: accounts::SigninTurn,
             store: accounts::Store,
             guard: Arc<Mutex<AutoRenewGuard>>,
             observed: Arc<Mutex<Option<(bool, bool)>>>,
@@ -22499,8 +23328,9 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             panic!("an explicit saved request must not fetch an automatic source")
         };
         let cooldown = Mutex::new(None);
-        let fx = UpkeepEffects {
-            scope: None,
+        let lifetime = crate::harness::account_work::Lifetime::default();
+        let mut fx = UpkeepEffects {
+            scope: lifetime.enter(),
             fetch: &fetch,
             spawn_renewal: &spawn,
             sync_cooldown: &cooldown,
@@ -22517,13 +23347,9 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             run_attempt: None,
             shared: shared_renewal::Effects::default(),
         };
-        let select = |label| match store
-            .select_account(&roster, &w.roster(), label, UPKEEP_NOW)
-            .unwrap()
-        {
-            accounts::PinSelection::Renew(request) => request,
-            accounts::PinSelection::Pinned => panic!("the fixture login is absent"),
-        };
+        // Historical saved intent remains readable even where new FIFO admission
+        // is unsupported; this test exercises continuation, not new admission.
+        let select = |label| store.request_pin(label, UPKEEP_NOW).unwrap();
         let first = select("m27");
         let mut held = AutoRenewPermit::claim(&guard, "other", Instant::now(), false).unwrap();
         held.wake_pending = Some(w.state.clone());
@@ -22542,7 +23368,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         assert!(queued.lock().unwrap().is_empty());
         assert_eq!(
             store.load(UPKEEP_NOW).unwrap().0.pending_pin,
-            Some(first.clone())
+            Some(first.clone().into())
         );
 
         let latest = select("m27-2");
@@ -22561,6 +23387,25 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         drop(held);
         assert!(!guard.lock().unwrap().in_flight);
         assert!(store.wake_path().is_file());
+        let admitted_scope = fx.scope.take();
+        assert_eq!(
+            resume_pending_pin(&w.home, &w.state, &w.roster(), UPKEEP_NOW, &fx),
+            Some(RenewalDispatch::Held),
+            "unscoped upkeep cannot detach a manual continuation"
+        );
+        let closed = crate::harness::account_work::Lifetime::default();
+        fx.scope = closed.enter();
+        let closed_pause = closed.pause().unwrap();
+        assert_eq!(
+            resume_pending_pin(&w.home, &w.state, &w.roster(), UPKEEP_NOW, &fx),
+            Some(RenewalDispatch::Held),
+            "closed upkeep cannot detach a manual continuation"
+        );
+        assert!(queued.lock().unwrap().is_empty());
+        fx.scope = admitted_scope;
+        closed_pause
+            .try_wait()
+            .expect("closed control retired its scope");
         assert_eq!(
             upkeep(
                 &w.home,
@@ -22577,17 +23422,20 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         assert_eq!(queued.lock().unwrap().len(), 1);
         {
             let admitted = guard.lock().unwrap();
-            assert!(admitted.in_flight);
-            assert!(admitted.last_attempt.contains_key("m27-2"));
+            assert!(
+                !admitted.in_flight,
+                "queued manual work has not begun authentication"
+            );
+            assert!(!admitted.last_attempt.contains_key("m27-2"));
             assert!(!admitted.last_attempt.contains_key("m27"));
         }
         store.cancel_pin_request(&first, UPKEEP_NOW).unwrap();
         assert_eq!(
             store.load(UPKEEP_NOW).unwrap().0.pending_pin,
-            Some(latest.clone())
+            Some(latest.clone().into())
         );
 
-        // Dropping injected work releases admission without executing authentication.
+        // Dropping injected work retires its counted owner without authentication.
         queued.lock().unwrap().clear();
         assert!(!guard.lock().unwrap().in_flight);
         assert_eq!(
@@ -22611,32 +23459,48 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                 &spawn,
                 None,
                 None,
+                &mut None,
             ),
-            RenewalDispatch::Held,
-            "ordinary interactive rotation still observes the per-label cooldown"
+            RenewalDispatch::Started,
+            "unstarted manual work does not fabricate a completed sign-in cooldown"
         );
-        assert!(queued.lock().unwrap().is_empty());
+        queued.lock().unwrap().clear();
         let refusal =
             |_work: Box<dyn FnOnce() + Send>| Err(io::Error::other("injected spawn refusal"));
         let refused_fx = UpkeepEffects {
-            scope: None,
             spawn_renewal: &refusal,
             ..fx
         };
         assert_eq!(
             resume_pending_pin(&w.home, &w.state, &w.roster(), UPKEEP_NOW, &refused_fx),
-            None,
-            "a failed startup leaves no pending choice to block the rest of upkeep"
+            Some(RenewalDispatch::Held),
+            "refused unstarted work retains its intent without late cancellation"
         );
-        assert!(store.load(UPKEEP_NOW).unwrap().0.pending_pin.is_none());
+        assert_eq!(
+            store.load(UPKEEP_NOW).unwrap().0.pending_pin,
+            Some(latest.into())
+        );
         assert!(!guard.lock().unwrap().in_flight);
 
         let final_request = select("m27");
         let login = Path::new(roster.rows[0].dir.as_deref().unwrap());
         fs::create_dir_all(login).unwrap();
         fs::write(login.join(".credentials.json"), "private fixture").unwrap();
+        // Exercise synchronous recovery under the original request directly;
+        // enqueueing a detached owner is not evidence that recovery completed.
+        let recover = |request: accounts::PinRequest| {
+            Some(renew_requested_pin(
+                &w.home,
+                &w.state,
+                &w.roster(),
+                request,
+                UPKEEP_NOW,
+                &guard,
+                &refusal,
+            ))
+        };
         assert_eq!(
-            resume_pending_pin(&w.home, &w.state, &w.roster(), UPKEEP_NOW, &refused_fx),
+            recover(final_request.clone()),
             Some(RenewalDispatch::Recovered)
         );
         let pinned = store.load(UPKEEP_NOW).unwrap().0;
@@ -22654,19 +23518,25 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         let retained = ledger.with_extension("retained");
         fs::rename(&ledger, &retained).unwrap();
         fs::create_dir(&ledger).unwrap();
-        assert_eq!(
-            resume_pending_pin(&w.home, &w.state, &w.roster(), UPKEEP_NOW, &refused_fx),
-            Some(RenewalDispatch::Fenced)
-        );
+        assert_eq!(recover(retry.clone()), Some(RenewalDispatch::Fenced));
         assert_eq!(store.load(UPKEEP_NOW).unwrap().0, before_fault);
-        assert_eq!(before_fault.pending_pin.as_ref(), Some(&retry));
+        assert_eq!(
+            before_fault
+                .pending_pin
+                .as_ref()
+                .and_then(accounts::PendingSelection::account),
+            Some(&retry)
+        );
         fs::rename(&ledger, ledger.with_extension("obstruction")).unwrap();
         fs::rename(&retained, &ledger).unwrap();
-        assert_eq!(
-            resume_pending_pin(&w.home, &w.state, &w.roster(), UPKEEP_NOW, &refused_fx),
-            Some(RenewalDispatch::Recovered)
-        );
+        assert_eq!(recover(retry.clone()), Some(RenewalDispatch::Recovered));
         assert!(store.load(UPKEEP_NOW).unwrap().0.pending_pin.is_none());
+        drop(refused_fx);
+        lifetime
+            .pause()
+            .unwrap()
+            .try_wait()
+            .expect("all queued work and fixture scopes retired");
     }
 
     /// A PERSON'S PIN OF A CLAUDE CODE ROW WAITS OUT ANOTHER CLI'S SIGN-IN: while a vendor's
@@ -22733,7 +23603,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         assert!(queued.lock().unwrap().is_empty(), "nothing queued");
         assert_eq!(
             store.load(UPKEEP_NOW).unwrap().0.pending_pin,
-            Some(request.clone()),
+            Some(request.clone().into()),
             "the person's pin stays pending"
         );
         {
@@ -22819,7 +23689,13 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                 .unwrap()
         };
         let before = store.load(UPKEEP_NOW).unwrap().0;
-        assert_eq!(before.pending_pin.as_ref(), Some(&request));
+        assert_eq!(
+            before
+                .pending_pin
+                .as_ref()
+                .and_then(accounts::PendingSelection::account),
+            Some(&request)
+        );
         assert!(complete(&request, UPKEEP_NOW).is_empty());
         assert_eq!(
             accounts::Store::at(&w.state).load(UPKEEP_NOW).unwrap().0,

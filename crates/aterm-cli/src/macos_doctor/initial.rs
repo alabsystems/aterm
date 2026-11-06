@@ -14,6 +14,8 @@ pub use check::{check_initial_setup, check_initial_setup_observed};
 pub use input_activation::{activate_input_attachments, input_activation_revision};
 mod background_observation;
 pub use background_observation::check_background_workstation;
+mod background_vault_authorization;
+pub use background_vault_authorization::BackgroundVaultAuthorization;
 mod observation;
 pub use observation::{InitialSetupObservation, InitialSetupObserved};
 mod authorization;
@@ -22,7 +24,7 @@ pub use authorization::InitialSetupAuthorization;
 pub use authorization::{InitialSetupAdmissionFault, InitialSetupAdmissionStopTest};
 mod access;
 mod observe;
-pub use observe::observe_initial_setup;
+pub use observe::{ObservationRead, observe_initial_setup};
 pub(super) use observe::{changed_at_login, note_at_login};
 mod scope;
 #[cfg(any(test, debug_assertions))]
@@ -177,7 +179,6 @@ impl Stage {
                 Subject::Access(Access::FullDiskAccess),
                 Subject::Access(Access::DeveloperTools),
                 Subject::Access(Access::Debugger),
-                Subject::Access(Access::LocalNetwork),
             ],
             Self::Secrets => &[Subject::Setting(Setting::Secrets)],
             Self::Repositories => &[Subject::Setting(Setting::Repositories)],
@@ -1413,62 +1414,6 @@ fn unanswered_join_rows(reports: Vec<aterm_machines::model::ItemReport>) -> Vec<
         })
         .collect()
 }
-
-/// What an authorized join heard of macOS's
-/// Local Network switch, kept for the Local Network row and later launches
-/// ([`access::lan_answered`]) as the probe would have kept it. A join made, waiting for an admin
-/// Mac, or failing after the vault answered (its subscriber not installed), and a server there
-/// holding no vault are a reach; macOS refusing the vault's `.local` name is the person's Don't
-/// Allow; a look nothing answered, or a join that failed before the vault answered, says nothing
-/// of the switch.
-/// The authorized join's rows, after `keep` receives what its attempt heard of Local Network
-/// ([`join_lan_answer`], [`unanswered_join_rows`]).
-fn unanswered_join(
-    reports: Vec<aterm_machines::model::ItemReport>,
-    keep: impl FnOnce(access::LanAnswer),
-) -> Vec<Row> {
-    if let Some(answer) = join_lan_answer(&reports) {
-        keep(answer);
-    }
-    unanswered_join_rows(reports)
-}
-
-fn join_lan_answer(reports: &[aterm_machines::model::ItemReport]) -> Option<access::LanAnswer> {
-    use access::LanAnswer::{Reached, Refused};
-    use aterm_converge::StoodAside;
-    use aterm_machines::model::Outcome;
-    reports
-        .iter()
-        .find_map(|report| match (report.outcome, &report.stood_aside) {
-            (Outcome::Blocked, Some(StoodAside::Waiting(why)))
-                if why.starts_with(aterm_machines::init_secrets::NATIVE_ADMISSION_PENDING) =>
-            {
-                None
-            }
-            (Outcome::Changed, None) | (Outcome::Blocked, Some(StoodAside::Waiting(_))) => {
-                Some(Reached)
-            }
-            (Outcome::Failed, None)
-                if report.why.as_deref().is_some_and(|why| {
-                    why.starts_with(aterm_machines::init_secrets::VAULT_ANSWERED_BUT)
-                }) =>
-            {
-                Some(Reached)
-            }
-            (Outcome::Blocked, Some(StoodAside::Offline(why))) => {
-                if why.starts_with(aterm_machines::init_secrets::NO_VAULT_NOW) {
-                    Some(Reached)
-                } else {
-                    aterm_secrets::client::refused_by_local_network(&aterm_secrets::Error::new(
-                        why.as_str(),
-                    ))
-                    .then_some(Refused)
-                }
-            }
-            _ => None,
-        })
-}
-
 /// The plan in force as offered and shown: the `saved` one (or every group, before any is saved)
 /// in the vault this Mac is `configured` for now. A vault configuration aterm cannot read (a
 /// root-owned `source.toml` from a `sudo aterm secrets …`, a newer format) reads as no vault
@@ -2151,8 +2096,8 @@ fn restart_with(
 /// Who restarts a run ([`stage_restart`]).
 #[derive(Clone, Copy, Debug, Default)]
 struct Restart {
-    /// A person's choice of groups or a Join ([`InitialSetupRestart::chosen`]), which is
-    /// never provisional; otherwise Set up now, or a resume of the plan in force.
+    /// Keep completed settings across a choice, Join or automatic widening; otherwise
+    /// Set up now, or a resume of the plan in force, applies its whole selection.
     chosen: bool,
     /// A Join: the vault typed in System State, whose steps run again.
     joins: bool,
@@ -2751,7 +2696,7 @@ fn carry_restored_run(
 ///   pending or unverified) has no run to carry them. This stages the
 ///   run a choice over the Restore stages ([`stage_restart`]), unadmitted, for the launch's offer
 ///   to admit as it admits any staged choice ([`InitialSetupAuthorization`]): Full Disk Access,
-///   Developer Tools, the debugger and Local Network then go on by themselves. The Mac
+///   Developer Tools and the debugger then go on by themselves. The Mac
 ///   preference groups stay where the Restore left them, at Leave as is, and every other stage
 ///   the plan selects is recorded finished, so that run runs Permissions alone: no sign-out, no
 ///   Spotlight, no Dock.
@@ -3418,207 +3363,24 @@ pub(super) fn revision_at(root: &Path) -> Result<u64, String> {
     plan_revision(Some(progress), saved_plan(root)?.as_ref())
 }
 
-/// The window recorded an access step (`aterm_types::macos_setup::access_record`): Local
-/// Network's says what the window heard of the switch, now, which outranks any older answer kept
-/// from a look ([`access::local_network_step`]). The step itself is never a question asked again.
-pub fn initial_setup_access_step(
-    access: aterm_types::macos_setup::Access,
-    outcome: aterm_types::macos_setup::AccessOutcome,
-) {
-    if access == aterm_types::macos_setup::Access::LocalNetwork {
-        access::local_network_step(outcome);
-    }
+/// Check again's look at the ALab vault (System State design §3.3): the Secrets vault row then
+/// reads what this look heard at the ALab vault's address ([`scope::look_again`]), not a look
+/// kept from long ago. The look is `aterm_secrets`' probe of the vault, made only while the root
+/// LAN broker answers ([`access::lan_unavailable`]), as the Secrets stage waits for it; with none
+/// it leaves the last look standing. It waits for the look on the caller's thread.
+pub fn look_for_the_vault_again() {
+    look_again_when(
+        ensure_person_scope().is_ok(),
+        access::lan_unavailable,
+        scope::look_again,
+    );
 }
 
-/// Check again's look at the LAN (System State design §3.3): the Local Network row then reads
-/// what macOS answers now, not an answer kept from long ago, and the Secrets vault row what this
-/// look heard at the ALab vault's address ([`scope::look_again`]). It looks only once macOS has
-/// asked aterm already ([`access::lan_asked_before`]), so it never puts the question on screen,
-/// and it waits for the look on the caller's thread.
-pub fn probe_local_network_again() {
-    if ensure_person_scope().is_ok() && access::lan_asked_before() {
-        scope::look_again();
-    }
-}
-
-/// The converge pass's look for the ALab vault on this network (`sync.peers`), System State's
-/// own ([`scope::probe_vault`]): a kept look of another vault on this network stands for it, and
-/// what it hears of the LAN is kept. Its caller looks only once macOS asked aterm before
-/// ([`local_network_heard`] not `Untold`), so it never puts the question on screen.
-#[must_use]
-pub fn look_for_the_alab_vault() -> aterm_machines::sync::peers::Heard {
-    use aterm_machines::sync::peers::Heard;
-    if let Err(why) = ensure_person_scope() {
-        return Heard::Unreached(why);
-    }
-    match scope::probe_vault() {
-        scope::VaultHere::Found => Heard::Found,
-        scope::VaultHere::Absent => Heard::Elsewhere,
-        scope::VaultHere::Unreached | scope::VaultHere::Unasked => {
-            if access::last_answer() == Some(access::LanAnswer::Refused) {
-                Heard::Refused
-            } else {
-                Heard::Unreached("nothing answered at its address".to_owned())
-            }
-        }
-    }
-}
-
-/// What aterm last heard of macOS's Local Network switch for it ([`local_network_heard`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LocalNetworkHeard {
-    /// Nothing says: no look heard the switch, and the window has not raised macOS's question.
-    Untold,
-    /// The window raised macOS's question, and no look since heard how it went: a look that
-    /// nothing answered (a network with no ALab vault) says nothing of it.
-    Asked,
-    /// A look reached the LAN.
-    On,
-    /// macOS refused a look the LAN: the person's Don't Allow, or the switch turned off since.
-    Off,
-}
-
-/// What the last look at the LAN, or the window's Local Network step, heard of the switch
-/// ([`access::last_answer`]). Reads aterm's own records only.
-#[must_use]
-pub fn local_network_heard() -> LocalNetworkHeard {
-    match access::last_answer() {
-        None => LocalNetworkHeard::Untold,
-        Some(access::LanAnswer::Asked) => LocalNetworkHeard::Asked,
-        Some(access::LanAnswer::Reached) => LocalNetworkHeard::On,
-        Some(access::LanAnswer::Refused) => LocalNetworkHeard::Off,
-    }
-}
-
-/// Whether the Local Network question macOS puts this process is aterm's own, the one aterm's
-/// records keep: the process macOS holds responsible for this one is this process (one launchd or
-/// the window started by itself) or runs this same executable (aterm's window, for a tab's
-/// program). A process another app is responsible for (a shell in Terminal) is asked that app's
-/// question, and one whose responsible process cannot be read is asked none aterm knows. Read by
-/// file, a window an update swapped aside while it runs counts as another program until it
-/// relaunches: what its tabs hear meanwhile is not kept, which a later look hears again.
-#[must_use]
-pub fn local_network_question_is_own() -> bool {
-    let Ok(me) = i32::try_from(std::process::id()) else {
-        return false;
-    };
-    let Some(responsible) = aterm_containment::consent::responsible_pid(me) else {
-        return false;
-    };
-    responsible == me
-        || matches!(
-            (
-                aterm_uds::sudo::exe_path(responsible),
-                aterm_uds::sudo::exe_path(me),
-            ),
-            (Some(theirs), Some(mine)) if same_executable(&theirs, &mine)
-        )
-}
-
-/// Whether `a` and `b` are one regular file (its device and inode), as two processes'
-/// executables are when both run one aterm, through whatever links named it.
-#[cfg(unix)]
-fn same_executable(a: &std::path::Path, b: &std::path::Path) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-    match (std::fs::metadata(a), std::fs::metadata(b)) {
-        (Ok(a), Ok(b)) => a.is_file() && a.dev() == b.dev() && a.ino() == b.ino(),
-        _ => false,
-    }
-}
-
-/// Off Unix no process's question is aterm's to read.
-#[cfg(not(unix))]
-fn same_executable(_: &std::path::Path, _: &std::path::Path) -> bool {
-    false
-}
-
-/// What keeps what this process's looks and vault syncs at a `.local` address hear of macOS's
-/// Local Network switch (`aterm_machines::init_secrets::on_lan_heard`): `aterm init`'s, the
-/// window's Secrets stage and `sync.peers`, kept as the window's own looks keep it, where the
-/// question macOS puts this process is aterm's own ([`local_network_question_is_own`]). A look
-/// from another app's process heard that app's switch, which says nothing of aterm's.
-pub const LAN_KEEPER: aterm_machines::init_secrets::LanKeeper =
-    aterm_machines::init_secrets::LanKeeper {
-        keeps: local_network_question_is_own,
-        keep: keep_lan_heard,
-    };
-
-/// [`LAN_KEEPER`]'s keep, once its `keeps` said this process's question is aterm's own.
-fn keep_lan_heard(heard: aterm_machines::init_secrets::LanHeard) {
-    use aterm_machines::init_secrets::LanHeard;
-    access::lan_answered(match heard {
-        LanHeard::Reached => access::LanAnswer::Reached,
-        LanHeard::Refused => access::LanAnswer::Refused,
-    });
-}
-
-/// Who may make this process's first use of the LAN, which is when macOS puts its Local Network
-/// question on screen, as the Commons runtime reads it before its own (design §6: System State's
-/// Local Network step is the one meant to raise that question, in its order).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LocalNetworkFirstUse {
-    /// macOS answered aterm's question before: a look reached the LAN or was refused, or the
-    /// window recorded the grant, in any revision.
-    Answered,
-    /// macOS asked aterm before and no answer was heard since: a kept `asked`, or the window's
-    /// step recorded `triggered`, in any revision (an older aterm's revision 0 included).
-    Asked,
-    /// System State's Local Network step is still to come, and raises the question.
-    StepToCome,
-    /// The step will not run, for this reason: the first LAN use asks by itself.
-    NoStep(&'static str),
-}
-
-/// [`LocalNetworkFirstUse`] now, from aterm's own records only: the last answer a LAN look or the
-/// window's step heard ([`local_network_heard`]'s), the access record's Local Network row in any
-/// revision, and the setup records' [`PermissionSteps`]. `step_off` says why System State's
-/// Local Network step will not run in a window here (a `[privacy]` switch off, `[swarm]` off);
-/// `None` while it may.
-#[must_use]
-pub fn local_network_first_use(step_off: Option<&'static str>) -> LocalNetworkFirstUse {
-    use aterm_types::macos_setup::{Access, access_record};
-    first_use(
-        access::last_answer(),
-        aterm_types::dirs::state_dir()
-            .and_then(|dir| access_record::latest_of_any_revision(&dir, Access::LocalNetwork)),
-        initial_setup_permission_steps(),
-        step_off,
-    )
-}
-
-/// [`LocalNetworkFirstUse::NoStep`]'s reason where a newer aterm saved this Mac's setup
-/// ([`NEWER_SETUP`]): this build reads no access revision from those records, so its window takes
-/// no Local Network step, and nothing waits for one.
-const NEWER_SETUP_NO_STEP: &str = "a newer aterm saved this Mac's setup, so this aterm's System State takes no Local Network step";
-
-/// [`local_network_first_use`] of what it read (pure). Evidence that macOS already asked aterm
-/// comes first, whatever the steps say; records a newer aterm saved ([`NEWER_SETUP`]) leave no
-/// step to come ([`NEWER_SETUP_NO_STEP`]), and any other records read that failed leaves the step
-/// to come.
-fn first_use(
-    last: Option<access::LanAnswer>,
-    recorded: Option<aterm_types::macos_setup::AccessOutcome>,
-    steps: Result<PermissionSteps, String>,
-    step_off: Option<&'static str>,
-) -> LocalNetworkFirstUse {
-    use access::LanAnswer;
-    use aterm_types::macos_setup::AccessOutcome;
-    if matches!(last, Some(LanAnswer::Reached | LanAnswer::Refused))
-        || recorded == Some(AccessOutcome::Granted)
-    {
-        LocalNetworkFirstUse::Answered
-    } else if last == Some(LanAnswer::Asked) || recorded == Some(AccessOutcome::Triggered) {
-        LocalNetworkFirstUse::Asked
-    } else if let Some(why) = step_off {
-        LocalNetworkFirstUse::NoStep(why)
-    } else if steps == Ok(PermissionSteps::Off) {
-        LocalNetworkFirstUse::NoStep(
-            "no person asked for System State's access steps, or a person's Cancel or Stop holds them",
-        )
-    } else if steps.as_ref().is_err_and(|error| setup_is_newer(error)) {
-        LocalNetworkFirstUse::NoStep(NEWER_SETUP_NO_STEP)
-    } else {
-        LocalNetworkFirstUse::StepToCome
+/// [`look_for_the_vault_again`] of what it reads: `look` runs only in a person's scope (`scoped`)
+/// and once `broker` says the root LAN broker answers (`None`).
+fn look_again_when(scoped: bool, broker: impl FnOnce() -> Option<String>, look: impl FnOnce()) {
+    if scoped && broker().is_none() {
+        look();
     }
 }
 
@@ -4642,8 +4404,8 @@ fn snapshot_with(
     ))
 }
 
-/// Whether System State's access steps (the window's Permissions lanes, its Local Network step
-/// first) run for the setup records in force (design §6).
+/// Whether System State's access steps (the window's Permissions lanes) run for the setup records
+/// in force (design §6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PermissionSteps {
     /// They run: a person pressed for them on this Mac ([`note_person_asked_for_access`]), with an
@@ -4905,18 +4667,6 @@ fn permission_steps(records: &Records, progress: Option<Progress>, plan: &Plan) 
     }
 }
 
-/// [`PermissionSteps`] of this Mac's setup records now, for a process that shows no System State
-/// (the Commons runtime asks it every 2 s while it waits for the Local Network step). It reads the
-/// records alone: no vault, no ledger.
-///
-/// # Errors
-///
-/// The state root cannot be resolved, or the records cannot be read ([`setup_is_newer`] says
-/// whether a newer aterm saved them).
-pub fn initial_setup_permission_steps() -> Result<PermissionSteps, String> {
-    permission_steps_at(&state_root()?)
-}
-
 fn permission_steps_at(root: &Path) -> Result<PermissionSteps, String> {
     let records = observation_at(root)
         .map_err(|error| error.to_string())?
@@ -5081,15 +4831,6 @@ trait InitialHost {
         password: &mut Option<SecretBytes>,
     ) -> Result<Vec<Row>, String>;
     fn secrets_pace(&mut self) -> Option<Pace>;
-    /// Whether the Secrets stage's join ([`Self::secrets`]: the look for the ALab vault on this
-    /// network, the join's look at its vault) waits for System State's Local Network step: those
-    /// use the LAN, which would put macOS's Local Network question on screen ahead of the step
-    /// while it is still to come (`aterm_types::macos_setup::lan_first_use::step_use`, design §6).
-    /// The run then parks, and its park ends the moment the LAN opens or the wait for the step
-    /// could have run out ([`InitialSetupParkMark`]'s door).
-    fn secrets_wait_for_local_network(&mut self) -> bool {
-        false
-    }
     fn configured_vault(&mut self) -> Result<Option<ConfiguredVault>, String>;
     fn current_vault(&mut self, plan: &Plan) -> Result<Vec<Row>, String>;
     /// Read current repository inputs, credential routing and required checkout readiness
@@ -5130,8 +4871,8 @@ trait InitialHost {
     fn now_secs(&mut self) -> u64 {
         ledger::now_secs()
     }
-    /// Concurrent Secrets lane that starts on Local Network `Granted` beside
-    /// [`Stage::Workstation`], when this host supports parallel execution.
+    /// Concurrent Secrets lane that starts beside [`Stage::Workstation`] once the root LAN broker
+    /// answers, when this host supports parallel execution.
     fn secrets_lane(&mut self) -> Option<Box<dyn SecretsLane>> {
         None
     }
@@ -5149,6 +4890,10 @@ trait SecretsLane: Send {
         password: &mut Option<SecretBytes>,
     ) -> Result<Vec<Row>, String>;
     fn secrets_pace(&mut self) -> Option<Pace>;
+    /// Why the root LAN broker the lane's join reaches the LAN through does not answer now, in
+    /// its own words ([`access::lan_unavailable`]); `None` once it answers. The lane waits for
+    /// it, never for a person.
+    fn lan_unavailable(&mut self) -> Option<String>;
     fn configured_vault(&mut self) -> Result<Option<ConfiguredVault>, String>;
     fn current_vault(&mut self, plan: &Plan) -> Result<Vec<Row>, String>;
     fn now_secs(&mut self) -> u64 {
@@ -5235,8 +4980,8 @@ pub(super) const WAITING: &str = "waiting";
 
 /// A row's status when the ALab vault did not answer ([`scope::NOT_REACHED`]): the
 /// pass parks, and the Secrets retry pause wakes it to ask again
-/// ([`secrets_retry::retry_due`]), since a Local Network grant, a network or the
-/// vault coming back moves it without a person.
+/// ([`secrets_retry::retry_due`]), since a network, the LAN broker or the vault
+/// coming back moves it without a person.
 pub(super) const UNREACHED: &str = "unreached";
 
 /// Git availability and the admitted executable behind its selected command.
@@ -5252,7 +4997,6 @@ impl RepositoryGit {
             .map_or(Self::Missing, Self::Installed)
     }
 }
-
 /// Local facts that can wake a parked setup run. This is an observation, never
 /// authorization to run its stages.
 #[derive(Clone, PartialEq, Eq)]
@@ -5263,8 +5007,7 @@ pub struct InitialSetupParkMark {
     materialization: Option<aterm_secrets::client::MaterializationMark>,
     subscriber_run: Option<u64>,
     subscriber: Option<bool>,
-    local_network: Option<access::LanAnswer>,
-    /// Only an unfinished Secrets join may wait on its first-use door or retry deadline.
+    /// The unfinished Secrets join whose broker readiness is observed.
     join_run: Option<u64>,
     /// The network this Mac's traffic leaves on ([`aterm_secrets::network::default_route`]), for
     /// selected Secrets or Repositories while setup remains pending: an address beside it
@@ -5281,9 +5024,8 @@ pub struct InitialSetupParkMark {
     mac_settings_retry_due: Option<u64>,
     /// The earliest Secrets or Mac settings retry not due yet ([`InitialSetupParkMark::next_due`]).
     retry_ahead: Option<u64>,
-    /// Current door readiness for an unfinished Secrets join. Becoming ready,
-    /// or another use asking, wakes the join without a countdown.
-    lan: Option<aterm_types::macos_setup::lan_first_use::Door>,
+    /// Broker readiness for an unfinished Secrets join, observed without prompts.
+    broker_unready: Option<bool>,
     /// An admitted, unfinished Accounts or Permissions stage
     /// ([`InitialSetupParkMark::waits_on_settings`]).
     in_settings: bool,
@@ -5318,8 +5060,7 @@ impl InitialSetupParkMark {
             || (self.subscriber_run.is_some()
                 && self.subscriber_run == before.subscriber_run
                 && (changed(&self.subscriber, &before.subscriber)
-                    || changed(&self.local_network, &before.local_network)
-                    || changed(&self.lan, &before.lan)))
+                    || changed(&self.broker_unready, &before.broker_unready)))
             // Activation can replace Git behind the same stable shim; losing it also changes
             // whether a completed repository stage can still be verified.
             || (self.git_run.is_some()
@@ -5331,12 +5072,9 @@ impl InitialSetupParkMark {
                     }))
     }
 
-    /// Read the first-use door only for an unfinished Secrets stage.
-    fn with_lan_door(
-        mut self,
-        door: impl FnOnce() -> aterm_types::macos_setup::lan_first_use::Door,
-    ) -> Self {
-        self.lan = self.join_run.map(|_| door());
+    /// Read broker readiness only for an unfinished Secrets stage.
+    fn with_lan_broker(mut self, unready: impl FnOnce() -> bool) -> Self {
+        self.broker_unready = self.join_run.map(|_| unready());
         self
     }
 
@@ -5405,14 +5143,10 @@ impl InitialSetupParkMark {
         self.retry_ahead
     }
 
-    /// Presence, key rest or another dialog holds the first LAN use. These
-    /// process-local conditions need a bounded look beside the file/network watches.
+    /// An absent broker can become ready without any watched file changing.
     #[must_use]
-    pub fn waits_on_lan_door(&self) -> bool {
-        matches!(
-            self.lan,
-            Some(aterm_types::macos_setup::lan_first_use::Door::Waiting)
-        )
+    pub fn waits_on_lan_broker(&self) -> bool {
+        self.broker_unready == Some(true)
     }
 
     /// The facts [`Self::facts_changed_since`] reads that can move while the run is parked: the
@@ -5442,7 +5176,7 @@ pub fn initial_setup_park_mark() -> InitialSetupParkMark {
         secrets_retry::Reads::now(&secrets_retry::Live),
         aterm_secrets::network::default_route,
     )
-    .with_lan_door(aterm_types::macos_setup::lan_first_use::door)
+    .with_lan_broker(|| access::lan_unavailable().is_some())
     .with_git(|| Some(RepositoryGit::read(&sys)))
     .with_repository_inputs(|| aterm_machines::init_github::repository_input_mark(&sys).ok())
 }
@@ -5550,9 +5284,6 @@ fn initial_setup_park_mark_reading(
         materialization: materialization_run.and_then(|_| materialization()),
         subscriber_run: selected_secrets.map(|(_, progress, _, _, _, _)| progress.revision),
         subscriber: selected_secrets.and_then(|_| subscriber()),
-        local_network: unfinished_secrets.and_then(|(root, progress, _, _, _, _)| {
-            access::answer_at(root, progress.access_revision())
-        }),
         join_run: unfinished_secrets.map(|(_, progress, _, _, _, _)| progress.revision),
         network: selected_network.and_then(|_| network()),
         git_run: pending
@@ -5596,7 +5327,7 @@ fn initial_setup_park_mark_reading(
             )
             .min(),
         in_settings: pending.is_some_and(|(_, _, _, _, _, in_settings)| in_settings),
-        lan: None,
+        broker_unready: None,
     }
 }
 
@@ -5841,7 +5572,7 @@ mod parked_secrets_route_tests {
                 || subscriber,
             )
             .with_git(|| installed.map(git))
-            .with_lan_door(|| panic!("a completed join has no first-use door to poll"))
+            .with_lan_broker(|| panic!("a completed join has no broker readiness to poll"))
         };
         let before = read(1, Some(true), Some(false));
         assert!(before.watches().secrets && before.watches().network && before.watches().git);
@@ -5852,7 +5583,7 @@ mod parked_secrets_route_tests {
         assert_eq!(before.git_run, Some(revision));
         assert_eq!(before.retry_due(), None);
         assert_eq!(before.next_due(), None);
-        assert!(!before.waits_on_lan_door());
+        assert!(!before.waits_on_lan_broker());
         assert!(!read(1, Some(true), Some(false)).facts_changed_since(&before));
         assert!(read(2, Some(true), Some(false)).facts_changed_since(&before));
         assert!(read(1, Some(false), Some(false)).facts_changed_since(&before));
@@ -5906,7 +5637,7 @@ mod parked_secrets_route_tests {
             || panic!("no selected subscriber"),
         )
         .with_git(|| panic!("Repositories is off"))
-        .with_lan_door(|| panic!("Secrets is off"));
+        .with_lan_broker(|| panic!("Secrets is off"));
         assert!(mark.watches().none());
         assert!(mark.waits_on_settings());
         assert_eq!(mark.next_due(), None);
@@ -6345,11 +6076,6 @@ struct LiveInitial<R> {
     /// Whether the last Repositories stage stopped for want of a GitHub token
     /// ([`InitialHost::repositories_want_token`]).
     token_wanted: bool,
-    /// The door pass that let the Secrets stage's join use the LAN past the wait for System
-    /// State's step, taking this process's dialog slot for the question the join raises
-    /// ([`InitialHost::secrets_wait_for_local_network`]): the join, and only it, takes that slot
-    /// over ([`run_live_secrets`]).
-    door_pass: Option<aterm_types::macos_setup::lan_first_use::DoorPass>,
 }
 
 impl LiveInitial<secrets_retry::Live> {
@@ -6358,7 +6084,6 @@ impl LiveInitial<secrets_retry::Live> {
             reads: secrets_retry::Live,
             repositories_failure: None,
             token_wanted: false,
-            door_pass: None,
         }
     }
 }
@@ -6471,7 +6196,7 @@ impl<R: secrets_retry::Reads> InitialHost for LiveInitial<R> {
         replaces: Replaces,
         password: &mut Option<SecretBytes>,
     ) -> Result<Vec<Row>, String> {
-        run_live_secrets(plan, replaces, password, self.door_pass.take())
+        run_live_secrets(plan, replaces, password)
     }
 
     fn secrets_lane(&mut self) -> Option<Box<dyn SecretsLane>> {
@@ -6482,19 +6207,6 @@ impl<R: secrets_retry::Reads> InitialHost for LiveInitial<R> {
 
     fn secrets_pace(&mut self) -> Option<Pace> {
         Some(secrets_retry::pace(&self.reads))
-    }
-
-    fn secrets_wait_for_local_network(&mut self) -> bool {
-        use aterm_types::macos_setup::lan_first_use::{LanUse, step_use};
-        // The join reads `[swarm] enabled` itself and its row names the switch, so only the
-        // step's rule holds it here.
-        match step_use() {
-            LanUse::Waits => true,
-            LanUse::Goes(pass) => {
-                self.door_pass = pass;
-                false
-            }
-        }
     }
 
     fn configured_vault(&mut self) -> Result<Option<ConfiguredVault>, String> {
@@ -6570,12 +6282,15 @@ impl SecretsLane for LiveSecretsLane {
         replaces: Replaces,
         password: &mut Option<SecretBytes>,
     ) -> Result<Vec<Row>, String> {
-        // The lane runs once macOS let aterm reach the LAN: no door pass is its.
-        run_live_secrets(plan, replaces, password, None)
+        run_live_secrets(plan, replaces, password)
     }
 
     fn secrets_pace(&mut self) -> Option<Pace> {
         Some(secrets_retry::pace(self.reads.as_ref()))
+    }
+
+    fn lan_unavailable(&mut self) -> Option<String> {
+        access::lan_unavailable()
     }
 
     fn configured_vault(&mut self) -> Result<Option<ConfiguredVault>, String> {
@@ -6587,13 +6302,13 @@ impl SecretsLane for LiveSecretsLane {
     }
 }
 
-/// The Secrets stage's join, live. `door` is the door pass that let it use the LAN past the
-/// wait for System State's step, if one did ([`LiveInitial::door_pass`]).
+/// The Secrets stage's join, live. It runs once the lane found the root LAN broker answering
+/// ([`access::wait_for_lan_broker`]); its LAN uses are `aterm_secrets`' and `aterm_machines`',
+/// and it holds no macOS dialog slot for them.
 fn run_live_secrets(
     plan: &Plan,
     replaces: Replaces,
     password: &mut Option<SecretBytes>,
-    door: Option<aterm_types::macos_setup::lan_first_use::DoorPass>,
 ) -> Result<Vec<Row>, String> {
     if let Some(rows) =
         automatic_secrets_rows(aterm_secrets::swarm::enabled_live().map_err(|why| why.to_string()))
@@ -6602,23 +6317,6 @@ fn run_live_secrets(
     }
     let sys = aterm_machines::port::Live::new();
     let ctx = aterm_machines::init::initial_setup_context(&sys)?;
-    // A slot the door took for the question this join's own LAN use raises past the wait for
-    // System State's step (its door pass, `lan_first_use::step_use`) is the join's: it holds it
-    // through the use rather than wait behind it, and it goes back to the question's hold when
-    // the join lets it go. A slot another use's pass took is that use's question's.
-    let _dialog = match join_dialog_slot(lan_asked(), || {
-        door.and_then(aterm_types::macos_setup::lan_first_use::take_door_slot)
-            .map(|held| JoinSlot::Door { _held: held })
-            .or_else(|| {
-                aterm_types::macos_setup::MacosDialog::when_none_up(
-                    aterm_types::macos_setup::DIALOG_WAIT,
-                )
-                .map(|held| JoinSlot::Own { _held: held })
-            })
-    }) {
-        Ok(dialog) => dialog,
-        Err(row) => return Ok(vec![row]),
-    };
     if let Some(rows) =
         automatic_secrets_rows(aterm_secrets::swarm::enabled_live().map_err(|why| why.to_string()))
     {
@@ -6650,91 +6348,10 @@ fn run_live_secrets(
         APPROVAL_WAIT,
         &current,
     )
-    .map(|reports| unanswered_join(reports, access::lan_answered))
+    .map(unanswered_join_rows)
 }
 
 const APPROVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
-
-/// The dialog slot the Secrets stage's join holds through its LAN use ([`join_dialog_slot`]),
-/// held while this lives.
-enum JoinSlot {
-    /// The slot the join's own door pass took for its question, taken over from the door's hold.
-    Door {
-        _held: aterm_types::macos_setup::lan_first_use::DoorSlot,
-    },
-    /// The slot the join took itself.
-    Own {
-        _held: aterm_types::macos_setup::MacosDialog,
-    },
-}
-
-/// The Secrets stage's row while its join waits for System State's Local Network step
-/// ([`InitialHost::secrets_wait_for_local_network`]). The step's record wakes the parked run.
-const SECRETS_WAIT_LOCAL_NETWORK: &str = "waits for System State's Local Network question: the \
-    join looks for the vault on this Mac's network, which would put macOS's question up before \
-    System State asks it";
-
-/// What the vault join reads of macOS's Local Network question for this app ([`join_needs_slot`]).
-#[derive(Clone, Copy, Debug)]
-struct LanAsked {
-    /// This process's last answer ([`access::heard_here`]).
-    heard: Option<access::LanAnswer>,
-    /// The later of it and the one an earlier launch kept ([`access::last_answer`]).
-    last: Option<access::LanAnswer>,
-    /// macOS put the question to this app on this Mac outside this process: the vault subscriber
-    /// asked, or a window of an earlier launch lived through it
-    /// ([`aterm_types::macos_setup::lan_first_use::asked_elsewhere`]).
-    elsewhere: bool,
-}
-
-/// [`LanAsked`], live.
-fn lan_asked() -> LanAsked {
-    LanAsked {
-        heard: access::heard_here(),
-        last: access::last_answer(),
-        elsewhere: aterm_types::macos_setup::lan_first_use::asked_elsewhere(),
-    }
-}
-
-/// The join's hold on this process's one macOS dialog slot (System State design §6), taken by
-/// `take` (`None` once its wait ends with another dialog still up) while [`join_needs_slot`] says
-/// the join's LAN use could still raise macOS's Local Network question (`asked` as it reads it):
-/// the join then holds the slot, waits behind another dialog this process put up, and stops at a
-/// row that says so. Once the question is settled, the join takes no slot (`take` is never
-/// called), so it neither waits behind the window's Full Disk Access or Developer Tools step nor
-/// holds those steps off while it waits for an admin Mac's approval.
-fn join_dialog_slot<G>(
-    asked: LanAsked,
-    take: impl FnOnce() -> Option<G>,
-) -> Result<Option<G>, Row> {
-    if !join_needs_slot(asked) {
-        return Ok(None);
-    }
-    take().map(Some).ok_or_else(|| {
-        readiness_row(
-            Stage::Secrets.name(),
-            false,
-            "another macOS dialog is still up; the join waits for it".into(),
-        )
-    })
-}
-
-/// Whether the vault join's LAN use could still raise macOS's Local Network question, so the
-/// join must hold the dialog slot (pure). The question is settled once macOS answered (`last` is
-/// `Reached` or `Refused`), once this process's own Local Network step raised it (`heard` is
-/// `Asked`: the window's step runs in the process the setup worker runs in), or once it was put
-/// to this app on this Mac outside this process (`elsewhere`: the vault subscriber's use, or a
-/// window of an earlier launch that lived through it, on which the Commons gate opens with no
-/// slot too). An `Asked` known only from an earlier launch's record, with no window that lived
-/// through it, is not settled: that launch may have quit, crashed or relaunched with macOS's
-/// alert unanswered, and the window's step runs once per revision, so nothing raises the
-/// question again in order; the join takes the slot then, as the Commons gate does.
-fn join_needs_slot(asked: LanAsked) -> bool {
-    use access::LanAnswer;
-    let answered = matches!(asked.last, Some(LanAnswer::Reached | LanAnswer::Refused));
-    let asked_here = asked.heard == Some(LanAnswer::Asked);
-    !(answered || asked_here || asked.elsewhere)
-}
 
 /// Automatic setup leaves explicit manual joins alone. A disabled or unreadable master
 /// switch reaches neither vault discovery nor the dialog/join path.
@@ -6889,7 +6506,7 @@ struct WakeLaneOnDrop<'a>(&'a std::sync::atomic::AtomicBool);
 impl Drop for WakeLaneOnDrop<'_> {
     fn drop(&mut self) {
         self.0.store(true, std::sync::atomic::Ordering::Release);
-        access::notify_local_network_waiters();
+        access::wake_lane_waiters();
     }
 }
 
@@ -6902,7 +6519,6 @@ fn run_secrets_lane(
     root: &Path,
     plan: &Plan,
     revision: u64,
-    access_revision: u64,
     admitted_vault: AdmittedVault,
     initial_done: u16,
     boot: Option<u128>,
@@ -6924,13 +6540,16 @@ fn run_secrets_lane(
     {
         return Ok(SecretsLaneFinish::NotRun);
     }
-    let lan = access::wait_for_local_network_grant(root, access_revision, || {
-        stop_lane.load(Ordering::Acquire)
-            || reached_secrets.load(Ordering::Acquire)
-            || (hooks.stop)(revision)
-            || stopped_at(root).ok().flatten().is_some()
-    });
-    if lan != Some(access::LanAnswer::Reached)
+    let broker = access::wait_for_lan_broker(
+        || lane.lan_unavailable(),
+        || {
+            stop_lane.load(Ordering::Acquire)
+                || reached_secrets.load(Ordering::Acquire)
+                || (hooks.stop)(revision)
+                || stopped_at(root).ok().flatten().is_some()
+        },
+    );
+    if !broker
         || stop_lane.load(Ordering::Acquire)
         || (hooks.stop)(revision)
         || stopped_at(root)?.is_some()
@@ -7046,7 +6665,7 @@ fn stop_secrets_lane(
     >,
 ) {
     stop_lane.store(true, std::sync::atomic::Ordering::Release);
-    access::notify_local_network_waiters();
+    access::wake_lane_waiters();
     if let Some(Ok(handle)) = lane {
         let _ = handle.join();
     }
@@ -7208,7 +6827,6 @@ fn execute_pass(
     let stop_lane = std::sync::atomic::AtomicBool::new(false);
     let initial_done = progress.done;
     let pass_revision = progress.revision;
-    let pass_access_revision = progress.access_revision();
     let pass_admitted_vault = progress.admitted_vault;
     // The typed join password, held for the Secrets lane while it runs beside the stages: what
     // the lane leaves unspent goes back to `password` however the scope ends (its Secrets stage,
@@ -7234,7 +6852,6 @@ fn execute_pass(
                         root,
                         lane_plan,
                         pass_revision,
-                        pass_access_revision,
                         pass_admitted_vault,
                         initial_done,
                         boot,
@@ -7252,7 +6869,7 @@ fn execute_pass(
             }
             if stage == Stage::Secrets {
                 reached_secrets.store(true, std::sync::atomic::Ordering::Release);
-                access::notify_local_network_waiters();
+                access::wake_lane_waiters();
                 if let Some(spawned) = lane_handle.take() {
                     let finished = spawned
                         .map_err(|why| format!("secrets setup lane did not start: {why}"))?
@@ -7421,9 +7038,6 @@ fn execute_pass(
             let fence = StageFence::open(hooks, &settings, &subjects);
             // The page's words for the stage's rows, where its report has them.
             let mut page = None;
-            // The Secrets stage's join waited for System State's Local Network step, so it tried
-            // nothing: no try is kept, and no retry pause holds the join once the step asked.
-            let mut waits_for_local_network = false;
             let result = match stage {
                 Stage::Workstation => match host.workstation(root, progress.only) {
                     Ok(Some(result)) => {
@@ -7463,15 +7077,6 @@ fn execute_pass(
                                 }),
                             }
                             Ok(rows)
-                        }
-                        Ok(SecretsTry::RunItem(_)) if host.secrets_wait_for_local_network() => {
-                            waits_for_local_network = true;
-                            Ok(vec![Row {
-                                name: stage.name().into(),
-                                status: WAITING.into(),
-                                detail: SECRETS_WAIT_LOCAL_NETWORK.into(),
-                                elapsed_ms: None,
-                            }])
                         }
                         Ok(SecretsTry::RunItem(replaces)) => {
                             host.secrets(&plan, replaces, password)
@@ -7556,7 +7161,6 @@ fn execute_pass(
             save_progress(root, progress)?;
             begun.ended()?;
             if let Some(before) = paced.as_ref()
-                && !waits_for_local_network
                 && let Some(mut after) = host.secrets_pace()
             {
                 after.retain_known_from(before);
@@ -7817,6 +7421,7 @@ mod tests {
     mod embedded_restore_tests;
     mod ledger_conformance;
     pub(super) mod run_ledger_tests;
+    mod upgrade_completion_tests;
 
     type StageReading = (bool, Vec<Setting>, Vec<Subject>);
 
@@ -7824,7 +7429,7 @@ mod tests {
     const AT_THE_PAGE: SetupHooks = SetupHooks::NONE;
 
     #[derive(Default)]
-    struct Fake {
+    pub(super) struct Fake {
         calls: Vec<Stage>,
         pending: Option<Stage>,
         /// A stage whose row waits on a person ([`WAITING`]).
@@ -7869,9 +7474,6 @@ mod tests {
         wedged_rows: Vec<Vec<Row>>,
         /// The Secrets stage's rows, in place of the injected outcome.
         secrets_rows: Option<Vec<Row>>,
-        /// System State's Local Network step is still to come, so the join waits for it
-        /// ([`InitialHost::secrets_wait_for_local_network`]).
-        lan_waits: bool,
         /// Whether each Repositories stage was handed the plan's vault.
         repositories_vault: Vec<bool>,
         /// aterm quits as each stage of the run under this root is about to begin: the quit's
@@ -8056,9 +7658,6 @@ mod tests {
         }
         fn secrets_pace(&mut self) -> Option<Pace> {
             self.pace.clone()
-        }
-        fn secrets_wait_for_local_network(&mut self) -> bool {
-            self.lan_waits
         }
         fn configured_vault(&mut self) -> Result<Option<ConfiguredVault>, String> {
             if self.configured_unreadable {
@@ -9631,185 +9230,18 @@ mod tests {
         }
     }
 
-    /// Who makes this process's first LAN use, so macOS's Local Network question comes from
-    /// System State's step in its order: evidence that macOS asked aterm before opens the LAN
-    /// whatever else holds; with none, the step is to come unless it will not run.
+    /// Check again looks at the LAN only in a person's scope and while the root LAN broker
+    /// answers, as the Secrets stage waits for it. NEGATIVE CONTROL: with both, it looks.
     #[test]
-    fn the_first_lan_use_waits_for_the_step_unless_macos_asked_or_no_step_runs() {
-        use access::LanAnswer;
-        use aterm_types::macos_setup::AccessOutcome;
-        const PRIVACY: &str = "a [privacy] switch is off";
-        let no_step = LocalNetworkFirstUse::NoStep(
-            "no person asked for System State's access steps, or a person's Cancel or Stop holds them",
-        );
-        let off = || Ok(PermissionSteps::Off);
-        let to_come = || Ok(PermissionSteps::NotYet);
-        let cases: [(_, _, Result<PermissionSteps, String>, _, _); 14] = [
-            (
-                Some(LanAnswer::Reached),
-                None,
-                to_come(),
-                None,
-                LocalNetworkFirstUse::Answered,
-            ),
-            (
-                Some(LanAnswer::Refused),
-                None,
-                to_come(),
-                None,
-                LocalNetworkFirstUse::Answered,
-            ),
-            (
-                None,
-                Some(AccessOutcome::Granted),
-                to_come(),
-                None,
-                LocalNetworkFirstUse::Answered,
-            ),
-            (
-                Some(LanAnswer::Asked),
-                None,
-                to_come(),
-                None,
-                LocalNetworkFirstUse::Asked,
-            ),
-            (
-                None,
-                Some(AccessOutcome::Triggered),
-                to_come(),
-                None,
-                LocalNetworkFirstUse::Asked,
-            ),
-            (
-                Some(LanAnswer::Asked),
-                Some(AccessOutcome::Granted),
-                to_come(),
-                None,
-                LocalNetworkFirstUse::Answered,
-            ),
-            (
-                None,
-                None,
-                to_come(),
-                Some(PRIVACY),
-                LocalNetworkFirstUse::NoStep(PRIVACY),
-            ),
-            (None, None, off(), None, no_step),
-            (
-                None,
-                None,
-                to_come(),
-                None,
-                LocalNetworkFirstUse::StepToCome,
-            ),
-            (
-                None,
-                None,
-                Ok(PermissionSteps::Allowed),
-                None,
-                LocalNetworkFirstUse::StepToCome,
-            ),
-            (
-                None,
-                None,
-                Err("the setup records could not be read".into()),
-                None,
-                LocalNetworkFirstUse::StepToCome,
-            ),
-            (
-                None,
-                Some(AccessOutcome::Handed),
-                to_come(),
-                None,
-                LocalNetworkFirstUse::StepToCome,
-            ),
-            (
-                Some(LanAnswer::Reached),
-                None,
-                off(),
-                Some(PRIVACY),
-                LocalNetworkFirstUse::Answered,
-            ),
-            (
-                None,
-                Some(AccessOutcome::Triggered),
-                off(),
-                None,
-                LocalNetworkFirstUse::Asked,
-            ),
-        ];
-        for (n, (last, recorded, steps, step_off, expected)) in cases.into_iter().enumerate() {
-            assert_eq!(
-                first_use(last, recorded, steps, step_off),
-                expected,
-                "case {n}"
-            );
-        }
-
-        // The access record read in any revision: an older revision's step is evidence.
-        let state = aterm_tempfile::tempdir().unwrap();
-        aterm_types::macos_setup::access_record::append(
-            state.path(),
-            3,
-            aterm_types::macos_setup::Access::LocalNetwork,
-            AccessOutcome::Triggered,
-        )
-        .unwrap();
-        let recorded = aterm_types::macos_setup::access_record::latest_of_any_revision(
-            state.path(),
-            aterm_types::macos_setup::Access::LocalNetwork,
-        );
-        assert_eq!(
-            first_use(None, recorded, off(), None),
-            LocalNetworkFirstUse::Asked,
-            "an older revision's step"
-        );
-    }
-
-    /// Two processes run one aterm when their executables are one file, whatever link or hard
-    /// link named it; another file holding the same bytes is another program (its switch is its
-    /// own), and a folder or a path with nothing there is no executable.
-    /// NEGATIVE CONTROL: a comparison of the paths' bytes calls the link another program; one of
-    /// the files' contents calls the copy this one.
-    #[cfg(unix)]
-    #[test]
-    fn one_aterm_is_one_file_whatever_names_it() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let exe = dir.path().join("aterm");
-        std::fs::write(&exe, b"one program").unwrap();
-        let linked = dir.path().join("linked");
-        std::os::unix::fs::symlink(&exe, &linked).unwrap();
-        let hard = dir.path().join("hard");
-        std::fs::hard_link(&exe, &hard).unwrap();
-        let copy = dir.path().join("copy");
-        std::fs::write(&copy, b"one program").unwrap();
-        assert!(same_executable(&exe, &exe));
-        assert!(same_executable(&linked, &exe), "a link names it");
-        assert!(same_executable(&exe, &hard), "a hard link names it");
-        assert!(!same_executable(&exe, &copy), "a copy is another program");
-        assert!(!same_executable(dir.path(), dir.path()), "a folder");
-        assert!(!same_executable(&dir.path().join("none"), &exe));
-    }
-
-    /// A newer aterm's setup records give this build no access revision, so its window never runs
-    /// the Local Network step: nothing waits for one, and the first LAN use asks by itself.
-    #[test]
-    fn a_newer_aterms_setup_leaves_no_step_to_wait_for() {
-        assert_eq!(
-            first_use(None, None, Err(NEWER_SETUP.into()), None),
-            LocalNetworkFirstUse::NoStep(NEWER_SETUP_NO_STEP),
-            "a newer aterm's setup runs no step here; nothing may wait for one"
-        );
-        assert_eq!(
-            first_use(
-                Some(access::LanAnswer::Asked),
-                None,
-                Err(NEWER_SETUP.into()),
-                None
-            ),
-            LocalNetworkFirstUse::Asked,
-            "evidence that macOS asked aterm still comes first"
-        );
+    fn check_again_looks_only_while_the_broker_answers() {
+        let looked = |scoped: bool, broker: Option<&str>| {
+            let mut looked = false;
+            super::look_again_when(scoped, || broker.map(str::to_owned), || looked = true);
+            looked
+        };
+        assert!(looked(true, None), "the control: scoped, broker answers");
+        assert!(!looked(true, Some("no root LAN broker answers")));
+        assert!(!looked(false, None));
     }
 
     /// The launch's startup as `prepare_setup` reads the records: nothing when setup is finished,
@@ -12568,7 +12000,6 @@ mod tests {
                     Access::FullDiskAccess,
                     Access::DeveloperTools,
                     Access::Debugger,
-                    Access::LocalNetwork,
                 ]
                 .map(Subject::Access)
                 .to_vec(),
@@ -14578,7 +14009,7 @@ mod tests {
                 if *self.answers.lock().unwrap() {
                     Look::Answers
                 } else {
-                    Look::Held(NO_ROUTE.into())
+                    Look::Unreached(NO_ROUTE.into())
                 }
             }
             fn keep(&self, into: &Path, replaces: &Replaces) -> aterm_secrets::Result<()> {
@@ -14601,7 +14032,9 @@ mod tests {
                 interactive: bool,
                 _wait: std::time::Duration,
                 requested: &dyn Fn() -> bool,
+                current_authority: &(dyn Fn() -> Result<(), String> + Sync),
             ) -> aterm_secrets::Result<JoinOutcome> {
+                current_authority().map_err(aterm_secrets::Error::new)?;
                 assert!(!interactive, "the setup's join is unattended");
                 self.log.lock().unwrap().push(format!("join {source}"));
                 if let Some(why) = self.refusal.lock().unwrap().clone() {
@@ -14661,7 +14094,11 @@ mod tests {
             fn synced(&self) -> aterm_secrets::Result<bool> {
                 Ok(true)
             }
-            fn sync(&self) -> aterm_secrets::Result<()> {
+            fn sync(
+                &self,
+                current: &(dyn Fn() -> Result<(), String> + Sync),
+            ) -> aterm_secrets::Result<()> {
+                current().map_err(aterm_secrets::Error::new)?;
                 self.log.lock().unwrap().push("sync".into());
                 Ok(())
             }
@@ -15602,11 +15039,7 @@ mod tests {
         );
         assert!(password.is_some(), "kept for a try that reaches the vault");
         assert_eq!(rows.len(), 21);
-        let offline = format!(
-            "the vault does not answer, so nothing was changed: {NO_ROUTE}; if macOS asked \
-             whether this app may find devices on your local network and it was not allowed, \
-             turn it on in System Settings > Privacy & Security > Local Network; "
-        );
+        let offline = format!("the vault does not answer, so nothing was changed: {NO_ROUTE}; ");
         assert!(
             rows.iter()
                 .all(|row| row.status == "blocked" && row.detail.starts_with(&offline)),
@@ -15751,7 +15184,6 @@ mod tests {
             reads: reads(true),
             repositories_failure: None,
             token_wanted: false,
-            door_pass: None,
         };
         let first = host.secrets_pace().expect("the live host paces every try");
         assert_eq!(first, secrets_retry::pace(&reads(true)));
@@ -16356,104 +15788,6 @@ mod tests {
         assert!(automatic_vault_bootstrap_allowed_at(root.path()).is_err());
     }
 
-    /// The vault join takes this process's macOS dialog slot until macOS's Local Network question
-    /// is settled (0.145's website run: a join that always took it waited on the window's Full
-    /// Disk Access and Developer Tools steps, credentials at +621 s). Settled is macOS's answer,
-    /// `Reached` or `Refused` as the last answer heard here or kept, this process's own step
-    /// having asked (`Asked` heard here), or the question put to this app on this Mac outside this
-    /// process (the vault subscriber's use, or a window of an earlier launch that lived through
-    /// it). An `Asked` kept only from an earlier launch, with no window that lived through it, is
-    /// not settled (that launch may have left macOS's alert unanswered, and no step raises it
-    /// again in order), nor is one heard here that a later `Asked` kept outranks. Taking the slot,
-    /// the join holds it when it is free and stops at the "still up" row when another dialog
-    /// holds it. E3 (2026-11-05): a relaunched guest whose first launch's window lived through
-    /// the question stood at that row behind the Full Disk Access panel, which nobody answered,
-    /// for eleven minutes, while its Commons runtime had opened at once. Negative controls:
-    /// reading any answer as settled (`last.is_some()`) fails the kept-`Asked` case; dropping
-    /// the asked-here half fails the case where this process asked; dropping `elsewhere` fails
-    /// the relaunch's case.
-    #[test]
-    fn the_vault_join_takes_the_dialog_slot_until_macos_local_network_question_is_settled() {
-        use access::LanAnswer::{Asked, Reached, Refused};
-        use std::cell::Cell;
-        let asked = |heard, last, elsewhere| LanAsked {
-            heard,
-            last,
-            elsewhere,
-        };
-        for (heard, last, why) in [
-            (None, None, "never asked"),
-            (None, Some(Asked), "asked in an earlier launch"),
-            (Some(Reached), Some(Asked), "ask kept after Reached"),
-            (Some(Refused), Some(Asked), "ask kept after Refused"),
-        ] {
-            assert!(
-                join_needs_slot(asked(heard, last, false)),
-                "{why}: takes the slot"
-            );
-            assert!(
-                !join_needs_slot(asked(heard, last, true)),
-                "{why}, asked outside this process: takes no slot"
-            );
-        }
-        for (heard, last, why) in [
-            (Some(Asked), Some(Asked), "asked here"),
-            (None, Some(Reached), "Reached, kept"),
-            (None, Some(Refused), "Refused, kept"),
-            (Some(Reached), Some(Reached), "Reached here"),
-            (Some(Refused), Some(Refused), "Refused here"),
-            (Some(Asked), Some(Reached), "Reached since asked here"),
-            (Some(Asked), Some(Refused), "Refused since asked here"),
-        ] {
-            assert!(
-                !join_needs_slot(asked(heard, last, false)),
-                "{why}: takes no slot"
-            );
-        }
-
-        let takes = Cell::new(0_u32);
-        // Another macOS dialog of this process holds the slot: `take` waits it out to `None`.
-        let held = || {
-            takes.set(takes.get() + 1);
-            None::<&str>
-        };
-        assert!(
-            matches!(
-                join_dialog_slot(asked(Some(Asked), Some(Asked), false), held),
-                Ok(None)
-            ),
-            "settled: the join goes on"
-        );
-        assert_eq!(takes.get(), 0, "settled: the join takes no slot");
-        // The relaunch: an `Asked` kept from the launch whose window lived through the question.
-        assert!(
-            matches!(
-                join_dialog_slot(asked(None, Some(Asked), true), held),
-                Ok(None)
-            ),
-            "asked outside this process: the join goes on beside the panel"
-        );
-        assert_eq!(takes.get(), 0, "asked outside this process: no slot taken");
-
-        let row = join_dialog_slot(asked(None, Some(Asked), false), held)
-            .expect_err("unsettled: the join waits");
-        assert_eq!(takes.get(), 1);
-        assert_eq!(
-            (row.name.as_str(), row.status.as_str(), row.detail.as_str()),
-            (
-                Stage::Secrets.name(),
-                "blocked",
-                "another macOS dialog is still up; the join waits for it",
-            )
-        );
-
-        // Unsettled, and the slot is free: the join holds it while its LAN use may ask.
-        assert!(matches!(
-            join_dialog_slot(asked(None, None, false), || Some("slot")),
-            Ok(Some("slot"))
-        ));
-    }
-
     /// An authorized join parks where the vault cannot yet answer:
     /// a row stood aside because the vault did not answer is unreached, and one whose look heard
     /// a server with no vault waits, each with the look's words, so the pass parks; any other row
@@ -16524,136 +15858,6 @@ mod tests {
             SetupNext::Park
         );
         assert_eq!(SetupNext::of(&secrets_rows(reports)[..1]), SetupNext::Retry);
-    }
-
-    /// An authorized join keeps what its attempt heard of macOS's Local Network switch:
-    /// a join made or waiting for an admin Mac, or a
-    /// server there with no vault, reads the switch on; macOS refusing the vault's `.local` name
-    /// reads it off; a look nothing answered leaves it untold, so a laptop away from the vault's
-    /// LAN never reads on. A join that failed after the vault answered it (its subscriber not
-    /// installed) reads on; one that failed before reaching it says nothing. What is heard is
-    /// handed to the keeper the live pass gives (`access::lan_answered`) through
-    /// [`unanswered_join`]. Negative controls: a join made whose answer is not kept leaves its row
-    /// untold; reading every stand-aside as a reach fails the unanswered case.
-    #[test]
-    fn a_join_an_unanswered_probe_let_through_keeps_what_its_look_heard_of_the_lan() {
-        use access::{Lan, LanAnswer};
-        use aterm_converge::StoodAside;
-        use aterm_machines::model::{Effect, ItemReport, Outcome};
-        let item = |outcome: Outcome, stood_aside: Option<StoodAside>| ItemReport {
-            id: "secrets.vault".into(),
-            family: "secrets".into(),
-            title: "vault".into(),
-            outcome,
-            from: None,
-            to: None,
-            why: stood_aside.as_ref().map(|aside| aside.why().to_owned()),
-            revert: None,
-            effect: Effect::Now,
-            detail: None,
-            layer: None,
-            class: None,
-            explain: None,
-            stood_aside,
-            essential: false,
-            elapsed_ms: None,
-        };
-        let failed = |why: &str| ItemReport {
-            why: Some(why.to_owned()),
-            ..item(Outcome::Failed, None)
-        };
-        let refused = format!(
-            "the vault does not answer, so nothing was changed: fetching \
-             http://alab-secrets.local:7484/v1/alab: {}",
-            aterm_secrets::client::LOCAL_NETWORK_REFUSED
-        );
-        let cases = [
-            (
-                item(Outcome::Changed, None),
-                Some(LanAnswer::Reached),
-                Lan::On,
-            ),
-            (
-                item(
-                    Outcome::Blocked,
-                    Some(StoodAside::Waiting("an admin Mac approves it".into())),
-                ),
-                Some(LanAnswer::Reached),
-                Lan::On,
-            ),
-            (
-                item(
-                    Outcome::Blocked,
-                    Some(StoodAside::Offline(format!(
-                        "{}: a login page",
-                        aterm_machines::init_secrets::NO_VAULT_NOW
-                    ))),
-                ),
-                Some(LanAnswer::Reached),
-                Lan::On,
-            ),
-            (
-                item(Outcome::Blocked, Some(StoodAside::Offline(refused))),
-                Some(LanAnswer::Refused),
-                Lan::Off,
-            ),
-            (
-                item(
-                    Outcome::Blocked,
-                    Some(StoodAside::Offline(
-                        "the vault does not answer, so nothing was changed: no route".into(),
-                    )),
-                ),
-                None,
-                Lan::Untold,
-            ),
-            (
-                item(
-                    Outcome::Blocked,
-                    Some(StoodAside::Offline(format!(
-                        "{}: http://alab-secrets.local:7484/v1/alab: no vault there",
-                        aterm_machines::init_secrets::NO_VAULT_NOW
-                    ))),
-                ),
-                Some(LanAnswer::Reached),
-                Lan::On,
-            ),
-            (
-                failed(&format!(
-                    "{} the subscriber could not be installed: launchctl bootstrap failed",
-                    aterm_machines::init_secrets::VAULT_ANSWERED_BUT
-                )),
-                Some(LanAnswer::Reached),
-                Lan::On,
-            ),
-            (
-                failed("joining the vault: could not write source.toml"),
-                None,
-                Lan::Untold,
-            ),
-            (
-                item(
-                    Outcome::Blocked,
-                    Some(StoodAside::Waiting(
-                        aterm_machines::init_secrets::NATIVE_ADMISSION_PENDING.into(),
-                    )),
-                ),
-                None,
-                Lan::Untold,
-            ),
-        ];
-        for (report, answer, lan) in cases {
-            let heard = join_lan_answer(std::slice::from_ref(&report));
-            assert_eq!(heard, answer, "{report:?}");
-            assert_eq!(Lan::of(heard, &[]), lan, "{report:?}");
-            let mut kept = None;
-            let rows = unanswered_join(vec![report.clone()], |answer| kept = Some(answer));
-            assert_eq!(kept, answer, "kept: {report:?}");
-            assert_eq!(
-                format!("{rows:?}"),
-                format!("{:?}", unanswered_join_rows(vec![report]))
-            );
-        }
     }
 
     /// A Mac where aterm saved no plan and the vault's `source.toml` cannot be read (a
@@ -16796,132 +16000,6 @@ mod tests {
         let page = report.page.expect("the pass's page");
         assert!(page.rows.is_empty(), "{:?}", page.rows);
         assert!(page.outcome.unfinished.is_empty());
-    }
-
-    /// The Secrets stage's join looks on this Mac's network, so while System State's Local
-    /// Network step is still to come it waits: a row that names the step's question, a park the
-    /// step's record wakes, no join and no try kept, since a kept try's retry pause would hold
-    /// the join past the step's ask. Once the step asked, or never will, the next pass joins.
-    #[test]
-    fn the_secrets_join_waits_for_the_local_network_step_and_keeps_no_try() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        authorize_at(root.path(), &selected(&[Setting::Secrets])).unwrap();
-        let mut host = Fake {
-            lan_waits: true,
-            pace: Some(Pace {
-                build: "1.0.0+gtest".into(),
-                marks: Some("unchanged".into()),
-                inputs: None,
-                materialization: None,
-                network: None,
-                now: vault::START,
-            }),
-            ..Fake::default()
-        };
-        let (report, next) = execute_pass(&mut host, root.path(), &mut None, SetupHooks::NONE)
-            .unwrap()
-            .unwrap();
-        assert!(
-            host.calls.is_empty(),
-            "no look and no join: {:?}",
-            host.calls
-        );
-        let [row] = report.rows.as_slice() else {
-            panic!("{:?}", report.rows)
-        };
-        assert_eq!(
-            (row.name.as_str(), row.status.as_str(), row.detail.as_str()),
-            (Stage::Secrets.name(), WAITING, SECRETS_WAIT_LOCAL_NETWORK)
-        );
-        assert_eq!(next, SetupNext::Park, "the step's record wakes the park");
-        assert!(
-            !root.path().join(secrets_retry::RECORD).exists(),
-            "no try kept, so no retry pause holds the join once the step asked"
-        );
-        assert!(!finished_at(root.path()).unwrap());
-
-        host.lan_waits = false;
-        let (report, next) = execute_pass(&mut host, root.path(), &mut None, SetupHooks::NONE)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            host.calls,
-            [Stage::Secrets],
-            "the step asked: the join runs"
-        );
-        assert!(
-            report.rows.iter().all(|row| row.status == "ok"),
-            "{:?}",
-            report.rows
-        );
-        assert_eq!(next, SetupNext::Done);
-    }
-
-    /// A Secrets join reacts to the first-use door's actual conditions, without
-    /// arming an artificial timer. A run with no unfinished Secrets stage reads no door.
-    #[test]
-    fn a_secrets_join_parked_on_the_step_wakes_once_the_lan_is_free() {
-        use aterm_types::macos_setup::lan_first_use::Door;
-        let root = aterm_tempfile::tempdir().unwrap();
-        authorize_at(root.path(), &selected(&[Setting::Secrets])).unwrap();
-        let mut host = Fake {
-            lan_waits: true,
-            pace: Some(Pace {
-                build: "1.0.0+gtest".into(),
-                marks: Some("unchanged".into()),
-                inputs: None,
-                materialization: None,
-                network: None,
-                now: vault::START,
-            }),
-            ..Fake::default()
-        };
-        let (_, next) = execute_pass(&mut host, root.path(), &mut None, SetupHooks::NONE)
-            .unwrap()
-            .unwrap();
-        assert_eq!(next, SetupNext::Park);
-        let route = || Some("en0 192.168.1.20 00:11:22:33:44:55".to_owned());
-        let at = |now: u64, door: Door| {
-            initial_setup_park_mark_with(Some(root.path()), None, now, route).with_lan_door(|| door)
-        };
-        let before = at(vault::START, Door::Waiting);
-        assert_eq!(before.next_due(), None, "no pre-door countdown");
-        assert!(
-            before.waits_on_lan_door(),
-            "the runner watches local readiness"
-        );
-        let later = at(vault::START + 41, Door::Waiting);
-        assert!(
-            later == before && !later.facts_changed_since(&before),
-            "elapsed time alone changes no door fact"
-        );
-        let ready = at(vault::START + 42, Door::Ready);
-        assert!(
-            ready != before && ready.facts_changed_since(&before),
-            "the person's quiet moment admits the join now"
-        );
-        assert_eq!(ready.next_due(), None);
-        assert!(!ready.waits_on_lan_door());
-        let open = at(vault::START + 3_600, Door::Open);
-        assert!(!open.waits_on_lan_door());
-        assert!(
-            open != ready && open.facts_changed_since(&ready),
-            "another use asked through the door: the join follows its answer"
-        );
-        assert!(
-            open.facts_changed_since(&before),
-            "or the step handed the LAN over"
-        );
-
-        let done = aterm_tempfile::tempdir().unwrap();
-        authorize_at(done.path(), &selected(&[Setting::Repositories])).unwrap();
-        let read = |door: Door| {
-            initial_setup_park_mark_with(Some(done.path()), None, vault::START, route)
-                .with_lan_door(|| door)
-        };
-        let waits = read(Door::Waiting);
-        assert_eq!(waits.next_due(), None, "no Secrets stage: no door timer");
-        assert!(read(Door::Open) == waits, "and no door fact");
     }
 
     #[test]
@@ -20723,9 +19801,11 @@ mod tests {
         }
     }
 
+    /// The concurrent Secrets lane waits for the root LAN broker, never for a person, and joins
+    /// the moment it answers while the Workstation pass is still running; a sequential host
+    /// joins after Workstation, and master-Off holds both paths before any vault read or join.
     #[test]
-    fn secrets_join_starts_on_local_network_granted_in_a_lane_beside_the_workstation_pass() {
-        use aterm_types::macos_setup::AccessOutcome;
+    fn secrets_join_starts_once_the_lan_broker_answers_in_a_lane_beside_the_workstation_pass() {
         use std::sync::{Arc, Condvar, Mutex};
         use std::time::{Duration, Instant};
 
@@ -20736,6 +19816,7 @@ mod tests {
             lane_checked: bool,
             post_off_checked: bool,
             swarm_off: bool,
+            broker: bool,
             joined: bool,
             repositories_saw_joined: bool,
         }
@@ -20762,6 +19843,10 @@ mod tests {
                     self.state.1.notify_all();
                 }
                 Ok(self.swarm && !state.swarm_off)
+            }
+            fn lan_unavailable(&mut self) -> Option<String> {
+                let broker = self.state.0.lock().unwrap().broker;
+                (!broker).then(|| "no root LAN broker answers".to_owned())
             }
             fn secrets(
                 &mut self,
@@ -20843,8 +19928,6 @@ mod tests {
                 root: &Path,
                 _only: Option<Selection>,
             ) -> Result<Option<Report>, String> {
-                let revision = access_revision_at(root)?;
-                access::record_step_isolated_at(root, revision, AccessOutcome::Triggered);
                 if self.abort_before_grant {
                     // The pass then reads no progress after the step, an error it ends on.
                     std::fs::remove_file(root.join("initial-setup.json")).unwrap();
@@ -20872,9 +19955,13 @@ mod tests {
                     }
                     state.swarm_off = true;
                 }
-                // A synthetic grant releases the lane while Workstation is still active.
-                self.state.0.lock().unwrap().events.push("grant");
-                access::record_step_isolated_at(root, revision, AccessOutcome::Granted);
+                // The broker coming up releases the lane while Workstation is still active.
+                {
+                    let mut state = self.state.0.lock().unwrap();
+                    state.events.push("grant");
+                    state.broker = true;
+                }
+                access::wake_lane_waiters();
                 if self.turn_off_on_grant {
                     let (lock, cvar) = &*self.state;
                     let mut state = lock.lock().unwrap();
@@ -21184,42 +20271,6 @@ mod tests {
         );
         assert_eq!((&events[0].1, &events[0].2), (&events[1].1, &events[1].2));
         assert!(events[0].1.contains(&Setting::Dock), "{events:?}");
-    }
-
-    #[test]
-    fn parked_secrets_wakes_when_local_network_transitions_from_asked_to_granted() {
-        use aterm_secrets::client::{Membership, Status};
-        use aterm_types::macos_setup::AccessOutcome;
-
-        let root = aterm_tempfile::tempdir().unwrap();
-        let plan = selected(&[Setting::Permissions, Setting::Secrets]);
-        let revision = authorize_at(root.path(), &plan).unwrap().unwrap();
-        let sample = || {
-            initial_setup_park_mark_with(
-                Some(root.path()),
-                Some(Status {
-                    config: None,
-                    machine: None,
-                    membership: Membership::Unconfigured,
-                    names: Vec::new(),
-                }),
-                1_000,
-                || None,
-            )
-        };
-        access::record_step_isolated_at(root.path(), revision, AccessOutcome::Triggered);
-        let asked = sample();
-        assert!(
-            !sample().facts_changed_since(&asked),
-            "Asked -> Asked stays parked"
-        );
-
-        access::record_step_isolated_at(root.path(), revision, AccessOutcome::Granted);
-        let granted = sample();
-        assert!(
-            granted.facts_changed_since(&asked),
-            "Asked -> Granted wakes a parked Secrets run"
-        );
     }
 
     /// The explicit plan a whole-profile `aterm init` and `aterm doctor --apply` save

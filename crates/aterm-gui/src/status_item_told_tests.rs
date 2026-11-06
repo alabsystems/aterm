@@ -766,3 +766,223 @@ fn told_once_cancels_a_pending_retry() {
     assert!(at(t0, 1) + step * 2 < at(t0, 1) + NOTIFY_RETRY);
     assert_eq!(body(&c), Some(format!("worker: {C} (+1 more)").as_str()));
 }
+
+/// A NEED TOLD BEFORE A RESTART IS TOLD ONCE ACROSS IT (§14.18, ATERM-KI-1105-5): the told ids
+/// ride a seamless update's status row (`told_ids=`) and a quit's restore leaf, and the next
+/// process keeps them as its memory. So a need told before the update and not standing then
+/// stays quiet when it comes back, a quit's gap (nothing standing yet) forgets nothing, and the
+/// first need noted after it is judged by them. CONTROLS: the owner's plain Enter in the new
+/// process before its first need, and a take-down after it, each forget them, as within one
+/// process. Mutants: an adoption that seeds no ids, or a gap note that forgets them, posts a
+/// told need again; one that keeps them past the owner's turn posts nothing for them.
+#[test]
+fn a_need_told_before_a_restart_is_told_once_across_it() {
+    let t0 = std::time::Instant::now();
+    let mut before = Herald::default();
+    assert!(
+        note(&mut before, Some(&asks(&[A])), true, at(t0, 0))
+            .notice
+            .is_some()
+    );
+    // A is told, then a set of B alone stands at the update: A is told but no longer standing.
+    assert!(
+        note(&mut before, Some(&asks(&[B])), true, at(t0, 1))
+            .notice
+            .is_some()
+    );
+    let row = before.carry_of(1).row().expect("a row");
+    assert!(row.contains("told_ids="), "{row}");
+    let carried = StatusCarry::parse(&row);
+    assert_eq!(carried.told_ids, before.told_ids(1));
+    let left = told_ids_row(&before.told_ids(1)).expect("a leaf's row");
+    assert_eq!(parse_told_ids(&left), before.told_ids(1));
+
+    // A seamless update: B stands, then A comes back.
+    let mut update = Herald::default();
+    update.adopt(1, carried.clone(), 1_000, at(t0, 2));
+    let standing = note(&mut update, Some(&asks(&[B])), true, at(t0, 2));
+    assert!(standing.notice.is_none(), "{standing:?}");
+    let back = note(&mut update, Some(&asks(&[A])), true, at(t0, 3));
+    assert!(back.notice.is_none(), "told before the update: {back:?}");
+    assert_eq!(update.last_quiet(), Some(HeraldQuiet::ToldOnce));
+    let c = note(&mut update, Some(&asks(&[A, C])), true, at(t0, 4));
+    assert_eq!(body(&c), Some(format!("worker: {C} (+1 more)").as_str()));
+    // CONTROL: the owner's plain Enter in the successor before its first need forgets what was
+    // carried, though the standing need the update told is still adopted as told.
+    let mut turned = Herald::default();
+    turned.adopt(
+        1,
+        StatusCarry {
+            need: Some((NeedWord::Ask, 100)),
+            told: true,
+            ..carried.clone()
+        },
+        1_000,
+        at(t0, 5),
+    );
+    let adopted = note(&mut turned, Some(&asks_at(&[B], 1)), true, at(t0, 5));
+    assert!(adopted.notice.is_none(), "the update told B: {adopted:?}");
+    let a = note(&mut turned, Some(&asks_at(&[A], 1)), true, at(t0, 6));
+    assert_eq!(
+        body(&a),
+        Some(format!("worker: {A}").as_str()),
+        "their turn forgot A"
+    );
+
+    // A quit and a cold restore: the leaf's ids alone, a gap with nothing standing, then A.
+    let cold = |turn: u64, gap: bool| {
+        let mut h = Herald::default();
+        h.adopt(
+            1,
+            StatusCarry {
+                told_ids: parse_told_ids(&left),
+                ..StatusCarry::default()
+            },
+            1_000,
+            at(t0, 2),
+        );
+        if gap {
+            let _ = note(&mut h, None, true, at(t0, 2));
+        }
+        let first = note(&mut h, Some(&asks_at(&[A, B], turn)), true, at(t0, 3));
+        (h, first)
+    };
+    let (mut h, first) = cold(0, true);
+    assert!(first.notice.is_none(), "told before the quit: {first:?}");
+    // Once a need was noted here, a take-down forgets as within one process.
+    let _ = note(&mut h, None, true, at(t0, 4));
+    let again = note(&mut h, Some(&asks(&[A])), true, at(t0, 5));
+    assert_eq!(body(&again), Some(format!("worker: {A}").as_str()));
+    // CONTROL: the owner's plain Enter in the new process before its first need.
+    let (_, turned) = cold(1, true);
+    assert!(turned.notice.is_some(), "their turn forgets: {turned:?}");
+    // CONTROL: no carry, no memory.
+    let mut fresh = Herald::default();
+    assert!(
+        note(&mut fresh, Some(&asks(&[A, B])), true, at(t0, 3))
+            .notice
+            .is_some()
+    );
+}
+
+/// TOLD ONCE ACROSS THE FLEET (design §14.18): a content survey row names its ask's needs as this
+/// Mac's herald reads them (`need_ids=`, [`need_ids_row`]) and a fleet peer's herald reads them
+/// back (`fleet_glance::escalation`), so there each need is told once too: the peer's set
+/// re-ordered or cut posts nothing, a need it adds posts, and a first need read from the entry
+/// alone is the one read whole beside the entry's cut later. CONTROL: a facts row, and an older
+/// peer's row with no `need_ids=`, keep one notice per appearance of the word, so the added need
+/// posts nothing there.
+#[test]
+fn a_fleet_peers_ask_is_told_once_by_the_need_ids_its_row_names() {
+    let t0 = std::time::Instant::now();
+    // `row`'s need on the wire, as the peer's survey writes it at `level` (`survey::session_row`)
+    // and this Mac's glance reads it; `ids` false is an older peer's row, which names none.
+    let fleet = |row: &SessionRow, level: &str, ids: bool| -> Escalation {
+        let need = row.need.as_ref().expect("an ask");
+        let attention = match level {
+            "content" => need.what.clone(),
+            _ => "1".to_string(),
+        };
+        let named = need_ids_row(need).filter(|_| ids && level == "content");
+        let need_ids = named.map_or(String::new(), |ids| format!(",\"need_ids\":\"{ids}\""));
+        let json = format!(
+            "[{{\"label\":\"mac-1\",\"fleet\":true,\"instance\":{{\"pid\":\"77\",\"host\":\
+             \"mac.local\",\"sessions\":\"1\",\"level\":\"{level}\",\"cut\":\"0\",\"node\":\
+             \"n1\"}},\"sessions\":[{{\"sid\":\"s-a\",\"state\":\"alive\",\"program\":\"claude\",\
+             \"program_kind\":\"agent\",\"agent\":\"idle\",\"needs\":\"ask\",\"needs_by\":\
+             \"harness\",\"attention\":\"{attention}\"{need_ids}}}]}}]"
+        );
+        let mac = crate::fleet_glance::parse(&json, None, 1_000)
+            .expect("a survey")
+            .macs
+            .remove(0);
+        crate::fleet_glance::escalation(&mac, &mac.needs[0])
+    };
+    let posts = |level: &str, ids: bool| -> Vec<bool> {
+        let mut h = Herald::default();
+        let cut = cut_entry(LONG, 0);
+        [
+            asks(&[A, B]),
+            asks(&[B, A]),
+            asks(&[A]),
+            asks(&[A, C]),
+            ask_row(&cut, None, 0),
+            ask_row(&cut, Some(&[LONG]), 0),
+        ]
+        .iter()
+        .enumerate()
+        .map(|(k, row)| {
+            let esc = fleet(row, level, ids);
+            let mut k = k as u32;
+            // The agent takes its set down before the cut need: a new episode.
+            if k >= 4 {
+                if k == 4 {
+                    let _ = h.note(esc.session, None, false, true, at(t0, k));
+                }
+                k += 1;
+            }
+            h.note(esc.session, Some(&esc), false, true, at(t0, k))
+                .notice
+                .is_some()
+        })
+        .collect()
+    };
+    assert_eq!(
+        posts("content", true),
+        [true, false, false, true, true, false],
+        "each need told once"
+    );
+    assert_eq!(
+        posts("facts", true),
+        [true, false, false, false, true, false],
+        "CONTROL: a facts row names no needs"
+    );
+    assert_eq!(
+        posts("content", false),
+        [true, false, false, false, true, false],
+        "CONTROL: an older peer's row names none"
+    );
+    // The wire keeps how each need was read: the entry alone, then whole beside its cut.
+    let cut = cut_entry(LONG, 0);
+    let reads = |row: &SessionRow| -> Vec<NeedRead> {
+        fleet(row, "content", true)
+            .needs
+            .iter()
+            .map(|n| n.read)
+            .collect()
+    };
+    let entry_words = format!("{}\u{2026}", LONG.chars().take(63).collect::<String>());
+    assert_eq!(reads(&ask_row(&cut, None, 0)), [NeedRead::Entry]);
+    assert_eq!(
+        reads(&ask_row(&cut, Some(&[LONG]), 0)),
+        [NeedRead::Cut(crate::needs::need_id(&entry_words))]
+    );
+}
+
+/// `need_ids=` reads back as it was written, each need's read with it, and a part that does not
+/// read is dropped; past [`NEED_IDS_MAX`] the rest are not read.
+#[test]
+fn a_need_ids_row_reads_back_and_drops_what_does_not_read() {
+    assert_eq!(
+        parse_need_ids("1f,00000000000000a1/b2,/c3,,0,zz,/0,d4/,1/zz,00000000000000001"),
+        [
+            (0x1f, NeedRead::Whole),
+            (0xa1, NeedRead::Cut(0xb2)),
+            (0xc3, NeedRead::Entry),
+        ]
+    );
+    let many: Vec<String> = (1..=40).map(|id| format!("{id:x}")).collect();
+    let read = parse_need_ids(&many.join(","));
+    assert_eq!(read.len(), NEED_IDS_MAX);
+    assert_eq!(read.last(), Some(&(NEED_IDS_MAX as u64, NeedRead::Whole)));
+    let row = asks(&[A, B]);
+    let written = need_ids_row(row.need.as_ref().expect("an ask")).expect("ids");
+    let want: Vec<(u64, NeedRead)> = escalation(&row)
+        .expect("an escalation")
+        .needs
+        .iter()
+        .map(|n| (n.id, n.read))
+        .collect();
+    assert_eq!(parse_need_ids(&written), want);
+    assert_eq!(need_ids_row(boxed().need.as_ref().expect("a box")), None);
+}

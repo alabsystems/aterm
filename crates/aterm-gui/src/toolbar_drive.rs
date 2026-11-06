@@ -412,7 +412,6 @@ mod macos {
             &m.tooltips,
             &m.ext,
             m.active,
-            None,
         );
     }
 

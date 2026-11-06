@@ -58,6 +58,7 @@ mod release_status;
 mod release_steps;
 mod release_timeline;
 
+mod managed_prerequisites;
 mod sign;
 mod source_signing;
 mod stage_local;

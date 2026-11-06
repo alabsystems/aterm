@@ -91,15 +91,19 @@ struct LockHost {
     next: i32,
     now: i64,
     check_error: bool,
-    /// The sign-in that holds the lock, which ends at this host's first answer on retrying.
-    running: RefCell<Option<accounts::Lock>>,
+    /// The actual signer that retires after the manual queue observation.
+    running: RefCell<Option<accounts::SigninTurn>>,
     /// What that sign-in leaves in the records as it ends.
     left: RefCell<Option<Box<dyn FnOnce()>>>,
     agent: bool,
     tty: bool,
     mailbox: Option<PathBuf>,
-    finish_on_contention: bool,
+    automatic: bool,
     contended: Cell<bool>,
+    positions: RefCell<Vec<accounts::SigninPosition>>,
+    work: Option<crate::harness::account_work::Scope>,
+    close_on_queue: Option<crate::harness::account_work::Lifetime>,
+    paused: RefCell<Option<crate::harness::account_work::Pause>>,
 }
 
 impl LockHost {
@@ -117,8 +121,12 @@ impl LockHost {
             agent: false,
             tty: true,
             mailbox: None,
-            finish_on_contention: false,
+            automatic: false,
             contended: Cell::new(false),
+            positions: RefCell::new(Vec::new()),
+            work: None,
+            close_on_queue: None,
+            paused: RefCell::new(None),
         }
     }
     fn held(&self) {
@@ -144,28 +152,33 @@ impl AccountsHost for LockHost {
         self.tty
     }
     fn automatic_sign_in(&self) -> bool {
-        // This existing host observation follows signin_lock's failed immediate take.
-        if self.finish_on_contention {
-            let held = self.running.borrow_mut().take();
-            if held.is_some() {
-                self.contended.set(true);
-                if let Some(left) = self.left.borrow_mut().take() {
-                    left();
-                }
-                drop(held);
-            }
-        }
-        false
+        self.automatic
+    }
+    fn work_scope(&self) -> Option<crate::harness::account_work::Scope> {
+        self.work.clone()
+    }
+    fn work_cancelled(&self) -> bool {
+        self.work
+            .as_ref()
+            .is_some_and(crate::harness::account_work::Scope::cancelled)
     }
     fn current_exe(&self) -> Option<PathBuf> {
         Some(std::env::current_exe().expect("the test executable"))
     }
-    fn retries_sign_in_lock(&self, _: u32) -> bool {
-        let ended = self.running.borrow_mut().take().is_some();
+    fn signin_queued(&self, position: accounts::SigninPosition) {
+        self.positions.borrow_mut().push(position);
+        let held = self.running.borrow_mut().take();
+        self.contended.set(self.contended.get() || held.is_some());
         if let Some(left) = self.left.borrow_mut().take() {
             left();
         }
-        ended
+        drop(held);
+        let unpaused = self.paused.borrow().is_none();
+        if let Some(lifetime) = &self.close_on_queue
+            && unpaused
+        {
+            *self.paused.borrow_mut() = lifetime.pause();
+        }
     }
     fn machine_var(&self, name: &str) -> Option<std::ffi::OsString> {
         if name == crate::harness::open_url::MAILBOX_ENV {
@@ -246,10 +259,11 @@ fn fixture(tag: &str, renewal: bool) -> (Tmp, Env, AccountsCmd) {
 }
 
 #[test]
-fn claude_login_and_renewal_wait_for_other_providers_and_hold_through_checks() {
+fn bounded_background_refusal_and_manual_provider_cleanup_share_machine_exclusion() {
     for renewal in [false, true] {
         let (tmp, env, form) = fixture("claude-signin-lock", renewal);
-        let host = LockHost::new(&env, Ok(0));
+        let mut host = LockHost::new(&env, Ok(0));
+        host.automatic = true;
         let held = host.peer.signin_now().unwrap().unwrap();
         let before = every_file(tmp.path());
         let (code, out, err) = acc(form.clone(), &env, &host);
@@ -263,6 +277,7 @@ fn claude_login_and_renewal_wait_for_other_providers_and_hold_through_checks() {
             "busy sign-in creates no staging or credentials"
         );
         drop(held);
+        host.automatic = false;
         let (code, out, err) = acc(form, &env, &host);
         assert_eq!(code, exit(0), "{out}{err}");
         assert_eq!(host.login_calls.get(), 1);
@@ -274,25 +289,65 @@ fn claude_login_and_renewal_wait_for_other_providers_and_hold_through_checks() {
     }
 }
 
-/// A person's own sign-in waits for the one that holds the lock, told so, since that one ends by
-/// itself and they have just asked. NEGATIVE CONTROL: an agent's terminal is refused at once, by
-/// the same lock, with the same host willing to retry.
+/// An explicit manual command owns a FIFO place independently of terminal or
+/// agent markers. This scheduling control starts no provider and changes no auth rules.
 #[test]
-fn a_person_waits_out_the_sign_in_that_holds_the_lock() {
-    for renewal in [false, true] {
+fn manual_fifo_waiting_is_independent_of_terminal_and_agent_markers() {
+    for tty in [false, true] {
         for agent in [false, true] {
-            let (_tmp, env, form) = fixture("claude-signin-person", renewal);
+            let (_tmp, env, _) = fixture("claude-signin-person", false);
             let mut host = LockHost::new(&env, Ok(0));
             host.agent = agent;
+            host.tty = tty;
             let held = host.peer.signin_now().unwrap().unwrap();
             host.running.replace(Some(held));
-            let (code, out, err) = acc(form, &env, &host);
-            assert_eq!(code, exit(u8::from(agent)), "{out}{err}");
-            assert_eq!(out.contains("waiting for it to end"), !agent, "{out}{err}");
-            assert_eq!(out.contains(": held: "), agent, "{out}{err}");
-            assert_eq!(host.login_calls.get(), usize::from(!agent));
+            let mut out = Vec::new();
+            let (turn, waited) = signin_lock(&env.accounts_store(), &host, "work-2", &mut out)
+                .unwrap()
+                .unwrap();
+            assert!(waited);
+            assert_eq!(
+                *host.positions.borrow(),
+                [accounts::SigninPosition {
+                    ahead: 0,
+                    blocker: accounts::SigninBlocker::UnscheduledSignin
+                }]
+            );
+            assert!(host.peer.signin_now().unwrap().is_none());
+            assert_eq!(host.login_calls.get(), 0);
+            drop(turn);
         }
     }
+}
+
+#[test]
+fn closing_the_actual_scope_at_queue_observation_starts_no_provider() {
+    let (_tmp, env, _) = fixture("claude-signin-cancel-queued", false);
+    let lifetime = crate::harness::account_work::Lifetime::default();
+    let mut host = LockHost::new(&env, Ok(0));
+    host.work = Some(lifetime.enter().unwrap());
+    host.close_on_queue = Some(lifetime.clone());
+    host.running.replace(host.peer.signin_now().unwrap());
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    assert!(matches!(
+        signin_guard(
+            &env.accounts_store(),
+            &host,
+            "work-2",
+            "login",
+            &mut out,
+            &mut err
+        ),
+        Err(Renewal::Deferred)
+    ));
+    assert_eq!(host.positions.borrow().len(), 1);
+    assert_eq!(host.login_calls.get(), 0);
+    assert_eq!(host.check_calls.get(), 0);
+    assert!(host.peer.signin_now().unwrap().is_some());
+    let paused = host.paused.borrow_mut().take().unwrap();
+    drop(host.work.take());
+    assert!(paused.try_wait().is_ok());
 }
 
 /// What a person's wait outlasted is what they go by: the sign-in they waited for renewed another
@@ -345,15 +400,6 @@ fn a_person_is_not_signed_in_again_over_a_renewal_they_waited_for() {
     }
 }
 
-/// The wait outlasts the longest sign-in that can hold the lock, which is another CLI's and not
-/// Claude Code's: the lock is one for every CLI ([`accounts::Store::shared_dir`]).
-#[test]
-fn a_persons_wait_outlasts_every_cli_s_sign_in() {
-    let waits = u64::from(PERSON_LOCK_TRIES) * LOCK_TRY_S;
-    assert!(waits > UNATTENDED_RENEWAL_BUDGET.as_secs());
-    assert!(waits > crate::harness::login_drive::HANG.as_secs());
-}
-
 #[test]
 fn claude_signin_failures_release_the_machine_lock() {
     for renewal in [false, true] {
@@ -393,7 +439,23 @@ fn an_unopenable_signin_lock_starts_no_claude_flow() {
         assert_eq!(code, exit(1));
         assert_eq!(host.login_calls.get(), 0);
         assert_eq!(host.check_calls.get(), 0);
-        assert_eq!(every_file(tmp.path()), before);
+        // Normal queue-aware admission can prune the released ticket, then
+        // still reports the actual malformed signer instead of contention.
+        assert!(store.signin_now().is_err());
+        let gate = store.shared_dir().join("signin-queue/queue.lock");
+        let mut after = every_file(tmp.path());
+        assert_eq!(
+            after
+                .iter()
+                .find(|(path, _)| path == &gate)
+                .map(|(_, bytes)| bytes.as_slice()),
+            Some([].as_slice())
+        );
+        after.retain(|(path, _)| path != &gate);
+        assert_eq!(
+            after, before,
+            "only the empty scheduling gate may be created"
+        );
         assert!(lock.is_dir());
     }
 }
@@ -476,7 +538,6 @@ fn a_non_tty_sign_in_rechecks_the_renewal_that_ended_its_contention() {
         let mailbox = tmp.path().join("synthetic-mailbox");
         std::fs::create_dir_all(&mailbox).unwrap();
         host.mailbox = Some(mailbox);
-        host.finish_on_contention = true;
         if contended {
             host.running
                 .replace(Some(host.peer.signin_now().unwrap().unwrap()));

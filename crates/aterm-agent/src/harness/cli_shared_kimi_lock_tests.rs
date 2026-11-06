@@ -4,8 +4,60 @@
 use super::*;
 use std::os::unix::fs::{PermissionsExt as _, symlink};
 
-fn deadline() -> Instant {
-    Instant::now() + Duration::from_secs(60)
+fn deadline() -> login_drive::Deadline<'static> {
+    login_drive::Deadline::after(Duration::from_secs(60))
+}
+
+#[test]
+fn the_actual_native_http_guard_expires_on_sleep_in_the_original_clock_domain() {
+    assert!(aterm_uds::process::continuous_ns().is_some());
+    for lease_fresh in [true, false] {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let budget = login_drive::Deadline::after(Duration::from_secs(3600));
+        let lock = NativeLock::acquire(
+            home.path(),
+            Region::Global,
+            budget,
+            Arc::new(aterm_http::AlwaysAuthorized),
+        )
+        .unwrap();
+        let guard = lock.guard();
+        assert!(guard.is_authorized());
+        {
+            let mut lease = lock.lease.lock().unwrap();
+            // Same live continuous clock as the original budget, advanced only for this lease.
+            lease
+                .slept_ns
+                .store(7200 * 1_000_000_000, std::sync::atomic::Ordering::Release);
+            if lease_fresh {
+                lease.updated_continuous = lease
+                    .updated_continuous
+                    .map(|now| now + 7200 * 1_000_000_000);
+            }
+        }
+        let refused = !guard.is_authorized();
+        let current = lock.check_current();
+        assert_eq!(guard.receipt_current(), lease_fresh);
+        let before = std::fs::metadata(path(home.path(), Region::Global))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(lock.lease.lock().unwrap().heartbeat(), lease_fresh);
+        if !lease_fresh {
+            assert_eq!(
+                std::fs::metadata(path(home.path(), Region::Global))
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+                before,
+                "a stale lease is not revived by its former heartbeat"
+            );
+        }
+        drop(lock);
+        assert!(refused);
+        assert!(current.is_err());
+        assert!(!path(home.path(), Region::Global).exists());
+    }
 }
 
 fn path(home: &Path, region: Region) -> PathBuf {
@@ -25,7 +77,13 @@ fn stamp(path: &Path, time: SystemTime) {
 fn native_lock_uses_the_region_storage_slot_and_releases_its_guard() {
     for region in [Region::Global, Region::MainlandCn] {
         let home = aterm_tempfile::tempdir().unwrap();
-        let lock = NativeLock::acquire(home.path(), region, deadline()).unwrap();
+        let lock = NativeLock::acquire(
+            home.path(),
+            region,
+            deadline(),
+            Arc::new(aterm_http::AlwaysAuthorized),
+        )
+        .unwrap();
         let path = path(home.path(), region);
         assert!(path.is_dir());
         assert_eq!(std::fs::read_dir(&path).unwrap().count(), 0);
@@ -33,8 +91,16 @@ fn native_lock_uses_the_region_storage_slot_and_releases_its_guard() {
             std::fs::create_dir(&path).is_err(),
             "native peer cannot acquire"
         );
-        assert!(NativeLock::acquire(home.path(), region, deadline()).is_err());
-        let guard = lock.guard(Arc::new(aterm_http::AlwaysAuthorized));
+        assert!(
+            NativeLock::acquire(
+                home.path(),
+                region,
+                deadline(),
+                Arc::new(aterm_http::AlwaysAuthorized)
+            )
+            .is_err()
+        );
+        let guard = lock.guard();
         assert!(guard.is_authorized());
         drop(lock);
         assert!(!path.exists());
@@ -42,7 +108,15 @@ fn native_lock_uses_the_region_storage_slot_and_releases_its_guard() {
             !guard.is_authorized(),
             "a retained HTTP guard cannot outlive its lock"
         );
-        drop(NativeLock::acquire(home.path(), region, deadline()).unwrap());
+        drop(
+            NativeLock::acquire(
+                home.path(),
+                region,
+                deadline(),
+                Arc::new(aterm_http::AlwaysAuthorized),
+            )
+            .unwrap(),
+        );
     }
 }
 
@@ -77,13 +151,15 @@ fn stale_native_lock_recovery_refuses_fresh_future_or_unowned_shapes() {
             );
         }
         let before = std::fs::symlink_metadata(&path).unwrap();
-        let result = NativeLock::acquire(home.path(), Region::Global, deadline());
+        let result = NativeLock::acquire(
+            home.path(),
+            Region::Global,
+            deadline(),
+            Arc::new(aterm_http::AlwaysAuthorized),
+        );
         if case == 0 {
             let lock = result.unwrap();
-            assert!(
-                lock.guard(Arc::new(aterm_http::AlwaysAuthorized))
-                    .is_authorized()
-            );
+            assert!(lock.guard().is_authorized());
             drop(lock);
             assert!(!path.exists());
         } else {
@@ -106,9 +182,15 @@ fn stale_native_lock_recovery_refuses_fresh_future_or_unowned_shapes() {
 fn lost_native_lock_never_touches_or_removes_a_replacement() {
     for replace_inode in [false, true] {
         let home = aterm_tempfile::tempdir().unwrap();
-        let lock = NativeLock::acquire(home.path(), Region::Global, deadline()).unwrap();
+        let lock = NativeLock::acquire(
+            home.path(),
+            Region::Global,
+            deadline(),
+            Arc::new(aterm_http::AlwaysAuthorized),
+        )
+        .unwrap();
         let path = path(home.path(), Region::Global);
-        let guard = lock.guard(Arc::new(aterm_http::AlwaysAuthorized));
+        let guard = lock.guard();
         if replace_inode {
             std::fs::rename(&path, path.with_extension("retained")).unwrap();
             std::fs::create_dir(&path).unwrap();
@@ -137,16 +219,24 @@ fn lost_native_lock_never_touches_or_removes_a_replacement() {
 fn native_lease_guard_rejects_a_missed_heartbeat_or_deadline() {
     for expired_deadline in [false, true] {
         let home = aterm_tempfile::tempdir().unwrap();
-        let lock = NativeLock::acquire(home.path(), Region::Global, deadline()).unwrap();
-        let guard = lock.guard(Arc::new(aterm_http::AlwaysAuthorized));
+        let lock = NativeLock::acquire(
+            home.path(),
+            Region::Global,
+            deadline(),
+            Arc::new(aterm_http::AlwaysAuthorized),
+        )
+        .unwrap();
+        let guard = lock.guard();
         {
             let mut lease = lock.lease.lock().unwrap();
             if expired_deadline {
-                lease.deadline = Instant::now();
+                lease.deadline = login_drive::Deadline::after(Duration::ZERO).bounds();
             } else {
                 lease.updated = Instant::now() - STALE;
             }
-            assert!(!lease.heartbeat());
+            // Work expiry denies HTTP, while the held owner can retain the exact response's
+            // lease until checkpoint/retirement. A missed heartbeat still loses authority.
+            assert_eq!(lease.heartbeat(), expired_deadline);
         }
         assert!(!guard.is_authorized());
         drop(lock);
@@ -157,20 +247,20 @@ fn native_lease_guard_rejects_a_missed_heartbeat_or_deadline() {
 #[test]
 fn native_heartbeat_updates_mtime_and_keeps_a_peer_excluded() {
     let home = aterm_tempfile::tempdir().unwrap();
-    let lock = NativeLock::acquire(home.path(), Region::Global, deadline()).unwrap();
+    let lock = NativeLock::acquire(
+        home.path(),
+        Region::Global,
+        deadline(),
+        Arc::new(aterm_http::AlwaysAuthorized),
+    )
+    .unwrap();
     let path = path(home.path(), Region::Global);
     let first = std::fs::metadata(&path).unwrap().modified().unwrap();
     let hang = deadline();
     while std::fs::metadata(&path).unwrap().modified().unwrap() == first {
-        assert!(
-            Instant::now() < hang,
-            "heartbeat worker stopped making progress"
-        );
+        assert!(!hang.expired(), "heartbeat worker stopped making progress");
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(
-        lock.guard(Arc::new(aterm_http::AlwaysAuthorized))
-            .is_authorized()
-    );
+    assert!(lock.guard().is_authorized());
     assert!(std::fs::create_dir(&path).is_err());
 }

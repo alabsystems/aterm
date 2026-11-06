@@ -306,6 +306,13 @@ pub struct Watcher {
     kq: OwnedFd,
 }
 
+#[cfg(target_os = "macos")]
+impl std::os::fd::AsFd for Watcher {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&self.kq)
+    }
+}
+
 impl Watcher {
     /// A new kqueue, its bell ([`Self::ring`]) registered.
     /// # Errors

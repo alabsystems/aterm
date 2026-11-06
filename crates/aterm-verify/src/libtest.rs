@@ -91,6 +91,40 @@ pub(crate) fn binary_path(header: &str) -> Option<&str> {
 /// The words a test prints when the machine refused it, not the tree.
 pub use aterm_uds::host::COULD_NOT_RUN as COULD_NOT_RUN_SENTINEL;
 
+/// What one failed case's captured block says of its machine: the one rule every reader of a
+/// block applies ([`failed_tests`], [`environment_refusals`], [`out_of_disk`], and the live view
+/// of a running binary's cases, `exec`'s `LiveCases`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Marks {
+    /// The block carries [`COULD_NOT_RUN_SENTINEL`]: the case refused its machine.
+    pub(crate) refused: bool,
+    /// The block names [`crate::exec::ENOSPC_SENTENCE`]: the case hit a full disk.
+    pub(crate) disk: bool,
+}
+
+/// [`Marks`] of a case's block, plain or ANSI-coloured.
+#[must_use]
+pub(crate) fn marks(block: &str) -> Marks {
+    let plain = if block.contains('\x1b') {
+        std::borrow::Cow::Owned(strip_ansi(block))
+    } else {
+        std::borrow::Cow::Borrowed(block)
+    };
+    Marks {
+        refused: plain.contains(COULD_NOT_RUN_SENTINEL),
+        disk: plain.contains(crate::exec::ENOSPC_SENTENCE),
+    }
+}
+
+/// Whether the failed cases `seen` so far, each by its block's [`Marks`], already make their
+/// binary a FAIL whatever its other cases do: a binary is NOT RUN only when every failed case's
+/// block refused ([`environment_refusals`]) or every one hit a full disk ([`out_of_disk`]), so
+/// once neither can hold of the cases seen, none still to come can restore it.
+#[must_use]
+pub(crate) fn decisive(seen: &[Marks]) -> bool {
+    !seen.is_empty() && !seen.iter().all(|m| m.refused) && !seen.iter().all(|m| m.disk)
+}
+
 /// Whether `log` carries [`crate::findings::CEILING_KILL`], plain or ANSI-coloured.
 #[must_use]
 pub(crate) fn has_ceiling_kill(log: &str) -> bool {
@@ -150,7 +184,7 @@ pub fn environment_refusals(log: &str) -> Option<Vec<String>> {
     if log.contains('\x1b') {
         return environment_refusals(&strip_ansi(log));
     }
-    let mut blocks: Vec<(&str, bool)> = Vec::new();
+    let mut blocks: Vec<(&str, String)> = Vec::new();
     let mut listed: Vec<&str> = Vec::new();
     let mut current: Option<usize> = None;
     let mut in_list = false;
@@ -163,7 +197,7 @@ pub fn environment_refusals(log: &str) -> Option<Vec<String>> {
         {
             current = Some(blocks.len());
             in_list = false;
-            blocks.push((name, false));
+            blocks.push((name, String::new()));
             continue;
         }
         if line == "failures:" {
@@ -206,10 +240,9 @@ pub fn environment_refusals(log: &str) -> Option<Vec<String>> {
         {
             binaries += 1;
         }
-        if let Some(at) = current
-            && line.contains(COULD_NOT_RUN_SENTINEL)
-        {
-            blocks[at].1 = true;
+        if let Some(at) = current {
+            blocks[at].1.push_str(line);
+            blocks[at].1.push('\n');
         }
     }
     let mut named: Vec<&str> = blocks.iter().map(|(name, _)| *name).collect();
@@ -217,7 +250,7 @@ pub fn environment_refusals(log: &str) -> Option<Vec<String>> {
     listed.sort_unstable();
     (!open_libtest
         && !blocks.is_empty()
-        && blocks.iter().all(|(_, refused)| *refused)
+        && blocks.iter().all(|(_, block)| marks(block).refused)
         && listed == named
         && binaries > 0
         && results == binaries)
@@ -313,7 +346,7 @@ pub fn failed_tests(log: &str) -> Option<Vec<FailedTest>> {
         return failed_tests(&strip_ansi(log));
     }
     let mut done: Vec<FailedTest> = Vec::new();
-    let mut pending: Vec<(String, String, bool)> = Vec::new();
+    let mut pending: Vec<(String, String)> = Vec::new();
     let mut listed: Vec<&str> = Vec::new();
     let mut listed_here: Vec<&str> = Vec::new();
     let mut result_here = false;
@@ -333,7 +366,7 @@ pub fn failed_tests(log: &str) -> Option<Vec<FailedTest>> {
             }
             current = Some(pending.len());
             in_list = false;
-            pending.push((name.to_string(), String::new(), false));
+            pending.push((name.to_string(), String::new()));
             continue;
         }
         if line == "failures:" {
@@ -398,17 +431,16 @@ pub fn failed_tests(log: &str) -> Option<Vec<FailedTest>> {
             result_here = false;
             binaries += 1;
             current = None;
-            done.extend(pending.drain(..).map(|(name, block, refused)| FailedTest {
+            done.extend(pending.drain(..).map(|(name, block)| FailedTest {
                 spec: spec.to_string(),
+                refused: marks(&block).refused,
                 name,
                 block,
-                refused,
             }));
             continue;
         }
         if let Some(at) = current {
             let block = &mut pending[at];
-            block.2 |= line.contains(COULD_NOT_RUN_SENTINEL);
             block.1.push_str(line);
             block.1.push('\n');
         }
@@ -448,23 +480,54 @@ fn has_compile_failure(chunk: &[&str]) -> bool {
     chunk.iter().copied().any(compile_failure_line)
 }
 
-/// Whether a failed child's log attributes every failure to `sentence` (`ENOSPC`): never on a
+/// The `---- <name> stdout ----` blocks of `lines`, each up to the next block, the closing
+/// `failures:` list, a `test result:` line, cargo's re-run line or its abnormal-exit words.
+fn blocks_in<'a>(lines: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut open = false;
+    for line in lines {
+        if line
+            .strip_prefix("---- ")
+            .and_then(|r| r.strip_suffix(" stdout ----"))
+            .is_some()
+        {
+            out.push(String::new());
+            open = true;
+        } else if line == "failures:"
+            || line.starts_with("test result: ")
+            || rerun_spec(line).is_some()
+            || abnormal_exit(line)
+        {
+            open = false;
+        } else if open && let Some(block) = out.last_mut() {
+            block.push_str(line);
+            block.push('\n');
+        }
+    }
+    out
+}
+
+/// Whether a failed child's log attributes every failure to a full disk
+/// ([`crate::exec::ENOSPC_SENTENCE`], each failed case's block read by [`marks`]): never on a
 /// ceiling kill, and in a `targo test` log any binary section that completed cleanly (`test result:
 /// ok.`, a skipped doctest pass, or a `harness = false` binary that finished with exit 0) is
 /// ignored so simulated full-disk output from a passing test never masks a later crash, timeout,
-/// test failure, or compile error.
+/// test failure, or compile error. A binary that crashed after a failed case whose block shows no
+/// full disk is that case's FAIL, as it is when the binary ends with libtest's report: a halted
+/// run that stopped at that case and a bare one that let the binary crash read it alike.
 #[must_use]
-pub(crate) fn out_of_disk(log: &str, sentence: &str) -> bool {
+pub(crate) fn out_of_disk(log: &str) -> bool {
     if log.contains('\x1b') {
-        return out_of_disk(&strip_ansi(log), sentence);
+        return out_of_disk(&strip_ansi(log));
     }
+    let sentence = crate::exec::ENOSPC_SENTENCE;
     if log.contains(crate::findings::CEILING_KILL) {
         return false;
     }
     if let Some(failed) = failed_tests(log)
         && !failed.is_empty()
     {
-        return failed.iter().all(|test| test.block.contains(sentence));
+        return failed.iter().all(|test| marks(&test.block).disk);
     }
     let mut lead: Vec<&str> = Vec::new();
     let mut sections: Vec<Vec<&str>> = Vec::new();
@@ -539,12 +602,18 @@ pub(crate) fn out_of_disk(log: &str, sentence: &str) -> bool {
         let joined = section.join("\n");
         match failed_tests(&joined) {
             Some(failed) if !failed.is_empty() => {
-                if !failed.iter().all(|test| test.block.contains(sentence)) {
+                if !failed.iter().all(|test| marks(&test.block).disk) {
                     return false;
                 }
             }
             _ => {
-                if !joined.contains(sentence) {
+                // A crash (or any end libtest did not report): a failed case's block that shows
+                // no full disk is a FAIL of its own, whatever the crash said.
+                if blocks_in(section.iter().copied())
+                    .iter()
+                    .any(|b| !marks(b).disk)
+                    || !joined.contains(sentence)
+                {
                     return false;
                 }
             }
@@ -666,6 +735,7 @@ mod tests {
     #[test]
     fn a_full_disk_a_passing_test_simulated_does_not_hide_a_failed_test() {
         let run = |output: String| crate::exec::Run {
+            stopped_at: None,
             ok: false,
             output,
             code: Some(101),
@@ -851,6 +921,7 @@ mod tests {
             );
             let log = failed_binary("render_suite", &[(name, &block)]);
             let run = crate::exec::Run {
+                stopped_at: None,
                 ok: false,
                 output: log.clone(),
                 code: Some(101),
@@ -1101,7 +1172,6 @@ mod tests {
 
     #[test]
     fn out_of_disk_never_masks_trailing_compile_errors_after_custom_or_enospc_binaries() {
-        let sentence = "No space left on device";
         let custom_then_compile = "\
      Running tests/custom_harness.rs (target/debug/deps/custom-1)\n\
 simulated fault injection: No space left on device (os error 28)\n\
@@ -1109,7 +1179,7 @@ simulated fault injection: No space left on device (os error 28)\n\
 error[E0425]: cannot find value `missing` in this scope\n\
 error: could not compile `broken` (test \"broken\") due to 1 previous error\n";
         assert!(
-            !out_of_disk(custom_then_compile, sentence),
+            !out_of_disk(custom_then_compile),
             "passing custom-harness simulated ENOSPC must not mask a later compile error"
         );
 
@@ -1129,7 +1199,7 @@ error: could not compile `broken` (test \"broken\") due to 1 previous error\n";
             ),
         );
         assert!(
-            !out_of_disk(&enospc_then_pass_then_compile, sentence),
+            !out_of_disk(&enospc_then_pass_then_compile),
             "trailing non-ENOSPC compile failure must not be hidden behind an earlier ENOSPC binary"
         );
 
@@ -1140,8 +1210,74 @@ error: test failed, to rerun pass `-p x --test custom_harness`\n\n\
 Caused by:\n\
   process didn't exit successfully: `custom-1` (exit status: 1)\n";
         assert!(
-            out_of_disk(custom_enospc_fail, sentence),
+            out_of_disk(custom_enospc_fail),
             "genuinely failing custom-harness binary reporting ENOSPC still classifies as out_of_disk"
         );
+    }
+
+    /// A CRASH AFTER A PLAIN FAILURE IS THAT FAILURE: a binary whose case failed with a block that
+    /// shows no full disk, and which then died of one, reads FAIL, as the same binary does when it
+    /// ends with libtest's report ([`out_of_disk`]'s abnormal-exit fallback reads each block with
+    /// [`marks`]). NEGATIVE CONTROL: with the plain block's panic itself out of disk, the crash's
+    /// full disk is the binary's, and it reads NOT RUN.
+    #[test]
+    fn a_plain_failure_followed_by_an_enospc_crash_reads_fail() {
+        let log = |block: &str| {
+            format!(
+                "{HEADER}\nrunning 2 tests\ntest a::plain ... FAILED\n\nfailures:\n\n\
+                 ---- a::plain stdout ----\n{block}\n\nfailures:\n    a::plain\n\
+                 fatal write error: {} (os error 28)\n\
+                 error: test failed, to rerun pass `-p x --lib`\n\nCaused by:\n  process \
+                 didn't exit successfully: `x-abc` (signal: 6, SIGABRT)\n",
+                crate::exec::ENOSPC_SENTENCE
+            )
+        };
+        let plain = log("\nthread 'a::plain' panicked at src/a.rs:1:1:\nassertion failed");
+        assert!(!out_of_disk(&plain), "{plain}");
+        let full = log(&format!(
+            "\nthread 'a::plain' panicked at src/a.rs:1:1:\n{} (os error 28)",
+            crate::exec::ENOSPC_SENTENCE
+        ));
+        assert!(out_of_disk(&full), "{full}");
+    }
+
+    /// ONE RULE FOR A BLOCK: [`marks`] reads a sentinel and a full disk alike through ANSI, and
+    /// [`decisive`] holds once neither every-refused nor every-out-of-disk can hold. NEGATIVE
+    /// CONTROL: no case seen decides nothing.
+    #[test]
+    fn a_block_has_one_reading_and_decisiveness_follows_it() {
+        let refused = marks(&format!(
+            "\x1b[31m{COULD_NOT_RUN_SENTINEL}\x1b[0m — no fish"
+        ));
+        assert_eq!(
+            refused,
+            Marks {
+                refused: true,
+                disk: false
+            }
+        );
+        let disk = marks(&format!(
+            "panicked: {} (os error 28)",
+            crate::exec::ENOSPC_SENTENCE
+        ));
+        assert_eq!(
+            disk,
+            Marks {
+                refused: false,
+                disk: true
+            }
+        );
+        let plain = marks("assertion failed");
+        assert!(!decisive(&[]));
+        assert!(decisive(&[plain]));
+        assert!(!decisive(&[refused]));
+        assert!(!decisive(&[disk, disk]));
+        assert!(decisive(&[refused, disk]));
+        let both = Marks {
+            refused: true,
+            disk: true,
+        };
+        assert!(!decisive(&[both, refused]));
+        assert!(!decisive(&[both, disk]));
     }
 }

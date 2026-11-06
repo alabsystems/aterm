@@ -568,7 +568,7 @@ fn admission_stop_handoff_no_stop_and_untouched_refusals_owe_no_save() {
 /// The first-launch offer answered with a typed Join while this Mac's vault configuration
 /// cannot be read (a root-owned `source.toml`): the real startup review admits the answer at
 /// once, as the person's choice of groups without the Join, so aterm's own permissions (Full
-/// Disk Access, the debugger, Local Network) get their run with no other press. Nothing is
+/// Disk Access, the debugger) get their run with no other press. Nothing is
 /// tried again, nothing is reported failed, and the window learns the vault was not joined.
 #[test]
 fn a_startup_join_over_an_unreadable_vault_is_admitted_at_once_without_the_join() {

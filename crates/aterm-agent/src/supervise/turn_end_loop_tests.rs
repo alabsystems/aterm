@@ -34653,10 +34653,12 @@ fn a_restart_whose_process_was_taken_reads_the_count_again() {
 
 /// A RELAUNCH THE HOST MADE RESUMES THE SESSION'S CONVERSATION, so a taskless screen just after
 /// it is that resume's banner, not a program started fresh (`TurnEndState::resumed`); one that
-/// started the agent afresh (`done:fresh`: nothing to resume) is a fresh start, and a restart the
-/// host refused is no relaunch.
+/// started the agent afresh (`done:fresh`: nothing to resume) is a fresh start, its next exchange
+/// the session's opening with no screen of it read (`TurnEndState::opened_fresh`), and a restart
+/// the host refused is no relaunch.
 /// NEGATIVE CONTROL: with `relaunched_afresh` out of `restart_agent`, `done:fresh` reads as a
-/// resume.
+/// resume; with it called before `restarted`, the restart's resume clears its mark; with it
+/// called on every answer the host made, a resume reads as a fresh start.
 #[test]
 fn a_relaunch_that_resumes_reads_its_banner_as_the_session_and_one_afresh_does_not() {
     let run = |answer: &'static str| {
@@ -34685,14 +34687,19 @@ fn a_relaunch_that_resumes_reads_its_banner_as_the_session_and_one_afresh_does_n
         )
         .expect("the restart");
         assert_eq!(host.said("restart"), ["restart:memory"], "{answer}");
-        s.turn_end.resumed_at().is_some()
+        (s.turn_end.resumed_at().is_some(), s.turn_end.opened_fresh())
     };
     for answer in ["adopted", "relaunched", "done:resumed"] {
-        assert!(run(answer), "{answer}: the session resumed");
+        assert_eq!(run(answer), (true, false), "{answer}: the session resumed");
     }
-    assert!(!run("done:fresh"), "a relaunch afresh resumes nothing");
-    assert!(
-        !run("refused:not-a-shell-job"),
+    assert_eq!(
+        run("done:fresh"),
+        (false, true),
+        "a relaunch afresh resumes nothing"
+    );
+    assert_eq!(
+        run("refused:not-a-shell-job"),
+        (false, false),
         "a restart the host did not make"
     );
 }

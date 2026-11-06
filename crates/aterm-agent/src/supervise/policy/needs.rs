@@ -344,6 +344,90 @@ const MENTION_NOUNS: &[&str] = &[
 
 const MENTION_ARTICLES: &[&str] = &["a", "an", "the", "each", "every", "any", "one", "that"];
 
+/// The finite auxiliaries, a closed class: the forms of `be`, `have` and `do` that carry a tense,
+/// the modals, and their negatives. A bare head one follows is the subject of its clause, no head
+/// (`NEEDS YOU can be lost.`, `NEEDS YOU is loud and never blocks.`: [`subject_of`]). The base
+/// forms `be`, `have` and `do` are not among them: a need opens on one as on any imperative
+/// (`NEEDS YOU have the key ready`).
+const FINITE_AUXILIARIES: &[&str] = &[
+    "is",
+    "are",
+    "was",
+    "were",
+    "isn't",
+    "aren't",
+    "wasn't",
+    "weren't",
+    "has",
+    "had",
+    "hasn't",
+    "hadn't",
+    "does",
+    "did",
+    "doesn't",
+    "didn't",
+    "can",
+    "cannot",
+    "can't",
+    "could",
+    "couldn't",
+    "may",
+    "might",
+    "mightn't",
+    "must",
+    "mustn't",
+    "shall",
+    "shan't",
+    "should",
+    "shouldn't",
+    "will",
+    "won't",
+    "would",
+    "wouldn't",
+];
+
+/// The subjects behind which an auxiliary asks the person a question, a need (`NEEDS YOU can you
+/// sign in to GitHub`, `NEEDS YOU should I force-push main`: [`subject_of`]).
+const ASKED_SUBJECTS: &[&str] = &[
+    "you", "i", "we", "they", "he", "she", "it", "someone", "somebody", "anyone", "anybody",
+];
+
+/// Whether `rest`, the words after a bare head (no separator, no qualifier), make the head the
+/// subject of their clause, so no head: they open on a finite auxiliary ([`FINITE_AUXILIARIES`])
+/// and ask nothing. An auxiliary before a subject ([`ASKED_SUBJECTS`]: `NEEDS YOU can you sign in
+/// to GitHub`), or a question mark anywhere in the words (`NEEDS YOU is the key still valid? If
+/// not, rotate it.`; [`asked_below`] reads them on with the rows wrapped under the head's),
+/// asks the person, and a question to the person is a need.
+fn subject_of(rest: &str) -> bool {
+    let mut words = rest
+        .split(|c: char| !c.is_alphanumeric() && !matches!(c, '\'' | '’'))
+        .map(|w| w.trim_matches(['\'', '’']).replace('’', "'").to_lowercase())
+        .filter(|w| !w.is_empty());
+    let Some(first) = words.next() else {
+        return false;
+    };
+    FINITE_AUXILIARIES.contains(&first.as_str())
+        && !words
+            .next()
+            .is_some_and(|w| ASKED_SUBJECTS.contains(&w.as_str()))
+        && !rest.contains('?')
+}
+
+/// Whether the words of `text` at byte `at` open on the `you` of a NEEDS YOU token ([`needs_token`],
+/// any case) whose clause has it for its subject ([`subject_of`]: `needs you can be lost`): a
+/// noun naming the head, not the person, so no phrase that opens on that `you` (`you can`)
+/// asks them anything.
+pub(super) fn token_you(text: &str, at: usize) -> bool {
+    let before = text[..at].trim_end_matches([' ', '\t', '\u{a0}', '\u{202f}', '-', '_']);
+    let start = before.trim_end_matches(char::is_alphabetic).len();
+    !text[..start]
+        .chars()
+        .next_back()
+        .is_some_and(char::is_alphanumeric)
+        && needs_token(&text[start..]).is_some_and(|(len, _)| start + len == at + "you".len())
+        && subject_of(&text[at + "you".len()..])
+}
+
 /// The demonstratives: behind one, as behind an article, NEEDS YOU is a noun (`This NEEDS YOU
 /// (…) is cleared`).
 const DEMONSTRATIVES: &[&str] = &["this", "these", "those"];
@@ -612,8 +696,20 @@ fn need_rest(line: &str) -> Option<&str> {
 /// in brackets, or a name after a comma, ends no clause: words after them that no separator
 /// opens go on with the clause the head sits in, and a qualifier with none after it names the
 /// noun (`No session has a NEEDS YOU (checked all six tabs).`); neither is a need, unless the
-/// qualifier says none (`the NEEDS YOU (none)`).
+/// qualifier says none (`the NEEDS YOU (none)`). A bare head, one no separator or qualifier
+/// follows, before a finite auxiliary is the subject of its clause, no head ([`subject_of`]:
+/// `NEEDS YOU can be lost.`), unless its words ask the person a question; an imperative or a noun
+/// after it is its need (`NEEDS YOU approve the deploy`, `NEEDS YOU the release credential`).
 fn head_from(t: &str, named: bool, inside: bool) -> Option<&str> {
+    head_parts(t, named, inside)
+        .filter(|&(rest, bare)| !(bare && subject_of(rest)))
+        .map(|(rest, _)| rest)
+}
+
+/// The head that opens `t` as [`head_from`] reads it, whatever the words after it say, and
+/// whether it is bare: no separator and no qualifier follows it. A head so read opens a line of
+/// its own ([`a_head`]) even where its words make it the subject of their clause.
+fn head_parts(t: &str, named: bool, inside: bool) -> Option<(&str, bool)> {
     let wrap = t.chars().next().filter(|c| matches!(c, '[' | '|' | '`'));
     let t = match wrap {
         Some(c) => past_need_lead(&t[c.len_utf8()..]),
@@ -623,11 +719,12 @@ fn head_from(t: &str, named: bool, inside: bool) -> Option<&str> {
     let (len, capitals) = needs_token(t)?;
     let rest = &t[len..];
     if let Some(words) = your_head(rest) {
-        return Some(if says_none(words) || words.is_empty() {
+        let words = if says_none(words) || words.is_empty() {
             words
         } else {
             t[len - 3..].trim()
-        });
+        };
+        return Some((words, false));
     }
     let mut next = rest.chars();
     match next.next() {
@@ -731,11 +828,12 @@ fn head_from(t: &str, named: bool, inside: bool) -> Option<&str> {
     if inside && !separated && (!rest.is_empty() || qualifier.is_some_and(|q| !says_none(q))) {
         return None;
     }
-    match qualifier {
-        Some(q) if rest.is_empty() && says_none(q) => Some(q),
-        Some(q) if rest.is_empty() && !separated && q.split_whitespace().count() >= 3 => Some(q),
-        _ => Some(rest),
-    }
+    let words = match qualifier {
+        Some(q) if rest.is_empty() && says_none(q) => q,
+        Some(q) if rest.is_empty() && !separated && q.split_whitespace().count() >= 3 => q,
+        _ => rest,
+    };
+    Some((words, bare))
 }
 
 fn past_heading(t: &str) -> (&str, bool) {
@@ -1051,8 +1149,16 @@ impl NeedLines {
     }
 }
 
+/// Whether `line` opens on a head: a NEEDS YOU head whatever its words say ([`head_parts`]: a
+/// subject's too, `NEEDS YOU can be lost.`, so a question after a bare head stays a line of its
+/// own), or a defense's.
 fn a_head(line: &str) -> bool {
-    need_rest(line).is_some() || defense_rest(line).is_some()
+    opens_head(line) || defense_rest(line).is_some()
+}
+
+/// Whether `line` opens on a NEEDS YOU head, whatever its words say ([`head_parts`]).
+fn opens_head(line: &str) -> bool {
+    head_parts(past_need_lead(unquoted(line)), false, false).is_some()
 }
 
 fn paragraph(under: &str) -> bool {
@@ -1197,6 +1303,25 @@ fn cut_instruction(rest: &str, rows: &[&str]) -> bool {
     false
 }
 
+/// The words of the bare head `rows[i]` opens before a finite auxiliary ([`subject_of`]) where a
+/// row the writer or the screen wrapped under it ([`wraps`]) asks the line's question:
+/// `NEEDS YOU can the release go out` above `today?` asks the person, a need.
+fn asked_below<'a>(rows: &[&'a str], i: usize) -> Option<&'a str> {
+    let (rest, _) = head_parts(past_need_lead(unquoted(rows[i])), false, false)?;
+    let mut line = rest.to_string();
+    for next in &rows[i + 1..] {
+        if !wraps(&line, next) {
+            return None;
+        }
+        line.push(' ');
+        line.push_str(unquoted(next).trim_end());
+        if !subject_of(&line) {
+            return Some(rest);
+        }
+    }
+    None
+}
+
 const MID_OPENS: &[char] = &['*', '_', '`', '['];
 
 const MID_QUOTES: &[char] = &['"', '“', '‘', '\''];
@@ -1324,7 +1449,7 @@ fn needs_lines_by(tail: &str, by: &NoneWords<'_>, join: Join) -> NeedLines {
             continue;
         }
         let above = if i > 0 { rows[i - 1] } else { "" };
-        if names_a_head(above) && need_rest(row).is_some() {
+        if names_a_head(above) && opens_head(row) {
             i += 1;
             continue;
         }
@@ -1351,7 +1476,7 @@ fn needs_lines_by(tail: &str, by: &NoneWords<'_>, join: Join) -> NeedLines {
         let opens = if named_above || inside_above {
             head_from(past_need_lead(unquoted(row)), named_above, inside_above)
         } else {
-            need_rest(row)
+            need_rest(row).or_else(|| asked_below(&rows, i))
         };
         let rest = match opens {
             Some(rest) => {

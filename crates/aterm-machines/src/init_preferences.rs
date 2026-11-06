@@ -11,6 +11,7 @@ use crate::model::{Effect, PValue, Probe, Read, User};
 use crate::plist::Entries;
 use crate::port::{Cmd, KeyboardMapChange, KeyboardPrefix, System};
 use aterm_types::macos_setup::{Selection, Setting};
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -307,10 +308,7 @@ pub fn accept_native_caps_control(vendor: u32, product: u32, registry: u64) -> R
 
 /// Activate the accepted Caps setting on only newly observed services, retaining a device's
 /// explicit saved or live Caps choice. This never writes persistent preferences.
-pub(crate) fn attachment_items(
-    ctx: &Ctx,
-    registries: &[u64],
-) -> Result<Vec<Box<dyn Item>>, String> {
+pub(crate) fn attachment_items(ctx: &Ctx, registries: &[u64]) -> Result<Vec<Attachment>, String> {
     let [user] = ctx.users.as_slice() else {
         return Err("input activation requires exactly one local user".into());
     };
@@ -327,27 +325,67 @@ pub(crate) fn attachment_items(
     models.dedup();
     Ok(models
         .into_iter()
-        .map(|model| {
-            Box::new(Attachment {
-                inner: AttachedKeyboard {
-                    model,
-                    user: user.clone(),
-                    reading: LastReading::default(),
-                },
-                registries: registries.to_vec(),
-            }) as Box<dyn Item>
+        .map(|model| Attachment {
+            inner: AttachedKeyboard {
+                model,
+                user: user.clone(),
+                reading: LastReading::default(),
+            },
+            registries: registries.to_vec(),
+            observed: Mutex::default(),
         })
         .collect())
 }
 
-struct Attachment {
+/// Requested services actually resolved by a mapping read, including intentional holds.
+#[derive(Clone, Default)]
+pub(crate) struct AttachmentCoverage(BTreeSet<u64>);
+
+impl AttachmentCoverage {
+    fn of(ids: impl IntoIterator<Item = u64>) -> Self {
+        Self(ids.into_iter().collect())
+    }
+
+    /// Include another item's actual observations from this pass.
+    pub(crate) fn include(&mut self, other: Self) {
+        self.0.extend(other.0);
+    }
+
+    /// Every requested identity was resolved, including intentional per-device holds.
+    pub(crate) fn covers(&self, registries: &[u64]) -> bool {
+        registries.iter().all(|registry| self.0.contains(registry))
+    }
+}
+
+/// One model's requested-service item and its most recent mapping coverage.
+pub(crate) struct Attachment {
     inner: AttachedKeyboard,
     registries: Vec<u64>,
+    observed: Mutex<AttachmentCoverage>,
 }
 
 impl Attachment {
+    /// A held model needs only its matching identities, never its activation or defaults.
+    pub(crate) fn inspect_kept(&self, sys: &dyn System) -> Result<AttachmentCoverage, String> {
+        self.inner
+            .matching_services(sys, Some(&self.registries))
+            .map(|matched| AttachmentCoverage::of(matched.into_iter().map(|(id, _)| id)))
+    }
+
+    /// The latest probe or apply observation, never a previous successful cohort.
+    pub(crate) fn observed_services(&self) -> AttachmentCoverage {
+        self.observed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     fn maps(&self, sys: &dyn System) -> Result<Option<Vec<HidMapping>>, String> {
+        *self.observed.lock().unwrap_or_else(PoisonError::into_inner) =
+            AttachmentCoverage::default();
         let maps = self.inner.mappings_for(sys, Some(&self.registries))?;
+        *self.observed.lock().unwrap_or_else(PoisonError::into_inner) =
+            AttachmentCoverage::of(maps.iter().map(|map| map.registry));
         if maps.is_empty() {
             return Ok(None);
         }
@@ -479,17 +517,7 @@ impl AttachedKeyboard {
         sys: &dyn System,
         registries: Option<&[u64]>,
     ) -> Result<Vec<HidMapping>, String> {
-        let command = self.command().args(["--get", "UserKeyMapping"]);
-        let ran = sys
-            .run_complete_stdout(&command)
-            .map_err(|e| e.to_string())?;
-        if !ran.success() {
-            return Err(format!("{}: {}", command.display(), ran.describe()));
-        }
-        let mut matched = parse_hid_mappings(&ran.out())?;
-        if let Some(registries) = registries {
-            matched.retain(|(registry, _)| registries.contains(registry));
-        }
+        let matched = self.matching_services(sys, registries)?;
         if matched.is_empty() {
             return Ok(Vec::new());
         }
@@ -503,6 +531,25 @@ impl AttachedKeyboard {
             return Err(format!("{}: {}", command.display(), ran.describe()));
         }
         live_hid_mappings(&ran.out(), &matched)
+    }
+
+    fn matching_services(
+        &self,
+        sys: &dyn System,
+        registries: Option<&[u64]>,
+    ) -> Result<Vec<(u64, KeyMapping)>, String> {
+        let command = self.command().args(["--get", "UserKeyMapping"]);
+        let ran = sys
+            .run_complete_stdout(&command)
+            .map_err(|e| e.to_string())?;
+        if !ran.success() {
+            return Err(format!("{}: {}", command.display(), ran.describe()));
+        }
+        let mut matched = parse_hid_mappings(&ran.out())?;
+        if let Some(registries) = registries {
+            matched.retain(|(registry, _)| registries.contains(registry));
+        }
+        Ok(matched)
     }
 
     fn set_mappings(&self, sys: &dyn System, mappings: &[KeyboardMapChange]) -> Result<(), String> {
@@ -1962,6 +2009,7 @@ pub(crate) mod tests {
                 reading: LastReading::default(),
             },
             registries: vec![2],
+            observed: Mutex::default(),
         }
     }
 
@@ -2017,6 +2065,7 @@ pub(crate) mod tests {
         );
         let context = ctx(std::slice::from_ref(&who));
         assert!(matches!(item.probe(&sys, &context), Probe::Change { .. }));
+        assert!(item.observed_services().covers(&[2]));
         item.apply(&sys, &context).unwrap();
         let changes = sys.keyboard_changes();
         assert_eq!(changes.len(), 1);
@@ -2043,6 +2092,7 @@ pub(crate) mod tests {
             other.probe(&sys, &context),
             Probe::NotApplicable { .. }
         ));
+        assert!(!other.observed_services().covers(&[2]));
         assert_eq!(
             sys.calls().len(),
             before + 1,
@@ -2108,9 +2158,43 @@ pub(crate) mod tests {
                 item.probe(&sys, &context),
                 Probe::NotApplicable { .. }
             ));
+            assert!(
+                item.observed_services().covers(&[2]),
+                "an observed explicit choice resolves that service without changing it"
+            );
             item.apply(&sys, &context).unwrap();
             assert!(sys.keyboard_changes().is_empty());
         }
+    }
+
+    #[test]
+    fn attachment_coverage_discards_an_earlier_read_when_the_next_probe_sees_no_service() {
+        let who = user("alice", 501);
+        let item = attachment(&who, 65534, 169);
+        let mut sys = Fake::root();
+        sys.euid = who.uid;
+        let get = item.inner.command().args(["--get", "UserKeyMapping"]);
+        sys.on(&get.display(), Ran::ok(&hid_user_row(2, &[])));
+        sys.on(&get.display(), Ran::ok("RegistryID Key Value\n"));
+        sys.on(
+            &hid_dump_command(&who).display(),
+            Ran::ok(&hid_dump(&[(2, &[], &[])])),
+        );
+        sys.on(
+            &Target::host("-g", &item.inner.model.key(), &who)
+                .export_cmd()
+                .display(),
+            export("<dict/>"),
+        );
+        let context = ctx(std::slice::from_ref(&who));
+        assert!(matches!(item.probe(&sys, &context), Probe::Change { .. }));
+        assert!(item.observed_services().covers(&[2]));
+        assert!(matches!(
+            item.probe(&sys, &context),
+            Probe::NotApplicable { .. }
+        ));
+        assert!(!item.observed_services().covers(&[2]));
+        assert!(sys.keyboard_changes().is_empty());
     }
 
     fn composite_keyboard_dump(maps: &[HidDumpRow<'_>], keyboard_usage: bool) -> String {

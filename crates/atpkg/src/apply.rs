@@ -107,16 +107,25 @@ pub enum TxnOutcome {
     Aborted {
         failed: String,
         during_flip: bool,
+        /// The failed stage's or flip's own cause.
         why: String,
+        /// The members that had already flipped when `failed`'s flip failed, in flip order,
+        /// each with what its rollback answered: `Err` names what it could not put back.
+        /// Empty for a stage failure, and for a flip failure of the first member.
+        rolled_back: Vec<(String, Result<(), String>)>,
     },
 }
 
 /// Run one coherence group as an all-or-nothing transaction over injected actions.
+///
+/// A stage or flip that fails says why, and the group's [`TxnOutcome::Aborted`] carries that
+/// cause; after a failed flip it also carries each member already flipped with its rollback's
+/// own answer, so a rollback that could not put a member back is never reported as done.
 pub fn transact(
     decisions: &[(String, ApplyDecision)],
     stage: &mut dyn FnMut(&str) -> Result<(), String>,
-    flip: &mut dyn FnMut(&str) -> bool,
-    rollback: &mut dyn FnMut(&str),
+    flip: &mut dyn FnMut(&str) -> Result<(), String>,
+    rollback: &mut dyn FnMut(&str) -> Result<(), String>,
 ) -> TxnOutcome {
     transact_holding(decisions, stage, &mut || None, flip, rollback)
 }
@@ -126,8 +135,8 @@ pub fn transact_holding(
     decisions: &[(String, ApplyDecision)],
     stage: &mut dyn FnMut(&str) -> Result<(), String>,
     hold: &mut dyn FnMut() -> Option<(String, i64)>,
-    flip: &mut dyn FnMut(&str) -> bool,
-    rollback: &mut dyn FnMut(&str),
+    flip: &mut dyn FnMut(&str) -> Result<(), String>,
+    rollback: &mut dyn FnMut(&str) -> Result<(), String>,
 ) -> TxnOutcome {
     let tombstoned: Vec<String> = decisions
         .iter()
@@ -153,6 +162,7 @@ pub fn transact_holding(
                 failed: (*name).clone(),
                 during_flip: false,
                 why,
+                rolled_back: Vec::new(),
             };
         }
     }
@@ -165,22 +175,21 @@ pub fn transact_holding(
         };
     }
 
-    let mut flipped: Vec<&String> = Vec::new();
+    let mut flipped: Vec<&str> = Vec::new();
     for name in &installs {
-        if flip(name) {
-            flipped.push(name);
-        } else {
-            for done in &flipped {
-                rollback(done);
-            }
+        if let Err(why) = flip(name) {
+            let rolled_back = flipped
+                .iter()
+                .map(|done| ((*done).to_string(), rollback(done)))
+                .collect();
             return TxnOutcome::Aborted {
                 failed: (*name).clone(),
                 during_flip: true,
-                why: String::from(
-                    "the flip failed and the members already flipped were rolled back",
-                ),
+                why,
+                rolled_back,
             };
         }
+        flipped.push(name);
     }
     TxnOutcome::Applied(installs.into_iter().cloned().collect())
 }
@@ -285,9 +294,9 @@ repo = "aterm"
             },
             &mut |n| {
                 flipped.push(n.to_string());
-                true
+                Ok(())
             },
-            &mut |_| {},
+            &mut |_| Ok(()),
         );
         assert_eq!(out, TxnOutcome::UpToDate);
         assert!(
@@ -312,14 +321,18 @@ repo = "aterm"
             },
             &mut |n| {
                 order.borrow_mut().push(format!("flip:{n}"));
-                true
+                Ok(())
             },
-            &mut |_| {},
+            &mut |n| {
+                order.borrow_mut().push(format!("rollback:{n}"));
+                Ok(())
+            },
         );
         assert_eq!(out, TxnOutcome::Applied(vec!["ay".into(), "trust".into()]));
         assert_eq!(
             order.into_inner(),
-            vec!["stage:ay", "stage:trust", "flip:ay", "flip:trust"]
+            vec!["stage:ay", "stage:trust", "flip:ay", "flip:trust"],
+            "and nothing is rolled back"
         );
     }
 
@@ -342,9 +355,9 @@ repo = "aterm"
             },
             &mut |n| {
                 flipped.push(n.to_string());
-                true
+                Ok(())
             },
-            &mut |_| {},
+            &mut |_| Ok(()),
         );
         assert_eq!(
             out,
@@ -352,33 +365,73 @@ repo = "aterm"
                 failed: "trust".into(),
                 during_flip: false,
                 why: "stage refused".into(),
+                rolled_back: Vec::new(),
             }
         );
         assert!(flipped.is_empty(), "a stage failure must flip nothing");
     }
 
+    /// A failed flip's own error is the abort's cause, and each member already flipped is rolled
+    /// back once, in flip order, with its rollback's own answer; the failed member is not among
+    /// them, and a first member that fails rolls nothing back.
     #[test]
     fn a_flip_failure_rolls_back_the_already_flipped() {
+        const CAUSE: &str = "resolve check: libLLVM not found";
+        const STUCK: &str = "re-pointing current: no space left";
         let decs = vec![
             d("ay", ApplyDecision::Install),
+            d("trust-ir", ApplyDecision::Install),
             d("trust", ApplyDecision::Install),
         ];
-        let mut rolled = Vec::new();
-        let out = transact(
-            &decs,
-            &mut |_| Ok(()),       // both stage ok
-            &mut |n| n != "trust", // ay flips ok, trust's flip fails
-            &mut |n| rolled.push(n.to_string()),
-        );
-        assert!(
-            matches!(&out, TxnOutcome::Aborted { failed, during_flip: true, .. } if failed == "trust"),
-            "{out:?}"
-        );
+        let pass = |refused: &str| {
+            let mut rolled = Vec::new();
+            let out = transact(
+                &decs,
+                &mut |_| Ok(()),
+                &mut |n| {
+                    if n == refused {
+                        Err(CAUSE.to_string())
+                    } else {
+                        Ok(())
+                    }
+                },
+                &mut |n| {
+                    rolled.push(n.to_string());
+                    if n == "trust-ir" {
+                        Err(STUCK.to_string())
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            (out, rolled)
+        };
+        let (out, rolled) = pass("trust");
         assert_eq!(
-            rolled,
-            vec!["ay"],
-            "the already-flipped member is rolled back"
+            out,
+            TxnOutcome::Aborted {
+                failed: "trust".into(),
+                during_flip: true,
+                why: CAUSE.into(),
+                rolled_back: vec![
+                    ("ay".into(), Ok(())),
+                    ("trust-ir".into(), Err(STUCK.into())),
+                ],
+            },
+            "each flipped member carries its own rollback's answer"
         );
+        assert_eq!(rolled, ["ay", "trust-ir"], "each is rolled back once");
+        let (out, rolled) = pass("ay");
+        assert_eq!(
+            out,
+            TxnOutcome::Aborted {
+                failed: "ay".into(),
+                during_flip: true,
+                why: CAUSE.into(),
+                rolled_back: Vec::new(),
+            }
+        );
+        assert!(rolled.is_empty(), "nothing had flipped: {rolled:?}");
     }
 
     /// The hold is asked once, after the last stage and before the first flip; holding
@@ -404,9 +457,9 @@ repo = "aterm"
             },
             &mut |n| {
                 order.borrow_mut().push(format!("flip:{n}"));
-                true
+                Ok(())
             },
-            &mut |_| {},
+            &mut |_| Ok(()),
         );
         assert_eq!(
             out,
@@ -425,8 +478,8 @@ repo = "aterm"
             &decs,
             &mut |_| Ok(()),
             &mut || None,
-            &mut |_| true,
-            &mut |_| {},
+            &mut |_| Ok(()),
+            &mut |_| Ok(()),
         );
         assert!(matches!(out, TxnOutcome::Applied(_)));
         let revoked = vec![d("trust", ApplyDecision::Tombstone)];
@@ -434,8 +487,8 @@ repo = "aterm"
             &revoked,
             &mut |_| Ok(()),
             &mut || panic!("a tombstoned group is never held"),
-            &mut |_| true,
-            &mut |_| {},
+            &mut |_| Ok(()),
+            &mut |_| Ok(()),
         );
         assert!(matches!(out, TxnOutcome::Tombstoned(_)));
     }
@@ -456,10 +509,11 @@ repo = "aterm"
             },
             &mut |_| {
                 touched.set(true);
-                true
+                Ok(())
             },
             &mut |_| {
                 touched.set(true);
+                Ok(())
             },
         );
         assert_eq!(out, TxnOutcome::Tombstoned(vec!["trust".into()]));

@@ -587,25 +587,26 @@ fn set_complex_cell(
 fn apply_row_extra(extras: &mut CellExtras, row_idx: u16, extra: RestoredExtra) {
     match extra {
         RestoredExtra::CombiningMarks(col, marks) => {
-            let entry = extras.get_or_create(CellCoord::new(row_idx, col));
-            for mark in marks {
-                entry.add_combining(mark);
-            }
+            extras.modify(CellCoord::new(row_idx, col), |entry| {
+                for mark in marks {
+                    entry.add_combining(mark);
+                }
+            });
         }
         RestoredExtra::ComplexChar(col, s) => {
-            extras
-                .get_or_create(CellCoord::new(row_idx, col))
-                .set_complex_char(Some(s));
+            extras.modify(CellCoord::new(row_idx, col), |entry| {
+                entry.set_complex_char(Some(s))
+            });
         }
         RestoredExtra::RgbFg(col, rgb) => {
-            extras
-                .get_or_create(CellCoord::new(row_idx, col))
-                .set_fg_rgb(Some(rgb));
+            extras.modify(CellCoord::new(row_idx, col), |entry| {
+                entry.set_fg_rgb(Some(rgb))
+            });
         }
         RestoredExtra::RgbBg(col, rgb) => {
-            extras
-                .get_or_create(CellCoord::new(row_idx, col))
-                .set_bg_rgb(Some(rgb));
+            extras.modify(CellCoord::new(row_idx, col), |entry| {
+                entry.set_bg_rgb(Some(rgb))
+            });
         }
     }
 }

@@ -342,22 +342,29 @@ fn words_to(n: usize) -> String {
     s
 }
 
-fn light(s: &Sim, row: u16, col: u16) -> u8 {
-    let x0 = usize::from(col) * CW;
-    let x1 = x0 + CW;
-    s.glow
+/// Each column's brightest under light on `row`, read in one pass over the frame's quads: these
+/// takes ask it of every column past a row's last glyph on every frame.
+///
+/// NEGATIVE CONTROL (2026-11-05): every column read lit fires `"the relaid glued word dark or light
+/// left on blanks"` and `"F2 reproduced"`. The column-by-column scan this replaces read the same on
+/// every call of this module's ten tests, compared in one build.
+fn lights(s: &Sim, row: u16) -> [u8; TW + 2] {
+    let mut lit = [0; TW + 2];
+    for q in s
+        .glow
         .under_quads()
         .iter()
-        .filter(|q| {
-            let qx = usize::from(q.x);
-            q.row == row && qx < x1 && qx + usize::from(q.w) > x0
-        })
-        .map(|q| {
-            let c = q.color;
-            ((c >> 16) & 0xff).max((c >> 8) & 0xff).max(c & 0xff) as u8
-        })
-        .max()
-        .unwrap_or(0)
+        .filter(|q| q.row == row && q.w > 0)
+    {
+        let c = q.color;
+        let lv = ((c >> 16) & 0xff).max((c >> 8) & 0xff).max(c & 0xff) as u8;
+        let from = usize::from(q.x) / CW;
+        let to = (usize::from(q.x) + usize::from(q.w) - 1) / CW;
+        for at in lit.iter_mut().take(to + 1).skip(from) {
+            *at = (*at).max(lv);
+        }
+    }
+    lit
 }
 
 fn last_glyph(s: &Sim, row: u16) -> Option<u16> {
@@ -455,8 +462,9 @@ fn boxgrow_take(
             }
         }
         let last = last_glyph(s, row0).unwrap_or(0).max(cc);
+        let lit = lights(s, row0);
         let past: Vec<u16> = ((last + 1)..=(TW as u16 + 1))
-            .filter(|&c| light(s, row0, c) > 40)
+            .filter(|&c| lit[usize::from(c)] > 40)
             .collect();
         if past.is_empty() {
             if let Some(since) = lit_blank_since.take() {
@@ -467,7 +475,7 @@ fn boxgrow_take(
             let since = *lit_blank_since.get_or_insert(t);
             c.lit_blank_max_run_ms = c.lit_blank_max_run_ms.max(t - since);
             if c.lit_blank_example.is_empty() {
-                let lv: Vec<u8> = past.iter().map(|&col| light(s, row0, col)).collect();
+                let lv: Vec<u8> = past.iter().map(|&col| lit[usize::from(col)]).collect();
                 c.lit_blank_example =
                     format!("t={t}ms row {row0} lit over blanks {past:?} lv {lv:?}");
             }
@@ -717,11 +725,12 @@ fn probe_f2_midline_wrap_vacated_light() {
                     }
                     let Some(old) = hand_row else { return };
                     let last = last_glyph(s, old).unwrap_or(0);
+                    let lit = lights(s, old);
                     let past: Vec<u16> = ((last + 2)..=(TW as u16 + 1))
-                        .filter(|&c| light(s, old, c) > 40)
+                        .filter(|&c| lit[usize::from(c)] > 40)
                         .collect();
                     if !past.is_empty() && t > relay_press + 300 {
-                        let lv = past.iter().map(|&c| light(s, old, c)).collect();
+                        let lv = past.iter().map(|&c| lit[usize::from(c)]).collect();
                         vac.push((t, past, lv));
                     }
                     if relaid_lit_at.is_none() && cr == old + 1 && cc > 9 {
@@ -949,9 +958,10 @@ fn probe_f5_backspace_hold_retract_linger() {
                     return;
                 }
                 let (cr, cc) = s.caret();
+                let by_col = lights(s, cr);
                 let lit: Vec<(u16, u8)> = (cc..cc + held as u16)
                     .filter(|&c| s.live(cr).contains(&c))
-                    .map(|c| (c, light(s, cr, c)))
+                    .map(|c| (c, by_col.get(usize::from(c)).copied().unwrap_or(0)))
                     .collect();
                 if !lit.is_empty() {
                     linger.push(format!("t={t} caret ({cr},{cc}) lit right {lit:?}"));

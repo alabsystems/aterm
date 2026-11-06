@@ -424,7 +424,7 @@ fn recovered_issuer_prepares_a_newly_admitted_member_without_relaxing_direct_iss
     }
     assert!(db.materialize_next_intent(&admin).unwrap().is_none());
     let config = lab._home.path().join("aterm.toml");
-    std::fs::write(&config, "").unwrap();
+    aterm_uds::atomic_file::write(&config, b"", 0o600).unwrap();
     let selected = crate::generation::test_complete_successor(
         lab._home.path(),
         &original,

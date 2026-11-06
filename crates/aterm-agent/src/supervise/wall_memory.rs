@@ -233,8 +233,10 @@ impl<C: Ctl> Session<'_, C> {
     /// a break ([`super::policy::turn_end::TurnEndState::fact_typed`]), so what the loop awaits or
     /// owes past it (a land check, a continuation's answer) stays. A replay of a tape whose
     /// recording build had no break door with guards (`host.at_background_on`) records it as
-    /// that build did, as any host turn.
+    /// that build did, as any host turn. Either way it is the harness's own submission, as
+    /// Cruise's carry counts them (`CarryWatch::host_typed`).
     pub(super) fn host_turn(&mut self, kind: HostTurn, seq: u64) {
+        self.cruise_carry.host_typed();
         if kind == HostTurn::Fact && !self.fx.replay_lacks_host_door("host.at_background_on") {
             self.turn_end.fact_typed();
             return;

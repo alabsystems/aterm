@@ -71,15 +71,21 @@ impl Rests {
     }
 
     fn key(login: &str, target: Option<&str>) -> [u8; 32] {
-        let mut hasher = aterm_digest::Sha256::new();
-        for b in login.trim().bytes() {
-            hasher.update([b.to_ascii_lowercase()]);
+        fn update_lower(hasher: &mut aterm_digest::Sha256, s: &str) {
+            let s = s.trim();
+            if !s.bytes().any(|b| b.is_ascii_uppercase()) {
+                hasher.update(s.as_bytes());
+            } else {
+                for b in s.bytes() {
+                    hasher.update([b.to_ascii_lowercase()]);
+                }
+            }
         }
+        let mut hasher = aterm_digest::Sha256::new();
+        update_lower(&mut hasher, login);
         hasher.update([0]);
         if let Some(target) = target {
-            for b in target.trim().bytes() {
-                hasher.update([b.to_ascii_lowercase()]);
-            }
+            update_lower(&mut hasher, target);
         }
         hasher.finalize()
     }

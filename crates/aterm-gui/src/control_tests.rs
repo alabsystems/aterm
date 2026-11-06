@@ -10828,6 +10828,182 @@ fn background_input_into_a_program_that_reads_nothing_never_parks_the_lane() {
     drop(reader);
 }
 
+/// A turn's delivery ([`TurnInput`]) finishes whatever its caller does: a paste into a program
+/// that reads nothing, its caller hung up, waits out its bound for the program and is in doubt,
+/// where the same paste outside a turn answers the hang-up at once
+/// ([`background_input_into_a_program_that_reads_nothing_never_parks_the_lane`]); once the program
+/// reads, the next is taken whole. A paste's write queued behind ordered egress waits out its
+/// bound the same way, `Queued`, never `HungUp`.
+/// NEGATIVE CONTROL: the delivery's waits parked on the served lane alone answer `ERR hangup`, and
+/// the write's wait alone `HungUp`.
+#[test]
+#[cfg(unix)]
+fn a_turns_paste_whose_caller_hung_up_still_waits_for_its_program() {
+    use aterm_spec::wait::{MUST_HAPPEN, until_within};
+    let (handle, mut reader) = pipe_session(79);
+    aterm_pty::set_nonblocking(handle.master, true).expect("nonblocking test master");
+    handle.ctx.sink.note_master_nonblocking(true);
+    loop {
+        match aterm_pty::write_some(handle.master, &[b'.'; 4096]) {
+            Ok(n) if n > 0 => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            other => panic!("unexpected pipe fill result: {other:?}"),
+        }
+    }
+    let turns_paste = |text: &'static str, bound: std::time::Duration| {
+        let (term, ctx) = (Arc::clone(&handle.term), Arc::clone(&handle.ctx));
+        move || {
+            let (client, server) = CtlStream::pair().expect("socket pair");
+            let _serving = ServingFd::enter(&server);
+            drop(client);
+            until_within(MUST_HAPPEN, "the hang-up, seen by the lane", || {
+                caller_hung_up().then_some(())
+            });
+            let _turn = TurnInput::enter();
+            background_input(
+                &term,
+                &ctx,
+                &InputEvent::Paste(text.into(), PasteFraming::AtDrain),
+                bound,
+            )
+        }
+    };
+    let held = answered_without_parking(
+        "a turn's paste the program has not read",
+        turns_paste("held", std::time::Duration::from_millis(300)),
+    );
+    assert_eq!(
+        held,
+        Err(PASTE_UNREAD.to_string()),
+        "in doubt at its bound, never cut by the hang-up"
+    );
+    let spilled = handle.ctx.sink.spilled_bytes();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let taking = turns_paste("taken", MUST_HAPPEN);
+    std::thread::spawn(move || {
+        let _ = tx.send(taking());
+    });
+    until_within(
+        MUST_HAPPEN,
+        "the paste queued behind the unread input",
+        || (handle.ctx.sink.spilled_bytes() >= spilled + "taken".len()).then_some(()),
+    );
+    let mut tail = Vec::new();
+    let mut buf = [0u8; 8192];
+    while !tail.ends_with(b"heldtaken") {
+        let n = std::io::Read::read(&mut reader, &mut buf).expect("the program reads");
+        assert!(n > 0, "the session's input closed");
+        tail.extend_from_slice(&buf[..n]);
+        let keep = tail.len().saturating_sub(64);
+        tail.drain(..keep);
+    }
+    let taken = rx
+        .recv_timeout(MUST_HAPPEN)
+        .expect("the turn's paste answered once its program read it");
+    assert_eq!(taken, Ok(InputOutcome::Ok), "taken whole, its caller gone");
+
+    let (unrun, written) = crate::app_input::paste_order::Written::for_test();
+    let queued =
+        answered_without_parking("a turn's paste queued behind ordered egress", move || {
+            let (client, server) = CtlStream::pair().expect("socket pair");
+            let _serving = ServingFd::enter(&server);
+            drop(client);
+            until_within(MUST_HAPPEN, "the hang-up, seen by the lane", || {
+                caller_hung_up().then_some(())
+            });
+            let _turn = TurnInput::enter();
+            let bound = HANGUP_POLL * 2;
+            matches!(super::await_written(&written, bound), super::Waited::Queued)
+        });
+    assert!(queued, "the write's wait ran to its bound, its caller gone");
+    drop(unrun);
+}
+
+/// A turn on the background route whose caller goes while its paste waits for a program that
+/// reads nothing yet still submits once the program reads: the caller is there when the turn
+/// judges it, before the paste's bytes go, and gone while their receipt waits, so that wait
+/// answers for the turn, its bytes already queued, and its Enter follows the text.
+/// NEGATIVE CONTROL: without the turn's [`TurnInput`], the receipt wait answers the hang-up at its
+/// first poll, the turn `ERR paste delivery failed` with its text unread.
+#[test]
+#[cfg(unix)]
+fn a_turn_whose_caller_goes_while_its_paste_waits_still_submits_once_its_program_reads() {
+    use aterm_spec::wait::{MUST_HAPPEN, until_within};
+    let (handle, mut reader) = pipe_session(80);
+    aterm_pty::set_nonblocking(handle.master, true).expect("nonblocking test master");
+    handle.ctx.sink.note_master_nonblocking(true);
+    loop {
+        match aterm_pty::write_some(handle.master, &[b'.'; 4096]) {
+            Ok(n) if n > 0 => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            other => panic!("unexpected pipe fill result: {other:?}"),
+        }
+    }
+    let spilled = handle.ctx.sink.spilled_bytes();
+    let (term, ctx) = (Arc::clone(&handle.term), Arc::clone(&handle.ctx));
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (client, server) = CtlStream::pair().expect("socket pair");
+        let _serving = ServingFd::enter(&server);
+        let client = std::cell::Cell::new(Some(client));
+        let store = crate::session_store::new_store();
+        let deliver = |ev: &InputEvent| {
+            matches!(
+                background_input(&term, &ctx, ev, PASTE_RECEIPT_WAIT),
+                Ok(InputOutcome::Ok)
+            )
+        };
+        let paste = |text: &str| {
+            drop(client.take());
+            until_within(MUST_HAPPEN, "the hang-up, seen by the turn", || {
+                caller_hung_up().then_some(())
+            });
+            deliver(&InputEvent::Paste(text.into(), PasteFraming::AtDrain))
+        };
+        let press = |name: &str| parse_key(name).is_some_and(|ev| deliver(&ev));
+        let io = control_session::TurnIo {
+            paste: &paste,
+            press: &press,
+            ..control_session::TurnIo::paste_only()
+        };
+        let line = "idle=1 timeout=20000 submit_window=300 presses=1 hello";
+        let _ = tx.send(control_session::cmd_turn(&term, &store, 0, line, &ctx, &io));
+    });
+    until_within(
+        MUST_HAPPEN,
+        "the paste queued behind the unread input",
+        || (handle.ctx.sink.spilled_bytes() >= spilled + "hello".len()).then_some(()),
+    );
+    // A wait sees a hang-up once a poll's slice ends with nothing read: the turn is still waiting
+    // three of them after its caller went.
+    if let Ok(early) = rx.recv_timeout(HANGUP_POLL * 3) {
+        panic!("the turn answered with its text unread: {early}");
+    }
+    let mut tail = Vec::new();
+    let mut buf = [0u8; 8192];
+    let after = loop {
+        let n = std::io::Read::read(&mut reader, &mut buf).expect("the program reads");
+        assert!(n > 0, "the session's input closed");
+        tail.extend_from_slice(&buf[..n]);
+        if let Some(at) = tail.windows(5).position(|w| w == b"hello") {
+            break tail.split_off(at + 5);
+        }
+        let keep = tail.len().saturating_sub(8);
+        tail.drain(..keep);
+    };
+    let reply = rx
+        .recv_timeout(MUST_HAPPEN)
+        .expect("the turn answered once its program read the text");
+    assert!(
+        !reply.starts_with("ERR"),
+        "the turn ran to its verdict: {reply}"
+    );
+    // A pipe draws nothing, so its Enter goes unverified: pressed once.
+    assert!(reply.contains(" pressed=1"), "{reply}");
+    let after = [after, drain_pipe(&reader)].concat();
+    assert_eq!(after, b"\r", "the text, then its one Enter: {reply}");
+}
+
 #[test]
 #[cfg(target_os = "macos")]
 fn a_background_paste_a_discard_drops_is_never_ok() {
@@ -11746,6 +11922,99 @@ fn cap_gives_a_typed_turn_room_to_press_a_long_text() {
     }
 }
 
+/// A TYPED TURN'S REST PRESSES ITS TABS (the hostile review of the turn-deadline work,
+/// 2026-11-06): wherever the cap stops the keys of `col1<Tab>col2 x`, the rest goes as typing it
+/// would, its text pasted and its Tab pressed as the Tab key, in order, so a shell under bracketed
+/// paste still completes where the keys would have; each of the text's keys is counted once,
+/// typed or pasted. NEGATIVE CONTROL: with the rest pasted in one piece, the Tab is inside a
+/// paste for every cap that stops the keys before it (1 to 4).
+#[test]
+fn a_typed_turn_s_rest_presses_its_tabs_wherever_the_cap_stops_the_keys() {
+    use std::cell::RefCell;
+    use std::time::Instant;
+
+    use aterm_types::keyboard::{Key, NamedKey};
+
+    use crate::input::InputEvent;
+
+    const TEXT: &str = "col1\tcol2 x";
+    let run = |cap: usize| -> (String, Vec<(bool, String)>) {
+        // Each write in order: (pressed as a key, what it wrote).
+        let writes = RefCell::new(Vec::<(bool, String)>::new());
+        let key = |ev: InputEvent| {
+            let InputEvent::Key { key, mods, .. } = ev else {
+                panic!("a typed key is a key event: {ev:?}");
+            };
+            assert!(mods.is_empty(), "no shifted key in {TEXT:?}");
+            let written = match key {
+                Key::Character(c) => c.to_string(),
+                Key::Named(NamedKey::Space) => " ".to_string(),
+                Key::Named(NamedKey::Tab) => "\t".to_string(),
+                other => panic!("no {other:?} in {TEXT:?}"),
+            };
+            writes.borrow_mut().push((true, written));
+            true
+        };
+        let paste = |t: &str| {
+            writes.borrow_mut().push((false, t.to_string()));
+            true
+        };
+        let press = |_: &str| true;
+        let momentum = || Ok((0.0, Instant::now()));
+        let store = session_store::new_store();
+        let h = registered_session(0, -1, b"");
+        store.write().unwrap().register(h.clone());
+        let out = cmd_turn(
+            &h.term,
+            &store,
+            0,
+            &format!("typed=1 cadence=1 submit=none idle=20 timeout=60000 cap={cap} {TEXT}"),
+            &h.ctx,
+            &TurnIo {
+                paste: &paste,
+                press: &press,
+                key: &key,
+                momentum: &momentum,
+                driver: None,
+                by: crate::turn_ledger::TurnBy::Ctl,
+                actor: aterm_slog::Actor::Ctl,
+                cause: None,
+                mark: None,
+                witness: None,
+                refused: &|| None,
+            },
+        );
+        let verdict = out.lines().next().unwrap_or("").to_string();
+        (verdict, writes.into_inner())
+    };
+    for cap in 1..=11 {
+        let (verdict, writes) = run(cap);
+        let written: String = writes.iter().map(|(_, w)| w.as_str()).collect();
+        assert_eq!(written, TEXT, "cap={cap}: {writes:?}");
+        assert!(
+            !writes.iter().any(|(key, w)| !key && w.contains('\t')),
+            "cap={cap}: the Tab was pasted: {writes:?}"
+        );
+        let keys = writes.iter().filter(|(key, _)| *key).count();
+        let pasted: usize = writes
+            .iter()
+            .filter(|(key, _)| !key)
+            .map(|(_, w)| w.chars().count())
+            .sum();
+        assert_eq!(keys + pasted, 11, "cap={cap}: {writes:?}");
+        assert!(
+            verdict.ends_with(&format!(" typed={keys} pasted={pasted}")),
+            "cap={cap}: {verdict}"
+        );
+    }
+    let (_, writes) = run(4);
+    assert_eq!(
+        writes[4..],
+        [(true, "\t".to_string()), (false, "col2 x".to_string())],
+        "past the cap: the Tab pressed, then the rest pasted in one piece"
+    );
+}
+
 fn typed_turn_with(
     opts: &str,
     fence: bool,
@@ -12486,6 +12755,161 @@ fn a_digit_waits_for_the_program_to_read_every_key_before_it() {
     );
     aterm_pty::close_fd(slave);
     aterm_pty::close_fd(master);
+}
+
+/// A fenced typed turn's pasted rest, where it holds a digit, waits as a typed digit does for the
+/// program to read and draw the key before it ([`a_digit_waits_for_the_program_to_read_every_key_before_it`]):
+/// past `cap=8`, the rest `2.1.291 is in` goes only once the line typed before it is read, and a
+/// wait the program never ends is cut there, nothing pasted, as for the rest `is 2.1.291`, whose
+/// digit comes later; a rest of letters does not wait.
+/// NEGATIVE CONTROLS: the rest held to an open frame alone is pasted over the unread line,
+/// `submitted=1 … typed=8 pasted=13`; held for a digit first alone, `is 2.1.291` is,
+/// `typed=8 pasted=10`.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_fenced_turns_pasted_rest_with_a_digit_waits_for_the_program_to_read_every_key_before_it() {
+    use super::control_session::set_hold_wait_for_test;
+    use aterm_session::sink::Discard;
+    use std::time::Instant;
+    struct Clock;
+    impl Drop for Clock {
+        fn drop(&mut self) {
+            set_hold_wait_for_test(None);
+        }
+    }
+    let _clock = Clock;
+    let (master, slave) = aterm_pty::open_pty_pair().expect("a pty pair");
+    let budget = aterm_spec::wait::MUST_HAPPEN;
+    let opts = format!("timeout={} cap=8", budget.as_millis());
+    let waits = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let unread_after = |at: usize, reads: bool| {
+        let waits = std::rc::Rc::clone(&waits);
+        move |k: usize, _: &Composer, h: &SessionHandle| {
+            if k == at {
+                aterm_pty::write_all(master, b"x\n");
+                let waits = std::rc::Rc::clone(&waits);
+                let sink = h.ctx.sink.clone();
+                set_hold_wait_for_test(Some(Box::new(move || {
+                    waits.set(waits.get() + 1);
+                    if reads {
+                        let _ = sink.discard_unread_input(Discard::Flush);
+                        Instant::now()
+                    } else {
+                        Instant::now() + budget
+                    }
+                })));
+            }
+        }
+    };
+    let rule = composer_rule();
+    let text = "version 2.1.291 is in";
+    let t = composer_turn_on(master, &rule, 76, &opts, text, &unread_after(8, false));
+    set_hold_wait_for_test(None);
+    assert!(
+        t.verdict
+            .starts_with("OK 0 turn skipped reason=deadline typed=8 pasted=0 submitted=0"),
+        "{}",
+        t.verdict
+    );
+    assert_eq!((t.keys.concat().as_str(), t.enters), ("version ", 0));
+    assert_eq!(
+        waits.get(),
+        1,
+        "the rest waited, and its deadline came there"
+    );
+    waits.set(0);
+    let later = "version is 2.1.291";
+    let t = composer_turn_on(master, &rule, 76, &opts, later, &unread_after(8, false));
+    set_hold_wait_for_test(None);
+    assert!(
+        t.verdict
+            .starts_with("OK 0 turn skipped reason=deadline typed=8 pasted=0 submitted=0"),
+        "{}",
+        t.verdict
+    );
+    assert_eq!((t.keys.concat().as_str(), t.enters), ("version ", 0));
+    assert_eq!(waits.get(), 1, "a rest whose digit comes later waited too");
+    waits.set(0);
+    let t = composer_turn_on(master, &rule, 76, &opts, text, &unread_after(8, true));
+    set_hold_wait_for_test(None);
+    assert!(
+        t.verdict.contains(" submitted=1 ") && t.verdict.ends_with(" typed=8 pasted=13"),
+        "{}",
+        t.verdict
+    );
+    assert!(waits.get() >= 1, "the rest waited for the line to be read");
+    waits.set(0);
+    let letters = "version is all in";
+    let t = composer_turn_on(master, &rule, 76, &opts, letters, &unread_after(8, false));
+    set_hold_wait_for_test(None);
+    assert!(
+        t.verdict.contains(" submitted=1 ") && t.verdict.ends_with(" typed=8 pasted=9"),
+        "{}",
+        t.verdict
+    );
+    assert_eq!(waits.get(), 0, "a rest of letters did not wait");
+    aterm_pty::close_fd(slave);
+    aterm_pty::close_fd(master);
+}
+
+/// A FENCED REST'S DIGIT WAITS ON A TAB ONLY WHERE TYPING'S WOULD (the hostile review of the
+/// rest's writes, 2026-11-06): to a composer whose Tab draws nothing (its echo held back here),
+/// past `cap=2` of `ab<Tab>c1` the rest presses the Tab and pastes `c1`, which waits for the `b`
+/// before the Tab to be drawn, as typing the whole text waits on no Tab's echo, and both land;
+/// past `cap=2` of `ab<Tab>1c`, whose digit follows the Tab, the paste waits for the Tab's echo
+/// as typing's `1` does, and both stop there at the deadline, `ab<Tab>` left standing.
+/// NEGATIVE CONTROL: with a paste's digit waiting on the write just before it, `ab<Tab>c1` past
+/// `cap=2` stops at the deadline, `typed=3 pasted=0`, where typed whole it lands.
+#[test]
+fn a_fenced_rests_digit_waits_on_a_tab_only_where_typing_would() {
+    use super::control_session::set_hold_wait_for_test;
+    use std::time::Instant;
+    struct Clock;
+    impl Drop for Clock {
+        fn drop(&mut self) {
+            set_hold_wait_for_test(None);
+        }
+    }
+    let _clock = Clock;
+    let budget = aterm_spec::wait::MUST_HAPPEN;
+    let rule = composer_rule();
+    // After the second key the Tab's echo is held back, and a wait for it meets the deadline at
+    // its first look.
+    let tab_draws_nothing = move |k: usize, c: &Composer, _: &SessionHandle| {
+        if k == 2 {
+            c.hold.set(true);
+            set_hold_wait_for_test(Some(Box::new(move || Instant::now() + budget)));
+        }
+    };
+    let run = |cap: usize, text: &str| {
+        let opts = format!("timeout={} cap={cap}", budget.as_millis());
+        let t = composer_turn_with(&rule, 76, &opts, text, &tab_draws_nothing);
+        set_hold_wait_for_test(None);
+        t
+    };
+    for (cap, ends) in [(2, " typed=3 pasted=2"), (5, " typed=5 pasted=0")] {
+        let t = run(cap, "ab\tc1");
+        assert!(
+            t.verdict.contains(" submitted=1 ") && t.verdict.ends_with(ends),
+            "cap={cap}: {}",
+            t.verdict
+        );
+        assert_eq!(t.enters, 1, "cap={cap}");
+    }
+    for cap in [2, 5] {
+        let t = run(cap, "ab\t1c");
+        assert!(
+            t.verdict
+                .starts_with("OK 0 turn skipped reason=deadline typed=3 pasted=0 submitted=0"),
+            "cap={cap}: {}",
+            t.verdict
+        );
+        assert_eq!(
+            (t.keys.concat().as_str(), t.enters),
+            ("ab\t", 0),
+            "cap={cap}"
+        );
+    }
 }
 
 /// The test's hand at a typed turn's typing hold, as a starved program: each frame

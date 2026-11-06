@@ -203,6 +203,31 @@ impl Scratch {
         args: &[&str],
         env: &[(&str, &str)],
     ) -> aterm_uds::spawnfd::Child {
+        self.front_command(ignored, args, env)
+            .spawn()
+            .expect("the front")
+    }
+
+    /// [`Self::front`], started in a session of its own (`setsid`), as aterm starts each tab's
+    /// shell: none of its ancestors is in its session.
+    fn front_in_its_own_session(
+        &self,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> aterm_uds::spawnfd::Child {
+        self.front_command(None, args, env)
+            .setsid(true)
+            .spawn()
+            .expect("the front")
+    }
+
+    /// The command [`Self::front_ignoring`] spawns.
+    fn front_command(
+        &self,
+        ignored: Option<&str>,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> aterm_uds::spawnfd::Command {
         let atpkg = aterm_tempfile::bin_exe("atpkg");
         let mut cmd = match ignored {
             None => aterm_uds::spawnfd::command(&atpkg),
@@ -241,7 +266,7 @@ impl Scratch {
         for (k, v) in env {
             cmd.env(k, v);
         }
-        cmd.spawn().expect("the front")
+        cmd
     }
 
     /// What the stand-in found, once it said it.
@@ -583,10 +608,12 @@ enum Went {
     Ran,
     /// It said it waits (`capacity: … waits (…)`), which it says at its first look that waits.
     Waits,
+    /// It exited first, neither building nor saying it waits: its status and what it said.
+    Exited(String, Vec<String>),
 }
 
-/// Whether `child`'s build started (its stand-in wrote `report`) or it said it waits, whichever
-/// comes first, within the hang detector. Takes its stderr.
+/// Whether `child`'s build started (its stand-in wrote `report`), it said it waits, or it exited
+/// without either, whichever comes first, within the hang detector. Takes its stderr.
 fn admitted_or_waits(child: &mut aterm_uds::spawnfd::Child, report: &Path) -> Went {
     use std::io::BufRead as _;
     let err = child.stderr.take().expect("its stderr");
@@ -620,7 +647,7 @@ fn admitted_or_waits(child: &mut aterm_uds::spawnfd::Child, report: &Path) -> We
             if std::fs::metadata(report).is_ok() {
                 return Some(Went::Ran);
             }
-            panic!("the front exited {status} without building or waiting: {lines:?}");
+            return Some(Went::Exited(status.to_string(), std::mem::take(&mut lines)));
         }
         None
     })
@@ -742,20 +769,25 @@ fn an_ordinary_ancestors_unlocked_lock_file_cannot_force_admission() {
     }
 }
 
-/// A genuinely held but foreign lock is no authority either. With no covering claim and an
-/// unrelated ALONE claim, the real front must give a bounded, named refusal instead of forcing
-/// admission or entering a permanent wait cycle. The holding ancestor here is an isolated child of
-/// this suite (so concurrent tests in the shared runner process inherit no open `.cargo-lock`),
-/// not Cargo. Cleanup precedes the outcome assertions, including against old production.
+/// A HELD LOCK BOUNDS THE WAIT ONLY OF A FRONT IN ITS HOLDER'S SESSION. A genuinely held but
+/// foreign lock is no authority: with no covering claim and an unrelated ALONE claim, a front in
+/// its holder's session gives a bounded, named refusal instead of forcing admission or entering a
+/// permanent wait cycle. A front its holder started in a session of its own, as aterm starts each
+/// tab's shell, waits as any front does: what hosts a session is no build that waits on it, and
+/// aterm holds a profile's Cargo locks while its disk watch reclaims that profile's
+/// `incremental/`. The holding ancestor is an isolated child of this suite (so concurrent tests
+/// in the shared runner process inherit no open `.cargo-lock`), not Cargo. NEGATIVE CONTROL: the
+/// in-session leg, the same holder and lock refusing; and the own-session leg exited 75 too while
+/// the front walked every ancestor up to launchd. Cleanup precedes the outcome assertions.
 #[test]
-fn an_ambiguous_unclaimed_lock_has_a_bounded_named_outcome() {
+fn a_held_lock_bounds_the_wait_only_of_a_front_in_its_holders_session() {
     const ISOLATED_ENV: &str = "ATPKG_HOP_ISOLATED_LOCK_ANCESTOR";
     if std::env::var_os(ISOLATED_ENV).is_none() {
         let exe = std::env::current_exe().expect("the suite's own path");
         let mut cmd = aterm_uds::spawnfd::command(exe);
         cmd.args([
             "--exact",
-            "build_hop::an_ambiguous_unclaimed_lock_has_a_bounded_named_outcome",
+            "build_hop::a_held_lock_bounds_the_wait_only_of_a_front_in_its_holders_session",
             "--test-threads=1",
             "--nocapture",
         ])
@@ -779,6 +811,20 @@ fn an_ambiguous_unclaimed_lock_has_a_bounded_named_outcome() {
         4096,
     )
     .expect("foreign lock held by this ordinary ancestor");
+    let hosted = s.root().join("hosted");
+    let mut own = s.front_in_its_own_session(
+        &["--unverified", "check", "-p", "small"],
+        &[
+            ("ATERM_ADMIT", "wait"),
+            ("HOP_OUT", hosted.to_str().expect("UTF-8")),
+        ],
+    );
+    let went = admitted_or_waits(&mut own, &hosted);
+    if went == Went::Waits {
+        // SAFETY: `kill` with two integers; the front is this test's live child, unreaped.
+        unsafe { libc::kill(i32::try_from(own.id()).expect("a pid"), libc::SIGTERM) };
+    }
+    let _ = finish(own);
     let mut child = s.front(
         &["--unverified", "check", "-p", "small"],
         &[("ATERM_ADMIT", "wait")],
@@ -802,6 +848,12 @@ fn an_ambiguous_unclaimed_lock_has_a_bounded_named_outcome() {
     until_within(MUST_HAPPEN, "all claims let go", || {
         s.listed().is_empty().then_some(())
     });
+    assert_eq!(
+        went,
+        Went::Waits,
+        "a front in a session of its own took its host's held lock for an outer build's"
+    );
+    assert!(!hosted.exists(), "its build never started");
     assert_eq!(exited.and_then(|s| s.code()), Some(75), "{err}");
     assert!(!s.out().exists(), "no unclaimed build started");
     assert!(

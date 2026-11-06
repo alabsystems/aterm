@@ -6,8 +6,8 @@
 //!
 //! The sprite is [`RING_CELLS`] cells by one, rastered on the CPU from the signed distance to one
 //! pill 82% of the cell high, centred on the rule's `─` stroke and grown to clear the small
-//! emoji's rows by a pixel inside its rim: a hairline rim in the rule's ink at
-//! the line's end, floored to 3:1 on the ground ([`ring_ink`]), washed [`RING_WASH`] inside.
+//! emoji's rows by a pixel inside its rim: a hairline rim in the rule's ink where the ring sits,
+//! floored to 3:1 on the ground ([`ring_ink`]), washed [`RING_WASH`] inside.
 //! Coverage is `clamp(0.5 - d, 0, 1)` at pixel centres. The harness switch beside the ⬆️ is words
 //! alone and has no sprite.
 
@@ -20,17 +20,14 @@ use aterm_core::render::{
 use crate::cli_marks::ICON_CONTRAST;
 use crate::color_math::{floor_contrast_keeping_hue, hypot_f32};
 use crate::effect_util::lerp_rgb as mix;
-use crate::harness_card::{CardPalette, dark_ground};
 
 /// Where the ring takes its hue: the hue of the rule it closes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RingHue {
-    /// A harness theme's arc at its end: Cruise's spectrum, Land's sunset, Autopilot Off's
-    /// moonbow.
-    Arc(CardPalette),
-    /// No harness theme: one hue, the chrome band's accent (`0x00RRGGBB`).
-    Accent(u32),
-    /// The harness is off: no hue, the ground moved toward the ink.
+    /// The rule's own tinted ink where the ring sits (`0x00RRGGBB`): a harness theme's arc at
+    /// the arrow's column ([`crate::glass_inks::GlassInks::rule`]).
+    Rule(u32),
+    /// The harness off, or no harness theme: no hue, the ground moved toward the ink.
     Neutral,
 }
 
@@ -43,8 +40,6 @@ pub struct RingKey {
     pub ground: u32,
     /// The pane's ink.
     pub fg: u32,
-    /// The rule's own ink, which the arc is laid over.
-    pub rule: u32,
     /// The ring's hue.
     pub hue: RingHue,
 }
@@ -58,19 +53,14 @@ pub const RING_CELLS: u16 = 3;
 /// The wash inside the ring.
 pub const RING_WASH: f32 = 0.14;
 
-/// The ring's ink: the rule's tint at the line's end (the arc lifted a quarter toward the ink,
-/// laid 68% over the rule, as the gui inks the rule's `─`), floored to 3:1 on the ground.
+/// The ring's ink: the rule's tint where it sits, or with no hue the ground moved toward the ink,
+/// floored to 3:1 on the ground.
 #[must_use]
 #[inline]
 pub const fn ring_ink(key: &RingKey) -> u32 {
     let (g, f) = (key.ground, key.fg);
     let ink = match key.hue {
-        RingHue::Arc(palette) => mix(
-            key.rule,
-            mix(palette.art(1.0, dark_ground(g)), f, 0.25),
-            0.68,
-        ),
-        RingHue::Accent(accent) => accent,
+        RingHue::Rule(rule) => rule,
         RingHue::Neutral => mix(g, f, 0.30),
     };
     floor_contrast_keeping_hue(ink, g, RING_CONTRAST)
@@ -271,6 +261,8 @@ pub fn layer(id: u64, content: Arc<FxContent>, offset: (i32, i32), clip: PxRect)
 mod tests {
     use super::*;
     use crate::color_math::contrast_ratio;
+    use crate::glass_inks::GlassInks;
+    use crate::harness_card::CardPalette;
 
     const DARK: u32 = 0x0011_1318;
     const DARK_FG: u32 = 0x00D0_D2D6;
@@ -282,9 +274,14 @@ mod tests {
             cell: (15, 28),
             ground,
             fg,
-            rule: mix(ground, fg, 0.35),
             hue,
         }
+    }
+
+    /// `palette`'s rule at the right end of a line on `ground` inked `fg`, where a ⬆️ sits.
+    fn arc(palette: CardPalette, ground: u32, fg: u32) -> RingHue {
+        let rule = mix(ground, fg, 0.35);
+        RingHue::Rule(GlassInks::of(Some(palette), ground, fg, rule).rule(0.02))
     }
 
     fn px(bytes: &[u8], w: u16, x: u16, y: u16) -> [u8; 4] {
@@ -299,7 +296,7 @@ mod tests {
     #[test]
     fn the_ring_is_a_hairline_pill_round_the_arrow() {
         for (ground, fg) in [(DARK, DARK_FG), (PAPER, PAPER_FG)] {
-            let k = key(ground, fg, RingHue::Arc(CardPalette::Cruise));
+            let k = key(ground, fg, arc(CardPalette::Cruise, ground, fg));
             let shown = content(&k);
             let items = shown.items();
             assert_eq!(items.len(), 1, "the ring alone");
@@ -345,7 +342,7 @@ mod tests {
         for cell in [(15, 28), (8, 16), (7, 14), (9, 18), (18, 36)] {
             let k = RingKey {
                 cell,
-                ..key(DARK, DARK_FG, RingHue::Arc(CardPalette::Cruise))
+                ..key(DARK, DARK_FG, arc(CardPalette::Cruise, DARK, DARK_FG))
             };
             let (w, h, bytes) = raster(&k);
             let (top, rows) = aterm_core::terminal::Script::small_emoji_rows(h as usize);
@@ -367,8 +364,8 @@ mod tests {
     }
 
     /// EVERY RING READS ON ITS GROUND: on dark, on paper and on mid greys inked white and black,
-    /// under every palette, the accent and the harness off, the ring's ink reads at 3:1 on the
-    /// ground. CONTROL: Dracula's accent unfloored reads under 3:1 on paper, floored at 3:1.
+    /// under every palette's rule and with no hue, the ring's ink reads at 3:1 on the ground.
+    /// CONTROL: a pale violet rule unfloored reads under 3:1 on paper, floored at 3:1.
     #[test]
     fn every_ring_reads_on_its_ground() {
         let mut checked = 0;
@@ -381,10 +378,9 @@ mod tests {
             (0x0082_8282, 0),
         ] {
             for hue in [
-                RingHue::Arc(CardPalette::Cruise),
-                RingHue::Arc(CardPalette::Land),
-                RingHue::Arc(CardPalette::Off),
-                RingHue::Accent(0x003B_8EEA),
+                arc(CardPalette::Cruise, ground, fg),
+                arc(CardPalette::Land, ground, fg),
+                arc(CardPalette::Off, ground, fg),
                 RingHue::Neutral,
             ] {
                 let r = contrast_ratio(ring_ink(&key(ground, fg, hue)), ground);
@@ -392,11 +388,11 @@ mod tests {
                 checked += 1;
             }
         }
-        assert_eq!(checked, 6 * 5);
+        assert_eq!(checked, 6 * 4);
         let violet = 0x00BD_93F9;
         let raw = contrast_ratio(violet, PAPER);
         assert!(raw < RING_CONTRAST, "CONTROL: unfloored {raw:.2}:1");
-        let k = key(PAPER, PAPER_FG, RingHue::Accent(violet));
+        let k = key(PAPER, PAPER_FG, RingHue::Rule(violet));
         assert!(contrast_ratio(ring_ink(&k), PAPER) >= RING_CONTRAST);
     }
 }

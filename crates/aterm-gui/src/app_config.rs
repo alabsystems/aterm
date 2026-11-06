@@ -3510,19 +3510,6 @@ impl Config {
         self.privacy_probe_gate().permits() && self.privacy_notice()
     }
 
-    /// Why System State's Local Network step will not run in a window of this config: a
-    /// `[privacy]` switch off ([`Self::access_steps_allowed`]), or swarm participation off
-    /// (`App::tick_local_network_step` asks nothing then); `None` while it may.
-    pub(crate) fn local_network_step_off(&self) -> Option<&'static str> {
-        if !self.access_steps_allowed() {
-            Some(LOCAL_NETWORK_STEP_PRIVACY_OFF)
-        } else if !self.swarm_enabled() {
-            Some(LOCAL_NETWORK_STEP_SWARM_OFF)
-        } else {
-            None
-        }
-    }
-
     /// The `[privacy]` `report_attribution` bit (default true).
     pub(crate) fn privacy_report_attribution(&self) -> bool {
         self.privacy
@@ -5468,33 +5455,6 @@ pub(crate) fn agents_auto_prime_setting() -> bool {
         Ok(observation) => agents_auto_prime_from_text(&observation.text),
         Err(_) => true,
     }
-}
-
-/// [`Config::local_network_step_off`]'s reason while a `[privacy]` switch is off.
-pub(crate) const LOCAL_NETWORK_STEP_PRIVACY_OFF: &str = "a [privacy] switch is off";
-
-/// [`Config::local_network_step_off`]'s reason while swarm participation is off.
-pub(crate) const LOCAL_NETWORK_STEP_SWARM_OFF: &str =
-    "[swarm] enabled is off, so System State asks no Local Network question";
-
-/// [`Config::local_network_step_off`] of `aterm.toml` as it reads now, read without
-/// [`load_config`]'s stderr lines or notices (another thread of the process asks it). A missing
-/// file reads as the defaults; one that cannot be read or parsed says nothing is off, so no
-/// waiver comes from it.
-pub(crate) fn local_network_step_off_setting() -> Option<&'static str> {
-    let Some(path) = config_path() else {
-        return Config::default().local_network_step_off();
-    };
-    match crate::native_config_service::VersionedConfigService::observe_path(&path, true) {
-        Ok(observation) => local_network_step_off_from_text(&observation.text),
-        Err(_) => None,
-    }
-}
-
-fn local_network_step_off_from_text(text: &str) -> Option<&'static str> {
-    aterm_toml::from_str::<Config>(text)
-        .ok()
-        .and_then(|config| config.local_network_step_off())
 }
 
 /// Read source and application policy from one persisted config observation.
@@ -7706,9 +7666,6 @@ impl App {
         let claude_footer_changed = self.config.claude_footer != config.claude_footer;
         let ai_changed = self.config.ai != config.ai;
         self.config = config.clone();
-        if !self.config.swarm_enabled() {
-            crate::system_state_access::cancel_local_network_probe();
-        }
         self.reconcile_consent_config();
         let _ = self.reconcile_consent_observer();
         crate::fleet_listen::configure_fleet_listener(self.config.effective_fleet());
@@ -11718,7 +11675,6 @@ mod theme_live_tests {
             crate::tab_bar::VersionSlotCols::NONE,
             false,
             crate::tab_bar::CaptionSlot::NONE,
-            None,
             None,
         ));
 

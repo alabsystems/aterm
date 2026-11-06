@@ -247,7 +247,7 @@ impl Repo {
                 .iter()
                 .map(|(name, sha)| (name.clone(), sha.clone())),
         );
-        refs.sort();
+        refs.sort_unstable();
         refs
     }
 }

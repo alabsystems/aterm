@@ -132,8 +132,8 @@ pub struct Seen {
     pub last_use: BTreeMap<String, (String, u64)>,
     /// Each account's sign-in word per Mac (32 hex).
     pub signins: BTreeMap<String, BTreeMap<String, SignedIn>>,
-    readings: BTreeMap<(String, Window), Vec<Reading>>,
-    walls: BTreeMap<(String, Window), Wall>,
+    readings: BTreeMap<String, BTreeMap<Window, Vec<Reading>>>,
+    walls: BTreeMap<String, BTreeMap<Window, Wall>>,
     /// Each sub-account key to the account it belongs to.
     pub sub_of: BTreeMap<String, String>,
     /// Every in-window event, by (time, Mac, counter).
@@ -358,17 +358,28 @@ impl Seen {
     }
 
     fn read(&mut self, pk: &str, window: Window, reading: Reading) {
-        let list = self.readings.entry((pk.to_owned(), window)).or_default();
-        if !list.contains(&reading) {
-            list.push(reading);
+        if let Some(by_window) = self.readings.get_mut(pk) {
+            let list = by_window.entry(window).or_default();
+            if !list.contains(&reading) {
+                list.push(reading);
+            }
+            return;
         }
+        let mut by_window = BTreeMap::new();
+        by_window.insert(window, vec![reading]);
+        self.readings.insert(pk.to_owned(), by_window);
     }
 
     fn wall(&mut self, pk: &str, window: Window, wall: Wall) {
-        let key = (pk.to_owned(), window);
-        if self.walls.get(&key).is_none_or(|held| held.t <= wall.t) {
-            self.walls.insert(key, wall);
+        if let Some(by_window) = self.walls.get_mut(pk) {
+            if by_window.get(&window).is_none_or(|held| held.t <= wall.t) {
+                by_window.insert(window, wall);
+            }
+            return;
         }
+        let mut by_window = BTreeMap::new();
+        by_window.insert(window, wall);
+        self.walls.insert(pk.to_owned(), by_window);
     }
 
     fn fold_event(&mut self, uuid: &str, event: &Event) {
@@ -420,9 +431,13 @@ impl Seen {
                 },
             ),
             Kind::WallCleared => {
-                let key = (pk.to_owned(), window);
-                if self.walls.get(&key).is_some_and(|held| held.t <= event.t) {
-                    self.walls.remove(&key);
+                if let Some(by_window) = self.walls.get_mut(pk)
+                    && by_window.get(&window).is_some_and(|held| held.t <= event.t)
+                {
+                    by_window.remove(&window);
+                    if by_window.is_empty() {
+                        self.walls.remove(pk);
+                    }
                 }
             }
             _ => {}
@@ -498,21 +513,22 @@ impl Seen {
         );
         let mut out = Vec::new();
         for pk in pks {
-            let mut key = (pk.to_owned(), Window::FiveHour);
+            let readings = self.readings.get(pk);
+            let walls = self.walls.get(pk);
+            if readings.is_none() && walls.is_none() {
+                continue;
+            }
             for &window in Window::ALL {
-                key.1 = window;
-                let usage = self
-                    .readings
-                    .get(&key)
+                let usage = readings
+                    .and_then(|by_window| by_window.get(&window))
                     .and_then(|readings| usage(window, readings, self.now));
-                let wall = self
-                    .walls
-                    .get(&key)
+                let wall = walls
+                    .and_then(|by_window| by_window.get(&window))
                     .filter(|wall| wall.until.is_none_or(|until| until > self.now))
                     .cloned();
                 if usage.is_some() || wall.is_some() {
                     out.push(WindowQuota {
-                        pk: key.0.clone(),
+                        pk: pk.to_owned(),
                         window,
                         usage,
                         wall,
@@ -577,7 +593,7 @@ impl Seen {
     pub fn accounts(&self) -> std::collections::BTreeSet<String> {
         let mut out: std::collections::BTreeSet<String> = self.last_use.keys().cloned().collect();
         out.extend(self.signins.keys().cloned());
-        for (pk, _) in self.readings.keys().chain(self.walls.keys()) {
+        for pk in self.readings.keys().chain(self.walls.keys()) {
             out.insert(self.sub_of.get(pk).unwrap_or(pk).clone());
         }
         out

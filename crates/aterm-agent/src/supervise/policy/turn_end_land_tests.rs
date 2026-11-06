@@ -157,6 +157,36 @@ fn land_reads_the_needs_table_as_labelled() {
     }));
 }
 
+/// A NEEDS YOU TOKEN ITS CLAUSE HAS FOR SUBJECT ASKS THE PERSON NOTHING (live 2026-11-04: `- **NEEDS
+/// YOU can be lost.** …`): its `YOU` is the head's name, not the person, so Land reads no `you can`
+/// there ([`needs::token_you`]) and a defense beside it lands. A `you can` that is no token's, and
+/// a question after a bare head, still hold. Negative control: on the reader before the rule each
+/// prose report below held on `you can`.
+#[test]
+fn a_needs_you_token_its_clause_has_for_subject_asks_nothing() {
+    let defense = "Nothing left: all on origin/main.";
+    for said in [
+        "- **NEEDS YOU can be lost.** A NEEDS YOU line in a turn that ended on a usage wall …",
+        "NEEDS YOU can't be answered by the harness.",
+        "The rule: NEEDS-YOU could be read past a comma too.",
+    ] {
+        let reply = format!("Merged and pushed main.\n{said}\n{defense}");
+        assert!(
+            clean_defense(Some(&reply)),
+            "{reply:?}: {:?}",
+            land_open_words(Some(&reply))
+        );
+    }
+    for said in [
+        "If you can, rotate the deploy key.",
+        "The signing step needs you: you can run it from the Settings page.",
+        "NEEDS YOU can you sign in to GitHub?",
+    ] {
+        let reply = format!("Merged and pushed main.\n{said}\n{defense}");
+        assert!(!clean_defense(Some(&reply)), "{reply:?}");
+    }
+}
+
 #[test]
 fn a_need_however_headed_holds_the_landing() {
     let defense = "Nothing left: all on origin/main.";

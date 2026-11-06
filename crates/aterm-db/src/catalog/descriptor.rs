@@ -176,7 +176,7 @@ impl Descriptor {
     }
 }
 
-fn application_scope(trust: Trust, application: &str, role: &str) -> Result<Scope> {
+pub(crate) fn application_scope(trust: Trust, application: &str, role: &str) -> Result<Scope> {
     let mut sha = aterm_digest::Sha256::new();
     sha.update(b"aterm/commons/application-table/1\0");
     sha.update(trust.network);

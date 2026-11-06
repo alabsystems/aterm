@@ -454,7 +454,7 @@ pub fn test_run(up: &Up, cargo: impl Fn(&[&str]) -> Vec<String>, args: &[&str]) 
 }
 
 /// The packages whose Linux tests the proof runs.
-pub const TESTED: [&str; 3] = ["aterm-uds", "aterm-pty", "libc"];
+pub const TESTED: [&str; 4] = ["aterm-uds", "aterm-pty", "libc", "amacs-files"];
 
 /// The package whose library tests the proof runs on their own row: the renderer's glyph and
 /// icon tests measure the face the guest resolves as its system face.
@@ -2091,12 +2091,12 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
             if arch == Arch::X86_64 {
                 tests.push(ROSETTA_ONE_AT_A_TIME);
             }
-            println!("\n=== {tag}: aterm-uds, aterm-pty, aterm-libc tests ===");
+            println!("\n=== {tag}: aterm-uds, aterm-pty, aterm-libc, amacs-files tests ===");
             let manifest = format!("{repo}/Cargo.toml");
             let workspace = |args: &[&str]| cargo(&env, &manifest, "test", args);
             let out = test_run(&up, workspace, &tests);
             rows.push(translator_not_runs(
-                test_verdict(&format!("{tag} tests: uds pty libc"), &out),
+                test_verdict(&format!("{tag} tests: uds pty libc files"), &out),
                 &out.text,
                 arch,
             ));

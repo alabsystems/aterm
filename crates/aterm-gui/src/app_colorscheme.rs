@@ -422,7 +422,6 @@ pub(crate) mod install_resolved_colors {
                 false,
                 crate::tab_bar::CaptionSlot::NONE,
                 None,
-                None,
             ));
         };
         let install = |app: &mut App, text: &str| {

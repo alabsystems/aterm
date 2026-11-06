@@ -283,7 +283,10 @@ pub fn self_check(
     let record = snapshot.join("INSTALLED-FROM");
     let recorded = crate::identity::read_regular_text(&record, crate::identity::MAX_META_BYTES)
         .map_err(|e| not_a_snapshot(format!("{}: {e}", record.display())))?;
-    if !recorded.lines().any(|l| l == format!("sha256 {actual}")) {
+    if !recorded
+        .lines()
+        .any(|l| l.strip_prefix("sha256 ") == Some(actual.as_str()))
+    {
         return Err(not_a_snapshot(format!(
             "{} records another sha256",
             record.display()

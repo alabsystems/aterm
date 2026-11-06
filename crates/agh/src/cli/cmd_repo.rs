@@ -15,6 +15,116 @@ use crate::github::RepoListKind;
 use crate::policy::{Access, Named};
 use crate::slug::Slug;
 
+/// Admit local source reads with no identity load, request, grant or source mutation.
+pub(crate) fn repo_check_local(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
+    let dir = inv
+        .rest()
+        .first()
+        .ok_or_else(|| inv.usage("DIR is required"))?;
+    let dir =
+        std::fs::canonicalize(dir).map_err(|_| inv.usage("DIR must be an existing repository"))?;
+    // A local admission has no account authority. In particular, constructing
+    // this client must not adopt or read credentials to inspect a config file.
+    let gh = ctx.client(crate::policy::Router::empty());
+    let (slug, named) = inv.repo(gh.router())?;
+    let out = gh.run_git(&GitRun::check_local(&slug, &dir).with_named(named))?;
+    let common = out
+        .stdout
+        .strip_suffix('\n')
+        .ok_or_else(|| inv.usage("Git did not frame its common directory"))?;
+    Ok(Outcome {
+        answer: Answer::Object {
+            noun: Noun::Raw,
+            value: aterm_json::json!({
+                "schema": 1, "mode": "local-read", "repository": slug.to_string(),
+                "directory": dir, "common_dir": common,
+                "admitted": true, "github_requests": 0, "source_mutated": false,
+            }),
+        },
+        receipt: Receipt::for_repo(inv, &gh, &slug),
+    })
+}
+
+/// Publish exact local objects with one explicit atomic lease batch.
+///
+/// # Errors
+/// Input and repository usage errors, writer policy and local Git refusals,
+/// stale leases, or an unknown journaled remote outcome.
+pub(crate) fn repo_push(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
+    use super::cmd_release_write::{
+        Write, as_outcome, journaled, latest_intent, naming_intent, one_shot_answer,
+    };
+    use super::write_out::{ReportOutcome, done};
+    use crate::error::{Error, Kind};
+    use crate::github::refs::{ATOMIC_KEY, AtomicRefBatch, RefUpdate};
+    use crate::write::WriteOp;
+    let file = inv
+        .flag("--input")
+        .ok_or_else(|| inv.usage("--input FILE is required"))?;
+    let updates: Vec<RefUpdate> = super::cmd_api::read_input(file)?;
+    let batch = AtomicRefBatch::new(updates)?;
+    for update in batch.updates() {
+        if update.before == update.after {
+            return Err(inv.usage("native push omits unchanged refs; remove before == after rows"));
+        }
+        journaled(inv, WriteOp::RefUpdateAtomic, "ref", &update.reference)?;
+    }
+    let dir = inv
+        .rest()
+        .first()
+        .ok_or_else(|| inv.usage("DIR is required"))?;
+    let dir = std::path::absolute(dir).map_err(|e| inv.usage(format!("DIR: {e}")))?;
+    if !dir.is_dir() {
+        return Err(inv.usage("DIR must be an existing Git repository directory"));
+    }
+    let w = Write::begin(ctx, inv)?;
+    journaled(inv, WriteOp::RefUpdateAtomic, "repo", &w.slug.key())?;
+    let report = w.report(WriteOp::RefUpdateAtomic, ATOMIC_KEY);
+    w.finish(report, |report| {
+        let permit = w.permit()?;
+        let refs = w.gh.refs(&w.slug).how(w.how.clone());
+        if w.dry {
+            let journal = super::dry_run::readable_journal(&w)?;
+            if let Some(view) = journal.latest(WriteOp::RefUpdateAtomic, ATOMIC_KEY)?
+                && view.open
+            {
+                let id = view.intent.id;
+                return Err(Error::new(
+                    Kind::OutcomeUnknown,
+                    "an atomic ref update intent is still open",
+                )
+                .with_sub(crate::error::Sub::IntentOpen {
+                    intent: id.to_string(),
+                })
+                .with_next(format!("agh intent show {} {id}", w.slug))
+                .with_repo(w.slug.to_string()));
+            }
+            refs.check_push(&permit, &dir, &batch)?;
+            return Ok(done(as_outcome(report.clone(), ReportOutcome::WouldSend)));
+        }
+        let journal = w.gh.journal(&w.slug)?;
+        let before = latest_intent(&journal, WriteOp::RefUpdateAtomic, ATOMIC_KEY);
+        let outcome = refs
+            .push_atomic(&permit, &dir, &batch, &journal)
+            .map_err(|e| {
+                naming_intent(
+                    report,
+                    &journal,
+                    WriteOp::RefUpdateAtomic,
+                    before.as_ref(),
+                    e,
+                )
+            })?;
+        Ok(one_shot_answer(
+            report,
+            WriteOp::RefUpdateAtomic,
+            &journal,
+            outcome,
+            |_| (None, None),
+        ))
+    })
+}
+
 /// Create a public User-owned repository after literal/grant routing and owner proof.
 pub(crate) fn repo_create(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     use super::cmd_release_write::{Write, journaled, one_shot_answer};
@@ -267,26 +377,33 @@ pub(crate) fn repo_fetch_main(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome
     })
 }
 
-/// Fetch one exact source into an agh-owned local ref; anonymous mode is a
+/// Fetch one source or an expected-OID batch into agh-owned local refs; anonymous mode is a
 /// credential-free read, not a fallback from a failed authenticated operation.
 pub(crate) fn repo_fetch(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     if inv.global.as_profile.is_some() {
         return Err(inv.usage("repo fetch uses routed credentials or --anonymous, not --as"));
     }
-    let reference = inv
-        .flag("--ref")
-        .ok_or_else(|| inv.usage("--ref is required"))?;
-    let into = inv
-        .flag("--into")
-        .ok_or_else(|| inv.usage("--into is required"))?;
-    if !(crate::path::is_sha(reference)
-        || (reference.starts_with("refs/") && crate::path::ref_name_ok(reference)))
-    {
-        return Err(inv.usage("--ref must be a full ref or forty lowercase hex digits"));
-    }
-    if !into.starts_with("refs/agh/") || !crate::path::ref_name_ok(into) {
-        return Err(inv.usage("--into must be a valid ref beneath refs/agh/"));
-    }
+    let reference = inv.flag("--ref");
+    let into = inv.flag("--into");
+    let batch = if let Some(file) = inv.flag("--input") {
+        if reference.is_some() || into.is_some() {
+            return Err(inv.usage("--input cannot be combined with --ref or --into"));
+        }
+        let rows: Vec<crate::git::FetchRow> = super::cmd_api::read_input(file)?;
+        Some(crate::git::FetchBatch::new(rows)?)
+    } else {
+        let reference = reference.ok_or_else(|| inv.usage("--ref or --input is required"))?;
+        let into = into.ok_or_else(|| inv.usage("--into is required with --ref"))?;
+        if !(crate::path::is_sha(reference)
+            || (reference.starts_with("refs/") && crate::path::ref_name_ok(reference)))
+        {
+            return Err(inv.usage("--ref must be a full ref or forty lowercase hex digits"));
+        }
+        if !into.starts_with("refs/agh/") || !crate::path::ref_name_ok(into) {
+            return Err(inv.usage("--into must be a valid ref beneath refs/agh/"));
+        }
+        None
+    };
     let dir = inv
         .rest()
         .first()
@@ -297,18 +414,48 @@ pub(crate) fn repo_fetch(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     }
     let gh = ctx.github()?;
     let (slug, named) = inv.repo(gh.router())?;
-    let out = gh.run_git(
-        &GitRun::fetch_ref(&slug, &dir, reference, into, inv.global.anonymous).with_named(named),
-    )?;
+    let (run, note) = if let Some(batch) = batch {
+        let count = batch.rows().len().to_string();
+        (
+            GitRun::fetch_batch(&slug, &dir, batch, inv.global.anonymous),
+            ("refs", count),
+        )
+    } else {
+        let reference = reference.ok_or_else(|| inv.usage("--ref is required"))?;
+        let into = into.ok_or_else(|| inv.usage("--into is required"))?;
+        (
+            GitRun::fetch_ref(&slug, &dir, reference, into, inv.global.anonymous),
+            ("ref", into.to_string()),
+        )
+    };
+    let out = gh.run_git(&run.with_named(named))?;
     let mut receipt = Receipt::for_repo(inv, &gh, &slug);
     receipt.as_ = None;
     receipt
         .notes
         .push(("as".into(), out.as_.unwrap_or_else(|| "anonymous".into())));
-    receipt.notes.push(("ref".into(), into.into()));
-    receipt.notes.push(("source".into(), reference.into()));
+    receipt.notes.push((note.0.into(), note.1));
+    if let Some(reference) = reference {
+        receipt.notes.push(("source".into(), reference.into()));
+    }
     Ok(Outcome {
         answer: Answer::Nothing,
+        receipt,
+    })
+}
+
+/// Read the public smart-HTTP advertisement without a credential or REST lookup.
+pub(crate) fn repo_public_refs(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
+    if !inv.global.anonymous || inv.global.as_profile.is_some() {
+        return Err(inv.usage("repo public-refs requires --anonymous"));
+    }
+    let gh = ctx.github()?;
+    let (slug, named) = inv.repo(gh.router())?;
+    let out = gh.run_git(&GitRun::public_refs(&slug).with_named(named))?;
+    let mut receipt = Receipt::for_repo(inv, &gh, &slug);
+    receipt.notes.push(("as".into(), "anonymous".into()));
+    Ok(Outcome {
+        answer: Answer::Bytes(out.stdout.into_bytes()),
         receipt,
     })
 }

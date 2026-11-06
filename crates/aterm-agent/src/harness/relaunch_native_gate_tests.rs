@@ -727,7 +727,9 @@ fn exit_input(world: &Path, st: &St) -> (Snapshot, Plan) {
         profile: None,
         tab: TAB.into(),
         pid: std::process::id(),
-        start: "captured start".into(),
+        // This process's own kernel start: the snapshot names the live process itself, so
+        // the exit guard sees the same agent, never a reused pid ([`gone_by_identity`]).
+        start: kernel_start(std::process::id()).expect("this process's kernel start"),
         shell: std::process::id(),
         program: std::env::current_exe().unwrap(),
         argv: Vec::new(),
@@ -943,7 +945,16 @@ fn disabled_native_kind_exit_launch_tail_preserves_legacy_guard_and_coordinated_
         let (snap, plan) = exit_input(world.path(), &st);
         // This is the production after_exit_as tail, after its record/plan/roster selection.
         // The live PID simulates the mandatory final exit guard refusing a late continuation.
-        let result = launch_after_exit(&opts, &snap, ExitCause::Exit, report(), st, plan, client);
+        let result = launch_after_exit(
+            &opts,
+            &snap,
+            ExitCause::Exit,
+            false,
+            report(),
+            st,
+            plan,
+            client,
+        );
         let seen = worker.join().unwrap();
         assert_eq!(
             result.step,
@@ -995,7 +1006,16 @@ fn missing_private_token_exit_launch_tail_preserves_only_zero_native_legacy_stat
         let st = state(coordinated);
         assert!(st.native.is_none() && st.native_prepare.is_empty());
         let (snap, plan) = exit_input(world.path(), &st);
-        let result = launch_after_exit(&opts, &snap, ExitCause::Exit, report(), st, plan, client);
+        let result = launch_after_exit(
+            &opts,
+            &snap,
+            ExitCause::Exit,
+            false,
+            report(),
+            st,
+            plan,
+            client,
+        );
         let seen = worker.join().unwrap();
         assert_eq!(
             result.step,
@@ -1010,4 +1030,376 @@ fn missing_private_token_exit_launch_tail_preserves_only_zero_native_legacy_stat
                 .all(|line| line.starts_with(&format!("@{TAB} lease acquire ")))
         );
     }
+}
+
+/// RS1, THE COLD RESTORE'S OLD PATH: an agent that ended under an earlier aterm process (a
+/// reboot), its tab's shell a fresh one, handed to the native cold constructor launches
+/// nothing: no witness of this host names it, so every try is `wait:native-crash-observation`
+/// and nothing is typed. NEGATIVE CONTROL for the host's `ColdEnd::EarlierHost` admission,
+/// which takes the typed line instead (`harness_claude_cold_tests`).
+#[test]
+fn a_cold_intent_for_an_agent_of_an_earlier_host_waits_on_a_witness_it_cannot_have() {
+    let world = aterm_tempfile::tempdir().unwrap();
+    let opts = options(world.path());
+    let (client, worker) = endpoint_with(|line| {
+        if line == format!("@{TAB} native-act constructors") {
+            "OK native-act state=constructors plans=cold-restart\n"
+        } else {
+            "ERR unexpected fixture action\n"
+        }
+        .into()
+    });
+    let st = state(false);
+    let (mut snap, mut plan) = exit_input(world.path(), &st);
+    // The old agent's pid is free (as after a reboot); the tab's shell is the restored one.
+    let mut exited = aterm_uds::spawnfd::command(crate::test_program::kept("/usr/bin/true"))
+        .spawn()
+        .unwrap();
+    snap.pid = exited.id();
+    exited.wait().unwrap();
+    plan.cold = Some(super::super::native_act::ColdIntent {
+        login: None,
+        home: None,
+        auth_observed: true,
+        stored_login: true,
+        conversation: Some(SESSION.into()),
+        profile: None,
+        mode: super::super::accounts::Mode::Wall,
+        billing: super::super::native_act::ColdBilling::Keep,
+    });
+    let result = launch_after_exit(
+        &opts,
+        &snap,
+        ExitCause::HostEnded,
+        true,
+        report(),
+        st,
+        plan,
+        client,
+    );
+    let seen = worker.join().unwrap();
+    assert_eq!(result.step, "wait:native-crash-observation");
+    assert!(
+        seen.iter()
+            .all(|line| line == &format!("@{TAB} native-act constructors")),
+        "nothing was typed or leased: {seen:?}"
+    );
+}
+
+/// RS1: AN EXIT PROVEN BY IDENTITY IS NOT WAITED ON BY PID. After a reboot the old agent's pid
+/// can name another live process; the exit tail records the agent gone (its kernel start is
+/// another's), so the typed-line wait never waits on that stranger and goes on to the shell.
+/// NEGATIVE CONTROL: the same live pid under its own start is waited on (`wait:exiting`),
+/// as `disabled_native_kind_exit_launch_tail_preserves_legacy_guard_and_coordinated_refusal`
+/// holds.
+#[test]
+fn a_reused_pid_after_a_reboot_is_not_the_agent_the_relaunch_waits_for() {
+    for reused in [true, false] {
+        let world = aterm_tempfile::tempdir().unwrap();
+        let opts = options(world.path());
+        let (client, worker) = endpoint();
+        let st = state(false);
+        let (mut snap, plan) = exit_input(world.path(), &st);
+        if reused {
+            // This live pid's process was born at another time than the agent was.
+            snap.start = "Thu Jan  1 00:00:00 1970".into();
+        }
+        let result = launch_after_exit(
+            &opts,
+            &snap,
+            ExitCause::HostEnded,
+            false,
+            report(),
+            st,
+            plan,
+            client,
+        );
+        let _seen = worker.join().unwrap();
+        if reused {
+            assert_ne!(result.step, "wait:exiting", "{}", result.step);
+        } else {
+            assert_eq!(result.step, "wait:exiting");
+        }
+    }
+}
+
+#[test]
+fn identity_proves_an_exit_only_from_a_recorded_start() {
+    assert!(gone_by_identity("a", false, None));
+    assert!(gone_by_identity("a", true, Some("b")));
+    assert!(!gone_by_identity("a", true, Some("a")));
+    // A live pid whose start is unreadable is not proven gone, nor is an unrecorded start.
+    assert!(!gone_by_identity("a", true, None));
+    assert!(!gone_by_identity("", false, None));
+    assert!(!gone_by_identity("", true, Some("b")));
+}
+
+/// RS1: A COORDINATED RECORD'S AGENT, ENDED UNDER AN EARLIER ATERM PROCESS, STILL RESUMES. A
+/// worker once natively cold-restarted keeps `native_coordination` in its record (a one-way
+/// mark the record protocol keeps). After a reboot its admitted, fresh relaunch is gated by
+/// no native authority, because none outlived the ended process: it is neither
+/// `native-constructor-disabled` nor `native-recovery`, the record keeps its mark, and the
+/// record as saved still earns the exemption on the next pass (it is recomputed, never
+/// stored), whatever restart stamp its layout carried (a restart or a stall's remedy that the
+/// reboot cut short). NEGATIVE CONTROLS: the same record's exits under this host, and a
+/// host-ended relaunch its host does not know ended under an earlier process (a stranded or
+/// rolled-back one), keep the refusal.
+#[test]
+fn a_coordinated_workers_relaunch_after_its_host_ended_is_not_held_by_the_mark() {
+    for (cause, earlier) in [
+        (ExitCause::HostEnded, true),
+        (ExitCause::Asked, true),
+        (ExitCause::Stall, true),
+        (ExitCause::HostEnded, false),
+        (ExitCause::Asked, false),
+        (ExitCause::Exit, false),
+    ] {
+        let world = aterm_tempfile::tempdir().unwrap();
+        let opts = options(world.path());
+        let (client, worker) = endpoint();
+        let st = state(true);
+        let (mut snap, plan) = exit_input(world.path(), &st);
+        let mut exited = aterm_uds::spawnfd::command(crate::test_program::kept("/usr/bin/true"))
+            .spawn()
+            .unwrap();
+        snap.pid = exited.id();
+        exited.wait().unwrap();
+        let result = launch_after_exit(&opts, &snap, cause, earlier, report(), st, plan, client);
+        let seen = worker.join().unwrap();
+        if earlier {
+            assert!(
+                !result.step.starts_with("wait:native-"),
+                "{}: {seen:?}",
+                result.step
+            );
+            let saved = load(&opts, SESSION).expect("the relaunch's record");
+            assert!(saved.native_coordination, "the record keeps its mark");
+            assert!(!saved.host_ended_fresh, "the exemption is never stored");
+            assert!(
+                host_ended_fresh(true, false, false, &saved),
+                "the next pass earns it again from the record as saved"
+            );
+        } else {
+            assert_eq!(
+                result.step, "wait:native-constructor-disabled",
+                "{cause:?} {earlier}"
+            );
+        }
+        assert!(seen.iter().all(|line| !line.contains(" turn ")), "{seen:?}");
+    }
+}
+
+#[test]
+fn a_fresh_host_ended_plan_needs_a_proven_exit_and_nothing_native_unresolved() {
+    let fresh = |st: &St| host_ended_fresh(true, false, false, st);
+    let mut st = state(true);
+    st.exited_at = 1;
+    assert!(fresh(&st));
+    assert!(
+        !host_ended_fresh(false, false, false, &st),
+        "this host's end"
+    );
+    assert!(
+        !host_ended_fresh(true, true, false, &st),
+        "a deferred cold intent"
+    );
+    assert!(
+        !host_ended_fresh(true, false, true, &st),
+        "a native act of this host"
+    );
+    let mut uncoordinated = state(false);
+    uncoordinated.exited_at = 1;
+    assert!(!fresh(&uncoordinated));
+    let mut unproven = st.clone();
+    unproven.exited_at = 0;
+    assert!(!fresh(&unproven));
+    let mut unresolved = st.clone();
+    unresolved.native_prepare = "prepare fixture".into();
+    assert!(!fresh(&unresolved));
+    let mut rollback = st.clone();
+    rollback.native_rollback = true;
+    assert!(!fresh(&rollback));
+    let mut retired = st;
+    retired.native_retired_unissued = true;
+    assert!(!fresh(&retired));
+}
+
+/// RS1: A NATIVE ACT IS THIS PROCESS'S BY ITS HOST'S EPOCH, read only when the record stamps
+/// one. NEGATIVE CONTROLS: an earlier epoch is not this process's, and an epoch that cannot be
+/// read counts as this one's (the gates stay).
+#[test]
+fn a_native_act_is_this_hosts_only_by_its_epoch() {
+    let mut st = state(true);
+    assert!(!native_of_this_host(&st, || unreachable!(
+        "nothing stamped is never asked"
+    )));
+    st.native_completed_prepare = Some(Box::new(super::super::native_act::Prepare {
+        id: "12".repeat(16),
+        host_epoch: "34".repeat(16),
+        holder: "fixture@1".into(),
+        revision: 1,
+        expected_human_seq: None,
+        deadline_us: 1,
+        duty: super::super::contract::Scope::Upgrade,
+        plan: super::super::native_act::NativePlan::OwnImage {
+            child: super::super::native_act::Process {
+                pid: 1,
+                birth: 1,
+                parent: 1,
+                group: 1,
+                session: 1,
+                image: super::super::native_act::Image {
+                    path: b"/fixture".to_vec(),
+                    device: 1,
+                    inode: 1,
+                },
+            },
+            target: super::super::native_act::Image {
+                path: b"/fixture".to_vec(),
+                device: 1,
+                inode: 1,
+            },
+            version: "0.1.0".into(),
+        },
+    }));
+    assert!(native_of_this_host(&st, || Some("34".repeat(16))));
+    assert!(
+        !native_of_this_host(&st, || Some("56".repeat(16))),
+        "an earlier epoch"
+    );
+    assert!(native_of_this_host(&st, || None), "an unread epoch");
+}
+
+/// RS1: A RESTART IN FLIGHT WHEN ATERM ENDED IS PROVEN EXITED BY ITS AGENT'S KERNEL START, so
+/// its carry never waits on a pid a reboot gave another process. NEGATIVE CONTROLS: the same
+/// live process, another pid, a record already stamped, or one past its exit is not touched.
+#[test]
+fn an_in_flight_exit_is_proven_only_for_its_own_agent_by_identity() {
+    let world = aterm_tempfile::tempdir().unwrap();
+    let st = state(false);
+    let (snap, _) = exit_input(world.path(), &st);
+    assert!(in_flight_exit_proven(
+        &st,
+        &snap,
+        true,
+        Some("another birth")
+    ));
+    assert!(in_flight_exit_proven(&st, &snap, false, None));
+    assert!(!in_flight_exit_proven(
+        &st,
+        &snap,
+        true,
+        Some(snap.start.as_str())
+    ));
+    let mut other = st.clone();
+    other.pid += 1;
+    assert!(!in_flight_exit_proven(&other, &snap, false, None));
+    let mut stamped = st.clone();
+    stamped.exited_at = 1;
+    assert!(!in_flight_exit_proven(&stamped, &snap, false, None));
+    let mut relaunched = st;
+    relaunched.phase = upgrade::Phase::Relaunched { at_s: 1 };
+    assert!(!in_flight_exit_proven(&relaunched, &snap, false, None));
+}
+
+/// The `HostEndedRelaunch` step [`host_ended_fresh`] takes from `state` under `action`: an input
+/// action sets its input; `Decide` asks the code over a record built from those inputs.
+pub(crate) fn host_ended_transition(
+    model: &aterm_spec::interp::State,
+    action: &str,
+) -> aterm_spec::interp::State {
+    let mut next = model.clone();
+    let input = match action {
+        "Own" => Some("own"),
+        "Earlier" => Some("ea"),
+        "Coordinated" => Some("co"),
+        "Deferred" => Some("de"),
+        "Proven" => Some("pr"),
+        "Unresolved" => Some("un"),
+        _ => None,
+    };
+    if let Some(var) = input {
+        next.insert(var, 1);
+        return next;
+    }
+    let mut st = state(model["co"] == 1);
+    st.exited_at = if model["pr"] == 1 { 1 } else { 0 };
+    st.native_retired_unissued = model["un"] == 1;
+    let fresh = host_ended_fresh(model["ea"] == 1, model["de"] == 1, model["own"] == 1, &st);
+    next.insert("fresh", i64::from(fresh));
+    next.insert("phase", 1);
+    next
+}
+
+/// RS1: THE CODE'S HOST-ENDED DECISION REFINES `HostEndedRelaunch` over every reachable input,
+/// so a coordinated worker that ended under an earlier host comes back and nothing else is let
+/// past its gates. NEGATIVE CONTROL: a decision flipped either way breaks an invariant.
+#[test]
+fn host_ended_relaunch_conforms_to_its_model() {
+    let model = aterm_models_harness::host_ended_relaunch_model();
+    aterm_spec::interp::prove_and_catch(&model);
+    for state in aterm_spec::interp::reachable_states(&model) {
+        for action in &model.actions {
+            if model.action_enabled(action.name, &state) {
+                let next = host_ended_transition(&state, action.name);
+                assert!(
+                    model.successors(action.name, &state).contains(&next),
+                    "{}: {state:?} -> {next:?}",
+                    action.name
+                );
+            }
+        }
+    }
+    let mut back = model.init_state();
+    for var in ["ea", "co", "pr"] {
+        back.insert(var, 1);
+    }
+    back = host_ended_transition(&back, "Decide");
+    assert_eq!(back["fresh"], 1, "{back:?}");
+    back.insert("fresh", 0);
+    assert!(!model.check_invariant("ComesBack", &back));
+    let mut this_host = model.init_state();
+    for var in ["co", "pr"] {
+        this_host.insert(var, 1);
+    }
+    this_host = host_ended_transition(&this_host, "Decide");
+    assert_eq!(this_host["fresh"], 0, "{this_host:?}");
+    this_host.insert("fresh", 1);
+    assert!(!model.check_invariant("OnlyAnEarlierHost", &this_host));
+}
+
+/// RS1: A STAMPED AGENT THAT ENDED UNDER AN EARLIER HOST KEEPS ITS FAILED RESTART'S REFUSAL, as
+/// it did under that host: a restart that failed within its ownership window is never retried
+/// as a fresh plan after the host ends. NEGATIVE CONTROL: an unstamped host-ended agent is not
+/// held by that record.
+#[test]
+fn an_earlier_hosts_failed_restart_keeps_its_refusal() {
+    let world = aterm_tempfile::tempdir().unwrap();
+    let opts = options(world.path());
+    let mut exited = aterm_uds::spawnfd::command(crate::test_program::kept("/usr/bin/true"))
+        .spawn()
+        .unwrap();
+    let pid = exited.id();
+    exited.wait().unwrap();
+    let mut st = state(false);
+    st.pid = pid;
+    st.cause = String::new();
+    st.phase = super::super::upgrade::Phase::Failed("fixture-failure".into());
+    st.exited_at = now_s();
+    save(&opts, SESSION, &st);
+    let (mut snap, _) = exit_input(world.path(), &st);
+    snap.pid = pid;
+    let asked = Some(super::super::restart_stamp::Cause::Asked);
+    let refused = after_earlier_host_ended(&opts, &snap, false, None, asked, None);
+    assert!(
+        refused.step.ends_with(":fixture-failure"),
+        "{}",
+        refused.step
+    );
+    let unstamped = after_earlier_host_ended(&opts, &snap, false, None, None, None);
+    assert!(
+        !unstamped.step.ends_with(":fixture-failure"),
+        "{}",
+        unstamped.step
+    );
 }

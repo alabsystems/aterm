@@ -19,7 +19,7 @@ macro_rules! opaque {
         }
     )*};
 }
-opaque! { __CFAllocator, __CFArray, __CFData, __CFDictionary, __CFNumber, __CFString }
+opaque! { __CFAllocator, __CFArray, __CFBoolean, __CFData, __CFDictionary, __CFNumber, __CFString }
 
 pub type CFIndex = isize;
 pub type CFTypeID = usize;
@@ -30,6 +30,7 @@ pub type CFNumberType = CFIndex;
 pub type CFTypeRef = *const c_void;
 pub type CFAllocatorRef = *const __CFAllocator;
 pub type CFArrayRef = *const __CFArray;
+pub type CFBooleanRef = *const __CFBoolean;
 pub type CFDataRef = *const __CFData;
 pub type CFDictionaryRef = *const __CFDictionary;
 pub type CFMutableDictionaryRef = *mut __CFDictionary;
@@ -143,6 +144,8 @@ unsafe extern "C" {
     pub fn CFArrayGetCount(theArray: CFArrayRef) -> CFIndex;
     /// Borrowed (the Get rule) while the array lives.
     pub fn CFArrayGetValueAtIndex(theArray: CFArrayRef, idx: CFIndex) -> *const c_void;
+    pub fn CFBooleanGetTypeID() -> CFTypeID;
+    pub fn CFBooleanGetValue(boolean: CFBooleanRef) -> Boolean;
     pub fn CFDataGetTypeID() -> CFTypeID;
     pub fn CFDictionaryGetTypeID() -> CFTypeID;
     pub fn CFNumberGetTypeID() -> CFTypeID;
@@ -205,9 +208,8 @@ unsafe extern "C" {
     ) -> CFTypeRef;
 }
 
-// The calls a test makes to hold a power assertion of its own, which
-// `IOPMCopyAssertionsByProcess` then lists under the test's pid.
-#[cfg(test)]
+// The calls that hold a power assertion of this process's own (`crate::power::hold`), which
+// `IOPMCopyAssertionsByProcess` then lists under its pid.
 #[link(name = "IOKit", kind = "framework")]
 unsafe extern "C" {
     /// Public IOPMLib.h: `level` 255 is `kIOPMAssertionLevelOn`; `id` is written on success.

@@ -873,7 +873,7 @@ pub fn run(
         &store,
         &path,
         host.now().max(env.now),
-        false,
+        RenewalRecovery::None,
         env.home.as_deref(),
         err,
     ) else {
@@ -904,7 +904,7 @@ pub fn run(
             &store,
             &path,
             host.now().max(env.now),
-            false,
+            RenewalRecovery::None,
             env.home.as_deref(),
             err,
         ) else {

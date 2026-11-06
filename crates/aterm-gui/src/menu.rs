@@ -2404,10 +2404,10 @@ fn chrome_lines_for(
 
 #[cfg(target_os = "macos")]
 pub(crate) use macos::{
-    MenuHandle, ask_machine_name, ask_nickname, choose_local_file, choose_local_image,
-    choose_save_path, confirm, confirm_owner, defer_quit_for_terminate, install,
-    open_file_in_workspace, open_help_url, order_front_regardless, reveal_file_in_workspace,
-    show_handoff_target_version, update_machine_menu, update_version_menu,
+    MenuHandle, ask_nickname, choose_local_file, choose_local_image, choose_save_path, confirm,
+    confirm_owner, defer_quit_for_terminate, install, open_file_in_workspace, open_help_url,
+    order_front_regardless, reveal_file_in_workspace, show_handoff_target_version,
+    update_machine_menu, update_version_menu,
 };
 
 static PROCESS_HEADLESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -3250,24 +3250,6 @@ mod macos {
         body: &str,
         current: &str,
     ) -> Option<crate::machine_title::NickAnswer> {
-        ask_machine_text(title, body, current, true)
-    }
-
-    /// Ask for the number and optional nickname, with Change and Cancel buttons.
-    pub(crate) fn ask_machine_name(
-        title: &str,
-        body: &str,
-        current: &str,
-    ) -> Option<crate::machine_title::NickAnswer> {
-        ask_machine_text(title, body, current, false)
-    }
-
-    fn ask_machine_text(
-        title: &str,
-        body: &str,
-        current: &str,
-        random_noun: bool,
-    ) -> Option<crate::machine_title::NickAnswer> {
         if super::os_ui_refused(title) {
             return None;
         }
@@ -3332,9 +3314,7 @@ mod macos {
                 sel!(addButtonWithTitle:),
                 cancel.id(),
             ));
-            if random_noun {
-                let _ = appkit::send_id_id(alert.id(), sel!(addButtonWithTitle:), random.id());
-            }
+            let _ = appkit::send_id_id(alert.id(), sel!(addButtonWithTitle:), random.id());
             appkit::send_v(alert.id(), sel!(layout));
             let panel = Obj::retain(appkit::send_id(alert.id(), sel!(window)));
             if let Some(panel) = &panel {
@@ -3344,7 +3324,7 @@ mod macos {
             // client posted presses neither, nor types into the field.
             let _keys = match (panel, Obj::retain(field.id()), accept, refuse) {
                 (Some(panel), Some(watched), Some(accept), Some(refuse)) => {
-                    crate::alert_keys::watch_field_alert_keys(panel, watched, accept, refuse)
+                    crate::alert_keys::watch_field_alert_keys(panel, vec![watched], accept, refuse)
                 }
                 _ => None,
             };

@@ -4,6 +4,8 @@
 //! Machine provisioning for `targo --unverified ship provision --id <machine-id>`.
 
 #[cfg(unix)]
+use std::fmt::Write as _;
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
@@ -731,7 +733,7 @@ pub(crate) fn report_done(r: &atpkg_keys::provision::Report) -> Vec<(String, Str
         r.roster_machines.join(", ")
     );
     if r.roster_valid_until != atpkg_keys::roster_ops::VALID_UNTIL_FOREVER {
-        roster.push_str(&format!("  valid until {}", r.roster_valid_until));
+        let _ = write!(roster, "  valid until {}", r.roster_valid_until);
     }
     if r.roster_was_fresh {
         roster.push_str(
@@ -1595,7 +1597,7 @@ fn apple_identity_check(
                 ),
             };
             if let Some(note) = note {
-                msg.push_str(&format!("; {note}"));
+                let _ = write!(msg, "; {note}");
             }
             (Check::Pass(msg), Some(ids[0].clone()))
         }

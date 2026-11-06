@@ -235,7 +235,7 @@ pub fn read_log(
             }
         }
     }
-    read.entries.sort_by_key(|e| (e.machine, e.n));
+    read.entries.sort_unstable_by_key(|e| (e.machine, e.n));
     read
 }
 

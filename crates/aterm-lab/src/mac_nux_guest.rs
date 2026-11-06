@@ -103,11 +103,33 @@ pub const SHELL_OWNERS: [&str; 11] = [
     "Terminal",
 ];
 
-/// What kind of dialog an owner's window is.
+/// The words of macOS's Local Network question, as the reader reads its alert: "Allow “<app>” to
+/// find devices on local networks?" (macOS 27.2, `docs/measured/local-network-exemption-2026-11-05.md`).
+pub const LOCAL_NETWORK_WORDS: &str = "find devices on local networks";
+
+/// The app macOS's Local Network question names in a reading's `words` ([`LOCAL_NETWORK_WORDS`]):
+/// what stands between `Allow ` and ` to find devices`, its quotes (curly, straight, or straight
+/// escaped as the reader writes them) dropped; `None` when the words are no such question. Pure.
 #[must_use]
-pub fn dialog_kind(owner: &str) -> &'static str {
+pub fn local_network_asker(words: &str) -> Option<String> {
+    let (before, _) = words.split_once(LOCAL_NETWORK_WORDS)?;
+    let before = before.trim_end().strip_suffix(" to").unwrap_or(before);
+    let (_, name) = before.rsplit_once("Allow ")?;
+    let name =
+        name.trim_matches(|c: char| c.is_whitespace() || matches!(c, '“' | '”' | '"' | '\\'));
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// What kind of dialog an owner's window is, and its words when the reader read them (`words`):
+/// macOS 27 shows its Local Network question in a UserNotificationCenter window, which is named
+/// by its words, since that owner's other windows are consent alerts.
+#[must_use]
+pub fn dialog_kind(owner: &str, words: Option<&str>) -> &'static str {
     match owner {
         "nehelper" => "Local Network",
+        "UserNotificationCenter" if words.is_some_and(|w| local_network_asker(w).is_some()) => {
+            "Local Network"
+        }
         "CoreServicesUIAgent" => "Gatekeeper",
         // macOS 27 names the installer's windows `Install Command Line Developer`, cut short
         // (nux round 9's devtools-control row, the census on a guest without the tools); an
@@ -124,7 +146,7 @@ pub fn dialog_kind(owner: &str) -> &'static str {
     }
 }
 
-/// One dialog owner the census saw after a mark.
+/// One dialog owner the census saw after a mark, of one kind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dialog {
     pub owner: String,
@@ -135,20 +157,34 @@ pub struct Dialog {
 }
 
 /// The owners of windows that appeared at or after `since_ms` (epoch ms), each with when its first
-/// came and how many came, the shell's own ([`SHELL_OWNERS`]) left out, in the order they came.
+/// came and how many came, the shell's own ([`SHELL_OWNERS`]) left out, in the order they came;
+/// an owner's windows of two kinds are two dialogs. A window's kind reads the reader's words of
+/// it when they are macOS's Local Network question (`read`, [`Reader::words`]): a reading of the
+/// window's process taken while the window was up (from its coming to its going, or on, when it
+/// never went). Pure.
 #[must_use]
-pub fn dialogs(census: &Census, since_ms: u64) -> Vec<Dialog> {
+pub fn dialogs(census: &Census, since_ms: u64, read: &[Words]) -> Vec<Dialog> {
     let mut out: Vec<Dialog> = Vec::new();
     for w in census
         .new
         .iter()
         .filter(|w| w.at_ms >= since_ms && !SHELL_OWNERS.contains(&w.owner.as_str()))
     {
-        match out.iter_mut().find(|d| d.owner == w.owner) {
+        let gone = census.gone.get(&w.id).copied();
+        let words = read
+            .iter()
+            .filter(|r| r.pid == w.pid && r.at_ms >= w.at_ms && gone.is_none_or(|g| r.at_ms <= g))
+            .map(|r| r.words.as_str())
+            .find(|words| local_network_asker(words).is_some());
+        let kind = dialog_kind(&w.owner, words);
+        match out
+            .iter_mut()
+            .find(|d| d.owner == w.owner && d.kind == kind)
+        {
             Some(d) => d.windows += 1,
             None => out.push(Dialog {
                 owner: w.owner.clone(),
-                kind: dialog_kind(&w.owner),
+                kind,
                 first_ms: w.at_ms - since_ms,
                 windows: 1,
             }),
@@ -172,12 +208,20 @@ pub fn apple_devtools_dialogs(dialogs: &[Dialog]) -> Vec<&Dialog> {
 }
 
 /// The `setup=` rows only a person can settle: a privacy switch in System Settings (Full Disk
-/// Access, Developer Tools, Accessibility) and macOS's own Local Network alert, which aterm offers
-/// (`;offered:`), never answers, and waits on only once a person asked for the batch; and the
-/// debugger's developer mode on an account that may not turn it on, which needs an administrator.
-/// An admin account's debugger row is neither offered nor waited on: it reads Waiting until setup's
-/// one Mac password (the Mac Setup tab) turns developer mode on.
-pub const MACOS_PERSON_ROWS: [&str; 5] = ["fda", "devtools", "lan", "ax", "debugger"];
+/// Access, Developer Tools, Accessibility), which aterm offers (`;offered:`), never answers, and
+/// waits on only once a person asked for the batch; and the debugger's developer mode on an
+/// account that may not turn it on, which needs an administrator. An admin account's debugger row
+/// is neither offered nor waited on: it reads Waiting until setup's one Mac password (the Mac
+/// Setup tab) turns developer mode on. macOS's Local Network question is none of them: aterm's own
+/// LAN traffic goes through its root LAN broker, which macOS never asks about
+/// (`docs/DESIGN-lan-broker-2026-11-05.md`), so a `lan` row waiting on a press is one aterm could
+/// have spared.
+pub const MACOS_PERSON_ROWS: [&str; 4] = ["fda", "devtools", "ax", "debugger"];
+
+/// The `setup=` word of a System State Local Network row. A broker build has no such row
+/// (`docs/DESIGN-lan-broker-2026-11-05.md`): one named in any reading is a Local Network step
+/// System State should not have ([`Presses::local_network_step`]).
+pub const LOCAL_NETWORK_ROW: &str = "lan";
 
 /// The rows after `key:` in a `setup=` field (`;needs:<row,...>` or `;offered:<row,...>`,
 /// aterm's `system_state_access::setup_field`). Pure.
@@ -197,6 +241,8 @@ pub fn setup_rows<'a>(field: &'a str, key: &str) -> Vec<&'a str> {
 pub struct Presses {
     pub needs: Vec<String>,
     pub offered: Vec<String>,
+    /// Every row any reading named (`pending:`, `asking:`, `needs:`, `offered:`).
+    pub named: Vec<String>,
 }
 
 impl Presses {
@@ -209,6 +255,20 @@ impl Presses {
                 }
             }
         }
+        for key in ["pending", "asking", "needs", "offered"] {
+            for row in setup_rows(field, key) {
+                if !self.named.iter().any(|seen| seen == row) {
+                    self.named.push(row.to_owned());
+                }
+            }
+        }
+    }
+
+    /// Whether any reading named System State's Local Network row ([`LOCAL_NETWORK_ROW`]): a
+    /// Local Network step a broker build should never show.
+    #[must_use]
+    pub fn local_network_step(&self) -> bool {
+        self.named.iter().any(|row| row == LOCAL_NETWORK_ROW)
     }
 
     /// The presses aterm could have made itself: every row that waited on a press while nobody
@@ -353,13 +413,23 @@ pub fn read_person(text: &str) -> Person {
     p
 }
 
+/// One reading the reader wrote: when, the dialog's process and owner, its controls on one line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Words {
+    pub at_ms: u64,
+    pub pid: i32,
+    pub owner: String,
+    pub words: String,
+}
+
 /// The reader's record (`aterm-lab-guest reader`): whether it had Accessibility, and the words
 /// of each dialog it read, never answered.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Reader {
     pub trusted: Option<bool>,
-    /// Each reading: when, the dialog's owner, its controls on one line.
-    pub words: Vec<(u64, String, String)>,
+    /// Each reading, in the order written: the reader writes a process's reading again only when
+    /// it changed, or when that process's windows went and came back.
+    pub words: Vec<Words>,
 }
 
 /// Read the reader's record: a `reader trusted=…` line, then `words <pid> <owner>: <controls>`
@@ -377,10 +447,16 @@ pub fn read_reader(text: &str) -> Reader {
                     .map(|v| v == "yes");
             }
             "words" => {
-                if let Some((_pid, rest)) = rest.split_once(' ')
+                if let Some((pid, rest)) = rest.split_once(' ')
+                    && let Ok(pid) = pid.parse()
                     && let Some((owner, words)) = rest.split_once(": ")
                 {
-                    r.words.push((at, owner.to_owned(), words.to_owned()));
+                    r.words.push(Words {
+                        at_ms: at,
+                        pid,
+                        owner: owner.to_owned(),
+                        words: words.to_owned(),
+                    });
                 }
             }
             _ => {}
@@ -917,27 +993,6 @@ impl Reading {
         }
     }
 
-    /// Whether setup has only the vault left while the Secrets stage runs: the join's look for
-    /// a vault, which keeps trying for macOS's Local Network answer for up to
-    /// [`aterm_secrets::client::PATIENT_LOOK_MAX`] by its own design. Only the vault is left when
-    /// `setup=` names it alone (`pending:vault`), or names no row (`pending`): the vault row has no
-    /// reading until a try of the look ends, so 0.155.0 said `pending` through the whole first
-    /// look (E3's third first-launch run, 2026-11-05, ended by the one-minute detector 61 s into
-    /// a 212 s look). Pure.
-    #[must_use]
-    pub fn vault_look(&self) -> bool {
-        self.setup.as_deref().is_some_and(|field| {
-            field == "pending"
-                || field
-                    .strip_prefix("pending:")
-                    .is_some_and(|rest| rest.split(';').next() == Some("vault"))
-        }) && self
-            .record
-            .as_ref()
-            .and_then(|r| r.running)
-            .is_some_and(|bit| stage_name(bit) == "Secrets")
-    }
-
     /// What it says, on one line: what [`Stall`] compares.
     #[must_use]
     pub fn said(&self) -> String {
@@ -1000,18 +1055,9 @@ impl Stall {
             return Waited::Done;
         }
         let said = reading.said();
-        // The vault's look bounds its own wait; the hang detector counts from that bound on.
-        let limit_ms = if reading.vault_look() {
-            self.limit_ms.saturating_add(
-                u64::try_from(aterm_secrets::client::PATIENT_LOOK_MAX.as_millis())
-                    .unwrap_or(u64::MAX),
-            )
-        } else {
-            self.limit_ms
-        };
         match &self.last {
             Some((last, acts, since)) if *last == said && *acts == reading.acts => {
-                if now_ms.saturating_sub(*since) >= limit_ms {
+                if now_ms.saturating_sub(*since) >= self.limit_ms {
                     Waited::Stalled {
                         stood: said,
                         since_ms: *since,
@@ -1051,7 +1097,7 @@ mod tests {
         assert_eq!(c.new[1].owner, "nehelper");
         assert_eq!(c.new[4].owner, "Install Command Line Developer Tools");
         assert_eq!(c.gone.get(&41), Some(&7000));
-        let d = dialogs(&c, 4000);
+        let d = dialogs(&c, 4000, &[]);
         assert_eq!(
             d.iter()
                 .map(|d| (d.owner.as_str(), d.kind, d.first_ms, d.windows))
@@ -1068,7 +1114,10 @@ mod tests {
             ],
             "the app's own window and the baseline are never dialogs"
         );
-        assert!(dialogs(&c, 9200).is_empty(), "nothing came after the mark");
+        assert!(
+            dialogs(&c, 9200, &[]).is_empty(),
+            "nothing came after the mark"
+        );
         let failed = read_census("census-error 5 the window list is unreadable\n");
         assert_eq!(
             failed.error.as_deref(),
@@ -1089,8 +1138,73 @@ mod tests {
             ("universalAccessAuthWarn", "Accessibility"),
             ("Something New", "other"),
         ] {
-            assert_eq!(dialog_kind(owner), kind, "{owner}");
+            assert_eq!(dialog_kind(owner, None), kind, "{owner}");
         }
+        // macOS 27 puts its Local Network question in a UserNotificationCenter window: its words
+        // name it; that owner's other windows stay consent alerts.
+        let question = "AXWindow; AXStaticText \"Allow “aterm” to find devices on local networks?\"; \
+                        AXButton \"Allow\"; AXButton \"Don’t Allow\"";
+        assert_eq!(
+            dialog_kind("UserNotificationCenter", Some(question)),
+            "Local Network"
+        );
+        assert_eq!(
+            dialog_kind(
+                "UserNotificationCenter",
+                Some("AXStaticText \"Background Items Added\"")
+            ),
+            "consent"
+        );
+    }
+
+    #[test]
+    fn the_local_network_question_names_the_app_it_asks_about() {
+        let curly = "AXStaticText \"Allow “aterm” to find devices on local networks?\"";
+        assert_eq!(local_network_asker(curly).as_deref(), Some("aterm"));
+        let escaped =
+            "AXStaticText \"Allow \\\"tart-guest-agent\\\" to find devices on local networks?\"";
+        assert_eq!(
+            local_network_asker(escaped).as_deref(),
+            Some("tart-guest-agent")
+        );
+        assert_eq!(
+            local_network_asker("AXStaticText \"“aterm” would like to access files\""),
+            None,
+            "another question"
+        );
+    }
+
+    /// A UserNotificationCenter window is the Local Network question only by a reading of its own
+    /// process taken while it was up; the same owner's other window stays a consent alert.
+    #[test]
+    fn a_notification_centre_window_is_named_by_the_readers_words_of_it() {
+        let c = read_census(
+            "census 1000 every=250 windows=0\n\
+             new 2000 40 300 0 420x210 UserNotificationCenter\n\
+             gone 2600 40\n\
+             new 5000 41 300 0 420x210 UserNotificationCenter\n",
+        );
+        let read = read_reader(
+            "reader 900 trusted=yes\n\
+             words 2100 300 UserNotificationCenter: AXStaticText \"Allow “aterm” to find devices on local networks?\"\n\
+             words 5100 300 UserNotificationCenter: AXStaticText \"Background Items Added\"\n",
+        );
+        let d = dialogs(&c, 1000, &read.words);
+        assert_eq!(
+            d.iter()
+                .map(|d| (d.kind, d.first_ms, d.windows))
+                .collect::<Vec<_>>(),
+            [("Local Network", 1000, 1), ("consent", 4000, 1)]
+        );
+        // Negative control: with no words, both are consent alerts, one dialog of two windows.
+        let blind = dialogs(&c, 1000, &[]);
+        assert_eq!(
+            blind
+                .iter()
+                .map(|d| (d.kind, d.windows))
+                .collect::<Vec<_>>(),
+            [("consent", 2)]
+        );
     }
 
     #[test]
@@ -1105,16 +1219,18 @@ mod tests {
         assert_eq!(
             r.words,
             vec![
-                (
-                    200,
-                    "UserNotificationCenter".to_owned(),
-                    "AXWindow; AXStaticText \"Background Items Added\"".to_owned()
-                ),
-                (
-                    300,
-                    "CoreServicesUIAgent".to_owned(),
-                    "AXStaticText \"\\\"kimi\\\" is an app downloaded: x\"".to_owned()
-                ),
+                Words {
+                    at_ms: 200,
+                    pid: 77,
+                    owner: "UserNotificationCenter".to_owned(),
+                    words: "AXWindow; AXStaticText \"Background Items Added\"".to_owned()
+                },
+                Words {
+                    at_ms: 300,
+                    pid: 80,
+                    owner: "CoreServicesUIAgent".to_owned(),
+                    words: "AXStaticText \"\\\"kimi\\\" is an app downloaded: x\"".to_owned()
+                },
             ],
             "the words after the owner's first ': ', a garbled line dropped"
         );
@@ -1539,57 +1655,6 @@ mod tests {
         ));
     }
 
-    /// The vault's own look bounds its wait: with only the vault left and the Secrets stage
-    /// running, the hang detector counts from the look's bound on, and from a minute anywhere
-    /// else (the negative control: the same reading with another stage running stalls at once).
-    #[test]
-    fn the_vaults_bounded_look_is_waited_out_before_the_hang_detector_counts() {
-        let look = aterm_secrets::client::PATIENT_LOOK_MAX.as_millis() as u64;
-        let reading = |setup: &str, bit| Reading {
-            setup: Some(setup.to_owned()),
-            record: Some(Record {
-                state: "pending".into(),
-                done: 6,
-                running: Some(bit),
-            }),
-            acts: 0,
-        };
-        let vault = reading("pending:vault", 8);
-        assert!(vault.vault_look());
-        assert!(reading("pending:vault;needs:vault", 8).vault_look());
-        // The first look, before the vault row has a reading, names no row.
-        let first = reading("pending", 8);
-        assert!(first.vault_look(), "the look before its first reading");
-        assert!(!reading("pending", 16).vault_look(), "another stage runs");
-        assert!(
-            !reading("pending:vault,repos", 8).vault_look(),
-            "more than the vault left"
-        );
-        assert!(
-            !reading("pending:vault", 16).vault_look(),
-            "another stage runs"
-        );
-        let mut wait = Stall::new(STALL_MS);
-        assert_eq!(wait.see(0, &vault), Waited::Moving);
-        assert_eq!(wait.see(STALL_MS + look - 1, &vault), Waited::Moving);
-        assert!(matches!(
-            wait.see(STALL_MS + look, &vault),
-            Waited::Stalled { .. }
-        ));
-        // The first look is waited out the same: a minute into it is no stall (the reading E3's
-        // third run stopped on).
-        let mut first_wait = Stall::new(STALL_MS);
-        assert_eq!(first_wait.see(0, &first), Waited::Moving);
-        assert_eq!(first_wait.see(STALL_MS + 1_000, &first), Waited::Moving);
-        let other = reading("pending:vault", 16);
-        let mut control = Stall::new(STALL_MS);
-        assert_eq!(control.see(0, &other), Waited::Moving);
-        assert!(matches!(
-            control.see(STALL_MS, &other),
-            Waited::Stalled { .. }
-        ));
-    }
-
     /// A press aterm could have made is a row that waited on one (`;needs:`) while nobody asked
     /// for anything; once a person asked for macOS's batch, the grants only a person gives are
     /// theirs. Grants on offer are no press. Negative control: a run whose readings name none.
@@ -1609,18 +1674,33 @@ mod tests {
             "pending",
             "pending:vault;needs:debugger",
             "pending:vault,repos;needs:repos,debugger",
+            "pending:lan;needs:lan,fda",
             "done;asking:vault;offered:fda",
         ] {
             presses.see(field);
         }
-        assert_eq!(presses.needs, ["debugger", "repos"]);
+        assert_eq!(presses.needs, ["debugger", "repos", "lan", "fda"]);
         assert_eq!(presses.offered, ["fda"]);
-        assert_eq!(presses.avoidable(false), ["debugger", "repos"]);
-        assert_eq!(presses.avoidable(true), ["repos"]);
+        assert_eq!(
+            presses.avoidable(false),
+            ["debugger", "repos", "lan", "fda"]
+        );
+        // Someone at the console: a privacy switch is theirs, but the Local Network question is
+        // no press at all (the LAN broker), so a `lan` card that waited fails the row.
+        assert_eq!(presses.avoidable(true), ["repos", "lan"]);
+        assert!(presses.local_network_step());
         let mut none = Presses::default();
         none.see("pending:vault");
         none.see("done;asking:vault;offered:debugger");
         assert!(none.avoidable(false).is_empty(), "CONTROL: {none:?}");
+        assert!(!none.local_network_step(), "CONTROL: {none:?}");
+        let mut pending = Presses::default();
+        pending.see("pending:vault,lan");
+        assert!(pending.avoidable(false).is_empty());
+        assert!(
+            pending.local_network_step(),
+            "a Local Network row named while pending is a step"
+        );
     }
 
     /// Apple's developer-tools dialog is told from every other window the census lists.
@@ -1631,24 +1711,24 @@ mod tests {
              new 2000 40 800 0 900x644 UserNotificationCenter\n\
              new 3000 44 77 0 300x80 Install Command Line Developer Tools\n",
         );
-        let all = dialogs(&c, 1000);
+        let all = dialogs(&c, 1000, &[]);
         let apple = apple_devtools_dialogs(&all);
         assert_eq!(apple.len(), 1);
         assert_eq!(apple[0].first_ms, 2000);
         let quiet = read_census(
             "census 1000 every=250 windows=0\nnew 2000 40 800 0 900x644 UserNotificationCenter\n",
         );
-        assert!(apple_devtools_dialogs(&dialogs(&quiet, 1000)).is_empty());
+        assert!(apple_devtools_dialogs(&dialogs(&quiet, 1000, &[])).is_empty());
         // The name macOS 27 gave the installer's window, as the control row's census read it.
         assert_eq!(
-            dialog_kind("Install Command Line Developer"),
+            dialog_kind("Install Command Line Developer", None),
             APPLE_DEVTOOLS_DIALOG
         );
         assert_eq!(
-            dialog_kind("Install Command Line Tools"),
+            dialog_kind("Install Command Line Tools", None),
             APPLE_DEVTOOLS_DIALOG
         );
-        assert_eq!(dialog_kind("Installer"), "other");
+        assert_eq!(dialog_kind("Installer", None), "other");
     }
 
     /// The person's and the processes' records as the guest helper writes them, from a run

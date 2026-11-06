@@ -99,9 +99,10 @@ impl Jobserver {
         stopped: &dyn Fn() -> bool,
     ) -> io::Result<Token<'_>> {
         let token = self.acquire(stopped)?;
+        let flags = self.flags();
         command
-            .env("MAKEFLAGS", self.flags())
-            .env("CARGO_MAKEFLAGS", self.flags())
+            .env("MAKEFLAGS", &flags)
+            .env("CARGO_MAKEFLAGS", flags)
             .arg("-j")
             .arg(self.slots.to_string());
         Ok(token)

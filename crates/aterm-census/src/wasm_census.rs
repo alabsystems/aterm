@@ -103,16 +103,16 @@ fn wasm_term_hops(body: &[String]) -> Vec<WasmTermHop> {
                 continue;
             }
             let after = &line[i + 1..];
-            let method: String = after
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_')
-                .collect();
+            let len = after
+                .find(|c: char| !c.is_alphanumeric() && c != '_')
+                .unwrap_or(after.len());
+            let method = &after[..len];
             if !method.is_empty()
                 && after[method.len()..].starts_with('(')
-                && UNBOUNDED_TERM_METHODS.contains(&method.as_str())
+                && UNBOUNDED_TERM_METHODS.contains(&method)
             {
                 out.push(WasmTermHop {
-                    method,
+                    method: method.to_string(),
                     line: raw.trim().to_string(),
                 });
             }
@@ -355,10 +355,11 @@ pub fn run_wasm_census(root: &Path) -> CensusOutcome {
     }
     let mut sinks_in_closure = 0usize;
     for sink in UNBOUNDED_REGISTRY {
-        let in_closure = scan
-            .scan_dirs
-            .iter()
-            .any(|d| sink.def_file.starts_with(&format!("{d}/")));
+        let in_closure = scan.scan_dirs.iter().any(|d| {
+            sink.def_file
+                .strip_prefix(d.as_str())
+                .is_some_and(|s| s.starts_with('/'))
+        });
         if !in_closure {
             continue;
         }
@@ -396,10 +397,11 @@ pub fn run_wasm_census(root: &Path) -> CensusOutcome {
         let def = f.body.first().map(String::as_str).unwrap_or("");
         if def.trim_start().starts_with("pub ") {
             roots.push(idx);
-            if let Some(rc) = WASM_ROOT_CRATES
-                .iter()
-                .find(|rc| f.span.starts_with(&format!("{}/", rc)))
-            {
+            if let Some(rc) = WASM_ROOT_CRATES.iter().find(|rc| {
+                f.span
+                    .strip_prefix(**rc)
+                    .is_some_and(|s| s.starts_with('/'))
+            }) {
                 *pub_count.entry(rc).or_insert(0) += 1;
             }
         }

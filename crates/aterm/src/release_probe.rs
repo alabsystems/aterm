@@ -49,11 +49,14 @@ pub(super) fn run(args: &[std::ffi::OsString]) -> ExitCode {
                 Some("complete" | "clean" | "historical_unrevalidated")
             );
             match aterm_json::to_string(&report) {
-                Ok(report) => aterm_uds::stdout::answer_exit(
-                    "aterm release probe",
-                    &format!("{report}\n"),
-                    if complete { 0 } else { 1 },
-                ),
+                Ok(mut report) => {
+                    report.push('\n');
+                    aterm_uds::stdout::answer_exit(
+                        "aterm release probe",
+                        &report,
+                        if complete { 0 } else { 1 },
+                    )
+                }
                 Err(_) => ExitCode::from(2),
             }
         }

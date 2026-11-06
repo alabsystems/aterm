@@ -572,7 +572,7 @@ impl Adoption {
         } else {
             first_faults.unwrap_or_default()
         };
-        let why = list(&left_out);
+        let why = ConfigFault::list(&left_out);
         for v in &mut vaulted {
             if keep.contains(&v.slot) {
                 continue;
@@ -716,18 +716,8 @@ fn subsets(slots: &[Slot]) -> Vec<Vec<Slot>> {
                 .collect()
         })
         .collect();
-    all.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    all.sort_unstable_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
     all
-}
-
-/// `faults` as one text: each `{rule}: {what}`, joined with `; `.
-#[cfg(unix)]
-fn list(faults: &[ConfigFault]) -> String {
-    faults
-        .iter()
-        .map(|f| format!("{}: {what}", f.rule, what = f.what))
-        .collect::<Vec<_>>()
-        .join("; ")
 }
 
 /// The rows `agh auth add NAME --file VAULT_FILE --tier T --owner OWNER --write --drafts` writes
@@ -859,14 +849,18 @@ pub fn names_vault_path(path: &Path) -> bool {
 /// Whether `file` is one of the vault's two token files, as named or once both resolve.
 #[cfg(unix)]
 pub(crate) fn is_vault_file(dirs: &Dirs, file: &Path) -> bool {
-    let resolved = std::fs::canonicalize(file).ok();
-    Slot::ALL.into_iter().any(|slot| {
-        let path = slot.path(&dirs.home);
-        path == file
-            || resolved.as_ref().is_some_and(|resolved| {
-                std::fs::canonicalize(&path).ok().as_ref() == Some(resolved)
-            })
-    })
+    if Slot::ALL
+        .into_iter()
+        .any(|slot| slot.path(&dirs.home) == file)
+    {
+        return true;
+    }
+    let Ok(resolved) = std::fs::canonicalize(file) else {
+        return false;
+    };
+    Slot::ALL
+        .into_iter()
+        .any(|slot| std::fs::canonicalize(slot.path(&dirs.home)).ok().as_ref() == Some(&resolved))
 }
 
 /// Off unix there is no permission check, so no token file is read (design §6.6).

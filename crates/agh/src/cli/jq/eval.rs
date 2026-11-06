@@ -852,7 +852,9 @@ fn call(
                     match item {
                         Value::Null => {}
                         Value::String(text) => joined.push_str(text),
-                        Value::Number(_) | Value::Bool(_) => joined.push_str(&item.to_string()),
+                        Value::Number(_) | Value::Bool(_) => {
+                            let _ = std::fmt::Write::write_fmt(&mut joined, format_args!("{item}"));
+                        }
                         other => {
                             return Err(runtime(&format!("cannot join with {}", type_name(other))));
                         }

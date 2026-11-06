@@ -143,7 +143,7 @@ fn desks_in(dir: &Path) -> std::io::Result<Vec<String>> {
             desks.push(entry.file_name().to_string_lossy().into_owned());
         }
     }
-    desks.sort();
+    desks.sort_unstable();
     Ok(desks)
 }
 
@@ -648,7 +648,7 @@ fn files_under(dir: &Path) -> Result<Vec<(String, Vec<u8>)>> {
             }
         }
     }
-    out.sort();
+    out.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
 }
 

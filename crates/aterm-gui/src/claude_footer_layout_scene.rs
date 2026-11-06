@@ -190,7 +190,10 @@ fn paint_with(layouts: &mut Layouts, input: &mut RenderInput, cell: (usize, usiz
                 CardPalette::Cruise
             }),
             blank,
-            mark_fg: [0xd7, 0x77, 0x57],
+            field: PaneField {
+                col_off: 0,
+                cols: input.cols,
+            },
             face: KeyFace::default(),
             cell: (cw, ch),
             clip: aterm_core::render::PxRect::EVERYWHERE,
@@ -211,6 +214,23 @@ fn paint_with(layouts: &mut Layouts, input: &mut RenderInput, cell: (usize, usiz
             .extend(top.mark.iter().chain(top.ring.iter()).cloned());
     }
     paint_chip_and_effort_samples(layouts, input, blank);
+}
+
+/// The glass a sample rule wears under Cruise, laid from frame column 2 to two short of a row
+/// `cols` wide, as a pane's composer rule is.
+fn scene_glass(cols: usize, rule: RenderCell, blank: RenderCell) -> (GlassInks, RuleAt) {
+    (
+        GlassInks::of(
+            Some(CardPalette::Cruise),
+            pack_rgb(blank.bg),
+            pack_rgb(blank.fg),
+            pack_rgb(rule.fg),
+        ),
+        RuleAt {
+            end: cols.saturating_sub(2),
+            cols,
+        },
+    )
 }
 
 /// Bottom-rule chips and mode rows use the same composers as a live Claude pane.
@@ -238,14 +258,22 @@ fn paint_chip_and_effort_samples(
         fg: mix(blank.fg, blank.bg, 0.6),
         ..blank
     };
-    let block = crate::claude_lights::Block::layout_scene(blank, [0xd7, 0x77, 0x57]);
+    let (glass, at) = scene_glass(input.cols, rule, blank);
+    let block = crate::claude_lights::Block::layout_scene(
+        blank,
+        crate::claude_lights::ChipAt {
+            glass,
+            col: 2 + footer::RULE_LEAD + 1,
+            cols: input.cols,
+        },
+    );
     let footer = &mut layouts.footers[7];
     footer.compose(
-        input.cols.saturating_sub(4),
+        footer::rule_room(&(2..at.end)),
         Some(&block),
         rule,
         blank,
-        ([0xd7, 0x77, 0x57], WARN_FG),
+        (glass, at),
         None,
     );
     input.cells[base + 31].fill(rule);
@@ -297,12 +325,13 @@ fn paint_effort_sample(
         effort: Some(level.to_owned()),
     };
     footer.note_facts(&facts, Some(&card), true, FactMask::default());
+    let (glass, at) = scene_glass(input.cols, rule, blank);
     footer.compose(
-        input.cols.saturating_sub(4),
+        footer::rule_room(&(2..at.end)),
         None,
         rule,
         blank,
-        ([0xd7, 0x77, 0x57], WARN_FG),
+        (glass, at),
         None,
     );
     input.cells[base + 34].fill(rule);

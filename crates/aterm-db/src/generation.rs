@@ -1103,10 +1103,12 @@ fn reserve_until(
         trust: trust(bootstrap),
         complete: None,
     };
-    aterm_journal::create_private_dir_durable(&root(paths))?;
+    let root_dir = root(paths);
+    aterm_journal::create_private_dir_durable(&root_dir)?;
     let reservation = selection.bytes();
-    fsx::write_new(&root(paths).join(FENCE), &reservation, 0o600).map_err(crate::table::failure)?;
-    if fsx::read_private(&root(paths).join(FENCE), MAX_STATE)
+    let fence_path = root_dir.join(FENCE);
+    fsx::write_new(&fence_path, &reservation, 0o600).map_err(crate::table::failure)?;
+    if fsx::read_private(&fence_path, MAX_STATE)
         .map_err(crate::table::failure)?
         .as_ref()
         .map(|value| value.as_slice())
@@ -1114,12 +1116,12 @@ fn reserve_until(
     {
         return Err(fail());
     }
-    aterm_durable::durable_dir(&root(paths))?;
+    aterm_durable::durable_dir(&root_dir)?;
     let next = candidate(paths);
     // Each component is private and symlinks are refused. The materializer may
     // write only under this independent home, never under the person's home.
     for path in [
-        root(paths),
+        root_dir,
         next.home.clone(),
         next.home.join(".config"),
         next.home.join(".config/aterm"),
@@ -1127,8 +1129,9 @@ fn reserve_until(
     ] {
         aterm_journal::create_private_dir_durable(&path)?;
     }
-    fsx::write_new(&next.dir.join(LINK), &reservation, 0o600).map_err(crate::table::failure)?;
-    if fsx::read_private(&next.dir.join(LINK), MAX_STATE)
+    let link_path = next.dir.join(LINK);
+    fsx::write_new(&link_path, &reservation, 0o600).map_err(crate::table::failure)?;
+    if fsx::read_private(&link_path, MAX_STATE)
         .map_err(crate::table::failure)?
         .as_ref()
         .map(|v| v.as_slice())

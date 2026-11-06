@@ -32,8 +32,11 @@
 //! admissions do not qualify. At its bound on a machine that stayed busy a strict need is
 //! refused, and one that runs loaded ([`Need::runs_loaded`]) starts and states it
 //! ([`Claim::timing_protection`], [`Claim::stated_entry`]); with no CPU window or no load either
-//! is refused. A sampled CPU interval promises neither continuous quiet nor GPU quiet;
-//! unclaimed work and old clients that do not implement this policy remain outside its protection.
+//! is refused. A sampled CPU interval promises neither continuous quiet nor GPU quiet: before its
+//! bound a measured claim, and a load-only one with a patience, also waits for the GPU to read
+//! at most [`QUIET_GPU_BUSY`] busy over a short window, and at its bound starts whatever the GPU,
+//! saying how busy it read ([`QuietStart`]). Unclaimed work and old clients that do not
+//! implement this policy remain outside its protection.
 //!
 //! An ordinary holder-based claim's memory reservation is its declared peak less what its holder's process tree
 //! already uses, so memory in use is not counted twice: a process is counted toward its
@@ -395,9 +398,10 @@ impl Need {
         self
     }
 
-    /// Admit it only while the 1-minute load is at or below `max_load1`, alone among quiet claims:
-    /// unless its own process, or one its process descends from, already holds a quiet claim,
-    /// which covers it, so it is admitted under that claim with no wait for either.
+    /// Admit it only while the 1-minute load is at or below `max_load1`, and with a
+    /// [`Self::patience`] the GPU at or below [`QUIET_GPU_BUSY`] until its bound, alone among
+    /// quiet claims: unless its own process, or one its process descends from, already holds a
+    /// quiet claim, which covers it, so it is admitted under that claim with no wait for either.
     #[must_use]
     pub const fn quiet(mut self, max_load1: f64) -> Need {
         self.quiet = Some(max_load1);
@@ -567,6 +571,16 @@ pub const fn cold_claim(physical: Option<u64>) -> u64 {
 /// admitted at.
 pub const QUIET_LOAD_PER_CORE: f64 = 2.0;
 
+/// The busiest the GPU may be, percent, for timing-sensitive work to start ([`Need::timing`]):
+/// the accelerator's own device utilization at its most over [`reading::GPU_WINDOW`]
+/// ([`Machine::gpu_busy`]). Another process's long command buffers starve the frames a timed take
+/// renders as surely as load starves its threads, and the load does not show them. Measured on
+/// a 14-core M4 Pro (`docs/measured/quiet-burst-2026-10-29.md`): a Metal compute loop of 270 ms
+/// buffers read 92-100% and starved paint takes with the load under its bound, while the
+/// machine's own use around those runs, other sessions' windows and builds included, read under
+/// 25% in 1,015 of 1,019 readings, the other four in one 22 s spell.
+pub const QUIET_GPU_BUSY: u8 = 50;
+
 /// The most 1-minute load timing-sensitive work starts under on a machine of `cores` logical
 /// cores: [`QUIET_LOAD_PER_CORE`] a core.
 #[must_use]
@@ -574,9 +588,10 @@ pub fn quiet_bound(cores: u32) -> f64 {
     QUIET_LOAD_PER_CORE * f64::from(cores.max(1))
 }
 
-/// How long a quiet claim waits for the load once nothing but the load holds it back (no other
-/// quiet claim is held or waits ahead of it: it is next). Its patience counts from then, so a
-/// claim that queued behind another timed run still gets all of it.
+/// How long a quiet claim waits for the load (and the GPU, [`QUIET_GPU_BUSY`]) once nothing but
+/// the machine holds it back (no other quiet claim is held or waits ahead of it: it is next). Its
+/// patience counts from then, so a claim that queued behind another timed run still gets all of
+/// it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Patience {
     /// Next for this long, it reserves the machine: claimed work that asked after it (memory,

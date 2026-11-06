@@ -98,10 +98,8 @@ pub(crate) fn collect_input_paths(args: &[String]) -> Vec<PathBuf> {
             }
             "-filelist" => {
                 if let Some(list_path) = expanded.get(i + 1)
-                    && let Ok(text) = aterm_uds::atomic_file::read_regular_text(
-                        std::path::Path::new(list_path),
-                        aterm_uds::atomic_file::MAX_CONFIG_BYTES,
-                    )
+                    && let Ok(text) =
+                        read_regular_text(std::path::Path::new(list_path), MAX_CONFIG_BYTES)
                 {
                     for line in text.lines() {
                         let entry = line.split(',').next().unwrap_or("").trim();
@@ -128,10 +126,8 @@ fn expand_response_args(args: &[String], depth: usize, out: &mut Vec<String>) {
     for arg in args {
         if depth < 2
             && let Some(resp_path) = arg.strip_prefix('@')
-            && let Ok(content) = aterm_uds::atomic_file::read_regular_text(
-                std::path::Path::new(resp_path),
-                aterm_uds::atomic_file::MAX_CONFIG_BYTES,
-            )
+            && let Ok(content) =
+                read_regular_text(std::path::Path::new(resp_path), MAX_CONFIG_BYTES)
         {
             let nested: Vec<String> = split_response_tokens(&content);
             expand_response_args(&nested, depth + 1, out);
@@ -181,7 +177,61 @@ fn has_object_or_archive_ext(path: &str) -> bool {
     path.ends_with(".o") || path.ends_with(".rlib") || path.ends_with(".a")
 }
 
+const MAX_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CONTAINER_BYTES: u64 = 512 * 1024 * 1024;
+
+#[cfg(target_os = "macos")]
+const OPEN_NOFOLLOW_CLOEXEC: i32 = 0x0100 | 0x0100_0000;
+#[cfg(target_os = "macos")]
+const OPEN_NONBLOCK_NOFOLLOW_CLOEXEC: i32 = 0x0004 | OPEN_NOFOLLOW_CLOEXEC;
+
+#[cfg(all(unix, not(target_os = "macos")))]
+const OPEN_NOFOLLOW_CLOEXEC: i32 = 0o400_000 | 0o2_000_000;
+#[cfg(all(unix, not(target_os = "macos")))]
+const OPEN_NONBLOCK_NOFOLLOW_CLOEXEC: i32 = 0o4000 | OPEN_NOFOLLOW_CLOEXEC;
+
+// `build.rs` compiles `macho_order.rs` into the standalone `aterm-order-ld` wrapper using bare
+// `rustc` with no `--extern` crates, so file I/O helpers here must use `std` only.
+fn read_regular_bytes(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(OPEN_NONBLOCK_NOFOLLOW_CLOEXEC);
+    }
+    let file = opts.open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    if meta.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file exceeds size limit",
+        ));
+    }
+    let cap = usize::try_from(meta.len().min(max_bytes).saturating_add(1)).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(cap);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file exceeds size limit",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn read_regular_text(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    String::from_utf8(read_regular_bytes(path, max_bytes)?)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
 
 /// Reads all Mach-O object and archive inputs and returns the deduplicated static symbol
 /// order list for Apple `ld -order_file`.
@@ -189,7 +239,7 @@ const MAX_CONTAINER_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) fn build_order_list(paths: &[PathBuf]) -> Vec<String> {
     let mut raw = Vec::new();
     for (idx, path) in paths.iter().enumerate() {
-        let Ok((bytes, _)) = aterm_uds::atomic_file::read_regular(path, MAX_CONTAINER_BYTES) else {
+        let Ok(bytes) = read_regular_bytes(path, MAX_CONTAINER_BYTES) else {
             continue;
         };
         let file_order = u32::try_from(idx).unwrap_or(u32::MAX);
@@ -370,21 +420,15 @@ pub(crate) fn write_probe_spacer_object(
     hdr.extend_from_slice(&stroff.to_le_bytes());
     hdr.extend_from_slice(&strsize.to_le_bytes());
 
+    let _ = std::fs::remove_file(path);
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(false);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+        opts.mode(0o600).custom_flags(OPEN_NOFOLLOW_CLOEXEC);
     }
     let mut file = opts.open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "not a regular file",
-        ));
-    }
-    file.set_len(0)?;
     file.write_all(&hdr)?;
     file.seek(SeekFrom::Start(symoff_u64))?;
     file.write_all(&sym_records)?;
@@ -445,7 +489,7 @@ pub(crate) fn refine_order_with_probe_hits(
         .enumerate()
         .map(|(idx, sym)| (bucket_of(sym), idx, sym))
         .collect();
-    indexed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    indexed.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     indexed.into_iter().map(|(_, _, sym)| sym.clone()).collect()
 }
 
@@ -582,7 +626,7 @@ pub(crate) fn extract_executable_faulted_symbols(
         sect_syms.push((n_sect, addr, name));
     }
 
-    sect_syms.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    sect_syms.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
     for i in 0..sect_syms.len() {
         let (sect, start, name) = sect_syms[i];
@@ -1173,11 +1217,7 @@ pub(crate) fn write_order_file(path: &Path, symbols: &[String]) -> std::io::Resu
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        #[cfg(target_os = "macos")]
-        const FLAGS: i32 = 0x0100 | 0x0100_0000;
-        #[cfg(not(target_os = "macos"))]
-        const FLAGS: i32 = 0o2_000_000;
-        opts.mode(0o600).custom_flags(FLAGS);
+        opts.mode(0o600).custom_flags(OPEN_NOFOLLOW_CLOEXEC);
     }
     opts.open(path)?.write_all(buf.as_bytes())
 }
@@ -1509,6 +1549,13 @@ mod tests {
         assert_eq!(pad_names.len(), 12);
         let parsed_pad = build_order_list(std::slice::from_ref(&pad_obj));
         assert_eq!(parsed_pad.len(), 12);
+
+        let src = include_str!("macho_order.rs");
+        let non_test = src.split("#[cfg(test)]").next().unwrap_or(src);
+        assert!(
+            !non_test.contains("aterm_uds::") && !non_test.contains("libc::"),
+            "macho_order.rs is compiled standalone by build.rs without external crates"
+        );
 
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {

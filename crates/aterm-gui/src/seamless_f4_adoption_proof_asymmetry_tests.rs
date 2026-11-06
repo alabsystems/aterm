@@ -67,6 +67,7 @@ fn realistic_layout() -> RestoreManifest {
                         not_claim_worker: false,
                         claim_worker: None,
                         task: None,
+                        told: None,
                     },
                 ))),
                 second: Box::new(RestoredSplitTree::leaf(RestoredView::Terminal(
@@ -97,6 +98,7 @@ fn realistic_layout() -> RestoreManifest {
                         not_claim_worker: false,
                         claim_worker: None,
                         task: None,
+                        told: None,
                     },
                 ))),
             },

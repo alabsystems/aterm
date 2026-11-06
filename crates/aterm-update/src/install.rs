@@ -4497,6 +4497,74 @@ fn check_boot_health(
     )
 }
 
+/// Only this installed image's headless-owned trial may request crash-loop recovery.
+pub fn headless_boot_trial_pending(current_build: u64) -> bool {
+    let Some(staging) = Staging::resolve() else {
+        return false;
+    };
+    let Some(installed) = bundle::resolve_layout() else {
+        return false;
+    };
+    headless_boot_trial_pending_at(
+        &staging,
+        current_build,
+        &installed.app_root,
+        unix_now_secs(),
+    )
+}
+
+fn headless_boot_trial_pending_at(
+    staging: &Staging,
+    current_build: u64,
+    app_root: &Path,
+    now: u64,
+) -> bool {
+    trial_armed_for(staging, current_build)
+        && trial_owned_by(staging, app_root)
+        && !matches!(
+            trial_window_launch(staging, current_build, now),
+            WindowLaunch::Waiting { .. }
+        )
+}
+
+/// Recovery of an existing trial only: never continue into stage admission.
+pub fn recover_boot_trial(
+    current_build: u64,
+    current_commit: Option<&str>,
+    witness: crate::TrialWitness,
+) -> ApplyOutcome {
+    let Some(staging) = Staging::resolve() else {
+        return ApplyOutcome::NotApplicable;
+    };
+    recover_boot_trial_at(
+        &staging,
+        current_build,
+        witness,
+        bundle::resolve_layout,
+        |app_root| ensure_current_trial_receipt(&staging, app_root, current_build, current_commit),
+    )
+}
+
+fn recover_boot_trial_at(
+    staging: &Staging,
+    current_build: u64,
+    witness: crate::TrialWitness,
+    resolve_installed: impl FnOnce() -> Option<bundle::Bundle>,
+    prove: impl FnOnce(&Path) -> Result<TrialRevert, String>,
+) -> ApplyOutcome {
+    check_boot_health_with_proof(
+        staging,
+        current_build,
+        RollbackHandoff::NONE,
+        false,
+        witness,
+        APPLY_LOCK_WAIT,
+        resolve_installed,
+        prove,
+    )
+    .unwrap_or(ApplyOutcome::NotApplicable)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn check_boot_health_with_lock_wait(
     staging: &Staging,
@@ -4734,7 +4802,6 @@ struct RollbackHandoff<'a> {
     image: crate::ImageReplacement,
 }
 
-#[cfg(test)]
 impl RollbackHandoff<'_> {
     const NONE: RollbackHandoff<'static> = RollbackHandoff {
         fds: &[],

@@ -4,8 +4,8 @@
 
 //! A scratch world: the private HOME, configuration and runtime folders a check, a measurement
 //! or a smoke starts an aterm in. That aterm is never the person's, so it starts none of the
-//! automatic lanes that act for the login's own account, and none that can put an OS consent
-//! prompt on the person's desk: macOS keys the Local Network decision, the firewall's
+//! automatic lanes that act for the login's own account or reach the person's real LAN, and none
+//! that can put an OS consent prompt on the person's desk: macOS keys the firewall's
 //! incoming-connection question and a background item to the account and the app, never to
 //! HOME, so a world cannot answer them privately and must not ask them at all.
 //!
@@ -56,9 +56,8 @@ pub fn state_home(home: &Path) -> Option<PathBuf> {
 /// - `[machine] universal_control = "leave"`: the Mac's own preferences left alone;
 /// - `[keeper]`: no keeper job in the login's launchd domain, which a lasting bundle's window
 ///   would share with the person's own windows of it and leave running after the world ends;
-/// - `[swarm]`: no part in the swarm: no `_alab._tcp` browse, no fleet reads, no vault sharing
-///   and no System State Local Network step, each a local-network use macOS asks the person
-///   about.
+/// - `[swarm]`: no part in the swarm: no `_alab._tcp` browse, no fleet reads and no vault
+///   sharing, each a use of the person's real LAN.
 ///
 /// Tables only, no root keys, so a world may put its own root keys and tables before it.
 pub const LANES_OFF: &str = "[update]\nenabled = false\nauto_apply = false\n\

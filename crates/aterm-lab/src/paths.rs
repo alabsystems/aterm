@@ -332,34 +332,33 @@ impl Paths {
 }
 
 /// This crate's directory in a checkout.
-const CRATE_DIR: &str = "crates/aterm-lab";
+pub(crate) const CRATE_DIR: &str = "crates/aterm-lab";
 
 /// The checkout this program runs from, read when it runs (a build directory reused at another
 /// path serves that path's checkout): the nearest directory holding this crate's manifest
 /// ([`CRATE_DIR`]) at or above `CARGO_MANIFEST_DIR`, which `targo --unverified lab` (a `targo
-/// run`) and `targo test` set to this crate's directory; else at or above the working directory,
-/// where verify starts its lab lanes (the checkout's root, with `CARGO_MANIFEST_DIR` removed);
-/// else `.`.
+/// run`) and `targo test` set to this crate's directory; else at or above the directory the run
+/// started in ([`caller_dir`]: [`crate::sys::confine_env`] has left the working directory at `/`
+/// by now), where verify starts its lab lanes (the checkout's root, with `CARGO_MANIFEST_DIR`
+/// removed); else that directory itself.
 fn checkout() -> PathBuf {
+    let caller = PathBuf::from(caller_dir());
     let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
         .filter(|d| !d.is_empty())
         .map(PathBuf::from);
-    checkout_from(manifest.into_iter().chain(std::env::current_dir().ok()))
+    checkout_from(manifest.into_iter().chain([caller.clone()])).unwrap_or(caller)
 }
 
 /// [`checkout`] from each of `starts` in turn: the first nearest directory at or above one that
-/// holds [`CRATE_DIR`]'s manifest, else `.`.
-fn checkout_from(starts: impl IntoIterator<Item = PathBuf>) -> PathBuf {
+/// holds [`CRATE_DIR`]'s manifest, if any does.
+fn checkout_from(starts: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
     let manifest_file = Path::new(CRATE_DIR).join("Cargo.toml");
-    starts
-        .into_iter()
-        .find_map(|start| {
-            start
-                .ancestors()
-                .find(|dir| dir.join(&manifest_file).is_file())
-                .map(Path::to_path_buf)
-        })
-        .unwrap_or_else(|| PathBuf::from("."))
+    starts.into_iter().find_map(|start| {
+        start
+            .ancestors()
+            .find(|dir| dir.join(&manifest_file).is_file())
+            .map(Path::to_path_buf)
+    })
 }
 
 fn find_aterm(exe: &Path, repo: &Path) -> (Option<PathBuf>, Option<String>) {
@@ -571,7 +570,7 @@ mod tests {
     use super::*;
 
     /// The checkout is the nearest one holding the lab's crate above the package directory the
-    /// run names, else above the working directory, else `.`. NEGATIVE CONTROL: a start inside a
+    /// run names, else above the folder it started in. NEGATIVE CONTROL: a start inside a
     /// tree without the lab's crate (a second checkout's sibling, a scratch folder) names no
     /// checkout and gives way to the next.
     #[test]
@@ -584,14 +583,23 @@ mod tests {
         }
         let elsewhere = scratch.path().join("elsewhere/deep");
         std::fs::create_dir_all(&elsewhere).unwrap();
-        assert_eq!(checkout_from([second.join(CRATE_DIR)]), second);
-        assert_eq!(checkout_from([first.join("crates/other/src")]), first);
+        assert_eq!(
+            checkout_from([second.join(CRATE_DIR)]),
+            Some(second.clone())
+        );
+        assert_eq!(
+            checkout_from([first.join("crates/other/src")]),
+            Some(first.clone())
+        );
         assert_eq!(
             checkout_from([second.join(CRATE_DIR), first.clone()]),
-            second
+            Some(second)
         );
-        assert_eq!(checkout_from([elsewhere.clone(), first.clone()]), first);
-        assert_eq!(checkout_from([elsewhere]), PathBuf::from("."));
+        assert_eq!(
+            checkout_from([elsewhere.clone(), first.clone()]),
+            Some(first)
+        );
+        assert_eq!(checkout_from([elsewhere]), None);
         assert_eq!(
             checkout().join(CRATE_DIR),
             aterm_tempfile::manifest_dir(),

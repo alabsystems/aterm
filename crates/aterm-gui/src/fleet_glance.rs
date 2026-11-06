@@ -45,6 +45,8 @@ pub(crate) struct FleetNeed {
     pub(crate) claim: Option<&'static str>,
     /// The row says the need is a harness's `NEEDS YOU:` report its agent carries on past (`needs_by=harness`): Needs you lists it after the needs that stopped their agents ([`crate::status_item::NeedRow::carries_on`]).
     pub(crate) carries_on: bool,
+    /// An ask's needs as the peer's own herald reads them, each its id and how it was read (`need_ids=`, a content row's, [`crate::status_item::need_ids_row`]), so this herald tells each of them once ([`escalation`]); empty for another need, a facts row and an older peer's, which keep one notice per appearance of the need.
+    pub(crate) ids: Vec<(u64, crate::status_item::NeedRead)>,
 }
 
 /// One session on a fleet peer that this Mac holds over the fleet.
@@ -94,6 +96,9 @@ pub(crate) struct FleetMac {
     pub(crate) working: usize,
     /// Rows its reply cap left out (`sessions=` past every session row sent, exited ones included: the header counts them too).
     pub(crate) left_out: usize,
+    /// Live instances the peer reports whose sessions this reply read (`instances_read=`, 1 where
+    /// a window answered alone).
+    pub(crate) instances_read: usize,
     /// Other live instances the peer reports, whose sessions this reply did not read.
     pub(crate) instances_unread: usize,
     /// Its needs.
@@ -148,11 +153,6 @@ pub(crate) struct FleetSnapshot {
     pub(crate) macs: Vec<FleetMac>,
     /// The peers that did not, and why.
     pub(crate) unanswered: Vec<Unanswered>,
-    /// The read judged a no-route this Mac's Local Network privacy, until the person allows
-    /// aterm: a member on this network refused with none there answering
-    /// (`aterm_netplace::words::ON_LINK_PRIVACY_NOTE`), or, with no address to judge, every peer
-    /// refused at once (`aterm_ctl::NO_ROUTE_NOTE`).
-    pub(crate) no_route: bool,
 }
 
 impl FleetSnapshot {
@@ -358,6 +358,12 @@ fn mac_of(
     };
     let dial = dial_of(label);
     let proven = |key: &str| (!unproven).then(|| field(instance, key)).flatten();
+    let count = |key: &str| {
+        field(instance, key)
+            .filter(|n| n.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|n| n.parse::<usize>().ok())
+            .unwrap_or(1)
+    };
     let mut mac = FleetMac {
         name: short_name(dial),
         dial: dial.to_string(),
@@ -370,11 +376,10 @@ fn mac_of(
         older,
         unproven,
         sessions: rows.len(),
-        instances_unread: field(instance, "instances")
-            .filter(|n| n.bytes().all(|b| b.is_ascii_digit()))
-            .and_then(|n| n.parse::<usize>().ok())
-            .unwrap_or(1)
-            .saturating_sub(1),
+        // A node service answers for every window it reaches (`instances_read=`); a window that
+        // answered alone read itself.
+        instances_read: count("instances_read"),
+        instances_unread: count("instances").saturating_sub(count("instances_read")),
         ..FleetMac::default()
     };
     let claimed = field(instance, "sessions")
@@ -450,6 +455,10 @@ fn mac_of(
                 .or_else(|| content.then(|| content_what(need, row)).flatten()),
             claim,
             carries_on: field(row, "needs_by") == Some("harness"),
+            ids: field(row, "need_ids")
+                .filter(|_| content && need == NeedWord::Ask)
+                .map(crate::status_item::parse_need_ids)
+                .unwrap_or_default(),
         });
     }
     mac
@@ -487,7 +496,6 @@ fn content_what(word: NeedWord, row: &aterm_json::Map) -> Option<String> {
 /// THE FLEET READ, PARSED.
 pub(crate) fn parse(
     json: &str,
-    no_route: bool,
     own_node: Option<&str>,
     now_ms: u64,
 ) -> Result<FleetSnapshot, String> {
@@ -498,7 +506,6 @@ pub(crate) fn parse(
         .ok_or_else(|| "the fleet read is no list".to_string())?;
     let mut snapshot = FleetSnapshot {
         read_at_ms: now_ms,
-        no_route,
         ..FleetSnapshot::default()
     };
     for host in hosts {
@@ -850,12 +857,11 @@ pub(crate) struct ReaderSeams {
     /// This process's "network moved" signal, each move a [`Kick::Moved`]; none in a test that
     /// kicks by hand.
     pub(crate) moved: Option<crate::network_moved::Watch>,
-    /// Whether this process may use the local network now
-    /// ([`aterm_types::macos_setup::lan_first_use::may_use`]): a read dials the fleet's Macs, so
-    /// none goes by itself (the tick, a menu, a move) while System State's Local Network step,
-    /// which asks macOS first, is still to come. A person's Read the Fleet Now still reads. It is
-    /// asked only for a read the tick would make ([`should_poll`]), right before it: past the
-    /// step's wait it is the door that takes the dialog slot for macOS's question.
+    /// Whether aterm's own LAN traffic can go out now ([`crate::network_moved::lan_answers`]: on
+    /// macOS the root LAN broker answers): a read dials the fleet's Macs, so none goes by itself
+    /// (the tick, a menu, a move) while it cannot. A person's Read the Fleet Now still reads, and
+    /// its unanswered rows carry the broker's words. It is asked only for a read the tick would
+    /// make ([`should_poll`]), right before it.
     pub(crate) lan: Box<dyn Fn() -> bool + Send>,
     /// Whether the automatic LAN lanes pace themselves now (`aterm_netplace::routes::paced`: away
     /// from the ALab LAN, on a hotspot, offline): a read then that reached nobody waits
@@ -956,9 +962,8 @@ fn reader_loop(
         }
         let tried = lock().tried_ms.filter(|_| !asked.moved);
         let watch = seams.watch.load(std::sync::atomic::Ordering::Acquire);
-        // The LAN door is asked last, only for a read this tick makes: past the wait for System
-        // State's Local Network step it takes the dialog slot for macOS's question, so a tick
-        // that reads nothing must not go through it.
+        // The broker is asked last, only for a read this tick makes: a tick that reads nothing
+        // dials nothing.
         let read = book.in_fleet
             && (asked.now
                 || (should_poll(&book, watch, tried, now, asked.menu, quiet.every())
@@ -988,14 +993,7 @@ fn reader_loop(
             // for another.
             moved_since = Asked::with_queued(None, rx).moved;
             let now = (seams.now_ms)();
-            let parsed = answer.and_then(|(json, stderr)| {
-                parse(
-                    &json,
-                    privacy_refused(&stderr),
-                    seams.own_node.as_deref(),
-                    now,
-                )
-            });
+            let parsed = answer.and_then(|(json, _)| parse(&json, seams.own_node.as_deref(), now));
             // Whom a read on the old network reached says nothing of the new one.
             let away = (seams.away)();
             if !moved_since && quiet.after(&parsed, away) {
@@ -1082,22 +1080,31 @@ const fn need_key(word: NeedWord) -> u64 {
     aterm_hash::fnv1a_64(word.word().as_bytes())
 }
 
-/// A fleet need as the herald reads it.
+/// A fleet need as the herald reads it: an ask the peer names by its needs ([`FleetNeed::ids`]) stands for each of them, read as the peer read it and named by the row's words, so a need this herald told is told once (design §14.18) whatever the peer's set does around it; one it does not name keeps one notice per appearance of its word.
 pub(crate) fn escalation(mac: &FleetMac, need: &FleetNeed) -> crate::status_item::Escalation {
     let what = need
         .what
         .as_deref()
         .unwrap_or_else(|| crate::status_item::need_words(need.word));
+    let body = crate::needs::fold_clip(&format!("{} \u{b7} {}: {what}", mac.name, need.who), 120);
     crate::status_item::Escalation {
         session: herald_key(mac.ident(), &need.sid),
         kind: crate::status_item::EscalationKind::of(need.word),
         word: need.word,
         key: need_key(need.word),
         label: format!("{} \u{b7} {} \u{2014} {what}", mac.name, need.who),
-        body: crate::needs::fold_clip(&format!("{} \u{b7} {}: {what}", mac.name, need.who), 120),
+        needs: need
+            .ids
+            .iter()
+            .map(|&(id, read)| crate::status_item::NeedId {
+                id,
+                read,
+                body: body.clone(),
+            })
+            .collect(),
+        body,
         headline: crate::status_item::headline(need.word),
         report: None,
-        needs: Vec::new(),
         owner_turn: 0,
     }
 }
@@ -1126,43 +1133,6 @@ pub(crate) fn parse_told(rows: &[String]) -> std::collections::HashMap<u64, Need
         .take(FLEET_TOLD_MAX)
         .collect()
 }
-
-/// Whether a fleet read's notes (its `stderr`) judged a no-route this Mac's Local Network
-/// privacy ([`FleetSnapshot::no_route`]): the on-link verdict's note
-/// (`aterm_netplace::words::ON_LINK_PRIVACY_NOTE`), or with no address to judge every peer
-/// refused at once (`aterm_ctl::NO_ROUTE_NOTE`). A read that says where this Mac is instead
-/// blames nothing.
-pub(crate) fn privacy_refused(stderr: &str) -> bool {
-    stderr.contains(aterm_ctl::NO_ROUTE_NOTE)
-        || stderr.contains(aterm_netplace::words::ON_LINK_PRIVACY_NOTE)
-}
-
-/// THE FLEET'S DIGEST ENTRY (`fleet.unreadable.no-route`, the whole answer of the level `Family::FleetUnreadable`).
-pub(crate) fn no_route_entry() -> aterm_messages::exceptions::Entry {
-    use aterm_messages::exceptions::{Entry, Family};
-    use aterm_messages::need::{Reason, Resurface, Then, Why};
-    Entry::new(
-        Family::FleetUnreadable,
-        "",
-        "no-route",
-        "No route to any fleet Mac",
-        Why::OnlyYou(Reason::new(
-            "every peer refused at once with no route: local-network privacy",
-        )),
-        Then::step("Allow aterm in System Settings ▸ Privacy & Security ▸ Local Network"),
-    )
-    .severity(aterm_messages::Severity::Info)
-    .resurface(Resurface::WAIT)
-    .log_line("fleet unreadable no-route")
-}
-
-/// The Local Network privacy pane's URL.
-#[cfg_attr(
-    not(target_os = "macos"),
-    expect(dead_code, reason = "the menu-bar status item is macOS's")
-)]
-pub(crate) const LOCAL_NETWORK_PANE: &str =
-    "x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork";
 
 impl crate::App {
     /// START THE FLEET GLANCE with the status item (the first OS window's attach).
@@ -1193,7 +1163,7 @@ impl crate::App {
             post: Box::new(move || proxy.send_event(crate::Wake::FleetRead).is_ok()),
             tick: POLL_EVERY,
             moved: Some(crate::network_moved::watch()),
-            lan: Box::new(aterm_types::macos_setup::lan_first_use::may_use),
+            lan: Box::new(crate::network_moved::lan_answers),
             #[cfg(unix)]
             away: Box::new(move || {
                 place_state
@@ -1238,19 +1208,6 @@ impl crate::App {
     /// The `Wake::FleetRead` arm: the fleet glance wrote its slot.
     pub(crate) fn on_fleet_read(&mut self) {
         self.mark_status_dirty();
-        let no_route = self.fleet_glance.as_ref().is_some_and(|f| {
-            let slot = f.copy();
-            slot.book.in_fleet && slot.snapshot.as_ref().is_some_and(|s| s.no_route)
-        });
-        let entries = if no_route {
-            vec![no_route_entry()]
-        } else {
-            Vec::new()
-        };
-        self.except_replace(
-            aterm_messages::exceptions::Family::FleetUnreadable,
-            &entries,
-        );
         self.herald_fleet();
     }
 

@@ -27,7 +27,7 @@ use aterm_effects::aos_momentum::m6_policy::{RANKER_POLICY_NAME, RANKER_POLICY_V
 use aterm_uds::atomic_file::read_regular;
 
 use crate::instance::take_value;
-use crate::lab_build::{LAB_BUILD, check_build};
+use crate::lab_build::{check_build, lab_build};
 use crate::paths::{from_caller, paths};
 use crate::spread::Threads;
 use crate::sys::max_footprint;
@@ -41,8 +41,6 @@ usage: targo --unverified lab aos-learn VERB ...
 Aos M6's learner (design §13). Every verb reads training data alone but `session`, which alone labels
 a held-out, report or practice set, under its pair's write-ahead ledger.
 
-  build
-        this lab's build and profile, which aos-learn-bench checks before either child (G0)
   init --store DIR (--pair I | --practice J)
         a new store for the pair: v0 active and at the head, revision 0
   chain [--threads N]
@@ -736,7 +734,6 @@ fn refused(verb: &str, name: &str, why: impl std::fmt::Display) -> Fail {
 /// What a verb was asked.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Verb {
-    Build,
     Init { store: String, pair: Pair },
     Chain { threads: usize },
     Train { store: String, threads: usize },
@@ -818,7 +815,6 @@ fn parse(args: &[String]) -> Result<Verb, Fail> {
         ("--replay", replay.is_some()),
     ];
     let takes: &[&str] = match verb.as_str() {
-        "build" => &[],
         "init" => &["--store", "--pair or --practice"],
         "chain" => &["--threads"],
         "train" | "verify" => &["--store", "--threads"],
@@ -849,7 +845,6 @@ fn parse(args: &[String]) -> Result<Verb, Fail> {
     }
     let threads = threads.unwrap_or(1);
     Ok(match verb.as_str() {
-        "build" => Verb::Build,
         "init" => Verb::Init {
             store: need(store, "--store DIR")?,
             pair: pair.ok_or_else(|| {
@@ -924,10 +919,6 @@ pub fn guarded(command: &str, out: Res, read: u64) -> Res {
 
 fn run(verb: &Verb) -> Res {
     match verb {
-        Verb::Build => {
-            print!("{}", build_text());
-            Ok(0)
-        }
         Verb::Init { store, pair } => init(store, *pair),
         Verb::Chain { threads } => print_chain(*threads),
         Verb::Train { store, threads } => train(store, *threads),
@@ -935,12 +926,6 @@ fn run(verb: &Verb) -> Res {
         Verb::Verify { store, threads } => verify(store, *threads),
         Verb::Session(args) => session(args),
     }
-}
-
-/// `build`'s output: this lab's build and profile.
-#[must_use]
-pub fn build_text() -> String {
-    format!("build {LAB_BUILD}\nprofile {}\n", env!("ATERM_LAB_PROFILE"))
 }
 
 /// The physical store directory `given` names, refused inside this repository's checkouts.
@@ -997,7 +982,7 @@ fn nonce() -> Result<u64, Fail> {
 
 /// The pinned evaluator, refused when its baseline drifts.
 fn evaluator(verb: &str) -> Result<Evaluator, Fail> {
-    Evaluator::v1(LAB_BUILD, Instant::now()).map_err(|e| refused(verb, "Evaluator", e))
+    Evaluator::v1(lab_build(), Instant::now()).map_err(|e| refused(verb, "Evaluator", e))
 }
 
 /// The store under `dir`, locked, loaded and checked for this build.
@@ -1010,7 +995,7 @@ fn load(verb: &str, dir: PathBuf) -> Result<Store<LabStore>, Fail> {
         ));
     }
     let io = LabStore::open(dir).map_err(|e| refused(verb, "StoreBusy", e))?;
-    Store::load(io, LAB_BUILD).map_err(|e| refused(verb, "Store", e))
+    Store::load(io, lab_build()).map_err(|e| refused(verb, "Store", e))
 }
 
 /// A new store's directory under `dir`, made and locked: `dir` must be absent or empty.
@@ -1031,7 +1016,7 @@ fn new_store(verb: &str, dir: &Path) -> Result<LabStore, Fail> {
 }
 
 fn init(given: &str, pair: Pair) -> Res {
-    check_build(LAB_BUILD)?;
+    check_build(lab_build())?;
     let dir = store_dir("init", given)?;
     if !is_new(&dir)? {
         return Err(Fail::usage(format!(
@@ -1042,7 +1027,7 @@ fn init(given: &str, pair: Pair) -> Res {
     let root = root_for("init")?;
     let head = head_of("init", &root, pair)?;
     let io = new_store("init", &dir)?;
-    let store = Store::init(io, LAB_BUILD, pair, nonce()?, head)
+    let store = Store::init(io, lab_build(), pair, nonce()?, head)
         .map_err(|e| refused("init", "Store", e))?;
     println!(
         "aos-learn init: store {} for {}: v0 {} active",
@@ -1072,9 +1057,10 @@ fn pin_source(pin: &ChainPin) -> String {
             .collect::<String>()
     };
     format!(
-        "// The chain v0..v4 on training data alone, from aos-learn chain at {LAB_BUILD}; its digest \
+        "// The chain v0..v4 on training data alone, from aos-learn chain at {}; its digest \
          is {}.\npub const M6_CHAIN_V1: Option<ChainPin> = Some(ChainPin {{\n    ids: [\n{}    ],\n    \
          labels: [\n{}    ],\n}});\n",
+        lab_build(),
         pin.digest().hex(),
         digests(&pin.ids),
         digests(&pin.labels),
@@ -1363,7 +1349,7 @@ impl Summary {
 fn session(a: &SessionArgs) -> Res {
     let start = Instant::now();
     let mut summary = Summary {
-        build: LAB_BUILD.to_owned(),
+        build: lab_build().to_owned(),
         profile: env!("ATERM_LAB_PROFILE").to_owned(),
         child: if a.replay.is_some() { "B" } else { "A" }.to_owned(),
         pair: a.pair.name(),
@@ -1407,7 +1393,7 @@ fn session_run(a: &SessionArgs, summary: &mut Summary) -> Result<(), Fail> {
             "HOME is a scratch home, and a session's ledgers live under the account's own",
         ));
     }
-    check_build(LAB_BUILD)?;
+    check_build(lab_build())?;
     let pin = M6_CHAIN_V1.ok_or_else(|| {
         refused(
             "session",
@@ -1447,14 +1433,14 @@ fn session_run(a: &SessionArgs, summary: &mut Summary) -> Result<(), Fail> {
     let sets = Sets::v1();
     let spread = Threads(a.threads);
     let env = SessionEnv {
-        build: LAB_BUILD,
+        build: lab_build(),
         sets: &sets,
         labeller: Labeller::new(&ev, &spread),
         chain: pin,
         tests_log: a.tests_log,
     };
     let io = new_store("session", &dir)?;
-    let mut store = Store::init(io, LAB_BUILD, a.pair, nonce()?, ledger.head())
+    let mut store = Store::init(io, lab_build(), a.pair, nonce()?, ledger.head())
         .map_err(|e| refused("session", "Store", e))?;
     summary.store = Some(store.id());
     let run = if a.replay.is_some() {

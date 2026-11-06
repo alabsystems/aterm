@@ -64,6 +64,29 @@ impl HuffmanTable {
     }
 }
 
+/// Whether the entropy-coded segment at `pos` holds a data byte before the
+/// marker or end of input that ends it; fill bytes and restart markers are none.
+pub(crate) fn has_coded_data(data: &[u8], mut pos: usize) -> bool {
+    loop {
+        match (
+            data.get(pos),
+            pos.checked_add(1).and_then(|next| data.get(next)),
+        ) {
+            (None, _) => return false,
+            (Some(&0xFF), Some(&0x00)) | (Some(0x00..=0xFE), _) => return true,
+            (Some(&0xFF), Some(&0xFF)) => pos += 1,
+            (Some(&0xFF), Some(0xD0..=0xD7)) => pos += 2,
+            (Some(&0xFF), _) => return false,
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The Huffman symbols this thread's readers have decoded.
+    pub(crate) static DECODED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Bit reader for an entropy-coded JPEG segment, undoing `0xFF 0x00` byte stuffing.
 pub(crate) struct BitReader<'a> {
     data: &'a [u8],
@@ -72,8 +95,13 @@ pub(crate) struct BitReader<'a> {
     /// Loaded bits, left-aligned (the next bit is bit 63).
     acc: u64,
     bits: u32,
+    /// How many leading bits of `acc` came from the data; the zeros loaded
+    /// once it `ended` follow them.
+    real: u32,
     /// A marker (or the end of the data) was reached; `pos` is at its `0xFF`.
     ended: bool,
+    /// A read took bits past the data, or no restart marker followed it.
+    exhausted: bool,
 }
 
 impl<'a> BitReader<'a> {
@@ -84,7 +112,9 @@ impl<'a> BitReader<'a> {
             pos,
             acc: 0,
             bits: 0,
+            real: 0,
             ended: false,
+            exhausted: false,
         }
     }
 
@@ -92,6 +122,21 @@ impl<'a> BitReader<'a> {
     #[inline]
     pub(crate) const fn position(&self) -> usize {
         self.pos
+    }
+
+    /// The segment's data ran out before its reads did, so what the scan
+    /// codes past here is not in the file.
+    #[inline]
+    pub(crate) const fn exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    #[inline]
+    fn consume(&mut self, n: u32) {
+        self.acc <<= n;
+        self.bits -= n;
+        self.exhausted |= n > self.real;
+        self.real = self.real.saturating_sub(n);
     }
 
     #[inline]
@@ -109,6 +154,7 @@ impl<'a> BitReader<'a> {
                         match self.pos.checked_add(1).and_then(|next| self.data.get(next)) {
                             Some(&0x00) => {
                                 self.pos += 2;
+                                self.real += 8;
                                 0xFF
                             }
                             Some(&0xFF) => {
@@ -123,6 +169,7 @@ impl<'a> BitReader<'a> {
                     }
                     Some(&byte) => {
                         self.pos += 1;
+                        self.real += 8;
                         byte
                     }
                 }
@@ -142,8 +189,7 @@ impl<'a> BitReader<'a> {
             self.refill();
         }
         let value = (self.acc >> (64 - n)) as u32;
-        self.acc <<= n;
-        self.bits -= n;
+        self.consume(n);
         value
     }
 
@@ -169,15 +215,15 @@ impl<'a> BitReader<'a> {
     /// The next Huffman symbol, or `None` for a bit pattern no code has.
     #[inline]
     pub(crate) fn decode(&mut self, table: &HuffmanTable) -> Option<u8> {
+        #[cfg(test)]
+        DECODED.set(DECODED.get() + 1);
         if self.bits < 16 {
             self.refill();
         }
         let window = (self.acc >> 48) as u32;
         let fast = table.fast[(window >> (16 - FAST_BITS)) as usize];
         if fast != 0 {
-            let length = u32::from(fast >> 8);
-            self.acc <<= length;
-            self.bits -= length;
+            self.consume(u32::from(fast >> 8));
             return Some(fast as u8);
         }
         let mut length = FAST_BITS as usize + 1;
@@ -192,45 +238,57 @@ impl<'a> BitReader<'a> {
             .symbols
             .get(usize::try_from(code + table.delta[length]).ok()?)
             .copied()?;
-        self.acc <<= length;
-        self.bits -= length as u32;
+        self.consume(length as u32);
         Some(symbol)
     }
 
-    /// Drops buffered bits and advances past the next restart marker (`0xFFD0..=0xFFD7`).
+    /// Drops buffered bits and advances past the next restart marker
+    /// (`0xFFD0..=0xFFD7`), the data after which is fresh; without one the
+    /// reader is [`exhausted`](Self::exhausted).
     pub(crate) fn restart(&mut self) -> bool {
         self.acc = 0;
         self.bits = 0;
+        self.real = 0;
         let mut at = self.pos;
-        loop {
+        let found = loop {
             match (
                 self.data.get(at),
                 at.checked_add(1).and_then(|next| self.data.get(next)),
             ) {
                 (Some(&0xFF), Some(&marker)) if (0xD0..=0xD7).contains(&marker) => {
                     self.pos = at + 2;
-                    self.ended = false;
-                    return true;
+                    break true;
                 }
                 (Some(&0xFF), Some(&marker)) if marker != 0x00 && marker != 0xFF => {
                     self.pos = at;
-                    self.ended = true;
-                    return false;
+                    break false;
                 }
                 (Some(_), _) => at = at.saturating_add(1),
                 (None, _) => {
                     self.pos = at;
-                    self.ended = true;
-                    return false;
+                    break false;
                 }
             }
-        }
+        };
+        self.ended = !found;
+        self.exhausted = !found;
+        found
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BitReader, HuffmanTable};
+    use super::{BitReader, HuffmanTable, has_coded_data};
+
+    #[test]
+    fn a_segment_of_markers_and_fill_holds_no_data() {
+        let restarts_and_fill = [0xFF, 0xD0, 0xFF, 0xFF, 0xD7, 0xFF, 0xD9];
+        assert!(!has_coded_data(&restarts_and_fill, 0));
+        assert!(!has_coded_data(&[0xFF, 0xD0, 0xFF], 0));
+        assert!(!has_coded_data(&[], 0));
+        assert!(has_coded_data(&[0xFF, 0xD0, 0x12, 0xFF, 0xD9], 0));
+        assert!(has_coded_data(&[0xFF, 0xFF, 0x00, 0xFF, 0xD9], 0));
+    }
 
     #[test]
     fn the_standard_dc_table_decodes_every_code() {

@@ -224,7 +224,20 @@ mod local_signins {
     pub fn standin_main(_: &str, _: &[String]) -> i32 {
         1
     }
+
+    pub const LOOK_UP_VERB: &str = "local-signins-look-up";
+    pub const REAP_VERB: &str = "local-signins-reap";
+
+    pub fn look_up_main(_: &[String]) -> i32 {
+        2
+    }
+
+    pub fn reap_main(_: &[String]) -> i32 {
+        2
+    }
 }
+#[cfg(all(target_os = "macos", debug_assertions))]
+mod local_signins_heal;
 #[cfg(target_os = "macos")]
 mod look_away;
 #[cfg(target_os = "macos")]
@@ -339,6 +352,8 @@ mod system_state_sheet;
 mod tab_gallery;
 #[cfg(target_os = "macos")]
 mod tape;
+#[cfg(target_os = "macos")]
+mod told_once;
 #[cfg(target_os = "macos")]
 mod trail_census;
 #[cfg(target_os = "macos")]
@@ -727,6 +742,11 @@ Outside any lab (no jail, no stub):
                                  evaluate abrew admission of Homebrew's formula.json and cask.json (fetched from
                                  formulae.brew.sh unless --indexes DIR holds them) on the newest Mac, that Mac with the
                                  named facts replaced, or this one (--this-machine)
+  told-once [--json] [ATERM]      design §14.18 on a private window (desktop_alerts = true): one NEEDS YOU set told in
+                                 a background tab, then re-ordered, re-counted and joined by a new need, 25 s apart; the
+                                 herald's aterm.log lines must say one post for the set, `not queued: told once` per
+                                 repeat and a post for the new need, and with told memory off (ATERM_DEV_HERALD_TOLD_OFF)
+                                 a post every step; aterm drops its own notices, so no banner (debug or dev-seams aterm)
   reveal-tab [--json] [--ax-helper HELPER] [--plain-publication] [ATERM]
                                  one-mesh A17 on a private window: synthetic logins sealed in a scratch Commons;
                                  `aterm db emails --show-passwords` prints outside aterm and, in a tab, opens a
@@ -736,17 +756,23 @@ Outside any lab (no jail, no stub):
                                  by the guest helper's ax-texts, as `mac nux --scenario reveal-tab` runs it in a
                                  guest); --plain-publication: the GUI's negative control, under which the tree's
                                  no-value check must fail (debug lab image)
-  commons-lan prepare-recipient|prepare-source|join|run|node|pair|follow|stop|db|secrets|declare|write|read|emails-* …
+  commons-lan prepare-recipient|prepare-source|join|pin|home-lan|run|node|pair|follow|stop|db|secrets|members|declare|write|read|emails-* …
                                  prepare preserved private profiles on separate LAN hosts; synthetic prior vault approval,
                                  ordinary executable startup, exact generic table readback, no installed state changes
                                  pair: run the owner and a local follower under one capacity reservation
-                                 node: the headless node service in a profile, its LAN use charged to the caller
+                                 node: the headless node service in a profile, its LAN use charged to the caller, with
+                                 its fleet key (`aterm fleet init`), a served vault's server, and network.jsonl
+                                 prepare-source --serve <ip:port>: the lab vault served at a LAN URL; --port: the lab
+                                 fleet port (7190; never 7100); pin: a Mac nobody approved waits at that vault;
+                                 home-lan: the lab's home LAN on a member, whose desk then lets a Mac on it in by its
+                                 proof (debug image); members: `aterm members join --at <ip:port>...`, no phrase
                                  emails-fixture|emails-set|emails-wait: the owner's emails table across the
                                  profiles (seeded fleet_db replica and flag-only sheet, stdin-only edits,
                                  keyed-digest waits); no value crosses Macs or reaches a report
                                  emails-reveal: A17 on that table in a windowed instance of the profile (debug image)
                                  db: run the shipped proposal/data CLI in that profile, online or offline
-                                 secrets: an admin's approval of a key, a join of a lab profile's vault file, status
+                                 secrets: an admin's approval of a key, a join of a lab profile's vault file or of the
+                                 lab URL it follows, status
                                  a world on the live default ALab vault (one an earlier run left admitted there) opens for no
                                  verb but behind --live-alab-vault-keeps-member: no run takes that member out again
   commons-startup <aterm> <new-output-directory> [--log-backed] [--suppressed | --observe SECONDS | --peer-cycle [--peer-details] | --local-follower]
@@ -947,6 +973,8 @@ Outside any lab (no jail, no stub):
                                  person's typing is present then the move at a safe point, its own re-exec, signal and
                                  exit propagation; then the negative control (an aterm serving no contract=3: it passes
                                  through, the built-in lanes take the session); its worlds are always kept
+  codex-accounts-proof --package DIR --aterm PATH [--keep]
+                                 Read-only /accounts in a private native host, real package and fake loopback model.
   codex-measure [--package DIR] [--keep]
                                  measure a codex-alab build for the rollout tap, in a clean checkout (~25 min): the proof
                                  in process expecting it partial, its six legs' rollouts reduced to a fixed point the
@@ -1151,6 +1179,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "fleet-menu" => fleet_menu::cmd(args),
         "local-signins" => local_signins::cmd(args),
         "reveal-tab" => reveal_tab::cmd(args),
+        "told-once" => told_once::cmd(args),
         "commons-lan" => commons_lan::cmd(args),
         "commons-startup" => commons_startup::cmd(args),
         "swarm" => swarm::cmd_swarm(args),
@@ -1248,6 +1277,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "meta-keys" => meta_keys::cmd_meta_keys(args),
         "predict-live" => predict_live::cmd_predict_live(args),
         "codex-alab-proof" => codex_alab_proof::cmd_codex_alab_proof(args),
+        "codex-accounts-proof" => codex_alab_proof::cmd_codex_accounts_proof(args),
         "codex-boxes" => codex_alab_proof::cmd_codex_boxes(args),
         "harness-proof" => harness_proof::cmd_harness_proof(args),
         "codex-measure" => codex_measure::cmd_codex_measure(args),
@@ -1361,6 +1391,10 @@ fn main() -> std::process::ExitCode {
                 "link" => link::main(rest),
                 "probe-inside" => probe::inside_main(rest),
                 "probe-tiocsti" => probe::tiocsti_child(),
+                #[cfg(target_os = "macos")]
+                local_signins::LOOK_UP_VERB => local_signins::look_up_main(rest),
+                #[cfg(target_os = "macos")]
+                local_signins::REAP_VERB => local_signins::reap_main(rest),
                 "hold" => recorder::hold(rest),
                 "keeper" => instance::keeper_main(rest),
                 "band" => band::band_main(rest),

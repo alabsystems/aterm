@@ -127,7 +127,7 @@ impl AlabWatch for LateSignal<'_> {
         self.setup.widens()
     }
 
-    fn wait(&mut self, _: Duration, _: Duration) {}
+    fn wait(&mut self, _: crate::AlabWait, _: Duration) {}
 
     fn heard(&mut self) -> Result<bool, String> {
         Ok(true)

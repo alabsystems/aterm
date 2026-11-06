@@ -34,7 +34,7 @@ fn pool_hooks(a: &Arc<Accts>) -> Hooks {
     );
     let mut hooks = a.hooks();
     let accounts = Arc::clone(a);
-    hooks.acts.account_cold = Arc::new(move |snapshot, mode| {
+    hooks.acts.account_cold = Arc::new(move |snapshot, mode, _| {
         let seat = accounts.seat();
         account_cold_at(&seat, snapshot, mode, || {
             Some(vec![
@@ -194,8 +194,8 @@ fn live_case(case: i64) -> [i64; 4] {
         let switches = Arc::clone(&job.switches);
         let revoked = Arc::clone(&job.revoked);
         let left = Arc::clone(&job.left);
-        hooks.acts.account_cold = Arc::new(move |snapshot, mode| {
-            let result = gate(snapshot, mode);
+        hooks.acts.account_cold = Arc::new(move |snapshot, mode, end| {
+            let result = gate(snapshot, mode, end);
             if case == 7 {
                 let mut cfg = on();
                 cfg.set("accounts", "off").unwrap();
@@ -291,7 +291,7 @@ fn claude_live_account_wait_retries_without_losing_the_owed_conversation() {
     let accounts = Arc::clone(&a);
     let kept = Arc::clone(&job.kept);
     let gate = Arc::clone(&hooks.acts.account_cold);
-    hooks.acts.account_cold = Arc::new(move |snapshot, mode| {
+    hooks.acts.account_cold = Arc::new(move |snapshot, mode, end| {
         let count = observed.fetch_add(1, Ordering::SeqCst) + 1;
         assert!(count <= 10, "a usable account must end the wait");
         {
@@ -304,7 +304,7 @@ fn claude_live_account_wait_retries_without_losing_the_owed_conversation() {
         if count == 10 {
             hold(&accounts, false);
         }
-        gate(snapshot, mode)
+        gate(snapshot, mode, end)
     });
     let mut executed = 0;
     relaunch_until(

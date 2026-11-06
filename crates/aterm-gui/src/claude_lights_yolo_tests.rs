@@ -2,8 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! The mode light as the mode's one home where the glass rewrites Claude Code's mode row
-//! (`yolo`, `lame`), under the footer's gate: `yolo` in the rule's ink, a click on it turning it
-//! `lame`, and titles that say what each mode does.
+//! (`yolo`, `lame`), under the footer's gate: `yolo` in the glass's value ink, a click on it
+//! turning it `lame`, and titles that say what each mode does.
 
 use std::time::{Duration, Instant};
 
@@ -13,7 +13,7 @@ use aterm_window::event::{ElementState, MouseButton};
 use super::gesture_tests::{
     AUTO, BYPASS, Hosted, PGID, a_minute_ago, app, cell_at, check_mode_toggle_transition,
     draw_claude, drive_mode_toggle_action, feed, footer_row, frame, hit, host, interval, painted,
-    press_at, press_not_due, pty, publish_facts, px_of, redraw_mode_row, row_text, rule_ink,
+    press_at, press_not_due, pty, publish_facts, px_of, redraw_mode_row, row_text, value_ink,
 };
 use super::{Chip, Refusal, TITLE_CLICK, cells_of};
 use crate::{App, WindowId};
@@ -249,10 +249,11 @@ fn the_mode_lights_titles_say_what_each_mode_does_and_where_a_click_goes() {
 }
 
 /// A CLICK ON YOLO TURNS IT LAME (the owner, 2026-11-02): on a rewritten row `yolo` stands at
-/// rest in the ink of the rule it sits on (Claude's grey here, never its red); a click writes one
-/// shift+tab as the person's, the chip says `◐ yolo` while Claude answers, and once Claude shows
-/// manual mode the chip reads `lame`, in the row's own ink, with nothing more pressed. A second
-/// click from `lame` goes back to `yolo`. CONTROL: a rule in another grey draws `yolo` in that one.
+/// rest in the glass's value ink whatever grey the rule it sits on wears (never Claude's red); a
+/// click writes one shift+tab as the person's, the chip says `◌ yolo` while Claude answers, and
+/// once Claude shows manual mode the chip reads `lame`, in the row's own ink, with nothing more
+/// pressed. A second click from `lame` goes back to `yolo`. CONTROL: Claude's grey rule is not
+/// that ink, so the rule's grey no longer decides it.
 #[test]
 fn a_click_on_yolo_turns_it_lame() {
     const GREY_RULE: &str = "\x1b[38;2;136;136;136m";
@@ -270,19 +271,12 @@ fn a_click_on_yolo_turns_it_lame() {
         frame(&mut app, wid);
         let (cells, text) = light_cells(&app, wid);
         assert_eq!(text, "yolo", "grey={grey}: yolo at rest");
-        let ink = rule_ink(&app, wid, footer_row(&app, wid));
+        let ink = value_ink(&app, wid);
         if grey {
-            assert_eq!(
-                ink, [136; 3],
-                "Claude's grey clears the chip floor on this ground"
-            );
+            assert_ne!(ink, [136; 3], "CONTROL: the value ink is not Claude's grey");
         }
         for &at in &cells {
-            assert_eq!(
-                cell_at(&app, wid, at).fg,
-                ink,
-                "grey={grey}: the rule's ink"
-            );
+            assert_eq!(cell_at(&app, wid, at).fg, ink, "grey={grey}: the value ink");
             assert_ne!(cell_at(&app, wid, at).fg, [0xE0, 0x5A, 0x5A], "never red");
         }
 
@@ -308,7 +302,7 @@ fn a_click_on_yolo_turns_it_lame() {
             .map(|p| p.goal);
         assert_eq!(goal, Some(Goal::Off), "to manual");
         frame(&mut app, wid);
-        assert_eq!(light_cells(&app, wid).1, "\u{25D0} yolo", "in flight");
+        assert_eq!(light_cells(&app, wid).1, "\u{25CC} yolo", "in flight");
         let rule = row_text(&app, wid, footer_row(&app, wid));
         assert!(rule.contains("switching to lame\u{2026}"), "{rule:?}");
 
@@ -329,7 +323,7 @@ fn a_click_on_yolo_turns_it_lame() {
             assert_ne!(
                 cell_at(&app, wid, cells[0]).fg,
                 ink,
-                "lame is a deviation: the row's ink, not the rule's"
+                "lame is a deviation: the row's ink, not the value's"
             );
         }
 

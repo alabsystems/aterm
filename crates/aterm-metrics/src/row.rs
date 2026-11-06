@@ -507,7 +507,7 @@ pub struct QuotaRow {
     /// The roster label.
     pub label: Label,
     /// The condition word (`usable`, `low`, `limited`, `signed-out`, `not-enrolled`,
-    /// `unseen`).
+    /// `unseen`), or [`QuotaRow::REMOVED`] once this Mac's roster no longer lists the account.
     pub condition: Word,
     /// Whether its login is made on this Mac.
     pub enrolled: bool,
@@ -531,15 +531,53 @@ pub struct QuotaRow {
     pub last_end: Option<u64>,
     /// Sessions started here in the last 7 days.
     pub sessions_7d: u32,
-    /// The plan word.
+    /// The plan as this Mac's accounts view names it: its word, then `-` and its tier where one
+    /// was seen (`max-20x`, `pro`, `plus`).
     pub plan: Option<Word>,
 }
 
 impl QuotaRow {
+    /// The condition of an account this Mac's roster no longer lists. Its quota class keeps
+    /// each subject's last row, so the publisher ends the account's row once, as
+    /// [`QuotaRow::ended`], and a reader leaves it out ([`crate::merge::Snapshots::accounts`]).
+    pub const REMOVED: &'static str = "removed";
+
     /// Where `node` publishes it; `None` for a row whose CLI is agy.
     #[must_use]
     pub const fn subject(&self, node: Node) -> Option<Subject> {
         Subject::quota(node, self.cli, self.account)
+    }
+
+    /// Whether this Mac's roster no longer lists the account ([`QuotaRow::REMOVED`]).
+    #[must_use]
+    pub fn removed(&self) -> bool {
+        self.condition.as_str() == Self::REMOVED
+    }
+
+    /// This row as its account's end on its Mac at `at`: the same CLI, account and label, the
+    /// condition [`QuotaRow::REMOVED`], and no figure, reset, wall, use, sign-in, session or
+    /// plan, so a reader that does not know the word counts nothing of it either.
+    #[must_use]
+    pub fn ended(&self, at: u64) -> QuotaRow {
+        QuotaRow {
+            at,
+            cli: self.cli,
+            account: self.account,
+            label: self.label.clone(),
+            condition: Word(Self::REMOVED.into()),
+            enrolled: false,
+            pct5: None,
+            pct7: None,
+            five_hour_reset: None,
+            week_reset: None,
+            walled_until: None,
+            last_used: None,
+            signin: None,
+            last_start: None,
+            last_end: None,
+            sessions_7d: 0,
+            plan: None,
+        }
     }
 
     /// The canonical encoding; each percent at most [`PCT_MAX`].
@@ -1023,7 +1061,7 @@ impl WindowRecord {
         revision: u64,
         summary: Summary,
     ) -> Option<WindowRecord> {
-        if !Metric::ALL.contains(&metric) {
+        if !metric.is_named() {
             return None;
         }
         let window = Window::starting(start_ms, metric.width().window_len())?;

@@ -613,6 +613,85 @@ fn repo_clone_clones_through_the_runner() {
 }
 
 #[test]
+fn local_read_admission_needs_no_identity_or_request_and_preserves_source() {
+    let world = World::canonical("helper-local-admission");
+    let source = crate::git_runner::bare_repo(world.root.path(), "source with spaces ");
+    crate::git_runner::host_git(
+        &source,
+        &[
+            "config",
+            "remote.upstream.pushurl",
+            "NEVER-PUSH-TO-UPSTREAM",
+        ],
+    );
+    // A local check must not load routing or credential values, even when the
+    // CLI would refuse this routing document for an actual network operation.
+    common::write_config(&world.dirs, "[not valid TOML");
+    let before = std::fs::read(source.join("config")).unwrap();
+    let head = std::fs::read(source.join("HEAD")).unwrap();
+    let refs = crate::git_runner::host_git(&source, &["for-each-ref"]);
+    let (mut ctx, captured) = world.ctx(
+        crate::git_runner::git_env()
+            .with("GIT_DIR", "/unrelated")
+            .with("GIT_CONFIG_COUNT", "1"),
+    );
+    let path = source.display().to_string();
+    let exit = common::run_cli(
+        &mut ctx,
+        &["repo", "check-local", "alabsystems/aterm", &path],
+    );
+    assert_eq!(exit, 0, "{}", captured.stderr_text());
+    let report = common::stdout_json(&captured);
+    let directory = std::fs::canonicalize(&source)
+        .unwrap()
+        .display()
+        .to_string();
+    assert_eq!(
+        report,
+        aterm_json::json!({
+            "schema": 1, "mode": "local-read", "repository": "alabsystems/aterm",
+            "directory": directory, "common_dir": directory,
+            "admitted": true, "github_requests": 0, "source_mutated": false,
+        })
+    );
+    assert_eq!(std::fs::read(source.join("config")).unwrap(), before);
+    assert_eq!(std::fs::read(source.join("HEAD")).unwrap(), head);
+    assert_eq!(
+        crate::git_runner::host_git(&source, &["for-each-ref"]),
+        refs
+    );
+    assert!(world.fake.seen().is_empty());
+    assert!(!world.dirs.grants().exists());
+}
+
+#[test]
+fn local_read_admission_refuses_hooks_and_enclosing_repositories() {
+    let world = World::canonical("helper-local-admission-refusals");
+    let source = crate::git_runner::bare_repo(world.root.path(), "source");
+    let invoke = |directory: &Path| {
+        let (mut ctx, captured) = world.ctx(crate::git_runner::git_env());
+        let path = directory.display().to_string();
+        let exit = common::run_cli(&mut ctx, &["repo", "check-local", "fixture-dev/app", &path]);
+        (exit, captured)
+    };
+    let empty = source.join("not-a-repository");
+    std::fs::create_dir(&empty).unwrap();
+    assert_ne!(
+        invoke(&empty).0,
+        0,
+        "the parent's repository is never admitted"
+    );
+    crate::git_runner::host_git(&source, &["config", "hook.hostile.command", "false"]);
+    let config = std::fs::read(source.join("config")).unwrap();
+    let (exit, captured) = invoke(&source);
+    assert_ne!(exit, 0);
+    assert!(captured.stderr_text().contains("git_config"));
+    assert_eq!(std::fs::read(source.join("config")).unwrap(), config);
+    assert!(world.fake.seen().is_empty());
+    assert!(!world.dirs.grants().exists());
+}
+
+#[test]
 fn repo_fetch_accepts_exact_anonymous_reads_and_refuses_unsafe_names() {
     let world = World::canonical("helper-exact-fetch");
     let bare = crate::git_runner::bare_repo(world.root.path(), "app");
@@ -668,6 +747,81 @@ fn repo_fetch_accepts_exact_anonymous_reads_and_refuses_unsafe_names() {
     assert!(
         world.fake.seen().is_empty(),
         "the local fixture needs no HTTP or credential probe"
+    );
+}
+
+#[test]
+fn repo_batch_fetch_requires_expected_ids_and_keeps_anonymous_authority_explicit() {
+    let world = World::canonical("helper-batch-fetch");
+    let bare = crate::git_runner::bare_repo(world.root.path(), "app");
+    let sha = crate::git_runner::host_git(&bare, &["rev-parse", "main"]);
+    let receiver = world.root.path().join("receiver with spaces.git");
+    std::fs::create_dir(&receiver).unwrap();
+    crate::git_runner::host_git(&receiver, &["init", "--quiet", "--bare"]);
+    let file = world.root.path().join("refs with spaces.json");
+    let invoke = |extra: &[&str]| {
+        let (ctx, captured) = world.ctx(crate::git_runner::git_env());
+        let mut ctx = ctx
+            .with_git_helper(common::helper())
+            .with_git_remote("alabsystems/aterm", &bare);
+        let receiver = receiver.to_string_lossy();
+        let file = file.to_string_lossy();
+        let mut args = vec![
+            "repo",
+            "fetch",
+            "alabsystems/aterm",
+            receiver.as_ref(),
+            "--input",
+            file.as_ref(),
+            "--anonymous",
+            "--meta",
+        ];
+        args.extend_from_slice(extra);
+        let exit = common::run_cli(&mut ctx, &args);
+        (exit, captured)
+    };
+    std::fs::write(
+        &file,
+        format!(
+            r#"[{{"source":"refs/heads/main","into":"refs/agh/main","expected_oid":"{sha}"}}]"#
+        ),
+    )
+    .unwrap();
+    let (exit, captured) = invoke(&[]);
+    assert_eq!(exit, 0, "{}", captured.stderr_text());
+    assert!(captured.stderr_text().contains("as=anonymous"));
+    assert_eq!(
+        crate::git_runner::host_git(&receiver, &["rev-parse", "refs/agh/main"]),
+        sha
+    );
+    let before = crate::git_runner::host_git(&receiver, &["for-each-ref"]);
+    for extra in [
+        &["--ref", "refs/heads/main"][..],
+        &["--into", "refs/agh/other"][..],
+        &["--as", "release"][..],
+    ] {
+        let (exit, _) = invoke(extra);
+        assert_eq!(exit, 2);
+    }
+    for body in [
+        "[]".to_string(),
+        format!(
+            r#"[{{"source":"refs/heads/main","into":"refs/heads/main","expected_oid":"{sha}"}}]"#
+        ),
+        format!(
+            r#"[{{"source":"refs/heads/main","into":"refs/agh/other","expected_oid":"{sha}","extra":true}}]"#
+        ),
+    ] {
+        std::fs::write(&file, body).unwrap();
+        assert_ne!(invoke(&[]).0, 0);
+        assert_eq!(
+            crate::git_runner::host_git(&receiver, &["for-each-ref"]),
+            before
+        );
+    }
+    assert!(
+        world.fake.seen().is_empty(),
+        "anonymous local fixture reads do not judge or use credentials"
     );
 }
 
@@ -929,4 +1083,61 @@ fn store_and_erase_are_never_read() {
             "{op}'s stdin was read"
         );
     }
+}
+
+#[test]
+fn public_refs_include_peeled_tags_without_rest_or_writer_identity() {
+    let world = World::canonical("helper-public-refs");
+    let bare = crate::git_runner::bare_repo(world.root.path(), "app");
+    crate::git_runner::host_git(
+        &bare,
+        &[
+            "-c",
+            "user.name=Andrew Yates",
+            "-c",
+            "user.email=test@example.com",
+            "tag",
+            "-a",
+            "v1",
+            "-m",
+            "tag",
+        ],
+    );
+    let tag_oid = crate::git_runner::host_git(&bare, &["rev-parse", "refs/tags/v1"]);
+    let packed = (0..2000)
+        .map(|i| format!("{tag_oid} refs/tags/history-{i}\n"))
+        .collect::<String>();
+    std::fs::write(bare.join("packed-refs"), packed).unwrap();
+    let (ctx, captured) = world.ctx(crate::git_runner::git_env());
+    let mut ctx = ctx
+        .with_git_helper(common::helper())
+        .with_git_remote("alabsystems/aterm", &bare);
+    assert_eq!(
+        common::run_cli(
+            &mut ctx,
+            &[
+                "--anonymous",
+                "--no-anonymous-api",
+                "repo",
+                "public-refs",
+                "alabsystems/aterm",
+                "--meta"
+            ]
+        ),
+        0,
+        "{}",
+        captured.stderr_text()
+    );
+    let text = captured.stdout_text();
+    assert!(text.len() > 64 * 1024);
+    assert!(text.contains("refs/tags/history-0^{}"));
+    assert!(text.contains("refs/tags/history-1999^{}"));
+    assert!(text.contains("refs/tags/v1^{}"), "{text}");
+    assert!(captured.stderr_text().contains("as=anonymous"));
+    assert!(world.fake.seen().is_empty());
+    // Negative control: this verb never silently adopts a routed writer.
+    assert_eq!(
+        common::run_cli(&mut ctx, &["repo", "public-refs", "alabsystems/aterm"]),
+        2
+    );
 }

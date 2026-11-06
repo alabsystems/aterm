@@ -93,7 +93,6 @@ impl TerminalHandler<'_> {
         self.sgr_style().apply_style_change();
         self.transient.current_underline_color = None;
         self.transient.current_hyperlink = None;
-        self.transient.current_hyperlink_id = None;
         self.transient.update_has_transient_extras();
 
         self.transient.last_graphic_char = None;

@@ -125,9 +125,17 @@ fn decode(email: &str, bytes: &[u8]) -> Result<Credentials, String> {
 
 #[cfg(unix)]
 fn email_digest(email: &str) -> [u8; 32] {
+    let trimmed = email.trim().as_bytes();
+    if !trimmed.iter().any(u8::is_ascii_uppercase) {
+        return aterm_digest::Sha256::digest(trimmed);
+    }
     let mut hasher = aterm_digest::Sha256::new();
-    for b in email.trim().bytes() {
-        hasher.update([b.to_ascii_lowercase()]);
+    for chunk in trimmed.chunks(64) {
+        let mut buf = [0u8; 64];
+        for (dst, &src) in buf.iter_mut().zip(chunk) {
+            *dst = src.to_ascii_lowercase();
+        }
+        hasher.update(&buf[..chunk.len()]);
     }
     hasher.finalize()
 }

@@ -76,6 +76,8 @@ pub fn escalation() -> astream_broker::Escalation {
     use astream_broker::Escalate::{Group, PrincipalPrefix, Subject};
     astream_broker::Escalation::new([
         Subject("/f/*/fleet/>".into()),
+        // A Mac's halts with the mesh on, its own and each relayed copy (§11 C4).
+        Subject("/f/*/halt/>".into()),
         Subject("/f/*/in/p/>".into()),
         PrincipalPrefix("h-".into()),
         Group("/f/*/cur/p/>".into()),
@@ -845,7 +847,7 @@ mod tests {
         let served = opened.broker.served_durability();
         let said = describe_served(Durability::Ordered, Some(served), Some(true));
         assert_eq!(served.requested, Tier::Ordered);
-        assert_eq!(served.rules, 4, "aterm's four rules");
+        assert_eq!(served.rules, 5, "aterm's five rules");
         if cfg!(target_vendor = "apple") {
             assert_eq!(
                 (served.served, served.reason, served.horizon_ms),
@@ -856,7 +858,7 @@ mod tests {
                 said.contains("the last 100 ms of records, plus a batch and a full flush"),
                 "astream's bound, not a shorter one: {said}"
             );
-            assert!(said.contains("its 4 escalation rules name"), "{said}");
+            assert!(said.contains("its 5 escalation rules name"), "{said}");
             assert!(
                 !said.contains(SPARED),
                 "a count identifies no table: {said}"
@@ -917,13 +919,13 @@ mod tests {
             Some(test_boot(1)),
         )
         .unwrap();
-        assert_eq!(relaxed.broker.served_durability().rules, 4);
+        assert_eq!(relaxed.broker.served_durability().rules, 5);
         let said = describe_served(
             Durability::Relaxed,
             Some(relaxed.broker.served_durability()),
             Some(true),
         );
-        assert!(said.contains("its 4 escalation rules name"), "{said}");
+        assert!(said.contains("its 5 escalation rules name"), "{said}");
         assert!(
             !said.contains(SPARED),
             "a count identifies no table: {said}"

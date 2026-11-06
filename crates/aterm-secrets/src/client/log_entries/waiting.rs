@@ -21,7 +21,8 @@ pub(in super::super) struct WaitingWrite {
     /// What the log may hold at the name for this write to be signed over it, each as its
     /// [`entry_digest`] (`None`: no value): the log's value the draft read, the waiting write the
     /// view the edit was made from showed there, and the one that stood there when the draft read
-    /// the log, and their own bases ([`everyone_edit`]). A name the log holds as none of these was changed by another
+    /// the log, and their own bases, and what this Mac's held drafts leave there ([`held_values`],
+    /// [`everyone_edit`]). A name the log holds as none of these was changed by another
     /// write since, which this one would revert: it is overtaken ([`sign_waiting_writes`]).
     bases: BTreeSet<Option<[u8; 32]>>,
     /// A person's save of a name the log holds concurrent values for: a `Delete` goes first, so the
@@ -296,33 +297,122 @@ pub(in super::super) fn claim_draft(
     if draft_unclaimed() {
         return Ok(DraftClaim(None));
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the shared take of a publish's claim, released by LOCK_UN (DraftClaim's Drop)"
+    )]
+    let take = |file: &std::fs::File| file.try_lock_shared();
+    lock_by(
+        paths,
+        &claim_file(paths),
+        deadline,
+        take,
+        || {},
+        "a vault pass still signed this Mac's waiting writes at the deadline: run it again",
+    )
+    .map(|file| DraftClaim(Some(file)))
+}
+
+/// Take the lock at `path` as `take` does (an exclusive or a shared take that does not block),
+/// trying again with a growing backoff until `deadline` (a minute from now where none is given):
+/// `busy` runs each time the lock is held, and `late` is the refusal once the deadline passed.
+///
+/// # Errors
+/// The lock cannot be opened or taken, or it is still held at the deadline (`late`).
+fn lock_by(
+    paths: &Paths,
+    path: &Path,
+    deadline: Option<std::time::Instant>,
+    take: impl Fn(&std::fs::File) -> Result<(), std::fs::TryLockError>,
+    mut busy: impl FnMut(),
+    late: &str,
+) -> crate::Result<std::fs::File> {
     let until =
         deadline.unwrap_or_else(|| std::time::Instant::now() + std::time::Duration::from_secs(60));
-    let path = claim_file(paths);
     fsx::ensure_private_dir(&paths.dir)?;
-    let file = fsx::open_lock(&path)?;
+    let file = fsx::open_lock(path)?;
     let mut backoff = std::time::Duration::from_millis(1);
     loop {
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "the shared take of a publish's claim, released by LOCK_UN (DraftClaim's Drop)"
-        )]
-        match file.try_lock_shared() {
-            Ok(()) => return Ok(DraftClaim(Some(file))),
-            Err(std::fs::TryLockError::WouldBlock) => {}
+        match take(&file) {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) => busy(),
             Err(std::fs::TryLockError::Error(error)) => {
                 return Err(Error::new(format!("{}: {error}", path.display())));
             }
         }
         let remaining = until.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            return Err(Error::new(
-                "a vault pass still signed this Mac's waiting writes at the deadline: run it again",
-            ));
+            return Err(Error::new(late));
         }
         std::thread::sleep(backoff.min(remaining));
         backoff = (backoff * 2).min(std::time::Duration::from_millis(50));
     }
+}
+
+/// The lock a publish of this Mac holds exclusive from before its draft reads the log until its
+/// hold and pending set are written ([`draft_turn`]).
+fn turn_file(paths: &Paths) -> PathBuf {
+    paths.dir.join(".everyone.turn")
+}
+
+/// A publish's turn to draft ([`draft_turn`]), released on drop, the process's end included.
+pub(in super::super) struct DraftTurn(Option<std::fs::File>);
+
+impl Drop for DraftTurn {
+    fn drop(&mut self) {
+        if let Some(file) = &self.0 {
+            let _ = file.unlock();
+        }
+    }
+}
+
+/// Take this Mac's turn to draft for a publish, from before its draft reads the log until its
+/// hold and pending set are written (one-mesh P3): one publish drafts at a time. A publish's
+/// records are in neither the log nor a hold from its draft until its hold is written
+/// ([`hold_drafted`]); a draft that ran meanwhile would read neither, and a waiting write it made
+/// of a name the other wrote would be overtaken by this Mac's own earlier value once that publish
+/// kept its records. Drafted in turn, the later draft reads them in the log or in that publish's
+/// hold, and its waiting write is signed over their value ([`held_values`]): the person's later
+/// edit of a name replaces this Mac's own earlier one. Several claims stand at once
+/// ([`claim_draft`]), one turn; another publish's turn ends first, within `deadline` (a minute
+/// where none is given).
+///
+/// # Errors
+/// The lock cannot be opened, or another publish of this Mac still drafts at the deadline.
+pub(in super::super) fn draft_turn(
+    paths: &Paths,
+    deadline: Option<std::time::Instant>,
+) -> crate::Result<DraftTurn> {
+    if drafts_at_once() {
+        return Ok(DraftTurn(None));
+    }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the exclusive take of a publish's turn, released by LOCK_UN (DraftTurn's Drop)"
+    )]
+    let take = |file: &std::fs::File| file.try_lock();
+    lock_by(
+        paths,
+        &turn_file(paths),
+        deadline,
+        take,
+        || {
+            #[cfg(test)]
+            if let Some(hook) = TURN_WAITS.with(|hook| hook.borrow_mut().take()) {
+                hook();
+            }
+        },
+        "another publish of this Mac still drafted at the deadline: run it again",
+    )
+    .map(|file| DraftTurn(Some(file)))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's hook, run once by the next publish on this thread that finds another publish's
+    /// turn taken ([`draft_turn`]), before it waits for it.
+    pub(crate) static TURN_WAITS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// A vault pass's take of the claim lock ([`claim_draft`]), at once: `None` while a publish holds
@@ -1005,10 +1095,15 @@ pub(in super::super) struct EveryoneEdit {
 /// write, signed after the view or the draft read it, nor a pass racing the draft reads the newer
 /// edit as overtaken, and a write over the text's value, where this Mac opens none of the newest
 /// epochs and reads that text as the log's, still stands over the value its earlier write did.
+/// They also hold `held`, what this Mac's own earlier publishes whose records are held and not
+/// kept leave at the name ([`held_values`]): such a publish's version may be on a server already,
+/// its records entering the log only once it keeps them, after this draft read the log, and its
+/// value is this Mac's own earlier write, which the newer edit replaces rather than reverts.
 pub(in super::super) fn everyone_edit(
     log: Option<&BTreeMap<String, Entry>>,
     view: Option<&Waiting>,
     now: &Waiting,
+    held: &HeldValues,
     doc: Option<&BTreeMap<String, Entry>>,
     resolving: impl Fn(&String) -> bool,
 ) -> EveryoneEdit {
@@ -1081,6 +1176,7 @@ pub(in super::super) fn everyone_edit(
                 bases.insert(write.to.as_ref().map(entry_digest));
                 bases.extend(write.bases.iter().copied());
             }
+            bases.extend(held.get(name).into_iter().flatten().copied());
         }
         if changed {
             shows.push(name.clone());
@@ -1100,6 +1196,107 @@ pub(in super::super) fn everyone_edit(
         writes: Waiting(writes),
         settles: Waiting(settles),
         shows,
+    }
+}
+
+/// What this Mac's held drafts leave at each `[everyone]` name they change ([`held_values`]): the
+/// [`entry_digest`] of each value the name then holds, or `None` where it holds none.
+pub(in super::super) type HeldValues = BTreeMap<String, BTreeSet<Option<[u8; 32]>>>;
+
+/// What each of this Mac's held drafts ([`hold_drafted`]) whose records `store` does not hold yet
+/// leaves at each `[everyone]` name it changes, as `identity` opens `store` with that hold's
+/// records taken in and without them: the [`entry_digest`] of the value the name then holds, or
+/// `None` where it holds none. A hold is the edit of a publish of this Mac whose version a server
+/// may hold already, its records entering the log only once that publish keeps them or this Mac
+/// adopts them ([`keep_drafted_until`], [`adopt_held_draft`]), so a draft that reads the log
+/// meanwhile does not see them. A waiting write drafted now is signed over each
+/// ([`everyone_edit`]). Every publish of this Mac drafts in its turn and writes its hold before
+/// the turn ends ([`draft_turn`]), so a draft made after it reads its records in the log or in its
+/// hold: the person's later edit of a name replaces this Mac's own earlier one, whichever reaches
+/// the log first (one-mesh P3).
+///
+/// # Errors
+/// A hold does not read or decode, the store refuses its records, or the store does not open with
+/// or without them: what it leaves is unknown, and is never read as nothing (one-mesh W3).
+pub(super) fn held_values(
+    paths: &Paths,
+    store: &Store,
+    identity: &Identity,
+) -> crate::Result<HeldValues> {
+    if bases_without_held() {
+        return Ok(BTreeMap::new());
+    }
+    held_changes(paths, store, identity)
+}
+
+/// [`held_values`] as the held drafts read, whatever [`BASES_WITHOUT_HELD`] says: what each hold
+/// whose records `store` does not hold yet leaves at each `[everyone]` name it changes.
+///
+/// # Errors
+/// As [`held_values`].
+fn held_changes(paths: &Paths, store: &Store, identity: &Identity) -> crate::Result<HeldValues> {
+    let mut values = HeldValues::new();
+    let holds = held_drafts(paths);
+    if holds.is_empty() {
+        return Ok(values);
+    }
+    // `[everyone]` as `identity` opens `store`, each name with its value's digest.
+    let everyone = |store: &Store| -> crate::Result<Option<BTreeMap<String, [u8; 32]>>> {
+        let Some(log) = store.log() else {
+            return Ok(None);
+        };
+        Ok(log.open_audience_entries(identity)?.map(|opened| {
+            opened
+                .by_audience
+                .get(&Audience::Everyone)
+                .into_iter()
+                .flatten()
+                .map(|(name, entry)| (name.clone(), entry_digest(entry)))
+                .collect()
+        }))
+    };
+    let before = everyone(store)?
+        .ok_or_else(|| Error::new("this Mac does not open its log for its held drafts"))?;
+    for (_, _, path) in holds {
+        let unread = |why: &str| Error::new(format!("{}: {why}", path.display()));
+        // None: the hold went since the directory was read.
+        let Some(held) = read_held(&path)? else {
+            continue;
+        };
+        let records = crate::membership_log::decode_records(held.records())
+            .map_err(|error| unread(&error.to_string()))?;
+        if records.iter().all(|record| store.holds(record.id())) {
+            continue;
+        }
+        let mut with = store.clone();
+        with.ingest_records(records)
+            .map_err(|error| unread(&error.to_string()))?;
+        let after = everyone(&with)
+            .map_err(|error| unread(&error.to_string()))?
+            .ok_or_else(|| unread("this Mac does not open its log with it"))?;
+        for name in before.keys().chain(after.keys()) {
+            let now = after.get(name).copied();
+            if before.get(name).copied() != now {
+                values.entry(name.clone()).or_default().insert(now);
+            }
+        }
+    }
+    Ok(values)
+}
+
+/// What a draft whose writes wait reads of this Mac's held drafts ([`held_values`]): what each
+/// leaves at each name, or none and why they do not read. A hold that does not read is never
+/// read as leaving nothing (one-mesh W3): the draft refuses over it ([`nle::draft_refuses`]), as
+/// over unread waiting writes. [`UNREAD_AS_NONE`] reads it as nothing, as before.
+pub(in super::super) fn held_values_or_unread(
+    paths: &Paths,
+    store: &Store,
+    identity: &Identity,
+) -> (HeldValues, Option<Error>) {
+    match held_values(paths, store, identity) {
+        Ok(values) => (values, None),
+        Err(_) if unread_as_none() => (BTreeMap::new(), None),
+        Err(error) => (BTreeMap::new(), Some(error)),
     }
 }
 
@@ -1128,8 +1325,10 @@ fn settle(held: &mut Waiting, done: &Waiting) {
 /// now and when the write was dropped, which the admin view shows once. A record, never an alert.
 /// A write whose name a pending set of this Mac writes ([`pending_names`]) is left as it is: that
 /// set is this Mac's own later edit of the name, which lands over it or goes and leaves it, and
-/// is never read as a change that overtook it. Nothing is signed while a publish of this Mac holds
-/// its claim, from before its draft reads the log until its pending set is written
+/// is never read as a change that overtook it. So is one whose name a held draft of this Mac
+/// changes ([`held_changes`]), an edit in flight whose records the log lacks until its keep or
+/// adoption, and every write while a held draft does not read. Nothing is signed while a publish
+/// of this Mac holds its claim, from before its draft reads the log until its pending set is written
 /// ([`claim_draft`]): a write signed there would land under a set the pass could not see yet, a
 /// value the person took back would be published, and a change whose records sign its own value
 /// would meet a concurrent `Put` of the one it replaced. Nothing is signed where this Mac does not open the newest
@@ -1203,18 +1402,34 @@ pub(in super::super) fn sign_waiting_writes_by(
         // read as overtaken by it, the person's own newer edit would read as another's. A set
         // this Mac cannot read may write any name: then no write is signed or dropped while it is
         // there (one-mesh W3).
-        let deferred = if race_undeferred() {
+        let pending = if race_undeferred() {
             Some(BTreeSet::new())
         } else {
             pending_names(paths, &identity)
         };
-        // Whether the pass signs at all is no_lost_edit's kernel (one-mesh P3).
-        if !nle::pass_signs(due, opens, deferred.is_some()) {
+        // Whether the pass signs at all is no_lost_edit's kernel (one-mesh P3, the island's
+        // `signW`), over whether every pending set reads.
+        if !nle::pass_signs(due, opens, pending.is_some()) {
             return none();
         }
-        let Some(deferred) = deferred else {
+        let Some(mut deferred) = pending else {
             return none();
         };
+        // A name a held draft of this Mac changes is this Mac's own edit in flight too: its
+        // records enter the log only once its publish keeps them or this Mac adopts them, so the
+        // log read here does not hold them. Signed now, the write would meet them as a concurrent
+        // write of its name once they are kept (a conflict), and an earlier edit's keep would take
+        // the place of the later edit signed here (one-mesh P3, LaterKept); its write waits for
+        // the keep, or for the hold's going. A hold that does not read may change any name, so
+        // every name waits (the island's `deferredW` with `holdUnread`): no write is signed or
+        // dropped while it is there (one-mesh W3).
+        if !held_undeferred() {
+            match held_changes(paths, store, &identity) {
+                Ok(held) => deferred.extend(held.into_keys()),
+                Err(_) if unread_as_none() => {}
+                Err(_) => return none(),
+            }
+        }
         let roster = roster_from_doc_or_opened(None, Some(&opened), Some(&log));
         let denied = |r: &Recipient| recipient_denied_by_roster_or_log(roster.as_ref(), &log, r);
         let membership = log.membership();
@@ -1362,6 +1577,10 @@ pub(in super::super) fn sign_waiting_writes_by(
     let Some((minted, _, (settled, overtaken))) = authored else {
         return Ok(None);
     };
+    #[cfg(test)]
+    if let Some(hook) = PASS_COMMITTED.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
     if !settled.is_empty() {
         let _lock = match waiting_lock(paths, deadline) {
             Ok(lock) => lock,
@@ -1613,13 +1832,23 @@ thread_local! {
     /// new key while the host list's `Delete` is signed at once, as before W3; `race-undeferred`,
     /// a vault pass signs or drops a waiting write whose name a pending set of this Mac writes,
     /// as before W3; `unread-as-none`, a pending set, or the waiting writes, that this Mac cannot
-    /// read reads as none (the set's file removed), as before W3; `draft-unclaimed`, a publish
+    /// read reads as none (the set's file removed), as before W3, and so does a held draft that
+    /// does not read ([`held_values`]); `draft-unclaimed`, a publish
     /// takes no claim ([`claim_draft`]), as before W3, so a pass may sign between its draft and
     /// its pending set; `names-unmerged`, an edit reviews only the names its own entries hold
     /// ([`everyone_edit`]), not those the view showed waiting or that stand now, so it never
     /// takes back a name only a waiting write added; `settle-uncarried`, a save that leaves a
     /// waiting settle of a conflict as its view showed it signs the name without settling it, as
-    /// before 24410be588 (`draft_document_diff_with`'s `resolving`).
+    /// before 24410be588 (`draft_document_diff_with`'s `resolving`). One-mesh P3's
+    /// `bases-without-held`: a write's bases leave out what this Mac's held drafts write
+    /// ([`held_values`]), as before, so a waiting write drafted while an earlier version of this
+    /// Mac is stored and its records are not kept yet is overtaken by that version's value;
+    /// `drafts-at-once`, a publish takes no turn ([`draft_turn`]), as before, so its draft may run
+    /// while another publish of this Mac drafted records it has not held yet, and a waiting write
+    /// it makes is overtaken by that publish's value; `held-undeferred`, a vault pass defers only
+    /// the names pending sets write, not those this Mac's held drafts change, as before, so it
+    /// signs a later edit while an earlier direct draft of its name is in flight, and that
+    /// draft's keep then takes the later edit's place.
     pub(crate) static VIEW_WITHOUT_WAITING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(crate) static BASES_LOG_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(crate) static OVERTAKEN_UNRECORDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -1630,6 +1859,48 @@ thread_local! {
     pub(crate) static DRAFT_UNCLAIMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(crate) static NAMES_UNMERGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(crate) static SETTLE_UNCARRIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static BASES_WITHOUT_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static DRAFTS_AT_ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static HELD_UNDEFERRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether [`HELD_UNDEFERRED`] is on; never in a release build, which has neither switch.
+fn held_undeferred() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    {
+        HELD_UNDEFERRED.with(std::cell::Cell::get)
+            || aterm_types::negative_control::on("held-undeferred")
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        false
+    }
+}
+
+/// Whether [`DRAFTS_AT_ONCE`] is on; never in a release build, which has neither switch.
+fn drafts_at_once() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    {
+        DRAFTS_AT_ONCE.with(std::cell::Cell::get)
+            || aterm_types::negative_control::on("drafts-at-once")
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        false
+    }
+}
+
+/// Whether [`BASES_WITHOUT_HELD`] is on; never in a release build, which has neither switch.
+fn bases_without_held() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    {
+        BASES_WITHOUT_HELD.with(std::cell::Cell::get)
+            || aterm_types::negative_control::on("bases-without-held")
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        false
+    }
 }
 
 /// Whether [`DRAFT_UNCLAIMED`] is on; never in a release build, which has neither switch.
@@ -1741,7 +2012,117 @@ fn pending_by_count() -> bool {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// A test's hook, run once by the next vault pass on this thread that commits, between its
+    /// commit and its settle ([`sign_waiting_writes_by`]): another lock section while the pass
+    /// holds its claim, as P3's island lets one run between `signPass` and `settlePass`.
+    pub(in super::super) static PASS_COMMITTED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// One write as [`Waiting::of_writes`] takes it: its name, the value it becomes (`None`: taken
+/// back to absent) and the values it may be signed over (`None`: none).
+#[cfg(test)]
+pub(in super::super) type WriteShape<'a> = (&'a str, Option<&'a [u8]>, &'a [Option<&'a [u8]>]);
+
+/// Waiting writes as each name, the value it becomes (`None`: taken back to absent) and its
+/// bases ([`WaitingWrite::bases`]).
+#[cfg(test)]
+pub(in super::super) type Shapes = BTreeMap<String, (Option<Vec<u8>>, BTreeSet<Option<[u8; 32]>>)>;
+
+/// The base `value` is in a write's bases ([`WaitingWrite::bases`]): its [`entry_digest`] as an
+/// `[everyone]` entry with no flag and no anchor.
+#[cfg(test)]
+pub(in super::super) fn base_of(value: &[u8]) -> [u8; 32] {
+    entry_digest(&Entry {
+        name: String::new(),
+        value: SecretBytes::from(value.to_vec()),
+        audience: Audience::Everyone,
+        if_absent: false,
+        anchor: None,
+    })
+}
+
+/// What waits ([`waiting_file`]), and each pending set that opens ([`pending_dir`]) by version,
+/// oldest first, as [`Waiting::shapes`]: a set that does not open is left out.
+#[cfg(test)]
+pub(in super::super) fn waiting_shapes(
+    paths: &Paths,
+    identity: &Identity,
+) -> (Shapes, Vec<([u8; 32], Shapes)>) {
+    let waiting = read_waiting(paths, identity).expect("waiting").shapes();
+    let mut files = pending_files(paths).expect("pending");
+    files.sort_by_key(|&(order, seq, version, _)| (order, seq, version));
+    let pending = files
+        .into_iter()
+        .filter_map(|(_, _, version, path)| {
+            let sealed = fsx::read_private(&path, crate::membership_log::MAX_RECORDS_STREAM)
+                .expect("a pending set")?;
+            let (_, writes) = open_pending(identity, sealed.as_slice())?;
+            Some((version, writes.shapes()))
+        })
+        .collect();
+    (waiting, pending)
+}
+
+#[cfg(test)]
 impl Waiting {
+    /// `[everyone]` writes of `writes`: each name, the value it becomes (`None`: taken back to
+    /// absent) and the values it may be signed over (`None`: none).
+    pub(in super::super) fn of_writes(writes: &[WriteShape<'_>]) -> Self {
+        Self(
+            writes
+                .iter()
+                .map(|&(name, value, bases)| {
+                    let to = value.map(|value| Entry {
+                        name: name.to_owned(),
+                        value: SecretBytes::from(value.to_vec()),
+                        audience: Audience::Everyone,
+                        if_absent: false,
+                        anchor: None,
+                    });
+                    let bases = bases.iter().map(|base| base.map(base_of)).collect();
+                    let write = WaitingWrite {
+                        to,
+                        bases,
+                        resolve: false,
+                    };
+                    (name.to_owned(), write)
+                })
+                .collect(),
+        )
+    }
+
+    /// These writes with each of `more` among the bases of the write of `name`, where one is
+    /// ([`WaitingWrite::bases`]).
+    pub(in super::super) fn with_bases(
+        mut self,
+        name: &str,
+        more: impl IntoIterator<Item = Option<[u8; 32]>>,
+    ) -> Self {
+        if let Some(write) = self.0.get_mut(name) {
+            write.bases.extend(more);
+        }
+        self
+    }
+
+    /// These writes and `other`'s, `other`'s where both write a name.
+    pub(in super::super) fn joined(mut self, other: Self) -> Self {
+        self.0.extend(other.0);
+        self
+    }
+
+    /// Each name, the value it becomes and its bases ([`Shapes`]).
+    pub(in super::super) fn shapes(&self) -> Shapes {
+        self.0
+            .iter()
+            .map(|(name, write)| {
+                let value = write.to.as_ref().map(|to| to.value.as_slice().to_vec());
+                (name.clone(), (value, write.bases.clone()))
+            })
+            .collect()
+    }
+
     /// `[everyone]` `Put`s of `writes` (name, value), each over a name the writer read empty.
     pub(in super::super) fn of_puts(writes: &[(&str, &[u8])]) -> Self {
         Self(
@@ -1791,6 +2172,22 @@ pub(in super::super) fn waiting_values(paths: &Paths, identity: &Identity) -> Va
 /// Waiting writes as each name and the value it becomes ([`Waiting::values`]).
 #[cfg(test)]
 pub(in super::super) type Values = BTreeMap<String, Vec<u8>>;
+
+/// Whether the write of `name` that waits here may be signed over `read`, the log's value there
+/// ([`WaitingWrite::stands_over`]); `None` where none waits.
+#[cfg(test)]
+pub(in super::super) fn waits_over(
+    paths: &Paths,
+    identity: &Identity,
+    name: &str,
+    read: Option<&Entry>,
+) -> Option<bool> {
+    read_waiting(paths, identity)
+        .expect("waiting")
+        .0
+        .get(name)
+        .map(|write| write.stands_over(read))
+}
 
 /// What waits ([`waiting_file`]) and what is pending ([`pending_dir`]), by version, oldest first,
 /// as [`Waiting::values`].
@@ -1867,7 +2264,14 @@ mod edit_tests {
             ("shared".to_owned(), a.clone()),
             ("other".to_owned(), other.clone()),
         ]);
-        let edit = everyone_edit(Some(&log), Some(&settle), &settle, Some(&doc), |_| false);
+        let edit = everyone_edit(
+            Some(&log),
+            Some(&settle),
+            &settle,
+            &BTreeMap::new(),
+            Some(&doc),
+            |_| false,
+        );
         let write = edit
             .writes
             .0
@@ -1894,7 +2298,14 @@ mod edit_tests {
             ("shared".to_owned(), v1.clone()),
             ("other".to_owned(), other),
         ]);
-        let edit = everyone_edit(Some(&text), Some(&earlier), &earlier, Some(&doc), |_| false);
+        let edit = everyone_edit(
+            Some(&text),
+            Some(&earlier),
+            &earlier,
+            &BTreeMap::new(),
+            Some(&doc),
+            |_| false,
+        );
         let write = edit
             .writes
             .0

@@ -15,6 +15,55 @@ use std::ffi::OsString;
 use super::*;
 use crate::ai::connector::{CODEX_SIGNIN, GROK_SIGNIN, Hosts, KIMI_SIGNIN};
 
+#[test]
+fn an_injected_clock_without_a_transferable_parent_refuses_native_codex_before_effects() {
+    struct NoEffects;
+    impl Approver for NoEffects {
+        fn resume(&mut self, _: &Request<'_>, _: Deadline<'_>) -> Result<Resume, String> {
+            panic!("a nontransferable clock cannot start native resume")
+        }
+        fn begin(&mut self, _: &Request<'_>) -> Result<(), String> {
+            panic!("a nontransferable clock cannot begin provider work")
+        }
+        fn approve(&mut self, _: &Handoff<'_>) -> Approval {
+            panic!("a nontransferable clock cannot open a callback listener")
+        }
+    }
+    let root = aterm_tempfile::tempdir().unwrap();
+    let store = super::super::accounts::Store::at_for(root.path(), Cli::Codex, root.path());
+    let staging = root.path().join("unstarted");
+    let row = super::super::accounts::Row {
+        label: "one".into(),
+        ..Default::default()
+    };
+    let route = CODEX_SIGNIN.route(None).unwrap();
+    assert!(matches!(route.drive, Drive::CodexPkce));
+    let request = Request {
+        recovery: None,
+        admission: None,
+        cli: Cli::Codex,
+        row: &row,
+        staging: &staging,
+        store: &store,
+        route,
+        hosts: route.hosts.of(None).unwrap(),
+    };
+    let clock = Instant::now;
+    let continuous = || None;
+    let budget = Deadline::with_clocks(Duration::from_secs(60), &clock, &continuous);
+    let drove = sign_in_until(
+        &request,
+        (Path::new("unstarted-codex"), &[]),
+        None,
+        None,
+        &|_| None,
+        &mut NoEffects,
+        budget,
+    );
+    assert!(matches!(drove.outcome, Outcome::NotRun(_)));
+    assert!(!staging.exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn uncertain_provider_wait_retains_the_real_signin_lock_and_app_scope() {
@@ -352,7 +401,7 @@ fn signin_stand_in() {
     let mut words = which.split_whitespace();
     let first = words.next();
     let transcript = match first {
-        Some("kimi" | "hold") => KIMI.to_owned(),
+        Some("kimi" | "hold" | "sleep-budget") => KIMI.to_owned(),
         Some("kimi-unfinished" | "hold-unfinished") => KIMI
             .lines()
             .filter(|line| !line.contains("Logged in"))
@@ -367,10 +416,16 @@ fn signin_stand_in() {
         eprintln!("the stand-in was run as {argv:?}");
         std::process::exit(3);
     }
-    if first == Some("hold") {
+    if matches!(first, Some("hold" | "sleep-budget")) {
         std::fs::write(home.join("pid"), std::process::id().to_string()).expect("pid");
         eprint!("{transcript}");
-        std::thread::sleep(Duration::from_secs(60));
+        if first == Some("sleep-budget") {
+            while !home.join("release").exists() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        } else {
+            std::thread::sleep(Duration::from_secs(60));
+        }
         std::process::exit(0);
     }
     if first == Some("hold-unfinished") {
@@ -414,15 +469,19 @@ fn stand_in_drive(script: &str) -> (Drove, Handed) {
 
 /// The Kimi stand-in driven in `root/sol+1`, its page handed to `approver`.
 fn stand_in_drive_in(root: &Path, script: &str, approver: &mut dyn Approver) -> Drove {
-    stand_in_drive_within(root, script, approver, Duration::from_secs(60))
+    stand_in_drive_until(
+        root,
+        script,
+        approver,
+        Deadline::after(Duration::from_secs(60)),
+    )
 }
 
-/// [`stand_in_drive_in`] within `hang`.
-fn stand_in_drive_within(
+fn stand_in_drive_until(
     root: &Path,
     script: &str,
     approver: &mut dyn Approver,
-    hang: Duration,
+    deadline: Deadline<'_>,
 ) -> Drove {
     let tmp = root;
     let staging = tmp.join("sol+1");
@@ -450,7 +509,7 @@ fn stand_in_drive_within(
     ]
     .map(OsString::from)
     .to_vec();
-    drive(
+    drive_until(
         &Spec {
             program: &exe,
             lead: &lead,
@@ -461,10 +520,139 @@ fn stand_in_drive_within(
             completion,
             hosts: hosts.of(Some(Region::Global)).expect("global"),
             email: Some("kimi-one@example.com"),
-            hang,
+            hang: deadline.remaining().unwrap_or_default(),
         },
         approver,
+        deadline,
     )
+}
+
+#[cfg(unix)]
+#[test]
+fn a_lines_drive_counts_sleep_and_settles_its_original_child_and_scope() {
+    struct Sleeping {
+        slept: Arc<std::sync::atomic::AtomicU64>,
+        work: super::super::account_work::Scope,
+    }
+    impl Approver for Sleeping {
+        fn work_scope(&self) -> Option<super::super::account_work::Scope> {
+            Some(self.work.clone())
+        }
+        fn approve(&mut self, _: &Handoff<'_>) -> Approval {
+            self.slept.store(7200 * 1_000_000_000, Ordering::Release);
+            Approval::Approved { page: false }
+        }
+    }
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let store = super::super::accounts::Store::at(scratch.path());
+    let signin = store.signin_now().unwrap().unwrap();
+    let lifetime = super::super::account_work::Lifetime::default();
+    let work = lifetime.enter().unwrap();
+    let root = scratch.path().to_owned();
+    let recovery = root.join("sol+1/release");
+    let (done, result) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let (answered, answer) = mpsc::sync_channel(1);
+        let run = work.clone().wrap(move || {
+            let _signin = signin;
+            let slept = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let continuous = || Some(slept.load(Ordering::Acquire));
+            let deadline =
+                Deadline::with_clocks(Duration::from_secs(3600), &Instant::now, &continuous);
+            let mut approver = Sleeping {
+                slept: slept.clone(),
+                work,
+            };
+            let drove = stand_in_drive_until(&root, "sleep-budget 0", &mut approver, deadline);
+            let _ = answered.send(drove);
+        });
+        run();
+        let _ = done.send(answer.recv().unwrap());
+    });
+    let answer = result.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+    // Recover the actual owned child cooperatively before asserting the deadline result.
+    let _ = std::fs::write(recovery, "release");
+    worker.join().unwrap();
+    let mut pause = Some(lifetime.pause().unwrap());
+    let drained = aterm_spec::wait::within(
+        aterm_spec::wait::MUST_HAPPEN,
+        Duration::from_millis(1),
+        || match pause.take().unwrap().try_wait() {
+            Ok(drained) => Some(drained),
+            Err(held) => {
+                pause = Some(held);
+                None
+            }
+        },
+    )
+    .expect("actual provider readers retired");
+    assert_eq!(answer.unwrap().outcome, Outcome::Hung);
+    assert!(store.signin_now().unwrap().is_some());
+    assert!(drained.resume().is_ok());
+}
+
+#[test]
+fn sleep_during_resume_cannot_restart_the_budget_or_enter_a_fresh_provider() {
+    struct Sleeping<'a> {
+        slept: &'a std::cell::Cell<u64>,
+        began: bool,
+        approved: bool,
+    }
+    impl Approver for Sleeping<'_> {
+        fn resume(&mut self, _: &Request<'_>, _: Deadline<'_>) -> Result<Resume, String> {
+            self.slept.set(7200 * 1_000_000_000);
+            Ok(Resume::Fresh)
+        }
+        fn begin(&mut self, _: &Request<'_>) -> Result<(), String> {
+            self.began = true;
+            Ok(())
+        }
+        fn approve(&mut self, _: &Handoff<'_>) -> Approval {
+            self.approved = true;
+            Approval::Approved { page: false }
+        }
+    }
+    let root = aterm_tempfile::tempdir().unwrap();
+    let store = super::super::accounts::Store::at_for(root.path(), Cli::Kimi, root.path());
+    let row = super::super::accounts::Row {
+        label: "sleep-test".into(),
+        vendor: super::super::accounts::Vendor {
+            region: Some(Region::Global),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let route = KIMI_SIGNIN.route(None).unwrap();
+    let request = Request {
+        recovery: None,
+        admission: None,
+        cli: Cli::Kimi,
+        row: &row,
+        staging: root.path(),
+        store: &store,
+        route,
+        hosts: route.hosts.of(Some(Region::Global)).unwrap(),
+    };
+    let slept = std::cell::Cell::new(0);
+    let continuous = || Some(slept.get());
+    let deadline = Deadline::with_clocks(Duration::from_secs(3600), &Instant::now, &continuous);
+    let mut approver = Sleeping {
+        slept: &slept,
+        began: false,
+        approved: false,
+    };
+    let result = sign_in_until(
+        &request,
+        (Path::new("unavailable-sign-in-fixture"), &[]),
+        None,
+        None,
+        &vars(&[]),
+        &mut approver,
+        deadline,
+    );
+    assert!(matches!(result.outcome, Outcome::NotRun(_)));
+    assert!(!approver.began && !approver.approved);
+    assert!(deadline.expired());
 }
 
 /// A PROGRAM THAT CANNOT START NAMES ITSELF, ONCE: `NotRun` is the program and the system's reason,
@@ -1318,10 +1506,10 @@ fn native_completion_hooks_surround_the_real_driver_and_can_refuse_publication()
             &mut self,
             request: &Request<'_>,
             outcome: &Outcome,
-            deadline: WakeDeadline,
+            deadline: Deadline<'_>,
         ) -> Result<(), String> {
             self.seen.push("complete");
-            assert!(!deadline.passed());
+            assert!(!deadline.expired());
             if matches!(outcome, Outcome::SignedIn { .. }) {
                 assert!(request.staging.join("credentials/kimi-code.json").is_file());
             }
@@ -1408,10 +1596,88 @@ fn native_completion_hooks_surround_the_real_driver_and_can_refuse_publication()
 }
 
 #[test]
+fn completed_native_custody_survives_revoked_admission_without_fresh_completion() {
+    struct CompletionCalls(usize);
+    impl Approver for CompletionCalls {
+        fn approve(&mut self, _: &Handoff<'_>) -> Approval {
+            panic!("completion must not reopen approval")
+        }
+        fn complete(
+            &mut self,
+            _: &Request<'_>,
+            _: &Outcome,
+            _: Deadline<'_>,
+        ) -> Result<(), String> {
+            self.0 += 1;
+            Err("fresh verification refused".into())
+        }
+    }
+    let root = aterm_tempfile::tempdir().unwrap();
+    let store = super::super::accounts::Store::at_for(root.path(), Cli::Codex, root.path());
+    let staging = root.path().join("staging");
+    std::fs::create_dir(&staging).unwrap();
+    let artifact = b"completed native response fixture";
+    std::fs::write(staging.join("auth.json"), artifact).unwrap();
+    let row = super::super::accounts::Row {
+        label: "one".into(),
+        ..Default::default()
+    };
+    let route = CODEX_SIGNIN.route(None).unwrap();
+    for revoked in [false, true] {
+        for held in [false, true] {
+            let admission = RecoveryAdmission::new(RecoveryKey([4; 32]), true, move |_| {
+                if revoked {
+                    Err("root admission revoked".into())
+                } else {
+                    Ok(())
+                }
+            });
+            let request = Request {
+                recovery: Some(admission.key()),
+                admission: Some(&admission),
+                cli: Cli::Codex,
+                row: &row,
+                staging: &staging,
+                store: &store,
+                route,
+                hosts: route.hosts.of(None).unwrap(),
+            };
+            let mut hooks = CompletionCalls(0);
+            let result = complete_sign_in(
+                &request,
+                &mut hooks,
+                Drove {
+                    outcome: if held {
+                        Outcome::CompletedHeld
+                    } else {
+                        Outcome::Failed
+                    },
+                    host: None,
+                },
+                Deadline::after(if held {
+                    Duration::ZERO
+                } else {
+                    aterm_spec::wait::MUST_HAPPEN
+                }),
+                true,
+                CompletionCustody::Ordinary,
+            );
+            if held {
+                assert_eq!(result.outcome, Outcome::CompletedHeld);
+            } else {
+                assert!(matches!(result.outcome, Outcome::Unverified(_)));
+            }
+            assert_eq!(hooks.0, usize::from(!held && !revoked));
+            assert_eq!(std::fs::read(staging.join("auth.json")).unwrap(), artifact);
+        }
+    }
+}
+
+#[test]
 fn retained_native_state_never_becomes_no_start_when_native_setup_fails() {
     struct ResumeOnly(u8);
     impl Approver for ResumeOnly {
-        fn resume(&mut self, _: &Request<'_>, _: WakeDeadline) -> Result<Resume, String> {
+        fn resume(&mut self, _: &Request<'_>, _: Deadline<'_>) -> Result<Resume, String> {
             match self.0 {
                 0 => Ok(Resume::Fresh),
                 1 => Ok(Resume::NativeSeed),
@@ -1465,7 +1731,7 @@ fn retained_native_state_never_becomes_no_start_when_native_setup_fails() {
     }
     struct NoHooks;
     impl Approver for NoHooks {
-        fn resume(&mut self, _: &Request<'_>, _: WakeDeadline) -> Result<Resume, String> {
+        fn resume(&mut self, _: &Request<'_>, _: Deadline<'_>) -> Result<Resume, String> {
             panic!("revoked root admission reached a recovery hook")
         }
         fn approve(&mut self, _: &Handoff<'_>) -> Approval {
@@ -1554,7 +1820,7 @@ fn native_kimi_cancellation_runs_completion_without_opening_a_window() {
             &mut self,
             _: &Request<'_>,
             outcome: &Outcome,
-            _: WakeDeadline,
+            _: Deadline<'_>,
         ) -> Result<(), String> {
             self.0.push("complete");
             assert!(matches!(outcome, Outcome::Unverified(_)));
@@ -1642,7 +1908,12 @@ fn a_driven_sign_in_its_host_slept_past_ends_hung_at_its_first_look() {
     std::thread::spawn(move || {
         let _seam = super::super::wake_deadline::SleepSeam::hold();
         let mut approver = Sleeps(false);
-        let drove = stand_in_drive_within(&root, "hold-unfinished", &mut approver, HOUR);
+        let drove = stand_in_drive_until(
+            &root,
+            "hold-unfinished",
+            &mut approver,
+            Deadline::after(HOUR),
+        );
         let _ = tx.send((drove, approver.0));
     });
     let (drove, slept) = rx
@@ -1677,7 +1948,7 @@ fn a_driven_sign_in_its_host_slept_past_ends_hung_at_its_first_look() {
 fn a_sign_in_whose_resume_its_host_slept_through_starts_no_child() {
     struct SleepsInResume;
     impl Approver for SleepsInResume {
-        fn resume(&mut self, _: &Request<'_>, _: WakeDeadline) -> Result<Resume, String> {
+        fn resume(&mut self, _: &Request<'_>, _: Deadline<'_>) -> Result<Resume, String> {
             super::super::wake_deadline::host_slept(2 * HOUR);
             Ok(Resume::Fresh)
         }
@@ -1739,4 +2010,124 @@ fn a_sign_in_whose_resume_its_host_slept_through_starts_no_child() {
         !staging.join("credentials").exists(),
         "no child ran to sign in"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn saved_native_custody_rechecks_work_after_admission_and_completion() {
+    use crate::harness::{
+        account_work::{Lifetime, Scope},
+        wake_deadline::SleepSeam,
+    };
+    struct Hooks {
+        scope: Scope,
+        sleeper: super::super::wake_deadline::Sleeper,
+        lifetime: Lifetime,
+        phase: u8,
+        calls: usize,
+    }
+    impl Approver for Hooks {
+        fn work_scope(&self) -> Option<Scope> {
+            Some(self.scope.clone())
+        }
+        fn approve(&mut self, _: &Handoff<'_>) -> Approval {
+            panic!("no new page approval")
+        }
+        fn complete(
+            &mut self,
+            _: &Request<'_>,
+            _: &Outcome,
+            _: Deadline<'_>,
+        ) -> Result<(), String> {
+            self.calls += 1;
+            match self.phase {
+                4 => return Err("completion refused".into()),
+                5 => self.sleeper.slept(Duration::from_secs(7200)),
+                6 => drop(self.lifetime.pause().unwrap()),
+                _ => {}
+            }
+            Ok(())
+        }
+    }
+    for phase in 0..7 {
+        let seam = SleepSeam::hold();
+        let sleeper = seam.sleeper();
+        sleeper.slept(Duration::from_secs(3600));
+        let parent = super::super::wake_deadline::WakeDeadline::after(Duration::from_secs(3600));
+        let deadline = Deadline::waking(parent, &Instant::now);
+        let root = aterm_tempfile::tempdir().unwrap();
+        let store = super::super::accounts::Store::at_for(root.path(), Cli::Codex, root.path());
+        let staging = root.path().join("staging");
+        std::fs::create_dir(&staging).unwrap();
+        let token = super::super::codex_app_login::tests::make_chatgpt_jwt(
+            Some("owner@example.test"),
+            "pro",
+            crate::supervise::limit::unix_now() + 3600,
+        );
+        let bytes = aterm_json::to_vec(&aterm_json::json!({"tokens":{"id_token":token,"access_token":token,"refresh_token":"synthetic"}})).unwrap();
+        aterm_uds::atomic_file::write(&staging.join("auth.json"), &bytes, 0o600).unwrap();
+        assert_eq!(
+            super::super::codex_app_login::read_account_email(&staging).as_deref(),
+            Some("owner@example.test")
+        );
+        let row = super::super::accounts::Row {
+            label: "one".into(),
+            ..Default::default()
+        };
+        let route = CODEX_SIGNIN.route(None).unwrap();
+        let lifetime = Lifetime::default();
+        let admission_lifetime = lifetime.clone();
+        let admission = RecoveryAdmission::new(RecoveryKey([5; 32]), true, move |_| {
+            match phase {
+                1 => sleeper.slept(Duration::from_secs(7200)),
+                2 => drop(admission_lifetime.pause().unwrap()),
+                3 => return Err("admission revoked".into()),
+                _ => {}
+            }
+            Ok(())
+        });
+        let req = Request {
+            cli: Cli::Codex,
+            row: &row,
+            staging: &staging,
+            store: &store,
+            route,
+            hosts: route.hosts.of(None).unwrap(),
+            recovery: Some(admission.key()),
+            admission: Some(&admission),
+        };
+        let mut hooks = Hooks {
+            scope: lifetime.enter().unwrap(),
+            sleeper,
+            lifetime,
+            phase,
+            calls: 0,
+        };
+        let result = complete_sign_in(
+            &req,
+            &mut hooks,
+            Drove {
+                outcome: Outcome::SignedIn {
+                    email: Some("owner@example.test".into()),
+                    page: false,
+                },
+                host: None,
+            },
+            deadline,
+            false,
+            CompletionCustody::NativeSaved,
+        );
+        assert_eq!(hooks.calls, usize::from(phase == 0 || phase >= 4));
+        if phase == 0 {
+            assert!(matches!(result.outcome, Outcome::SignedIn { .. }));
+        } else {
+            assert_eq!(result.outcome, Outcome::CompletedHeld);
+        }
+        assert_eq!(std::fs::read(staging.join("auth.json")).unwrap(), bytes);
+        assert!(
+            !staging
+                .join(super::super::accounts::RENEWAL_CHECKPOINT_FILE)
+                .exists()
+        );
+    }
 }

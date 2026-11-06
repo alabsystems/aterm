@@ -268,8 +268,8 @@ pub fn deploy(
     };
     let site = plan
         .site
-        .clone()
-        .or_else(|| key.project.clone())
+        .as_deref()
+        .or(key.project.as_deref())
         .ok_or_else(|| {
             not_released(
                 "no Hosting site is named (firebase.json's hosting.site, FIREBASE_SITE, \
@@ -278,9 +278,7 @@ pub fn deploy(
                 None,
             )
         })?;
-    let site = site_id(&site)
-        .map_err(|why| not_released(why, None))?
-        .to_string();
+    let site = site_id(site).map_err(|why| not_released(why, None))?;
     let bearer = client.token(key, now)?;
     let _ = writeln!(out, "  hosting: {site}: token issued to {}", key.email);
 
@@ -320,7 +318,7 @@ pub fn deploy(
     let _ = writeln!(out, "  hosting: created {version}");
     let v = Some(version.as_str());
 
-    let mut required: BTreeSet<String> = BTreeSet::new();
+    let mut required: BTreeSet<&str> = BTreeSet::new();
     let mut upload_url: Option<String> = None;
     for batch in plan.files.chunks(POPULATE_BATCH) {
         let named: Map = batch
@@ -350,11 +348,11 @@ pub fn deploy(
             }
         };
         for hash in asked {
-            match hash.as_str() {
-                Some(h) if hashes.contains(h) => {
-                    required.insert(h.to_string());
+            match hash.as_str().and_then(|h| hashes.get(h).copied()) {
+                Some(h) => {
+                    required.insert(h);
                 }
-                _ => {
+                None => {
                     return Err(not_released(
                         format!(
                             "naming the files: Hosting asked for {hash}, a file this deploy did not name"
@@ -381,7 +379,7 @@ pub fn deploy(
     let mut uploads: Vec<&File> = Vec::new();
     let mut queued: BTreeSet<&str> = BTreeSet::new();
     for f in &plan.files {
-        if required.contains(&f.hash) && queued.insert(&f.hash) {
+        if required.contains(f.hash.as_str()) && queued.insert(&f.hash) {
             uploads.push(f);
         }
     }
@@ -394,7 +392,7 @@ pub fn deploy(
             - plan
                 .files
                 .iter()
-                .filter(|f| required.contains(&f.hash))
+                .filter(|f| required.contains(f.hash.as_str()))
                 .count(),
         uploads.len()
     );
@@ -441,7 +439,10 @@ pub fn deploy(
     }
     let _ = writeln!(out, "  hosting: finalized {version}");
 
-    let message: String = message.chars().take(MESSAGE_MAX).collect();
+    let message = match message.char_indices().nth(MESSAGE_MAX) {
+        Some((idx, _)) => &message[..idx],
+        None => message,
+    };
     let release_failed = |why: String| Failed::Release {
         why,
         version: version.clone(),

@@ -215,103 +215,7 @@ pub(crate) fn last_tooltips_pushed(window: crate::WindowId) -> Option<Vec<Option
     })
 }
 
-thread_local! {
-    static COUNTING: Cell<bool> = const { Cell::new(false) };
-    static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
-    static FREED: Cell<usize> = const { Cell::new(0) };
-}
-
-/// Threads inside [`allocations_in`] now: while none is, an allocation
-/// skips the thread-local read (unoptimised test builds pay more for that
-/// read than for the allocation itself).
-static COUNTING_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-struct CountingAlloc;
-
-impl CountingAlloc {
-    fn note() {
-        if COUNTING_THREADS.load(std::sync::atomic::Ordering::Relaxed) == 0 {
-            return;
-        }
-        let _ = COUNTING.try_with(|on| {
-            if on.get() {
-                let _ = ALLOCATIONS.try_with(|n| n.set(n.get() + 1));
-            }
-        });
-    }
-
-    /// Count `bytes` handed back to the allocator on a counting thread ([`bytes_freed_in`]).
-    fn note_freed(bytes: usize) {
-        if COUNTING_THREADS.load(std::sync::atomic::Ordering::Relaxed) == 0 {
-            return;
-        }
-        let _ = COUNTING.try_with(|on| {
-            if on.get() {
-                let _ = FREED.try_with(|n| n.set(n.get().saturating_add(bytes)));
-            }
-        });
-    }
-}
-
-// SAFETY: every method forwards to `System` with the caller's layout and
-// pointer unchanged; the count beside it never allocates.
-unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
-    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        Self::note();
-        // SAFETY: forwarded with the caller's layout.
-        unsafe { std::alloc::System.alloc(layout) }
-    }
-
-    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
-        Self::note();
-        // SAFETY: forwarded with the caller's layout.
-        unsafe { std::alloc::System.alloc_zeroed(layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
-        Self::note();
-        Self::note_freed(layout.size().saturating_sub(size));
-        // SAFETY: forwarded with the caller's pointer, layout and size.
-        unsafe { std::alloc::System.realloc(ptr, layout, size) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
-        Self::note_freed(layout.size());
-        // SAFETY: forwarded with the caller's pointer and layout.
-        unsafe { std::alloc::System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: CountingAlloc = CountingAlloc;
-
-/// Run `f` and say how many heap allocations (and reallocations) it made
-/// on this thread: the per-frame paths' allocation budget, asserted.
-pub(crate) fn allocations_in<R>(f: impl FnOnce() -> R) -> (R, usize) {
-    struct Counting;
-    impl Drop for Counting {
-        fn drop(&mut self) {
-            COUNTING.with(|on| on.set(false));
-            COUNTING_THREADS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-    ALLOCATIONS.with(|n| n.set(0));
-    COUNTING_THREADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let counting = Counting;
-    COUNTING.with(|on| on.set(true));
-    let out = f();
-    drop(counting);
-    (out, ALLOCATIONS.with(|n| n.replace(0)))
-}
-
-/// Run `f` and say how many heap bytes it handed back on this thread: each
-/// freed block's requested size, and what a shrinking reallocation gave up
-/// (a growing one frees nothing net).
-pub(crate) fn bytes_freed_in<R>(f: impl FnOnce() -> R) -> (R, usize) {
-    FREED.with(|n| n.set(0));
-    let (out, _) = allocations_in(f);
-    (out, FREED.with(|n| n.replace(0)))
-}
+pub(crate) use aterm_heap_count::{allocations_in, bytes_freed_in};
 
 thread_local! {
     static HARNESS_CLOCK_READS: Cell<usize> = const { Cell::new(0) };
@@ -334,6 +238,7 @@ thread_local! {
     static FOOTER_RULES_COMPOSED: Cell<usize> = const { Cell::new(0) };
     static FOOTER_RULE_MASKS: Cell<usize> = const { Cell::new(0) };
     static BAND_DERIVES: Cell<usize> = const { Cell::new(0) };
+    static ROLES_SOLVES: Cell<usize> = const { Cell::new(0) };
     static CAPTURE_INPUTS_CLONED: Cell<usize> = const { Cell::new(0) };
     static CAPTURE_FORCED_SAMPLES: Cell<usize> = const { Cell::new(0) };
     static UNFORCED_SAMPLES: Cell<usize> = const { Cell::new(0) };
@@ -501,6 +406,14 @@ pub(crate) fn band_derived() {
 }
 pub(crate) fn take_band_derives() -> usize {
     take(&BAND_DERIVES)
+}
+
+/// A native palette solved on this thread (`native_appearance::solve_roles`).
+pub(crate) fn roles_solved() {
+    bump(&ROLES_SOLVES);
+}
+pub(crate) fn take_roles_solved() -> usize {
+    take(&ROLES_SOLVES)
 }
 
 pub(crate) fn footer_rule_masked() {

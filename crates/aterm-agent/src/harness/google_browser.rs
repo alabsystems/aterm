@@ -7,7 +7,7 @@
 
 use std::os::fd::OwnedFd;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aterm_json::{Value, json};
 
@@ -108,12 +108,12 @@ fn page_info(value: &Value, context: &str) -> Option<PageInfo> {
 
 /// Owns the browser until it exits, then removes its scratch profile and releases the identity.
 /// Authentication pages can be created only in its off-the-record context.
-pub struct MemoryBrowser {
+pub struct MemoryBrowser<'a> {
     // Field order matters: reap the browser before removing files or releasing ownership.
     _child: BrowserChild,
     cdp: CdpClient,
     context: String,
-    deadline: WakeDeadline,
+    deadline: super::login_drive::Deadline<'a>,
     _profile: aterm_tempfile::TempDir,
     _identity: Option<Session>,
     identity: Identity,
@@ -272,7 +272,7 @@ pub(super) fn pending_fixture(
     }
 }
 
-impl MemoryBrowser {
+impl MemoryBrowser<'static> {
     /// Fetch the pinned full browser, launch it without a window, and create one incognito context.
     /// The scratch default profile receives no authentication navigation.
     ///
@@ -295,13 +295,32 @@ impl MemoryBrowser {
         deadline: WakeDeadline,
         work: Option<super::account_work::Scope>,
     ) -> Result<Self, Error> {
+        Self::start_until(
+            identity,
+            machine_state,
+            home,
+            super::login_drive::Deadline::waking(deadline, &Instant::now),
+            work,
+        )
+    }
+}
+
+impl<'a> MemoryBrowser<'a> {
+    /// Start within the original caller's sleep-aware budget, without resetting it.
+    pub(super) fn start_until(
+        identity: &Identity,
+        machine_state: &Path,
+        home: Option<&Path>,
+        deadline: super::login_drive::Deadline<'a>,
+        work: Option<super::account_work::Scope>,
+    ) -> Result<Self, Error> {
         if work
             .as_ref()
             .is_some_and(super::account_work::Scope::cancelled)
         {
             return Err(Error::Prepare);
         }
-        unpassed(deadline)?;
+        deadline.remaining().map_err(|_| Error::Deadline)?;
         let claim = identity
             .claim(machine_state)
             .map_err(|_| Error::IdentityBusy)?;
@@ -311,14 +330,14 @@ impl MemoryBrowser {
             home,
             &mut super::headless_fetch::Curl,
             &|| {
-                deadline.passed()
+                deadline.expired()
                     || work
                         .as_ref()
                         .is_some_and(super::account_work::Scope::cancelled)
             },
         )
         .map_err(|_| Error::Prepare)?;
-        unpassed(deadline)?;
+        deadline.remaining().map_err(|_| Error::Deadline)?;
         let profile = aterm_tempfile::tempdir().map_err(|_| Error::Prepare)?;
         let browser = HeadlessBrowser {
             path: browser,
@@ -336,6 +355,7 @@ impl MemoryBrowser {
         {
             return Err(Error::Prepare);
         }
+        deadline.remaining().map_err(|_| Error::Deadline)?;
         let child = aterm_uds::spawnfd::spawn_with_two_fds(
             command,
             OwnedFd::from(commands),
@@ -348,7 +368,7 @@ impl MemoryBrowser {
         let context = call_within(
             &mut cdp,
             deadline,
-            CALL_WAIT,
+            Duration::from_secs(10),
             None,
             "Target.createBrowserContext",
             json!({"disposeOnDetach":true}),
@@ -672,7 +692,7 @@ impl MemoryBrowser {
         call_within(
             &mut self.cdp,
             self.deadline,
-            CALL_WAIT,
+            Duration::from_secs(10),
             session,
             method,
             params,
@@ -805,7 +825,7 @@ fn google_cookies(value: &Value) -> Result<SecretValue, Error> {
     Ok(admitted)
 }
 
-impl Drop for MemoryBrowser {
+impl Drop for MemoryBrowser<'_> {
     fn drop(&mut self) {
         let _ = self.cdp.call(
             None,
@@ -819,33 +839,19 @@ impl Drop for MemoryBrowser {
     }
 }
 
-/// The longest one browser call waits for its answer.
-const CALL_WAIT: Duration = Duration::from_secs(10);
-
-/// [`Error::Deadline`] once `deadline`, which counts the time the host slept, has passed.
-fn unpassed(deadline: WakeDeadline) -> Result<(), Error> {
-    if deadline.passed() {
-        Err(Error::Deadline)
-    } else {
-        Ok(())
-    }
-}
-
-/// One DevTools call within `deadline`, which counts the time the host slept, and at most `cap`
-/// ([`WakeDeadline::within`]): its waits look at both clocks at least every
-/// [`super::wake_deadline::SLEEP_CHECK`] ([`CdpClient::call_until`]), so a call the host slept
-/// past ends within that of its waking. [`Error::Deadline`] where `deadline` has passed before it
-/// is sent.
+/// One bounded call under the original shared deadline.
 fn call_within(
     cdp: &mut CdpClient,
-    deadline: WakeDeadline,
+    deadline: super::login_drive::Deadline<'_>,
     cap: Duration,
     session: Option<&str>,
     method: &str,
     params: Value,
 ) -> Result<Value, Error> {
-    unpassed(deadline)?;
-    cdp.call_until(session, method, params, deadline.within(cap))
+    if deadline.expired() {
+        return Err(Error::Deadline);
+    }
+    cdp.call_by(session, method, params, deadline.limited(cap))
         .map_err(|_| Error::Protocol)
 }
 
@@ -881,7 +887,10 @@ mod tests {
             let mut cdp = CdpClient::new(to_browser, from_browser);
             let got = call_within(
                 &mut cdp,
-                WakeDeadline::after(HOUR),
+                super::super::login_drive::Deadline::waking(
+                    WakeDeadline::after(HOUR),
+                    &Instant::now,
+                ),
                 HOUR,
                 None,
                 "Runtime.evaluate",

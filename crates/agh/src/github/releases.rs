@@ -175,7 +175,7 @@ impl<'a> Releases<'a> {
         }
         listing
             .items
-            .sort_by(|a, b| (&b.created_at, b.id).cmp(&(&a.created_at, a.id)));
+            .sort_unstable_by(|a, b| (&b.created_at, b.id).cmp(&(&a.created_at, a.id)));
         limit_after_sort(&mut listing, opts.limit);
         Ok(listing)
     }
@@ -785,7 +785,7 @@ impl<'a> Releases<'a> {
                 found.push(release);
             }
         }
-        found.sort_by_key(|release| release.id);
+        found.sort_unstable_by_key(|release| release.id);
         let objects = match found.len() {
             0 => TagObjects::None,
             1 => TagObjects::One(Box::new(found.remove(0))),

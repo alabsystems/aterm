@@ -19,13 +19,14 @@
 
 use super::{
     Registry,
-    registry::{ADDRESS, MAILBOX},
+    registry::{ADDRESS, AddressHolder, AddressIndex, MAILBOX},
     secret::{Journal, Surface},
 };
 use crate::{
     Result,
     typed::{
         cell::{Projection, Row},
+        keys,
         secret::{Cell, Sealer},
     },
 };
@@ -138,24 +139,26 @@ pub(crate) fn untagged(address: &str) -> Option<String> {
 }
 
 /// The live base address of `pk`'s `+tag` and the one mailbox whose latest complete observation
-/// lists that base: the alias link an address list supplies, `(base pk, mailbox pk)`. Only the
-/// observation that supplies the link decides it, so a base two mailboxes list, or one only a
-/// route or a guess places, links nothing and the tag keeps its own routes. Derived on every read
-/// and never stored (§3.11), so the owner's and the importer's `alias_of` stay theirs alone.
+/// lists that base: the alias link an address list supplies, `(base pk, mailbox pk)`. The base
+/// is the one row whose `addr` says the base address now (`index`, built from `addresses`), not
+/// the key that address derives, so a renamed row keeps its tags. Only the observation that
+/// supplies the link decides it, so a base two mailboxes list, or one only a route or a guess
+/// places, links nothing and the tag keeps its own routes. Derived on every read and never
+/// stored (§3.11), so the owner's and the importer's `alias_of` stay theirs alone.
 pub fn listed_base(
     addresses: &Projection,
+    index: &AddressIndex,
     observed: &Observed,
     pk: &str,
 ) -> Option<(String, String)> {
-    let base = untagged(column(addresses, pk, "addr")?)?;
-    let base = crate::typed::keys::address_pk(&base).ok()?;
-    addresses.rows.get(&base).filter(|row| unshielded(row))?;
-    let set = observed.get(&base)?;
+    let base = index.row(&untagged(column(addresses, pk, "addr")?)?)?;
+    addresses.rows.get(base).filter(|row| unshielded(row))?;
+    let set = observed.get(base)?;
     if set.len() != 1 {
         return None;
     }
     let mailbox = set.first()?.clone();
-    Some((base, mailbox))
+    Some((base.to_owned(), mailbox))
 }
 
 /// Whether following `pk`'s alias links returns to an address already followed.
@@ -179,9 +182,9 @@ pub fn alias_cycle(addresses: &Projection, pk: &str) -> bool {
     false
 }
 
-/// The effective mailbox of address `pk`. `routes` answers for an address on a Mac that holds
-/// `ai-mailbox.toml`, and nothing elsewhere. A link to a retired or absent address, or a cycle,
-/// is left and read past: `check` reports it.
+/// The effective mailbox of address `pk`, over `addresses` and its `index`. `routes` answers
+/// for an address on a Mac that holds `ai-mailbox.toml`, and nothing elsewhere. A link to a
+/// retired or absent address, or a cycle, is left and read past: `check` reports it.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -192,15 +195,17 @@ pub fn alias_cycle(addresses: &Projection, pk: &str) -> bool {
 )]
 pub fn effective(
     addresses: &Projection,
+    index: &AddressIndex,
     observed: &Observed,
     routes: &dyn Fn(&str) -> Option<String>,
     pk: &str,
 ) -> Option<Effective> {
-    follow(addresses, observed, routes, pk, &mut BTreeSet::new())
+    follow(addresses, index, observed, routes, pk, &mut BTreeSet::new())
 }
 
 fn follow<'a>(
     addresses: &'a Projection,
+    index: &AddressIndex,
     observed: &Observed,
     routes: &dyn Fn(&str) -> Option<String>,
     pk: &str,
@@ -224,7 +229,7 @@ fn follow<'a>(
         return found(mailbox, How::Owner);
     }
     if let Some(target) = row_column(row, "alias_of")
-        && let Some(mut reached) = follow(addresses, observed, routes, target, seen)
+        && let Some(mut reached) = follow(addresses, index, observed, routes, target, seen)
     {
         reached.via.insert(0, target.to_owned());
         return Some(reached);
@@ -235,7 +240,7 @@ fn follow<'a>(
     {
         return found(mailbox, How::Observed);
     }
-    if let Some((base, mailbox)) = listed_base(addresses, observed, pk) {
+    if let Some((base, mailbox)) = listed_base(addresses, index, observed, pk) {
         return Some(Effective {
             mailbox,
             how: How::Observed,
@@ -300,12 +305,20 @@ pub struct Mailbox {
 fn token_candidates<'a>(row: &'a Row, column: &str) -> Vec<&'a str> {
     row.fields
         .get(column)
-        .map(|field| field.candidates_x())
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(Value::as_str)
+        .map_or(&[][..], crate::typed::cell::Field::candidates)
+        .iter()
+        .filter_map(|c| c.value.x.as_str())
         .filter(|token| !token.is_empty())
         .collect()
+}
+
+fn has_token_candidate(row: &Row, column: &str) -> bool {
+    row.fields
+        .get(column)
+        .map_or(&[][..], crate::typed::cell::Field::candidates)
+        .iter()
+        .filter_map(|c| c.value.x.as_str())
+        .any(|token| !token.is_empty())
 }
 
 fn text_ref<'a>(row: &'a Row, column: &str) -> Option<&'a str> {
@@ -363,7 +376,7 @@ fn mailbox_of(addresses: &Projection, pk: &str, row: &Row) -> Option<Mailbox> {
                 Credential::Password => login_row,
                 _ => row,
             };
-            !token_candidates(holder, which.column()).is_empty()
+            has_token_candidate(holder, which.column())
         })
         .collect();
     Some(Mailbox {
@@ -495,8 +508,37 @@ pub fn reveal_in<T>(
 /// # Errors
 /// The registry is not declared here or its log does not read.
 pub fn sign_in_mailboxes(registry: &Registry) -> Result<Vec<Mailbox>> {
+    sign_in_read(registry).map(|(found, _)| found)
+}
+
+/// [`sign_in_mailboxes`] and, from the same read, the `address` rows by what they say now: what
+/// names the login of a mailbox the registry names none of ([`login_mailbox`]).
+///
+/// # Errors
+/// The registry is not declared here or its log does not read.
+pub fn sign_in_read(registry: &Registry) -> Result<(Vec<Mailbox>, AddressIndex)> {
     let view = crate::att::Handle::at(registry.paths().clone(), &crate::att::REGISTRY).view()?;
-    Ok(mailboxes(&view.project(&ADDRESS), &view.project(&MAILBOX)))
+    let addresses = view.project(&ADDRESS);
+    Ok((
+        mailboxes(&addresses, &view.project(&MAILBOX)),
+        AddressIndex::of(&addresses),
+    ))
+}
+
+/// The mailbox key login `login` names: the key its login row's key derives
+/// ([`keys::mailbox_pk`]), that row the one whose `addr` says the login now (a renamed row keeps
+/// its birth key, decision f189), or, where no row says it and none holds the key it derives,
+/// that derived key (a mailbox whose login row is not here yet). `None` where several rows say
+/// it, its key is another row's, or it is not an address.
+pub fn login_mailbox(index: &AddressIndex, login: &str) -> Option<String> {
+    match index.holder(login).ok()? {
+        AddressHolder::Row(pk) => keys::mailbox_pk(pk).ok(),
+        AddressHolder::Free {
+            derived,
+            taken: false,
+        } => keys::mailbox_pk(&derived).ok(),
+        AddressHolder::Several(_) | AddressHolder::Free { .. } => None,
+    }
 }
 
 /// [`reveal_in`] over this Mac's registry, its Secret keys resolved inside the table session.

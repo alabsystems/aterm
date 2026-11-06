@@ -4,12 +4,13 @@
 //! The owner's grid edit (docs/DESIGN-alab-lab-model-2026-11-01.md §8): one collection written
 //! as a TSV to a private scratch folder, opened in amacs's spreadsheet mode and waited on, then
 //! read back and written cell by cell. A file the save cannot take (a bad value, a changed
-//! read-only cell) reopens unchanged with the caret on the first bad row and nothing written; a
-//! cell that changed meanwhile reopens as `⚠ mine ‖ theirs`, the rest written. Closing a
-//! reopened file unchanged ends the session. The scratch folder goes when the session ends,
-//! however it ends. [`show`] opens the same grid read-only and writes nothing back.
+//! read-only cell, a save the table's rules refuse) reopens unchanged with the caret on the
+//! first bad row and nothing written; a cell that changed meanwhile reopens as `⚠ mine ‖
+//! theirs`, the rest written. Closing a reopened file unchanged ends the session. The scratch
+//! folder goes when the session ends, however it ends. [`show`] opens the same grid read-only
+//! and writes nothing back.
 
-use super::{Applied, Handle};
+use super::{Applied, Handle, Refused};
 use crate::{
     Error, Result,
     alab::secret::{Journal, Surface},
@@ -17,7 +18,7 @@ use crate::{
         Collection, Ty,
         cell::{Cells, Field},
         check,
-        grid::{self, Base, Opened, Problem, Where},
+        grid::{self, Base, Opened, Plan, Problem, Where},
     },
 };
 use std::path::Path;
@@ -287,6 +288,27 @@ pub fn place(base: &Base, problem: &Problem) -> String {
     }
 }
 
+/// The problem a save the table's rules refused is ([`Applied::refused`]): at the record and
+/// grid column of the refused row's edit of that column, else of its first edit, else the
+/// header's.
+pub(crate) fn refused_problem(plan: &Plan, refused: &Refused) -> Problem {
+    let edits = plan
+        .rows
+        .iter()
+        .find(|(pk, _)| *pk == refused.pk)
+        .map_or(&[][..], |(_, edits)| edits.as_slice());
+    let edit = edits
+        .iter()
+        .find(|edit| edit.column == refused.column)
+        .or_else(|| edits.first());
+    Problem {
+        record: edit.map_or(0, |edit| edit.record),
+        column: edit.map_or(0, |edit| edit.at),
+        line: edit.map_or(1, |edit| edit.line),
+        rule: refused.problem_rule(),
+    }
+}
+
 fn read_back(path: &Path) -> Result<String> {
     super::read_regular_utf8(
         path,
@@ -380,6 +402,18 @@ pub fn edit(
             Ok(plan) => {
                 edited.problems.clear();
                 let applied = handle.apply(collection, &plan)?;
+                if let Some(refused) = &applied.refused {
+                    let problem = refused_problem(&plan, refused);
+                    report(&format!(
+                        "{}: {}",
+                        place(&exported.base, &problem),
+                        problem.rule
+                    ));
+                    line = problem.line;
+                    edited.problems = vec![problem];
+                    presented = saved;
+                    continue;
+                }
                 let stale = applied.stale.clone();
                 edited.applied.push(applied);
                 if stale.is_empty() {

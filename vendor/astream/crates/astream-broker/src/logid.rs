@@ -314,7 +314,9 @@ pub(crate) struct Sidecar {
     format: u8,
     /// How the writing run stood with the log ([`State`]).
     pub(crate) state: State,
-    /// The tier that run served ([`SERVED_STRICT`] and its siblings).
+    /// The tier that run served ([`SERVED_STRICT`] and its siblings), or Strict for an
+    /// Ordered run whose embedder acked only what a full flush covered
+    /// ([`Acks::FullFlush`](crate::Acks)): the tier its acks stood at.
     pub(crate) served: u8,
     /// That run's boot ([`astream_sys::boot_session`]); all zero when unknown.
     pub(crate) boot: [u8; 16],

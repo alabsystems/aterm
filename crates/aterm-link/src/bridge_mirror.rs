@@ -55,9 +55,10 @@ impl Outcome {
 
 /// How long the first pass of an open after an attach is held at most while the open has yet to
 /// make the pin's fence ([`Bridge::mirror_yields`], critic item D06). What an attach or a
-/// handoff owes a delivery is on its way by then: a post the loop's first drain published comes
-/// back on the inbox face once the broker has taken it, an ordering barrier later (a pong's
-/// acked -> visible read 0.04 / 0.12 ms at p50 / p99 in ping-pong, `2026-11-04-fabric-504`).
+/// handoff owes a delivery is on its way by then: a post the loop's first drain published to a
+/// session this node hosts comes back on the inbox face once the broker has taken it, an
+/// ordering barrier later (a pong's acked -> visible read 0.04 / 0.12 ms at p50 / p99 in ping-pong,
+/// `2026-11-04-fabric-504`).
 /// The mirror has no deadline, so this is at most how much later it starts.
 pub(super) const FIRST_PASS_HOLD: Duration = Duration::from_millis(5);
 
@@ -72,8 +73,8 @@ enum FirstPass {
     /// Nothing holds a pass back.
     Free,
     /// An attach came up ([`Bridge::mirror_attached`]) and its first pass has yet to come due;
-    /// `drained`: how many posts the loop's drains listed since ([`Bridge::mirror_drained_posts`]),
-    /// each a record that comes back on the inbox face when its session is here.
+    /// `drained`: how many posts the loop's drains published since to a session this node hosts
+    /// ([`Bridge::mirror_drained_post`]), each a record that comes back on the inbox face.
     Attached { drained: u64 },
     /// The pass is held until `until`, while `awaits` records are still to come back (each
     /// inbox record the loop takes counts one off, [`Bridge::mirror_took_inbox`]) or an item is
@@ -983,17 +984,21 @@ impl Bridge {
     /// WHETHER THE LOOP HOLDS THE MIRROR'S PASS BACK FOR A ROUND (critic item D06): the first
     /// pass due after an attach, in an open that has yet to make the pin's fence
     /// ([`StateDir::logpin_fence_held`]), is held while the loop owes a delivery the attach
-    /// brought: an item queued, or the record of a post its drains listed still on its way
-    /// back ([`FirstPass::Attached`]; each inbox record taken counts one off). The hold lasts
-    /// at most the mirror's `hold` ([`FIRST_PASS_HOLD`]) from when the pass came due, and ends
-    /// at the first round that finds the loop owing neither ([`FirstPass::Held`]). Each round
-    /// under it parks until an item comes or the hold is out ([`Bridge::mirror_due`]) and takes
-    /// what comes, so the deliveries an attach or a handoff owes go ahead of the fence's two
-    /// full flushes and the pass, and a steady stream of items cannot starve the pass past the
-    /// hold. A post whose record never comes back here (one to another node's session) holds
-    /// the pass the whole hold. What the fence orders is unchanged: the pass that follows makes
-    /// it durable before any take or send ([`Bridge::mirror_key_on_the_media`]), and sends the
-    /// inbox commit its deliveries owe ahead of it ([`Bridge::commit_ahead_of_the_fence`]).
+    /// brought: an item queued, or the record of a post its drains published to a session this
+    /// node hosts still on its way back ([`FirstPass::Attached`]; each inbox record taken
+    /// counts one off). The hold lasts at most the mirror's `hold` ([`FIRST_PASS_HOLD`]) from
+    /// when the pass came due, and ends at the first round that finds the loop owing neither
+    /// ([`FirstPass::Held`]). Each round under it parks until an item comes or the hold is out
+    /// ([`Bridge::mirror_due`]) and takes what comes, so the deliveries an attach or a handoff
+    /// owes go ahead of the fence and the pass, and a steady stream of items cannot starve the
+    /// pass past the hold. The fence is the pin's two full flushes of the bridge's own, or,
+    /// where the broker settles the pin ([`Bridge::broker_settles_the_pin`]), its barriers on
+    /// the loop and the settle the take then waits for ([`Bridge::make_the_pin_fence`], critic
+    /// item F07). A post whose record never comes back here (one to another node's session, or
+    /// to a topic) is not awaited (critic item G04). What the fence orders is unchanged: the
+    /// pass that follows makes it durable before any take or send
+    /// ([`Bridge::mirror_key_on_the_media`]), and sends the inbox commit its deliveries owe
+    /// ahead of it ([`Bridge::commit_ahead_of_the_fence`]).
     pub(super) fn mirror_yields(&mut self) -> bool {
         #[cfg(test)]
         if self
@@ -1030,10 +1035,15 @@ impl Bridge {
         next != FirstPass::Free
     }
 
-    /// A drain listed `posts` to publish: an attach's first pass not yet due waits for their
-    /// records to come back, or for its hold to run out, as it does for a post to another
-    /// node's session ([`Bridge::mirror_yields`]).
-    pub(super) fn mirror_drained_posts(&mut self, posts: u64) {
+    /// A drain publishes a post onto `subject`: an attach's first pass not yet due waits for its
+    /// record to come back, or for its hold to run out ([`Bridge::mirror_yields`]), when that
+    /// record comes back here, on this node's inbox face (a lane of a session this node hosts,
+    /// [`subject::inbox_filter`]). A post to another node's session, or to a topic, lands
+    /// where this node's inbox face never reads it, so it is not awaited (critic item G04):
+    /// counted, it held the pass the whole hold. NEGATIVE CONTROLS:
+    /// `Mutant::FirstPassForgetsTheDrainedPosts` counts none, and
+    /// `Mutant::FirstPassCountsAnotherNodesPost` counts every post, as D06 did.
+    pub(super) fn mirror_drained_post(&mut self, subject: &str) {
         #[cfg(test)]
         if self
             .fx
@@ -1041,9 +1051,24 @@ impl Bridge {
         {
             return;
         }
+        #[cfg(test)]
+        let every = self
+            .fx
+            .mutant(crate::sim::world::Mutant::FirstPassCountsAnotherNodesPost);
+        #[cfg(not(test))]
+        let every = false;
+        let here = subject
+            .strip_prefix("/f/")
+            .and_then(|s| s.strip_prefix(self.cfg.fleet.as_str()))
+            .and_then(|s| s.strip_prefix("/in/"))
+            .and_then(|s| s.strip_prefix(self.node.as_str()))
+            .is_some_and(|s| s.starts_with('/'));
+        if !(here || every) {
+            return;
+        }
         if let Some(m) = self.mirror.as_deref_mut() {
             if let FirstPass::Attached { drained } = &mut m.first_pass {
-                *drained = drained.saturating_add(posts);
+                *drained = drained.saturating_add(1);
             }
         }
     }
@@ -1674,8 +1699,13 @@ impl Bridge {
 
     /// Send every owed slot pipelined at its pinned sequence, the session's `ev` face opened only through the subject budget's mirror reserve.
     ///
-    /// Every owed slot's face is judged first, each new face counted against the budget together with the faces the pass already allowed, which the broker's count does not hold until they land; the slots it allows go out in bursts, one write each ([`crate::pipeline::Link::send_burst`]), each as many as the room left under [`PIPELINE_WINDOW`] holds, and each waiting for [`BURST_ROOM`] first. The first burst carries the inbox commit a round holds, or, with no inbox record queued, the one the round's settle would hold for the loop's next write ([`Bridge::take_commit_for_the_mirror`]: only one still due, clamped), ahead of its slots, so a snapshot a delivery owed shares the commit's write rather than going in a write of its own ahead of it (critic item C13). The commit is taken just before the write, after every ack the window waited on was read, so it crosses no item the loop takes. A burst the link does not take is judged, the commit concluded failed, and every slot in it left owed and counted sent ([`MirrorRun::sent`]): a write cut short lands each frame the broker received whole ahead of the cut, so a resend's dedup is read back, never taken for another writer's.
+    /// Every owed slot's face is judged first, each new face counted against the budget together with the faces the pass already allowed, which the broker's count does not hold until they land, the budget read at most once for the pass and again only for a face the count since says it is short for (one budget scope, [`Bridge::budget_scoped`], critic item G04); the slots it allows go out in bursts, one write each ([`crate::pipeline::Link::send_burst`]), each as many as the room left under [`PIPELINE_WINDOW`] holds, and each waiting for [`BURST_ROOM`] first. The first burst carries the inbox commit a round holds, or, with no inbox record queued, the one the round's settle would hold for the loop's next write ([`Bridge::take_commit_for_the_mirror`]: only one still due, clamped), ahead of its slots, so a snapshot a delivery owed shares the commit's write rather than going in a write of its own ahead of it (critic item C13). The commit is taken just before the write, after every ack the window waited on was read, so it crosses no item the loop takes. A burst the link does not take is judged, the commit concluded failed, and every slot in it left owed and counted sent ([`MirrorRun::sent`]): a write cut short lands each frame the broker received whole ahead of the cut, so a resend's dedup is read back, never taken for another writer's.
     pub(super) fn mirror_send(&mut self) {
+        self.budget_scoped(Self::mirror_send_scoped);
+    }
+
+    /// [`Bridge::mirror_send`] inside its budget scope.
+    fn mirror_send_scoped(&mut self) {
         let k = self.mirror.as_deref().map_or(0, |m| m.pin.slots.len());
         if k > 0 && !(self.mirror_key_on_the_media() && self.mirror_floor_covers()) {
             return;
@@ -1771,6 +1801,9 @@ impl Bridge {
             let (burst, later) = rest.split_at(rest.len().min(room - usize::from(held.is_some())));
             rest = later;
             let (retry, producer_id, inc) = (self.commit_refused, self.producer_id, self.inc);
+            for (_, face) in burst {
+                self.count_opening(face);
+            }
             let started = self.fx.now();
             let (Some(m), Some(link)) = (self.mirror.as_deref(), self.conn.as_mut()) else {
                 return;

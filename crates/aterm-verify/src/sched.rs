@@ -384,12 +384,6 @@ mod tests {
             spec(StageId::Forge, "forge", Lane::Pure, false),
             spec(StageId::ForeignCells, "cells", Lane::CellsTarget, false),
             spec(
-                StageId::CheckersCompile,
-                "checkers",
-                Lane::CheckersTarget,
-                false,
-            ),
-            spec(
                 StageId::MeasurePrebuild,
                 "prebuild",
                 Lane::MainTarget,
@@ -633,7 +627,6 @@ mod tests {
                 ("compile", "forge"),
                 ("forge", "l0"),
                 ("compile", "fmt"),
-                ("compile", "checkers"),
                 ("compile", "cells"),
             ],
         );
@@ -663,12 +656,10 @@ mod tests {
             "`Pure` is the ABSENCE of a contended resource: pure stages must \
              overlap each other too, not queue behind one another"
         );
-        for side in ["cells", "checkers"] {
-            assert!(
-                overlaps(at(idx("compile")), at(idx(side))),
-                "{side} has its own target dir and must overlap the test compile"
-            );
-        }
+        assert!(
+            overlaps(at(idx("compile")), at(idx("cells"))),
+            "cells has its own target dir and must overlap the test compile"
+        );
     }
 
     #[test]
@@ -1089,12 +1080,7 @@ mod tests {
             claiming(StageId::Export, "export", Lane::TrustTarget, 0),
             claiming(StageId::LibcOracle, "libc", Lane::LibcOracleTarget, 0),
             claiming(StageId::ForeignCells, "cells", Lane::CellsTarget, 0),
-            claiming(
-                StageId::CheckersCompile,
-                "checkers",
-                Lane::CheckersTarget,
-                0,
-            ),
+            claiming(StageId::SpecCheckers, "checkers", Lane::AfterCompile, 0),
             spec(StageId::Formatting, "fmt", Lane::Pure, false),
         ]
     }

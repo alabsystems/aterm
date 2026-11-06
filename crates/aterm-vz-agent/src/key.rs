@@ -88,7 +88,7 @@ pub fn find(sys_block: &Path, dev: &Path) -> Result<Key, String> {
         .filter_map(|e| e.file_name().into_string().ok())
         .filter(|name| name.starts_with("vd"))
         .collect();
-    names.sort();
+    names.sort_unstable();
     let mut read = Vec::new();
     for name in &names {
         let device = dev.join(name);

@@ -3,7 +3,8 @@
 
 use super::*;
 use crate::client::log_entries_tests::{
-    TwoMacs, copy_private_tree, hand, join_host, member_key, two_macs, two_macs_with,
+    LabTemplate, TwoMacs, copy_private_tree, hand, join_host, member_key, off_this_thread,
+    two_macs, two_macs_with,
 };
 use crate::commons::bootstrap::Bootstrap;
 use crate::membership_log::encode_records;
@@ -20,6 +21,10 @@ mod capacity;
 /// One-mesh W3's tests of `log_entries/waiting.rs`, beside it, declared here for this lab.
 #[path = "log_entries/waiting_tests.rs"]
 mod waiting;
+
+/// P3's binding (3) for waiting writes, beside them, declared here for this lab.
+#[path = "log_entries/waiting_conformance_tests.rs"]
+mod waiting_conformance;
 
 /// Every clock in the log-derived envelope survives persistence, including maximum
 /// timestamps: every held record an epoch (a due, a seen and a wait clock each), and half of
@@ -2566,6 +2571,139 @@ fn the_vault_pass_after_the_heal_reseals_an_epoch_kept_readable() {
     split.macs.server.stop();
 }
 
+/// The churn lab's heal shape (one-mesh §11 H1), on two sides: m22 (the admin) removes m40, whose
+/// rotation `R` is the one newest `[everyone]` epoch and wraps no removed Mac, while m7, not yet
+/// told, puts `shared` = v2 under the epoch before it, `E0`, which wraps m40. After the heal no
+/// newest epoch wraps a removed Mac (no rotation is due, so no write waits for a key), but `E0`
+/// wins `shared` and still wraps m40: a departure the log made, whose reseal is due. Returns the
+/// two Macs, m22's text before the split and m40's recipient.
+fn departure_heal() -> (TwoMacs, Document, Recipient) {
+    let macs = two_macs(&[
+        (Audience::Everyone, "shared", b"v1".as_slice()),
+        (Audience::Everyone, "other", b"o1".as_slice()),
+    ]);
+    let (m22, m7) = (&macs.m22, &macs.m7);
+    let (_m40, _, rec40) = let_in(&macs, "m40", "m40");
+    sync_records(m22, None).expect("m22 pulls the admission");
+    let doc = admin_open(m22).expect("m22 opens the vault").doc.clone();
+    remove_member(m22, &join_code(&rec40), false).expect("m22 removes m40");
+    test_put_everyone(m7, "shared", b"v2").expect("m7, not yet told, puts shared = v2");
+    let wires = [
+        load_records(m22).unwrap().encode(),
+        load_records(m7).unwrap().encode(),
+    ];
+    for paths in [m22, m7] {
+        for wire in &wires {
+            save_records(paths, wire).expect("the heal keeps every record");
+        }
+    }
+    let log = log_of(m22);
+    let newest = log.newest_epochs(&EpochAudience::Everyone);
+    let to_m40 = epochs_wrapped_to(&log, &rec40);
+    assert!(
+        !newest.is_empty() && newest.iter().all(|epoch| !to_m40.contains(epoch)),
+        "CONTROL: no newest epoch wraps m40"
+    );
+    (macs, doc, rec40)
+}
+
+/// What m22's publish of `doc`, overlaid with its log so it changes no entry, signs into
+/// `[everyone]`: the kinds of the `Epoch`s and `Put`s it drafts there.
+fn unchanged_publish(m22: &Paths, doc: &Document) -> Vec<Kind> {
+    let identity = read_identity(m22).unwrap().unwrap();
+    let mut doc = doc.clone();
+    log_entries::overlay_log_onto_document(&log_of(m22), &identity, &mut doc, None).unwrap();
+    let cfg = config(m22).unwrap().expect("m22's config");
+    let drafted = log_entries::draft_document_diff(
+        m22,
+        &cfg,
+        &cfg.signer.expect("m22 pins the vault's signer"),
+        &[],
+        &identity,
+        &doc,
+        log_entries::Base::default(),
+    )
+    .unwrap()
+    .expect("m22 writes the log");
+    drafted
+        .records
+        .into_iter()
+        .filter(|r| match r.body() {
+            Body::Epoch { audience, .. } | Body::Put { audience, .. } => {
+                *audience == EpochAudience::Everyone
+            }
+            _ => false,
+        })
+        .map(|r| r.kind())
+        .collect()
+}
+
+/// H1 (one-mesh §11; the churn lab's bimodal heal): a departure the log made is the ranked
+/// tender's to reseal. In [`departure_heal`]'s shape the admin m22's publish of a text that
+/// changes no entry (what an envelope mirror of the heads a heal left diverged publishes) mints
+/// nothing in `[everyone]`; the tender's reseal, on the vault pass's injected clock, then wraps
+/// no removed Mac, and nothing is left due. In the churn lab that mirror's fresh epoch landed
+/// over island A's prefix within the settle grace, unranked, before the gap rule ran.
+///
+/// NEGATIVE CONTROL: `log_entries::DEPARTURE_MINTS` (an unchanged edit mints for the log's
+/// departure, as before) makes m22's publish mint a fresh `[everyone]` epoch and re-put entries.
+#[test]
+fn an_unchanged_publish_mints_nothing_for_a_departure_the_log_made() {
+    let (macs, doc, _) = departure_heal();
+    let (m22, m7) = (&macs.m22, &macs.m7);
+    assert_eq!(
+        unchanged_publish(m22, &doc),
+        Vec::new(),
+        "an unchanged publish signs nothing into [everyone]"
+    );
+    // Nothing else is due: m40 already held `E0` and the `Put` m7 sealed under it before it
+    // heard of the removal, so a fresh epoch takes nothing from it. Each Mac's vault passes, a
+    // step apart on an injected clock past every rank and the settle grace, sign nothing, and
+    // both read the newest epoch and v2.
+    let t0 = aterm_time::unix_millis().unwrap_or(0);
+    let steps = 2 + log_entries::SETTLE_GRACE_MS / log_entries::GAP_STEP_MS;
+    for k in 0..steps {
+        for (who, paths) in [("m22", m22), ("m7", m7)] {
+            assert_eq!(
+                vault_pass_at(paths, t0 + k * log_entries::GAP_STEP_MS)
+                    .unwrap()
+                    .len(),
+                0,
+                "{who} signs nothing at step {k}"
+            );
+        }
+    }
+    for (who, paths) in [("m22", m22), ("m7", m7)] {
+        let log = log_of(paths);
+        let opened = log
+            .open_audience_entries(&read_identity(paths).unwrap().unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(
+            log.newest_epochs(&EpochAudience::Everyone)
+                .iter()
+                .all(|epoch| opened.unwrapped_keys.contains_key(epoch)),
+            "{who} opens the newest epoch"
+        );
+        assert_eq!(
+            KeyedSplit::read(paths, "shared"),
+            Some(b"v2".to_vec()),
+            "{who} reads v2"
+        );
+    }
+    macs.server.stop();
+
+    let (macs, doc, _) = departure_heal();
+    log_entries::DEPARTURE_MINTS.with(|cell| cell.set(true));
+    let minted = unchanged_publish(&macs.m22, &doc);
+    log_entries::DEPARTURE_MINTS.with(|cell| cell.set(false));
+    assert!(
+        minted.contains(&Kind::Epoch) && minted.contains(&Kind::Put),
+        "CONTROL: an unchanged publish mints a fresh epoch for the log's departure: {minted:?}"
+    );
+    macs.server.stop();
+}
+
 /// F21 rules 5 and 8 on the vault pass's tender after the heal: m7, which holds E and every
 /// newest epoch, reseals at first sight (rank 0, as the signer of E's dependent), which covers E,
 /// and records what m40 could read while out.
@@ -4329,4 +4467,53 @@ fn the_planned_cost_of_an_audience_not_opened_whole_counts_no_superseded_write()
         "the bound is never below what the reseal signs: {signed} > {bound}"
     );
     split.macs.server.stop();
+}
+
+/// What the recording table-cuts hook saw: each call's vault, target and pass, and whether the
+/// target was still a member then.
+static TABLE_CUT_CALLS: std::sync::Mutex<Vec<(std::path::PathBuf, MemberId, CutPass, bool)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn record_table_cuts(paths: &Paths, member: &MemberId, pass: CutPass) -> usize {
+    // Installed for the whole test binary, so it never fails another test's removal.
+    let seated = load_records(paths)
+        .ok()
+        .and_then(|store| store.log().map(|log| log.membership().contains(member)))
+        .unwrap_or(false);
+    TABLE_CUT_CALLS
+        .lock()
+        .unwrap()
+        .push((paths.dir.clone(), *member, pass, seated));
+    0
+}
+
+/// `aterm secrets revoke` signs its table cutoffs too (one-mesh §4.10, B11): the vault
+/// revocation runs the installed table-cuts hook on the revoked seat, before its `Remove`, as the
+/// first remover. CONTROL: no call names m40 before the revoke.
+#[test]
+fn a_vault_revocation_cuts_the_revoked_seats_tables_before_its_remove() {
+    on_table_cuts(record_table_cuts);
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
+    let m22 = &macs.m22;
+    let (_m40, actor40, _) = let_in(&macs, "m40", "m40");
+    sync(m22, None).expect("m22 syncs m40's admission");
+    let calls = || -> Vec<(CutPass, bool)> {
+        TABLE_CUT_CALLS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(dir, member, ..)| *dir == m22.dir && *member == actor40)
+            .map(|(_, _, pass, seated)| (*pass, *seated))
+            .collect()
+    };
+    assert!(calls().is_empty(), "CONTROL: nothing cut m40 yet");
+    let admin = admin_open(m22).expect("admin");
+    admin_revoke(m22, &admin, "m40", false).expect("m22 revokes m40");
+    assert!(log_of(m22).membership().removal(&actor40).is_some());
+    assert_eq!(
+        calls(),
+        vec![(CutPass::BeforeRemove, true)],
+        "one first remover's cut, while m40 was still seated"
+    );
+    macs.server.stop();
 }

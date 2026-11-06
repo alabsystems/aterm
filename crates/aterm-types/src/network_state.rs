@@ -47,8 +47,8 @@ pub enum Visibility {
     /// The person disabled discovery.
     Disabled,
     /// Another local process owns transport, or this observer waits before it may use the local
-    /// network (System State's Local Network step, or another macOS question of aterm's); the
-    /// owner's liveness has not been read.
+    /// network (a macOS question of aterm's still to settle); the owner's liveness has not been
+    /// read.
     Waiting,
     /// Required control or local observation access is unavailable.
     Unavailable,

@@ -202,7 +202,10 @@ fn lockup_key(
             fg: [220, 220, 220],
             ..RenderCell::default()
         },
-        mark_fg: [0xd7, 0x77, 0x57],
+        field: PaneField {
+            col_off: 0,
+            cols: 240,
+        },
         face: KeyFace::default(),
         cell: (7, 14),
         clip: aterm_core::render::PxRect::EVERYWHERE,
@@ -815,11 +818,11 @@ fn agys_lit_switch_is_one_switch_and_its_press_turns_it_off() {
     );
 }
 
-/// AGY'S LABEL WEARS THE WHITE UNDER AUTOPILOT OFF: on the white line (`CardPalette::Off`) the
-/// label's `alab` is drawn bold in the moonbow's white like the rule it closes, and the switch's
-/// words keep the pane's inks. CONTROL: under Cruise `alab` keeps the arc's end.
+/// AGY'S LABEL WEARS THE MOONBOW UNDER AUTOPILOT OFF: on the moonbow's line (`CardPalette::Off`)
+/// the label's `alab` is drawn bold in the moonbow's hero (the Off card's settled hero letters),
+/// and the switch's words keep the pane's inks. CONTROL: under Cruise `alab` is another ink.
 #[test]
-fn agys_label_wears_the_white_under_autopilot_off() {
+fn agys_label_wears_the_moonbow_under_autopilot_off() {
     let rows = fixture_rows(include_str!(
         "../../aterm-phase/src/fixtures/agy-1.4.0-idle.txt"
     ));
@@ -852,11 +855,13 @@ fn agys_label_wears_the_white_under_autopilot_off() {
     settle(&mut app);
     let (white, switch) = read(&app);
     assert_eq!(white.iter().map(|c| c.ch).collect::<String>(), "alab");
-    for c in &white {
-        let spread = c.fg.iter().max().unwrap() - c.fg.iter().min().unwrap();
+    let ground = app.windows[&wid].input_scratch.implicit_blank.bg;
+    let ground = u32::from_be_bytes([0, ground[0], ground[1], ground[2]]);
+    for (k, c) in white.iter().enumerate() {
+        let hero = aterm_effects::harness_card::CardPalette::Off.hero_on(k as f32 / 3.0, ground);
         assert!(
-            c.bold && spread <= 24,
-            "{:?} is white and bold: {:?}",
+            c.bold && c.fg == hero.to_be_bytes()[1..],
+            "{:?} is bold in the moonbow's hero {hero:06x}: {:?}",
             c.ch,
             c.fg
         );
@@ -867,7 +872,7 @@ fn agys_label_wears_the_white_under_autopilot_off() {
     );
     assert_ne!(
         cruise[0].fg, white[0].fg,
-        "CONTROL: under Cruise `alab` keeps the arc's end"
+        "CONTROL: under Cruise `alab` is Cruise's hero"
     );
 }
 

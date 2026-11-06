@@ -1634,12 +1634,6 @@ pub(crate) const PHRASE_NOT_REACHED: &str = "No Mac in ALab answered on this net
     the phrase is still good. Make sure the Mac that showed it is awake and on this network, \
     then press Join again.";
 
-/// [`PHRASE_NOT_REACHED`] while this Mac reads macOS's Local Network switch for aterm off: macOS
-/// let the join reach no Mac, so the line names that switch and where it is, not the other Mac.
-pub(crate) const PHRASE_LOCAL_NETWORK_OFF: &str = "macOS's Local Network switch for aterm is \
-    off, so the phrase reached no Mac and is still good. Turn aterm on in System Settings > \
-    Privacy & Security > Local Network, then press Join again.";
-
 /// The line under the phrase field once a try stopped before it said what the phrase came to
 /// (its worker ended): the words stay in the field, and Join tries again.
 pub(crate) const PHRASE_STOPPED: &str = "The try with this phrase stopped before it finished. \
@@ -2052,14 +2046,6 @@ fn row_view_as(
             };
             (RowValue::One("—".to_owned()), None, label)
         }
-        // macOS tells aterm nothing of it, and nothing in this launch can read it (Local
-        // Network): `—`, its probe's one calm note, and no check claimed, so it never holds the
-        // headline at a check nothing is making (§3.2).
-        Some(Standing::Untold) => (
-            RowValue::One("—".to_owned()),
-            None,
-            format!("{name}: unknown"),
-        ),
         // A row read as wanted shows the value read, never the wanted one in
         // its place: with nothing read it is `—` beside the check.
         Some(Standing::InPlace) => match now {
@@ -2415,15 +2401,9 @@ fn rows_as_they_stand(status: &SetupStatus) -> Vec<RowView> {
             let now = reading
                 .and_then(|observation| observation.now.clone())
                 .filter(|now| !now.trim().is_empty());
-            // A reading macOS answers nothing for (Local Network) is unknown, as on the managed
-            // page: no read is still to come.
-            let label = match (
-                now.as_deref(),
-                reading.map(|observation| observation.standing),
-            ) {
-                (Some(now), _) => format!("{}: {}", subject.name(), now.replace(" · ", " ")),
-                (None, Some(Standing::Untold)) => format!("{}: unknown", subject.name()),
-                (None, _) => format!("{}: not read", subject.name()),
+            let label = match now.as_deref() {
+                Some(now) => format!("{}: {}", subject.name(), now.replace(" · ", " ")),
+                None => format!("{}: not read", subject.name()),
             };
             RowView {
                 subject,
@@ -2811,8 +2791,6 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
     }
     // A source change can leave just its managed rows unread. Known changes
     // and waits above stay useful, but unread rows cannot establish success.
-    // A row macOS tells nothing of (`Untold`) was read: nothing in this launch
-    // reads more of it, so it never holds the page at a check.
     if rows
         .iter()
         .any(|row| row.managed && matches!(row.standing, None | Some(Standing::Unknown)))
@@ -3502,28 +3480,14 @@ impl SystemStateApp {
 
     /// The line under the phrase field: what to type, that the last phrase let nobody in, that
     /// it reached no Mac in ALab and is still good, or that no phrase lets a dropped Mac in.
-    /// A try that reached no member while this page reads macOS's Local Network switch for aterm
-    /// off names that switch, not the other Mac: macOS let the join reach nobody.
     pub(crate) fn phrase_help(&self) -> &'static str {
         match self.phrase_came_to {
             Some(PhraseOutcome::Refused) => PHRASE_REFUSED,
-            Some(PhraseOutcome::NotReached) if self.local_network_reads_off() => {
-                PHRASE_LOCAL_NETWORK_OFF
-            }
             Some(PhraseOutcome::NotReached) => PHRASE_NOT_REACHED,
             Some(PhraseOutcome::Stopped) => PHRASE_STOPPED,
             Some(PhraseOutcome::Dropped) => PHRASE_DROPPED,
             Some(PhraseOutcome::Joined) | None => PHRASE_HELP,
         }
-    }
-
-    /// Whether this page reads macOS's Local Network switch for aterm off: a look macOS refused
-    /// (`access::observation`'s `Off`).
-    fn local_network_reads_off(&self) -> bool {
-        self.status.observed.iter().any(|row| {
-            row.subject == Subject::Access(Access::LocalNetwork)
-                && row.now.as_deref() == Some("Off")
-        })
     }
 
     /// What the phrase try `sent` came to: once the join answered, a phrase that let this Mac in
@@ -4703,7 +4667,7 @@ pub(crate) const GITHUB_TOKEN_REFUSED: &str = aterm_types::macos_setup::GITHUB_T
 /// test that sweeps the scenarios sweeps it. `older-cancel` is a Cancel an older aterm recorded.
 /// Debug and dev-seam builds only.
 #[cfg(any(debug_assertions, feature = "dev-seams"))]
-pub(crate) const FIXTURES: [&str; 67] = [
+pub(crate) const FIXTURES: [&str; 66] = [
     "checking",
     "account-provisioning",
     "plan-unread",
@@ -4765,7 +4729,6 @@ pub(crate) const FIXTURES: [&str; 67] = [
     "clt-not-admin",
     "vault-asking-long",
     "walk",
-    "local-network",
     "vault-approve",
     "mixed@mac",
     "set-up@secrets",
@@ -4793,9 +4756,7 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
     }
     // `<scenario>@<line>` is that scenario with the line open ([`fixture_line`]).
     let name = name.split_once('@').map_or(name, |(scenario, _)| scenario);
-    use Standing::{
-        AtLogin, Differs, Failed, InPlace, NeedsYou, NotNeeded, Unknown, Untold, Waiting,
-    };
+    use Standing::{AtLogin, Differs, Failed, InPlace, NeedsYou, NotNeeded, Unknown, Waiting};
     use aterm_types::macos_setup::until_login;
     let read = |subject: Subject, standing: Standing, now: Option<&str>| Observation {
         subject,
@@ -4844,12 +4805,6 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             }
         }
         all
-    };
-    // Local Network as `access::observation` reads it where no LAN look has answered aterm
-    // (no ALab vault on this network, or none asked in this launch): macOS tells apps nothing.
-    let untold_lan = || Observation {
-        note: Some(aterm_types::macos_setup::LOCAL_NETWORK_UNTOLD.to_owned()),
-        ..access(Access::LocalNetwork, Untold, None)
     };
     // The repositories as the worker reads them before the vault has synced
     // this Mac, and so its GitHub token: no count, and what they wait on in
@@ -4934,9 +4889,6 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             status.observed = with(
                 in_place(),
                 vec![
-                    // Local Network as `access::observation` reads it where no LAN look has
-                    // answered aterm: macOS tells apps nothing of it.
-                    untold_lan(),
                     setting(Setting::Dock, Differs, Some("9 apps")),
                     setting(Setting::Messages, Differs, Some("Signed in")),
                     setting(Setting::FaceTime, Differs, Some("Signed in")),
@@ -4969,14 +4921,6 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
                     access(Access::Accessibility, NeedsYou, Some("Off")),
                 ],
             );
-        }
-        "local-network" => {
-            // macOS's Local Network question is up, at the walk's moment for it: the person
-            // answers it in macOS's dialog.
-            status.busy = true;
-            status.running = vec![Setting::Permissions];
-            status.access_step = Some(Access::LocalNetwork);
-            status.observed = with(in_place(), vec![untold_lan()]);
         }
         "needs-you" => {
             // Each reason where its probe puts it: a grant's in the description, Developer
@@ -5011,11 +4955,7 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
                 Some("On an admin Mac: aterm secrets approve 7QK2-M9WD-4HTX-PL3B".to_owned());
             status.observed = with(
                 in_place(),
-                vec![
-                    access(Access::Accessibility, NotNeeded, None),
-                    untold_lan(),
-                    vault,
-                ],
+                vec![access(Access::Accessibility, NotNeeded, None), vault],
             );
         }
         "vault" => {
@@ -5056,7 +4996,7 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             status.retrying = true;
             let mut vault = setting(Setting::Secrets, Waiting, Some("Not joined"));
             vault.note = Some("The ALab vault did not answer on this network".to_owned());
-            status.observed = with(in_place(), vec![untold_lan(), vault, token_waiting()]);
+            status.observed = with(in_place(), vec![vault, token_waiting()]);
         }
         "vault-not-syncing" => {
             let mut vault = setting(Setting::Secrets, Differs, Some("Not syncing"));
@@ -5093,16 +5033,12 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             }];
         }
         "set-up" => {
-            // Trackpad scrolling, set in this login session, is in full use from the next.
-            // Local Network reads as `access::observation` reads it where no LAN look has
-            // answered aterm: macOS tells apps nothing of it. The run took 72 seconds.
+            // Trackpad scrolling, set in this login session, is in full use from the next. The
+            // run took 72 seconds.
             status.ready_in = Some(std::time::Duration::from_secs(72));
             status.observed = with(
                 in_place(),
-                vec![
-                    setting(Setting::TrackpadScrolling, AtLogin, Some("All on")),
-                    untold_lan(),
-                ],
+                vec![setting(Setting::TrackpadScrolling, AtLogin, Some("All on"))],
             );
         }
         "account-provisioning" => {
@@ -5132,7 +5068,6 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
                 in_place(),
                 vec![
                     access(Access::Accessibility, NotNeeded, None),
-                    untold_lan(),
                     setting(Setting::CapsLock, Differs, Some("Caps Lock")),
                     setting(Setting::NaturalScrolling, Differs, Some("On")),
                     setting(Setting::Desktop, Differs, Some("Icons hidden")),
@@ -5380,7 +5315,6 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             status.observed = with(
                 in_place(),
                 vec![
-                    untold_lan(),
                     engine(
                         Setting::CapsLock,
                         Differs,
@@ -5501,7 +5435,6 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             status.observed = with(
                 in_place(),
                 vec![
-                    untold_lan(),
                     setting(Setting::Dock, Differs, Some("9 apps")),
                     setting(Setting::Spotlight, Differs, Some("Docs indexed")),
                 ],
@@ -5646,7 +5579,6 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             status.observed = with(
                 in_place(),
                 vec![
-                    untold_lan(),
                     setting(Setting::Dock, Differs, Some("9 apps")),
                     read(Subject::Setting(Setting::Messages), Unknown, None),
                     read(Subject::Setting(Setting::FaceTime), Unknown, None),
@@ -5691,7 +5623,7 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             let mut repositories = setting(Setting::Repositories, NeedsYou, None);
             repositories.note =
                 Some(aterm_types::macos_setup::COMMAND_LINE_TOOLS_MISSING.to_owned());
-            status.observed = with(in_place(), vec![untold_lan(), repositories]);
+            status.observed = with(in_place(), vec![repositories]);
             status.developer_tools = match name {
                 "clt-queued" => Some(ToolsInstall::Queued),
                 "clt-password" => Some(ToolsInstall::Password),

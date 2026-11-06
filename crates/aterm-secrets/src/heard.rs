@@ -17,8 +17,8 @@
 //! A look that heard the vault stands for [`FOUND_FOR`], one that heard another vault's signed
 //! envelope at its address for [`ABSENT_FOR`], each only on the network it was made on. A look
 //! that heard nothing definitive (a timeout, a refused connect, a 404, an answer that is no
-//! vault, macOS's Local Network question still open) is not kept. A network change (a new
-//! gateway) or a Local Network grant ([`forget`]) drops the record. The record never feeds a pin
+//! vault, an unavailable LAN broker) is not kept. A network change (a new gateway) or
+//! [`forget`] drops the record. The record never feeds a pin
 //! or the ALab signal — only an anchor does (`docs/DESIGN-init-on-by-default-2026-10-25.md`
 //! §8.2, §8.3); it is a hint that spares an unconfigured Mac a look during init's pinned fallback,
 //! the window lane and the first-launch Secrets stage.
@@ -156,8 +156,7 @@ pub fn read(paths: &Paths) -> Option<Verdict> {
 }
 
 /// Drop any kept look under `paths`. A network change (a new gateway) already strands a record
-/// by its key; a Local Network grant does not, so the step that records the grant calls this, so
-/// a verdict formed before the grant does not stand after it.
+/// by its key; a caller that knows a verdict formed before now no longer stands calls this.
 pub fn forget(paths: &Paths) {
     let _ = crate::fsx::wipe_and_remove(&paths.dir.join(FILE));
 }
@@ -320,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn a_local_network_grant_forgets_the_kept_look() {
+    fn forget_drops_the_kept_look() {
         let root = aterm_tempfile::tempdir().unwrap();
         let paths = Paths::for_home(root.path());
         let here = "n00112233445566aa";

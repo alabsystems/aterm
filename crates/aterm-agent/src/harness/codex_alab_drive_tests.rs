@@ -414,6 +414,9 @@ struct Crashed {
     looks: Arc<AtomicUsize>,
     marks: crate::harness::FakeInstanceLog,
     owners: Mutex<VecDeque<aterm_uds::ownerlock::Owner>>,
+    /// The kernel start of the process `TUI` names while it is alive: `None` reads as
+    /// unknown; another start than the snapshot's is a reused pid (after a reboot).
+    tui_birth: Option<String>,
 }
 
 const NEW_BIRTH: &str = "Thu Oct 16 08:00:09 2026";
@@ -502,6 +505,9 @@ impl AlabKernel for Crashed {
     }
 
     fn birth(&self, pid: u32) -> Option<String> {
+        if pid == TUI && self.alive(TUI) {
+            return self.tui_birth.clone();
+        }
         if pid != NEW || !self.alive(NEW) {
             return None;
         }
@@ -610,6 +616,7 @@ impl Rig {
             looks: Arc::new(AtomicUsize::new(0)),
             marks: asked.clone(),
             owners: Mutex::new(VecDeque::new()),
+            tui_birth: None,
         };
         Rig {
             _waits: crate::harness::relaunch::virtual_waits(),
@@ -1400,6 +1407,7 @@ impl Crashed {
     fn clone_world(&self) -> Crashed {
         Crashed {
             owners: Mutex::new(VecDeque::new()),
+            tui_birth: None,
             relaunched: Arc::clone(&self.relaunched),
             lock: self.lock.clone(),
             new_argv: self.new_argv.clone(),
@@ -1835,4 +1843,39 @@ fn a_crash_relaunch_on_a_row_of_its_own_is_refused_on_a_build_that_ignores_codex
     );
     assert_eq!(r.step, "done:resumed", "{r:?}");
     assert_eq!(rig.typed().len(), 1, "{:#?}", rig.asked());
+}
+
+/// RS1: A CODEX-ALAB RESTORED AFTER A REBOOT IS NOT HELD BY A REUSED PID. Its TUI's pid now
+/// names a process born at another time, so the relaunch does not wait for that stranger's
+/// exit and types its record's resume line. NEGATIVE CONTROL: the same pid under the TUI's own
+/// start is the TUI still running, waited on (`wait:exiting`), nothing typed.
+#[test]
+fn a_reused_tui_pid_after_a_reboot_does_not_hold_the_relaunch() {
+    for reused in [true, false] {
+        let mut rig = Rig::new(
+            &format!("reused-tui-pid-{reused}"),
+            &["zsh: killed     codex"],
+        );
+        let snap = rig.snap(None);
+        rig.kernel.tui_alive = true;
+        rig.kernel.tui_birth = Some(if reused {
+            "Fri Nov  6 07:00:00 2026".to_string()
+        } else {
+            snap.start.clone()
+        });
+        let r = self_claimed_after_exit(
+            &rig.opts,
+            &snap,
+            &rig.resume(None),
+            ExitCause::HostEnded,
+            &rig.kernel,
+        );
+        if reused {
+            assert_ne!(r.step, "wait:exiting", "{r:?}\n{:#?}", rig.asked());
+            assert_eq!(rig.typed().len(), 1, "{:#?}", rig.asked());
+        } else {
+            assert_eq!(r.step, "wait:exiting", "{r:?}");
+            assert!(rig.typed().is_empty(), "{:#?}", rig.asked());
+        }
+    }
 }

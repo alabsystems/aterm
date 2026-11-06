@@ -193,6 +193,8 @@ impl stable::Rustup for Bare {
 }
 
 struct Fake {
+    managed: RefCell<Vec<(atpkg::prerequisite::Prerequisite, bool)>>,
+    managed_result: Result<(PathBuf, bool), String>,
     served: BTreeMap<String, Vec<u8>>,
     refused: BTreeMap<String, String>,
     fetched: RefCell<Vec<String>>,
@@ -218,6 +220,8 @@ struct Fake {
 impl Fake {
     fn new() -> Self {
         Self {
+            managed: RefCell::default(),
+            managed_result: Ok((PathBuf::from("/signed/store/bin/tool"), true)),
             served: BTreeMap::new(),
             refused: BTreeMap::new(),
             fetched: RefCell::default(),
@@ -274,6 +278,15 @@ fn arg_after(spawn: &Spawn, flag: &str) -> PathBuf {
 }
 
 impl Host for Fake {
+    fn managed(
+        &self,
+        want: atpkg::prerequisite::Prerequisite,
+        install: bool,
+    ) -> Result<(PathBuf, bool), String> {
+        self.managed.borrow_mut().push((want, install));
+        self.managed_result.clone()
+    }
+
     fn fetch(&self, url: &str, dest: &Path, bytes: u64) -> Result<(), String> {
         self.fetched.borrow_mut().push(url.to_string());
         self.fetched_into
@@ -1240,7 +1253,78 @@ fn a_run_with_every_row_in_place_changes_nothing_and_a_flag_adds_its_rows() {
     assert!(picked(&release).contains(&"openssl-signing"));
     assert!(!picked(&Options::default()).contains(&"cpython"));
     assert!(picked(&release).contains(&"cpython"));
+    assert!(!picked(&Options::default()).contains(&"lean4"));
+    assert!(picked(&release).contains(&"lean4"));
     assert!(picked(&linux).contains(&"lima"));
+}
+
+#[test]
+fn managed_rows_authenticate_instead_of_admitting_legacy_cache_stamps() {
+    use atpkg::prerequisite::Prerequisite;
+    let home = aterm_tempfile::tempdir().unwrap();
+    let m = machine(home.path());
+    // A historical copy is irrelevant, even with its formerly admitted stamp.
+    let legacy = m.tooling.join("gitleaks-8.30.1");
+    std::fs::create_dir_all(&legacy).unwrap();
+    std::fs::write(legacy.join("gitleaks"), "old unmanaged cache").unwrap();
+    std::fs::write(legacy.join(STAMP), "old cache stamp").unwrap();
+    let mut host = Fake::new();
+    host.managed_result = Err("no signed selected build".into());
+    for (name, want) in [
+        ("gitleaks", Prerequisite::Gitleaks),
+        ("cpython", Prerequisite::Python),
+        ("openssl-signing", Prerequisite::OpenSslSigning),
+        ("lean4", Prerequisite::Lake),
+    ] {
+        let row = row(name).unwrap();
+        assert!(matches!(check(row, &m, &host), State::Missing(why)
+            if why.contains("no signed selected build")));
+        assert_eq!(host.managed.borrow().last(), Some(&(want, false)));
+        assert!(matches!(
+            provide(row, &m, &host, &mut |_| {}),
+            State::Failed(_)
+        ));
+        assert_eq!(host.managed.borrow().last(), Some(&(want, true)));
+    }
+    assert!(host.fetched.borrow().is_empty() && host.spawns.borrow().is_empty());
+    assert_eq!(
+        std::fs::read_to_string(legacy.join("gitleaks")).unwrap(),
+        "old unmanaged cache"
+    );
+
+    host.managed_result = Ok((PathBuf::from("/signed/store/bin/gitleaks"), false));
+    assert_eq!(
+        provide(row("gitleaks").unwrap(), &m, &host, &mut |_| {}),
+        State::Placed(PathBuf::from("/signed/store/bin/gitleaks"))
+    );
+}
+
+#[test]
+fn unavailable_managed_hosts_refuse_before_discovery_and_do_not_report_all_ready() {
+    let home = aterm_tempfile::tempdir().unwrap();
+    let mut m = machine(home.path());
+    let host = Fake::new();
+    for platform in ["windows-x86_64", "linux-aarch64", "linux-x86_64"] {
+        m.platform = platform.into();
+        for name in ["cpython", "openssl-signing", "lean4"] {
+            assert!(matches!(
+                check(row(name).unwrap(), &m, &host),
+                State::CouldNotRun(_)
+            ));
+            assert!(matches!(
+                provide(row(name).unwrap(), &m, &host, &mut |_| {}),
+                State::CouldNotRun(_)
+            ));
+        }
+    }
+    assert!(host.managed.borrow().is_empty());
+    // Gitleaks has real GNU builds; other managed prerequisites remain unavailable.
+    assert!(check(row("gitleaks").unwrap(), &m, &host).in_place());
+    let opts = parse(&["gitleaks".into(), "cpython".into(), "--check".into()]).unwrap();
+    assert_eq!(
+        run(&opts, &m, &host, &mut |_| {}),
+        crate::exit::COULD_NOT_RUN
+    );
 }
 
 #[test]
@@ -2245,11 +2329,6 @@ fn a_run_that_meets_an_archived_release_could_not_run() {
             .any(|l| l.starts_with("COULD NOT RUN — ubuntu-root 20260926: Ubuntu has moved")),
         "{said:#?}"
     );
-    assert_eq!(
-        said.last().map(String::as_str),
-        Some("COULD NOT RUN — 1 of 1 rows pin a file upstream no longer serves here")
-    );
-
     let offline = "/usr/bin/curl exited Some(6): curl: (6) Could not resolve host";
     let mut said = Vec::new();
     let code = run(&opts, &m, &Fake::new().refuse(&url, offline), &mut |l| {

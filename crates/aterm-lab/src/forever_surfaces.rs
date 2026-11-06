@@ -125,8 +125,8 @@ pub struct Window {
     /// What a screen reader is handed at each of those looks, one per [`Self::held`] entry at its
     /// time: `sid`'s Autopilot chip node and the window's Messages band row nodes ([`ax_of`]).
     pub held_ax: Vec<(i64, String)>,
-    /// `cruise-n`'s stand-in ask beside its N4 report ([`stopped::ask_step`]): what Needs you and
-    /// `presence pressing=` showed of the two ([`stopped::Read::line`]).
+    /// `cruise-n`'s stand-in ask beside its N4 report ([`stopped::ask_step`]): what Needs you
+    /// showed of the two ([`stopped::Read::line`]).
     pub stopped: Option<(i64, String)>,
 }
 
@@ -203,8 +203,6 @@ pub struct Desk {
     /// Observed This Mac menu rows (`This Mac — …`, or `m8 Heron — …` once the title is read;
     /// [`here_counts`]).
     pub here: Vec<(i64, String)>,
-    /// Observed `presence` lines with ages masked.
-    pub presence: Vec<(i64, String)>,
     /// Observed `Sessions: …` page rows.
     pub sessions: Vec<(i64, String)>,
     /// Observed today summary lines under STATUS ([`today_of`]).
@@ -225,11 +223,6 @@ impl Desk {
             .iter()
             .find(|r| r.section == "here")
             .map_or_else(|| "-".to_string(), |r| r.label.clone());
-        let presence = g
-            .chrome
-            .lines()
-            .find(|l| l.starts_with("presence "))
-            .map_or_else(|| "-".to_string(), masked);
         let sessions = g
             .page
             .iter()
@@ -240,7 +233,6 @@ impl Desk {
         let mut said = Vec::new();
         for (what, list, v) in [
             ("here", &mut self.here, here),
-            ("presence", &mut self.presence, presence),
             ("sessions", &mut self.sessions, sessions),
             ("today", &mut self.today, today),
             ("every", &mut self.every, every),
@@ -3459,7 +3451,7 @@ pub fn judge_end(desk: &Desk, tabs: &[(Chain, &Window)], program: &str) -> Verdi
     Verdict::Pass(said)
 }
 
-/// The deadline owner presence keeps (the pill's age, the claim's lapse): armed at rest, never fired there.
+/// The deadline owner presence keeps (the claim's lapse): armed at rest, never fired there.
 const PRESENCE: &str = "presence";
 
 /// The deadline owner of the status sweep, which answers a program's output.

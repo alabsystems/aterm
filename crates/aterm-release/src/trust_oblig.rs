@@ -200,28 +200,26 @@ impl Record {
             Some((_, l)) if l == RECORD_MAGIC => {}
             _ => return Err(format!("its first line is not `{RECORD_MAGIC}`")),
         }
-        let mut head = |want: &str| -> std::result::Result<String, String> {
+        let mut head = |want: &str| -> std::result::Result<&str, String> {
             match lines.next() {
                 Some((_, l)) => match l.split_once('\t') {
-                    Some((k, v)) if k == want && !v.is_empty() && !v.contains('\t') => {
-                        Ok(v.to_string())
-                    }
+                    Some((k, v)) if k == want && !v.is_empty() && !v.contains('\t') => Ok(v),
                     _ => Err(format!("its `{want}` line is missing or malformed")),
                 },
                 None => Err(format!("it ends before its `{want}` line")),
             }
         };
-        let package = head("package")?;
-        let unit = head("unit")?;
+        let package = head("package")?.to_string();
+        let unit = head("unit")?.to_string();
         let number = |s: &str, what: &str| {
             (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
                 .then(|| s.parse::<u64>().ok())
                 .flatten()
                 .ok_or_else(|| format!("its `{what}` line is not a count"))
         };
-        let functions = number(&head("functions")?, "functions")?;
-        let total = number(&head("total")?, "total")?;
-        let proved = number(&head("proved")?, "proved")?;
+        let functions = number(head("functions")?, "functions")?;
+        let total = number(head("total")?, "total")?;
+        let proved = number(head("proved")?, "proved")?;
         let mut rows = Vec::with_capacity(usize::try_from(total).unwrap_or(0).min(1_000_000));
         let mut end = None;
         for (n, line) in lines {
@@ -577,6 +575,7 @@ struct Sources<'a> {
     repo_real: Option<PathBuf>,
     /// Repo-relative directories a relative path may be relative to.
     bases: Vec<String>,
+    resolved: BTreeMap<String, (String, bool)>,
     lines: BTreeMap<String, Vec<String>>,
 }
 
@@ -610,12 +609,22 @@ impl<'a> Sources<'a> {
             repo,
             repo_real: fs::canonicalize(repo).ok(),
             bases,
+            resolved: BTreeMap::new(),
             lines: BTreeMap::new(),
         })
     }
 
     /// The normalised name of a file a report printed, and whether it is in the checkout.
-    fn resolve(&self, raw: &str) -> std::result::Result<(String, bool), String> {
+    fn resolve(&mut self, raw: &str) -> std::result::Result<(String, bool), String> {
+        if let Some(cached) = self.resolved.get(raw) {
+            return Ok(cached.clone());
+        }
+        let found = self.resolve_uncached(raw)?;
+        self.resolved.insert(raw.to_string(), found.clone());
+        Ok(found)
+    }
+
+    fn resolve_uncached(&self, raw: &str) -> std::result::Result<(String, bool), String> {
         if raw.is_empty() || raw.chars().any(char::is_control) {
             return Err(format!("a location in no file (`{}`)", one_line(raw)));
         }
@@ -817,10 +826,15 @@ pub fn anchor_of(lines: &[String], s: Span) -> std::result::Result<String, Strin
     if text.is_empty() {
         return Ok("(empty)".into());
     }
-    if text.chars().count() > 100 {
-        let head: String = text.chars().take(80).collect();
-        let digest = hex(&Sha256::digest(text.as_bytes())[..6]);
-        return Ok(format!("{head}…#{digest}"));
+    if text.len() > 100 {
+        let mut indices = text.char_indices();
+        if let Some((head_end, _)) = indices.nth(80)
+            && indices.nth(19).is_some()
+        {
+            let head = &text[..head_end];
+            let digest = hex(&Sha256::digest(text.as_bytes())[..6]);
+            return Ok(format!("{head}…#{digest}"));
+        }
     }
     Ok(text)
 }
@@ -1189,7 +1203,7 @@ mod tests {
     fn files_are_named_as_the_record_keeps_them() {
         let d = checkout();
         let repo = d.path();
-        let s = Sources::new(repo, None).unwrap();
+        let mut s = Sources::new(repo, None).unwrap();
         assert_eq!(
             s.resolve("src/lib.rs").unwrap(),
             ("src/lib.rs".into(), true)
@@ -1226,7 +1240,7 @@ mod tests {
         );
         let abs = format!("{}/src/lib.rs", repo.display());
         assert_eq!(s.resolve(&abs).unwrap(), ("src/lib.rs".into(), true));
-        let fork = Sources::new(repo, Some("vendor/w/crates/f/Cargo.toml")).unwrap();
+        let mut fork = Sources::new(repo, Some("vendor/w/crates/f/Cargo.toml")).unwrap();
         assert_eq!(
             fork.resolve("crates/f/src/lib.rs").unwrap(),
             ("vendor/w/crates/f/src/lib.rs".into(), true)

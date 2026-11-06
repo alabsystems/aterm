@@ -11,11 +11,14 @@
 use super::{HANG, Lab, Mac, lock, seating};
 use crate::egress::{Egress, Feed, Wake};
 use crate::inventory::Reason;
+use crate::logs::MESH_DIR;
+use crate::presence::{self, Presence, PresenceConfig};
 use crate::stores::{self, Digest, Held, Kind, ProofKey, Stores, TableKey, Verdict};
 use crate::{Event, MeshLog};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::Instant;
 
@@ -38,19 +41,32 @@ struct Fake {
     moved: Condvar,
 }
 
+/// The records of a stand-in store file: its newline-terminated lines. The egress threads and the
+/// test append to one file at once, so a line still being written (no newline yet) is no record
+/// until it is whole.
 fn lines(path: &Path) -> Vec<String> {
     std::fs::read_to_string(path)
-        .map(|text| text.lines().map(str::to_owned).collect())
+        .map(|text| {
+            text.split_inclusive('\n')
+                .filter_map(|line| line.strip_suffix('\n'))
+                .map(str::to_owned)
+                .collect()
+        })
         .unwrap_or_default()
 }
 
+/// Append one record as one write, its newline included: `writeln!` on a `File` writes the line
+/// and its newline apart, so two threads appending at once could join two records into one line.
 fn append_line(path: &Path, line: &str) {
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .expect("a stand-in store file");
-    writeln!(file, "{line}").expect("a stand-in record");
+    let mut bytes = Vec::with_capacity(line.len() + 1);
+    bytes.extend_from_slice(line.as_bytes());
+    bytes.push(b'\n');
+    file.write_all(&bytes).expect("a stand-in record");
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -146,13 +162,18 @@ impl Fake {
 
     /// Wait until this store holds the operation whose text is `text`.
     fn until_holds(&self, text: &str) {
+        self.until(text, |fake| fake.holds(text));
+    }
+
+    /// Wait until `done` holds of this store, `what` naming it.
+    fn until(&self, what: &str, done: impl Fn(&Self) -> bool) {
         let deadline = Instant::now() + HANG;
         let mut changed = lock(&self.changed);
-        while !self.holds(text) {
+        while !done(self) {
             let left = deadline.saturating_duration_since(Instant::now());
             assert!(
                 !left.is_zero(),
-                "{} did not come to hold {text:?} within the hang detector",
+                "{} did not come to hold {what:?} within the hang detector",
                 self.dir.display()
             );
             changed = self
@@ -225,7 +246,10 @@ impl Fake {
             })
             .map(|line| line + "\n")
             .collect();
-        std::fs::write(&file, kept).expect("the stand-in store file");
+        // A reader racing the rewrite reads the file before or after it, never a cut of it.
+        let next = file.with_extension("next");
+        std::fs::write(&next, kept).expect("the stand-in store file");
+        std::fs::rename(&next, &file).expect("the stand-in store file");
         self.bump();
     }
 
@@ -396,25 +420,37 @@ fn tables_mac(lab: &Lab, tag: u8, seats: &[&str]) -> (Mac, Arc<Fake>) {
 /// Start each Mac, seated in all, its store serving its egress, and wait until every relay follows
 /// and the first `Inventory` of each new link ended.
 fn start_all(lab: &Lab, macs: &mut [(Mac, Arc<Fake>)]) {
+    start_linked(lab, macs, |_, _| true);
+}
+
+/// [`start_all`] where Macs `i < j` are neighbours only where `linked(i, j)`: the lab keeps every
+/// other pair apart.
+fn start_linked(lab: &Lab, macs: &mut [(Mac, Arc<Fake>)], linked: impl Fn(usize, usize) -> bool) {
+    let neighbours = |i: usize, j: usize| i != j && linked(i.min(j), i.max(j));
+    for i in 0..macs.len() {
+        for j in i + 1..macs.len() {
+            if !neighbours(i, j) {
+                lab.keep_apart(&macs[i].0, &macs[j].0);
+            }
+        }
+    }
     let all = seating(&macs.iter().map(|(mac, _)| mac).collect::<Vec<_>>());
     for (mac, fake) in macs.iter_mut() {
         mac.read(all.clone());
         mac.start(lab);
         fake.serve(&mac.mesh().egress().expect("the mesh moves tables"));
     }
-    for (mac, _) in macs.iter() {
+    for (i, (mac, _)) in macs.iter().enumerate() {
         let peers: Vec<&Mac> = macs
             .iter()
-            .map(|(m, _)| m)
-            .filter(|m| m.key != mac.key)
+            .enumerate()
+            .filter(|(j, _)| neighbours(i, *j))
+            .map(|(_, (m, _))| m)
             .collect();
         mac.until_following(&peers, 0);
-    }
-    for (mac, _) in macs.iter() {
-        let others = macs.len() - 1;
         mac.seen
             .until("the first Inventory of each link", |events| {
-                started(events, 0) + skipped(events) >= others
+                started(events, 0) + skipped(events) >= peers.len()
             });
     }
 }
@@ -522,32 +558,46 @@ fn a_write_projects_on_the_other_two_with_no_repair_round() {
 }
 
 /// Each Mac's tables digest once its egress has passed every record its store holds: the stores'
-/// own inventory ([`crate::presence::Held::table`] of `table_inventory`), the same on every Mac.
+/// own records, the operations `table_inventory` lists ([`crate::presence::Held::table`]) and the
+/// conflict records ([`crate::presence::Held::conflicts`]), the same on every Mac.
 fn settled_tables(macs: &[(Mac, Arc<Fake>)]) -> crate::presence::Held {
+    use crate::presence::Held as Holding;
     let key = TableKey {
         table: TABLE,
         recovery: false,
     };
-    let held: Vec<crate::presence::Held> = macs
+    let held: Vec<Holding> = macs
         .iter()
         .map(|(mac, fake)| {
             let length = fake.records(&TABLE).len() as u64;
             let egress = mac.mesh().egress().expect("an egress");
             assert!(egress.wait_published(key, length, Instant::now() + HANG));
-            let ids = fake
+            let operations = fake
                 .table_inventory(TABLE)
                 .expect("the store reads")
                 .expect("the store holds the table");
+            let conflicts: BTreeSet<Digest> = fake
+                .records(&TABLE)
+                .iter()
+                .filter(|(kind, _)| *kind == Kind::Conflict)
+                .map(|(_, wire)| stores::digest(wire))
+                .collect();
+            let of = |ids: &BTreeSet<Digest>, summary: fn(&BTreeSet<Digest>) -> Holding| {
+                (!ids.is_empty())
+                    .then(|| (TABLE, summary(ids)))
+                    .into_iter()
+                    .collect::<BTreeMap<Digest, Holding>>()
+            };
             let held = mac
                 .mesh()
                 .tables_held()
                 .expect("the first catch-up read every store");
             assert_eq!(
                 held,
-                crate::presence::Held::tables(&BTreeMap::from([(
-                    TABLE,
-                    crate::presence::Held::table(&ids)
-                )])),
+                Holding::tables(
+                    &of(&operations, Holding::table),
+                    &of(&conflicts, Holding::conflicts)
+                ),
                 "{} reads what its store holds",
                 mac.principal
             );
@@ -558,13 +608,13 @@ fn settled_tables(macs: &[(Mac, Arc<Fake>)]) -> crate::presence::Held {
     held[0]
 }
 
-/// Macs that hold the same operations read the same tables digest in their presence rows (§10's
+/// Macs that hold the same records read the same tables digest in their presence rows (§10's
 /// soak: "every instance's presence row shows the same tables digest"), and it is what their
 /// stores hold: an operation from before the mesh counts (the first catch-up read it, no sink fed
-/// it), as does one the mesh delivered; a write moves it on every Mac once it projects there; a
-/// conflict record is no operation and moves nothing.
+/// it), as does one the mesh delivered; a write moves it on every Mac once it projects there, and
+/// so does a conflict record, which an `Inventory` moves too (PF5b's finding H1).
 #[test]
-fn macs_that_hold_the_same_operations_read_the_same_tables_digest() {
+fn macs_that_hold_the_same_records_read_the_same_tables_digest() {
     let lab = Lab::new();
     let mut macs: Vec<(Mac, Arc<Fake>)> =
         (1..=3).map(|tag| tables_mac(&lab, tag, &["w"])).collect();
@@ -590,10 +640,11 @@ fn macs_that_hold_the_same_operations_read_the_same_tables_digest() {
         fake.until_holds("a-conflict");
         assert!(fake.holds_kind(Kind::Conflict, "a-conflict"));
     }
-    assert_eq!(
-        settled_tables(&macs),
-        written,
-        "a conflict record moves nothing"
+    let conflicted = settled_tables(&macs);
+    assert_eq!(conflicted.count, 3, "two operations and a conflict record");
+    assert_ne!(
+        conflicted.digest, written.digest,
+        "a conflict record moves the digest"
     );
 }
 
@@ -808,7 +859,12 @@ fn a_record_cut_below_a_sleeping_macs_cursor_reaches_it_by_one_inventory() {
 
 /// The offset of the table operation on `mac`'s `tables.log` whose text is `text`.
 fn offset_of(mac: &Mac, text: &str) -> u64 {
-    let tail = format!("|{text}");
+    offset_carrying(mac, format!("|{text}").as_bytes())
+        .unwrap_or_else(|| panic!("{}'s log holds no {text:?}", mac.principal))
+}
+
+/// The offset of the first record on `mac`'s `tables.log` whose body carries `needle`.
+fn offset_carrying(mac: &Mac, needle: &[u8]) -> Option<u64> {
     let mut client = mac
         .mesh()
         .read_client(MeshLog::Tables, "/t/>", Some(HANG))
@@ -818,11 +874,13 @@ fn offset_of(mac: &Mac, text: &str) -> u64 {
         let (page, (next, head)) = client.fetch(from, "/t/>", 1024).expect("a page");
         if let Some((offset, _, _)) = page
             .iter()
-            .find(|(_, _, body)| body.windows(tail.len()).any(|w| w == tail.as_bytes()))
+            .find(|(_, _, body)| body.windows(needle.len()).any(|w| w == needle))
         {
-            return *offset;
+            return Some(*offset);
         }
-        assert!(next < head, "{}'s log holds no {text:?}", mac.principal);
+        if next >= head {
+            return None;
+        }
         from = next;
     }
 }
@@ -913,6 +971,443 @@ fn a_neighbour_that_lost_what_it_answered_gets_it_back_by_the_lineage_exchange()
             );
         }
     }
+}
+
+/// A Mac's presence, its rows naming what its membership log holds (as the node service's read
+/// its records file) and what its lab tables hold as its egress read them (as the node service's
+/// do), and what it reported.
+struct Rows {
+    presence: Presence,
+    heard: Arc<(Mutex<Vec<presence::Event>>, Condvar)>,
+}
+
+impl Rows {
+    /// Start `mac`'s presence over its store `fake`, as its node service does, and wait until its
+    /// tail runs and its first row is out (so the next period is the one its next row waits for).
+    fn start(mac: &Mac, fake: &Arc<Fake>) -> Self {
+        let mesh = Arc::downgrade(mac.mesh());
+        let store = Arc::clone(fake);
+        let heard: Arc<(Mutex<Vec<presence::Event>>, Condvar)> = Arc::default();
+        let noted = Arc::clone(&heard);
+        let presence = Presence::start(
+            mac.mesh(),
+            PresenceConfig {
+                dir: mac.dir.path().join(MESH_DIR),
+                facts: Arc::new(move || presence::Facts {
+                    build: presence::Build::new("0.155.0+gdigest").expect("a build"),
+                    addresses: Vec::new(),
+                    membership: store
+                        .members_inventory()
+                        .ok()
+                        .map(|ids| presence::Held::membership(&ids)),
+                    tables: mesh.upgrade().and_then(|mesh| mesh.tables_held()),
+                    topics: Vec::new(),
+                }),
+                observe: Some(Arc::new(move |event: &presence::Event| {
+                    lock(&noted.0).push(event.clone());
+                    noted.1.notify_all();
+                })),
+            },
+        )
+        .expect("presence starts");
+        let rows = Self { presence, heard };
+        let deadline = Instant::now() + HANG;
+        let mut heard = lock(&rows.heard.0);
+        while !(heard
+            .iter()
+            .any(|e| matches!(e, presence::Event::Tailing { .. }))
+            && heard
+                .iter()
+                .any(|e| matches!(e, presence::Event::Published { .. })))
+        {
+            let left = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !left.is_zero(),
+                "{}'s presence did not start within the hang detector",
+                mac.principal
+            );
+            heard = rows
+                .heard
+                .1
+                .wait_timeout(heard, left)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+        drop(heard);
+        rows
+    }
+
+    /// Wait until this Mac holds the row `of` wrote at wall time `at_ms` and reported taking it:
+    /// the digest trigger read it then.
+    fn until_took(&self, of: &Mac, at_ms: u64) {
+        let deadline = Instant::now() + HANG;
+        let mut heard = lock(&self.heard.0);
+        loop {
+            let row = self
+                .presence
+                .seat(&of.principal)
+                .and_then(|seat| seat.row)
+                .filter(|(_, row)| row.at_ms == at_ms);
+            if let Some((seq, _)) = row
+                && heard.iter().any(|event| {
+                    matches!(event, presence::Event::Took { principal, seq: s, .. }
+                        if *principal == of.principal && *s == seq)
+                })
+            {
+                return;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !left.is_zero(),
+                "no row of {} written at {at_ms} was taken within the hang detector",
+                of.principal
+            );
+            heard = self
+                .heard
+                .1
+                .wait_timeout(heard, left)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+    }
+}
+
+/// What a digest-trigger run cuts below sleeping B's cursor: a record of one unit an `Inventory`
+/// moves, so each unit's digest is held to carrying it on.
+#[derive(Clone, Copy, Debug)]
+enum Cut {
+    /// A table operation: the tables digest's operations.
+    Operation,
+    /// A conflict certificate: the tables digest's conflict records.
+    Conflict,
+    /// A membership record: the membership digest.
+    Member,
+}
+
+impl Cut {
+    /// A's local write of it.
+    fn write(self, fake: &Fake) {
+        match self {
+            Self::Operation => fake.write("w", "while-asleep"),
+            Self::Conflict => fake.append(&TABLE, Kind::Conflict, b"w|while-asleep", false),
+            Self::Member => fake.append_member(b"seat:while-asleep"),
+        }
+    }
+
+    /// Whether `fake` holds it.
+    fn held(self, fake: &Fake) -> bool {
+        match self {
+            Self::Operation => fake.holds_kind(Kind::Operation, "while-asleep"),
+            Self::Conflict => fake.holds_kind(Kind::Conflict, "while-asleep"),
+            Self::Member => fake.seated("while-asleep"),
+        }
+    }
+
+    /// Wait until `fake` holds it.
+    fn until_held(self, fake: &Fake) {
+        fake.until(&format!("the {self:?} record"), |fake| self.held(fake));
+    }
+
+    /// What a `tables.log` record of it carries.
+    const fn needle(self) -> &'static [u8] {
+        match self {
+            Self::Operation | Self::Conflict => b"|while-asleep",
+            Self::Member => b"seat:while-asleep",
+        }
+    }
+
+    /// Wait until A's egress published it (A's store holding it and `before`).
+    fn until_published(self, a: &(Mac, Arc<Fake>)) {
+        let egress = a.0.mesh().egress().expect("an egress");
+        let deadline = Instant::now() + HANG;
+        let published = match self {
+            Self::Operation | Self::Conflict => {
+                let key = TableKey {
+                    table: TABLE,
+                    recovery: false,
+                };
+                egress.wait_published(key, 2, deadline)
+            }
+            Self::Member => egress.wait_members_published(a.1.members().len(), deadline),
+        };
+        assert!(published, "A published the {self:?} record");
+    }
+}
+
+/// H1 closed (`relay_live_island.rs`'s `h1_hole` and `h1_digest_closes_it`;
+/// `relay_digest_island.rs`), for every unit an exchange moves: on a line of Macs A - B - C, a
+/// record cut from A's log below sleeping B's cursor reaches B by the gap's `Inventory`, which puts
+/// it in B's stores and in no log, so B's relay owes C nothing of it. Each Mac's presence rows then
+/// show a digest of that record's store other than the other's, two rows in a row, both relays
+/// caught up, and the digest trigger asks the exchange that brings the record to C. With
+/// `NO_DIGEST_TRIGGER` on, it never reaches C.
+fn a_record_repaired_to_a_neighbour_reaches_the_next_hop(cut: Cut) {
+    for trigger in [true, false] {
+        crate::inventory::NO_DIGEST_TRIGGER.with(|on| on.set(!trigger));
+        let lab = Lab::new();
+        let mut macs: Vec<(Mac, Arc<Fake>)> =
+            (1..=3).map(|tag| tables_mac(&lab, tag, &["w"])).collect();
+        start_linked(&lab, &mut macs, |i, j| j == i + 1);
+        macs[0].1.write("w", "before");
+        macs[2].1.until_holds("before");
+        // B sleeps; A writes, and its log is cut past what B's cursor holds.
+        macs[1].0.stop();
+        cut.write(&macs[0].1);
+        cut.until_published(&macs[0]);
+        let last = offset_carrying(&macs[0].0, cut.needle()).expect("A's log holds the record");
+        let ingest = macs[0].0.mesh().ingest().expect("an ingest consumer");
+        assert!(ingest.wait_committed_for_test(last, Instant::now() + HANG));
+        let floor = ingest.floor(macs[0].0.mesh());
+        assert!(floor > last, "the floor {floor} passes the write at {last}");
+        macs[0]
+            .0
+            .mesh()
+            .cut_tables_for_test(floor)
+            .expect("the cut");
+        // B wakes cut off, so its store serves its egress before an exchange lands in it, then
+        // links again: A's relay reads the gap, and its exchange brings the record to B.
+        let marks: Vec<usize> = macs.iter().map(|(mac, _)| mac.seen.mark()).collect();
+        lock(&lab.cut).insert(macs[1].0.principal.clone());
+        macs[1].0.start(&lab);
+        macs[1]
+            .1
+            .serve(&macs[1].0.mesh().egress().expect("an egress"));
+        macs[1].0.heal(&lab);
+        cut.until_held(&macs[1].1);
+        macs[0].0.seen.until("A's gap exchange ends", |events| {
+            started_for(events, marks[0], Reason::Gap) > 0
+        });
+        macs[1]
+            .0
+            .until_following(&[&macs[0].0, &macs[2].0], marks[1]);
+        macs[2].0.until_following(&[&macs[1].0], marks[2]);
+        // The hole: the record is in B's stores and its egress's digest (which names what A's
+        // does), in no log B's relays read, and not on C.
+        settled_tables(&macs[..2]);
+        assert_eq!(offset_carrying(&macs[1].0, cut.needle()), None);
+        assert!(!cut.held(&macs[2].1));
+
+        // Two rows of each, both read by the other: the digests differ, steady, the relays follow.
+        let rows: Vec<Rows> = [&macs[2], &macs[1]]
+            .into_iter()
+            .map(|(mac, fake)| Rows::start(mac, fake))
+            .collect();
+        let (b, c) = (&macs[1].0, &macs[2].0);
+        for _ in 0..2 {
+            lab.age(u64::try_from(presence::EVERY.as_millis()).expect("a period"));
+            lab.clock.advance(presence::EVERY);
+            let at = lab.wall.load(Ordering::Acquire);
+            for reader in &rows {
+                for of in [b, c] {
+                    reader.until_took(of, at);
+                }
+            }
+        }
+        // Each row above asked what it asks before it was reported; the exchanges it asked end
+        // before B's and C's Inventory workers are idle.
+        let settle = |m: usize| {
+            let inventory = macs[m].0.mesh().inventory().expect("an Inventory");
+            assert!(inventory.wait_idle_for_test(Instant::now() + HANG));
+            let events = lock(&macs[m].0.seen.events).clone();
+            (
+                started(&events, marks[m]),
+                started_for(&events, marks[m], Reason::Digest),
+            )
+        };
+        if trigger {
+            cut.until_held(&macs[2].1);
+            assert_eq!(
+                offset_carrying(&macs[2].0, cut.needle()),
+                None,
+                "the record reached C by an exchange, not by a relay"
+            );
+            let mut asked = 0;
+            for m in [1, 2] {
+                let (all, digest) = settle(m);
+                assert_eq!(
+                    all, digest,
+                    "{} started only digest exchanges",
+                    macs[m].0.principal
+                );
+                asked += digest;
+            }
+            assert!(asked > 0, "no digest exchange ran");
+        } else {
+            // A barrier: a later record reaches C over both relays, after every row above, and
+            // B's and C's Inventory workers then have nothing asked or running.
+            macs[0].1.write("w", "after");
+            macs[2].1.until_holds("after");
+            for m in [1, 2] {
+                assert_eq!(
+                    settle(m),
+                    (0, 0),
+                    "{} started an exchange",
+                    macs[m].0.principal
+                );
+            }
+            assert!(
+                !cut.held(&macs[2].1),
+                "the record reached C with the digest trigger off"
+            );
+        }
+        drop(rows);
+        crate::inventory::NO_DIGEST_TRIGGER.with(|on| on.set(false));
+    }
+}
+
+/// H2 (`relay_live_island.rs`'s `h2Run`): B's log holds a record its stores have not yet ingested
+/// when its relay to a new neighbour C starts at the head, so the new link's exchange, listing B's
+/// stores, moves nothing of it, and no relay carries it. The start asked again for when B's ingest
+/// passes the last table record its log held (`relay_live::asks_again`), and that exchange brings
+/// it. Under `NO_SECOND_ASK` (the island's `noSecondAsk`) nothing asks again, and C never gets it.
+/// B's ingest settles the record either when it is let go (a test hold) or, `by_retry`, when its
+/// writer's seat reaches B's stores and the waiting record applies on its retry, with nothing new
+/// delivered and no commit to take the floor past it.
+#[test]
+fn a_record_a_relay_start_had_not_ingested_reaches_the_new_neighbour_by_the_second_ask() {
+    for (second_ask, by_retry) in [(true, false), (false, false), (true, true), (false, true)] {
+        crate::inventory::NO_SECOND_ASK.with(|on| on.set(!second_ask));
+        let lab = Lab::new();
+        // C seats both writers; A and B only `w`, so a record of `late` waits in B's ingest.
+        let mut macs: Vec<(Mac, Arc<Fake>)> = (1..=3)
+            .map(|tag| tables_mac(&lab, tag, if tag == 3 { &["w", "late"] } else { &["w"] }))
+            .collect();
+        let writer = if by_retry { "late" } else { "w" };
+        // A and B run, seating C, which starts later.
+        let all = seating(&macs.iter().map(|(mac, _)| mac).collect::<Vec<_>>());
+        for (mac, fake) in &mut macs[..2] {
+            mac.read(all.clone());
+            mac.start(&lab);
+            fake.serve(&mac.mesh().egress().expect("the mesh moves tables"));
+        }
+        macs[0].0.until_following(&[&macs[1].0], 0);
+        macs[1].0.until_following(&[&macs[0].0], 0);
+        for (mac, _) in &macs[..2] {
+            mac.seen.until("the first Inventory of the link", |events| {
+                started(events, 0) + skipped(events) >= 1
+            });
+        }
+        // B's ingest holds what it reads, or the record waits for its writer's seat: A's record
+        // lands in B's log, not in its stores.
+        let ingest = macs[1].0.mesh().ingest().expect("an ingest consumer");
+        ingest.hold_for_test(!by_retry);
+        let b = macs[1].0.principal.clone();
+        let mark = macs[0].0.seen.mark();
+        macs[0].1.write(writer, "unsettled");
+        macs[0]
+            .0
+            .seen
+            .until("A's relay lands it in B's log", |events| {
+                events.iter().skip(mark).any(|e| {
+                    matches!(e, Event::Burst { peer, log: MeshLog::Tables, appended, .. }
+                    if *peer == b && *appended > 0)
+                })
+            });
+        let at = offset_of(&macs[1].0, "unsettled");
+        if by_retry {
+            // A commit passes a waiting record: the group stands past it, the floor at it.
+            assert!(ingest.wait_committed_for_test(at, Instant::now() + HANG));
+        }
+        assert!(
+            ingest.floor(macs[1].0.mesh()) <= at,
+            "B's ingest settled nothing of it"
+        );
+        assert!(!macs[1].1.holds("unsettled"));
+        // A leaves, so only B can bring it to C; C starts, and B's relay to it, with no cursor,
+        // starts at B's head, past the record. Both new link's exchanges end before B ingests.
+        macs[0].0.stop();
+        let (mark_b, mark_c) = (macs[1].0.seen.mark(), macs[2].0.seen.mark());
+        macs[2].0.read(all.clone());
+        macs[2].0.start(&lab);
+        macs[2]
+            .1
+            .serve(&macs[2].0.mesh().egress().expect("an egress"));
+        lab.tick();
+        macs[1].0.until_following(&[&macs[2].0], mark_b);
+        let c = macs[2].0.principal.clone();
+        // Each side's new link request runs, or is skipped once the other's moved nothing.
+        macs[1]
+            .0
+            .seen
+            .until("B's new link request with C is answered", |events| {
+                events.iter().skip(mark_b).any(|e| {
+                    matches!(e, Event::Inventory { peer, reason: Some(Reason::NewLink), .. }
+                    | Event::InventorySkipped { peer, reason: Reason::NewLink }
+                    if *peer == c)
+                })
+            });
+        macs[2]
+            .0
+            .seen
+            .until("C's new link request with B is answered", |events| {
+                events.iter().skip(mark_c).any(|e| {
+                    matches!(e, Event::Inventory { peer, reason: Some(Reason::NewLink), .. }
+                    | Event::InventorySkipped { peer, reason: Reason::NewLink }
+                    if *peer == b)
+                })
+            });
+        assert!(
+            !macs[2].1.holds("unsettled"),
+            "the first exchange brought what B's stores lacked"
+        );
+        // C holds the table (an exchange lists only the tables both sides hold), by a record the
+        // mesh delivered, which its egress does not publish again.
+        macs[2].1.append(&TABLE, Kind::Operation, b"w|seed", true);
+        let released = macs[1].0.seen.mark();
+        if by_retry {
+            // The seat reaches B's stores by another way than its log (as an exchange of the
+            // membership log or a membership read brings it), and the mesh kicks the ingest.
+            macs[1].1.seed_seat("late");
+            ingest.kick();
+        } else {
+            ingest.hold_for_test(false);
+        }
+        if second_ask {
+            macs[2].1.until_holds("unsettled");
+            macs[1]
+                .0
+                .seen
+                .until("B's second exchange with C ends", |events| {
+                    started_for(events, released, Reason::NewLink) > 0
+                });
+        } else {
+            // A barrier: B's ingest settles the record, a later record of B's reaches C over the
+            // relay, and B's Inventory worker then has nothing asked or running.
+            assert!(ingest.wait_committed_for_test(at, Instant::now() + HANG));
+            macs[1].1.until_holds("unsettled");
+            macs[1].1.write("w", "after");
+            macs[2].1.until_holds("after");
+            let inventory = macs[1].0.mesh().inventory().expect("an Inventory");
+            assert!(inventory.wait_idle_for_test(Instant::now() + HANG));
+            let events = lock(&macs[1].0.seen.events).clone();
+            assert_eq!(started_for(&events, released, Reason::NewLink), 0);
+            assert!(
+                !macs[2].1.holds("unsettled"),
+                "the record reached C with no second ask"
+            );
+        }
+        crate::inventory::NO_SECOND_ASK.with(|on| on.set(false));
+    }
+}
+
+/// [`a_record_repaired_to_a_neighbour_reaches_the_next_hop`] for a table operation.
+#[test]
+fn a_record_repaired_to_a_neighbour_reaches_the_next_hop_by_the_digest_trigger() {
+    a_record_repaired_to_a_neighbour_reaches_the_next_hop(Cut::Operation);
+}
+
+/// [`a_record_repaired_to_a_neighbour_reaches_the_next_hop`] for a conflict certificate, which
+/// the tables digest names beside the operations.
+#[test]
+fn a_conflict_certificate_repaired_to_a_neighbour_reaches_the_next_hop() {
+    a_record_repaired_to_a_neighbour_reaches_the_next_hop(Cut::Conflict);
+}
+
+/// [`a_record_repaired_to_a_neighbour_reaches_the_next_hop`] for a membership record, which the
+/// membership digest names.
+#[test]
+fn a_membership_record_repaired_to_a_neighbour_reaches_the_next_hop() {
+    a_record_repaired_to_a_neighbour_reaches_the_next_hop(Cut::Member);
 }
 
 /// An `Inventory` that moved nothing is not run again with the same neighbour while this Mac's

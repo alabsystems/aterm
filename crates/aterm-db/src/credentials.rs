@@ -200,7 +200,10 @@ fn canonical(body: &Map) -> Result<Vec<u8>> {
 fn text<'a>(body: &'a Map, field: &str, cap: usize) -> Result<&'a str> {
     body.get(field)
         .and_then(Value::as_str)
-        .filter(|text| text.chars().count() <= cap && !text.chars().any(char::is_control))
+        .filter(|text| {
+            !text.chars().any(char::is_control)
+                && (text.len() <= cap || text.chars().nth(cap).is_none())
+        })
         .ok_or_else(|| Error::new("credential record field is missing or malformed"))
 }
 
@@ -369,11 +372,29 @@ fn check_command(command: &Command) -> Result<(&str, &str, &Map)> {
     Ok((&change.collection, &change.key, body))
 }
 
+#[cfg(test)]
 fn record_of(command: &Command) -> Result<Record> {
     let (kind, key, body) = check_command(command)?;
     Ok(Record {
         kind: kind.to_owned(),
         key: key.to_owned(),
+        body: body.clone(),
+    })
+}
+
+fn decoded_record(command: &Command) -> Option<Record> {
+    let Command::Write { changes, .. } = command else {
+        return None;
+    };
+    let [change] = changes.as_slice() else {
+        return None;
+    };
+    let Some(Value::Object(body)) = &change.value else {
+        return None;
+    };
+    Some(Record {
+        kind: change.collection.clone(),
+        key: change.key.clone(),
         body: body.clone(),
     })
 }
@@ -507,7 +528,7 @@ impl Book {
     /// Project `entries` under `context` (§6.2's checks).
     #[must_use]
     pub fn project(mut entries: Vec<Entry>, context: &Context) -> Self {
-        entries.sort_by_key(|entry| entry.id);
+        entries.sort_unstable_by_key(|entry| entry.id);
         let mut book = Self::default();
         let mut inert = |id: Digest, why: &str| book.inert.push((id, why.to_owned()));
         let mut threads: BTreeMap<[u8; 16], Thread> = BTreeMap::new();
@@ -693,11 +714,12 @@ impl Book {
                                 "the catalog gives this reason to no posted want",
                             )
                         }
-                        Reason::NotAuthorized => {
-                            let cited = format!("policy {}", context.policy.generation);
-                            (context.policy.allows(&thread.want) || evidence != cited)
-                                .then_some("the cited policy gives this want to the requester")
-                        }
+                        Reason::NotAuthorized => (context.policy.allows(&thread.want)
+                            || evidence
+                                .strip_prefix("policy ")
+                                .and_then(|s| s.parse::<u64>().ok())
+                                != Some(context.policy.generation))
+                        .then_some("the cited policy gives this want to the requester"),
                         Reason::NotHeld => (!attested
                             || !(thread.swept_by_all(&context.members)
                                 || thread.window_ended(context.now_ms)))
@@ -732,7 +754,7 @@ impl Book {
         // identity, so two consumers of one want each hear their answer), and 16 live per
         // requester.
         let mut order: Vec<&Thread> = threads.values().collect();
-        order.sort_by_key(|thread| (thread.requester, thread.sequence));
+        order.sort_unstable_by_key(|thread| (thread.requester, thread.sequence));
         let mut live: BTreeMap<Actor, Vec<(&Want, Purpose)>> = BTreeMap::new();
         let mut dropped = Vec::new();
         for thread in order {
@@ -776,7 +798,7 @@ impl Book {
         let entries = eligible
             .iter()
             .filter_map(|&(operation, command)| {
-                record_of(command).ok().map(|record| Entry {
+                decoded_record(command).map(|record| Entry {
                     actor: operation.header.actor,
                     sequence: operation.header.sequence,
                     id: operation.header.id,
@@ -817,11 +839,26 @@ fn context(
     })
 }
 
+/// How long a pass waits for another local writer of the control journal before the table is
+/// not reached this time. A window's Commons runtime holds that writer for local work only, but
+/// one repair exchange takes it back to back until the exchange's deadline, past the 2 s other
+/// Commons opens wait, so a pass beside a busy window (`aterm secrets need`, the window's own
+/// `sync.requests`) waits the exchange out rather than refuse. It waits holding no custody
+/// ([`crate::documents::application::with_store_awaiting_journal`]), so the Writer read and the
+/// window's own sessions are not held up behind it.
+const WRITER_WAIT: std::time::Duration = crate::network::WITHIN;
+
+/// The table open of a pass: [`WRITER_WAIT`] for the journal's writer, or the ordinary admission
+/// where that is later (a test binary's hang detector, [`crate::admission`]), so a pass never
+/// waits less than an open that names no deadline.
 fn with_store<T>(
     paths: &Paths,
     action: impl FnOnce(&Session<'_>, &mut Store, Scope) -> Result<T>,
 ) -> Result<T> {
-    crate::documents::application::with_store(paths, true, descriptor, action)
+    let deadline = (std::time::Instant::now() + WRITER_WAIT).max(crate::admission::deadline());
+    crate::documents::application::with_store_awaiting_journal(
+        paths, true, descriptor, deadline, action,
+    )
 }
 
 /// A read of the request table's verified retained prefix. It makes no request, sweep or
@@ -1243,7 +1280,7 @@ pub fn give_from(
             .join("aterm.toml")
     };
     let bootstrap = Bootstrap::required(paths).map_err(crate::table::failure)?;
-    let table = descriptor(&bootstrap)?.scope;
+    let table = crate::catalog::application_scope(bootstrap.trust(), "credentials", "requests")?;
     let check_sharing = || {
         let policy = crate::catalog::policy::Policy::read(&config)?;
         let current = Bootstrap::required(paths).map_err(crate::table::failure)?;

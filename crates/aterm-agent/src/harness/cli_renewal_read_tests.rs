@@ -372,7 +372,11 @@ fn scheduling_notes_are_emitted_once_even_when_staging_is_checked() {
                 &bed.store,
                 &bed.path,
                 bed.env.now,
-                recover_staging,
+                if recover_staging {
+                    RenewalRecovery::Fresh
+                } else {
+                    RenewalRecovery::None
+                },
                 bed.env.home.as_deref(),
                 &mut err,
             )
@@ -382,5 +386,442 @@ fn scheduling_notes_are_emitted_once_even_when_staging_is_checked() {
             assert_eq!(err.lines().count(), 1);
             assert!(err.contains(&expected[0]));
         }
+    }
+}
+
+#[test]
+fn native_enrollment_runs_existing_provider_once_and_rejects_retargeted_operation() {
+    let bed = Bed::new(Cli::Codex);
+    let records = bed
+        .store
+        .read_account_records(Some(&bed.path), bed.env.now)
+        .unwrap();
+    let request = crate::harness::codex_enrollment::Request {
+        id: "a".repeat(32),
+        caller: "b".repeat(64),
+        label: "main".into(),
+        revision: accounts::pool_authority_revision(&records.raw_roster, &records.logins).unwrap(),
+    };
+    let host = Host {
+        emails: RefCell::new(Vec::new()),
+    };
+    let original = records.logins.get("main").unwrap().dir.clone();
+    let first = enroll_codex_operation(&bed.env, &host, &request).unwrap();
+    assert_eq!(host.emails.borrow().as_slice(), ["main@example.test"]);
+    assert_eq!(
+        first.phase,
+        crate::harness::codex_enrollment::Phase::Running,
+        "the failed provider observation remains uncertain"
+    );
+    assert_eq!(
+        enroll_codex_operation(&bed.env, &host, &request).unwrap(),
+        first
+    );
+    assert_eq!(
+        host.emails.borrow().len(),
+        1,
+        "poll/restart cannot replay provider work"
+    );
+    let mut retargeted = request.clone();
+    retargeted.label = "other".into();
+    assert!(enroll_codex_operation(&bed.env, &host, &retargeted).is_err());
+    assert_eq!(
+        bed.store
+            .load_logins(bed.env.now)
+            .unwrap()
+            .0
+            .get("main")
+            .unwrap()
+            .dir,
+        original
+    );
+    let cancelled = cancel_codex_operation(&bed.env, &request).unwrap();
+    assert_eq!(
+        cancelled.phase,
+        crate::harness::codex_enrollment::Phase::CancelRequested
+    );
+    assert_eq!(host.emails.borrow().len(), 1);
+    // A fresh runtime scope for an old ID cannot release the old driver's custody.
+    let lifetime = crate::harness::account_work::Lifetime::default();
+    let (work, control) =
+        crate::harness::codex_enrollment::owned_work(request.clone(), lifetime.enter().unwrap());
+    assert_eq!(work.run(&bed.env).unwrap(), cancelled);
+    assert!(control.retired().is_none());
+    assert_eq!(host.emails.borrow().len(), 1);
+}
+
+struct SuccessfulEnrollmentHost {
+    calls: std::cell::Cell<usize>,
+    now: i64,
+    held: bool,
+    artifact: RefCell<Option<(PathBuf, Vec<u8>)>>,
+}
+
+impl AccountsHost for SuccessfulEnrollmentHost {
+    fn stdin_is_terminal(&self) -> bool {
+        false
+    }
+    fn auth_status(&self, _: &str) -> Result<Captured, String> {
+        panic!("no default auth status")
+    }
+    fn unaskable(&self) -> Option<String> {
+        None
+    }
+    fn login(&self, _: Option<&str>) -> Result<i32, String> {
+        panic!("no default login")
+    }
+    fn now(&self) -> i64 {
+        self.now
+    }
+    fn renew_flow(&self, _: &str, _: &str, _: &RenewBrowser) -> Result<i32, String> {
+        panic!("no desktop browser flow")
+    }
+    fn vendor_sign_in(
+        &self,
+        req: &crate::harness::login_drive::Request<'_>,
+    ) -> crate::harness::login_drive::Drove {
+        self.calls.set(self.calls.get() + 1);
+        codex_login(req.staging);
+        if self.held {
+            *self.artifact.borrow_mut() = Some((
+                req.staging.to_path_buf(),
+                std::fs::read(req.staging.join("auth.json")).unwrap(),
+            ));
+            return crate::harness::login_drive::Drove {
+                outcome: crate::harness::login_drive::Outcome::CompletedHeld,
+                host: None,
+            };
+        }
+        crate::harness::login_drive::Drove {
+            outcome: crate::harness::login_drive::Outcome::SignedIn {
+                email: Some("main@example.test".into()),
+                page: false,
+            },
+            host: None,
+        }
+    }
+}
+
+#[test]
+fn native_enrollment_publishes_only_verified_staging_and_returns_committed_generation() {
+    let bed = Bed::new(Cli::Codex);
+    let records = bed
+        .store
+        .read_account_records(Some(&bed.path), bed.env.now)
+        .unwrap();
+    let request = crate::harness::codex_enrollment::Request {
+        id: "d".repeat(32),
+        caller: "b".repeat(64),
+        label: "main".into(),
+        revision: accounts::pool_authority_revision(&records.raw_roster, &records.logins).unwrap(),
+    };
+    let before = records.logins.get("main").unwrap().last_success_generation;
+    let host = SuccessfulEnrollmentHost {
+        calls: std::cell::Cell::new(0),
+        now: bed.env.now + 1,
+        held: false,
+        artifact: RefCell::new(None),
+    };
+    let status = enroll_codex_operation(&bed.env, &host, &request).unwrap();
+    assert_eq!(host.calls.get(), 1);
+    assert_eq!(
+        status.phase,
+        crate::harness::codex_enrollment::Phase::Applied
+    );
+    let logins = bed.store.load_logins(host.now).unwrap().0;
+    let binding = logins.get("main").unwrap();
+    assert!(binding.last_success_generation > before);
+    assert_eq!(status.generation, Some(binding.last_success_generation));
+    assert_eq!(binding.proved_by, Some(accounts::Proof::Status));
+    assert_eq!(
+        enroll_codex_operation(&bed.env, &host, &request).unwrap(),
+        status
+    );
+    assert_eq!(host.calls.get(), 1);
+}
+
+#[test]
+fn native_enrollment_keeps_completed_held_artifact_running_without_a_second_provider_attempt() {
+    let bed = Bed::new(Cli::Codex);
+    let records = bed
+        .store
+        .read_account_records(Some(&bed.path), bed.env.now)
+        .unwrap();
+    let request = crate::harness::codex_enrollment::Request {
+        id: "f".repeat(32),
+        caller: "b".repeat(64),
+        label: "main".into(),
+        revision: accounts::pool_authority_revision(&records.raw_roster, &records.logins).unwrap(),
+    };
+    let original = records.logins.get("main").unwrap().clone();
+    let original_auth =
+        std::fs::read(Path::new(original.dir.as_ref().unwrap()).join("auth.json")).unwrap();
+    let roster_before = std::fs::read(&bed.path).unwrap();
+    let host = SuccessfulEnrollmentHost {
+        calls: std::cell::Cell::new(0),
+        now: bed.env.now + 1,
+        held: true,
+        artifact: RefCell::new(None),
+    };
+    let first = enroll_codex_operation(&bed.env, &host, &request).unwrap();
+    assert_eq!(
+        first.phase,
+        crate::harness::codex_enrollment::Phase::Running
+    );
+    assert_eq!(first.generation, None);
+    assert_eq!(
+        enroll_codex_operation(&bed.env, &host, &request).unwrap(),
+        first
+    );
+    let mut different = request.clone();
+    different.id = "e".repeat(32);
+    assert!(enroll_codex_operation(&bed.env, &host, &different).is_err());
+    assert_eq!(host.calls.get(), 1);
+    let artifact = host.artifact.borrow();
+    let (staging, exact) = artifact.as_ref().unwrap();
+    assert_eq!(std::fs::read(staging.join("auth.json")).unwrap(), *exact);
+    assert!(!staging.join(accounts::RENEWAL_CHECKPOINT_FILE).exists());
+    let current = bed.store.load_logins(host.now).unwrap().0;
+    let binding = current.get("main").unwrap();
+    assert_eq!(binding.dir, original.dir);
+    assert_eq!(
+        binding.last_success_generation,
+        original.last_success_generation
+    );
+    assert_eq!(binding.sign_in_task, original.sign_in_task);
+    assert_eq!(std::fs::read(&bed.path).unwrap(), roster_before);
+    assert_eq!(
+        std::fs::read(Path::new(binding.dir.as_ref().unwrap()).join("auth.json")).unwrap(),
+        original_auth
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn queued_due_reread_recovers_a_completed_checkpoint_with_its_original_signer() {
+    struct Queued<'a> {
+        bed: &'a Bed,
+        held: RefCell<Option<accounts::SigninTurn>>,
+        completed: RefCell<Option<PathBuf>>,
+    }
+    impl AccountsHost for Queued<'_> {
+        fn stdin_is_terminal(&self) -> bool {
+            true
+        }
+        fn unaskable(&self) -> Option<String> {
+            None
+        }
+        fn now(&self) -> i64 {
+            self.bed.env.now + 1
+        }
+        fn auth_status(&self, _: &str) -> Result<Captured, String> {
+            panic!("completed recovery starts no provider status")
+        }
+        fn login(&self, _: Option<&str>) -> Result<i32, String> {
+            panic!("completed recovery starts no login")
+        }
+        fn renew_flow(&self, _: &str, _: &str, _: &RenewBrowser) -> Result<i32, String> {
+            panic!("completed recovery must not replay provider work")
+        }
+        fn signin_queued(&self, position: accounts::SigninPosition) {
+            if self.held.borrow().is_none() {
+                return;
+            }
+            assert_eq!(position.blocker, accounts::SigninBlocker::UnscheduledSignin);
+            let staged = self.bed.store.claim_staging_dir("main").unwrap();
+            let credential = staged.join(Cli::Claude.connector().stores[0]);
+            std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
+            std::fs::write(credential, b"completed local fixture").unwrap();
+            accounts::write_renewal_checkpoint_for(
+                Cli::Claude,
+                None,
+                "main",
+                "main@example.test",
+                staged.to_str().unwrap(),
+                None,
+                Some(accounts::Proof::Status),
+                self.now(),
+                &self.bed.store.load_logins(self.now()).unwrap().0,
+            )
+            .unwrap();
+            *self.completed.borrow_mut() = Some(staged);
+            drop(self.held.borrow_mut().take());
+        }
+    }
+    let bed = Bed::new(Cli::Claude);
+    let host = Queued {
+        bed: &bed,
+        held: RefCell::new(Some(bed.store.signin_now().unwrap().unwrap())),
+        completed: RefCell::new(None),
+    };
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = run_accounts_renew(&bed.env, &host, (&[], true, Some(&[])), &mut out, &mut err);
+    assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&err));
+    assert!(String::from_utf8_lossy(&out).contains(RENEWED_WHILE_WAITING));
+    let staged = host
+        .completed
+        .borrow()
+        .clone()
+        .expect("actual queue callback completed the receipt");
+    let records = bed
+        .store
+        .read_account_records(Some(&bed.path), host.now())
+        .unwrap();
+    assert_eq!(
+        records.roster.row("main").unwrap().dir.as_deref(),
+        staged.to_str()
+    );
+    assert!(
+        bed.store.signin_now().unwrap().is_some(),
+        "original queued signer retired"
+    );
+    let host = Host {
+        emails: RefCell::new(Vec::new()),
+    };
+    assert_eq!(bed.run(true, &host).0, ExitCode::SUCCESS);
+    assert!(
+        host.emails.borrow().is_empty(),
+        "completed checkpoint cannot replay on a later due pass"
+    );
+}
+
+#[test]
+fn enrollment_proven_before_provider_refusal_does_not_keep_uncertain_custody() {
+    struct Stopped;
+    impl AccountsHost for Stopped {
+        fn stdin_is_terminal(&self) -> bool {
+            false
+        }
+        fn work_cancelled(&self) -> bool {
+            true
+        }
+        fn auth_status(&self, _: &str) -> Result<Captured, String> {
+            panic!("no provider status")
+        }
+        fn unaskable(&self) -> Option<String> {
+            None
+        }
+        fn login(&self, _: Option<&str>) -> Result<i32, String> {
+            panic!("no provider login")
+        }
+        fn now(&self) -> i64 {
+            1
+        }
+        fn renew_flow(&self, _: &str, _: &str, _: &RenewBrowser) -> Result<i32, String> {
+            panic!("no browser")
+        }
+        fn vendor_sign_in(
+            &self,
+            _: &crate::harness::login_drive::Request<'_>,
+        ) -> crate::harness::login_drive::Drove {
+            panic!("no provider dispatch")
+        }
+    }
+    let bed = Bed::new(Cli::Codex);
+    let records = bed
+        .store
+        .read_account_records(Some(&bed.path), bed.env.now)
+        .unwrap();
+    let mut request = crate::harness::codex_enrollment::Request {
+        id: "d".repeat(32),
+        caller: "b".repeat(64),
+        label: "main".into(),
+        revision: accounts::pool_authority_revision(&records.raw_roster, &records.logins).unwrap(),
+    };
+    let first = enroll_codex_operation(&bed.env, &Stopped, &request).unwrap();
+    assert_eq!(
+        first.phase,
+        crate::harness::codex_enrollment::Phase::Refused
+    );
+    assert_eq!(first.generation, None);
+    assert_eq!(
+        enroll_codex_operation(&bed.env, &Stopped, &request).unwrap(),
+        first
+    );
+    request.id = "e".repeat(32);
+    assert_eq!(
+        enroll_codex_operation(&bed.env, &Stopped, &request).unwrap(),
+        first
+    );
+    let lifetime = crate::harness::account_work::Lifetime::default();
+    let host = LiveAccounts::manual_work(lifetime.enter().unwrap());
+    assert!(
+        !host.automatic_sign_in(),
+        "explicit native management uses the existing manual FIFO"
+    );
+}
+
+#[test]
+fn enrollment_uses_only_typed_no_action_for_provider_route_refusal() {
+    struct Typed {
+        outcome: crate::harness::login_drive::Outcome,
+        calls: std::cell::Cell<usize>,
+    }
+    impl AccountsHost for Typed {
+        fn stdin_is_terminal(&self) -> bool {
+            false
+        }
+        fn auth_status(&self, _: &str) -> Result<Captured, String> {
+            panic!("no default status")
+        }
+        fn unaskable(&self) -> Option<String> {
+            None
+        }
+        fn login(&self, _: Option<&str>) -> Result<i32, String> {
+            panic!("no default login")
+        }
+        fn now(&self) -> i64 {
+            0
+        }
+        fn renew_flow(&self, _: &str, _: &str, _: &RenewBrowser) -> Result<i32, String> {
+            panic!("no browser")
+        }
+        fn vendor_sign_in(
+            &self,
+            _: &crate::harness::login_drive::Request<'_>,
+        ) -> crate::harness::login_drive::Drove {
+            self.calls.set(self.calls.get() + 1);
+            crate::harness::login_drive::Drove {
+                outcome: self.outcome.clone(),
+                host: None,
+            }
+        }
+    }
+    use crate::harness::{codex_enrollment::Phase, login_drive::Outcome};
+    for (outcome, expected) in [
+        (
+            Outcome::NotRun("original budget expired before native effects".into()),
+            Phase::Refused,
+        ),
+        (
+            Outcome::PageNotOpened("provider may already have seen the page request".into()),
+            Phase::Running,
+        ),
+    ] {
+        let bed = Bed::new(Cli::Codex);
+        let records = bed
+            .store
+            .read_account_records(Some(&bed.path), bed.env.now)
+            .unwrap();
+        let request = crate::harness::codex_enrollment::Request {
+            id: "f".repeat(32),
+            caller: "b".repeat(64),
+            label: "main".into(),
+            revision: accounts::pool_authority_revision(&records.raw_roster, &records.logins)
+                .unwrap(),
+        };
+        let host = Typed {
+            outcome,
+            calls: std::cell::Cell::new(0),
+        };
+        let status = enroll_codex_operation(&bed.env, &host, &request).unwrap();
+        assert_eq!(status.phase, expected);
+        assert_eq!(status.generation, None);
+        assert_eq!(host.calls.get(), 1);
+        assert_eq!(
+            enroll_codex_operation(&bed.env, &host, &request).unwrap(),
+            status
+        );
+        assert_eq!(host.calls.get(), 1, "exact ID never dispatches twice");
     }
 }

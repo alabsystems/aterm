@@ -11,8 +11,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-mod dial;
-pub(super) use dial::Dial;
 mod listen;
 pub(super) use listen::Prepared;
 pub(super) mod multicast;
@@ -409,4 +407,42 @@ fn align4(length: usize) -> io::Result<usize> {
         .checked_add(3)
         .map(|n| n & !3)
         .ok_or_else(|| refuse("route length overflow"))
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod tests {
+    use super::*;
+
+    fn loopback() -> (&'static str, u32) {
+        let name = if cfg!(target_os = "macos") {
+            "lo0"
+        } else {
+            "lo"
+        };
+        (name, index(name).unwrap())
+    }
+
+    #[test]
+    fn expired_route_lookup_cannot_restart_the_deadline() {
+        assert_eq!(
+            route(None, "127.0.0.1:9".parse().unwrap(), None, Instant::now())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    #[test]
+    fn accepted_sockets_acquire_or_preserve_but_never_replace_their_binding() {
+        let (name, index) = loopback();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        ensure_binding(&accepted, index, name).unwrap();
+        ensure_binding(&accepted, index, name).unwrap();
+        restrict_hops(&accepted).unwrap();
+        socket_policy(&accepted, Some(index), true).unwrap();
+        assert!(ensure_binding(&accepted, index.checked_add(1).unwrap(), name).is_err());
+        socket_policy(&accepted, Some(index), true).unwrap();
+    }
 }

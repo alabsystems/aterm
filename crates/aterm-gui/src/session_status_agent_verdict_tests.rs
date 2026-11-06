@@ -2216,7 +2216,7 @@ fn a_lapsed_supervisor_claim_hands_its_box_to_the_human() {
     );
     let short = lapse - Duration::from_millis(2);
     at(short);
-    let _ = app.presence_tick(short);
+    app.presence_tick(short);
     assert!(take_posts().is_empty(), "NEGATIVE CONTROL: not lapsed yet");
     assert_eq!(
         ctx.meta.lock().unwrap().supervisor_expiry(),
@@ -2225,7 +2225,7 @@ fn a_lapsed_supervisor_claim_hands_its_box_to_the_human() {
     );
 
     at(lapse);
-    let _ = app.presence_tick(lapse);
+    app.presence_tick(lapse);
     let posts = take_posts();
     assert_eq!(posts.len(), 1, "exactly one notice: {posts:?}");
     assert_eq!(posts[0].session, sid);
@@ -2243,7 +2243,7 @@ fn a_lapsed_supervisor_claim_hands_its_box_to_the_human() {
         "{meta_events:?}"
     );
     assert!(ctx.meta.lock().unwrap().supervisor_expiry().is_none());
-    let _ = app.presence_tick(lapse);
+    app.presence_tick(lapse);
     assert!(take_posts().is_empty(), "announced once");
 }
 

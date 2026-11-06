@@ -217,6 +217,68 @@ fn a_turn_whose_caller_hung_up_before_typing_types_nothing() {
     assert_eq!(reply, "ERR paste delivery failed\n");
 }
 
+/// A turn judges its caller before its first write on any route, not only through the
+/// main-thread gate: with writes that never consult the gate, as the background route's do, a
+/// caller already gone gets nothing pasted, typed or pressed (an Enter is the first write of a
+/// text of control characters alone, and a typed turn's rest the first of one whose typed head
+/// is), with the reply text the gate's refusal gives.
+/// NEGATIVE CONTROLS: without the turn's own look, the text is pasted (and typed) for a caller
+/// that is gone; without it before the press, that Enter is pressed; without it before the
+/// rest's writes, the rest is pasted.
+#[test]
+fn a_turn_whose_caller_hung_up_writes_nothing_on_a_route_with_no_gate() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (client, server) = CtlStream::pair().expect("socket pair");
+    let writes = AtomicUsize::new(0);
+    let handle = crate::session_store::test_handle(0);
+    let store = crate::session_store::new_store();
+    let _serving = ServingFd::enter(&server);
+    drop(client);
+    until_seen("the hangup to become visible to the lane", caller_hung_up);
+    let paste = |_: &str| {
+        writes.fetch_add(1, Ordering::SeqCst);
+        true
+    };
+    let key = |_: crate::input::InputEvent| {
+        writes.fetch_add(1, Ordering::SeqCst);
+        true
+    };
+    let press = |_: &str| {
+        writes.fetch_add(1, Ordering::SeqCst);
+        true
+    };
+    let io = TurnIo {
+        paste: &paste,
+        press: &press,
+        key: &key,
+        ..TurnIo::paste_only()
+    };
+    let turn = |line: &str| cmd_turn(&handle.term, &store, 0, line, &handle.ctx, &io);
+    let reply = turn("idle=1 timeout=5000 submit_window=300 presses=1 hello");
+    assert_eq!(writes.load(Ordering::SeqCst), 0, "nothing pasted: {reply}");
+    assert_eq!(reply, "ERR paste delivery failed\n");
+    let reply = turn("idle=1 timeout=5000 submit_window=300 presses=1 typed=1 cadence=1 hey");
+    assert_eq!(writes.load(Ordering::SeqCst), 0, "nothing typed: {reply}");
+    assert_eq!(reply, "ERR key delivery failed\n");
+    // Control characters alone type no key and paste nothing: the Enter is the first write.
+    let reply = turn("idle=1 timeout=5000 submit_window=300 presses=1 typed=1 cadence=1 \u{1b}");
+    assert_eq!(writes.load(Ordering::SeqCst), 0, "nothing pressed: {reply}");
+    assert_eq!(reply, "ERR key delivery failed\n");
+    // A typed head of control characters alone presses no key: the rest past the cap is the
+    // first write, a paste, and then a Tab key the rest presses.
+    for (rest, failed) in [
+        ("hello", "ERR paste delivery failed\n"),
+        ("\thello", "ERR key delivery failed\n"),
+    ] {
+        let reply = turn(&format!(
+            "idle=1 timeout=5000 submit_window=300 presses=1 typed=1 cadence=1 cap=1 \u{1b}{rest}"
+        ));
+        assert_eq!(writes.load(Ordering::SeqCst), 0, "nothing written: {reply}");
+        assert_eq!(reply, failed);
+    }
+}
+
 #[test]
 fn a_turn_whose_caller_hangs_up_after_its_submit_is_still_recorded() {
     let handle = crate::session_store::test_handle(0);

@@ -2076,7 +2076,54 @@ pub fn refresh_local_census(
     let inputs = collect_local_census_inputs(state_dir, home_dir, bonjour_hosts, now_s)?;
     let census = SwarmCensus::compute(&inputs);
     write_cached_census(state_dir, &census)?;
+    if let Some(home) = home_dir {
+        let paths = aterm_secrets::client::Paths::for_home(home);
+        // The census never fails over the gate's mark: the mark is sticky and the note
+        // idempotent, so one this refresh could not write is written by the next.
+        if paths.dir.join("commons").is_dir() {
+            let _ = note_fold_gate(
+                &paths,
+                &census,
+                &aterm_secrets::commons::fold::Gate::compiled(),
+                now_s,
+            );
+        }
+    }
     Ok(census)
+}
+
+/// Each census member as the fold's adoption gate hears it (docs/DESIGN-alab-one-mesh-2026-11-05.md
+/// §4.2 M6): when it was last heard by any source the census joins (the vault's server rows,
+/// heartbeats, the fleet book, a window, Bonjour) and the build its newest survey facts reported.
+/// A member heard with no build reported is an older aterm's and keeps the gate shut. Every member
+/// counts, the fleet's as well as the Commons': one counted that holds no seat can only keep the
+/// gate shut.
+#[must_use]
+pub fn fold_seats(census: &SwarmCensus) -> Vec<aterm_secrets::commons::fold::Heard<'_>> {
+    census
+        .members
+        .iter()
+        .map(|member| aterm_secrets::commons::fold::Heard {
+            last_heard_ms: member.last_seen.map(|at| at.saturating_mul(1000)),
+            build: member.version.as_deref(),
+        })
+        .collect()
+}
+
+/// Feed the fold's adoption gate from a fresh census (§11 B11): the vault at `paths` turns the fold
+/// on, stickily, once `gate` holds over [`fold_seats`] at `now_s`. Whether the fold is on.
+///
+/// # Errors
+/// The gate's mark cannot be written.
+#[cfg(unix)]
+pub fn note_fold_gate(
+    paths: &aterm_secrets::client::Paths,
+    census: &SwarmCensus,
+    gate: &aterm_secrets::commons::fold::Gate,
+    now_s: u64,
+) -> Result<bool, String> {
+    aterm_secrets::commons::fold::note(paths, gate, &fold_seats(census), now_s.saturating_mul(1000))
+        .map_err(|err| format!("fold gate: {err}"))
 }
 
 #[cfg(unix)]

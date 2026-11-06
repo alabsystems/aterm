@@ -41,7 +41,7 @@ mod extra_flags {
 
 /// Hyperlink data: URL and optional ID from OSC 8 sequences.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct HyperlinkData {
+pub struct HyperlinkData {
     /// Hyperlink URL (OSC 8).
     pub url: Arc<str>,
     /// Hyperlink ID (OSC 8 `id=` parameter).
@@ -150,7 +150,7 @@ impl CellExtra {
 
     /// Attach an already-built, possibly shared, hyperlink payload.
     #[inline]
-    pub(crate) fn set_hyperlink_data(&mut self, data: Option<Arc<HyperlinkData>>) {
+    pub fn set_hyperlink_data(&mut self, data: Option<Arc<HyperlinkData>>) {
         self.hyperlink = data;
     }
 
@@ -467,10 +467,8 @@ pub struct UniformExtras<'a> {
     pub underline_color: Option<u32>,
     /// Extended flags (bits 3-18 of CellExtra flags field).
     pub extended_flags: u16,
-    /// Hyperlink URL (OSC 8).
-    pub hyperlink: Option<&'a Arc<str>>,
-    /// Hyperlink ID (OSC 8 `id=` parameter).
-    pub hyperlink_id: Option<&'a Arc<str>>,
+    /// Shared hyperlink URL and optional ID (OSC 8).
+    pub hyperlink: Option<&'a Arc<HyperlinkData>>,
 }
 
 /// Encode a packed `0xTT_XXXXXX` underline colour as an SGR 58/59 parameter.

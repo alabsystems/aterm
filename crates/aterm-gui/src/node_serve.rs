@@ -14,22 +14,29 @@
 //! ending its run for launchd to start again, applying the stage at that boot
 //! (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.13, [`NodeUpdater`]).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use aterm_agent::node_service::{AlabTcpAdvertiser, NodeJobLock};
+use aterm_metrics::row::NeedsRow;
 use aterm_net::fleet::heard::{Heard, LiveSight, Sight};
 use aterm_net::fleet::link::{
     Incoming, LinkClock, LinkConfig, LinkStream, Neighbours, NoteProven, ServeFn, SystemClock,
 };
 use aterm_net::fleet::{FleetOp, FleetScope, NodeIdentity};
+use aterm_session::SessionId;
+use aterm_types::MutexExt as _;
 use aterm_uds::{CtlListener, CtlStream};
+
+#[path = "node_serve/health.rs"]
+mod health;
 
 use super::{
     CENSUS_REFRESH_EVERY, DENY_LIST_UNREAD, DeniedCache, FACTS_HEARTBEAT_EVERY, HeartbeatClock,
@@ -43,7 +50,9 @@ use super::{
 
 const RELAY_PREFIX: &str = "wf-";
 const RELAY_SUFFIX: &str = ".sock";
-const RELAY_HEADER_MAX: usize = 1024;
+/// A relay header's bound, and a window's answer to one: a drive's carries the sessions its line
+/// names (an `await task` may name many), so the line's own bound plus the rest of the header.
+const RELAY_HEADER_MAX: usize = aterm_types::control_verbs::MAX_REQUEST_LINE + 1024;
 #[cfg(not(test))]
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// A unit test's window relays are its own, which answer, and its hand-overs run on node-job
@@ -104,6 +113,11 @@ pub trait WindowLauncher: Send + Sync {
     /// # Errors
     /// Returns a human-readable error if spawning the background window failed.
     fn launch_window(&self, state_dir: &Path, relay_dir: &Path) -> Result<(), String>;
+
+    /// Whether the window whose relay is `wf-<pid>.sock` runs this node service's own app, the
+    /// one [`Self::launch_window`] opens: a drive that names no session goes to it first
+    /// ([`WindowRelays::in_order`]).
+    fn runs_this_app(&self, pid: u32) -> bool;
 }
 
 /// Production [`WindowLauncher`] checking `/dev/console` ownership on macOS (or `DISPLAY` /
@@ -132,6 +146,17 @@ impl WindowLauncher for LiveWindowLauncher {
         {
             std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some()
         }
+    }
+
+    /// The kernel's word on the image `pid` loaded: the file now at this node service's own
+    /// executable path, which [`Self::launch_window`] opens (the installed app, whose launchd job
+    /// runs this service). A dev build's window, or one an update left on the image it replaced,
+    /// is not; nor is a window whose image cannot be read.
+    fn runs_this_app(&self, pid: u32) -> bool {
+        let (Ok(exe), Ok(pid)) = (std::env::current_exe(), i32::try_from(pid)) else {
+            return false;
+        };
+        aterm_uds::process::image_matches_file(pid, &exe) == Some(true)
     }
 
     fn launch_window(&self, _state_dir: &Path, _relay_dir: &Path) -> Result<(), String> {
@@ -204,10 +229,18 @@ pub(crate) enum RelayHeader {
         driver: crate::fabric::Driver,
         key: Option<aterm_net::fleet::NodeKey>,
         peer: Option<SocketAddr>,
+        /// The sessions the drive's line names ([`crate::control::drive_line_sessions`]): a
+        /// window takes it only if it hosts or keeps every one, and answers `ELSEWHERE` if not
+        /// ([`handle_relay_accept`]). Empty: any window takes it.
+        sids: Vec<SessionId>,
     },
     /// A Mac with no fleet secret asking to join ALab from `peer`: the window's members desk
     /// serves it once the node job writes `go` (`docs/DESIGN-fluid-swarm-2026-10-28.md` F10).
     Ask { peer: SocketAddr },
+    /// The node job's read of the window's needs (`docs/DESIGN-alab-one-mesh-2026-11-05.md`
+    /// §4.14): once the node job writes `go`, the window writes its needs row as one frame
+    /// ([`write_needs_frame`]) and another each time it changes, until the node job hangs up.
+    Needs,
 }
 
 impl RelayHeader {
@@ -223,22 +256,32 @@ impl RelayHeader {
                 u8::from(*drive),
                 peer.map_or_else(|| "-".to_owned(), |p| p.to_string()),
             ),
-            Self::Drive { driver, key, peer } => match key {
-                Some(key) => format!(
-                    "DRIVE node={} host={} key={} peer={}\n",
+            Self::Drive {
+                driver,
+                key,
+                peer,
+                sids,
+            } => {
+                let mut line = format!(
+                    "DRIVE node={} host={}",
                     aterm_codec::pct::encode(&driver.node),
                     aterm_codec::pct::encode(&driver.host),
-                    key.hex(),
-                    peer.map_or_else(|| "-".to_owned(), |p| p.to_string()),
-                ),
-                None => format!(
-                    "DRIVE node={} host={} peer={}\n",
-                    aterm_codec::pct::encode(&driver.node),
-                    aterm_codec::pct::encode(&driver.host),
-                    peer.map_or_else(|| "-".to_owned(), |p| p.to_string()),
-                ),
-            },
+                );
+                if let Some(key) = key {
+                    line.push_str(&format!(" key={}", key.hex()));
+                }
+                line.push_str(&format!(
+                    " peer={}",
+                    peer.map_or_else(|| "-".to_owned(), |p| p.to_string())
+                ));
+                if !sids.is_empty() {
+                    line.push_str(&format!(" sids={}", sid_list(sids)));
+                }
+                line.push('\n');
+                line
+            }
             Self::Ask { peer } => format!("ASK peer={peer}\n"),
+            Self::Needs => "NEEDS\n".to_owned(),
         }
     }
 
@@ -302,6 +345,7 @@ impl RelayHeader {
                 let mut host = None;
                 let mut key = None;
                 let mut peer = None;
+                let mut sids = None;
                 for word in words {
                     let Some((k, v)) = word.split_once('=') else {
                         return Err("malformed DRIVE token");
@@ -342,6 +386,14 @@ impl RelayHeader {
                                 return Err("duplicate DRIVE key");
                             }
                         }
+                        "sids" => {
+                            let parsed = parse_sid_list(v)
+                                .filter(|sids| !sids.is_empty())
+                                .ok_or("invalid drive sessions")?;
+                            if sids.replace(parsed).is_some() {
+                                return Err("duplicate DRIVE key");
+                            }
+                        }
                         _ => return Err("unknown DRIVE key"),
                     }
                 }
@@ -352,6 +404,7 @@ impl RelayHeader {
                     },
                     key,
                     peer: peer.ok_or("missing peer field")?,
+                    sids: sids.unwrap_or_default(),
                 })
             }
             "ASK" => match (words.next(), words.next()) {
@@ -363,6 +416,10 @@ impl RelayHeader {
                         .map_err(|_| "invalid peer addr")?,
                 }),
                 _ => Err("malformed ASK header"),
+            },
+            "NEEDS" => match words.next() {
+                None => Ok(Self::Needs),
+                Some(_) => Err("malformed NEEDS header"),
             },
             _ => Err("unknown relay command"),
         }
@@ -437,13 +494,16 @@ fn run_window_fleet_relay() {
         return;
     };
     let pid = std::process::id();
-    let _ = serve_window_relay_at(&dir, pid, None, |header, stream| match header {
+    let hosts = |sid: &SessionId| crate::control::hosts_or_keeps(sid);
+    let _ = serve_window_relay_at(&dir, pid, None, hosts, |header, stream| match header {
         RelayHeader::Survey {
             content,
             drive,
             peer,
         } => crate::control::attach_fleet_connection(stream, (content, drive), peer),
-        RelayHeader::Drive { driver, key, peer } => {
+        RelayHeader::Drive {
+            driver, key, peer, ..
+        } => {
             if let Some(key) = key {
                 super::note_admitted_driver(&driver.node, key);
             }
@@ -453,6 +513,7 @@ fn run_window_fleet_relay() {
             crate::control::attach_fleet_drive(stream, peer, driver, key, false)
         }
         RelayHeader::Ask { peer } => crate::members_desk::attach_relayed(stream, peer),
+        RelayHeader::Needs => crate::control::attach_needs_stream(stream),
     });
 }
 
@@ -461,12 +522,12 @@ fn run_window_fleet_relay() {
 /// serves the node's current automatic LAN policy; without one it refuses. A running window
 /// that takes no hand-over is still reported as busy.
 fn relay_ask(
-    relay_dir: PathBuf,
+    windows: WindowRelays,
     automatic: Option<aterm_net::fleet::AskHandler>,
 ) -> aterm_net::fleet::AskHandler {
     Arc::new(
         move |stream: &mut dyn aterm_net::fleet::Duplex, peer: SocketAddr| {
-            let mut window = match relay_to_window(&relay_dir, &RelayHeader::Ask { peer }) {
+            let mut window = match relay_to_window(&windows, &RelayHeader::Ask { peer }) {
                 RelayOpen::Opened(window) => window,
                 RelayOpen::NoWindow => {
                     if let Some(automatic) = &automatic {
@@ -503,13 +564,19 @@ fn relay_ask(
     )
 }
 
-pub(crate) fn serve_window_relay_at<F>(
+/// Serve this window's `wf-<pid>.sock` relay in `relay_dir` until `stop` (or for good): each
+/// header node serve hands over is `attach`ed, except a drive naming a session `hosts` says this
+/// window neither hosts nor keeps a retired worker's row of, which it answers `ELSEWHERE` so node
+/// serve asks the next window ([`handle_relay_accept`]).
+pub(crate) fn serve_window_relay_at<H, F>(
     relay_dir: &Path,
     pid: u32,
     stop: Option<&AtomicBool>,
+    hosts: H,
     attach: F,
 ) -> std::io::Result<()>
 where
+    H: Fn(&SessionId) -> bool + Send + Sync + 'static,
     F: Fn(RelayHeader, CtlStream) -> bool + Send + Sync + 'static,
 {
     crate::control_auth::ensure_control_dir(relay_dir)?;
@@ -532,6 +599,7 @@ where
     }
     let _unlink = UnlinkOnDrop(sock_path);
     let attach = Arc::new(attach);
+    let hosts = Arc::new(hosts);
 
     loop {
         if stop.is_some_and(|flag| flag.load(Ordering::Acquire)) {
@@ -550,10 +618,11 @@ where
                     continue;
                 }
                 let attach = Arc::clone(&attach);
+                let hosts = Arc::clone(&hosts);
                 let _ = std::thread::Builder::new()
                     .name("aterm-wf-admit".to_owned())
                     .spawn(move || {
-                        handle_relay_accept(&mut stream, &*attach);
+                        handle_relay_accept(&mut stream, &*hosts, &*attach);
                     });
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -565,7 +634,11 @@ where
     }
 }
 
-fn handle_relay_accept(stream: &mut CtlStream, attach: &dyn Fn(RelayHeader, CtlStream) -> bool) {
+fn handle_relay_accept(
+    stream: &mut CtlStream,
+    hosts: &dyn Fn(&SessionId) -> bool,
+    attach: &dyn Fn(RelayHeader, CtlStream) -> bool,
+) {
     let _ = stream.set_read_timeout(Some(RELAY_CONNECT_TIMEOUT));
     let _ = stream.set_write_timeout(Some(RELAY_CONNECT_TIMEOUT));
     let line = match read_line_raw(stream, RELAY_HEADER_MAX) {
@@ -584,6 +657,17 @@ fn handle_relay_accept(stream: &mut CtlStream, attach: &dyn Fn(RelayHeader, CtlS
             return;
         }
     };
+    // A drive goes to the window that hosts its sessions: one hosting not every one says which
+    // it does, and node serve asks the next window, or splits a wait across them.
+    if let RelayHeader::Drive { sids, .. } = &header {
+        let hosted: Vec<SessionId> = sids.iter().filter(|sid| hosts(sid)).cloned().collect();
+        if hosted.len() < sids.len() {
+            let _ = stream.write_all(elsewhere_line(&hosted).as_bytes());
+            let _ = stream.flush();
+            aterm_uds::hangup::hang_up(stream);
+            return;
+        }
+    }
     let Ok(cloned) = aterm_uds::kept_out(|| stream.try_clone()) else {
         aterm_uds::hangup::hang_up(stream);
         return;
@@ -661,6 +745,37 @@ fn has_live_window_relay(relay_dir: &Path) -> bool {
     !live_relay_candidates(relay_dir).is_empty()
 }
 
+/// This Mac's windows as node serve hands a fleet connection to them: the folder of their
+/// `wf-<pid>.sock` relays, and the launcher that knows which of them runs this node service's
+/// own app ([`WindowLauncher::runs_this_app`]).
+#[derive(Clone)]
+pub(crate) struct WindowRelays {
+    dir: PathBuf,
+    launcher: Arc<dyn WindowLauncher>,
+}
+
+impl WindowRelays {
+    pub(crate) fn new(dir: PathBuf, launcher: Arc<dyn WindowLauncher>) -> Self {
+        Self { dir, launcher }
+    }
+
+    /// The folder of the relays, where a woken window binds its own.
+    fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The live relays in the order a hand-over tries them: the windows of this node service's
+    /// own app first, then the rest (a dev build's, or one an update left behind), newest first
+    /// within each. A second window someone starts on this Mac's state, from another build, so
+    /// never takes a drive that names no session from the installed app's.
+    fn in_order(&self) -> Vec<(u32, PathBuf)> {
+        let mut windows = live_relay_candidates(&self.dir);
+        // Stable: newest first stays within each side.
+        windows.sort_by_key(|(pid, _)| !self.launcher.runs_this_app(*pid));
+        windows
+    }
+}
+
 /// What a hand-over to this Mac's windows found ([`relay_to_window`]).
 enum RelayOpen {
     /// A window took it: the stream to relay on.
@@ -671,64 +786,146 @@ enum RelayOpen {
     Busy(String),
 }
 
-/// Hand `header` to the newest window that takes it. A window that runs and takes none is
-/// [`RelayOpen::Busy`], never [`RelayOpen::NoWindow`], so a peer is never told this Mac has no
-/// window (nor opened a second one) while one is up.
-fn relay_to_window(relay_dir: &Path, header: &RelayHeader) -> RelayOpen {
-    let wire = header.encode();
-    let mut busy = None;
-    for (_pid, path) in live_relay_candidates(relay_dir) {
-        let mut why = |what: &str| busy = Some(what.to_owned());
-        let deadline = Instant::now() + RELAY_CONNECT_TIMEOUT;
-        // Kept out of children from its creation (`aterm_uds::connect::until`).
-        let Ok(mut stream) = aterm_uds::connect::until(&path, deadline) else {
-            why("its relay socket took no connection");
-            continue;
-        };
-        if crate::control_auth::peer_check(&stream).is_err() {
-            aterm_uds::hangup::hang_up(&stream);
-            why("its relay socket is not this account's");
-            continue;
-        }
-        let _ = stream.set_read_timeout(Some(RELAY_CONNECT_TIMEOUT));
-        let _ = stream.set_write_timeout(Some(RELAY_CONNECT_TIMEOUT));
-        if stream.write_all(wire.as_bytes()).is_err() || stream.flush().is_err() {
-            aterm_uds::hangup::hang_up(&stream);
-            why("it hung up on the hand-over");
-            continue;
-        }
-        let Some(reply) = read_line_raw(&mut stream, 256).ok().flatten() else {
-            aterm_uds::hangup::hang_up(&stream);
-            why("it did not answer the hand-over");
-            continue;
-        };
-        let reply = reply.trim_end_matches(['\r', '\n']);
-        if reply != "OK" {
-            aterm_uds::hangup::hang_up(&stream);
-            why(&aterm_log::sanitize_record(reply));
-            continue;
-        }
-        let _ = stream.set_read_timeout(None);
-        let _ = stream.set_write_timeout(None);
-        return RelayOpen::Opened(stream);
+/// What this Mac's windows answered a hand-over none of them took ([`hand_over_in_order`]).
+struct Declined {
+    /// Each window that hosts not every session the drive names ([`RelayHeader::Drive`]'s
+    /// `sids`), in hand-over order, with those of them it does host or keep.
+    hosting: Vec<(PathBuf, Vec<SessionId>)>,
+    /// Why, last heard, a window took none for another reason: one that may host the rest.
+    busy: Option<String>,
+}
+
+/// What one window answered a hand-over ([`hand_over`]).
+enum HandOver {
+    /// It took it: the stream to relay on.
+    Took(CtlStream),
+    /// It hosts or keeps not every session the header names, only these (`ELSEWHERE hosts=…`).
+    Elsewhere(Vec<SessionId>),
+    /// It took none: why.
+    Busy(String),
+}
+
+/// The line a window answers a drive header whose sessions it does not all host or keep, naming
+/// those it does ([`handle_relay_accept`]).
+fn elsewhere_line(hosted: &[SessionId]) -> String {
+    format!("ELSEWHERE hosts={}\n", sid_list(hosted))
+}
+
+/// `sids` as a relay line carries them: comma-separated, `-` for none.
+fn sid_list(sids: &[SessionId]) -> String {
+    if sids.is_empty() {
+        return "-".to_owned();
     }
-    busy.map_or(RelayOpen::NoWindow, RelayOpen::Busy)
+    sids.iter()
+        .map(SessionId::as_str)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// [`sid_list`] read back: `None` where an element is no session id a drive can name.
+fn parse_sid_list(list: &str) -> Option<Vec<SessionId>> {
+    if list == "-" {
+        return Some(Vec::new());
+    }
+    list.split(',')
+        .map(|sid| relay_names(sid).then(|| SessionId::new(sid)))
+        .collect()
+}
+
+/// Whether `sid` is a session id a relay line carries: `s-` and then letters, digits, `-` or
+/// `_`, as this Mac mints them (`aterm_session::SessionId`), so no list separator or space can
+/// ride in one.
+fn relay_names(sid: &str) -> bool {
+    sid.strip_prefix("s-").is_some_and(|rest| {
+        !rest.is_empty()
+            && rest
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    })
+}
+
+/// Hand `wire` to the window whose relay is `path`, and read what it answered.
+fn hand_over(path: &Path, wire: &str) -> HandOver {
+    let deadline = Instant::now() + RELAY_CONNECT_TIMEOUT;
+    // Kept out of children from its creation (`aterm_uds::connect::until`).
+    let Ok(mut stream) = aterm_uds::connect::until(path, deadline) else {
+        return HandOver::Busy("its relay socket took no connection".to_owned());
+    };
+    if crate::control_auth::peer_check(&stream).is_err() {
+        aterm_uds::hangup::hang_up(&stream);
+        return HandOver::Busy("its relay socket is not this account's".to_owned());
+    }
+    let _ = stream.set_read_timeout(Some(RELAY_CONNECT_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(RELAY_CONNECT_TIMEOUT));
+    if stream.write_all(wire.as_bytes()).is_err() || stream.flush().is_err() {
+        aterm_uds::hangup::hang_up(&stream);
+        return HandOver::Busy("it hung up on the hand-over".to_owned());
+    }
+    let Some(reply) = read_line_raw(&mut stream, RELAY_HEADER_MAX).ok().flatten() else {
+        aterm_uds::hangup::hang_up(&stream);
+        return HandOver::Busy("it did not answer the hand-over".to_owned());
+    };
+    let reply = reply.trim_end_matches(['\r', '\n']);
+    if reply != "OK" {
+        aterm_uds::hangup::hang_up(&stream);
+        if let Some(hosted) = reply
+            .strip_prefix("ELSEWHERE hosts=")
+            .and_then(parse_sid_list)
+        {
+            return HandOver::Elsewhere(hosted);
+        }
+        return HandOver::Busy(aterm_log::sanitize_record(reply).into_owned());
+    }
+    let _ = stream.set_read_timeout(None);
+    let _ = stream.set_write_timeout(None);
+    HandOver::Took(stream)
+}
+
+/// Hand `header` to the first window that takes it, in [`WindowRelays::in_order`]'s order: the
+/// installed app's windows first. A drive that names sessions is taken only by a window that
+/// hosts or keeps every one; one that names none, a survey's and an ask's, by the first that
+/// answers.
+fn hand_over_in_order(windows: &WindowRelays, header: &RelayHeader) -> Result<CtlStream, Declined> {
+    let wire = header.encode();
+    let mut declined = Declined {
+        hosting: Vec::new(),
+        busy: None,
+    };
+    for (_pid, path) in windows.in_order() {
+        match hand_over(&path, &wire) {
+            HandOver::Took(stream) => return Ok(stream),
+            HandOver::Elsewhere(hosted) => declined.hosting.push((path, hosted)),
+            HandOver::Busy(why) => declined.busy = Some(why),
+        }
+    }
+    Err(declined)
+}
+
+/// [`hand_over_in_order`] of a header that names no session. A window that runs and takes none
+/// is [`RelayOpen::Busy`], never [`RelayOpen::NoWindow`], so a peer is never told this Mac has
+/// no window (nor opened a second one) while one is up.
+fn relay_to_window(windows: &WindowRelays, header: &RelayHeader) -> RelayOpen {
+    match hand_over_in_order(windows, header) {
+        Ok(stream) => RelayOpen::Opened(stream),
+        Err(Declined {
+            busy: Some(why), ..
+        }) => RelayOpen::Busy(why),
+        Err(Declined {
+            hosting,
+            busy: None,
+        }) if !hosting.is_empty() => {
+            RelayOpen::Busy("it hosts not the sessions the hand-over names".to_owned())
+        }
+        Err(Declined { .. }) => RelayOpen::NoWindow,
+    }
 }
 
 /// [`relay_to_window`]'s stream, where a window took it.
-fn open_window_relay(relay_dir: &Path, header: &RelayHeader) -> Option<CtlStream> {
-    match relay_to_window(relay_dir, header) {
+fn open_window_relay(windows: &WindowRelays, header: &RelayHeader) -> Option<CtlStream> {
+    match relay_to_window(windows, header) {
         RelayOpen::Opened(stream) => Some(stream),
         RelayOpen::NoWindow | RelayOpen::Busy(_) => None,
     }
-}
-
-/// The answer to a fleet peer whose request a running window here took no hand-over of.
-fn answer_busy(served: aterm_net::fleet::Served, why: &str) -> std::io::Result<()> {
-    served.answer(|stream| {
-        stream.set_write_timeout(Some(HANDSHAKE))?;
-        std::io::Write::write_all(stream, busy_line(why).as_bytes())
-    })
 }
 
 /// What a survey is answered while a window is open and took no fleet connection.
@@ -740,55 +937,338 @@ fn busy_line(why: &str) -> String {
     )
 }
 
+/// This Mac's windows' survey facts, read as one ([`survey_every_window`]): every window's
+/// sessions counted, the installed app's window's facts.
 pub(crate) fn query_window_survey_facts(
-    relay_dir: &Path,
+    windows: &WindowRelays,
 ) -> Option<aterm_agent::survey_facts::SwarmSurveyFacts> {
-    let mut stream = open_window_relay(
-        relay_dir,
-        &RelayHeader::Survey {
-            content: false,
-            drive: false,
-            peer: None,
-        },
-    )?;
-    let _ = stream.set_read_timeout(Some(RELAY_CONNECT_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(RELAY_CONNECT_TIMEOUT));
-    if stream.write_all(b"survey\n").is_err() || stream.flush().is_err() {
-        aterm_uds::hangup::hang_up(&stream);
+    let header = RelayHeader::Survey {
+        content: false,
+        drive: false,
+        peer: None,
+    };
+    let WindowsSurveyed::Answered(wire) = survey_every_window(windows, &header, "survey\n") else {
         return None;
-    }
-    let head = read_line_raw(&mut stream, 512).ok().flatten()?;
+    };
+    aterm_agent::survey_facts::SwarmSurveyFacts::from_survey_reply(&wire).ok()
+}
+
+/// What a survey of every window here found ([`survey_every_window`]).
+enum WindowsSurveyed {
+    /// Their answers, merged ([`merge_window_surveys`]), or the installed app's window's one
+    /// refusal line where none answered with a survey.
+    Answered(String),
+    /// No window took the hand-over: why, last heard (or `None`: no window runs).
+    Untaken(Option<String>),
+}
+
+/// The bounds of one window's survey answer: as many lines as a survey sends at most, in the
+/// reply bound a fleet reader takes.
+const SURVEY_LINES_MAX: usize = 4096;
+const SURVEY_LINE_MAX: usize = aterm_types::control_verbs::MAX_REQUEST_LINE;
+
+/// How long a survey of this Mac waits for its windows' answers: as long as a fleet reader waits
+/// at most for one (`aterm ctl survey --timeout`'s bound, 10 s), as the reader's own deadline
+/// alone bounded a window's answer when it was relayed whole. A unit test's windows are its own,
+/// which answer: they wait the hang detector.
+#[cfg(not(test))]
+const SURVEY_ANSWER_WITHIN: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const SURVEY_ANSWER_WITHIN: Duration = aterm_spec::wait::MUST_HAPPEN;
+
+/// Read a counted answer (`OK <n>` and `n` lines, within [`SURVEY_LINES_MAX`] lines and
+/// `aterm_net::fleet::REPLY_MAX` bytes) from `stream` by `deadline`: `Ok` its whole text, `Err` its
+/// one line where it answered otherwise (`None`: nothing whole by then).
+fn read_counted(stream: &mut CtlStream, deadline: Instant) -> Result<String, Option<String>> {
+    let line = |stream: &mut CtlStream| {
+        let left = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())?;
+        // macOS refuses the option (`EINVAL`) on a socket its peer closed, whose answer may still
+        // wait unread; a closed peer cannot hold the read past it.
+        let _ = stream.set_read_timeout(Some(left));
+        read_line_raw(stream, SURVEY_LINE_MAX).ok().flatten()
+    };
+    let head = line(stream).ok_or(None)?;
     let trimmed = head.trim_end_matches(['\r', '\n']);
-    let count_str = trimmed
-        .strip_prefix("OK ")?
-        .split_ascii_whitespace()
-        .next()?;
-    (!count_str.is_empty()
-        && (count_str == "0" || !count_str.starts_with('0'))
-        && count_str.bytes().all(|b| b.is_ascii_digit()))
-    .then_some(())?;
-    const SURVEY_FACTS_MAX_LINES: usize = 4096;
-    const SURVEY_FACTS_WIRE_MAX: usize = 1 << 20;
-    let count = count_str.parse::<usize>().ok()?;
-    if count > SURVEY_FACTS_MAX_LINES {
-        aterm_uds::hangup::hang_up(&stream);
-        return None;
-    }
-    let mut wire = String::with_capacity(head.len() + count.min(64) * 128);
-    wire.push_str(&head);
+    let Some(count) = trimmed
+        .strip_prefix("OK ")
+        .and_then(|rest| rest.split_ascii_whitespace().next())
+    else {
+        return Err(Some(head));
+    };
+    let count = (!count.is_empty()
+        && (count == "0" || !count.starts_with('0'))
+        && count.bytes().all(|b| b.is_ascii_digit()))
+    .then(|| count.parse::<usize>().ok())
+    .flatten()
+    .filter(|&n| n <= SURVEY_LINES_MAX)
+    .ok_or(None)?;
+    let mut wire = head;
     for _ in 0..count {
-        let Some(line) = read_line_raw(&mut stream, 4096).ok().flatten() else {
-            aterm_uds::hangup::hang_up(&stream);
-            return None;
-        };
-        if wire.len() + line.len() > SURVEY_FACTS_WIRE_MAX {
-            aterm_uds::hangup::hang_up(&stream);
-            return None;
+        let line = line(stream).ok_or(None)?;
+        if wire.len() + line.len() > aterm_net::fleet::REPLY_MAX {
+            return Err(None);
         }
         wire.push_str(&line);
     }
-    aterm_uds::hangup::hang_up(&stream);
-    aterm_agent::survey_facts::SwarmSurveyFacts::from_survey_reply(&wire).ok()
+    Ok(wire)
+}
+
+/// What one window answered a survey ([`ask_window_survey`]): its whole answer, or its one line
+/// (`Ok`) or why it gave none (`Err`).
+type WindowSurvey = Result<String, Result<String, String>>;
+
+/// Ask the window at `path` `request` on a hand-over of `wire`, its answer read by `deadline`.
+fn ask_window_survey(path: &Path, wire: &str, request: &str, deadline: Instant) -> WindowSurvey {
+    match hand_over(path, wire) {
+        HandOver::Took(mut stream) => {
+            let _ = stream.set_write_timeout(Some(RELAY_CONNECT_TIMEOUT));
+            let answer = if stream
+                .write_all(request.as_bytes())
+                .and_then(|()| stream.flush())
+                .is_ok()
+            {
+                read_counted(&mut stream, deadline).map_err(|line| {
+                    line.ok_or_else(|| "it did not answer the survey whole".to_owned())
+                })
+            } else {
+                Err(Err("it hung up on the survey".to_owned()))
+            };
+            aterm_uds::hangup::hang_up(&stream);
+            answer
+        }
+        HandOver::Elsewhere(_) => Err(Err("it answered a survey as a drive".to_owned())),
+        HandOver::Busy(why) => Err(Err(why)),
+    }
+}
+
+/// Ask every window here `request` (a `survey [facts|content]` line) on a hand-over of `header`,
+/// all at once, and merge their answers in [`WindowRelays::in_order`]'s order, the installed
+/// app's window first: a survey of this Mac lists every window's sessions, not the one window
+/// that took it.
+///
+/// Each window has [`SURVEY_ANSWER_WITHIN`] to answer; once one has, the rest have
+/// [`RELAY_CONNECT_TIMEOUT`] more, so a stopped window delays a survey of this Mac by no more
+/// than that, and is left out (`instances_read=` counts the windows read).
+fn survey_every_window(
+    windows: &WindowRelays,
+    header: &RelayHeader,
+    request: &str,
+) -> WindowsSurveyed {
+    let wire = header.encode();
+    let deadline = Instant::now() + SURVEY_ANSWER_WITHIN;
+    let order = windows.in_order();
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, WindowSurvey)>();
+    let mut asked = 0;
+    for (at, (_pid, path)) in order.into_iter().enumerate() {
+        let (wire, request, tx) = (wire.clone(), request.to_owned(), tx.clone());
+        let started = std::thread::Builder::new()
+            .name("aterm-node-survey-window".to_owned())
+            .spawn(move || {
+                let _ = tx.send((at, ask_window_survey(&path, &wire, &request, deadline)));
+            });
+        asked += usize::from(started.is_ok());
+    }
+    drop(tx);
+    let mut answers: Vec<(usize, WindowSurvey)> = Vec::with_capacity(asked);
+    let mut until = deadline;
+    while answers.len() < asked {
+        let now = Instant::now();
+        let Some(left) = until.checked_duration_since(now) else {
+            break;
+        };
+        let Ok((at, answer)) = rx.recv_timeout(left) else {
+            break;
+        };
+        if answer.is_ok() && until == deadline {
+            until = deadline.min(now + RELAY_CONNECT_TIMEOUT);
+        }
+        answers.push((at, answer));
+    }
+    answers.sort_by_key(|(at, _)| *at);
+    let mut surveys = Vec::new();
+    let mut refused = None;
+    let mut busy = None;
+    for (_, answer) in answers {
+        match answer {
+            Ok(survey) => surveys.push(survey),
+            Err(Ok(line)) => {
+                refused.get_or_insert(line);
+            }
+            Err(Err(why)) => busy = Some(why),
+        }
+    }
+    if !surveys.is_empty() {
+        return WindowsSurveyed::Answered(merge_window_surveys(
+            &surveys,
+            aterm_net::fleet::REPLY_MAX,
+        ));
+    }
+    if let Some(line) = refused {
+        return WindowsSurveyed::Answered(line);
+    }
+    WindowsSurveyed::Untaken(busy.or_else(|| (asked > 0).then(|| "no window answered".to_owned())))
+}
+
+/// The windows' survey answers (`OK <n>`, one `instance` line, `session` rows, then the Mac's
+/// own lines: accounts, checkouts, …) merged into one answer of this Mac, at most `max` bytes.
+/// The first answer (the installed app's window's) gives the `instance` line and the Mac's own
+/// lines; its `sessions=` counts every window's sessions, `cut=` the rows sent cut to facts,
+/// `instances=` at least every window read,
+/// and `instances_read=` how many were, so a reader says `k of n instances read` only where some
+/// went unread. Every window's `session` rows follow; past `max`, the rows a window itself would
+/// cut first go (the least kept, the latest first), and `sessions=` still counts them, so a reader
+/// reports them not sent. One answer is returned as it came.
+fn merge_window_surveys(surveys: &[String], max: usize) -> String {
+    if let [only] = surveys {
+        return only.clone();
+    }
+    struct Read<'a> {
+        instance: Option<&'a str>,
+        rows: Vec<&'a str>,
+        own: Vec<&'a str>,
+    }
+    fn read(survey: &str) -> Read<'_> {
+        let mut read = Read {
+            instance: None,
+            rows: Vec::new(),
+            own: Vec::new(),
+        };
+        for line in survey.lines().skip(1) {
+            if line.starts_with("instance ") {
+                read.instance.get_or_insert(line);
+            } else if line.starts_with("session ") {
+                read.rows.push(line);
+            } else {
+                read.own.push(line);
+            }
+        }
+        read
+    }
+    let reads: Vec<Read<'_>> = surveys.iter().map(|survey| read(survey)).collect();
+    let number = |line: Option<&str>, key: &str| -> usize {
+        line.and_then(|line| {
+            line.split_ascii_whitespace()
+                .find_map(|token| token.strip_prefix(key)?.strip_prefix('='))
+        })
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+    };
+    let sessions: usize = reads
+        .iter()
+        .map(|read| number(read.instance, "sessions"))
+        .sum();
+    let cuts: Vec<usize> = reads
+        .iter()
+        .map(|read| number(read.instance, "cut"))
+        .collect();
+    let instances = reads
+        .iter()
+        .map(|read| number(read.instance, "instances"))
+        .max()
+        .unwrap_or(0)
+        .max(reads.len());
+    let primary = &reads[0];
+    let instance_line = |cut: usize| {
+        let mut instance: Vec<String> = primary
+            .instance
+            .unwrap_or("instance")
+            .split_ascii_whitespace()
+            .filter(|token| !token.starts_with("instances_read="))
+            .map(|token| match token.split_once('=') {
+                Some(("sessions", _)) => format!("sessions={sessions}"),
+                Some(("cut", _)) => format!("cut={cut}"),
+                Some(("instances", _)) => format!("instances={instances}"),
+                _ => token.to_owned(),
+            })
+            .collect();
+        instance.push(format!("instances_read={}", reads.len()));
+        instance.join(" ")
+    };
+    // Fitted with every window's cut rows counted, at least as long as the line it ends with.
+    let instance = instance_line(cuts.iter().sum());
+    // The rows in the order they are cut, as a window cuts its own: the least kept first, the
+    // latest (the last window's last row) first among equals.
+    let mut rows: Vec<(usize, usize, &str)> = reads
+        .iter()
+        .enumerate()
+        .flat_map(|(window, read)| {
+            read.rows
+                .iter()
+                .enumerate()
+                .map(move |(at, row)| (window, at, *row))
+        })
+        .collect();
+    let mut cut_order: Vec<usize> = (0..rows.len()).collect();
+    cut_order.sort_by_key(|&at| {
+        let (window, row, text) = rows[at];
+        (row_kept(text), std::cmp::Reverse((window, row)))
+    });
+    let own_bytes: usize = primary.own.iter().map(|line| line.len() + 1).sum();
+    let head_bytes =
+        |sent: usize| format!("OK {}\n{instance}\n", sent + 1 + primary.own.len()).len();
+    let mut total: usize = rows.iter().map(|(_, _, row)| row.len() + 1).sum();
+    let mut sent = rows.len();
+    let mut dropped = vec![false; rows.len()];
+    for at in cut_order {
+        if head_bytes(sent) + total + own_bytes <= max {
+            break;
+        }
+        dropped[at] = true;
+        total -= rows[at].2.len() + 1;
+        sent -= 1;
+    }
+    let mut at = 0;
+    rows.retain(|_| {
+        let keep = !dropped[at];
+        at += 1;
+        keep
+    });
+    // `cut=` counts the rows sent cut to facts: of a window that cut some, each sent without the
+    // `said=` every content row carries.
+    let cut = rows
+        .iter()
+        .filter(|(window, _, row)| {
+            cuts[*window] > 0 && !row.split_ascii_whitespace().any(|t| t.starts_with("said="))
+        })
+        .count();
+    let mut out = format!(
+        "OK {}\n{}\n",
+        rows.len() + 1 + primary.own.len(),
+        instance_line(cut)
+    );
+    for (_, _, row) in rows {
+        out.push_str(row);
+        out.push('\n');
+    }
+    for line in &primary.own {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// How much a survey keeps a session row, read off its words as the window ranked it when it
+/// wrote it (`crate::survey`'s own rank): 2 for one that needs someone or is mid-turn
+/// (`attention=`, `needs=`, an agent busy, prompting, asking or at a wall), 1 for another
+/// agent's (`program_kind=agent`), 0 for the rest.
+fn row_kept(row: &str) -> u8 {
+    let word = |key: &str| {
+        row.split_ascii_whitespace()
+            .find_map(|token| token.strip_prefix(key)?.strip_prefix('='))
+            .unwrap_or("-")
+    };
+    let agent = word("agent");
+    if word("attention") != "-"
+        || word("needs") != "-"
+        || matches!(agent, "busy" | "prompt" | "question")
+        || agent.starts_with("wall:")
+    {
+        2
+    } else {
+        u8::from(word("program_kind") == "agent")
+    }
 }
 
 /// Configuration for the node job's supervision loop ([`serve_node_job`]), which production
@@ -824,11 +1304,11 @@ pub struct NodeServeConfig {
     pub stop: Arc<AtomicBool>,
     /// Window launcher seam for windowless `Drive` `spawn` (§7.4).
     pub launcher: Arc<dyn WindowLauncher>,
-    /// Whether this job may use the local network now
-    /// ([`aterm_types::macos_setup::lan_first_use::may_use`]): not while System State's Local
-    /// Network step is still to come, which asks macOS's question first. Until then the job
-    /// advertises, listens and dials nothing on the LAN.
-    pub lan_may_go: fn() -> bool,
+    /// Why this job cannot use the local network now, in the LAN broker's words
+    /// ([`crate::network_moved::lan_unavailable`]): on macOS aterm's LAN traffic goes through
+    /// the root LAN broker, so while it does not answer the job advertises, listens and dials
+    /// nothing on the LAN. `None` once it answers.
+    pub lan_unavailable: fn() -> Option<String>,
     /// This run's updater and what its boot found (`None`: a run that updates nothing, as a
     /// lab's or a test's on scratch state), [`NodeUpdates`].
     pub updates: Option<NodeUpdates>,
@@ -983,6 +1463,10 @@ pub trait NodeUpdater: Send + Sync {
     /// where a stage is ready it swaps the stage in and execs the build it installed, and never
     /// returns. Otherwise it returns what it did.
     fn apply_at_boot(&self) -> String;
+    /// Count and recover an already-armed trial without admitting any staged update.
+    fn recover_trial_at_boot(&self) -> String;
+    /// Whether this installed image has a trial still owed to its headless service.
+    fn trial_pending(&self) -> bool;
     /// Confirm this build's boot trial; `false` asks again.
     fn confirm_trial(&self) -> bool;
     /// The build installed in this copy's place where it is older than the one this job runs
@@ -1030,26 +1514,170 @@ impl NodeBoot {
 pub struct NodeUpdates {
     updater: Arc<dyn NodeUpdater>,
     boot: NodeBoot,
-    confirmed: Arc<AtomicBool>,
 }
 
 impl NodeUpdates {
     /// `updater` for a run whose boot found `boot`.
     #[must_use]
     pub fn new(updater: Arc<dyn NodeUpdater>, boot: NodeBoot) -> Self {
-        Self {
-            updater,
-            boot,
-            confirmed: Arc::new(AtomicBool::new(false)),
+        Self { updater, boot }
+    }
+
+    fn active_trial(&self) -> bool {
+        // Window custody can expire or move after a look. Only the canonical
+        // trial receipt, not this process's earlier checkpoint, owns that truth.
+        self.updater.trial_pending()
+    }
+
+    fn confirm_checkpoint(&self, stop: &AtomicBool) {
+        if !stop.load(Ordering::Acquire) && self.active_trial() && !stop.load(Ordering::Acquire) {
+            // Confirmation rechecks headless ownership under the apply lock. A
+            // window may have acquired it since active_trial; its true return
+            // can leave that window's trial armed, so never cache the result.
+            let _ = self.updater.confirm_trial();
         }
     }
 
-    /// Confirm this build's boot trial, until it is: the job asks once it has run a tick in its
-    /// steady state (its listener serving, or holding the LAN as its configuration says).
-    fn settle_trial(&self) {
-        if !self.confirmed.load(Ordering::Acquire) && self.updater.confirm_trial() {
-            self.confirmed.store(true, Ordering::Release);
+    fn failed_trial(&self, stop: &AtomicBool, why: &str) {
+        if !stop.load(Ordering::Acquire) && self.active_trial() && !stop.load(Ordering::Acquire) {
+            self.updater.restart(&format!(
+                "the active node update trial could not prove its listener: {why}"
+            ));
         }
+    }
+
+    fn settle_service(
+        &self,
+        inputs: &health::Inputs,
+        (addr, secret, node, listen): (
+            SocketAddr,
+            &aterm_net::fleet::FleetSecret,
+            &Option<(String, aterm_net::fleet::NodeKey)>,
+            &str,
+        ),
+        stop: &AtomicBool,
+    ) -> bool {
+        self.settle_service_with(inputs, (addr, secret, node, listen), stop, |basis| {
+            basis.prove(addr, HANDSHAKE)
+        })
+    }
+
+    fn settle_service_with(
+        &self,
+        inputs: &health::Inputs,
+        (_addr, secret, node, listen): (
+            SocketAddr,
+            &aterm_net::fleet::FleetSecret,
+            &Option<(String, aterm_net::fleet::NodeKey)>,
+            &str,
+        ),
+        stop: &AtomicBool,
+        prove: impl FnOnce(&health::Basis) -> Result<health::Proven, String>,
+    ) -> bool {
+        if stop.load(Ordering::Acquire) {
+            return false;
+        }
+        if !self.active_trial() {
+            return true;
+        }
+        let before = match inputs.observe() {
+            health::Standing::Held => {
+                if !stop.load(Ordering::Acquire) {
+                    self.confirm_checkpoint(stop);
+                }
+                return !stop.load(Ordering::Acquire);
+            }
+            health::Standing::Unread(why) => {
+                self.failed_trial(stop, why);
+                return false;
+            }
+            health::Standing::Admitted(basis) => basis,
+        };
+        if !before.is_generation(secret, node, listen) {
+            return false;
+        }
+        if stop.load(Ordering::Acquire) {
+            return false;
+        }
+        let proof = prove(&before);
+        if stop.load(Ordering::Acquire) {
+            return false;
+        }
+        // A successful old exchange grants no checkpoint after its policy, key,
+        // identity or generation changed. A withdrawn source grants no restart either.
+        let after = inputs.observe();
+        if stop.load(Ordering::Acquire) {
+            return false;
+        }
+        match after {
+            health::Standing::Admitted(after)
+                if after.is_generation(secret, node, listen) && before.same_as(&after) =>
+            {
+                match proof {
+                    Ok(proof) => self.confirm_service(stop, proof),
+                    Err(why) => self.failed_trial(stop, &why),
+                }
+            }
+            _ => return false,
+        }
+        !stop.load(Ordering::Acquire)
+    }
+
+    fn confirm_service(&self, stop: &AtomicBool, _proof: health::Proven) {
+        self.confirm_checkpoint(stop);
+    }
+}
+
+enum IdleCheckpoint<'a> {
+    Waiting,
+    PortOwnedElsewhere,
+    Failed(&'a str),
+}
+
+fn checkpoint_idle(cfg: &NodeServeConfig, why: IdleCheckpoint<'_>) {
+    checkpoint_idle_with(cfg, why, || a_window_relay_answers(&cfg.relay_dir));
+}
+
+fn checkpoint_idle_with(
+    cfg: &NodeServeConfig,
+    why: IdleCheckpoint<'_>,
+    window_answers: impl FnOnce() -> bool,
+) {
+    let Some(updates) = &cfg.updates else {
+        return;
+    };
+    if cfg.stop.load(Ordering::Acquire) || !updates.active_trial() {
+        return;
+    }
+    let inputs = health::Inputs::of(cfg);
+    let standing = inputs.observe();
+    if cfg.stop.load(Ordering::Acquire) {
+        return;
+    }
+    match standing {
+        health::Standing::Held => updates.confirm_checkpoint(&cfg.stop),
+        health::Standing::Unread(why) => updates.failed_trial(&cfg.stop, why),
+        health::Standing::Admitted(before) => match why {
+            IdleCheckpoint::Waiting => {}
+            IdleCheckpoint::PortOwnedElsewhere => {
+                let answers = window_answers();
+                if cfg.stop.load(Ordering::Acquire) {
+                    return;
+                }
+                let after = inputs.observe();
+                if cfg.stop.load(Ordering::Acquire)
+                    || !matches!(after, health::Standing::Admitted(after) if before.same_as(&after))
+                {
+                    return;
+                }
+                if answers {
+                    updates.confirm_checkpoint(&cfg.stop);
+                } else {
+                    updates.failed_trial(&cfg.stop, "node port is held but no window answers");
+                }
+            }
+            IdleCheckpoint::Failed(why) => updates.failed_trial(&cfg.stop, why),
+        },
     }
 }
 
@@ -1083,18 +1711,21 @@ fn relay_answers(path: &Path) -> bool {
 }
 
 /// The node job's boot (§4.13, A4), before its Commons runtime, listener or checker starts. The
-/// boot apply runs unless `[update] auto_apply` is off (Install applies a stage then) or a window
-/// runs here (it applies its own), whatever this job's look at the stage finds, since the apply
-/// reads the stage itself. So each windowless start counts against a boot trial of its build,
-/// and a build that crash-loops under launchd is reverted and the restored build re-execed
-/// (`ImageReplacement::Replaceable`). A boot that applies a stage never returns.
+/// boot apply runs with `[update] auto_apply` on and no window here (a window applies its own),
+/// whatever this job's look at the stage finds, since the apply reads the stage itself. With
+/// automatic installation off, a windowless start only counts and recovers an already-armed
+/// trial. A build that crash-loops under launchd is therefore reverted and the restored build
+/// re-execed (`ImageReplacement::Replaceable`) without admitting a stage while Install owns
+/// that decision. A boot that applies a stage never returns.
 pub(crate) fn apply_at_node_boot(updater: &dyn NodeUpdater, relay_dir: &Path) -> NodeBoot {
     let started = updater.now();
     let newer = updater.newer_build();
-    let held = if !updater.auto_apply() {
-        Some("[update] auto_apply is off, so Install applies it")
-    } else if a_window_relay_answers(relay_dir) {
+    let held = if a_window_relay_answers(relay_dir) {
         Some("a window runs here, which applies it")
+    } else if !updater.auto_apply() {
+        let recovery = updater.recover_trial_at_boot();
+        aterm_log::info!("aterm node serve: boot trial recovery with auto-apply off: {recovery}");
+        Some("[update] auto_apply is off, so Install applies it")
     } else {
         None
     };
@@ -1287,12 +1918,25 @@ impl NodeUpdater for LiveNodeUpdater {
         format!("{outcome:?}")
     }
 
+    fn recover_trial_at_boot(&self) -> String {
+        let outcome = aterm_update::recover_boot_trial_exact(
+            crate::running_build_number(),
+            crate::build_info::git_commit(),
+            aterm_update::TrialWitness::Headless,
+        );
+        format!("{outcome:?}")
+    }
+
     fn confirm_trial(&self) -> bool {
         aterm_update::confirm_boot_health_exact(
             crate::running_build_number(),
             crate::build_info::git_commit(),
             aterm_update::TrialWitness::Headless,
         )
+    }
+
+    fn trial_pending(&self) -> bool {
+        aterm_update::headless_boot_trial_pending(crate::running_build_number())
     }
 
     fn older_build_installed(&self) -> Option<u64> {
@@ -1382,10 +2026,25 @@ fn apply_node_update_at_boot() -> NodeBoot {
     }
 }
 
+/// A test child's stand-in for the root LAN broker's answer, which [`run_node_serve`] gates its
+/// LAN work on ([`node_lan_gate`]): a test binary has no broker of its own.
+#[cfg(test)]
+pub(crate) static NODE_LAN_GATE_FOR_TEST: std::sync::OnceLock<fn() -> Option<String>> =
+    std::sync::OnceLock::new();
+
+/// The gate [`run_node_serve`] asks before its LAN work: the root LAN broker's answer
+/// ([`crate::network_moved::lan_unavailable`]), or a test child's stand-in.
+fn node_lan_gate() -> fn() -> Option<String> {
+    #[cfg(test)]
+    if let Some(gate) = NODE_LAN_GATE_FOR_TEST.get() {
+        return *gate;
+    }
+    crate::network_moved::lan_unavailable
+}
+
 /// Foreground entry point for `aterm node serve` (`systems.alab.aterm-node`, C20–C23,
 /// §4.13): the job's lock first ([`own_node_job`]), then its boot apply
-/// ([`apply_node_update_at_boot`]), then `startup` (the job's Commons runtime and the LAN gates
-/// it starts under), then the run. A start that finds the lock held is a second instance and
+/// ([`apply_node_update_at_boot`]), then `startup` (the job's Commons runtime), then the run. A start that finds the lock held is a second instance and
 /// does none of it, so it neither swaps a stage in nor counts a start against the boot trial of
 /// a build another instance runs, and starts no service beside the one that serves.
 #[must_use = "return or inspect the node service's exit status"]
@@ -1496,7 +2155,7 @@ fn run_node_serve(state_dir: PathBuf, boot: NodeBoot, job_lock: NodeJobLock) -> 
         wake_timeout: DEFAULT_WAKE_TIMEOUT,
         stop,
         launcher: Arc::new(LiveWindowLauncher::default()),
-        lan_may_go: aterm_types::macos_setup::lan_first_use::may_use,
+        lan_unavailable: node_lan_gate(),
         updates,
         mesh: NodeMesh::live(),
     };
@@ -1640,34 +2299,27 @@ fn serve_node_job(mut cfg: NodeServeConfig, job_lock: NodeJobLock) -> ExitCode {
         crate::network_moved::alab_tcp()
     });
     let denied_cache: Arc<Mutex<DeniedCache>> = Arc::new(Mutex::new(DeniedCache::new()));
-    let mut waits_for_step = false;
-    let mut went_round = false;
+    let mut waits_for_broker = false;
     // The fabric's bus.log, hosted here with the mesh on (C2), whatever the generations do:
-    // local clients reach it with no fleet key, no Local Network step and no node key. Held
+    // local clients reach it with no fleet key, no LAN broker and no node key. Held
     // before the mesh logs, so it closes after them.
     let bus_keeper = cfg.mesh.keep_bus();
     let mut mesh_logs = MeshHeld::default();
     mesh_logs.bus = bus_keeper.as_ref().map(|keeper| Arc::clone(keeper.slot()));
 
     while !cfg.stop.load(Ordering::Acquire) {
-        // Round again, the job has held the LAN for a tick as its configuration says, or served
-        // a generation: either is its steady state, so its boot trial is confirmed. A serving
-        // generation's watcher confirms it after the listener's first tick.
-        if std::mem::replace(&mut went_round, true)
-            && let Some(updates) = cfg.updates.as_ref()
-        {
-            updates.settle_trial();
-        }
         if fleet_turned_off_or_swarm_disabled(&cfg) {
             advertiser.stop();
             port_lock = None;
             sleep_interruptible(&cfg.stop, cfg.tick_every);
+            checkpoint_idle(&cfg, IdleCheckpoint::Waiting);
             continue;
         }
         let Some(wanted) = wanted_for_node(&cfg) else {
             advertiser.stop();
             port_lock = None;
             sleep_interruptible(&cfg.stop, cfg.tick_every);
+            checkpoint_idle(&cfg, IdleCheckpoint::Waiting);
             continue;
         };
         let secret = match aterm_net::fleet::read_key_file(&cfg.state_dir) {
@@ -1676,21 +2328,23 @@ fn serve_node_job(mut cfg: NodeServeConfig, job_lock: NodeJobLock) -> ExitCode {
                 advertiser.stop();
                 port_lock = None;
                 sleep_interruptible(&cfg.stop, cfg.tick_every);
+                checkpoint_idle(&cfg, IdleCheckpoint::Waiting);
                 continue;
             }
         };
         // Asked once a generation is due (the job is wanted and holds the fleet's key), right
         // before it advertises, listens and dials.
-        if !(cfg.lan_may_go)() {
-            if !std::mem::replace(&mut waits_for_step, true) {
+        if let Some(why) = (cfg.lan_unavailable)() {
+            if !std::mem::replace(&mut waits_for_broker, true) {
                 aterm_log::info!(
-                    "aterm node serve: waits for System State's Local Network step, which asks \
-                     macOS first, before it advertises, listens or dials on the local network"
+                    "aterm node serve: waits for the LAN broker before it advertises, listens or \
+                     dials on the local network: {why}"
                 );
             }
             advertiser.stop();
             port_lock = None;
             sleep_interruptible(&cfg.stop, cfg.tick_every);
+            checkpoint_idle(&cfg, IdleCheckpoint::Waiting);
             continue;
         }
 
@@ -1711,19 +2365,36 @@ fn serve_node_job(mut cfg: NodeServeConfig, job_lock: NodeJobLock) -> ExitCode {
                 advertiser.stop();
                 port_lock = None;
                 sleep_interruptible(&cfg.stop, cfg.tick_every);
+                checkpoint_idle(
+                    &cfg,
+                    IdleCheckpoint::Failed("node listen address is invalid"),
+                );
                 continue;
             };
             if aterm_net::loopback::check(aterm_net::loopback::Reach::Listen(addr)).is_err() {
                 advertiser.stop();
                 port_lock = None;
                 sleep_interruptible(&cfg.stop, cfg.tick_every);
+                checkpoint_idle(
+                    &cfg,
+                    IdleCheckpoint::Failed("node listen address is refused"),
+                );
                 continue;
             }
             if port_lock.is_none() {
                 match NodeJobLock::try_acquire_port(&cfg.state_dir) {
                     Ok(Some(held)) => port_lock = Some(held),
-                    Ok(None) | Err(_) => {
+                    Ok(None) => {
                         sleep_interruptible(&cfg.stop, cfg.tick_every);
+                        checkpoint_idle(&cfg, IdleCheckpoint::PortOwnedElsewhere);
+                        continue;
+                    }
+                    Err(_) => {
+                        sleep_interruptible(&cfg.stop, cfg.tick_every);
+                        checkpoint_idle(
+                            &cfg,
+                            IdleCheckpoint::Failed("node port custody is unreadable"),
+                        );
                         continue;
                     }
                 }
@@ -1735,6 +2406,7 @@ fn serve_node_job(mut cfg: NodeServeConfig, job_lock: NodeJobLock) -> ExitCode {
                         port_lock = None;
                     }
                     sleep_interruptible(&cfg.stop, cfg.tick_every);
+                    checkpoint_idle(&cfg, IdleCheckpoint::Failed("node listener could not bind"));
                     continue;
                 }
             }
@@ -1743,6 +2415,10 @@ fn serve_node_job(mut cfg: NodeServeConfig, job_lock: NodeJobLock) -> ExitCode {
         let Ok(bound_addr) = listener.local_addr() else {
             port_lock = None;
             sleep_interruptible(&cfg.stop, cfg.tick_every);
+            checkpoint_idle(
+                &cfg,
+                IdleCheckpoint::Failed("node bound address is unreadable"),
+            );
             continue;
         };
         if let Some(vault_paths) = cfg.vault_paths.as_ref() {
@@ -1775,6 +2451,10 @@ fn serve_node_job(mut cfg: NodeServeConfig, job_lock: NodeJobLock) -> ExitCode {
             mesh_now.as_ref(),
         ) {
             port_lock = None;
+            checkpoint_idle(
+                &cfg,
+                IdleCheckpoint::Failed("node listener could not start"),
+            );
         }
     }
 
@@ -1793,7 +2473,7 @@ fn spawn_node_vault_pass(cfg: &NodeServeConfig) -> Option<std::thread::JoinHandl
     let stop = Arc::clone(&cfg.stop);
     let state_dir = cfg.state_dir.clone();
     let config_path = cfg.config_path.clone();
-    let lan_may_go = cfg.lan_may_go;
+    let lan_unavailable = cfg.lan_unavailable;
     let now_ms = Arc::clone(&cfg.mesh.pass_now_ms);
     let start_converge = Arc::clone(&cfg.mesh.pass_converge);
     let pace = cfg.mesh.pass_pace;
@@ -1804,7 +2484,7 @@ fn spawn_node_vault_pass(cfg: &NodeServeConfig) -> Option<std::thread::JoinHandl
                 paths: &paths,
                 stop: &stop,
                 held: &|| sharing_held(&state_dir, config_path.as_deref()),
-                may_post: &lan_may_go,
+                may_post: &|| lan_unavailable().is_none(),
                 start_converge: &*start_converge,
                 now_ms: &*now_ms,
                 log: &|line| aterm_log::info!("node: {line}"),
@@ -1874,11 +2554,14 @@ fn node_serving(
 /// once the mesh is on and this Mac holds its node key, kept across generations (a sealed log's
 /// reopen reads it whole) while that key stays, and closed as the job ends, however it ends.
 /// Presence (B7c) runs on them while they are held: this Mac's row every 30 seconds, and every
-/// seat's standing read from the rows; it stops before they close.
+/// seat's standing read from the rows; it stops before they close. So do the needs reads (Q4,
+/// §4.14), which hand every window's needs row to the installed [`WindowNeeds`].
 #[derive(Default)]
 struct MeshHeld {
     mesh: Option<Arc<aterm_mesh::Mesh>>,
     presence: Option<aterm_mesh::presence::Presence>,
+    /// The reads of this Mac's windows' needs ([`WindowNeedsReads`]).
+    needs: Option<WindowNeedsReads>,
     /// The node listener's port this generation bound, which this Mac's row names.
     port: Arc<AtomicU16>,
     /// The last reason an open failed, journaled once.
@@ -1916,6 +2599,7 @@ impl MeshHeld {
             && key != Some(mesh.key())
         {
             aterm_log::info!("node: the node key changed, so the mesh logs reopen");
+            self.needs = None;
             self.presence = None;
             mesh.close();
             self.mesh = None;
@@ -1960,12 +2644,29 @@ impl MeshHeld {
                 }
             }
         }
+        if self.needs.is_none() && self.mesh.is_some() {
+            match WindowNeedsReads::start(
+                cfg.relay_dir.clone(),
+                cfg.tick_every,
+                installed_window_needs(),
+            ) {
+                Ok(needs) => self.needs = Some(needs),
+                Err(e) => {
+                    let why = format!("the needs reads did not start: {e}");
+                    if self.said.as_deref() != Some(why.as_str()) {
+                        aterm_log::warn!("node: {why}");
+                        self.said = Some(why);
+                    }
+                }
+            }
+        }
         self.mesh.clone()
     }
 }
 
 impl Drop for MeshHeld {
     fn drop(&mut self) {
+        self.needs = None;
         self.presence = None;
         if let Some(mesh) = self.mesh.take() {
             mesh.close();
@@ -2010,6 +2711,334 @@ fn presence_config(
         }),
         observe: None,
     }
+}
+
+/// The cap on one needs frame's row, both ways: a window writes none longer, and the node job
+/// refuses a length past it before it reads any of the row ([`RelayHeader::Needs`]).
+pub(crate) const NEEDS_FRAME_MAX: usize = 64 * 1024;
+
+/// How long a window that took no needs hand-over (a build that predates it) is left before the
+/// node job asks it again.
+const NEEDS_ASK_AGAIN: Duration = Duration::from_secs(60);
+
+/// Write `row` to `out` as one needs frame: the length of its encoding as a big-endian `u32`,
+/// then [`NeedsRow::encode`], flushed.
+///
+/// # Errors
+/// `InvalidInput` for an encoding longer than [`NEEDS_FRAME_MAX`], which writes nothing; else the
+/// write's own.
+pub(crate) fn write_needs_frame(out: &mut impl Write, row: &NeedsRow) -> std::io::Result<()> {
+    let body = row.encode();
+    let len = u32::try_from(body.len())
+        .ok()
+        .filter(|_| body.len() <= NEEDS_FRAME_MAX)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "a needs row longer than a frame holds",
+            )
+        })?;
+    let mut frame = Vec::with_capacity(4 + body.len());
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.extend_from_slice(&body);
+    out.write_all(&frame)?;
+    out.flush()
+}
+
+/// Read one needs frame from `input` ([`write_needs_frame`]): its row, decoded strictly.
+///
+/// # Errors
+/// `UnexpectedEof` where the stream ends, before a frame as within one; `InvalidData` for a
+/// length past [`NEEDS_FRAME_MAX`], refused before any of the row is read, or for a row
+/// [`NeedsRow::decode`] refuses, one with a trailing byte among them; else the read's own.
+pub(crate) fn read_needs_frame(input: &mut impl Read) -> std::io::Result<NeedsRow> {
+    let mut len = [0u8; 4];
+    input.read_exact(&mut len)?;
+    let len = usize::try_from(u32::from_be_bytes(len)).unwrap_or(usize::MAX);
+    if len > NEEDS_FRAME_MAX {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "a needs frame longer than its cap",
+        ));
+    }
+    let mut body = vec![0u8; len];
+    input.read_exact(&mut body)?;
+    NeedsRow::decode(&body).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("a needs row: {error}"),
+        )
+    })
+}
+
+/// Every live window's latest needs row, by the window's pid, handed to the metrics publisher
+/// each time one changes or a window goes (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.14).
+pub type WindowNeeds = Arc<dyn Fn(&BTreeMap<u32, NeedsRow>) + Send + Sync>;
+
+/// The [`WindowNeeds`] this process installed ([`install_window_needs`]).
+static WINDOW_NEEDS: OnceLock<WindowNeeds> = OnceLock::new();
+
+/// Install `sink` as the node job's [`WindowNeeds`], which the job's needs reads hand each change
+/// to while it holds the mesh. The first install stands: the answer says whether this call
+/// installed `sink`. With none installed, the job keeps each window's row and calls nothing.
+pub fn install_window_needs(sink: WindowNeeds) -> bool {
+    WINDOW_NEEDS.set(sink).is_ok()
+}
+
+/// What the node job's needs reads hand each change to: the installed [`WindowNeeds`], looked up
+/// at each change, so one installed after the reads began is handed the next.
+fn installed_window_needs() -> WindowNeeds {
+    Arc::new(|rows| {
+        if let Some(sink) = WINDOW_NEEDS.get() {
+            sink(rows);
+        }
+    })
+}
+
+/// Whether `a` and `b` say the same, the times they were written aside.
+fn same_needs(a: &NeedsRow, b: &NeedsRow) -> bool {
+    a.needs == b.needs && a.held == b.held && a.managers == b.managers
+}
+
+/// The node job's reads of its windows' needs (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.14),
+/// run while it holds the mesh ([`MeshHeld`]): one thread that, every tick, hands
+/// [`RelayHeader::Needs`] to each live window it reads none from, and one reader per window that
+/// keeps the window's latest row and hands its sink the whole map at each change, a window that
+/// goes included, from the first map that holds every window the first look found
+/// ([`NeedsReads::prime`]). Dropping it stops them: it hangs up on every window, joins every thread, and
+/// hands nothing more on.
+struct WindowNeedsReads {
+    shared: Arc<NeedsReads>,
+    dialer: Option<std::thread::JoinHandle<()>>,
+}
+
+/// What [`WindowNeedsReads`]' threads share.
+struct NeedsReads {
+    /// Set as the reads stop.
+    stop: AtomicBool,
+    /// Each window's latest row, by pid: the map the sink is handed.
+    rows: Mutex<BTreeMap<u32, NeedsRow>>,
+    /// A copy of the stream each window is read on, by pid, to hang up on as the reads stop.
+    streams: Mutex<BTreeMap<u32, CtlStream>>,
+    /// Each window's reader, joined as the reads stop.
+    readers: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// What each change is handed to, called with [`Self::rows`] held, so the calls come in the
+    /// order the changes did.
+    sink: WindowNeeds,
+    /// Set, with [`Self::rows`] held, once every window the first look opened wrote its first row
+    /// or went, or [`HANDSHAKE`] passed ([`Self::prime`]): until then rows are kept and handed on
+    /// to no one, so the sink's first map is every window's, not the first one read.
+    primed: AtomicBool,
+    /// The windows the first look opened that have neither written a row nor gone yet.
+    first: Mutex<BTreeSet<u32>>,
+    /// Rung as each window leaves [`Self::first`].
+    first_left: std::sync::Condvar,
+}
+
+impl WindowNeedsReads {
+    /// Read the needs of every live window whose relay socket is in `relay_dir`, looking for
+    /// windows not yet read every `every`, and hand `sink` the whole map at each change.
+    ///
+    /// # Errors
+    /// The spawn of the thread that looks for windows.
+    fn start(relay_dir: PathBuf, every: Duration, sink: WindowNeeds) -> std::io::Result<Self> {
+        let shared = Arc::new(NeedsReads {
+            stop: AtomicBool::new(false),
+            rows: Mutex::default(),
+            streams: Mutex::default(),
+            readers: Mutex::default(),
+            sink,
+            primed: AtomicBool::new(false),
+            first: Mutex::default(),
+            first_left: std::sync::Condvar::new(),
+        });
+        let dialer = std::thread::Builder::new()
+            .name("aterm-node-needs".to_owned())
+            .spawn({
+                let shared = Arc::clone(&shared);
+                move || shared.dial_windows(&relay_dir, every)
+            })?;
+        Ok(Self {
+            shared,
+            dialer: Some(dialer),
+        })
+    }
+}
+
+impl Drop for WindowNeedsReads {
+    fn drop(&mut self) {
+        self.shared.stop.store(true, Ordering::Release);
+        if let Some(dialer) = self.dialer.take() {
+            let _ = dialer.join();
+        }
+        for stream in self.shared.streams.lock_or_recover().values() {
+            aterm_uds::hangup::hang_up(stream);
+        }
+        let readers = std::mem::take(&mut *self.shared.readers.lock_or_recover());
+        for reader in readers {
+            let _ = reader.join();
+        }
+    }
+}
+
+impl NeedsReads {
+    /// Until the reads stop, every `every`: open a read of each live window in `relay_dir` this
+    /// holds none of, a window that refused one left [`NEEDS_ASK_AGAIN`] first.
+    fn dial_windows(self: &Arc<Self>, relay_dir: &Path, every: Duration) {
+        let mut refused: BTreeMap<u32, Instant> = BTreeMap::new();
+        let mut looked = false;
+        while !self.stop.load(Ordering::Acquire) {
+            self.readers
+                .lock_or_recover()
+                .retain(|reader| !reader.is_finished());
+            let windows = live_relay_candidates(relay_dir);
+            refused.retain(|pid, _| windows.iter().any(|(live, _)| live == pid));
+            for (pid, path) in windows {
+                if self.stop.load(Ordering::Acquire) {
+                    return;
+                }
+                if self.streams.lock_or_recover().contains_key(&pid)
+                    || refused
+                        .get(&pid)
+                        .is_some_and(|until| Instant::now() < *until)
+                {
+                    continue;
+                }
+                match open_needs(&path) {
+                    Some(stream) => {
+                        if !looked {
+                            self.first.lock_or_recover().insert(pid);
+                        }
+                        self.read_window(pid, stream);
+                    }
+                    None => {
+                        refused.insert(pid, Instant::now() + NEEDS_ASK_AGAIN);
+                    }
+                }
+            }
+            if !looked {
+                looked = true;
+                self.prime();
+            }
+            sleep_interruptible(&self.stop, every);
+        }
+    }
+
+    /// Read window `pid`'s needs on `stream` on a thread of its own, holding a copy of the stream
+    /// to hang up on.
+    fn read_window(self: &Arc<Self>, pid: u32, stream: CtlStream) {
+        let Ok(copy) = aterm_uds::kept_out(|| stream.try_clone()) else {
+            aterm_uds::hangup::hang_up(&stream);
+            self.left_first(pid);
+            return;
+        };
+        self.streams.lock_or_recover().insert(pid, copy);
+        let shared = Arc::clone(self);
+        match std::thread::Builder::new()
+            .name("aterm-node-needs-read".to_owned())
+            .spawn(move || shared.take_frames(pid, &stream))
+        {
+            Ok(reader) => self.readers.lock_or_recover().push(reader),
+            Err(error) => {
+                aterm_log::warn!("node: no needs read of window {pid}: {error}");
+                if let Some(copy) = self.streams.lock_or_recover().remove(&pid) {
+                    aterm_uds::hangup::hang_up(&copy);
+                }
+                self.left_first(pid);
+            }
+        }
+    }
+
+    /// Keep each row window `pid` writes on `stream`, handing the sink the map at each change,
+    /// until the window hangs up, writes a frame [`read_needs_frame`] refuses, or the reads stop.
+    /// Then forget its row, handing the sink the map without it where it held one and the reads
+    /// did not stop, and let go of its stream, so the next look may read the window again.
+    fn take_frames(&self, pid: u32, stream: &CtlStream) {
+        let mut awake = aterm_uds::hangup::Awake(stream);
+        while let Ok(row) = read_needs_frame(&mut awake) {
+            if self.stop.load(Ordering::Acquire) {
+                break;
+            }
+            let mut rows = self.rows.lock_or_recover();
+            if rows.get(&pid).is_some_and(|held| same_needs(held, &row)) {
+                continue;
+            }
+            rows.insert(pid, row);
+            if self.primed.load(Ordering::Acquire) {
+                (self.sink)(&rows);
+            } else {
+                drop(rows);
+                self.left_first(pid);
+            }
+        }
+        {
+            let mut rows = self.rows.lock_or_recover();
+            if rows.remove(&pid).is_some()
+                && self.primed.load(Ordering::Acquire)
+                && !self.stop.load(Ordering::Acquire)
+            {
+                (self.sink)(&rows);
+            }
+        }
+        self.left_first(pid);
+        aterm_uds::hangup::hang_up(stream);
+        drop(self.streams.lock_or_recover().remove(&pid));
+    }
+}
+
+impl NeedsReads {
+    /// Wait, at most [`HANDSHAKE`], until every window the first look opened wrote its first row
+    /// or went, then hand the sink the map once, an empty one included, so a row of windows gone
+    /// before this node job started is cleared, and every change from then on.
+    fn prime(&self) {
+        let deadline = Instant::now() + HANDSHAKE;
+        let mut first = self.first.lock_or_recover();
+        while !first.is_empty() && !self.stop.load(Ordering::Acquire) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            first = self
+                .first_left
+                .wait_timeout(first, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        first.clear();
+        drop(first);
+        let rows = self.rows.lock_or_recover();
+        self.primed.store(true, Ordering::Release);
+        if !self.stop.load(Ordering::Acquire) {
+            (self.sink)(&rows);
+        }
+    }
+
+    /// Window `pid` wrote its first row or went: the first look waits on it no longer.
+    fn left_first(&self, pid: u32) {
+        if self.first.lock_or_recover().remove(&pid) {
+            self.first_left.notify_all();
+        }
+    }
+}
+
+/// The stream a window's needs are read on: [`RelayHeader::Needs`] handed to the window whose
+/// relay socket is `path` ([`hand_over`]), then `go` written within [`HANDSHAKE`]; `None` where
+/// the window took none.
+fn open_needs(path: &Path) -> Option<CtlStream> {
+    let HandOver::Took(mut stream) = hand_over(path, &RelayHeader::Needs.encode()) else {
+        return None;
+    };
+    let _ = stream.set_write_timeout(Some(HANDSHAKE));
+    if stream
+        .write_all(b"go\n")
+        .and_then(|()| stream.flush())
+        .is_err()
+    {
+        aterm_uds::hangup::hang_up(&stream);
+        return None;
+    }
+    let _ = stream.set_write_timeout(None);
+    Some(stream)
 }
 
 /// Open the mesh logs in the node job's state dir: the standings are the vault's, read as
@@ -2383,6 +3412,7 @@ fn serve_one_node_generation(
     let _announcing = Announcing(advertiser);
     let running = Arc::new(AtomicBool::new(true));
     let open_table = Arc::new(NodeOpenTable::default());
+    let windows = WindowRelays::new(cfg.relay_dir.clone(), Arc::clone(&cfg.launcher));
     let automatic_joins = match cfg
         .vault_paths
         .clone()
@@ -2439,7 +3469,7 @@ fn serve_one_node_generation(
         (Some(me), true) => {
             let serve = LinkServe {
                 state_dir: cfg.state_dir.clone(),
-                relay_dir: cfg.relay_dir.clone(),
+                windows: windows.clone(),
                 home_dir: cfg.home_dir.clone(),
                 config_path: cfg.config_path.clone(),
                 vault_paths: cfg.vault_paths.clone(),
@@ -2447,12 +3477,8 @@ fn serve_one_node_generation(
                 denied: Arc::clone(denied_cache),
                 open: Arc::clone(&open_table),
                 serving: Arc::new(serving_fn.clone()),
-                launcher: Arc::clone(&cfg.launcher),
                 wake_timeout: cfg.wake_timeout,
-                ask: relay_ask(
-                    cfg.relay_dir.clone(),
-                    automatic_handle.clone().map(automatic_ask),
-                ),
+                ask: relay_ask(windows.clone(), automatic_handle.clone().map(automatic_ask)),
                 units: Arc::clone(&cfg.mesh.units),
                 mesh: mesh_logs.cloned(),
             }
@@ -2517,7 +3543,7 @@ fn serve_one_node_generation(
         let open_watch = Arc::clone(&open_table);
         let stop = Arc::clone(&cfg.stop);
         let state_dir = cfg.state_dir.clone();
-        let relay_dir = cfg.relay_dir.clone();
+        let windows = windows.clone();
         let home_dir = cfg.home_dir.clone();
         let config_path = cfg.config_path.clone();
         let vault_paths = cfg.vault_paths.clone();
@@ -2533,6 +3559,7 @@ fn serve_one_node_generation(
         let discovery = Arc::clone(discovery);
         let automatic = automatic_handle.clone();
         let updates_watch = cfg.updates.clone();
+        let health_inputs = health::Inputs::of(cfg);
         std::thread::Builder::new()
             .name("aterm-node-watch".to_owned())
             .spawn(move || {
@@ -2552,11 +3579,6 @@ fn serve_one_node_generation(
                     if stop.load(Ordering::Acquire) {
                         running.store(false, Ordering::Release);
                         return;
-                    }
-                    // The listener has answered for a tick: this build's boot trial is
-                    // confirmed (A4).
-                    if let Some(updates) = &updates_watch {
-                        updates.settle_trial();
                     }
                     if admission_network.take_at(Instant::now()).is_some()
                         && let Some(automatic) = &automatic
@@ -2585,6 +3607,17 @@ fn serve_one_node_generation(
                         .flatten();
                     let now_node = identity.as_ref().map(|n| (n.node().to_owned(), n.key()));
                     if now_key.as_ref().ok() != Some(&secret_watch) || now_node != proved {
+                        running.store(false, Ordering::Release);
+                        return;
+                    }
+
+                    if let Some(updates) = &updates_watch
+                        && !updates.settle_service(
+                            &health_inputs,
+                            (addr, &secret_watch, &proved, &initial_listen),
+                            &stop,
+                        )
+                    {
                         running.store(false, Ordering::Release);
                         return;
                     }
@@ -2643,7 +3676,7 @@ fn serve_one_node_generation(
                             vp,
                             config_path.as_deref(),
                             addr.port(),
-                            has_live_window_relay(&relay_dir),
+                            has_live_window_relay(windows.dir()),
                         );
                     }
 
@@ -2660,7 +3693,7 @@ fn serve_one_node_generation(
                         last_facts_push = Instant::now();
                         push_node_facts_heartbeat(
                             &state_dir,
-                            &relay_dir,
+                            &windows,
                             home_dir.as_deref(),
                             config_path.as_deref(),
                             &secret_watch,
@@ -2737,11 +3770,10 @@ fn serve_one_node_generation(
         lifetime: lifetime(),
     };
     let state_dir = cfg.state_dir.clone();
-    let relay_dir = cfg.relay_dir.clone();
+    let windows = windows.clone();
     let home_dir = cfg.home_dir.clone();
     let config_path = cfg.config_path.clone();
     let vault_paths = cfg.vault_paths.clone();
-    let launcher = Arc::clone(&cfg.launcher);
     let wake_timeout = cfg.wake_timeout;
     let join_secret = Arc::new(secret);
     let members = cfg.members.clone();
@@ -2749,7 +3781,7 @@ fn serve_one_node_generation(
     let serving_for_offer = serving_fn.clone();
     let open_for_serve = Arc::clone(&open_table);
     let serving_generation = Arc::clone(&running);
-    let ask = relay_ask(relay_dir.clone(), automatic_handle.map(automatic_ask));
+    let ask = relay_ask(windows.clone(), automatic_handle.map(automatic_ask));
     let mesh = cfg.mesh.on;
     let table_for_serve = neighbours.as_ref().map(|links| Arc::clone(&links.table));
     let mesh_for_serve = mesh_logs.cloned();
@@ -2947,10 +3979,9 @@ fn serve_one_node_generation(
                     Arc::clone(&open),
                     vault_paths.clone(),
                     state_dir.clone(),
-                    relay_dir.clone(),
+                    windows.clone(),
                     (driver, driver_key),
                     peer,
-                    Arc::clone(&launcher),
                     wake_timeout,
                 )?;
                 return served.relay_answers(far);
@@ -2967,32 +3998,8 @@ fn serve_one_node_generation(
                     &denied,
                     log.as_deref(),
                 );
-            let relayed = relay_to_window(
-                &relay_dir,
-                &RelayHeader::Survey {
-                    content,
-                    drive,
-                    peer,
-                },
-            );
-            if let RelayOpen::Busy(why) = relayed {
-                return answer_busy(served, &why);
-            }
-            if let RelayOpen::Opened(window_stream) = relayed {
-                let Some(_open) = open_for_serve.admit(content, None, &window_stream, |c, d| {
-                    serving_fn().serves(c, d, &|_, _| false, &[])
-                })?
-                else {
-                    aterm_uds::hangup::hang_up(&window_stream);
-                    return Err(std::io::Error::other(
-                        "[fleet] lowered its level while it was admitted",
-                    ));
-                };
-                return served.relay_answers(window_stream);
-            }
-
             let (near, far) = aterm_uds::kept_out(CtlStream::pair)?;
-            let Some(_open) = open_for_serve.admit(content, None, &near, |c, d| {
+            let Some(open) = open_for_serve.admit(content, None, &near, |c, d| {
                 serving_fn().serves(c, d, &|_, _| false, &[])
             })?
             else {
@@ -3000,13 +4007,22 @@ fn serve_one_node_generation(
                     "[fleet] lowered its level while it was admitted",
                 ));
             };
-            spawn_windowless_survey(
-                near,
-                state_dir.clone(),
-                home_dir.clone(),
-                config_path.clone(),
-                (content, drive),
-            )?;
+            if has_live_window_relay(windows.dir()) {
+                let header = RelayHeader::Survey {
+                    content,
+                    drive,
+                    peer,
+                };
+                spawn_node_survey(near, windows.clone(), header, Arc::clone(&open))?;
+            } else {
+                spawn_windowless_survey(
+                    near,
+                    state_dir.clone(),
+                    home_dir.clone(),
+                    config_path.clone(),
+                    (content, drive),
+                )?;
+            }
             served.relay_answers(far)
         },
         fleet_event,
@@ -3046,13 +4062,13 @@ pub(crate) fn read_checkouts_when_due(
 
 fn push_node_facts_heartbeat(
     state_dir: &Path,
-    relay_dir: &Path,
+    windows: &WindowRelays,
     home_dir: Option<&Path>,
     config_path: Option<&Path>,
     secret: &aterm_net::fleet::FleetSecret,
     (denied_nodes, log): (&[String], Option<&aterm_net::fleet_member::MemberKeys>),
 ) {
-    let window = has_live_window_relay(relay_dir);
+    let window = has_live_window_relay(windows.dir());
     let node = aterm_net::fleet_member::read_node_id(state_dir)
         .ok()
         .flatten();
@@ -3060,7 +4076,7 @@ fn push_node_facts_heartbeat(
         .and_then(|s| i64::try_from(s).ok())
         .unwrap_or(0);
     let facts = if window {
-        query_window_survey_facts(relay_dir).map(|mut live| {
+        query_window_survey_facts(windows).map(|mut live| {
             if live.node.is_none() {
                 live.node.clone_from(&node);
             }
@@ -3093,6 +4109,77 @@ fn push_node_facts_heartbeat(
             aterm_log::sanitize_record(&why)
         );
     }
+}
+
+/// How many requests one fleet `Survey` connection is served, as a window serves one
+/// (`crate::control`'s `FLEET_REQUESTS`): each `survey` asks every window here.
+const SURVEY_REQUESTS: usize = 4;
+
+/// Serve a fleet `Survey` connection on `near` while windows run here: each `survey` line is
+/// answered by every window at once, merged ([`survey_every_window`]); any other line (`version`,
+/// `setup …`, or one a window refuses in its words) and the rest of the connection go to the
+/// installed app's window, as the one window served them all before. Where no window takes a
+/// survey, it is answered busy, as a window that took no hand-over was.
+fn spawn_node_survey(
+    mut near: CtlStream,
+    windows: WindowRelays,
+    header: RelayHeader,
+    open: Arc<NodeOpened>,
+) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("aterm-node-survey".to_owned())
+        .spawn(move || {
+            for _ in 0..SURVEY_REQUESTS {
+                let line =
+                    match read_line_raw(&mut near, aterm_types::control_verbs::MAX_REQUEST_LINE) {
+                        Ok(Some(line)) => line,
+                        Ok(None) => break,
+                        Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+                            let msg = format!(
+                                "ERR {}\n",
+                                aterm_types::control_verbs::request_line_too_long()
+                            );
+                            let _ = near.write_all(msg.as_bytes());
+                            break;
+                        }
+                        Err(_) => break,
+                    };
+                if open.is_cut() {
+                    break;
+                }
+                let verb = line.split_ascii_whitespace().next().unwrap_or_default();
+                if verb != "survey" {
+                    match relay_to_window(&windows, &header) {
+                        RelayOpen::Opened(window) => {
+                            forward_node_drive(near, window, &open, &line);
+                            return;
+                        }
+                        RelayOpen::Busy(why) => {
+                            let _ = near.write_all(busy_line(&why).as_bytes());
+                        }
+                        RelayOpen::NoWindow => {
+                            let _ = near.write_all(busy_line("its window closed").as_bytes());
+                        }
+                    }
+                    break;
+                }
+                let answer = match survey_every_window(&windows, &header, &line) {
+                    WindowsSurveyed::Answered(answer) => answer,
+                    WindowsSurveyed::Untaken(why) => {
+                        let _ = near.write_all(
+                            busy_line(why.as_deref().unwrap_or("its window closed")).as_bytes(),
+                        );
+                        break;
+                    }
+                };
+                if near.write_all(answer.as_bytes()).is_err() || near.flush().is_err() {
+                    break;
+                }
+            }
+            let _ = near.flush();
+            aterm_uds::hangup::hang_up(&near);
+        })
+        .map(|_| ())
 }
 
 fn spawn_windowless_survey(
@@ -3206,10 +4293,9 @@ fn spawn_node_drive(
     open: Arc<NodeOpened>,
     vault_paths: Option<aterm_secrets::client::Paths>,
     state_dir: PathBuf,
-    relay_dir: PathBuf,
+    windows: WindowRelays,
     (driver, driver_key): (crate::fabric::Driver, aterm_net::fleet::NodeKey),
     peer: Option<SocketAddr>,
-    launcher: Arc<dyn WindowLauncher>,
     wake_timeout: Duration,
 ) -> std::io::Result<()> {
     std::thread::Builder::new()
@@ -3243,11 +4329,14 @@ fn spawn_node_drive(
                 return;
             }
             let trimmed = first_line.trim_end_matches(['\r', '\n']).trim_start();
-            let (verb, rest) = trimmed.split_once(char::is_whitespace)
+            let (verb, rest) = trimmed
+                .split_once(char::is_whitespace)
                 .map_or((trimmed, ""), |(verb, rest)| (verb, rest.trim_start()));
             if verb == "vault" {
                 let reply = aterm_secrets::client::admin_service::serve_at(
-                    vault_paths.as_ref(), &format!("fleet:{}", driver.node), rest,
+                    vault_paths.as_ref(),
+                    &format!("fleet:{}", driver.node),
+                    rest,
                 );
                 let _ = near.write_all(reply.as_bytes());
                 let _ = near.flush();
@@ -3273,7 +4362,8 @@ fn spawn_node_drive(
             // Forwarding polls to the newest window would lose their request book.
             if verb == aterm_agent::harness::remote_renew::VERB {
                 let reply = aterm_agent::harness::remote_renew::serve(
-                    &format!("fleet:{}", driver.node), rest,
+                    &format!("fleet:{}", driver.node),
+                    rest,
                 );
                 let _ = near.write_all(reply.as_bytes());
                 let _ = near.flush();
@@ -3282,48 +4372,57 @@ fn spawn_node_drive(
             }
             if verb == aterm_agent::service_repair_rpc::VERB {
                 let reply = aterm_agent::service_repair_rpc::serve_in_context(
-                    &driver.node, &driver_key.hex(), rest, vault_paths.as_ref(), &state_dir,
+                    &driver.node,
+                    &driver_key.hex(),
+                    rest,
+                    vault_paths.as_ref(),
+                    &state_dir,
                 );
                 let _ = near.write_all(reply.as_bytes());
                 let _ = near.flush();
                 aterm_uds::hangup::hang_up(&near);
                 return;
             }
+            let busy = |why: &str| {
+                format!(
+                    "ERR busy: an aterm window is open on this Mac and took no fleet connection \
+                     ({}); ask again\n",
+                    aterm_log::sanitize_record(why),
+                )
+            };
             let header = RelayHeader::Drive {
                 driver,
                 key: Some(driver_key),
                 peer,
+                sids: Vec::new(),
             };
-            match relay_to_window(&relay_dir, &header) {
-                RelayOpen::Opened(win) => {
+            let answer = match route_drive(&windows, &header, &first_line) {
+                DriveRoute::Window(win) => {
                     forward_node_drive(near, win, &open, &first_line);
                     return;
                 }
-                RelayOpen::Busy(why) => {
-                    let reply = format!(
-                        "ERR busy: an aterm window is open on this Mac and took no fleet connection ({}); ask again\n",
-                        aterm_log::sanitize_record(&why),
-                    );
-                    let _ = near.write_all(reply.as_bytes());
-                    let _ = near.flush();
-                    aterm_uds::hangup::hang_up(&near);
+                DriveRoute::Split(shares) => {
+                    serve_split_await(near, &open, &header, shares, &first_line);
                     return;
                 }
-                RelayOpen::NoWindow => {}
-            }
-            if verb != "spawn" {
-                let _ = near.write_all(b"ERR no window open on this Mac\n");
+                DriveRoute::Answer(answer) => answer,
+                DriveRoute::Busy(why) => busy(&why),
+                DriveRoute::NoWindow if verb == "spawn" => String::new(),
+                DriveRoute::NoWindow => "ERR no window open on this Mac\n".to_owned(),
+            };
+            if !answer.is_empty() {
+                let _ = near.write_all(answer.as_bytes());
                 let _ = near.flush();
                 aterm_uds::hangup::hang_up(&near);
                 return;
             }
-            if !launcher.is_logged_in() {
+            if !windows.launcher.is_logged_in() {
                 let _ = near.write_all(b"ERR logged out\n");
                 let _ = near.flush();
                 aterm_uds::hangup::hang_up(&near);
                 return;
             }
-            if let Err(why) = launcher.launch_window(&state_dir, &relay_dir) {
+            if let Err(why) = windows.launcher.launch_window(&state_dir, windows.dir()) {
                 let _ = near.write_all(
                     format!(
                         "ERR window launch failed: {}\n",
@@ -3346,7 +4445,7 @@ fn spawn_node_drive(
                     aterm_uds::hangup::hang_up(&near);
                     return;
                 }
-                if let Some(stream) = open_window_relay(&relay_dir, &header) {
+                if let Some(stream) = open_window_relay(&windows, &header) {
                     window_stream = Some(stream);
                     break;
                 }
@@ -3373,6 +4472,411 @@ fn forward_node_drive(near: CtlStream, mut win: CtlStream, open: &NodeOpened, fi
         return;
     }
     pump_bidirectional(near, win);
+}
+
+/// Where a drive's first line goes among this Mac's windows ([`route_drive`]).
+enum DriveRoute {
+    /// The window that took it: the one that hosts or keeps every session it names, or with none
+    /// named the installed app's.
+    Window(CtlStream),
+    /// No window runs here.
+    NoWindow,
+    /// Windows run and none took it: why, last heard.
+    Busy(String),
+    /// An `await task` whose targets live in more than one window: each window's share, in
+    /// hand-over order ([`serve_split_await`]).
+    Split(Vec<AwaitShare>),
+    /// Answered here, as a window would: a session the wait names that no window hosts.
+    Answer(String),
+}
+
+/// One window's share of an `await task` split across windows: its relay, the stream it took the
+/// share's header on, and the targets it hosts or keeps.
+struct AwaitShare {
+    path: PathBuf,
+    stream: CtlStream,
+    sids: Vec<SessionId>,
+}
+
+/// Route a drive's `first_line`, one rule for every drive verb. A line that names sessions
+/// ([`crate::control::drive_line_sessions`]) goes to the window that hosts or keeps every one, as
+/// `header` carries them; one that names none (a spawn's) to the installed app's window
+/// ([`WindowRelays::in_order`]).
+///
+/// Where no window hosts them all: an `await task` whose targets live in several windows is split
+/// across them, so a driver never needs to know this Mac runs two (a refusal would make it ask
+/// each window apart, which it cannot name); any other line goes, naming no session, to the window
+/// that hosts the most of them (the first in order where none does), whose own drive gate answers
+/// for the rest in its words (`no such session`, or that a drive names a session this Mac hosts).
+/// A window that answered nothing at all may host the rest: then the drive is answered busy.
+fn route_drive(windows: &WindowRelays, header: &RelayHeader, first_line: &str) -> DriveRoute {
+    let mut sids = crate::control::drive_line_sessions(first_line);
+    sids.retain(|sid| relay_names(sid.as_str()));
+    let naming = |sids: Vec<SessionId>| match header.clone() {
+        RelayHeader::Drive {
+            driver, key, peer, ..
+        } => RelayHeader::Drive {
+            driver,
+            key,
+            peer,
+            sids,
+        },
+        other => other,
+    };
+    let declined = match hand_over_in_order(windows, &naming(sids.clone())) {
+        Ok(stream) => return DriveRoute::Window(stream),
+        Err(declined) => declined,
+    };
+    if declined.hosting.is_empty() {
+        return declined.busy.map_or(DriveRoute::NoWindow, DriveRoute::Busy);
+    }
+    // The window (by its place in `hosting`) that hosts each named session, the first in order.
+    let owner: Vec<Option<usize>> = sids
+        .iter()
+        .map(|sid| {
+            declined
+                .hosting
+                .iter()
+                .position(|(_, hosted)| hosted.contains(sid))
+        })
+        .collect();
+    if let Some(why) = &declined.busy
+        && owner.iter().any(Option::is_none)
+    {
+        return DriveRoute::Busy(why.clone());
+    }
+    let mut owners: Vec<usize> = owner.iter().flatten().copied().collect();
+    owners.sort_unstable();
+    owners.dedup();
+    let unconstrained = naming(Vec::new()).encode();
+    if owners.len() > 1 && is_await_task(first_line) {
+        if let Some(gone) = sids.iter().zip(&owner).find(|(_, at)| at.is_none()) {
+            return DriveRoute::Answer(format!("ERR no such session @{}\n", gone.0.as_str()));
+        }
+        let mut shares = Vec::with_capacity(owners.len());
+        for at in owners {
+            let share: Vec<SessionId> = sids
+                .iter()
+                .zip(&owner)
+                .filter(|(_, by)| **by == Some(at))
+                .map(|(sid, _)| sid.clone())
+                .collect();
+            let path = declined.hosting[at].0.clone();
+            match hand_over(&path, &naming(share.clone()).encode()) {
+                HandOver::Took(stream) => shares.push(AwaitShare {
+                    path,
+                    stream,
+                    sids: share,
+                }),
+                HandOver::Elsewhere(_) => {
+                    return DriveRoute::Busy("a session moved between windows".to_owned());
+                }
+                HandOver::Busy(why) => return DriveRoute::Busy(why),
+            }
+        }
+        return DriveRoute::Split(shares);
+    }
+    let most = declined
+        .hosting
+        .iter()
+        .enumerate()
+        .max_by_key(|(at, (_, hosted))| (hosted.len(), std::cmp::Reverse(*at)))
+        .map(|(_, (path, _))| path.clone());
+    match most.map(|path| hand_over(&path, &unconstrained)) {
+        Some(HandOver::Took(stream)) => DriveRoute::Window(stream),
+        Some(HandOver::Elsewhere(_)) | None => {
+            DriveRoute::Busy("it hosts not the sessions the drive names".to_owned())
+        }
+        Some(HandOver::Busy(why)) => DriveRoute::Busy(why),
+    }
+}
+
+/// Whether a drive's line is an `await task` (with no selector in front).
+fn is_await_task(line: &str) -> bool {
+    let mut words = line.split_whitespace();
+    words.next() == Some("await") && words.next() == Some("task")
+}
+
+/// `first_line`, an `await task` over several windows' sessions, narrowed to the targets in
+/// `share` (each list element kept as the driver spelled it, `@s-…:<rev>` edges included) and,
+/// where `timeout` is given, waiting that long instead of the line's own timeout.
+fn await_share_line(first_line: &str, share: &[SessionId], timeout: Option<&str>) -> String {
+    let mut words = first_line.split_whitespace();
+    let mut out: Vec<String> = Vec::new();
+    while let Some(word) = words.next() {
+        if word.starts_with('@') {
+            let kept: Vec<&str> = word
+                .split(',')
+                .filter(|element| {
+                    let body = element.strip_prefix('@').unwrap_or(element);
+                    let sid = body.split_once(':').map_or(body, |(sid, _)| sid);
+                    share.iter().any(|named| named.as_str() == sid)
+                })
+                .collect();
+            if !kept.is_empty() {
+                out.push(kept.join(","));
+            }
+        } else if timeout.is_some() && word == "timeout" {
+            // `timeout <ms>`, replaced below.
+            let _ = words.next();
+        } else if !(timeout.is_some() && word.starts_with("timeout=")) {
+            out.push(word.to_owned());
+        }
+    }
+    if let Some(timeout) = timeout {
+        out.push(format!("timeout={timeout}"));
+    }
+    let mut line = out.join(" ");
+    line.push('\n');
+    line
+}
+
+/// What a window answered its share of a split `await task`: `OK <n>[ status=timeout]` and its
+/// rows, the one line it answered otherwise (an `ERR`), or nothing whole: it hung up, or no window
+/// here took the share again.
+enum ShareReply {
+    Rows { timed_out: bool, rows: Vec<String> },
+    Line(String),
+    HungUp,
+}
+
+/// Read a window's answer to an `await task` share.
+fn read_share_reply(stream: &mut CtlStream) -> ShareReply {
+    let Some(head) = read_line_raw(stream, aterm_types::control_verbs::MAX_REQUEST_LINE)
+        .ok()
+        .flatten()
+    else {
+        return ShareReply::HungUp;
+    };
+    let Some(count) = head
+        .trim_end_matches(['\r', '\n'])
+        .strip_prefix("OK ")
+        .map(|rest| rest.split_whitespace().collect::<Vec<_>>())
+    else {
+        return ShareReply::Line(head);
+    };
+    let timed_out = count.get(1) == Some(&"status=timeout");
+    let Some(n) = count
+        .first()
+        .and_then(|n| n.parse::<usize>().ok())
+        .filter(|&n| n <= crate::task_record::MAX_AWAIT_TARGETS)
+    else {
+        return ShareReply::Line(head);
+    };
+    let mut rows = Vec::with_capacity(n);
+    for _ in 0..n {
+        let Some(row) = read_line_raw(stream, aterm_types::control_verbs::MAX_REQUEST_LINE)
+            .ok()
+            .flatten()
+        else {
+            return ShareReply::HungUp;
+        };
+        rows.push(row.trim_end_matches(['\r', '\n']).to_owned());
+    }
+    ShareReply::Rows { timed_out, rows }
+}
+
+/// Serve an `await task` whose targets live in several windows here ([`DriveRoute::Split`]): each
+/// window waits on its own share, as the line asked (`any` or `all`, its edges and timeout), and
+/// the driver is answered as one window would answer the whole wait: one row per target, in the
+/// line's order.
+///
+/// Under `any`, the first share with news ends the wait: every other window's wait is hung up and
+/// its share read again at once (`timeout=0`, the same edges, so news there shows too). Under
+/// `all`, or once a share ran out of time, every share's answer is waited for; the answer times
+/// out where the line's combine says (`any`: all of them; `all`: any). A share answered with one
+/// line (an `ERR`) is the answer. A window that hangs up on its share hangs up the driver too,
+/// unanswered, as one window closing on the whole wait would: the driver asks again, and the
+/// question finds where the sessions are then. The driver hanging up hangs up every window's wait.
+fn serve_split_await(
+    mut near: CtlStream,
+    open: &NodeOpened,
+    header: &RelayHeader,
+    shares: Vec<AwaitShare>,
+    first_line: &str,
+) {
+    let all = first_line.split_whitespace().any(|word| word == "all");
+    let hang_up_all = |shares: &[(PathBuf, Vec<SessionId>, CtlStream)]| {
+        for (_, _, stream) in shares {
+            aterm_uds::hangup::hang_up(stream);
+        }
+    };
+    let mut held = Vec::with_capacity(shares.len());
+    for share in shares {
+        held.push((share.path, share.sids, share.stream));
+    }
+    let attached = held
+        .first()
+        .is_some_and(|(_, _, stream)| open.attach_line(stream));
+    let mut sent = attached;
+    for (_, sids, stream) in &mut held {
+        sent = sent
+            && stream
+                .write_all(await_share_line(first_line, sids, None).as_bytes())
+                .and_then(|()| stream.flush())
+                .is_ok();
+    }
+    if !sent {
+        hang_up_all(&held);
+        aterm_uds::hangup::hang_up(&near);
+        return;
+    }
+    enum Heard {
+        Share(usize, ShareReply),
+        HungUp,
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<Heard>();
+    for (at, (_, _, stream)) in held.iter().enumerate() {
+        let Ok(mut reading) = aterm_uds::kept_out(|| stream.try_clone()) else {
+            hang_up_all(&held);
+            aterm_uds::hangup::hang_up(&near);
+            return;
+        };
+        let tx = tx.clone();
+        let _ = std::thread::Builder::new()
+            .name("aterm-node-await-share".to_owned())
+            .spawn(move || {
+                let _ = tx.send(Heard::Share(at, read_share_reply(&mut reading)));
+            });
+    }
+    if let Ok(mut watching) = aterm_uds::kept_out(|| near.try_clone()) {
+        let tx = tx.clone();
+        let _ = std::thread::Builder::new()
+            .name("aterm-node-await-driver".to_owned())
+            .spawn(move || {
+                let mut sink = [0u8; 256];
+                while matches!(watching.read(&mut sink), Ok(n) if n > 0) {}
+                let _ = tx.send(Heard::HungUp);
+            });
+    }
+    drop(tx);
+    let mut answers: Vec<Option<(bool, Vec<String>)>> = vec![None; held.len()];
+    let answer = loop {
+        let Ok(heard) = rx.recv() else {
+            break None;
+        };
+        let (at, reply) = match heard {
+            Heard::HungUp => break None,
+            Heard::Share(at, reply) => (at, reply),
+        };
+        let (timed_out, rows) = match reply {
+            ShareReply::Line(line) => break Some(line),
+            ShareReply::HungUp => break None,
+            ShareReply::Rows { timed_out, rows } => (timed_out, rows),
+        };
+        answers[at] = Some((timed_out, rows));
+        if !all && !timed_out {
+            // News ends an `any` wait: the other shares are read again at once.
+            let mut failed = None;
+            for (other, (path, sids, stream)) in held.iter().enumerate() {
+                if answers[other].is_some() {
+                    continue;
+                }
+                aterm_uds::hangup::hang_up(stream);
+                match read_share_now(path, header, sids, first_line) {
+                    ShareReply::Rows { rows, .. } => answers[other] = Some((false, rows)),
+                    ShareReply::Line(line) => {
+                        failed = Some(Some(line));
+                        break;
+                    }
+                    ShareReply::HungUp => {
+                        failed = Some(None);
+                        break;
+                    }
+                }
+            }
+            if let Some(failed) = failed {
+                break failed;
+            }
+        }
+        if answers.iter().all(Option::is_some) {
+            break Some(merge_share_rows(first_line, &answers, all));
+        }
+    };
+    hang_up_all(&held);
+    if let Some(answer) = answer {
+        let _ = near.write_all(answer.as_bytes());
+        let _ = near.flush();
+    }
+    aterm_uds::hangup::hang_up(&near);
+}
+
+/// A split wait's share read at once (`timeout=0`, the line's own edges), on a hand-over of its
+/// own to the window at `path`, once another share's news ended an `any` wait. A look answers
+/// within the served exchange's handshake bound; a window that does not, or no longer hosts the
+/// share or takes no connection, is [`ShareReply::HungUp`].
+fn read_share_now(
+    path: &Path,
+    header: &RelayHeader,
+    sids: &[SessionId],
+    first_line: &str,
+) -> ShareReply {
+    let HandOver::Took(mut stream) = hand_over(path, &share_header(header, sids).encode()) else {
+        return ShareReply::HungUp;
+    };
+    let _ = stream.set_read_timeout(Some(HANDSHAKE));
+    let read = stream
+        .write_all(await_share_line(first_line, sids, Some("0")).as_bytes())
+        .and_then(|()| stream.flush())
+        .map(|()| read_share_reply(&mut stream));
+    aterm_uds::hangup::hang_up(&stream);
+    read.unwrap_or(ShareReply::HungUp)
+}
+
+/// `header` naming `sids`: a split wait's share handed over again.
+fn share_header(header: &RelayHeader, sids: &[SessionId]) -> RelayHeader {
+    match header.clone() {
+        RelayHeader::Drive {
+            driver, key, peer, ..
+        } => RelayHeader::Drive {
+            driver,
+            key,
+            peer,
+            sids: sids.to_vec(),
+        },
+        other => other,
+    }
+}
+
+/// The split wait's answer, as one window answers `await task`: `OK <n>`, ` status=timeout` where
+/// the line's combine has every share (`any`) or one share (`all`) out of time, then each
+/// target's row in the line's order.
+fn merge_share_rows(
+    first_line: &str,
+    answers: &[Option<(bool, Vec<String>)>],
+    all: bool,
+) -> String {
+    let timed_out = |share: &Option<(bool, Vec<String>)>| share.as_ref().is_some_and(|(t, _)| *t);
+    let timeout = if all {
+        answers.iter().any(timed_out)
+    } else {
+        answers.iter().all(timed_out)
+    };
+    let mut rows: Vec<&str> = answers
+        .iter()
+        .flatten()
+        .flat_map(|(_, rows)| rows.iter().map(String::as_str))
+        .collect();
+    let order = crate::control::drive_line_sessions(first_line);
+    let place = |row: &str| {
+        let sid = row.split_whitespace().next().unwrap_or_default();
+        let sid = sid.strip_prefix('@').unwrap_or(sid);
+        order
+            .iter()
+            .position(|named| named.as_str() == sid)
+            .unwrap_or(usize::MAX)
+    };
+    rows.sort_by_key(|row| place(row));
+    let mut out = format!(
+        "OK {}{}\n",
+        rows.len(),
+        if timeout { " status=timeout" } else { "" }
+    );
+    for row in rows {
+        out.push_str(row);
+        out.push('\n');
+    }
+    out
 }
 
 /// atpkg's dialer of a fleet member's toolset units over the mesh ([`atpkg::peers::set_units_dialer`],
@@ -3556,7 +5060,7 @@ impl atpkg::peers::UnitConn for UnitsOver<'_> {
 /// the membership log read now.
 struct LinkServe {
     state_dir: PathBuf,
-    relay_dir: PathBuf,
+    windows: WindowRelays,
     home_dir: Option<PathBuf>,
     config_path: Option<PathBuf>,
     vault_paths: Option<aterm_secrets::client::Paths>,
@@ -3564,7 +5068,6 @@ struct LinkServe {
     denied: Arc<Mutex<DeniedCache>>,
     open: Arc<NodeOpenTable>,
     serving: Arc<dyn Fn() -> Serving + Send + Sync>,
-    launcher: Arc<dyn WindowLauncher>,
     wake_timeout: Duration,
     ask: aterm_net::fleet::AskHandler,
     units: UnitsFn,
@@ -3689,46 +5192,32 @@ impl LinkServe {
         let still = |c: bool, d: Option<&aterm_net::fleet::DriveGrant>| {
             (self.serving)().serves(c, d, &|_, _| false, &[])
         };
-        match relay_to_window(
-            &self.relay_dir,
-            &RelayHeader::Survey {
+        let Ok((near, far)) = aterm_uds::kept_out(CtlStream::pair) else {
+            return incoming.refuse("busy");
+        };
+        let Ok(Some(open)) = self.open.admit(content, None, &near, still) else {
+            return incoming.refuse("level");
+        };
+        let serving = if has_live_window_relay(self.windows.dir()) {
+            let header = RelayHeader::Survey {
                 content,
                 drive,
                 peer,
-            },
-        ) {
-            RelayOpen::Busy(why) => {
-                let stream = incoming.accept();
-                let _ = (&stream).write_all(busy_line(&why).as_bytes());
-            }
-            RelayOpen::Opened(window) => match self.open.admit(content, None, &window, still) {
-                Ok(Some(open)) => pump_link(incoming.accept(), window, open),
-                Ok(None) | Err(_) => {
-                    aterm_uds::hangup::hang_up(&window);
-                    incoming.refuse("level");
-                }
-            },
-            RelayOpen::NoWindow => {
-                let Ok((near, far)) = aterm_uds::kept_out(CtlStream::pair) else {
-                    return incoming.refuse("busy");
-                };
-                let Ok(Some(open)) = self.open.admit(content, None, &near, still) else {
-                    return incoming.refuse("level");
-                };
-                if spawn_windowless_survey(
-                    near,
-                    self.state_dir.clone(),
-                    self.home_dir.clone(),
-                    self.config_path.clone(),
-                    (content, drive),
-                )
-                .is_err()
-                {
-                    return incoming.refuse("busy");
-                }
-                pump_link(incoming.accept(), far, open);
-            }
+            };
+            spawn_node_survey(near, self.windows.clone(), header, Arc::clone(&open))
+        } else {
+            spawn_windowless_survey(
+                near,
+                self.state_dir.clone(),
+                self.home_dir.clone(),
+                self.config_path.clone(),
+                (content, drive),
+            )
+        };
+        if serving.is_err() {
+            return incoming.refuse("busy");
         }
+        pump_link(incoming.accept(), far, open);
     }
 
     fn drive(
@@ -3783,10 +5272,9 @@ impl LinkServe {
             Arc::clone(&open),
             self.vault_paths.clone(),
             self.state_dir.clone(),
-            self.relay_dir.clone(),
+            self.windows.clone(),
             (driver, driver_key),
             peer,
-            Arc::clone(&self.launcher),
             self.wake_timeout,
         )
         .is_err()

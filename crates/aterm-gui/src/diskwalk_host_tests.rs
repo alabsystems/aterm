@@ -585,9 +585,9 @@ fn a_scope_no_discovery_has_derived_on_these_facts_is_owed_not_empty() {
         })
     };
     let (_inbox_tx, inbox) = std::sync::mpsc::channel();
-    let (out, from_engine) = std::sync::mpsc::channel();
-    let mut engine = Engine::new(inbox, out, None);
-    let board = || from_engine.try_iter().last().expect("a publication");
+    let out = Arc::new(Mailbox::default());
+    let mut engine = Engine::new(inbox, Arc::clone(&out), None);
+    let board = || out.take().expect("a publication");
     let report = |p: &Published, scope| build_report(scope, p, WalkerState::Running);
     let now = Instant::now();
     assert!(

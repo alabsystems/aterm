@@ -366,20 +366,6 @@ pub enum NodeRead {
     },
 }
 
-/// Whose network a pass's publication to the vault goes out on (the steward's revoke repair or
-/// lease, a founding of Commons), which decides whether macOS's Local Network answer stands
-/// before it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Publisher {
-    /// The vault subscriber's launchd job, whose runner this pass is: the job's own rounds reach
-    /// the vault, so a publication to it raises no question they did not, whatever aterm.app
-    /// last heard of Local Network.
-    Subscriber,
-    /// aterm's own (a window's pass, the first launch's, a person's `aterm init --converge`,
-    /// or a subscriber pass handed to the installed app): Local Network as aterm last heard it.
-    Aterm,
-}
-
 /// What the ALab steward's revoke-repair step reads as (`sync.steward.revoke`, §7.6, C25).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StewardRevokeRead {
@@ -394,7 +380,8 @@ pub enum StewardRevokeRead {
         /// What its apply publishes.
         makes: String,
     },
-    /// It would finish the cascade once Local Network permission is granted: why.
+    /// It would finish the cascade once the LAN broker, through which it reaches the vault,
+    /// answers: why.
     Deferred(String),
 }
 
@@ -412,7 +399,7 @@ pub enum StewardLeaseRead {
         /// What its apply publishes.
         makes: String,
     },
-    /// It would publish once Local Network permission is granted: why.
+    /// It would publish once the LAN broker, through which it reaches the vault, answers: why.
     Deferred(String),
 }
 
@@ -443,8 +430,8 @@ pub enum SharedRead {
     Unavailable(String),
     /// This Mac, its open vault's only admin, founds the vault's Commons: what it finds.
     Foundable(String),
-    /// It would, once a person gives what the founding waits on (Local Network, or an approver
-    /// that shares the Commons root on an open approval): why. It is never asked here.
+    /// It would, once what the founding waits on is there (the LAN broker, or an approver that
+    /// shares the Commons root on an open approval): why. It is never asked here.
     Deferred(String),
     /// The control record is here: what it reads, in one line.
     Visible(String),
@@ -541,9 +528,10 @@ pub enum AwakeRead {
 pub enum PeersRead {
     /// A vault is configured: which, in one line.
     Joined(String),
-    /// An open vault answered and asks nothing to join: which.
+    /// The automatic ALab join is eligible; its guarded apply discovers members first.
     Joinable(String),
-    /// A join waits on a person (a password, Local Network): why. It is never asked here.
+    /// A join waits (on a person's password or approval, or on the LAN broker): why. It is never
+    /// asked here.
     Deferred(String),
     /// No vault is joined here, and none is this pass's to join: why (a person's choice, or no
     /// ALab vault on this network).
@@ -555,9 +543,9 @@ pub enum PeersRead {
 pub enum PeersDone {
     /// The vault let this Mac in: what was joined.
     Joined(String),
-    /// The vault keeps the request and asks more than a pass gives (a join password, an admin's
-    /// approval): why. The pass stands aside, waiting on that person.
-    Waiting(String),
+    /// The join is incomplete without failing: an automatic retry, an offline source, or a
+    /// prerequisite the pass cannot supply. Preserve the stage's reason and retry class.
+    Deferred(StoodAside),
 }
 
 /// What the pass reads and changes, each through one port so a test runs it inert.
@@ -674,12 +662,11 @@ pub trait Ports: Sync {
         Ok("nothing changed".to_owned())
     }
 
-    /// What the steward's revoke-repair step finds (`sync.steward.revoke`), writing nothing; `by`
-    /// says whose network its publish goes out on.
+    /// What the steward's revoke-repair step finds (`sync.steward.revoke`), writing nothing.
     ///
     /// # Errors
     /// Local vault state, roster, or pool entries cannot be read.
-    fn steward_revoke(&self, _by: Publisher) -> Result<StewardRevokeRead, String> {
+    fn steward_revoke(&self) -> Result<StewardRevokeRead, String> {
         Ok(StewardRevokeRead::Idle(
             "this Mac holds no admin key of the ALab vault".to_owned(),
         ))
@@ -693,12 +680,11 @@ pub trait Ports: Sync {
         Ok("every revoked Mac's roster and pool cascade is complete".to_owned())
     }
 
-    /// What the always-on steward's lease step finds (`sync.steward.lease`), writing nothing; `by`
-    /// says whose network its publish goes out on.
+    /// What the always-on steward's lease step finds (`sync.steward.lease`), writing nothing.
     ///
     /// # Errors
     /// Local vault state, policy, or lease entry cannot be read.
-    fn steward_lease(&self, _by: Publisher) -> Result<StewardLeaseRead, String> {
+    fn steward_lease(&self) -> Result<StewardLeaseRead, String> {
         Ok(StewardLeaseRead::Idle(
             "this Mac holds no admin key of the ALab vault".to_owned(),
         ))
@@ -729,11 +715,11 @@ pub trait Ports: Sync {
     fn apply_steward_standby_server(&self) -> Result<String, String> {
         Ok("standby vault server runs".to_owned())
     }
-    /// `sync.shared-data`'s read; `by` says whose network a founding's publish goes out on.
+    /// `sync.shared-data`'s read.
     ///
     /// # Errors
     /// The Commons setting or the vault's copy cannot be read.
-    fn shared_data(&self, by: Publisher) -> Result<SharedRead, String>;
+    fn shared_data(&self) -> Result<SharedRead, String>;
     /// `sync.requests`'s read: the need ledger and whether this Mac is a Commons Writer.
     ///
     /// # Errors
@@ -856,13 +842,12 @@ pub trait Ports: Sync {
     /// # Errors
     /// A step failed.
     fn turn_on_fabric(&self) -> Result<String, String>;
-    /// `sync.peers`'s read; `look` says whether it may look for the open vault on this network
-    /// (the window's pass, the one that joins it, where Local Network is aterm.app's, when it
-    /// applies: a look keeps what it heard, which a plan never writes).
+    /// `sync.peers`'s local read; `can_join` selects the applying window pass, whose subsequent
+    /// guarded apply may use the LAN. A read never discovers the vault or enrolls this Mac.
     ///
     /// # Errors
     /// The vault's local state cannot be read.
-    fn peers(&self, look: bool) -> Result<PeersRead, String>;
+    fn peers(&self, can_join: bool) -> Result<PeersRead, String>;
     /// `sync.peers`'s apply: the open vault's join, with nothing typed.
     ///
     /// # Errors
@@ -996,16 +981,6 @@ impl<'a> Synced<'a> {
     /// instances start no window's pass, and a pass refuses a private state root outright.
     fn turns_fabric_on(&self) -> bool {
         self.trigger != Trigger::Subscriber && self.ports.window_runs()
-    }
-
-    /// Whose network this runner's publications use: a held subscriber fallback keeps its
-    /// job's network; the installed app uses aterm's, even with a subscriber trigger.
-    fn publisher(&self) -> Publisher {
-        if self.trigger == Trigger::Subscriber && !self.ports.installed_release() {
-            Publisher::Subscriber
-        } else {
-            Publisher::Aterm
-        }
     }
 }
 
@@ -1173,22 +1148,19 @@ impl Item for Synced<'_> {
         }
         match self.kind {
             Kind::Peers => {
-                // Only the window's pass joins, so only it looks for an open vault, and only
-                // when it applies: the look keeps what it heard (the network's verdict, the
-                // Local Network answer), and a plan (`--check`) writes nothing.
-                let look = self.trigger == Trigger::Window && self.mode == Mode::Apply;
-                read(self.ports.peers(look), |peers| match peers {
+                // Only the applying window pass may join. Its read is local; discovery belongs
+                // to the guarded apply, after the same current-choice and LAN broker checks.
+                let can_join = self.trigger == Trigger::Window && self.mode == Mode::Apply;
+                read(self.ports.peers(can_join), |peers| match peers {
                     PeersRead::Joined(now) => Probe::Ok { now },
                     PeersRead::Deferred(why) => Probe::Deferred { why },
                     PeersRead::Off(why) => not_applicable(why),
-                    PeersRead::Joinable(from) if look => Probe::Change {
+                    PeersRead::Joinable(from) if can_join => Probe::Change {
                         from,
                         to: "joined, nothing typed".to_owned(),
                     },
                     PeersRead::Joinable(from) => Probe::Deferred {
-                        why: format!(
-                            "{from}: the aterm window joins it, where Local Network is aterm.app's"
-                        ),
+                        why: format!("{from}: the aterm window joins it"),
                     },
                 })
             }
@@ -1258,34 +1230,24 @@ impl Item for Synced<'_> {
                     GithubRead::Deferred(why) => Probe::Deferred { why },
                 }
             }),
-            Kind::StewardRevoke => {
-                read(
-                    self.ports.steward_revoke(self.publisher()),
-                    |revoke| match revoke {
-                        StewardRevokeRead::Idle(why) => not_applicable(why),
-                        StewardRevokeRead::Current(now) => Probe::Ok { now },
-                        StewardRevokeRead::Due { found, makes } => Probe::Change {
-                            from: found,
-                            to: makes,
-                        },
-                        StewardRevokeRead::Deferred(why) => Probe::Deferred { why },
-                    },
-                )
-            }
-            Kind::StewardLease => {
-                read(
-                    self.ports.steward_lease(self.publisher()),
-                    |lease| match lease {
-                        StewardLeaseRead::Idle(why) => not_applicable(why),
-                        StewardLeaseRead::Current(now) => Probe::Ok { now },
-                        StewardLeaseRead::Due { found, makes } => Probe::Change {
-                            from: found,
-                            to: makes,
-                        },
-                        StewardLeaseRead::Deferred(why) => Probe::Deferred { why },
-                    },
-                )
-            }
+            Kind::StewardRevoke => read(self.ports.steward_revoke(), |revoke| match revoke {
+                StewardRevokeRead::Idle(why) => not_applicable(why),
+                StewardRevokeRead::Current(now) => Probe::Ok { now },
+                StewardRevokeRead::Due { found, makes } => Probe::Change {
+                    from: found,
+                    to: makes,
+                },
+                StewardRevokeRead::Deferred(why) => Probe::Deferred { why },
+            }),
+            Kind::StewardLease => read(self.ports.steward_lease(), |lease| match lease {
+                StewardLeaseRead::Idle(why) => not_applicable(why),
+                StewardLeaseRead::Current(now) => Probe::Ok { now },
+                StewardLeaseRead::Due { found, makes } => Probe::Change {
+                    from: found,
+                    to: makes,
+                },
+                StewardLeaseRead::Deferred(why) => Probe::Deferred { why },
+            }),
             Kind::StewardServerStandby => {
                 read(
                     self.ports.steward_standby_server(),
@@ -1313,19 +1275,16 @@ impl Item for Synced<'_> {
                 NodeRead::Current(now) => Probe::Ok { now },
                 NodeRead::Due { from, to } => Probe::Change { from, to },
             }),
-            Kind::SharedData => read(
-                self.ports.shared_data(self.publisher()),
-                |shared| match shared {
-                    SharedRead::Off => not_applicable("off: [commons] enabled = false"),
-                    SharedRead::Unavailable(why) => not_applicable(why),
-                    SharedRead::Foundable(from) => Probe::Change {
-                        from,
-                        to: "founded by this Mac, under the authority it holds".to_owned(),
-                    },
-                    SharedRead::Deferred(why) => Probe::Deferred { why },
-                    SharedRead::Visible(now) => Probe::Ok { now },
+            Kind::SharedData => read(self.ports.shared_data(), |shared| match shared {
+                SharedRead::Off => not_applicable("off: [commons] enabled = false"),
+                SharedRead::Unavailable(why) => not_applicable(why),
+                SharedRead::Foundable(from) => Probe::Change {
+                    from,
+                    to: "founded by this Mac, under the authority it holds".to_owned(),
                 },
-            ),
+                SharedRead::Deferred(why) => Probe::Deferred { why },
+                SharedRead::Visible(now) => Probe::Ok { now },
+            }),
             Kind::Requests => read(self.ports.requests(), |requests| match requests {
                 RequestsRead::Idle(why) => not_applicable(why),
                 RequestsRead::Due(now) if self.detail().is_some() => Probe::Ok { now },
@@ -1441,8 +1400,8 @@ impl Item for Synced<'_> {
         let said = match self.kind {
             Kind::Peers => match self.ports.join_peers()? {
                 PeersDone::Joined(said) => said,
-                PeersDone::Waiting(why) => {
-                    self.stand_aside(StoodAside::Waiting(why));
+                PeersDone::Deferred(why) => {
+                    self.stand_aside(why);
                     return Ok(());
                 }
             },

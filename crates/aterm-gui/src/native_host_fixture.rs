@@ -296,29 +296,92 @@ fn accept_until(listener: &CtlListener, deadline: Instant) -> io::Result<CtlStre
     }
 }
 
-fn observe_policy(socket: &str, sid: &str, expected: Vec<Constructor>) -> io::Result<()> {
-    let mut wrong = aterm_agent::RelayClient::connect_local(socket, "invalid-fixture-token")?
-        .bounded(MUST_HAPPEN);
-    let refusal = wrong.request_line(&format!("@{sid} native-act constructors"));
-    if !matches!(refusal.as_deref(), Ok("ERR auth")) {
-        return Err(failure("wrong-token connection did not receive ERR auth"));
+fn observe_policy(
+    socket: &str,
+    sid: &str,
+    token: &str,
+    expected: Vec<Constructor>,
+) -> io::Result<()> {
+    for request in [
+        format!("@{sid} native-act constructors"),
+        format!("@{sid} codex-accounts snapshot schema=1 request=0123456789abcdef0123456789abcdef"),
+        format!(
+            "@{sid} codex-accounts enrollment-status schema=1 request=0123456789abcdef0123456789abcdef"
+        ),
+        format!(
+            "@{sid} codex-accounts-change enrollment-poll schema=1 operation=0123456789abcdef0123456789abcdef"
+        ),
+    ] {
+        let mut wrong = aterm_agent::RelayClient::connect_local(socket, "invalid-fixture-token")?
+            .bounded(MUST_HAPPEN);
+        if !matches!(wrong.request_line(&request).as_deref(), Ok("ERR auth")) {
+            return Err(failure("wrong-token connection did not receive ERR auth"));
+        }
     }
-    drop(wrong);
+    let mut ordinary = aterm_agent::RelayClient::connect_local(socket, token)?.bounded(MUST_HAPPEN);
+    let denied = ordinary.request_line(&format!(
+        "@{sid} codex-accounts snapshot schema=1 request=0123456789abcdef0123456789abcdef"
+    ))?;
+    if denied != "ERR codex-accounts denied" {
+        return Err(failure(format!(
+            "authenticated non-Codex peer gained pool observation: {denied}"
+        )));
+    }
+    for (request, expected) in [
+        (
+            format!(
+                "@{sid} codex-accounts enrollment-status schema=1 request=0123456789abcdef0123456789abcdef"
+            ),
+            "ERR codex-accounts denied",
+        ),
+        (
+            format!(
+                "@{sid} codex-accounts-change enrollment-poll schema=1 operation=0123456789abcdef0123456789abcdef"
+            ),
+            "ERR codex-accounts-change denied",
+        ),
+    ] {
+        if ordinary.request_line(&request)? != expected {
+            return Err(failure(
+                "authenticated non-Codex peer gained enrollment authority",
+            ));
+        }
+    }
+    drop(ordinary);
 
-    // This uses the actual beside-token connector, not a pre-resolved owner or
-    // an injected Principal. The server independently checks this peer's uid.
+    // Preserve the original beside-token connector and its policy observations.
     let mut client =
         aterm_agent::harness::upgrade_drive::harness_client_within(socket, None, MUST_HAPPEN)?;
     let info = aterm_agent::harness::native_act::exchange(&mut client, sid, &NativeRequest::Info)?;
     if !matches!(info, Reply::Info { .. }) {
         return Err(failure("real native host Info was not served"));
     }
-    if aterm_agent::harness::native_act::exchange(&mut client, sid, &NativeRequest::Constructors)?
-        != Reply::Constructors(expected)
-    {
-        return Err(failure(
-            "constructor policy differed from the configured case",
-        ));
+    let constructors =
+        aterm_agent::harness::native_act::exchange(&mut client, sid, &NativeRequest::Constructors)?;
+    if constructors != Reply::Constructors(expected.clone()) {
+        return Err(failure(format!(
+            "constructor policy differed from the configured case: expected {expected:?}, observed {constructors:?}"
+        )));
+    }
+    for (request, expected) in [
+        (
+            format!(
+                "@{sid} codex-accounts enrollment-status schema=1 request=0123456789abcdef0123456789abcdef"
+            ),
+            "ERR codex-accounts denied",
+        ),
+        (
+            format!(
+                "@{sid} codex-accounts-change enrollment-poll schema=1 operation=0123456789abcdef0123456789abcdef"
+            ),
+            "ERR codex-accounts-change denied",
+        ),
+    ] {
+        if client.request_line(&request)? != expected {
+            return Err(failure(
+                "beside-token harness gained explicit Codex enrollment authority",
+            ));
+        }
     }
     // Dropping the actual connector supplies EOF to the real connection guard.
     drop(client);
@@ -362,9 +425,18 @@ fn run_native_host_fixture_inner(
     // this slice makes no foreground, child-identity or mutation assertion.
     let mut handle = super::control_redraw_conformance::registered_session(1, &term);
     let configured = policy.is_some();
-    let expected = policy
-        .as_ref()
-        .map_or_else(Vec::new, |p| p.enabled_constructors());
+    let expected = policy.as_ref().map_or_else(
+        || {
+            // Shipping cold relaunch was qualified on Apple Silicon; generic
+            // constructors and sealed renewal discovery stay disabled.
+            if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                vec![Constructor::ColdRestart]
+            } else {
+                Vec::new()
+            }
+        },
+        |p| p.enabled_constructors(),
+    );
     if let Some(policy) = policy {
         Arc::get_mut(&mut handle.ctx)
             .ok_or_else(|| failure("fixture context already shared"))?
@@ -404,6 +476,7 @@ fn run_native_host_fixture_inner(
     )?;
     let listener = aterm_uds::kept_out(|| CtlListener::bind(&socket))?;
     listener.set_nonblocking(true)?;
+    let client_token = token.clone();
     let context = ControlWorkerContext {
         active,
         store,
@@ -421,19 +494,17 @@ fn run_native_host_fixture_inner(
     let worker = std::thread::Builder::new()
         .name("native-host-fixture".into())
         .spawn(move || {
-            let rejected = accept_until(&listener, Instant::now() + MUST_HAPPEN)?;
-            if serve_connection(&context, rejected)? {
-                return Err(failure("wrong-token peer was authenticated"));
-            }
-            let accepted = accept_until(&listener, Instant::now() + MUST_HAPPEN)?;
-            if !serve_connection(&context, accepted)? {
-                return Err(failure("beside-token peer was not authenticated"));
+            for expected_authenticated in [false, false, false, false, true, true] {
+                let stream = accept_until(&listener, Instant::now() + MUST_HAPPEN)?;
+                if serve_connection(&context, stream)? != expected_authenticated {
+                    return Err(failure("fixture peer authentication differed"));
+                }
             }
             Ok(())
         })?;
     // Always join after client errors too: their owners drop before the worker
     // sees EOF. The finite accept/read/write detectors bound every owned wait.
-    let result = observe_policy(&socket_text, &sid, expected);
+    let result = observe_policy(&socket_text, &sid, &client_token, expected);
     let closed = worker
         .join()
         .map_err(|_| failure("native host fixture worker panicked"))?;
@@ -454,7 +525,7 @@ fn run_native_host_fixture_inner(
         if configured {
             "fixture-configured"
         } else {
-            "shipping-empty"
+            "shipping-qualified"
         }
     );
     Ok(())

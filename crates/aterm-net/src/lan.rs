@@ -21,37 +21,6 @@ pub use listener::Listener;
 pub(crate) use listener::Witness as ListenerWitness;
 pub use multicast::Multicast;
 
-/// Why a [`Listener::try_bind`] or a [`Multicast::try_bind`] made no socket, and whether it
-/// `reached` its socket first: past its checks of the address and its attachment, it created
-/// one and may have bound, joined or listened on the LAN before a later step (the attachment's
-/// re-check among them) refused. An OS that asks before an app's first LAN use (macOS's Local
-/// Network question) may have asked at that syscall; one that failed before it asked nothing.
-#[derive(Debug)]
-pub struct BindFailure {
-    /// What refused.
-    pub error: io::Error,
-    /// The bind made its socket before it failed.
-    pub reached: bool,
-}
-
-impl BindFailure {
-    /// A failure at the checks, before any socket.
-    const fn before(error: io::Error) -> Self {
-        Self {
-            error,
-            reached: false,
-        }
-    }
-
-    /// A failure once the socket was made.
-    const fn after(error: io::Error) -> Self {
-        Self {
-            error,
-            reached: true,
-        }
-    }
-}
-
 /// Loopback is an explicit local/test transport, never inferred as a LAN.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
@@ -199,6 +168,20 @@ impl Connection {
 
     /// Check the selected route before dialing, then verify the actual socket.
     /// There is no DNS lookup, public fallback, relay, or route modification.
+    ///
+    /// A LAN dial is made by `aterm_uds::lan::connect`: on macOS the root LAN broker makes the
+    /// socket, bound to the checked attachment and source with a one-hop limit, connects it and
+    /// passes it here (macOS's Local Network privacy gates the act of a process of the person's,
+    /// never of root's); elsewhere it is made here with the same options. Before the handshake
+    /// only the selected route and those options constrain it: the exact tuple (the source port
+    /// the connect chose) and the socket's policy are checked against its route and attachment
+    /// once it is connected, before any payload byte is sent, and a mismatch drops the
+    /// connection.
+    ///
+    /// # Errors
+    /// A refused route, attachment or socket policy (`PermissionDenied`), an expired `within`
+    /// (`TimedOut`), the connect's error, or on macOS a missing LAN broker (`NotConnected`, its
+    /// words naming what installs it).
     pub fn connect(peer: SocketAddr, scope: Scope, within: Duration) -> io::Result<Self> {
         crate::loopback::check(crate::loopback::Reach::Dial(peer))?;
         if within.is_zero() {
@@ -220,18 +203,36 @@ impl Connection {
                     .attachment
                     .as_ref()
                     .ok_or_else(|| refuse("missing LAN attachment"))?;
-                let dial = native::Dial::new(
-                    initial.local,
-                    peer,
-                    attachment.index,
-                    &attachment.name,
-                    until,
-                )?;
-                // Binding reserves the source port before this exact tuple is
-                // submitted to the kernel route lookup. No SYN has been sent.
-                let local = dial.local_addr()?;
-                inspect(Some(local), peer, Some(attachment.index), until)?;
-                return Self::connected(dial.connect()?, scope, Some(attachment.index), until);
+                let index = attachment.index;
+                let left = until.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "LAN connection deadline expired before dialing",
+                    ));
+                }
+                let options = aterm_uds::lan::ConnectOptions {
+                    bound_if: Some(index),
+                    // A link-local source is named by its zone, which an address alone cannot
+                    // carry: the interface binding keeps the kernel's choice on the attachment,
+                    // and the connected tuple's check below refuses any other source.
+                    source: match initial.local {
+                        SocketAddr::V6(local) if local.ip().is_unicast_link_local() => None,
+                        local => Some(local.ip()),
+                    },
+                    hop_limit: Some(1),
+                };
+                let (stream, reached) = aterm_uds::lan::connect(
+                    &aterm_uds::lan::Target::Addr(peer),
+                    peer.port(),
+                    left,
+                    options,
+                )
+                .map_err(aterm_uds::lan::LanError::into_io)?;
+                if reached != peer || stream.peer_addr()? != peer {
+                    return Err(refuse("LAN connection reached another address"));
+                }
+                return Self::connected(stream, scope, Some(index), until);
             }
             Scope::Loopback => {}
         }

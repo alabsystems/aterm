@@ -186,8 +186,9 @@ fn find_root(start: &Path) -> Option<PathBuf> {
     start
         .ancestors()
         .find(|dir| {
-            dir.join("libc-oracle/Cargo.toml").is_file()
-                && dir.join("crates/aterm-libc/src/lib.rs").is_file()
+            std::fs::symlink_metadata(dir.join("libc-oracle/Cargo.toml")).is_ok_and(|m| m.is_file())
+                && std::fs::symlink_metadata(dir.join("crates/aterm-libc/src/lib.rs"))
+                    .is_ok_and(|m| m.is_file())
         })
         .map(Path::to_path_buf)
 }

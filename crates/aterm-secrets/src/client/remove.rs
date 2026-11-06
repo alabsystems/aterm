@@ -606,6 +606,7 @@ pub fn remove_member(paths: &Paths, who: &str, stolen: bool) -> crate::Result<Me
         read_identity(paths)?.ok_or_else(|| Error::new("this Mac has no secrets identity"))?;
     // Read under the draft's observation: a pass that held the state when the person asked
     // delays this with the draft, rather than hiding the admin behind a busy read.
+    cut_tables_first(paths, Target::Word(who));
     let mut vault_admin = None;
     let (minted, _, report) = log_entries::author_and_commit_records(paths, |store| {
         vault_admin = vault_admin_named(paths, who);
@@ -649,6 +650,7 @@ pub fn remove_member(paths: &Paths, who: &str, stolen: bool) -> crate::Result<Me
 pub(super) fn remove_actor(paths: &Paths, target: MemberId) -> crate::Result<Vec<Record>> {
     let identity =
         read_identity(paths)?.ok_or_else(|| Error::new("this Mac has no secrets identity"))?;
+    cut_tables_first(paths, Target::Actor(target));
     let (minted, _, report) = log_entries::author_and_commit_records(paths, |store| {
         // Another member's removal of `target` reached this Mac first: sign this Mac's share at
         // that removal's cutoff instead, so the two form a quorum `Remove` (F18's runtime path,
@@ -666,6 +668,125 @@ pub(super) fn remove_actor(paths: &Paths, target: MemberId) -> crate::Result<Vec
     })?;
     report?;
     Ok(minted)
+}
+
+/// Which pass of a removal's table cutoffs [`TableCuts`] runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CutPass {
+    /// Before the `Remove` is drafted: sign each table's cutoff at the removed writer's last
+    /// operation held now, and keep that frontier for the repair where a table cannot be cut.
+    BeforeRemove,
+    /// The remover's repair once the `Remove` stands ([`cut_own_removals`]): sign only the
+    /// cutoffs still missing, at the frontier kept before the `Remove` where there is one.
+    Repair,
+    /// A share of a removal another member made first: sign no cutoff of this Mac's own, only
+    /// replace one an earlier attempt of its left, which would otherwise count as its newest.
+    Share,
+}
+
+/// What signs a removal's table cutoffs (docs/DESIGN-alab-one-mesh-2026-11-05.md §4.10, §11
+/// B11): for each lab table this Mac holds, a cutoff naming the removed writer's last operation
+/// held here, signed as this Mac's own table operation, returning how many it signed. aterm-db
+/// writes table operations and depends on this crate, so the `aterm` executable installs its one
+/// entry point here ([`on_table_cuts`]); with none installed (a test of this crate alone) a
+/// removal signs no table cutoff.
+pub type TableCuts = fn(&Paths, &MemberId, CutPass) -> usize;
+
+static TABLE_CUTS: std::sync::OnceLock<TableCuts> = std::sync::OnceLock::new();
+
+/// Install what signs a removal's table cutoffs. The first call wins.
+pub fn on_table_cuts(cut: TableCuts) {
+    let _ = TABLE_CUTS.set(cut);
+}
+
+/// Sign `target`'s table cutoffs before the `Remove` is drafted, so a crash between the two never
+/// leaves a `Remove` with none. A reader counts only each remover's newest cutoff of a writer, and
+/// only once its log shows that writer removed, so cutoffs signed before a refused or failed
+/// `Remove` change nothing once a later one is signed. Only the first remover cuts: once this
+/// Mac's log shows `target` removed, its `Remove` is a share at that removal's cutoff, and a
+/// cutoff of its own, read from a replica that may be behind, would cut honest operations the
+/// first remover kept; the share only replaces a cutoff an earlier attempt of its left
+/// ([`CutPass::Share`]). A table this pass could not cut is one [`cut_own_removals`] signs at the
+/// node service's next start.
+fn cut_tables_first(paths: &Paths, target: Target<'_>) {
+    let Some(cut) = TABLE_CUTS.get() else {
+        return;
+    };
+    let Ok(Some(log)) = trusted_store(paths).map(|s| s.and_then(|s| s.log().cloned())) else {
+        return;
+    };
+    let target = match target {
+        Target::Actor(actor) => actor,
+        Target::Word(who) => {
+            let Ok(Some((me, _, _))) = log_entries::open_local_member_signer(paths, &log) else {
+                return;
+            };
+            let Ok((target, _, _)) = removal_target(&log, who, &me) else {
+                return;
+            };
+            target
+        }
+    };
+    let pass = if log.membership().removal(&target).is_none() {
+        CutPass::BeforeRemove
+    } else {
+        CutPass::Share
+    };
+    cut(paths, &target, pass);
+}
+
+/// [`cut_tables_first`] for a vault revocation or retirement, which names its targets by
+/// recipient: each current seat bound to one of `recipients`.
+pub(super) fn cut_tables_for_recipients(paths: &Paths, recipients: &[Recipient]) {
+    if TABLE_CUTS.get().is_none() {
+        return;
+    }
+    let Ok(Some(log)) = trusted_store(paths).map(|s| s.and_then(|s| s.log().cloned())) else {
+        return;
+    };
+    let targets: Vec<MemberId> = log
+        .membership()
+        .members()
+        .iter()
+        .filter(|(_, member)| recipients.contains(&member.binding.recipient()))
+        .map(|(actor, _)| *actor)
+        .collect();
+    for target in targets {
+        cut_tables_first(paths, Target::Actor(target));
+    }
+}
+
+/// The repair of [`cut_tables_first`]: sign each table cutoff a removal this Mac made still
+/// lacks. Only the remover repairs its own, and only a removal it made first (its `Remove` the
+/// first of that member's effective ones in log order), not a share it signed at another's
+/// cutoff: cutoffs intersect, so a Mac that is behind must not cut a writer earlier than its
+/// remover did. The node service runs it once as it starts.
+pub fn cut_own_removals(paths: &Paths) -> usize {
+    let Some(cut) = TABLE_CUTS.get() else {
+        return 0;
+    };
+    let Ok(Some(log)) = trusted_store(paths).map(|s| s.and_then(|s| s.log().cloned())) else {
+        return 0;
+    };
+    let Ok(Some((me, _, _))) = log_entries::open_local_member_signer(paths, &log) else {
+        return 0;
+    };
+    let membership = log.membership();
+    let mut first = BTreeMap::new();
+    for record in log.records() {
+        if let Body::Remove { member, .. } = record.body()
+            && membership
+                .removal(member)
+                .is_some_and(|removal| removal.by.contains(record.actor()))
+        {
+            first.entry(*member).or_insert(*record.actor());
+        }
+    }
+    first
+        .into_iter()
+        .filter(|(_, by)| *by == me)
+        .map(|(member, _)| cut(paths, &member, CutPass::Repair))
+        .sum()
 }
 
 /// What a draft signed, beside what it reports to the person (its refusal, where it refused).
@@ -1406,8 +1527,18 @@ pub fn undo_offers(paths: &Paths) -> crate::Result<Vec<UndoOffer>> {
 /// This Mac's vault has no trusted log, this Mac has no seat in it, `who` names no Mac or more
 /// than one, that Mac has no removal to undo, or this Mac does not vote at its cutoff.
 pub fn undo_removals(paths: &Paths, who: &str) -> crate::Result<UndoShare> {
-    if trusted_store(paths)?.is_none() {
+    let Some(held) = trusted_store(paths)? else {
         return Err(Error::new("this Mac's vault has no membership log yet"));
+    };
+    // The quorum this share joins takes the remover out: each signer cuts its tables first, as
+    // every removal path does (one-mesh §4.10, B11). Before the quorum is met each cuts from its
+    // own replica, and cutoffs intersect, so one that is behind withholds more of the remover's
+    // operations, never fewer.
+    if let Some(log) = held.log()
+        && let Ok(Some((me, _, _))) = open_local_seat_signer(paths, log)
+        && let Ok((remover, _, _)) = undo_target(log, &me, who)
+    {
+        cut_tables_first(paths, Target::Actor(remover));
     }
     let (minted, _, outcome) =
         log_entries::author_and_commit_records(paths, |store| draft_undo_share(paths, store, who))?;
@@ -2027,7 +2158,7 @@ pub struct NodePassHost<'a> {
     /// Whether the node's switches hold sharing off now (`[swarm] enabled = false`, this Mac left
     /// the fleet): no pass runs while one does.
     pub held: &'a dyn Fn() -> bool,
-    /// Whether this Mac may use the local network now.
+    /// Whether this Mac's LAN broker answers now, so the pass may post on the LAN.
     pub may_post: &'a dyn Fn() -> bool,
     /// Start the converge pass's runner (`crate::converge::start`), without waiting for it.
     pub start_converge: &'a dyn Fn() -> Option<aterm_uds::spawnfd::Child>,
@@ -2046,6 +2177,9 @@ pub struct NodePassHost<'a> {
 /// secrets status` reads it. A person's `aterm secrets agent off` holds it too
 /// ([`crate::service::subscriber_turned_off`]), as it holds all automatic vault work.
 pub fn run_node_pass(host: &NodePassHost<'_>) {
+    // A removal's table cutoffs come before its `Remove`; one a crash or a busy table left
+    // unsigned is signed as the node service starts.
+    cut_own_removals(host.paths);
     let mut pass = NodePass::default();
     let mut due = NodePassDue::default();
     let mut last_said = None;

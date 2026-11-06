@@ -28,6 +28,7 @@ pub(crate) struct AskpassSheet {
     panel: Obj,
     parent: Obj,
     reply: Sender<AskpassAnswer>,
+    _details: aterm_objc::Retained<PasswordDetailsTarget>,
     _keys: crate::alert_keys::PasswordKeyWatch,
     _input_fence: crate::askpass::PromptInputFence<'static>,
 }
@@ -50,6 +51,95 @@ impl Drop for AskpassSheet {
     }
 }
 
+struct PasswordDetails {
+    alert: Obj,
+    text: String,
+    open: std::cell::Cell<bool>,
+}
+
+aterm_objc::declare_class! {
+    /// The password sheet's disclosure; it never reads or submits the password.
+    struct PasswordDetailsTarget: NSObject {
+        const NAME: &str = "ATermPasswordDetailsTarget";
+        type Ivars = PasswordDetails;
+
+        @sel(toggleDetails:)
+        fn toggle_details(&self, sender: Id) {
+            let state = self.ivars();
+            let open = !state.open.get();
+            let text = if open { state.text.as_str() } else { "" };
+            let title = if open { "Hide Details" } else { "Details…" };
+            let (Some(text), Some(title)) = (appkit::nsstring(text), appkit::nsstring(title)) else {
+                return;
+            };
+            // SAFETY: the target owns this live NSAlert; sender is its NSButton.
+            // All access and NSAlert's relayout happen on AppKit's main thread.
+            unsafe {
+                appkit::send_v_id(state.alert.id(), sel!(setInformativeText:), text.id());
+                appkit::send_v_id(sender, sel!(setTitle:), title.id());
+                appkit::send_v(state.alert.id(), sel!(layout));
+            }
+            state.open.set(open);
+        }
+    }
+}
+
+/// Keep the password and disclosure together in NSAlert's accessory. Details start collapsed.
+fn password_accessory(
+    mtm: MainThread,
+    alert: &Obj,
+    field: &Obj,
+    text: String,
+) -> Option<(Obj, aterm_objc::Retained<PasswordDetailsTarget>)> {
+    let target = PasswordDetailsTarget::alloc_init(
+        mtm,
+        PasswordDetails {
+            alert: alert.clone_retained(),
+            text,
+            open: std::cell::Cell::new(false),
+        },
+    )?;
+    let title = appkit::nsstring("Details…")?;
+    // SAFETY: newly allocated AppKit views, built on the main thread. The view retains
+    // its children; the sheet retains the action target because NSButton does not.
+    unsafe {
+        let view = Obj::from_owned(appkit::send_id_rect(
+            appkit::alloc(class(c"NSView")),
+            sel!(initWithFrame:),
+            CGRect {
+                origin: CGPoint { x: 0.0, y: 0.0 },
+                size: CGSize {
+                    width: 340.0,
+                    height: 60.0,
+                },
+            },
+        ))?;
+        let button = Obj::from_owned(appkit::send_id_rect(
+            appkit::alloc(class(c"NSButton")),
+            sel!(initWithFrame:),
+            CGRect {
+                origin: CGPoint { x: 0.0, y: 0.0 },
+                size: CGSize {
+                    width: 120.0,
+                    height: 24.0,
+                },
+            },
+        ))?;
+        appkit::send_v_id(button.id(), sel!(setTitle:), title.id());
+        appkit::send_v_bool(button.id(), sel!(setBordered:), false);
+        appkit::send_v_isize(
+            button.id(),
+            sel!(setAlignment:),
+            appkit::consts::NS_TEXT_ALIGNMENT_LEFT,
+        );
+        appkit::send_v_id(button.id(), sel!(setTarget:), target.as_id());
+        appkit::send_v_sel(button.id(), sel!(setAction:), sel!(toggleDetails:));
+        appkit::send_v_id(view.id(), sel!(addSubview:), field.id());
+        appkit::send_v_id(view.id(), sel!(addSubview:), button.id());
+        Some((view, target))
+    }
+}
+
 impl App {
     /// Attribute, gate, and raise the askpass sheet, or reply with a refusal.
     pub(crate) fn present_askpass_sheet(&mut self, request: crate::askpass::AskpassRequest) {
@@ -59,6 +149,7 @@ impl App {
             owned,
             exact,
             command,
+            purpose,
             invoker,
             reply,
         } = request;
@@ -122,7 +213,7 @@ impl App {
         self.build_askpass_sheet(
             wid,
             session,
-            (&command, &invoker, exact),
+            (&command, &invoker, exact, purpose.as_deref()),
             owned,
             ticket,
             reply,
@@ -134,7 +225,7 @@ impl App {
         &mut self,
         wid: crate::WindowId,
         session: u64,
-        (command, invoker, exact): (&str, &str, bool),
+        (command, invoker, exact, purpose): (&str, &str, bool, Option<&str>),
         owned: Option<std::sync::Arc<crate::cpu_policy_authorization::Operation>>,
         ticket: std::sync::Arc<crate::askpass::AskpassTicket>,
         reply: Sender<AskpassAnswer>,
@@ -165,21 +256,21 @@ impl App {
         };
 
         let id = ticket.id;
-        let (message, informative) = if owned.is_some() {
+        let (message, details) = if owned.is_some() {
             ("Authorize CPU diagnostics".to_owned(),
              "Read CPU scheduling information and save a diagnostic report. Authorization applies to this collection only.".to_owned())
         } else if exact {
             (
-                format!("Run this as root in tab for session {session}?"),
+                purpose
+                    .unwrap_or("Enter your system sudo password to allow this change.")
+                    .to_owned(),
                 format!(
-                    "{command}\n\nAsked by:\n{invoker}\n\nYour password authorizes this one command, not later ones. A shell or script can go on to run anything."
+                    "Session {session}\n\n{command}\n\nAsked by:\n{invoker}\n\nYour password authorizes this one command, not later ones. A shell or script can go on to run anything."
                 ),
             )
         } else {
             (
-                format!(
-                    "sudo needs your password in tab for session {session}.\nThe command sudo was given (as the kernel records it):"
-                ),
+                "Enter your system sudo password to allow this command.".to_owned(),
                 format!(
                     "{command}\n\nRun by:\n{invoker}\n\nAllowing lets any sudo from that shell run as root without asking again for about 5 minutes (sudo's own cache), not only the command above."
                 ),
@@ -187,7 +278,7 @@ impl App {
         };
         let (Some(message), Some(informative), Some(allow), Some(cancel)) = (
             appkit::nsstring(&message),
-            appkit::nsstring(&informative),
+            appkit::nsstring(""),
             appkit::nsstring("Allow"),
             appkit::nsstring("Cancel"),
         ) else {
@@ -214,7 +305,7 @@ impl App {
         // SAFETY: `+[NSSecureTextField alloc]` then `-initWithFrame:` is +1.
         let field = unsafe {
             let frame = CGRect {
-                origin: CGPoint { x: 0.0, y: 0.0 },
+                origin: CGPoint { x: 0.0, y: 32.0 },
                 size: CGSize {
                     width: 340.0,
                     height: 24.0,
@@ -228,6 +319,11 @@ impl App {
         };
         let Some(field) = field else {
             return refuse(reply, "could not create the password field");
+        };
+
+        let Some((accessory, details_target)) = password_accessory(mtm, &alert, &field, details)
+        else {
+            return refuse(reply, "could not create the details disclosure");
         };
 
         // SAFETY: standard NSAlert setters on the main thread; text setters
@@ -269,7 +365,7 @@ impl App {
             }
             appkit::send_v_id(alert.id(), sel!(setMessageText:), message.id());
             appkit::send_v_id(alert.id(), sel!(setInformativeText:), informative.id());
-            appkit::send_v_id(alert.id(), sel!(setAccessoryView:), field.id());
+            appkit::send_v_id(alert.id(), sel!(setAccessoryView:), accessory.id());
             let _ = appkit::send_id_id(alert.id(), sel!(addButtonWithTitle:), allow.id());
             let _ = appkit::send_id_id(alert.id(), sel!(addButtonWithTitle:), cancel.id());
             let panel = Obj::retain(appkit::send_id(alert.id(), sel!(window)));
@@ -307,6 +403,7 @@ impl App {
             panel,
             parent: ns_window,
             reply,
+            _details: details_target,
             _keys: keys,
             _input_fence: input_fence,
             owned,
@@ -409,4 +506,46 @@ pub(crate) fn read_secure_field(field: &Obj) -> Option<aterm_uds::sudo::Secret> 
         );
         aterm_uds::sudo::Secret::from_utf16(units.as_units())
     }
+}
+
+/// AppKit driver: opening and closing Details preserves the secure field and the alert.
+/// This uses a local inert alert and never makes an authorization request.
+pub(crate) fn check_password_disclosure(mtm: MainThread) -> Result<(), &'static str> {
+    let alert = crate::app_icon::alert(mtm).ok_or("no alert")?;
+    // SAFETY: NSSecureTextField allocation and initialization on the main thread.
+    let field = unsafe {
+        Obj::from_owned(appkit::send_id(
+            appkit::alloc(class(c"NSSecureTextField")),
+            sel!(init),
+        ))
+    }
+    .ok_or("no field")?;
+    let (view, target) = password_accessory(mtm, &alert, &field, "Exact command and folder".into())
+        .ok_or("no accessory")?;
+    let password = appkit::nsstring("inert test value").ok_or("no text")?;
+    // SAFETY: the accessory owns the field and button, and the alert owns the accessory.
+    unsafe {
+        appkit::send_v_id(alert.id(), sel!(setAccessoryView:), view.id());
+        appkit::send_v_id(field.id(), sel!(setStringValue:), password.id());
+        let children = appkit::send_id(view.id(), sel!(subviews));
+        let child: unsafe extern "C-unwind" fn(Id, Sel, usize) -> Id = aterm_objc::checked_msg();
+        let button = child(children, sel!(objectAtIndex:), 1);
+        for expected in ["Exact command and folder", ""] {
+            appkit::send_v_id(button, sel!(performClick:), Id::NIL);
+            let actual =
+                appkit::nsstring_to_rust(appkit::send_id(alert.id(), sel!(informativeText)));
+            if actual != expected {
+                return Err("disclosure did not toggle");
+            }
+            if appkit::nsstring_to_rust(appkit::send_id(field.id(), sel!(stringValue)))
+                != "inert test value"
+            {
+                return Err("disclosure changed password input");
+            }
+        }
+    }
+    if target.ivars().open.get() {
+        return Err("details did not close");
+    }
+    Ok(())
 }

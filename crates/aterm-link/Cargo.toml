@@ -56,6 +56,11 @@ astream-aead = { path = "../../vendor/astream/crates/astream-aead", default-feat
 # the config. Zero dependencies, and already in the shipped graph through
 # astream-broker.
 astream-wire = { path = "../../vendor/astream/crates/astream-wire" }
+# The one mesh's decision kernels (`aterm_mesh_core::inbox_move`, §11 C3b): when
+# the node service's own-inbox move may open (`federate::Routes`), held to the Clean
+# island that proves a move it opens never takes a record the old node's bridge
+# delivered. No dependencies of its own.
+aterm-mesh-core = { path = "../aterm-mesh-core" }
 # The kernel's boot session (`boot_session`), aterm-link's ONE reading of this
 # boot (`durability::this_boot`): the boot the broker opens its log in and judges
 # a legacy relaxed mark by (`durability.rs`, "One boot, one reading"), and whether
@@ -103,6 +108,10 @@ aterm-slog = { workspace = true }
 aterm-toml = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
+# The anchor attributes that bind the mail route and the halt state machine to the
+# `FabricRouting` and `FabricHalts` models (std-only): expands in every test and debug build;
+# release strips it.
+aterm-spec-anchor = { workspace = true }
 # `pthread_sigmask` and `sigwait`, for a relaxed broker's clean stop
 # (`cli::take_stop_signals`): the workspace's own libc (crates/aterm-libc).
 libc = { workspace = true }
@@ -121,6 +130,8 @@ aterm-json = { workspace = true }
 # The models its tests drive (a model edit rebuilds only their tests).
 aterm-models-core = { workspace = true }
 aterm-models-session = { workspace = true }
+# `FabricRouting`, `FabricHalts` and `FabricMoves`, which the conformance tests refine.
+aterm-models-swarm = { workspace = true }
 
 [lints]
 workspace = true

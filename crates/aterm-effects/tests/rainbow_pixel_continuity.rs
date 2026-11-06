@@ -157,24 +157,24 @@ impl PixelBand {
         }
     }
 
-    /// Maximum RGB channel delta from `theme_bg` across all scanlines of pixel column `x`.
-    fn column_lift(&self, x: usize) -> u8 {
-        if x >= self.width {
-            return 0;
-        }
-        let mut best = 0u8;
-        for y in 0..self.height {
-            let p = self.px[y * self.width + x];
-            let dr = p[0].abs_diff(self.bg[0]);
-            let dg = p[1].abs_diff(self.bg[1]);
-            let db = p[2].abs_diff(self.bg[2]);
-            best = best.max(dr.max(dg).max(db));
-        }
-        best
-    }
-
+    /// Each pixel column's maximum RGB channel delta from `theme_bg` across all its scanlines, read
+    /// row by row: this runs on every frame of every cadence, and a column at a time reads the band
+    /// out of order, one bounds-checked pixel at a time.
+    ///
+    /// NEGATIVE CONTROL (2026-11-05): quads cut around one pixel column in [`Self::blend_quad`] fire
+    /// `"pixel hole"` in all five of this module's tests. The column-by-column read this replaces
+    /// read the same on every band of them, compared in one build.
     fn all_column_lifts(&self) -> Vec<u8> {
-        (0..self.width).map(|x| self.column_lift(x)).collect()
+        let mut lifts = vec![0u8; self.width];
+        for row in self.px.chunks_exact(self.width.max(1)) {
+            for (best, p) in lifts.iter_mut().zip(row) {
+                let dr = p[0].abs_diff(self.bg[0]);
+                let dg = p[1].abs_diff(self.bg[1]);
+                let db = p[2].abs_diff(self.bg[2]);
+                *best = (*best).max(dr.max(dg).max(db));
+            }
+        }
+        lifts
     }
 }
 

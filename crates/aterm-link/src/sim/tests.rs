@@ -395,38 +395,41 @@ fn a_landed_posts_entry_stands_until_its_post_left_aterms_outbox() {
         report(&fixed)
     );
     type Switch = Box<dyn Fn(u64) -> Opts + Sync>;
-    let controls: Vec<(Mutant, Switch, &str, u64)> = vec![
+    let controls: Vec<(Mutant, Switch, &str, u64, u64)> = vec![
         (
             Mutant::LandedBeforeOutboxSent,
             Box::new(|s| rate_bound(s).with(Mutant::LandedBeforeOutboxSent)),
             "dup delivery",
-            78,
+            168,
+            // Since a drain reads the subject budget once, not at each lane it opens (critic
+            // item G04), no seed within the committed ones meets it: 168 is the first.
+            RARE_SEEDS,
         ),
         (
             Mutant::LandedBeforeAcked,
             Box::new(|s| Opts::seed(s).with(Mutant::LandedBeforeAcked)),
             "forged-self",
-            42,
+            11,
+            COMMITTED_SEEDS,
         ),
         (
             Mutant::RetireBeforeOutboxSent,
             Box::new(|s| Opts::seed(s).with(Mutant::RetireBeforeOutboxSent)),
             "dup post",
             2,
+            COMMITTED_SEEDS,
         ),
     ];
-    let shown = aterm_spec::check::each(&controls, |(_, opts, law, witness)| {
-        let off = breaking_at(opts.as_ref(), law, *witness, COMMITTED_SEEDS);
+    let shown = aterm_spec::check::each(&controls, |(_, opts, law, witness, limit)| {
+        let off = breaking_at(opts.as_ref(), law, *witness, *limit);
         let on = off
             .as_ref()
             .map(|out| run(&with_every_rule(opts(out.seed))));
         (off, on)
     });
-    for ((mutant, _, law, _), (off, on)) in controls.iter().zip(&shown) {
+    for ((mutant, _, law, _, limit), (off, on)) in controls.iter().zip(&shown) {
         let (Some(off), Some(on)) = (off, on) else {
-            panic!(
-                "NEGATIVE CONTROL: with {mutant:?}, no seed within {COMMITTED_SEEDS} breaks `{law}`"
-            );
+            panic!("NEGATIVE CONTROL: with {mutant:?}, no seed within {limit} breaks `{law}`");
         };
         eprintln!(
             "{mutant:?} at seed {}: {}",
@@ -451,16 +454,17 @@ fn a_landed_posts_entry_stands_until_its_post_left_aterms_outbox() {
 /// law holds across a kill between its ack and that answer. NEGATIVE CONTROL: the entry ended
 /// at the ack, as every build before F15 ended it, answers one decision twice (the `receipt:`
 /// law). Under ten records a second and a burst of four ([`super::world::binding_rate`]), seed
-/// 515 kills a bridge between its receipt's ack (@11) and the retirement; the next bridge's
-/// attach hands @11 over, its entry ended, a cut gives it up, and the drain's retry at the pin
-/// finds no entry to read back from (a receipt's pin holds no head) and lands the answer again
-/// (@19). The committed worlds, with no rate limit, reach it in no seed to 20,000 (searched
-/// with `ATERM_SIM_DISCOVER_WITNESSES=1`, F15). With the rule on, seed 515 holds every law.
+/// 478 (515 until a drain read the subject budget once, critic item G04) kills a bridge between
+/// its receipt's ack and the retirement; the next bridge's attach hands the record over, its
+/// entry ended, a cut gives it up, and the drain's retry at the pin finds no entry to read back
+/// from (a receipt's pin holds no head) and lands the answer again. The committed worlds, with
+/// no rate limit, reached it in no seed to 20,000 (searched with
+/// `ATERM_SIM_DISCOVER_WITNESSES=1`, F15). With the rule on, seed 478 holds every law.
 #[test]
 fn a_landed_receipts_entry_stands_until_aterm_retired_it() {
     const LAW: &str = "decision on";
     let control = |s| rate_bound(s).with(Mutant::ReceiptRetiredAtAck);
-    let off = breaking_at(&control, LAW, 515, RARE_SEEDS).unwrap_or_else(|| {
+    let off = breaking_at(&control, LAW, 478, RARE_SEEDS).unwrap_or_else(|| {
         panic!(
             "NEGATIVE CONTROL: with ReceiptRetiredAtAck, no seed within {RARE_SEEDS} breaks `{LAW}`"
         )
@@ -857,7 +861,7 @@ fn each_rule_switched_off_is_caught() {
             "a post is not sent past an answer that held its sender since its drain reached it",
             Box::new(|s| Opts::seed(s).with(Mutant::SendPastAHeldSender)),
             "order:",
-            5,
+            377,
         ),
         (
             "a pipelining drain skips the posts owed at its peek, not those owed as it goes",
@@ -1000,7 +1004,7 @@ fn each_rule_switched_off_is_caught() {
             "the recovery a write error stopped is done before the run record",
             Box::new(|s| Opts::seed(s).with(Mutant::BeginRunPastAFailedRecovery)),
             "liveness",
-            47,
+            219,
         ),
         (
             "the mirror judges its pin once the recovery reconciled it",
@@ -1012,7 +1016,7 @@ fn each_rule_switched_off_is_caught() {
             "an own record is delivered only once its in-flight entry is gone",
             Box::new(|s| Opts::seed(s).with(Mutant::DeliverPastAStandingEntry)),
             "dup delivery",
-            14,
+            42,
         ),
         (
             "a mirror takes only once its open made the pin's fence durable (D06)",
@@ -1044,22 +1048,26 @@ fn each_rule_switched_off_is_caught() {
             "mirror total",
             2795,
         ),
+        // Explicit discovery on the composed budget scope and per-node hand-over found this
+        // first witness within the original 20,000-seed bound.
         (
             "an attach delivers on a new log only once its witness is written",
             Box::new(|s| both_ways(s).with(Mutant::AttachPastAnUnwrittenWitness)),
             "dup delivery",
-            4431,
+            1465,
         ),
         // Critic item E07's grouped landing moved this rule's first seed in the world with write
         // errors and quits past 20,000 (to 27907); where power is lost both ways a recovery is
-        // owed more often, and its first seed is 9538.
+        // owed more often, and its first seed was 9538, which C3b's per-node inbox hand-over
+        // (no state-dir write where no node's is held) moved off it to 1307. Composing G04
+        // moved that witness to 167, still within the original 20,000-seed bound.
         (
             "a run whose recovery is owed makes no clean stop",
             Box::new(|s| {
                 both_ways_erring_quitting(s).with(Mutant::CleanStopOverAnOwedRecovery)
             }),
             "mirror",
-            9538,
+            167,
         ),
         (
             "a recovery tried again moves each file once",
@@ -1151,7 +1159,7 @@ fn each_rule_switched_off_is_caught() {
             "a read back that meets its subject's floor reads again told",
             Box::new(|s| Opts::seed(s).with(Mutant::ReadBackWithoutTheHeld)),
             "dup post",
-            239,
+            878,
         ),
         (
             "a read of one offset below its filter's oldest reads again told (F3)",
@@ -1205,13 +1213,14 @@ fn each_rule_switched_off_is_caught() {
             "an answer is delivered only once the deadline it settles is off the disk (F4)",
             Box::new(|s| asking_erring(s).with(Mutant::DeliverOverAnUnwrittenSettle)),
             "was handed",
-            606,
+            614,
         ),
+        // This committed witness still reaches the hand-off bug after both scheduling changes.
         (
             "an attach takes a hand-off's files before its incarnation (F4)",
             Box::new(|s| asking_erring(s).with(Mutant::AdoptAfterTheAttach)),
             "dup post|answered 2 times| expired 2 times",
-            202,
+            244,
         ),
         (
             "an adoption names the attach of the hand-off it takes (F4)",
@@ -1223,7 +1232,7 @@ fn each_rule_switched_off_is_caught() {
             "a post retires only once its deadline is on disk (F4)",
             Box::new(|s| asking_erring(s).with(Mutant::RetireOverAnUnwrittenDeadline)),
             "neither answered nor expired",
-            282,
+            19,
         ),
         // The keyed world's own bug (F23): a keyed re-post published past a cut that carried
         // its key's winner unread and dropped its dedup key lands a second copy of the key. The
@@ -1290,6 +1299,11 @@ fn each_rule_switched_off_is_caught() {
         "the recovery a write error stopped is done before the run record",
         "an own record is delivered only once its in-flight entry is gone",
         "a read back that meets its subject's floor reads again told",
+        // Met where a blocking call inside a drain reads an answer that holds the sender of a
+        // post the drain reaches next. Since a drain reads the subject budget once, not at each
+        // lane it opens (critic item G04), fewer such calls do: no seed within 64 meets it, and
+        // 377 is the first.
+        "a post is not sent past an answer that held its sender since its drain reached it",
         // Item F4's, each met at one moment of a kill, a hand-off or a catch-up, a seed in the
         // hundreds or the thousands: a refused write of the deadline table, then a kill before
         // it is written again, the asker still hosted once settled; an uncounted notice below a
@@ -1446,9 +1460,9 @@ const FOUND_ERRING: &[(u64, usize, &str)] = &[
     // read back ends the entry it finds standing) moved 171 and 187 off their bugs (each holds
     // every law still). Each replacement is the first seed to 60,000 that breaks its law with the
     // rule off and holds all with it on ([`found_again`]). Critic item F20's floor, written at
-    // the attach, moved 59 to 47.
+    // the attach, moved 59 to 47, and G04's one subject-budget read a drain 47 to 219.
     (
-        47,
+        219,
         400,
         "a sweep a write error stopped, closed by the run record",
     ),
@@ -1467,22 +1481,20 @@ const FOUND_ERRING: &[(u64, usize, &str)] = &[
         400,
         "an entry published again at its pin after a cut dropped its key",
     ),
-    // Grouped landing moved 31196 off it, and the E07 review's fix 12556; the first replacement in
-    // this world to 60,000. A bridge unit test holds the rule with no seed:
+    // The read-back bug (`an entry read back from its head on a log a move continued below it`)
+    // has no row since critic item G04: grouped landing moved 31196 off it, the E07 review's fix
+    // 12556, and G04's one subject-budget read a drain 26926, and no seed of this world to
+    // 60,000 reaches it with its rule off since. A bridge unit test holds the rule with no seed:
     // `bridge::tests::an_entry_a_replay_published_on_a_moved_generation_is_read_back_from_the_fork`.
+    //
+    // Composing grouped landing with main moved 13 off this bug, and G04 14; the replacement is
+    // the first seed to 60,000 that breaks its law with the rule off and holds all with it on.
+    // The row before it, "a deduped replay moved the self-lane window down" (seeds 106, 28, 108
+    // and 142), went with its rule at critic item F17's review: the window's floor is its own,
+    // apart from the offsets it holds (`bridge::self_window`), so a replay's offset below it
+    // moves nothing, and no rule is left for a mutant to switch off.
     (
-        26926,
-        400,
-        "an entry read back from its head on a log a move continued below it",
-    ),
-    // Composing grouped landing with main moved 13 off this bug; the replacement is the first
-    // seed to 60,000 that breaks its law with the rule off and holds all with it on. The row
-    // before it, "a deduped replay moved the self-lane window down" (seeds 106, 28, 108 and
-    // 142), went with its rule at critic item F17's review: the window's floor is its own, apart
-    // from the offsets it holds (`bridge::self_window`), so a replay's offset below it moves
-    // nothing, and no rule is left for a mutant to switch off.
-    (
-        14,
+        42,
         400,
         "a record delivered while its in-flight entry stood",
     ),
@@ -1490,9 +1502,9 @@ const FOUND_ERRING: &[(u64, usize, &str)] = &[
     // `outbox sent`; an ack pass's landings are one write each) moved every seed's journal and lane
     // steps, and every row of this bug off it (each holds every law still); the first seed
     // of a plain search to 60,000 that reaches it with its rule off, and holds every law with it
-    // on ([`found_again`]).
+    // on ([`found_again`]). G04's one subject-budget read a drain moved 25964 to 4633.
     (
-        25964,
+        4633,
         400,
         "a record dropped while the disk refused the drop",
     ),
@@ -1500,10 +1512,10 @@ const FOUND_ERRING: &[(u64, usize, &str)] = &[
 
 const FOUND_BOTH_WAYS: &[(u64, usize, &str)] = &[
     // Grouped landing moved 3273 off it, the E07 review's fix 558, critic item F17's self-lane
-    // log 7324, and F20's floor written at the attach 2127; the first replacement in this world
-    // to 60,000.
+    // log 7324, F20's floor written at the attach 2127, and G04's one subject-budget read a
+    // drain 4431. With C3b's per-node hand-over, discovery found 1465 first within 60,000.
     (
-        4431,
+        1465,
         400,
         "an attach delivered on a log the state dir's witness does not name",
     ),
@@ -1519,21 +1531,24 @@ const FOUND_BOTH_WAYS_ERRING: &[(u64, usize, &str)] = &[
     // `outbox sent`; an ack pass's landings are one write each) moved every seed's journal and lane
     // steps, and 6751's, 7755's, 735's, 2270's, 3018's and 6371's trajectories off this bug (each
     // holds every law still); the first seed of this world to 60,000 that reaches it with its
-    // rule off ([`found_again`]).
+    // rule off ([`found_again`]). G04's one subject-budget read a drain moved 210 to 7759;
+    // composing C3b moved it to 22763, discovered within the same 60,000-seed bound.
     (
-        210,
+        22763,
         400,
         "a move an `auto` mirror met before its hello left its pinned batch to recover",
     ),
     // The read-back bug (`an entry read back from its head`) has no row here: grouped landing
     // moved 4067 and 36319 off it to 16088, and the E07 review's fix (a read back ends the entry
     // it finds standing) moved 16088 off it, and no seed of this world to 60,000 reaches it with
-    // its rule off since. `FOUND_ERRING`'s row and a bridge unit test hold it.
+    // its rule off since. A bridge unit test holds it (`FOUND_ERRING`'s row went at critic item
+    // G04).
     // Main replaced the obsolete carried-cut seed 31508 with 1179. Grouped landing moved that
-    // row too, the E07 review's fix 462, and critic item F17's self-lane log 931; this is the
-    // first replacement in this world to 60,000.
+    // row too, the E07 review's fix 462, critic item F17's self-lane log 931, and G04's one
+    // subject-budget read a drain 1634. Composed with C3b, the first replacement is 409, found
+    // within the original 60,000-seed bound.
     (
-        1634,
+        409,
         400,
         "a read back that went on at the floor missed the record a hold rule carried below it",
     ),
@@ -1562,32 +1577,36 @@ const FOUND_QUITTING: &[FoundIn] = &[
         400,
         "a post retried at its pin after a cut dropped its key",
     ),
-    // Grouped landing moved 15410 off it; the first replacement in this world to 60,000.
+    // Grouped landing moved 15410 off it, and C3b's per-node inbox hand-over (no state-dir write
+    // where no node's is held) 9538. Composing G04 moved that witness from 1307 to 167,
+    // discovered first within the same 60,000-seed bound.
     (
         both_ways_erring_quitting,
-        9538,
+        167,
         400,
         "a clean stop over a recovery owed vouched for what nobody reconciled or set aside",
     ),
     // These rare bugs were found scanning the quitting world, which no regular sweep runs.
-    // Grouped landing moved 3362 and 31710 off their bugs; their replacements below are the first
-    // to 60,000 that break their law with the rule off and hold every law with it on. 5951 remains.
+    // Each row reaches its bug with the rule off and holds every law with it on. After
+    // composing G04 and C3b, the first witness still does; explicit discovery found 2375
+    // first for the second within the original 60,000-seed bound.
     (
         both_ways_erring_quitting,
-        3306,
+        3397,
         400,
         "a clean stop left the heads it kept unflushed",
     ),
     (
         both_ways_erring_quitting,
-        5951,
+        2375,
         400,
         "an entry sent ahead of a post of its sender's with none",
     ),
     (
-        // Critic item F20's floor written at the attach moved 13679 to 3400.
+        // Critic item F20's floor written at the attach moved 13679 to 3400, and G04's one
+        // subject-budget read a drain 3400 to 55609.
         both_ways_erring_quitting,
-        3400,
+        55609,
         400,
         "a retired record's copy ended the memory of its torn file's",
     ),
@@ -1688,11 +1707,6 @@ const FOUND_RULES: &[(&str, Mutant, &str)] = &[
         "a move an `auto` mirror met before its hello left its pinned batch to recover",
         Mutant::ForgetOnlyAJudgedPin,
         "mirror",
-    ),
-    (
-        "an entry read back from its head on a log a move continued below it",
-        Mutant::ReadBackFromTheJournaledHead,
-        "dup",
     ),
     (
         "a hello's judge that said the mirror runs kept the wait it no longer showed",
@@ -4328,7 +4342,7 @@ fn a_post_the_log_lost_stays_lost_after_a_later_power_cut() {
         o
     };
     let republishing = move |s: u64| world(s).with(Mutant::RepublishInFlightOfAnEarlierBoot);
-    let out = breaking_at(&republishing, "order:", 775, RARE_SEEDS)
+    let out = breaking_at(&republishing, "order:", 561, RARE_SEEDS)
         .expect("NEGATIVE CONTROL: the old republish puts some post out of its sender's order");
     eprintln!(
         "the old republish at seed {}: {}",

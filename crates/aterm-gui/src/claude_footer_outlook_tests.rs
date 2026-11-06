@@ -2,8 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! The account unit's outlook inks (`docs/DESIGN-accounts-outlook-2026-10-25.md` §3.4, T20): the
-//! bar's meter and track and a projected stop's words, on the pane's rule and on the Accounts
-//! card, over every built-in scheme and the macOS accents.
+//! bar's meter and track and a projected stop's words, on the pane's rule in the glass's tokens
+//! (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §4.1) under every palette, and on the
+//! Accounts card under the macOS accents, over every built-in scheme.
 
 use super::*;
 use crate::autopilot_menu::{MenuRow, NoteTone, PlotCell, PlotInk};
@@ -11,6 +12,7 @@ use crate::native_appearance::{SystemAccent, install_system_accent};
 use aterm_agent::harness::outlook::{BarCell, Glance, VerdictWords};
 use aterm_effects::cli_marks::{ICON_CONTRAST, NAME_CONTRAST};
 use aterm_effects::color_math::contrast_ratio;
+use aterm_effects::glass_inks::day_vivid;
 use aterm_types::scheme::{builtin, builtin_names};
 
 fn reads(a: [u8; 3], b: [u8; 3]) -> f32 {
@@ -130,58 +132,57 @@ fn rule_greys(blank: RenderCell) -> [RenderCell; 3] {
 }
 
 /// T20: THE OUTLOOK'S INKS READ ON EVERY GROUND, AND DAY STAYS VIVID. Over every built-in scheme,
-/// with its own accent and each macOS accent, on three rule greys: the bar's `━ ╍ ┽` take the
-/// meter ink at 4.5:1 or more on the pane's ground and on the card's, its `─ ┄` the track ink at
-/// 3:1 or more, a stop's words the warn ink at 4.5:1 or more; on Aterm Day the meter keeps an
-/// OKLCH chroma of 0.10 or more for every accent but graphite; the bar never takes the warn ink,
-/// and wherever the warn ink is used its words lead with `⧗` (a stop is said, not coloured).
-/// Negative control: the dashes mixed toward the ground (`mix(meter, bg, 0.4)`) wash out on Day.
+/// under every palette and none, on three rule greys: the bar's `━ ╍ ┽` wear the marks ink of
+/// their column ([`GlassInks::mark`]), at 3:1 or more and at 4.5:1 on a light ground, its `─ ┄`
+/// the track ink at 3:1 or more, a stop's words the warn ink at 4.5:1 or more; on Aterm Day
+/// under Cruise and Land the meter keeps the glass's vivid law
+/// ([`aterm_effects::glass_inks::day_vivid`]: OKLCh C 0.12, or nearly the most sRGB holds at its
+/// hue and lightness where that is less); the bar never takes the warn ink, and wherever
+/// the warn ink is used its words lead with `⧗` (a stop is said, not coloured). The system
+/// accent reads nowhere on the rule (`lines_b_d_and_e_ignore_the_system_accent`). Negative
+/// control: the dashes mixed toward the ground (`mix(meter, bg, 0.4)`) wash out on Day.
 #[test]
 fn the_outlooks_inks_read_on_every_ground_and_day_stays_vivid() {
+    use aterm_effects::harness_card::CardPalette;
     let rgb = |c: aterm_types::Rgb| [c.r, c.g, c.b];
-    let accents: Vec<(&str, Option<[u8; 3]>)> = std::iter::once(("its own", None))
-        .chain(MAC_ACCENTS.iter().map(|&(name, c)| (name, Some(c))))
-        .collect();
+    let palettes = [
+        Some(CardPalette::Cruise),
+        Some(CardPalette::Land),
+        Some(CardPalette::Off),
+        None,
+    ];
+    let room = 200;
+    let at = rule_at_room(room);
     let (mut meters, mut tracks, mut warns, mut days) = (0usize, 0usize, 0usize, 0usize);
+    let mut washed = 0usize;
     for name in builtin_names() {
         let Some(scheme) = builtin(name) else {
             continue;
         };
-        let theme = aterm_render::Theme::from(&scheme);
         let blank = RenderCell {
             ch: ' ',
             fg: rgb(scheme.foreground),
             bg: rgb(scheme.background),
             ..RenderCell::default()
         };
-        for &(accent_name, accent) in &accents {
-            install_system_accent(accent.map(|c| SystemAccent {
-                on_dark: c,
-                on_light: c,
-            }));
-            let band = crate::chrome_band::band_colors(theme);
-            let mark_fg = accent.unwrap_or(band.accent);
-            let what = format!("{name}, {accent_name} accent");
-            let vivid = name == "Aterm Day" && accent_name != GREY_ACCENT;
+        let dark = crate::claude_card::dark_ground(blank);
+        for palette in palettes {
+            let what = format!("{name}, {palette:?}");
+            let vivid = name == "Aterm Day"
+                && matches!(palette, Some(CardPalette::Cruise | CardPalette::Land));
             for rule in rule_greys(blank) {
+                let glass = rule_glass(palette, rule, blank);
                 for stop in [false, true] {
                     let facts = unit(stop);
-                    let fit = footer::fit_rule(&facts, 200, None);
-                    let paint = compose_rule_spans(
-                        &fit,
-                        None,
-                        rule,
-                        blank,
-                        (mark_fg, band.warn),
-                        200,
-                        None,
-                    );
+                    let fit = footer::fit_rule(&facts, room, None);
+                    let paint =
+                        compose_rule_spans(&fit, None, rule, blank, (&glass, at), room, None);
                     let set = footer::set_facts(&fit.segments);
-                    let meter_ink = legible_on(mark_fg, blank.bg);
                     let mut said = String::new();
                     let mut bar_cells = 0;
                     for glyph in &set.glyphs {
-                        let cell = paint.cells[paint.facts_at + 1 + glyph.cell];
+                        let col = paint.facts_at + 1 + glyph.cell;
+                        let cell = paint.cells[col];
                         assert_eq!(cell.ch, glyph.ch, "{what}: the composed cell");
                         let k = reads(cell.fg, blank.bg);
                         if glyph.meter {
@@ -190,24 +191,29 @@ fn the_outlooks_inks_read_on_every_ground_and_day_stays_vivid() {
                                 assert!(k >= ICON_CONTRAST, "{what}: track {k:.2}:1");
                                 tracks += 1;
                             } else {
-                                assert!(k >= NAME_CONTRAST, "{what}: meter {k:.2}:1");
+                                let floor = if dark { ICON_CONTRAST } else { NAME_CONTRAST };
+                                assert!(k >= floor, "{what}: meter {k:.2}:1");
                                 assert_eq!(
-                                    cell.fg, meter_ink,
-                                    "{what}: the bar keeps the meter ink, never the warn ink"
+                                    cell.fg,
+                                    rgb_of(glass.mark(at.t(col))),
+                                    "{what}: the bar keeps its column's marks ink, never the warn"
                                 );
                                 if vivid {
                                     let c = chroma(cell.fg);
                                     assert!(
-                                        c >= 0.10,
+                                        day_vivid(pack_rgb(cell.fg)),
                                         "{what}: the meter on Day at OKLCH C {c:.3}, {:?}",
                                         cell.fg
                                     );
+                                    let mixed = mix(cell.fg, blank.bg, 0.4);
+                                    washed += usize::from(!day_vivid(pack_rgb(mixed)));
                                     days += 1;
                                 }
                                 meters += 1;
                             }
                         } else if glyph.warn {
                             assert!(k >= NAME_CONTRAST, "{what}: warn {k:.2}:1");
+                            assert_eq!(cell.fg, rgb_of(glass.warn()), "{what}: the warn ink");
                             said.push(glyph.ch);
                             warns += 1;
                         }
@@ -223,6 +229,48 @@ fn the_outlooks_inks_read_on_every_ground_and_day_stays_vivid() {
                     }
                 }
             }
+        }
+    }
+    let schemes = builtin_names().len();
+    assert!(schemes >= 17, "{schemes} built-ins");
+    assert!(
+        meters >= schemes * palettes.len() * 3 * 2 * 7 && tracks > 0 && warns > 0,
+        "{meters} meter, {tracks} track, {warns} warn cells"
+    );
+    assert!(days > 0, "Aterm Day's meter was looked at");
+    // CONTROL: the washed-out look the owner ruled against (2026-10-17): the dashes mixed toward
+    // Day's ground lose their chroma below the floor.
+    assert!(
+        washed > 0,
+        "CONTROL: a mix toward Day's ground keeps its chroma"
+    );
+}
+
+/// T20 ON THE ACCOUNTS CARD: over every built-in scheme, with its own accent and each macOS
+/// accent, the card's bar `━ ╍ ┽` takes the meter ink at 4.5:1 or more on the card's ground, its
+/// `─ ┄` the track ink at 3:1, `╳` and a stop's words at 4.5:1; on Aterm Day the meter keeps an
+/// OKLCH chroma of 0.10 or more for every accent but those dull on the card. The card still
+/// reads the system accent (S6 moves it onto the glass's tokens). Negative control: the dashes
+/// mixed toward the ground (`mix(meter, bg, 0.4)`) wash out on Day.
+#[test]
+fn the_cards_outlook_inks_read_on_every_ground_and_day_stays_vivid() {
+    let rgb = |c: aterm_types::Rgb| [c.r, c.g, c.b];
+    let accents: Vec<(&str, Option<[u8; 3]>)> = std::iter::once(("its own", None))
+        .chain(MAC_ACCENTS.iter().map(|&(name, c)| (name, Some(c))))
+        .collect();
+    let mut checked = 0usize;
+    for name in builtin_names() {
+        let Some(scheme) = builtin(name) else {
+            continue;
+        };
+        let theme = aterm_render::Theme::from(&scheme);
+        for &(accent_name, accent) in &accents {
+            install_system_accent(accent.map(|c| SystemAccent {
+                on_dark: c,
+                on_light: c,
+            }));
+            let what = format!("{name}, {accent_name} accent");
+            let vivid = name == "Aterm Day" && accent_name != GREY_ACCENT;
             let menu = crate::tab_menu::menu_colors(theme);
             let rect = crate::tab_menu::MenuRect {
                 row: 0,
@@ -251,6 +299,7 @@ fn the_outlooks_inks_read_on_every_ground_and_day_stays_vivid() {
                     '\u{2573}' => assert!(k >= NAME_CONTRAST, "{what}: card stop {k:.2}:1"),
                     _ => {}
                 }
+                checked += 1;
             }
             let note: String = painted[2].iter().map(|c| c.ch).collect();
             assert!(note.contains("\u{29d7} stop"), "{what}: {note:?}");
@@ -265,12 +314,7 @@ fn the_outlooks_inks_read_on_every_ground_and_day_stays_vivid() {
     }
     install_system_accent(None);
     let schemes = builtin_names().len();
-    assert!(schemes >= 17, "{schemes} built-ins");
-    assert!(
-        meters >= schemes * accents.len() * 3 * 2 * 7 && tracks > 0 && warns > 0,
-        "{meters} meter, {tracks} track, {warns} warn cells"
-    );
-    assert!(days > 0, "Aterm Day's meter was looked at");
+    assert!(checked >= schemes * accents.len(), "{checked} card cells");
 
     // CONTROL: the washed-out look the owner ruled against (2026-10-17): the dashes mixed toward
     // Day's ground lose their chroma below the floor.

@@ -810,8 +810,11 @@ pub struct Inbox {
     bus_head: u64,
     addressed_head: Option<u64>,
     oldest_on_bus: Option<u64>,
-    /// The offsets this session took or refused, oldest first, each with whether its delivery
-    /// recorded a [`FabricFact::MailIn`] (a quota refusal records none).
+    /// The offsets this session took or refused, oldest first, each with whether the mail at
+    /// that offset has a [`FabricFact::MailIn`] in this session's log: that delivery recorded it,
+    /// an earlier delivery of the same mail did (a moved copy's offset and the one its `was=`
+    /// names, §11 C3b), or the carried log holds it (`carried_marks`); a quota refusal
+    /// records none.
     dedup: VecDeque<(u64, bool)>,
     dedup_set: HashSet<u64>,
     /// The marks a seamless update carried ([`FabricCarry::marked`]): offsets the carried log
@@ -965,7 +968,8 @@ pub struct FabricCarry {
     #[serde(default, skip_serializing_if = "is_zero")]
     pub broadcasts_refilled: u64,
     /// The offsets, on [`Self::bus_log`], of the mail whose delivery this session's log marked
-    /// (`mail dir=in`), oldest first, as far as the budget reached. The ring is not carried, so the
+    /// (`mail dir=in`), a moved copy's offset and its first offset among them, oldest first, as
+    /// far as the budget reached. The ring is not carried, so the
     /// successor's bridge offers the unhandled ones again; a successor whose log is the carried one
     /// ([`Timeline::log_carried`]) takes each back into its ring without a second mark, or its fold
     /// would hold the mail twice.
@@ -4787,7 +4791,7 @@ pub fn person_hold(ctx: &dyn FabricSession, on: bool, wake: &dyn Fn()) -> Person
 }
 
 const DELIVER_USAGE: &str = "ERR usage: deliver <sid> off=<n> from=<p> kind=<k> [trust=<t>] \
-                             [topic=<t>] [re=<n>] [dl=<ms>] [late=1] [demoted=<k>] \
+                             [topic=<t>] [re=<n>] [dl=<ms>] [was=<n>] [late=1] [demoted=<k>] \
                              [via=<p,...>] [verdict=<handled|refused|deferred>] [len=<n>] \
                              [text=<pct>] \
                              | deliver <sid> landed=<post-id> off=<n> \
@@ -5030,6 +5034,9 @@ struct DeliverFields {
     len: usize,
     declared_len: Option<usize>,
     topic: Option<String>,
+    /// The offset on this log a record moved here across this Mac's key rotation was first moved
+    /// from (§11 C3b, `aterm_types::control_verbs::LINK_MOVED_LANE`).
+    was: Option<u64>,
     body: String,
 }
 
@@ -5048,6 +5055,7 @@ fn parse_deliver_fields(toks: &[&str], len_max: usize) -> Result<DeliverFields, 
         len: 0,
         declared_len: None,
         topic: None,
+        was: None,
         body: String::new(),
     };
     let mut declared_len: Option<usize> = None;
@@ -5072,6 +5080,11 @@ fn parse_deliver_fields(toks: &[&str], len_max: usize) -> Result<DeliverFields, 
         } else if let Some(v) = kv(tok, "dl") {
             match parse_uint(v) {
                 Some(n) => f.dl = Some(n),
+                None => return Err(DELIVER_USAGE.to_string()),
+            }
+        } else if let Some(v) = kv(tok, "was") {
+            match parse_uint(v) {
+                Some(n) => f.was = Some(n),
                 None => return Err(DELIVER_USAGE.to_string()),
             }
         } else if let Some(v) = kv(tok, "late") {
@@ -5456,6 +5469,7 @@ fn deliver_row(ctx: &dyn FabricSession, toks: &[&str], wake: &dyn Fn()) -> Strin
         len,
         declared_len: _,
         topic,
+        was,
         body,
     } = match parse_deliver_fields(toks, BODY_MAX) {
         Ok(f) => f,
@@ -5471,8 +5485,26 @@ fn deliver_row(ctx: &dyn FabricSession, toks: &[&str], wake: &dyn Fn()) -> Strin
         ctx.self_id().as_str(),
         topic.as_deref(),
     );
-    if inbox.dedup_set.contains(&off) || inbox.row_at(off).is_some() {
-        let existing = inbox.row_at(off).map(|r| r.id);
+    // A repeat of an offset this endpoint holds is answered from that memory, and so is a record
+    // moved here across this Mac's key rotation whose first offset it holds (`was=`, §11 C3b): its
+    // session was shown that mail before the move, which a bridge that went before its commit
+    // left to the move.
+    let known = |at: u64| inbox.dedup_set.contains(&at) || inbox.row_at(at).is_some();
+    let (off_known, was_known) = (known(off), was.is_some_and(known));
+    if !aterm_mesh_core::inbox_move::shows_anew(off_known, was_known) {
+        let existing = inbox
+            .row_at(off)
+            .or_else(|| was.and_then(|w| inbox.row_at(w)))
+            .map(|r| r.id);
+        // The mail it names was shown, its `MailIn` recorded: each offset this delivery names is
+        // remembered as that mail's, so a copy a later rotation moved from this one, whose bridge
+        // names it by this copy's offset where it cannot read further back, is answered too.
+        if !off_known {
+            remember_offset(&mut inbox, off, true);
+        }
+        if let Some(was) = was.filter(|_| !was_known) {
+            remember_offset(&mut inbox, was, true);
+        }
         return match existing {
             Some(id) => format!("OK {id}\n"),
             None => "OK 0\n".to_string(),
@@ -5542,7 +5574,12 @@ fn deliver_row(ctx: &dyn FabricSession, toks: &[&str], wake: &dyn Fn()) -> Strin
     }
     inbox.oldest_on_bus = Some(inbox.oldest_on_bus.map_or(off, |o| o.min(off)));
     remember_offset(&mut inbox, off, true);
-    if inbox.carried_marks.remove(&off) {
+    if let Some(was) = was {
+        // So another copy of it, one a second rotation moved again, is answered too.
+        remember_offset(&mut inbox, was, true);
+    }
+    let carried_was = was.is_some_and(|w| inbox.carried_marks.remove(&w));
+    if inbox.carried_marks.remove(&off) | carried_was {
         drop(inbox);
         ctx.fabric().changed.notify_all();
         ctx.fabric_changed();
@@ -7740,6 +7777,66 @@ mod inbox_hold {
         assert_eq!(rows(&cmd_inbox(&ctx, "--peek")).len(), 1);
         assert_eq!(deliver(&store, &sid, 90313, "h-a", "ask", "next"), "OK 2\n");
         assert_eq!(rows(&cmd_inbox(&ctx, "--peek")).len(), 2);
+    }
+
+    /// A RECORD MOVED ACROSS THIS MAC'S KEY ROTATION IS SHOWN ONCE (§11 C3b): the old node's
+    /// bridge delivered `in/<old>` mail at offset 7 and went before its commit, so the move put a
+    /// copy on this node's lane at 40, naming 7 (`was=7`). The endpoint answers the copy with the
+    /// row 7 got, showing nothing, and a second copy (a later rotation moved it again, at 60) is
+    /// answered too, whether its bridge names 7 or, where it could not read back past the first
+    /// copy, 40: an answered copy is remembered by its own offset as well. A moved record whose
+    /// first offset it never showed is shown, once.
+    /// NEGATIVE CONTROL: the same copy with no `was=`, as a bridge before lane 11 sends it, is a
+    /// second row.
+    #[test]
+    fn a_moved_copy_of_mail_shown_before_the_move_is_not_shown_again() {
+        let store = new_store();
+        let (sid, ctx) = registered(&store);
+        let moved = |off: u64, was: u64| {
+            cmd_deliver(
+                &store,
+                &format!(
+                    "{sid} off={off} from=s-b@n-peer kind=ask trust=agent was={was} text=read"
+                ),
+            )
+        };
+        assert_eq!(
+            deliver(&store, &sid, 7, "s-b@n-peer", "ask", "read"),
+            "OK 1\n"
+        );
+        assert_eq!(moved(40, 7), "OK 1\n", "answered as the row 7 got");
+        assert_eq!(moved(60, 7), "OK 1\n", "and again for a copy moved twice");
+        assert_eq!(
+            moved(70, 40),
+            "OK 0\n",
+            "a copy that names an answered copy is answered from its memory"
+        );
+        assert_eq!(moved(80, 9), "OK 2\n", "mail the move took unread is shown");
+        assert_eq!(
+            moved(90, 9),
+            "OK 0\n",
+            "once: answered from the memory of 9, as a repeat held by offset alone is"
+        );
+        assert_eq!(
+            ctx.fabric.lock().rows.len(),
+            2,
+            "{:?}",
+            ctx.fabric.lock().rows
+        );
+
+        assert_eq!(
+            deliver(&store, &sid, 41, "s-b@n-peer", "ask", "read"),
+            "OK 3\n",
+            "without was= the copy is another row"
+        );
+        assert_eq!(
+            cmd_deliver(
+                &store,
+                &format!("{sid} off=42 from=s-b@n-peer kind=ask was=x")
+            ),
+            DELIVER_USAGE,
+            "was= names an offset"
+        );
     }
 
     #[test]

@@ -172,6 +172,57 @@ pub fn parse_halt<'a>(fleet: &str, subject: &'a str, body: &[u8]) -> Option<Halt
     })
 }
 
+/// The leaf of a person's halt requests ([`halt_ask`]), beside the old `halt` row's.
+pub const HALT_ASK_LEAF: &str = "halts";
+
+/// `/f/<F>/fleet/<person>/halts` — where a person asks their own Mac's bridge to halt the fleet,
+/// or to lift a halt, by its id (`crate::halt::Ask`; §11 C4). Only that person's ring writes it.
+#[must_use]
+pub fn halt_ask(fleet: &str, person: &str) -> String {
+    format!("/f/{fleet}/fleet/{person}/{HALT_ASK_LEAF}")
+}
+
+/// Every person's halt requests, as one filter.
+#[must_use]
+pub fn halt_asks(fleet: &str) -> String {
+    format!("/f/{fleet}/fleet/*/{HALT_ASK_LEAF}")
+}
+
+/// The person a halt request's subject names: `None` for any other subject, and for a principal
+/// that is no person (`h-`), since only a person halts.
+#[must_use]
+pub fn parse_halt_ask<'a>(fleet: &str, subject: &'a str) -> Option<&'a str> {
+    let rest = subject.strip_prefix("/f/")?.strip_prefix(fleet)?;
+    let person = rest
+        .strip_prefix("/fleet/")?
+        .strip_suffix(HALT_ASK_LEAF)?
+        .strip_suffix('/')?;
+    (is_principal(person) && person.starts_with("h-")).then_some(person)
+}
+
+/// `/f/<F>/halt/<node>` — the one subject a Mac's bridge says its halts on, relayed to every Mac
+/// (§4.11).
+#[must_use]
+pub fn halt_subject(fleet: &str, node: &str) -> String {
+    format!("/f/{fleet}/halt/{node}")
+}
+
+/// Every Mac's halt subject, as one filter.
+#[must_use]
+pub fn halt_filter(fleet: &str) -> String {
+    format!("/f/{fleet}/halt/>")
+}
+
+/// The Mac a halt subject names: `None` for any other subject, a deeper one included.
+#[must_use]
+pub fn parse_halt_origin<'a>(fleet: &str, subject: &'a str) -> Option<&'a str> {
+    let node = subject
+        .strip_prefix("/f/")?
+        .strip_prefix(fleet)?
+        .strip_prefix("/halt/")?;
+    crate::federate::is_node(node).then_some(node)
+}
+
 /// Every broadcast face in the fleet, as one filter.
 #[must_use]
 pub fn say_filter(fleet: &str) -> String {

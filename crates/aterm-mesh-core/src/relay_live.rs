@@ -12,7 +12,10 @@
 //! for a kept cursor, a lineage exchange for a moved one, a new link's otherwise. A gap notice (a
 //! retention cut below the neighbour's cursor) asks one too, unless `NO_INVENTORY_ON_GAP`
 //! ([`requests`]); an asked exchange runs unless the pair's last one moved nothing and this Mac's
-//! summary has not changed since ([`runs`]).
+//! summary has not changed since ([`runs`]). A start that asked while this Mac's ingest had not yet
+//! passed the last table record its log held asks once more when it does ([`asks_again`]): the
+//! first exchange can run before this Mac's stores hold what its log held, and move nothing
+//! (finding H2).
 //!
 //! Each decision is a scalar `contract!` kernel stating `ensures result == spec_<name>(..) by
 //! <name>_is_exact` for a definition of `relay_live_island.rs`. That island (every Trust build)
@@ -21,7 +24,8 @@
 //! bring the record to every seat the origin reaches (`flood_without_let_go`); a record an edge owes
 //! reaches the neighbour's stores, by the push or by Inventory after a cut, a lost log or a new link
 //! (`the_edge_is_repaired`); and with the digest trigger, every reachable seat gets it
-//! (`every_seat_gets_the_record`); each under its named fairness premises, and runs by `rfl` show
+//! (`every_seat_gets_the_record`); each under its named fairness premises, with no premise on the
+//! order of a start and the ingest, and runs by `rfl` show
 //! each kernel decision and each premise is needed. `relay_live_binding_island.rs` proves each
 //! compiled kernel equal to its spec and closes the theorems for the compiled kernels; the answer
 //! sheet `relay_live::tests` recomputes holds the Rust to the island until TG12.
@@ -69,6 +73,14 @@ contract! {
     pub fn runs(remembers: bool, quiet_same: bool) -> bool
     clauses [ensures result == spec_runs(remembers, quiet_same) by runs_is_exact]
     { !(remembers && quiet_same) }
+}
+contract! {
+    /// A relay start that `asked` an exchange asks it once more when this Mac's ingest passes
+    /// the last table record its log held at the start, unless the ingest had `ingested` through
+    /// it already.
+    pub fn asks_again(asked: bool, ingested: bool) -> bool
+    clauses [ensures result == spec_asks_again(asked, ingested) by asks_again_is_exact]
+    { asked && !ingested }
 }
 
 #[cfg(clean_islands)]

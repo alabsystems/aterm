@@ -38,6 +38,15 @@
 //! to within 10 minutes. It lives beside the two logs' folders, not in either, so a renewed log
 //! keeps it. Only the current seats' lines are kept: a removed or re-keyed seat's line goes.
 //!
+//! **A row that differs asks an exchange** (PF5b's finding H1, §4.6's gap notice). Each live,
+//! fresh row of another Mac is handed, with its membership and tables digests and this Mac's own
+//! latest row's, to the `Inventory` digest trigger ([`crate::inventory::Inventory::digest_row`]),
+//! which asks an exchange with that neighbour where one store's two digests differ two rows in a
+//! row while both relays are caught up: a record that reached one Mac by `Inventory` is in no log,
+//! so no relay carries it on, and this is what does. The two digests name every record an exchange
+//! moves: the membership log's records, and each table's operations and conflict records
+//! ([`Held::tables`]). `NO_DIGEST_TRIGGER` is its negative control.
+//!
 //! **A row is its origin's alone.** The tail judges each row again, beside the broker's own
 //! check of the relay: its subject must name a current seat (or this Mac), carry that seat's
 //! producer id, and verify under that seat's node key, and its body must be a presence row. So a
@@ -45,6 +54,7 @@
 //! yet, or a log read at a start before the removal reached it), and no relaying Mac can forge
 //! another's presence.
 
+use crate::inventory::Holds;
 use crate::logs::{Mesh, MeshLog};
 use crate::relay;
 use aterm_digest::Sha256;
@@ -186,6 +196,23 @@ const MEMBERSHIP_DOMAIN: &[u8] = b"aterm/mesh/presence/membership/1\0";
 /// The tables digest's domain.
 const TABLES_DOMAIN: &[u8] = b"aterm/mesh/presence/tables/1\0";
 
+/// The domain of one table's conflict records' digest.
+const CONFLICTS_DOMAIN: &[u8] = b"aterm/mesh/presence/conflicts/1\0";
+
+/// Hash `tables` into `h`: their number, then each one's identity, count and digest.
+fn put_tables(h: &mut Sha256, tables: &BTreeMap<[u8; 32], Held>) {
+    h.update(
+        u64::try_from(tables.len())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
+    for (table, held) in tables {
+        h.update(table);
+        h.update(held.count.to_le_bytes());
+        h.update(held.digest);
+    }
+}
+
 impl Held {
     /// The membership log's: every record id it holds, verified (`Store::inventory`), in order.
     #[must_use]
@@ -214,25 +241,47 @@ impl Held {
         }
     }
 
-    /// The lab tables': each table's own count and fingerprint of the operation ids it retains
-    /// ([`Self::table`]), keyed by the table's identity digest (`Scope::digest`). The count is
-    /// every table's operations.
+    /// One table's conflict records: the ids (each record's wire digest) of the conflict
+    /// certificates its store holds, in order.
     #[must_use]
-    pub fn tables(tables: &BTreeMap<[u8; 32], Self>) -> Self {
-        let count = tables
+    pub fn conflicts(ids: &BTreeSet<[u8; 32]>) -> Self {
+        let count = u64::try_from(ids.len()).unwrap_or(u64::MAX);
+        let mut h = Sha256::new();
+        h.update(CONFLICTS_DOMAIN);
+        h.update(count.to_le_bytes());
+        for id in ids {
+            h.update(id);
+        }
+        Self {
+            digest: h.finalize(),
+            count,
+        }
+    }
+
+    /// The lab tables': each table's own count and fingerprint of the operation ids it retains
+    /// (`operations`, each [`Self::table`]), and of the conflict records it holds (`conflicts`,
+    /// each [`Self::conflicts`]), both keyed by the table's identity digest (`Scope::digest`).
+    /// The count is every table's operations and conflict records.
+    ///
+    /// The SHA-256 runs over the domain and `operations` (their number, then each table's
+    /// identity, count and digest), then over `conflicts` the same way only where it names a
+    /// table. So the encoding reads one way (the first part's length is its number's; the second
+    /// is there or not), and a lab that holds no conflict record reads as it did before conflict
+    /// records were counted, on every build.
+    #[must_use]
+    pub fn tables(
+        operations: &BTreeMap<[u8; 32], Self>,
+        conflicts: &BTreeMap<[u8; 32], Self>,
+    ) -> Self {
+        let count = operations
             .values()
+            .chain(conflicts.values())
             .fold(0u64, |sum, held| sum.saturating_add(held.count));
         let mut h = Sha256::new();
         h.update(TABLES_DOMAIN);
-        h.update(
-            u64::try_from(tables.len())
-                .unwrap_or(u64::MAX)
-                .to_le_bytes(),
-        );
-        for (table, held) in tables {
-            h.update(table);
-            h.update(held.count.to_le_bytes());
-            h.update(held.digest);
+        put_tables(&mut h, operations);
+        if !conflicts.is_empty() {
+            put_tables(&mut h, conflicts);
         }
         Self {
             digest: h.finalize(),
@@ -453,17 +502,31 @@ impl PresenceRow {
         }
         put_held(&mut out, self.membership);
         put_held(&mut out, self.tables);
-        let topics: BTreeSet<&str> = self
-            .topics
-            .iter()
-            .map(String::as_str)
-            .filter(|topic| aterm_types::fabric_grammar::is_topic(topic))
-            .collect();
-        let topic_count = topics.len().min(TOPICS_MAX);
-        put_varint(&mut out, u64::try_from(topic_count).unwrap_or(0));
-        for topic in topics.into_iter().take(TOPICS_MAX) {
-            out.push(u8::try_from(topic.len()).unwrap_or(u8::MAX));
-            out.extend_from_slice(topic.as_bytes());
+        if self.topics.len() <= TOPICS_MAX
+            && self
+                .topics
+                .iter()
+                .all(|topic| aterm_types::fabric_grammar::is_topic(topic))
+            && self.topics.windows(2).all(|w| w[0] < w[1])
+        {
+            put_varint(&mut out, u64::try_from(self.topics.len()).unwrap_or(0));
+            for topic in &self.topics {
+                out.push(u8::try_from(topic.len()).unwrap_or(u8::MAX));
+                out.extend_from_slice(topic.as_bytes());
+            }
+        } else {
+            let topics: BTreeSet<&str> = self
+                .topics
+                .iter()
+                .map(String::as_str)
+                .filter(|topic| aterm_types::fabric_grammar::is_topic(topic))
+                .collect();
+            let topic_count = topics.len().min(TOPICS_MAX);
+            put_varint(&mut out, u64::try_from(topic_count).unwrap_or(0));
+            for topic in topics.into_iter().take(TOPICS_MAX) {
+                out.push(u8::try_from(topic.len()).unwrap_or(u8::MAX));
+                out.extend_from_slice(topic.as_bytes());
+            }
         }
         out
     }
@@ -531,6 +594,15 @@ impl PresenceRow {
     pub fn in_step_with(&self, other: &Self) -> bool {
         let same = |a: Option<Held>, b: Option<Held>| a.is_some() && a == b;
         same(self.membership, other.membership) && same(self.tables, other.tables)
+    }
+
+    /// What it says its Mac holds of each store `Inventory` moves: what the digest trigger
+    /// compares.
+    pub(crate) const fn holds(&self) -> Holds {
+        Holds {
+            membership: self.membership,
+            tables: self.tables,
+        }
     }
 }
 
@@ -1070,10 +1142,20 @@ impl Shared {
         };
         let now = self.mesh.clock.now();
         let wall = relay::wall_ms(&self.mesh.wall);
-        let took = self
-            .board
-            .lock_or_recover()
-            .offer(principal, seq, row, live, now, wall);
+        let theirs = row.holds();
+        let (took, mine) = {
+            let mut board = self.board.lock_or_recover();
+            let took = board.offer(principal, seq, row, live, now, wall);
+            let mine = board
+                .row(&self.mesh.me.principal)
+                .map(|(_, row)| row.holds())
+                .unwrap_or_default();
+            (took, mine)
+        };
+        // Before the row is reported, so a reader of the report knows what it asked.
+        if took == Took::Advanced && principal != self.mesh.me.principal {
+            self.digest_row(principal, theirs, mine);
+        }
         if let Some(observe) = &self.observe {
             observe(&Event::Took {
                 principal: principal.to_owned(),
@@ -1084,6 +1166,17 @@ impl Shared {
         if took == Took::Advanced {
             self.write_seen(now);
         }
+    }
+
+    /// Hand `principal`'s row that advanced, what it holds `theirs` against this Mac's own latest
+    /// row's `mine`, to the digest trigger of this mesh's `Inventory`, where it moves tables: with
+    /// whether a tables relay to `principal` follows now.
+    fn digest_row(&self, principal: &str, theirs: Holds, mine: Holds) {
+        let Some(inventory) = self.mesh.inventory() else {
+            return;
+        };
+        let follows = self.mesh.heard.lock_or_recover().contains_key(principal);
+        inventory.digest_row(principal, theirs, mine, follows);
     }
 
     /// The current seats' principals, this Mac's among them; `None` before the standings were
@@ -1413,13 +1506,16 @@ mod tests {
                 "[fd00::22]:7480".parse().expect("an address"),
             ],
             membership: Some(Held::membership(&BTreeSet::from([[1; 32], [2; 32]]))),
-            tables: Some(Held::tables(&BTreeMap::from([(
-                [9; 32],
-                Held {
-                    digest: [3; 32],
-                    count: 12,
-                },
-            )]))),
+            tables: Some(Held::tables(
+                &BTreeMap::from([(
+                    [9; 32],
+                    Held {
+                        digest: [3; 32],
+                        count: 12,
+                    },
+                )]),
+                &BTreeMap::new(),
+            )),
             topics: vec!["build".to_owned(), "deploy".to_owned()],
         }
     }
@@ -1888,7 +1984,7 @@ mod tests {
 
     /// The two digests name what is held, not how it was gathered: the same ids give the same
     /// digest whatever order they arrive in, one more id gives another, and a table's own
-    /// summary feeds the lab's.
+    /// summaries feed the lab's, its conflict records apart from its operations.
     #[test]
     fn a_digest_names_what_is_held() {
         let ids: BTreeSet<[u8; 32]> = (0..50u8).map(|n| [n; 32]).collect();
@@ -1900,16 +1996,53 @@ mod tests {
         more.insert([99; 32]);
         assert_ne!(one.digest, Held::membership(&more).digest);
         let table = |count, digest| Held { digest, count };
+        let none = BTreeMap::new();
         let lab = BTreeMap::from([([1; 32], table(3, [7; 32])), ([2; 32], table(4, [8; 32]))]);
-        let tables = Held::tables(&lab);
+        let tables = Held::tables(&lab, &none);
         assert_eq!(tables.count, 7);
         let mut moved = lab.clone();
         moved.insert([2; 32], table(4, [6; 32]));
-        assert_ne!(tables.digest, Held::tables(&moved).digest);
+        assert_ne!(tables.digest, Held::tables(&moved, &none).digest);
         assert_ne!(
-            Held::tables(&BTreeMap::new()).digest,
+            Held::tables(&none, &none).digest,
             Held::membership(&BTreeSet::new()).digest,
             "the two domains differ"
+        );
+        // With no conflict record the digest is the one the operations alone give, as on a build
+        // that counted none: the domain, the number of tables, each one's identity, count, digest.
+        let mut alone = Sha256::new();
+        alone.update(b"aterm/mesh/presence/tables/1\0");
+        alone.update(2u64.to_le_bytes());
+        for (id, count, digest) in [([1; 32], 3u64, [7; 32]), ([2; 32], 4, [8; 32])] {
+            alone.update(id);
+            alone.update(count.to_le_bytes());
+            alone.update(digest);
+        }
+        assert_eq!(tables.digest, alone.finalize());
+        // A conflict record moves the digest and the count; the same records give the same one;
+        // and one table's summary read as conflicts is not read as operations.
+        let certificates = Held::conflicts(&BTreeSet::from([[5; 32]]));
+        assert_eq!(
+            certificates,
+            Held::conflicts(&BTreeSet::from([[5; 32]])),
+            "one set, one digest"
+        );
+        assert_ne!(
+            certificates.digest,
+            Held::conflicts(&BTreeSet::from([[6; 32]])).digest
+        );
+        let fork = BTreeMap::from([([2; 32], certificates)]);
+        let with_fork = Held::tables(&lab, &fork);
+        assert_eq!(with_fork.count, 8, "operations and conflict records");
+        assert_ne!(
+            with_fork.digest, tables.digest,
+            "a conflict record moves it"
+        );
+        let one_table = BTreeMap::from([([1; 32], table(3, [7; 32]))]);
+        assert_ne!(
+            Held::tables(&one_table, &none).digest,
+            Held::tables(&none, &one_table).digest,
+            "operations and conflict records read apart"
         );
         let (a, mut b) = (row(T0_MS), row(T0_MS + 1));
         assert!(a.in_step_with(&b), "in step: the same digests");
@@ -1918,7 +2051,7 @@ mod tests {
             !a.in_step_with(&b),
             "a table digest not known is not in step"
         );
-        b.tables = Some(Held::tables(&moved));
+        b.tables = Some(Held::tables(&moved, &none));
         assert!(!a.in_step_with(&b));
     }
 

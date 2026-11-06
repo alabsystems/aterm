@@ -49,9 +49,9 @@ pub(super) fn is_link(meta: &std::fs::Metadata) -> bool {
 /// Error returned when inspecting, writing, or releasing the reserve file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReserveError {
-    /// Target path is not a regular file owned by the current user.
+    /// Target path is not an owned reserve file, including a shared inode on Unix.
     NotOurs(String),
-    /// Reserve file is sparse, compressed, offline, or under-allocated on Windows.
+    /// Reserve file is under-allocated, or compressed, sparse or offline on Windows.
     Thin(String),
     /// Underlying filesystem error.
     Io(String),
@@ -85,6 +85,18 @@ pub enum State {
 /// # Errors
 /// Returns [`ReserveError`] if `path` is not ours, is under-allocated, or fails an I/O check.
 pub fn state(path: &Path) -> Result<State, ReserveError> {
+    let Some(meta) = reserve_metadata(path)? else {
+        return Ok(State::Absent);
+    };
+    #[cfg(unix)]
+    check_unix_allocation(path, &meta)?;
+    #[cfg(windows)]
+    holds_its_blocks(path)?;
+    Ok(State::Present(meta.len()))
+}
+
+/// Admit the reserve's metadata without imposing its allocation requirement.
+fn reserve_metadata(path: &Path) -> Result<Option<std::fs::Metadata>, ReserveError> {
     if let Some(folder) = path.parent() {
         match std::fs::symlink_metadata(folder) {
             Ok(m) if is_link(&m) || !m.is_dir() => {
@@ -94,13 +106,13 @@ pub fn state(path: &Path) -> Result<State, ReserveError> {
                 )));
             }
             Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(State::Absent),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(ReserveError::Io(format!("{}: {e}", folder.display()))),
         }
     }
     let meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(State::Absent),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(ReserveError::Io(format!("{}: {e}", path.display()))),
     };
     if is_link(&meta) || !meta.file_type().is_file() {
@@ -119,10 +131,34 @@ pub fn state(path: &Path) -> Result<State, ReserveError> {
                 meta.uid()
             )));
         }
+        if meta.nlink() != 1 {
+            return Err(ReserveError::NotOurs(format!(
+                "{} has {} names, so one unlink cannot release its blocks",
+                path.display(),
+                meta.nlink()
+            )));
+        }
     }
-    #[cfg(windows)]
-    holds_its_blocks(path)?;
-    Ok(State::Present(meta.len()))
+    Ok(Some(meta))
+}
+
+#[cfg(unix)]
+fn allocated_bytes(meta: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt as _;
+    meta.blocks().saturating_mul(512)
+}
+
+#[cfg(unix)]
+fn check_unix_allocation(path: &Path, meta: &std::fs::Metadata) -> Result<(), ReserveError> {
+    let held = allocated_bytes(meta);
+    if held < meta.len() {
+        return Err(ReserveError::Thin(format!(
+            "{} holds {held} bytes of disk for its {}",
+            path.display(),
+            meta.len()
+        )));
+    }
+    Ok(())
 }
 
 /// Open the regular file at `path` AS ITSELF (never through a reparse point)
@@ -258,6 +294,9 @@ fn write_blocks(path: &Path, bytes: u64) -> std::io::Result<()> {
         left -= n as u64;
     }
     aterm_durable::ordered(&f)?;
+    #[cfg(unix)]
+    check_unix_allocation(path, &f.metadata()?)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt as _;
@@ -273,10 +312,22 @@ fn write_blocks(path: &Path, bytes: u64) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Unlinks the reserve at `path` and returns its byte size, or `Ok(None)` if absent.
+/// Unlinks the reserve at `path` and returns its allocated payload bytes, capped at its
+/// length, or `Ok(None)` if absent. An owned thin file can still be released.
 /// # Errors
 /// Returns [`ReserveError`] if `path` is not ours or unlinking fails.
 pub fn release(path: &Path) -> Result<Option<u64>, ReserveError> {
+    #[cfg(unix)]
+    {
+        let Some(meta) = reserve_metadata(path)? else {
+            return Ok(None);
+        };
+        let bytes = allocated_bytes(&meta).min(meta.len());
+        std::fs::remove_file(path)
+            .map_err(|e| ReserveError::Io(format!("{}: {e}", path.display())))?;
+        Ok(Some(bytes))
+    }
+    #[cfg(not(unix))]
     match state(path) {
         Ok(State::Absent) => Ok(None),
         #[cfg(windows)]

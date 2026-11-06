@@ -800,7 +800,7 @@ impl CompiledInputs {
                 .map(|entry| entry.map(|entry| entry.path()))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| InputError::Read(path.clone(), error))?;
-            entries.sort();
+            entries.sort_unstable();
             for entry in entries {
                 self.read(&entry, resolved)?;
             }

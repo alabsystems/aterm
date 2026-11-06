@@ -39,6 +39,7 @@ pub mod init_spotlight;
 pub mod init_toolset;
 pub mod init_trackpad;
 pub mod items;
+pub mod lan_reach;
 pub mod model;
 pub mod plist;
 pub mod port;

@@ -112,6 +112,8 @@ pub(crate) mod control_disk;
 mod control_session;
 #[cfg(all(test, unix))]
 pub(crate) use control_query::cmd_offscreen;
+#[cfg(unix)]
+pub(crate) use control_session::attach_needs_stream;
 #[cfg(all(test, unix))]
 pub(crate) use control_session::autopilot_by_fields;
 #[cfg(test)]
@@ -126,6 +128,7 @@ pub(crate) use control_session::cmd_sessions_store;
 pub(crate) use control_session::harness_act_face;
 #[cfg(all(test, unix))]
 pub(crate) use control_session::mint_turn_id_for_test;
+pub(crate) use control_session::needs_moved;
 #[cfg(test)]
 pub(crate) use control_session::own_turn_ids;
 pub(crate) use control_session::presence_meta_tokens;
@@ -134,6 +137,8 @@ pub(crate) use control_session::self_claim_write;
 pub(crate) use control_session::turn_ids_for_handoff;
 #[cfg(unix)]
 pub(crate) use control_session::turn_ids_past_handoff_ceiling;
+#[cfg(test)]
+pub(crate) use control_session::{RestWrite, rest_writes, turn_paste_event, typed_key_events};
 pub(crate) use control_session::{TURN_ID_RESERVE, raise_turn_ids, turn_ids_minted};
 #[cfg(test)]
 pub(crate) use control_session::{TurnIo, cmd_turn};
@@ -2955,6 +2960,18 @@ pub(crate) fn attach_fleet_connection(
     .is_ok()
 }
 
+/// Whether this window hosts session `sid`, or keeps the row of a retired worker that was it
+/// ([`crate::retired_workers`]): what a fleet drive naming `sid` needs of the window node serve
+/// hands it to (`node_serve::serve_window_relay_at`). False before the control server is up.
+#[cfg(unix)]
+pub(crate) fn hosts_or_keeps(sid: &SessionId) -> bool {
+    let Some(context) = BRIDGE_CONTEXT.get() else {
+        return false;
+    };
+    let store = context.store.read().unwrap_or_else(|p| p.into_inner());
+    store.by_sid(sid).is_some() || store.retired_workers().by_sid(sid).is_some()
+}
+
 /// [`crate::fabric::lift_ungranted_remote_holds`] over this instance's sessions: how many it lifted.
 #[cfg(unix)]
 pub(crate) fn lift_ungranted_remote_holds(granted: &dyn Fn(&str) -> bool) -> usize {
@@ -4198,7 +4215,7 @@ fn serve_meta_wired(
 
 fn meta_change_wakes(session: u64, sid: &str, rest: &str) -> Vec<Wake> {
     // A self-claim's NEEDS YOU set is a needs fact, as aterm's own loop's tell is: the need
-    // published again, and the hover stamped where the pill's words did not move.
+    // published again, and the hover stamped where the need's words did not move.
     if control_session::is_harness_needs(rest) {
         return vec![Wake::HarnessFact {
             sid: sid.to_string(),
@@ -5809,6 +5826,7 @@ thread_local! {
     static SERVING_CONNECTION: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     static CONNECTION_CLAIMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static INPUT_COMMITTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TURN_INPUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static SERVING_FLEET_KEY: std::cell::Cell<Option<aterm_net::fleet::NodeKey>> =
         const { std::cell::Cell::new(None) };
     static SERVING_SERVICE_REPAIR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -6191,6 +6209,43 @@ impl Drop for CommittedInput {
 /// Whether the verb on this thread is inside a [`CommittedInput`].
 pub(crate) fn input_committed() -> bool {
     INPUT_COMMITTED.with(std::cell::Cell::get)
+}
+
+/// Marks the verb on this thread as a `turn` delivering its text, until dropped: each delivery it
+/// makes waits for its program whatever its caller does ([`delivery_lane`]). Whether the turn
+/// writes at all is judged before its first write: its caller still there, and, for a hop to the
+/// main thread, the gate ([`crate::control_media::main_thread_refusal`]), which spares only a
+/// [`CommittedInput`].
+pub(crate) struct TurnInput {
+    outer: bool,
+}
+
+impl TurnInput {
+    pub(crate) fn enter() -> Self {
+        Self {
+            outer: TURN_INPUT.with(|turn| turn.replace(true)),
+        }
+    }
+}
+
+impl Drop for TurnInput {
+    fn drop(&mut self) {
+        TURN_INPUT.with(|turn| turn.set(self.outer));
+    }
+}
+
+/// The lane a delivery's waits for its write and its kernel receipt park on
+/// ([`await_written`], [`background_reply`]), which only a paste's reach a hang-up poll (a key's
+/// write wait is [`QUEUED_INPUT_WAIT`], shorter, and a key has no receipt wait): the served one,
+/// which its caller's hang-up ends, or, inside a [`TurnInput`], one that finishes whatever the
+/// caller does. A paste's bytes are queued before either wait begins, and a hang-up answered there
+/// would not withdraw them; for a turn it would only leave its text without its Enter.
+fn delivery_lane() -> crate::park::Lane {
+    if TURN_INPUT.with(std::cell::Cell::get) {
+        crate::park::Lane::SERVED.ignoring_hangup()
+    } else {
+        crate::park::Lane::SERVED
+    }
 }
 
 pub(crate) use aterm_control::hangup::{HANGUP_POLL, HUNG_UP_REPLY, caller_hung_up, hangup_park};
@@ -6926,6 +6981,46 @@ fn drive_gate(
         }
         Some(_) => Err(drive_refused(SID, selected)),
     }
+}
+
+/// The sessions a drive's `line` names, in its order, once each: its `@<sid>` selector, a
+/// `hold <sid>`'s sid, or each target of `await task @a,@b,…`. Only `s-` ids, the only ones
+/// [`drive_gate`] serves; a `spawn`'s `from=` is the driver's own session, on its own Mac, and
+/// names none here. Node serve hands the line to the window that hosts or keeps every one
+/// (`node_serve::route_drive`).
+#[cfg(unix)]
+pub(crate) fn drive_line_sessions(line: &str) -> Vec<SessionId> {
+    let request = Request::parse(line.trim_end_matches(['\r', '\n']).to_owned());
+    let Head {
+        selector,
+        verb,
+        rest,
+    } = request.head();
+    let named: Vec<String> = match selector {
+        Some(Selector::Sid(sid)) => vec![sid.as_str().to_owned()],
+        Some(_) => Vec::new(),
+        None => match verb {
+            "hold" => rest
+                .split_whitespace()
+                .next()
+                .map(str::to_owned)
+                .into_iter()
+                .collect(),
+            "await" => await_task_list(rest)
+                .and_then(|words| crate::task_record::parse_await_task(&words, true).ok())
+                .map(|args| args.targets.into_iter().map(|t| t.selector).collect())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        },
+    };
+    let mut sids: Vec<SessionId> = Vec::new();
+    for sid in named {
+        let sid = SessionId::new(sid);
+        if sid.as_str().starts_with("s-") && !sids.contains(&sid) {
+            sids.push(sid);
+        }
+    }
+    sids
 }
 
 #[cfg(any(unix, test))]
@@ -9664,7 +9759,7 @@ fn await_written(
             got.is_some()
         },
         deadline,
-        crate::park::Lane::SERVED,
+        delivery_lane(),
         &|| false,
     );
     match got {
@@ -9696,7 +9791,7 @@ fn background_reply(
             drained.is_some()
         },
         deadline,
-        crate::park::Lane::SERVED,
+        delivery_lane(),
         &|| false,
     );
     match drained {
@@ -10209,6 +10304,27 @@ fn serve_session_verb(
     if verb == "codex-rotation" {
         return crate::native_act::serve_codex_rotation(self_ctx, master, rest);
     }
+    if verb == "codex-accounts-change" {
+        return crate::native_act::serve_codex_enrollment(
+            self_ctx,
+            master,
+            rest,
+            &cx.account_services.lifetime,
+            false,
+        );
+    }
+    if verb == "codex-accounts" {
+        if rest.split_ascii_whitespace().next() == Some("enrollment-status") {
+            return crate::native_act::serve_codex_enrollment(
+                self_ctx,
+                master,
+                rest,
+                &cx.account_services.lifetime,
+                true,
+            );
+        }
+        return crate::native_act::serve_codex_accounts(self_ctx, master, rest);
+    }
     if verb == "codex-exec-handoff" {
         note_connection_claim();
         return crate::native_act::serve_codex_exec_handoff(self_ctx, master, rest);
@@ -10505,12 +10621,7 @@ fn serve_session_verb(
                 *refused.borrow_mut() = wrote.err().flatten();
                 delivered
             };
-            let paste = |text: &str| {
-                applied(InputEvent::Paste(
-                    control_input::paste_text(text),
-                    PasteFraming::AtDrain,
-                ))
-            };
+            let paste = |text: &str| applied(control_session::turn_paste_event(text));
             let press = |name: &str| parse_key(name).is_some_and(applied);
             control_session::cmd_turn(
                 term,

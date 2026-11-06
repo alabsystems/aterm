@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Native macOS unified titlebar tab strip, NeedsPill, and inline tab rename editor.
+//! Native macOS unified titlebar tab strip and inline tab rename editor.
 
 #[cfg(target_os = "macos")]
 pub(crate) use macos::native_strip_container;
@@ -10,8 +10,8 @@ pub(crate) use macos::{
     ToolbarHandle, begin_tab_rename, can_present_tab_rename, end_tab_rename,
     install_window_toolbar, native_selected_pill_rgb, read_tab_chrome, read_tab_menus,
     reflow_window_tabs, rename_editor_edit, rename_editor_text, set_active_tab_color,
-    set_app_tiles, set_chip_loads, set_strip_accent, set_strip_dark, set_window_pill,
-    set_window_tabs, tab_frame_lines,
+    set_app_tiles, set_chip_loads, set_strip_accent, set_strip_dark, set_window_tabs,
+    tab_frame_lines,
 };
 
 #[cfg(not(target_os = "macos"))]
@@ -227,67 +227,9 @@ fn native_tab_cells(band_width: f64, count: usize, active: usize) -> Vec<(f64, f
     cells
 }
 
-/// Maximum width share (40%) of `band_w` that the needs pill may occupy.
-#[cfg(any(target_os = "macos", test))]
-fn pill_share(band_w: f64) -> f64 {
-    (band_w * 0.4).floor().max(0.0)
-}
-
-/// Gap and horizontal padding (points) for the macOS titlebar pill.
-#[cfg(any(target_os = "macos", test))]
-const PILL_GAP: f64 = 4.0;
-#[cfg(any(target_os = "macos", test))]
-const PILL_PAD: f64 = 8.0;
-
-/// Lay out the titlebar pill in at most `share` points, returning its layout and total width.
-#[cfg(any(target_os = "macos", test))]
-fn titlebar_pill_layout(
-    words: &crate::presence::PillWords,
-    share: f64,
-    measure: impl Fn(&str) -> f64,
-) -> (aterm_messages::presence::PillLayout, f64) {
-    let inner = (share - 2.0 * PILL_PAD).max(0.0);
-    let layout = aterm_messages::presence::pill_layout(words, inner, PILL_GAP, measure);
-    let width = layout.width + 2.0 * PILL_PAD;
-    (layout, width)
-}
-
 #[cfg(test)]
 mod shared_tests {
     use super::*;
-
-    #[test]
-    fn a_pills_age_moves_no_titlebar_tab_within_its_unit() {
-        use crate::presence::{NeedSeverity, PillKind, PillWords};
-        let t0 = std::time::Instant::now();
-        let pill = aterm_messages::presence::Pill {
-            kind: PillKind::Need(NeedSeverity::Decide),
-            session: 1,
-            label: "fmt".into(),
-            tab: Some(2),
-            what: "deploy to prod?".into(),
-            since: Some(t0),
-            act: None,
-            more: 0,
-        };
-        let at = |secs: u64| {
-            crate::presence::pill_words(&pill, t0 + std::time::Duration::from_secs(secs))
-        };
-        let measure = |text: &str| text.chars().count() as f64 * 7.0;
-        let band = 900.0;
-        let cells = |words: &PillWords| {
-            let (_, width) = titlebar_pill_layout(words, pill_share(band), measure);
-            (width, native_tab_cells(band - width, 3, 0))
-        };
-        let (young, old) = (at(3), at(47));
-        assert_ne!(young.words, old.words);
-        assert_eq!(cells(&young), cells(&old), "the tabs hold still");
-        let drawn = |w: &PillWords| PillWords {
-            room: w.words.clone(),
-            ..w.clone()
-        };
-        assert_ne!(cells(&drawn(&young)).0, cells(&drawn(&old)).0);
-    }
 
     #[test]
     fn single_settings_tab_keeps_route_and_all_independent_states() {
@@ -650,10 +592,6 @@ mod non_macos {
     }
 
     /// Update the non-macOS [`ToolbarHandle`] with the current tab set.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the macOS strip's signature: every per-tab vector, the active index and the window's pill"
-    )]
     pub(crate) fn set_window_tabs(
         handle: &ToolbarHandle,
         titles: &[String],
@@ -662,7 +600,6 @@ mod non_macos {
         tooltips: &[Option<String>],
         ext: &[TabChromeExt],
         active: usize,
-        _pill: Option<&crate::app_presence::NeedsPillModel>,
     ) {
         let mut chrome = handle.chrome.borrow_mut();
         chrome.titles.clear();
@@ -809,8 +746,8 @@ mod macos {
     use aterm_window::event_loop::EventLoopProxy;
 
     use super::{
-        PILL_PAD, format_tab_chrome, native_tab_cells, pill_share, tab_close_accessibility_label,
-        tab_display_label, tab_help, titlebar_pill_layout,
+        format_tab_chrome, native_tab_cells, tab_close_accessibility_label, tab_display_label,
+        tab_help,
     };
     use crate::app_tabs::{NativeTabCommand, TabStripOrigin};
     use crate::appkit::{self, consts};
@@ -995,22 +932,6 @@ mod macos {
         unsafe { appkit::send_id_f64(class(c"NSFont").as_id(), name, size) }
     }
 
-    /// Return the regular-weight monospaced-digit system `NSFont` of `size`.
-    /// # Safety
-    /// Must be called on the main thread.
-    unsafe fn monospaced_digit_font(size: f64) -> Id {
-        const REGULAR: f64 = 0.0;
-        // SAFETY: `+(NSFont *)(CGFloat, NSFontWeight)`, non-raising; `NSFontWeight` is a `CGFloat`.
-        unsafe {
-            appkit::send_id_f64_f64(
-                class(c"NSFont").as_id(),
-                sel!(monospacedDigitSystemFontOfSize:weight:),
-                size,
-                REGULAR,
-            )
-        }
-    }
-
     /// Set tail-truncation line-break mode on `field`'s cell.
     /// # Safety
     /// `field` must be a live `NSTextField`.
@@ -1165,25 +1086,6 @@ mod macos {
         /// than a chip because a rebuild (tab count or width change) destroys every
         /// chip; the field is repositioned across a rebuild instead.
         rename: RefCell<Option<RenameEditor>>,
-        /// The NEEDS PILL ([`NeedsPill`], §5): built on the first lit pill and
-        /// kept, hidden while the window's border is unlit.
-        pill: RefCell<Option<Retained<NeedsPill>>>,
-        /// The pill's laid-out width (points, its pads included) at the last
-        /// [`plan_strip`]: what it takes from the tab band.
-        pill_w: Cell<f64>,
-        /// Where the last [`plan_strip`] laid the pill out (its share, its
-        /// right edge, the strip's height and centre line): what a pill-only
-        /// push ([`set_window_pill`]) lays it out at again.
-        pill_slot: Cell<Option<PillSlot>>,
-    }
-
-    /// Where the strip lays its pill out ([`ToolbarHandle::pill_slot`]).
-    #[derive(Clone, Copy, Debug)]
-    struct PillSlot {
-        share: f64,
-        right: f64,
-        strip_h: f64,
-        center_y: f64,
     }
 
     /// Live inline rename editor overlaying one tab chip.
@@ -1404,379 +1306,6 @@ mod macos {
             };
             p.x >= 0.0 && p.x <= b.size.width && p.y >= 0.0 && p.y <= b.size.height
         }
-    }
-
-    /// Per-view state for [`NeedsPill`].
-    pub(crate) struct PillIvars {
-        /// The `Wake` channel a click relays through.
-        proxy: EventLoopProxy<Wake>,
-        /// The window the pill belongs to.
-        window: WindowId,
-        /// The session the drawn pill names: a click carries it, so a click
-        /// on a pill that has since moved acts on nothing (`App::on_pill_act`).
-        session: Cell<u64>,
-        /// What lit it, for its tone; `None` while hidden.
-        kind: Cell<Option<crate::presence::PillKind>>,
-        /// The drawn words, for the next layout and the accessibility label.
-        words: RefCell<Option<crate::presence::PillWords>>,
-        /// The pieces as laid out (`pill_layout`, in points from the pad).
-        layout: Cell<Option<aterm_messages::presence::PillLayout>>,
-        /// The mouse is held down inside the pill.
-        pressed: Cell<bool>,
-        /// The glyph, label, words, act and `+N` labels, in that order.
-        fields: RefCell<Vec<Obj>>,
-    }
-
-    aterm_objc::declare_class! {
-        /// Titlebar view displaying the window's projected pill.
-        pub(crate) struct NeedsPill: NSView {
-            const NAME: &str = "ATermNeedsPill";
-            type Ivars = PillIvars;
-            protocols: [NSObject];
-            /// The fill: the tone at a low alpha, a stronger one while pressed.
-            @sel(drawRect:)
-            fn drawRect(&self, _dirty: CGRect) {
-                let ivars = self.ivars();
-                let Some(kind) = ivars.kind.get() else {
-                    return;
-                };
-                // SAFETY: `-bounds` is a side-effect-free `-(NSRect)` getter on this live view, inside AppKit's own draw cycle; the colours are autoreleased (+0) and used in this frame; none raise.
-                unsafe {
-                    let bounds = appkit::send_rect(self.as_id(), sel!(bounds));
-                    let pill = rect(
-                        bounds.origin.x,
-                        bounds.origin.y + (bounds.size.height - TAB_PILL_HEIGHT) * 0.5,
-                        bounds.size.width,
-                        TAB_PILL_HEIGHT,
-                    );
-                    let alpha = if ivars.pressed.get() { 0.30 } else { 0.16 };
-                    appkit::send_v(with_alpha(ns_color(tone_of(kind)), alpha), sel!(set));
-                    appkit::send_v(rounded_rect(pill, TAB_PILL_RADIUS), sel!(fill));
-                }
-            }
-
-            /// Press begins: latch the pressed fill.
-            @sel(mouseDown:)
-            fn mouseDown(&self, _event: Id) {
-                self.ivars().pressed.set(true);
-                mark_dirty(self.as_id());
-            }
-
-            /// Release inside the pill: resolve the region through the drawn
-            /// layout and post its act.
-            @sel(mouseUp:)
-            fn mouseUp(&self, event: Id) {
-                let was_pressed = self.ivars().pressed.get();
-                self.ivars().pressed.set(false);
-                mark_dirty(self.as_id());
-                if !was_pressed || event.is_null() {
-                    return;
-                }
-                // SAFETY: `event` is the live NSEvent AppKit passed.
-                let p = unsafe { point_in_view(self.as_id(), event) };
-                let hit = self
-                    .ivars()
-                    .layout
-                    .get()
-                    .and_then(|layout| layout.hit(p.x - PILL_PAD));
-                if let Some(hit) = hit {
-                    self.post(hit);
-                }
-            }
-
-            /// Accept the first click in a non-key window, so the pill works
-            /// in one click from a window behind.
-            @sel(acceptsFirstMouse:) @abort_on_exception
-            fn acceptsFirstMouse(&self, _event: Id) -> aterm_objc::Bool {
-                aterm_objc::Bool::YES
-            }
-
-            /// VoiceOver's press goes to the tab, the body's act.
-            @sel(accessibilityPerformPress)
-            fn accessibilityPerformPress(&self) -> aterm_objc::Bool {
-                self.post(crate::presence::PillHit::Go);
-                aterm_objc::Bool::YES
-            }
-        }
-    }
-
-    /// Return the `NSColor` selector for `kind`.
-    fn tone_of(kind: crate::presence::PillKind) -> aterm_objc::Sel {
-        match kind {
-            crate::presence::PillKind::Need(crate::presence::NeedSeverity::Stuck) => {
-                sel!(systemRedColor)
-            }
-            crate::presence::PillKind::Need(crate::presence::NeedSeverity::Decide) => {
-                sel!(systemOrangeColor)
-            }
-            crate::presence::PillKind::Yours => sel!(secondaryLabelColor),
-        }
-    }
-
-    impl NeedsPill {
-        /// Build a hidden pill for `window` with its five labels.
-        fn build(
-            mtm: MainThread,
-            proxy: EventLoopProxy<Wake>,
-            window: WindowId,
-        ) -> Option<Retained<Self>> {
-            let ivars = PillIvars {
-                proxy,
-                window,
-                session: Cell::new(0),
-                kind: Cell::new(None),
-                words: RefCell::new(None),
-                layout: Cell::new(None),
-                pressed: Cell::new(false),
-                fields: RefCell::new(Vec::new()),
-            };
-            // SAFETY: as `ChromeButton::build`: `alloc_ivars` returns a +1 instance owing one designated initializer, the next send.
-            let this: Retained<Self> = unsafe {
-                let raw = Self::alloc_ivars(mtm, ivars);
-                if raw.is_null() {
-                    return None;
-                }
-                Retained::from_owned(appkit::send_id_rect(
-                    raw,
-                    sel!(initWithFrame:),
-                    rect(0.0, 0.0, 0.0, STRIP_HEIGHT),
-                ))?
-            };
-            let mut fields = Vec::with_capacity(5);
-            for (index, bold) in [true, false, false, true, false].into_iter().enumerate() {
-                // SAFETY: `labelWithString:` is the documented non-raising
-                // factory (+0, retained here); plain setters follow, on the
-                // main thread; the labels pass the mouse through to the pill.
-                let field = unsafe {
-                    let field = Obj::retain(appkit::send_id_id(
-                        class(c"NSTextField").as_id(),
-                        sel!(labelWithString:),
-                        appkit::nsstring("")?.id(),
-                    ))?;
-                    appkit::send_v_bool(field.id(), sel!(setDrawsBackground:), false);
-                    appkit::send_v_bool(field.id(), sel!(setBezeled:), false);
-                    appkit::send_v_bool(field.id(), sel!(setEditable:), false);
-                    appkit::send_v_bool(field.id(), sel!(setSelectable:), false);
-                    appkit::send_v_bool(field.id(), sel!(setUsesSingleLineMode:), true);
-                    let font = if index == 2 {
-                        monospaced_digit_font(12.0)
-                    } else {
-                        system_font(12.0, bold)
-                    };
-                    appkit::send_v_id(field.id(), sel!(setFont:), font);
-                    truncate_tail(field.id());
-                    appkit::send_v_id(this.as_id(), sel!(addSubview:), field.id());
-                    field
-                };
-                fields.push(field);
-            }
-            *this.ivars().fields.borrow_mut() = fields;
-            // SAFETY: plain main-thread metadata writes on the fresh view.
-            unsafe {
-                make_accessibility_element(this.as_id(), "AXButton")?;
-                appkit::send_v_bool(this.as_id(), sel!(setHidden:), true);
-            }
-            Some(this)
-        }
-
-        /// Post the click's act for the session the drawn pill names.
-        fn post(&self, hit: crate::presence::PillHit) {
-            let ivars = self.ivars();
-            if ivars.kind.get().is_none() {
-                return;
-            }
-            let _ = ivars.proxy.send_event(Wake::PillAct {
-                window: ivars.window,
-                session: ivars.session.get(),
-                hit,
-            });
-        }
-
-        /// Show `model` or hide on `None`.
-        fn set_model(&self, model: Option<&crate::app_presence::NeedsPillModel>) {
-            let ivars = self.ivars();
-            let Some(model) = model else {
-                ivars.kind.set(None);
-                *ivars.words.borrow_mut() = None;
-                ivars.layout.set(None);
-                // SAFETY: plain main-thread setters on the live view;
-                // `-setToolTip:` takes nil to clear the tip.
-                unsafe {
-                    appkit::send_v_id(self.as_id(), sel!(setToolTip:), Id::NIL);
-                    appkit::send_v_bool(self.as_id(), sel!(setHidden:), true);
-                }
-                return;
-            };
-            ivars.kind.set(Some(model.kind));
-            ivars.session.set(model.session);
-            *ivars.words.borrow_mut() = Some(model.words.clone());
-            let words = &model.words;
-            let mut glyph = [0u8; 4];
-            let texts: [&str; 5] = [
-                words.glyph.encode_utf8(&mut glyph),
-                &words.label,
-                &words.words,
-                words.act.map_or("", |a| a.word()),
-                words.more.as_deref().unwrap_or(""),
-            ];
-            let fields = ivars.fields.borrow();
-            // SAFETY: main-thread setters on the live retained labels; the
-            // colours are +0 and retained by `-setTextColor:`.
-            unsafe {
-                let inks = [
-                    ns_color(tone_of(model.kind)),
-                    ns_color(sel!(labelColor)),
-                    ns_color(sel!(labelColor)),
-                    ns_color(sel!(controlAccentColor)),
-                    ns_color(sel!(secondaryLabelColor)),
-                ];
-                for ((field, text), ink) in fields.iter().zip(texts).zip(inks) {
-                    if let Some(ns) = appkit::nsstring(text) {
-                        appkit::send_v_id(field.id(), sel!(setStringValue:), ns.id());
-                    }
-                    appkit::send_v_id(field.id(), sel!(setTextColor:), ink);
-                }
-                if let Some(label) = appkit::nsstring(&words.text()) {
-                    appkit::send_v_id(self.as_id(), sel!(setAccessibilityLabel:), label.id());
-                    appkit::send_v_id(self.as_id(), sel!(setToolTip:), label.id());
-                }
-                appkit::send_v_bool(self.as_id(), sel!(setHidden:), false);
-            }
-            mark_dirty(self.as_id());
-        }
-
-        /// Lay out the shown pill in at most `max_w` points with its right edge at `right`.
-        fn lay_out(&self, max_w: f64, right: f64, strip_h: f64, center_y: f64) -> f64 {
-            let ivars = self.ivars();
-            let words = ivars.words.borrow();
-            let Some(words) = words.as_ref() else {
-                return 0.0;
-            };
-            let fields = ivars.fields.borrow();
-            // SAFETY: `-fittingSize` is a side-effect-free `-(NSSize)` getter.
-            let natural: Vec<f64> = fields
-                .iter()
-                .map(|field| unsafe { appkit::send_size(field.id(), sel!(fittingSize)).width })
-                .collect();
-            let mut glyph = [0u8; 4];
-            let pieces: [&str; 5] = [
-                words.glyph.encode_utf8(&mut glyph),
-                &words.label,
-                &words.words,
-                words.act.map_or("", |a| a.word()),
-                words.more.as_deref().unwrap_or(""),
-            ];
-            let room_w = if words.room == words.words {
-                natural.get(2).copied().unwrap_or(0.0)
-            } else {
-                fields.get(2).map_or(0.0, |field| {
-                    // SAFETY: main-thread setters and a side-effect-free `-fittingSize` getter on the live retained label; its text is put back before the frame is drawn.
-                    unsafe {
-                        let set = |text: &str| {
-                            if let Some(ns) = appkit::nsstring(text) {
-                                appkit::send_v_id(field.id(), sel!(setStringValue:), ns.id());
-                            }
-                        };
-                        set(&words.room);
-                        let w = appkit::send_size(field.id(), sel!(fittingSize)).width;
-                        set(&words.words);
-                        w
-                    }
-                })
-            };
-            let measure = |text: &str| {
-                if text == words.room {
-                    return room_w;
-                }
-                pieces
-                    .iter()
-                    .position(|piece| *piece == text)
-                    .and_then(|i| natural.get(i).copied())
-                    .unwrap_or(0.0)
-            };
-            let (layout, width) = titlebar_pill_layout(words, max_w, measure);
-            ivars.layout.set(Some(layout));
-            let spans = [
-                Some(layout.glyph),
-                Some(layout.label),
-                Some(layout.words),
-                layout.act.map(|(_, span)| span),
-                layout.more,
-            ];
-            let field_h = 16.0;
-            let y = center_y - field_h * 0.5;
-            // SAFETY: main-thread geometry setters on the live retained view and labels.
-            unsafe {
-                appkit::send_v_rect(
-                    self.as_id(),
-                    sel!(setFrame:),
-                    rect(right - width, 0.0, width, strip_h),
-                );
-                for (field, span) in fields.iter().zip(spans) {
-                    let span = span.filter(|span| span.w > 0.0);
-                    appkit::send_v_bool(field.id(), sel!(setHidden:), span.is_none());
-                    if let Some(span) = span {
-                        appkit::send_v_rect(
-                            field.id(),
-                            sel!(setFrame:),
-                            rect(PILL_PAD + span.x, y, span.w, field_h),
-                        );
-                    }
-                }
-            }
-            mark_dirty(self.as_id());
-            width
-        }
-    }
-
-    /// Sync the window's pill model onto its view.
-    fn sync_pill(
-        handle: &ToolbarHandle,
-        mtm: MainThread,
-        model: Option<&crate::app_presence::NeedsPillModel>,
-    ) {
-        if model.is_none() && handle.pill.borrow().is_none() {
-            return;
-        }
-        if handle.pill.borrow().is_none() {
-            let Some(pill) = NeedsPill::build(mtm, handle.proxy.clone(), handle.window) else {
-                return;
-            };
-            // SAFETY: `addSubview:` on the live container, main thread.
-            unsafe {
-                appkit::send_v_id(handle.container.id(), sel!(addSubview:), pill.as_id());
-            }
-            *handle.pill.borrow_mut() = Some(pill);
-        }
-        if let Some(pill) = handle.pill.borrow().as_ref() {
-            pill.set_model(model);
-        }
-    }
-
-    /// Lay out the window's pill at `slot`, returning its width.
-    fn place_pill(handle: &ToolbarHandle, slot: PillSlot) -> f64 {
-        handle.pill.borrow().as_ref().map_or(0.0, |pill| {
-            pill.lay_out(slot.share, slot.right, slot.strip_h, slot.center_y)
-        })
-    }
-
-    /// Update the window's [`NeedsPill`] and re-layout if its width changed.
-    pub(crate) fn set_window_pill(
-        handle: &ToolbarHandle,
-        pill: Option<&crate::app_presence::NeedsPillModel>,
-    ) -> bool {
-        let Some(mtm) = MainThread::new() else {
-            return true;
-        };
-        let Some(slot) = handle.pill_slot.get() else {
-            return false;
-        };
-        let was = handle.pill_w.get();
-        if pill.is_some() != (was > 0.0) {
-            return false;
-        }
-        sync_pill(handle, mtm, pill);
-        place_pill(handle, slot) == was
     }
 
     /// Request a repaint of the whole view (after a hover / press / state change).
@@ -3450,9 +2979,6 @@ mod macos {
             // takes one +1 of a live object, released when the handle drops.
             content_view: unsafe { Obj::retain(view) }?,
             rename: RefCell::new(None),
-            pill: RefCell::new(None),
-            pill_w: Cell::new(0.0),
-            pill_slot: Cell::new(None),
         })
     }
 
@@ -3706,10 +3232,6 @@ mod macos {
     }
 
     /// Synchronize the native tab strip with the window's current tab state.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the strip's one consistent snapshot: every per-tab vector, the active index and the window's pill"
-    )]
     pub(crate) fn set_window_tabs(
         handle: &ToolbarHandle,
         titles: &[String],
@@ -3718,12 +3240,10 @@ mod macos {
         tooltips: &[Option<String>],
         ext: &[TabChromeExt],
         active: usize,
-        pill: Option<&crate::app_presence::NeedsPillModel>,
     ) {
         let Some(mtm) = MainThread::new() else {
             return;
         };
-        sync_pill(handle, mtm, pill);
         let container = handle.container.id();
         let metadata_at = |i: usize| {
             metadata.get(i).copied().unwrap_or(TabStripMetadata {
@@ -3850,17 +3370,7 @@ mod macos {
             .size
             .width
             .max(left + cluster + 1.0);
-        let slot = PillSlot {
-            share: pill_share((total_w - left - cluster).max(0.0)),
-            right: total_w - cluster,
-            strip_h,
-            center_y: metrics.center_y,
-        };
-        handle.pill_slot.set(Some(slot));
-        let pill_w = place_pill(handle, slot);
-        handle.pill_w.set(pill_w);
-        let reserved = if pill_w > 0.0 { pill_w + TAB_GAP } else { 0.0 };
-        let band_w = (total_w - left - cluster - reserved).max(1.0);
+        let band_w = (total_w - left - cluster).max(1.0);
         let active = active.min(n.saturating_sub(1));
 
         // SAFETY: main-thread geometry setter on the retained live button.
@@ -4282,7 +3792,7 @@ mod macos {
         }
     }
 
-    /// Runtime tests for this module's five declared classes: each asks the
+    /// Runtime tests for this module's four declared classes: each asks the
     /// Objective-C runtime or Foundation what was registered, and behavioural tests
     /// dispatch through machinery other than the code under test.
     #[cfg(test)]
@@ -4293,8 +3803,7 @@ mod macos {
         };
 
         use super::{
-            ChromeButton, NeedsPill, STRIP_ITEM_ID, TabGeometry, TabRenameTarget, TabView,
-            ToolbarDelegate,
+            ChromeButton, STRIP_ITEM_ID, TabGeometry, TabRenameTarget, TabView, ToolbarDelegate,
         };
         use crate::appkit;
 
@@ -4310,10 +3819,9 @@ mod macos {
         }
 
         #[test]
-        fn all_five_declared_classes_register_as_they_did() {
+        fn all_four_declared_classes_register_as_they_did() {
             for (cls, name, superclass) in [
                 (ChromeButton::class(), c"ATermChromeButton", c"NSView"),
-                (NeedsPill::class(), c"ATermNeedsPill", c"NSView"),
                 (TabView::class(), c"ATermTabView", c"NSView"),
                 (
                     ToolbarDelegate::class(),
@@ -4440,20 +3948,6 @@ mod macos {
                     format!("{b}@:"),
                 ),
                 (ChromeButton::class(), sel!(dealloc), "v@:".into()),
-                (NeedsPill::class(), sel!(drawRect:), format!("v@:{rect}")),
-                (NeedsPill::class(), sel!(mouseDown:), "v@:@".into()),
-                (NeedsPill::class(), sel!(mouseUp:), "v@:@".into()),
-                (
-                    NeedsPill::class(),
-                    sel!(acceptsFirstMouse:),
-                    format!("{b}@:@"),
-                ),
-                (
-                    NeedsPill::class(),
-                    sel!(accessibilityPerformPress),
-                    format!("{b}@:"),
-                ),
-                (NeedsPill::class(), sel!(dealloc), "v@:".into()),
                 (TabView::class(), sel!(drawRect:), format!("v@:{rect}")),
                 (TabView::class(), sel!(mouseDown:), "v@:@".into()),
                 (TabView::class(), sel!(rightMouseDown:), "v@:@".into()),

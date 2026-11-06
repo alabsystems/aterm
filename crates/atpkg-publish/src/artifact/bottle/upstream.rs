@@ -325,8 +325,16 @@ pub fn collect(request: &Request, source: &dyn Source, dir: &Path) -> Result<Inp
 /// Any metadata, digest, relocation, client staging or native qualification refusal.
 pub fn pack(ctx: &Ctx, request: &Request) -> Result<BottleOutcome> {
     let (_, definition) = super::bottle_row(&request.program, request.triple)?;
-    if let Some(recipe) = definition.pinned {
-        return super::pinned::pack(ctx, request, recipe);
+    match definition.origin {
+        crate::programs::BottleOrigin::Pinned(recipe) => {
+            return super::pinned::pack(ctx, request, recipe);
+        }
+        crate::programs::BottleOrigin::Reference(_) => {
+            return Err(Error::cannot_run(
+                "source-derived references use pack-bottle --install-tree with their qualified build and corresponding source",
+            ));
+        }
+        crate::programs::BottleOrigin::Formula => {}
     }
     let work = crate::channel::Scratch::new("upstream-bottle")?;
     let inputs = collect(request, &Official, work.path())?;
@@ -358,10 +366,12 @@ pub fn pack(ctx: &Ctx, request: &Request) -> Result<BottleOutcome> {
 
 pub(crate) fn can_build(program: &str, triple: Triple) -> Result<()> {
     let (_, definition) = super::bottle_row(program, triple)?;
-    if let Some(recipe) = definition.pinned {
-        super::pinned::can_pack(recipe, triple)
-    } else {
-        super::source::can_build(triple)
+    match definition.origin {
+        crate::programs::BottleOrigin::Pinned(recipe) => super::pinned::can_pack(recipe, triple),
+        crate::programs::BottleOrigin::Reference(_) => Err(Error::cannot_run(
+            "source-derived references require a separately qualified install tree",
+        )),
+        crate::programs::BottleOrigin::Formula => super::source::can_build(triple),
     }
 }
 

@@ -9,7 +9,7 @@ fn mesh_node_hosts_local_fabric_without_swarm_or_membership() {
     let tmp = aterm_tempfile::tempdir().unwrap();
     let state = tmp.path().join("state");
     let config = tmp.path().join("aterm.toml");
-    std::fs::write(&config, "[swarm]\nenabled = false\n").unwrap();
+    aterm_uds::atomic_file::write(&config, b"[swarm]\nenabled = false\n", 0o600).unwrap();
     assert!(
         sync_gate_with_mesh(&state, Some(&config), false, true)
             .unwrap()
@@ -205,6 +205,24 @@ fn alab_tcp_txt_carries_only_four_anonymous_fields_and_info_plist_lists_service(
             "window=0".to_owned(),
         ]
     );
+    let advert = alab_tcp_advert("alab-deadbeef", txt);
+    assert_eq!(
+        (
+            advert.name.as_str(),
+            advert.service.as_str(),
+            advert.domain.as_str(),
+            advert.port
+        ),
+        ("alab-deadbeef", "_alab._tcp", "local.", 7100)
+    );
+    assert_eq!(
+        advert.txt,
+        pairs
+            .iter()
+            .map(|pair| pair.as_bytes().to_vec())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!((advert.host, advert.addresses), (None, Vec::new()));
     let args = alab_tcp_dns_sd_args("alab-deadbeef", txt);
     assert_eq!(
         args,
@@ -220,11 +238,6 @@ fn alab_tcp_txt_carries_only_four_anonymous_fields_and_info_plist_lists_service(
             "window=0",
         ]
     );
-    for token in &args {
-        assert!(!token.starts_with("label="), "leaked label: {token}");
-        assert!(!token.starts_with("node="), "leaked node id: {token}");
-        assert!(!token.starts_with("version="), "leaked version: {token}");
-    }
 
     let plist = include_str!("../../../apps/aterm-mac/Info.plist");
     assert!(

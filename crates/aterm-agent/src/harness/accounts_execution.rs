@@ -432,7 +432,11 @@ pub(super) fn capture_held(
             .state
             .pending_pin
             .as_ref()
-            .is_some_and(|pin| Some(pin.label()) != label)
+            .is_some_and(|selection| {
+                selection
+                    .account()
+                    .is_some_and(|pin| Some(pin.label()) != label)
+            })
         || (mode == Mode::Off && pin.is_none() && login.is_some())
     {
         return Err("execution no longer matches the selected account policy".into());

@@ -4,8 +4,8 @@
 //! Provisioned tool rows for `verify provision`.
 
 pub use aterm_uds::host::upstream::Archive;
-use aterm_uds::host::upstream::{CPYTHON, GITLEAKS, OPENSSL_SIGNING, OPENSSL_SIGNING_SOURCE};
 use aterm_uds::host::{Tool, When};
+use atpkg::prerequisite::Prerequisite;
 
 /// Origin verification anchor for an unpacked archive tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +47,14 @@ pub enum Holds {
 /// How a row is installed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Install {
+    /// A shared pinned prerequisite installed and admitted through atpkg's
+    /// signed stable channel, with a lease retained by this provision run.
+    Managed {
+        /// Shared recipe and exposed command; no second version or hash table.
+        prerequisite: Prerequisite,
+        /// Which provisioning run needs this prerequisite.
+        when: When,
+    },
     /// Upstream release archive verified against `anchor` and unpacked with `strip` leading
     /// components dropped.
     Unpack {
@@ -89,11 +97,6 @@ pub enum Install {
         /// Patches, in the order they apply.
         patches: &'static [Archive],
     },
-    /// Native source-signing executable, statically linked to its pinned OpenSSL libraries.
-    OpenSsl {
-        /// Upstream source tarball, held to its size and SHA-256.
-        source: Archive,
-    },
     /// Browser engine pinned by the browser lane.
     Browser(Engine),
     /// rustup-init at its tool row's pin, copied into the cache as `bin/rustup` (rustup-init
@@ -124,18 +127,25 @@ impl Row {
         self.tool.map(aterm_uds::host::tool)
     }
 
-    /// The run that provides it: its tool row's, else every run.
+    /// The run that provides it: the managed strategy's scope, its workspace
+    /// tool row's scope, or every run for an unscoped row.
     #[must_use]
     pub fn when(&self) -> When {
+        if let Install::Managed { when, .. } = self.install {
+            return when;
+        }
         match self.tool_row().map(|t| t.provider) {
             Some(aterm_uds::host::Provider::Workspace { when }) => when,
             _ => When::Always,
         }
     }
 
-    /// Version pinned by its tool row (`None` for browsers).
+    /// Version in the managed shared recipe or workspace tool pin (`None` for browsers).
     #[must_use]
     pub fn version(&self) -> Option<&'static str> {
+        if let Install::Managed { prerequisite, .. } = self.install {
+            return Some(prerequisite.recipe().version);
+        }
         self.tool_row().and_then(|t| t.pin).map(|p| p.version)
     }
 
@@ -146,9 +156,7 @@ impl Row {
             Install::Unpack { archives, .. } | Install::Rustup { init: archives, .. } => {
                 archives.iter().find(|a| a.platform == platform).copied()
             }
-            Install::Build { source, .. }
-            | Install::Configure { source, .. }
-            | Install::OpenSsl { source } => self
+            Install::Build { source, .. } | Install::Configure { source, .. } => self
                 .tool_row()
                 .and_then(|t| t.pin)
                 .is_some_and(|p| p.pinned_for(platform))
@@ -209,36 +217,37 @@ const BASH_PATCHES: [Archive; aterm_uds::host::bash::PATCHES.len()] = {
 pub const MICROSOFT_TEAM: &str = "UBF8T346G9";
 
 /// Every row, in the order a run provides them.
-pub const ROWS: [Row; 14] = [
+pub const ROWS: [Row; 15] = [
     Row {
-        name: OPENSSL_SIGNING.name,
-        tool: Some(OPENSSL_SIGNING.name),
-        install: Install::OpenSsl {
-            source: OPENSSL_SIGNING_SOURCE,
+        name: Prerequisite::OpenSslSigning.recipe().name,
+        tool: Some(Prerequisite::OpenSslSigning.executable()),
+        install: Install::Managed {
+            prerequisite: Prerequisite::OpenSslSigning,
+            when: When::Release,
         },
     },
     Row {
-        name: CPYTHON.name,
-        tool: Some(CPYTHON.name),
-        install: Install::Unpack {
-            archives: CPYTHON.archives,
-            strip: CPYTHON.strip,
-            anchor: Anchor::Sha256,
-            keep: CPYTHON.licenses,
-            cap: None,
-            holds: Holds::Program,
+        name: Prerequisite::Python.recipe().name,
+        tool: Some(Prerequisite::Python.executable()),
+        install: Install::Managed {
+            prerequisite: Prerequisite::Python,
+            when: When::Release,
         },
     },
     Row {
-        name: GITLEAKS.name,
-        tool: Some(GITLEAKS.name),
-        install: Install::Unpack {
-            archives: GITLEAKS.archives,
-            strip: GITLEAKS.strip,
-            anchor: Anchor::Sha256,
-            keep: GITLEAKS.licenses,
-            cap: None,
-            holds: Holds::Program,
+        name: Prerequisite::Gitleaks.recipe().name,
+        tool: Some(Prerequisite::Gitleaks.executable()),
+        install: Install::Managed {
+            prerequisite: Prerequisite::Gitleaks,
+            when: When::Always,
+        },
+    },
+    Row {
+        name: Prerequisite::Lake.recipe().name,
+        tool: Some(Prerequisite::Lake.executable()),
+        install: Install::Managed {
+            prerequisite: Prerequisite::Lake,
+            when: When::Release,
         },
     },
     Row {

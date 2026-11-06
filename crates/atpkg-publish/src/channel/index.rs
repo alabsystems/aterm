@@ -1187,6 +1187,22 @@ pub fn publish_with(ctx: &Ctx, request: &IndexRequest, log: &mut Log) -> Result<
     }
 
     if request.upload {
+        let mut trust_builds = BTreeSet::new();
+        if let Some(build) = request.delta.pins.get("trust")
+            && base.channel.pin.get("trust") != Some(build)
+        {
+            trust_builds.insert(*build);
+        }
+        for (target, pins) in &request.delta.target_pins {
+            if let Some(build) = pins.get("trust")
+                && base.channel.for_target(target.as_str()).pin.get("trust") != Some(build)
+            {
+                trust_builds.insert(*build);
+            }
+        }
+        for build in trust_builds {
+            crate::canary::verify_pinned(ctx, &new, build)?;
+        }
         publish_quad(ctx, request, &base, head.as_ref(), &new, &plan, log)?;
     } else {
         log.say("DRY RUN — nothing published (--upload publishes)");

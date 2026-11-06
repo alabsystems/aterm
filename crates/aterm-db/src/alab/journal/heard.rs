@@ -91,7 +91,11 @@ pub(crate) fn archived(spool: &Path, since: u64) -> io::Result<BTreeMap<String, 
                 value.get("m").and_then(Value::as_str),
                 value.get("n").and_then(Value::as_u64),
             ) {
-                held.entry(m.to_owned()).or_default().insert(n);
+                if let Some(set) = held.get_mut(m) {
+                    set.insert(n);
+                } else {
+                    held.insert(m.to_owned(), BTreeSet::from([n]));
+                }
             }
         }
     }
@@ -122,7 +126,7 @@ pub(crate) fn batches(spool: &Path, since: u64) -> io::Result<Vec<Batch>> {
     if days.is_empty() {
         return Ok(Vec::new());
     }
-    days.sort();
+    days.sort_unstable();
     let judged = match aterm_uds::private_file::JudgedDir::judge(&dir) {
         Ok(judged) => judged,
         Err(aterm_uds::private_file::PrivateFileError::Io(error)) => return Err(error),

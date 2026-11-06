@@ -1532,7 +1532,7 @@ impl TurnIo<'static> {
     }
 }
 
-/// The typed-prefix cap of `turn typed=1`: at most this many graphemes are pressed one key at a time, the remainder going as one paste. 240 at the default cadence is ~17 s of typing, inside the default 240 s deadline with room for the reply; a turn whose keys go slower than its deadline allows pastes the rest sooner ([`TypingPace`]).
+/// The typed-prefix cap of `turn typed=1`: at most this many graphemes are pressed one key at a time, the remainder going as the rest's writes ([`rest_writes`]: one paste where it holds no Tab or line break). 240 at the default cadence is ~17 s of typing, inside the default 240 s deadline with room for the reply; a turn whose keys go slower than its deadline allows pastes the rest sooner ([`TypingPace`]).
 pub(crate) const TYPED_CAP: usize = 240;
 
 /// The most graphemes `turn typed=1 cap=<n>` may ask to have pressed one key at a time.
@@ -1617,16 +1617,118 @@ pub(crate) fn typed_key_events(text: &str) -> Vec<(usize, InputEvent)> {
         .collect()
 }
 
+/// A turn's paste of `text`, framed at the drain: the text exactly as the turn was given it. The
+/// `paste` verb reads a trailing literal `\n` as a line break
+/// ([`crate::control::control_input::paste_text`]); a turn reads none, since it submits with its
+/// own Enter and a `typed=1` turn presses a literal `\n` as the two keys it is: a rest whose paste turned it into a CR sent a second Enter where
+/// the program had no bracketed paste, and lost the text where it had.
+pub(crate) fn turn_paste_event(text: &str) -> InputEvent {
+    InputEvent::Paste(text.to_owned(), crate::input::PasteFraming::AtDrain)
+}
+
+/// One write of a `typed=1` turn's rest ([`rest_writes`]).
+#[derive(Debug)]
+pub(crate) enum RestWrite {
+    /// A run of text the typing would have pressed as character keys, pasted.
+    Paste {
+        /// The run, with no Tab, line break or other control character in it.
+        text: String,
+        /// Its graphemes as the turn's text segments them, one key each had they been typed.
+        graphemes: usize,
+    },
+    /// A Tab or Enter, pressed as the key the typing presses.
+    Key(InputEvent),
+}
+
+/// Whether the typed key `ev` is one a rest presses rather than pastes ([`rest_writes`]).
+fn presses_in_rest(ev: &InputEvent) -> bool {
+    use aterm_types::keyboard::{Key, NamedKey};
+    matches!(
+        ev,
+        InputEvent::Key {
+            key: Key::Named(NamedKey::Enter | NamedKey::Tab),
+            ..
+        }
+    )
+}
+
+/// The writes of a `typed=1` turn's `rest`, the text after the last key it typed
+/// ([`TypingPace`]): what typing it would have sent, in as few writes as that allows. Each Tab
+/// and line break goes as the Tab or Enter key typing presses, since a paste under DEC 2004
+/// delivers neither as that key: a pasted Tab is text a shell never completes on, and a pasted
+/// line break one no composer submits on (with 2004 off their bytes are the keys' either way).
+/// Each run of other text between them is one paste of the graphemes typing presses as keys,
+/// without the control characters typing drops ([`typed_key_event`]), so the keys typed and the
+/// writes of the rest are the whole text as typing it would have gone.
+pub(crate) fn rest_writes(rest: &str) -> Vec<RestWrite> {
+    use aterm_grapheme::GraphemeClusters;
+    let mut writes = Vec::new();
+    let mut run = String::new();
+    let mut graphemes = 0usize;
+    let flush = |writes: &mut Vec<RestWrite>, run: &mut String, graphemes: &mut usize| {
+        if !run.is_empty() {
+            writes.push(RestWrite::Paste {
+                text: std::mem::take(run),
+                graphemes: std::mem::take(graphemes),
+            });
+        }
+    };
+    for g in rest.graphemes() {
+        match typed_key_event(g) {
+            Some(ev) if presses_in_rest(&ev) => {
+                flush(&mut writes, &mut run, &mut graphemes);
+                writes.push(RestWrite::Key(ev));
+            }
+            Some(_) => {
+                run.push_str(g);
+                graphemes += 1;
+            }
+            None => {}
+        }
+    }
+    flush(&mut writes, &mut run, &mut graphemes);
+    writes
+}
+
+/// How many writes [`rest_writes`] makes of `text[at..]`, for `at` each grapheme's offset in
+/// `text` and its end, ascending by offset: what a typed turn's pace budgets for the rest it
+/// would write after a key ([`TypingPace::fits`]), counted in one pass from the end.
+fn rest_write_counts(text: &str) -> Vec<(usize, usize)> {
+    use aterm_grapheme::GraphemeClusters;
+    let graphemes: Vec<(usize, &str)> = text.grapheme_indices().collect();
+    let mut counts = Vec::with_capacity(graphemes.len() + 1);
+    counts.push((text.len(), 0));
+    // The writes from here on, and whether the first of them is a paste the text here joins.
+    let (mut writes, mut opens_paste) = (0usize, false);
+    for &(at, g) in graphemes.iter().rev() {
+        match typed_key_event(g) {
+            Some(ev) if presses_in_rest(&ev) => {
+                writes += 1;
+                opens_paste = false;
+            }
+            Some(_) => {
+                writes += usize::from(!opens_paste);
+                opens_paste = true;
+            }
+            None => {}
+        }
+        counts.push((at, writes));
+    }
+    counts.reverse();
+    counts
+}
+
 /// THE PACE OF A TYPED TURN: a `turn typed=1` never leaves part of its text in the composer for
-/// its deadline. Before each key it asks whether that key, one paste of everything after it, the
+/// its deadline. Before each key it asks whether that key, the writes of everything after it
+/// ([`rest_writes`]: one paste, plus a key and a paste for each Tab or line break), the
 /// longest wait a typing hold has needed so far, and the submit's share of the turn
 /// ([`TypingPace::new`]) still end by the deadline, at the pace its keys have gone so far and never
-/// faster than `cadence=`. The moment they would not, the rest of
-/// the text goes as one paste (bracketed where the program turned DEC 2004 on), a write nothing
-/// cuts part-way, and the turn goes on to its submit. Typing that keeps delivering is never cut:
-/// a drive's turn (`timeout=20000`) to a loaded Claude Code worker whose keys went at about 5 a
-/// second answered `skipped reason=deadline typed=106` and left the 106 in its composer, and each
-/// retry stacked another (m14 driving m108, 2026-11-04). Before its first key the turn can still
+/// faster than `cadence=`. The moment they would not, the rest of the text goes as those writes
+/// (each paste bracketed where the program turned DEC 2004 on), none of which cuts part-way, and
+/// the turn goes on to its submit. Typing that keeps delivering is never cut: a drive's turn
+/// (`timeout=20000`) to a loaded Claude Code worker whose keys went at about 5 a second answered
+/// `skipped reason=deadline typed=106` and left the 106 in its composer, and each retry stacked
+/// another (m14 driving m108, 2026-11-04). Before its first key the turn can still
 /// end as it found the composer, and does when that key does not fit: `reason=deadline typed=0
 /// pasted=0`, never a paste whose submit the deadline leaves no time to see, which a retry would
 /// send again. The echo's settle after the paste ends in time for the submit's share
@@ -1695,11 +1797,20 @@ impl TypingPace {
     }
 
     /// Whether the next key, after `typed`, still fits at `now` under `deadline`: its hold's wait
-    /// at the longest so far, it, one paste of the rest, and the reserve, each key and the paste
-    /// at [`TypingPace::per_key`].
-    fn fits(&self, typed: usize, now: std::time::Instant, deadline: std::time::Instant) -> bool {
+    /// at the longest so far, it, the `rest` writes after it ([`rest_write_counts`]; at least the
+    /// one paste a rest takes), and the reserve, each key and write at [`TypingPace::per_key`].
+    fn fits(
+        &self,
+        typed: usize,
+        rest: usize,
+        now: std::time::Instant,
+        deadline: std::time::Instant,
+    ) -> bool {
         let per = self.per_key(typed, now, deadline);
-        per.checked_mul(2)
+        u32::try_from(rest.max(1))
+            .ok()
+            .and_then(|rest| rest.checked_add(1))
+            .and_then(|writes| per.checked_mul(writes))
             .and_then(|both| both.checked_add(self.reserve))
             .and_then(|need| need.checked_add(self.longest_hold))
             .and_then(|need| now.checked_add(need))
@@ -3004,16 +3115,22 @@ fn turn_attempt(
     let mut pasted_graphemes = 0usize;
     let cadence = Duration::from_millis(cadence_ms);
     let mut committed: Option<crate::control::CommittedInput> = None;
+    // Every delivery the turn makes waits for its program whatever the caller does; whether it
+    // writes at all is judged here, before its first write: a caller already gone gets nothing
+    // written (on the main thread its gate refuses it too), not a text whose Enter never comes.
+    let _delivering = crate::control::TurnInput::enter();
+    let gone_before_writing = || !wrote.get() && crate::control::caller_hung_up();
     // When the typing ended, which the echo of the text is waited for from.
     let mut typed_end = None;
     // The caret the typing hold read just before the turn's last write, which its echo moves.
     let mut sent_from = None;
+    // The same before its last write of text (a character key or a paste), not a Tab or Enter.
+    let mut text_from = None;
     if !text.is_empty() {
         if typed {
-            use aterm_grapheme::GraphemeClusters;
             let (head, _) = split_typed_cap(text, typed_cap);
-            // Where the paste of the rest starts: past the cap, or at the first key the pace
-            // leaves no room to press ([`TypingPace`]).
+            // Where the rest starts: past the cap, or at the first key the pace leaves no room
+            // to press ([`TypingPace`]).
             let mut rest_at = head.len();
             let mut pace = TypingPace::new(
                 cadence,
@@ -3023,12 +3140,25 @@ fn turn_attempt(
             );
             let mut due = Instant::now();
             let key_lag = typed_key_lag();
-            for (at, ev) in typed_key_events(head) {
+            let keys = typed_key_events(head);
+            // The writes of the rest after each key: from the next key on, or past the cap.
+            let counts = rest_write_counts(text);
+            let rest_after: Vec<usize> = (0..keys.len())
+                .map(|i| {
+                    let next = keys.get(i + 1).map_or(head.len(), |&(at, _)| at);
+                    counts
+                        .binary_search_by_key(&next, |&(at, _)| at)
+                        .ok()
+                        .and_then(|found| counts.get(found))
+                        .map_or(0, |&(_, writes)| writes)
+                })
+                .collect();
+            for ((at, ev), rest) in keys.into_iter().zip(rest_after) {
                 let now = Instant::now();
                 if due > now {
                     std::thread::sleep(due - now);
                 }
-                if !pace.fits(typed_keys, Instant::now(), deadline) {
+                if !pace.fits(typed_keys, rest, Instant::now(), deadline) {
                     // Nothing written yet: the turn can still end as it found the composer.
                     if typed_keys == 0 {
                         return typed_cut(term, "deadline", 0, 0, turn_id);
@@ -3052,6 +3182,9 @@ fn turn_attempt(
                     ) {
                         Ok(cursor) => {
                             sent_from = Some(cursor);
+                            if !presses_in_rest(&ev) {
+                                text_from = Some(cursor);
+                            }
                             // What it waited, it gave back: the next key keeps room for as much.
                             pace.held(deadline.saturating_duration_since(before));
                         }
@@ -3060,6 +3193,9 @@ fn turn_attempt(
                 }
                 if let Some(cut) = halted(committed.is_some().then_some((typed_keys, 0))) {
                     return cut;
+                }
+                if gone_before_writing() {
+                    return KEY_DELIVERY_FAILED.to_string();
                 }
                 if typed_keys == 0 {
                     note_ctl_input();
@@ -3077,34 +3213,80 @@ fn turn_attempt(
                 committed.get_or_insert_with(crate::control::CommittedInput::enter);
                 typed_keys += 1;
             }
-            // The rest of the text, past the cap or from the key the pace stopped before.
-            let remainder = &text[rest_at..];
-            if !remainder.is_empty() {
+            // The rest of the text, past the cap or from the key the pace stopped before, as
+            // typing it would have gone: its runs pasted, its Tabs and line breaks pressed.
+            for write in rest_writes(&text[rest_at..]) {
                 // The loop checks before each key only: a head of control characters, which
-                // `typed_key_events` drops, presses none and leaves this paste the first write.
+                // `typed_key_events` drops, presses none and leaves the rest's first write the
+                // turn's first.
                 if exited(store) {
                     return "ERR exited\n".to_string();
                 }
+                // A paste with a digit in it waits as a typed digit does, for the program to
+                // read and draw what went before it: a box mounted meanwhile would take the
+                // digit. Typing waits on the key just before a digit, so a paste waits on a Tab or
+                // Enter the rest pressed just before it only when it starts with the digit, and
+                // otherwise on the last text written, as the keys of its own run would have: a
+                // composer's Tab may move no caret, and typing waits on that for no later digit.
+                let sent = match &write {
+                    RestWrite::Paste { text, .. }
+                        if text.starts_with(|c: char| c.is_ascii_digit()) =>
+                    {
+                        sent_from
+                    }
+                    RestWrite::Paste { text, .. }
+                        if text.contains(|c: char| c.is_ascii_digit()) =>
+                    {
+                        text_from
+                    }
+                    RestWrite::Paste { .. } => None,
+                    RestWrite::Key(ev) => sent_from.filter(|_| is_digit_key(ev)),
+                };
                 match hold
                     .as_mut()
-                    .map(|h| h.held(term, ctx, &sub, None, cadence, &mut deadline))
+                    .map(|h| h.held(term, ctx, &sub, sent.map(Sent::key), cadence, &mut deadline))
                 {
-                    Some(Err(why)) => return typed_cut(term, why, typed_keys, 0, turn_id),
-                    Some(Ok(cursor)) => sent_from = Some(cursor),
+                    Some(Err(why)) => {
+                        return typed_cut(term, why, typed_keys, pasted_graphemes, turn_id);
+                    }
+                    Some(Ok(cursor)) => {
+                        sent_from = Some(cursor);
+                        if matches!(write, RestWrite::Paste { .. }) {
+                            text_from = Some(cursor);
+                        }
+                    }
                     None => {}
                 }
-                if let Some(cut) = halted(committed.is_some().then_some((typed_keys, 0))) {
+                if let Some(cut) = halted(
+                    committed
+                        .is_some()
+                        .then_some((typed_keys, pasted_graphemes)),
+                ) {
                     return cut;
                 }
-                pasted_graphemes = remainder.graphemes().count();
-                if typed_keys == 0 {
+                let failed = match write {
+                    RestWrite::Paste { .. } => PASTE_DELIVERY_FAILED,
+                    RestWrite::Key(_) => KEY_DELIVERY_FAILED,
+                };
+                if gone_before_writing() {
+                    return failed.to_string();
+                }
+                if typed_keys == 0 && pasted_graphemes == 0 {
                     note_ctl_input();
                 }
                 let first = !wrote.replace(true);
-                if !(io.paste)(remainder) {
-                    return undelivered(first, PASTE_DELIVERY_FAILED);
-                }
+                let delivered = match write {
+                    RestWrite::Paste { text, graphemes } => {
+                        (io.paste)(&text).then_some((0, graphemes))
+                    }
+                    RestWrite::Key(ev) => (io.key)(ev).then_some((1, 0)),
+                };
+                let Some((keys, graphemes)) = delivered else {
+                    return undelivered(first, failed);
+                };
                 committed.get_or_insert_with(crate::control::CommittedInput::enter);
+                typed_keys += keys;
+                pasted_graphemes += graphemes;
             }
         } else {
             if exited(store) {
@@ -3115,6 +3297,9 @@ fn turn_attempt(
             }
             if person_moved() {
                 return typed_cut(term, "person", 0, 0, turn_id);
+            }
+            if gone_before_writing() {
+                return PASTE_DELIVERY_FAILED.to_string();
             }
             note_ctl_input();
             let first = !wrote.replace(true);
@@ -3258,6 +3443,11 @@ fn turn_attempt(
                     break;
                 }
                 return typed_cut(term, "person", typed_keys, pasted(), turn_id);
+            }
+            // A text that typed no key and pasted nothing (control characters alone) makes the
+            // Enter its first write, judged as any first write is.
+            if gone_before_writing() {
+                return KEY_DELIVERY_FAILED.to_string();
             }
             let window = deadline.min(Instant::now() + Duration::from_millis(submit_window_ms));
             let (base_started, typed_row, base_turns, mut id) = {
@@ -4776,10 +4966,15 @@ pub(crate) fn cmd_meta_harness_needs(
         Err(usage) => return Some((usage.to_string(), false)),
     };
     let count = told.as_ref().map(|told| told.needs().len());
+    let unclaimed = told.clone();
     let Some((holder, moved)) = self_claim_write(ctx, conn, prove, |meta, proven| {
         meta.tell_self_needs(proven, told)
     }) else {
-        return Some(("ERR denied\n".to_string(), false));
+        let lab = aterm_types::dev_seam!("ATERM_DEV_LAB_NEEDS").is_some_and(|v| v == "1");
+        return Some(lab_loop_tell(lab, ctx, unclaimed).map_or_else(
+            || ("ERR denied\n".to_string(), false),
+            |moved| ("OK\n".to_string(), moved),
+        ));
     };
     if moved {
         aterm_log::info!(
@@ -4789,6 +4984,30 @@ pub(crate) fn cmd_meta_harness_needs(
         );
     }
     Some(("OK\n".to_string(), moved))
+}
+
+/// A `meta set|unset harness_needs` no self-claim admits, where the dev seam `ATERM_DEV_LAB_NEEDS=1` is on (`lab`; debug and dev-seams builds only): told into the timeline's own set beside the session's `owner=needs` entry as stored now, as aterm's own loop's tell is ([`crate::harness_host::store_needs`]), so a windowed lab raises a NEEDS YOU set with no agent in the tab (`aterm-lab told-once`). Whether it moved what a reader reads; `None` with the seam off, which the verb answers `ERR denied`.
+pub(crate) fn lab_loop_tell(
+    lab: bool,
+    ctx: &SessionCtx,
+    told: Option<Arc<crate::needs::HarnessNeeds>>,
+) -> Option<bool> {
+    if !lab {
+        return None;
+    }
+    let standing = ctx
+        .meta
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .attention_owners
+        .get(crate::harness_host::NEEDS_ATTENTION_OWNER)
+        .map(str::to_string);
+    Some(
+        ctx.timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .set_harness_needs(told, standing.as_deref()),
+    )
 }
 
 /// `meta set questions|autopilot …` / `meta unset questions|autopilot` from a connection that is not Owner-class: `ERR denied`.
@@ -5992,6 +6211,246 @@ pub(crate) fn cmd_whoami(ctx: &SessionCtx, scope: Scope) -> String {
         .to_string(),
     };
     format!("OK {} {} {}\n", ctx.self_id.as_str(), ctx.nonce.to_hex(), s)
+}
+
+/// The generation [`needs_moved`] moves, which every needs pusher waits on ([`NEEDS_MOVED`]).
+static NEEDS_GENERATION: Mutex<u64> = Mutex::new(0);
+
+/// Woken each time [`NEEDS_GENERATION`] moves.
+static NEEDS_MOVED: std::sync::Condvar = std::sync::Condvar::new();
+
+/// How long a needs pusher waits for the generation to move before it builds its row again
+/// anyway, writing it only where it changed: the backstop for a change no herald saw.
+#[cfg(unix)]
+const NEEDS_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long a needs pusher waits for the node job's `go`, and each of its frames may take to
+/// write: aterm-net's `HANDSHAKE_WITHIN`, as the node job's own hand-overs; a unit test's node
+/// job is its own, which answers, so it waits the hang detector.
+#[cfg(all(unix, not(test)))]
+const NEEDS_HANDSHAKE: std::time::Duration = aterm_net::fleet::HANDSHAKE_WITHIN;
+#[cfg(all(unix, test))]
+const NEEDS_HANDSHAKE: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
+
+/// Say this window's needs may have moved (a session's published need, hold, wait, agent class
+/// or task, as the herald saw it move, `App::herald_session`): every needs pusher builds its row
+/// again and writes it where it changed. Never waits on a pusher.
+pub(crate) fn needs_moved() {
+    let mut generation = NEEDS_GENERATION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *generation = generation.wrapping_add(1);
+    drop(generation);
+    NEEDS_MOVED.notify_all();
+}
+
+/// The needs generation now.
+#[cfg(unix)]
+fn needs_generation() -> u64 {
+    *NEEDS_GENERATION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The needs generation once it is no longer `seen`, or after `within` whatever it is.
+#[cfg(unix)]
+fn needs_generation_after(seen: u64, within: std::time::Duration) -> u64 {
+    let generation = NEEDS_GENERATION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (generation, _) = NEEDS_MOVED
+        .wait_timeout_while(generation, within, |now| *now == seen)
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *generation
+}
+
+/// This window's needs row at `now_unix_ms` (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.14),
+/// read from each session in `store` that has not exited and whose sid is minted, as the survey
+/// reads it (`survey::session_row`) and the Fleet menu reads a peer's survey (`fleet_glance`):
+/// a need where its published verdict names one, `harness` where that need is a harness's own
+/// ask and not the program's report, its manager the sid its task came from, and its since the
+/// survey age the Fleet menu ages it by (`task_ms` for `stalled`, none for `ask` or for
+/// `frozen` and `stopped` on a non-agent, else `agent_ms`) taken from now; a hold where one
+/// stands, by the Mac that holds it where that is a node id; and each manager with how many of
+/// these sessions' tasks came from it. Ids, words and times only, each list sorted by sid.
+#[cfg(unix)]
+pub(crate) fn needs_row(store: &Store, now_unix_ms: u64) -> aterm_metrics::row::NeedsRow {
+    use aterm_metrics::row::{HeldEntry, ManagerEntry, NeedEntry, NeedsRow, Sid, Word};
+    use aterm_types::needs::NeedWord;
+
+    let snapshot = store.read().unwrap_or_else(|p| p.into_inner()).snapshot();
+    let mut row = NeedsRow {
+        at: now_unix_ms / 1000,
+        ..NeedsRow::default()
+    };
+    let mut managers = std::collections::BTreeMap::<Sid, u32>::new();
+    for h in snapshot
+        .iter()
+        .filter(|h| !matches!(h.state, SessionState::Exited))
+    {
+        let Some(sid) = Sid::parse(h.sid.as_str()) else {
+            continue;
+        };
+        let (need, held, worker_of, task_since, is_agent, agent_ms) = {
+            let timeline = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            let agent = timeline.agent();
+            // A reader that names no state (codex's) ages by what the program says itself.
+            let agent_ms = match timeline.program_shown().filter(|_| agent.word == "unknown") {
+                Some(shown) => shown.age_ms(),
+                None => agent.age_ms(),
+            };
+            let verdict = timeline.need();
+            let task = timeline.task();
+            (
+                verdict
+                    .need
+                    .as_ref()
+                    .map(|need| (need.word, need.report.is_none() && need.harness.is_some())),
+                verdict.held,
+                task.and_then(|task| Sid::parse(&task.from)),
+                task.map(|task| task.since_unix_ms),
+                agent.reader.is_some(),
+                agent_ms,
+            )
+        };
+        if let Some(manager) = worker_of {
+            let workers = managers.entry(manager).or_default();
+            *workers = workers.saturating_add(1);
+        }
+        if let Some(hold) = held.and_then(|hold| Word::new(hold.word())) {
+            let by = h.ctx.fabric.holds().remote().and_then(|remote| {
+                aterm_metrics::subject::Node::parse(&remote.node.to_ascii_lowercase())
+            });
+            row.held.push(HeldEntry {
+                sid,
+                hold,
+                by,
+                since: None,
+            });
+        }
+        let Some((word, harness)) = need else {
+            continue;
+        };
+        let Some(need_word) = Word::new(word.word()) else {
+            continue;
+        };
+        let age_ms = match word {
+            NeedWord::Stalled => task_since.map(|since| now_unix_ms.saturating_sub(since)),
+            NeedWord::Ask => None,
+            NeedWord::Frozen | NeedWord::Stopped if !is_agent => None,
+            _ => Some(agent_ms),
+        };
+        row.needs.push(NeedEntry {
+            sid,
+            word: need_word,
+            harness,
+            worker_of,
+            since: age_ms.map(|age| now_unix_ms.saturating_sub(age) / 1000),
+        });
+    }
+    row.needs.sort_by_key(|need| need.sid);
+    row.held.sort_by_key(|held| held.sid);
+    row.managers = managers
+        .into_iter()
+        .map(|(sid, workers)| ManagerEntry { sid, workers })
+        .collect();
+    row
+}
+
+/// Serve the node job's read of this window's needs on `stream`
+/// (`node_serve::RelayHeader::Needs`) on a thread of its own ([`push_needs`]): `false` where no
+/// control server runs here whose sessions it could read, or the thread did not start.
+#[cfg(unix)]
+pub(crate) fn attach_needs_stream(stream: aterm_uds::CtlStream) -> bool {
+    let Some(context) = super::BRIDGE_CONTEXT.get().cloned() else {
+        return false;
+    };
+    crate::qos::spawn_lane_thread(
+        "aterm-needs-push".to_string(),
+        crate::qos::Role::Background,
+        move || push_needs(&context.store, stream),
+    )
+    .is_ok()
+}
+
+/// The needs row to write next: `store`'s at `now_unix_ms` ([`needs_row`]), each standing need's
+/// since kept as `sent` said it ([`steady_since`]), where it says other than `sent`, the row last
+/// written, `at` aside, which it then becomes; `None` where it says the same, whenever it was
+/// written.
+#[cfg(unix)]
+fn changed_needs(
+    store: &Store,
+    now_unix_ms: u64,
+    sent: &mut Option<aterm_metrics::row::NeedsRow>,
+) -> Option<aterm_metrics::row::NeedsRow> {
+    let mut row = needs_row(store, now_unix_ms);
+    if let Some(last) = sent.as_ref() {
+        steady_since(&mut row, last);
+        let timeless =
+            |r: &aterm_metrics::row::NeedsRow| aterm_metrics::row::NeedsRow { at: 0, ..r.clone() };
+        if timeless(last) == timeless(&row) {
+            return None;
+        }
+    }
+    *sent = Some(row.clone());
+    Some(row)
+}
+
+/// Keep each need's since as `last` said it where `last` lists the same session with the same
+/// need and a since at most a second off: a since is now on the wall clock less an age on the
+/// continuous one, cut to a second, so two builds of one standing need can differ by a second
+/// with nothing changed.
+#[cfg(unix)]
+fn steady_since(row: &mut aterm_metrics::row::NeedsRow, last: &aterm_metrics::row::NeedsRow) {
+    for need in &mut row.needs {
+        let was = last
+            .needs
+            .iter()
+            .find(|was| was.sid == need.sid && was.word == need.word)
+            .and_then(|was| was.since);
+        if let (Some(was), Some(now)) = (was, need.since)
+            && was.abs_diff(now) <= 1
+        {
+            need.since = Some(was);
+        }
+    }
+}
+
+/// Once the node job writes `go` on `stream` (within [`NEEDS_HANDSHAKE`]), write it this window's
+/// needs row ([`needs_row`] of `store`) as one frame (`node_serve::write_needs_frame`), and again
+/// each time the row changes, `at` aside ([`changed_needs`]): the row is built again each time
+/// [`needs_moved`] moves the generation, and at least every [`NEEDS_BACKSTOP`]. Ends, hanging up,
+/// once the node job has: a write fails, or after a wake the stream reads its end (or anything
+/// at all, which the node job never writes past `go`).
+#[cfg(unix)]
+fn push_needs(store: &Store, mut stream: aterm_uds::CtlStream) {
+    use std::io::Read as _;
+
+    use aterm_uds::hangup::{Awake, PeerState, hang_up, peer_state};
+
+    let _ = stream.set_read_timeout(Some(NEEDS_HANDSHAKE));
+    let mut go = [0u8; 3];
+    if Awake(&stream).read_exact(&mut go).is_err() || &go != b"go\n" {
+        hang_up(&stream);
+        return;
+    }
+    let _ = stream.set_read_timeout(None);
+    let _ = stream.set_write_timeout(Some(NEEDS_HANDSHAKE));
+    let mut seen = needs_generation();
+    let mut sent = None;
+    loop {
+        let now_unix_ms = aterm_time::unix_millis().unwrap_or(0);
+        if let Some(row) = changed_needs(store, now_unix_ms, &mut sent)
+            && crate::fleet_listen::node_serve::write_needs_frame(&mut stream, &row).is_err()
+        {
+            break;
+        }
+        seen = needs_generation_after(seen, NEEDS_BACKSTOP);
+        if peer_state(&stream) != PeerState::Idle {
+            break;
+        }
+    }
+    hang_up(&stream);
 }
 
 #[cfg(test)]
@@ -10246,10 +10705,10 @@ mod typing_pace_tests {
         let need = ms(1_500) * 2 + ms(2_150);
         let roomy = now + need + ms(500);
         assert_eq!(paced(roomy).per_key(4, now, roomy), ms(1_500));
-        assert!(paced(roomy).fits(4, now, roomy));
+        assert!(paced(roomy).fits(4, 1, now, roomy));
         let tight = now + need - ms(500);
         assert!(
-            !paced(tight).fits(4, now, tight),
+            !paced(tight).fits(4, 1, now, tight),
             "keys at 1.5 s stop with {need:?} left, not at the cadence's 2.29 s"
         );
         // A hold gave 10 s back: the deadline moved, the keys' time did not.
@@ -10278,16 +10737,16 @@ mod typing_pace_tests {
         // 200 keys in 16 s: 80 ms each.
         let now = deadline - ms(4_000);
         assert!(
-            pace.fits(200, now, deadline),
+            pace.fits(200, 1, now, deadline),
             "no hold yet: 4 s is room enough"
         );
         pace.held(ms(3_000));
         pace.held(ms(1_000));
         assert!(
-            !pace.fits(200, now, deadline),
+            !pace.fits(200, 1, now, deadline),
             "a 3 s wait does not fit in 4 s"
         );
-        assert!(pace.fits(200, deadline - ms(5_500), deadline));
+        assert!(pace.fits(200, 1, deadline - ms(5_500), deadline));
     }
 
     /// The reserve is the settle and the submit's window, at most half the turn; a turn whose
@@ -10298,17 +10757,80 @@ mod typing_pace_tests {
         let pace = TypingPace::new(ms(1), ms(3_000), SETTLE, Some(ms(2_000)));
         let deadline = t0 + ms(3_000);
         assert!(
-            pace.fits(0, deadline - ms(1_503), deadline),
+            pace.fits(0, 1, deadline - ms(1_503), deadline),
             "1.5 s, not 2.15 s"
         );
-        assert!(!pace.fits(0, deadline - ms(1_501), deadline));
+        assert!(!pace.fits(0, 1, deadline - ms(1_501), deadline));
         let none = TypingPace::new(ms(1), ms(3_000), SETTLE, None);
         assert!(
-            none.fits(0, deadline - ms(153), deadline),
+            none.fits(0, 1, deadline - ms(153), deadline),
             "submit=none keeps the settle"
         );
         let huge = TypingPace::new(Duration::MAX, ms(3_000), SETTLE, Some(ms(2_000)));
-        assert!(!huge.fits(0, t0, t0 + ms(3_000_000)));
+        assert!(!huge.fits(0, 1, t0, t0 + ms(3_000_000)));
+        assert!(!pace.fits(0, usize::MAX, t0, t0 + ms(3_000_000)));
+    }
+
+    /// A rest that goes as several writes, a key for each Tab between its pastes, keeps room for
+    /// each of them at the keys' pace: keys at 1.5 s with three writes left need 4 x 1.5 s and
+    /// the reserve, not the 2 x 1.5 s of one paste. NEGATIVE CONTROL: budgeting one paste
+    /// whatever the rest, the three writes fit where they do not.
+    #[test]
+    fn the_pace_keeps_room_for_each_write_of_the_rest() {
+        let t0 = Instant::now();
+        let paced = |deadline: Instant| {
+            let mut pace = TypingPace::new(ms(70), ms(20_000), SETTLE, Some(ms(2_000)));
+            for key in 0..4u32 {
+                pace.pressed(t0 + ms(1_500) * key, deadline);
+            }
+            pace
+        };
+        let now = t0 + ms(6_000);
+        let one = now + ms(1_500) * 2 + ms(2_150) + ms(500);
+        assert!(paced(one).fits(4, 1, now, one));
+        assert!(
+            paced(one).fits(4, 0, now, one),
+            "an empty rest still budgets a paste"
+        );
+        assert!(
+            !paced(one).fits(4, 3, now, one),
+            "a paste, a Tab and a paste do not fit where one paste does"
+        );
+        let three = now + ms(1_500) * 4 + ms(2_150) + ms(500);
+        assert!(paced(three).fits(4, 3, now, three));
+    }
+
+    /// The counts the pace budgets are the writes the rest makes, from every grapheme's offset.
+    #[test]
+    fn the_rest_write_counts_are_the_writes_of_each_rest() {
+        use aterm_grapheme::GraphemeClusters;
+
+        use super::{rest_write_counts, rest_writes};
+        for text in [
+            "",
+            "abc",
+            "a\tb",
+            "\t\t",
+            "a\u{1}\tb\u{1}c",
+            "\u{1b}\u{1b}",
+            "x\r\ny\nz\r",
+            "e\u{301}\t\u{1f44d}\u{1f3fd} z\t",
+        ] {
+            let counts = rest_write_counts(text);
+            let offsets: Vec<usize> = text
+                .grapheme_indices()
+                .map(|(at, _)| at)
+                .chain([text.len()])
+                .collect();
+            assert_eq!(
+                counts.iter().map(|&(at, _)| at).collect::<Vec<_>>(),
+                offsets,
+                "{text:?}"
+            );
+            for (at, writes) in counts {
+                assert_eq!(writes, rest_writes(&text[at..]).len(), "{text:?} from {at}");
+            }
+        }
     }
 
     /// The waits after the last write end with the submit's window still to run, though the
@@ -10337,5 +10859,288 @@ mod typing_pace_tests {
             deadline,
             "submit=none: the deadline"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod needs_tests {
+    use std::io::{Read as _, Write as _};
+    use std::time::Instant;
+
+    use aterm_metrics::row::{HeldEntry, ManagerEntry, NeedEntry, Sid, Word};
+    use aterm_types::needs::{HoldWord, NeedWord};
+
+    use crate::fleet_listen::node_serve::read_needs_frame;
+    use crate::needs::{HarnessAsk, Need, NeedTail, Verdict};
+    use crate::session_store::{SessionHandle, SessionState, new_store, test_handle};
+    use crate::task_record::{TaskMark, TaskState};
+
+    /// When the tasks below began, Unix milliseconds.
+    const TASKS_AT_MS: u64 = 1_793_160_000_000;
+
+    /// A verdict whose need is `word`, a harness's own ask where `harness`.
+    fn needing(word: NeedWord, harness: bool) -> Verdict {
+        Verdict {
+            need: Some(Need {
+                word,
+                key: 1,
+                what: "the row's words, which never leave the Mac".to_owned(),
+                harness: harness.then(|| HarnessAsk {
+                    first: "pick the release name".to_owned(),
+                    more: 0,
+                    others: Vec::new(),
+                    program: aterm_phase::Program::Claude,
+                    tail: NeedTail::CarryingOn,
+                    entry_first: None,
+                }),
+                report: None,
+            }),
+            ..Verdict::default()
+        }
+    }
+
+    fn set(h: &SessionHandle, verdict: Verdict) {
+        h.ctx.timeline.lock().unwrap().set_need(verdict);
+    }
+
+    /// `worker`'s task, in `state`, came from `manager` at [`TASKS_AT_MS`].
+    fn works_for(worker: &SessionHandle, manager: &SessionHandle, state: TaskState) {
+        let mark = TaskMark {
+            from: Some(manager.sid.as_str().to_owned()),
+            ..TaskMark::new(state)
+        };
+        let _ = worker.ctx.timeline.lock().unwrap().mark_task(
+            &mark,
+            false,
+            Instant::now(),
+            TASKS_AT_MS,
+        );
+    }
+
+    fn sid_of(h: &SessionHandle) -> Sid {
+        Sid::parse(h.sid.as_str()).expect("a minted sid")
+    }
+
+    /// A window with a session that asks for a person, two workers of it (one stalled, one at a
+    /// harness's own ask), a held session and an exited worker yields those needs, that hold and
+    /// that manager with its two live workers, each list by sid, with the ages the Fleet menu
+    /// reads; the exited session is in none of them.
+    #[test]
+    fn a_windows_needs_row_names_its_needs_its_holds_and_its_managers() {
+        let manager = test_handle(1);
+        let stalled = test_handle(2);
+        let approving = test_handle(3);
+        let held = test_handle(4);
+        let gone = test_handle(5);
+        set(&manager, needing(NeedWord::Ask, false));
+        works_for(&stalled, &manager, TaskState::Stalled);
+        set(&stalled, needing(NeedWord::Stalled, false));
+        works_for(&approving, &manager, TaskState::Working);
+        set(&approving, needing(NeedWord::Approval, true));
+        set(
+            &held,
+            Verdict {
+                held: Some(HoldWord::Person),
+                ..Verdict::default()
+            },
+        );
+        works_for(&gone, &manager, TaskState::Working);
+        set(&gone, needing(NeedWord::Question, false));
+        let ids = [&manager, &stalled, &approving, &held].map(sid_of);
+        let store = new_store();
+        for h in [&manager, &stalled, &approving, &held, &gone] {
+            store.write().unwrap().register(h.clone());
+        }
+        store.write().unwrap().set_state(5, SessionState::Exited);
+
+        let now_ms = TASKS_AT_MS + 600_000;
+        let row = super::needs_row(&store, now_ms);
+        assert_eq!(row.at, now_ms / 1000);
+        assert_eq!(
+            row.managers,
+            [ManagerEntry {
+                sid: ids[0],
+                workers: 2
+            }],
+            "the exited worker is not counted"
+        );
+        assert_eq!(
+            row.held,
+            [HeldEntry {
+                sid: ids[3],
+                hold: Word::new("person").unwrap(),
+                by: None,
+                since: None,
+            }]
+        );
+        let approval_since = row
+            .needs
+            .iter()
+            .find(|need| need.sid == ids[2])
+            .and_then(|need| need.since);
+        assert!(
+            approval_since
+                .is_some_and(|since| (TASKS_AT_MS / 1000..=now_ms / 1000).contains(&since)),
+            "an approval is aged by its agent verdict, taken from now: {approval_since:?}"
+        );
+        let mut want = vec![
+            NeedEntry {
+                sid: ids[0],
+                word: Word::new("ask").unwrap(),
+                harness: false,
+                worker_of: None,
+                since: None,
+            },
+            NeedEntry {
+                sid: ids[1],
+                word: Word::new("stalled").unwrap(),
+                harness: false,
+                worker_of: Some(ids[0]),
+                since: Some(TASKS_AT_MS / 1000),
+            },
+            NeedEntry {
+                sid: ids[2],
+                word: Word::new("approval").unwrap(),
+                harness: true,
+                worker_of: Some(ids[0]),
+                since: approval_since,
+            },
+        ];
+        want.sort_by_key(|need| need.sid);
+        assert_eq!(row.needs, want);
+    }
+
+    /// A program's own report is no harness's ask, whatever the need carries beside it.
+    #[test]
+    fn a_programs_reported_need_is_not_the_harnesss() {
+        let reported = test_handle(1);
+        let mut verdict = needing(NeedWord::Approval, true);
+        if let Some(need) = verdict.need.as_mut() {
+            need.report = Some(7);
+        }
+        set(&reported, verdict);
+        let store = new_store();
+        store.write().unwrap().register(reported);
+        let row = super::needs_row(&store, TASKS_AT_MS);
+        assert_eq!(row.needs.len(), 1);
+        assert!(!row.needs[0].harness);
+    }
+
+    /// A row is written where it says other than the one last written, and not where it says the
+    /// same, whenever it was built; a row changed back is written again.
+    #[test]
+    fn only_a_changed_row_is_written_again_whenever_it_was_built() {
+        let asking = test_handle(1);
+        let ctx = std::sync::Arc::clone(&asking.ctx);
+        let store = new_store();
+        store.write().unwrap().register(asking);
+        let mut sent = None;
+        let first = super::changed_needs(&store, TASKS_AT_MS, &mut sent).expect("the first row");
+        assert!(first.needs.is_empty());
+        assert!(
+            super::changed_needs(&store, TASKS_AT_MS + 60_000, &mut sent).is_none(),
+            "the same row a minute later is no change"
+        );
+        ctx.timeline
+            .lock()
+            .unwrap()
+            .set_need(needing(NeedWord::Ask, false));
+        let asked = super::changed_needs(&store, TASKS_AT_MS + 61_000, &mut sent)
+            .expect("the row once its session asks");
+        assert_eq!(asked.needs.len(), 1);
+        assert!(super::changed_needs(&store, TASKS_AT_MS + 62_000, &mut sent).is_none());
+        ctx.timeline.lock().unwrap().set_need(Verdict::default());
+        assert_eq!(
+            super::changed_needs(&store, TASKS_AT_MS + 63_000, &mut sent)
+                .expect("the row changed back")
+                .needs,
+            []
+        );
+    }
+
+    /// A standing need whose since a rebuild reads a second off keeps the since last sent, so it
+    /// is no change; two seconds off, or another need of the session, is one.
+    #[test]
+    fn a_since_a_second_off_is_the_since_last_sent() {
+        let need = |word: &str, since: u64| aterm_metrics::row::NeedsRow {
+            at: 0,
+            needs: vec![NeedEntry {
+                sid: Sid::parse("s-00000000000000000001").expect("a sid"),
+                word: Word::new(word).expect("a word"),
+                harness: false,
+                worker_of: None,
+                since: Some(since),
+            }],
+            held: Vec::new(),
+            managers: Vec::new(),
+        };
+        let sent = need("stalled", 1_000);
+        for (word, since, kept) in [
+            ("stalled", 1_001, 1_000),
+            ("stalled", 999, 1_000),
+            ("stalled", 1_002, 1_002),
+            ("frozen", 1_001, 1_001),
+        ] {
+            let mut row = need(word, since);
+            super::steady_since(&mut row, &sent);
+            assert_eq!(row.needs[0].since, Some(kept), "{word} at {since}");
+        }
+    }
+
+    /// The pusher writes nothing before the node job's `go`, then the window's row, then the row
+    /// again once it changed and the generation moved. Once the node job hangs up, the pusher's
+    /// next wake ends it.
+    #[test]
+    fn the_pusher_writes_the_row_after_go_and_again_once_it_changed() {
+        let asking = test_handle(1);
+        let ctx = std::sync::Arc::clone(&asking.ctx);
+        let store = new_store();
+        store.write().unwrap().register(asking);
+        let (window, mut node) = aterm_uds::CtlStream::pair().expect("a stream pair");
+        node.set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
+            .unwrap();
+        let (ended, pusher_ended) = std::sync::mpsc::channel();
+        let pusher = std::thread::spawn({
+            let store = store.clone();
+            move || {
+                super::push_needs(&store, window);
+                let _ = ended.send(());
+            }
+        });
+
+        node.write_all(b"go\n").unwrap();
+        let first = read_needs_frame(&mut node).expect("the row once go is written");
+        assert!(first.needs.is_empty() && first.held.is_empty() && first.managers.is_empty());
+
+        ctx.timeline
+            .lock()
+            .unwrap()
+            .set_need(needing(NeedWord::Ask, false));
+        super::needs_moved();
+        let second = read_needs_frame(&mut node).expect("the changed row");
+        assert_eq!(second.needs.len(), 1);
+        assert_eq!(second.needs[0].word.as_str(), "ask");
+
+        aterm_uds::hangup::hang_up(&node);
+        super::needs_moved();
+        pusher_ended
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("the pusher ended once the node job hung up");
+        pusher.join().unwrap();
+    }
+
+    /// A node job that writes anything but `go` is hung up on before any row is written.
+    #[test]
+    fn the_pusher_writes_nothing_to_a_node_job_that_did_not_say_go() {
+        let store = new_store();
+        store.write().unwrap().register(test_handle(1));
+        let (window, mut node) = aterm_uds::CtlStream::pair().expect("a stream pair");
+        node.set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
+            .unwrap();
+        node.write_all(b"no\n").unwrap();
+        super::push_needs(&store, window);
+        let mut rest = Vec::new();
+        node.read_to_end(&mut rest).expect("the pusher hung up");
+        assert!(rest.is_empty(), "no row: {rest:?}");
     }
 }

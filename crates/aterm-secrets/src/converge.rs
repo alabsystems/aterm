@@ -10,11 +10,10 @@
 //! each version it applies, and in a healthy round once [`Due`] says so), the aterm window's
 //! lane, and the first-launch Secrets stage as it ends. Each starts [`runner`] in a session of
 //! its own and never disclaims responsibility for it, so macOS keeps attributing the runner's
-//! Local Network use to the app that started it. A subscriber whose job runs a held copy (an
+//! privacy-gated acts to the app that started it. A subscriber whose job runs a held copy (an
 //! admin Mac's snapshot, a program `agent on --program` named) starts that copy, and the copy
 //! hands the pass to the installed aterm.app (`aterm init --converge`'s hand-off), started as its
-//! own responsible process: the rows it applies and its Local Network use are aterm.app's, as
-//! the window's are.
+//! own responsible process: the rows it applies are aterm.app's, as the window's are.
 
 use crate::client::SyncOutcome;
 use aterm_uds::spawnfd::{Child, Command, Stdio};
@@ -56,7 +55,7 @@ pub const LONGEST_RETRY_MS: u64 = 5 * 60 * 1000;
 /// threads at the background class instead, its children started in the band (`aterm init
 /// --converge`), so only the lock's holder is lifted. A window's or the first launch's runner
 /// starts with its starter's process type, in no band, and holds its threads at utility.
-/// Responsibility is never disclaimed: the runner's Local Network use stays the starting app's.
+/// Responsibility is never disclaimed: the runner's privacy-gated acts stay the starting app's.
 #[must_use]
 pub fn runner(exe: &Path, trigger: &str) -> Command {
     let mut command = aterm_uds::spawnfd::command(exe);
@@ -185,6 +184,16 @@ pub struct Due {
 }
 
 impl Due {
+    /// Service the same job while another subscriber lane is waiting on HTTP.
+    pub(crate) fn poll(&mut self, now_ms: u64, routes: Routes, last: Last) -> bool {
+        self.start(false, now_ms, routes, last)
+    }
+
+    /// Verified local member admission may have delivered work independently of HTTP.
+    pub(crate) fn after_local_progress(&mut self, now_ms: u64, routes: Routes, last: Last) -> bool {
+        self.start(true, now_ms, routes, last)
+    }
+
     /// Whether the subscriber starts a runner as it starts: always, unless one it started still
     /// runs (none can yet), at `now_ms` with `routes`.
     pub fn at_start(&mut self, now_ms: u64, routes: Routes, last: Last) -> bool {
@@ -432,7 +441,7 @@ mod tests {
     }
 
     /// The runner is `aterm init --converge --trigger <who>` of the program given, never
-    /// disclaims responsibility (macOS then keeps the runner's Local Network use the starting
+    /// disclaims responsibility (macOS then keeps the runner's privacy-gated acts the starting
     /// app's), and the subscriber's leaves its starter's background band, so the fleet book's
     /// lock lift reaches its holder under the vault subscriber's `Background` job (that a child
     /// so started leaves the band is `aterm_uds`'s
@@ -451,7 +460,7 @@ mod tests {
             assert_eq!(args, ["init", "--converge", "--trigger", trigger]);
             assert!(
                 !command.get_disclaim_responsibility(),
-                "the runner's Local Network use stays the starting app's"
+                "the runner's privacy-gated acts stay the starting app's"
             );
             assert_eq!(
                 command.leaves_background_band(),

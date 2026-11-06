@@ -6,6 +6,7 @@
 use std::process::ExitCode;
 
 use crate::flow::now_unix;
+use crate::source::{advance_floors, build_floor, effective_anchor};
 
 /// The dispatch roster, public so the manual (a sibling crate) can be pinned against the verbs that actually run.
 #[must_use]
@@ -374,9 +375,7 @@ const TABLE: &[Verb] = &[
     Verb {
         name: "lease",
         tier: Tier::Plumbing,
-        usage: "aterm pkg lease <toolchain-dir> [--who <words>] -- <command> [args…]  — hold \
-                the toolchain while <command> runs: no cleanup, no unattended swap, no rustup \
-                re-lay",
+        usage: "aterm pkg lease (<toolchain-dir> | --tool <name>...) [--who <words>] -- <command> [args…]  — hold a directory, or authenticate and lease named build prerequisites, until the command exits",
         arity: Arity::Own,
         program_flags: None,
         mutates_store: false,
@@ -3733,9 +3732,15 @@ fn runs_self_update_verb(layout: &crate::store::Layout, tool: &str, args: &[Stri
 
 #[derive(Debug, PartialEq, Eq)]
 struct LeaseArgs {
-    dir: std::path::PathBuf,
+    subject: LeaseSubject,
     who: Option<String>,
     command: Vec<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LeaseSubject {
+    Directory(std::path::PathBuf),
+    Prerequisites(Vec<crate::prerequisite::Prerequisite>),
 }
 
 fn parse_lease_args(rest: &[String]) -> Result<LeaseArgs, String> {
@@ -3747,10 +3752,18 @@ fn parse_lease_args(rest: &[String]) -> Result<LeaseArgs, String> {
         return Err("no command after `--`".to_string());
     }
     let mut dir = None;
+    let mut tools = Vec::new();
     let mut who = None;
     let mut it = head.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
+            "--tool" => {
+                let name = it
+                    .next()
+                    .ok_or("`--tool` needs an exposed prerequisite name")?;
+                let tool = crate::prerequisite::Prerequisite::named(name).ok_or_else(|| format!("unsupported prerequisite {name:?}; use gitleaks, python3.14, openssl-signing or lake"))?;
+                tools.push(tool);
+            }
             "--who" if who.is_none() => match it.next() {
                 Some(words) => who = Some(words.clone()),
                 None => return Err("`--who` takes the words that name the run".to_string()),
@@ -3759,11 +3772,14 @@ fn parse_lease_args(rest: &[String]) -> Result<LeaseArgs, String> {
             other => return Err(format!("unexpected argument {other:?}")),
         }
     }
-    let Some(dir) = dir else {
-        return Err("no toolchain directory to hold".to_string());
+    let subject = match (dir, tools.is_empty()) {
+        (Some(dir), true) => LeaseSubject::Directory(dir),
+        (None, false) => LeaseSubject::Prerequisites(tools),
+        (None, true) => return Err("name a toolchain directory or --tool prerequisite".into()),
+        (Some(_), false) => return Err("a directory and --tool are mutually exclusive".into()),
     };
     Ok(LeaseArgs {
-        dir,
+        subject,
         who: who.filter(|w| !w.trim().is_empty()),
         command: command.to_vec(),
     })
@@ -3800,6 +3816,7 @@ enum LeaseRun {
     NotHeld(crate::lease::Subject, crate::lease::LeaseError),
     NotStarted(std::io::Error),
     Lost(std::io::Error),
+    PrerequisiteRefused(String),
 }
 
 fn lease_and_run(
@@ -3809,10 +3826,39 @@ fn lease_and_run(
     wait: std::time::Duration,
     say: &mut dyn FnMut(&str),
 ) -> LeaseRun {
+    let dir = match &args.subject {
+        LeaseSubject::Directory(dir) => dir,
+        LeaseSubject::Prerequisites(wants) => {
+            let held = match crate::prerequisite::configured(wants, who) {
+                Ok(held) => held,
+                Err(why) => return LeaseRun::PrerequisiteRefused(why),
+            };
+            let path = match held.child_path(&std::env::var_os("PATH").unwrap_or_default()) {
+                Ok(path) => path,
+                Err(why) => return LeaseRun::PrerequisiteRefused(why),
+            };
+            say("atpkg lease: holding authenticated build prerequisites until the command exits");
+            for want in wants {
+                if let Some(tool) = held.tool(*want) {
+                    say(&format!(
+                        "atpkg lease: {} {} build {} tree {} as {}",
+                        tool.program(),
+                        want.recipe().version,
+                        tool.build(),
+                        tool.tree_root(),
+                        want.executable()
+                    ));
+                }
+            }
+            let result = lease_child(args, Some(&path));
+            drop(held);
+            return result;
+        }
+    };
     let Some(prefix) = prefix else {
         return LeaseRun::NoPrefix;
     };
-    let hold = match crate::lease::hold_for(prefix, &args.dir, who, wait) {
+    let hold = match crate::lease::hold_for(prefix, dir, who, wait) {
         Ok(hold) => hold,
         Err(missing) => return LeaseRun::Missing(missing),
     };
@@ -3826,7 +3872,7 @@ fn lease_and_run(
             format!(
                 "atpkg lease: {} is no build atpkg manages \u{2014} nothing of atpkg's reclaims \
                  it, so nothing is held",
-                args.dir.display()
+                dir.display()
             ),
         ),
         crate::lease::Hold::NotTaken(subject, error) => {
@@ -3834,14 +3880,22 @@ fn lease_and_run(
         }
     };
     say(&line);
+    let result = lease_child(args, None);
+    drop(hold);
+    result
+}
+
+fn lease_child(args: &LeaseArgs, path: Option<&std::ffi::OsStr>) -> LeaseRun {
     let forwarding = crate::platform::arm_forwarding();
     let mut command = aterm_uds::spawnfd::transparent(&args.command[0]);
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
     let mut child = match command.args(&args.command[1..]).spawn() {
         Ok(child) => child,
         Err(e) => return LeaseRun::NotStarted(e),
     };
     let status = crate::platform::wait_standing_aside(&mut child, forwarding);
-    drop(hold);
     match status {
         Ok(status) => LeaseRun::Ran(status),
         Err(e) => LeaseRun::Lost(e),
@@ -3912,6 +3966,10 @@ fn cmd_lane(rest: &[String]) -> ExitCode {
 }
 
 fn cmd_lease(rest: &[String]) -> ExitCode {
+    if rest == ["--capabilities"] {
+        println!("{}", crate::prerequisite::LEASE_CAPABILITY);
+        return ExitCode::SUCCESS;
+    }
     let args = match parse_lease_args(rest) {
         Ok(args) => args,
         Err(why) => return usage_error("lease", Some(&why)),
@@ -3963,6 +4021,10 @@ fn cmd_lease(rest: &[String]) -> ExitCode {
                 "atpkg lease: lost {} ({e}) \u{2014} the lease is let go",
                 args.command[0]
             );
+            ExitCode::from(1)
+        }
+        LeaseRun::PrerequisiteRefused(why) => {
+            eprintln!("atpkg lease: authenticated prerequisite refused: {why}");
             ExitCode::from(1)
         }
     }
@@ -5485,55 +5547,6 @@ fn record_index_freshness(layout: &crate::store::Layout, now: i64, index_build: 
     }
 }
 
-fn github_fetcher(layout: &crate::store::Layout) -> crate::GithubFetcher {
-    let cfg = crate::config::cached();
-    let owner = crate::resolve_account(cfg.account()).owner;
-    let floor = crate::index_probe::verified_floor(layout);
-    let hint = discovery_hint(
-        floor,
-        || crate::index_probe::cached_index_builds(layout, &crate::net::github_source_id(&owner)),
-        (owner == aterm_update_core::ATPKG_INDEX_OWNER)
-            .then(crate::net::stamped_index_hint)
-            .flatten(),
-        PUBLISHED_INDEX_HINT.with(std::cell::Cell::get),
-    );
-    crate::GithubFetcher::new(owner)
-        .with_overrides(crate::repo_overrides(cfg))
-        .with_index_floor(floor)
-        .with_index_hint(hint)
-        .with_unit_peers(crate::peers::unit_peers(cfg.peers.as_deref()))
-}
-
-fn discovery_hint(
-    floor: u64,
-    cached: impl FnOnce() -> Option<Vec<u64>>,
-    stamped: Option<crate::net::IndexHint>,
-    published: Option<u64>,
-) -> Option<crate::net::IndexHint> {
-    let fresh = floor == 0;
-    let cached = fresh
-        .then(cached)
-        .flatten()
-        .and_then(|b| b.into_iter().max());
-    let stamped = stamped.filter(|_| fresh);
-    let newest = [cached, stamped.map(|c| c.newest), published]
-        .into_iter()
-        .flatten()
-        .max()?;
-    Some(crate::net::IndexHint {
-        low: stamped.and_then(|c| c.low),
-        newest,
-    })
-}
-
-/// `ATPKG_REGISTRY`.
-pub(crate) const REGISTRY_SEAM: &str = "ATPKG_REGISTRY";
-
-/// The [`REGISTRY_SEAM`] value this process runs under.
-pub(crate) fn registry_seam() -> Option<std::ffi::OsString> {
-    aterm_types::dev_seam!(REGISTRY_SEAM)
-}
-
 fn already_current_line(r: &crate::flow::InstallReport) -> String {
     format!(
         "atpkg: {} already current (build {}, as index {} pins it)",
@@ -5541,42 +5554,8 @@ fn already_current_line(r: &crate::flow::InstallReport) -> String {
     )
 }
 
-/// The directory an `ATPKG_REGISTRY` value names with `dir:`, which [`resolve_fetcher`] serves through [`crate::DirFetcher`].
-pub(crate) fn dir_registry(spec: Option<&std::ffi::OsStr>) -> Option<std::path::PathBuf> {
-    spec?
-        .to_string_lossy()
-        .strip_prefix("dir:")
-        .map(std::path::PathBuf::from)
-}
-
 fn resolve_fetcher(layout: &crate::store::Layout) -> Box<dyn crate::flow::Fetcher> {
-    if let Some(dir) = dir_registry(registry_seam().as_deref()) {
-        return Box::new(crate::DirFetcher::new(dir));
-    }
-    Box::new(github_fetcher(layout))
-}
-
-fn effective_anchor(layout: &crate::store::Layout) -> crate::Anchor {
-    crate::Anchor::pinned(crate::sig::Floor::new(layout.roster_floor()).current())
-}
-
-fn build_floor(layout: &crate::store::Layout) -> crate::sig::BuildFloor {
-    crate::sig::BuildFloor {
-        index_build: crate::sig::Floor::new(layout.floor()).current(),
-        roster_seq: crate::sig::Floor::new(layout.floor_generation()).current(),
-    }
-}
-
-fn advance_floors(layout: &crate::store::Layout, index_build: u64, roster_seq: u64) {
-    let generation = crate::sig::Floor::new(layout.floor_generation());
-    let build = crate::sig::Floor::new(layout.floor());
-    if roster_seq > generation.current() {
-        build.rebase(index_build);
-    } else {
-        let _ = build.check_and_record(index_build);
-    }
-    let _ = generation.check_and_record(roster_seq);
-    crate::flow::observe_roster_generation(layout, roster_seq);
+    crate::source::resolve_fetcher(layout, PUBLISHED_INDEX_HINT.with(std::cell::Cell::get))
 }
 
 const fn manager_enabled() -> bool {
@@ -6181,6 +6160,53 @@ pub fn clip_cause(why: &str) -> String {
     let mut clipped: String = first.chars().take(CAUSE_CAP).collect();
     clipped.push('…');
     clipped
+}
+
+/// A group abort's cause as its notice, marker line and status row carry it: the failed step's
+/// own cause, then the members already flipped that were rolled back, then each one whose
+/// rollback could not put it back, with that rollback's own cause. Only the causes are clipped
+/// ([`clip_cause`]), so a long cause never pushes a member's name off the line.
+#[must_use]
+pub fn abort_cause(why: &str, rolled_back: &[(String, Result<(), String>)]) -> String {
+    let mut cause = clip_cause(why);
+    let back: Vec<&str> = rolled_back
+        .iter()
+        .filter(|(_, undone)| undone.is_ok())
+        .map(|(member, _)| member.as_str())
+        .collect();
+    if !back.is_empty() {
+        cause.push_str("; the members already flipped were rolled back: ");
+        cause.push_str(&back.join(", "));
+    }
+    for (member, undone) in rolled_back {
+        if let Err(stuck) = undone {
+            cause.push_str("; ");
+            cause.push_str(member);
+            cause.push_str(" could not be rolled back: ");
+            cause.push_str(&clip_cause(stuck));
+        }
+    }
+    cause
+}
+
+/// A group abort's phase and what it says the members run now: it failed staging or flipping,
+/// and after a flip, whether every member already flipped was put back on its previous version.
+fn abort_words(
+    during_flip: bool,
+    rolled_back: &[(String, Result<(), String>)],
+) -> (&'static str, &'static str) {
+    const PREVIOUS: &str = "still using the previous version";
+    match (
+        during_flip,
+        rolled_back.iter().all(|(_, undone)| undone.is_ok()),
+    ) {
+        (false, _) => ("stage", PREVIOUS),
+        (true, true) => ("flip (rolled back)", PREVIOUS),
+        (true, false) => (
+            "flip (rollback failed)",
+            "not every member is back on its previous version",
+        ),
+    }
 }
 
 /// The stable stdout markers the GUI parses (`crates/aterm-gui`, `parse_seed_line`).
@@ -10903,8 +10929,16 @@ fn bootstrap_group(
             }
             0
         }
-        Ok((crate::TxnOutcome::Aborted { failed, why, .. }, _)) => {
-            let cause = clip_cause(&why);
+        Ok((
+            crate::TxnOutcome::Aborted {
+                failed,
+                why,
+                rolled_back,
+                ..
+            },
+            _,
+        )) => {
+            let cause = abort_cause(&why, &rolled_back);
             eprintln!(
                 "atpkg: could not install {} ({failed}: {cause}) \u{2014} nothing changed",
                 missing.join(", ")
@@ -13361,18 +13395,15 @@ fn report_channel_apply(
                 failed,
                 during_flip,
                 why,
+                rolled_back,
             } => {
                 failures += 1;
                 failed_names.push(failed.clone());
-                let phase = if *during_flip {
-                    "flip (rolled back)"
-                } else {
-                    "stage"
-                };
-                let cause = clip_cause(why);
+                let (phase, using) = abort_words(*during_flip, rolled_back);
+                let cause = abort_cause(why, rolled_back);
                 eprintln!(
-                    "atpkg: could not update {} ({failed}: {cause}) \u{2014} still using the \
-                     previous version; the next update tries again",
+                    "atpkg: could not update {} ({failed}: {cause}) \u{2014} {using}; the next \
+                     update tries again",
                     group.members.join(", ")
                 );
                 emit_marker_line(&format!(

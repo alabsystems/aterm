@@ -796,6 +796,141 @@ fn a_sign_out_written_after_the_move_is_never_checked_away() {
     );
 }
 
+/// The stored login file the default home keeps for each world of
+/// [`the_upkeep_heal_answers_from_the_stored_login_file_and_runs_no_process`]: `None` keeps none
+/// (a keychain-held login).
+#[cfg(unix)]
+fn lay_default_credentials(desk: &Desk, tokens: Option<(&str, &str)>) {
+    let Some((access, refresh)) = tokens else {
+        return;
+    };
+    let dir = desk.home.join(".claude");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join(".credentials.json"),
+        format!(
+            "{{\"claudeAiOauth\":{{\"accessToken\":\"{access}\",\"refreshToken\":\"{refresh}\"}}}}"
+        ),
+    )
+    .unwrap();
+}
+
+/// A stand-in `claude` where [`resolve_claude_program`] finds it in `desk`'s home
+/// (`~/.local/bin/claude`): each run appends one line to the returned file and fails.
+#[cfg(unix)]
+fn plant_claude_stand_in(desk: &Desk) -> PathBuf {
+    let ran = desk.home.join("claude-ran.log");
+    let bin = desk.home.join(".local/bin");
+    fs::create_dir_all(&bin).unwrap();
+    let program = bin.join("claude");
+    fs::write(
+        &program,
+        format!("#!/bin/sh\necho \"$@\" >> '{}'\nexit 1\n", ran.display()),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+    ran
+}
+
+#[cfg(unix)]
+fn runs_noted(ran: &Path) -> usize {
+    fs::read_to_string(ran).map_or(0, |text| text.lines().count())
+}
+
+/// §4.15 rule 6 for the upkeep's heal of [`repointed_with_a_stale_sign_out`]: the live check
+/// ([`default_login_check_live`]) answers from the default home's stored login file alone, so the
+/// heal runs no process and notes no probe. A file holding a refresh token heals the row; one
+/// holding no token is signed out, and its sign-out stands; no file is no answer, which records
+/// nothing. Where the default login is the keychain's (macOS,
+/// [`crate::ai::connector::test_on_login_platform`] picks either OS on any), even a file holding
+/// a refresh token is not that login and heals nothing. NEGATIVE CONTROL: the planted stand-in
+/// is the program the check ran before (`claude auth status` through
+/// [`resolve_claude_program`]), and a run of it is noted, so a check that ran it would be seen.
+#[cfg(unix)]
+#[test]
+fn the_upkeep_heal_answers_from_the_stored_login_file_and_runs_no_process() {
+    let control = Desk::new("m2");
+    let ran = plant_claude_stand_in(&control);
+    let program = resolve_claude_program(&control.home);
+    let _ = super::super::cli::auth_status_within_for_test(
+        program.as_os_str(),
+        "",
+        &|name| (name == "USER").then(|| "lab".into()),
+        Duration::from_secs(60),
+    );
+    assert_eq!(
+        runs_noted(&ran),
+        1,
+        "CONTROL: the CLI check the heal made before runs the stand-in, and its run is noted"
+    );
+
+    for (in_file, tokens, healed_to, words) in [
+        (
+            true,
+            Some(("", "lab-refresh")),
+            accounts::Auth::Ok,
+            "checked signed in",
+        ),
+        (
+            true,
+            Some(("", "")),
+            accounts::Auth::SignedOut,
+            "answered signed out",
+        ),
+        (true, None, accounts::Auth::SignedOut, DEFAULT_LOGIN_UNREAD),
+        (
+            false,
+            Some(("", "lab-refresh")),
+            accounts::Auth::SignedOut,
+            DEFAULT_LOGIN_IN_KEYCHAIN,
+        ),
+    ] {
+        let desk = Desk::new("m2");
+        let store = desk.store();
+        repointed_with_a_stale_sign_out(&desk, NOW + 20);
+        lay_default_credentials(&desk, tokens);
+        let ran = plant_claude_stand_in(&desk);
+        let fetch = |_: &Env, source: &str| -> Result<String, String> {
+            Err(format!("no fetch in a test: {source}"))
+        };
+        let spawn = |_work: Box<dyn FnOnce() + Send>| Ok(());
+        let inline = |work: Box<dyn FnOnce() + Send>| {
+            work();
+            Ok(())
+        };
+        let (cooldown, rediscovery) = (Mutex::new(None), Mutex::new(Rediscovery::default()));
+        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let kept = Arc::clone(&lines);
+        let mut fx = upkeep_effects(&fetch, &spawn, &cooldown, &rediscovery, &guard);
+        fx.spawn_vault = &inline;
+        fx.default_check = |home, _scope| default_login_check_live(home);
+        fx.log = Arc::new(move |line: &str| kept.lock().unwrap().push(line.to_owned()));
+        let ((), probes) = crate::ai::connector::test_on_login_platform(in_file, || {
+            super::super::provider_read::captured(|| {
+                heal_default_login_in_upkeep(
+                    &desk.home,
+                    &desk.state,
+                    &desk.roster(),
+                    NOW + 100,
+                    &fx,
+                );
+            })
+        });
+        let lines = lines.lock().unwrap().clone();
+        assert_eq!(lines.len(), 1, "{in_file} {tokens:?}: {lines:?}");
+        assert!(lines[0].contains(words), "{in_file} {tokens:?}: {lines:?}");
+        assert_eq!(runs_noted(&ran), 0, "{tokens:?}: the heal ran no process");
+        assert!(probes.is_empty(), "{tokens:?}: no probe: {probes:?}");
+        let (state, _) = store.load(NOW + 100).unwrap();
+        assert_eq!(state.account("m2-2").auth, healed_to, "{tokens:?}");
+        if healed_to == accounts::Auth::SignedOut {
+            assert_eq!(state.account("m2-2").auth_at, Some(NOW + 20), "{tokens:?}");
+        }
+    }
+}
+
 /// The default login's move takes `active` with it: m2 was the active account (pinned) when a
 /// `/login` moved the default login onto m2-2, which holds a login made now; `active` names m2-2,
 /// proven, with no canary and nothing to go back to, and the listing's `active` mark is m2-2's.

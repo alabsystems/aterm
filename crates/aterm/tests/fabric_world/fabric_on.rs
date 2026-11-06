@@ -174,9 +174,20 @@ impl Drop for Broker {
     }
 }
 
+fn node_ring_rules(fleet: &str, node: &str) -> Vec<String> {
+    astream_cap::GrantCeiling::aterm_node_ring(fleet, node)
+        .expect("node ceiling")
+        .rules()
+}
+
 fn deployed_broker_checks_the_minted_caps(s: &Scratch, node: &str) {
     let caps = aterm_link::bridge::read_cap_file(&s.path("root/node.cap")).expect("cap file");
-    assert_eq!(caps.len(), 6);
+    assert_eq!(
+        caps.iter()
+            .map(|cap| cap.grant.as_str())
+            .collect::<Vec<_>>(),
+        node_ring_rules("local", node)
+    );
     let mut c = harness::broker_client(s.sock());
     c.attach_all(
         caps.iter()
@@ -482,12 +493,19 @@ fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
     let node = node.trim().to_string();
     assert!(node.starts_with("n-") && node.len() == 18, "{node}");
     let cap = std::fs::read_to_string(s.root().join("node.cap")).expect("cap");
-    assert_eq!(cap.lines().count(), 6, "{cap}");
+    assert_eq!(
+        cap.lines().count(),
+        node_ring_rules("local", &node).len(),
+        "{cap}"
+    );
     assert_eq!(
         cap.lines()
             .filter(|l| l.contains(&format!("p={node}:")))
             .count(),
-        3,
+        node_ring_rules("local", &node)
+            .iter()
+            .filter(|rule| rule.contains(&format!("p={node}:")))
+            .count(),
         "{cap}"
     );
     assert_eq!(mode_of(&s.root().join("node.cap")), 0o600);
@@ -724,7 +742,7 @@ fn a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model() {
         .iter_mut()
         .find(|(key, _)| *key == "Grants")
         .expect("the model has Grants")
-        .1 = 6;
+        .1 = i64::try_from(node_ring_rules("local", "n-0").len()).unwrap();
     let stale = |s: &Scratch, node: &str| {
         harness::write_cap(
             &s.root().join("node.cap"),
@@ -800,7 +818,7 @@ fn a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model() {
     };
 
     for existing in ["absent", "stale", "foreign", "renode"] {
-        for fail_at in ["1", "3", "6"] {
+        for fail_at in (1..=node_ring_rules("local", "n-0").len()).map(|n| n.to_string()) {
             let s = Scratch::new(&format!("mint-{existing}-{fail_at}"));
             let node = node_of(&s);
             seed_secret(&s);
@@ -818,7 +836,7 @@ fn a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model() {
             let (code, out, _) = run(s
                 .fabric_cmd(&["on", "--service", "none"])
                 .env("ATERM_FABRIC_TRACE", s.path("effects.trace"))
-                .env("ATERM_FABRIC_FAIL_MINT_AT", fail_at));
+                .env("ATERM_FABRIC_FAIL_MINT_AT", &fail_at));
             assert_eq!(code, 1, "{existing}/{fail_at}:\n{out}");
             assert_eq!(secret_bytes(&s), secret_before, "the secret was replaced");
             assert_eq!(
@@ -909,19 +927,20 @@ fn a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model() {
         let trace = trace_of(&s);
         assert_eq!(
             trace,
-            ["Mint"; 6]
-                .iter()
-                .map(|s| (*s).to_string())
+            std::iter::repeat_n("Mint".to_owned(), node_ring_rules("local", &node).len())
                 .chain(["Publish".to_string(), "Supervise".to_string()])
                 .collect::<Vec<_>>(),
             "{existing}"
         );
         let state = check(&trace);
-        assert_eq!(state["completed"], 6);
+        assert_eq!(
+            state["completed"],
+            i64::try_from(node_ring_rules("local", &node).len()).unwrap()
+        );
         assert_eq!(state["published"], 1);
         assert_eq!(state["supervised"], 1);
         let cap = std::fs::read_to_string(s.root().join("node.cap")).expect("cap");
-        assert_eq!(cap.lines().count(), 6);
+        assert_eq!(cap.lines().count(), node_ring_rules("local", &node).len());
         assert!(cap.lines().all(|l| l.contains("/f/local/")), "{cap}");
         assert!(cap.contains(&format!("p={node}:")));
         assert!(!cap.contains("n-previous"), "the stale cap survived: {cap}");
@@ -1531,7 +1550,7 @@ fn role_identity_reapplication_preserves_the_nondefault_fleet() {
             .unwrap();
     assert_eq!(rendezvous.fleet, "work");
     let caps = aterm_link::bridge::read_cap_file(&s.path("root/node.cap")).unwrap();
-    assert_eq!(caps.len(), 6);
+    assert_eq!(caps.len(), node_ring_rules("work", "n-0").len());
     assert!(
         caps.iter().all(|c| c.grant.contains(":/f/work/")),
         "{caps:?}"
@@ -1606,7 +1625,10 @@ fn off_then_on_for_another_fleet_mints_that_fleets_ring() {
         let (_, dry, _) = s.fabric(&["on", "--fleet", fleet, "--service", "none", "--dry-run"]);
         let cap = step(&dry, "cap").join("\n");
         assert!(
-            cap.contains("mint 6 grants"),
+            cap.contains(&format!(
+                "mint {} grants",
+                node_ring_rules(fleet, "n-0").len()
+            )),
             "the dry run mints a ring:\n{dry}"
         );
         cap
@@ -1633,7 +1655,8 @@ fn off_then_on_for_another_fleet_mints_that_fleets_ring() {
     );
     let caps = aterm_link::bridge::read_cap_file(&s.path("root/node.cap")).unwrap();
     assert!(
-        caps.len() == 6 && caps.iter().all(|c| c.grant.contains(":/f/other/")),
+        caps.len() == node_ring_rules("other", "n-0").len()
+            && caps.iter().all(|c| c.grant.contains(":/f/other/")),
         "{caps:?}\n{out}"
     );
     assert!(
@@ -1669,7 +1692,8 @@ fn off_then_on_for_another_fleet_mints_that_fleets_ring() {
     );
     let caps = aterm_link::bridge::read_cap_file(&s.path("root/node.cap")).unwrap();
     assert!(
-        caps.len() == 6 && caps.iter().all(|c| c.grant.contains(":/f/third/")),
+        caps.len() == node_ring_rules("third", "n-0").len()
+            && caps.iter().all(|c| c.grant.contains(":/f/third/")),
         "{caps:?}\n{out}"
     );
 }

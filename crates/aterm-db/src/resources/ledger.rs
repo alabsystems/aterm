@@ -127,7 +127,7 @@ pub(super) struct Ledger {
 impl Ledger {
     pub fn read(allocation: &Allocation, session: &Session<'_>, store: &Store) -> Result<Self> {
         let mut records = store.liability_evidence(session)?;
-        records.sort_by_key(|record| {
+        records.sort_unstable_by_key(|record| {
             (
                 record.header().actor,
                 record.header().sequence,

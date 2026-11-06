@@ -30,6 +30,11 @@ clean {
     -- spec_runs: a queued exchange runs, unless the pair's last one moved nothing and
     -- this Mac's summary has not changed since (the quiet rule).
     def spec_runs (remembers quietSame : Bool) : Bool := !(remembers && quietSame)
+    -- spec_asks_again: a start that asked an exchange asks it once more, when the ingest
+    -- has passed the last table record its log held at the start, unless its stores already
+    -- held what its log held then (finding H2: the first exchange can run before the ingest
+    -- and move nothing).
+    def spec_asks_again (asked ingested : Bool) : Bool := asked && !ingested
 
     namespace AtermMeshRelayLive
 
@@ -44,7 +49,8 @@ clean {
     -- per relay edge s→d, whether the edge still owes d the record (`owes`: the
     -- relay's cursor is below it), whether d's log lost what the edge had landed in
     -- it (`lost`: the next relay start reads a log that moved), whether an exchange is
-    -- asked (`asked`), and whether s remembers the pair's last exchange as quiet.
+    -- asked (`asked`), whether s remembers the pair's last exchange as quiet, and whether a
+    -- relay start owes the pair a second ask once s's stores ingest the record (`again`).
 
     structure W where
       log   : Nat → Bool
@@ -53,20 +59,24 @@ clean {
       lost  : Nat → Nat → Bool
       asked : Nat → Nat → Bool
       quiet : Nat → Nat → Bool
+      again : Nat → Nat → Bool
 
     structure Kernels where
       cursor : Bool → Bool → Bool → Bool → UInt8
       startRepair : UInt8 → UInt8
       requests : Bool → Bool → Bool
       runs : Bool → Bool → Bool
+      asksAgain : Bool → Bool → Bool
 
     def Exact (K : Kernels) : Prop :=
       (∀ a b c d, K.cursor a b c d = spec_cursor a b c d) ∧ (∀ c, K.startRepair c = spec_start_repair c) ∧
-      (∀ a b, K.requests a b = spec_requests a b) ∧ (∀ a b, K.runs a b = spec_runs a b)
+      (∀ a b, K.requests a b = spec_requests a b) ∧ (∀ a b, K.runs a b = spec_runs a b) ∧
+      (∀ a b, K.asksAgain a b = spec_asks_again a b)
 
-    def spec : Kernels := Kernels.mk spec_cursor spec_start_repair spec_requests spec_runs
+    def spec : Kernels := Kernels.mk spec_cursor spec_start_repair spec_requests spec_runs spec_asks_again
 
-    theorem spec_exact : Exact spec := ⟨fun _ _ _ _ => rfl, fun _ => rfl, fun _ _ => rfl, fun _ _ => rfl⟩
+    theorem spec_exact : Exact spec :=
+      ⟨fun _ _ _ _ => rfl, fun _ => rfl, fun _ _ => rfl, fun _ _ => rfl, fun _ _ => rfl⟩
 
     -- The events: an edge lands the record in d's log (its flood owes d's own edges
     -- the record when d's log did not hold it), a Mac ingests its log into its stores,
@@ -74,8 +84,9 @@ clean {
     -- its stores hold it; each edge it owed asks an exchange by the gap notice), d's log
     -- loses it (an unclean stop or a renewed log; never a durable Mac's), a relay
     -- starts again (its entry's presence and freshness, and whether the lineage
-    -- continues, are the run's), an asked exchange happens, and the digest trigger
-    -- asks one (H1, B7c).
+    -- continues, are the run's; a start that asks while s's stores lack what s's log
+    -- holds owes a second ask, which s's ingest, or a cut, answers), an asked exchange
+    -- happens, and the digest trigger asks one (H1, B7c).
     inductive Ev where
       | land (s d : Nat)
       | ingest (m : Nat)
@@ -113,13 +124,17 @@ clean {
 
     def ingestW (w : W) (m : Nat) : W :=
       { w with store := set1 w.store m true,
-               quiet := fun x y => if x = m then (w.quiet x y && w.store m) else w.quiet x y }
+               quiet := fun x y => if x = m then (w.quiet x y && w.store m) else w.quiet x y,
+               asked := fun x y => if x = m then (w.asked x y || w.again x y) else w.asked x y,
+               again := fun x y => if x = m then false else w.again x y }
 
     def cutW (K : Kernels) (noGap : Bool) (w : W) (s : Nat) : W :=
       { w with log := set1 w.log s false,
                owes := fun x y => if x = s then false else w.owes x y,
-               asked := fun x y => if x = s then (w.asked x y || (w.owes x y && K.requests true noGap))
-                                   else w.asked x y }
+               asked := fun x y => if x = s then ((w.asked x y || (w.owes x y && K.requests true noGap)) ||
+                                                  w.again x y)
+                                   else w.asked x y,
+               again := fun x y => if x = s then false else w.again x y }
 
     def loseW (w : W) (d : Nat) : W :=
       { w with log := set1 w.log d false,
@@ -132,7 +147,10 @@ clean {
                   then w.owes s d else false),
                asked := set2 w.asked s d
                  (w.asked s d || !(decide (K.startRepair (cursorOf K w s d has fresh cont) = 0))),
-               lost := set2 w.lost s d false }
+               lost := set2 w.lost s d false,
+               again := set2 w.again s d
+                 (w.again s d || K.asksAgain (!(decide (K.startRepair (cursorOf K w s d has fresh cont) = 0)))
+                   (w.store s || !w.log s)) }
 
     def keepQ (w : W) (s d x : Nat) (u : Bool) : Bool :=
       if x = s then decide (w.store s = u) else if x = d then decide (w.store d = u) else true
@@ -195,7 +213,7 @@ clean {
     def Init (nb : Nat → Nat → Bool) (o : Nat) (w : W) : Prop :=
       (∀ x, w.log x = decide (x = o)) ∧ (∀ x, w.store x = decide (x = o)) ∧
       (∀ x y, w.owes x y = (decide (x = o) && nb x y)) ∧ (∀ x y, w.lost x y = false) ∧
-      (∀ x y, w.asked x y = false) ∧ (∀ x y, w.quiet x y = false)
+      (∀ x y, w.asked x y = false) ∧ (∀ x y, w.quiet x y = false) ∧ (∀ x y, w.again x y = false)
 
     def SpecM (M : Model) (o : Nat) : StateMachine W :=
       StateMachine.mk (Init M.nb o) (fun w w' => ∃ e, w' = step M e w)
@@ -254,7 +272,7 @@ clean {
     def QInv (w : W) : Prop := ∀ s d, w.quiet s d = true → w.store s = true → w.store d = true
 
     theorem init_qinv (nb : Nat → Nat → Bool) (o : Nat) (w : W) (h : Init nb o w) : QInv w :=
-      fun s d hq _ => absurd (hq.symm.trans (h.2.2.2.2.2 s d)) (by decide)
+      fun s d hq _ => absurd (hq.symm.trans (h.2.2.2.2.2.1 s d)) (by decide)
 
     theorem step_qinv (M : Model) (e : Ev) (w : W) (hi : QInv w) : QInv (step M e w) := by
       rcases step_spec M e w with ⟨hg, he⟩ | he
@@ -386,7 +404,7 @@ clean {
         exact or_l _ _ hl'
 
     theorem quiet_of_skip (K : Kernels) (hK : Exact K) (q : Bool) (hr : ¬ K.runs true q = true) : q = true := by
-      rw [hK.2.2.2 true q] at hr
+      rw [hK.2.2.2.1 true q] at hr
       cases q with
       | false => exact absurd rfl hr
       | true => rfl
@@ -400,11 +418,16 @@ clean {
       · rw [he] at ha' ⊢
         cases e with
         | land a b => exact (ne_true _ ha ha').elim
-        | ingest m => exact (ne_true _ ha ha').elim
+        | ingest m =>
+          have h1 : (if s = m then (w.asked s d || w.again s d) else w.asked s d) = false := ha'
+          by_cases hsm : s = m
+          · rw [if_pos hsm] at h1; exact (ne_true _ (or_l _ _ ha) h1).elim
+          · rw [if_neg hsm] at h1; exact (ne_true _ ha h1).elim
         | cut a =>
-          have h1 : (if s = a then (w.asked s d || (w.owes s d && M.K.requests true M.noGap)) else w.asked s d) = false := ha'
+          have h1 : (if s = a then ((w.asked s d || (w.owes s d && M.K.requests true M.noGap)) || w.again s d)
+              else w.asked s d) = false := ha'
           by_cases hsa : s = a
-          · rw [if_pos hsa] at h1; exact (ne_true _ (or_l _ _ ha) h1).elim
+          · rw [if_pos hsa] at h1; exact (ne_true _ (or_l _ _ (or_l _ _ ha)) h1).elim
           · rw [if_neg hsa] at h1; exact (ne_true _ ha h1).elim
         | lose a => exact (ne_true _ ha ha').elim
         | restart a b f g c =>
@@ -579,10 +602,10 @@ clean {
           · have hg' : (w.log a && w.store a) = true := hg
             rw [← hsa] at hg'
             refine Or.inr (Or.inl ⟨?_, and_r _ _ hg'⟩)
-            show (if s = a then (w.asked s d || (w.owes s d && M.K.requests true M.noGap))
+            show (if s = a then ((w.asked s d || (w.owes s d && M.K.requests true M.noGap)) || w.again s d)
                   else w.asked s d) = true
             rw [if_pos hsa, ho, hK.2.2.1 true M.noGap, hg0]
-            exact or_r _ _ rfl
+            exact or_l _ _ (or_r _ _ rfl)
           · have hx : ((cutW M.K M.noGap w a).owes s d && (cutW M.K M.noGap w a).log s) = true := by
               show ((if s = a then false else w.owes s d) && set1 w.log a false s) = true
               rw [if_neg hsa, set1_ne _ _ _ _ hsa]; exact h
@@ -625,6 +648,76 @@ clean {
           · rw [exchangeW_skip M.K w a b hr] at h0; exact (ne_true _ h h0).elim
         | digest a b => exact (ne_true _ h h').elim
       · rw [he] at h'; exact (ne_true _ h h').elim
+
+    -- A relay that starts again anywhere but its kept cursor, its log holding the record, asks an
+    -- exchange, and while its stores lack the record it owes the pair a second ask.
+    theorem restart_asks (M : Model) (hK : Exact M.K) (w : W) (s d : Nat) (f g c : Bool)
+        (hc : cursorOf M.K w s d f g c ≠ 1) (hl : w.log s = true) :
+        (step M (Ev.restart s d f g c) w).asked s d = true ∧
+          ((step M (Ev.restart s d f g c) w).store s = true ∨
+            (step M (Ev.restart s d f g c) w).again s d = true) := by
+      have hs : step M (Ev.restart s d f g c) w = restartW M.K w s d f g c := rfl
+      have ha : M.K.startRepair (cursorOf M.K w s d f g c) ≠ 0 := by
+        rw [hK.2.1]; unfold spec_start_repair; rw [if_neg hc]
+        by_cases h2 : cursorOf M.K w s d f g c = 2
+        · rw [if_pos h2]; decide
+        · rw [if_neg h2]; decide
+      rw [hs]
+      refine ⟨?_, ?_⟩
+      · show set2 w.asked s d
+          (w.asked s d || !(decide (M.K.startRepair (cursorOf M.K w s d f g c) = 0))) s d = true
+        rw [set2_eq]; exact or_r _ _ (asks_of_ne _ ha)
+      · by_cases hst : w.store s = true
+        · exact Or.inl hst
+        · apply Or.inr
+          show set2 w.again s d (w.again s d || M.K.asksAgain
+            (!(decide (M.K.startRepair (cursorOf M.K w s d f g c) = 0))) (w.store s || !w.log s)) s d = true
+          rw [set2_eq, hK.2.2.2.2, asks_of_ne _ ha, not_true _ hst, hl]
+          exact or_r _ _ rfl
+
+    -- A start's second ask ends only when s ingests, or cuts (which only a record its stores hold
+    -- allows): the exchange is then asked, s's stores holding the record.
+    theorem again_drop (M : Model) (e : Ev) (w : W) (s d : Nat)
+        (ha : w.again s d = true) (ha' : (step M e w).again s d = false) :
+        (step M e w).asked s d = true ∧ (step M e w).store s = true := by
+      rcases step_spec M e w with ⟨hg, he⟩ | he
+      · rw [he] at ha' ⊢
+        cases e with
+        | land a b => exact (ne_true _ ha ha').elim
+        | ingest m =>
+          by_cases hsm : s = m
+          · refine ⟨?_, ?_⟩
+            · show (if s = m then (w.asked s d || w.again s d) else w.asked s d) = true
+              rw [if_pos hsm]; exact or_r _ _ ha
+            · show set1 w.store m true s = true
+              rw [hsm, set1_eq]
+          · have h1 : (if s = m then false else w.again s d) = false := ha'
+            rw [if_neg hsm] at h1; exact (ne_true _ ha h1).elim
+        | cut a =>
+          by_cases hsa : s = a
+          · have hg' : (w.log a && w.store a) = true := hg
+            refine ⟨?_, ?_⟩
+            · show (if s = a then ((w.asked s d || (w.owes s d && M.K.requests true M.noGap)) || w.again s d)
+                  else w.asked s d) = true
+              rw [if_pos hsa]; exact or_r _ _ ha
+            · show w.store s = true
+              rw [hsa]; exact and_r _ _ hg'
+          · have h1 : (if s = a then false else w.again s d) = false := ha'
+            rw [if_neg hsa] at h1; exact (ne_true _ ha h1).elim
+        | lose a => exact (ne_true _ ha ha').elim
+        | restart a b f g c =>
+          have h1 : set2 w.again a b (w.again a b || M.K.asksAgain
+              (!(decide (M.K.startRepair (cursorOf M.K w a b f g c) = 0))) (w.store a || !w.log a)) s d = false := ha'
+          by_cases hp : s = a ∧ d = b
+          · rw [hp.1, hp.2, set2_eq] at h1; rw [hp.1, hp.2] at ha; exact (ne_true _ (or_l _ _ ha) h1).elim
+          · rw [set2_ne _ _ _ _ _ _ hp] at h1; exact (ne_true _ ha h1).elim
+        | exchange a b =>
+          have h0 : (exchangeW M.K w a b).again s d = false := ha'
+          by_cases hr : M.K.runs true (w.quiet a b) = true
+          · rw [exchangeW_run M.K w a b hr] at h0; exact (ne_true _ ha h0).elim
+          · rw [exchangeW_skip M.K w a b hr] at h0; exact (ne_true _ ha h0).elim
+        | digest a b => exact (ne_true _ ha ha').elim
+      · rw [he] at ha'; exact (ne_true _ ha ha').elim
 
 
     -- ===========================================================================
@@ -682,17 +775,13 @@ clean {
         exact step_carrier M (ev (n + k)) (b (n + k)) s hd ih
 
     -- The fair hop from s to d: its relay lands what it owes, d ingests what its log holds, a relay
-    -- that finds d's log moved starts again, and an asked exchange happens.
+    -- that finds d's log moved starts again, an asked exchange happens, and a start's second ask is
+    -- answered (s's ingest passes the last table record its log held at the start: H2's repair,
+    -- `h2Run` below).
     def FairHop (b : Nat → W) (s d : Nat) : Prop :=
       Fades (fun i => (b i).owes s d && (b i).log s) ∧ Fades (fun i => (b i).log d && !(b i).store d) ∧
-      Fades (fun i => (b i).lost s d) ∧ Fades (fun i => (b i).asked s d)
-
-    -- Premise H2: a relay that starts again anywhere but its kept cursor does so only once s's
-    -- stores hold what s's log holds. Without it the exchange it asks can run before s ingests, move
-    -- nothing, and leave nothing asking again (`h2_race` below).
-    def RepairAfterIngest (M : Model) (b : Nat → W) (ev : Nat → Ev) (s d : Nat) : Prop :=
-      ∀ i f g c, ev i = Ev.restart s d f g c → (b i).log s = true → cursorOf M.K (b i) s d f g c ≠ 1 →
-        (b i).store s = true
+      Fades (fun i => (b i).lost s d) ∧ Fades (fun i => (b i).asked s d) ∧
+      Fades (fun i => (b i).again s d)
 
 
     -- ===========================================================================
@@ -711,11 +800,30 @@ clean {
           exact asked_drop M hK (ev (n + i)) (b (n + i)) s d (run_qinv M o b ev hr (n + i)) hj.1 h0
             (run_store M o b ev hr s n hs i)⟩)
 
+    -- A relay that starts again anywhere but its kept cursor, its log holding the record, asks an
+    -- exchange from stores that hold it: at once, or by its second ask once s ingests (H2).
+    theorem restart_leads_to_ask (M : Model) (o : Nat) (b : Nat → W) (ev : Nat → Ev)
+        (hr : RunsE M o b ev) (hK : Exact M.K) (s d t : Nat) (f g c : Bool)
+        (hfa : Fades (fun i => (b i).again s d)) (he : ev t = Ev.restart s d f g c)
+        (hc : cursorOf M.K (b t) s d f g c ≠ 1) (hl : (b t).log s = true) :
+        ∃ j, (b j).asked s d = true ∧ (b j).store s = true := by
+      have hst : b (t + 1) = step M (Ev.restart s d f g c) (b t) := by rw [hr.2 t, he]
+      have hra := restart_asks M hK (b t) s d f g c hc hl
+      rcases hra.2 with hs | hag
+      · exact ⟨t + 1, by rw [hst]; exact hra.1, by rw [hst]; exact hs⟩
+      · have hag1 : (b (t + 1)).again s d = true := by rw [hst]; exact hag
+        exact Exists.elim (fade_edge _ hfa (t + 1) hag1) (fun i hj => by
+          have h0 : (b (t + 1 + i + 1)).again s d = false := hj.2
+          rw [hr.2 (t + 1 + i)] at h0
+          have hd := again_drop M (ev (t + 1 + i)) (b (t + 1 + i)) s d hj.1 h0
+          exact ⟨t + 1 + i + 1, by rw [hr.2 (t + 1 + i)]; exact hd.1,
+            by rw [hr.2 (t + 1 + i)]; exact hd.2⟩)
+
     -- A relay into a log that lost what it answered starts again and asks, its stores holding it.
     theorem lost_leads_to_ask (M : Model) (o : Nat) (b : Nat → W) (ev : Nat → Ev)
         (hr : RunsE M o b ev) (hK : Exact M.K) (s d m : Nat) (hd : M.durable s = true)
         (hc : ((b m).log s || (b m).store s) = true) (hfr : Fades (fun i => (b i).lost s d))
-        (hra : RepairAfterIngest M b ev s d) (hl : (b m).lost s d = true) :
+        (hfa : Fades (fun i => (b i).again s d)) (hl : (b m).lost s d = true) :
         ∃ j, (b j).asked s d = true ∧ (b j).store s = true :=
       Exists.elim (fade_edge _ hfr m hl) (fun i hj => by
         have hlj : (b (m + i)).lost s d = true := hj.1
@@ -723,25 +831,21 @@ clean {
         rw [hr.2 (m + i)] at h0
         have hd' := lost_drop M hK (ev (m + i)) (b (m + i)) s d hlj h0
         have hcj : ((b (m + i)).log s || (b (m + i)).store s) = true := run_carrier M o b ev hr s hd m hc i
-        have hsj : (b (m + i)).store s = true := by
-          cases hst : (b (m + i)).store s with
-          | true => rfl
-          | false =>
-            rw [hst] at hcj
-            have hls : (b (m + i)).log s = true := or_false_l _ hcj
-            exact Exists.elim hd'.2 (fun f hf => Exists.elim hf (fun g hg => Exists.elim hg (fun c hc' => by
-              have hcur : cursorOf M.K (b (m + i)) s d f g c ≠ 1 := by
-                unfold cursorOf; rw [hlj]; exact (moved_cursor M.K hK f g c).1
-              have hx := hra (m + i) f g c hc' hls hcur
-              rw [hst] at hx; exact hx)))
-        exact ⟨m + i + 1, by rw [hr.2 (m + i)]; exact hd'.1,
-          by rw [hr.2 (m + i)]; exact store_mono M (ev (m + i)) (b (m + i)) s hsj⟩)
+        by_cases hsj : (b (m + i)).store s = true
+        · exact ⟨m + i + 1, by rw [hr.2 (m + i)]; exact hd'.1,
+            by rw [hr.2 (m + i)]; exact store_mono M (ev (m + i)) (b (m + i)) s hsj⟩
+        · have hls : (b (m + i)).log s = true := by
+            rw [not_true _ hsj] at hcj; exact or_false_l _ hcj
+          exact Exists.elim hd'.2 (fun f hf => Exists.elim hf (fun g hg => Exists.elim hg (fun c hc' => by
+            have hcur : cursorOf M.K (b (m + i)) s d f g c ≠ 1 := by
+              unfold cursorOf; rw [hlj]; exact (moved_cursor M.K hK f g c).1
+            exact restart_leads_to_ask M o b ev hr hK s d (m + i) f g c hfa hc' hcur hls))))
 
     -- What d's log took from the edge reaches d's stores, or d's log lost it and Inventory brings it.
     theorem log_reaches_store (M : Model) (o : Nat) (b : Nat → W) (ev : Nat → Ev)
         (hr : RunsE M o b ev) (hK : Exact M.K) (s d m : Nat) (hd : M.durable s = true)
         (hc : ((b m).log s || (b m).store s) = true) (hf : FairHop b s d)
-        (hra : RepairAfterIngest M b ev s d) (hl : (b m).log d = true) : ∃ k, (b k).store d = true := by
+        (hl : (b m).log d = true) : ∃ k, (b k).store d = true := by
       cases hsd : (b m).store d with
       | true => exact ⟨m, hsd⟩
       | false =>
@@ -763,15 +867,16 @@ clean {
               have hcj : ((b (m + i + 1)).log s || (b (m + i + 1)).store s) = true :=
                 run_carrier M o b ev hr s hd m hc (i + 1)
               exact Exists.elim
-                (lost_leads_to_ask M o b ev hr hK s d (m + i + 1) hd hcj hf.2.2.1 hra hls)
-                (fun k hk => asked_leads_to_store M o b ev hr hK s d k hf.2.2.2 hk.1 hk.2))
+                (lost_leads_to_ask M o b ev hr hK s d (m + i + 1) hd hcj hf.2.2.1 hf.2.2.2.2 hls)
+                (fun k hk => asked_leads_to_store M o b ev hr hK s d k hf.2.2.2.1 hk.1 hk.2))
 
     -- The edge's debt is paid: a record the relay from a durable s owes d reaches d's stores, by the
     -- push, or by Inventory after a retention cut (gap notice), after d's log lost what it answered
-    -- (lineage event), or after a relay that could not keep its cursor (new link).
+    -- (lineage event), or after a relay that could not keep its cursor (new link), the start's
+    -- second ask covering an exchange that ran before s ingested (H2).
     theorem the_edge_is_repaired (M : Model) (o : Nat) (b : Nat → W) (ev : Nat → Ev)
         (hr : RunsE M o b ev) (hK : Exact M.K) (hg0 : M.noGap = false) (s d n : Nat)
-        (hd : M.durable s = true) (hf : FairHop b s d) (hra : RepairAfterIngest M b ev s d)
+        (hd : M.durable s = true) (hf : FairHop b s d)
         (h : ((b n).owes s d && (b n).log s) = true) : ∃ k, (b k).store d = true :=
       Exists.elim (fade_edge _ hf.1 n h) (fun i hj => by
         have hpj : ((b (n + i)).owes s d && (b (n + i)).log s) = true := hj.1
@@ -781,15 +886,14 @@ clean {
         have hc1 : ((b (n + i + 1)).log s || (b (n + i + 1)).store s) = true :=
           run_carrier M o b ev hr s hd (n + i) (or_l _ _ hlj) 1
         rcases owes_drop M hK hg0 (ev (n + i)) (b (n + i)) s d hd hpj hp1 with hland | hcut | ⟨f, g, c, hc'⟩
-        · exact log_reaches_store M o b ev hr hK s d (n + i + 1) hd hc1 hf hra
+        · exact log_reaches_store M o b ev hr hK s d (n + i + 1) hd hc1 hf
             (by rw [hr.2 (n + i)]; exact hland)
-        · exact asked_leads_to_store M o b ev hr hK s d (n + i + 1) hf.2.2.2
+        · exact asked_leads_to_store M o b ev hr hK s d (n + i + 1) hf.2.2.2.1
             (by rw [hr.2 (n + i)]; exact hcut.1)
             (by rw [hr.2 (n + i)]; exact store_mono M (ev (n + i)) (b (n + i)) s hcut.2)
-        · exact asked_leads_to_store M o b ev hr hK s d (n + i + 1) hf.2.2.2
-            (by rw [hr.2 (n + i)]; exact hc'.2.2)
-            (by rw [hr.2 (n + i)]
-                exact store_mono M (ev (n + i)) (b (n + i)) s (hra (n + i) f g c hc'.1 hlj hc'.2.1)))
+        · exact Exists.elim
+            (restart_leads_to_ask M o b ev hr hK s d (n + i) f g c hf.2.2.2.2 hc'.1 hc'.2.1 hlj)
+            (fun k hk => asked_leads_to_store M o b ev hr hK s d k hf.2.2.2.1 hk.1 hk.2))
 
 
     -- ===========================================================================
@@ -1018,19 +1122,25 @@ clean {
     def only0 (x : Nat) : Bool := decide (x = 0)
     def w0 : W :=
       W.mk (fun x => decide (x = 0)) (fun x => decide (x = 0)) (fun x y => decide (x = 0) && line x y)
-        (fun _ _ => false) (fun _ _ => false) (fun _ _ => false)
+        (fun _ _ => false) (fun _ _ => false) (fun _ _ => false) (fun _ _ => false)
     theorem w0_init : Init line 0 w0 :=
-      ⟨fun _ => rfl, fun _ => rfl, fun _ _ => rfl, fun _ _ => rfl, fun _ _ => rfl, fun _ _ => rfl⟩
+      ⟨fun _ => rfl, fun _ => rfl, fun _ _ => rfl, fun _ _ => rfl, fun _ _ => rfl, fun _ _ => rfl,
+        fun _ _ => rfl⟩
 
     def model (K : Kernels) (noGap : Bool) : Model := Model.mk K noGap only0 line
 
     -- Mutants of each kernel, each the decision the Rust negative controls take.
-    def quietBlind : Kernels := Kernels.mk spec_cursor spec_start_repair spec_requests (fun r _ => !r)
-    def gapDeaf : Kernels := Kernels.mk spec_cursor spec_start_repair (fun _ _ => false) spec_runs
+    def quietBlind : Kernels :=
+      Kernels.mk spec_cursor spec_start_repair spec_requests (fun r _ => !r) spec_asks_again
+    def gapDeaf : Kernels :=
+      Kernels.mk spec_cursor spec_start_repair (fun _ _ => false) spec_runs spec_asks_again
     def keptOnMove : Kernels :=
       Kernels.mk (fun h f _ _ => if (h && f) = true then 1 else 0) spec_start_repair spec_requests spec_runs
+        spec_asks_again
     def movedAsksNothing : Kernels :=
-      Kernels.mk spec_cursor (fun c => if c = 0 then 2 else 0) spec_requests spec_runs
+      Kernels.mk spec_cursor (fun c => if c = 0 then 2 else 0) spec_requests spec_runs spec_asks_again
+    def noSecondAsk : Kernels :=
+      Kernels.mk spec_cursor spec_start_repair spec_requests spec_runs (fun _ _ => false)
 
     -- The gap: Mac 0's retention cuts the record before its relay to Mac 1 lands it.
     def gapRun : List Ev := [Ev.cut 0, Ev.exchange 0 1]
@@ -1056,16 +1166,20 @@ clean {
         (runE (model spec false) (gapRun ++ [Ev.digest 1 2, Ev.exchange 1 2]) w0).store 2 = true := rfl
 
     -- H2: Mac 1's relay to Mac 2 starts at its head (a new link) while Mac 1's log holds the record
-    -- its stores have not ingested; the exchange it asks runs first and moves nothing.
-    def h2Run : List Ev := [Ev.land 0 1, Ev.restart 1 2 false false false, Ev.exchange 1 2, Ev.ingest 1]
-    def h2End : W := runE (model spec false) h2Run w0
-    theorem h2_race : h2End.store 1 = true ∧ h2End.store 2 = false ∧ h2End.log 2 = false ∧
-        h2End.owes 1 2 = false ∧ h2End.asked 1 2 = false ∧ h2End.lost 1 2 = false :=
-      ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
-    -- The order RepairAfterIngest asks for: ingest first, then the new link's exchange brings it.
-    theorem h2_ingest_first :
-        (runE (model spec false) [Ev.land 0 1, Ev.ingest 1, Ev.restart 1 2 false false false,
-          Ev.exchange 1 2] w0).store 2 = true := rfl
+    -- its stores have not ingested; the exchange it asks runs first and moves nothing. The start's
+    -- second ask, answered once Mac 1 ingests, brings it; without it nothing asks again. Mac 1 is
+    -- durable here (the run loses no log, so its states are `model`'s), as `the_edge_is_repaired`
+    -- takes the source to be: under `noSecondAsk` nothing is owed, asked, lost or pending, so the
+    -- run may stutter forever with `FairHop` holding and Mac 2 never gets the record.
+    def modelH2 (K : Kernels) : Model := Model.mk K false (fun x => decide (x ≤ 1)) line
+    def h2Run : List Ev :=
+      [Ev.land 0 1, Ev.restart 1 2 false false false, Ev.exchange 1 2, Ev.ingest 1, Ev.exchange 1 2]
+    theorem h2_second_ask_repairs : (runE (modelH2 spec) h2Run w0).store 2 = true := rfl
+    def h2End : W := runE (modelH2 noSecondAsk) h2Run w0
+    theorem h2_race_without_it : h2End.store 1 = true ∧ h2End.store 2 = false ∧ h2End.log 2 = false ∧
+        h2End.owes 1 2 = false ∧ h2End.asked 1 2 = false ∧ h2End.lost 1 2 = false ∧
+        h2End.again 1 2 = false :=
+      ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 
     -- ===========================================================================
@@ -1081,15 +1195,18 @@ clean {
     def yes (v : Bool) : Nat := if v = true then 1 else 0
 
     -- The cursor over (has, fresh, same, continues) as bits 3..0 of 0..15, then the start over the
-    -- codes 0..3, then requests over (gap, no_gap) and runs over (remembers, quiet_same), bits 1..0.
+    -- codes 0..3, then requests over (gap, no_gap), runs over (remembers, quiet_same) and
+    -- asks_again over (asked, ingested), bits 1..0.
     def sheet : List Nat :=
       (List.range 16).map (fun k => (spec_cursor (bit k 3) (bit k 2) (bit k 1) (bit k 0)).toNat) ++
       (List.range 4).map (fun k => (spec_start_repair (UInt8.ofNat k)).toNat) ++
       (List.range 4).map (fun k => yes (spec_requests (bit k 1) (bit k 0))) ++
-      (List.range 4).map (fun k => yes (spec_runs (bit k 1) (bit k 0)))
+      (List.range 4).map (fun k => yes (spec_runs (bit k 1) (bit k 0))) ++
+      (List.range 4).map (fun k => yes (spec_asks_again (bit k 1) (bit k 0)))
 
     theorem sheet_is : sheet =
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 1, 2, 0, 1, 2, 1, 1, 1, 0, 1, 1, 1, 0] := by rfl
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 1, 2, 0, 1, 2, 1, 1, 1, 0, 1, 1, 1, 0,
+          0, 0, 1, 0] := by rfl
 
     end AtermMeshRelayLive
 }

@@ -5,9 +5,8 @@
 
 use crate::presence::{
     AgentPhase, AgentReading, ChipLevel, Facts, Hand, HoldFact, Host, Level, Link, MailFacts,
-    MailLast, NeedFact, NeedSeverity, Pill, PillAct, PillHit, PillKind, PresenceTones, Rim, Slot,
-    StopCause, TurnFact, View, WallAnswer, chip_of_attention, fmt_dur, pill_age, pill_age_room,
-    pill_due, pill_layout, pill_text, pill_words, sanitize_token, short_sid, state_line,
+    MailLast, NeedFact, NeedSeverity, Slot, StopCause, TurnFact, WallAnswer, chip_of_attention,
+    fmt_dur, sanitize_token, short_sid, state_line,
 };
 use crate::{Duration, Instant};
 
@@ -111,12 +110,11 @@ pub(crate) fn need(severity: NeedSeverity, cause: StopCause, key: u64) -> NeedFa
         cause,
         key: (0, key),
         what: "never started".to_string(),
-        show_pill: true,
     }
 }
 
 #[test]
-fn the_wire_level_ranks_as_before_and_the_border_reads_no_level() {
+fn the_wire_level_ranks_as_before() {
     let now = Instant::now();
     let at = |f: TFacts| slot_of(f, now).level(0);
     assert_eq!(at(TFacts::default()), Level::Quiet);
@@ -202,7 +200,6 @@ fn the_wire_level_ranks_as_before_and_the_border_reads_no_level() {
     );
     assert_eq!(busy.level(0), Level::Hold);
     assert_eq!(busy.chip(), ChipLevel::Off);
-    assert_eq!(busy.severity(), None);
 }
 
 #[test]
@@ -726,8 +723,11 @@ fn the_chip_reads_the_published_need_and_the_persons_hold() {
     );
 }
 
+/// A NEED MOVES THE SLOT ON ITS WORDS AND ON ITS KEY: the key is the only mover where a transition
+/// keeps the words (a harness's entry whose tail alone was rewritten). CONTROL: the same need
+/// told again moves nothing.
 #[test]
-fn a_need_keeps_its_age_until_its_episode_moves() {
+fn a_need_moves_the_slot_on_its_words_and_on_its_key() {
     let t0 = Instant::now();
     let at = |s: u64| t0 + Duration::from_secs(s);
     let facts = |need: Option<NeedFact>| TFacts {
@@ -738,198 +738,28 @@ fn a_need_keeps_its_age_until_its_episode_moves() {
         facts(Some(need(NeedSeverity::Stuck, StopCause::Wall, 7))),
         t0,
     );
-    assert_eq!(s.need_since, t0);
-    let mut reworded = need(NeedSeverity::Stuck, StopCause::Wall, 7);
-    reworded.what = "other words".to_string();
-    assert!(s.absorb(facts(Some(reworded)), at(30)), "the words moved");
-    assert_eq!(s.need_since, t0, "the same episode keeps its age");
-    assert!(!s.absorb(
-        facts(Some({
-            let mut n = need(NeedSeverity::Stuck, StopCause::Wall, 7);
-            n.what = "other words".to_string();
-            n
-        })),
-        at(40)
-    ));
-    assert!(s.absorb(
-        facts(Some(need(NeedSeverity::Stuck, StopCause::Wall, 8))),
-        at(50)
-    ));
-    assert_eq!(s.need_since, at(50), "a new episode starts its own age");
+    let reworded = NeedFact {
+        what: "other words".to_string(),
+        ..need(NeedSeverity::Stuck, StopCause::Wall, 7)
+    };
+    assert!(
+        s.absorb(facts(Some(reworded.clone())), at(30)),
+        "the words moved"
+    );
+    assert!(
+        !s.absorb(facts(Some(reworded.clone())), at(40)),
+        "control: nothing moved"
+    );
+    let same_words = NeedFact {
+        key: (0, 8),
+        ..reworded
+    };
+    assert!(
+        s.absorb(facts(Some(same_words)), at(50)),
+        "the same words, a new transition"
+    );
     assert!(s.absorb(facts(None), at(60)));
     assert_eq!(s.chip(), ChipLevel::Off);
-}
-
-fn tones() -> PresenceTones {
-    PresenceTones {
-        wait: [1, 1, 1],
-        stop: [2, 2, 2],
-        yours: [3, 3, 3],
-    }
-}
-
-#[test]
-fn the_border_is_steady_and_a_quiet_view_costs_nothing() {
-    let mut v = View::default();
-    assert_eq!(v.fp(), 0);
-    assert!(
-        v.rim_glow(|| unreachable!("no tones on a quiet frame"))
-            .is_none()
-    );
-    assert!(!v.show(Rim::None, None, None), "nothing moved");
-    assert_eq!(v.fp(), 0);
-    let mut glows = Vec::new();
-    for rim in [Rim::Stuck, Rim::Decide, Rim::Yours] {
-        assert!(v.show(rim, Some(1), None));
-        let fp = v.fp();
-        assert_ne!(fp, 0);
-        assert!(!v.show(rim, Some(1), None));
-        assert_eq!(v.fp(), fp, "unmoved");
-        glows.push(v.rim_glow(tones).expect("lit"));
-    }
-    assert!(glows.iter().all(|g| g.wash_a == 0), "no wash");
-    assert_eq!(glows[0].accent, tones().stop);
-    assert_eq!(glows[1].accent, tones().wait);
-    assert_eq!(glows[2].accent, tones().yours);
-    assert_eq!(
-        (glows[0].border_scale_q4, glows[1].border_scale_q4),
-        (16, 16)
-    );
-    assert_eq!(
-        glows[2].border_scale_q4,
-        crate::presence::YOURS_BORDER_SCALE_Q4
-    );
-    assert!(glows[2].border_scale_q4 < 16, "the outline is thinner");
-    assert_eq!(Rim::Stuck.wire(), "stuck");
-    assert_eq!(Rim::of(NeedSeverity::Decide), Rim::Decide);
-}
-
-fn pill(kind: PillKind, tab: Option<usize>, act: Option<PillAct>, more: usize) -> Pill {
-    Pill {
-        kind,
-        session: 3,
-        label: if tab.is_some() { "fmt" } else { "" }.to_string(),
-        tab,
-        what: "never started".to_string(),
-        since: tab.map(|_| Instant::now()),
-        act,
-        more,
-    }
-}
-
-#[test]
-fn the_pill_names_a_background_tab_and_offers_the_act_in_front() {
-    let now = Instant::now();
-    let stuck = PillKind::Need(NeedSeverity::Stuck);
-    let back = pill_words(&pill(stuck, Some(4), None, 0), now);
-    assert_eq!(back.glyph, '\u{25c6}');
-    assert!(back.label.contains("fmt") && back.label.contains('4'));
-    assert_eq!(back.act, None);
-    assert_eq!(back.more, None);
-    assert_eq!(
-        back.text().split(" \u{b7} ").count(),
-        3,
-        "label, words, age"
-    );
-    let untitled = pill_words(
-        &Pill {
-            label: "tab 4".to_string(),
-            ..pill(stuck, Some(4), None, 0)
-        },
-        now,
-    );
-    assert_eq!(untitled.label, "tab 4");
-    assert_ne!(back.room, back.words);
-    assert!(back.room.ends_with("59s"), "{:?}", back.room);
-    let front = pill_words(&pill(stuck, None, Some(PillAct::Restart), 2), now);
-    assert!(front.label.is_empty(), "the front tab is named already");
-    assert_eq!(front.room, front.words, "no age, nothing to make room for");
-    let pane = pill_words(
-        &Pill {
-            label: "fmt".to_string(),
-            ..pill(stuck, None, None, 0)
-        },
-        now,
-    );
-    assert_eq!(pane.label, "fmt");
-    assert_eq!(pane.room, pane.words);
-    assert_eq!(front.act, Some(PillAct::Restart));
-    assert_eq!(front.more.as_deref(), Some("+2"));
-    let decide = pill_words(
-        &pill(PillKind::Need(NeedSeverity::Decide), None, None, 0),
-        now,
-    );
-    assert_eq!(decide.glyph, '\u{25c7}');
-    let yours = pill_words(
-        &pill(PillKind::Yours, None, Some(PillAct::HandBack), 0),
-        now,
-    );
-    assert_eq!(yours.glyph, '\u{270b}');
-    assert_eq!(yours.act, Some(PillAct::HandBack));
-}
-
-#[test]
-fn pill_hit_regions_resolve_to_their_acts_through_the_layout() {
-    let now = Instant::now();
-    let words = pill_words(
-        &pill(
-            PillKind::Need(NeedSeverity::Stuck),
-            None,
-            Some(PillAct::Restart),
-            2,
-        ),
-        now,
-    );
-    let cells = |s: &str| aterm_grapheme::str_grid_columns(s) as f64;
-    let lay = pill_layout(&words, 200.0, 1.0, cells);
-    let mut seen = Vec::new();
-    let mut x = 0.0;
-    while x < lay.width {
-        if let Some(hit) = lay.hit(x)
-            && seen.last() != Some(&hit)
-        {
-            seen.push(hit);
-        }
-        x += 0.5;
-    }
-    assert_eq!(
-        seen,
-        [PillHit::Go, PillHit::Act(PillAct::Restart), PillHit::More]
-    );
-    assert_eq!(lay.hit(-1.0), None);
-    assert_eq!(lay.hit(lay.width + 1.0), None);
-    let (_, act) = lay.act.expect("the act is drawn");
-    assert_eq!(
-        lay.hit(act.x + act.w / 2.0),
-        Some(PillHit::Act(PillAct::Restart))
-    );
-}
-
-#[test]
-fn the_words_clip_first_then_the_label_never_the_glyph() {
-    let now = Instant::now();
-    let words = pill_words(
-        &pill(
-            PillKind::Need(NeedSeverity::Decide),
-            Some(2),
-            Some(PillAct::Restart),
-            1,
-        ),
-        now,
-    );
-    let cells = |s: &str| aterm_grapheme::str_grid_columns(s) as f64;
-    let full = pill_layout(&words, 500.0, 1.0, cells);
-    for max in (0..=full.width as usize).rev() {
-        let lay = pill_layout(&words, max as f64, 1.0, cells);
-        assert_eq!(lay.glyph.w, full.glyph.w, "the glyph at {max}");
-        assert!(lay.width <= (max as f64).max(full.glyph.w), "fits at {max}");
-        if lay.label.w < full.label.w {
-            assert_eq!(lay.words.w, 0.0, "the words went first at {max}");
-        }
-        if lay.act.is_none() {
-            assert!(lay.more.is_none(), "the count goes before the act");
-        }
-    }
 }
 
 #[test]
@@ -953,10 +783,6 @@ fn sanitize_refuses_presence_glyphs_bidi_and_control_characters() {
             "{c:?}"
         );
     }
-    assert_eq!(
-        pill_text::<TestHost>("\u{25c6} ~/repo \u{b7} \u{270b}x\u{202e}", 32),
-        "~/repo \u{b7} x"
-    );
     assert_eq!(
         crate::presence::hold_reason_words::<TestHost>("main%20broken\u{202e}"),
         "main broken"
@@ -995,7 +821,6 @@ fn sanitize_strips_invisible_characters_on_every_path() {
             "ab",
             "{c:?}"
         );
-        assert_eq!(pill_text::<TestHost>(&format!("a{c}b"), 8), "ab", "{c:?}");
     }
     let smuggled = format!("ok{}end", hidden.iter().collect::<String>());
     assert_eq!(sanitize_token::<TestHost>(&smuggled, 64), "okend");
@@ -1028,13 +853,9 @@ fn a_cell_holds_what_the_grids_cell_holds() {
         .map(|c| format!("{}{}", char::from(c), marks(40)))
         .collect();
     for cap in [1usize, 2, 8, 32] {
-        for t in [
-            sanitize_token::<TestHost>(&many, cap),
-            pill_text::<TestHost>(&many, cap),
-        ] {
-            assert!(t.chars().count() <= 17 * cap, "cap {cap}: {t:?}");
-            assert!(aterm_grapheme::str_grid_columns(&t) <= cap, "cap {cap}");
-        }
+        let t = sanitize_token::<TestHost>(&many, cap);
+        assert!(t.chars().count() <= 17 * cap, "cap {cap}: {t:?}");
+        assert!(aterm_grapheme::str_grid_columns(&t) <= cap, "cap {cap}");
     }
 }
 
@@ -1042,60 +863,22 @@ fn a_cell_holds_what_the_grids_cell_holds() {
 fn the_cell_walk_is_linear_in_its_string() {
     for n in [256usize, 4096] {
         let raw = format!("a{}", "\u{301}".repeat(n));
-        for (name, work) in [
-            (
-                "sanitize",
-                measured(|| drop(sanitize_token::<TestHost>(&raw, 32))),
-            ),
-            ("pill", measured(|| drop(pill_text::<TestHost>(&raw, 32)))),
-        ] {
-            assert!(
-                work <= 8 * (n + 1),
-                "{name}: {work} characters measured for {}",
-                n + 1
-            );
-        }
+        let work = measured(|| drop(sanitize_token::<TestHost>(&raw, 32)));
+        assert!(
+            work <= 8 * (n + 1),
+            "{work} characters measured for {}",
+            n + 1
+        );
     }
 }
 
 #[test]
-fn durations_and_the_pills_age_step_by_their_own_units() {
+fn durations_and_short_ids_print_in_their_own_units() {
     assert_eq!(fmt_dur(Duration::from_secs(12)), "12s");
     assert_eq!(fmt_dur(Duration::from_secs(192)), "3m12s");
     assert_eq!(fmt_dur(Duration::from_secs(7_500)), "2h05m");
     assert_eq!(fmt_dur(Duration::from_secs(165_600)), "1d 22h");
     assert_eq!(short_sid("s-1e918c4662a1b7b8bd43"), "s-1e91");
-    for (secs, age) in [(5, "5s"), (125, "2m"), (7_500, "2h"), (172_800, "2d")] {
-        assert_eq!(pill_age(Duration::from_secs(secs)), age);
-    }
-    for secs in [
-        0u64, 9, 10, 59, 60, 599, 3_599, 3_600, 86_399, 86_400, 950_400,
-    ] {
-        let d = Duration::from_secs(secs);
-        let (age, room) = (pill_age(d), pill_age_room(d));
-        assert!(age.len() <= room.len(), "{secs}: {age} in {room}");
-        assert_eq!(age.chars().last(), room.chars().last(), "{secs}: one unit");
-    }
-    assert_eq!(
-        pill_age_room(Duration::from_secs(3)),
-        pill_age_room(Duration::from_secs(47))
-    );
-    let t0 = Instant::now();
-    let at = |s: u64| t0 + Duration::from_secs(s);
-    assert_eq!(pill_due(t0, t0), at(1));
-    assert_eq!(pill_due(t0, at(59)), at(60));
-    assert_eq!(pill_due(t0, at(61)), at(120));
-    assert_eq!(pill_due(t0, at(3_601)), at(7_200));
-    for s in [0u64, 30, 59, 60, 61, 3_599, 3_600, 90_000] {
-        let now = at(s) + Duration::from_millis(400);
-        let due = pill_due(t0, now);
-        assert!(due > now, "after now at {s}");
-        assert_ne!(
-            pill_age(due.saturating_duration_since(t0)),
-            pill_age(now.saturating_duration_since(t0)),
-            "the figure moves at the due {s}"
-        );
-    }
 }
 
 #[test]

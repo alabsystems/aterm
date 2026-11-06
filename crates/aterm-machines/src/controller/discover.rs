@@ -2,17 +2,18 @@
 // Copyright 2026 Andrew Yates
 
 //! LAN discovery of Macs via Bonjour (`_ssh._tcp`, `_sftp-ssh._tcp`, `_rfb._tcp`) and port-22 sweep.
+//! Both go through the root LAN broker on macOS (`aterm_uds::lan`), so macOS asks nobody whether
+//! aterm may use the local network: the port's [`System::bonjour`] for Bonjour, and
+//! `aterm_uds::lan::connect` for the sweep's connects.
 
 use super::inventory::{Inventory, Paths};
-use super::ssh::{LOCAL_NETWORK_ROW, fan_out, is_local_address};
+use super::ssh::fan_out;
 use crate::model::Read;
-use crate::port::{Cmd, System};
+use crate::port::{Bonjour, System};
+use aterm_uds::lan::{Event, LanError};
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
-
-/// Apple's Bonjour client.
-pub const DNS_SD: &str = aterm_uds::os_path!("dns-sd");
 
 /// Remote Login's service type.
 pub const SSH_SERVICE: &str = "_ssh._tcp";
@@ -23,24 +24,18 @@ pub const RFB_SERVICE: &str = "_rfb._tcp";
 /// SFTP service type macOS Remote Login advertises beside [`SSH_SERVICE`].
 pub const SFTP_SERVICE: &str = "_sftp-ssh._tcp";
 
-/// How long one `dns-sd -L` resolve runs.
+/// How long one resolve listens for answers.
 pub const RESOLVE_BUDGET: Duration = Duration::from_secs(2);
 
-/// Resolves run at once. Each `dns-sd -L` runs its whole budget (it never exits), so a lab
-/// of 65 Macs resolves in three rounds.
+/// Resolves run at once. Each listens its whole budget (an answer can come on each interface),
+/// so a lab of 65 Macs resolves in three rounds.
 const RESOLVE_PARALLEL: usize = 32;
-
-/// Apple's host-key scanner.
-pub const SSH_KEYSCAN: &str = aterm_uds::os_path!("ssh-keyscan");
 
 /// The widest subnet [`subnet`] sweeps: a /22, 1024 addresses.
 pub const WIDEST_PREFIX: u8 = 22;
 
 /// Connects a sweep has in flight at once.
 const KNOCK_PARALLEL: usize = 64;
-/// Bonjour's refusal of a process macOS's Local Network privacy has not allowed:
-/// `kDNSServiceErr_PolicyDenied` in `dns_sd.h`.
-const POLICY_DENIED: &str = "-65570";
 
 /// Where a row came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,9 +88,8 @@ pub struct Browse {
 /// Browse `_ssh._tcp`, `_sftp-ssh._tcp` and `_rfb._tcp` for `wait`, then resolve each instance.
 ///
 /// # Errors
-/// One line when the `_ssh._tcp` or `_rfb._tcp` browse's `dns-sd` could not run, quit on
-/// its own with an error, or printed Bonjour's refusal of this process (that error names
-/// Local Network privacy).
+/// One line when the `_ssh._tcp` or `_rfb._tcp` browse could not run: no LAN broker to ask (its
+/// words name what installs it), or Bonjour's own error.
 pub fn browse(sys: &dyn System, wait: Duration) -> Result<Browse, String> {
     let services = [SSH_SERVICE, RFB_SERVICE, SFTP_SERVICE];
     let mut seen = fan_out(&services, services.len(), |service| {
@@ -182,66 +176,45 @@ pub fn browse(sys: &dyn System, wait: Duration) -> Result<Browse, String> {
     Ok(out)
 }
 
-/// One `dns-sd -B <service> local.` run, kept to `wait`, parsed.
+/// One browse of `service` in `local.`, kept to `wait`, as [`instances`].
 fn browse_one(sys: &dyn System, service: &str, wait: Duration) -> Result<Vec<Instance>, String> {
-    let cmd = Cmd::new(DNS_SD)
-        .args(["-B", service, "local."])
-        .budget(wait)
-        .until_deadline();
-    let ran = sys
-        .run(&cmd)
-        .map_err(|e| format!("dns-sd -B {service}: {e}"))?;
-    let text = ran.out();
-    let said = format!("{text}\n{}", ran.err());
-    let denied = said
-        .lines()
-        .filter(|l| !is_browse_row(l))
-        .any(|l| l.split_whitespace().any(|w| w == POLICY_DENIED));
-    if denied {
-        return Err(format!(
-            "dns-sd -B {service}: Bonjour refused this process ({POLICY_DENIED}); \
-             {LOCAL_NETWORK_ROW}"
-        ));
-    }
-    if ran.status.is_some_and(|s| s != 0) {
-        return Err(format!("dns-sd -B {service}: {}", ran.describe()));
-    }
-    Ok(parse_browse(&text, service))
+    let heard = sys
+        .bonjour(&Bonjour::Browse(service.to_owned()), wait)
+        .map_err(|why| format!("Bonjour browse of {service}: {why}"))?;
+    Ok(instances(&heard, service))
 }
 
-/// Parse advertised instances from a `dns-sd -B` transcript in first-seen order.
+/// Whether two service types name one (`_ssh._tcp` and `_ssh._tcp.`).
+fn same_service(a: &str, b: &str) -> bool {
+    a.trim_end_matches('.') == b.trim_end_matches('.')
+}
+
+/// The instances of `service` a browse heard (`heard`, in order), first seen first, each merged
+/// across the interfaces it is advertised on: one withdrawn on every interface is gone.
 #[must_use]
-pub fn parse_browse(text: &str, service: &str) -> Vec<Instance> {
-    let want = format!("{service}.");
+pub fn instances(heard: &[Event], service: &str) -> Vec<Instance> {
     let mut instances: Vec<Instance> = Vec::new();
-    for line in text.lines() {
-        let line = line.trim_end_matches('\r');
-        let Some((cols, name)) = columns(line, 6) else {
-            continue;
-        };
-        let add = match cols[1] {
-            "Add" => true,
-            "Rmv" => false,
+    for event in heard {
+        let (seen, add) = match event {
+            Event::Added(seen) => (seen, true),
+            Event::Removed(seen) => (seen, false),
             _ => continue,
         };
-        let (Some(interface), true) = (crate::parse_uint::<u32>(cols[3]), cols[5] == want) else {
-            continue;
-        };
-        if name.is_empty() {
+        if seen.name.is_empty() || !same_service(&seen.service, service) {
             continue;
         }
-        let at = instances.iter().position(|i| i.name == name);
+        let at = instances.iter().position(|i| i.name == seen.name);
         match (at, add) {
             (Some(i), true) => {
-                if !instances[i].interfaces.contains(&interface) {
-                    instances[i].interfaces.push(interface);
+                if !instances[i].interfaces.contains(&seen.interface) {
+                    instances[i].interfaces.push(seen.interface);
                 }
             }
             (None, true) => instances.push(Instance {
-                name: name.to_owned(),
-                interfaces: vec![interface],
+                name: seen.name.clone(),
+                interfaces: vec![seen.interface],
             }),
-            (Some(i), false) => instances[i].interfaces.retain(|&x| x != interface),
+            (Some(i), false) => instances[i].interfaces.retain(|&x| x != seen.interface),
             (None, false) => {}
         }
     }
@@ -252,26 +225,8 @@ pub fn parse_browse(text: &str, service: &str) -> Vec<Instance> {
     instances
 }
 
-/// Whether `line` is a `dns-sd -B` result row (`Add` or `Rmv` in its second column).
-fn is_browse_row(line: &str) -> bool {
-    columns(line, 6).is_some_and(|(cols, _)| matches!(cols[1], "Add" | "Rmv"))
-}
-
-/// The first `n` whitespace-separated columns of `line`, and the rest of it after them
-/// (leading blanks dropped, inner ones kept).
-fn columns(line: &str, n: usize) -> Option<(Vec<&str>, &str)> {
-    let mut cols = Vec::with_capacity(n);
-    let mut rest = line;
-    for _ in 0..n {
-        rest = rest.trim_start();
-        let end = rest.find(char::is_whitespace)?;
-        cols.push(&rest[..end]);
-        rest = &rest[end..];
-    }
-    Some((cols, rest.trim_start()))
-}
-
-/// Resolve one instance via `dns-sd -L <name> <service> local.` within `budget`.
+/// Resolve the instance `name` of `service` in `local.` within `budget`, as [`targets`]; a
+/// resolve that cannot run locates nothing.
 #[must_use]
 pub fn resolve(
     sys: &dyn System,
@@ -279,61 +234,53 @@ pub fn resolve(
     service: &str,
     budget: Duration,
 ) -> Vec<(String, u16)> {
-    let cmd = Cmd::new(DNS_SD)
-        .args(["-L", name, service, "local."])
-        .budget(budget)
-        .until_deadline();
-    sys.run(&cmd)
-        .map(|ran| parse_resolve(&ran.out()))
+    let ask = Bonjour::Resolve {
+        name: name.to_owned(),
+        service: service.to_owned(),
+    };
+    sys.bonjour(&ask, budget)
+        .map(|heard| targets(&heard))
         .unwrap_or_default()
 }
 
-/// Parse distinct `(host, port)` targets from a `dns-sd -L` transcript.
+/// The distinct `(host, port)` targets a resolve heard, each host without its trailing dot; a
+/// host that is no plain DNS name, or port 0, is none.
 #[must_use]
-pub fn parse_resolve(text: &str) -> Vec<(String, u16)> {
-    const REACHED: &str = " can be reached at ";
+pub fn targets(heard: &[Event]) -> Vec<(String, u16)> {
     let mut targets: Vec<(String, u16)> = Vec::new();
-    for line in text.lines() {
-        // The last marker: the instance name before it is the advertiser's free text.
-        let Some(at) = line.rfind(REACHED) else {
-            continue;
-        };
-        let rest = &line[at + REACHED.len()..];
-        let hostport = rest.split(" (interface ").next().unwrap_or(rest).trim();
-        let Some((host, port)) = hostport.rsplit_once(':') else {
+    for event in heard {
+        let Event::Resolved { host, port, .. } = event else {
             continue;
         };
         let host = host.trim_end_matches('.');
-        let Some(port) = crate::parse_uint::<u16>(port).filter(|&p| p != 0) else {
-            continue;
-        };
         let plain = !host.is_empty()
             && !host.starts_with(['.', '-'])
             && host
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'));
         if plain
+            && *port != 0
             && !targets
                 .iter()
-                .any(|(h, p)| h.eq_ignore_ascii_case(host) && *p == port)
+                .any(|(h, p)| h.eq_ignore_ascii_case(host) && p == port)
         {
-            targets.push((host.to_owned(), port));
+            targets.push((host.to_owned(), *port));
         }
     }
     targets
 }
 
 /// What one TCP connect learned.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Answer {
     /// It accepted the connection.
     Open,
     /// It refused it: a Mac is there, its Remote Login is off.
     Closed,
-    /// Nothing answered in time (or the host is down).
+    /// Nothing answered in time (or the host is down, or no route reaches it).
     NoAnswer,
-    /// `EHOSTUNREACH`: no route, which on-link is also how Local Network privacy refuses.
-    NoRoute,
+    /// No LAN broker to connect through (its words).
+    NoBroker(String),
 }
 
 /// One bounded TCP connect; the seam that keeps the network out of tests.
@@ -342,19 +289,24 @@ pub trait Knock: Sync {
     fn knock(&self, addr: SocketAddr, timeout: Duration) -> Answer;
 }
 
-/// The live connect: `TcpStream::connect_timeout`, closed again at once.
+/// The live connect, through the LAN broker on macOS (`aterm_uds::lan::connect`), closed again
+/// at once.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TcpKnock;
 
 impl Knock for TcpKnock {
     fn knock(&self, addr: SocketAddr, timeout: Duration) -> Answer {
-        match TcpStream::connect_timeout(&addr, timeout) {
+        let dialled = aterm_uds::lan::connect(
+            &aterm_uds::lan::Target::Addr(addr),
+            addr.port(),
+            timeout,
+            aterm_uds::lan::ConnectOptions::default(),
+        );
+        match dialled {
             Ok(_) => Answer::Open,
-            Err(e) => match e.kind() {
-                io::ErrorKind::ConnectionRefused => Answer::Closed,
-                io::ErrorKind::HostUnreachable => Answer::NoRoute,
-                _ => Answer::NoAnswer,
-            },
+            Err(LanError::Unavailable(why)) => Answer::NoBroker(why.to_string()),
+            Err(LanError::Io(e)) if e.kind() == io::ErrorKind::ConnectionRefused => Answer::Closed,
+            Err(LanError::Io(_)) => Answer::NoAnswer,
         }
     }
 }
@@ -395,21 +347,18 @@ pub fn hosts_of(cidr: &str) -> Result<Vec<Ipv4Addr>, String> {
 /// Sweep `cidr`'s port 22 with `knock` and return the addresses that accepted.
 ///
 /// # Errors
-/// One line: a bad or too wide `cidr`, or every address of a local subnet answering
-/// `No route to host`, which is Local Network privacy refusing this process, not a
-/// subnet of Macs that are all missing.
+/// One line: a bad or too wide `cidr`, or no LAN broker to connect through (its words, which
+/// name what installs it), not a subnet of Macs that are all missing.
 pub fn subnet(knock: &dyn Knock, cidr: &str, timeout: Duration) -> Result<Vec<Found>, String> {
     let hosts = hosts_of(cidr)?;
     let answers = fan_out(&hosts, KNOCK_PARALLEL, |ip| {
         knock.knock(SocketAddr::V4(SocketAddrV4::new(*ip, 22)), timeout)
     });
-    let local = hosts
-        .first()
-        .is_some_and(|ip| is_local_address(&ip.to_string()));
-    if local && !answers.is_empty() && answers.iter().all(|a| *a == Answer::NoRoute) {
-        return Err(format!(
-            "{LOCAL_NETWORK_ROW} (every address in {cidr} answered No route to host)"
-        ));
+    if let Some(why) = answers.iter().find_map(|a| match a {
+        Answer::NoBroker(why) => Some(why),
+        _ => None,
+    }) {
+        return Err(format!("{cidr} was not swept: {why}"));
     }
     Ok(hosts
         .iter()
@@ -435,31 +384,32 @@ pub fn pinned_host(
     inv: &Inventory,
     found: &Found,
 ) -> Read<String> {
-    match offered_keys(sys, found) {
+    match offered_keys(sys, paths, found) {
         Ok(offered) => pinned_name(sys, paths, inv, &offered),
         Err(why) => Read::Unusable(why),
     }
 }
 
-/// The ed25519 key blobs `found` presents (`ssh-keyscan`, three seconds).
+/// How long [`offered_keys`] gives a Mac a scan found to show its host key.
+pub const OFFERED_WITHIN: Duration = Duration::from_secs(3);
+
+/// The ed25519 key blobs `found` presents ([`super::lan_proxy::scan`] within
+/// [`OFFERED_WITHIN`], recorded under the controller's folder only while it is read).
 ///
 /// # Errors
-/// One line: Remote Login is off, the address is not one, or no key came back.
-pub fn offered_keys(sys: &dyn System, found: &Found) -> Result<Vec<String>, String> {
+/// One line: Remote Login is off, the address is not one, the record could not be kept, or no
+/// key came back.
+pub fn offered_keys(sys: &dyn System, paths: &Paths, found: &Found) -> Result<Vec<String>, String> {
     if !found.ssh {
         return Err("Remote Login is not on, so it shows no host key".into());
     }
     if found.address.is_empty() || found.address.starts_with('-') {
         return Err(format!("{:?} is not an address", found.address));
     }
-    let cmd = Cmd::new(SSH_KEYSCAN)
-        .args(["-T", "3", "-t", "ed25519", "-p"])
-        .arg(found.port.to_string())
-        .arg("--")
-        .arg(&found.address)
-        .budget(Duration::from_secs(10));
-    let ran = sys.run(&cmd).map_err(|e| format!("ssh-keyscan: {e}"))?;
-    let offered = host_keys(&ran.out());
+    let dir = super::lan_proxy::scan_dir(sys, paths)?;
+    let (recorded, ran) =
+        super::lan_proxy::scan(sys, &dir, &found.address, found.port, OFFERED_WITHIN)?;
+    let offered = host_keys(&recorded);
     if offered.is_empty() {
         return Err(format!(
             "no host key from {}:{} ({})",
@@ -505,8 +455,8 @@ pub fn pinned_name(
     Read::Absent
 }
 
-/// The ed25519 key blobs in `ssh-keyscan` output (`<host> ssh-ed25519 <base64>` lines;
-/// `#` lines are its banner notes).
+/// The ed25519 key blobs in known_hosts lines (`<host> ssh-ed25519 <base64>`, as the scan
+/// records them; `#` lines are notes).
 fn host_keys(text: &str) -> Vec<String> {
     host_keys_with_patterns(text)
         .into_iter()
@@ -533,152 +483,116 @@ pub(crate) mod tests {
     use crate::port::{Fake, Ran};
     use std::collections::BTreeMap;
 
-    /// `dns-sd -B _ssh._tcp local.` in the VM, killed after four seconds: this Mac on
-    /// interface 5 (en0), the VM itself on 1 (lo0) and 5.
-    const BROWSE_SSH: &str = "Browsing for _ssh._tcp.local.
-DATE: ---Fri 16 Oct 2026---
-23:07:32.176  ...STARTING...
-Timestamp     A/R    Flags  if Domain               Service Type         Instance Name
-23:07:32.177  Add        3   5 local.               _ssh._tcp.           m14 Air M5 32GB 4TB prime
-23:07:32.177  Add        3   1 local.               _ssh._tcp.           Managed\u{2019}s Virtual Machine
-23:07:32.177  Add        2   5 local.               _ssh._tcp.           Managed\u{2019}s Virtual Machine
-";
+    /// A browse heard `name` of `service` come on `interface`.
+    fn added(name: &str, service: &str, interface: u32) -> Event {
+        Event::Added(heard(name, service, interface))
+    }
 
-    /// The same browse while a service was registered (`dns-sd -R … 2222`) and then
-    /// withdrawn: its `Add` and `Rmv` rows on both interfaces.
-    const BROWSE_SSH_ADD_RMV: &str = "Browsing for _ssh._tcp.local.
-DATE: ---Fri 16 Oct 2026---
-23:22:36.989  ...STARTING...
-Timestamp     A/R    Flags  if Domain               Service Type         Instance Name
-23:22:36.989  Add        3   5 local.               _ssh._tcp.           m14 Air M5 32GB 4TB prime
-23:22:36.989  Add        3   1 local.               _ssh._tcp.           Managed\u{2019}s Virtual Machine
-23:22:36.989  Add        2   5 local.               _ssh._tcp.           Managed\u{2019}s Virtual Machine
-23:22:38.919  Add        3   1 local.               _ssh._tcp.           Caf\u{e9} Lab\u{2019}s Mac 7 (fixture)
-23:22:38.919  Add        2   5 local.               _ssh._tcp.           Caf\u{e9} Lab\u{2019}s Mac 7 (fixture)
-23:22:43.243  Rmv        1   1 local.               _ssh._tcp.           Caf\u{e9} Lab\u{2019}s Mac 7 (fixture)
-23:22:43.243  Rmv        0   5 local.               _ssh._tcp.           Caf\u{e9} Lab\u{2019}s Mac 7 (fixture)
-";
+    /// A browse heard `name` of `service` go on `interface`.
+    fn removed(name: &str, service: &str, interface: u32) -> Event {
+        Event::Removed(heard(name, service, interface))
+    }
 
-    /// `dns-sd -B _rfb._tcp local.` in the VM: only the VM advertises Screen Sharing.
-    const BROWSE_RFB: &str = "Browsing for _rfb._tcp.local.
-DATE: ---Fri 16 Oct 2026---
-23:07:43.772  ...STARTING...
-Timestamp     A/R    Flags  if Domain               Service Type         Instance Name
-23:07:43.772  Add        3   1 local.               _rfb._tcp.           Managed\u{2019}s Virtual Machine
-23:07:43.772  Add        2   5 local.               _rfb._tcp.           Managed\u{2019}s Virtual Machine
-";
-
-    /// `dns-sd -L "m14 Air M5 32GB 4TB prime" _ssh._tcp local.` in the VM.
-    const RESOLVE_AIR: &str = "Lookup m14 Air M5 32GB 4TB prime._ssh._tcp.local.
-DATE: ---Fri 16 Oct 2026---
-23:07:47.792  ...STARTING...
-23:07:47.792  m14\\032Air\\032M5\\03232GB\\0324TB\\032prime._ssh._tcp.local. can be reached at m14-Air-M5-32GB-4TB-prime.local.:22 (interface 5)
-";
-
-    /// `dns-sd -L "Managed’s Virtual Machine" _ssh._tcp local.`: two answers, the first
-    /// flagged more-coming.
-    const RESOLVE_VM: &str = "Lookup Managed\u{2019}s Virtual Machine._ssh._tcp.local.
-DATE: ---Fri 16 Oct 2026---
-23:07:51.808  ...STARTING...
-23:07:51.809  Managed\u{2019}s\\032Virtual\\032Machine._ssh._tcp.local. can be reached at Manageds-Virtual-Machine.local.:22 (interface 5) Flags: 1
-23:07:51.809  Managed\u{2019}s\\032Virtual\\032Machine._ssh._tcp.local. can be reached at Manageds-Virtual-Machine.local.:22 (interface 5)
-";
-
-    /// `dns-sd -L "Managed’s Virtual Machine" _rfb._tcp local.`.
-    const RESOLVE_VM_RFB: &str = "Lookup Managed\u{2019}s Virtual Machine._rfb._tcp.local.
-DATE: ---Fri 16 Oct 2026---
-23:11:19.410  ...STARTING...
-23:11:19.411  Managed\u{2019}s\\032Virtual\\032Machine._rfb._tcp.local. can be reached at Manageds-Virtual-Machine.local.:5900 (interface 5) Flags: 1
-23:11:19.411  Managed\u{2019}s\\032Virtual\\032Machine._rfb._tcp.local. can be reached at Manageds-Virtual-Machine.local.:5900 (interface 5)
-";
-
-    /// `dns-sd -L` of the registered fixture service.
-    const RESOLVE_FIXTURE: &str = "Lookup Caf\u{e9} Lab\u{2019}s Mac 7 (fixture)._ssh._tcp.local.
-DATE: ---Fri 16 Oct 2026---
-23:22:40.020  ...STARTING...
-23:22:40.022  Caf\u{e9}\\032Lab\u{2019}s\\032Mac\\0327\\032(fixture)._ssh._tcp.local. can be reached at Manageds-Virtual-Machine.local.:2222 (interface 5) Flags: 1
-23:22:40.022  Caf\u{e9}\\032Lab\u{2019}s\\032Mac\\0327\\032(fixture)._ssh._tcp.local. can be reached at Manageds-Virtual-Machine.local.:2222 (interface 5)
-";
-
-    /// A resolve of a name nobody advertises, killed at its deadline: dns-sd flushes its
-    /// header only with a result, so nothing at all was captured.
-    const RESOLVE_NOBODY: &str = "";
-
-    /// A later capture in the VM (macOS 27.0, then named lab-02), while `dns-sd -R spark-1
-    /// _ssh._tcp local. 22` advertised a host with Remote Login alone, as a Linux box's Avahi
-    /// does: `dns-sd -B _ssh._tcp local.`, then `_sftp-ssh._tcp` and `_rfb._tcp`.
-    const BROWSE_SSH_LAB: &str = "Browsing for _ssh._tcp.local.
-DATE: ---Sun 18 Oct 2026---
- 6:21:48.496  ...STARTING...
-Timestamp     A/R    Flags  if Domain               Service Type         Instance Name
- 6:21:48.497  Add        3   1 local.               _ssh._tcp.           lab-02
- 6:21:48.497  Add        3   5 local.               _ssh._tcp.           lab-02
- 6:21:48.497  Add        3   1 local.               _ssh._tcp.           spark-1
- 6:21:48.497  Add        2   5 local.               _ssh._tcp.           spark-1
- 6:21:48.702  Add        2   5 local.               _ssh._tcp.           m14 Air M5 32GB 4TB prime
-";
-    const BROWSE_SFTP_LAB: &str = "Browsing for _sftp-ssh._tcp.local.
-DATE: ---Sun 18 Oct 2026---
- 6:21:51.515  ...STARTING...
-Timestamp     A/R    Flags  if Domain               Service Type         Instance Name
- 6:21:51.516  Add        3   1 local.               _sftp-ssh._tcp.      lab-02
- 6:21:51.516  Add        3   5 local.               _sftp-ssh._tcp.      lab-02
- 6:21:51.516  Add        2   5 local.               _sftp-ssh._tcp.      m14 Air M5 32GB 4TB prime
-";
-    const BROWSE_RFB_LAB: &str = "Browsing for _rfb._tcp.local.
-DATE: ---Sun 18 Oct 2026---
- 6:21:54.535  ...STARTING...
-Timestamp     A/R    Flags  if Domain               Service Type         Instance Name
- 6:21:54.542  Add        3   1 local.               _rfb._tcp.           lab-02
- 6:21:54.542  Add        2   5 local.               _rfb._tcp.           lab-02
-";
-    /// `dns-sd -L lab-02 _ssh._tcp local.` in that session.
-    const RESOLVE_LAB: &str = "Lookup lab-02._ssh._tcp.local.
-DATE: ---Sun 18 Oct 2026---
- 6:21:59.636  ...STARTING...
- 6:21:59.637  lab-02._ssh._tcp.local. can be reached at lab-02.local.:22 (interface 5) Flags: 1
- 6:21:59.637  lab-02._ssh._tcp.local. can be reached at lab-02.local.:22 (interface 5)
-";
-    /// `dns-sd -L spark-1 _ssh._tcp local.` in that session, its target the box's own name
-    /// (registered in the VM, it named the VM's, lab-02.local, which a Linux box would not).
-    const RESOLVE_SPARK: &str = "Lookup spark-1._ssh._tcp.local.
-DATE: ---Sun 18 Oct 2026---
- 6:21:57.613  ...STARTING...
- 6:21:57.613  spark-1._ssh._tcp.local. can be reached at spark-1.local.:22 (interface 5) Flags: 1
- 6:21:57.613  spark-1._ssh._tcp.local. can be reached at spark-1.local.:22 (interface 5)
-";
-
-    fn killed(stdout: &str) -> Ran {
-        Ran {
-            status: None,
-            stdout: stdout.as_bytes().to_vec(),
-            stderr: Vec::new(),
+    fn heard(name: &str, service: &str, interface: u32) -> aterm_uds::lan::Instance {
+        aterm_uds::lan::Instance {
+            name: name.to_owned(),
+            service: format!("{service}."),
+            domain: "local.".to_owned(),
+            interface,
         }
     }
 
-    fn browse_key(service: &str) -> String {
-        format!("/usr/bin/dns-sd -B {service} local.")
+    /// A resolve heard `host:port` on interface 5.
+    fn resolved(host: &str, port: u16) -> Event {
+        Event::Resolved {
+            host: host.to_owned(),
+            port,
+            txt: Vec::new(),
+            interface: 5,
+        }
     }
 
-    fn resolve_key(name: &str, service: &str) -> String {
-        format!(
-            "/usr/bin/dns-sd -L {} {service} local.",
-            crate::port::shell_word(name)
-        )
+    const AIR: &str = "m14 Air M5 32GB 4TB prime";
+    const VM: &str = "Managed\u{2019}s Virtual Machine";
+    const FIXTURE: &str = "Caf\u{e9} Lab\u{2019}s Mac 7 (fixture)";
+
+    /// A browse of `_ssh._tcp` in the VM (captured with `dns-sd -B` on 16 Oct 2026): this Mac
+    /// on interface 5 (en0), the VM itself on 1 (lo0) and 5.
+    fn browse_ssh() -> Vec<Event> {
+        vec![
+            added(AIR, SSH_SERVICE, 5),
+            added(VM, SSH_SERVICE, 1),
+            added(VM, SSH_SERVICE, 5),
+        ]
+    }
+
+    /// The same browse while a service was registered and then withdrawn: its comings and
+    /// goings on both interfaces.
+    fn browse_ssh_add_rmv() -> Vec<Event> {
+        let mut heard = browse_ssh();
+        heard.extend([
+            added(FIXTURE, SSH_SERVICE, 1),
+            added(FIXTURE, SSH_SERVICE, 5),
+            removed(FIXTURE, SSH_SERVICE, 1),
+            removed(FIXTURE, SSH_SERVICE, 5),
+        ]);
+        heard
+    }
+
+    /// A browse of `_rfb._tcp` in the VM: only the VM advertises Screen Sharing.
+    fn browse_rfb() -> Vec<Event> {
+        vec![added(VM, RFB_SERVICE, 1), added(VM, RFB_SERVICE, 5)]
+    }
+
+    /// A later session in the VM (macOS 27.0, then named lab-02), while a host with Remote
+    /// Login alone was advertised (`spark-1`), as a Linux box's Avahi does.
+    fn browse_ssh_lab() -> Vec<Event> {
+        vec![
+            added("lab-02", SSH_SERVICE, 1),
+            added("lab-02", SSH_SERVICE, 5),
+            added("spark-1", SSH_SERVICE, 1),
+            added("spark-1", SSH_SERVICE, 5),
+            added(AIR, SSH_SERVICE, 5),
+        ]
+    }
+
+    fn browse_sftp_lab() -> Vec<Event> {
+        vec![
+            added("lab-02", SFTP_SERVICE, 1),
+            added("lab-02", SFTP_SERVICE, 5),
+            added(AIR, SFTP_SERVICE, 5),
+        ]
+    }
+
+    fn browse_rfb_lab() -> Vec<Event> {
+        vec![
+            added("lab-02", RFB_SERVICE, 1),
+            added("lab-02", RFB_SERVICE, 5),
+        ]
+    }
+
+    fn browsing(service: &str) -> Bonjour {
+        Bonjour::Browse(service.to_owned())
+    }
+
+    fn resolving(name: &str, service: &str) -> Bonjour {
+        Bonjour::Resolve {
+            name: name.to_owned(),
+            service: service.to_owned(),
+        }
     }
 
     #[test]
-    fn an_instance_name_is_the_rest_of_the_row_and_interfaces_merge() {
-        let found = parse_browse(BROWSE_SSH, SSH_SERVICE);
+    fn an_instance_merges_the_interfaces_it_was_heard_on() {
         assert_eq!(
-            found,
+            instances(&browse_ssh(), SSH_SERVICE),
             [
                 Instance {
-                    name: "m14 Air M5 32GB 4TB prime".into(),
+                    name: AIR.into(),
                     interfaces: vec![5],
                 },
                 Instance {
-                    name: "Managed\u{2019}s Virtual Machine".into(),
+                    name: VM.into(),
                     interfaces: vec![1, 5],
                 },
             ]
@@ -687,84 +601,75 @@ DATE: ---Sun 18 Oct 2026---
 
     #[test]
     fn an_instance_withdrawn_on_every_interface_is_gone() {
-        let found = parse_browse(BROWSE_SSH_ADD_RMV, SSH_SERVICE);
+        let found = instances(&browse_ssh_add_rmv(), SSH_SERVICE);
         let names: Vec<&str> = found.iter().map(|i| i.name.as_str()).collect();
-        assert_eq!(
-            names,
-            [
-                "m14 Air M5 32GB 4TB prime",
-                "Managed\u{2019}s Virtual Machine"
-            ]
-        );
-        let half = BROWSE_SSH_ADD_RMV
-            .lines()
-            .filter(|l| !l.contains("Rmv        0   5"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let found = parse_browse(&half, SSH_SERVICE);
-        let fixture = found
-            .iter()
-            .find(|i| i.name == "Caf\u{e9} Lab\u{2019}s Mac 7 (fixture)")
-            .unwrap();
+        assert_eq!(names, [AIR, VM]);
+        let mut half = browse_ssh_add_rmv();
+        half.pop();
+        let found = instances(&half, SSH_SERVICE);
+        let fixture = found.iter().find(|i| i.name == FIXTURE).unwrap();
         assert_eq!(fixture.interfaces, [5]);
     }
 
     #[test]
-    fn a_row_for_another_service_or_a_header_is_not_an_instance() {
-        assert!(parse_browse(BROWSE_RFB, SSH_SERVICE).is_empty());
-        assert_eq!(parse_browse(BROWSE_RFB, RFB_SERVICE).len(), 1);
-        assert!(parse_browse("Timestamp     A/R    Flags  if Domain\n", SSH_SERVICE).is_empty());
-        assert!(parse_browse("", SSH_SERVICE).is_empty());
+    fn an_event_of_another_service_or_kind_is_not_an_instance() {
+        assert!(instances(&browse_rfb(), SSH_SERVICE).is_empty());
+        assert_eq!(instances(&browse_rfb(), RFB_SERVICE).len(), 1);
+        assert!(instances(&[resolved("lab-02.local.", 22)], SSH_SERVICE).is_empty());
+        assert!(instances(&[], SSH_SERVICE).is_empty());
     }
 
     #[test]
     fn a_resolve_names_each_target_once_without_its_trailing_dot() {
         assert_eq!(
-            parse_resolve(RESOLVE_AIR),
+            targets(&[resolved("m14-Air-M5-32GB-4TB-prime.local.", 22)]),
             [("m14-Air-M5-32GB-4TB-prime.local".to_string(), 22)]
         );
         assert_eq!(
-            parse_resolve(RESOLVE_VM),
+            targets(&[
+                resolved("Manageds-Virtual-Machine.local.", 22),
+                resolved("Manageds-Virtual-Machine.local.", 22),
+            ]),
             [("Manageds-Virtual-Machine.local".to_string(), 22)]
         );
-        assert_eq!(
-            parse_resolve(RESOLVE_FIXTURE),
-            [("Manageds-Virtual-Machine.local".to_string(), 2222)]
-        );
-        assert!(parse_resolve(RESOLVE_NOBODY).is_empty());
+        assert!(targets(&[resolved("-x.local.", 22), resolved("a.local.", 0)]).is_empty());
+        assert!(targets(&[]).is_empty());
     }
 
-    /// The fake answering the VM's captures (the SFTP browse is a later session's, when the
-    /// VM was named lab-02: only this Mac's row there matches a row here).
-    fn vm(browse_ssh: &str) -> Fake {
+    /// The fake answering the VM's session (the SFTP browse is a later session's, when the VM
+    /// was named lab-02: only this Mac's row there matches a row here).
+    fn vm(browse_ssh: Vec<Event>) -> Fake {
         let fake = Fake::root();
-        fake.on(&browse_key(SSH_SERVICE), killed(browse_ssh));
-        fake.on(&browse_key(RFB_SERVICE), killed(BROWSE_RFB));
-        fake.on(&browse_key(SFTP_SERVICE), killed(BROWSE_SFTP_LAB));
-        fake.on(
-            &resolve_key("m14 Air M5 32GB 4TB prime", SSH_SERVICE),
-            killed(RESOLVE_AIR),
+        fake.on_bonjour(&browsing(SSH_SERVICE), Ok(browse_ssh));
+        fake.on_bonjour(&browsing(RFB_SERVICE), Ok(browse_rfb()));
+        fake.on_bonjour(&browsing(SFTP_SERVICE), Ok(browse_sftp_lab()));
+        fake.on_bonjour(
+            &resolving(AIR, SSH_SERVICE),
+            Ok(vec![resolved("m14-Air-M5-32GB-4TB-prime.local.", 22)]),
         );
-        fake.on(
-            &resolve_key("Managed\u{2019}s Virtual Machine", SSH_SERVICE),
-            killed(RESOLVE_VM),
+        fake.on_bonjour(
+            &resolving(VM, SSH_SERVICE),
+            Ok(vec![
+                resolved("Manageds-Virtual-Machine.local.", 22),
+                resolved("Manageds-Virtual-Machine.local.", 22),
+            ]),
         );
-        fake.on(
-            &resolve_key("Managed\u{2019}s Virtual Machine", RFB_SERVICE),
-            killed(RESOLVE_VM_RFB),
+        fake.on_bonjour(
+            &resolving(VM, RFB_SERVICE),
+            Ok(vec![resolved("Manageds-Virtual-Machine.local.", 5900)]),
         );
         fake
     }
 
     #[test]
     fn a_browse_finds_one_row_per_mac_and_marks_screen_sharing() {
-        let fake = vm(BROWSE_SSH);
+        let fake = vm(browse_ssh());
         let got = browse(&fake, Duration::from_secs(3)).unwrap();
         assert_eq!(
             got.found,
             [
                 Found {
-                    name: "m14 Air M5 32GB 4TB prime".into(),
+                    name: AIR.into(),
                     address: "m14-Air-M5-32GB-4TB-prime.local".into(),
                     port: 22,
                     ssh: true,
@@ -773,7 +678,7 @@ DATE: ---Sun 18 Oct 2026---
                     source: Source::Bonjour,
                 },
                 Found {
-                    name: "Managed\u{2019}s Virtual Machine".into(),
+                    name: VM.into(),
                     address: "Manageds-Virtual-Machine.local".into(),
                     port: 22,
                     ssh: true,
@@ -787,28 +692,37 @@ DATE: ---Sun 18 Oct 2026---
         let calls = fake.calls();
         assert_eq!(calls.len(), 5, "{calls:?}");
         assert!(
-            !calls
-                .iter()
-                .any(|c| c.contains("-L") && c.contains(RFB_SERVICE))
+            calls.iter().all(|c| c.starts_with("bonjour ")),
+            "every Bonjour request goes through the port: {calls:?}"
         );
+        assert!(!calls.contains(&resolving(VM, RFB_SERVICE).key()));
     }
 
-    /// Fake system fixture for the lab-02 capture session.
+    /// Fake system fixture for the lab-02 session.
     pub(crate) fn lab_session() -> Fake {
-        lab_session_with(killed(BROWSE_SFTP_LAB))
+        lab_session_with(Ok(browse_sftp_lab()))
     }
 
     /// [`lab_session`] with the SFTP browse answering `sftp`.
-    pub(crate) fn lab_session_with(sftp: Ran) -> Fake {
+    pub(crate) fn lab_session_with(sftp: Result<Vec<Event>, String>) -> Fake {
         let fake = Fake::root();
-        fake.on(&browse_key(SSH_SERVICE), killed(BROWSE_SSH_LAB));
-        fake.on(&browse_key(SFTP_SERVICE), sftp);
-        fake.on(&browse_key(RFB_SERVICE), killed(BROWSE_RFB_LAB));
-        fake.on(&resolve_key("lab-02", SSH_SERVICE), killed(RESOLVE_LAB));
-        fake.on(&resolve_key("spark-1", SSH_SERVICE), killed(RESOLVE_SPARK));
-        fake.on(
-            &resolve_key("m14 Air M5 32GB 4TB prime", SSH_SERVICE),
-            killed(RESOLVE_AIR),
+        fake.on_bonjour(&browsing(SSH_SERVICE), Ok(browse_ssh_lab()));
+        fake.on_bonjour(&browsing(SFTP_SERVICE), sftp);
+        fake.on_bonjour(&browsing(RFB_SERVICE), Ok(browse_rfb_lab()));
+        fake.on_bonjour(
+            &resolving("lab-02", SSH_SERVICE),
+            Ok(vec![
+                resolved("lab-02.local.", 22),
+                resolved("lab-02.local.", 22),
+            ]),
+        );
+        fake.on_bonjour(
+            &resolving("spark-1", SSH_SERVICE),
+            Ok(vec![resolved("spark-1.local.", 22)]),
+        );
+        fake.on_bonjour(
+            &resolving(AIR, SSH_SERVICE),
+            Ok(vec![resolved("m14-Air-M5-32GB-4TB-prime.local.", 22)]),
         );
         fake
     }
@@ -833,21 +747,20 @@ DATE: ---Sun 18 Oct 2026---
 
     #[test]
     fn a_failed_sftp_browse_is_noted_and_the_scan_goes_on() {
-        let fake = lab_session_with(Ran::exit(255, "DNSService call failed -65570"));
+        let fake = lab_session_with(Err("Bonjour error -65537".to_owned()));
         let got = browse(&fake, Duration::from_secs(3)).unwrap();
         assert_eq!(got.found.len(), 3);
         assert!(got.found.iter().all(|f| !f.sftp));
-        assert!(got.sftp_failed.unwrap().contains("-65570"));
+        assert!(got.sftp_failed.unwrap().contains("-65537"));
     }
 
     #[test]
     fn a_mac_with_only_screen_sharing_is_a_row_without_ssh() {
-        let only_air = BROWSE_SSH
-            .lines()
-            .filter(|l| !l.contains("Managed"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let got = browse(&vm(&only_air), Duration::from_secs(3)).unwrap();
+        let got = browse(
+            &vm(vec![added(AIR, SSH_SERVICE, 5)]),
+            Duration::from_secs(3),
+        )
+        .unwrap();
         let vm_row = got
             .found
             .iter()
@@ -861,63 +774,37 @@ DATE: ---Sun 18 Oct 2026---
     #[test]
     fn an_instance_no_resolve_locates_is_listed_not_dropped() {
         let lost = Fake::root();
-        lost.on(&browse_key(SSH_SERVICE), killed(BROWSE_SSH_ADD_RMV));
-        lost.on(&browse_key(RFB_SERVICE), killed(""));
-        lost.on(&browse_key(SFTP_SERVICE), killed(""));
-        lost.on(
-            &resolve_key("m14 Air M5 32GB 4TB prime", SSH_SERVICE),
-            killed(RESOLVE_AIR),
-        );
-        lost.on(
-            &resolve_key("Managed\u{2019}s Virtual Machine", SSH_SERVICE),
-            killed(RESOLVE_NOBODY),
+        lost.on_bonjour(&browsing(SSH_SERVICE), Ok(browse_ssh_add_rmv()));
+        lost.on_bonjour(
+            &resolving(AIR, SSH_SERVICE),
+            Ok(vec![resolved("m14-Air-M5-32GB-4TB-prime.local.", 22)]),
         );
         let got = browse(&lost, Duration::from_secs(3)).unwrap();
         assert_eq!(got.found.len(), 1);
-        assert_eq!(got.unresolved, ["Managed\u{2019}s Virtual Machine"]);
+        assert_eq!(got.unresolved, [VM]);
     }
 
+    /// A browse that cannot run (no LAN broker, or Bonjour's own error) fails the scan with its
+    /// words; one whose instance names look like error codes is still a browse.
     #[test]
-    fn browse_runs_dns_sd_by_its_absolute_path() {
-        let fake = vm(BROWSE_SSH);
-        browse(&fake, Duration::from_secs(3)).unwrap();
-        for call in fake.calls() {
-            assert!(call.starts_with("/usr/bin/dns-sd "), "{call}");
-        }
-    }
-
-    #[test]
-    fn a_dns_sd_that_quits_with_an_error_fails_the_browse() {
+    fn a_browse_that_cannot_run_fails_the_scan() {
         let fake = Fake::root();
-        fake.on(
-            &browse_key(SSH_SERVICE),
-            Ran::exit(255, "DNSService call failed -65537"),
+        fake.on_bonjour(
+            &browsing(SSH_SERVICE),
+            Err("Bonjour error -65537".to_owned()),
         );
-        fake.on(&browse_key(RFB_SERVICE), killed(BROWSE_RFB));
-        fake.on(&browse_key(SFTP_SERVICE), killed(""));
         let err = browse(&fake, Duration::from_secs(1)).unwrap_err();
         assert!(err.contains("-65537"), "{err}");
-        let denied = Fake::root();
-        denied.on(
-            &browse_key(SSH_SERVICE),
-            Ran::exit(255, "DNSService call failed -65570"),
-        );
-        denied.on(&browse_key(RFB_SERVICE), killed(""));
-        denied.on(&browse_key(SFTP_SERVICE), killed(""));
-        let err = browse(&denied, Duration::from_secs(1)).unwrap_err();
-        assert!(err.contains("Local Network"), "{err}");
+        let absent = Fake::root();
+        let why = aterm_uds::lan::Unavailable::NotInstalled.to_string();
+        absent.on_bonjour(&browsing(SSH_SERVICE), Err(why.clone()));
+        let err = browse(&absent, Duration::from_secs(1)).unwrap_err();
+        assert!(err.ends_with(&why), "{err}");
         let named = Fake::root();
-        named.on(
-            &browse_key(SSH_SERVICE),
-            killed(&format!(
-                "{BROWSE_SSH} 0:00:13.263  Add        3   5 local.               _ssh._tcp.           Lab -65570\n"
-            )),
-        );
-        named.on(&browse_key(RFB_SERVICE), killed(""));
-        named.on(&browse_key(SFTP_SERVICE), killed(""));
+        let mut heard = browse_ssh();
+        heard.push(added("Lab -65570", SSH_SERVICE, 5));
+        named.on_bonjour(&browsing(SSH_SERVICE), Ok(heard));
         assert!(browse(&named, Duration::from_secs(1)).is_ok());
-        let missing = Fake::root();
-        assert!(browse(&missing, Duration::from_secs(1)).is_err());
     }
 
     /// Every accepted CIDR's endpoints are representable, including the
@@ -989,9 +876,11 @@ DATE: ---Sun 18 Oct 2026---
     impl Knock for Scripted {
         fn knock(&self, addr: SocketAddr, _timeout: Duration) -> Answer {
             match addr {
-                SocketAddr::V4(v4) if v4.port() == 22 => {
-                    self.0.get(v4.ip()).copied().unwrap_or(self.1)
-                }
+                SocketAddr::V4(v4) if v4.port() == 22 => self
+                    .0
+                    .get(v4.ip())
+                    .cloned()
+                    .unwrap_or_else(|| self.1.clone()),
                 _ => panic!("knocked {addr}, not port 22"),
             }
         }
@@ -1017,14 +906,18 @@ DATE: ---Sun 18 Oct 2026---
         );
     }
 
+    /// Without a LAN broker to connect through, a sweep is not run, naming the broker, rather
+    /// than reading as a subnet with no Macs. NEGATIVE CONTROL: a subnet nothing answers on is
+    /// swept, and empty.
     #[test]
-    fn a_local_subnet_with_no_route_anywhere_is_local_network_privacy() {
-        let knock = Scripted(BTreeMap::new(), Answer::NoRoute);
+    fn a_sweep_with_no_lan_broker_names_it() {
+        let why = aterm_uds::lan::Unavailable::NotInstalled.to_string();
+        let knock = Scripted(BTreeMap::new(), Answer::NoBroker(why.clone()));
         let err = subnet(&knock, "192.168.64.0/28", Duration::from_millis(1)).unwrap_err();
-        assert!(err.starts_with(LOCAL_NETWORK_ROW), "{err}");
+        assert_eq!(err, format!("192.168.64.0/28 was not swept: {why}"));
         let knock = Scripted(
             BTreeMap::from([(Ipv4Addr::new(192, 168, 64, 3), Answer::Closed)]),
-            Answer::NoRoute,
+            Answer::NoAnswer,
         );
         assert!(
             subnet(&knock, "192.168.64.0/28", Duration::from_millis(1))
@@ -1033,10 +926,8 @@ DATE: ---Sun 18 Oct 2026---
         );
     }
 
-    /// `ssh-keyscan -T 3 -t ed25519 -p 22 -- Manageds-Virtual-Machine.local` in the VM.
-    const KEYSCAN_VM: &str = "# Manageds-Virtual-Machine.local:22 SSH-2.0-OpenSSH_10.3
-manageds-virtual-machine.local ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHv2Xf9kgkNkpV3WltnLoVx25AQOEx+mch1DHT/oZdSa
-";
+    /// The VM's host key blob, as `ssh-keyscan -t ed25519` read it there.
+    const VM_KEY: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIHv2Xf9kgkNkpV3WltnLoVx25AQOEx+mch1DHT/oZdSa";
 
     const VM_UUID: &str = "0A1B2C3D-0000-4000-8000-000000000002";
 
@@ -1063,14 +954,33 @@ manageds-virtual-machine.local ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHv2Xf9kgkNkp
         (paths, inv)
     }
 
-    const KEYSCAN_KEY: &str =
-        "/usr/bin/ssh-keyscan -T 3 -t ed25519 -p 22 -- Manageds-Virtual-Machine.local";
+    /// `fake` answers the scan of the VM ([`super::super::lan_proxy::scanned`]): `key`
+    /// recorded, or nothing, and `ssh` ending as `ran`.
+    pub(crate) fn vm_scanned(fake: &Fake, key: Option<&str>, ran: Ran) {
+        super::super::lan_proxy::scanned(
+            fake,
+            std::path::Path::new("/ctl/machines/scan"),
+            "Manageds-Virtual-Machine.local",
+            22,
+            OFFERED_WITHIN,
+            key,
+            ran,
+        );
+    }
+
+    /// How `ssh` ends a scan whose key exchange recorded the key: no method authenticates.
+    fn denied() -> Ran {
+        Ran::exit(
+            255,
+            "hostkey@host: Permission denied (publickey,password).\n",
+        )
+    }
 
     #[test]
     fn a_mac_whose_key_is_pinned_under_an_inventory_uuid_is_that_host() {
         let (paths, inv) = lab();
         let fake = Fake::root();
-        fake.on(KEYSCAN_KEY, Ran::ok(KEYSCAN_VM));
+        vm_scanned(&fake, Some(VM_KEY), denied());
         fake.file(
             "/ctl/machines/known_hosts",
             format!(
@@ -1089,7 +999,7 @@ manageds-virtual-machine.local ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHv2Xf9kgkNkp
     fn a_mac_whose_key_matches_no_pin_is_new_even_at_an_enrolled_address() {
         let (paths, inv) = lab();
         let fake = Fake::root();
-        fake.on(KEYSCAN_KEY, Ran::ok(KEYSCAN_VM));
+        vm_scanned(&fake, Some(VM_KEY), denied());
         fake.file(
             "/ctl/machines/known_hosts",
             format!("{VM_UUID} ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOtherKeyOtherKeyOtherKeyOtherKeyOtherKey\n")
@@ -1097,7 +1007,7 @@ manageds-virtual-machine.local ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHv2Xf9kgkNkp
         );
         assert_eq!(pinned_host(&fake, &paths, &inv, &vm_row()), Read::Absent);
         let fresh = Fake::root();
-        fresh.on(KEYSCAN_KEY, Ran::ok(KEYSCAN_VM));
+        vm_scanned(&fresh, Some(VM_KEY), denied());
         assert_eq!(pinned_host(&fresh, &paths, &inv, &vm_row()), Read::Absent);
     }
 
@@ -1105,7 +1015,7 @@ manageds-virtual-machine.local ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHv2Xf9kgkNkp
     fn a_mac_that_shows_no_key_is_unknown_never_new() {
         let (paths, inv) = lab();
         let fake = Fake::root();
-        fake.on(KEYSCAN_KEY, Ran::exit(1, ""));
+        vm_scanned(&fake, None, Ran::exit(255, ""));
         assert!(matches!(
             pinned_host(&fake, &paths, &inv, &vm_row()),
             Read::Unusable(_)
@@ -1124,11 +1034,14 @@ manageds-virtual-machine.local ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHv2Xf9kgkNkp
         assert!(resolve(&fake, "x", SSH_SERVICE, Duration::from_millis(1)).is_empty());
     }
 
-    /// An instance name that spells the marker and a host of its own does not choose the
-    /// target: the record's own `can be reached at`, the line's last, does.
+    /// A browse instance whose name looks like a target never supplies a socket address.
+    /// Only a resolved event supplies the target, independently of the instance's free text.
     #[test]
     fn an_instance_name_that_spells_the_marker_does_not_choose_the_target() {
         let spoofed = " 0:00:00.001  Lab can be reached at decoy.local.:2222 (interface 1)._ssh._tcp.local. can be reached at real.local.:22 (interface 14)\n";
-        assert_eq!(parse_resolve(spoofed), vec![("real.local".into(), 22)]);
+        assert_eq!(
+            targets(&[added(spoofed, SSH_SERVICE, 14), resolved("real.local", 22)]),
+            vec![("real.local".into(), 22)]
+        );
     }
 }

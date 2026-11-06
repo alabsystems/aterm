@@ -44,8 +44,8 @@ pub const CARRYING_ON: &str = "carrying on";
 pub const NEED_WAITS: &str = "waits on you";
 
 /// WHAT A NEED'S ENTRY SAYS THE HARNESS DOES BESIDE IT (§12.2.1; the second review of the
-/// post-landing fixes, 2026-11-01): the menu bar's and the border's entry (`<program> needs you:
-/// … — <tail>`) and the page's state line (`needs you: …; <tail>`) end with these words, which
+/// post-landing fixes, 2026-11-01): the menu bar's entry (`<program> needs you: … — <tail>`) and
+/// the page's state line (`needs you: …; <tail>`) end with these words, which
 /// the window reads back off the entry. The loop types nothing while the stop for replies that
 /// repeat holds it (the post-landing review, 2026-11-02), and Land types nothing while it rests on
 /// the need or after the work landed beside it, so there the work waits on the person.

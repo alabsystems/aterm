@@ -22,10 +22,12 @@ pub mod docdriver;
 pub mod docscan;
 pub mod event_log;
 pub mod exec;
+pub mod export_scan;
 pub mod findings;
 pub mod fmt;
 pub mod ladder;
 pub mod libtest;
+pub mod libtest_json;
 pub mod memory;
 pub mod perf;
 pub mod plan;
@@ -118,6 +120,9 @@ pub struct EnvSnapshot {
     pub cargo_home: Option<PathBuf>,
     /// The enabled native package prefix, resolved by the package manager.
     pub native_packages: Option<PathBuf>,
+    /// The publication engine's checkout: `PUBLICATION_ENGINE`, else `$HOME/publication`
+    /// ([`aterm_census::export_scan::rows::engine_dir`]).
+    pub publication_engine: Option<PathBuf>,
     /// `ATERM_DISK_COVERED` ([`aterm_capacity::DISK_COVER_ENV`]): the name of the disk claim the
     /// work this run is part of holds (the release's), which covers the run's disk
     /// ([`disk::admit`]). Read here alone and removed from every child ([`CHILD_ENV_REMOVED`]),
@@ -158,6 +163,9 @@ impl EnvSnapshot {
                 .collect(),
             rust_test_threads: std::env::var_os("RUST_TEST_THREADS"),
             native_packages,
+            publication_engine: aterm_census::export_scan::rows::engine_dir(&|name| {
+                std::env::var_os(name)
+            }),
             disk_cover: std::env::var(aterm_capacity::DISK_COVER_ENV)
                 .ok()
                 .filter(|m| !m.trim().is_empty()),
@@ -560,7 +568,7 @@ pub struct Ctx {
     pub cursor_pacing: bool,
     /// Run only the test compilation stage, never a release qualification.
     pub compile_only: bool,
-    /// The test children carry `aterm-spec/checkers` ([`stages::CHECKERS_FEATURE`]) and the test
+    /// The test children carry `ATERM_SPEC_CHECKERS=1` and the test
     /// run owes [`checks::GOLDEN`]'s test: under `release`, whose run of the suite that is, and
     /// under `--as-release`, which compiles it or reruns it.
     pub checkers_in_tests: bool,
@@ -598,8 +606,6 @@ pub struct Ctx {
     /// run's own compile, are COULD NOT RUN behind it and start no cargo, since a recompile of
     /// what failed would run under a claim learned when it passed, or none.
     pub test_compile_failed: std::sync::atomic::AtomicBool,
-    /// Checker-enabled compilation failed; its runtime stage must not retry it.
-    pub checkers_compile_failed: std::sync::atomic::AtomicBool,
     /// What the run's first proven red ends (A3): under `release` and `--fail-fast` the rest of
     /// the run, which then says NOT RUN with the halt's words; in a bare run nothing.
     pub halt: sched::Halt,
@@ -630,13 +636,14 @@ pub fn parse_build_jobs(raw: Option<&OsStr>) -> Option<u32> {
 /// What `cargo run` hands the verify process about ITSELF (the `verify` alias is `run -q -p aterm-verify`): `aterm_toolchain::build_cache::CARGO_RUN_ENV`.
 pub const CARGO_RUN_ENV: [&str; 7] = aterm_toolchain::build_cache::CARGO_RUN_ENV;
 
-/// Variables removed from every child's inherited environment: what `cargo run` says of the
+/// Variables removed from every child's inherited environment: checker policy, what `cargo run` says of the
 /// verify process ([`CARGO_RUN_ENV`]), and the disk claim that covers this run
 /// ([`aterm_capacity::DISK_COVER_ENV`], [`EnvSnapshot::disk_cover`]), which covers no child's
 /// own claim and which a test binary must never read (a release's children would then run its
 /// tests unlike a developer's).
-pub const CHILD_ENV_REMOVED: [&str; 8] = {
-    let mut all = [aterm_capacity::DISK_COVER_ENV; 8];
+pub const CHILD_ENV_REMOVED: [&str; 9] = {
+    let mut all = [aterm_capacity::DISK_COVER_ENV; 9];
+    all[8] = stages::CHECKERS_ENV;
     let mut i = 0;
     while i < CARGO_RUN_ENV.len() {
         all[i] = CARGO_RUN_ENV[i];
@@ -742,7 +749,6 @@ impl Ctx {
             passed_binaries: None,
             events: None,
             test_compile_failed: std::sync::atomic::AtomicBool::new(false),
-            checkers_compile_failed: std::sync::atomic::AtomicBool::new(false),
             halt: sched::Halt::off(),
             unit_graph: stages::unit_graph,
             shape_run: Mutex::new(shape::Run::default()),
@@ -1070,9 +1076,10 @@ impl Ctx {
 
     /// The command that reruns `check` over this run's selection, as this run ran it: a release's
     /// `test` and `doc` rows name `--as-release`, without which they carry no
-    /// [`stages::CHECKERS_FEATURE`] and `test` owes no [`checks::GOLDEN`] test, so would pass what
+    /// `ATERM_SPEC_CHECKERS=1` and `test` owes no [`checks::GOLDEN`] test, so would pass what
     /// failed. A cone's `lint` row names the cone's base: `-p` over its crates would lint every
-    /// target of each and the crates it left out ([`stages::tippy_passes`]). A lint rerun pulls
+    /// target of each and the crates it left out ([`stages::tippy_passes`]). So does a cone's
+    /// `export-scan` row: under `-p` it scans the whole export, not the changed files. A lint rerun pulls
     /// `cells` as any dev lint does ([`checks::pulls_cells`]).
     #[must_use]
     pub fn rerun(&self, check: Check) -> String {
@@ -1081,7 +1088,7 @@ impl Ctx {
             match &self.scope {
                 Scope::Workspace => cmd.push_str(" --all"),
                 s if s.selects_nothing() => {}
-                Scope::Changed(cone) if check == Check::Lint => {
+                Scope::Changed(cone) if matches!(check, Check::Lint | Check::ExportScan) => {
                     cmd.push_str(" --base ");
                     cmd.push_str(&cone.base);
                 }
@@ -1361,9 +1368,14 @@ pub(crate) fn admission(
 ) -> String {
     let bound = claim.record().need.quiet.unwrap_or_default();
     if claim.record().need.quiet_policy == aterm_capacity::QuietPolicy::Timing {
+        // How busy the GPU read at admission, which it waited for until its bound (QUIET-BURST).
+        let gpu = claim
+            .quiet()
+            .and_then(|q| q.gpu)
+            .map_or_else(String::new, |g| format!(", GPU {g}% busy"));
         if let Ok(aterm_capacity::Protection::Loaded(observed)) = claim.timing_protection() {
             return format!(
-                "{} loaded timing reservation after {}: {}; ran without a qualified quiet \
+                "{} loaded timing reservation after {}: {}{gpu}; ran without a qualified quiet \
                  admission (stated, not a finding: a busy machine never blocks a release)",
                 if first { "acquired" } else { "retained" },
                 aterm_capacity::span(claim.waited()),
@@ -1373,7 +1385,7 @@ pub(crate) fn admission(
         let evidence = claim.record().timing;
         return evidence.admission.map_or_else(
             || "timing reservation with unknown admission CPU; no measurement qualification".into(),
-            |window|format!("{} timing reservation; admission CPU {:.2}% over {:.3}s at epoch {}ms, load {:?} <= {bound:.1}; admission sample is not fresh measurement-entry evidence or continuous quiet",
+            |window|format!("{} timing reservation; admission CPU {:.2}% over {:.3}s at epoch {}ms, load {:?} <= {bound:.1}{gpu}; admission sample is not fresh measurement-entry evidence or continuous quiet",
                 if first {"acquired"}else{"retained"},window.busy_ticks as f64*100.0/window.total_ticks as f64,window.interval_ns as f64/1e9,window.observed_ms,evidence.admission_load1),
         );
     }
@@ -1823,7 +1835,9 @@ fn claim_memory(
 /// held it back for ([`held_note`]), and what its claim did. A stage on the quiet machine
 /// ([`takes_quiet`]) claims its memory only once it holds it: a run holds that across all of its
 /// timed stages, so a timed stage of another run that held memory while it waited for it could
-/// keep this run's next timed stage waiting for that memory, and neither would ever start. A stage holds its memory
+/// keep this run's next timed stage waiting for that memory, and neither would ever start. That
+/// claim waits for the held claims alone, never behind a waiter (QUIET-FIRST, `aterm_capacity`),
+/// so the quiet machine is not held through a turn in the queue. A stage holds its memory
 /// share until it ends; bounded and pool workers retain their own shares until their work
 /// ends. It waits for nothing while it holds one. A stage the run's end keeps
 /// from starting ([`stopping`]), or whose memory or quiet claim an interrupt ended or gave up
@@ -2949,6 +2963,12 @@ mod interrupt_report_tests;
 #[cfg(all(test, unix))]
 mod halt_report_tests;
 
+#[cfg(test)]
+mod libtest_fixture;
+
+#[cfg(all(test, unix))]
+mod live_halt_tests;
+
 #[cfg(all(test, unix))]
 mod memory_claim_tests;
 
@@ -3072,6 +3092,12 @@ mod tests {
 
     #[test]
     fn a_borrowed_tools_build_is_held_for_the_run() {
+        #[cfg(unix)]
+        if !aterm_uds::test_binary::isolated_lifecycle(
+            "tests::a_borrowed_tools_build_is_held_for_the_run",
+        ) {
+            return;
+        }
         use aterm_toolchain::lease::{self, Holders, Subject};
         let home = std::fs::canonicalize(mktemp_dir("atv-lease").expect("mktemp")).expect("real");
         let env = EnvSnapshot {
@@ -3110,8 +3136,28 @@ mod tests {
         ));
         let said = said.expect("said in the log");
         assert!(said.contains("trust build 9192"), "{said}");
+        #[cfg(unix)]
+        let fork = aterm_uds::fork_window::Parked::park();
         drop(held);
-        assert_eq!(lease::holders(&prefix, &subject), Holders::Free);
+        #[cfg(unix)]
+        {
+            // SDK leases deliberately retain genuine descriptor duplicates. A sibling
+            // spawn also holds one until exec, even though this run dropped its lease.
+            assert!(matches!(
+                lease::holders(&prefix, &subject),
+                Holders::Held(_)
+            ));
+            assert!(fork.release().success());
+        }
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the final borrowed-tool lease descriptor closing",
+            || match lease::holders(&prefix, &subject) {
+                Holders::Free => Some(()),
+                Holders::Held(_) => None,
+                Holders::Unknown(error) => panic!("lease probe failed: {error}"),
+            },
+        );
 
         let own_only = Toolchain {
             borrowed: Vec::new(),
@@ -3466,9 +3512,18 @@ mod tests {
         assert_eq!(pinned(&c), Some(fast));
         assert_eq!(c.main_build_dir.as_deref(), Some(fast_cfg.as_str()));
         let argv = stages::main_targo(&c, vec!["--unverified".into(), "test".into()]).argv();
+        let [config, workspace] = aterm_toolchain::build_cache::TEST_GRAPH_CONFIG;
         assert_eq!(
             argv[1..],
-            ["--config", fast_cfg.as_str(), "--unverified", "test"]
+            [
+                "--config",
+                fast_cfg.as_str(),
+                "--unverified",
+                config,
+                workspace,
+                "test",
+                aterm_toolchain::build_cache::TEST_GRAPH_FLAG
+            ]
         );
         let c = ctx(&repo, EnvSnapshot::default());
         let repo_cfg = format!(

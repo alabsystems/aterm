@@ -887,9 +887,18 @@ fn always_on_desktop(sys: &dyn System, ctx: &Ctx) -> Result<(), Probe> {
 }
 
 fn daemon_loaded_pid(sys: &dyn System) -> Result<Option<Option<u32>>, String> {
+    system_job_pid(sys, aterm_secrets::service::DAEMON_LABEL)
+}
+
+/// Whether launchd's `system` domain holds the job `label`: `None` when it is not loaded, else
+/// its pid when it runs.
+///
+/// # Errors
+/// `launchctl print` could not run or answered with anything but loaded or not, in one line.
+pub(crate) fn system_job_pid(sys: &dyn System, label: &str) -> Result<Option<Option<u32>>, String> {
     let cmd =
         Cmd::new(super::sharing::LAUNCHCTL).args(aterm_secrets::service::system_launchctl_argv(
-            aterm_secrets::service::SystemLaunchctl::Print(aterm_secrets::service::DAEMON_LABEL),
+            aterm_secrets::service::SystemLaunchctl::Print(label),
         ));
     match sys.run(&cmd) {
         Ok(ran) if ran.success() => Ok(Some(aterm_secrets::service::print_pid(&ran.out()))),
@@ -902,6 +911,66 @@ fn daemon_loaded_pid(sys: &dyn System) -> Result<Option<Option<u32>>, String> {
 fn run_launchctl(sys: &dyn System, args: Vec<String>) -> Result<Ran, String> {
     let cmd = Cmd::new(super::sharing::LAUNCHCTL).args(args);
     sys.run(&cmd).map_err(|e| format!("{}: {e}", cmd.display()))
+}
+
+/// (Re)start the system job `label` that `plist_path` defines: `bootout` where it is loaded (one
+/// not loaded is no error), then `enable`, `bootstrap` and `kickstart`.
+///
+/// # Errors
+/// The first `launchctl` call that failed, in one line.
+pub(crate) fn start_system_job(
+    sys: &dyn System,
+    plist_path: &Path,
+    label: &str,
+) -> Result<(), String> {
+    if system_job_pid(sys, label)?.is_some() {
+        let bootout = aterm_secrets::service::system_launchctl_argv(
+            aterm_secrets::service::SystemLaunchctl::Bootout(label),
+        );
+        let ran = run_launchctl(sys, bootout)?;
+        if !ran.success()
+            && ran.status != Some(super::sharing::NO_SUCH_PROCESS)
+            && ran.status != Some(super::sharing::NOT_LOADED)
+        {
+            return Err(format!(
+                "launchctl bootout system/{label}: {}",
+                ran.describe()
+            ));
+        }
+    }
+    let enable = run_launchctl(sys, vec!["enable".into(), format!("system/{label}")])?;
+    if !enable.success() {
+        return Err(format!(
+            "launchctl enable system/{label}: {}",
+            enable.describe()
+        ));
+    }
+    let bootstrap = run_launchctl(
+        sys,
+        aterm_secrets::service::system_launchctl_argv(
+            aterm_secrets::service::SystemLaunchctl::Bootstrap(plist_path),
+        ),
+    )?;
+    if !bootstrap.success() {
+        return Err(format!(
+            "launchctl bootstrap system {}: {}",
+            plist_path.display(),
+            bootstrap.describe()
+        ));
+    }
+    let kickstart = run_launchctl(
+        sys,
+        aterm_secrets::service::system_launchctl_argv(
+            aterm_secrets::service::SystemLaunchctl::Kickstart(label),
+        ),
+    )?;
+    if !kickstart.success() {
+        return Err(format!(
+            "launchctl kickstart system/{label}: {}",
+            kickstart.describe()
+        ));
+    }
+    Ok(())
 }
 
 impl Item for VaultServer {
@@ -1075,54 +1144,7 @@ impl Item for VaultServer {
             .map_err(|e| format!("{}: {e}", plist_path.display()))?;
         sys.chown(plist_path, 0, 0)
             .map_err(|e| format!("chown {}: {e}", plist_path.display()))?;
-        if daemon_loaded_pid(sys)?.is_some() {
-            let bootout = aterm_secrets::service::system_launchctl_argv(
-                aterm_secrets::service::SystemLaunchctl::Bootout(label),
-            );
-            let ran = run_launchctl(sys, bootout)?;
-            if !ran.success()
-                && ran.status != Some(super::sharing::NO_SUCH_PROCESS)
-                && ran.status != Some(super::sharing::NOT_LOADED)
-            {
-                return Err(format!(
-                    "launchctl bootout system/{label}: {}",
-                    ran.describe()
-                ));
-            }
-        }
-        let enable = run_launchctl(sys, vec!["enable".into(), format!("system/{label}")])?;
-        if !enable.success() {
-            return Err(format!(
-                "launchctl enable system/{label}: {}",
-                enable.describe()
-            ));
-        }
-        let bootstrap = run_launchctl(
-            sys,
-            aterm_secrets::service::system_launchctl_argv(
-                aterm_secrets::service::SystemLaunchctl::Bootstrap(plist_path),
-            ),
-        )?;
-        if !bootstrap.success() {
-            return Err(format!(
-                "launchctl bootstrap system {}: {}",
-                plist_path.display(),
-                bootstrap.describe()
-            ));
-        }
-        let kickstart = run_launchctl(
-            sys,
-            aterm_secrets::service::system_launchctl_argv(
-                aterm_secrets::service::SystemLaunchctl::Kickstart(label),
-            ),
-        )?;
-        if !kickstart.success() {
-            return Err(format!(
-                "launchctl kickstart system/{label}: {}",
-                kickstart.describe()
-            ));
-        }
-        Ok(())
+        start_system_job(sys, plist_path, label)
     }
 
     fn revert(&self) -> Option<String> {

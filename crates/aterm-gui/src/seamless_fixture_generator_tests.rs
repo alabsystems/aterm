@@ -362,6 +362,7 @@ fn fx_leaf(local_id: u64, title: &str, cwd: Option<&str>) -> crate::restore::Res
         not_claim_worker: false,
         claim_worker: None,
         task: None,
+        told: None,
     }))
 }
 
@@ -3629,6 +3630,7 @@ fn fx_carried_state_desk() -> FxDesk {
     record.status_seen = crate::status_item::StatusCarry {
         need: None,
         told: false,
+        told_ids: Vec::new(),
         held: Some((
             aterm_types::needs::HoldWord::Local,
             release_ms / 1_000 + 3_600,
@@ -4645,6 +4647,9 @@ const NO_HANDOFF_WRITES: &[(&str, &str)] = &[
     ("layout", "TerminalLeafRestore.held"),
     ("layout", "TerminalLeafRestore.holds"),
     ("layout", "TerminalLeafRestore.profile"),
+    // Only a quit's desk writes a leaf's told-once ids (`App::quit_agents`); a seamless update
+    // carries them in the session's status row (`SessionRecord::status_seen`'s `told_ids=`).
+    ("layout", "TerminalLeafRestore.told"),
     ("layout", "CodexRestore.carried"),
     // Context::of_exec_env returns no profile for an unknown filename selector,
     // so a production capture never writes this variant into Claude attribution.

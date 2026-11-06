@@ -10,7 +10,7 @@
 //!
 //! `<state>/fleet-seed` holds the one this node holds, written under the book's lock
 //! ([`super::HeldBook::keep_seed`]); a leave removes it and keeps its digest in
-//! [`DIGEST_FILE`] beside the node key ([`super::Leaving::keep_seed_digest`]), for Floor. A seed
+//! [`DIGEST_FILE`] beside the node key ([`super::Leaving::keep_seed_digest`]). A seed
 //! a member's book reply relays is adopted under the same lock ([`super::HeldBook::adopt_relayed_seed`]),
 //! and the last one refused as another minter's is recorded in [`CONFLICT_FILE`]. A root that
 //! holds none mints after [`UNHELD_WAIT_MS`] ([`super::HeldBook::mint_unheld_seed`]).
@@ -256,27 +256,6 @@ pub fn read_digest(dir: &Path) -> io::Result<Option<[u8; 8]>> {
     lower_hex(text.strip_suffix('\n').unwrap_or(&text))
         .map(Some)
         .ok_or_else(|| malformed(DIGEST_FILE, "holds no seed digest"))
-}
-
-/// The digests this node's own name records may be signed under, for Floor (§3.2): the seed's
-/// it holds, the one kept from its last leave, and the zero digest, each once. A seed file
-/// that cannot be read adds nothing, as a digest file does.
-#[must_use]
-pub fn floor_digests(dir: &Path) -> Vec<[u8; 8]> {
-    let mut digests = Vec::with_capacity(3);
-    for digest in [
-        read(dir).ok().flatten().map(|seed| seed.digest()),
-        read_digest(dir).ok().flatten(),
-        Some(super::name_record::ZERO_DIGEST),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if !digests.contains(&digest) {
-            digests.push(digest);
-        }
-    }
-    digests
 }
 
 /// What the minter signs: the seed, its node id (a length byte, then its bytes), the mint time

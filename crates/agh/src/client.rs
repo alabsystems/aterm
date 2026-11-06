@@ -386,6 +386,8 @@ impl std::fmt::Debug for Streamed {
 pub struct Meter {
     /// Requests sent (retries, probes, moves and hops included).
     pub requests: u32,
+    /// REST requests by identity, including retries and probes; excludes web/CDN transfers.
+    pub rest_requests: BTreeMap<String, u32>,
     /// The identity of the last request sent.
     pub as_: Option<IdentityRef>,
     /// The last `x-ratelimit-*` snapshot.
@@ -453,6 +455,7 @@ struct Inner {
     retry: RetryPolicy,
     redactor: Redactor,
     backstop: Option<Duration>,
+    no_anonymous_api: bool,
     /// Each profile's load, once per process.
     credentials: Mutex<BTreeMap<String, std::result::Result<Arc<Credential>, LoadError>>>,
     /// Each repository's numeric id, by [`Slug`]: the only memo (design §14).
@@ -493,6 +496,7 @@ pub struct GithubBuilder {
     retry: RetryPolicy,
     redactor: Redactor,
     backstop: Option<Duration>,
+    no_anonymous_api: bool,
     dirs: Option<Dirs>,
     notifier: Arc<dyn Notifier>,
     git_helper: Option<HelperCommand>,
@@ -515,12 +519,21 @@ impl GithubBuilder {
             retry: RetryPolicy::STANDARD,
             redactor: Redactor::new(),
             backstop: None,
+            no_anonymous_api: false,
             dirs: None,
             notifier: Arc::new(NoNotifier),
             git_helper: None,
             #[cfg(any(test, debug_assertions))]
             git_remotes: BTreeMap::new(),
         }
+    }
+
+    /// Refuse anonymous API sends before the wire, including an absent reader's fallback.
+    /// Credential-free Git and web/CDN transfers do not consume this API budget.
+    #[must_use]
+    pub fn refuse_anonymous_api(mut self, refuse: bool) -> GithubBuilder {
+        self.no_anonymous_api = refuse;
+        self
     }
 
     /// Set a custom sealed transport.
@@ -641,6 +654,7 @@ impl GithubBuilder {
                 retry: self.retry,
                 redactor: self.redactor,
                 backstop: self.backstop,
+                no_anonymous_api: self.no_anonymous_api,
                 credentials: Mutex::new(BTreeMap::new()),
                 ids: Mutex::new(BTreeMap::new()),
                 meter: Mutex::new(Meter::default()),
@@ -856,6 +870,10 @@ impl Github {
         }
         let mut meter = self.lock_meter();
         meter.requests = meter.requests.saturating_add(spent.requests);
+        for (identity, count) in &spent.rest_requests {
+            let entry = meter.rest_requests.entry(identity.clone()).or_default();
+            *entry = entry.saturating_add(*count);
+        }
         if meter.as_.is_none() {
             meter.as_.clone_from(&spent.as_);
         }
@@ -894,6 +912,7 @@ impl Github {
                 retry: inner.retry,
                 redactor: inner.redactor.clone(),
                 backstop: inner.backstop,
+                no_anonymous_api: inner.no_anonymous_api,
                 credentials: Mutex::new(BTreeMap::new()),
                 ids: Mutex::new(BTreeMap::new()),
                 meter: Mutex::new(Meter::default()),
@@ -1238,6 +1257,83 @@ impl Github {
         crate::git::run(self, run)
     }
 
+    /// One exact native ref push, using the same repository-wide journal bucket
+    /// as the API batch. Preparation failures close with no remote side effect;
+    /// an ambiguous push keeps the intent open and cannot be retried silently.
+    pub(crate) fn push_git_once(
+        &self,
+        run: &GitRun,
+        permit: &Permit,
+        intents: &dyn IntentStore,
+    ) -> Result<Outcome<GitOut>> {
+        crate::github::permit_covers(permit, &run.slug, "refs")?;
+        self.bind_login(permit.profile())
+            .map_err(before_the_write)?;
+        let decided = self.decided_for(permit)?;
+        let fingerprint = if self.taped() {
+            TAPED.to_string()
+        } else {
+            decided
+                .cred
+                .as_ref()
+                .ok_or_else(|| not_loaded(permit.profile()))?
+                .fingerprint()
+                .to_string()
+        };
+        let canonical = canon::git_request(run);
+        let draft = IntentDraft::new(
+            WriteOp::RefUpdateAtomic,
+            &run.slug,
+            permit,
+            &fingerprint,
+            crate::github::refs::ATOMIC_KEY,
+        )
+        .with_request(canon::request_digest(&canonical))
+        .with_body_digest(Some(crate::model::Sha256Digest::of(&canonical).to_string()))
+        .with_after(
+            intents
+                .latest(WriteOp::RefUpdateAtomic, crate::github::refs::ATOMIC_KEY)?
+                .map(|v| v.intent.id),
+        );
+        let id = intents.begin(&draft)?;
+        let result = self.run_git(run);
+        let settled = match &result {
+            Ok(_) => Settled::Created {
+                id: 0,
+                url: String::new(),
+            },
+            Err(error) => crate::write::settle_error(error),
+        };
+        let settled = match settled {
+            Settled::Unknown { why } => Settled::Unknown {
+                why: self.redactor().apply(&why),
+            },
+            other => other,
+        };
+        if let Err(error) = intents.settle(&id, &settled) {
+            let effect = if result.is_ok() {
+                SideEffect::Applied
+            } else {
+                SideEffect::Unknown
+            };
+            return Err(Error::local(format!(
+                "the native push journal could not record its result: {}; intent {id} stays open",
+                self.redactor().apply(&error.why)
+            ))
+            .with_side_effect(effect)
+            .with_repo(run.slug.to_string())
+            .with_next(format!("agh intent show {} {id}", run.slug)));
+        }
+        Ok(match result {
+            Ok(out) => Outcome::Done(out),
+            Err(error) => match settled {
+                Settled::NeverSent => Outcome::NeverSent(error),
+                Settled::Refused { .. } => Outcome::Refused(error),
+                _ => Outcome::Unknown { intent: id, error },
+            },
+        })
+    }
+
     /// The write journal for `slug`: `Journal::open(dirs, slug, fx)` when the builder had
     /// `journal(dirs)`; under a tape, `Journal::taped(slug, fx)` (a replay has no `Dirs`);
     /// else could_not_run `no journal: a one-shot write needs agh's state directory`.
@@ -1464,6 +1560,7 @@ const COVERS: &str = "covers";
 const PACE: Duration = Duration::from_secs(1);
 
 struct Prepared {
+    origin: OriginRole,
     atomic_refs: Option<crate::github::refs::AtomicRefWrite>,
     repo_create: Option<crate::github::repos::RepoCreateWrite>,
     method: Method,
@@ -1797,10 +1894,10 @@ fn file_digest(file: &mut std::fs::File, path: &std::path::Path, len: u64) -> Re
     }
     file.seek(SeekFrom::Start(0))
         .map_err(|e| file_error(path, &format!("could not be read: {e}")))?;
-    Ok(format!(
-        "sha256:{}",
-        aterm_codec::hex::encode_lower(&hasher.finalize())
-    ))
+    let mut out = String::with_capacity(7 + 64);
+    out.push_str("sha256:");
+    aterm_codec::hex::push_lower(&mut out, &hasher.finalize());
+    Ok(out)
 }
 
 /// The call's body as the wire takes it, and a file body's digest when `digest` asks for it
@@ -2094,6 +2191,7 @@ impl Github {
         consult_book: bool,
     ) -> Result<Answered> {
         let prepared = self.prepare_write(call, decided);
+        self.check_anonymous_api(&prepared)?;
         let key = book_key(&decided.identity);
         let booked = call.origin == OriginRole::Api && self.inner.rate_book.enabled();
         if booked && consult_book {
@@ -2110,6 +2208,13 @@ impl Github {
             let mut meter = self.lock_meter();
             meter.requests = meter.requests.saturating_add(1);
             meter.as_ = Some(prepared.as_.clone());
+            if matches!(prepared.origin, OriginRole::Api | OriginRole::Uploads) {
+                let count = meter
+                    .rest_requests
+                    .entry(prepared.as_.label().to_string())
+                    .or_default();
+                *count = count.saturating_add(1);
+            }
         }
         let exchanged = self
             .inner
@@ -2228,6 +2333,7 @@ impl Github {
             IdentityRef::Anonymous => None,
         };
         Prepared {
+            origin: call.origin,
             atomic_refs: call.atomic_refs.clone(),
             repo_create: call.repo_create.clone(),
             method: call.method,
@@ -2242,11 +2348,31 @@ impl Github {
         }
     }
 
+    fn check_anonymous_api(&self, prepared: &Prepared) -> Result<()> {
+        if self.inner.no_anonymous_api
+            && matches!(prepared.origin, OriginRole::Api | OriginRole::Uploads)
+            && prepared.as_ == IdentityRef::Anonymous
+        {
+            return Err(Error::refused(
+                "anonymous API budget is zero; select an available authenticated reader or a quota-free public read",
+            ));
+        }
+        Ok(())
+    }
+
     fn send(&self, prepared: &Prepared) -> Result<std::result::Result<WireResponse, WireError>> {
+        self.check_anonymous_api(prepared)?;
         {
             let mut meter = self.lock_meter();
             meter.requests = meter.requests.saturating_add(1);
             meter.as_ = Some(prepared.as_.clone());
+            if matches!(prepared.origin, OriginRole::Api | OriginRole::Uploads) {
+                let count = meter
+                    .rest_requests
+                    .entry(prepared.as_.label().to_string())
+                    .or_default();
+                *count = count.saturating_add(1);
+            }
         }
         let transport = &*self.inner.transport;
         match prepared.reading {

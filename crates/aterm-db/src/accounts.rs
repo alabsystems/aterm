@@ -79,8 +79,7 @@ pub fn validate(value: &Value) -> Result<()> {
             || first.is_empty()
             || second.is_empty()
             || pieces.next().is_some()
-            || email.chars().any(char::is_whitespace)
-            || email.chars().any(char::is_control)
+            || email.chars().any(|c| c.is_whitespace() || c.is_control())
         {
             return Err(Error::new("account email is invalid"));
         }

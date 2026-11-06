@@ -502,8 +502,9 @@ pub fn apply_kept_off(
 }
 
 /// [`apply_kept_off`], passing over a pixel no lit half-res texel lies within `quiet` of the
-/// taps' reach of (`None`: none passed over). Only a share below 1 can change a pixel: the
-/// negative control of `a_quiet_pixel_passed_over_takes_no_light`.
+/// taps' reach of and each tap on four dark texels (`None`: none passed over, every pixel its 50
+/// samples). Only a share below 1 can change a pixel: the negative control of
+/// `a_quiet_pixel_passed_over_takes_no_light`.
 fn bloom_kept_off(
     frame: &mut Frame,
     glow: &[GlowQuad],
@@ -577,7 +578,10 @@ fn bloom_kept_off(
             }
         }
     }
-    let sample = |u: f32, v: f32| -> [f32; 3] {
+    // A tap on four dark texels reads zero whatever its weights, and adds nothing to a sum of
+    // non-negative parts. A trail's half-res target is mostly dark, so most taps are such.
+    let pass_dark_taps = quiet.is_some();
+    let sample = |u: f32, v: f32| -> Option<[f32; 3]> {
         let fx = u * bw as f32 - 0.5;
         let fy = v * bh as f32 - 0.5;
         let (ix, iy) = (fx.floor(), fy.floor());
@@ -586,15 +590,19 @@ fn bloom_kept_off(
         let clampy = |y: f32| (y.max(0.0) as usize).min(bh - 1);
         let (xa, xb) = (clampx(ix), clampx(ix + 1.0));
         let (ya, yb) = (clampy(iy), clampy(iy + 1.0));
-        let t = |x: usize, y: usize| channels(half[y * bw + x]);
+        let t = |x: usize, y: usize| half[y * bw + x];
         let (aa, ba, ab, bb) = (t(xa, ya), t(xb, ya), t(xa, yb), t(xb, yb));
+        if pass_dark_taps && aa | ba | ab | bb == 0 {
+            return None;
+        }
+        let (aa, ba, ab, bb) = (channels(aa), channels(ba), channels(ab), channels(bb));
         let mut out = [0.0; 3];
         for (k, o) in out.iter_mut().enumerate() {
             let top = aa[k] * (1.0 - ax) + ba[k] * ax;
             let bottom = ab[k] * (1.0 - ax) + bb[k] * ax;
             *o = top * (1.0 - ay) + bottom * ay;
         }
-        out
+        Some(out)
     };
     let white_part = |c: [f32; 3]| c[0].min(c[1]).min(c[2]);
     let extent = bw.max(bh) as f32;
@@ -646,11 +654,27 @@ fn bloom_kept_off(
         let clamp = |x: f32| (x.max(0.0) as usize).min(n - 1);
         (clamp((c - reach).floor()), clamp((c + reach).floor() + 1.0))
     };
+    // The half-res rows that hold a lit texel. The taps stand in five rows, each row's five on
+    // the same two texel rows at a given pixel row: a tap row on two dark rows reads nothing
+    // across, and a thin light leaves most of a pixel's tap rows so.
+    let row_lit: Vec<bool> = half
+        .chunks_exact(bw)
+        .map(|r| r.iter().any(|&t| t != 0))
+        .collect();
     for py in sy0..sy1 {
         let v = (py as f32 + 0.5) / h as f32;
         let ys = lit
             .as_ref()
             .map(|(_, reach)| span(v * bh as f32 - 0.5, *reach, bh));
+        // Each tap row's two texel rows as [`sample`] finds them: white, chroma.
+        let row_reads = |dv: f32| {
+            let fy = (v + dv) * bh as f32 - 0.5;
+            let iy = fy.floor();
+            let clampy = |y: f32| (y.max(0.0) as usize).min(bh - 1);
+            !pass_dark_taps || row_lit[clampy(iy)] || row_lit[clampy(iy + 1.0)]
+        };
+        let tap_rows: [(bool, bool); 5] =
+            std::array::from_fn(|j| (row_reads(taps[j * 5].1), row_reads(taps[j * 5].3)));
         for px in sx0..sx1 {
             let u = (px as f32 + 0.5) / w as f32;
             if let (Some((table, reach)), Some(ys)) = (&lit, ys)
@@ -664,13 +688,17 @@ fn bloom_kept_off(
             }
             let mut white = 0.0f32;
             let mut chroma = [0.0f32; 3];
-            for &(du_w, dv_w, du_c, dv_c, weight) in &taps {
-                let sw = sample(u + du_w, v + dv_w);
-                white += white_part(sw) * weight;
-                let sc = sample(u + du_c, v + dv_c);
-                let wc = white_part(sc);
-                for k in 0..3 {
-                    chroma[k] += (sc[k] - wc) * weight;
+            for (row, &(reads_w, reads_c)) in taps.as_chunks::<5>().0.iter().zip(&tap_rows) {
+                for &(du_w, dv_w, du_c, dv_c, weight) in row {
+                    if reads_w && let Some(sw) = sample(u + du_w, v + dv_w) {
+                        white += white_part(sw) * weight;
+                    }
+                    if reads_c && let Some(sc) = sample(u + du_c, v + dv_c) {
+                        let wc = white_part(sc);
+                        for k in 0..3 {
+                            chroma[k] += (sc[k] - wc) * weight;
+                        }
+                    }
                 }
             }
             let src = [
@@ -1222,10 +1250,13 @@ mod tests {
         assert!(bare.pixels.iter().all(|&p| p == 0));
     }
 
-    /// A pixel passed over for no lit texel within its taps' reach takes no light: over lights
-    /// apart, in both modes, at every radius, the frame is the one each pixel's 50 samples make.
-    /// NEGATIVE CONTROL: judged over a quarter of the reach, a pixel the light reaches is passed
-    /// over, so the comparison sees a reach too short.
+    /// A pixel passed over for no lit texel within its taps' reach, and a tap passed over for four
+    /// dark texels or a tap row for two dark rows, take no light: over lights apart, in both modes,
+    /// at every radius, the frame is the one each pixel's 50 samples make. NEGATIVE CONTROL: judged
+    /// over a quarter of the reach, a pixel the light reaches is passed over, so the comparison
+    /// sees a reach too short. NEGATIVE CONTROLS (2026-11-05): a dark tap read from three of its
+    /// texels, and a dark tap row read from the first of its two rows, each fail it ("a passed-over
+    /// pixel took light").
     #[test]
     fn a_quiet_pixel_passed_over_takes_no_light() {
         let mut seed = 0x9E37_79B9_7F4A_7C15u64;

@@ -1432,7 +1432,9 @@ fn relaunch_held(
         upgrade::Agent::Claude => true,
         upgrade::Agent::Codex | upgrade::Agent::Agy | upgrade::Agent::Muse => false,
     };
-    if (super::native_restart::coordinated(st) || opts.token.is_some() && has_private_constructor)
+    if !st.host_ended_fresh
+        && (super::native_restart::coordinated(st)
+            || opts.token.is_some() && has_private_constructor)
         && st.native.is_none()
         && st.native_prepare.is_empty()
     {
@@ -1516,7 +1518,9 @@ fn relaunch_held(
             return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
         }
     }
-    if !super::upgrade_wake::wait_exit(old, opts.timings.exited) {
+    // A record that already saw its agent gone ([`St::exited_at`]) waits on no pid: that
+    // number may name another process since (a reboot reuses them).
+    if st.exited_at == 0 && !super::upgrade_wake::wait_exit(old, opts.timings.exited) {
         return said(r, "wait:exiting");
     }
     st.seen_gone(now_s());
@@ -1544,7 +1548,7 @@ fn relaunch_held(
         return said(r, "wait:native-continuation-changed");
     }
     let native = st.native.clone();
-    if native.is_none() && super::native_restart::coordinated(st) {
+    if native.is_none() && !st.host_ended_fresh && super::native_restart::coordinated(st) {
         return said(r, "wait:native-recovery");
     }
     let native_phase = super::native_restart::phase(st);
@@ -6051,7 +6055,7 @@ pub fn after_exit(
         Some(super::restart_stamp::Cause::Asked) => ExitCause::Asked,
         None => ExitCause::Exit,
     };
-    after_exit_as(opts, snap, left, upgrade, cause, None, None)
+    after_exit_as(opts, snap, left, upgrade, cause, None, None, false)
 }
 
 /// Admission for a newly planned execution, after ended exits and existing durable plans are resolved.
@@ -6090,7 +6094,7 @@ pub fn after_exit_admitting(
             None => ExitCause::Exit,
         }
     };
-    after_exit_as(opts, snap, left, upgrade, cause, None, Some(admit))
+    after_exit_as(opts, snap, left, upgrade, cause, None, Some(admit), false)
 }
 
 /// [`after_exit`] of an exit an Autopilot carries ([`Carried::Yes`]): relaunched on its
@@ -6103,7 +6107,16 @@ pub fn after_carried_exit(
     left: &ExitRecord,
     upgrade: bool,
 ) -> Report {
-    after_exit_as(opts, snap, left, upgrade, ExitCause::Carried, None, None)
+    after_exit_as(
+        opts,
+        snap,
+        left,
+        upgrade,
+        ExitCause::Carried,
+        None,
+        None,
+        false,
+    )
 }
 
 /// Whose an exit [`on_exit`] found nobody owns is, under the session's Autopilot ([`carried`]).
@@ -6222,6 +6235,7 @@ pub fn after_host_ended_from(
         ExitCause::HostEnded,
         was,
         None,
+        false,
     )
 }
 
@@ -6242,6 +6256,39 @@ pub fn after_host_ended_admitting(
         ExitCause::HostEnded,
         was,
         Some(admit),
+        false,
+    )
+}
+
+/// [`after_host_ended_admitting`] of an agent its host knows ended under an earlier aterm
+/// process (a tab restored from the layout, after a reboot, a kill or an update's owed
+/// relaunch), `asked` the restart stamp its layout carried (its restart or a stall's remedy ended
+/// it, so the relaunch is that one's), `admit` its admission where a new plan is made. Every native act of that
+/// process died with its epoch, so a record's kept native coordination gates no fresh,
+/// admitted relaunch of it ([`host_ended_fresh`]), on this pass or a later one.
+#[must_use]
+pub fn after_earlier_host_ended(
+    opts: &Opts,
+    snap: &Snapshot,
+    upgrade: bool,
+    was: Option<&str>,
+    asked: Option<super::restart_stamp::Cause>,
+    admit: Option<&Admission<'_>>,
+) -> Report {
+    let cause = match asked {
+        Some(super::restart_stamp::Cause::Stall) => ExitCause::Stall,
+        Some(super::restart_stamp::Cause::Asked) => ExitCause::Asked,
+        None => ExitCause::HostEnded,
+    };
+    after_exit_as(
+        opts,
+        snap,
+        &ExitRecord::Unread,
+        upgrade,
+        cause,
+        was,
+        admit,
+        true,
     )
 }
 
@@ -6265,6 +6312,7 @@ pub fn same_self_claim(snap: &Snapshot, copy: &super::self_claimed::Copy) -> boo
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn after_exit_as(
     opts: &Opts,
     snap: &Snapshot,
@@ -6273,6 +6321,7 @@ fn after_exit_as(
     cause: ExitCause,
     was: Option<&str>,
     admit: Option<&Admission<'_>>,
+    earlier: bool,
 ) -> Report {
     match &snap.run {
         AgentRun::Codex(_) => {
@@ -6355,10 +6404,15 @@ fn after_exit_as(
             );
         }
     };
-    if cause != ExitCause::HostEnded
-        && let Some(st) = prior
-            .clone()
-            .filter(|st| ended_by_restart(st, upgrade::Agent::Claude, &snap.tab, snap.pid, now_s()))
+    // An agent that ended under an earlier aterm process is that host's end whatever stamp its
+    // layout carried: a restart that process had in flight is carried below, by identity. A
+    // stamped one whose restart already failed keeps that refusal, as it did under its host.
+    let host_ended = cause == ExitCause::HostEnded || earlier;
+    if let Some(st) = prior
+        .clone()
+        .filter(|st| ended_by_restart(st, upgrade::Agent::Claude, &snap.tab, snap.pid, now_s()))
+        && (!host_ended
+            || (cause != ExitCause::HostEnded && matches!(st.phase, upgrade::Phase::Failed(_))))
     {
         r.to = format!("{}({})", st.to, st.source);
         return carry_own(opts, r, st, &session, &snap.tab);
@@ -6369,10 +6423,10 @@ fn after_exit_as(
             return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
         }
         r.to = format!("{}({})", st.to, st.source);
-        if st.tab != snap.tab && cause != ExitCause::HostEnded {
+        if st.tab != snap.tab && !host_ended {
             return said(r, "wait:conversation-in-other-tab");
         }
-        let overtaken = if cause == ExitCause::HostEnded && st.tab != snap.tab {
+        let overtaken = if host_ended && st.tab != snap.tab {
             Some((
                 "host-ended",
                 "aterm ended while this relaunch was in flight; its tab was reopened".to_string(),
@@ -6408,6 +6462,24 @@ fn after_exit_as(
                 save(opts, &session, &st);
             }
         } else {
+            if in_flight_exit_proven(
+                &st,
+                snap,
+                alive(snap.pid),
+                kernel_start(snap.pid).as_deref(),
+            ) {
+                // A restart in flight when aterm ended (a stall's or an asked one) waits on
+                // its agent's exit: proven here by its kernel start, never by a pid that may
+                // name another process since (a reboot reuses them).
+                st.exited_at = now_s();
+            }
+            if host_ended && snap.shell != NO_SHELL && alive(snap.shell) {
+                // Aterm ended: the restart's line goes to the shell the restored tab holds
+                // now, never to the pid its earlier shell had.
+                st.shell = snap.shell;
+            }
+            // Recomputed on every pass: the record keeps the mark, never this exemption.
+            st.host_ended_fresh = host_ended_fresh_now(opts, earlier, false, &st);
             return carry_in_flight(opts, r, st, &session, &snap.tab);
         }
     }
@@ -6595,16 +6667,18 @@ fn after_exit_as(
     if !roster(&mut c).contains(&snap.tab) {
         return said(r, "wait:tab-not-live");
     }
-    launch_after_exit(opts, snap, cause, r, st, plan, c)
+    launch_after_exit(opts, snap, cause, earlier, r, st, plan, c)
 }
 
 /// The real exit lane's already-selected immutable plan, current connection and state. The
 /// caller has performed record/target/roster selection; the held relaunch retains every
 /// person, shell and process-exit guard before any legacy or typed continuation.
+#[allow(clippy::too_many_arguments)]
 fn launch_after_exit(
     opts: &Opts,
     snap: &Snapshot,
     cause: ExitCause,
+    earlier: bool,
     r: Report,
     mut st: St,
     plan: Plan,
@@ -6629,7 +6703,17 @@ fn launch_after_exit(
         .and_then(|command| command.account_intent.clone());
     st.line_dir = line_dir.unwrap_or_default();
     st.phase = upgrade::Phase::Exiting { at_s: now_s() };
-    if opts.token.is_some() || super::native_restart::coordinated(&st) {
+    if gone_by_identity(
+        &snap.start,
+        alive(snap.pid),
+        kernel_start(snap.pid).as_deref(),
+    ) {
+        // The process that ran as `snap.pid` is gone, by its kernel start: a live pid here
+        // is another process (pids are reused, as after a reboot), never a guard to wait on.
+        st.exited_at = now_s();
+    }
+    st.host_ended_fresh = host_ended_fresh_now(opts, earlier, cold.is_some(), &st);
+    if !st.host_ended_fresh && (opts.token.is_some() || super::native_restart::coordinated(&st)) {
         match super::native_restart::begin_crash(
             opts,
             &mut c,
@@ -6661,6 +6745,140 @@ fn launch_after_exit(
     let r = relaunch(opts, r, &mut st, &mut c, &session, &Live);
     save(opts, &session, &st);
     r
+}
+
+/// Whether the in-flight restart `st` was waiting on the exit of the agent `snap` names, and
+/// that agent is proven gone by its kernel start (its pid `alive`, born `start_now`), as
+/// [`gone_by_identity`] judges: only an Exiting record not yet stamped, of that same pid.
+pub(super) fn in_flight_exit_proven(
+    st: &St,
+    snap: &Snapshot,
+    alive: bool,
+    start_now: Option<&str>,
+) -> bool {
+    matches!(st.phase, upgrade::Phase::Exiting { .. })
+        && st.exited_at == 0
+        && st.pid == snap.pid
+        && gone_by_identity(&snap.start, alive, start_now)
+}
+
+/// Whether an exit's relaunch is a typed plan no native authority gates
+/// ([`St::host_ended_fresh`]): its agent ended under an earlier aterm process (`earlier`, as
+/// its host knows it: a tab restored from the layout, never a stranded or rolled-back relaunch
+/// of this one), its record coordinated (an uncoordinated one takes its gates as before), the
+/// plan carries no deferred cold intent (it was admitted now), its exit is proven
+/// ([`St::exited_at`], by [`gone_by_identity`]), no native operation or rollback is left
+/// unresolved (one is reconciled or held as it is, never replaced by a line), and the record
+/// holds no native act of this process (`own`, [`native_of_this_host`]). Every native act of
+/// the ended process died with its epoch, so the record's kept coordination is no grant to
+/// wait on.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HostEndedRelaunch",
+        action = "Own",
+        reason = "Select one input of the relaunch's fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HostEndedRelaunch",
+        action = "Earlier",
+        reason = "Select one input of the relaunch's fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HostEndedRelaunch",
+        action = "Coordinated",
+        reason = "Select one input of the relaunch's fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HostEndedRelaunch",
+        action = "Deferred",
+        reason = "Select one input of the relaunch's fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HostEndedRelaunch",
+        action = "Proven",
+        reason = "Select one input of the relaunch's fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HostEndedRelaunch",
+        action = "Unresolved",
+        reason = "Select one input of the relaunch's fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "HostEndedRelaunch",
+        action = "Decide",
+        project = "aterm_agent::harness::relaunch::native_gate_tests::host_ended_transition"
+    )
+)]
+pub(super) fn host_ended_fresh(earlier: bool, deferred: bool, own: bool, st: &St) -> bool {
+    earlier
+        && super::native_restart::coordinated(st)
+        && !deferred
+        && st.exited_at != 0
+        && st.native.is_none()
+        && st.native_prepare.is_empty()
+        && !st.native_retired_unissued
+        && st.native_account_candidate.is_none()
+        && !st.native_rollback
+        && !own
+}
+
+/// [`host_ended_fresh`] of `st` now, asking its host whether a native act the record holds
+/// is this process's only where nothing else already refuses it.
+fn host_ended_fresh_now(opts: &Opts, earlier: bool, deferred: bool, st: &St) -> bool {
+    let own = host_ended_fresh(earlier, deferred, false, st)
+        && native_of_this_host(st, || {
+            let mut c = connect(opts, &st.tab).ok()?;
+            match super::native_act::exchange(&mut c, &st.tab, &super::native_act::Request::Info) {
+                Ok(super::native_act::Reply::Info { epoch, .. }) => Some(epoch),
+                _ => None,
+            }
+        });
+    host_ended_fresh(earlier, deferred, own, st)
+}
+
+/// Whether `st` holds a native act of this aterm process: a completed preparation or a death
+/// witness stamped with the epoch its host reports now (`epoch`, read only when one is
+/// stamped). One whose host's epoch cannot be read counts as this process's, so its gates
+/// stay.
+pub(super) fn native_of_this_host(st: &St, epoch: impl FnOnce() -> Option<String>) -> bool {
+    let stamped: Vec<&str> = st
+        .native_completed_prepare
+        .iter()
+        .map(|p| p.host_epoch.as_str())
+        .chain(
+            st.native_observation
+                .iter()
+                .map(|o| o.registration.host_epoch.as_str()),
+        )
+        .collect();
+    !stamped.is_empty() && epoch().is_none_or(|now| stamped.contains(&now.as_str()))
+}
+
+/// Whether the agent that ran with kernel start `start` is proven gone, by what the kernel
+/// answers for its pid now: gone when no process holds it (`now` is `None` and the pid is
+/// not `alive`) or one born at another time does (a reused pid, as after a reboot). An
+/// unrecorded `start` proves nothing, nor does a live pid whose start cannot be read.
+pub(super) fn gone_by_identity(start: &str, alive: bool, now: Option<&str>) -> bool {
+    !start.is_empty() && (!alive || now.is_some_and(|now| now != start))
 }
 
 /// The fallback origin an exit's relaunch of `session` records ([`fallback_carried`] of the one its last record keeps).

@@ -4,6 +4,7 @@
 use super::*;
 use crate::commons::binding::Request;
 use crate::crossing::fixture::LEGACY;
+use crate::membership_log::RecordBudgets;
 
 fn member(tag: u8) -> ([u8; 32], [u8; 16], MemberId, Entrant) {
     let seed = [tag; 32];
@@ -90,11 +91,11 @@ fn accepted_publication_at_a_full_held_store() {
         let before = std::fs::read(paths.records_file()).unwrap();
         let held = std::fs::read(held_draft_file(&paths, 2, &VERSION)).unwrap();
         let deadline = bounded.then(|| Instant::now() + aterm_spec::wait::MUST_HAPPEN);
-        let result = keep_drafted_until(&paths, &drafted, &[], deadline, None);
-        if result.is_ok() {
+        let result = keep_drafted_until(&paths, &drafted, (2, &VERSION), &[], deadline, None);
+        if let Ok(&kept) = result.as_ref() {
             // This is the publication caller's success path: it may discard
             // recovery only after every record was made durably complete.
-            forget_landed_draft(&paths, 2, &VERSION, &[], &[], true, deadline);
+            forget_landed_draft(&paths, 2, &VERSION, &[], &[], true, kept, deadline);
         }
         let store = super::super::load_records(&paths).unwrap();
         let retained = drafted
@@ -479,7 +480,7 @@ fn a_hold_goes_only_by_descent_or_the_answer_of_every_server_it_may_have_reached
             .reach
     };
     let land = |seq: u64, version: u8, parents: &[[u8; 32]], took: &[String]| {
-        forget_landed_draft(&paths, seq, &[version; 32], parents, took, true, None);
+        forget_landed_draft(&paths, seq, &[version; 32], parents, took, true, true, None);
     };
 
     land(6, 6, &[[6; 32]], std::slice::from_ref(&b));
@@ -532,13 +533,84 @@ fn a_hold_is_removed_only_under_the_state_lock() {
     let all = held(&paths);
     let passed = Some(Instant::now());
     forget_held_draft(&paths, refused.0, &refused.1, passed);
-    forget_landed_draft(&paths, landed.0, &landed.1, &[older.1], &a, true, passed);
+    forget_landed_draft(
+        &paths,
+        landed.0,
+        &landed.1,
+        &[older.1],
+        &a,
+        true,
+        true,
+        passed,
+    );
     assert_eq!(held(&paths), all, "no hold goes without the lock");
 
-    forget_landed_draft(&paths, landed.0, &landed.1, &[older.1], &a, true, None);
+    forget_landed_draft(
+        &paths,
+        landed.0,
+        &landed.1,
+        &[older.1],
+        &a,
+        true,
+        true,
+        None,
+    );
     assert!(
         held(&paths).is_empty(),
         "the next settled head removes them: its own, by descent and by A's answer"
+    );
+}
+
+/// A landed version whose records were not kept settles the other holds by its servers alone,
+/// never by its parent spine ([`nle::spine_settles`], the island's `landSpine`): its hold went by
+/// descent before its keep, so the head that settled it carries its edit, and that head's spine,
+/// capped at [`MAX_PARENTS`](crate::envelope::MAX_PARENTS), may leave out a version this one's
+/// names. Here v2, drafted from v1, lands on B with its records not kept: v1's hold, which only
+/// A may hold, stays. It goes by descent where v2 kept its records or drafted none. The island's
+/// run `cappedSpine` (section 7) reaches this landing through v3, drafted from v2 with v1 left
+/// out of its spine.
+///
+/// NEGATIVE CONTROL, run in the test: [`SPINE_ALWAYS`] (`spine-always`, a landed version settles
+/// by its spine whatever became of its records, as before the gate) drops v1's hold.
+#[test]
+fn a_landed_version_whose_records_were_not_kept_settles_by_reach_alone() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let paths = Paths::for_home(root.path());
+    fsx::ensure_private_dir(&paths.dir).unwrap();
+    let nothing = Drafted {
+        records: Vec::new(),
+        heads: Vec::new(),
+    };
+    let (a, b) = (
+        vec!["https://a.example/v".to_owned()],
+        vec!["https://b.example/v".to_owned()],
+    );
+    let (v1, v2) = ((2, [1; 32]), (3, [2; 32]));
+    // Whether v1's hold stays once v2 lands on B, v1 its spine's one version.
+    let stays = |drafted: bool, kept: bool| {
+        hold_drafted(&paths, &nothing, v1.0, &v1.1, &a).unwrap();
+        forget_landed_draft(&paths, v2.0, &v2.1, &[v1.1], &b, drafted, kept, None);
+        held(&paths).contains(&v1)
+    };
+    assert!(
+        stays(true, false),
+        "v2's records were not kept: v1's hold waits on A"
+    );
+    assert!(
+        !stays(true, true),
+        "v2 kept its records: v1's hold goes by descent"
+    );
+    assert!(
+        !stays(false, false),
+        "v2 drafted none: v1's hold goes by descent"
+    );
+
+    SPINE_ALWAYS.with(|cell| cell.set(true));
+    let stayed = stays(true, false);
+    SPINE_ALWAYS.with(|cell| cell.set(false));
+    assert!(
+        !stayed,
+        "CONTROL: settled by the spine of a version whose records were not kept, v1's hold goes"
     );
 }
 
@@ -648,4 +720,135 @@ fn the_unversioned_hold_goes_only_once_the_store_holds_every_record_in_it() {
     );
     assert!(held(m22).is_empty());
     macs.server.stop();
+}
+
+/// The unversioned hold's law (P3 section 13): every record it was written with is in it or in the
+/// records store, so it goes, at an adoption as at a settled head, only once the store holds every
+/// record in it ([`unversioned_goes`]). Here it holds P1's records and a record the store refuses
+/// (another network's genesis): m22 reads P1 back and takes the hold in, since it completes P1's
+/// stamp, and keeps the file for the refused record, through the next landed head too. With
+/// [`UNVERSIONED_GOES_EARLY`] on, a landed head removes it once it reads, and the law breaks.
+#[test]
+fn the_unversioned_hold_stays_until_the_store_holds_every_record_and_an_early_removal_is_caught() {
+    let macs = super::super::log_entries_tests::two_macs(&[(
+        Audience::Everyone,
+        "gh-token",
+        b"token-v1".as_slice(),
+    )]);
+    let m22 = &macs.m22;
+    {
+        let admin = admin_open(m22).unwrap();
+        admin_publish(m22, &admin, &admin.doc.clone()).expect("a stamped version");
+    }
+    let publish = |name: &str| {
+        let admin = admin_open(m22).unwrap();
+        let mut doc = admin.doc.clone();
+        doc.set_entry(&Audience::Everyone, name, b"x").unwrap();
+        admin_publish(m22, &admin, &doc)
+    };
+    CUT_AFTER_STORE.with(|cut| cut.set(true));
+    assert!(publish("p1").is_err(), "P1's reply is lost");
+    let [(_, _, path)] = &held_drafts(m22)[..] else {
+        panic!("P1 is held under its version");
+    };
+    let mut written =
+        crate::membership_log::decode_records(read_held(path).unwrap().unwrap().records()).unwrap();
+    let (_, _, _, founder) = member(1);
+    written.push(Record::found(&[7; 32], vec![founder], 1_000).unwrap());
+    let unversioned = unversioned_held_draft_file(m22);
+    super::super::write_record_file(&unversioned, |writer| {
+        writer.write_all(&encode_records(&written))
+    })
+    .unwrap();
+    std::fs::remove_file(path).unwrap();
+    let kept = || {
+        let store = super::super::load_records(m22).unwrap();
+        unversioned.exists() || written.iter().all(|record| store.holds(record.id()))
+    };
+
+    sync(m22, None).expect("m22 reads P1 back");
+    assert!(
+        log_covers_served(m22, &macs.url),
+        "the old hold completes P1's stamp and is taken in"
+    );
+    assert!(
+        unversioned.exists() && kept(),
+        "the store refused one of its records: it stays"
+    );
+    publish("landed").expect("a landed head");
+    assert!(unversioned.exists() && kept(), "a landed head keeps it too");
+
+    UNVERSIONED_GOES_EARLY.with(|early| early.set(true));
+    let landed = publish("early");
+    UNVERSIONED_GOES_EARLY.with(|early| early.set(false));
+    landed.expect("another landed head");
+    assert!(
+        !unversioned.exists() && !kept(),
+        "removed before the store holds its records, the refused record is lost, and the law sees it"
+    );
+    macs.server.stop();
+}
+
+/// P3 section 13's premise is a complete record's: one the records store holds only waiting on a
+/// parent it lacks is not stored for the unversioned hold ([`unversioned_goes`] asks
+/// [`Store::holds`]), since the store drops waiting records, highest first, to make room for
+/// complete ones. Here the hold's one record waits on a parent the store never had: the hold
+/// stays, and once the store's held total fills with complete records it drops the waiting one,
+/// so the hold is that record's one copy.
+///
+/// NEGATIVE CONTROL, run in the test: [`WAITING_COUNTS_STORED`] (`waiting-counts-stored`,
+/// [`Store::contains`] in place of [`Store::holds`], the rule before) lets the hold go while its
+/// record only waits; the store then drops that record, which is in neither.
+#[test]
+fn a_record_the_store_holds_only_waiting_keeps_the_unversioned_hold() {
+    let budgets = RecordBudgets {
+        held: 4,
+        ..RecordBudgets::PRODUCTION
+    };
+    budgets.within(|| {
+        let (seed, incarnation, actor, founder) = member(1);
+        let (other_seed, other_incarnation, other, other_founder) = member(2);
+        let genesis = Record::found(&[7; 32], vec![founder, other_founder], 1_000).unwrap();
+        let mut drafted = Log::new(genesis.clone()).unwrap();
+        let parent = name(&mut drafted, &actor, &seed, incarnation);
+        let waiting = name(&mut drafted, &actor, &seed, incarnation);
+        assert!(waiting.parents().contains(parent.id()));
+        let mut store = Store::with_compiled(None);
+        store.insert(genesis.clone()).unwrap();
+        store.insert(waiting.clone()).unwrap();
+        assert!(
+            store.contains(waiting.id()) && !store.holds(waiting.id()),
+            "it waits on its parent"
+        );
+        let hold = encode_records([&waiting]);
+        assert!(
+            !unversioned_goes(&hold, Some(&store)),
+            "a record the store holds waiting keeps the hold"
+        );
+        WAITING_COUNTS_STORED.with(|cell| cell.set(true));
+        let goes_early = unversioned_goes(&hold, Some(&store));
+        WAITING_COUNTS_STORED.with(|cell| cell.set(false));
+        assert!(
+            goes_early,
+            "CONTROL: a waiting record counted as stored lets the hold go"
+        );
+
+        let mut others = Log::new(genesis).unwrap();
+        for _ in 0..budgets.held {
+            if !store.contains(waiting.id()) {
+                break;
+            }
+            store
+                .insert(name(&mut others, &other, &other_seed, other_incarnation))
+                .unwrap();
+        }
+        assert!(
+            !store.contains(waiting.id()),
+            "the store dropped the waiting record for complete ones"
+        );
+        assert!(
+            !unversioned_goes(&hold, Some(&store)),
+            "the hold is its one copy"
+        );
+    });
 }

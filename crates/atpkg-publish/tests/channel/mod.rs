@@ -5,6 +5,7 @@
 
 mod agh_read_contract;
 mod agh_write_contract;
+mod canary;
 mod conformance_index_publish;
 mod group;
 mod identity;

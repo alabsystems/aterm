@@ -132,11 +132,11 @@ pub(crate) fn has_token() -> bool {
 
 /// `path` as an API path: a leading `/`, as `repos/{slug}/…` is spelled throughout the
 /// release.
-fn api_path(path: &str) -> String {
+fn api_path(path: &str) -> std::borrow::Cow<'_, str> {
     if path.starts_with('/') {
-        path.to_string()
+        std::borrow::Cow::Borrowed(path)
     } else {
-        format!("/{path}")
+        std::borrow::Cow::Owned(format!("/{path}"))
     }
 }
 

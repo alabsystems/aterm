@@ -635,11 +635,13 @@ fn fence_field(value: &str) -> String {
         .chars()
         .map(|c| if c.is_control() { '_' } else { c })
         .collect();
-    let out = out.trim().to_string();
-    if out.is_empty() {
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
         "unknown".to_string()
-    } else {
+    } else if trimmed.len() == out.len() {
         out
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -2394,15 +2396,17 @@ fn github_refusal_summary(response: &[u8]) -> Option<String> {
 }
 
 fn release_post_failure_detail(out: &RunOut, posted_body_chars: usize) -> String {
+    use std::fmt::Write as _;
     let stderr = out.stderr_utf8();
     let mut detail = stderr.trim().to_string();
     if http_status_from_curl_failure(&stderr) == Some(HTTP_UNPROCESSABLE_CONTENT) {
         let limit = changelog::GITHUB_RELEASE_BODY_LIMIT;
-        detail.push_str(&format!(
+        let _ = write!(
+            detail,
             " — {HTTP_UNPROCESSABLE_CONTENT} is GitHub understanding the request and refusing \
              its CONTENT. The release body this POST carried was {posted_body_chars} characters \
              against the {limit}-character release-body limit, which is "
-        ));
+        );
         if posted_body_chars > limit {
             detail.push_str(
                 "OVER IT — that is this refusal, and nothing else needs investigating until \
@@ -2416,7 +2420,7 @@ fn release_post_failure_detail(out: &RunOut, posted_body_chars: usize) -> String
         }
     }
     if let Some(said) = github_refusal_summary(&out.stdout) {
-        detail.push_str(&format!(" — GitHub said: {said}"));
+        let _ = write!(detail, " — GitHub said: {said}");
     }
     detail
 }
@@ -3997,7 +4001,7 @@ pub fn release_asset_inventory_for_release_id(
             size: uint(size, "release inventory asset size is non-numeric")?,
         });
     }
-    inventory.sort();
+    inventory.sort_unstable();
     if inventory
         .windows(2)
         .any(|pair| pair[0].name == pair[1].name)
@@ -7388,7 +7392,8 @@ fn step_sign(ctx: &mut CutCtx) -> Result<()> {
                     provenance_path.display()
                 ))
             })?;
-        provenance.push_str(&format!("update_pubkey_fingerprint_sha256={fingerprint}\n"));
+        use std::fmt::Write as _;
+        let _ = writeln!(provenance, "update_pubkey_fingerprint_sha256={fingerprint}");
         crate::durable::write_fresh(&provenance_path, provenance).map_err(|error| {
             Error::new(format!(
                 "write {} update-pin provenance: {error}",

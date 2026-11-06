@@ -633,6 +633,45 @@ fn a_review_never_shows_a_secret_and_goes_with_its_session() {
     assert!(!folder.exists());
 }
 
+/// `check` reports a live row that says an address whose birth key another row holds, the one
+/// state in which the importer (matching by key) and every lookup (by what a row says now) name
+/// two rows: by both keys, never the address. A row saying its own birth address, or renamed to a
+/// fresh one, is no finding.
+/// NEGATIVE CONTROL: with the `address-key-elsewhere` rule in `checks::lab` never firing (its
+/// `filter` answering `false`), the state goes unreported: `` left: [] right: [Finding { kind:
+/// "address-key-elsewhere", collection: "address", pks: ["ad-…", "ad-…"] }] ``.
+#[test]
+fn check_reports_an_address_whose_birth_key_another_row_holds() {
+    let pk = |local: &str| keys::address_pk(&format!("{local}@example.invalid")).unwrap();
+    let (ann, bob, cy, dee) = (pk("ann"), pk("bob"), pk("cy"), pk("dee"));
+    let mut changes = Vec::new();
+    for (key, says) in [(&ann, "bob"), (&bob, "bob2"), (&cy, "cy2"), (&dee, "dee")] {
+        changes.push(put(
+            &ADDRESS,
+            key,
+            "addr",
+            json!(format!("{says}@example.invalid")),
+        ));
+        changes.push(put(&ADDRESS, key, "row", json!("live")));
+    }
+    let mut book = Book::new();
+    book.write(1, &[], changes);
+    let (lab, _) = checks::lab(&book.cells());
+    let elsewhere: Vec<&checks::Finding> = lab
+        .iter()
+        .filter(|f| f.kind == "address-key-elsewhere")
+        .collect();
+    assert_eq!(
+        elsewhere,
+        [&checks::Finding {
+            kind: "address-key-elsewhere",
+            collection: ADDRESS.name,
+            pks: vec![ann, bob],
+        }]
+    );
+    assert!(!format!("{lab:?}").contains('@'));
+}
+
 /// The importer needs the harness's reading: without it (`aterm db` reached outside the `aterm`
 /// executable) `import` refuses, even a dry run of readable sheets, and opens no review.
 /// NEGATIVE CONTROL: with `run` falling back to the test's own reading (`vendors.unwrap_or(
@@ -1390,6 +1429,87 @@ fn an_account_is_added_from_stdin_and_its_address_never_printed() {
     assert_eq!(codex["address_born"], json!(false));
 }
 
+/// `add account` signs in with the row whose `addr` says the address now: a renamed row's new
+/// address links that row and births no second one, its old address (whose key the row still
+/// holds) is refused, an account beside a live one of the realm that signs in as that address
+/// (a rename went past it) is refused, and a retired row is refused; nothing it prints holds an
+/// address.
+/// NEGATIVE CONTROL: with `add_account` keying the login by `keys::address_pk` again (born where
+/// that key has no row), the new address's add births a row beside the one saying it, which the
+/// registry's rules refuse: `` called `Result::unwrap()` on an `Err` value: Error("address.addr:
+/// row ad-…: email row ad-… holds that address; name that row, or rename it first") ``.
+#[test]
+fn an_account_signs_in_with_the_row_its_address_names_now() {
+    let lab = Lab::new(&[Role::Writer]);
+    let paths = &lab.paths[0];
+    let registry = Registry::at(paths.clone());
+    registry.open().unwrap();
+    let (ann, gone) = (
+        keys::address_pk("ann@example.test").unwrap(),
+        keys::address_pk("gone@example.test").unwrap(),
+    );
+    registry
+        .write(vec![vec![
+            put(&ADDRESS, &ann, "addr", json!("ann.new@example.test")),
+            put(&ADDRESS, &ann, "domain", json!("example.test")),
+            put(&ADDRESS, &ann, "row", json!("live")),
+            put(&ADDRESS, &gone, "addr", json!("gone@example.test")),
+            put(&ADDRESS, &gone, "row", json!("retired")),
+        ]])
+        .unwrap();
+    let mut open = |_: &Path, _, _: &[String]| Ok(());
+    let added = verb_io(
+        paths,
+        &["add", "account", "claude"],
+        &mut open,
+        "ann.new@example.test\n",
+    )
+    .unwrap();
+    assert!(!aterm_json::to_string(&added).unwrap().contains('@'));
+    assert_eq!(added["ad"], json!(ann));
+    assert_eq!(added["address_born"], json!(false));
+    let ac = keys::account_pk("claude", "ann.new@example.test").unwrap();
+    let view = registry.view().unwrap();
+    assert_eq!(
+        view.project(&ACCOUNT).rows[&ac].get("login"),
+        Some(&json!(ann))
+    );
+    assert!(
+        !view
+            .project(&ADDRESS)
+            .rows
+            .contains_key(&keys::address_pk("ann.new@example.test").unwrap())
+    );
+    // A rename past the account (two Macs' concurrent edits can make one): the row's new address
+    // keys another claude account, of the same row.
+    registry
+        .write(vec![vec![put(
+            &ADDRESS,
+            &ann,
+            "addr",
+            json!("ann.third@example.test"),
+        )]])
+        .unwrap();
+    for refused in [
+        // Its old address: the row born with it says another.
+        ("codex", "ann@example.test"),
+        // Beside a live account of the realm that signs in as that address now.
+        ("claude", "ann.third@example.test"),
+        // A retired row.
+        ("claude", "gone@example.test"),
+    ] {
+        let text = verb_io(
+            paths,
+            &["add", "account", refused.0],
+            &mut open,
+            &format!("{}\n", refused.1),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!text.contains('@'), "{text}");
+    }
+}
+
 /// `edit machines` opens the machine grid in the scripted editor and saves the owner's cell
 /// through the grid's three-way save; `edit mail` opens the address grid, its addresses masked.
 /// NEGATIVE CONTROL: with `edited` opening the account collection for `machines`, the opened
@@ -1561,6 +1681,7 @@ fn what_runs_on_a_machine_is_its_preferences_places_facts_and_sum() {
             Machine {
                 pk: pk.into(),
                 label: Some(label.into()),
+                nickname: crate::alab::view::MachineNickname::Unset,
                 aliases: Vec::new(),
                 live: true,
             },
@@ -1710,6 +1831,7 @@ fn a_label_a_retired_row_shares_names_the_live_replacement() {
             Machine {
                 pk: pk.into(),
                 label: Some(label.into()),
+                nickname: crate::alab::view::MachineNickname::Unset,
                 aliases: Vec::new(),
                 live,
             },

@@ -424,11 +424,10 @@ fn capture_body(state: &mut State, req: &Request) {
         && aterm_json::from_slice::<Value>(&req.body).is_ok())
     .then(|| String::from_utf8(req.body.clone()).ok())
     .flatten();
-    let digest = aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(&req.body));
     state.bodies.push(crate::SeenBody {
         seen: state.seen.len().saturating_sub(1),
         len: u64::try_from(req.body.len()).unwrap_or(u64::MAX),
-        sha256: format!("sha256:{digest}"),
+        sha256: crate::sha256_prefixed(&req.body),
         json,
     });
 }
@@ -623,8 +622,10 @@ fn etag(req: &Request, mut a: Answer) -> Answer {
     if a.status != 200 || !json {
         return a;
     }
-    let digest = aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(&a.body)[..8]);
-    let tag = format!("W/\"{digest}\"");
+    let mut tag = String::with_capacity(20);
+    tag.push_str("W/\"");
+    aterm_codec::hex::push_lower(&mut tag, &aterm_digest::Sha256::digest(&a.body)[..8]);
+    tag.push('"');
     let hit = req.header("if-none-match").is_some_and(|v| {
         v.split(',')
             .map(str::trim)
@@ -747,10 +748,14 @@ fn segments(path: &str) -> Vec<&str> {
 
 /// Segments decoded and joined with `/`.
 fn joined(segs: &[&str]) -> String {
-    segs.iter()
-        .map(|s| aterm_codec::pct::decode(s))
-        .collect::<Vec<_>>()
-        .join("/")
+    let mut out = String::new();
+    for (i, s) in segs.iter().enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        out.push_str(&aterm_codec::pct::decode(s));
+    }
+    out
 }
 
 /// `text` as one RFC 3986 path segment, as GitHub writes a tag or an asset name into a URL.
@@ -1174,7 +1179,7 @@ fn release_assets(state: &State, req: &Request, ctx: &Ctx, repo: &Repo, id: &str
         return Answer::not_found();
     };
     let mut assets: Vec<&crate::state::Asset> = release.assets.iter().collect();
-    assets.sort_by_key(|a| a.id);
+    assets.sort_unstable_by_key(|a| a.id);
     let items = assets
         .into_iter()
         .map(|a| asset_json(state, repo, release, a))
@@ -1282,7 +1287,7 @@ fn releases(state: &State, req: &Request, ctx: &Ctx, repo: &Repo) -> Answer {
             &format!("Only the first {RELEASES_RESULT_CAP} results are available."),
         );
     }
-    list.sort_by(|a, b| (&b.spec.created_at, b.id).cmp(&(&a.spec.created_at, a.id)));
+    list.sort_unstable_by(|a, b| (&b.spec.created_at, b.id).cmp(&(&a.spec.created_at, a.id)));
     let items = list
         .into_iter()
         .map(|r| release_json(state, repo, r))
@@ -1313,33 +1318,41 @@ fn latest(state: &State, repo: &Repo) -> Answer {
 
 /// The CDN URL of asset `id`, with its signature.
 fn cdn_url(state: &State, id: u64) -> String {
+    use std::fmt::Write as _;
     let cdn = state.ports.cdn;
-    format!("http://127.0.0.1:{cdn}/assets/{id}?sig={}", signature(id))
+    let mut url = String::with_capacity(48);
+    let _ = write!(url, "http://127.0.0.1:{cdn}/assets/{id}?sig=");
+    push_signature(&mut url, id);
+    url
+}
+
+fn push_signature(out: &mut String, id: u64) {
+    let mut buf = [0u8; 20];
+    let mut cursor = std::io::Cursor::new(&mut buf[..]);
+    let _ = std::io::Write::write_fmt(&mut cursor, format_args!("{id}"));
+    let pos = cursor.position() as usize;
+    let mut hasher = aterm_digest::Sha256::new();
+    hasher.update(b"agh-fake/sig\0");
+    hasher.update(&buf[..pos]);
+    aterm_codec::hex::push_lower(out, &hasher.finalize()[..4]);
 }
 
 /// Eight hex digits that bind a CDN URL to its asset.
 fn signature(id: u64) -> String {
-    let mut hasher = aterm_digest::Sha256::new();
-    hasher.update(b"agh-fake/sig\0");
-    hasher.update(id.to_string().as_bytes());
-    aterm_codec::hex::encode_lower(&hasher.finalize()[..4])
+    let mut out = String::with_capacity(8);
+    push_signature(&mut out, id);
+    out
 }
 
 /// What an asset's `digest` field says.
 fn digest_json(spec: &crate::AssetSpec) -> Value {
-    let of = |bytes: &[u8]| {
-        format!(
-            "sha256:{}",
-            aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(bytes))
-        )
-    };
     match spec.digest {
-        DigestSpec::True => of(&spec.bytes).into(),
+        DigestSpec::True => crate::sha256_prefixed(&spec.bytes).into(),
         DigestSpec::Null => Value::Null,
         DigestSpec::Wrong => {
             let mut other = spec.bytes.clone();
             other.extend_from_slice(b"\0wrong");
-            of(&other).into()
+            crate::sha256_prefixed(&other).into()
         }
     }
 }
@@ -1524,7 +1537,7 @@ fn contents(state: &State, req: &Request, repo: &Repo, path: &str) -> Answer {
             names.push((name, is_file.then_some(*file)));
         }
     }
-    names.sort_by(|a, b| a.0.cmp(&b.0));
+    names.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let items: Vec<Value> = names
         .into_iter()
         .map(|(name, file)| {
@@ -1564,7 +1577,7 @@ fn tree(state: &State, req: &Request, repo: &Repo, reference: &str) -> Answer {
     if !recursive {
         entries.retain(|(p, _)| !p.contains('/'));
     }
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let tree: Vec<Value> = entries
         .into_iter()
         .map(|(path, file)| match file {
@@ -2105,7 +2118,7 @@ fn keys_list(state: &State, req: &Request, ctx: &Ctx) -> Answer {
         .filter(|k| k.login.eq_ignore_ascii_case(login))
         .map(|k| &k.key)
         .collect();
-    keys.sort_by_key(|k| k.id);
+    keys.sort_unstable_by_key(|k| k.id);
     let items = keys.into_iter().map(key_json).collect();
     let api = state.ports.api;
     page(req, items, &format!("http://127.0.0.1:{api}/user/keys"))

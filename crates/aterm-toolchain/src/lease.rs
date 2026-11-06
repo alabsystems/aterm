@@ -165,8 +165,13 @@ impl Subject {
 }
 
 /// A held lease.
+/// On Unix, every actual duplicate keeps the named slot in use until its final
+/// close. Reclaim or sweep removes the slot only after probing its kernel lock.
 #[derive(Debug)]
 pub struct Lease {
+    #[cfg(unix)]
+    file: crate::record_lock::CloseOnlyLock,
+    #[cfg(not(unix))]
     file: crate::record_lock::RecordLock,
     path: PathBuf,
     subject: Subject,
@@ -184,8 +189,98 @@ impl Lease {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Check that the named slot still denotes this actual held description.
+    /// This checks lease custody, not SDK authenticity or immutable SDK bytes.
+    /// Failure leaves the original lock held and never adopts a replacement.
+    ///
+    /// # Errors
+    /// The held or named file cannot be read, their identities differ, required
+    /// private regular-file properties changed, or this platform is unsupported.
+    pub fn check_current(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let held = self.file.metadata()?;
+            let named = std::fs::symlink_metadata(&self.path)?;
+            // SAFETY: geteuid observes this process's effective uid without memory arguments.
+            let uid = unsafe { libc::geteuid() };
+            if held.dev() != named.dev() || held.ino() != named.ino() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "original lease slot changed",
+                ));
+            }
+            for metadata in [&held, &named] {
+                if !metadata.is_file()
+                    || metadata.nlink() != 1
+                    || metadata.uid() != uid
+                    || metadata.mode() & 0o022 != 0
+                    || metadata.len() > WHO_MAX
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "original lease slot is unsafe",
+                    ));
+                }
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "checked SDK lease identity requires Unix",
+            ))
+        }
+    }
 }
 
+/// How long [`Lease::release`] waits for the lease to be let go: a hang detector, not a budget.
+#[cfg(any(test, debug_assertions))]
+const LET_GO_HANG: Duration = Duration::from_secs(60);
+
+#[cfg(any(test, debug_assertions))]
+impl Lease {
+    /// Test seam: let the lease go, and return once it is let go ([`let_go_within`], under a
+    /// one-minute hang detector). A lease is let go by the last close of its descriptor (on Unix,
+    /// close-only custody), and a child another thread of this process forks holds a copy of
+    /// every descriptor from its `fork` until its `exec` closes it, which a test binary's sibling
+    /// tests do at any moment (`aterm_uds::fork_window`); so a test that asks what letting a
+    /// lease go changed asks after this, not after a drop.
+    ///
+    /// # Panics
+    /// It was still held when the hang detector ended, or its file could not be tested.
+    pub fn release(self) {
+        let path = self.path.clone();
+        drop(self);
+        if let Err(why) = let_go_within(&path, LET_GO_HANG) {
+            panic!("the lease {} was not let go: {why}", path.display());
+        }
+    }
+}
+
+/// Test seam: wait up to `within` until nothing holds the lease whose holder's file is `path`
+/// (no copy of its descriptor is open, as reclaim tests it), looking again after a 1 ms slice.
+///
+/// # Errors
+/// Who still held it once `within` had passed, or why its file could not be tested.
+#[cfg(any(test, debug_assertions))]
+pub fn let_go_within(path: &Path, within: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + within;
+    loop {
+        match probe_file(path, false) {
+            Ok(None) => return Ok(()),
+            Ok(Some(who)) if Instant::now() >= deadline => {
+                return Err(format!("still held by {who}"));
+            }
+            Ok(Some(_)) => std::thread::sleep(Duration::from_millis(1)),
+            Err(e) => return Err(format!("its file could not be tested: {e}")),
+        }
+    }
+}
+
+#[cfg(not(unix))]
 impl Drop for Lease {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
@@ -349,6 +444,20 @@ fn holder_tag() -> String {
     format!("{}-{nanos:x}{n:x}", std::process::id())
 }
 
+// Publication must never replace a still-live slot whose process tag collided.
+// The shared rendezvous gate remains held until the taking link is removed.
+fn publish_lease_file(taking: &Path, path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::hard_link(taking, path)?;
+        std::fs::remove_file(taking)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::rename(taking, path)
+    }
+}
+
 /// Take a lease on `subject` under `prefix`, saying `who` holds it (one line — a program, a pid, what it is doing).
 /// # Errors
 /// [`LeaseError::Busy`] when the gate stayed held past `wait`; [`LeaseError::Io`] when the directory or a file in it could not be made, written or locked.
@@ -407,7 +516,7 @@ pub fn take(
         line.push('\n');
         let laid = file
             .write_all(line.as_bytes())
-            .and_then(|()| std::fs::rename(&taking, &path));
+            .and_then(|()| publish_lease_file(&taking, &path));
         if let Err(e) = laid {
             file.unlock();
             return Err(e);
@@ -416,11 +525,18 @@ pub fn take(
     })();
     let _ = gate.unlock();
     match laid {
-        Ok(file) => Ok(Lease {
-            file,
-            path,
-            subject: subject.clone(),
-        }),
+        Ok(file) => {
+            // Keep the rendezvous named while any genuine duplicate remains.
+            // No Unix Drop may LOCK_UN a shared original description or hide it
+            // from reclaim. Existing kernel probes reap it after the last close.
+            #[cfg(unix)]
+            let file = file.into_close_only();
+            Ok(Lease {
+                file,
+                path,
+                subject: subject.clone(),
+            })
+        }
         Err(e) => {
             let _ = std::fs::remove_file(&taking);
             Err(e.into())
@@ -945,11 +1061,136 @@ mod tests {
         };
         assert_eq!(who.len(), 2);
         assert_eq!(live(&p).unwrap().len(), 1);
-        drop(lease);
-        drop(second);
+        lease.release();
+        second.release();
         assert_eq!(holders(&p, &trust(1)), Holders::Free);
         assert!(live(&p).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&p);
+    }
+
+    /// A lease dropped while a child forked by another thread holds a copy of its descriptor stays
+    /// held until that child's `exec` closes the copy, so a drop alone does not let it go
+    /// (NEGATIVE CONTROL: with the child parked, a zero wait finds it held); `release` returns once
+    /// it is let go.
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    #[test]
+    fn a_lease_is_let_go_once_a_forked_childs_copy_closes() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let subject = trust(92);
+        let lease = take(root.path(), &subject, "forked sibling", Duration::ZERO).unwrap();
+        let path = lease.path().to_path_buf();
+        let parked = aterm_uds::fork_window::Parked::park();
+        drop(lease);
+        assert!(matches!(holders(root.path(), &subject), Holders::Held(_)));
+        assert!(
+            let_go_within(&path, Duration::ZERO).is_err(),
+            "the parked child's copy holds it"
+        );
+        drop(parked);
+        assert_eq!(let_go_within(&path, LET_GO_HANG), Ok(()));
+        assert_eq!(holders(root.path(), &subject), Holders::Free);
+        let again = take(root.path(), &subject, "after", Duration::ZERO).unwrap();
+        again.release();
+        assert_eq!(holders(root.path(), &subject), Holders::Free);
+    }
+
+    /// The original owner's Drop cannot free a real shared-description copy.
+    #[cfg(unix)]
+    #[test]
+    fn sdk_lease_stays_visible_until_the_last_actual_description_closes() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let subject = trust(91);
+        let lease = take(root.path(), &subject, "retained SDK user", Duration::ZERO).unwrap();
+        let path = lease.path().to_path_buf();
+        let duplicate = lease.file.try_clone().unwrap();
+
+        drop(lease);
+
+        assert!(
+            matches!(holders(root.path(), &subject), Holders::Held(_)),
+            "a live duplicate became invisible to SDK reclamation"
+        );
+        assert!(matches!(reclaim(root.path(), &subject), Reclaim::Keep(_)));
+        assert!(
+            path.exists(),
+            "a live description must keep its rendezvous named"
+        );
+        drop(duplicate);
+        assert_eq!(holders(root.path(), &subject), Holders::Free);
+        let Reclaim::Clear(_guard) = reclaim(root.path(), &subject) else {
+            panic!("the final actual close must permit SDK reclamation");
+        };
+        assert!(
+            !path.exists(),
+            "reclaim removes the positively unlocked slot"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lease_identity_drift_refuses_without_releasing_or_deleting_a_replacement() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let subject = trust(92);
+        let lease = take(root.path(), &subject, "original SDK user", Duration::ZERO).unwrap();
+        lease.check_current().unwrap();
+        let path = lease.path().to_path_buf();
+        let old = root.path().join("original-slot");
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::rename(&path, &old).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let replacement = crate::record_lock::RecordLock::try_lock(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap(),
+            WHO_MAX,
+        )
+        .unwrap();
+        assert_eq!(
+            lease.check_current().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(
+            probe_file(&old, false).unwrap().is_some(),
+            "a failed check must retain the original lock"
+        );
+        drop(lease);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes,
+            "Drop must preserve the replacement"
+        );
+        assert!(matches!(
+            reclaim(root.path(), &subject),
+            Reclaim::Keep(Holders::Held(_))
+        ));
+        drop(replacement);
+        assert!(matches!(reclaim(root.path(), &subject), Reclaim::Clear(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_colliding_publication_never_hides_a_live_sdk_lease() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let subject = trust(93);
+        let lease = take(root.path(), &subject, "live SDK user", Duration::ZERO).unwrap();
+        let path = lease.path().to_path_buf();
+        let bytes = std::fs::read(&path).unwrap();
+        let taking = dir(root.path()).join("colliding.taking");
+        std::fs::write(&taking, b"replacement user\n").unwrap();
+        assert_eq!(
+            publish_lease_file(&taking, &path).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        lease.check_current().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(matches!(
+            reclaim(root.path(), &subject),
+            Reclaim::Keep(Holders::Held(_))
+        ));
+        lease.release();
+        assert!(matches!(reclaim(root.path(), &subject), Reclaim::Clear(_)));
     }
 
     /// A holder that died without dropping (its lock released by the kernel, its file left
@@ -959,8 +1200,13 @@ mod tests {
         let p = prefix("dead");
         let lease = take(&p, &trust(3), "gone", DEFAULT_WAIT).unwrap();
         let path = lease.path().to_path_buf();
-        lease.file.unlock();
-        std::mem::forget(lease);
+        #[cfg(unix)]
+        drop(lease);
+        #[cfg(not(unix))]
+        {
+            lease.file.unlock();
+            std::mem::forget(lease);
+        }
         assert!(path.exists());
         assert_eq!(holders(&p, &trust(3)), Holders::Free);
         assert!(path.exists(), "a read never reaps");
@@ -982,7 +1228,7 @@ mod tests {
             Reclaim::Keep(Holders::Held(who)) => assert_eq!(who, ["gate run"]),
             other => panic!("a leased build is kept: {other:?}"),
         }
-        drop(lease);
+        lease.release();
         let Reclaim::Clear(guard) = reclaim(&p, &trust(4)) else {
             panic!("free once released");
         };
@@ -1005,8 +1251,13 @@ mod tests {
         let kept = take(&p, &trust(6), "live", DEFAULT_WAIT).unwrap();
         let dead = take(&p, &trust(7), "dead", DEFAULT_WAIT).unwrap();
         let dead_path = dead.path().to_path_buf();
-        dead.file.unlock();
-        std::mem::forget(dead);
+        #[cfg(unix)]
+        drop(dead);
+        #[cfg(not(unix))]
+        {
+            dead.file.unlock();
+            std::mem::forget(dead);
+        }
         let debris = dir(&p).join("store-trust-8@1-1.taking");
         std::fs::write(&debris, b"x\n").unwrap();
         let exists = |s: &Subject| *s == trust(6) || *s == trust(8);
@@ -1136,12 +1387,26 @@ mod tests {
     /// rather than causing `probe_file` to discard the holder identity.
     #[test]
     fn probe_file_decodes_non_utf8_who_bytes_lossily() {
-        use std::io::Seek as _;
         let p = prefix("lossy-who");
-        let mut lease = take(&p, &trust(5), "placeholder", DEFAULT_WAIT).unwrap();
-        lease.file.seek(io::SeekFrom::Start(0)).unwrap();
-        lease.file.set_len(0).unwrap();
-        lease.file.write_all(b"targo in /w/\xff/repo\n").unwrap();
+        let lease = take(&p, &trust(5), "placeholder", DEFAULT_WAIT).unwrap();
+        #[cfg(unix)]
+        {
+            let mut writer = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(lease.path())
+                .unwrap();
+            writer.write_all(b"targo in /w/\xff/repo\n").unwrap();
+        }
+        #[cfg(not(unix))]
+        let mut lease = lease;
+        #[cfg(not(unix))]
+        {
+            use std::io::Seek as _;
+            lease.file.seek(io::SeekFrom::Start(0)).unwrap();
+            lease.file.set_len(0).unwrap();
+            lease.file.write_all(b"targo in /w/\xff/repo\n").unwrap();
+        }
         assert_eq!(
             holders(&p, &trust(5)),
             Holders::Held(vec!["targo in /w/\u{fffd}/repo".to_string()])

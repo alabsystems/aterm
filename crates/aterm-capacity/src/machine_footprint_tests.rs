@@ -169,6 +169,65 @@ fn wider_selections_or_crates_held_together_cover_a_new_selection() {
     assert_eq!((none.bytes, none.selections), (2 * GIB, 1));
 }
 
+/// A run that did a selection's work and more of the words its keeper names as adding work alone
+/// (for verify, its checks that build) bounds it, over its crates or summed with others; a word of
+/// any other kind (pulled cells, a compile-only run) must be the same in both, and less work never
+/// bounds more. NEGATIVE CONTROL: read by the same work alone ([`MachineFootprints::cover`]),
+/// the record covers none of these.
+#[test]
+fn a_run_of_more_checks_over_its_crates_bounds_one_of_fewer() {
+    let more: Vec<String> = ["cells", "doc", "lint", "test"]
+        .iter()
+        .map(|w| (*w).to_owned())
+        .collect();
+    let at = |work: &str, crates: &[&str]| Selection {
+        work: work.to_owned(),
+        crates: Some(crates.iter().map(|c| (*c).to_owned()).collect()),
+    };
+    let mut m = MachineFootprints::default();
+    m.push(at("cells doc lint test", &["a", "b"]), run(0, 3, 1, 10));
+    m.push(at("lint test --compile-only", &["c"]), run(0, 2, 2, 20));
+    m.push(at("cells lint pulled-cells", &["d"]), run(0, 5, 3, 30));
+    let lint_a = at("lint test", &["a"]);
+    assert_eq!(m.cover(&lint_a, 0, COLD), None, "the same work alone");
+    let c = m
+        .cover_by(&lint_a, 0, COLD, &more)
+        .expect("more checks over more crates bound it");
+    assert_eq!((c.bytes, c.selections, c.exact), (3 * GIB, 1, false));
+    assert_eq!(
+        m.cover_by(&at("lint", &["c"]), 0, COLD, &more),
+        None,
+        "--compile-only changes what the rest write"
+    );
+    assert_eq!(
+        m.cover_by(&at("lint test --compile-only", &["c"]), 0, COLD, &more)
+            .map(|c| (c.bytes, c.exact)),
+        Some((2 * GIB, true))
+    );
+    assert_eq!(
+        m.cover_by(&at("cells lint", &["d"]), 0, COLD, &more),
+        None,
+        "pulled cells change what cells lints"
+    );
+    assert_eq!(
+        m.cover_by(
+            &at("cells doc lint test pulled-cells", &["a"]),
+            0,
+            COLD,
+            &more
+        ),
+        None,
+        "less work never bounds more"
+    );
+    assert_eq!(m.cover_by(&at("lint", &["a", "e"]), 0, COLD, &more), None);
+    m.push(at("doc lint", &["e"]), run(0, 1, 4, 40));
+    let summed = m
+        .cover_by(&at("lint", &["a", "e"]), 0, COLD, &more)
+        .expect("each crate's cheapest of work bounding its");
+    assert_eq!((summed.bytes, summed.selections), (4 * GIB, 2));
+    assert_eq!(m.cover(&at("lint", &["a", "e"]), 0, COLD), None);
+}
+
 /// The record lowers a claim and never raises one: only a claim read from no run on its own
 /// directories, the cold budget less what they hold, is lowered, and only to a figure below it.
 /// NEGATIVE CONTROL: with no cover the estimate is the cold budget's, as before.

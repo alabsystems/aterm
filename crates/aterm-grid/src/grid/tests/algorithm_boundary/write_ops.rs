@@ -113,7 +113,6 @@ fn bulk_writers_finish_after_a_wrap_past_a_double_width_row() {
                 None,
                 0,
                 None,
-                None,
                 &mut None,
             )
         }),

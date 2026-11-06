@@ -16,6 +16,7 @@ use aterm_agent::harness::tap;
 use aterm_core::render::RenderInput;
 use aterm_core::terminal::RenderCell;
 use aterm_effects::cli_marks::{Build, CliMark};
+use aterm_effects::glass_inks::GlassInks;
 use aterm_window::event_loop::EventLoopProxy;
 
 use crate::session_timeline::SessionTimeline;
@@ -127,7 +128,6 @@ struct TopLineAt {
     palette: Option<aterm_effects::harness_card::CardPalette>,
     held: bool,
     cell: (u16, u16),
-    mark_fg: [u8; 3],
 }
 
 /// One undoable row edit for agy's transcript presentation on `RenderInput`.
@@ -241,6 +241,12 @@ struct FooterPane {
         Option<aterm_agent::supervise::Autopilot>,
         crate::autopilot::AutopilotView,
     ),
+    /// The palette the glass wears on the pane ([`crate::autopilot::harness_theme`]), `None`
+    /// with no harness theme.
+    palette: Option<aterm_effects::harness_card::CardPalette>,
+    /// The pane's width, across which each cell takes its column's hue
+    /// ([`aterm_effects::glass_inks::field`]).
+    cols: usize,
     /// Whether the glass rewrote Claude's mode row on this pane, its pill dropped
     /// ([`rewrites_mode_row`], [`collect_mode_row`]).
     row_rewritten: bool,
@@ -1399,6 +1405,9 @@ struct RulePaint {
     /// The title slot's words in `cells` (empty: none drawn).
     title: std::ops::Range<usize>,
     glass: std::ops::Range<usize>,
+    /// Whether `cells` end with the run's last cell, its close: a rule that wears the arc is
+    /// written whole, its lead and its close among it ([`compose_rule_spans`]).
+    close: bool,
     /// Where the facts' cells start in `cells` ([`FactWrite`]).
     facts_at: usize,
     spans: footer::FactSpans,
@@ -1415,9 +1424,10 @@ struct RuleKey {
     room: usize,
     rule: RenderCell,
     blank: RenderCell,
-    mark_fg: [u8; 3],
-    /// The warn ink a projected stop's words take ([`compose_rule_spans`]).
-    warn_fg: [u8; 3],
+    /// The glass's tokens on the pane ([`GlassInks`]).
+    glass: GlassInks,
+    /// Where the rule sits across its pane.
+    at: RuleAt,
     /// The fact the pointer or the keyboard's selection is on, drawn lit.
     lit: Option<FactKind>,
 }
@@ -1637,7 +1647,7 @@ impl PaneFooter {
         block: Option<&crate::claude_lights::Block>,
         rule: RenderCell,
         blank: RenderCell,
-        (mark_fg, warn_fg): ([u8; 3], [u8; 3]),
+        (glass, at): (GlassInks, RuleAt),
         lit: Option<FactKind>,
     ) -> Composed {
         let key = RuleKey {
@@ -1645,8 +1655,8 @@ impl PaneFooter {
             room,
             rule,
             blank,
-            mark_fg,
-            warn_fg,
+            glass,
+            at,
             lit,
         };
         let composed = &mut self.rule;
@@ -1667,8 +1677,7 @@ impl PaneFooter {
             });
             let fit = footer::fit_rule(&self.shown, room, widths);
             composed.key = Some(key);
-            composed.paint =
-                compose_rule_spans(&fit, block, rule, blank, (mark_fg, warn_fg), room, lit);
+            composed.paint = compose_rule_spans(&fit, block, rule, blank, (&glass, at), room, lit);
             match block {
                 Some(block) => composed
                     .block
@@ -1682,6 +1691,7 @@ impl PaneFooter {
             lights_at: composed.paint.lights_at,
             title: composed.paint.title.clone(),
             glass: composed.paint.glass.clone(),
+            close: composed.paint.close,
             facts_at: composed.paint.facts_at,
             spans: composed.paint.spans,
         }
@@ -1696,8 +1706,18 @@ struct Composed {
     /// The title slot's words in the cells (empty: none drawn).
     title: std::ops::Range<usize>,
     glass: std::ops::Range<usize>,
+    /// The cells end with the run's close ([`RulePaint::close`]).
+    close: bool,
     facts_at: usize,
     spans: footer::FactSpans,
+}
+
+impl Composed {
+    /// The pane column of the composition's first cell on a run ending at pane column `end`:
+    /// right-aligned before the run's close, or through it where it is written.
+    const fn start(&self, end: usize) -> usize {
+        (end + self.close as usize).saturating_sub(1 + self.cells)
+    }
 }
 
 /// Whether `text` reads as `cells`' chars.
@@ -3972,20 +3992,51 @@ fn rule_mask_into(
     Some(rule)
 }
 
-/// The cells aterm writes into `room` cells of the rule for one pane: the account unit's bar in
-/// the meter ink (the accent floored to 4.5:1) and the track ink (the rule's, floored to 3:1), a
-/// projected stop's words in the warn ink floored to 4.5:1
-/// (`docs/DESIGN-accounts-outlook-2026-10-25.md` §3.4).
+/// Where a footer rule sits across its pane ([`compose_rule_spans`]): the pane column past the
+/// last cell of the run it may write (`footer::rule_run`) and the pane's width, so each cell takes
+/// its column's hue ([`aterm_effects::glass_inks::field`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RuleAt {
+    end: usize,
+    cols: usize,
+}
+
+impl RuleAt {
+    /// A rule across a whole pane `cols` wide.
+    #[cfg(test)]
+    const fn across(cols: usize) -> Self {
+        Self { end: cols, cols }
+    }
+
+    /// The palette position of pane column `col`.
+    fn t(self, col: usize) -> f32 {
+        aterm_effects::glass_inks::field(col, self.cols)
+    }
+}
+
+/// The cells aterm writes into `room` cells of the rule for one pane, in the glass's tokens
+/// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §4.1): a fact's mark in the mark ink of its
+/// column, a value and a quiet word in theirs, the account unit's bar in the mark ink and the
+/// track ink, a projected stop's words in the warn ink. Under a palette the rule's own `─` (its
+/// lead, the run between the chips and the facts, and its close) wear the arc of their columns,
+/// so the whole run is written; with none, the run between stays Claude's. A run with no room
+/// (`footer::RULE_LEAD + 1` cells or fewer) takes no cells either way: the arc's lead and close
+/// would not fit inside it.
 fn compose_rule_spans(
     fit: &footer::RuleFit,
     block: Option<&crate::claude_lights::Block>,
     rule: RenderCell,
     blank: RenderCell,
-    (mark_fg, warn_fg): ([u8; 3], [u8; 3]),
+    (glass, at): (&GlassInks, RuleAt),
     room: usize,
     lit: Option<FactKind>,
 ) -> RulePaint {
-    let mut out: Vec<RenderCell> = Vec::with_capacity(room);
+    let arc = glass.palette().is_some() && room > 0;
+    let mut out: Vec<RenderCell> = Vec::with_capacity(room + footer::RULE_LEAD + 1);
+    if arc {
+        out.extend(std::iter::repeat_n(rule, footer::RULE_LEAD));
+    }
+    let lead = out.len();
     let mut lights_at = None;
     let mut title_at = 0..0;
     if let Some(block) = block.filter(|_| fit.chips) {
@@ -4014,29 +4065,31 @@ fn compose_rule_spans(
     let mut clusters = Vec::new();
     let mut combining = Vec::new();
     if !fit.segments.is_empty() {
-        let quiet = |fg: [u8; 3]| RenderCell {
-            fg,
+        let quiet = |fg: u32| RenderCell {
+            fg: rgb_of(fg),
             bold: true,
             script: aterm_core::terminal::Script::Sub { nudge: 0 },
             ..blank
         };
-        let mark = quiet(visible_on(mix(mark_fg, rule.fg, 0.5), blank.bg));
-        let accent = legible_on(mark_fg, blank.bg);
-        let words = FactInks::of(rule.fg, blank.fg, blank.bg);
-        let value = quiet(words.value);
-        // A stub is quieter than its value by its ink ([`FactInks`]). On a light ground it keeps
-        // the values' weight: at the subscript size a thin dark stroke covers no whole pixel and
-        // reads lighter than the ink it was floored to. A dark ground keeps its thin stub (owner
-        // ruling 2026-10-28: the black theme is not changed).
+        let value = quiet(glass.value());
+        // A stub is quieter than its value by its ink ([`GlassInks::quiet`]). On a light ground
+        // it keeps the values' weight: at the subscript size a thin dark stroke covers no whole
+        // pixel and reads lighter than the ink it was floored to. A dark ground keeps its thin
+        // stub (owner ruling 2026-10-28: the black theme is not changed).
         let stub = RenderCell {
             bold: !crate::claude_card::dark_ground(blank),
-            ..quiet(words.stub)
+            ..quiet(glass.quiet())
         };
-        let lifted = |cell: RenderCell, fg: [u8; 3]| RenderCell { fg, ..cell };
-        let meter = quiet(accent);
-        let track = quiet(visible_on(rule.fg, blank.bg));
-        let warn = quiet(legible_on(warn_fg, blank.bg));
+        let lifted = |cell: RenderCell, fg: u32| RenderCell {
+            fg: rgb_of(fg),
+            ..cell
+        };
+        let track = quiet(glass.track());
+        let warn = quiet(glass.warn());
         let set = footer::set_facts(&fit.segments);
+        // The facts are laid against the run's close, at pane column `at.end - 1`: their cell
+        // `c` (a blank first) sits at this pane column.
+        let fact_col = |c: usize| (at.end + c).saturating_sub(set.cells + 3);
         spans = footer::fact_spans(&set, &fit.segments);
         let lit_span = lit.and_then(|kind| {
             spans
@@ -4058,6 +4111,7 @@ fn compose_rule_spans(
             let lit = lit_cells.as_ref().is_some_and(|c| c.contains(&glyph.cell));
             let joins = glyph.ch == footer::JOIN_MARK
                 && unit.as_ref().is_some_and(|c| c.contains(&glyph.cell));
+            let t = at.t(fact_col(1 + glyph.cell));
             let ink = match (
                 glyph.mark || glyph.ch == footer::RESET_MARK || joins,
                 glyph.quiet,
@@ -4068,16 +4122,16 @@ fn compose_rule_spans(
                     if matches!(glyph.ch, '\u{2500}' | '\u{2504}') {
                         track
                     } else {
-                        meter
+                        quiet(glass.mark(t))
                     }
                 }
                 (false, false, false) if glyph.warn => warn,
-                (true, _, false) => mark,
-                (true, _, true) => lifted(mark, accent),
+                (true, _, false) => quiet(glass.mark(t)),
+                (true, _, true) => quiet(glass.letter(t)),
                 (false, true, false) => stub,
-                (false, true, true) => lifted(stub, value.fg),
+                (false, true, true) => lifted(stub, glass.value()),
                 (false, false, false) => value,
-                (false, false, true) => lifted(value, words.lit),
+                (false, false, true) => lifted(value, glass.lit()),
             };
             let cell = RenderCell {
                 ch: glyph.ch,
@@ -4116,10 +4170,15 @@ fn compose_rule_spans(
         clusters = set.clusters;
         combining = set.combining;
     }
-    let mut glass = 0..0;
-    if !out.is_empty() {
+    let mut kept = 0..0;
+    if arc {
+        out.extend(std::iter::repeat_n(
+            rule,
+            (lead + room).saturating_sub(out.len() + facts.len()),
+        ));
+    } else if out.len() > lead {
         let glyphs = room.saturating_sub(out.len() + facts.len());
-        glass = out.len()..out.len() + glyphs;
+        kept = out.len()..out.len() + glyphs;
         out.extend(std::iter::repeat_n(rule, glyphs));
     }
     let facts_at = out.len();
@@ -4130,11 +4189,22 @@ fn compose_rule_spans(
         *col += facts_at + 1;
     }
     out.extend(facts);
+    if arc {
+        out.push(rule);
+        // Every one of the rule's own `─` laid wears the arc of its column.
+        let start = at.end.saturating_sub(out.len());
+        for (i, cell) in out.iter_mut().enumerate() {
+            if *cell == rule {
+                cell.fg = rgb_of(glass.rule(at.t(start + i)));
+            }
+        }
+    }
     RulePaint {
         cells: out,
         lights_at,
         title: title_at,
-        glass,
+        glass: kept,
+        close: arc,
         facts_at,
         spans,
         clusters,
@@ -4142,23 +4212,55 @@ fn compose_rule_spans(
     }
 }
 
-/// The warn ink the tests' compositions and the layout scene's rules take (Aterm Day's floored
-/// warn; a projected stop's words, which no sample draws).
-#[cfg(any(test, debug_assertions, feature = "dev-seams"))]
-const WARN_FG: [u8; 3] = [0x9e, 0x66, 0x02];
+/// The quiet ink a greyed word (a hidden fact's stub, the key's ghost) wears on `blank`'s pane
+/// beside a rule drawn in `rule` ([`GlassInks::quiet`]). Its one caller is a unix test.
+#[cfg(all(test, unix))]
+pub(crate) fn quiet_ink(rule: RenderCell, blank: RenderCell) -> [u8; 3] {
+    rgb_of(rule_glass(None, rule, blank).quiet())
+}
 
-/// [`compose_rule_spans`]' cells and where the chips start, as the tests
-/// read a composition.
+/// The glass's tokens a rule drawn in `rule` on `blank`'s pane wears under `palette`.
+#[cfg(test)]
+fn rule_glass(
+    palette: Option<aterm_effects::harness_card::CardPalette>,
+    rule: RenderCell,
+    blank: RenderCell,
+) -> GlassInks {
+    GlassInks::of(
+        palette,
+        pack_rgb(blank.bg),
+        pack_rgb(blank.fg),
+        pack_rgb(rule.fg),
+    )
+}
+
+/// The place of a rule whose `room` is a whole pane's run ([`RuleAt`]).
+#[cfg(test)]
+const fn rule_at_room(room: usize) -> RuleAt {
+    RuleAt::across(room + footer::RULE_LEAD + 1)
+}
+
+/// [`compose_rule_spans`]' cells and where the chips start under `palette`, on a pane whose run
+/// is the room's, as the tests read a composition.
 #[cfg(test)]
 fn compose_rule(
     fit: &footer::RuleFit,
     block: Option<&crate::claude_lights::Block>,
     rule: RenderCell,
     blank: RenderCell,
-    mark_fg: [u8; 3],
+    palette: Option<aterm_effects::harness_card::CardPalette>,
     room: usize,
 ) -> (Vec<RenderCell>, Option<usize>) {
-    let paint = compose_rule_spans(fit, block, rule, blank, (mark_fg, WARN_FG), room, None);
+    let glass = rule_glass(palette, rule, blank);
+    let paint = compose_rule_spans(
+        fit,
+        block,
+        rule,
+        blank,
+        (&glass, rule_at_room(room)),
+        room,
+        None,
+    );
     (paint.cells, paint.lights_at)
 }
 
@@ -4849,7 +4951,6 @@ impl App {
             palette,
             held,
             cell,
-            mark_fg,
         } = *at;
         let Some(top) = texts.top_line(leaf_index, program) else {
             return;
@@ -4868,7 +4969,6 @@ impl App {
             return;
         };
         let ground = blank;
-        let mark_fg = legible_on(mark_fg, ground.bg);
         let hide_lockup = bare_while_off(Some(program), switch.map(|s| s.face));
         let frame_row = region.strip + region.row_off + top;
         // The hover was named on the last paint's hits: a line this paint moves from under a
@@ -4924,7 +5024,10 @@ impl App {
             switch,
             palette: palette.filter(|_| !hide_lockup),
             blank: ground,
-            mark_fg,
+            field: PaneField {
+                col_off: pane.col_off,
+                cols: pane.cols,
+            },
             face,
             cell,
             clip: pane_grid_px(cell, pane),
@@ -5085,8 +5188,9 @@ impl App {
             }
             return;
         }
-        let band = crate::chrome_band::band_colors(self.theme);
-        let (mark_fg, warn_fg) = (band.accent, band.warn);
+        // The agents' transcripts keep the instance's accent until their markdown has tokens
+        // of its own; the composer's lines take none of it ([`GlassInks`]).
+        let markdown_accent = crate::chrome_band::band_colors(self.theme).accent;
         let cell = {
             let (cw, ch) = grid.map_or_else(|| self.win_cell_size(wid), |g| g.cell());
             (
@@ -5177,7 +5281,7 @@ impl App {
                                 None,
                                 blank,
                                 rule_cell,
-                                mark_fg,
+                                markdown_accent,
                                 &mut lists.agy_edits,
                             );
                         }
@@ -5701,7 +5805,6 @@ impl App {
                             palette: border,
                             held: true,
                             cell,
-                            mark_fg,
                         },
                     );
                     if harness_on
@@ -5716,7 +5819,7 @@ impl App {
                             top_rule,
                             blank,
                             rule_cell,
-                            mark_fg,
+                            markdown_accent,
                             &mut lists.agy_edits,
                         );
                     }
@@ -5806,6 +5909,8 @@ impl App {
                     rule,
                     blank,
                     autopilot: (word, view),
+                    palette: border,
+                    cols: pane_cols,
                     row_rewritten,
                 });
             }
@@ -5849,18 +5954,30 @@ impl App {
                 continue;
             };
             self.note_claude_footer_row(wid, pane.session, chips_room);
-            self.note_claude_autopilot(
-                wid,
-                pane.session,
-                pane.autopilot,
-                (pane.row_rewritten, pane.rule.fg),
-            );
+            self.note_claude_autopilot(wid, pane.session, pane.autopilot, pane.row_rewritten);
             self.note_claude_team(wid, pane.session);
+            let glass = GlassInks::of(
+                pane.palette,
+                pack_rgb(pane.blank.bg),
+                pack_rgb(pane.blank.fg),
+                pack_rgb(pane.rule.fg),
+            );
+            let rule_at = RuleAt {
+                end: pane.run.end,
+                cols: pane.cols,
+            };
+            // The chips stand a blank after the rule's lead ([`compose_rule_spans`]).
+            let chips_at = crate::claude_lights::ChipAt {
+                glass,
+                col: pane.run.start + footer::RULE_LEAD + 1,
+                cols: pane.cols,
+            };
             let mut block = self.claude_lights_block(
                 wid,
                 pane.session,
                 pane.leaf_index,
                 pane.blank,
+                chips_at,
                 (chips_room, true),
             );
             // The mode's name a click brought up takes only cells the rule spares: where it would
@@ -5880,6 +5997,7 @@ impl App {
                     pane.session,
                     pane.leaf_index,
                     pane.blank,
+                    chips_at,
                     (chips_room, false),
                 );
             }
@@ -5891,25 +6009,25 @@ impl App {
                     block.as_ref(),
                     pane.rule,
                     pane.blank,
-                    (mark_fg, warn_fg),
+                    (glass, rule_at),
                     lit,
                 ))
             });
-            let Some(Composed {
-                cells,
-                lights_at,
-                title,
-                glass,
-                facts_at,
-                spans,
-            }) = composed.filter(|c| c.cells > 0)
-            else {
+            let Some(composed) = composed.filter(|c| c.cells > 0) else {
                 if let Some(block) = block {
                     self.recycle_claude_lights_block(wid, block);
                 }
                 continue;
             };
-            let col = pane.col_off + pane.run.end - 1 - cells;
+            let col = pane.col_off + composed.start(pane.run.end);
+            let Composed {
+                lights_at,
+                title,
+                glass,
+                facts_at,
+                spans,
+                ..
+            } = composed;
             let edit_col = if glass.is_empty() {
                 col
             } else {
@@ -6861,7 +6979,7 @@ pub(crate) enum UpState {
     /// ([`HELD_ARROW`]), never the ⬆️ a press acts on; its words say when it would land and a
     /// press says why it cannot ([`TopUp::why`]), asking nothing.
     Held,
-    /// The person asked for the move, or it is under way: `◐`, its words say so.
+    /// The person asked for the move, or it is under way: `◌`, its words say so.
     Asked,
 }
 
@@ -7437,15 +7555,16 @@ impl SwitchFace {
 }
 
 /// The harness switch: its state's mark and word alone, ` ● on ` lit and ` ○ off ` held off.
-/// Turning shows the side it turns to with `◐` (` ◐ on `, ` ◐ off `). Under High Contrast the
+/// Turning shows the side it turns to with `◌`, the glass's in-flight mark (` ◌ on `, ` ◌ off `,
+/// [`crate::autopilot::IN_FLIGHT`]). Under High Contrast the
 /// face wears brackets (`[● on]`). A press anywhere on it turns the switch.
 fn switch_face(paint: SwitchPaint) -> SwitchFace {
     use crate::autopilot::HarnessSwitch;
     let (mark, word) = match paint.face {
         HarnessSwitch::On => ('\u{25cf}', "on"),
         HarnessSwitch::Off(_) => ('\u{25cb}', "off"),
-        HarnessSwitch::Turning => ('\u{25d0}', "on"),
-        HarnessSwitch::TurningOff => ('\u{25d0}', "off"),
+        HarnessSwitch::Turning => (crate::autopilot::IN_FLIGHT, "on"),
+        HarnessSwitch::TurningOff => (crate::autopilot::IN_FLIGHT, "off"),
     };
     let (open, close) = if paint.forced { ('[', ']') } else { (' ', ' ') };
     let mut f = SwitchFace {
@@ -7474,10 +7593,9 @@ enum LabelInk {
     Brand,
     /// The quiet words: `(v2.1.305)`.
     Muted,
-    /// The harness's version, `v0.5`, bold.
+    /// The harness's version, `v0.5`, and the build the ⬆️'s move goes to in its words: a
+    /// version, lit and bold.
     Lit,
-    /// The build the ⬆️'s move goes to, in its words: bold, in the arc's cyan.
-    Target,
 }
 
 /// The cells a label, or the words in its slot, may take: the widest label
@@ -7668,7 +7786,7 @@ fn up_words(up: &TopUp, jobs: &str, press: Option<&'static str>) -> Option<UpWor
         });
         UpWords {
             verb: (verb.to_owned(), LabelInk::Muted),
-            target: (up.target(), LabelInk::Target),
+            target: (up.target(), LabelInk::Lit),
             when: (when, LabelInk::Muted),
             terse,
             bare,
@@ -7885,82 +8003,45 @@ fn slot_words(paint: &SwitchPaint, tier: usize) -> Option<SlotWords> {
     }
 }
 
-/// The inks a top line's switch and label are drawn in ([`switch_cell`], [`label_cell`]).
+/// The inks a top line's switch and label are drawn in ([`switch_cell`], [`label_cell`]), the
+/// glass's tokens ([`GlassInks`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FaceInks {
-    /// The harness's version, the ⬆️, and the switch under High Contrast.
+    /// The harness's version, the ⬆️'s target build, the ⬆️, and the switch under the pointer,
+    /// the keyboard or High Contrast.
     lit: [u8; 3],
     /// The switch at rest, the label's quiet words, and a held move's `↑`.
     muted: [u8; 3],
-    /// The switch while the pointer or the keyboard is on it.
-    lifted: [u8; 3],
-    /// `alab`: the arc's end lifted toward the pane's ink, quiet with the harness off.
-    brand: [u8; 3],
-    /// The ⬆️'s target build in its words: the arc's cyan (a third toward the pane's ink on a
-    /// dark ground, a deep blue on a light one), the accent with no arc, the lit ink with the
-    /// harness off; floored to read.
-    target: [u8; 3],
+    /// `alab`'s letters ([`Self::brand`]).
+    glass: GlassInks,
 }
 
 impl FaceInks {
-    /// The inks on `blank`'s ground for `paint` under `palette` (`None`: the accent `mark_fg`).
-    fn of(
-        paint: &SwitchPaint,
-        palette: Option<aterm_effects::harness_card::CardPalette>,
-        blank: RenderCell,
-        mark_fg: [u8; 3],
-    ) -> Self {
-        let (f, g) = (blank.fg, blank.bg);
-        let dark = crate::claude_card::dark_ground(blank);
-        let lit = legible_on(
-            if dark {
-                mix(f, [255; 3], 0.5)
-            } else {
-                mix(f, [0; 3], 0.3)
-            },
-            g,
-        );
-        // On a mid grey a floor's own direction can flip: the quiet words keep the lit ink's
-        // side, lighter or darker than the ground.
-        let luminance = |c: [u8; 3]| aterm_effects::color_math::relative_luminance(pack_rgb(c));
-        let light = luminance(lit) > luminance(g);
-        let muted = floored_toward(mix(f, g, if dark { 0.42 } else { 0.35 }), g, light);
-        let lifted = floored_toward(mix(f, g, 0.15), g, light);
-        let brand = match palette {
-            _ if paint.face.is_off() => muted,
-            Some(palette) if dark => legible_on(mix(rgb_of(palette.art(1.0, true)), f, 0.30), g),
-            Some(palette) => brand_letter_fg(palette, 1.0, blank),
-            None => legible_on(mark_fg, g),
-        };
-        let target = match palette {
-            _ if paint.face.is_off() => lit,
-            Some(palette) if dark => {
-                legible_on(mix(rgb_of(palette.art(TARGET_ARC, true)), f, 0.35), g)
-            }
-            Some(_) => legible_on(TARGET_ON_LIGHT, g),
-            None => legible_on(mark_fg, g),
-        };
+    /// The inks of a top line in the glass's tokens.
+    fn of(glass: &GlassInks) -> Self {
         Self {
-            lit,
-            muted,
-            lifted,
-            brand,
-            target,
+            lit: rgb_of(glass.lit()),
+            muted: rgb_of(glass.quiet()),
+            glass: *glass,
         }
+    }
+
+    /// `alab`'s letter at `k` across it (`0.0..=1.0`): the launch card's settled hero
+    /// ([`GlassInks::hero`]); with the harness off the pane wears no palette, so the lit ink.
+    fn brand(&self, k: f32) -> [u8; 3] {
+        rgb_of(self.glass.hero(k))
     }
 }
 
-/// A switch cell on `blank`'s ground ([`FaceInks`]): the label's quiet ink at rest, lifted toward
-/// the pane's ink while the pointer or the keyboard is on it, and the version's lit ink under High
-/// Contrast, which asks for the stronger tone; never bold. Every cell keeps the ground and no
-/// sprite lies under it, so the switch draws no box.
+/// A switch cell on `blank`'s ground ([`FaceInks`]): the quiet ink at rest, and the lit ink while
+/// the pointer or the keyboard is on it or under High Contrast, which asks for the stronger tone;
+/// never bold. Every cell keeps the ground and no sprite lies under it, so the switch draws no
+/// box.
 fn switch_cell(ch: char, paint: &SwitchPaint, inks: &FaceInks, blank: RenderCell) -> RenderCell {
     RenderCell {
         ch,
-        fg: if paint.forced {
+        fg: if paint.forced || paint.hovered() {
             inks.lit
-        } else if paint.hovered() {
-            inks.lifted
         } else {
             inks.muted
         },
@@ -7970,8 +8051,9 @@ fn switch_cell(ch: char, paint: &SwitchPaint, inks: &FaceInks, blank: RenderCell
     }
 }
 
-/// A label cell in its ink on `blank`'s ground ([`FaceInks`]).
-fn label_cell(ch: char, ink: LabelInk, inks: &FaceInks, blank: RenderCell) -> RenderCell {
+/// A label cell in its ink on `blank`'s ground ([`FaceInks`]); a brand letter takes the hero's
+/// letter at `k` across the brand.
+fn label_cell(ch: char, ink: LabelInk, k: f32, inks: &FaceInks, blank: RenderCell) -> RenderCell {
     let mut cell = RenderCell {
         ch,
         bold: false,
@@ -7981,7 +8063,7 @@ fn label_cell(ch: char, ink: LabelInk, inks: &FaceInks, blank: RenderCell) -> Re
     match ink {
         LabelInk::Pad => cell.ch = ' ',
         LabelInk::Brand => {
-            cell.fg = inks.brand;
+            cell.fg = inks.brand(k);
             cell.bold = true;
         }
         LabelInk::Muted => cell.fg = inks.muted,
@@ -7989,19 +8071,9 @@ fn label_cell(ch: char, ink: LabelInk, inks: &FaceInks, blank: RenderCell) -> Re
             cell.fg = inks.lit;
             cell.bold = true;
         }
-        LabelInk::Target => {
-            cell.fg = inks.target;
-            cell.bold = true;
-        }
     }
     cell
 }
-
-/// Where on the arc the ⬆️'s target build takes its ink on a dark ground ([`FaceInks::target`]).
-const TARGET_ARC: f32 = 0.62;
-
-/// The ⬆️'s target build's ink on a light ground ([`FaceInks::target`]).
-const TARGET_ON_LIGHT: [u8; 3] = [0x10, 0x60, 0xD8];
 
 /// Adjusts `ink` along its hue to reach at least 4.5:1 contrast against `ground`.
 pub(crate) fn legible_on(ink: [u8; 3], ground: [u8; 3]) -> [u8; 3] {
@@ -8023,18 +8095,6 @@ fn relaid(c: &RenderCell) -> RenderCell {
     }
 }
 
-/// `ink` moved toward white (`light`) or black until it reads at the name floor on `ground`
-/// ([`aterm_effects::cli_marks::NAME_CONTRAST`]), the extreme where nothing nearer does: never
-/// across to the other side, as [`legible_on`]'s floor may go on a mid grey.
-fn floored_toward(ink: [u8; 3], ground: [u8; 3], light: bool) -> [u8; 3] {
-    let end = if light { [255; 3] } else { [0; 3] };
-    let floor = aterm_effects::cli_marks::NAME_CONTRAST;
-    (0..=32)
-        .map(|k| mix(ink, end, k as f32 / 32.0))
-        .find(|&c| reads_on(c, ground) >= floor)
-        .unwrap_or(end)
-}
-
 /// Adjusts `ink` along its hue to reach at least 3:1 contrast against `ground`.
 pub(crate) fn visible_on(ink: [u8; 3], ground: [u8; 3]) -> [u8; 3] {
     floored_on(ink, ground, aterm_effects::cli_marks::ICON_CONTRAST)
@@ -8050,6 +8110,7 @@ fn floored_on(ink: [u8; 3], ground: [u8; 3], min: f32) -> [u8; 3] {
 }
 
 /// The contrast `ink` reads at on `ground` (WCAG).
+#[cfg(test)]
 fn reads_on(ink: [u8; 3], ground: [u8; 3]) -> f32 {
     aterm_effects::color_math::contrast_ratio(pack_rgb(ink), pack_rgb(ground))
 }
@@ -8057,61 +8118,6 @@ fn reads_on(ink: [u8; 3], ground: [u8; 3]) -> f32 {
 /// `c` as `0x00RRGGBB`.
 const fn pack_rgb(c: [u8; 3]) -> u32 {
     u32::from_be_bytes([0, c[0], c[1], c[2]])
-}
-
-/// The facts' word inks on a pane, made from what the pane itself gives the glass.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct FactInks {
-    /// A value at rest ([`VALUE_LIFT`], [`value_fg`], [`legible_on`]), lifted halfway to the lit
-    /// ink where its stub's floor would read as loud.
-    value: [u8; 3],
-    /// A lit value: the pane's ink, floored to 4.5:1 ([`legible_on`]).
-    lit: [u8; 3],
-    /// A word greyed on purpose ([`greyed_on`]).
-    stub: [u8; 3],
-}
-
-impl FactInks {
-    /// The inks under a rule drawn in `gray`, on a pane whose ink is `ink`, laid on `ground`.
-    fn of(gray: [u8; 3], ink: [u8; 3], ground: [u8; 3]) -> Self {
-        let lit = legible_on(ink, ground);
-        let value = legible_on(value_fg(gray, ink), ground);
-        // A stub floored to the words' floor reads no quieter than a value standing at that
-        // floor: there the value is lifted halfway to the lit ink, so the stub stays the quieter
-        // word and a lit value the louder one.
-        let value = if reads_on(greyed_on(gray, value, ground), ground) < reads_on(value, ground) {
-            value
-        } else {
-            mix(value, lit, 0.5)
-        };
-        Self {
-            value,
-            lit,
-            stub: greyed_on(gray, value, ground),
-        }
-    }
-}
-
-/// [`FactInks::stub`] under a rule drawn in `gray` on `blank`'s pane.
-#[cfg(all(test, unix))]
-pub(crate) fn greyed_ink(gray: [u8; 3], blank: RenderCell) -> [u8; 3] {
-    FactInks::of(gray, blank.fg, blank.bg).stub
-}
-
-/// How far a greyed word is quieted from the live value toward the ground where the program's grey
-/// reads no quieter than the value ([`greyed_on`]).
-const GREYED_QUIET: f32 = 0.3;
-
-/// A word greyed on purpose on `ground`: the program's grey where it reads quieter than the live
-/// value, floored to read as words do ([`legible_on`]): a hidden fact's stub and the top-effort
-/// key's ghost are words a press brings back, quiet, never faint.
-fn greyed_on(gray: [u8; 3], value: [u8; 3], ground: [u8; 3]) -> [u8; 3] {
-    let ink = if reads_on(gray, ground) < reads_on(value, ground) {
-        gray
-    } else {
-        mix(value, ground, GREYED_QUIET)
-    };
-    legible_on(ink, ground)
 }
 
 /// The mark a program's top line wears ([`aterm_effects::cli_marks`]).
@@ -8336,12 +8342,48 @@ struct TopKey {
     switch: Option<SwitchPaint>,
     palette: Option<aterm_effects::harness_card::CardPalette>,
     blank: RenderCell,
-    mark_fg: [u8; 3],
+    /// Where the line sits across its pane, for each cell's hue.
+    field: PaneField,
     face: KeyFace,
     cell: (u16, u16),
     clip: aterm_core::render::PxRect,
     mark_hover: bool,
     title_gen: u64,
+}
+
+#[cfg(test)]
+impl TopKey {
+    /// The glass's tokens this line wears ([`compose_top`]).
+    fn glass(&self) -> GlassInks {
+        GlassInks::of(
+            self.palette,
+            pack_rgb(self.blank.bg),
+            pack_rgb(self.blank.fg),
+            pack_rgb(self.run.rule.fg),
+        )
+    }
+
+    /// The marks ink a mark at frame column `col` of this line wears ([`GlassInks::mark`]).
+    fn mark_ink_at(&self, col: usize) -> [u8; 3] {
+        rgb_of(self.glass().mark(self.field.t(col)))
+    }
+}
+
+/// A pane's span of frame columns, across which each glass cell takes its column's hue
+/// ([`aterm_effects::glass_inks::field`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PaneField {
+    /// The pane's first frame column.
+    col_off: usize,
+    /// Its width.
+    cols: usize,
+}
+
+impl PaneField {
+    /// The palette position of frame column `col`.
+    fn t(self, col: usize) -> f32 {
+        aterm_effects::glass_inks::field(col.saturating_sub(self.col_off), self.cols)
+    }
 }
 
 /// What aterm draws for the top-effort key on a top rule.
@@ -8351,7 +8393,7 @@ struct KeyFace {
     ghost: Option<bool>,
     /// Claude's own tag on the row.
     tag: Option<(usize, usize)>,
-    /// `◐` while a press of the key is in flight, `▸` while the keyboard selects it.
+    /// `◌` while a press of the key is in flight, `▸` while the keyboard selects it.
     mark: Option<char>,
 }
 
@@ -8448,23 +8490,6 @@ pub(crate) const UP_ARROW: char = '\u{2b06}';
 /// A held move's arrow ([`UpState::Held`]): `↑`, one cell in the label's quiet ink.
 pub(crate) const HELD_ARROW: char = '\u{2191}';
 
-/// A rule cell's ink at `t` of `palette`'s arc over a rule drawn in `rule` on a pane whose ink is
-/// `ink` ([`compose_top`]): the arc lifted a quarter toward the ink, laid 68% over the rule.
-fn arc_rule_fg(
-    palette: aterm_effects::harness_card::CardPalette,
-    t: f32,
-    dark: bool,
-    rule: [u8; 3],
-    ink: [u8; 3],
-) -> [u8; 3] {
-    let lifted = mix(rgb_of(palette.art(t, dark)), ink, 0.25);
-    let mut fg = mix(rule, lifted, 0.68);
-    if fg == rule {
-        fg[0] ^= 1;
-    }
-    fg
-}
-
 /// [`compose_top`] with the hover title leaving `title_lead` `─` before the tail slot.
 #[expect(
     clippy::too_many_lines,
@@ -8494,7 +8519,7 @@ fn compose_top_in(
         switch,
         palette,
         blank,
-        mark_fg,
+        field: across,
         face,
         ..
     } = *key;
@@ -8508,21 +8533,26 @@ fn compose_top_in(
     top.col = run.col;
     let rule_cell = run.rule;
     let tint = palette;
+    let glass = GlassInks::of(
+        palette,
+        pack_rgb(blank.bg),
+        pack_rgb(blank.fg),
+        pack_rgb(rule_cell.fg),
+    );
+    // A mark at cell `at` of the run, in the mark ink of its column.
+    let mark_ink = |at: usize| rgb_of(glass.mark(across.t(run.col + at)));
     let span = run.span(face);
     let mark = cli_mark(program);
-    let mark_cell = face.mark.map(|ch| RenderCell {
-        ch,
-        fg: mark_fg,
-        bold: false,
-        ..rule_cell
-    });
-    let ghost_inks = FactInks::of(rule_cell.fg, blank.fg, rule_cell.bg);
+    let mark_cell = |at: usize| {
+        face.mark.map(|ch| RenderCell {
+            ch,
+            fg: mark_ink(at),
+            bold: false,
+            ..rule_cell
+        })
+    };
     let ghost_cells = |lit: bool| {
-        let fg = if lit {
-            ghost_inks.value
-        } else {
-            ghost_inks.stub
-        };
+        let fg = rgb_of(if lit { glass.value() } else { glass.quiet() });
         ghost_chars().map(move |ch| RenderCell {
             ch,
             fg,
@@ -8552,7 +8582,7 @@ fn compose_top_in(
         let mark_at = mark_in_run(ghost_end);
         if let Some(first) = mark_at.or(ghost_end) {
             top.col = run.col + first;
-            if let (Some(_), Some(mark)) = (mark_at, mark_cell) {
+            if let Some(mark) = mark_at.and_then(mark_cell) {
                 top.cells.push(mark);
             }
             if let (Some(at), Some(lit)) = (ghost_end, face.ghost) {
@@ -8636,9 +8666,9 @@ fn compose_top_in(
     });
     // The close's blank, before its `──`.
     let close_pad = (rung.switch && rung.close == CLOSE).then_some(close_at);
-    // Drawn blank only beside the ⬆️'s two cells: an asked move's one-cell `◐` and a held
+    // Drawn blank only beside the ⬆️'s two cells: an asked move's one-cell `◌` and a held
     // move's `↑` keep the blank after them in the arrow's second cell, and the close's runs as
-    // rule (`◐ ───`, `↑ ───`), so the mark has one blank either side as the ⬆️ has.
+    // rule (`◌ ───`, `↑ ───`), so the mark has one blank either side as the ⬆️ has.
     let close_blank = close_pad.filter(|_| up.is_none_or(|up| up.offers()));
     if let (Some(f), Some(at)) = (&laid.face, &face_at) {
         let col_start = run.col + at.start;
@@ -8693,9 +8723,7 @@ fn compose_top_in(
     let cells = &mut top.cells;
     cells.resize(hi - lo, rule_cell);
     let pad = RenderCell { ch: ' ', ..blank };
-    if let Some(palette) = tint {
-        let dark = crate::claude_card::dark_ground(blank);
-        let gap = lockup_at.as_ref().map_or(0, |l| l.end)..handover;
+    if tint.is_some() {
         let parts = [
             lockup_at.clone(),
             ghost_slot.clone(),
@@ -8705,28 +8733,14 @@ fn compose_top_in(
             arrow_at.as_ref().map(|a| a.start - 1..a.end),
             close_blank.map(|p| p..p + 1),
         ];
-        let face_start = face_at.as_ref().map_or(field, |f| f.start);
+        // Every `─` wears the arc of its own column ([`GlassInks::rule`]).
         for i in 0..field {
             if parts.iter().flatten().any(|r| r.contains(&i)) {
                 continue;
             }
-            let t = if switch_slot.is_none() || i < gap.start {
-                1.0
-            } else if gap.contains(&i) {
-                let (j, g) = (i - gap.start, gap.len());
-                if g <= 1 {
-                    0.0
-                } else {
-                    1.0 - j as f32 / (g - 1) as f32
-                }
-            } else if i < face_start {
-                0.0
-            } else {
-                1.0
-            };
             cells[i - lo] = RenderCell {
                 ch: '\u{2500}',
-                fg: arc_rule_fg(palette, t, dark, rule_cell.fg, blank.fg),
+                fg: rgb_of(glass.rule(across.t(run.col + i))),
                 ..rule_cell
             };
         }
@@ -8797,7 +8811,7 @@ fn compose_top_in(
         }
     }
     if let Some(paint) = switch {
-        let inks = FaceInks::of(&paint, palette, blank, mark_fg);
+        let inks = FaceInks::of(&glass);
         if let (Some(f), Some(at)) = (&laid.face, &face_at) {
             for (k, &ch) in f.cells().iter().enumerate() {
                 cells[at.start + k - lo] = switch_cell(ch, &paint, &inks, blank);
@@ -8805,8 +8819,21 @@ fn compose_top_in(
         }
         if let (Some(label), Some(at)) = (&laid.label, &label_at) {
             cells[at.start - 1 - lo] = pad;
-            for (k, &(ch, ink)) in shown.as_ref().unwrap_or(label).cells().iter().enumerate() {
-                cells[at.start + k - lo] = label_cell(ch, ink, &inks, blank);
+            let laid = shown.as_ref().unwrap_or(label).cells();
+            // The brand's letters run the hero's ramp across the brand alone.
+            let brand = laid
+                .iter()
+                .filter(|(_, ink)| *ink == LabelInk::Brand)
+                .count();
+            let mut nth = 0usize;
+            for (k, &(ch, ink)) in laid.iter().enumerate() {
+                let along = if brand > 1 {
+                    nth as f32 / (brand - 1) as f32
+                } else {
+                    0.0
+                };
+                nth += usize::from(ink == LabelInk::Brand);
+                cells[at.start + k - lo] = label_cell(ch, ink, along, &inks, blank);
             }
         }
         if let (Some(at), Some(up)) = (&arrow_at, up) {
@@ -8814,8 +8841,8 @@ fn compose_top_in(
             let (lead, second) = match up.state {
                 UpState::Asked => (
                     RenderCell {
-                        ch: '\u{25d0}',
-                        fg: mark_fg,
+                        ch: crate::autopilot::IN_FLIGHT,
+                        fg: mark_ink(at.start),
                         bold: false,
                         ..pad
                     },
@@ -8864,34 +8891,36 @@ fn compose_top_in(
             cells[at.start + k - lo] = relaid(cell);
         }
     }
-    if let (Some(at), Some(mark)) = (mark_at, mark_cell) {
+    if let Some(at) = mark_at
+        && let Some(mark) = mark_cell(at)
+    {
         cells[at - lo] = mark;
     }
     if let Some(laid) = &goal_at {
-        let inks = FactInks::of(rule_cell.fg, blank.fg, rule_cell.bg);
         let pad = RenderCell {
             ch: ' ',
             ..rule_cell
         };
+        let lit = rgb_of(glass.lit());
         for (k, glyph) in laid.glyphs.iter().enumerate() {
             cells[laid.cols.start + k - lo] = match *glyph {
                 GoalGlyph::Pad => pad,
                 GoalGlyph::Mark => RenderCell {
                     ch: GOAL_MARK,
-                    fg: mark_fg,
+                    fg: mark_ink(laid.cols.start + k),
                     bold: false,
                     ..rule_cell
                 },
                 GoalGlyph::Text(ch) => RenderCell {
                     ch,
-                    fg: inks.lit,
+                    fg: lit,
                     bold: false,
                     ..rule_cell
                 },
                 GoalGlyph::Wide => RenderCell {
                     ch: ' ',
                     wide: true,
-                    fg: inks.lit,
+                    fg: lit,
                     bold: false,
                     ..rule_cell
                 },
@@ -9154,9 +9183,9 @@ impl RingContents {
 
 /// The ring's sprite for a top rule composed from `key` into `top` while the pointer is on its
 /// ⬆️: under the arrow, from half a cell left of its first cell, in the hue of the rule it closes
-/// (`palette`'s arc, the accent `mark_fg` with no theme, none with the harness off); `None` with
-/// the pointer elsewhere, or on an asked move's `◐`, which takes no press. The switch itself has
-/// no sprite.
+/// (the rule's arc at the arrow's column, [`GlassInks::rule`]; none with no theme or the harness
+/// off); `None` with the pointer elsewhere, or on an asked move's `◌`, which takes no press. The
+/// switch itself has no sprite.
 fn ring_layer(
     key: &TopKey,
     top: &ComposedTop,
@@ -9165,7 +9194,7 @@ fn ring_layer(
 ) -> Option<aterm_core::render::FxLayer> {
     use crate::autopilot::HarnessSwitch;
     use aterm_effects::up_ring::{RingHue, RingKey};
-    // Only a ⬆️ a press acts on is ringed: an asked move's `◐` takes no press, and a held move's
+    // Only a ⬆️ a press acts on is ringed: an asked move's `◌` takes no press, and a held move's
     // `↑` asks for nothing (`App::press_upgrade_arrow`).
     let paint = key
         .switch
@@ -9174,15 +9203,21 @@ fn ring_layer(
     let arrow = top.switch.as_ref()?.arrow.as_ref()?.start + 1;
     let pack = crate::claude_card::pack;
     let hue = match (paint.face, key.palette) {
-        (HarnessSwitch::Off(_) | HarnessSwitch::TurningOff, _) => RingHue::Neutral,
-        (_, Some(palette)) => RingHue::Arc(palette),
-        (_, None) => RingHue::Accent(pack(key.mark_fg)),
+        (HarnessSwitch::Off(_) | HarnessSwitch::TurningOff, _) | (_, None) => RingHue::Neutral,
+        (_, Some(palette)) => RingHue::Rule(
+            GlassInks::of(
+                Some(palette),
+                pack(key.blank.bg),
+                pack(key.blank.fg),
+                pack(key.run.rule.fg),
+            )
+            .rule(key.field.t(arrow)),
+        ),
     };
     let ring = RingKey {
         cell: key.cell,
         ground: pack(key.blank.bg),
         fg: pack(key.blank.fg),
-        rule: pack(key.run.rule.fg),
         hue,
     };
     let (cw, ch) = key.cell;
@@ -11101,10 +11136,10 @@ mod tests {
         }
         assert_eq!(
             face(paint(HarnessSwitch::Turning)),
-            " \u{25d0} on ",
+            " \u{25cc} on ",
             "turning on: the side it turns to"
         );
-        assert_eq!(face(paint(HarnessSwitch::TurningOff)), " \u{25d0} off ");
+        assert_eq!(face(paint(HarnessSwitch::TurningOff)), " \u{25cc} off ");
         assert_eq!(
             face(SwitchPaint {
                 forced: true,
@@ -11214,20 +11249,23 @@ mod tests {
         );
     }
 
-    /// A GREYED WORD READS AS WORDS DO: a hidden fact's stub and the ghost take Claude's rule
-    /// grey (#888888) where it reads quieter than the value, floored to 4.5:1 on Default Light's
-    /// page and still quieter than the value; on Default (dark) the grey already reads and is kept
-    /// as it is. CONTROL: the 3:1 floor left it at 3.31:1 on the light page.
+    /// A GREYED WORD READS AS WORDS DO: a hidden fact's stub and the ghost wear the glass's quiet
+    /// ink, at 4.5:1 or more on Default Light's page and on Default (dark), and quieter than the
+    /// value. CONTROL: Claude's rule grey (#888888) floored at 3:1 alone, as the stub once was,
+    /// read at 3.31:1 on the light page.
     #[test]
     fn a_greyed_word_reads_as_words_do() {
         use aterm_types::scheme::builtin;
         let gray = [0x88; 3];
         let rgb = |c: aterm_types::Rgb| [c.r, c.g, c.b];
-        for (name, kept) in [("Default Light", false), ("Default", true)] {
+        for name in ["Default Light", "Default"] {
             let scheme = builtin(name).expect("a built-in");
             let (fg, bg) = (rgb(scheme.foreground), rgb(scheme.background));
-            let inks = FactInks::of(gray, fg, bg);
-            let (stub, value) = (reads_on(inks.stub, bg), reads_on(inks.value, bg));
+            let inks = GlassInks::of(None, pack_rgb(bg), pack_rgb(fg), pack_rgb(gray));
+            let (stub, value) = (
+                reads_on(rgb_of(inks.quiet()), bg),
+                reads_on(rgb_of(inks.value()), bg),
+            );
             assert!(
                 stub >= aterm_effects::cli_marks::NAME_CONTRAST,
                 "{name}: the stub at {stub:.2}:1"
@@ -11236,19 +11274,13 @@ mod tests {
                 stub < value,
                 "{name}: quieter than the value ({stub:.2} < {value:.2})"
             );
-            assert_eq!(
-                inks.stub == gray,
-                kept,
-                "{name}: the grey kept where it reads"
-            );
-            if !kept {
-                let old = reads_on(visible_on(gray, bg), bg);
-                assert!(
-                    old < aterm_effects::cli_marks::NAME_CONTRAST,
-                    "CONTROL: the 3:1 floor at {old:.2}:1 on {name}"
-                );
-            }
         }
+        let bg = rgb(builtin("Default Light").expect("a built-in").background);
+        let old = reads_on(visible_on(gray, bg), bg);
+        assert!(
+            old < aterm_effects::cli_marks::NAME_CONTRAST,
+            "CONTROL: the 3:1 floor at {old:.2}:1 on Default Light"
+        );
     }
 
     #[test]
@@ -11395,8 +11427,7 @@ mod tests {
                             );
                             continue;
                         }
-                        let (cells, at) =
-                            compose_rule(&fit, Some(&block), rule, blank, [0, 128, 255], room);
+                        let (cells, at) = compose_rule(&fit, Some(&block), rule, blank, None, room);
                         let at = at.expect("drawn chips have a column");
                         let row = text_of(&cells);
                         assert!(cells.len() <= room, "{room}: {row:?}");
@@ -11834,7 +11865,7 @@ mod tests {
         let blank = cell(' ', [200, 200, 200]);
         let rule = cell('\u{2500}', [60, 60, 60]);
         let fit_plain = footer::fit_rule(&facts(), 76, None);
-        let (plain_cells, lights) = compose_rule(&fit_plain, None, rule, blank, [0, 128, 255], 76);
+        let (plain_cells, lights) = compose_rule(&fit_plain, None, rule, blank, None, 76);
         assert_eq!(lights, None);
         assert_eq!(
             plain_cells.len(),
@@ -11858,14 +11889,15 @@ mod tests {
         }
         let none = footer::fit_rule(&FooterFacts::default(), 76, None);
         assert!(
-            compose_rule(&none, None, rule, blank, [1, 1, 1], 76)
+            compose_rule(&none, None, rule, blank, None, 76)
                 .0
                 .is_empty()
         );
+        let chips_at = crate::claude_lights::ChipAt::cruise(blank);
         let harness = crate::claude_lights::Block::of_autopilot(
             crate::autopilot::AutopilotView::Cruise,
             blank,
-            [0, 128, 255],
+            chips_at,
         );
         let widths = footer::LightsWidth {
             chips: harness.lights.len(),
@@ -11876,7 +11908,7 @@ mod tests {
         };
         let fit = footer::fit_rule(&facts(), 76, Some(widths));
         assert_eq!(fit.segments, fit_plain.segments);
-        let (cells, lights) = compose_rule(&fit, Some(&harness), rule, blank, [0, 128, 255], 76);
+        let (cells, lights) = compose_rule(&fit, Some(&harness), rule, blank, None, 76);
         assert_eq!(lights, Some(1));
         assert_eq!(cells.len(), 76, "the rule's glyphs run on to the facts");
         assert_eq!(cells[0], blank);
@@ -11892,8 +11924,68 @@ mod tests {
             "the rule's glyphs bridge the lights and the facts"
         );
         assert_eq!(&cells[76 - plain_cells.len()..], plain_cells.as_slice());
-        assert_eq!(cells[1].fg, [0, 128, 255], "cruise in the accent");
+        assert_eq!(cells[1].fg, chips_at.letter_at(0), "cruise in its letter");
         assert_eq!(cells[1].script, aterm_core::terminal::Script::Normal);
+        // Under a palette the rule's lead, its run between the chips and the facts, and its close
+        // are written too, each `─` in the arc of its column.
+        let palette = Some(aterm_effects::harness_card::CardPalette::Cruise);
+        let (arc, lights) = compose_rule(&fit, Some(&harness), rule, blank, palette, 76);
+        let lead = footer::RULE_LEAD;
+        assert_eq!(lights, Some(lead + 1), "the lead, then a blank");
+        assert_eq!(arc.len(), lead + 76 + 1, "the lead, the room and the close");
+        let (glass, at) = (rule_glass(palette, rule, blank), rule_at_room(76));
+        let facts_at = 76 - plain_cells.len() + 1;
+        let marks: std::collections::HashSet<usize> = set
+            .glyphs
+            .iter()
+            .filter(|g| g.mark)
+            .map(|g| facts_at + g.cell)
+            .collect();
+        assert!(!marks.is_empty(), "CONTROL: the facts have marks");
+        for (i, want) in cells.iter().enumerate().filter(|(_, c)| **c != rule) {
+            let want = if marks.contains(&i) {
+                RenderCell {
+                    fg: rgb_of(glass.mark(at.t(lead + i))),
+                    ..*want
+                }
+            } else {
+                *want
+            };
+            assert_eq!(
+                arc[lead + i],
+                want,
+                "{i}: the chips and the facts after the lead, a mark in its column's marks ink"
+            );
+        }
+        let bridge = lead + 2 + harness.lights.len()..lead + 76 - plain_cells.len();
+        for i in (0..lead).chain(bridge).chain([arc.len() - 1]) {
+            assert_eq!(arc[i].ch, '\u{2500}', "{i}: the rule's own");
+            assert_eq!(
+                arc[i].fg,
+                rgb_of(glass.rule(at.t(i))),
+                "{i}: its column's arc"
+            );
+        }
+        assert_ne!(
+            arc[0].fg,
+            arc[arc.len() - 1].fg,
+            "CONTROL: the arc runs across the rule"
+        );
+        // A run of the lead and the close or fewer cells has no room: the arc lays nothing, so
+        // nothing is written past the run's ends. CONTROL: one cell of room lays exactly the run.
+        let none = footer::fit_rule(&facts(), 0, None);
+        assert!(
+            compose_rule(&none, None, rule, blank, palette, 0)
+                .0
+                .is_empty(),
+            "no room, no cells under a palette"
+        );
+        let one = footer::fit_rule(&facts(), 1, None);
+        assert_eq!(
+            compose_rule(&one, None, rule, blank, palette, 1).0.len(),
+            lead + 1 + 1,
+            "CONTROL: one cell of room lays the lead, it and the close"
+        );
     }
 
     #[test]
@@ -11901,7 +11993,7 @@ mod tests {
         let blank = cell(' ', [200, 200, 200]);
         let rule = cell('\u{2500}', [60, 60, 60]);
         let fit = footer::fit_rule(&facts(), 76, None);
-        let (cells, _) = compose_rule(&fit, None, rule, blank, [0, 128, 255], 76);
+        let (cells, _) = compose_rule(&fit, None, rule, blank, None, 76);
         let set = footer::set_facts(&fit.segments);
         assert_eq!(cells.len(), set.cells + 2);
         let mut glyph_cells = std::collections::HashSet::new();
@@ -11934,7 +12026,7 @@ mod tests {
         use aterm_core::terminal::{Script, UnderlineStyle};
         let blank = cell(' ', [200, 200, 200]);
         let rule = cell('\u{2500}', [60, 60, 60]);
-        let mark_fg = [0, 128, 255];
+        let glass = rule_glass(None, rule, blank);
         let fit = footer::RuleFit {
             segments: vec![
                 footer::Segment::plain(footer::ACCOUNT_MARK, "owner@example.com"),
@@ -11950,7 +12042,8 @@ mod tests {
             chips: false,
         };
         let room = 120;
-        let rest = compose_rule_spans(&fit, None, rule, blank, (mark_fg, WARN_FG), room, None);
+        let place = (&glass, rule_at_room(room));
+        let rest = compose_rule_spans(&fit, None, rule, blank, place, room, None);
         assert!(
             rest.cells
                 .iter()
@@ -11965,15 +12058,7 @@ mod tests {
             FactKind::Path,
             FactKind::Branch,
         ] {
-            let paint = compose_rule_spans(
-                &fit,
-                None,
-                rule,
-                blank,
-                (mark_fg, WARN_FG),
-                room,
-                Some(kind),
-            );
+            let paint = compose_rule_spans(&fit, None, rule, blank, place, room, Some(kind));
             let span = paint
                 .spans
                 .iter()
@@ -12040,16 +12125,23 @@ mod tests {
     }
 
     /// THE ACCOUNT, ITS PLAN AND ITS WEEK READ AS ONE UNIT ON THE GLASS, `⎆ <email> · <plan> ·
-    /// <week>`, every `·` of it in the marks' ink (the week's own too), and the next fact the
-    /// facts' gap away; lit, every glyph of it is lifted under one underline and the next fact
-    /// stays as at rest.
+    /// <week>`, every `·` of it in the marks' ink of its column (the week's own too), and the next
+    /// fact the facts' gap away; lit, every glyph of it is lifted under one underline and the next
+    /// fact stays as at rest.
     #[test]
     fn the_account_unit_reads_and_lights_as_one() {
         use aterm_agent::harness::profile::SubscriptionDisplay;
         use aterm_core::terminal::UnderlineStyle;
         let blank = cell(' ', [200, 200, 200]);
         let rule = cell('\u{2500}', [60, 60, 60]);
-        let mark_fg = [0, 128, 255];
+        let (plain, cruise) = (
+            rule_glass(None, rule, blank),
+            rule_glass(
+                Some(aterm_effects::harness_card::CardPalette::Cruise),
+                rule,
+                blank,
+            ),
+        );
         let week = "weekly 61.5% left \u{b7} 59m ago";
         let facts = FooterFacts {
             subscription: Some(SubscriptionDisplay {
@@ -12062,7 +12154,8 @@ mod tests {
         };
         let room = 120;
         let fit = footer::fit_rule(&facts, room, None);
-        let rest = compose_rule_spans(&fit, None, rule, blank, (mark_fg, WARN_FG), room, None);
+        let place = rule_at_room(room);
+        let rest = compose_rule_spans(&fit, None, rule, blank, (&plain, place), room, None);
         assert_eq!(
             text_of(&rest.cells),
             format!(
@@ -12088,28 +12181,37 @@ mod tests {
         );
         let at = rest.facts_at + 1;
         let own = at + usize::from(unit.cells.0)..at + usize::from(unit.cells.1);
-        let mark = rest.cells[own.start];
-        assert_eq!(mark.ch, footer::ACCOUNT_MARK);
-        let joins: Vec<&RenderCell> = rest.cells[own.clone()]
-            .iter()
-            .filter(|c| c.ch == footer::JOIN_MARK)
+        // Under the arc a mark wears the marks' ink of its column ([`GlassInks::mark`]).
+        let arc = compose_rule_spans(&fit, None, rule, blank, (&cruise, place), room, None);
+        let arc_at = arc.facts_at + 1;
+        let arc_own = arc_at + usize::from(unit.cells.0)..arc_at + usize::from(unit.cells.1);
+        let mark_ink = |c: usize| rgb_of(cruise.mark(place.t(c)));
+        assert_eq!(arc.cells[arc_own.start].ch, footer::ACCOUNT_MARK);
+        assert_eq!(arc.cells[arc_own.start].fg, mark_ink(arc_own.start));
+        let joins: Vec<usize> = arc_own
+            .clone()
+            .filter(|&c| arc.cells[c].ch == footer::JOIN_MARK)
             .collect();
         assert_eq!(joins.len(), 2, "the join and the week's own");
         assert!(
-            joins.iter().all(|c| c.fg == mark.fg),
-            "every join in the marks' ink"
+            joins.iter().all(|&c| arc.cells[c].fg == mark_ink(c)),
+            "every join in the marks' ink of its column"
         );
-        let word = rest.cells[own.clone()]
-            .iter()
-            .find(|c| c.ch == 'w')
+        let word = arc_own
+            .clone()
+            .find(|&c| arc.cells[c].ch == 'w')
             .expect("the week's word");
-        assert_ne!(word.fg, mark.fg, "CONTROL: a word is in the values' ink");
+        assert_ne!(
+            arc.cells[word].fg,
+            mark_ink(word),
+            "CONTROL: a word is in the values' ink"
+        );
         let lit = compose_rule_spans(
             &fit,
             None,
             rule,
             blank,
-            (mark_fg, WARN_FG),
+            (&plain, place),
             room,
             Some(FactKind::Account),
         );
@@ -12164,7 +12266,7 @@ mod tests {
         };
         let paint = |facts: &FooterFacts, room: usize| {
             let fit = footer::fit_rule(facts, room, None);
-            compose_rule(&fit, None, rule, blank, [0, 128, 255], room).0
+            compose_rule(&fit, None, rule, blank, None, room).0
         };
         let plain = " \u{25C6} Opus 5.5 xhigh   \u{2302} ~/aterm   \u{2387} main ";
         let named =
@@ -12228,14 +12330,7 @@ mod tests {
         };
         let blank = cell(' ', [1, 1, 1]);
         let fit = footer::fit_rule(&wide, 20, None);
-        let (row, _) = compose_rule(
-            &fit,
-            None,
-            cell('\u{2500}', [2, 2, 2]),
-            blank,
-            [3, 3, 3],
-            20,
-        );
+        let (row, _) = compose_rule(&fit, None, cell('\u{2500}', [2, 2, 2]), blank, None, 20);
         let lead = row.iter().position(|c| c.ch == '\u{6F22}').unwrap();
         assert!(
             !row[lead].wide && row[lead + 1].wide,
@@ -12273,6 +12368,10 @@ mod tests {
         }
     }
 
+    /// THE WALL AND USAGE MARKS TAKE THE MARKS' INK: `⧗`, `♻` and `Σ` are drawn as `◆` is, in
+    /// the glass's marks ink of their own column ([`GlassInks::mark`]), under Cruise on a dark
+    /// ground. CONTROL: the marks stand at different columns and their inks differ, so the
+    /// column, not one fixed ink, decides.
     #[test]
     fn the_wall_and_usage_marks_take_the_marks_ink() {
         let blank = cell(' ', [200, 200, 200]);
@@ -12288,17 +12387,28 @@ mod tests {
         facts.account_progress = Some(progress);
         let room = footer::segments_width(&footer::segments(&facts)) + 4;
         let fit = footer::fit_rule(&facts, room, None);
-        let cells = compose_rule(&fit, None, rule, blank, [0, 128, 255], room).0;
-        let ink = |mark: char| unplaced(cells[cells.iter().position(|c| c.ch == mark).unwrap()]);
+        let palette = Some(aterm_effects::harness_card::CardPalette::Cruise);
+        let cells = compose_rule(&fit, None, rule, blank, palette, room).0;
+        let (glass, at) = (rule_glass(palette, rule, blank), rule_at_room(room));
+        let col = |mark: char| cells.iter().position(|c| c.ch == mark).unwrap();
+        let model = unplaced(cells[col('\u{25C6}')]);
+        assert_eq!(model.fg, rgb_of(glass.mark(at.t(col('\u{25C6}')))), "`◆`");
+        let mut inks = vec![model.fg];
         for mark in ['\u{29D7}', footer::RESET_MARK, '\u{03A3}'] {
+            let c = col(mark);
             assert_eq!(
-                ink(mark),
+                unplaced(cells[c]),
                 RenderCell {
                     ch: mark,
-                    ..ink('\u{25C6}')
-                }
+                    fg: rgb_of(glass.mark(at.t(c))),
+                    ..model
+                },
+                "{mark}"
             );
+            inks.push(cells[c].fg);
         }
+        inks.dedup();
+        assert!(inks.len() > 1, "CONTROL: one ink at every column");
     }
 
     #[test]
@@ -13929,7 +14039,16 @@ mod tests {
             ..FooterFacts::default()
         };
         let fit = footer::fit_rule(&facts, 76, None);
-        let paint = compose_rule_spans(&fit, None, rule, blank, ([0, 128, 255], WARN_FG), 76, None);
+        let glass = rule_glass(None, rule, blank);
+        let paint = compose_rule_spans(
+            &fit,
+            None,
+            rule,
+            blank,
+            (&glass, rule_at_room(76)),
+            76,
+            None,
+        );
         assert!(!paint.clusters.is_empty() && !paint.combining.is_empty());
         let mut scratch = engine_fill(3);
         scratch.cells[2] = vec![rule; 100];
@@ -14147,7 +14266,7 @@ mod tests {
         let original = s.cells.clone();
         let facts = footer::fit_rule(&facts(), 36, None);
         let blank = cell(' ', [200, 200, 200]);
-        let (cells, _) = compose_rule(&facts, None, s.cells[2][0], blank, [0, 128, 255], 36);
+        let (cells, _) = compose_rule(&facts, None, s.cells[2][0], blank, None, 36);
         let col = 40 - 1 - cells.len();
         let mut slot = written(&mut s, vec![(2, col, cells.clone(), blank)]);
         assert_eq!(s.cells[2].len(), 40, "nothing padded");
@@ -14444,11 +14563,11 @@ mod tests {
             );
             let o = rule.iter().position(|c| c.ch == 'O').unwrap();
             let glyph = *vendor[strip + bottom].last().unwrap();
-            let ink = app.windows[&wid].input_scratch.implicit_blank.fg;
+            let blank = app.windows[&wid].input_scratch.implicit_blank;
             assert_eq!(
                 rule[o].fg,
-                mix(glyph.fg, ink, VALUE_LIFT),
-                "{label}: the value, in the rule's gray lifted toward the pane's ink"
+                rgb_of(rule_glass(None, glyph, blank).value()),
+                "{label}: the value, in the glass's value ink"
             );
             assert!(
                 matches!(rule[o].script, aterm_core::terminal::Script::Sub { .. }),
@@ -17456,13 +17575,16 @@ mod tests {
                 fg
             }
         };
-        let gap = cruise.len() - 4;
-        let shown: Vec<[u8; 3]> = [paint(1.0), paint(1.0)]
-            .into_iter()
-            .chain((0..gap).map(|j| paint(1.0 - j as f32 / (gap - 1) as f32)))
-            .chain([paint(1.0), paint(1.0)])
+        // Every `─` wears its own column's place on the palette, the lockup's and the close's
+        // too: violet at the pane's left, red at its right.
+        let scratch = &app.windows[&wid].input_scratch;
+        let shown: Vec<[u8; 3]> = scratch.cells[strip(&app, wid) + 5]
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.ch == '\u{2500}')
+            .map(|(col, _)| paint(aterm_effects::glass_inks::field(col, scratch.cols)))
             .collect();
-        assert_eq!(cruise, shown, "the palette backward over the gap");
+        assert_eq!(cruise, shown, "the palette backward over the pane");
         assert!(
             !cruise.iter().copied().all(warm),
             "CONTROL: Cruise's rule is not a sunset"

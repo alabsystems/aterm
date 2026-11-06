@@ -2192,7 +2192,7 @@ fn allowlist(file: &str) -> Vec<String> {
                 [
                     "crate::Res",
                     "crate::Fail",
-                    "crate::lab_build::LAB_BUILD",
+                    "crate::lab_build::lab_build",
                     "crate::lab_build::check_build",
                     "crate::spread::Threads",
                     "crate::sys::digest_file",
@@ -2229,6 +2229,9 @@ fn allowlist(file: &str) -> Vec<String> {
                         "crate::aos_learn::make_dirs",
                         "crate::stop::check",
                         "crate::stop::sleep",
+                        // The runner's commit (G0), which it passes to its children as their pin.
+                        "crate::lab_build::lab_commit",
+                        "crate::lab_build::PIN",
                     ]
                     .map(str::to_owned),
                 );
@@ -2540,7 +2543,7 @@ fn the_lab_allowlists_refuse_what_they_do_not_list() {
         concat!("use aterm_", "effects::aos_momentum::", "m6 as k;\n"),
         "use crate::sys::kill;\n",
         "use crate::aos_learn::version_root;\n",
-        concat!("use crate::aos_", "search::LAB_BUILD;\n"),
+        concat!("use crate::aos_", "search::lab_build;\n"),
         concat!("fn f() { let _ = crate::", "sys::kill(1, 9); }\n"),
         concat!(
             "fn f() { let _ = aterm_",

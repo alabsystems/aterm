@@ -52,7 +52,7 @@ pub(super) fn run_at(
             .map(crate::database::decode_hex)
             .collect::<Result<Vec<_>>>()?
     };
-    parents.sort();
+    parents.sort_unstable();
     if parents.windows(2).any(|p| p[0] == p[1]) {
         return Err(Error::new("duplicate account parent"));
     }

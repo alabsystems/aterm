@@ -3,18 +3,22 @@
 
 //! Private local identity of repository inputs. It observes only the parsed GitHub profile,
 //! its selected credential and default inventory, so unrelated init settings do not stop work.
+//! Readiness observation also tracks the actual admitted Git command and payload.
 
 use super::{Asked, Github, TOKEN_FILE, asked, inventory, profile, read_token};
 use crate::model::User;
 use crate::port::System;
 use std::path::{Path, PathBuf};
 
-/// Local source and pinned-helper changes that can invalidate a completed repository stage.
+type FileVersion = Result<[u8; 32], std::io::ErrorKind>;
+
+/// Local source, pinned-helper and Git changes that can invalidate a completed repository stage.
 /// Observing this mark grants no authority over inputs or effects and runs no program.
 #[derive(Clone, PartialEq, Eq)]
 pub struct RepositoryInputMark {
     source: Result<Stamp, String>,
     helper: Result<(PathBuf, [u8; 32]), std::io::ErrorKind>,
+    git: Vec<(PathBuf, FileVersion)>,
     paths: Vec<PathBuf>,
 }
 
@@ -34,8 +38,9 @@ fn account(sys: &dyn System) -> Result<User, String> {
     Ok(user)
 }
 
-/// Observe only this login's selected repository inputs and fixed credential helper. Missing
-/// or refused inputs remain stable observations, so removal and later repair each move it.
+/// Observe this login's selected repository inputs, fixed credential helper and admitted Git
+/// command/payload. Missing or refused inputs remain stable observations, so removal and
+/// later repair each move it.
 ///
 /// # Errors
 /// This process's own account cannot be identified.
@@ -50,13 +55,21 @@ pub fn repository_input_mark(sys: &dyn System) -> Result<RepositoryInputMark, St
     Ok(RepositoryInputMark {
         source: Stamp::read(sys, &user),
         helper,
+        git: git_paths(sys)
+            .into_iter()
+            .map(|path| {
+                let version = sys.file_version(&path).map_err(|why| why.kind());
+                (path, version)
+            })
+            .collect(),
         paths: watch_paths(sys, &user),
     })
 }
 
 /// Files whose parent directories can notify a parked repository stage. Its own selected
 /// token is included; global credential helpers are excluded because every setup Git command
-/// pins aterm's helper instead. A malformed profile still watches the profile's repair.
+/// pins aterm's helper instead. The admitted Git command and payload are included, so a
+/// same-build shim repair is observable. A malformed profile still watches its repair.
 ///
 /// # Errors
 /// This process's own account cannot be identified.
@@ -107,6 +120,17 @@ fn watch_paths(sys: &dyn System, user: &User) -> Vec<PathBuf> {
         Ok(Asked::Scoped(source) | Asked::Profile(source)) => paths.push(source.token_file),
         Ok(Asked::Off) | Err(_) => {}
     }
+    paths.extend(git_paths(sys));
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn git_paths(sys: &dyn System) -> Vec<PathBuf> {
+    let Some(git) = crate::items::github::installed_git_execution(sys) else {
+        return Vec::new();
+    };
+    let mut paths = vec![git.program, git.payload];
     paths.sort();
     paths.dedup();
     paths

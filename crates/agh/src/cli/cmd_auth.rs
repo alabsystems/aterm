@@ -302,7 +302,7 @@ pub(crate) fn auth_status(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
         Some(Ok(validated)) => {
             let router = Router::from_validated(validated.clone());
             let mut named = router.profiles();
-            named.sort_by(|a, b| a.name.cmp(&b.name));
+            named.sort_unstable_by(|a, b| a.name.cmp(&b.name));
             for profile in named {
                 profiles.push(profile_row(
                     profile,
@@ -322,7 +322,7 @@ pub(crate) fn auth_status(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     };
     if let Some(adoption) = adoption {
         profiles.extend(vault_rows(&adoption, &*ctx.env, &home, &ctx.redactor));
-        profiles.sort_by(|a, b| {
+        profiles.sort_unstable_by(|a, b| {
             a.get("profile")
                 .and_then(Value::as_str)
                 .cmp(&b.get("profile").and_then(Value::as_str))

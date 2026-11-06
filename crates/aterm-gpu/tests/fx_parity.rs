@@ -1619,16 +1619,23 @@ fn rounded_bars_are_byte_exact_on_the_gpu() {
     }
 }
 
+/// The rule's tint at the right end of a line, where a ⬆️ sits, for `palette` on `theme`'s
+/// ground ([`aterm_effects::glass_inks::GlassInks::rule`]).
+fn ring_rule(theme: Theme, palette: aterm_effects::harness_card::CardPalette) -> u32 {
+    let (ground, fg) = (theme.bg & 0x00FF_FFFF, theme.fg & 0x00FF_FFFF);
+    aterm_effects::glass_inks::GlassInks::of(Some(palette), ground, fg, 0x005A_5A5A).rule(0.02)
+}
+
 /// The ⬆️'s ring keys a frame draws: every hue, for `cell` on `theme`'s ground.
 fn ring_keys(theme: Theme, cell: (u16, u16)) -> Vec<aterm_effects::up_ring::RingKey> {
     use aterm_effects::harness_card::CardPalette;
     use aterm_effects::up_ring::{RingHue, RingKey};
     let (ground, fg) = (theme.bg & 0x00FF_FFFF, theme.fg & 0x00FF_FFFF);
     [
-        RingHue::Arc(CardPalette::Cruise),
-        RingHue::Arc(CardPalette::Land),
-        RingHue::Arc(CardPalette::Off),
-        RingHue::Accent(0x003B_8EEA),
+        RingHue::Rule(ring_rule(theme, CardPalette::Cruise)),
+        RingHue::Rule(ring_rule(theme, CardPalette::Land)),
+        RingHue::Rule(ring_rule(theme, CardPalette::Off)),
+        RingHue::Rule(0x003B_8EEA),
         RingHue::Neutral,
     ]
     .into_iter()
@@ -1636,7 +1643,6 @@ fn ring_keys(theme: Theme, cell: (u16, u16)) -> Vec<aterm_effects::up_ring::Ring
         cell,
         ground,
         fg,
-        rule: 0x005A_5A5A,
         hue,
     })
     .collect()
@@ -1723,8 +1729,7 @@ fn the_cpu_draws_the_up_rings_bytes() {
         ),
         ground: theme.bg & 0x00FF_FFFF,
         fg: theme.fg & 0x00FF_FFFF,
-        rule: 0x005A_5A5A,
-        hue: RingHue::Arc(CardPalette::Cruise),
+        hue: RingHue::Rule(ring_rule(theme, CardPalette::Cruise)),
     };
     let (w, h, bytes) = raster(&key);
     let texel = |x: usize, y: usize| {

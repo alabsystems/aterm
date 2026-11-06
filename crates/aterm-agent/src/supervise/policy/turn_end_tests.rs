@@ -16546,9 +16546,11 @@ fn a_persons_own_exchange_is_theirs_under_land_and_off() {
 /// relaunch; with `self.opened_fresh = false` out of `restarted`, the one after a banner read
 /// mid-relaunch. With `self.resumed = None` out of `new_point`, a fresh program's after a
 /// relaunch and a point is carried; so is one at `RESUME_DRAWN` past the relaunch with that bound
-/// out of `resuming`. With `!self.opened_fresh` out of `observe`'s `carried`, a fresh program's
-/// opening message is carried while the session's task is, and with `carried` dropped from its
-/// `theirs`, the session's own is left to the person under Off.
+/// out of `resuming`, and with `self.opened_fresh = true` out of `relaunched_afresh`, one whose
+/// banner was read before its `done:fresh` and no screen after. With `!self.opened_fresh` out of
+/// `observe`'s `carried`, a fresh program's opening message is carried while the session's task
+/// is, and with `carried` dropped from its `theirs`, the session's own is left to the person under
+/// Off.
 #[test]
 fn under_land_a_persons_message_mid_job_does_not_park_the_work() {
     let quick = Some(Duration::from_secs(5));
@@ -16668,10 +16670,11 @@ fn under_land_a_persons_message_mid_job_does_not_park_the_work() {
         // included, so the person's message after it interrupts the work. A taskless screen
         // after the next point, at `RESUME_DRAWN` past the relaunch, after a relaunch that
         // started the agent afresh (`done:fresh`) or after a restart the host did not make is a
-        // program started fresh. A fresh program carries nothing of the task before it: its
-        // opening message is theirs while the policy carries the session's task too (acts a loop
-        // before typed, no reply done), and a message to the session's own relaunch stays the
-        // carried task's, under Off too.
+        // program started fresh, and so is a `done:fresh` relaunch whose banner was read only
+        // while it was under way, the person typing before any screen after it. A fresh program
+        // carries nothing of the task before it: its opening message is theirs while the policy
+        // carries the session's task too (acts a loop before typed, no reply done), and a message
+        // to the session's own relaunch stays the carried task's, under Off too.
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         enum Since {
             Nothing,
@@ -16679,6 +16682,7 @@ fn under_land_a_persons_message_mid_job_does_not_park_the_work() {
             Point,
             Late,
             Afresh,
+            BannerThenAfresh,
             Unmade,
         }
         for (since, carry) in [
@@ -16687,6 +16691,7 @@ fn under_land_a_persons_message_mid_job_does_not_park_the_work() {
             Since::Point,
             Since::Late,
             Since::Afresh,
+            Since::BannerThenAfresh,
             Since::Unmade,
         ]
         .into_iter()
@@ -16699,7 +16704,7 @@ fn under_land_a_persons_message_mid_job_does_not_park_the_work() {
             }
             at(&mut st, &under(mode, work.clone()), now);
             let relaunch = now + 21 * MIN;
-            if since == Since::BannerFirst {
+            if matches!(since, Since::BannerFirst | Since::BannerThenAfresh) {
                 at(&mut st, &under(mode, fresh.clone()), relaunch);
             }
             let made = since != Since::Unmade;
@@ -16712,7 +16717,7 @@ fn under_land_a_persons_message_mid_job_does_not_park_the_work() {
                         relaunch + Duration::from_secs(10),
                     );
                 }
-                Since::Afresh => st.relaunched_afresh(),
+                Since::Afresh | Since::BannerThenAfresh => st.relaunched_afresh(),
                 Since::Nothing | Since::BannerFirst | Since::Late | Since::Unmade => {}
             }
             let drawn = if since == Since::Late {
@@ -16720,7 +16725,9 @@ fn under_land_a_persons_message_mid_job_does_not_park_the_work() {
             } else {
                 Duration::from_secs(20)
             };
-            at(&mut st, &under(mode, fresh.clone()), relaunch + drawn);
+            if since != Since::BannerThenAfresh {
+                at(&mut st, &under(mode, fresh.clone()), relaunch + drawn);
+            }
             at(&mut st, &under(mode, asked.clone()), relaunch + drawn + MIN);
             let opens = !matches!(since, Since::Nothing | Since::BannerFirst);
             assert_eq!(

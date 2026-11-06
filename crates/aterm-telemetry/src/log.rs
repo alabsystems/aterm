@@ -19,7 +19,7 @@ use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::row::{Line, Row, parse_line};
+use crate::row::{LineSince, Row, parse_line_since};
 
 /// The log's bounds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -313,22 +313,26 @@ pub fn read(dir: &Path, files: u32, since_ms: Option<u64>) -> io::Result<Reading
             if raw.is_empty() {
                 continue;
             }
-            let Some(line) = std::str::from_utf8(raw).ok().and_then(parse_line) else {
+            let Some(line) = std::str::from_utf8(raw)
+                .ok()
+                .and_then(|s| parse_line_since(s, since))
+            else {
                 out.torn += 1;
                 continue;
             };
             match line {
-                Line::Row(row) => {
+                LineSince::Row(row) => {
                     out.oldest_ms = Some(out.oldest_ms.map_or(row.at_ms, |o| o.min(row.at_ms)));
-                    if row.at_ms >= since {
-                        out.rows.push(row);
-                    }
+                    out.rows.push(row);
                 }
-                Line::Host(host) => {
+                LineSince::OldRow(at_ms) => {
+                    out.oldest_ms = Some(out.oldest_ms.map_or(at_ms, |o| o.min(at_ms)));
+                }
+                LineSince::Host(host) => {
                     out.oldest_ms = Some(out.oldest_ms.map_or(host.at_ms, |o| o.min(host.at_ms)));
                     out.hosts.push(host);
                 }
-                Line::Gap { at_ms, dropped } => {
+                LineSince::Gap { at_ms, dropped } => {
                     if at_ms >= since {
                         out.dropped += dropped;
                     }

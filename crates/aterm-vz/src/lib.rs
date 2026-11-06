@@ -212,6 +212,43 @@ pub(crate) fn read_regular_bounded(
     Ok(bytes)
 }
 
+/// Compute the lowercase-hex SHA-256 of a regular file up to `max_bytes` using a stack buffer,
+/// without following a terminal symlink or blocking on a FIFO.
+#[cfg(unix)]
+pub(crate) fn sha256_regular_bounded(
+    path: &std::path::Path,
+    max_bytes: u64,
+) -> std::io::Result<String> {
+    use std::io::Read as _;
+    let (mut file, meta) = open_regular_nonblock_with_meta(path)?;
+    if meta.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("file exceeds {max_bytes}-byte limit"),
+        ));
+    }
+    let mut h = aterm_digest::Sha256::new();
+    let mut buf = [0u8; 32 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        total = total.saturating_add(n as u64);
+        if total > max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("file exceeds {max_bytes}-byte limit"),
+            ));
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(hex(&h.finalize()))
+}
+
 #[cfg(unix)]
 fn chmod_regular(path: &std::path::Path, mode: u32, what: &str) -> Result<(), Error> {
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};

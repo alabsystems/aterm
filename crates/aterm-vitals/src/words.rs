@@ -2094,35 +2094,113 @@ fn scope_sentences(
     panes: &[u64],
     loc: &Locale,
 ) -> Vec<String> {
-    let (aterm, tab_cell) = match scope_forms(res, view, loc) {
-        ScopeForms::Span(c) => return vec![sentence(&c.forms[0])],
-        ScopeForms::Each { aterm, tab } => (aterm, tab),
-    };
     let label = (!panes.is_empty()).then(|| {
         panes
             .iter()
             .find_map(|&key| snap.tab(key))
             .map_or_else(|| "this tab".to_string(), |t| t.label.clone())
     });
-    let mut figures = Vec::new();
-    let mut none = Vec::new();
-    let scopes = [
-        (Some("aterm".to_string()), &view.aterm, aterm),
-        (label, &view.tab, tab_cell),
-    ];
-    for (who, fig, cell) in scopes {
-        let Some(who) = who else { continue };
-        if fig.missing == Some(NoFigure::NoAgent) {
-            none.push(format!("{who} has no agent."));
-        } else if fig.now.is_some() {
-            figures.push(format!("{who} {}", speak(&cell.forms[0])));
+    let mut out = match scope_forms(res, view, loc) {
+        ScopeForms::Span(c) => vec![sentence(&c.forms[0])],
+        ScopeForms::Each { aterm, tab } => {
+            let mut figures = Vec::new();
+            let mut none = Vec::new();
+            let scopes = [
+                (Some("aterm"), &view.aterm, aterm),
+                (label.as_deref(), &view.tab, tab),
+            ];
+            for (who, fig, cell) in scopes {
+                let Some(who) = who else { continue };
+                if fig.missing == Some(NoFigure::NoAgent) {
+                    none.push(format!("{who} has no agent."));
+                } else if fig.now.is_some() {
+                    figures.push(format!("{who} {}", speak(&cell.forms[0])));
+                }
+            }
+            let mut out = Vec::new();
+            if !figures.is_empty() {
+                out.push(format!("{}.", figures.join(", ")));
+            }
+            out.extend(none);
+            out
         }
+    };
+    out.extend(
+        footprints_over(res, view, label.as_deref(), loc)
+            .iter()
+            .map(|f| format!("{}.", f.said())),
+    );
+    out
+}
+
+/// A Memory footprint larger than the figure of the scope around it ([`footprints_over`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FootprintOver {
+    /// Whose footprint it is: "aterm", or the tab's name.
+    pub who: String,
+    /// Whether it is the tab's footprint, not aterm's (a tab may be named "aterm").
+    pub tab: bool,
+    /// What it is larger than: the machine's used memory ("this Mac's used memory"), or "aterm's".
+    pub than: String,
+}
+
+impl FootprintOver {
+    /// As speech says it: "aterm's footprint is larger than this Mac's used memory".
+    #[must_use]
+    pub fn said(&self) -> String {
+        format!("{}'s footprint is {}", self.who, self.clause())
     }
+
+    /// As it follows the footprint's own figure: "larger than this Mac's used memory".
+    #[must_use]
+    pub fn clause(&self) -> String {
+        format!("larger than {}", self.than)
+    }
+}
+
+/// Each Memory footprint larger than the figure of the scope around it: aterm's than the
+/// machine's used memory, and this tab's (named `tab`) than aterm's, or than the machine's where
+/// aterm has no figure. The deck's bar draws no fill past the one around it
+/// (`docs/DESIGN-stats-deck-units-2026-11-04.md` §4.6), and a footprint counts pages differently
+/// from the machine's used memory, so these words are where a larger footprint shows. It compares
+/// the figures, not the fills' px, and an equal one is not larger; a figure that is not a finite
+/// number is no figure, as the bar draws it. Empty on every other row, and wherever each
+/// footprint fits inside the scope around it.
+#[must_use]
+pub fn footprints_over(
+    res: Resource,
+    view: &ResourceView,
+    tab: Option<&str>,
+    loc: &Locale,
+) -> Vec<FootprintOver> {
+    if res != Resource::Memory {
+        return Vec::new();
+    }
+    let read = |v: Option<f64>| v.filter(|v| v.is_finite());
+    let (used, aterm) = (read(view.now), read(view.aterm.now));
+    let machine = format!("{}'s used memory", loc.platform.machine());
     let mut out = Vec::new();
-    if !figures.is_empty() {
-        out.push(format!("{}.", figures.join(", ")));
+    if let (Some(a), Some(u)) = (aterm, used)
+        && a > u
+    {
+        out.push(FootprintOver {
+            who: "aterm".into(),
+            tab: false,
+            than: machine.clone(),
+        });
     }
-    out.extend(none);
+    let around = aterm
+        .map(|a| (a, "aterm's".to_owned()))
+        .or_else(|| used.map(|u| (u, machine)));
+    if let (Some(who), Some(t), Some((p, than))) = (tab, read(view.tab.now), around)
+        && t > p
+    {
+        out.push(FootprintOver {
+            who: who.to_owned(),
+            tab: true,
+            than,
+        });
+    }
     out
 }
 
@@ -3572,6 +3650,89 @@ mod tests {
         assert_eq!(
             speak(&up_words(Some(47 * MIN), true).expect("long")),
             "up at least 47 minutes"
+        );
+    }
+
+    /// The edges of [`footprints_over`] the deck's own test leaves (`aterm-gui`'s
+    /// `the_this_mac_fill_is_the_percent_and_nested_fills_never_widen_it` holds below, equal and
+    /// above in speech and the lens): only the Memory row says it; a tab with no name says
+    /// nothing of its own; with no used memory read, aterm's has nothing around it, nor has the
+    /// tab's while aterm has no figure; an aterm figure that is no number passes the tab on to the
+    /// machine's, as the bar does; the machine is named as the platform names it; and each says
+    /// whose it is apart from its name, so a tab named "aterm" is still the tab.
+    /// CONTROL: the view that says nothing on another row says both on Memory.
+    #[test]
+    fn a_footprint_past_the_scope_around_it_is_said_in_words() {
+        let view = |used: Option<f64>, aterm: Option<f64>, tab: Option<f64>| ResourceView {
+            now: used.map(|g| g * GIB),
+            aterm: aterm.map_or_else(ScopeFig::default, |g| fig(g * GIB)),
+            tab: tab.map_or_else(ScopeFig::default, |g| fig(g * GIB)),
+            ..ResourceView::default()
+        };
+        let said = |v: &ResourceView, tab: Option<&str>, loc: &Locale| -> Vec<String> {
+            footprints_over(Resource::Memory, v, tab, loc)
+                .iter()
+                .map(FootprintOver::said)
+                .collect()
+        };
+        let both = view(Some(14.0), Some(15.0), Some(16.0));
+        assert_eq!(
+            said(&both, Some("Tab 1"), &MAC),
+            [
+                "aterm's footprint is larger than this Mac's used memory",
+                "Tab 1's footprint is larger than aterm's"
+            ],
+            "CONTROL"
+        );
+        for res in Resource::ALL.into_iter().filter(|&r| r != Resource::Memory) {
+            assert!(
+                footprints_over(res, &both, Some("Tab 1"), &MAC).is_empty(),
+                "{res:?}"
+            );
+        }
+        assert_eq!(
+            said(&both, None, &MAC),
+            ["aterm's footprint is larger than this Mac's used memory"],
+            "no tab named"
+        );
+        assert_eq!(
+            said(&view(None, Some(15.0), None), Some("Tab 1"), &MAC),
+            Vec::<String>::new(),
+            "no used memory read"
+        );
+        assert_eq!(
+            said(&view(None, None, Some(15.0)), Some("Tab 1"), &MAC),
+            Vec::<String>::new(),
+            "nothing around the tab"
+        );
+        assert_eq!(
+            said(
+                &ResourceView {
+                    aterm: fig(f64::NAN),
+                    ..view(Some(14.0), None, Some(15.0))
+                },
+                Some("Tab 1"),
+                &MAC
+            ),
+            ["Tab 1's footprint is larger than this Mac's used memory"],
+            "an aterm figure that is no number"
+        );
+        assert_eq!(
+            said(&view(Some(14.0), Some(15.0), None), None, &LINUX),
+            ["aterm's footprint is larger than this computer's used memory"]
+        );
+        let clauses: Vec<(bool, String)> =
+            footprints_over(Resource::Memory, &both, Some("aterm"), &MAC)
+                .iter()
+                .map(|f| (f.tab, f.clause()))
+                .collect();
+        assert_eq!(
+            clauses,
+            [
+                (false, "larger than this Mac's used memory".to_owned()),
+                (true, "larger than aterm's".to_owned())
+            ],
+            "a tab named aterm is still the tab"
         );
     }
 

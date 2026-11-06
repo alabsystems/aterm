@@ -881,8 +881,8 @@ const PRIVACY_CONFIG_PARAGRAPH: &str = "\n\
      \x20                         reads `unknown`, which is not `denied`; the report says which.\n\
      \x20 notice                  System State's access steps for an approved setup plan, only\n\
      \x20                         while System State is the visible view, one macOS gesture at a\n\
-     \x20                         time: the Local Network question; while Full Disk Access reads\n\
-     \x20                         off, System Settings at Privacy & Security \u{25b8} Full Disk Access\n\
+     \x20                         time: while Full Disk Access reads off, System Settings at\n\
+     \x20                         Privacy & Security \u{25b8} Full Disk Access\n\
      \x20                         with aterm's panel beside it (its icon to drag into the list,\n\
      \x20                         I've switched it on, and Not now); and the Developer Tools\n\
      \x20                         page. Each page comes once per approval, never on a build\n\
@@ -1762,6 +1762,7 @@ fn facts_rows_over(fix: bool, reads: &dyn Fn(&str) -> bool, ports: &FactReads<'_
             services: services.and_then(Beside::answer),
             shim_cache: reads("services:").then(shim_cache_fact).flatten(),
             network: reads("network:").then(network_fact).flatten(),
+            lan: reads("lan:").then(lan_fact).flatten(),
             program_check,
             leftovers: leftovers.map(Beside::answer),
             ..MachineFacts::absent()
@@ -1880,6 +1881,8 @@ struct MachineFacts {
     network: Option<(bool, String)>,
     /// macOS: whether aCaffeine keeps this Mac awake now ([`awake_fact`]).
     awake: Option<aterm_acaffeine::held::Held>,
+    /// macOS: the root LAN broker's install and whether its socket answers ([`lan_fact`]).
+    lan: Option<LanFact>,
     /// What closed tabs and dead verify runs left running ([`doctor_leftovers::fact`]); `None`
     /// where the row was not read.
     leftovers: Option<doctor_leftovers::LeftoversFact>,
@@ -1897,6 +1900,7 @@ impl MachineFacts {
             services: None,
             shim_cache: None,
             network: None,
+            lan: None,
             leftovers: None,
         }
     }
@@ -1938,6 +1942,107 @@ fn network_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
         .collect()
 }
 
+/// The root LAN broker as this account reads it (`docs/DESIGN-lan-broker-2026-11-05.md` §5).
+struct LanFact {
+    /// Its install against the app bundle this aterm runs from (`aterm_uds::lan::install::
+    /// read_here`): `None` outside a bundle (a development build).
+    install: Option<Result<LanInstall, String>>,
+    /// Whether something accepts a connection at its socket ([`aterm_uds::lan::socket_path`]).
+    answers: bool,
+}
+
+/// The broker's install as `aterm_uds::lan::install::Reading` reads it, in what the row shows.
+struct LanInstall {
+    /// Both parts are as this build installs them.
+    current: bool,
+    /// Setup's one elevation owes it (a part missing or another build's).
+    owed: bool,
+    /// `image <state>, plist <state>`.
+    words: String,
+}
+
+/// macOS: the root LAN broker's install and whether its socket answers a plain connect; `None`
+/// elsewhere, where no broker runs.
+fn lan_fact() -> Option<LanFact> {
+    let (install, answers) = lan_read()?;
+    Some(LanFact {
+        install: install.map(|read| {
+            read.map(|(current, owed, words)| LanInstall {
+                current,
+                owed,
+                words,
+            })
+        }),
+        answers,
+    })
+}
+
+/// What [`lan_fact`] reads: the install (`current`, `owed`, its words), and whether the socket
+/// answers.
+type LanRead = (Option<Result<(bool, bool, String), String>>, bool);
+
+/// [`lan_fact`]'s reads on macOS ([`aterm_uds::lan::install::read_here`], a plain connect to
+/// [`aterm_uds::lan::socket_path`]); none elsewhere or in a test.
+fn lan_read() -> Option<LanRead> {
+    #[cfg(all(target_os = "macos", not(test)))]
+    {
+        let install = aterm_uds::lan::install::read_here().map(|(_, reading)| {
+            reading.map(|reading| (reading.current(), reading.owed(), reading.words()))
+        });
+        let answers =
+            std::os::unix::net::UnixStream::connect(aterm_uds::lan::socket_path()).is_ok();
+        Some((install, answers))
+    }
+    #[cfg(not(all(target_os = "macos", not(test))))]
+    {
+        None
+    }
+}
+
+/// Doctor's `lan:` row: whether the broker is installed as this build installs it and whether
+/// its socket answers. A broker that is not installed is a note (setup's one elevation installs
+/// it, and nothing is wrong meanwhile but that aterm's own LAN traffic waits); an installed one
+/// whose socket does not answer is a warning.
+fn lan_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
+    let Some(lan) = &facts.lan else {
+        return Vec::new();
+    };
+    let answers = if lan.answers { "yes" } else { "no" };
+    let remedy = "sudo aterm machines here apply --plain installs it";
+    let (mark, fact, unmeasured) = match &lan.install {
+        None => (
+            Mark::Note,
+            format!("not read: this aterm runs outside an app bundle; socket answers: {answers}"),
+            true,
+        ),
+        Some(Err(why)) => (
+            Mark::Note,
+            format!("not read: {why}; socket answers: {answers}"),
+            true,
+        ),
+        Some(Ok(reading)) if reading.current => (
+            if lan.answers { Mark::Ok } else { Mark::Warn },
+            format!("installed ({}); socket answers: {answers}", reading.words),
+            false,
+        ),
+        Some(Ok(reading)) => (
+            Mark::Note,
+            format!(
+                "not installed as this build installs it ({}); socket answers: {answers}; \
+                 {remedy}",
+                reading.words
+            ),
+            !reading.owed,
+        ),
+    };
+    vec![DoctorRow {
+        label: "lan:",
+        mark,
+        fact,
+        unmeasured,
+    }]
+}
+
 /// macOS: whether aCaffeine keeps this Mac awake now, as macOS lists its assertion
 /// ([`aterm_acaffeine::held::held`]); `None` elsewhere.
 fn awake_fact() -> Option<aterm_acaffeine::held::Held> {
@@ -1967,6 +2072,38 @@ fn awake_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
             format!("aCaffeine (pid {pid}) holds macOS's idle-sleep assertion"),
             false,
         ),
+        Held::Paused {
+            pid,
+            why,
+            lingering,
+        } => {
+            let why = match why {
+                aterm_acaffeine::model::Pause::LidClosed => {
+                    "the lid is closed (`aterm acaffeine lid on` keeps this Mac running \
+                     lid-closed, on AC power)"
+                }
+                aterm_acaffeine::model::Pause::Asleep => "this Mac is in a dark wake",
+            };
+            if *lingering {
+                (
+                    Mark::Warn,
+                    format!(
+                        "aCaffeine (pid {pid}) is paused because {why}, but macOS still lists an \
+                         assertion of it; it lets go at its next look"
+                    ),
+                    false,
+                )
+            } else {
+                (
+                    Mark::Note,
+                    format!(
+                        "aCaffeine (pid {pid}) is paused and holds nothing because {why}; it \
+                         holds again when that ends"
+                    ),
+                    false,
+                )
+            }
+        }
         Held::NotHeld { pid, why } => (
             Mark::Warn,
             format!(
@@ -2689,18 +2826,16 @@ fn own_walk_word(word: &str) -> &str {
     }
 }
 
-/// Whether the window's permission walk takes `access` for this run: Local Network has no switch
-/// to turn (macOS asks it on a program's first look at the network), so it stays a row of its
-/// own. Full Disk Access and Accessibility macOS charges to the app it holds responsible for the
-/// run, and the walk turns on the window's own, so it takes them only when the window is that app
-/// (`own`, aterm's own tab); under another terminal their rows name that terminal's switch.
-/// Developer Tools is aterm's own entry and the debugger this Mac's, whoever runs.
+/// Whether the window's permission walk takes `access` for this run. Full Disk Access and
+/// Accessibility macOS charges to the app it holds responsible for the run, and the walk turns on
+/// the window's own, so it takes them only when the window is that app (`own`, aterm's own tab);
+/// under another terminal their rows name that terminal's switch. Developer Tools is aterm's own
+/// entry and the debugger this Mac's, whoever runs.
 const fn walks(access: aterm_types::macos_setup::Access, own: bool) -> bool {
     use aterm_types::macos_setup::Access;
     match access {
         Access::DeveloperTools | Access::Debugger => true,
         Access::FullDiskAccess | Access::Accessibility => own,
-        Access::LocalNetwork => false,
     }
 }
 
@@ -3482,6 +3617,7 @@ fn doctor_rows(
     checks.extend(services_rows(machine));
     checks.extend(network_rows(machine));
     checks.extend(awake_rows(machine));
+    checks.extend(lan_rows(machine));
     checks.extend(console_host_rows(machine));
     let (instances_mark, instances_fact) = instances_row(instances);
     let (recovery_mark, recovery_fact) = recovery_row(recovery);
@@ -6495,6 +6631,51 @@ mod tests {
         assert!(!r.contains("spotlight:"), "{r}");
     }
 
+    /// The `lan:` row's mark and whether it is measured: ok only for a current install whose
+    /// socket answers, a warning for a current one that does not answer, a measured note for an
+    /// owed install, and an unmeasured note for one the running broker adopts by itself and for
+    /// a reading that could not be made. NEGATIVE CONTROL: off macOS (no fact) there is no row,
+    /// in the report too.
+    #[test]
+    fn the_lan_row_marks_the_install_and_whether_the_socket_answers() {
+        let row = |install, answers| {
+            let rows = super::lan_rows(&MachineFacts {
+                lan: Some(super::LanFact { install, answers }),
+                ..MachineFacts::absent()
+            });
+            assert_eq!(rows.len(), 1);
+            (rows[0].mark, rows[0].unmeasured)
+        };
+        let install = |current, owed| {
+            Some(Ok(super::LanInstall {
+                current,
+                owed,
+                words: String::new(),
+            }))
+        };
+        assert_eq!(row(install(true, false), true), (Mark::Ok, false));
+        assert_eq!(row(install(true, false), false), (Mark::Warn, false));
+        assert_eq!(row(install(false, true), false), (Mark::Note, false));
+        assert_eq!(row(install(false, false), true), (Mark::Note, true));
+        assert_eq!(row(Some(Err(String::new())), true), (Mark::Note, true));
+        assert_eq!(row(None, false), (Mark::Note, true));
+        assert!(super::lan_rows(&MachineFacts::absent()).is_empty());
+        let report = doctor_checks_with_origin(
+            "/bin/sh",
+            ShellCheck::Runs,
+            None,
+            &unmeasured(),
+            &no_debugger(),
+            &DevtoolsFacts::absent(),
+            &no_census(),
+            &no_recovery(),
+            &no_exceptions(),
+            &MachineFacts::absent(),
+        )
+        .0;
+        assert!(!report.contains("lan:"), "{report}");
+    }
+
     #[test]
     fn the_syspolicyd_row_warns_while_the_pool_is_full() {
         let report = |program_check| {
@@ -6842,6 +7023,7 @@ mod tests {
             shim_cache: None,
             network: None,
             awake: None,
+            lan: None,
             leftovers: None,
         };
         let report = |d: &DevtoolsFacts| {
@@ -7136,6 +7318,16 @@ mod tests {
         assert_eq!(mark, Mark::Warn);
         assert!(fact.contains("the menu bar refused the mug"), "{fact}");
         assert_eq!(row(Held::Off).0, Mark::Note);
+        let paused = |lingering| Held::Paused {
+            pid: 42,
+            why: aterm_acaffeine::model::Pause::LidClosed,
+            lingering,
+        };
+        let (mark, fact, _) = row(paused(false));
+        assert_eq!(mark, Mark::Note, "a closed lid is no failure: {fact}");
+        assert!(fact.contains("lid is closed"), "{fact}");
+        assert!(fact.contains("aterm acaffeine lid on"), "{fact}");
+        assert_eq!(row(paused(true)).0, Mark::Warn, "still listed while paused");
         let (mark, _, unmeasured) = row(Held::Unread {
             pid: 42,
             why: "the power manager did not answer".to_owned(),
@@ -7931,19 +8123,11 @@ mod tests {
             asked.borrow_mut().push(words.to_owned());
             WindowAnswer::Reply(format!("OK walking {words}"))
         };
-        let missing = [
-            Access::FullDiskAccess,
-            Access::LocalNetwork,
-            Access::Debugger,
-        ];
+        let missing = [Access::FullDiskAccess, Access::Debugger];
         let line = init_walk_over(&missing, true, true, &walking).expect("a walk took them");
+        assert_eq!(asked.take(), ["full-disk-access debugger"]);
         assert_eq!(
-            asked.take(),
-            ["full-disk-access debugger"],
-            "Local Network has no step of the walk's"
-        );
-        assert_eq!(
-            init_walk_over(&[Access::LocalNetwork], true, true, &walking),
+            init_walk_over(&[Access::FullDiskAccess], true, false, &walking),
             None,
             "nothing walkable asks nothing"
         );

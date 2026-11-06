@@ -2822,7 +2822,7 @@ impl App {
         self.request_redraw_all_windows();
     }
 
-    /// One registry handle as the status item sees it (`docs/DESIGN-owner-surfaces-2026-10-16.md` §3): the tab's label as every Agents surface names it ([`Self::tab_label_of_session`]: the pill, the Overview, the tab menu and the long-hold entry name it the same), the session's PUBLISHED verdict ([`Self::publish_need`]), its agent word, its task record and what the person's hold refused.
+    /// One registry handle as the status item sees it (`docs/DESIGN-owner-surfaces-2026-10-16.md` §3): the tab's label as every Agents surface names it ([`Self::tab_label_of_session`]: the Overview, the tab menu and the long-hold entry name it the same), the session's PUBLISHED verdict ([`Self::publish_need`]), its agent word, its task record and what the person's hold refused.
     pub(crate) fn status_session_row(
         &self,
         h: &crate::session_store::SessionHandle,
@@ -2972,6 +2972,7 @@ impl App {
             .observe(session, row.as_ref(), now_unix)
         {
             self.mark_status_dirty();
+            crate::control::needs_moved();
         }
         if self.headless {
             return;
@@ -3707,9 +3708,6 @@ impl App {
                 if let Some(fleet) = &self.fleet_glance {
                     fleet.kick(crate::fleet_glance::Kick::Now);
                 }
-            }
-            StatusAction::OpenLocalNetwork => {
-                let _ = self.apprt.open_url(crate::fleet_glance::LOCAL_NETWORK_PANE);
             }
             StatusAction::OpenSystemState => {
                 let _ = self.open_system_state_from_status_item();
@@ -4559,7 +4557,6 @@ impl App {
             }
         }
         if let Some(handle) = self._toolbars.get(&wid) {
-            let pill = self.presence_pill(wid);
             self.apprt.set_toolbar_tabs(
                 handle,
                 crate::platform::ToolbarTabsModel {
@@ -4569,7 +4566,6 @@ impl App {
                     tooltips: &tooltips[..shown.min(tooltips.len())],
                     ext: &ext[..shown.min(ext.len())],
                     active,
-                    pill: pill.as_ref(),
                 },
             );
         }
@@ -5881,13 +5877,6 @@ impl App {
                 self.settle_rename_edit(wid);
                 self.post_menu_action(crate::menu::version_slot_click(attention));
             }
-            tab_bar::TabHit::Pill(hit) => {
-                self.clear_strip_press(wid);
-                self.settle_rename_edit(wid);
-                if let Some(session) = self.windows.get(&wid).and_then(|ws| ws.strip_pill_session) {
-                    self.on_pill_act(wid, session, hit);
-                }
-            }
             tab_bar::TabHit::Close(i) => self.close_tab_from_strip(wid, i),
             tab_bar::TabHit::Caption(button) => {
                 self.clear_strip_press(wid);
@@ -6673,6 +6662,10 @@ impl App {
             }
             None => (None, None),
         };
+        // Out of the store now, so a needs pusher's next row no longer lists it.
+        if stable.is_some() {
+            crate::control::needs_moved();
+        }
         let reads = closing.as_ref().map(|ctx| {
             let mut edges = ctx.edges.lock().unwrap_or_else(|p| p.into_inner());
             edges.keep_only(aterm_session::Op::ReadScreen);
@@ -10724,7 +10717,7 @@ mod status_glance_tests {
             "CONTROL: a freshly heralded box drops its program notification"
         );
 
-        let (mut resolved, resolved_notices) = desk(Some(&checkpoint), Some(carry));
+        let (mut resolved, resolved_notices) = desk(Some(&checkpoint), Some(carry.clone()));
         assert!(
             take_posts().is_empty(),
             "CONTROL: adoption posts no new herald notice"
@@ -10860,7 +10853,7 @@ mod status_glance_tests {
                 ctx.box_banner.shown(None);
                 moved
                     .status_carry
-                    .insert(ctx.self_id.as_str().to_string(), carry);
+                    .insert(ctx.self_id.as_str().to_string(), carry.clone());
                 moved.herald_session(0);
                 assert!(
                     ctx.box_banner.admit(&report),

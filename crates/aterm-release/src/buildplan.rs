@@ -1457,10 +1457,10 @@ fn run_slice_profile(
         target.map(|t| format!("--target {t} ")).unwrap_or_default()
     );
     if let Some(log) = log {
+        use std::io::Write as _;
         let mut file = crate::durable::create_fresh(log)
             .map_err(|e| format!("create {}: {e}", log.display()))?;
-        std::io::Write::write_all(&mut file, format!("{banner}\n").as_bytes())
-            .map_err(|e| format!("write {}: {e}", log.display()))?;
+        writeln!(file, "{banner}").map_err(|e| format!("write {}: {e}", log.display()))?;
         cmd.stderr(file);
     } else {
         println!("{banner}");
@@ -3279,6 +3279,64 @@ mod tests {
             !crt(&native) && !crt(&compat),
             "only a static build links the C library in"
         );
+    }
+
+    /// A slice keeps the features its own package selects: the workspace's feature unification,
+    /// which every test-profile build takes (`aterm_toolchain::build_cache::with_test_graph`),
+    /// reaches no slice's argv, nor the two configs a slice reads (the sealed one and the
+    /// checkout's, where only verify's alias carries the words). NEGATIVE CONTROL: the reader
+    /// finds the words in a test build's argv and a `[resolver]` table in a config.
+    #[test]
+    fn a_release_slice_never_resolves_the_workspaces_features() {
+        let config = std::path::Path::new("/c-release.noindex/snapshot/src/.cargo/config.toml");
+        let manifest = std::path::Path::new("/c-release.noindex/snapshot/src/Cargo.toml");
+        let unifies = |args: &[OsString]| {
+            args.iter().any(|a| {
+                a.to_str()
+                    .is_some_and(|a| a.contains("feature-unification"))
+            })
+        };
+        for target in [
+            None,
+            Some("x86_64-apple-darwin"),
+            Some("aarch64-unknown-linux-gnu"),
+        ] {
+            for static_crt in [false, true] {
+                for verb in ["build", "check"] {
+                    let args = cargo_build_args(
+                        verb, config, config, manifest, "aterm", target, static_crt,
+                    );
+                    assert!(!unifies(&args), "{args:?}");
+                }
+            }
+        }
+        let test_build: Vec<OsString> = aterm_toolchain::build_cache::with_test_graph(&[
+            "--unverified".to_owned(),
+            "test".to_owned(),
+        ])
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        assert!(unifies(&test_build), "the reader sees the words");
+        // A config line, outside comments and `[alias]` strings, that chooses the unification.
+        let chooses = |text: &str| {
+            let mut table = String::new();
+            text.lines().map(str::trim).any(|line| {
+                if line.starts_with('#') {
+                    return false;
+                }
+                if let Some(head) = line.strip_prefix('[') {
+                    table = head.trim_end_matches(']').trim().to_owned();
+                    return table == "resolver";
+                }
+                table != "alias"
+                    && (line.starts_with("resolver") || line.contains("feature-unification"))
+            })
+        };
+        assert!(!chooses(crate::snapshot::SEALED_CONFIG));
+        assert!(!chooses(include_str!("../../../.cargo/config.toml")));
+        assert!(chooses("[resolver]\nfeature-unification = \"workspace\"\n"));
+        assert!(chooses("[unstable]\nfeature-unification = true\n"));
     }
 
     #[test]

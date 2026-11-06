@@ -63,7 +63,7 @@ pub fn help() -> String {
     format!("usage: aterm doctor {GRAMMAR}\n{HELP_ROWS}")
 }
 
-const ROWS: [(&str, &str, &str, &str); 16] = [
+const ROWS: [(&str, &str, &str, &str); 17] = [
     ("shell:", SHELL, "shell", "the shell aterm starts"),
     (
         "privacy:",
@@ -113,6 +113,12 @@ const ROWS: [(&str, &str, &str, &str); 16] = [
         "base.machine.awake",
         "machine",
         "aCaffeine keeping this Mac awake",
+    ),
+    (
+        "lan:",
+        "base.machine.lan",
+        "machine",
+        "aterm's root LAN broker",
     ),
     (
         "conpty:",

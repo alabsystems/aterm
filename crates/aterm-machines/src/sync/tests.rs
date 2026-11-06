@@ -152,7 +152,6 @@ pub(crate) struct Inert {
     peer_looks: Mutex<Vec<bool>>,
     /// Whose network each `sync.steward.revoke`, `sync.steward.lease` and `sync.shared-data` read
     /// named.
-    publishers: Mutex<Vec<Publisher>>,
     peers_done: Mutex<PeersDone>,
     /// Each aterm.log line the pass wrote ([`Ports::log`]).
     logged: Mutex<Vec<String>>,
@@ -236,7 +235,6 @@ impl Inert {
             renewed: Mutex::new(Ok("renewed".to_owned())),
             peers: Mutex::new(PeersRead::Joined("in vault alab".to_owned())),
             peer_looks: Mutex::new(Vec::new()),
-            publishers: Mutex::new(Vec::new()),
             peers_done: Mutex::new(PeersDone::Joined("joined".to_owned())),
             logged: Mutex::new(Vec::new()),
             elsewhere: None,
@@ -406,8 +404,7 @@ impl Ports for Inert {
             NodeRead::Current("systems.alab.aterm-node runs (pid 9)".to_owned());
         Ok("installed and started systems.alab.aterm-node".to_owned())
     }
-    fn steward_revoke(&self, by: Publisher) -> Result<StewardRevokeRead, String> {
-        self.publishers.lock().unwrap().push(by);
+    fn steward_revoke(&self) -> Result<StewardRevokeRead, String> {
         self.read(&self.steward_revoke)
     }
     fn apply_steward_revoke(&self) -> Result<String, String> {
@@ -417,8 +414,7 @@ impl Ports for Inert {
         );
         Ok("finished half-done revoke cascade".to_owned())
     }
-    fn steward_lease(&self, by: Publisher) -> Result<StewardLeaseRead, String> {
-        self.publishers.lock().unwrap().push(by);
+    fn steward_lease(&self) -> Result<StewardLeaseRead, String> {
         self.read(&self.steward_lease)
     }
     fn apply_steward_lease(&self) -> Result<String, String> {
@@ -437,8 +433,7 @@ impl Ports for Inert {
         );
         Ok("started systems.alab.aterm-secrets-server advertising m29.local".to_owned())
     }
-    fn shared_data(&self, by: Publisher) -> Result<SharedRead, String> {
-        self.publishers.lock().unwrap().push(by);
+    fn shared_data(&self) -> Result<SharedRead, String> {
         self.read(&self.shared)
     }
     fn requests(&self) -> Result<RequestsRead, String> {
@@ -1520,8 +1515,7 @@ fn the_record_keeps_the_last_converged_time_across_a_failed_pass() {
     assert_eq!(second.converged_ms, first.converged_ms, "{second:?}");
 }
 
-/// Only the window's pass looks for and joins an open vault; any other says where the join
-/// happens.
+/// Only the window's applying pass may join a vault; every other trigger defers it.
 #[test]
 fn an_open_vault_is_joined_from_the_window_alone() {
     for trigger in [
@@ -1554,21 +1548,19 @@ fn an_open_vault_is_joined_from_the_window_alone() {
     }
 }
 
-/// Publications use the runner's network while the trigger keeps naming who started the pass.
-/// A subscriber handed to the installed app uses aterm's Local Network answer; a held copy
-/// with no app to hand to keeps the subscriber job's network. Every other trigger uses aterm's.
-/// NEGATIVE CONTROL: choosing from the trigger alone bypasses aterm's answer after the handoff.
+/// A pass's ledger line keeps naming who started it, the installed app's run of a subscriber
+/// pass included, and a plan writes none.
 #[test]
-fn a_publication_uses_the_runners_network_and_keeps_its_trigger() {
-    for (installed, trigger, want) in [
-        (false, Trigger::Subscriber, Publisher::Subscriber),
-        (true, Trigger::Subscriber, Publisher::Aterm),
-        (false, Trigger::Window, Publisher::Aterm),
-        (true, Trigger::Window, Publisher::Aterm),
-        (false, Trigger::Setup, Publisher::Aterm),
-        (true, Trigger::Setup, Publisher::Aterm),
-        (false, Trigger::Init, Publisher::Aterm),
-        (true, Trigger::Init, Publisher::Aterm),
+fn a_pass_keeps_its_trigger_in_its_ledger_line() {
+    for (installed, trigger) in [
+        (false, Trigger::Subscriber),
+        (true, Trigger::Subscriber),
+        (false, Trigger::Window),
+        (true, Trigger::Window),
+        (false, Trigger::Setup),
+        (true, Trigger::Setup),
+        (false, Trigger::Init),
+        (true, Trigger::Init),
     ] {
         for mode in [Mode::Apply, Mode::Plan] {
             let scratch = aterm_tempfile::tempdir().unwrap();
@@ -1578,12 +1570,6 @@ fn a_publication_uses_the_runners_network_and_keeps_its_trigger() {
             };
             assert!(ports.elsewhere.is_none(), "no further app to hand to");
             ran(ports.pass(trigger, mode));
-            let by = ports.publishers.lock().unwrap().clone();
-            assert_eq!(
-                by,
-                [want, want, want],
-                "installed={installed} {trigger:?} {mode:?}: revoke, lease and Commons use this runner's network"
-            );
             if mode == Mode::Apply && trigger == Trigger::Subscriber {
                 let logged = ports.logged();
                 assert_eq!(logged.len(), 1, "one pass ledger line");
@@ -1600,10 +1586,9 @@ fn a_publication_uses_the_runners_network_and_keeps_its_trigger() {
     }
 }
 
-/// A plan (`--check`) from the window does not look for the open vault, as its applying pass
-/// does: the look keeps what it heard (the network's verdict, the Local Network answer), and a
-/// plan writes nothing.
-/// NEGATIVE CONTROL: a look that ignores the pass's mode looks from the window's plan.
+/// A plan (`--check`) from the window cannot admit a join. The applying pass alone receives
+/// that authority; neither read discovers a vault, and the plan applies nothing.
+/// NEGATIVE CONTROL: ignoring the pass's mode admits a join from the window's plan.
 #[test]
 fn a_check_from_the_window_never_looks_for_the_open_vault() {
     let scratch = aterm_tempfile::tempdir().unwrap();
@@ -1625,14 +1610,27 @@ fn a_join_the_vault_keeps_waiting_stands_aside() {
     let scratch = aterm_tempfile::tempdir().unwrap();
     let ports = Inert::new(scratch.path());
     *ports.peers.lock().unwrap() = PeersRead::Joinable("vault alab answered".to_owned());
-    *ports.peers_done.lock().unwrap() =
-        PeersDone::Waiting("vault alab asks a join password".to_owned());
+    *ports.peers_done.lock().unwrap() = PeersDone::Deferred(StoodAside::Waiting(
+        "vault alab asks a join password".to_owned(),
+    ));
     let pass = ran(ports.pass(Trigger::Window, Mode::Apply));
     let peers = row(&pass.rows, PEERS);
     assert_eq!(peers.outcome, Outcome::Blocked, "{peers:?}");
     assert!(
         matches!(&peers.stood_aside, Some(StoodAside::Waiting(why)) if why.contains("password"))
     );
+    assert!(!peers.outcome.is_failure());
+
+    *ports.peers_done.lock().unwrap() = PeersDone::Deferred(StoodAside::Offline(
+        "the pending join waits for this LAN".to_owned(),
+    ));
+    let pass = ran(ports.pass(Trigger::Window, Mode::Apply));
+    let peers = row(&pass.rows, PEERS);
+    assert!(
+        matches!(&peers.stood_aside, Some(StoodAside::Offline(_))),
+        "{peers:?}"
+    );
+    assert_eq!(peers.outcome, Outcome::Blocked);
     assert!(!peers.outcome.is_failure());
 
     let scratch = aterm_tempfile::tempdir().unwrap();
@@ -1703,13 +1701,13 @@ fn an_admin_founds_commons_in_an_applying_pass_alone() {
     assert_eq!(tries, 2, "the failed founding and the next pass's");
 }
 
-/// A founding that waits on a person (Local Network) reads deferred, and a control record this
+/// A founding that waits (on the LAN broker) reads deferred, and a control record this
 /// Mac neither sees nor founds reads not applicable: neither founds.
 #[test]
 fn a_founding_that_waits_or_is_elsewhere_founds_nothing() {
     for (read, outcome) in [
         (
-            SharedRead::Deferred("macOS has not asked aterm about the local network".into()),
+            SharedRead::Deferred("the LAN broker is not installed".into()),
             Outcome::Deferred,
         ),
         (
@@ -2375,13 +2373,13 @@ fn thirty_five_joins_against_sixteen_connections_all_land_within_ten_minutes() {
                     self.joined.store(true, Ordering::SeqCst);
                     Ok(FleetDone::Synced(format!("m{} joined", self.idx + 1)))
                 }
-                fn steward_revoke(&self, _by: Publisher) -> Result<StewardRevokeRead, String> {
+                fn steward_revoke(&self) -> Result<StewardRevokeRead, String> {
                     Ok(StewardRevokeRead::Idle("no admin key here".to_owned()))
                 }
                 fn apply_steward_revoke(&self) -> Result<String, String> {
                     Err("no steward here".to_owned())
                 }
-                fn shared_data(&self, _by: Publisher) -> Result<SharedRead, String> {
+                fn shared_data(&self) -> Result<SharedRead, String> {
                     Ok(SharedRead::Visible("control record here".to_owned()))
                 }
                 fn requests(&self) -> Result<RequestsRead, String> {
@@ -2511,11 +2509,12 @@ fn thirty_five_joins_against_sixteen_connections_all_land_within_ten_minutes() {
     );
 }
 #[test]
-fn steward_lease_and_standby_server_items_apply_and_respect_local_network_deferral() {
+fn steward_lease_and_standby_server_items_apply_and_respect_a_lan_broker_deferral() {
     let scratch = aterm_tempfile::tempdir().unwrap();
     let ports = Inert::new(scratch.path());
     *ports.steward_lease.lock().unwrap() = StewardLeaseRead::Deferred(
-        "no lease published; macOS has not asked aterm about the local network yet".to_owned(),
+        "no lease published; the LAN broker is not installed, so the steward's lease waits for it"
+            .to_owned(),
     );
     *ports.steward_standby_server.lock().unwrap() = StewardStandbyServerRead::Due {
         found: "no vault server job is running on always-on steward m29".to_owned(),
@@ -2729,8 +2728,8 @@ pub(crate) mod owed_clone {
         fn ensure_node(&self) -> Result<String, String> {
             self.inner.ensure_node()
         }
-        fn shared_data(&self, by: Publisher) -> Result<SharedRead, String> {
-            self.inner.shared_data(by)
+        fn shared_data(&self) -> Result<SharedRead, String> {
+            self.inner.shared_data()
         }
         fn requests(&self) -> Result<RequestsRead, String> {
             self.inner.requests()

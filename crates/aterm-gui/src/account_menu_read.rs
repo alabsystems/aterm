@@ -15,7 +15,7 @@ use crate::fact_menu::{AccountMenuRow, SessionWeek};
 use crate::session_timeline::{ForegroundStamp, SessionTimeline};
 use crate::{App, Wake, WindowId};
 
-pub(crate) type ResultRows = Result<(Vec<AccountMenuRow>, bool), String>;
+pub(crate) type ResultRows = Result<(Vec<AccountMenuRow>, bool, Option<String>), String>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Key {
@@ -121,6 +121,11 @@ impl State {
 }
 
 impl App {
+    /// A saved choice supersedes every ready or in-flight observation of the earlier choice.
+    pub(crate) fn account_menu_selection_changed(&mut self) {
+        self.account_menu_read.close();
+    }
+
     pub(crate) fn account_menu_read_deadline(&self) -> Option<Instant> {
         let menu = self.autopilot_menu.as_ref()?;
         if menu.owner != MenuOwner::Fact(Fact::Account) {
@@ -366,30 +371,63 @@ fn read_rows(input: Input) -> ResultRows {
     let state_dir = state
         .or_else(crate::harness_host::harness_state)
         .ok_or("account state directory is unavailable")?;
-    if cli != accounts::Cli::Claude {
-        let home = home.ok_or("account home is unavailable")?;
-        return crate::fact_menu::pool_menu_rows(
-            cli,
-            (&config, &state_dir, &home),
-            (account.as_deref(), email.as_deref()),
-            now,
-        );
-    }
-    let path = accounts::roster_beside(&config).ok_or("account roster path is unavailable")?;
-    let roster = accounts::Roster::load(&path)?;
-    let store = accounts::Store::at(&state_dir);
-    let roster = store.bound(&roster, now)?;
-    let (state, _) = store.load_judged(now, &roster)?;
-    let enrolled = accounts::enrolled(&roster);
-    Ok(crate::fact_menu::account_menu_rows_from(
-        &roster,
-        &state,
-        &enrolled,
-        true,
-        account.as_deref(),
-        email.as_deref(),
+    crate::fact_menu::pool_menu_rows(
+        cli,
+        (&config, &state_dir, home.as_deref()),
+        (account.as_deref(), email.as_deref()),
         week,
         now,
+    )
+}
+
+pub(crate) fn queue_status(
+    store: &accounts::Store,
+    cli: accounts::Cli,
+    roster: &accounts::Roster,
+    state: &accounts::State,
+    now: i64,
+) -> Option<String> {
+    let activity =
+        aterm_agent::harness::accounts_sync::login_activity_batch([Some(store), None], cli, now)?;
+    queue_status_from(store, cli, roster, state, &activity)
+}
+
+fn queue_status_from(
+    store: &accounts::Store,
+    cli: accounts::Cli,
+    roster: &accounts::Roster,
+    state: &accounts::State,
+    activity: &aterm_agent::harness::accounts_sync::LoginActivityBatch,
+) -> Option<String> {
+    let selection = state.pending_pin.as_ref()?;
+    let (name, queued) = match selection {
+        accounts::PendingSelection::Account(request) => {
+            let row = roster.row(request.label())?;
+            let queued = activity
+                .for_store(store, cli)?
+                .iter()
+                .find(|entry| entry.matches_row(row))?
+                .queued
+                .as_ref()?;
+            (format!("Account {}", request.label()), queued)
+        }
+        accounts::PendingSelection::Next(_) => (
+            "Next account".to_owned(),
+            activity.queued_next_for(store, cli)?,
+        ),
+    };
+    if !queued.matches_selection(selection) {
+        return None;
+    }
+    let position = queued.position();
+    let blocker = match position.blocker {
+        accounts::SigninBlocker::ManualAhead => "earlier manual sign-in",
+        accounts::SigninBlocker::UnscheduledSignin => "another sign-in holds admission",
+        accounts::SigninBlocker::None => "awaiting admission",
+    };
+    Some(format!(
+        "{} ahead · {name}: sign-in queued · {blocker}",
+        position.ahead
     ))
 }
 
@@ -407,11 +445,17 @@ impl App {
     }
 
     /// Answer the account read in flight with `rows`, as the worker would: whether one was.
-    pub(crate) fn complete_account_menu_read_for_test(&mut self, rows: ResultRows) -> bool {
+    pub(crate) fn complete_account_menu_read_for_test(
+        &mut self,
+        rows: Result<(Vec<AccountMenuRow>, bool), String>,
+    ) -> bool {
         let Some(generation) = self.account_menu_read.in_flight else {
             return false;
         };
-        self.on_account_menu_read(Completion { generation, rows });
+        self.on_account_menu_read(Completion {
+            generation,
+            rows: rows.map(|(rows, unpinned)| (rows, unpinned, None)),
+        });
         true
     }
 }
@@ -420,6 +464,154 @@ impl App {
 mod tests {
     use super::*;
     use aterm_agent::harness::footer::FooterFacts;
+
+    #[cfg(unix)]
+    fn saved_next_for_projection(store: &accounts::Store, _nonce: u64) -> accounts::NextRequest {
+        store.request_next(100).unwrap()
+    }
+
+    // An unsupported host can still read historical selections. Seed that exact wire through
+    // the real decoder and transaction, without claiming fresh manual admission is supported.
+    #[cfg(not(unix))]
+    fn saved_next_for_projection(store: &accounts::Store, nonce: u64) -> accounts::NextRequest {
+        let mut wire: aterm_json::Value =
+            aterm_json::from_str(&store.load(100).unwrap().0.to_json()).unwrap();
+        wire.as_object_mut().unwrap().insert(
+            "pending_pin".into(),
+            aterm_json::json!({"kind": "next", "nonce": format!("{nonce:032x}")}),
+        );
+        let selection = accounts::State::from_json(&aterm_json::to_string(&wire).unwrap(), 100)
+            .unwrap()
+            .pending_pin
+            .unwrap();
+        let request = selection.next().unwrap().clone();
+        store
+            .transact(100, &mut None, |state| {
+                state.pending_pin = Some(selection.clone());
+                Ok(Vec::new())
+            })
+            .unwrap();
+        request
+    }
+
+    #[test]
+    fn queue_observation_requires_the_current_request_namespace_and_row() {
+        use aterm_agent::harness::accounts_sync::{
+            LoginActivity, LoginActivityBatch, LoginIdentity, QueuedSignin,
+        };
+        let root = aterm_tempfile::tempdir().unwrap();
+        let store = accounts::Store::at(root.path());
+        let request = store.request_pin("work", 100).unwrap();
+        let state = store.load(100).unwrap().0;
+        let row = accounts::Row {
+            label: "work".into(),
+            ..Default::default()
+        };
+        let roster = accounts::Roster {
+            rows: vec![row.clone()],
+        };
+        let queued = QueuedSignin::for_test(
+            request.into(),
+            accounts::SigninPosition {
+                ahead: 0,
+                blocker: accounts::SigninBlocker::UnscheduledSignin,
+            },
+        );
+        let entry = LoginActivity {
+            label: "work".into(),
+            route: None,
+            active: false,
+            observed_at: 100,
+            next_at: None,
+            diagnostic: None,
+            identity: Some(LoginIdentity::for_test(&row)),
+            queued: Some(queued),
+        };
+        let batch = LoginActivityBatch::for_test(
+            [Some((&store, vec![entry.clone()])), None],
+            accounts::Cli::Claude,
+        );
+        let waiting =
+            queue_status_from(&store, accounts::Cli::Claude, &roster, &state, &batch).unwrap();
+        assert!(waiting.contains("0 ahead"));
+        let mut changed = roster.clone();
+        changed.rows[0].email = Some("different@example.test".into());
+        assert!(
+            queue_status_from(&store, accounts::Cli::Claude, &changed, &state, &batch).is_none()
+        );
+        assert!(queue_status_from(&store, accounts::Cli::Codex, &roster, &state, &batch).is_none());
+        let mut acquired = entry;
+        acquired.queued = None;
+        acquired.active = true;
+        let acquired = LoginActivityBatch::for_test(
+            [Some((&store, vec![acquired])), None],
+            accounts::Cli::Claude,
+        );
+        assert!(
+            queue_status_from(&store, accounts::Cli::Claude, &roster, &state, &acquired).is_none(),
+            "an acquired worker has no waiting place"
+        );
+        let unobserved =
+            LoginActivityBatch::for_test([Some((&store, Vec::new())), None], accounts::Cli::Claude);
+        assert!(
+            queue_status_from(&store, accounts::Cli::Claude, &roster, &state, &unobserved)
+                .is_none()
+        );
+        let _newer = store.request_pin("work", 100).unwrap();
+        let replaced = store.load(100).unwrap().0;
+        assert!(
+            queue_status_from(&store, accounts::Cli::Claude, &roster, &replaced, &batch).is_none()
+        );
+    }
+
+    #[test]
+    fn next_queue_observation_never_survives_a_newer_selection() {
+        use aterm_agent::harness::accounts_sync::{LoginActivityBatch, QueuedSignin};
+        let root = aterm_tempfile::tempdir().unwrap();
+        let store = accounts::Store::at(root.path());
+        let request = saved_next_for_projection(&store, 1);
+        let state = store.load(100).unwrap().0;
+        let queued = QueuedSignin::for_test(
+            accounts::PendingSelection::Next(request),
+            accounts::SigninPosition {
+                ahead: 2,
+                blocker: accounts::SigninBlocker::ManualAhead,
+            },
+        );
+        let batch =
+            LoginActivityBatch::for_test([Some((&store, Vec::new())), None], accounts::Cli::Claude)
+                .with_queued_next_for_test(&store, accounts::Cli::Claude, queued);
+        let roster = accounts::Roster { rows: Vec::new() };
+        let waiting =
+            queue_status_from(&store, accounts::Cli::Claude, &roster, &state, &batch).unwrap();
+        assert!(waiting.contains("2 ahead"));
+        let other = accounts::Store::at(&root.path().join("other"));
+        assert!(
+            queue_status_from(&other, accounts::Cli::Claude, &roster, &state, &batch).is_none()
+        );
+        let _newer = saved_next_for_projection(&store, 2);
+        assert!(
+            queue_status_from(
+                &store,
+                accounts::Cli::Claude,
+                &roster,
+                &store.load(100).unwrap().0,
+                &batch
+            )
+            .is_none()
+        );
+        let _account = store.request_pin("work", 100).unwrap();
+        assert!(
+            queue_status_from(
+                &store,
+                accounts::Cli::Claude,
+                &roster,
+                &store.load(100).unwrap().0,
+                &batch
+            )
+            .is_none()
+        );
+    }
 
     fn rig() -> (App, WindowId, u64) {
         let mut app = App::headless_for_test();
@@ -485,6 +677,63 @@ mod tests {
     }
 
     #[test]
+    fn a_saved_pick_or_next_discards_ready_and_inflight_queue_notes() {
+        for next in [false, true] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let store = accounts::Store::at(root.path());
+            let _old = store.request_pin("work", 100).unwrap();
+            let before = store.load(100).unwrap().0.pending_pin;
+            let (mut app, wid, session) = rig();
+            let first = open(&mut app, wid, session);
+            app.on_account_menu_read(Completion {
+                generation: first,
+                rows: Ok((Vec::new(), true, Some("old queue observation".into()))),
+            });
+            assert!(matches!(
+                app.account_menu_rows_cached(session),
+                Some(Ok((_, _, Some(_))))
+            ));
+            let due = app.account_menu_read_deadline().unwrap();
+            let input = app.account_menu_input(session).unwrap();
+            app.account_menu_read.request(wid, input, due);
+            app.dispatch_account_menu_read();
+            let old_read = app.account_menu_read.in_flight.unwrap();
+            if next {
+                let _ = saved_next_for_projection(&store, 3);
+            } else {
+                let _ = store.request_pin("work", 100).unwrap();
+            }
+            assert_ne!(store.load(100).unwrap().0.pending_pin, before);
+            app.account_menu_selection_changed();
+            assert!(app.account_menu_rows_cached(session).is_none());
+            app.refresh_fact_menu(session);
+            let replacement = app.account_menu_read.pending.as_ref().unwrap().0;
+            for _ in 0..4 {
+                app.refresh_fact_menu(session);
+            }
+            assert_eq!(
+                app.account_menu_read.pending.as_ref().unwrap().0,
+                replacement
+            );
+            assert_eq!(app.account_menu_read.in_flight, Some(old_read));
+            app.on_account_menu_read(Completion {
+                generation: old_read,
+                rows: Ok((Vec::new(), true, Some("superseded observation".into()))),
+            });
+            assert!(app.account_menu_rows_cached(session).is_none());
+            assert_eq!(app.account_menu_read.in_flight, Some(replacement));
+            app.on_account_menu_read(Completion {
+                generation: replacement,
+                rows: Ok((Vec::new(), true, None)),
+            });
+            assert!(matches!(
+                app.account_menu_rows_cached(session),
+                Some(Ok((_, _, None)))
+            ));
+        }
+    }
+
+    #[test]
     fn an_immediate_start_failure_is_visible_after_opening_the_menu() {
         let (mut app, wid, session) = rig();
         app.account_menu_read.hold_for_test = false;
@@ -505,7 +754,7 @@ mod tests {
         app.windows.remove(&wid);
         app.on_account_menu_read(Completion {
             generation,
-            rows: Ok((Vec::new(), true)),
+            rows: Ok((Vec::new(), true, None)),
         });
         assert!(app.account_menu_read.active.is_none());
         assert!(app.account_menu_read.in_flight.is_none());
@@ -522,14 +771,14 @@ mod tests {
         assert_ne!(old, new);
         app.on_account_menu_read(Completion {
             generation: old,
-            rows: Ok((Vec::new(), true)),
+            rows: Ok((Vec::new(), true, None)),
         });
         assert!(app.account_menu_rows_cached(session).is_none());
         assert_eq!(app.account_menu_read.in_flight, Some(new));
         app.open_fact_menu(wid, session, Fact::Model, (0, 0), true);
         app.on_account_menu_read(Completion {
             generation: new,
-            rows: Ok((Vec::new(), true)),
+            rows: Ok((Vec::new(), true, None)),
         });
         assert_eq!(
             app.autopilot_menu.as_ref().unwrap().owner,
@@ -550,19 +799,19 @@ mod tests {
             publish(&app, session, birth, conversation, program);
             app.on_account_menu_read(Completion {
                 generation: old,
-                rows: Ok((Vec::new(), true)),
+                rows: Ok((Vec::new(), true, None)),
             });
             assert!(app.account_menu_rows_cached(session).is_none());
             let current = app.account_menu_read.in_flight.unwrap();
             assert_ne!(current, old);
             app.on_account_menu_read(Completion {
                 generation: current,
-                rows: Ok((Vec::new(), false)),
+                rows: Ok((Vec::new(), false, None)),
             });
             assert!(app.autopilot_menu.as_ref().unwrap().highlight.is_none());
             assert!(matches!(
                 app.account_menu_rows_cached(session),
-                Some(Ok((_, false)))
+                Some(Ok((_, false, _)))
             ));
         }
     }
@@ -573,7 +822,7 @@ mod tests {
         let generation = open(&mut app, wid, session);
         app.on_account_menu_read(Completion {
             generation,
-            rows: Ok((Vec::new(), true)),
+            rows: Ok((Vec::new(), true, None)),
         });
         let at = app
             .account_menu_read
@@ -598,7 +847,7 @@ mod tests {
         let old = open(&mut app, wid, session);
         app.on_account_menu_read(Completion {
             generation: old,
-            rows: Ok((Vec::new(), true)),
+            rows: Ok((Vec::new(), true, None)),
         });
         {
             let entry = app.pool.get(session).unwrap();
@@ -649,7 +898,7 @@ mod tests {
             assert!(app.autopilot_menu.as_ref().unwrap().highlight.is_none());
             app.on_account_menu_read(Completion {
                 generation,
-                rows: Ok((Vec::new(), true)),
+                rows: Ok((Vec::new(), true, None)),
             });
             let menu = app.autopilot_menu.as_mut().unwrap();
             let first = crate::autopilot_menu::step(&menu.rows, None, true);
@@ -672,7 +921,7 @@ mod tests {
             let generation = app.account_menu_read.in_flight.unwrap();
             app.on_account_menu_read(Completion {
                 generation,
-                rows: Ok((Vec::new(), true)),
+                rows: Ok((Vec::new(), true, None)),
             });
             assert_eq!(app.autopilot_menu.as_ref().unwrap().highlight, last);
         }
@@ -690,7 +939,7 @@ mod tests {
             }
             app.on_account_menu_read(Completion {
                 generation,
-                rows: Ok((Vec::new(), true)),
+                rows: Ok((Vec::new(), true, None)),
             });
             assert!(app.autopilot_menu.as_ref().unwrap().highlight.is_none());
             assert!(!app.account_menu_read.deferred_keyboard_selection);
@@ -707,7 +956,7 @@ mod tests {
         app.autopilot_menu_motion(wid, 10.0, 20.0);
         app.on_account_menu_read(Completion {
             generation,
-            rows: Ok((Vec::new(), true)),
+            rows: Ok((Vec::new(), true, None)),
         });
         assert!(app.autopilot_menu.as_ref().unwrap().highlight.is_some());
     }

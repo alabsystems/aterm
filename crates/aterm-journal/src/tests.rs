@@ -203,27 +203,33 @@ fn a_one_record_journal_can_archive_a_torn_tail() {
     assert_eq!(log.read_range(Offset::ZERO, 1).unwrap().len(), 1);
 }
 
-/// Where [`Log::append`] stands when the test seam runs: after the strict
-/// astream write (the checkpoint still names the old prefix), and after the
-/// checkpoint that acknowledges it was renamed into place.
+/// Where [`Log::append`] stands when the test seam runs, with the log's flushes so far:
+/// after the astream write (the checkpoint still names the old prefix), after the
+/// checkpoint that acknowledges it was renamed into place, after the caller's dependent
+/// write ([`Log::append_then`]), and after the commit's full flush.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Step {
     Published,
     Checkpointed,
+    Witnessed,
+    Committed,
 }
-type Hook = Box<dyn FnMut(Step)>;
+type Hook = Box<dyn FnMut(Step, astream_broker::FlushCounts)>;
 thread_local! {
     static HOOK: std::cell::RefCell<Option<Hook>> = const { std::cell::RefCell::new(None) };
 }
-pub(super) fn append_step(step: Step) {
+pub(super) fn append_step(step: Step, flushed: astream_broker::FlushCounts) {
     let hook = HOOK.with(|hook| hook.borrow_mut().take());
     if let Some(mut hook) = hook {
-        hook(step);
+        hook(step, flushed);
         HOOK.with(|slot| *slot.borrow_mut() = Some(hook));
     }
 }
-fn on_append(hook: impl FnMut(Step) + 'static) {
+pub(super) fn on_append(hook: impl FnMut(Step, astream_broker::FlushCounts) + 'static) {
     HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+pub(super) fn clear_append_hook() {
+    HOOK.with(|slot| slot.borrow_mut().take());
 }
 /// Where [`read_committed`] stands when the reader's seam runs: the checkpoint
 /// was opened and is not yet read; the one read was renamed over since its
@@ -406,9 +412,10 @@ fn a_reader_racing_an_append_sees_the_old_prefix_or_the_new_one() {
     let path = dir.path().to_path_buf();
     let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let steps = std::rc::Rc::clone(&seen);
-    on_append(move |step| {
-        // The writer stands between its strict write and its checkpoint, or
-        // just past the checkpoint: one read with the old prefix, one without.
+    on_append(move |step, _| {
+        // The writer stands between its astream write and its checkpoint, or past
+        // the checkpoint (before its commit or after it): one read with the old
+        // prefix, the others without.
         let from_old = read(&path, Some(&before)).unwrap();
         let (records, _) = rebuilt(&path);
         match step {
@@ -416,7 +423,7 @@ fn a_reader_racing_an_append_sees_the_old_prefix_or_the_new_one() {
                 assert!(matches!(from_old, Committed::Unchanged));
                 assert_eq!(records.len(), 1);
             }
-            Step::Checkpointed => {
+            Step::Checkpointed | Step::Witnessed | Step::Committed => {
                 let Committed::Extended { records: new, .. } = from_old else {
                     panic!("an acknowledged append extends the old prefix");
                 };
@@ -432,7 +439,10 @@ fn a_reader_racing_an_append_sees_the_old_prefix_or_the_new_one() {
     });
     log.append("app/1", vec![2; 40]).unwrap();
     HOOK.with(|slot| slot.borrow_mut().take());
-    assert_eq!(*seen.borrow(), [Step::Published, Step::Checkpointed]);
+    assert_eq!(
+        *seen.borrow(),
+        [Step::Published, Step::Checkpointed, Step::Committed]
+    );
 
     // A writer cut off mid-frame leaves part of a record past the checkpoint.
     let (_, acknowledged) = rebuilt(dir.path());

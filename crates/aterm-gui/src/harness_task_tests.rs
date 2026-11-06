@@ -444,6 +444,7 @@ fn a_word_carried_from_before_this_process_starts_no_span() {
         not_claim_worker: false,
         claim_worker: None,
         task: None,
+        told: None,
     };
     assert!(app.graft_restored_user_meta(0, &leaf("land")));
     claim(&mut app, &ctx, true);

@@ -41,6 +41,17 @@ pub const MAX_PROOFS: usize = MAX_RECORDS * 2 + aterm_secrets::commons::constrai
 pub const BATCH: usize = 16;
 /// A full batch may continue before the ordinary table scan resumes.
 const TABLE_BURST: usize = 4;
+/// An initiator asks for the peer's table witnesses ([`witness`]) on its first round with a peer,
+/// and again on the first round after one this long without a table list traded with it: a peer
+/// that restarted, slept or was cut off has its moved tables repaired before the regular turn.
+const WITNESS_GAP_MS: u64 = 120_000;
+/// How long one side spends reading its tables' content for witnesses in a round, checked before
+/// each table's read; a table left unread reads as differing ([`witness::UNKNOWN`]). Tests read
+/// every table: there it is a hang detector, never a latency budget that decides an order.
+#[cfg(not(test))]
+const WITNESS_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+#[cfg(test)]
+const WITNESS_BUDGET: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
 /// How many times a round reads its local state before state that keeps moving is its answer
 /// ([`Round::local`]).
 const LOCAL_READS: usize = 4;
@@ -122,14 +133,18 @@ impl InventorySummary {
     /// Summarize an exact operation-ID set with the same canonical encoding as
     /// authenticated repair reports. Counts alone do not establish equality.
     pub fn of(ids: &BTreeSet<Digest>) -> Self {
+        Self::of_sorted(ids.len(), ids)
+    }
+
+    pub(crate) fn of_sorted<'a>(count: usize, ids: impl IntoIterator<Item = &'a Digest>) -> Self {
         let mut hash = Sha256::new();
         hash.update(b"aterm/commons/table-operation-inventory/1\0");
-        hash.update((ids.len() as u64).to_le_bytes());
+        hash.update((count as u64).to_le_bytes());
         for id in ids {
             hash.update(id);
         }
         Self {
-            count: ids.len(),
+            count,
             fingerprint: hash.finalize(),
         }
     }
@@ -370,6 +385,13 @@ pub struct Report {
     /// peer accepted each one sent. A round that deferred the table, or selected none, has not.
     /// A push counts only such a round as reaching the peer (`crate::runtime::Pusher`).
     pub caught_up: bool,
+    /// The selected table was deferred: either side could not read an inventory of it, or a
+    /// batch of it was refused ([`Self::deferred`] counts these, and history keys besides). Such
+    /// a round repaired nothing of its table: it is no success (`crate::runtime`'s discovery
+    /// retries it soon), and the initiator takes the table again in its next round.
+    pub table_deferred: bool,
+    /// This side initiated the round and asked the peer which tables differ (`witness`).
+    pub witnesses_asked: bool,
     /// Encrypted historical handoffs written to the peer in this
     /// round. This is not a separate durable key-receipt acknowledgement.
     pub keys_sent: usize,
@@ -435,6 +457,15 @@ pub struct Repair {
     /// What this round's table-ID lists said of the peer's clock (`crate::clock`, F22), kept
     /// whether or not the table repair after them succeeded.
     pub(crate) clock: Option<crate::clock::Reading>,
+    /// When (unix ms) this side last traded table-ID lists with the peer as initiator: none, or
+    /// one [`WITNESS_GAP_MS`] ago, asks for witnesses ([`witness`]).
+    listed_ms: Option<u64>,
+    /// When (unix ms) this side last asked the peer for witnesses: a peer's ask heard within
+    /// [`WITNESS_GAP_MS`] of it answers this side's own, and is not echoed back.
+    asked_ms: Option<u64>,
+    /// The common tables whose witnesses differed when this side last asked ([`witness`]): the
+    /// regular turn visits these alone while any remain; a table leaves as it is selected.
+    differing: BTreeSet<Digest>,
 }
 
 /// Volatile work hints learned from authenticated inventory exchanges. These
@@ -530,12 +561,19 @@ pub struct Replica {
     /// Whether a Commons round's table-ID list carries this Mac's clock mark (`crate::clock`);
     /// tests turn it off to stand for a build from before F22.
     marks: bool,
+    /// Whether this side asks a peer, and answers one, which tables differ (`witness`); tests turn
+    /// it off to stand for a build from before CR1.
+    witnesses: bool,
     /// The claims ring's tables within [`crate::clock::BAND`] periods of one period, by digest,
     /// and that period: what a peer that sends no mark offered is matched against.
     offers: Arc<Mutex<Option<RingOffers>>>,
     /// The clock that places the ring windows, in place of the system's.
     #[cfg(test)]
     pub(crate) ring_clock: Option<u64>,
+    /// MUTANT (tests): a peer's ask is always echoed, as CR1's first cut did. A field, not a
+    /// thread-local, because a test's responder runs on its own thread.
+    #[cfg(test)]
+    echoes: bool,
 }
 /// One period and the claims ring's tables within [`crate::clock::BAND`] periods of it, each
 /// table's digest with its period ([`Replica::offers`]).
@@ -567,9 +605,12 @@ impl Replica {
             first: First::default(),
             backfill: Arc::default(),
             marks: true,
+            witnesses: true,
             offers: Arc::default(),
             #[cfg(test)]
             ring_clock: None,
+            #[cfg(test)]
+            echoes: false,
         })
     }
     /// Automatic catalog and application subscriptions. Construction performs
@@ -638,9 +679,12 @@ impl Replica {
             first: First::default(),
             backfill: Arc::default(),
             marks: true,
+            witnesses: true,
             offers: Arc::default(),
             #[cfg(test)]
             ring_clock: None,
+            #[cfg(test)]
+            echoes: false,
         }
     }
 
@@ -661,6 +705,20 @@ impl Replica {
     #[cfg(test)]
     pub(crate) const fn with_marks(mut self, marks: bool) -> Self {
         self.marks = marks;
+        self
+    }
+
+    /// Neither ask nor answer which tables differ, as a build from before CR1 (tests).
+    #[cfg(test)]
+    pub(crate) const fn with_witnesses(mut self, witnesses: bool) -> Self {
+        self.witnesses = witnesses;
+        self
+    }
+
+    /// MUTANT: echo every ask heard, as CR1's first cut did (tests).
+    #[cfg(test)]
+    pub(crate) const fn with_echoes(mut self, echoes: bool) -> Self {
+        self.echoes = echoes;
         self
     }
 
@@ -1559,10 +1617,75 @@ impl Round<'_> {
         // every receiver since 0.145 enforces; the marks a peer sent come out before anything
         // else reads its list, so no mark is ever common, selected, adopted or pushed.
         let marks = self.marks && self.commons.is_some();
-        let listed = with_mark(&local, marks.then(|| self.wall_ms()).flatten());
-        let received = exchange_ids(stream, side, &listed, MAX_TABLES, || {
-            self.local(peer, |_| Ok(()))
-        })?;
+        let mut listed = with_mark(&local, marks.then(|| self.wall_ms()).flatten());
+        // A first round with this peer, or the first after a long gap, asks which tables differ
+        // (`witness`): the ask, as the mark, goes only where the list has room below the bound.
+        let listed_ms = self.wall_ms();
+        let salt = if side == Side::Initiator
+            && self.witnesses
+            && listed.len() < MAX_TABLES
+            && repair.listed_ms.is_none_or(|at| {
+                listed_ms.is_none_or(|now| now.saturating_sub(at) >= WITNESS_GAP_MS)
+            }) {
+            witness_salt()
+        } else {
+            None
+        };
+        if let Some(salt) = salt {
+            listed.insert(witness::ask(salt));
+        }
+        let received = match side {
+            Side::Initiator => exchange_ids(stream, side, &listed, MAX_TABLES, || {
+                self.local(peer, |_| Ok(()))
+            })?,
+            Side::Responder => {
+                // As `exchange_ids`, but a peer's ask is answered in the list this side sends:
+                // the witnesses of the tables both list, as many chunks as fit below the bound.
+                let received = receive_ids(stream, MAX_TABLES)?;
+                self.local(peer, |_| Ok(()))?;
+                let (tables, heard) = if self.witnesses {
+                    witness::split(received.clone())
+                } else {
+                    (BTreeSet::new(), witness::Heard::default())
+                };
+                if let [salt] = heard.asks[..] {
+                    // The peer starts over with this side: this side's next round asks it too,
+                    // once. An ask within the gap of this side's own is that ask's echo, and
+                    // echoing it back would have the two sides ask each other every round.
+                    #[cfg(test)]
+                    let echoes = self.echoes;
+                    #[cfg(not(test))]
+                    let echoes = false;
+                    if echoes
+                        || repair.asked_ms.is_none_or(|at| {
+                            listed_ms.is_none_or(|now| now.saturating_sub(at) >= WITNESS_GAP_MS)
+                        })
+                    {
+                        repair.listed_ms = None;
+                    }
+                    let (tables, _) = crate::clock::split(&tables);
+                    let common: BTreeSet<_> = local.intersection(&tables).copied().collect();
+                    // Only the chunks that fit go out, so only their tables are read.
+                    let room = MAX_TABLES.saturating_sub(listed.len());
+                    let witnesses = self.table_witnesses(
+                        peer,
+                        &common,
+                        &salt,
+                        room.saturating_mul(witness::PER_CHUNK),
+                    );
+                    listed.extend(witness::chunks(&witnesses, room));
+                    // The witness reads took time: authorize again right before sending.
+                    self.local(peer, |_| Ok(()))?;
+                }
+                send_ids(stream, &listed, MAX_TABLES)?;
+                received
+            }
+        };
+        let (received, answered) = if self.witnesses {
+            witness::split(received)
+        } else {
+            (received, witness::Heard::default())
+        };
         let (remote, heard) = if self.marks {
             crate::clock::split(&received)
         } else {
@@ -1578,6 +1701,24 @@ impl Round<'_> {
             };
         }
         let common: BTreeSet<_> = local.intersection(&remote).copied().collect();
+        if side == Side::Initiator {
+            if let Some(salt) = salt
+                && !answered.chunks.is_empty()
+                && let Some(differing) = witness::differing(
+                    &common,
+                    &self.table_witnesses(peer, &common, &salt, common.len()),
+                    &answered,
+                )
+            {
+                repair.differing = differing;
+            }
+            if salt.is_some() {
+                repair.asked_ms = listed_ms;
+                report.witnesses_asked = true;
+            }
+            repair.listed_ms = listed_ms;
+            repair.differing.retain(|id| common.contains(id));
+        }
         let force_regular = side == Side::Initiator && std::mem::take(&mut repair.table_yield);
         let follow_up = if side == Side::Initiator {
             let saved = repair.table_follow_up.take();
@@ -1613,14 +1754,28 @@ impl Round<'_> {
                 None
             };
         let priority = pushed.or(follow_up.map(|(id, _)| id)).or(hinted);
+        // While tables whose witnesses differed remain, the regular turn visits only those, in the
+        // scan's own order (fresh peers still start apart); the scan goes on from the last.
+        #[cfg(test)]
+        let unwitnessed = UNWITNESSED.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let unwitnessed = false;
+        let turn = if unwitnessed || repair.differing.is_empty() {
+            &common
+        } else {
+            &repair.differing
+        };
         let selected = match side {
             Side::Initiator => {
                 let chosen = priority.or_else(|| {
                     self.backfill
                         .lock()
                         .unwrap_or_else(|poison| poison.into_inner())
-                        .regular(&common, repair.table)
+                        .regular(turn, repair.table)
                 });
+                if let Some(id) = chosen {
+                    repair.differing.remove(&id);
+                }
                 self.local(peer, |_| Ok(()))?;
                 control::send_frame(stream, chosen.as_ref().map_or(&[][..], |id| id.as_slice()))?;
                 chosen
@@ -1680,7 +1835,25 @@ impl Round<'_> {
             repair.table_yield = true;
         }
         report.table = Some(id);
+        let deferred = report.deferred;
         self.table(stream, peer, side, id, repair, report)?;
+        report.table_deferred = report.deferred > deferred;
+        #[cfg(test)]
+        let retried = !DEFERRAL_PASSES.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let retried = true;
+        if retried
+            && side == Side::Initiator
+            && priority.is_none()
+            && report.table_deferred
+            && repair.table_follow_up.is_none()
+        {
+            // A deferred table repaired nothing: the next round takes it again, once, as a
+            // follow-up, where the scan would leave it until it came round again. A second
+            // deferral yields to the scan as any preferred round does.
+            repair.table_follow_up = Some((id, 0));
+            repair.table_yield = false;
+        }
         if side == Side::Initiator
             && (report.sent >= BATCH
                 || report.received >= BATCH
@@ -1875,6 +2048,59 @@ impl Round<'_> {
             }))
         });
         Self::table_read(read, refusal, cause)
+    }
+
+    /// The witnesses of `common` under `salt` (`witness`), in digest order: each table's operation
+    /// inventory as its table round reads it, under the admission and subscription check that
+    /// round's reads take. A table this side cannot read now, holds no storage for, lies past the
+    /// first `read` tables, or comes after [`WITNESS_BUDGET`] reads as [`witness::UNKNOWN`]: it is
+    /// repaired early, never skipped.
+    fn table_witnesses(
+        &self,
+        peer: Actor,
+        common: &BTreeSet<Digest>,
+        salt: &[u8; 16],
+        read: usize,
+    ) -> Vec<witness::Witness> {
+        let started = Instant::now();
+        common
+            .iter()
+            .enumerate()
+            .map(|(at, id)| {
+                if at >= read || started.elapsed() >= WITNESS_BUDGET {
+                    return witness::UNKNOWN;
+                }
+                let before = self.active_table.replace(Some(*id));
+                let content = self.local(peer, |session| {
+                    let store = if let Some((directory, _)) = &self.commons {
+                        let (scope, _) = &self.tables[id];
+                        // Storage this side never enrolled stays so until its table round.
+                        let Some(store) = directory.observe_store_if_exists(session, *scope)?
+                        else {
+                            return Ok(None);
+                        };
+                        if !directory.is_recovery()
+                            && *scope != directory.catalog_scope()
+                            && let Some(recovery) = directory
+                                .recovery()
+                                .observe_store_if_exists(session, *scope)?
+                        {
+                            recovery
+                        } else {
+                            store
+                        }
+                    } else {
+                        self.store(session, *id)?
+                    };
+                    let known = store.inventory(session)?;
+                    Ok(Some(
+                        InventorySummary::of_sorted(known.len(), known).fingerprint,
+                    ))
+                });
+                self.active_table.set(before);
+                witness::witness(salt, id, content.ok().flatten())
+            })
+            .collect()
     }
 
     fn matching_inventory(
@@ -2292,6 +2518,23 @@ fn cycle<const N: usize>(
     let head = after.into_iter().flat_map(move |after| ids.range(..=after));
     tail.chain(head)
 }
+/// A fresh salt for one ask's witnesses (`witness`), so that no two contents' witnesses collide
+/// in every round: none when the system's random source fails, and the round asks nothing.
+fn witness_salt() -> Option<[u8; 16]> {
+    use ring::rand::SecureRandom;
+    let mut salt = [0; 16];
+    ring::rand::SystemRandom::new().fill(&mut salt).ok()?;
+    Some(salt)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Mutant (tests): the regular turn ignores the tables whose witnesses differed.
+    pub(crate) static UNWITNESSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Mutant (tests): a deferred table is passed over until the scan comes round again.
+    pub(crate) static DEFERRAL_PASSES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// `local` with the clock mark of `wall` (ms) where one is given and the list has room for it
 /// below [`MAX_TABLES`], which every receiver since 0.145 enforces (`receive_ids`): a full list
 /// goes without.
@@ -2453,3 +2696,4 @@ pub fn db_repair_policy_environment() {}
 mod mesh_tests;
 #[cfg(test)]
 pub(crate) mod tests;
+mod witness;

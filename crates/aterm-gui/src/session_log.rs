@@ -485,8 +485,8 @@ pub(crate) const ASKED_EXIT_STANDS: std::time::Duration = std::time::Duration::f
 #[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AskWord {
-    /// The restart act's `SIGTERM` (`ctl restart`, the tab's restart pill), or the ask its carrier
-    /// stands for an act a Commit cut: an end that asks for the program back.
+    /// The restart act's `SIGTERM` (`ctl restart`), or the ask its carrier stands for an act
+    /// a Commit cut: an end that asks for the program back.
     Restart,
     /// The `signal` verb's `term`, `kill`, `quit` or `hup`: a stop, which owns its agent's exit
     /// ([`SessionLog::end_asked_of`]).

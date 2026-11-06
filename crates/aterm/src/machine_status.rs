@@ -942,7 +942,7 @@ pub(crate) fn render_text(areas: &[Area]) -> String {
             let _ = writeln!(out, "{:<20} next, {}: {}", "", step.who.word(), step.act);
         }
     }
-    scrub(&out)
+    if out.contains('@') { scrub(&out) } else { out }
 }
 
 /// The `--json` report: `{"schema":1,"areas":[{"area","state","says","next":{"who","act"}|null}]}`.
@@ -1079,9 +1079,10 @@ fn read_clt() -> Clt {
         Clt::NotHere
     } else if aterm_types::clt_shim::developer_git() {
         Clt::Present
-    } else if aterm_types::clt_shim::shim_dir()
-        .is_some_and(|shim| aterm_types::clt_shim::installing_mark(&shim).exists())
-    {
+    } else if aterm_types::clt_shim::shim_dir().is_some_and(|shim| {
+        std::fs::symlink_metadata(aterm_types::clt_shim::installing_mark(&shim))
+            .is_ok_and(|meta| meta.is_file())
+    }) {
         Clt::Installing
     } else {
         Clt::Missing {
@@ -1148,7 +1149,10 @@ fn read_areas() -> Vec<Area> {
     let token = {
         let home = aterm_types::dirs::home_dir();
         bounded(move || {
-            home.is_some_and(|home| home.join(agh::identity::vault::DEV_TOKEN_FILE).is_file())
+            home.is_some_and(|home| {
+                std::fs::symlink_metadata(home.join(agh::identity::vault::DEV_TOKEN_FILE))
+                    .is_ok_and(|meta| meta.is_file())
+            })
         })
     };
     let agents = bounded(read_agents);
@@ -1225,7 +1229,11 @@ pub(crate) fn main_entry(args: &[OsString]) -> ExitCode {
             return ExitCode::from(2);
         }
         Some(Asked::Help) => format!("{USAGE}\n"),
-        Some(Asked::Json) => format!("{}\n", render_json(&read_areas())),
+        Some(Asked::Json) => {
+            let mut json = render_json(&read_areas());
+            json.push('\n');
+            json
+        }
         Some(Asked::Text) => render_text(&read_areas()),
     };
     aterm_uds::stdout::answer_exit("aterm status", &text, 0)

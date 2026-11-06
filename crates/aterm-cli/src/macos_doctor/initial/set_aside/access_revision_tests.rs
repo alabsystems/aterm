@@ -33,14 +33,13 @@ fn permission_rows(state: &Path, revision: u64) -> Vec<Row> {
         stable: true,
         devtools: access::DevTools::On,
         debugger: access::Debugger::On,
-        lan: access::Lan::On,
         accessibility: None,
         no_sign_out_owed: false,
-        opted_out: [None; 5],
+        opted_out: [None; Access::ALL.len()],
         acquiring: true,
     };
     grants.opted_out = access::opted_out(
-        [None; 5],
+        [None; Access::ALL.len()],
         &records,
         Access::ALL.map(|access| grants.reads_off(access)),
     );

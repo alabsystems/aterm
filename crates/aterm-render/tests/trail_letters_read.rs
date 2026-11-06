@@ -83,24 +83,28 @@ pub const PAPER_GREY: Look = Look {
     cursor: 0x0009_69DA,
 };
 
-/// Each channel's median (the upper one of an even count): a channel is a byte, so it is the
-/// first value whose running count passes half the pixels, with no sort of every ring.
-fn median(px: &[u32]) -> u32 {
-    let mid = px.len() / 2;
+/// The most pixels a ring reads: the Chebyshev ring [`RING_REACH`] px out.
+const RING_MOST: usize = 8 * RING_REACH as usize;
+
+/// Each channel's median (the upper one of an even count) of a ring's pixels: `at` gives the
+/// pixels, at most [`RING_MOST`] of them. A ring of one colour is that colour.
+fn median(n: usize, at: impl Fn(usize) -> u32) -> u32 {
+    let first = at(0) & 0x00FF_FFFF;
+    let mut chan = [[0u8; RING_MOST]; 3];
+    let mut uniform = true;
+    for i in 0..n {
+        let p = at(i);
+        uniform &= p & 0x00FF_FFFF == first;
+        chan[0][i] = (p >> 16) as u8;
+        chan[1][i] = (p >> 8) as u8;
+        chan[2][i] = p as u8;
+    }
+    if uniform {
+        return first;
+    }
     let mut out = 0;
-    for sh in [16, 8, 0] {
-        let mut count = [0u32; 256];
-        for p in px {
-            count[((p >> sh) & 0xff) as usize] += 1;
-        }
-        let mut seen = 0;
-        for (v, &n) in (0u32..).zip(&count) {
-            seen += n as usize;
-            if seen > mid {
-                out |= v << sh;
-                break;
-            }
-        }
+    for (c, sh) in chan.iter_mut().zip([16u32, 8, 0]) {
+        out |= u32::from(*c[..n].select_nth_unstable(n / 2).1) << sh;
     }
     out
 }
@@ -160,58 +164,65 @@ impl Pair<'_> {
         px[y * w + x] & 0x00FF_FFFF
     }
 
-    /// The cell `(row, col)` as `aterm-lab trail-contrast` measures it; `None` for a blank cell or
-    /// one the effects left as its twin.
-    pub fn letter(&self, row: usize, col: usize, span: usize, ch: char) -> Option<Letter> {
-        self.judge(row, col, span, ch, false)
-    }
-
-    /// The cell `(row, col)`'s own reading: its clean twin judged the same way.
-    pub fn own(&self, row: usize, col: usize, span: usize, ch: char) -> Option<f64> {
-        let twin = Pair {
-            frame: self.clean,
-            ..*self
-        };
-        twin.judge(row, col, span, ch, true).map(|l| l.judged())
-    }
-
-    fn judge(&self, row: usize, col: usize, span: usize, ch: char, twin: bool) -> Option<Letter> {
+    /// The cell's box, px: `(x0, y0, x1, y1)`.
+    fn cell_box(&self, row: usize, col: usize, span: usize) -> (usize, usize, usize, usize) {
         let h = self.clean.len() / self.w;
         let (x0, y0) = (col * self.cw, row * self.ch);
-        let (x1, y1) = ((x0 + span * self.cw).min(self.w), (y0 + self.ch).min(h));
-        let mut same = true;
+        (
+            x0,
+            y0,
+            (x0 + span * self.cw).min(self.w),
+            (y0 + self.ch).min(h),
+        )
+    }
+
+    /// Whether the effects left the cell `(row, col)` as its twin.
+    fn untouched(&self, row: usize, col: usize, span: usize) -> bool {
+        let (x0, y0, x1, y1) = self.cell_box(row, col, span);
+        (y0..y1).all(|y| {
+            let (from, to) = (y * self.w + x0, y * self.w + x1);
+            self.frame[from..to]
+                .iter()
+                .zip(&self.clean[from..to])
+                .all(|(f, c)| (f ^ c) & 0x00FF_FFFF == 0)
+        })
+    }
+
+    /// The cell `(row, col)` as `aterm-lab trail-contrast` measures it, all it reads of the clean
+    /// frame; `None` for a blank cell.
+    fn plan(&self, row: usize, col: usize, span: usize) -> Option<LetterPlan> {
+        let h = self.clean.len() / self.w;
+        let (x0, y0, x1, y1) = self.cell_box(row, col, span);
         let mut clean_px = Vec::with_capacity((x1 - x0) * (y1 - y0));
         for y in y0..y1 {
-            for x in x0..x1 {
-                let c = Self::at(self.clean, self.w, x, y);
-                same &= c == Self::at(self.frame, self.w, x, y);
-                clean_px.push(c);
-            }
+            clean_px.extend(
+                self.clean[y * self.w + x0..y * self.w + x1]
+                    .iter()
+                    .map(|c| c & 0x00FF_FFFF),
+            );
         }
-        if (same && !twin) || clean_px.is_empty() {
+        if clean_px.is_empty() {
             return None;
         }
         let ground = mode(&clean_px);
-        let extreme = clean_px
-            .iter()
-            .copied()
-            .max_by(|a, b| contrast(*a, ground).total_cmp(&contrast(*b, ground)))?;
-        if contrast(extreme, ground) < BLANK_BELOW {
+        let ratios: Vec<f64> = clean_px.iter().map(|c| contrast(*c, ground)).collect();
+        let extreme = ratios.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        if extreme < BLANK_BELOW {
             return None;
         }
-        let solid = SOLID_SHARE * contrast(extreme, ground);
-        let mut worst_row = f64::INFINITY;
-        let mut ratios = Vec::new();
-        let mut ring = Vec::new();
+        let solid_at = SOLID_SHARE * extreme;
+        let mut plan = LetterPlan {
+            solid: Vec::new(),
+            rings: Vec::new(),
+            own: std::cell::Cell::new(None),
+        };
         for y in y0..y1 {
-            ratios.clear();
             for x in x0..x1 {
-                if contrast(Self::at(self.clean, self.w, x, y), ground) < solid {
+                if ratios[(y - y0) * (x1 - x0) + x - x0] < solid_at {
                     continue;
                 }
-                let mut g = None;
+                let from = plan.rings.len();
                 for d in 1..=RING_REACH {
-                    ring.clear();
                     for dy in -d..=d {
                         for dx in -d..=d {
                             if dx.abs().max(dy.abs()) != d {
@@ -223,32 +234,87 @@ impl Pair<'_> {
                             }
                             let (xx, yy) = (xx as usize, yy as usize);
                             if Self::at(self.clean, self.w, xx, yy) == ground {
-                                ring.push(Self::at(self.frame, self.w, xx, yy));
+                                plan.rings.push((yy * self.w + xx) as u32);
                             }
                         }
                     }
-                    if !ring.is_empty() {
-                        g = Some(median(&ring));
+                    if plan.rings.len() > from {
+                        plan.solid.push((
+                            (y * self.w + x) as u32,
+                            y as u32,
+                            plan.rings.len() as u32,
+                        ));
                         break;
                     }
                 }
-                if let Some(g) = g {
-                    ratios.push(contrast(Self::at(self.frame, self.w, x, y), g));
-                }
-            }
-            if !ratios.is_empty() {
-                ratios.sort_by(f64::total_cmp);
-                worst_row = worst_row.min(ratios[(ratios.len() - 1) / 2]);
             }
         }
-        Some(Letter {
-            row,
-            col,
-            ch,
-            local: worst_row,
-            own: f64::INFINITY,
-        })
+        Some(plan)
     }
+}
+
+/// What the judge reads a lettered cell by: each solid ink pixel of the clean frame (at least
+/// [`SOLID_SHARE`] of its most contrasting pixel's ratio against the cell's ground) that has ground
+/// on its nearest ring, and those ring pixels. All of it is the clean frame's, so one plan reads
+/// every frame drawn over that clean frame ([`CleanFrame::plans`]).
+struct LetterPlan {
+    /// The pixels, row-major: each one's frame index, its pixel row, and where its ring ends in
+    /// [`Self::rings`] (it starts where the one before ends).
+    solid: Vec<(u32, u32, u32)>,
+    rings: Vec<u32>,
+    /// [`Letter::own`], its reading on the clean frame, once a replay has read it.
+    own: std::cell::Cell<Option<f64>>,
+}
+
+impl LetterPlan {
+    /// The letter's reading on frame `px`: its worst pixel row's lower median of each solid ink
+    /// pixel against its ring of ground (infinite with no such pixel).
+    fn reading(&self, px: &[u32], ratios: &mut Vec<f64>) -> f64 {
+        let mut worst = f64::INFINITY;
+        // A stroke's pixels are mostly one colour over one ring: the last pair's ratio stands.
+        let mut last = (u32::MAX, u32::MAX, 0.0);
+        let (mut i, mut from) = (0, 0);
+        while i < self.solid.len() {
+            let row = self.solid[i].1;
+            ratios.clear();
+            while let Some(&(at, _, to)) = self.solid.get(i).filter(|s| s.1 == row) {
+                let ring = &self.rings[from..to as usize];
+                from = to as usize;
+                let g = median(ring.len(), |k| px[ring[k] as usize]);
+                let p = px[at as usize] & 0x00FF_FFFF;
+                if (p, g) != (last.0, last.1) {
+                    last = (p, g, contrast(p, g));
+                }
+                ratios.push(last.2);
+                i += 1;
+            }
+            let mid = (ratios.len() - 1) / 2;
+            worst = worst.min(*ratios.select_nth_unstable_by(mid, f64::total_cmp).1);
+        }
+        worst
+    }
+
+    /// The letter's own reading: this plan on its `clean` frame.
+    fn own(&self, clean: &[u32], ratios: &mut Vec<f64>) -> f64 {
+        if let Some(own) = self.own.get() {
+            return own;
+        }
+        let own = self.reading(clean, ratios);
+        self.own.set(Some(own));
+        own
+    }
+}
+
+/// A frame with no effect drawn and what it was drawn from: the terminal's
+/// `screen_mutations` and caret, its pixels, and the plan of each cell its letters have been
+/// read in, by `(row, col, span)` ([`LetterPlan`], `None` for a blank cell). The plans read
+/// these pixels alone, so they last exactly as long as they do. NEGATIVE CONTROL (2026-11-05):
+/// plans carried to the next clean frame fail `every_letter_a_trail_lies_on_reads_at_the_bar` and
+/// `a_dim_letter_keeps_its_own_reading`.
+struct CleanFrame {
+    at: (u64, (usize, usize)),
+    px: Vec<u32>,
+    plans: std::collections::HashMap<(usize, usize, usize), Option<LetterPlan>>,
 }
 
 /// The lettered cells a frame's `blur` can lay light on or round, where `m` keeps it off every one:
@@ -256,7 +322,7 @@ impl Pair<'_> {
 /// (`bloom::apply_kept_off`): the blur paints no pixel past the source's bounds grown by its reach
 /// ([`bloom::reach_px`]), and none within a kept cell's box grown by [`bloom::LetterMask::grow`],
 /// which holds the [`RING_REACH`] the judge reads a letter's ground in. So where this is `Some`, the
-/// blur changes no pixel of a judged letter ([`Pair::judge`]). A cell the blur can reach and the
+/// blur changes no pixel of a judged letter ([`Pair::plan`]). A cell the blur can reach and the
 /// mask's window leaves out reads as not kept: a window shrunk under the reach is `None` here.
 fn spared_letters_in_reach(
     m: &aterm_render::bloom::LetterMask,
@@ -335,12 +401,6 @@ pub struct Judged {
     pub trail: usize,
 }
 
-/// [`Replay::own_memo`]: the frame's key and its readings.
-type OwnMemo = (
-    (u64, (usize, usize)),
-    std::collections::HashMap<(usize, usize, usize), f64>,
-);
-
 /// Where a frame's companion lay ([`Replay::coat`]): its drawn body (the knock layer's rects
 /// that meet the pet's box), against the letters' ink and the word icons.
 #[derive(Clone, Debug, Default)]
@@ -396,7 +456,7 @@ pub struct Replay {
     pub cell: (usize, usize),
     pub look: Look,
     pub ms: u64,
-    clean: Option<(u64, (usize, usize), Vec<u32>)>,
+    clean: Option<CleanFrame>,
     /// Frames to keep as PNGs: `(ms, path)`.
     pub dump: Vec<(u64, String)>,
     /// Whether each frame judges its letters ([`Judged::letters`]), half of what a frame costs
@@ -404,9 +464,6 @@ pub struct Replay {
     pub letters: bool,
     /// Whether each judged letter reads its own reading too ([`Letter::own`]).
     pub own: bool,
-    /// The clean frame's own readings by `(row, col, span)` ([`Letter::own`]): they read that
-    /// frame alone, so they last as long as its key, `(screen_mutations, caret)`.
-    own_memo: OwnMemo,
     /// The host's bloom: `Some(unheld)` blooms each frame as the GPU does
     /// (`aterm_render::bloom`), over text that holds it too when `unheld`
     /// (a negative control); `None` draws none, as a CPU frame.
@@ -518,7 +575,6 @@ impl Replay {
             dump: Vec::new(),
             letters: false,
             own: false,
-            own_memo: Default::default(),
             bloom: None,
             shade: false,
             air: false,
@@ -566,13 +622,12 @@ impl Replay {
         let mut input: RenderInput = self.term.cell_frame(rows, cols);
         let caret = (input.cursor_row, input.cursor_col);
         let key = (self.term.screen_mutations(), caret);
-        if self
-            .clean
-            .as_ref()
-            .is_none_or(|(at, c, _)| (*at, *c) != key)
-        {
-            let clean = self.rend.render_input(&input).pixels;
-            self.clean = Some((key.0, key.1, clean));
+        if self.clean.as_ref().is_none_or(|c| c.at != key) {
+            self.clean = Some(CleanFrame {
+                at: key,
+                px: self.rend.render_input(&input).pixels,
+                plans: Default::default(),
+            });
         }
         // What the frame's glyphs lay down, read off this input before the effects run, as the
         // GUI reads it every frame (`app_render`'s `glyph_ink_for` and `observe_glyph_ink`): the
@@ -659,17 +714,17 @@ impl Replay {
             let budget = hdr::sdr_glow_budget(hdr::packed_luma(bg), SDR_BOOST);
             bloom::sdr_crown(&mut frame, crown, input.rows, budget).expect("the frame is crowned");
         }
-        let mut bodies = Vec::new();
-        aterm_render::knock_rects(
-            &place,
-            &input.fx_layers,
-            &input.fx_occluders,
-            &mut aterm_render::FxSlicer::default(),
-            &mut aterm_render::SpriteCols::default(),
-            &mut bodies,
-        );
         let mut coat = Coat::default();
         if self.coat {
+            let mut bodies = Vec::new();
+            aterm_render::knock_rects(
+                &place,
+                &input.fx_layers,
+                &input.fx_occluders,
+                &mut aterm_render::FxSlicer::default(),
+                &mut aterm_render::SpriteCols::default(),
+                &mut bodies,
+            );
             let (px, py) = (place.pad as i32, place.grid_top as i32);
             let pet = self
                 .fx
@@ -698,7 +753,7 @@ impl Replay {
                 let page = self.look.bg & 0x00FF_FFFF;
                 let w = frame.width;
                 let h = frame.pixels.len() / w;
-                let clean = &self.clean.as_ref().expect("rendered above").2;
+                let clean = &self.clean.as_ref().expect("rendered above").px;
                 let off_page = |c: u32| {
                     [16u32, 8, 0].iter().any(|&sh| {
                         (((c >> sh) & 0xff) as i32 - ((page >> sh) & 0xff) as i32).abs() > 24
@@ -763,7 +818,7 @@ impl Replay {
                 px: frame.pixels.clone(),
                 w: frame.width,
                 top: place.grid_top,
-                clean: self.clean.as_ref().expect("rendered above").2.clone(),
+                clean: self.clean.as_ref().expect("rendered above").px.clone(),
                 left: place.pad,
                 caret,
                 cell: self.cell,
@@ -771,13 +826,39 @@ impl Replay {
             });
         }
         let w = frame.width;
-        let clean = &self.clean.as_ref().expect("rendered above").2;
+        let CleanFrame {
+            px: clean, plans, ..
+        } = self.clean.as_mut().expect("rendered above");
+        let clean = &*clean;
         let pair = Pair {
             frame: &frame.pixels,
             clean,
             w,
             cw,
             ch,
+        };
+        let mut ratios = Vec::new();
+        // The cell `(row, col)` as `aterm-lab trail-contrast` measures it, its own reading too
+        // where `own` says; `None` for a blank cell or one the effects left as its twin.
+        let mut judge = |row: usize, col: usize, span: usize, ch: char, own: bool| {
+            if pair.untouched(row, col, span) {
+                return None;
+            }
+            let plan = plans
+                .entry((row, col, span))
+                .or_insert_with(|| pair.plan(row, col, span))
+                .as_ref()?;
+            Some(Letter {
+                row,
+                col,
+                ch,
+                local: plan.reading(pair.frame, &mut ratios),
+                own: if own {
+                    plan.own(clean, &mut ratios)
+                } else {
+                    f64::INFINITY
+                },
+            })
         };
         let letters = self.letters.then(|| {
             let mut letters = Vec::new();
@@ -790,17 +871,7 @@ impl Replay {
                         continue;
                     }
                     let span = if c.wide { 2 } else { 1 };
-                    if let Some(mut l) = pair.letter(row, col, span, c.ch) {
-                        if self.own {
-                            let (held, memo) = &mut self.own_memo;
-                            if *held != key {
-                                *held = key;
-                                memo.clear();
-                            }
-                            l.own = *memo.entry((row, col, span)).or_insert_with(|| {
-                                pair.own(row, col, span, c.ch).unwrap_or(f64::INFINITY)
-                            });
-                        }
+                    if let Some(l) = judge(row, col, span, c.ch, self.own) {
                         letters.push(l);
                     }
                 }
@@ -814,11 +885,7 @@ impl Replay {
                 .get(row)
                 .and_then(|line| line.get(col))
                 .filter(|c| !c.wide && c.ch != ' ' && c.ch != '\0' && !c.ch.is_control())
-                .and_then(|c| {
-                    let mut l = pair.letter(row, col, 1, c.ch)?;
-                    l.own = pair.own(row, col, 1, c.ch).unwrap_or(f64::INFINITY);
-                    Some(l)
-                })
+                .and_then(|c| judge(row, col, 1, c.ch, true))
         } else {
             None
         };
@@ -2392,10 +2459,169 @@ fn a_dim_page_s_return_shows_in_the_air() {
     );
 }
 
-/// [`median`] is each channel's sorted middle (`sorted[len / 2]`) and [`mode`] the first longest
-/// run of the sorted colours, for odd and even counts, repeated values, ties and channels that
-/// differ in order. NEGATIVE CONTROLS: `seen >= mid` takes the value below the middle of an even
-/// count, and `c > best` takes a tie's highest colour; each fails.
+/// A LETTER'S PLAN READS WHAT THE JUDGE WRITTEN OUT READS. On seeded frames (a page and a second
+/// ground, inks strong and faint, lights in a few colours over the frame's alpha byte), each cell
+/// and two-cell span read through [`Pair::plan`] (blank or not, [`LetterPlan::reading`], its own
+/// reading on the clean frame, [`Pair::untouched`]) reads to the bit what `aterm-lab
+/// trail-contrast`'s judge reads, written out here pixel by pixel: the mode ground, the solid share
+/// of the extreme, each solid pixel's nearest ring of ground in the clean frame, its channel medians
+/// on the frame, each row's lower median, the worst row. NEGATIVE CONTROLS (2026-11-05), each fails
+/// here in the first case: a row's upper median (`ratios.len() / 2`), a ratio memo keyed on the
+/// ring's colour alone, and a plan that tries the far ring first.
+#[test]
+fn a_letter_s_plan_reads_the_judge_written_out() {
+    fn written_out(frame: &[u32], clean: &[u32], w: usize, cell: [usize; 4]) -> Option<f64> {
+        const RGB: u32 = 0x00FF_FFFF;
+        let [x0, y0, x1, y1] = cell;
+        let h = clean.len() / w;
+        let at = |px: &[u32], x: usize, y: usize| px[y * w + x] & RGB;
+        let mut seen: Vec<u32> = (y0..y1)
+            .flat_map(|y| (x0..x1).map(move |x| (x, y)))
+            .map(|(x, y)| at(clean, x, y))
+            .collect();
+        seen.sort_unstable();
+        let runs = seen.chunk_by(|a, b| a == b);
+        let longest = runs.clone().map(<[u32]>::len).max()?;
+        let ground = runs.into_iter().find(|r| r.len() == longest)?[0];
+        let extreme = seen
+            .iter()
+            .map(|c| contrast(*c, ground))
+            .fold(f64::NEG_INFINITY, f64::max);
+        if extreme < BLANK_BELOW {
+            return None;
+        }
+        let mut worst = f64::INFINITY;
+        for y in y0..y1 {
+            let mut ratios = Vec::new();
+            for x in x0..x1 {
+                if contrast(at(clean, x, y), ground) < SOLID_SHARE * extreme {
+                    continue;
+                }
+                let g = (1..=RING_REACH).find_map(|d| {
+                    let ring: Vec<u32> = (-d..=d)
+                        .flat_map(|dy| (-d..=d).map(move |dx| (dx, dy)))
+                        .filter(|&(dx, dy)| dx.abs().max(dy.abs()) == d)
+                        .map(|(dx, dy)| (x as i64 + dx, y as i64 + dy))
+                        .filter(|&(xx, yy)| xx >= 0 && yy >= 0 && xx < w as i64 && yy < h as i64)
+                        .map(|(xx, yy)| (xx as usize, yy as usize))
+                        .filter(|&(xx, yy)| at(clean, xx, yy) == ground)
+                        .map(|(xx, yy)| at(frame, xx, yy))
+                        .collect();
+                    (!ring.is_empty()).then(|| {
+                        [16u32, 8, 0].into_iter().fold(0, |out, sh| {
+                            let mut c: Vec<u32> = ring.iter().map(|p| (p >> sh) & 0xff).collect();
+                            c.sort_unstable();
+                            out | c[c.len() / 2] << sh
+                        })
+                    })
+                });
+                if let Some(g) = g {
+                    ratios.push(contrast(at(frame, x, y), g));
+                }
+            }
+            if !ratios.is_empty() {
+                ratios.sort_by(f64::total_cmp);
+                worst = worst.min(ratios[(ratios.len() - 1) / 2]);
+            }
+        }
+        Some(worst)
+    }
+    let mut x: u32 = 0x9E37_79B9;
+    let mut next = move |n: u32| {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        x % n
+    };
+    let (cw, ch, cols, rows) = (6usize, 10usize, 5usize, 3usize);
+    let w = cw * cols;
+    let mut ratios = Vec::new();
+    let (mut blank, mut read, mut untouched) = (0, 0, 0);
+    for case in 0..64 {
+        // Each cell a ground and, most of them, ink in two strengths.
+        let mut clean = vec![0xFF00_2B36u32; w * rows * ch];
+        let (ink, faint) = (0xFF83_9496, 0xFF40_5A62);
+        for (i, px) in clean.iter_mut().enumerate() {
+            let (col, row) = ((i % w) / cw, (i / w) / ch);
+            if (col + row + case) % 4 == 3 {
+                *px = 0xFF11_2233;
+            }
+            if (col + 2 * row + case) % 5 != 4 {
+                match next(9) {
+                    0 | 1 => *px = ink,
+                    2 => *px = faint,
+                    _ => {}
+                }
+            }
+        }
+        // Most cells lit, in a few colours, one or two of them left as their twin.
+        let mut frame = clean.clone();
+        let lights = [0xFF50_2B36, 0xFF00_4A36, 0xFF20_2020, 0xFFE0_E0D0];
+        for (i, px) in frame.iter_mut().enumerate() {
+            let (col, row) = ((i % w) / cw, (i / w) / ch);
+            if (col + row) % 7 != 6 && next(3) == 0 {
+                *px = lights[next(4) as usize];
+            }
+        }
+        let pair = Pair {
+            frame: &frame,
+            clean: &clean,
+            w,
+            cw,
+            ch,
+        };
+        for row in 0..rows {
+            for col in 0..cols {
+                for span in 1..=2 {
+                    let (x0, y0) = (col * cw, row * ch);
+                    let (x1, y1) = ((x0 + span * cw).min(w), y0 + ch);
+                    let same = (y0..y1).all(|y| {
+                        (x0..x1).all(|x| (frame[y * w + x] ^ clean[y * w + x]) & 0x00FF_FFFF == 0)
+                    });
+                    assert_eq!(pair.untouched(row, col, span), same);
+                    untouched += usize::from(same);
+                    let plan = pair.plan(row, col, span);
+                    let cell = [x0, y0, x1, y1];
+                    let want = written_out(&frame, &clean, w, cell);
+                    assert_eq!(
+                        plan.is_none(),
+                        want.is_none(),
+                        "case {case} cell {row},{col}+{span}: blank"
+                    );
+                    let (Some(plan), Some(want)) = (plan, want) else {
+                        blank += 1;
+                        continue;
+                    };
+                    read += 1;
+                    let got = plan.reading(&frame, &mut ratios);
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "case {case} cell {row},{col}+{span}: the plan reads {got}, the judge {want}"
+                    );
+                    let own = written_out(&clean, &clean, w, cell).expect("not blank");
+                    let got = plan.own(&clean, &mut ratios);
+                    assert_eq!(
+                        got.to_bits(),
+                        own.to_bits(),
+                        "case {case} cell {row},{col}+{span}: its own reading {got}, the judge {own}"
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        blank > 0 && read > 0 && untouched > 0,
+        "{blank} {read} {untouched}"
+    );
+}
+
+/// [`median`] is each channel's sorted middle (`sorted[len / 2]`) over a ring's every size, its
+/// one-colour path the same, and [`mode`] the first longest run of the sorted colours, for odd and
+/// even counts, repeated values, ties and channels that differ in order. NEGATIVE CONTROLS
+/// (2026-11-05): `select_nth_unstable((n - 1) / 2)` takes the value below the middle of an even
+/// count, a uniform path that drops the mask keeps the top byte of `0xAA11_2233`, and `c > best`
+/// takes a tie's highest colour; each fails here.
 #[test]
 fn median_and_mode_are_the_sorted_readings() {
     let sorted_middle = |px: &[u32]| {
@@ -2416,7 +2642,7 @@ fn median_and_mode_are_the_sorted_readings() {
     };
     let mut px = Vec::new();
     let mut x: u32 = 0x9E37_79B9;
-    for len in 1..=40 {
+    for len in 1..=RING_MOST {
         px.clear();
         for _ in 0..len {
             x ^= x << 13;
@@ -2428,8 +2654,10 @@ fn median_and_mode_are_the_sorted_readings() {
                 _ => x & 0x00FF_FFFF,
             });
         }
-        assert_eq!(median(&px), sorted_middle(&px), "{px:08x?}");
+        assert_eq!(median(len, |i| px[i]), sorted_middle(&px), "{px:08x?}");
         assert_eq!(mode(&px), sorted_mode(&px), "{px:08x?}");
+        let one = vec![0xAA11_2233; len];
+        assert_eq!(median(len, |i| one[i]), sorted_middle(&one), "{len} alike");
     }
 }
 

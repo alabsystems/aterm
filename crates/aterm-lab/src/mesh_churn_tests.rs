@@ -241,6 +241,7 @@ fn holding() -> Evidence {
         newest: vec![epoch],
         newest_wrap: BTreeSet::new(),
         opens_newest: true,
+        unsettled: Vec::new(),
         seats: Some(["m1", "m2"].into_iter().map(str::to_owned).collect()),
         node_seats: [(node, 1)].into_iter().collect(),
         entries: [(SPLIT_ENTRY.to_owned(), honest)].into_iter().collect(),
@@ -706,5 +707,25 @@ fn a_wait_ends_when_nothing_moved_past_the_schedule_or_as_a_livelock_while_movin
         ended(at(livelock), start, at(livelock - 1), schedule),
         Some(Ended::Livelock),
         "moving on every read past the bound is a livelock"
+    );
+}
+
+/// A settled wait's per-Mac line names the Macs whose reads changed last, latest first, each
+/// with its time from what the wait counts from, and how many read a newest epoch as a prefix:
+/// the line that named the Macs holding the ten-minute heal (one-mesh §11 H1).
+#[test]
+fn last_settled_names_the_macs_that_held_the_wait() {
+    let from = std::time::Instant::now();
+    let at = |s: u64| from + std::time::Duration::from_secs(s);
+    let seen = |name: &str, prefix: bool| Seen {
+        name: name.to_owned(),
+        unsettled: if prefix { vec![[3u8; 32]] } else { Vec::new() },
+        ..Seen::default()
+    };
+    let (a, b, c) = (seen("m01", false), seen("m02", true), seen("m03", false));
+    let line = last_settled(&[&a, &b, &c], &[at(14), at(652), at(14)], from);
+    assert_eq!(
+        line,
+        "last settled m02 652.0s, m01 14.0s, m03 14.0s; 1 of 3 read a newest [everyone] epoch as a prefix"
     );
 }

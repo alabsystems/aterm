@@ -4,7 +4,8 @@
 //! Tier-1: the real herald's told-once memory refines `HeraldToldOnce` (design §14.18).
 
 use super::{
-    Escalation, EscalationKind, Herald, NOTIFY_BURST_WINDOW, NeedId, NeedRead, NeedWord, headline,
+    Escalation, EscalationKind, Herald, NOTIFY_BURST_WINDOW, NeedId, NeedRead, NeedWord,
+    StatusCarry, headline,
 };
 use aterm_models_gui::herald_told_once_model;
 use aterm_spec::interp::State;
@@ -21,8 +22,9 @@ const BOX: u64 = 104;
 pub(super) struct Rig {
     herald: Herald,
     now: Instant,
+    /// The owner's last plain Enter, a count each process starts at 0.
     turn: u64,
-    /// The escalation noted last, which the owner's turn notes again.
+    /// The escalation noted last, which the owner's turn and a restart note again.
     last: Option<Escalation>,
     /// Notices naming each need since the last forget, capped at 2.
     named: (i64, i64),
@@ -146,6 +148,27 @@ impl Rig {
                 self.named = (0, 0);
                 self.fresh = 2;
             }
+            "Restart" => {
+                // A quit's cold restore: the leaf carries the told ids alone, a new process
+                // adopts them, notes the gap before the agent raises its need again, then what
+                // stood, at the new process's first turn.
+                let carry = StatusCarry {
+                    told_ids: self.herald.told_ids(0),
+                    ..StatusCarry::default()
+                };
+                self.herald = Herald {
+                    told_off: self.herald.told_off,
+                    ..Herald::default()
+                };
+                self.turn = 0;
+                self.herald.adopt(0, carry, 0, self.now);
+                let again = self.last.take().map(|mut esc| {
+                    esc.owner_turn = self.turn;
+                    esc
+                });
+                let _ = self.herald.note(0, None, false, true, self.now);
+                self.note(again);
+            }
             "OwnerTurn" => {
                 self.turn += 1;
                 let again = self.last.take().map(|mut esc| {
@@ -164,7 +187,7 @@ impl Rig {
     }
 }
 
-const ACTIONS: [&str; 7] = [
+const ACTIONS: [&str; 8] = [
     "ShowA",
     "ShowB",
     "ShowBoth",
@@ -172,6 +195,7 @@ const ACTIONS: [&str; 7] = [
     "Displace",
     "Clear",
     "OwnerTurn",
+    "Restart",
 ];
 
 #[test]
@@ -223,4 +247,18 @@ fn herald_told_once_conforms_to_real_herald() {
     }
     assert_eq!(told.named, (1, 0));
     assert!(model.check_invariant("ToldOnce", &told.project()));
+    // Negative control: a restart that carries nothing tells what stands again.
+    let mut forgets = Rig::new(false);
+    forgets.step("ShowA");
+    forgets.now += NOTIFY_BURST_WINDOW;
+    forgets.herald = Herald::default();
+    forgets.turn = 0;
+    let again = forgets.last.take();
+    forgets.note(again);
+    assert_eq!(
+        forgets.named,
+        (2, 0),
+        "a restart with no carry tells it twice"
+    );
+    assert!(!model.check_invariant("ToldOnce", &forgets.project()));
 }

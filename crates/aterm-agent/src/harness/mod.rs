@@ -44,9 +44,12 @@ pub mod challenge_relay;
 #[cfg(unix)]
 mod challenge_window;
 pub mod claims;
+#[cfg(unix)]
+pub mod claude_homes;
 pub mod cli;
 pub mod codex_alab;
 pub mod codex_app_login;
+pub mod codex_enrollment;
 #[cfg(unix)]
 pub mod codex_exec_handoff;
 pub mod codex_facts;

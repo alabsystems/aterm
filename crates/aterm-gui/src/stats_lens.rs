@@ -15,7 +15,7 @@ use aterm_vitals::model::{
     CpuView, DiskFacts, HeatCell, LinkKind, Pressure, ProcScope, Resource, ResourceView, Snapshot,
     StripEventKind,
 };
-use aterm_vitals::ring::GapKind;
+use aterm_vitals::ring::{Cell, GapKind};
 use aterm_vitals::words::{self, InkKind, Ladder, Locale, Platform};
 
 use crate::deck_face::{ASCENT_EM, DESCENT_EM, FaceMetrics, deck_metrics};
@@ -1135,18 +1135,27 @@ fn trace_overlays(
 }
 
 /// `view`'s last hour as 60 one-minute trace columns ending at `now`: each column's mean and
-/// largest reading over `unit` (never below 0), and its heat as the deck's strip takes it, a share
-/// of the row's capacity now.
+/// largest reading of the first series over `unit` (never below 0), and its heat as the deck's
+/// row takes it ([`ResourceView::heat_columns`]): a share of capacity now, on a two-series row
+/// (Processes: all, and yours against your user's limit) the larger of the two shares, the limit
+/// that binds first (the R3 lens fixes' review, 2026-11-06). A one-series row's is its first
+/// series' share alone.
 fn hour_columns(
     view: &ResourceView,
     now: i64,
     unit: f64,
 ) -> (Vec<Option<f64>>, Vec<Option<f64>>, Vec<HeatCell>) {
-    let cells = view.columns(60, 60, now);
+    let (vals, peaks) = trace_figures(&view.columns(60, 60, now), unit);
+    (vals, peaks, view.heat_columns(60, 60, now))
+}
+
+/// `cells` as a trace's figures over `unit` (never below 0): each column's mean, and its largest
+/// reading for its peak tick.
+fn trace_figures(cells: &[Cell], unit: f64) -> (Vec<Option<f64>>, Vec<Option<f64>>) {
     let of = |v: Option<f64>| v.map(|b| (b / unit).max(0.0));
     let vals = cells.iter().map(|cell| of(cell.mean)).collect();
     let peaks = cells.iter().map(|cell| of(cell.max)).collect();
-    (vals, peaks, view.heat_cells(cells))
+    (vals, peaks)
 }
 
 /// The labels under a 24 hour trace and an hour's.
@@ -4158,7 +4167,12 @@ fn classes_section(c: Ctx<'_>) -> Section<'_> {
     }
 }
 
-/// Biggest now: footprints in the chosen scope.
+/// Biggest now: footprints in the chosen scope. Its heading gives aterm's and this tab's
+/// footprints, and after each one larger than the figure of the scope around it
+/// ([`words::footprints_over`], `docs/DESIGN-stats-deck-units-2026-11-04.md` §4.6), which the bar
+/// cannot show, says so; its one-line form and its words say it too. Those words take no line of
+/// their own, so a footprint that crosses its parent between readings changes this section's words
+/// and moves no section, form or tab.
 fn biggest_section(c: Ctx<'_>) -> Section<'_> {
     let snap = c.snap;
     let total = snap.mem.as_ref().map_or(1, |m| m.sample.total.max(1)) as f64;
@@ -4177,29 +4191,87 @@ fn biggest_section(c: Ctx<'_>) -> Section<'_> {
     })
     .collect();
     let view = c.view(Resource::Memory);
-    let mut scopes = Vec::new();
+    let over = words::footprints_over(
+        Resource::Memory,
+        &view,
+        (!c.panes.is_empty()).then_some(c.tab_label),
+        &c.loc,
+    );
+    let clause = |tab: bool| {
+        over.iter()
+            .find(|f| f.tab == tab)
+            .map(words::FootprintOver::clause)
+    };
+    let mut scopes: Vec<(String, Option<String>)> = Vec::new();
     if let Some(b) = view.aterm.now {
-        scopes.push(format!("aterm {}", words::mem(b as u64)));
+        scopes.push((format!("aterm {}", words::mem(b as u64)), clause(false)));
     }
     if let Some(b) = view.tab.now {
-        scopes.push(format!("{} {}", c.tab_label, words::mem(b as u64)));
+        scopes.push((
+            format!("{} {}", c.tab_label, words::mem(b as u64)),
+            clause(true),
+        ));
     }
-    let subs: Vec<String> = if scopes.is_empty() {
-        vec!["physical footprint".into()]
+    let figures = if scopes.is_empty() {
+        "physical footprint".to_owned()
     } else {
-        vec![scopes.join(" \u{b7} "), scopes[0].clone()]
+        scopes
+            .iter()
+            .map(|(f, _)| f.as_str())
+            .collect::<Vec<_>>()
+            .join(" \u{b7} ")
     };
-    let name = format!("Biggest now{}", c.suffix());
-    let mut line: Vec<String> = rows.first().map(Row::said).into_iter().collect();
-    if rows.is_empty() {
-        line.push(
-            subs.first()
-                .cloned()
-                .unwrap_or_else(|| "no footprint read".into()),
+    // The forms that say a footprint is larger, longest first: each figure with its clause, then
+    // both figures under one clause. Each footprint over has its figure among `scopes`.
+    let mut larger: Vec<String> = Vec::new();
+    if !over.is_empty() {
+        larger.push(
+            scopes
+                .iter()
+                .map(|(f, cl)| {
+                    cl.as_ref()
+                        .map_or_else(|| f.clone(), |cl| format!("{f}, {cl}"))
+                })
+                .collect::<Vec<_>>()
+                .join(" \u{b7} "),
         );
-        return line_section(&name, "Biggest", line, true);
+        if over.len() == 2 {
+            larger.push(format!("{figures}, each larger than the one around it"));
+        }
     }
-    list_section(
+    let said: Vec<String> = over.iter().map(words::FootprintOver::said).collect();
+    let name = format!("Biggest now{}", c.suffix());
+    if rows.is_empty() {
+        let line = larger.into_iter().chain([figures.clone()]).collect();
+        let mut sec = line_section(&name, "Biggest", line, true);
+        sec.words = vec![figures];
+        sec.words.extend(said);
+        return sec;
+    }
+    let subs: Vec<String> = larger
+        .into_iter()
+        .chain([figures])
+        .chain(scopes.into_iter().next().map(|(f, _)| f))
+        .collect();
+    // The one-line form names the biggest process; a footprint larger than its parent follows it
+    // as speech says it, or both under one clause.
+    let first = rows[0].said();
+    let mut alone = Vec::new();
+    if !said.is_empty() {
+        alone.push(said.join(" \u{b7} "));
+    }
+    if let [a, b] = over.as_slice() {
+        alone.push(format!(
+            "{}'s and {}'s footprints are each larger than the one around it",
+            a.who, b.who
+        ));
+    }
+    let line: Vec<String> = alone
+        .iter()
+        .map(|w| format!("{first} \u{b7} {w}"))
+        .chain([first.clone()])
+        .collect();
+    let mut sec = list_section(
         c,
         name,
         subs,
@@ -4209,7 +4281,9 @@ fn biggest_section(c: Ctx<'_>) -> Section<'_> {
         "Biggest",
         line,
         true,
-    )
+    );
+    sec.words.extend(said);
+    sec
 }
 
 /// Swap: used, and its traffic.
@@ -5001,7 +5075,10 @@ fn traffic_section(c: Ctx<'_>) -> Section<'_> {
             false,
         );
     }
-    let forms = match view.now {
+    // The busier direction is the series that binds: the larger share of its own capacity, or
+    // with no share known the larger rate, the rule the trace's columns and the deck's row use;
+    // `view.now` is receiving's alone.
+    let forms = match view.binding().now {
         Some(bps) => {
             let w = net_rate_word(bps);
             vec![format!("{w} busier direction"), w]
@@ -5011,12 +5088,14 @@ fn traffic_section(c: Ctx<'_>) -> Section<'_> {
     line_section("Traffic now", "Traffic", forms, false)
 }
 
-fn net_trace_section(c: Ctx<'_>) -> Section<'_> {
+/// Throughput's last hour as its trace, its unit and its first minute (Unix ms): column by
+/// column, the busier direction's minute, as its heat, the deck's Network row and the words say
+/// ([`ResourceView::busier_columns`]).
+fn net_trace(c: Ctx<'_>) -> (Trace, &'static str, i64) {
     let snap = c.snap;
     let now = snap.at_unix_ms;
-    let view = c.view(Resource::Network);
-    let peak = view
-        .columns(60, 60, now)
+    let (cells, heat) = c.view(Resource::Network).busier_columns(60, 60, now);
+    let peak = cells
         .iter()
         .filter_map(|cell| cell.mean)
         .fold(0.0_f64, f64::max);
@@ -5025,7 +5104,7 @@ fn net_trace_section(c: Ctx<'_>) -> Section<'_> {
     } else {
         (1_000.0, "KB/s", 5.0)
     };
-    let (vals, peaks, heat) = hour_columns(&view, now, scale);
+    let (vals, peaks) = trace_figures(&cells, scale);
     let start = (now.div_euclid(60_000) - 59) * 60_000;
     let (gaps, events) = trace_overlays(snap, start, 60_000, vals.len());
     let trace = Trace {
@@ -5038,6 +5117,12 @@ fn net_trace_section(c: Ctx<'_>) -> Section<'_> {
         gaps,
         events,
     };
+    (trace, unit, start)
+}
+
+/// Throughput, last hour ([`net_trace`]).
+fn net_trace_section(c: Ctx<'_>) -> Section<'_> {
+    let (trace, unit, start) = net_trace(c);
     let said = trace_said(
         "Throughput over the last hour",
         unit,

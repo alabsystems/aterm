@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `/usr/bin/ssh` invocation with fleet keys, UUID-pinned host keys, and bounded fan-out.
+//! `/usr/bin/ssh` invocation with fleet keys, UUID-pinned host keys, and bounded fan-out. Every
+//! connection `ssh` opens is made by `aterm lan fdpass`, through the root LAN broker on macOS
+//! ([`super::lan_proxy`]).
 
 use super::inventory::{Host, Paths};
 use crate::port::{Cmd, Ran, RunFailed, System};
 use std::ffi::OsString;
-use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14,10 +15,6 @@ use std::time::Duration;
 
 /// Path to Apple's OpenSSH client.
 pub const SSH: &str = aterm_uds::os_path!("ssh");
-
-/// Controller report row when Local Network privacy may block LAN access.
-pub const LOCAL_NETWORK_ROW: &str = "controller: aterm has no Local Network access — System \
-                                     Settings ▸ Privacy & Security ▸ Local Network";
 
 /// OpenSSH stderr substring when a pinned host key does not match.
 pub const HOST_KEY_CHANGED: &str = "REMOTE HOST IDENTIFICATION HAS CHANGED!";
@@ -115,6 +112,10 @@ pub enum Mux<'a> {
     Through(&'a Path),
 }
 
+/// How long one connection the controller's `ssh` opens may take (`ConnectTimeout`, and the
+/// broker's connect behind it, [`super::lan_proxy::options`]).
+const CONNECT_WITHIN: Duration = Duration::from_secs(5);
+
 /// Base OpenSSH `-o` options shared by all fleet connections.
 #[must_use]
 pub fn base_options(paths: &Paths, target: &Target) -> Vec<OsString> {
@@ -152,7 +153,7 @@ fn build(paths: &Paths, target: &Target, mux: Mux<'_>) -> Vec<OsString> {
     } else {
         "BatchMode=yes"
     });
-    set("ConnectTimeout=5");
+    set(&format!("ConnectTimeout={}", CONNECT_WITHIN.as_secs()));
     set("ServerAliveInterval=15");
     set("ServerAliveCountMax=4");
     set("ForwardAgent=no");
@@ -178,12 +179,15 @@ fn build(paths: &Paths, target: &Target, mux: Mux<'_>) -> Vec<OsString> {
             set("KbdInteractiveAuthentication=no");
         }
     }
+    // A rider of a master opens no connection while the master lives; one that finds it gone
+    // connects through the proxy too.
+    out.extend(super::lan_proxy::options(CONNECT_WITHIN));
     out
 }
 
 /// `path` as an `-o` value. `ssh` reads `-o` as a config line: it splits a value at blanks
 /// unless it is double-quoted, and expands `%` tokens in these paths.
-fn config_path(path: &Path) -> String {
+pub(crate) fn config_path(path: &Path) -> String {
     let text = path.to_string_lossy().replace('%', "%%");
     if text
         .chars()
@@ -248,11 +252,14 @@ pub enum Failure {
     /// No answer: to the connect, to the SSH banner, or to the address at all (`Host is
     /// down`).
     TimedOut,
-    /// No route to it (and, to a local address, maybe Local Network privacy: the controller
-    /// says so once when every host fails this way).
+    /// No route to it.
     NoRoute,
     /// Its name does not resolve.
     Unresolved,
+    /// The LAN broker could not make the connection (`aterm lan fdpass`'s line, naming why:
+    /// not installed, another protocol, refused): nothing about the host, and the same for
+    /// every host this controller reaches on the LAN.
+    Broker(String),
     /// Anything else: `ssh`'s first line, or that it printed nothing.
     Other(String),
 }
@@ -288,18 +295,7 @@ impl Failure {
             Self::TimedOut => "no answer: asleep, off, or not on this network".into(),
             Self::NoRoute => "no route to it".into(),
             Self::Unresolved => "its name does not resolve".into(),
-            Self::Other(line) => line.clone(),
-        }
-    }
-
-    /// Formats [`Failure::why`] for a single-host command, noting Local Network privacy when applicable.
-    #[must_use]
-    pub fn why_alone(&self, address: &str) -> String {
-        match self {
-            Self::NoRoute if is_local_address(address) => {
-                format!("no route to it; if it is on this network, {LOCAL_NETWORK_ROW}")
-            }
-            other => other.why(),
+            Self::Broker(line) | Self::Other(line) => line.clone(),
         }
     }
 }
@@ -315,7 +311,12 @@ pub fn classify(ran: &Ran) -> Option<Failure> {
         return None;
     }
     let err = ran.err();
-    let failure = if err.contains(HOST_KEY_CHANGED) {
+    let failure = if let Some(line) = err
+        .lines()
+        .find(|line| line.contains(super::lan_proxy::BROKER_SAID))
+    {
+        Failure::Broker(line.trim().to_owned())
+    } else if err.contains(HOST_KEY_CHANGED) {
         Failure::HostKeyChanged
     } else if err.contains(HOST_KEY_UNKNOWN) && err.contains(HOST_KEY_FAILED) {
         Failure::HostKeyUnknown
@@ -341,28 +342,6 @@ pub fn classify(ran: &Ran) -> Option<Failure> {
         )
     };
     Some(failure)
-}
-
-/// Returns whether `address` is governed by macOS Local Network privacy.
-#[must_use]
-pub fn is_local_address(address: &str) -> bool {
-    let name = address.trim_end_matches('.').to_ascii_lowercase();
-    if name.ends_with(".local") {
-        return true;
-    }
-    let bare = name.split('%').next().unwrap_or("");
-    match bare.parse::<IpAddr>() {
-        Ok(IpAddr::V4(v4)) => v4.is_private() || v4.is_link_local(),
-        Ok(IpAddr::V6(v6)) => {
-            let first = v6.segments()[0];
-            (first & 0xffc0) == 0xfe80
-                || (first & 0xfe00) == 0xfc00
-                || v6
-                    .to_ipv4_mapped()
-                    .is_some_and(|v4| v4.is_private() || v4.is_link_local())
-        }
-        Err(_) => false,
-    }
 }
 
 /// Runs `work` across `items` with at most `parallel` concurrent workers, preserving input order.
@@ -452,8 +431,15 @@ mod tests {
         let all = strings(&args);
         assert_eq!(&all[..2], ["-F", "/dev/null"]);
         assert_eq!(all.len(), 2 + 2 * os(&args).len(), "{all:?}");
+        let mut set = os(&args);
+        let proxy = set.split_off(set.len() - 2);
+        assert!(
+            proxy[0].starts_with("ProxyCommand='") && proxy[0].ends_with("' lan fdpass %h %p 5"),
+            "{proxy:?}"
+        );
+        assert_eq!(proxy[1], "ProxyUseFdpass=yes");
         assert_eq!(
-            os(&args),
+            set,
             [
                 "IdentitiesOnly=yes",
                 "IdentityFile=/ctl/machines/keys/ssh_ed25519",
@@ -682,6 +668,15 @@ Host key verification failed.\r\n";
                 Failure::Other("hostname contains invalid characters".into()),
             ),
             ("", Failure::Other(EMPTY_255.into())),
+            (
+                "aterm lan fdpass: the LAN broker is not installed: setup's Mac password \
+                 installs it\r\nConnection closed by UNKNOWN port 65535\r\n",
+                Failure::Broker(
+                    "aterm lan fdpass: the LAN broker is not installed: setup's Mac password \
+                     installs it"
+                        .into(),
+                ),
+            ),
         ];
         for (stderr, want) in cases {
             assert_eq!(classify(&ssh_said(stderr)).as_ref(), Some(want), "{stderr}");
@@ -696,42 +691,7 @@ Host key verification failed.\r\n";
         assert!(Failure::Refused.unreachable());
         assert!(!Failure::HostKeyChanged.unreachable());
         assert!(!Failure::Denied.unreachable());
-    }
-
-    #[test]
-    fn local_network_privacy_governs_on_link_and_private_addresses_only() {
-        for local in [
-            "10.0.0.7",
-            "192.168.64.2",
-            "172.20.1.1",
-            "169.254.3.4",
-            "lab-07.local",
-            "Lab-07.LOCAL.",
-            "fe80::1473:84d2:c39d:69b8%en0",
-            "fd47:fcfc:1b69:b3db:8ce:a8e2:8815:1434",
-        ] {
-            assert!(is_local_address(local), "{local}");
-        }
-        for remote in ["8.8.8.8", "2001:db8::1", "lab.example.com", "localnet"] {
-            assert!(!is_local_address(remote), "{remote}");
-        }
-    }
-
-    #[test]
-    fn one_host_with_no_route_on_the_lan_names_local_network_privacy() {
-        assert!(
-            Failure::NoRoute
-                .why_alone("192.168.64.2")
-                .ends_with(LOCAL_NETWORK_ROW)
-        );
-        assert_eq!(
-            Failure::NoRoute.why_alone("8.8.8.8"),
-            Failure::NoRoute.why()
-        );
-        assert_eq!(
-            Failure::TimedOut.why_alone("192.168.64.2"),
-            Failure::TimedOut.why()
-        );
+        assert!(!Failure::Broker(String::new()).unreachable());
     }
 
     #[test]

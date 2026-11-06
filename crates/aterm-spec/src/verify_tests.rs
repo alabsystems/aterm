@@ -4,6 +4,33 @@
 
 use super::is_pending_stub;
 
+/// One compiled executable chooses its checker policy from each fresh process's environment.
+/// The absent, zero and noncanonical values are negative controls for the required arm.
+#[test]
+fn checkers_are_selected_at_runtime() {
+    const CHILD: &str = "ATERM_SPEC_POLICY_PROBE";
+    if let Some(expected) = std::env::var_os(CHILD) {
+        assert_eq!(super::checkers_required(), expected == "1");
+        return;
+    }
+    for value in [None, Some("0"), Some("true"), Some("1")] {
+        let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+        cmd.args(["--exact", "verify::tests::checkers_are_selected_at_runtime"]);
+        cmd.env(CHILD, if value == Some("1") { "1" } else { "0" });
+        cmd.env_remove("ATERM_SPEC_CHECKERS");
+        if let Some(value) = value {
+            cmd.env("ATERM_SPEC_CHECKERS", value);
+        }
+        let out = cmd.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{value:?}: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(String::from_utf8_lossy(&out.stdout).contains("1 passed"));
+    }
+}
+
 /// Exit 5 or a `Model checking stopped:` line under exit 0 reads as stopped, never a verdict.
 #[cfg(unix)]
 #[test]

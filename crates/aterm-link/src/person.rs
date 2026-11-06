@@ -24,8 +24,17 @@ pub const PERSON_KINDS: [&str; 5] = ["ask", "answer", "task", "report", "note"];
 /// What a person verb was asked to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Act {
-    /// `halt <reason>` (`Some`) or `halt off` (`None`).
+    /// `halt <reason>` (`Some`) or `halt off` (`None`): with the mesh on, `off` lifts every halt
+    /// that stands on this Mac, each by its id, on every Mac.
     Halt(Option<String>),
+    /// `halt off <id> [--here]`, with the mesh on: lift the halt that id names, on every Mac,
+    /// whichever member's person set it (§11 C4), or with `--here` on this Mac alone.
+    Lift {
+        /// The halt id.
+        id: String,
+        /// `--here`: this Mac alone.
+        here: bool,
+    },
     /// `inbox [--peek]`.
     Inbox {
         /// `--peek`: print, commit nothing.
@@ -62,6 +71,7 @@ pub struct PersonCmd {
 pub fn parse(verb: &str, rest: &[String]) -> Result<Option<PersonCmd>, String> {
     let mut cap_files = Vec::new();
     let mut peek = false;
+    let mut here = false;
     let mut words: Vec<String> = Vec::new();
     let mut literal_at = None;
     let mut it = rest.iter();
@@ -74,6 +84,7 @@ pub fn parse(verb: &str, rest: &[String]) -> Result<Option<PersonCmd>, String> {
                     .ok_or_else(|| "--cap-file needs a value".to_string())?,
             ),
             "--peek" if verb == "inbox" => peek = true,
+            "--here" if verb == "halt" => here = true,
             "--" if verb != "inbox" => {
                 literal_at = Some(words.len());
                 words.extend(it.by_ref().cloned());
@@ -83,7 +94,11 @@ pub fn parse(verb: &str, rest: &[String]) -> Result<Option<PersonCmd>, String> {
                 return Err(format!(
                     "unknown flag {} for `{verb}` (--cap-file{})",
                     safe(flag, 64),
-                    if verb == "inbox" { ", --peek" } else { "" }
+                    match verb {
+                        "inbox" => ", --peek",
+                        "halt" => ", --here",
+                        _ => "",
+                    }
                 ));
             }
             other => words.push(other.to_string()),
@@ -103,7 +118,34 @@ pub fn parse(verb: &str, rest: &[String]) -> Result<Option<PersonCmd>, String> {
                         .to_string(),
                 );
             }
+            _ if here && !matches!(words.as_slice(), [off, _] if off == "off") => {
+                return Err(
+                    "--here lifts one halt by its id on this Mac alone: `halt off <id> --here`"
+                        .to_string(),
+                );
+            }
             [off] if off == "off" => Act::Halt(None),
+            [off, id] if off == "off" => {
+                if !crate::halt::is_id(id) {
+                    return Err(format!(
+                        "halt off {}: a halt id is {} lowercase hex digits (`aterm fabric status` \
+                         names each halt that stands, with its id)",
+                        safe(id, 64),
+                        crate::halt::ID_HEX
+                    ));
+                }
+                Act::Lift {
+                    id: id.clone(),
+                    here,
+                }
+            }
+            [off, ..] if off == "off" => {
+                return Err(
+                    "halt off takes at most a halt id (`halt off <id> [--here]`); a reason that \
+                     starts with `off` reads as a halt-off"
+                        .to_string(),
+                );
+            }
             reason => Act::Halt(Some(reason.join(" "))),
         },
         "inbox" => {
@@ -182,7 +224,7 @@ pub fn main(verb: &str, cmd: &PersonCmd, cfg: &Config) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    if matches!(cmd.act, Act::Halt(_)) && !person.starts_with("h-") {
+    if matches!(cmd.act, Act::Halt(_) | Act::Lift { .. }) && !person.starts_with("h-") {
         eprintln!(
             "aterm fabric {verb}: {} is not a human: only an `h-<name>` halts the fleet (every \
              bridge applies `/f/<F>/fleet/h-<name>/halt` alone); an agent's session asks one \
@@ -203,7 +245,9 @@ pub fn main(verb: &str, cmd: &PersonCmd, cfg: &Config) -> ExitCode {
     };
     let caps = cmd.cap_files.join(" ");
     let done = match &cmd.act {
+        Act::Halt(reason) if cfg.mesh.is_some() => mesh_halt(cfg, cmd, &person, reason.as_deref()),
         Act::Halt(reason) => halt(cfg, cmd, &person, reason.as_deref()),
+        Act::Lift { id, here } => lift(cfg, cmd, &person, id, *here),
         Act::Inbox { peek } => inbox(cfg, cmd, &person, *peek, &mut io::stdout(), live()),
         Act::Post {
             sid,
@@ -492,6 +536,117 @@ fn publish(
         )));
     }
     Ok(off)
+}
+
+/// Ask this Mac's bridge for a halt (`reason`) or, with none, to lift every halt that stands
+/// here (§11 C4): the request goes on `/f/alab/fleet/<person>/halts` under the person's ring,
+/// and the bridge says it on this Mac's halt subject, which the mesh relays to every Mac.
+fn mesh_halt(cfg: &Config, cmd: &PersonCmd, person: &str, reason: Option<&str>) -> io::Result<()> {
+    let subject = crate::subject::halt_ask(crate::federate::FLEET, person);
+    let cap = cmd.cap_files.join(" --cap-file ");
+    let Some(reason) = reason else {
+        let standing = standing_here(cfg);
+        if standing.is_empty() {
+            println!(
+                "no halt stands on this Mac (its bridge's state names none); `aterm fabric \
+                 status` names any halt another Mac set that has not reached it yet"
+            );
+            return Ok(());
+        }
+        for id in &standing {
+            ask(
+                cfg,
+                cmd,
+                person,
+                &subject,
+                id,
+                crate::halt::Word::Off,
+                false,
+            )?;
+        }
+        println!(
+            "{person} lifts {} halt(s), on every Mac: {}",
+            standing.len(),
+            standing.join(", ")
+        );
+        return Ok(());
+    };
+    let id = crate::halt::fresh_id()?;
+    let token = crate::halt::reason_token(Some(&crate::pct::encode(reason)));
+    let off = ask(
+        cfg,
+        cmd,
+        person,
+        &subject,
+        &id,
+        crate::halt::Word::On(token),
+        false,
+    )?;
+    println!(
+        "{person}'s halt {id} is ON at @{off} (reason={}): this Mac's bridge says it to every Mac, \
+         and each holds every session (`hold=1 origin=fleet`) as it reads it. `aterm fabric halt \
+         --cap-file {cap} off {id}` lifts it, from any member's person",
+        safe(reason, 128)
+    );
+    Ok(())
+}
+
+/// `halt off <id> [--here]` (§11 C4): ask this Mac's bridge to lift that halt on every Mac, or
+/// with `here` on this Mac alone.
+fn lift(cfg: &Config, cmd: &PersonCmd, person: &str, id: &str, here: bool) -> io::Result<()> {
+    if cfg.mesh.is_none() {
+        return Err(io::Error::other(
+            "a halt id names a halt only with the mesh on; `halt off` withdraws this person's \
+             own halt row",
+        ));
+    }
+    let subject = crate::subject::halt_ask(crate::federate::FLEET, person);
+    let off = ask(cfg, cmd, person, &subject, id, crate::halt::Word::Off, here)?;
+    if here {
+        println!(
+            "{person} lifts halt {id} on this Mac alone at @{off}: its bridge releases the \
+             sessions it held for it (another halt still standing holds them); every other Mac \
+             keeps it"
+        );
+    } else {
+        println!(
+            "{person} lifts halt {id} at @{off}: this Mac's bridge says it to every Mac, and each \
+             releases the sessions it held for it (another halt still standing holds them)"
+        );
+    }
+    Ok(())
+}
+
+/// Write one halt request (`word` for `id`, for this Mac alone when `here`) on `subject`;
+/// answers its offset.
+fn ask(
+    cfg: &Config,
+    cmd: &PersonCmd,
+    person: &str,
+    subject: &str,
+    id: &str,
+    word: crate::halt::Word,
+    here: bool,
+) -> io::Result<u64> {
+    let body = crate::halt::Ask {
+        id: id.to_owned(),
+        word,
+        here,
+    }
+    .render(crate::now_ms());
+    publish(cfg, cmd, person, subject, body.as_bytes())
+}
+
+/// The ids of the halts this Mac's bridge holds its sessions under, from its state dir.
+fn standing_here(cfg: &Config) -> Vec<String> {
+    if cfg.state_dir.is_empty() {
+        return Vec::new();
+    }
+    crate::state::StateDir::peek(&cfg.state_dir)
+        .mesh_halts()
+        .and_then(|text| crate::halt::Halts::parse(&text).ok())
+        .map(|(halts, _)| halts.standing().keys().cloned().collect())
+        .unwrap_or_default()
 }
 
 fn halt(cfg: &Config, cmd: &PersonCmd, person: &str, reason: Option<&str>) -> io::Result<()> {
@@ -1018,7 +1173,10 @@ fn person_guidance(person: &str, fleet: &str, broker: &str, cap: &str) -> String
     let halt = if human {
         format!(
             "  aterm fabric halt --cap-file {cap} <reason>    hold every session on the fleet\n  \
-             aterm fabric halt --cap-file {cap} off         withdraw that halt\n"
+             aterm fabric halt --cap-file {cap} off         withdraw that halt (with the mesh on: \
+             every halt that stands here)\n  \
+             aterm fabric halt --cap-file {cap} off <id>    with the mesh on: lift that halt on \
+             every Mac (`--here`: on this Mac alone)\n"
         )
     } else {
         String::new()
@@ -1158,6 +1316,44 @@ mod tests {
         );
         let off = parse("halt", &words("off --cap-file c")).unwrap().unwrap();
         assert_eq!(off.act, Act::Halt(None));
+        let id = "0123456789abcdef0123456789abcdef";
+        for (tail, here) in [("", false), (" --here", true)] {
+            let lift = parse("halt", &words(&format!("off {id}{tail} --cap-file c")))
+                .unwrap()
+                .unwrap();
+            let want = Act::Lift {
+                id: id.to_string(),
+                here,
+            };
+            assert_eq!(lift.act, want, "off <id>{tail}");
+        }
+        assert!(
+            parse("halt", &words("off 0123 --cap-file c")).is_err(),
+            "not a halt id"
+        );
+        let flag_first = parse("halt", &words(&format!("--here --cap-file c off {id}")));
+        assert!(
+            matches!(
+                flag_first,
+                Ok(Some(PersonCmd {
+                    act: Act::Lift { here: true, .. },
+                    ..
+                }))
+            ),
+            "{flag_first:?}"
+        );
+        assert!(
+            parse("halt", &words(&format!("off {id} extra --cap-file c"))).is_err(),
+            "a mistyped halt-off never halts"
+        );
+        assert!(
+            parse("halt", &words("--here --cap-file c main is broken")).is_err(),
+            "a halt is never for one Mac"
+        );
+        assert!(
+            parse("halt", &words("--here off --cap-file c")).is_err(),
+            "--here names an id"
+        );
         assert!(parse("halt", &words("--cap-file c")).is_err());
         assert!(parse("halt", &words("main is broken")).is_err(), "no cap");
 
@@ -1947,6 +2143,7 @@ mod tests {
             me: here.clone(),
             members: [here.clone(), there.clone()].into(),
             moved: [(retired.to_owned(), there.clone())].into(),
+            gone: std::collections::BTreeSet::new(),
         }
         .write(&keys)
         .unwrap();

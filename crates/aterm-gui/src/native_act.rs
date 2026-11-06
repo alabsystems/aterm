@@ -49,6 +49,35 @@ pub(crate) use observe_control::serve as serve_observation;
 mod renewal;
 pub(crate) use renewal::serve as serve_codex_renewal;
 pub(crate) use renewal::serve_rotation as serve_codex_rotation;
+#[path = "codex_accounts_control.rs"]
+mod accounts_control;
+pub(crate) use accounts_control::serve as serve_codex_accounts;
+#[cfg(unix)]
+#[path = "codex_enrollment_control.rs"]
+mod enrollment_control;
+
+pub(crate) fn serve_codex_enrollment(
+    ctx: &Arc<crate::SessionCtx>,
+    master: i32,
+    line: &str,
+    lifetime: &aterm_agent::harness::account_work::Lifetime,
+    read: bool,
+) -> String {
+    #[cfg(unix)]
+    {
+        enrollment_control::serve(ctx, master, line, lifetime, read)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (ctx, master, line, lifetime);
+        if read {
+            "ERR codex-accounts unsupported\n".into()
+        } else {
+            "ERR codex-accounts-change unsupported\n".into()
+        }
+    }
+}
+
 pub(crate) fn cancel_renewal_owner(ctx: &crate::SessionCtx) -> Result<bool, &'static str> {
     #[cfg(unix)]
     let exec = exec_handoff::cancel_owner(ctx);

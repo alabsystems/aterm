@@ -12,6 +12,7 @@ use aterm_agent::harness::footer::{FactKind, FactMask};
 use aterm_agent::harness::lights::{self, Goal, Light, LightState, Mode, ModeInk, Reading, Screen};
 use aterm_agent::supervise::Autopilot;
 use aterm_core::terminal::{RenderCell, UnderlineStyle};
+use aterm_effects::glass_inks::{GlassInks, field};
 use aterm_window::event::KeyEvent;
 use aterm_window::keyboard::{Key, ModifiersState, NamedKey};
 
@@ -100,77 +101,128 @@ impl From<Light> for Chip {
     }
 }
 
-/// Land's ink: the amber of Claude Code's own auto-mode pill (`lights::Mode::Auto`'s hue).
-const AMBER: [u8; 3] = [0xE8, 0xB0, 0x3C];
+/// Where a chip block stands on its pane's rule, and the glass it wears there
+/// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §4.1): the pane column its first cell
+/// takes and the pane's width, so each chip wears the letter of its own column
+/// ([`GlassInks::letter`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChipAt {
+    pub(crate) glass: GlassInks,
+    pub(crate) col: usize,
+    pub(crate) cols: usize,
+}
 
-/// The text floor a chip's own hue is held to on the row's ground.
-const CHIP_INK_FLOOR: f64 = 4.5;
-
-/// How far a chip's title is lifted toward the row's ink.
-const TITLE_LIFT: f32 = 0.8;
-
-/// A chip's hue on `ground`.
-fn floored(hue: [u8; 3], ground: [u8; 3]) -> [u8; 3] {
-    type Kept = [Option<([u8; 3], [u8; 3], [u8; 3])>; 4];
-    thread_local! {
-        static KEPT: std::cell::Cell<Kept> = const { std::cell::Cell::new([None; 4]) };
+impl ChipAt {
+    /// A block whose width alone is read: no palette, at a pane's first column.
+    fn bare(blank: RenderCell) -> Self {
+        let pack = |c: [u8; 3]| u32::from_be_bytes([0, c[0], c[1], c[2]]);
+        Self {
+            glass: GlassInks::of(None, pack(blank.bg), pack(blank.fg), pack(blank.fg)),
+            col: 0,
+            cols: 1,
+        }
     }
-    KEPT.with(|kept| {
-        let mut pairs = kept.get();
-        let at = pairs
-            .iter()
-            .position(|p| p.is_some_and(|(h, g, _)| h == hue && g == ground));
-        let ink = match at {
-            Some(i) => pairs[i].map_or(hue, |(_, _, ink)| ink),
-            None => crate::chrome_band::ensure_contrast(hue, ground, CHIP_INK_FLOOR),
-        };
-        let last = at.unwrap_or(pairs.len() - 1);
-        pairs.copy_within(0..last, 1);
-        pairs[0] = Some((hue, ground, ink));
-        kept.set(pairs);
-        ink
-    })
+
+    /// The letter a chip `offset` cells into the block wears.
+    fn letter(self, offset: usize) -> [u8; 3] {
+        let c = self.glass.letter(field(self.col + offset, self.cols));
+        [(c >> 16) as u8, (c >> 8) as u8, c as u8]
+    }
 }
 
-/// Land's ink on `ground`.
-fn land_ink(ground: [u8; 3]) -> [u8; 3] {
-    floored(AMBER, ground)
+#[cfg(test)]
+impl ChipAt {
+    /// The pane width a test's block is laid across.
+    pub(crate) const TEST_COLS: usize = 80;
+
+    /// A block under `palette` on `blank`'s row, laid where a footer's chips stand on an
+    /// 80-column pane (a blank after the rule's lead).
+    pub(crate) fn test(
+        palette: Option<aterm_effects::harness_card::CardPalette>,
+        blank: RenderCell,
+    ) -> Self {
+        let pack = |c: [u8; 3]| u32::from_be_bytes([0, c[0], c[1], c[2]]);
+        Self {
+            glass: GlassInks::of(palette, pack(blank.bg), pack(blank.fg), 0x0088_8888),
+            col: aterm_agent::harness::footer::RULE_LEAD + 1,
+            cols: Self::TEST_COLS,
+        }
+    }
+
+    /// [`Self::test`] under Cruise.
+    pub(crate) fn cruise(blank: RenderCell) -> Self {
+        Self::test(
+            Some(aterm_effects::harness_card::CardPalette::Cruise),
+            blank,
+        )
+    }
+
+    /// [`Self::test`] under Land.
+    pub(crate) fn land(blank: RenderCell) -> Self {
+        Self::test(Some(aterm_effects::harness_card::CardPalette::Land), blank)
+    }
+
+    /// The letter a chip `offset` cells into the block wears.
+    pub(crate) fn letter_at(self, offset: usize) -> [u8; 3] {
+        self.letter(offset)
+    }
+
+    /// The quiet ink: the off chips' and the quiet marks' ([`GlassInks::quiet`]).
+    pub(crate) fn quiet(self) -> [u8; 3] {
+        Inks::of(RenderCell::default(), self).quiet
+    }
+
+    /// The value ink: a title's and an expected mode's ([`GlassInks::value`]).
+    pub(crate) fn value(self) -> [u8; 3] {
+        Inks::of(RenderCell::default(), self).title
+    }
 }
 
-/// The inks a block of chips is drawn in, read from its row's `blank` cell and `accent`.
+/// The inks a block of chips is drawn in: the glass's tokens on its row
+/// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §4.1), the letter the chip being laid's
+/// column wears ([`Inks::at`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Inks {
-    accent: [u8; 3],
-    amber: [u8; 3],
+    /// The chip being laid's letter ([`GlassInks::letter`]).
+    letter: [u8; 3],
+    /// The row's own ink ([`GlassInks::lit`]).
     ink: [u8; 3],
-    dim: [u8; 3],
-    /// The off chips' words ([`off_of`]).
-    off: [u8; 3],
+    /// The quiet words and marks: the off chips, a worker's, a manager's, an unknown mode
+    /// ([`GlassInks::quiet`]).
+    quiet: [u8; 3],
+    /// A chip's title and an expected mode's word ([`GlassInks::value`]).
     title: [u8; 3],
     ground: [u8; 3],
+    at: ChipAt,
 }
 
 impl Inks {
-    /// The inks of a row of `blank`'s under `accent`.
-    fn of(blank: RenderCell, accent: [u8; 3]) -> Self {
+    /// The inks of a row of `blank`'s, its block laid `at`.
+    fn of(blank: RenderCell, at: ChipAt) -> Self {
+        let rgb = |c: u32| [(c >> 16) as u8, (c >> 8) as u8, c as u8];
         Self {
-            accent: crate::claude_footer::legible_on(accent, blank.bg),
-            amber: land_ink(blank.bg),
-            ink: crate::claude_footer::legible_on(blank.fg, blank.bg),
-            dim: dim_of(blank),
-            off: off_of(blank),
-            title: title_ink(blank),
+            letter: at.letter(0),
+            ink: rgb(at.glass.lit()),
+            quiet: rgb(at.glass.quiet()),
+            title: rgb(at.glass.value()),
             ground: blank.bg,
+            at,
+        }
+    }
+
+    /// These inks for a chip `offset` cells into the block.
+    fn at(self, offset: usize) -> Self {
+        Self {
+            letter: self.at.letter(offset),
+            ..self
         }
     }
 
     /// A harness tone's ink.
     const fn of_tone(self, tone: ChipTone) -> [u8; 3] {
         match tone {
-            ChipTone::Accent => self.accent,
-            ChipTone::Amber => self.amber,
-            ChipTone::Dim => self.dim,
-            ChipTone::Off => self.off,
+            ChipTone::Letter => self.letter,
+            ChipTone::Quiet => self.quiet,
         }
     }
 }
@@ -510,7 +562,7 @@ struct SessionLights {
     /// An Autopilot click in flight.
     autopilot_pending: Option<(Autopilot, Instant)>,
     /// A press of the harness switch that wrote a switch of aterm.toml: the side it turns to
-    /// (`true` on, `false` off), and when `◐` stops waiting for the policy to read it back.
+    /// (`true` on, `false` off), and when `◌` stops waiting for the policy to read it back.
     switch_turning: Option<(bool, Instant)>,
     /// When the harness-switch gesture's last press came: a press that flipped the switch (either
     /// way) starts one, and a press of the switch or of the Autopilot chip within a double click's
@@ -529,9 +581,6 @@ struct SessionLights {
     /// Whether the glass rewrote Claude's mode row on this pane this frame, its pill dropped:
     /// the lights block is then the mode's one home ([`lights::Mode::word_on_glass`]).
     rewritten: bool,
-    /// The ink of the composer's bottom rule this frame read (one of its own `─` cells): `yolo`
-    /// is drawn in it ([`ModeInk::Rule`]), floored to read as text.
-    rule: Option<[u8; 3]>,
     /// What a fact menu's row just did here (a copy, a new tab).
     fact_notice: Option<(FactNotice, Instant)>,
     /// The mode's name a click on the Autopilot chip brought up beside its glyph.
@@ -1153,7 +1202,7 @@ struct Fitted {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FitKey {
     blank: RenderCell,
-    accent: [u8; 3],
+    at: ChipAt,
     selected: Option<Target>,
     hover: Option<Target>,
     room: usize,
@@ -1176,8 +1225,6 @@ struct LightsKey {
     glass: ChipGlass,
     /// The mode row's rewrite ([`SessionLights::rewritten`]).
     rewritten: bool,
-    /// The rule's ink ([`SessionLights::rule`]).
-    rule: Option<[u8; 3]>,
     team: Option<u64>,
     /// A fact notice's hash: a slash press's words are text.
     fact_notice: Option<u64>,
@@ -1210,7 +1257,6 @@ impl SessionLights {
             autopilot_pending: self.autopilot_pending.is_some(),
             glass: self.glass,
             rewritten: self.rewritten,
-            rule: self.rule,
             team: self.team.as_ref().map(|face| {
                 use std::hash::{Hash as _, Hasher as _};
                 let mut h = std::hash::DefaultHasher::new();
@@ -1613,11 +1659,9 @@ impl WindowLights {
     }
 
     /// Note the row `session`'s footer is drawn on this frame: whether the glass rewrote Claude's
-    /// mode row, and the ink of the bottom rule the chips sit in.
-    fn note_row(&mut self, session: u64, rewritten: bool, rule: [u8; 3]) {
-        let s = self.sessions.entry(session).or_default();
-        s.rewritten = rewritten;
-        s.rule = Some(rule);
+    /// mode row.
+    fn note_row(&mut self, session: u64, rewritten: bool) {
+        self.sessions.entry(session).or_default().rewritten = rewritten;
     }
 
     /// [`Self::note_autopilot_at`] at `now`.
@@ -1924,7 +1968,7 @@ impl WindowLights {
     /// Pane `pane`'s chip block of `session` ([`App::claude_lights_block`]).
     #[allow(
         clippy::too_many_arguments,
-        reason = "the fit's inputs: the pane, its ground, the accent, the two chips in focus, the \
+        reason = "the fit's inputs: the pane, its ground, where it stands, the two chips in focus, the \
                   room and Autopilot's title"
     )]
     fn lend_block(
@@ -1932,7 +1976,7 @@ impl WindowLights {
         session: u64,
         pane: usize,
         blank: RenderCell,
-        accent: [u8; 3],
+        chips_at: ChipAt,
         (selected, hover): (Option<Target>, Option<Target>),
         (room, named): (usize, bool),
         title: Option<TitleAt>,
@@ -1945,7 +1989,7 @@ impl WindowLights {
         };
         let key = FitKey {
             blank,
-            accent,
+            at: chips_at,
             selected,
             hover,
             room,
@@ -2011,7 +2055,7 @@ impl WindowLights {
             session,
             blank,
             now.unwrap_or_else(lights_now),
-            accent,
+            chips_at,
             selected.and_then(Target::chip),
             hover.and_then(Target::chip),
             (room, named),
@@ -2064,7 +2108,7 @@ impl WindowLights {
         session: u64,
         blank: RenderCell,
         now: Instant,
-        accent: [u8; 3],
+        chips_at: ChipAt,
         keep: Keep,
     ) -> Block {
         let mine = |at: Option<(u64, Target)>| {
@@ -2075,7 +2119,7 @@ impl WindowLights {
             session,
             blank,
             now,
-            accent,
+            chips_at,
             mine(self.selected),
             mine(self.hover),
             keep,
@@ -2086,7 +2130,7 @@ impl WindowLights {
     /// The block ([`Self::block_into`]) `room` cells hold, down [`Keep::LADDER`].
     #[allow(
         clippy::too_many_arguments,
-        reason = "the block's inputs: the session, its ground, the clock, the accent, the \
+        reason = "the block's inputs: the session, its ground, the clock, where it stands, the \
                   pointer's and the keyboard's chips and the room"
     )]
     fn fitted(
@@ -2094,7 +2138,7 @@ impl WindowLights {
         session: u64,
         blank: RenderCell,
         now: Instant,
-        accent: [u8; 3],
+        chips_at: ChipAt,
         selected: Option<Chip>,
         hover: Option<Chip>,
         room: usize,
@@ -2104,7 +2148,7 @@ impl WindowLights {
             session,
             blank,
             now,
-            accent,
+            chips_at,
             selected,
             hover,
             (room, true),
@@ -2125,7 +2169,7 @@ impl WindowLights {
         session: u64,
         blank: RenderCell,
         now: Instant,
-        accent: [u8; 3],
+        chips_at: ChipAt,
         selected: Option<Chip>,
         hover: Option<Chip>,
         (room, named): (usize, bool),
@@ -2134,7 +2178,7 @@ impl WindowLights {
     ) -> bool {
         let at_rest = SessionLights::default();
         let s = self.sessions.get(&session).unwrap_or(&at_rest);
-        let inks = Inks::of(blank, accent);
+        let inks = Inks::of(blank, chips_at);
         let glyph_rung = s.glyph_rung();
         let width_at = |keep: Keep, named: Option<(&'static str, u32)>| {
             let drawn = drawn_at(s, now, selected, hover, keep);
@@ -2159,7 +2203,7 @@ impl WindowLights {
             session,
             blank,
             now,
-            accent,
+            chips_at,
             selected,
             hover,
             (keep, named),
@@ -2183,7 +2227,7 @@ impl WindowLights {
         session: u64,
         blank: RenderCell,
         now: Instant,
-        accent: [u8; 3],
+        chips_at: ChipAt,
         selected: Option<Chip>,
         hover: Option<Chip>,
         keep: Keep,
@@ -2194,7 +2238,7 @@ impl WindowLights {
             session,
             blank,
             now,
-            accent,
+            chips_at,
             selected,
             hover,
             (
@@ -2213,7 +2257,7 @@ impl WindowLights {
     /// `session`'s chip block at `keep`.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the block's inputs: the session, its ground, the clock, the accent, the \
+        reason = "the block's inputs: the session, its ground, the clock, where it stands, the \
                   pointer's and the keyboard's chips, how much of the row is kept, Autopilot's \
                   title as its reading built it, and the block it lays into"
     )]
@@ -2222,7 +2266,7 @@ impl WindowLights {
         session: u64,
         blank: RenderCell,
         now: Instant,
-        accent: [u8; 3],
+        chips_at: ChipAt,
         selected: Option<Chip>,
         hover: Option<Chip>,
         (keep, named): (Keep, Option<(&'static str, u32)>),
@@ -2260,7 +2304,7 @@ impl WindowLights {
                 .filter(|_| drawn(Chip::Autopilot))
                 .map(ChipTitle::Act)
         });
-        let inks = Inks::of(blank, accent);
+        let inks = Inks::of(blank, chips_at);
         let title_ink = inks.title;
         let Block {
             title,
@@ -2306,6 +2350,7 @@ impl WindowLights {
                 }
             };
         let titled = titled.filter(|_| fact.is_none());
+        let mut act_tone = None;
         let focus_titled = matches!(titled, Some(ChipTitle::Chip(chip)) if focus == Some(chip));
         let fact_noticed = fact_noticed
             .filter(|(_, said)| fact.is_none() || *said)
@@ -2345,6 +2390,7 @@ impl WindowLights {
             Some(ChipTitle::Act(act)) => {
                 let view = s.autopilot.unwrap_or(AutopilotView::Unhosted);
                 let (glyph, word, tone) = act_label(view, act);
+                act_tone = Some(tone);
                 let ink = inks.of_tone(tone);
                 title.extend(
                     glyph
@@ -2369,7 +2415,7 @@ impl WindowLights {
                 if before.is_some_and(|(chip, worded)| gap_after(chip, worded) > 1) {
                     let mut rule = blank;
                     rule.ch = CHIP_RULE;
-                    rule.fg = inks.dim;
+                    rule.fg = inks.quiet;
                     cells.push(rule);
                     cells.push(blank);
                 }
@@ -2378,7 +2424,7 @@ impl WindowLights {
                 chip,
                 s,
                 keep,
-                inks,
+                inks.at(cells.len()),
                 named.filter(|_| chip == Chip::Autopilot),
             );
             before = Some((chip, face.worded()));
@@ -2400,6 +2446,14 @@ impl WindowLights {
                 }
             }
             cols.push((start..cells.len(), chip));
+        }
+        // An act's label stands after the chips and the two blanks the rule lays before a title
+        // ([`crate::claude_footer`]'s `compose_rule_spans`): its letter is that column's.
+        if let Some(tone) = act_tone {
+            let ink = inks.at(cells.len() + 2).of_tone(tone);
+            for c in title.iter_mut() {
+                c.fg = ink;
+            }
         }
         *holds = cells.len();
         if named.is_some() {
@@ -2782,10 +2836,10 @@ fn face_of<'a>(
         Chip::Team => match &s.team {
             Some(TeamFace::Yours) => Face::plain("\u{270b}", Some("you"), ink),
             Some(TeamFace::Worker { label, .. }) => {
-                Face::plain("\u{21e0}", Some(&**label), inks.dim)
+                Face::plain("\u{21e0}", Some(&**label), inks.quiet)
             }
-            Some(TeamFace::Manager { mark, .. }) => Face::plain(mark, None, inks.dim),
-            None => Face::plain("", None, inks.dim),
+            Some(TeamFace::Manager { mark, .. }) => Face::plain(mark, None, inks.quiet),
+            None => Face::plain("", None, inks.quiet),
         },
     }
 }
@@ -2807,8 +2861,8 @@ enum ChipTitle {
 }
 
 /// A light's glyph, word and ink: on a rewritten row `yolo`, `auto` and `lame` stand as words
-/// alone ([`Mode::glyph_on_glass`]), `◐` stands for the glyph while a toggle is in flight, and the
-/// ink is the mode's ([`Mode::ink`]): bypass in the rule's own, floored to read as text.
+/// alone ([`Mode::glyph_on_glass`]), `◌` stands for the glyph while a toggle is in flight, and the
+/// ink is the mode's ([`Mode::ink`]): an expected mode in the value ink, the rest in the row's.
 fn light_face(
     light: Light,
     s: &SessionLights,
@@ -2821,12 +2875,11 @@ fn light_face(
             glyph(mode.glyph_on_glass(s.rewritten)),
             mode.word_on_glass(s.rewritten),
             match mode.ink() {
-                ModeInk::Rule => s.rule.map_or(inks.ink, |rule| floored(rule, inks.ground)),
-                ModeInk::Hue(hue) => floored(hue, inks.ground),
+                ModeInk::Value => inks.title,
                 ModeInk::Row => inks.ink,
             },
         ),
-        None => (glyph("\u{25CC}"), light.word(), inks.dim),
+        None => (glyph("\u{25CC}"), light.word(), inks.quiet),
     }
 }
 
@@ -2935,13 +2988,15 @@ impl ChipFace {
     #[must_use]
     pub(crate) const fn tones(self) -> (ChipTone, ChipTone) {
         match self {
-            ChipFace::Cruise => (ChipTone::Accent, ChipTone::Accent),
-            ChipFace::CruiseUntil => (ChipTone::Accent, ChipTone::Amber),
-            ChipFace::Land | ChipFace::Landed => (ChipTone::Amber, ChipTone::Amber),
-            ChipFace::Theirs | ChipFace::Failed => (ChipTone::Dim, ChipTone::Dim),
-            ChipFace::Off | ChipFace::MasterOff | ChipFace::AgentOff(_) | ChipFace::Unhosted => {
-                (ChipTone::Off, ChipTone::Off)
+            ChipFace::Cruise | ChipFace::CruiseUntil | ChipFace::Land | ChipFace::Landed => {
+                (ChipTone::Letter, ChipTone::Letter)
             }
+            ChipFace::Theirs
+            | ChipFace::Failed
+            | ChipFace::Off
+            | ChipFace::MasterOff
+            | ChipFace::AgentOff(_)
+            | ChipFace::Unhosted => (ChipTone::Quiet, ChipTone::Quiet),
         }
     }
 
@@ -3437,51 +3492,12 @@ fn fenced_screen_now<T>(
     crate::reader_guard::read_or_none(session, "Claude Code live screen", rows, read).flatten()
 }
 
-/// The title's ink on `blank`'s row.
-fn title_ink(blank: RenderCell) -> [u8; 3] {
-    floored(
-        crate::chrome_band::mix3(blank.bg, blank.fg, TITLE_LIFT),
-        blank.bg,
-    )
-}
-
-/// `blank`'s ink halfway to its ground.
-fn halfway_of(blank: RenderCell) -> [u8; 3] {
-    let mix = |a: u8, b: u8| ((u16::from(a) + u16::from(b)) / 2) as u8;
-    [
-        mix(blank.fg[0], blank.bg[0]),
-        mix(blank.fg[1], blank.bg[1]),
-        mix(blank.fg[2], blank.bg[2]),
-    ]
-}
-
-/// `blank`'s ink halfway to its ground, floored to be seen (3:1): a worker's `⇠`, a manager's
-/// mark, an unknown mode's `◌`, a quiet tab's `⤓ quiet`.
-fn dim_of(blank: RenderCell) -> [u8; 3] {
-    crate::claude_footer::visible_on(halfway_of(blank), blank.bg)
-}
-
-/// The off chips' ink (`○`, `⊘ off`): `blank`'s halfway ink floored to read as words do
-/// (4.5:1), quiet, never faint, and never louder than the row's own ink.
-fn off_of(blank: RenderCell) -> [u8; 3] {
-    use crate::claude_footer::legible_on;
-    let reads = |c: [u8; 3]| {
-        let pack = |c: [u8; 3]| u32::from_be_bytes([0, c[0], c[1], c[2]]);
-        aterm_effects::color_math::contrast_ratio(pack(c), pack(blank.bg))
-    };
-    let (off, ink) = (
-        legible_on(halfway_of(blank), blank.bg),
-        legible_on(blank.fg, blank.bg),
-    );
-    if reads(off) > reads(ink) { ink } else { off }
-}
-
 #[cfg(test)]
 thread_local! {
     /// The windows [`App::redraw_autopilot_title_readers`] asked for a frame on this thread.
     pub(crate) static TITLE_READERS_ASKED: std::cell::Cell<u32> =
         const { std::cell::Cell::new(0) };
-    /// The harness switches a refused write let go of `◐ turning on` or `off` on this thread.
+    /// The harness switches a refused write let go of `◌ turning on` or `off` on this thread.
     pub(crate) static SWITCHES_LET_GO: std::cell::Cell<u32> =
         const { std::cell::Cell::new(0) };
 }
@@ -3538,7 +3554,7 @@ pub(crate) struct Block {
 impl Block {
     /// Synthetic private-dev input through the production lights reading and chip composition.
     #[cfg(any(debug_assertions, feature = "dev-seams"))]
-    pub(crate) fn layout_scene(blank: RenderCell, accent: [u8; 3]) -> Block {
+    pub(crate) fn layout_scene(blank: RenderCell, at: ChipAt) -> Block {
         let mut lights = WindowLights::default();
         let rows = [
             "─".repeat(80),
@@ -3564,7 +3580,7 @@ impl Block {
             0,
             blank,
             now,
-            accent,
+            at,
             None,
             None,
             (Keep::Revealed, named),
@@ -3618,11 +3634,11 @@ impl Block {
     }
 
     /// The block a session at rest draws under `view`.
-    pub(crate) fn of_autopilot(view: AutopilotView, blank: RenderCell, accent: [u8; 3]) -> Block {
+    pub(crate) fn of_autopilot(view: AutopilotView, blank: RenderCell, at: ChipAt) -> Block {
         let mut w = WindowLights::default();
         let now = Instant::now();
         w.note_autopilot(0, view.mode(), view, now);
-        w.block(0, blank, now, accent, Keep::Drawn)
+        w.block(0, blank, now, at, Keep::Drawn)
     }
 }
 
@@ -3665,7 +3681,7 @@ impl App {
         wid: WindowId,
         session: u64,
         (word, view): (Option<Autopilot>, AutopilotView),
-        (rewritten, rule): (bool, [u8; 3]),
+        rewritten: bool,
     ) {
         let glass = self.chip_glass(session);
         if let Some(ws) = self.windows.get_mut(&wid) {
@@ -3675,7 +3691,7 @@ impl App {
                     crate::work_counts::harness_clock_read();
                     Instant::now()
                 });
-            ws.claude_lights.note_row(session, rewritten, rule);
+            ws.claude_lights.note_row(session, rewritten);
         }
     }
 
@@ -3714,16 +3730,17 @@ impl App {
     }
 
     /// The chip block to paint in pane `pane` (its leaf) of `session`, in its composer rule: in
-    /// `room`'s cells, with the mode's name a click brought up where its flag lets it be laid.
+    /// `room`'s cells, standing at `chips_at`, with the mode's name a click brought up where its flag lets
+    /// it be laid.
     pub(crate) fn claude_lights_block(
         &mut self,
         wid: WindowId,
         session: u64,
         pane: usize,
         blank: RenderCell,
+        chips_at: ChipAt,
         room: (usize, bool),
     ) -> Option<Block> {
-        let accent = crate::chrome_band::band_colors(self.theme).accent;
         let ws = self.windows.get_mut(&wid)?;
         let waits = crate::claude_panel::pointed_wait(ws.claude_card.panels(), session);
         let lights = &mut ws.claude_lights;
@@ -3847,7 +3864,15 @@ impl App {
             None => panel_at.map(TitleAt::Panel),
             _ => at.map(TitleAt::Autopilot),
         };
-        lights.lend_block(session, pane, blank, accent, (selected, hover), room, title)
+        lights.lend_block(
+            session,
+            pane,
+            blank,
+            chips_at,
+            (selected, hover),
+            room,
+            title,
+        )
     }
 
     /// The WINDOWS reading `session`'s autopilot title.
@@ -4493,7 +4518,7 @@ impl App {
     /// off and the agent's own background work and waits only for what a restart would lose or
     /// cannot pass (`upgrade::press_gate`); for another CLI the tab menu's Upgrade Now for the
     /// build it offers (`App::send_upgrade_word`), which skips the hold clock and keeps every
-    /// safety gate. An asked move's `◐` takes no second press, and a held one asks nothing and
+    /// safety gate. An asked move's `◌` takes no second press, and a held one asks nothing and
     /// says why it cannot move (another supervisor holds it, or another CLI's harness or
     /// Autopilot is off, [`crate::claude_footer::UpState::Held`]). A tab name being edited settles
     /// first.
@@ -5055,7 +5080,7 @@ impl App {
                         session,
                         RenderCell::default(),
                         now,
-                        [0; 3],
+                        ChipAt::bare(RenderCell::default()),
                         Some(chip),
                         None,
                         room,
@@ -5631,9 +5656,6 @@ mod tests {
     /// The mode light's chip.
     const MODE: Chip = Chip::Light(Light::Mode);
 
-    /// The footer's mark accent, as a theme gives it: Cruise's ink.
-    const ACCENT: [u8; 3] = [0, 128, 255];
-
     #[test]
     fn inert_session_history_does_not_change_the_lights_repaint_key() {
         let now = Instant::now();
@@ -5737,14 +5759,14 @@ mod tests {
         let mut w = WindowLights::default();
         for mode in [BYPASS, AUTO] {
             observe(&mut w, &screen(&bare, mode, ""));
-            let rest = w.block(7, blank(), now, ACCENT, Keep::Revealed);
+            let rest = w.block(7, blank(), now, ChipAt::cruise(blank()), Keep::Revealed);
             assert!(
                 rest.lights.is_empty() && rest.cols.is_empty() && rest.title.is_empty(),
                 "nothing at rest: {mode:?}"
             );
         }
         observe(&mut w, &screen(&bare, PLAN, ""));
-        let block = w.block(7, blank(), now, ACCENT, Keep::Revealed);
+        let block = w.block(7, blank(), now, ChipAt::cruise(blank()), Keep::Revealed);
         let text: String = block.lights.iter().map(|c| c.ch).collect();
         assert_eq!(text, "\u{23F8} plan");
         assert_eq!(block.cols, vec![(0..6, MODE)]);
@@ -5752,12 +5774,13 @@ mod tests {
         assert_eq!(block.lights[0].fg, blank().fg, "plan, in the row's ink");
         w.observe(7, None);
         assert_eq!(
-            w.block(7, blank(), now, ACCENT, Keep::Revealed).lights,
+            w.block(7, blank(), now, ChipAt::cruise(blank()), Keep::Revealed)
+                .lights,
             block.lights,
             "a covered composer keeps the last reading"
         );
         w.hover = Some((7, Target::from(MODE)));
-        let hovered = w.block(7, blank(), now, ACCENT, Keep::Revealed);
+        let hovered = w.block(7, blank(), now, ChipAt::cruise(blank()), Keep::Revealed);
         assert!(!hovered.title.is_empty(), "a hover asks for the title");
         assert_eq!(
             hovered.lights.len(),
@@ -5773,21 +5796,25 @@ mod tests {
         observe(&mut w, &screen(&bare, BYPASS, ""));
         w.note_autopilot(7, None, AutopilotView::Unhosted, now);
         assert!(
-            w.block(7, blank(), now, ACCENT, Keep::Revealed)
+            w.block(7, blank(), now, ChipAt::cruise(blank()), Keep::Revealed)
                 .cols
                 .is_empty(),
             "no host: no chip"
         );
         w.note_autopilot(7, None, AutopilotView::Cruise, now);
-        let rest = w.block(7, blank(), now, ACCENT, Keep::Revealed);
+        let rest = w.block(7, blank(), now, ChipAt::cruise(blank()), Keep::Revealed);
         let text: String = rest.lights.iter().map(|c| c.ch).collect();
         assert_eq!(text, "\u{221e}", "at rest: Autopilot alone");
         assert_eq!(rest.cols, vec![(0..1, Chip::Autopilot)]);
-        assert_eq!(rest.lights[0].fg, ACCENT, "cruise in the accent");
+        assert_eq!(
+            rest.lights[0].fg,
+            ChipAt::cruise(blank()).letter_at(0),
+            "cruise in its column's letter"
+        );
         assert!(rest.title.is_empty(), "nothing asked for a title");
         observe(&mut w, &screen(&bare, PLAN, ""));
         let text: String = w
-            .block(7, blank(), now, ACCENT, Keep::Revealed)
+            .block(7, blank(), now, ChipAt::cruise(blank()), Keep::Revealed)
             .lights
             .iter()
             .map(|c| c.ch)
@@ -5823,7 +5850,7 @@ mod tests {
                     asked: 0,
                 });
             }
-            let block = w.block(7, blank(), now, ACCENT, Keep::Revealed);
+            let block = w.block(7, blank(), now, ChipAt::cruise(blank()), Keep::Revealed);
             assert_eq!(
                 text(&block.lights),
                 format!("{lead}\u{23F8} plan"),
@@ -5846,7 +5873,7 @@ mod tests {
                 "{view:?}: no chip's hit takes the rule"
             );
             let s = &w.sessions[&7];
-            let inks = Inks::of(blank(), ACCENT);
+            let inks = Inks::of(blank(), ChipAt::cruise(blank()));
             let drawn = drawn_at(s, now, None, None, Keep::Revealed);
             assert_eq!(
                 chips_width_at(
@@ -5891,7 +5918,7 @@ mod tests {
             ),
         ] {
             w.note_autopilot(7, view.mode(), view, now);
-            let block = w.block(7, blank(), now, ACCENT, Keep::Revealed);
+            let block = w.block(7, blank(), now, ChipAt::cruise(blank()), Keep::Revealed);
             assert_eq!(text(&block.lights), want, "{view:?}");
             assert_eq!(block.rule_gaps().count(), gaps, "{view:?}: the rule cells");
             let s = &w.sessions[&7];
@@ -5901,7 +5928,7 @@ mod tests {
                     s,
                     Chip::row().filter(|c| drawn(*c)),
                     Keep::Revealed,
-                    Inks::of(blank(), ACCENT),
+                    Inks::of(blank(), ChipAt::cruise(blank())),
                     None,
                 ),
                 block.lights.len(),
@@ -5910,47 +5937,61 @@ mod tests {
         }
     }
 
+    /// THE AUTOPILOT CHIP SAYS ITS VIEW IN ITS INK: under Cruise and Land the chip wears the
+    /// letter of its own column in its view's palette, Off and the harness held off the quiet
+    /// ink; no view reads the system accent or Claude's pill amber. CONTROL: Land's letter at the
+    /// chip's column is not Cruise's, so the palette, not a fixed ink, decides.
     #[test]
     fn the_autopilot_chip_says_its_view_in_its_ink() {
+        use aterm_effects::harness_card::CardPalette;
         let now = Instant::now();
-        let dim = off_of(blank());
         let mut w = WindowLights::default();
+        let (cruise, land, off, none) = (
+            ChipAt::cruise(blank()),
+            ChipAt::land(blank()),
+            ChipAt::test(Some(CardPalette::Off), blank()),
+            ChipAt::test(None, blank()),
+        );
         let rows = [
             (
                 AutopilotView::Cruise,
+                cruise,
                 "\u{221e}",
-                ACCENT,
+                cruise.letter_at(0),
                 format!("{} \u{b7} right-click: more", AutopilotView::Cruise.title()),
                 "autopilot: cruise",
             ),
             (
                 AutopilotView::Land,
+                land,
                 "\u{2913}",
-                AMBER,
+                land.letter_at(0),
                 format!("{} \u{b7} right-click: more", AutopilotView::Land.title()),
                 "autopilot: land",
             ),
             (
                 AutopilotView::Off,
+                off,
                 "\u{25cb}",
-                dim,
+                off.quiet(),
                 format!("{} \u{b7} right-click: more", AutopilotView::Off.title()),
                 "autopilot: off",
             ),
             (
                 AutopilotView::MasterOff,
+                none,
                 "\u{2298} off",
-                dim,
+                none.quiet(),
                 "harness off in Settings \u{b7} click: turn the harness on \u{b7} right-click: more"
                     .to_owned(),
                 "harness off in Settings",
             ),
         ];
         let text = |cells: &[RenderCell]| -> String { cells.iter().map(|c| c.ch).collect() };
-        for (view, face, ink, title, short) in rows {
+        for (view, at, face, ink, title, short) in rows {
             w.note_autopilot(7, view.mode(), view, now);
             w.hover = Some((7, Target::from(Chip::Autopilot)));
-            let block = w.block(7, blank(), now, ACCENT, Keep::Drawn);
+            let block = w.block(7, blank(), now, at, Keep::Drawn);
             let n = face.chars().count();
             assert_eq!(text(&block.lights), face, "{view:?}");
             assert_eq!(block.cols[0], (0..n, Chip::Autopilot), "{view:?}");
@@ -5967,18 +6008,23 @@ mod tests {
             assert_eq!(text(&block.short_title), format!("{short}  "), "{view:?}");
             assert!(!block.reason, "a hover's title gives way first");
         }
+        assert_ne!(
+            land.letter_at(0),
+            cruise.letter_at(0),
+            "CONTROL: the view's palette decides the letter"
+        );
         assert_eq!(
-            ModeInk::Hue(AMBER),
+            ModeInk::Value,
             Mode::Auto.ink(),
-            "land wears the auto pill's amber"
+            "auto reads as a value, not the pill's amber"
         );
 
         w.hover = None;
         w.note_autopilot(7, None, AutopilotView::Cruise, now);
         w.sessions.get_mut(&7).unwrap().autopilot_pending =
             Some((Autopilot::Land, now + Duration::from_secs(1)));
-        let block = w.block(7, blank(), now, ACCENT, Keep::Drawn);
-        assert_eq!(text(&block.lights), "\u{25d0}");
+        let block = w.block(7, blank(), now, ChipAt::cruise(blank()), Keep::Drawn);
+        assert_eq!(text(&block.lights), "\u{25cc}", "in flight");
         w.note_autopilot(7, None, AutopilotView::Cruise, now);
         assert!(
             w.sessions[&7].autopilot_pending.is_some(),
@@ -5987,7 +6033,10 @@ mod tests {
         w.note_autopilot(7, Some(Autopilot::Land), AutopilotView::Land, now);
         assert!(w.sessions[&7].autopilot_pending.is_none(), "read back");
         assert_eq!(
-            text(&w.block(7, blank(), now, ACCENT, Keep::Drawn).lights),
+            text(
+                &w.block(7, blank(), now, ChipAt::cruise(blank()), Keep::Drawn)
+                    .lights
+            ),
             "\u{2913}"
         );
         w.sessions.get_mut(&7).unwrap().autopilot_pending =
@@ -6002,11 +6051,17 @@ mod tests {
         );
     }
 
+    /// A CHIP'S TITLE READS AS A VALUE, THE OFF CHIPS AS QUIET WORDS: on four built-in grounds
+    /// every title cell (whole, lean and short, a refusal's too) wears the glass's value ink, at
+    /// 7:1 or more, and `○` the quiet ink, at 4.5:1 and quieter than the value. CONTROL: the ink
+    /// the titles and the off chips wore before, the pane's halfway to its ground floored at 3:1
+    /// alone, misses 4.5:1 on some ground.
     #[test]
-    fn a_chips_title_reads_above_the_facts_and_below_the_text() {
+    fn a_chips_title_reads_as_a_value_and_the_off_chips_quietly() {
         use crate::chrome_band::contrast;
         let now = Instant::now();
         let rgb = |c: aterm_types::Rgb| [c.r, c.g, c.b];
+        let mut old_misses = 0;
         for name in ["Default", "Aterm Night", "Aterm Day", "Linen"] {
             let scheme = aterm_types::scheme::builtin(name).expect("a built-in theme");
             let blank = RenderCell {
@@ -6015,14 +6070,15 @@ mod tests {
                 bg: rgb(scheme.background),
                 ..RenderCell::default()
             };
-            let (fg, bg) = (blank.fg, blank.bg);
-            let ink = title_ink(blank);
+            let bg = blank.bg;
+            let at = ChipAt::cruise(blank);
+            let ink = at.value();
             let in_ink = |cells: &[RenderCell]| cells.iter().all(|c| c.fg == ink);
             let mut w = WindowLights::default();
             observe(&mut w, &screen(&"\u{2500}".repeat(60), PLAN, ""));
             w.note_autopilot(7, None, AutopilotView::Cruise, now);
             w.hover = Some((7, Target::from(Chip::Autopilot)));
-            let block = w.block(7, blank, now, ACCENT, Keep::Drawn);
+            let block = w.block(7, blank, now, at, Keep::Drawn);
             assert!(
                 !block.title.is_empty() && !block.short_title.is_empty(),
                 "{name}: a title"
@@ -6032,7 +6088,7 @@ mod tests {
                 in_ink(&block.title)
                     && in_ink(&block.short_title)
                     && block.lean.iter().all(|form| in_ink(form)),
-                "{name}: every title cell in the title's ink"
+                "{name}: every title cell in the value ink"
             );
             w.hover = None;
             w.sessions.get_mut(&7).unwrap().refused = Some((
@@ -6040,49 +6096,36 @@ mod tests {
                 Refusal::StoppedIn(Mode::Plan),
                 now + REFUSAL_SHOWN,
             ));
-            let refused = w.block(7, blank, now, ACCENT, Keep::Drawn);
+            let refused = w.block(7, blank, now, at, Keep::Drawn);
             assert!(refused.reason && !refused.title.is_empty(), "{name}");
             assert!(in_ink(&refused.title), "{name}: the refusal's ink");
-            // The ink the titles and the off chips wore before: the pane's halfway to its
-            // ground, floored at 3:1 alone.
             let halfway = std::array::from_fn(|k| {
                 ((u16::from(blank.fg[k]) + u16::from(blank.bg[k])) / 2) as u8
             });
-            let (title, text, facts, old) = (
+            let (title, quiet, old) = (
                 contrast(ink, bg),
-                contrast(fg, bg),
-                contrast(crate::claude_footer::value_fg([136; 3], fg), bg),
+                contrast(at.quiet(), bg),
                 contrast(crate::claude_footer::visible_on(halfway, blank.bg), bg),
             );
-            let dim = contrast(off_of(blank), bg);
+            eprintln!("{name}: title {ink:?} {title:.2}:1, quiet {quiet:.2}:1, old {old:.2}:1");
             assert!(
-                dim >= CHIP_INK_FLOOR,
-                "{name}: the off chips read ({dim:.2})"
+                title >= f64::from(aterm_effects::glass_inks::VALUE_CONTRAST) - 0.01,
+                "{name}: a value reads at 7:1 ({title:.2})"
             );
-            assert!(dim < text, "{name}: and stay quiet ({dim:.2} < {text:.2})");
-            assert_eq!(
-                dim_of(blank),
-                crate::claude_footer::visible_on(halfway, blank.bg),
-                "{name}: the quiet marks keep the halfway ink at 3:1"
-            );
-            eprintln!(
-                "{name}: title {ink:?} {title:.2}:1, text {text:.2}:1, facts {facts:.2}:1, \
-                 old dim {old:.2}:1"
-            );
-            assert!(title >= CHIP_INK_FLOOR, "{name}: AA ({title:.2})");
+            assert!(quiet >= 4.5, "{name}: the off chips read ({quiet:.2})");
             assert!(
-                title < text,
-                "{name}: below the text ({title:.2} < {text:.2})"
+                quiet < title,
+                "{name}: and stay quiet ({quiet:.2} < {title:.2})"
             );
-            assert!(
-                title > facts,
-                "{name}: above the facts ({title:.2} > {facts:.2})"
-            );
-            assert!(old < CHIP_INK_FLOOR, "{name}: the old ink ({old:.2})");
+            old_misses += usize::from(old < 4.5);
             w.note_autopilot(7, Some(Autopilot::Off), AutopilotView::Off, now);
-            let off = w.block(7, blank, now, ACCENT, Keep::Drawn);
-            assert_eq!(off.lights[0].fg, off_of(blank), "{name}: `○`, the off ink");
+            let off = w.block(7, blank, now, at, Keep::Drawn);
+            assert_eq!(off.lights[0].fg, at.quiet(), "{name}: `○`, the quiet ink");
         }
+        assert!(
+            old_misses > 0,
+            "CONTROL: the old halfway ink reads 4.5:1 everywhere"
+        );
     }
 
     #[test]
@@ -6099,7 +6142,7 @@ mod tests {
             workers: 3,
         };
         let chips = |w: &WindowLights, room: usize| -> Vec<Chip> {
-            w.fitted(7, blank(), now, ACCENT, None, None, room)
+            w.fitted(7, blank(), now, ChipAt::cruise(blank()), None, None, room)
                 .map(|b| b.cols.iter().map(|(_, chip)| *chip).collect())
                 .unwrap_or_default()
         };
@@ -6108,14 +6151,18 @@ mod tests {
         assert!(chips(&w, 40).is_empty(), "control: no team, no chip");
         w.sessions.get_mut(&7).unwrap().team = Some(manager.clone());
         assert_eq!(chips(&w, 40), [Chip::Team]);
-        let block = w.fitted(7, blank(), now, ACCENT, None, None, 40).unwrap();
+        let block = w
+            .fitted(7, blank(), now, ChipAt::cruise(blank()), None, None, 40)
+            .unwrap();
         assert_eq!(
             block.lights.iter().map(|c| c.ch).collect::<String>(),
             "\u{21c9}3",
             "the manager's count"
         );
         w.sessions.get_mut(&7).unwrap().team = Some(TeamFace::Yours);
-        let block = w.fitted(7, blank(), now, ACCENT, None, None, 40).unwrap();
+        let block = w
+            .fitted(7, blank(), now, ChipAt::cruise(blank()), None, None, 40)
+            .unwrap();
         assert!(block.lights[0].ch == '\u{270b}' && block.lights[1].wide);
         assert_eq!(block.lights.len(), cells_of("\u{270b} you"));
         observe(&mut w, &screen(&bare, PLAN, ""));
@@ -6189,8 +6236,16 @@ mod tests {
         observe(&mut w, &screen(&bare, PLAN, ""));
         w.note_autopilot(7, None, AutopilotView::Cruise, now);
         let fitted = |w: &WindowLights, selected: Option<Chip>, room: usize| {
-            w.fitted(7, blank(), now, ACCENT, selected, None, room)
-                .map(|b| b.lights.iter().map(|c| c.ch).collect::<String>())
+            w.fitted(
+                7,
+                blank(),
+                now,
+                ChipAt::cruise(blank()),
+                selected,
+                None,
+                room,
+            )
+            .map(|b| b.lights.iter().map(|c| c.ch).collect::<String>())
         };
         for room in 8..=10 {
             assert_eq!(
@@ -6208,8 +6263,16 @@ mod tests {
         }
         assert_eq!(fitted(&w, None, 0), None, "then every chip");
         let fits = |w: &WindowLights, chip: Chip, room: usize| {
-            w.fitted(7, blank(), now, ACCENT, Some(chip), None, room)
-                .is_some_and(|b| b.shows(chip))
+            w.fitted(
+                7,
+                blank(),
+                now,
+                ChipAt::cruise(blank()),
+                Some(chip),
+                None,
+                room,
+            )
+            .is_some_and(|b| b.shows(chip))
         };
         assert!(fits(&w, MODE, 8) && !fits(&w, MODE, 7));
         assert!((1..=10).all(|room| fits(&w, Chip::Autopilot, room)));
@@ -6238,9 +6301,17 @@ mod tests {
             "the reveal first"
         );
         let drawn = |w: &WindowLights, selected: Option<Chip>, room: usize| -> Vec<Chip> {
-            w.fitted(7, blank(), now, ACCENT, selected, None, room)
-                .map(|b| b.cols.iter().map(|(_, chip)| *chip).collect())
-                .unwrap_or_default()
+            w.fitted(
+                7,
+                blank(),
+                now,
+                ChipAt::cruise(blank()),
+                selected,
+                None,
+                room,
+            )
+            .map(|b| b.cols.iter().map(|(_, chip)| *chip).collect())
+            .unwrap_or_default()
         };
         for view in [AutopilotView::Cruise, AutopilotView::Land] {
             w.note_autopilot(7, view.mode(), view, now);
@@ -6264,15 +6335,23 @@ mod tests {
                     assert!(wider.is_empty(), "control: no chip in no room");
                     let s = &w.sessions[&7];
                     for keep in Keep::LADDER {
-                        let block =
-                            w.block_with(7, blank(), now, ACCENT, selected, None, keep, None);
+                        let block = w.block_with(
+                            7,
+                            blank(),
+                            now,
+                            ChipAt::cruise(blank()),
+                            selected,
+                            None,
+                            keep,
+                            None,
+                        );
                         let on = drawn_at(s, now, selected, None, keep);
                         assert_eq!(
                             chips_width_at(
                                 s,
                                 Chip::row().filter(|chip| on(*chip)),
                                 keep,
-                                Inks::of(blank(), ACCENT),
+                                Inks::of(blank(), ChipAt::cruise(blank())),
                                 None,
                             ),
                             block.lights.len(),
@@ -6290,13 +6369,13 @@ mod tests {
         let mut w = WindowLights::default();
         observe(&mut w, &screen(&"\u{2500}".repeat(60), BYPASS, ""));
         assert!(
-            w.block(7, blank(), now, ACCENT, Keep::Revealed)
+            w.block(7, blank(), now, ChipAt::cruise(blank()), Keep::Revealed)
                 .cols
                 .is_empty(),
             "at rest"
         );
         w.selected = Some((7, Target::from(MODE)));
-        let block = w.block(7, blank(), now, ACCENT, Keep::Revealed);
+        let block = w.block(7, blank(), now, ChipAt::cruise(blank()), Keep::Revealed);
         assert!(!block.title.is_empty(), "the selection asks for the title");
         assert_eq!(
             block.lights[0].ch, '\u{23F5}',
@@ -6304,7 +6383,7 @@ mod tests {
         );
         assert!(block.lights[0].bold);
         assert!(
-            w.block(7, blank(), now, ACCENT, Keep::Drawn)
+            w.block(7, blank(), now, ChipAt::cruise(blank()), Keep::Drawn)
                 .shows(Light::Mode),
             "the selection itself is drawn without the reveal"
         );
@@ -6565,14 +6644,52 @@ mod gesture_tests {
         app.windows[&wid].input_scratch.cells[row][col]
     }
 
-    /// The ink `yolo` is drawn in on `row`: the first `─` cell's own, floored to read as text.
-    pub(super) fn rule_ink(app: &App, wid: WindowId, row: usize) -> [u8; 3] {
-        let rule = app.windows[&wid].input_scratch.cells[row]
-            .iter()
-            .find(|c| c.ch == '\u{2500}')
-            .copied()
-            .expect("the rule is drawn on the row");
-        super::floored(rule.fg, rule.bg)
+    /// The glass's tokens on `wid`'s one pane under `palette`, its chips' first cell at frame
+    /// column `col`.
+    fn chips_at(
+        app: &App,
+        wid: WindowId,
+        palette: Option<aterm_effects::harness_card::CardPalette>,
+        col: usize,
+    ) -> super::ChipAt {
+        let scratch = &app.windows[&wid].input_scratch;
+        super::ChipAt {
+            col,
+            cols: scratch.cols,
+            ..super::ChipAt::test(palette, scratch.implicit_blank)
+        }
+    }
+
+    /// The ink an expected mode (`yolo`, bypass) and a title are drawn in on `wid`'s pane: the
+    /// glass's value ink.
+    pub(super) fn value_ink(app: &App, wid: WindowId) -> [u8; 3] {
+        chips_at(app, wid, None, 0).value()
+    }
+
+    /// The quiet ink of `wid`'s pane: the off chips' (`○`, `⊘ off`).
+    pub(super) fn quiet_ink(app: &App, wid: WindowId) -> [u8; 3] {
+        chips_at(app, wid, None, 0).quiet()
+    }
+
+    /// The palette `session`'s glass wears: [`crate::autopilot::harness_theme`] of its reading,
+    /// none for a Cruise or Land this window's host holds no live claim on.
+    pub(super) fn worn(
+        app: &App,
+        session: u64,
+    ) -> Option<aterm_effects::harness_card::CardPalette> {
+        let (word, view, supervised) = app.session_autopilot(session);
+        crate::autopilot::harness_theme(view, supervised, word, false)
+    }
+
+    /// The letter a chip's cell at frame cell `at` of `wid`'s one pane wears under the palette
+    /// `session`'s glass wears ([`worn`]): the lit ink where it wears none.
+    pub(super) fn letter_ink(
+        app: &App,
+        wid: WindowId,
+        session: u64,
+        (_, col): (usize, usize),
+    ) -> [u8; 3] {
+        chips_at(app, wid, worn(app, session), col).letter_at(0)
     }
 
     /// The row as it reads on the glass (the footer's facts read as set).
@@ -6756,7 +6873,7 @@ mod gesture_tests {
 
             frame(&mut app, wid);
             let mode = hit(&app, wid, Light::Mode);
-            assert_eq!(cell_at(&app, wid, mode).ch, '\u{25D0}');
+            assert_eq!(cell_at(&app, wid, mode).ch, '\u{25CC}');
             let text = row_text(&app, wid, mode.0);
             assert!(
                 text.contains("switching to bypass or auto\u{2026}") && text.contains(WHOLE_FACTS),
@@ -6795,8 +6912,8 @@ mod gesture_tests {
             let cell = cell_at(&app, wid, mode);
             assert_eq!(
                 (cell.ch, cell.fg),
-                ('\u{23F5}', rule_ink(&app, wid, mode.0)),
-                "the arrival is said on the chip for a moment, in the rule's ink, never red"
+                ('\u{23F5}', value_ink(&app, wid)),
+                "the arrival is said on the chip for a moment, in the value ink, never red"
             );
             let text = row_text(&app, wid, mode.0);
             assert!(
@@ -6948,9 +7065,12 @@ mod gesture_tests {
                     "the harness's mark: {text:?}"
                 );
                 if hosted {
-                    let accent = crate::chrome_band::band_colors(app.theme).accent;
-                    let ink = |chip| cell_at(&app, wid, hit(&app, wid, chip)).fg;
-                    assert_eq!(ink(Chip::Autopilot), accent, "cruise: the accent");
+                    let at = hit(&app, wid, Chip::Autopilot);
+                    assert_eq!(
+                        cell_at(&app, wid, at).fg,
+                        letter_ink(&app, wid, session, at),
+                        "cruise: its column's letter, under the palette its glass wears"
+                    );
                 }
                 let claude = row_text(&app, wid, mode_row(&app, wid));
                 assert_eq!(claude.trim_end(), mode, "Claude's row, as drawn");
@@ -7094,7 +7214,7 @@ mod gesture_tests {
         frame(&mut app, wid);
         assert_eq!(
             cell_at(&app, wid, hit(&app, wid, Light::Mode)).ch,
-            '\u{25D0}'
+            '\u{25CC}'
         );
 
         redraw_mode_row(&app, session, BYPASS);
@@ -7956,8 +8076,7 @@ mod gesture_tests {
         draw_claude(&app, session, BYPASS);
         feed(&app, session, b"\x1b[?1000h\x1b[?1006h");
         frame(&mut app, wid);
-        let accent = crate::chrome_band::band_colors(app.theme).accent;
-        let dim = super::off_of(app.windows[&wid].input_scratch.implicit_blank);
+        let quiet = quiet_ink(&app, wid);
         let human = human_seq(&app, session);
         assert_eq!(
             autopilot(&app, session),
@@ -7967,7 +8086,7 @@ mod gesture_tests {
         let chip = hit(&app, wid, Chip::Autopilot);
         assert_eq!(
             (cell_at(&app, wid, chip).ch, cell_at(&app, wid, chip).fg),
-            ('\u{221e}', accent)
+            ('\u{221e}', letter_ink(&app, wid, session, chip))
         );
         let (x, y) = px_of(&app, wid, chip);
         app.on_cursor_moved(wid, x, y);
@@ -7980,10 +8099,10 @@ mod gesture_tests {
             )),
             "the hover's title: {text:?}"
         );
-        for (want, face, ink) in [
-            (Autopilot::Land, "\u{2913} land", super::AMBER),
-            (Autopilot::Off, "\u{25cb} off", dim),
-            (Autopilot::Cruise, "\u{221e} cruise", accent),
+        for (want, face, lettered) in [
+            (Autopilot::Land, "\u{2913} land", true),
+            (Autopilot::Off, "\u{25cb} off", false),
+            (Autopilot::Cruise, "\u{221e} cruise", true),
         ] {
             let before = footer_fp(&app, wid);
             click(&mut app, wid, Chip::Autopilot);
@@ -7993,6 +8112,11 @@ mod gesture_tests {
             let at = hit(&app, wid, Chip::Autopilot);
             let text = row_text(&app, wid, at.0);
             assert!(text.contains(face), "{want:?}: {text:?}");
+            let ink = if lettered {
+                letter_ink(&app, wid, session, at)
+            } else {
+                quiet
+            };
             assert_eq!(cell_at(&app, wid, at).fg, ink, "{want:?}");
             assert!(
                 app.windows[&wid].claude_lights.sessions[&session]
@@ -8454,11 +8578,10 @@ mod gesture_tests {
         publish_facts(&app, session);
         draw_claude(&app, session, BYPASS);
         frame(&mut app, wid);
-        let dim = super::off_of(app.windows[&wid].input_scratch.implicit_blank);
         let chip = hit(&app, wid, Chip::Autopilot);
         assert_eq!(
             (cell_at(&app, wid, chip).ch, cell_at(&app, wid, chip).fg),
-            ('\u{2298}', dim)
+            ('\u{2298}', quiet_ink(&app, wid))
         );
         let (x, y) = px_of(&app, wid, chip);
         app.on_cursor_moved(wid, x, y);
@@ -8486,7 +8609,7 @@ mod gesture_tests {
         assert_eq!(
             super::SWITCHES_LET_GO.with(std::cell::Cell::get),
             1,
-            "`◐ turning on` was armed, and the refusal let it go"
+            "`◌ turning on` was armed, and the refusal let it go"
         );
         assert!(
             app.native_settings_route_view_target(SettingsRoute::Harness)
@@ -8619,8 +8742,8 @@ mod gesture_tests {
             );
             assert_eq!(
                 cell_at(&app, wid, chip).fg,
-                super::off_of(app.windows[&wid].input_scratch.implicit_blank),
-                "own={own}: the off ink"
+                quiet_ink(&app, wid),
+                "own={own}: the quiet ink"
             );
         }
     }

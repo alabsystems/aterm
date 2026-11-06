@@ -282,12 +282,15 @@ fn link_params(text: &str) -> (&str, &str) {
 }
 
 /// Unquotes a `Link` parameter value (`token` or RFC 9110 `quoted-string`).
-fn unquote_param(raw: &str) -> Option<String> {
+fn unquote_param(raw: &str) -> Option<std::borrow::Cow<'_, str>> {
     let raw = raw.trim();
     let Some(inner) = raw.strip_prefix('"') else {
-        return (!raw.contains('"')).then(|| raw.to_string());
+        return (!raw.contains('"')).then_some(std::borrow::Cow::Borrowed(raw));
     };
     let inner = inner.strip_suffix('"')?;
+    if !inner.contains(['"', '\\']) {
+        return Some(std::borrow::Cow::Borrowed(inner));
+    }
     let mut out = String::with_capacity(inner.len());
     let mut escaped = false;
     for c in inner.chars() {
@@ -302,7 +305,7 @@ fn unquote_param(raw: &str) -> Option<String> {
             out.push(c);
         }
     }
-    (!escaped).then_some(out)
+    (!escaped).then_some(std::borrow::Cow::Owned(out))
 }
 
 /// The `rel="next"` URL of a `Link` header.
@@ -379,9 +382,14 @@ fn unnumbered_link(url: &str, query: &str) -> Error {
     }
 }
 
-/// A path's `/`-separated segments, after its leading `/`.
-fn segments(path: &str) -> Vec<&str> {
-    path.trim_start_matches('/').split('/').collect()
+/// Whether `text` is the decimal formatting of `id`, without allocating.
+fn eq_u64(text: &str, id: u64) -> bool {
+    use std::io::Write as _;
+    let mut buf = [0u8; 20];
+    let mut cursor = &mut buf[..];
+    let _ = write!(cursor, "{id}");
+    let len = 20 - cursor.len();
+    text.as_bytes() == &buf[..len]
 }
 
 /// Every value a query gives `name`, in appearance order.
@@ -405,27 +413,34 @@ fn query_value<'a>(query: &'a str, name: &str) -> Option<&'a str> {
 /// Whether a next link's path is one `LinkScope::Repo(slug)` accepts: `/repos/{o}/{r}` with
 /// the first path's suffix, or `/repositories/{repo_id}` with it.
 fn repo_link(path: &str, first: &str, slug: &Slug, repo_id: Option<u64>) -> Result<(), String> {
-    let first = segments(first);
-    let Some(suffix) = first.get(3..).filter(|_| first.first() == Some(&"repos")) else {
+    let mut first = first.trim_start_matches('/').split('/');
+    if first.next() != Some("repos") || first.next().is_none() || first.next().is_none() {
         return Err("the listing's first path is not under a repository".to_string());
-    };
-    let next = segments(path);
-    match next.first() {
-        Some(&"repos") if next.len() >= 3 => {
-            let same = next[1].eq_ignore_ascii_case(slug.owner())
-                && next[2].eq_ignore_ascii_case(slug.repo())
-                && next[3..] == *suffix;
+    }
+    let mut next = path.trim_start_matches('/').split('/');
+    match next.next() {
+        Some("repos") => {
+            let same = next
+                .next()
+                .is_some_and(|owner| owner.eq_ignore_ascii_case(slug.owner()))
+                && next
+                    .next()
+                    .is_some_and(|repo| repo.eq_ignore_ascii_case(slug.repo()))
+                && next.eq(first);
             if same {
                 Ok(())
             } else {
                 Err(format!("its path is not {slug}'s listing"))
             }
         }
-        Some(&"repositories") if next.len() >= 2 => {
+        Some("repositories") => {
+            let Some(next_id) = next.next() else {
+                return Err(format!("its path is not {slug}'s listing"));
+            };
             let Some(id) = repo_id else {
                 return Err(format!("{slug}'s repository id is not known"));
             };
-            if next[1] == id.to_string() && next[2..] == *suffix {
+            if eq_u64(next_id, id) && next.eq(first) {
                 Ok(())
             } else {
                 Err(format!(
@@ -443,13 +458,13 @@ fn owner_link(path: &str, first: &str, id: u64) -> Result<(), String> {
     if path == first {
         return Ok(());
     }
-    let first = segments(first);
-    let next = segments(path);
-    let rest = first.get(2..).unwrap_or_default();
-    let numbered = next.len() >= 2
-        && matches!(next[0], "organizations" | "user")
-        && next[1] == id.to_string()
-        && next[2..] == *rest;
+    let mut first = first.trim_start_matches('/').split('/');
+    let _ = first.next();
+    let _ = first.next();
+    let mut next = path.trim_start_matches('/').split('/');
+    let numbered = matches!(next.next(), Some("organizations" | "user"))
+        && next.next().is_some_and(|next_id| eq_u64(next_id, id))
+        && next.eq(first);
     if numbered {
         Ok(())
     } else {
@@ -666,7 +681,8 @@ impl Walk<'_> {
             .unwrap_or(1);
         let mut pages: Vec<PageRead> = Vec::new();
         let mut items: Vec<Value> = Vec::new();
-        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut seen_ids: BTreeSet<u64> = BTreeSet::new();
+        let mut seen_other: BTreeSet<String> = BTreeSet::new();
         let mut as_: Option<IdentityRef> = None;
         loop {
             let answered = match self.call(&call) {
@@ -695,9 +711,16 @@ impl Walk<'_> {
                     for item in array {
                         if self.consistency == Consistency::AsRead
                             && let Some(id) = item.get("id")
-                            && !seen.insert(aterm_json::to_string(id).unwrap_or_default())
                         {
-                            continue;
+                            let fresh = match id.as_u64() {
+                                Some(num) => seen_ids.insert(num),
+                                None => {
+                                    seen_other.insert(aterm_json::to_string(id).unwrap_or_default())
+                                }
+                            };
+                            if !fresh {
+                                continue;
+                            }
                         }
                         items.push(item);
                     }
@@ -845,23 +868,29 @@ fn walk_as(
     if opts.per_page == 0 || u64::from(opts.per_page) > MAX_PER_PAGE {
         return Err(bad_per_page());
     }
-    let path_query = first.path.split_once('?').map_or("", |(_, query)| query);
-    let named: Vec<&str> = first
-        .query
-        .iter()
-        .filter(|(key, _)| key == "per_page")
-        .map(|(_, value)| value.as_str())
-        .chain(query_values(path_query, "per_page"))
-        .collect();
-    let first = match named.as_slice() {
-        [] => first.query("per_page", opts.per_page.to_string()),
-        [value]
-            if crate::path::digits::<u64>(value)
-                .is_some_and(|n| (1..=MAX_PER_PAGE).contains(&n)) =>
-        {
-            first
+    let needs_per_page = {
+        let path_query = first.path.split_once('?').map_or("", |(_, query)| query);
+        let mut per_pages = first
+            .query
+            .iter()
+            .filter(|(key, _)| key == "per_page")
+            .map(|(_, value)| value.as_str())
+            .chain(query_values(path_query, "per_page"));
+        match (per_pages.next(), per_pages.next()) {
+            (None, None) => true,
+            (Some(value), None)
+                if crate::path::digits::<u64>(value)
+                    .is_some_and(|n| (1..=MAX_PER_PAGE).contains(&n)) =>
+            {
+                false
+            }
+            _ => return Err(bad_per_page()),
         }
-        _ => return Err(bad_per_page()),
+    };
+    let first = if needs_per_page {
+        first.query("per_page", opts.per_page.to_string())
+    } else {
+        first
     };
     let consistency = match shape {
         Shape::Items => opts.consistency,

@@ -1440,7 +1440,7 @@ fn older_build_appends(c: &Controls) -> Report {
                         })
                         .collect();
                     written.extend(batch.iter().cloned());
-                    sim.append(&unmarked_frames(&batch));
+                    sim.write_at(sim.log_len() as u64, &unmarked_frames(&batch));
                     if old_strict {
                         sim.full_flush();
                     }

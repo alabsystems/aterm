@@ -157,14 +157,44 @@ pub(crate) enum Mutant {
     /// The bus mirror's first pass after an attach runs ahead of what the loop holds queued
     /// while the open has yet to make the pin's fence, as before critic item D06
     /// (`Bridge::mirror_yields`): the first delivery an attach or a handoff finds waiting
-    /// waits behind the fence's two full flushes and the pass.
+    /// waits behind the fence (the bridge's own two full flushes, or where the broker settles
+    /// the pin its barriers and the settle the take waits for) and the pass.
     MirrorAheadOfTheFirstDelivery,
-    /// The first-pass hold forgets the posts a drain listed (`Bridge::mirror_drained_posts`),
+    /// The first-pass hold forgets the posts a drain published (`Bridge::mirror_drained_post`),
     /// as D06's first form did: a pass due before their records come back goes ahead of them.
     FirstPassForgetsTheDrainedPosts,
     /// A held first pass counts no inbox record it took off the ones it awaits
     /// (`Bridge::mirror_took_inbox`), so it waits out the whole hold after the record came.
     FirstPassAwaitsPastItsRecords,
+    /// The first-pass hold counts every post a drain published, one to another node's session
+    /// too, as D06 counted every post a drain listed (`Bridge::mirror_drained_post`, critic item
+    /// G04): that post's record never comes back on this node's inbox face, so the pass waits
+    /// out the whole hold for it. Its control is a bridge unit test
+    /// (`a_post_to_another_nodes_session_does_not_hold_the_first_pass`).
+    FirstPassCountsAnotherNodesPost,
+    /// Every subject a drain or a mirror pass opens reads the node's subject budget
+    /// (`Bridge::budget_allows`), as every build before critic item G04 did: an attach's first
+    /// drain over K fresh lanes makes K `subject_budget` requests, each behind every owed ack.
+    /// Its control is a bridge unit test
+    /// (`a_drain_reads_the_subject_budget_once_for_every_fresh_lane_it_opens`).
+    BudgetReadPerSubject,
+    /// Once a drain or a mirror pass has read the node's subject budget, every later subject it
+    /// meets may open (`Bridge::budget_allows`, critic item G04): the post that would take the
+    /// budget into the reserve its kind keeps whole opens a subject there. Its control is a
+    /// bridge unit test (`the_count_since_the_reading_refuses_where_the_per_subject_read_would`).
+    BudgetCountTakenAsUnlimited,
+    /// Where the count since a scope's reading says the node's subject budget is short, the
+    /// subject is refused on the count alone, never read again (`Bridge::budget_allows`, critic
+    /// item G04): a subject a retirement freed room for since the reading, or one the count
+    /// over-counted for, is refused where the per-subject read lets it open. Its control is a
+    /// bridge unit test (`a_budget_freed_inside_a_drain_is_read_where_the_count_says_short`).
+    BudgetShortOnTheCount,
+    /// A drain's reading of the node's subject budget is kept for the drains after it
+    /// (`Bridge::budget_scoped`, critic item G04): what another connection under this producer
+    /// spends between them is never read, so a post opens a subject inside the reserve its kind
+    /// keeps whole. Its control is a bridge unit test
+    /// (`each_drain_reads_the_budget_afresh_what_another_writer_spent_or_a_retirement_freed`).
+    BudgetReadOutlivesItsScope,
     /// A pass that makes the pin's fence leaves the inbox commit its deliveries owe for its
     /// burst behind the fence (`Bridge::commit_ahead_of_the_fence`).
     CommitBehindTheFence,
@@ -304,9 +334,12 @@ pub(crate) enum Mutant {
     /// told: a record retention still holds below its subject's oldest is missed.
     ReadBackWithoutTheHeld,
     /// A read of one offset that its filter's oldest lies above is taken for no record there,
-    /// never read again told (`Bridge::read_at`; the `read_back_rows` of before finding F3): a
-    /// record retention still holds there reads as gone, so a session's fetch of it is
-    /// answered `retained` and a dedup's read back finds nothing to verify.
+    /// never read again told (`Bridge::read_at`, and `Bridge::held_record`'s read of an old
+    /// node's row; the `read_back_rows` of before finding F3): a record retention still holds
+    /// there reads as gone, so a session's fetch of it is answered `retained`, a dedup's read
+    /// back finds nothing to verify, and a receipt for an old node's row names it by its
+    /// offset here. Its control for an old node's row is a bridge unit test
+    /// (`an_old_nodes_row_held_below_its_lanes_oldest_is_read_there`).
     ReadAtWithoutTheHeld,
     /// A relayed (`via=`) record is classified by a local rule that skips astream's relayed
     /// demotion (`Bridge::classify_delivery`): it keeps the kind it claims unless another of

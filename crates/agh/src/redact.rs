@@ -226,31 +226,33 @@ impl Redactor {
     #[inline]
     #[must_use]
     pub fn apply(&self, text: &str) -> String {
-        scan(self.learned(text), true)
+        scan(self.learned(text), true).into_owned()
     }
 
     /// Redacts learned values and context-free token prefixes (rule 1) without cross-field rules 2/3.
     #[inline]
     #[must_use]
     pub fn learned_and_tokens(&self, text: &str) -> String {
-        scan(self.learned(text), false)
+        scan(self.learned(text), false).into_owned()
     }
 
     fn learned<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
+        if text.len() < LEARN_MIN {
+            return std::borrow::Cow::Borrowed(text);
+        }
         let exact = self.exact.lock().unwrap_or_else(PoisonError::into_inner);
-        let has_match = exact
-            .iter()
-            .flat_map(|learned| std::iter::once(&learned.exact).chain(learned.basic.as_ref()))
-            .filter_map(|secret| std::str::from_utf8(secret.expose()).ok())
-            .any(|value| text.contains(value));
-        if !has_match {
+        if exact.is_empty() {
             return std::borrow::Cow::Borrowed(text);
         }
         let mut known: Vec<&str> = exact
             .iter()
             .flat_map(|learned| std::iter::once(&learned.exact).chain(learned.basic.as_ref()))
             .filter_map(|secret| std::str::from_utf8(secret.expose()).ok())
+            .filter(|value| text.contains(value))
             .collect();
+        if known.is_empty() {
+            return std::borrow::Cow::Borrowed(text);
+        }
         known.sort_by_key(|value| std::cmp::Reverse(value.len()));
         let mut out = String::with_capacity(text.len());
         let mut rest = text;
@@ -282,6 +284,14 @@ impl Redactor {
     #[inline]
     #[must_use]
     pub fn shapes(text: &str) -> String {
+        Self::shapes_cow(text).into_owned()
+    }
+
+    /// Borrowing variant of [`Redactor::shapes`]: returns [`std::borrow::Cow::Borrowed`] when no
+    /// credential shape matches in `text`.
+    #[inline]
+    #[must_use]
+    pub fn shapes_cow(text: &str) -> std::borrow::Cow<'_, str> {
         scan(std::borrow::Cow::Borrowed(text), true)
     }
 }
@@ -304,7 +314,7 @@ fn basic_at(bytes: &[u8], at: usize) -> Option<(usize, usize)> {
     (run.len() >= BASIC_MIN && run.iter().any(|b| !b.is_ascii_alphabetic())).then_some((start, end))
 }
 
-fn scan(text: std::borrow::Cow<'_, str>, context: bool) -> String {
+fn scan(text: std::borrow::Cow<'_, str>, context: bool) -> std::borrow::Cow<'_, str> {
     let bytes = text.as_bytes();
     let mut out = Vec::new();
     let mut flushed = 0;
@@ -332,10 +342,13 @@ fn scan(text: std::borrow::Cow<'_, str>, context: bool) -> String {
         }
     }
     if flushed == 0 {
-        return text.into_owned();
+        return text;
     }
     out.extend_from_slice(&bytes[flushed..]);
-    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+    std::borrow::Cow::Owned(
+        String::from_utf8(out)
+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()),
+    )
 }
 
 impl std::fmt::Debug for Redactor {

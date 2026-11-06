@@ -92,12 +92,13 @@ fn adoptable(state: &State, observed: &Observation, now: u64) -> bool {
 }
 
 fn reference(version: &str) -> Result<String, String> {
-    let parts: Vec<_> = version.split('.').collect();
-    if parts.len() != 3
-        || parts
-            .iter()
-            .any(|part| part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()))
-    {
+    let is_digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    let mut parts = version.split('.');
+    let valid = matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(a), Some(b), Some(c), None) if is_digits(a) && is_digits(b) && is_digits(c)
+    );
+    if !valid {
         return Err("line version must be numeric X.Y.Z".into());
     }
     Ok(format!("refs/aterm-release/line/{version}"))
@@ -707,9 +708,12 @@ fn p95(history: &str, step: &str) -> u64 {
     let mut samples: Vec<u64> = history
         .lines()
         .filter_map(|line| {
-            let fields: Vec<_> = line.split('\t').collect();
-            (fields.len() == 4 && fields[2] == step)
-                .then(|| fields[3].parse().ok())
+            let mut fields = line.split('\t');
+            let _ = (fields.next()?, fields.next()?);
+            let field_step = fields.next()?;
+            let val = fields.next()?;
+            (fields.next().is_none() && field_step == step)
+                .then(|| val.parse().ok())
                 .flatten()
         })
         .collect();
@@ -737,16 +741,19 @@ impl Rows {
             return rows;
         };
         for entry in entries.flatten() {
-            let path = entry.path();
-            if path.file_name().is_none_or(|name| {
-                name != "transcript.log" && !name.to_string_lossy().ends_with(".events")
-            }) {
+            let name = entry.file_name();
+            if name != "transcript.log"
+                && Path::new(&name)
+                    .extension()
+                    .is_none_or(|ext| ext != "events")
+            {
                 continue;
             }
             if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
                 continue;
             }
-            let Ok(mut file) = std::fs::File::open(&path) else {
+            let path = entry.path();
+            let Ok(mut file) = crate::durable::open_regular_file(&path) else {
                 continue;
             };
             let offset = self.0.entry(path).or_default();
@@ -796,9 +803,10 @@ fn red_items(state: &State) -> String {
         .iter()
         .filter_map(|row| {
             let event: aterm_json::Value = aterm_json::from_str(row).ok()?;
-            (matches!(event["outcome"].as_str(), Some("FAIL" | "fail" | "failed"))
-                || event["event"].as_str() == Some("test-case-failed"))
-            .then(|| event.to_string())
+            // A `test-case-failed` is a red by its outcome: a case its block spares (refused,
+            // out of disk) reads NOT RUN.
+            matches!(event["outcome"].as_str(), Some("FAIL" | "fail" | "failed"))
+                .then(|| event.to_string())
         })
         .collect::<Vec<_>>()
         .join("; ")

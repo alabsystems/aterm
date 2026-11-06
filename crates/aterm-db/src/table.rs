@@ -136,6 +136,23 @@ thread_local! {
     /// `ATERM_TEST_NEGATIVE_CONTROL` ([`aterm_types::negative_control::on`]).
     pub(crate) static TABLES_DONT_WAIT: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    /// The negative control of member-signed table cutoffs (one-mesh §4.10, §11 B11): while set,
+    /// a reader ignores them, so a removed writer's operation under an epoch it still held counts
+    /// as before B11. Process-wide as `table-cutoffs-off`.
+    pub(crate) static TABLE_CUTOFFS_OFF: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// The negative control of the F21 path (§4.10): while set, a removal cutoff also withholds
+    /// every other writer's operation sealed under the epoch the cutoff was signed under that is
+    /// not in the cutoff's causal past, the rule that cuts by epoch rather than by writer.
+    pub(crate) static TABLE_CUT_BY_EPOCH: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Whether [`TABLE_CUTOFFS_OFF`] is on, on this thread or for this process.
+#[cfg(any(test, debug_assertions))]
+fn table_cutoffs_off() -> bool {
+    TABLE_CUTOFFS_OFF.with(std::cell::Cell::get)
+        || aterm_types::negative_control::on("table-cutoffs-off")
 }
 
 /// Whether [`TABLES_DONT_WAIT`] is on: set on this thread, or named for this process
@@ -329,6 +346,32 @@ impl<'a> Session<'a> {
             .map_err(failure)
     }
 
+    /// Who removed each of `actors` whose seat this session's membership log shows removed: the
+    /// signers of the effective `Remove`s of it, or of the quorum `Remove` that took it out. Only
+    /// they may cut it from a table (`store::cutoff`). One log read for every actor asked; a
+    /// session with no log removes nobody this way.
+    pub(crate) fn removers_of(
+        &self,
+        actors: impl IntoIterator<Item = Actor>,
+    ) -> std::collections::BTreeMap<Actor, std::collections::BTreeSet<Actor>> {
+        if !self.access.is_log_backed() {
+            return std::collections::BTreeMap::new();
+        }
+        let Some((log, _)) = aterm_secrets::client::trusted_commons_log(
+            self.bootstrap.paths(),
+            self.bootstrap.trust(),
+        )
+        .ok()
+        .flatten() else {
+            return std::collections::BTreeMap::new();
+        };
+        let membership = log.membership();
+        actors
+            .into_iter()
+            .filter_map(|actor| Some((actor, membership.removal(&actor)?.by.clone())))
+            .collect()
+    }
+
     pub(crate) fn historical_writer_in(&self, roster: &Digest, actor: &Actor) -> bool {
         if !self.history.borrow().contains_key(roster) {
             let Ok(history) = self
@@ -373,10 +416,7 @@ impl<'a> Session<'a> {
             if !self.access.is_current(&self.journal) {
                 return Err(Error::new("table repair needs current Commons membership"));
             }
-            let mut observation = [0; 64];
-            observation[..32].copy_from_slice(self.access.head());
-            observation[32..].copy_from_slice(self.access.basis());
-            return Ok(observation);
+            return Ok(self.access_observation());
         }
         let aterm_secrets::commons::journal::State::Ready { head, .. } = self.journal.state()
         else {
@@ -386,6 +426,16 @@ impl<'a> Session<'a> {
         observation[..32].copy_from_slice(&head);
         observation[32..].copy_from_slice(self.access.basis());
         Ok(observation)
+    }
+
+    /// [`Self::observation`] without asking again: what [`Self::context`] holds current is this
+    /// access's own head and basis, so it is the observation wherever that check passes. It proves
+    /// nothing by itself: a fence compares it after a `context` of its own.
+    pub(crate) fn access_observation(&self) -> [u8; 64] {
+        let mut observation = [0; 64];
+        observation[..32].copy_from_slice(self.access.head());
+        observation[32..].copy_from_slice(self.access.basis());
+        observation
     }
 
     /// Older wire commitment from this same validated access snapshot. Local
@@ -1299,7 +1349,18 @@ impl<'a> Session<'a> {
         if !current.inventory().eq(self.journal.inventory()) || !self.access.is_current(&current) {
             return Err(Error::snapshot_changed());
         }
-        self.context(scope)
+        // A generation's check can wait, so what follows it is asked afresh, and a journal's own
+        // head is its handle's to answer. Under a log with neither, currency asks the log and holds
+        // a journal only to its trust: the answer just given, for a journal of that trust.
+        if self.generation.is_some() || !self.access.is_log_backed() {
+            return self.context(scope);
+        }
+        if scope.trust != self.journal.trust() || self.journal.trust() != current.trust() {
+            return Err(Error::new(
+                "table has another trust context or stale membership",
+            ));
+        }
+        Ok(())
     }
 
     fn envelope<'w>(&self, scope: Scope, wire: &'w [u8]) -> Result<Envelope<'w>> {
@@ -1584,6 +1645,17 @@ fn check_shape(header: Header) -> Result<()> {
         .map_err(|_| Error::new("malformed table causal header"))
 }
 
+fn node_bytes_denied(roster: &aterm_secrets::swarm_roster::SwarmRoster, bytes: &[u8]) -> bool {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut buf = [0u8; 64];
+    for (i, &b) in bytes.iter().enumerate() {
+        buf[i * 2] = HEX[(b >> 4) as usize];
+        buf[i * 2 + 1] = HEX[(b & 0x0f) as usize];
+    }
+    let hex_str = std::str::from_utf8(&buf[..bytes.len() * 2]).unwrap_or("");
+    roster.is_node_denied(hex_str)
+}
+
 pub(crate) fn binding_denied_in_roster(
     roster: &aterm_secrets::swarm_roster::SwarmRoster,
     binding: &aterm_secrets::commons::binding::Binding,
@@ -1592,11 +1664,14 @@ pub(crate) fn binding_denied_in_roster(
         return false;
     }
     if !roster.deny_nodes.is_empty()
-        && (roster.is_node_denied(&aterm_codec::hex::encode_lower(binding.writer()))
-            || roster.is_node_denied(&aterm_codec::hex::encode_lower(binding.incarnation()))
-            || roster.is_node_denied(&aterm_codec::hex::encode_lower(binding.machine())))
+        && (node_bytes_denied(roster, binding.writer())
+            || node_bytes_denied(roster, binding.incarnation())
+            || node_bytes_denied(roster, binding.machine()))
     {
         return true;
+    }
+    if roster.members.is_empty() {
+        return false;
     }
     let rec_str = binding.recipient().to_bech32();
     roster
@@ -1604,6 +1679,8 @@ pub(crate) fn binding_denied_in_roster(
         .is_some_and(|member| roster.is_member_denied(member))
 }
 
+#[cfg(all(test, unix))]
+mod cutoff_tests;
 #[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 pub mod fixture;

@@ -721,26 +721,6 @@ fn the_default_join_stays_automatic_after_its_initial_observation_interval() {
 }
 
 #[test]
-fn macos_local_network_question_is_in_the_card_while_it_is_held() {
-    let app = reading(&status_of("local-network"));
-    let (_, card, hero) = drawn(&app);
-    let item = card
-        .iter()
-        .find(|item| item.id == "local-network")
-        .expect("the question is in the card");
-    assert_eq!(item.title, "Allow aterm on your local network");
-    assert!(
-        item.button.is_none(),
-        "macOS's own dialog takes the answer: no dead control"
-    );
-    assert_eq!(
-        card.first().map(|item| item.id.as_str()),
-        Some("local-network")
-    );
-    assert!(hero.headline.contains("need"), "{}", hero.headline);
-}
-
-#[test]
 fn the_tools_password_goes_to_its_tab_from_the_card() {
     let app = reading(&status_of("clt-password"));
     let (_, card, _) = drawn(&app);

@@ -51,6 +51,58 @@ fn the_hook_installer_uses_only_its_execution_accounts_git_path() {
     );
 }
 
+/// AN INSTALLER NEVER ASKS A PERSON FOR THE DEVELOPER TOOLS (installer#0 of the hostile review
+/// of the hook installer, 2026-11-06): the setup clones before it installs the Command Line
+/// Tools, and on a Mac with no developer directory an installer's `/usr/bin` shim (clean's runs
+/// `python3`) puts Apple's install dialog on the person's screen. There its run names a
+/// `DEVELOPER_DIR` that does not exist, so a shim fails at once; where the chosen developer
+/// directory, else Xcode's or the tools' own, holds the tools, and off macOS, it names none.
+/// NEGATIVE CONTROL: without the variable, the run on a Mac with no tools leaves every shim free
+/// to ask.
+#[test]
+fn a_hook_installer_on_a_mac_without_developer_tools_cannot_ask_for_them() {
+    use crate::items::github::NO_DEVELOPER_DIR;
+
+    let who = user("alice", 501);
+    let clone = Path::new(&who.home).join("checkout");
+    let developer_dir = |sys: &Fake| {
+        installer_command(sys, &who, &clone)
+            .env
+            .into_iter()
+            .find(|(key, _)| key == "DEVELOPER_DIR")
+            .map(|(_, value)| value)
+    };
+    let tools = |sys: &Fake, dir: &str| {
+        sys.stat_of(&format!("{dir}/usr/bin"), directory(0));
+    };
+    const CLT: &str = "/Library/Developer/CommandLineTools";
+    const XCODE: &str = "/Applications/Xcode.app/Contents/Developer";
+    const BETA: &str = "/Applications/Xcode-beta.app/Contents/Developer";
+
+    let bare = Fake::root();
+    assert_eq!(developer_dir(&bare).as_deref(), Some(NO_DEVELOPER_DIR));
+    for found in [CLT, XCODE] {
+        let sys = Fake::root();
+        tools(&sys, found);
+        assert_eq!(developer_dir(&sys), None, "{found} holds the tools");
+    }
+    // A chosen directory is the one the shims use: gone, they ask though the tools are there.
+    let chosen = Fake::root();
+    chosen.link("/var/db/xcode_select_link", BETA);
+    tools(&chosen, CLT);
+    assert_eq!(developer_dir(&chosen).as_deref(), Some(NO_DEVELOPER_DIR));
+    tools(&chosen, BETA);
+    assert_eq!(developer_dir(&chosen), None);
+
+    let mut linux = Fake::root();
+    linux.linux = true;
+    assert_eq!(developer_dir(&linux), None, "no shims off macOS");
+    assert!(
+        bare.calls().is_empty(),
+        "the developer directory is read without a child"
+    );
+}
+
 /// The fake clone of github.com/alice/new, carrying an installer when `carries`, and the run
 /// of it [`install_hooks`] makes once it is published.
 fn clone_carrying(carries: bool) -> (Fake, User, Repo, String, String) {

@@ -160,7 +160,7 @@ pub(crate) trait PathSource: Send + Sync {
 /// kernel's route socket), each a [`PathEvent::Moved`] at once (the probe dials the API, which no
 /// fleet herd shares, so it waits out no spread: [`crate::network_moved::watch_at_once`]); the
 /// other sources that signal tells of
-/// (the fleet's browse and beacons, the Local Network answer) say nothing of the API's reach and
+/// (the fleet's browse and beacons, the network place) say nothing of the API's reach and
 /// are not passed on. On macOS the path's return after a loss is told too, as a
 /// [`PathEvent::Back`] after its reading ([`PathEdge`]), and so is a wake from sleep
 /// (`aterm_uds::power::listen`, IOKit's root power domain, on a thread of its own that ends
@@ -234,8 +234,8 @@ const fn usable(status: aterm_objc::path_monitor::PathStatus) -> Option<bool> {
 }
 
 /// Whether a move `woke` heard is passed on as a [`PathEvent::Moved`]: only the kernel's route
-/// socket's, since the fleet's browse and beacons and the Local Network answer say nothing of
-/// the API's reach.
+/// socket's, since the fleet's browse and beacons and the network place say nothing of the API's
+/// reach.
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 const fn route_move(woke: crate::network_moved::Woke) -> bool {
     matches!(woke, crate::network_moved::Woke::Route)
@@ -1880,7 +1880,7 @@ mod tests {
         use crate::network_moved::Woke;
         assert!(route_move(Woke::Route));
         assert!(!route_move(Woke::Browse));
-        for other in [Woke::Timer, Woke::Beacon, Woke::LocalNetwork] {
+        for other in [Woke::Timer, Woke::Beacon] {
             assert!(!route_move(other), "{other:?}");
         }
     }

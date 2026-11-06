@@ -50,3 +50,32 @@ pub(crate) fn asset_delete(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
         Ok(done(as_outcome(report.clone(), deleted)))
     })
 }
+
+/// Download one public asset by its web URL; no release or asset enumeration.
+pub(crate) fn asset_fetch_public(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
+    if !inv.global.anonymous || inv.global.as_profile.is_some() {
+        return Err(inv.usage("asset fetch-public requires --anonymous"));
+    }
+    let tag = inv
+        .rest()
+        .first()
+        .ok_or_else(|| inv.usage("TAG is required"))?;
+    let name = inv
+        .rest()
+        .get(1)
+        .ok_or_else(|| inv.usage("NAME is required"))?;
+    let gh = ctx.github()?;
+    let (slug, _) = inv.repo(gh.router())?;
+    let scratch =
+        aterm_tempfile::tempdir().map_err(|e| crate::error::Error::local(e.to_string()))?;
+    let path = scratch.path().join("asset");
+    gh.public().fetch(&slug, tag, name, &path, 2 << 30)?;
+    let mut file =
+        std::fs::File::open(path).map_err(|e| crate::error::Error::local(e.to_string()))?;
+    let written = std::io::copy(&mut file, &mut ctx.stdout)
+        .map_err(|e| crate::error::Error::local(e.to_string()))?;
+    Ok(Outcome {
+        answer: super::Answer::Streamed { written },
+        receipt: super::Receipt::for_repo(inv, &gh, &slug),
+    })
+}

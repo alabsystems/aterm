@@ -11,7 +11,11 @@ use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[path = "watch_service.rs"]
+mod service;
+
 const HELP: &str = "verify watch [--workspace DIR] [--remote NAME] [--branch BRANCH] [--once] [--interval SECONDS]\n\
+verify watch --install [--workspace DIR] [--interval SECONDS] installs a persistent macOS main lane.\n\
 Samples origin/main in a dedicated persistent clone at Background rank. Claims and verdicts\n\
 are appended to refs/aterm/judged (14 days of records). A release ends the sample; an Ordinary\n\
 waiter yields it at the next stage. --once attempts one sample. No hook, gate or publication.\n";
@@ -69,6 +73,15 @@ fn now() -> u64 {
 
 /// The lane controller. An internal sample verb is always launched in its own process group.
 pub fn run(args: &[String], cwd: &Path) -> i32 {
+    if args.first().is_some_and(|s| s == "--install") {
+        return match options(&args[1..], cwd).and_then(|o| service::install(&o, cwd)) {
+            Ok(()) => 0,
+            Err(why) => {
+                eprintln!("verify watch install: {why}");
+                3
+            }
+        };
+    }
     if args.first().is_some_and(|s| s == "--help" || s == "-h") {
         print!("{HELP}");
         return 0;
@@ -153,10 +166,13 @@ fn prepare_workspace(opts: &Options, cwd: &Path) -> Result<PathBuf, String> {
             &[
                 "clone",
                 "--no-hardlinks",
-                &source,
+                cwd.to_str().ok_or("source checkout is not UTF-8")?,
                 opts.workspace.to_str().ok_or("workspace is not UTF-8")?,
             ],
         )?;
+        // Seed independent objects locally; every sample still fetches the actual remote.
+        // A full network clone of this repository can exceed the bounded Git call.
+        git(&opts.workspace, &["remote", "set-url", "origin", &source])?;
         fs::write(
             opts.workspace.join(".git/verify-watch-owner"),
             source.as_bytes(),
@@ -202,11 +218,14 @@ fn attempt(opts: &Options) -> Result<(), String> {
     };
     // The claim precedes all expensive work. A losing append must inspect the winning claim.
     loop {
-        let head = judged::head(root, "origin")?;
-        if judged::record(root, head.as_deref(), &record.tree)?.is_some_and(|r| r.occupied(now())) {
+        let until = judged::deadline();
+        let head = judged::head(root, "origin", until)?;
+        if judged::record(root, head.as_deref(), &record.tree, until)?
+            .is_some_and(|r| r.occupied(now()))
+        {
             return Ok(());
         }
-        if judged::append(root, "origin", head.as_deref(), &record)? {
+        if judged::append(root, "origin", head.as_deref(), &record, until)? {
             break;
         }
     }
@@ -225,7 +244,7 @@ fn attempt(opts: &Options) -> Result<(), String> {
     }
     record.updated = now();
     record.lease_until = 0;
-    publish_owned(root, &record)?;
+    publish_owned(root, &record, judged::deadline()).map_err(|e| e.to_string())?;
     println!(
         "verify watch: {} {} elapsed_s={} (journal {})",
         record.state,
@@ -236,18 +255,111 @@ fn attempt(opts: &Options) -> Result<(), String> {
     Ok(())
 }
 
-fn publish_owned(root: &Path, record: &Record) -> Result<(), String> {
+#[derive(Debug)]
+enum PublishError {
+    Lost,
+    Unavailable(String),
+}
+
+impl From<String> for PublishError {
+    fn from(why: String) -> Self {
+        Self::Unavailable(why)
+    }
+}
+
+impl std::fmt::Display for PublishError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Lost => f.write_str("sample lost its lease; no verdict was written"),
+            Self::Unavailable(why) => f.write_str(why),
+        }
+    }
+}
+
+const STOP_GRACE: Duration = Duration::from_secs(20);
+const LEASE_MARGIN: Duration = Duration::from_secs(30);
+const _: () = assert!(LEASE_MARGIN.as_secs() > STOP_GRACE.as_secs());
+
+/// Only a confirmed append extends the lease. Leave enough of it to stop the group.
+struct Renewal {
+    expires: Instant,
+    epoch_until: u64,
+    next: Instant,
+}
+
+impl Renewal {
+    fn new(expires: Instant, epoch_until: u64, now: Instant) -> Self {
+        Self {
+            expires,
+            epoch_until,
+            next: now + Duration::from_secs(30),
+        }
+    }
+
+    fn cutoff(&self) -> Instant {
+        self.expires - LEASE_MARGIN
+    }
+
+    fn valid(&self, now: Instant, epoch: u64) -> bool {
+        // Unix time covers sleep/forward jumps; Instant prevents backward jumps extending ownership.
+        now < self.cutoff() && epoch.saturating_add(LEASE_MARGIN.as_secs()) < self.epoch_until
+    }
+
+    fn deadline(&self, now: Instant, epoch: u64) -> Instant {
+        self.cutoff()
+            .min(
+                now + Duration::from_secs(
+                    self.epoch_until
+                        .saturating_sub(epoch.saturating_add(LEASE_MARGIN.as_secs())),
+                ),
+            )
+            .min(now + Duration::from_secs(5))
+    }
+
+    fn finish(
+        &mut self,
+        result: Result<(), PublishError>,
+        proposed: Instant,
+        proposed_until: u64,
+        now: Instant,
+        epoch: u64,
+    ) -> Result<(), PublishError> {
+        match result {
+            Ok(()) => {
+                self.expires = proposed + Duration::from_secs(judged::LEASE);
+                self.epoch_until = proposed_until;
+                self.next = now + Duration::from_secs(30);
+                Ok(())
+            }
+            Err(PublishError::Unavailable(_)) if self.valid(now, epoch) => {
+                self.next = now + Duration::from_secs(5);
+                Ok(())
+            }
+            Err(why) => Err(why),
+        }
+    }
+}
+
+fn publish_owned(root: &Path, record: &Record, until: Instant) -> Result<(), PublishError> {
     loop {
-        let head = judged::head(root, "origin")?;
-        if !judged::record(root, head.as_deref(), &record.tree)?
+        let head = judged::head(root, "origin", until)?;
+        if !judged::record(root, head.as_deref(), &record.tree, until)?
             .is_some_and(|r| r.token == record.token)
         {
-            return Err("sample lost its lease; no verdict was written".into());
+            return Err(PublishError::Lost);
         }
-        if judged::append(root, "origin", head.as_deref(), record)? {
+        if judged::append(root, "origin", head.as_deref(), record, until)? {
             return Ok(());
         }
     }
+}
+
+fn sample_command(program: &Path) -> aterm_uds::spawnfd::Command {
+    let mut cmd = aterm_uds::spawnfd::command(program);
+    // launchd's session is zero. Tests exercise native terminal identities, so
+    // the sample leads both its own session and its cancellable process group.
+    cmd.setsid(true).tether();
+    cmd
 }
 
 fn judge(root: &Path, record: &mut Record) -> Result<(), String> {
@@ -264,20 +376,23 @@ fn judge(root: &Path, record: &mut Record) -> Result<(), String> {
     }
     record.updated = now();
     record.lease_until = now() + judged::LEASE;
-    publish_owned(root, record)?;
+    publish_owned(root, record, judged::deadline()).map_err(|e| e.to_string())?;
     let result = root.join(".git/watch-result.toml");
     let _ = fs::remove_file(&result);
     let log = root.join(".git/watch-sample.log");
-    let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().map_err(|e| e.to_string())?);
+    let mut cmd = sample_command(&std::env::current_exe().map_err(|e| e.to_string())?);
     cmd.current_dir(root)
         .args(["watch", "--sample"])
-        .arg(&result)
-        .process_group(0)
-        .tether();
+        .arg(&result);
     cmd.stdout(File::create(log).map_err(|e| e.to_string())?)
         .stderr(Stdio::inherit());
     let mut child = cmd.spawn().map_err(|e| e.to_string())?;
-    let mut renewed = Instant::now();
+    let began = Instant::now();
+    let mut renewal = Renewal::new(
+        began + Duration::from_secs(record.lease_until.saturating_sub(now())),
+        record.lease_until,
+        began,
+    );
     let stopped = aterm_toolchain::interrupt::Watch::enter();
     let status = loop {
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
@@ -288,14 +403,25 @@ fn judge(root: &Path, record: &mut Record) -> Result<(), String> {
             record.state = "cancelled".into();
             return Ok(());
         }
-        if renewed.elapsed() >= Duration::from_secs(30) {
+        let proposed = Instant::now();
+        if !renewal.valid(proposed, now()) {
+            stop_sample(&mut child)?;
+            return Err("could not renew the judging lease before its cleanup margin".into());
+        }
+        if proposed >= renewal.next {
             record.updated = now();
             record.lease_until = now() + judged::LEASE;
-            if let Err(why) = publish_owned(root, record) {
+            let published = publish_owned(root, record, renewal.deadline(proposed, now()));
+            if let Err(why) = renewal.finish(
+                published,
+                proposed,
+                record.lease_until,
+                Instant::now(),
+                now(),
+            ) {
                 let _ = stop_sample(&mut child);
-                return Err(why);
+                return Err(why.to_string());
             }
-            renewed = Instant::now();
         }
         stopped.nap(Duration::from_millis(100), &|| false);
     };
@@ -325,7 +451,7 @@ fn judge(root: &Path, record: &mut Record) -> Result<(), String> {
 
 fn stop_sample(child: &mut aterm_uds::spawnfd::Child) -> Result<(), String> {
     let _ = child.terminate();
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + STOP_GRACE;
     loop {
         if child.try_wait().map_err(|e| e.to_string())?.is_some() {
             return Ok(());
@@ -624,8 +750,9 @@ fn row(id: &str, code: Option<i32>, text: &str) -> Row {
 }
 
 fn attribute(root: &Path, record: &mut Record) -> Result<(), String> {
-    let head = judged::head(root, "origin")?;
-    let mut previous = judged::records(root, head.as_deref())?;
+    let until = judged::deadline();
+    let head = judged::head(root, "origin", until)?;
+    let mut previous = judged::records(root, head.as_deref(), until)?;
     previous.sort_by_key(|r| std::cmp::Reverse(r.updated));
     for row in &mut record.rows {
         let wanted = if row.outcome == "red" {
@@ -873,6 +1000,28 @@ fn dependency_closure(roots: &BTreeSet<String>, graph: &DependencyGraph) -> BTre
 mod tests {
     use super::*;
     #[test]
+    fn a_sample_has_a_real_session_as_well_as_its_own_group() {
+        let topology = |mut command: aterm_uds::spawnfd::Command| {
+            let mut child = command.arg("60").spawn().unwrap();
+            let pid = i32::try_from(child.id()).unwrap();
+            // SAFETY: these integer queries name this test's own unreaped child.
+            let (group, session) = unsafe { (libc::getpgid(pid), libc::getsid(pid)) };
+            child.kill().unwrap();
+            child.wait().unwrap();
+            (pid, group, session)
+        };
+        let (pid, group, session) = topology(sample_command(Path::new("/bin/sleep")));
+        assert_eq!((group, session), (pid, pid));
+        let mut group_only = aterm_uds::spawnfd::command("/bin/sleep");
+        group_only.process_group(0);
+        let (pid, group, session) = topology(group_only);
+        assert_eq!(group, pid);
+        assert_ne!(
+            session, pid,
+            "a group alone leaves launchd's session inherited"
+        );
+    }
+    #[test]
     fn attribution_resolves_package_aliases_and_submodule_pins() {
         let metadata: aterm_json::Value = aterm_json::from_str(r#"{"packages":[{"name":"alias","manifest_path":"/repo/crates/actual/Cargo.toml","dependencies":[]}]}"#).unwrap();
         let graph = metadata_graph(Path::new("/repo"), &metadata).unwrap();
@@ -911,6 +1060,92 @@ mod tests {
             "direct SIGKILL would prevent the worker from retiring its nested groups"
         );
     }
+    #[test]
+    fn failed_renewals_preserve_only_confirmed_time_and_ownership_loss_stops() {
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+        let mut lease = Renewal::new(at(120), 1120, start);
+        assert!(
+            lease
+                .finish(
+                    Err(PublishError::Unavailable("network".into())),
+                    at(30),
+                    1150,
+                    at(31),
+                    1031
+                )
+                .is_ok()
+        );
+        assert_eq!(lease.expires, at(120));
+        assert_eq!(lease.epoch_until, 1120);
+        assert_eq!(lease.next, at(36));
+        assert_eq!(lease.deadline(at(87), 1087), at(90));
+        assert!(
+            !lease.valid(at(31), 1121),
+            "sleep or a forward wall-clock jump cannot prolong ownership"
+        );
+        assert!(
+            !lease.valid(at(121), 900),
+            "a backward wall-clock jump cannot prolong ownership"
+        );
+        assert!(lease.finish(Ok(()), at(60), 1180, at(61), 1061).is_ok());
+        assert_eq!(lease.expires, at(180));
+        assert_eq!(lease.cutoff(), at(150));
+        assert!(
+            lease
+                .finish(Err(PublishError::Lost), at(80), 1200, at(81), 1081)
+                .is_err()
+        );
+        assert!(
+            lease
+                .finish(
+                    Err(PublishError::Unavailable("network".into())),
+                    at(145),
+                    1265,
+                    at(150),
+                    1150
+                )
+                .is_err()
+        );
+        assert_eq!(lease.expires, at(180));
+    }
+
+    #[test]
+    fn workspace_seed_survives_source_removal_without_contacting_remote() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-b", "main", "source"]).unwrap();
+        let source = dir.path().join("source");
+        git(&source, &["config", "user.name", "Andrew Yates"]).unwrap();
+        git(&source, &["config", "user.email", "test@example.invalid"]).unwrap();
+        fs::write(source.join("item"), "independent objects").unwrap();
+        git(&source, &["add", "item"]).unwrap();
+        git(&source, &["commit", "-m", "seed"]).unwrap();
+        // A network-first clone fails against this deliberately unavailable remote.
+        git(
+            &source,
+            &["remote", "add", "origin", "https://invalid.invalid/absent"],
+        )
+        .unwrap();
+        let opts = Options {
+            workspace: dir.path().join("lane"),
+            remote: "origin".into(),
+            branch: "main".into(),
+            once: false,
+            interval: Duration::from_secs(60),
+        };
+        let root = prepare_workspace(&opts, &source).unwrap();
+        fs::remove_dir_all(&source).unwrap();
+        assert_eq!(
+            git(&root, &["show", "HEAD:item"]).unwrap(),
+            "independent objects"
+        );
+        assert_eq!(
+            git(&root, &["remote", "get-url", "origin"]).unwrap(),
+            "https://invalid.invalid/absent"
+        );
+        assert!(!root.join(".git/objects/info/alternates").exists());
+    }
+
     #[test]
     fn attribution_names_non_merge_suspects_and_only_an_unambiguous_fix() {
         let dir = aterm_tempfile::tempdir().unwrap();
@@ -953,7 +1188,16 @@ mod tests {
             )],
         };
         let base = commit("base", "good");
-        assert!(judged::append(&root, "origin", None, &record(&base, "pass", 1)).unwrap());
+        assert!(
+            judged::append(
+                &root,
+                "origin",
+                None,
+                &record(&base, "pass", 1),
+                judged::deadline()
+            )
+            .unwrap()
+        );
         let red = commit("red", "bad");
         let mut red_record = record(&red, "red", 2);
         attribute(&root, &mut red_record).unwrap();
@@ -961,8 +1205,19 @@ mod tests {
             red_record.rows[0].suspects.as_slice(),
             std::slice::from_ref(&red)
         );
-        let head = judged::head(&root, "origin").unwrap().unwrap();
-        assert!(judged::append(&root, "origin", Some(&head), &red_record).unwrap());
+        let head = judged::head(&root, "origin", judged::deadline())
+            .unwrap()
+            .unwrap();
+        assert!(
+            judged::append(
+                &root,
+                "origin",
+                Some(&head),
+                &red_record,
+                judged::deadline()
+            )
+            .unwrap()
+        );
         let fix = commit("fix", "good again");
         let fixed_tree = git(&root, &["rev-parse", "HEAD^{tree}"]).unwrap();
         let merge = git(

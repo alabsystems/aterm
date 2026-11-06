@@ -1886,6 +1886,39 @@ fn only_a_held_file_in_the_lineage_is_a_possible_build_lock() {
     );
 }
 
+/// THE WALK FOR A POSSIBLE BUILD LOCK STAYS IN THE FRONT'S SESSION ([`in_session`]): it ends at
+/// the first ancestor outside it (43, the terminal app that started the tab's shell, holding a
+/// profile's Cargo lock as its disk watch reclaims it), or whose session is unread (50, ended), so
+/// that host's held lock is no hint; an unread own session walks nothing. NEGATIVE CONTROL: an
+/// ancestor in the session (42, an outer Cargo two levels up) is walked, and its held lock is the
+/// hint. `session_of` reads this process's own session as `getsid(0)` does.
+#[cfg(unix)]
+#[test]
+fn the_possible_build_lock_walk_ends_at_the_fronts_session() {
+    let sessions = |pid| match pid {
+        41 | 42 | 44 => Some(7),
+        43 => Some(1),
+        _ => None,
+    };
+    assert_eq!(
+        in_session(vec![41, 42, 43, 44], Some(7), &sessions),
+        [41, 42]
+    );
+    assert_eq!(in_session(vec![41, 50, 42], Some(7), &sessions), [41]);
+    assert_eq!(in_session(vec![41, 42], None, &sessions), Vec::<u32>::new());
+    let lock = || PathBuf::from("/cache/debug/.cargo-lock");
+    let walk = || in_session(vec![41, 42, 43], Some(7), &sessions);
+    let host = |pid| if pid == 43 { vec![lock()] } else { Vec::new() };
+    assert_eq!(possible_build_lock(&walk, &host, &|_| true), None);
+    let outer = |pid| if pid == 42 { vec![lock()] } else { Vec::new() };
+    assert_eq!(possible_build_lock(&walk, &outer, &|_| true), Some(lock()));
+    // SAFETY: `getsid(0)` reads this process's own session.
+    let own = u32::try_from(unsafe { libc::getsid(0) }).ok();
+    assert!(own.is_some());
+    assert_eq!(session_of(std::process::id()), own);
+    assert_eq!(session_of(u32::MAX), None, "no pid");
+}
+
 #[test]
 fn an_unproven_nested_lock_never_forces_admission_or_waits_in_a_cycle() {
     let dir = aterm_tempfile::tempdir().expect("scratch");

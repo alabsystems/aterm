@@ -23,17 +23,54 @@ const USED: [&str; 2] = ["used-1", "used-2"];
 
 type Work = Box<dyn FnOnce() + Send>;
 
-/// A Mac whose 20 Claude Code logins, each made here, all ended at [`START`].
+/// A lapsed Claude Code login file: no token (`aterm-lab`'s `claude_login_proof::DEAD_LOGIN`).
+const CLAUDE_DEAD: &str = "{\"claudeAiOauth\":{\"accessToken\":\"\",\"refreshToken\":\"\",\
+                           \"expiresAt\":0,\"scopes\":[\"user:inference\",\"user:profile\"],\
+                           \"subscriptionType\":null}}\n";
+
+/// A Mac whose Claude Code logins were each made here, in a directory of its own.
 struct Mac {
     _dir: aterm_tempfile::TempDir,
     home: PathBuf,
     state: PathBuf,
     config: PathBuf,
     store: accounts::Store,
+    /// Its rows' labels, in roster order.
+    labels: Vec<String>,
 }
 
 impl Mac {
+    /// 20 logins, all ended at [`START`]; the two [`USED`] ones a session here ran on yesterday.
     fn new() -> Self {
+        let labels: Vec<String> = (0..IDLE)
+            .map(|i| format!("idle-{i}"))
+            .chain(USED.map(str::to_owned))
+            .collect();
+        let mac = Self::laid(labels.clone(), |_| None);
+        mac.record(&labels, &USED);
+        mac
+    }
+
+    /// Three logins a session here ran on yesterday (ONE RULE FOR A LAPSED LOGIN, one-mesh AC1):
+    /// `lapsed`, whose credential file shows it lapsed and whose records say nothing ended;
+    /// `ended`, whose records say it ended at [`START`]; and `lapsed-ended`, both.
+    fn lapsed() -> Self {
+        let mac = Self::laid(
+            ["lapsed", "ended", "lapsed-ended"]
+                .map(str::to_owned)
+                .to_vec(),
+            |label| label.starts_with("lapsed").then_some(CLAUDE_DEAD),
+        );
+        mac.record(
+            &["ended", "lapsed-ended"],
+            &["lapsed", "ended", "lapsed-ended"],
+        );
+        mac
+    }
+
+    /// A Mac with a login made here for each of `labels`, each naming an email, its directory
+    /// holding a `.credentials.json` of `credential`'s bytes where that names some.
+    fn laid(labels: Vec<String>, credential: impl Fn(&str) -> Option<&'static str>) -> Self {
         let dir = aterm_tempfile::Builder::new()
             .prefix("aterm-no-sweep-")
             .tempdir()
@@ -44,19 +81,23 @@ impl Mac {
         let state = root.join("state");
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(&config).unwrap();
-        fs::write(config.join("aterm.toml"), "[fleet]\nmachine = \"m27\"\n").unwrap();
+        aterm_uds::atomic_file::write(
+            &config.join("aterm.toml"),
+            b"[fleet]\nmachine = \"m27\"\n",
+            0o600,
+        )
+        .unwrap();
         let store = accounts::Store::at(&state);
         store.machine_id("0123456789abcdef").unwrap();
-        let labels: Vec<String> = (0..IDLE)
-            .map(|i| format!("idle-{i}"))
-            .chain(USED.map(str::to_owned))
-            .collect();
         let rows = labels
             .iter()
             .map(|label| {
                 let made = store.logins_dir().join(label);
                 fs::create_dir_all(&made).unwrap();
                 fs::write(made.join(".claude.json"), "{}").unwrap();
+                if let Some(body) = credential(label) {
+                    fs::write(made.join(".credentials.json"), body).unwrap();
+                }
                 Row {
                     label: label.clone(),
                     dir: Some(made.to_str().unwrap().to_owned()),
@@ -71,14 +112,31 @@ impl Mac {
             format_roster_toml(&roster).unwrap(),
         )
         .unwrap();
-        store
+        Self {
+            _dir: dir,
+            home,
+            state,
+            config,
+            store,
+            labels,
+        }
+    }
+
+    /// Records each of `ended`'s logins ended at [`START`], and a session here on each of `used`
+    /// yesterday, ended since.
+    fn record(&self, ended: &[impl AsRef<str>], used: &[&str]) {
+        self.store
             .transact_logins(START, &mut None, |state, logins| {
                 let mut events = Vec::new();
-                for label in &labels {
-                    events.extend(accounts::note_login_end(state, logins, label, START));
+                for label in ended {
+                    events.extend(accounts::note_login_end(
+                        state,
+                        logins,
+                        label.as_ref(),
+                        START,
+                    ));
                 }
-                // Yesterday's sessions here, on the two used rows, ended since.
-                for (sid, label) in USED.iter().enumerate() {
+                for (sid, label) in used.iter().enumerate() {
                     events.extend(accounts::note_session(
                         state,
                         &format!("s-{sid}"),
@@ -91,13 +149,21 @@ impl Mac {
                 Ok(events)
             })
             .unwrap();
-        Self {
-            _dir: dir,
-            home,
-            state,
-            config,
-            store,
-        }
+    }
+
+    /// A session here that runs on `label` now, noted a minute before [`START`] and not ended.
+    fn run_on(&self, label: &str) {
+        self.store
+            .transact_logins(START, &mut None, |state, _| {
+                Ok(accounts::note_session(
+                    state,
+                    "s-live",
+                    label,
+                    None,
+                    START - MINUTE,
+                ))
+            })
+            .unwrap();
     }
 
     fn roster(&self) -> PathBuf {
@@ -139,10 +205,6 @@ impl Mac {
             run_attempt: None,
             shared: shared_renewal::Effects::default(),
         };
-        let labels: Vec<String> = (0..IDLE)
-            .map(|i| format!("idle-{i}"))
-            .chain(USED.map(str::to_owned))
-            .collect();
         let mut started = Vec::new();
         let mut now = from;
         while now <= until {
@@ -162,7 +224,8 @@ impl Mac {
                 let last = super::super::sign_in_ladder::last_started(&self.store)
                     .unwrap()
                     .expect("a started sign-in records its start");
-                let label = labels
+                let label = self
+                    .labels
                     .iter()
                     .find(|label| {
                         last == super::super::sign_in_ladder::Started::new(Cli::Claude, label, now)
@@ -221,5 +284,51 @@ fn negative_control_without_the_use_condition_the_upkeep_renews_idle_rows() {
             .windows(2)
             .all(|pair| pair[1].0 - pair[0].0 >= super::super::sign_in_ladder::SPACING_S),
         "the spacing still holds: {started:?}"
+    );
+}
+
+/// THE UPKEEP STARTS NOTHING FOR A LAPSED LOGIN (one-mesh AC1): an hour of the window's upkeep
+/// on a Mac whose used `lapsed` login's credential file shows it lapsed, though nothing recorded
+/// it ended, reads no provider and starts no sign-in for it, with or without a session here
+/// running on it: it reads expired ([`accounts::login_state`]), but the upkeep's doors open only
+/// on its records. The recorded ends beside it start as before (§4.15 rule 4), `lapsed-ended` included: a lapse takes
+/// no renewal away, and they show the upkeep's starts are seen. NEGATIVE CONTROL: with the door
+/// reading `login_state` ([`accounts::with_renewal_on_login_state`]), the same upkeep signs the
+/// lapsed login in by itself.
+#[test]
+fn the_upkeep_starts_nothing_for_a_lapsed_login() {
+    let by_label = |started: &[(i64, String)]| {
+        let mut labels: Vec<String> = started.iter().map(|(_, label)| label.clone()).collect();
+        labels.sort();
+        labels
+    };
+    let mac = Mac::lapsed();
+    let (started, probes) =
+        super::super::provider_read::captured(|| mac.upkeep_until(START, START + HOUR, |_| MINUTE));
+    assert!(probes.is_empty(), "the upkeep read a provider: {probes:?}");
+    assert_eq!(
+        by_label(&started),
+        ["ended", "lapsed-ended"],
+        "only the recorded ends start, each once: {started:?}"
+    );
+    // A session running on the lapsed login opens no door either: the session door reads the
+    // record, and nothing recorded a wall.
+    let mac = Mac::lapsed();
+    mac.run_on("lapsed");
+    let (started, probes) =
+        super::super::provider_read::captured(|| mac.upkeep_until(START, START + HOUR, |_| MINUTE));
+    assert!(probes.is_empty(), "the upkeep read a provider: {probes:?}");
+    assert_eq!(
+        by_label(&started),
+        ["ended", "lapsed-ended"],
+        "a session on the lapsed login starts it no sign-in: {started:?}"
+    );
+    let mac = Mac::lapsed();
+    let started =
+        accounts::with_renewal_on_login_state(|| mac.upkeep_until(START, START + HOUR, |_| MINUTE));
+    assert_eq!(
+        by_label(&started),
+        ["ended", "lapsed", "lapsed-ended"],
+        "NEGATIVE CONTROL: a door on `login_state` starts the lapsed login: {started:?}"
     );
 }

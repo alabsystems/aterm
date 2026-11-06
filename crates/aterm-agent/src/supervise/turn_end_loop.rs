@@ -4884,6 +4884,7 @@ impl<C: Ctl> Session<'_, C> {
                         .as_deref()
                         .and_then(crate::harness::upgrade_drive::host_turn)
                         .unwrap_or(super::super::policy::turn_end::HostTurn::CarryOn);
+                    self.cruise_carry.host_typed();
                     self.turn_end.host_typed(now, kind);
                 }
                 let what = match why {

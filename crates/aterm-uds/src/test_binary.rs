@@ -8,6 +8,43 @@ use std::path::Path;
 #[cfg(debug_assertions)]
 use std::path::PathBuf;
 
+/// Run a lifecycle body only in its fresh, exact-test owned process. The outer
+/// test waits for actual body entry and a successful child exit, then returns
+/// false; the child returns true. Stores created afterward cannot be inherited
+/// by unrelated parallel tests between fork and exec. No lease retry is involved.
+///
+/// # Panics
+/// The owned child cannot start, exceeds its hang detector, fails, or does not
+/// enter the exact requested case. A missing or renamed test never passes.
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub fn isolated_lifecycle(case: &str) -> bool {
+    assert!(
+        !case.is_empty() && !case.starts_with('-'),
+        "an exact test name is required"
+    );
+    const CHILD: &str = "ATERM_ISOLATED_LIFECYCLE_CASE";
+    let marker = format!("entered isolated lifecycle: {case}");
+    if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new(case)) {
+        println!("{marker}");
+        return true;
+    }
+    let mut command = crate::spawnfd::command(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", case, "--test-threads=1", "--nocapture"])
+        .env(CHILD, case);
+    let output = crate::deadline::output_within(&mut command, std::time::Duration::from_secs(60))
+        .expect("the owned lifecycle process finishes");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.lines().any(|line| line.ends_with(&marker)),
+        "owned lifecycle {case} did not enter and pass: {}\n{}\n{}",
+        output.status,
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
+}
+
 /// This test binary's per-user root (module docs), made at the first call.
 #[must_use]
 pub fn scratch_root() -> Option<&'static Path> {
@@ -24,6 +61,30 @@ pub fn scratch_root() -> Option<&'static Path> {
         .as_deref()
     }
     #[cfg(not(debug_assertions))]
+    {
+        None
+    }
+}
+
+/// This test binary's short root, `/tmp/aterm-tu-<uid>/<pid>-<stamp>`, made at the first call
+/// and removed at exit as [`scratch_root`]'s is: a place for a Unix socket whose path must fit
+/// `sun_path` (104 bytes on macOS), which a root under the test `TMPDIR` does not. `None` in any
+/// other program, and off unix.
+#[must_use]
+pub fn short_root() -> Option<&'static Path> {
+    #[cfg(all(unix, debug_assertions))]
+    {
+        static ROOT: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+        ROOT.get_or_init(|| {
+            let exe = std::env::current_exe().ok()?;
+            if !is_test_binary(&exe) {
+                return None;
+            }
+            claim(Path::new("/tmp"))
+        })
+        .as_deref()
+    }
+    #[cfg(not(all(unix, debug_assertions)))]
     {
         None
     }
@@ -220,16 +281,29 @@ fn owner_pid(name: &str) -> Option<u32> {
         .flatten()
 }
 
-/// Run [`sweep`] over `roots` inside `exit(3)`, taking back `own`, this process's root.
+/// Run [`sweep`] over `roots` inside `exit(3)`, as over every directory of roots an earlier call
+/// named ([`scratch_root`]'s and [`short_root`]'s), preserving first-exec custody for each root.
 #[cfg(all(unix, debug_assertions))]
 fn sweep_at_exit(roots: &Path, own: &Path) {
-    static ROOTS: std::sync::OnceLock<(PathBuf, PathBuf)> = std::sync::OnceLock::new();
-    if ROOTS.set((roots.to_path_buf(), own.to_path_buf())).is_err() {
-        return;
+    static ROOTS: std::sync::Mutex<Vec<(PathBuf, PathBuf)>> = std::sync::Mutex::new(Vec::new());
+    {
+        let mut named = ROOTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if named.iter().any(|(known, _)| known == roots) {
+            return;
+        }
+        named.push((roots.to_path_buf(), own.to_path_buf()));
+        if named.len() > 1 {
+            return;
+        }
     }
     extern "C" fn at_exit() {
-        if let Some((roots, own)) = ROOTS.get() {
-            let held = OWN_ROOT_HELD.load(std::sync::atomic::Ordering::SeqCst);
+        let named = ROOTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let held = OWN_ROOT_HELD.load(std::sync::atomic::Ordering::SeqCst);
+        for (roots, own) in named.iter() {
             sweep(roots, Some((own, held)), crate::process::awake_ms());
         }
     }

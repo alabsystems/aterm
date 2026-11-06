@@ -13,5 +13,6 @@ mod models_left;
 mod models_native_observation_continuity;
 mod models_occupancy;
 mod models_self_claim_fact;
+mod models_sources;
 mod models_usage_wall;
 mod models_wakes;

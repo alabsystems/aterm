@@ -15,20 +15,44 @@ use std::{
 // The minimal libc facade does not export this option on either platform.
 const MULTICAST_IF: i32 = if cfg!(target_os = "linux") { 32 } else { 9 };
 
+/// A socket bound to the wildcard address on `port`, sharing it (`SO_REUSEADDR`,
+/// `SO_REUSEPORT`), with `group` joined on interface `index` and a one-hop multicast limit. A
+/// LAN attachment's (`interface` named) is made by `aterm_uds::lan::udp`: on macOS by the root
+/// LAN broker, which passes it here (macOS's Local Network privacy gates the bind and join of a
+/// process of the person's, never of root's); elsewhere here. A loopback one (no `interface`)
+/// reaches no LAN and is made here ([`loopback`]), as a loopback [`crate::lan::Connection`] is
+/// dialed here. This process then binds it to `interface` (where
+/// one is named), names `source` as the address its multicast leaves from and keeps its own
+/// sends looped back, before [`policy`] checks the result.
+///
+/// # Errors
+/// For an attachment on macOS a missing LAN broker (`NotConnected`, its words naming what
+/// installs it) or a port or group the broker's rule refuses (`aterm_uds::lan::here::check_udp`);
+/// or a socket, bind, join or option error.
 pub(in crate::lan) fn bind(
     source: Ipv4Addr,
     group: Ipv4Addr,
     port: u16,
-    interface: Option<(u32, &str)>,
+    index: u32,
+    interface: Option<&str>,
 ) -> io::Result<UdpSocket> {
-    let socket =
-        UdpSocket::from(Socket::of_kind(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_UDP)?.0);
-    if let Some((index, name)) = interface {
+    let options = aterm_uds::lan::UdpOptions {
+        bind: SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)),
+        reuse: true,
+        groups: vec![(group.into(), Some(index))],
+        multicast_if: None,
+        ttl: Some(1),
+    };
+    let socket = if interface.is_some() {
+        aterm_uds::lan::udp(options).map_err(aterm_uds::lan::LanError::into_io)?
+    } else {
+        loopback(source, group, port)?
+    };
+    aterm_uds::keep_out_of_children(&socket)?;
+    socket.set_nonblocking(true)?;
+    if let Some(name) = interface {
         bind_interface(&socket, index, name)?;
     }
-    set_option(&socket, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?;
-    set_option(&socket, libc::SOL_SOCKET, libc::SO_REUSEPORT, 1)?;
-    socket.set_multicast_ttl_v4(1)?;
     socket.set_multicast_loop_v4(true)?;
     // Both kernels accept in_addr here. std handles their different TTL types.
     set_option(
@@ -37,13 +61,25 @@ pub(in crate::lan) fn bind(
         MULTICAST_IF,
         u32::from_ne_bytes(source.octets()),
     )?;
+    policy(&socket, source, interface.map(|_| index))?;
+    Ok(socket)
+}
+
+/// A loopback discovery socket made in this process: shared, bound to the wildcard address on
+/// `port` (any port: no root broker binds it, so the broker's port rule has nothing to guard),
+/// with `group` joined on `source`'s interface. [`bind`] configures the rest.
+fn loopback(source: Ipv4Addr, group: Ipv4Addr, port: u16) -> io::Result<UdpSocket> {
+    let socket =
+        UdpSocket::from(Socket::of_kind(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_UDP)?.0);
+    set_option(&socket, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?;
+    set_option(&socket, libc::SOL_SOCKET, libc::SO_REUSEPORT, 1)?;
+    socket.set_multicast_ttl_v4(1)?;
     let address = Inet::new(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)));
     let (pointer, length) = address.parts();
     // SAFETY: address owns the initialized sockaddr for this complete call.
     if unsafe { libc::bind(socket.as_raw_fd(), pointer, length) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    policy(&socket, source, interface.map(|(index, _)| index))?;
     socket.join_multicast_v4(&group, &source)?;
     Ok(socket)
 }

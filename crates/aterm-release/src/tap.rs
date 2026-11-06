@@ -194,8 +194,8 @@ pub fn plan(src: &Path, tap: &Path) -> Result<Vec<Planned>, String> {
         }
     };
     let mut read_sources = std::collections::BTreeMap::new();
-    for path in &all {
-        let raw = read(path)?;
+    for path in all {
+        let raw = read(&path)?;
         if let Some(w) = INTERNAL_WORDING.iter().find(|w| {
             raw.windows(w.len())
                 .any(|win| win.eq_ignore_ascii_case(w.as_bytes()))
@@ -205,7 +205,7 @@ pub fn plan(src: &Path, tap: &Path) -> Result<Vec<Planned>, String> {
                 path.display()
             ));
         }
-        read_sources.insert(path.clone(), raw);
+        read_sources.insert(path, raw);
     }
     let against_live = |path: String, bytes: Vec<u8>, live: Option<&[u8]>, seed: bool| -> Planned {
         let change = match live {
@@ -243,7 +243,7 @@ pub fn plan(src: &Path, tap: &Path) -> Result<Vec<Planned>, String> {
             casks.push(entry.path());
         }
     }
-    casks.sort();
+    casks.sort_unstable();
     if casks.is_empty() {
         return Err(format!("{} holds no cask", src.join("Casks").display()));
     }

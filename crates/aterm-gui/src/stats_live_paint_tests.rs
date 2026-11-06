@@ -984,9 +984,16 @@ fn a_tick_is_a_mark_at_both_scales() {
             for x in xs {
                 let at = format!("{form:?} {w} pt {s}x, tick at {x}");
                 let want = (x * s) as f32;
+                // The tick's own ink: the axis rail it ends on breaks over row 0's caps at 1×,
+                // and can leave a 1 px piece of its grid ink under a tick, at a gate.
+                let ink = rgba(input.inks.words2, 0xFF);
                 let mark = laid.prims.iter().find_map(|p| match *p {
-                    DrawPrim::Panel { x, y, w, h, .. }
-                        if w <= 1.01 && (x + w / 2.0 - want).abs() <= 1.0 && y < top =>
+                    DrawPrim::Panel {
+                        x, y, w, h, fill, ..
+                    } if fill == ink
+                        && w <= 1.01
+                        && (x + w / 2.0 - want).abs() <= 1.0
+                        && y < top =>
                     {
                         Some((y, w, h))
                     }

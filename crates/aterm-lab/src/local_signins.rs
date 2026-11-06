@@ -16,22 +16,32 @@
 //! of each by the other, and judges:
 //!
 //! 1. every row's state as the files say (signed in, signed out, expired);
-//! 2. nothing contacted a provider (no death, no proxy request, no stand-in run, no probe),
-//!    while a person's ask does take a `Use` and its probe is recorded;
+//! 2. nothing contacted a provider (no death of an instance, a client or a helper either one
+//!    reaped, no proxy request, no stand-in run, no probe), while a person's ask does take a
+//!    `Use` and its probe is recorded;
 //! 3. nothing opened a URL or a browser, and nothing signed a row in;
 //! 4. each Mac reports only its own rows, and the other's reach it only as that Mac's report;
 //! 5. agy's three states are read from local files alone.
 //!
-//! The positive controls show each witness bites: a jailed connect and a jailed `open` die, a
-//! proxied request is counted, the open recorder logs, and an asked agy read runs and is noted.
-//! No value of any fixture is printed or logged; files are compared by SHA-256.
+//! The jail kills whichever process asked. The instances' and this lane's clients' deaths are
+//! read from their exit statuses here. A helper either one spawns is reaped by aterm, and every
+//! world names the death journal ([`aterm_uds::deaths`]), so each aterm process there (a debug
+//! build) that reaps a child a signal ended appends a line: the kernel hands that status to the
+//! reaping wait however briefly the helper lived, which no fork tracking or process-table scan
+//! on macOS can promise (kqueue's `NOTE_TRACK` answers `ENOTSUP`, and there is no subreaper).
 //!
-//! What the witnesses do not see: the jail kills whichever process asked, and only the two
-//! instances' and this lane's own clients' deaths are read, so a helper an instance spawns that
-//! dies in the jail is not counted by itself. A provider CLI it spawned is a stand-in, noted
-//! before it could do anything, and a fetcher that honours the proxy variables (curl, a CLI's
-//! HTTP stack) is counted at the black hole. The `open` control dies at the exec rule; the
-//! LaunchServices lookup rule is a backstop no control reaches.
+//! The positive controls show each witness bites: a jailed connect and a jailed `open` die, a
+//! bare lookup of `com.apple.lsd.open` dies jailed (the LaunchServices rule) and answers
+//! unjailed, a jailed reaper's child that dies in the jail is journaled, a proxied request is
+//! counted, the open recorder logs; once the zero counts are read, a helper an instance spawned
+//! (a tab whose shell execs that lookup) dies in the jail and is journaled, and an asked agy read
+//! runs and is noted. No value of any fixture is printed or logged; files are compared by
+//! SHA-256.
+//!
+//! What the witnesses do not see: a death no aterm reap takes, of a child some other program
+//! reaps (a tab shell's own child) or of an orphan launchd reaps. A provider CLI aterm spawned is
+//! a stand-in, noted before it could do anything, and a fetcher that honours the proxy variables
+//! (curl, a CLI's HTTP stack) is counted at the black hole.
 
 use crate::instance::{BOOT, Instance, Launch, World};
 use crate::{Fail, Res};
@@ -77,6 +87,20 @@ const SSH_CONNECTION: &str = "127.0.0.1 1 127.0.0.1 22";
 
 /// The file each world's stand-ins note their runs in, under the world's directory.
 const RAN: &str = "standin-ran.log";
+
+/// The death journal every aterm process in a world appends to ([`aterm_uds::deaths`]), under
+/// the world's directory.
+const DEATHS: &str = "deaths.log";
+
+/// The LaunchServices open service the lookup controls ask for: one of the three names of the
+/// jail's mach-lookup rule.
+const LSD_OPEN: &str = "com.apple.lsd.open";
+
+/// The hidden verb that looks one Mach service up ([`look_up_main`]).
+pub const LOOK_UP_VERB: &str = "local-signins-look-up";
+
+/// The hidden verb that runs [`LOOK_UP_VERB`] as its own child and reaps it ([`reap_main`]).
+pub const REAP_VERB: &str = "local-signins-reap";
 
 /// The three states a login is laid out in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -313,6 +337,9 @@ struct Mac {
     port: u16,
     /// Fixture files and their SHA-256, as laid.
     digests: BTreeMap<PathBuf, String>,
+    /// The heal-due default row ([`crate::local_signins_heal::lay`]) and where its login is held:
+    /// in its stored file on A, in a keychain on B, so one run judges both answers.
+    heal: (String, crate::local_signins_heal::Held),
 }
 
 /// What one client run did.
@@ -591,8 +618,67 @@ pub fn standin_main(argv0: &str, args: &[String]) -> i32 {
     1
 }
 
+/// `local-signins-look-up <service>`: a bare `bootstrap_look_up` of `service` (no message sent,
+/// nothing opened), then `kr=<kern_return_t>` on stdout and exit 0. Under the jail a lookup of a
+/// LaunchServices open service kills it before it prints.
+#[must_use]
+pub fn look_up_main(args: &[String]) -> i32 {
+    let [service] = args else {
+        eprintln!("usage: {LOOK_UP_VERB} <service>");
+        return 2;
+    };
+    println!("kr={}", crate::sys::mach_look_up(service));
+    0
+}
+
+/// `local-signins-reap <service>`: run this lab image's [`LOOK_UP_VERB`] of `service` as a child
+/// (`aterm_uds::spawnfd`, whose reap notes a death by a signal in the death journal the
+/// environment names), reap it within [`HANG`], and print how it ended (`signal=<n>` or
+/// `code=<n>`). Exit 0 once it knows; 1 when the child could not run or hung; 2 for usage.
+#[must_use]
+pub fn reap_main(args: &[String]) -> i32 {
+    let [service] = args else {
+        eprintln!("usage: {REAP_VERB} <service>");
+        return 2;
+    };
+    let Ok(lab) = std::env::current_exe() else {
+        return 1;
+    };
+    let mut cmd = aterm_uds::spawnfd::command(&lab);
+    cmd.args([LOOK_UP_VERB, service.as_str()])
+        .stdin(aterm_uds::spawnfd::Stdio::null());
+    match aterm_uds::deadline::output_within(&mut cmd, HANG) {
+        Ok(out) => {
+            match out.status.signal() {
+                Some(signal) => println!("signal={signal}"),
+                None => println!("code={}", out.status.code().unwrap_or(-1)),
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("{REAP_VERB}: {e}");
+            1
+        }
+    }
+}
+
+/// The lines of a death journal's `text` that record a child a signal ended
+/// ([`aterm_uds::deaths::line`]).
+#[must_use]
+pub fn deaths(text: &str) -> Vec<String> {
+    text.lines()
+        .filter(|l| {
+            // The reaper's name may hold spaces: read the four words that end the line.
+            let words: Vec<&str> = l.split_whitespace().rev().take(4).collect();
+            matches!(words.as_slice(), [n, "signal", pid, "reaped"]
+                if n.parse::<i32>().is_ok() && pid.parse::<i32>().is_ok())
+        })
+        .map(str::to_string)
+        .collect()
+}
+
 /// The world's whole environment: [`World::env`], the loopback guard, the live upkeep, the
-/// black hole, the open recorder, agy's file backend, `USER` and `LOGNAME`.
+/// death journal, the black hole, the open recorder, agy's file backend, `USER` and `LOGNAME`.
 fn environment(world: &World, proxy: &str) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = world
         .env()
@@ -611,6 +697,7 @@ fn environment(world: &World, proxy: &str) -> Vec<(String, String)> {
             aterm_agent::harness::accounts_sync::UPKEEP_SEAM.into(),
             "1".into(),
         ),
+        (aterm_uds::deaths::SEAM.into(), s(&world.dir.join(DEATHS))),
         ("BROWSER".into(), s(&shim.join("open"))),
         ("LAB_OPEN_LOG".into(), s(&world.dir.join("open.log"))),
         ("SSH_CONNECTION".into(), SSH_CONNECTION.into()),
@@ -677,6 +764,15 @@ impl Mac {
             world.keep();
         }
         let digests = seed(&world, side, now).map_err(Fail::die)?;
+        let held = if side == 'a' {
+            crate::local_signins_heal::Held::File
+        } else {
+            crate::local_signins_heal::Held::Keychain
+        };
+        let heal = (
+            crate::local_signins_heal::lay(&world, side, held, now).map_err(Fail::die)?,
+            held,
+        );
         standins(&world).map_err(Fail::die)?;
         let shim = world.dir.join("shim");
         let lab = std::env::current_exe().map_err(|e| Fail::die(e.to_string()))?;
@@ -690,6 +786,7 @@ impl Mac {
             port: 0,
             instance: None,
             digests,
+            heal,
         })
     }
 
@@ -792,6 +889,12 @@ impl Mac {
             .lines()
             .map(str::to_string)
             .collect()
+    }
+
+    /// The death journal's lines: each child an aterm process of this world reaped dead by a
+    /// signal.
+    fn deaths(&self) -> Vec<String> {
+        deaths(&crate::util::read_regular_text(&self.world.dir.join(DEATHS)).unwrap_or_default())
     }
 
     fn opened(&self) -> Vec<String> {
@@ -962,6 +1065,51 @@ pub fn cmd(args: &[String]) -> Res {
         ),
     ));
     let _ = curl;
+
+    // The LaunchServices rule: a bare lookup of the open service dies jailed and answers
+    // unjailed; a jailed reaper's child that dies so is journaled (in a journal of its own, so
+    // the world's holds only what A's and B's aterm processes reaped).
+    let lab = std::env::current_exe().map_err(|e| Fail::die(e.to_string()))?;
+    let lsd_jailed = run(&a.env, &a.world.home, true, &lab, &[LOOK_UP_VERB, LSD_OPEN]);
+    let lsd_free = run(
+        &a.env,
+        &a.world.home,
+        false,
+        &lab,
+        &[LOOK_UP_VERB, LSD_OPEN],
+    );
+    let reap_journal = a.world.dir.join("deaths-control.log");
+    let mut reap_env = a.env.clone();
+    reap_env.retain(|(k, _)| k != aterm_uds::deaths::SEAM);
+    reap_env.push((
+        aterm_uds::deaths::SEAM.into(),
+        reap_journal.to_string_lossy().into_owned(),
+    ));
+    let reaped = run(&reap_env, &a.world.home, true, &lab, &[REAP_VERB, LSD_OPEN]);
+    let reap_deaths = deaths(&crate::util::read_regular_text(&reap_journal).unwrap_or_default());
+    let killed = format!(" signal {}", libc::SIGKILL);
+    lines.push(line(
+        "control: LaunchServices rule, helper death journaled",
+        lsd_jailed.signal == Some(libc::SIGKILL)
+            && lsd_free.signal.is_none()
+            && lsd_free.code == Some(0)
+            && lsd_free.stdout.starts_with("kr=")
+            && reaped.ok()
+            && reaped.stdout.trim() == format!("signal={}", libc::SIGKILL)
+            && reap_deaths.len() == 1
+            && reap_deaths[0].ends_with(&killed),
+        format!(
+            "jailed lookup of {LSD_OPEN} signal={:?}; unjailed lookup exit {:?} signal={:?} {}; \
+             jailed reaper's child {} (reaper exit {:?}), journaled {}",
+            lsd_jailed.signal,
+            lsd_free.code,
+            lsd_free.signal,
+            lsd_free.stdout.trim(),
+            reaped.stdout.trim(),
+            reaped.code,
+            reap_deaths.len()
+        ),
+    ));
 
     // The stand-ins' controls: each CLI's twin on the world's PATH runs its stand-in, which notes
     // the run, and the harness finds each CLI installed (so a run it started would be one).
@@ -1171,6 +1319,7 @@ pub fn cmd(args: &[String]) -> Res {
         b.ran().into_iter().skip(noted[1]).collect(),
     ];
     let opened = [a.opened(), b.opened()];
+    let helper_deaths = [a.deaths(), b.deaths()];
     let sign_ins = [a.sign_ins(), b.sign_ins()];
     let changed = [a.changed_fixtures(), b.changed_fixtures()];
     let auto_sign_in: Vec<String> = [a.log(), b.log()]
@@ -1183,22 +1332,92 @@ pub fn cmd(args: &[String]) -> Res {
         })
         .collect();
 
+    let now = crate::util::now_secs();
+    let healed: Vec<(char, Result<crate::local_signins_heal::Judged, String>)> = [&a, &b]
+        .iter()
+        .zip(noted.iter().copied())
+        .map(|(mac, noted)| {
+            (
+                mac.side,
+                crate::local_signins_heal::judge(&mac.world, &mac.heal.0, now, noted),
+            )
+        })
+        .collect();
+    lines.push(line(
+        "2c the default login's heal is answered locally",
+        healed
+            .iter()
+            .zip([a.heal.1, b.heal.1])
+            .all(|((_, j), held)| j.as_ref().is_ok_and(|j| j.pass(held))),
+        healed
+            .iter()
+            .zip([a.heal.1, b.heal.1])
+            .map(|((side, j), held)| match j {
+                Ok(j) => format!("{side} ({held:?}): {}", j.words()),
+                Err(e) => format!("{side} ({held:?}): unread: {e}"),
+            })
+            .collect::<Vec<_>>()
+            .join("; "),
+    ));
     lines.push(line(
         "2 no provider contacted",
         upkept == [true, true]
             && alive == [true, true]
             && client_signals.is_empty()
+            && helper_deaths.iter().all(Vec::is_empty)
             && hosts.is_empty()
             && probes.iter().all(Vec::is_empty)
             && ran.iter().all(Vec::is_empty),
         format!(
             "upkeep live a={} b={} (upkeep log lines a={} b={}, held {} s); instances alive a={} b={}; jailed client deaths={}; \
-             proxied requests={}{}; probes a={} b={}; stand-in runs a={:?} b={:?}",
+             helper deaths a={} b={}{}; proxied requests={}{}; probes a={} b={}; stand-in runs a={:?} b={:?}",
             upkept[0], upkept[1], a.log().matches("accounts-upkeep").count(),
             b.log().matches("accounts-upkeep").count(), hold.as_secs(),
-            alive[0], alive[1], client_signals.len(), hosts.len(),
+            alive[0], alive[1], client_signals.len(),
+            helper_deaths[0].len(), helper_deaths[1].len(),
+            if helper_deaths.iter().all(Vec::is_empty) {
+                String::new()
+            } else {
+                format!(" ({})", helper_deaths.concat().join("; "))
+            },
+            hosts.len(),
             if hosts.is_empty() { String::new() } else { format!(" ({})", hosts.join(",")) },
             probes[0].len(), probes[1].len(), ran[0], ran[1]
+        ),
+    ));
+    // The instance's own helper, once the zero counts are read: a tab A's instance spawns, whose
+    // shell execs the lookup, dies in the jail, and A's instance journals the death it reaped.
+    let spawn = a.ctl(&aterm, &["spawn"]);
+    let sid = spawn
+        .stdout
+        .lines()
+        .next()
+        .and_then(|l| l.strip_prefix("OK "))
+        .and_then(|rest| rest.split_whitespace().next())
+        .map(str::to_string);
+    let mut helper_seen = Vec::new();
+    if let Some(sid) = &sid {
+        let at = format!("@{sid}");
+        let exec = format!("exec '{}' {LOOK_UP_VERB} {LSD_OPEN}", lab.display());
+        let sent = a.ctl(&aterm, &[&at, "send", &exec]);
+        let entered = a.ctl(&aterm, &[&at, "key", "enter"]);
+        if sent.ok() && entered.ok() {
+            let deadline = Instant::now() + HANG;
+            while Instant::now() < deadline && helper_seen.is_empty() {
+                crate::stop::sleep(Duration::from_millis(200))?;
+                helper_seen = a.deaths();
+            }
+        }
+    }
+    let alive_after = a.alive();
+    lines.push(line(
+        "control: an instance's helper that dies in the jail is counted",
+        helper_seen.len() == 1 && helper_seen[0].ends_with(&killed) && alive_after,
+        format!(
+            "spawned tab {}; journaled {} ({}); instance alive after={alive_after}",
+            sid.as_deref().unwrap_or("none"),
+            helper_seen.len(),
+            helper_seen.join("; "),
         ),
     ));
     lines.push(line(

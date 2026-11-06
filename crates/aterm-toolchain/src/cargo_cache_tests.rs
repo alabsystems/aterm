@@ -13,7 +13,17 @@ use std::{
 
 const MUTATE: &str = ".package-cache-mutate";
 
-fn exclusive(path: &Path) -> Result<File, TryLockError> {
+/// An independent native exclusive contender on a Cargo lock file, let go by `LOCK_UN` when
+/// dropped (clippy.toml's flock release rule), so no sibling test's fork keeps it held.
+struct Exclusive(File);
+
+impl Drop for Exclusive {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+fn exclusive(path: &Path) -> Result<Exclusive, TryLockError> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -23,28 +33,42 @@ fn exclusive(path: &Path) -> Result<File, TryLockError> {
         .map_err(TryLockError::Error)?;
     #[expect(
         clippy::disallowed_methods,
-        reason = "independent native exclusive contender tests the exact Cargo lock protocol"
+        reason = "independent native exclusive contender tests the exact Cargo lock protocol; `Exclusive`'s Drop releases it by `LOCK_UN`"
     )]
     file.try_lock()?;
-    Ok(file)
+    Ok(Exclusive(file))
 }
 
-/// `exclusive` once every holder has let go. A lock this process just dropped can still read
-/// as held while any other test thread in the binary is between fork and exec: the child holds
-/// a copy of every descriptor (CLOEXEC ones close only at its exec), and an flock lives on the
-/// open file description. So the poll waits that window out; the minute is a hang detector,
-/// never a latency budget.
-fn exclusive_once_released(path: &Path) -> File {
-    let hang = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    loop {
-        match exclusive(path) {
-            Ok(file) => return file,
-            Err(TryLockError::WouldBlock) if std::time::Instant::now() < hang => {
-                aterm_uds::deadline::poll_yield();
-            }
-            Err(error) => panic!("{} was not released: {error:?}", path.display()),
-        }
+/// Each holder lets go at once, even while a child of another thread's spawn sits between fork
+/// and exec holding a copy of every descriptor (an flock lives on the open file description): the
+/// guard and the contender release by `LOCK_UN`, not by a close that copy outlives.
+/// NEGATIVE CONTROL (by hand): with `Held`'s Drop removed the exclusive take reads `WouldBlock`;
+/// with `Exclusive`'s, the guard's acquisition does.
+#[test]
+fn dropped_holders_let_go_while_a_forked_child_holds_their_descriptors() {
+    let home = aterm_tempfile::tempdir().unwrap();
+    let path = home.path().join(MUTATE);
+    let guard = SourceCacheGuard::try_acquire(home.path()).unwrap();
+    let guards_fork = aterm_uds::fork_window::Parked::park();
+    drop(guard);
+    let mutation = exclusive(&path).map_err(|error| format!("{error:?}"));
+    let mutations_fork = aterm_uds::fork_window::Parked::park();
+    let refused = mutation.as_ref().err().cloned();
+    drop(mutation);
+    let after = SourceCacheGuard::try_acquire(home.path()).map_err(|error| error.kind());
+    for fork in [guards_fork, mutations_fork] {
+        let status = fork.release();
+        assert!(status.success(), "{status}");
     }
+    assert_eq!(
+        refused, None,
+        "the dropped guard's lock stayed held in the forked child"
+    );
+    assert_eq!(
+        after.err(),
+        None,
+        "the dropped contender's lock stayed held in the forked child"
+    );
 }
 
 #[test]
@@ -64,7 +88,7 @@ fn shared_guards_allow_download_and_exclude_mutation_until_last_close() {
     drop(first);
     assert!(matches!(exclusive(&path), Err(TryLockError::WouldBlock)));
     drop(second);
-    let mutation = exclusive_once_released(&path);
+    let mutation = exclusive(&path).unwrap();
     assert_eq!(
         std::fs::read(&path).unwrap(),
         b"existing Cargo rendezvous bytes"
@@ -118,7 +142,7 @@ fn unsupported_filesystem_and_lock_errors_never_become_acquired() {
         let expected = (error.kind(), error.raw_os_error());
         let failed = imp::acquire_with(home.path(), |_| Ok(()), |_| Err(error)).unwrap_err();
         assert_eq!((failed.kind(), failed.raw_os_error()), expected);
-        drop(exclusive_once_released(&home.path().join(MUTATE)));
+        drop(exclusive(&home.path().join(MUTATE)).unwrap());
     }
 }
 
@@ -165,7 +189,7 @@ fn lock_name_replacement_is_detected_without_releasing_the_original_guard() {
     assert!(matches!(exclusive(&old), Err(TryLockError::WouldBlock)));
     drop(exclusive(&home.path().join(MUTATE)).unwrap());
     drop(guard);
-    drop(exclusive_once_released(&old));
+    drop(exclusive(&old).unwrap());
     assert_eq!(
         std::fs::read(home.path().join(MUTATE)).unwrap(),
         b"replacement"
@@ -187,7 +211,7 @@ fn home_replacement_is_detected_while_original_lock_remains_owned() {
         Err(TryLockError::WouldBlock)
     ));
     drop(guard);
-    drop(exclusive_once_released(&moved.join(MUTATE)));
+    drop(exclusive(&moved.join(MUTATE)).unwrap());
 }
 
 #[test]
@@ -272,7 +296,7 @@ fn identity_drift_after_actual_lock_acquisition_refuses_and_closes_only_its_file
     )
     .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    drop(exclusive_once_released(&old));
+    drop(exclusive(&old).unwrap());
     assert_eq!(
         std::fs::read(home.path().join(MUTATE)).unwrap(),
         b"replacement"

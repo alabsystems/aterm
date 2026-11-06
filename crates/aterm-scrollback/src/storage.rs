@@ -105,6 +105,22 @@ impl ScrollbackStorage {
         }
     }
 
+    /// Every inline-image span retained history holds, oldest line first.
+    /// Compressed tiers contain no image spans.
+    pub fn images(&self) -> impl Iterator<Item = &ImageSpan> {
+        match self {
+            Self::Memory(sb) => sb.hot.images(),
+        }
+    }
+
+    /// Lines [`Self::images`] walks, whether or not they hold a span: the hot tier's.
+    #[must_use]
+    pub fn image_lines(&self) -> usize {
+        match self {
+            Self::Memory(sb) => sb.hot.len(),
+        }
+    }
+
     /// Inline-image spans on uncompressed line `idx` (`0` = oldest across all tiers), if any.
     /// Compressed warm and cold lines carry no images and return `None` without decompressing.
     #[must_use]

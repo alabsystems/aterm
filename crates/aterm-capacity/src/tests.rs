@@ -1785,6 +1785,52 @@ fn a_claim_inside_held_work_is_held_to_the_other_held_claims_only() {
     );
 }
 
+/// QUIET-FIRST: verify (pid 10) holds its run's disk and the quiet machine, and asks for its
+/// measuring stage's 3 GiB. It is held to the held claims alone, its own and the lab's 16 GiB
+/// (11), never to the two 16 GiB builds that asked before it and wait (12, 13): admitted where 40
+/// GiB is available, though first in, first out would hold it behind 48 GiB reserved. Negative
+/// controls: a verify whose quiet claim only waits, or that holds its disk alone, keeps its place
+/// behind the builds.
+#[test]
+fn a_process_that_holds_the_quiet_machine_waits_behind_no_waiter() {
+    let m = Reading::of_gib(48, 40, 14);
+    let disk = record(10, 0, Need::new("verify").disk(GIB, "/vol"), Some(0));
+    let quiet = |held: Option<u32>| record(10, 1, Need::timing("verify measuring tests"), held);
+    let lab = record(11, 2, Need::new("lab boot").mem_gib(16), Some(0));
+    let build = |pid: u32| record(pid, u64::from(pid), Need::new("build").mem_gib(16), None);
+    let (b12, b13) = (build(12), build(13));
+    let stage = record(10, 20, Need::new("verify measuring tests").mem_gib(3), None);
+    let pids = |rs: &[&Record]| rs.iter().map(|r| r.pid).collect::<Vec<_>>();
+    let look = |rs: &[&Record]| {
+        let ahead: Vec<Other<'_>> = rs.iter().map(|r| plain(r)).collect();
+        decide(&stage.need, stage.order(), &m, &ahead, 30)
+    };
+    let held = quiet(Some(0));
+    let measuring = counted(vec![&disk, &held, &lab, &b12, &b13], 10, None);
+    assert_eq!(pids(&measuring), [10, 10, 11], "the held claims alone");
+    assert!(look(&measuring).is_ok(), "admitted beside the lab");
+
+    let waiting = quiet(None);
+    let queued = counted(vec![&disk, &waiting, &lab, &b12, &b13], 10, None);
+    assert_eq!(pids(&queued), [10, 10, 11, 12, 13]);
+    let short = look(&queued).expect_err("behind the builds");
+    assert_eq!(
+        short.shorts,
+        vec![Short::Memory {
+            need: 3 * GIB,
+            margin: 0,
+            available: 40 * GIB,
+            reserved: 48 * GIB
+        }]
+    );
+    let plain_run = counted(vec![&disk, &lab, &b12, &b13], 10, None);
+    assert_eq!(pids(&plain_run), [10, 11, 12, 13]);
+    assert!(
+        look(&plain_run).is_err(),
+        "a run that holds no quiet claim waits its turn"
+    );
+}
+
 /// The same on the ledger: the stand-in holds 60 GiB of the 90 above /vol's floor, and this
 /// process, its child by the sweep, asks for 40. Admitted, though its ancestor's reservation
 /// leaves it 30: held to that claim it would wait for its parent, which waits for it. Negative
@@ -3274,6 +3320,135 @@ fn a_reservation_holds_back_later_claimed_work_outside_its_kin() {
     );
 }
 
+/// QUIET-BURST through the ledger: a quiet claim waits for a busy GPU as it does for the load,
+/// its patience counting from that look, and its line says so; at its bound it starts whatever
+/// the GPU, saying how busy. Negative control: the same busy GPU holds back no claim that is not
+/// timed, nor a quiet claim with no patience, which waits for the load alone.
+#[test]
+fn a_quiet_claim_waits_for_a_busy_gpu() {
+    let s = scratch("gpu");
+    let m = mac48();
+    let mut busy = Reading::of_gib(48, 40, 14);
+    busy.gpu_busy = Some(97);
+    m.set(busy.clone());
+    let timed = |what: &str, p: Patience| Need::new(what).quiet(14.0).patience(p);
+    let (w, short) = waits(
+        enter(&s, &m, timed("measure paint", patience(120, 600, 900))),
+        &m,
+    );
+    assert_eq!(
+        short.shorts,
+        vec![Short::Gpu {
+            busy: 97,
+            max: crate::QUIET_GPU_BUSY,
+        }],
+        "the GPU alone"
+    );
+    assert!(
+        w.record().next_ms.is_some(),
+        "its patience counts from this look"
+    );
+    names(
+        &w.line(&short),
+        &[
+            "waiting for a quiet GPU: 97% busy > 50%",
+            "starts whatever the GPU in",
+        ],
+    );
+    let build = admitted(enter(&s, &m, Need::new("build").mem_gib(1)), &m);
+    drop(build);
+    let mut quiet = Reading::of_gib(48, 40, 14);
+    quiet.gpu_busy = Some(4);
+    m.set(quiet);
+    let paint = admitted(w, &m);
+    let q = paint.quiet().expect("how it started");
+    assert!(!q.at_bound && q.gpu == Some(4), "{q:?}");
+    names(
+        &q.to_string(),
+        &["started under load 0.0 <= 14.0, GPU 4% busy"],
+    );
+    drop(paint);
+    m.set(busy);
+    let (first, _) = waits(
+        enter(&s, &m, timed("lab instance", patience(0, 0, 900))),
+        &m,
+    );
+    let late = admitted(first, &m);
+    let q = late.quiet().expect("how it started");
+    assert!(q.at_bound && q.gpu == Some(97), "{q:?}");
+    names(
+        &q.to_string(),
+        &["started at its bound under load 0.0 <= 14.0, GPU 97% busy > 50%"],
+    );
+    drop(late);
+    let old = admitted(enter(&s, &m, Need::new("old rule").quiet(14.0)), &m);
+    drop(old);
+}
+
+/// QUIET-BURST, measured: a timing claim whose CPU window and load are quiet still waits for a
+/// busy GPU, though a quiet claim its own process holds covers it (verify's over the matrices it
+/// runs), and is admitted, qualified, once the GPU is quiet. Negative control: a timing claim
+/// at its bound is admitted on its quiet CPU window and load whatever the GPU, qualified, saying
+/// how busy the GPU was.
+#[test]
+fn a_measured_claim_waits_for_a_busy_gpu_whatever_covers_it() {
+    let s = scratch("gpu-timed");
+    let host = mac48();
+    let run = admitted(
+        enter(&s, &host, Need::new("verify measure").quiet(14.0)),
+        &host,
+    );
+    let gpu = |m: &TimingMachine, busy: u8| {
+        let mut reading = Reading::of_gib(48, 40, 14);
+        reading.load1 = Some(1.0);
+        reading.gpu_busy = Some(busy);
+        m.base.set(reading);
+    };
+    let m = TimingMachine::new(&[(0, 0), (1, 99), (2, 198)]);
+    gpu(&m, 97);
+    let w = Waiter::enter(&s.ledger, &m, Need::timing("measure paint")).expect("entered");
+    let Polled::Waiting(w, _) = w.poll(&m) else {
+        panic!("the first counter point cannot qualify");
+    };
+    let Polled::Waiting(w, short) = w.poll(&m) else {
+        panic!("a busy GPU holds a quiet CPU window back");
+    };
+    assert_eq!(
+        short.shorts,
+        vec![Short::Gpu {
+            busy: 97,
+            max: crate::QUIET_GPU_BUSY,
+        }],
+        "the GPU alone, never the covering claim"
+    );
+    names(&w.line(&short), &["starts whatever the GPU in"]);
+    gpu(&m, 3);
+    let Polled::Admitted(claim) = w.poll(&m) else {
+        panic!("a quiet GPU admits it");
+    };
+    assert!(claim.timing_admission().is_ok(), "qualified");
+    assert_eq!(claim.quiet().and_then(|q| q.gpu), Some(3));
+    drop(claim);
+
+    let m = TimingMachine::new(&[(0, 0), (1, 99)]);
+    gpu(&m, 97);
+    let need = Need::timing("lab proof").patience(patience(0, 0, 900));
+    let w = Waiter::enter(&s.ledger, &m, need).expect("entered");
+    let Polled::Waiting(w, _) = w.poll(&m) else {
+        panic!("the first counter point cannot qualify");
+    };
+    let Polled::Admitted(claim) = w.poll(&m) else {
+        panic!("at its bound the GPU holds it back no longer");
+    };
+    assert!(
+        claim.timing_admission().is_ok(),
+        "qualified by its CPU window"
+    );
+    let q = claim.quiet().expect("how it started");
+    assert!(q.at_bound && q.gpu == Some(97), "{q:?}");
+    drop((claim, run));
+}
+
 /// Through the ledger: a quiet claim with a patience waits for the load, and once it has been
 /// next for its bound (none here) it starts whatever the load and says so. Its patience counts
 /// from when it is next: behind another quiet claim (a stand-in's) it waits however long that
@@ -3549,29 +3724,73 @@ fn claimed_work_waits_behind_a_reserving_quiet_waiter_naming_it() {
     old.stop();
 }
 
-/// Two readings in one line: a figure that held is said once, one that moved as from→to, and a
-/// figure the OS does not report is left out.
+/// The GPU window ([`crate::reading::busiest`]): a quiet GPU is read across the whole window, a
+/// reading above the bound decides it at once, a GPU its first read cannot read is unread, a
+/// later reading that reads nothing keeps what was read, and an interrupt ends the read at its
+/// next reading, with the most read by then, so a quiet wait ends within a nap of it.
+#[test]
+fn the_gpu_window_ends_at_its_bound_an_unread_gpu_or_an_interrupt() {
+    let window = |readings: &[Option<u8>], stop_after: Option<usize>| {
+        let mut left = readings.iter().copied().chain(std::iter::repeat(Some(0)));
+        let naps = std::cell::Cell::new(0_usize);
+        let most = crate::reading::busiest(
+            &mut || left.next().flatten(),
+            &mut |_| naps.set(naps.get() + 1),
+            &|| stop_after.is_some_and(|n| naps.get() >= n),
+        );
+        (most, naps.get())
+    };
+    assert_eq!(
+        window(&[Some(10)], None),
+        (Some(10), 12),
+        "the whole window"
+    );
+    assert_eq!(
+        window(&[Some(10), Some(30), Some(97)], None),
+        (Some(97), 2),
+        "decided above the bound"
+    );
+    assert_eq!(window(&[None], None), (None, 0), "unread");
+    assert_eq!(window(&[Some(10), None, Some(20)], None).0, Some(20));
+    assert_eq!(
+        window(&[Some(10), Some(40)], Some(1)),
+        (Some(40), 1),
+        "an interrupt after the first nap"
+    );
+}
+
+/// Two readings in one line: a figure that held is said once, one that moved as from→to (the
+/// GPU's busy share among them), and a figure the OS does not report is left out.
 #[test]
 fn two_readings_read_as_one_line() {
     let mut a = Reading::of_gib(48, 30, 14);
     a.load1 = Some(3.24);
+    a.gpu_busy = Some(4);
     let mut b = a.clone();
     b.load1 = Some(5.06);
     b.available = Some(29 * GIB + GIB / 5);
+    b.gpu_busy = Some(100);
     let line = crate::between(&a, &b);
     names(
         &line,
-        &["3.2→5.1", "14 cores", "30.0→29.2", "48 GiB", "swap 0.0 GiB"],
+        &[
+            "3.2→5.1",
+            "14 cores",
+            "30.0→29.2",
+            "48 GiB",
+            "swap 0.0 GiB",
+            "GPU 4→100% busy",
+        ],
     );
     let held = a.brief();
-    names(&held, &["3.2", "30.0", "48 GiB"]);
+    names(&held, &["3.2", "30.0", "48 GiB", "GPU 4% busy"]);
     assert!(!held.contains('→'), "{held}");
     let bare = Reading {
         cores: 4,
         ..Reading::default()
     }
     .brief();
-    assert!(!bare.contains("GiB"), "{bare}");
+    assert!(!bare.contains("GiB") && !bare.contains("GPU"), "{bare}");
 }
 
 /// A machine of 14 cores at a 5-minute (and 1-minute) load of `load`, with room for any memory.

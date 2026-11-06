@@ -180,8 +180,10 @@ fn window_lane_in(
             .and_then(|()| aterm_uds::private_file::check_private_dir(ledger.dir()))
             .map_err(|why| fail(&why, None))?;
     }
-    let checkout = std::env::current_dir().map_err(|why| fail(&why, None))?;
-    let me = named_lock::Holder::me(&format!("lab {verb}: native windows"), &checkout);
+    let me = named_lock::Holder::me(
+        &format!("lab {verb}: native windows"),
+        &crate::paths::paths().repo,
+    );
     let held = named_lock::take(
         &path,
         &me,

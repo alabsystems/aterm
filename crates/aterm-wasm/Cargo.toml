@@ -34,6 +34,9 @@ aterm-types = { workspace = true }
 # sees, `verify glue` writes the JS glue, and the panic hook reports to
 # `console.error` through the `aterm_host` imports src/host.rs names.
 aterm-wasm-abi = { workspace = true, features = ["export"] }
+# The module's identity record (src/lib.rs `STAMP`), which `ship site` rewrites with the version
+# it builds; no dependencies of its own.
+aterm-stamp = { workspace = true }
 # No getrandom row: nothing needs entropy, and deny.toml admits getrandom only
 # under ring (`forge check` [OB-18]).
 

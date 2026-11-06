@@ -102,7 +102,7 @@ pub(crate) fn is_stored_address(raw: &str) -> bool {
         && is_well_formed_address(raw)
 }
 
-fn address_cow(raw: &str) -> Result<std::borrow::Cow<'_, str>> {
+pub(crate) fn address_cow(raw: &str) -> Result<std::borrow::Cow<'_, str>> {
     let trimmed = raw.trim_ascii();
     if !is_well_formed_address(trimmed) {
         return Err(Error::new("not an address"));

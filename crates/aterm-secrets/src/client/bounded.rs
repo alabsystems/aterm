@@ -188,11 +188,9 @@ fn probe_default_until(deadline: Instant) -> crate::Result<ProbeOutcome> {
     let Some(pin) = decode_key32(crate::ALAB_SIGNER) else {
         return Ok(ProbeOutcome::Absent);
     };
-    let discovered = match crate::discover::browse_alab(budget(Some(deadline), PROBE_DEADLINE)?) {
-        Ok(discovered) => discovered,
-        Err(error) if refused_by_local_network(&error) => return Err(error),
-        Err(_) => Vec::new(),
-    };
+    // A browse that cannot run (no LAN broker) finds none: the defaults are still asked.
+    let discovered =
+        crate::discover::browse_alab(budget(Some(deadline), PROBE_DEADLINE)?).unwrap_or_default();
     let left = budget(Some(deadline), PROBE_DEADLINE)?;
     probe_alab(&pin, &discovered, left, transport::look_within)
 }
@@ -232,7 +230,6 @@ pub fn join_if_unchanged_until(
     {
         match probe_default_until(deadline) {
             Ok(ProbeOutcome::Found(probed)) => Some(probed),
-            Err(error) if refused_by_local_network(&error) => return Err(error),
             _ => None,
         }
     } else {

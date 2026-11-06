@@ -146,11 +146,12 @@ version = "0.2.0"
 
 [[package]]
 name = "aterm"
-version = "0.158.0"
+version = "0.159.0"
 dependencies = [
  "agh",
  "astream-broker",
  "astream-cap",
+ "astream-wire",
  "aterm-acaffeine",
  "aterm-agent",
  "aterm-aos-pane",
@@ -168,10 +169,12 @@ dependencies = [
  "aterm-gui-fabric",
  "aterm-json",
  "aterm-keeper",
+ "aterm-lan",
  "aterm-link",
  "aterm-log",
  "aterm-machines",
  "aterm-mesh",
+ "aterm-metrics",
  "aterm-models-session",
  "aterm-net",
  "aterm-netplace",
@@ -592,6 +595,7 @@ dependencies = [
  "amacs",
  "astream-aead",
  "astream-broker",
+ "astream-sys",
  "astream-wire",
  "aterm-census",
  "aterm-codec",
@@ -848,6 +852,7 @@ dependencies = [
  "aterm-gui-tabs",
  "aterm-gui-timing",
  "aterm-hash",
+ "aterm-heap-count",
  "aterm-http",
  "aterm-jpeg",
  "aterm-json",
@@ -858,6 +863,7 @@ dependencies = [
  "aterm-mail",
  "aterm-mesh",
  "aterm-messages",
+ "aterm-metrics",
  "aterm-models-aos",
  "aterm-models-atpkg",
  "aterm-models-core",
@@ -947,6 +953,7 @@ dependencies = [
  "aterm-control",
  "aterm-gui-timing",
  "aterm-log",
+ "aterm-mesh-core",
  "aterm-messages",
  "aterm-serde",
  "aterm-session",
@@ -984,6 +991,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "aterm-heap-count"
+version = "0.0.0"
+
+[[package]]
 name = "aterm-http"
 version = "0.0.0"
 dependencies = [
@@ -1000,6 +1011,7 @@ name = "aterm-journal"
 version = "0.0.0"
 dependencies = [
  "astream-broker",
+ "astream-sys",
  "astream-wire",
  "aterm-codec",
  "aterm-digest",
@@ -1063,6 +1075,7 @@ dependencies = [
  "aterm-json",
  "aterm-link",
  "aterm-net",
+ "aterm-netplace",
  "aterm-phase",
  "aterm-png",
  "aterm-pty",
@@ -1093,6 +1106,16 @@ version = "0.0.0"
 dependencies = [
  "aterm-tempfile",
  "aterm-uds",
+]
+
+[[package]]
+name = "aterm-lan"
+version = "0.0.0"
+dependencies = [
+ "aterm-keeper",
+ "aterm-tempfile",
+ "aterm-uds",
+ "libc",
 ]
 
 [[package]]
@@ -1133,10 +1156,13 @@ dependencies = [
  "aterm-durable",
  "aterm-hash",
  "aterm-json",
+ "aterm-mesh-core",
  "aterm-models-core",
  "aterm-models-session",
+ "aterm-models-swarm",
  "aterm-slog",
  "aterm-spec",
+ "aterm-spec-anchor",
  "aterm-stamp",
  "aterm-sysprobe",
  "aterm-tempfile",
@@ -1237,6 +1263,7 @@ dependencies = [
  "aterm-net",
  "aterm-secrets",
  "aterm-spec",
+ "aterm-spec-anchor",
  "aterm-stamp",
  "aterm-tempfile",
  "aterm-types",
@@ -1446,12 +1473,13 @@ dependencies = [
  "aterm-codec",
  "aterm-digest",
  "aterm-durable",
+ "aterm-lan",
  "aterm-models-core",
  "aterm-models-session",
  "aterm-netplace",
- "aterm-objc",
  "aterm-spec",
  "aterm-spec-anchor",
+ "aterm-tempfile",
  "aterm-types",
  "aterm-uds",
  "aterm-win32",
@@ -1721,6 +1749,7 @@ dependencies = [
  "aterm-http",
  "aterm-journal",
  "aterm-json",
+ "aterm-log",
  "aterm-mesh-core",
  "aterm-messages",
  "aterm-models-db",
@@ -1974,6 +2003,7 @@ version = "0.0.0"
 dependencies = [
  "astream-sys",
  "aterm-durable",
+ "aterm-stamp",
  "aterm-sysprobe",
  "aterm-tempfile",
  "aterm-vitals",
@@ -2114,6 +2144,7 @@ dependencies = [
  "aterm-predict",
  "aterm-render",
  "aterm-spec",
+ "aterm-stamp",
  "aterm-time",
  "aterm-types",
  "aterm-wasm-abi",

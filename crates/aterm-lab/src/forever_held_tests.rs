@@ -368,19 +368,18 @@ fn the_wants_fold_into_a_same_reply_chains_last_scenario() {
 /// head cut; another tab's chip node, other lines and a `chrome` with no `a11y` line read `-`.
 #[test]
 fn the_screen_readers_nodes_are_the_tabs_chip_and_the_band_rows() {
-    let chrome = "OK 6\n\
+    let chrome = "OK 5\n\
          autopilot sid=s-c window=2 program=claude face=land drawn=\"⤓\"\n\
          a11y window=2 band row=0 role=Alert label=\"aterm stopped typing\" description=-\n\
          a11y window=2 autopilot sid=s-d role=Button label=\"Autopilot: land.\" description=-\n\
          a11y window=2 autopilot sid=s-c role=Button label=\"Autopilot: land.\" description=\"x\"\n\
-         statusitem title=❯ needs=0\n\
-         presence rim=none pressing=- pill=\"\"";
+         statusitem title=❯ needs=0";
     assert_eq!(
         ax_of(chrome, "s-c"),
         "window=2 band row=0 role=Alert label=\"aterm stopped typing\" description=-\n\
          window=2 autopilot sid=s-c role=Button label=\"Autopilot: land.\" description=\"x\""
     );
-    assert_eq!(ax_of("OK 1\npresence rim=none", "s-c"), "-");
+    assert_eq!(ax_of("OK 1\nstatusitem title=❯ needs=0", "s-c"), "-");
     assert_eq!(
         ax_of(chrome, "s-e"),
         "window=2 band row=0 role=Alert label=\"aterm stopped typing\" description=-"

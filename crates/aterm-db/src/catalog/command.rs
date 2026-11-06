@@ -1284,12 +1284,14 @@ mod tests {
             )
             .unwrap();
         }
-        std::fs::write(
+        aterm_uds::atomic_file::write(
             &config,
             format!(
                 "[commons]\nexclude_tables = [\"{}\"]\n",
                 aterm_codec::hex::encode_lower(&descriptors[2].scope.digest())
-            ),
+            )
+            .as_bytes(),
+            0o600,
         )
         .unwrap();
         let now = aterm_time::unix_millis().unwrap() / 1000;
@@ -1544,12 +1546,14 @@ mod tests {
         assert_eq!(read["receipt_prefix"]["state"], json!("verified"));
         assert_eq!(read["can_resume_writer"], json!(false));
         assert!(!read.to_string().contains("private-custody-payload"));
-        std::fs::write(
+        aterm_uds::atomic_file::write(
             &config,
             format!(
                 "[commons]\nexclude_tables = [\"{}\"]\n",
                 aterm_codec::hex::encode_lower(&scope.digest())
-            ),
+            )
+            .as_bytes(),
+            0o600,
         )
         .unwrap();
         // A damaged excluded target must remain uninspected.
@@ -1742,9 +1746,10 @@ mod tests {
         let log = table_path.join("table.astream");
         std::fs::write(&log, b"broken fixture journal").unwrap();
         let encoded = aterm_codec::hex::encode_lower(&scope.digest());
-        std::fs::write(
+        aterm_uds::atomic_file::write(
             &config,
-            format!("[commons]\nexclude_tables=[\"{encoded}\"]\n"),
+            format!("[commons]\nexclude_tables=[\"{encoded}\"]\n").as_bytes(),
+            0o600,
         )
         .unwrap();
         let excluded = inspect_inventory(paths, &config, scope.digest()).unwrap();
@@ -1855,9 +1860,10 @@ mod tests {
             assert_eq!(ready["role"].as_str(), Some(role));
             assert!(!lab.paths[index].dir.join("commons/tables").exists());
         }
-        std::fs::write(
-            lab.paths[0].home.join("config"),
-            "[commons]\nenabled=false\n",
+        aterm_uds::atomic_file::write(
+            &lab.paths[0].home.join("config"),
+            b"[commons]\nenabled=false\n",
+            0o600,
         )
         .unwrap();
         assert_eq!(

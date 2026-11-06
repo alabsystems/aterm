@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Workspace tool provisioning: `targo --unverified verify provision` fetches or builds each
-//! of [`ROWS`] ([`aterm_uds::host::Provider::Workspace`]).
+//! `verify provision` installs signed atpkg prerequisites and fetches or builds
+//! the remaining checkout-specific tools in [`ROWS`].
 
 mod bash;
 mod fish;
-mod openssl;
 mod place;
 mod rows;
 pub mod stable;
@@ -107,6 +106,18 @@ impl Spawn {
 
 /// What the rows do to the outside world.
 pub trait Host {
+    /// Admit a signed prerequisite and retain its lease through this run. With
+    /// `install`, first install its signed stable pin through the normal flow.
+    /// The path is status output, never authorization for a later operation.
+    ///
+    /// # Errors
+    /// Package installation, signed identity or held-byte admission failed.
+    fn managed(
+        &self,
+        want: atpkg::prerequisite::Prerequisite,
+        install: bool,
+    ) -> Result<(PathBuf, bool), String>;
+
     /// Download `url` into `dest`.
     ///
     /// # Errors
@@ -162,7 +173,7 @@ impl Machine {
 /// Where a row stands after a run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum State {
-    /// In place already, its stamp the pin's: nothing was fetched.
+    /// In place already: a cache stamp matches, or managed bytes were admitted.
     Present(PathBuf),
     /// Fetched or built, checked and placed by this run.
     Placed(PathBuf),
@@ -173,8 +184,8 @@ pub enum State {
     /// Refused or failed, and why: the row is not placed, though a scratch a program ran from,
     /// a copy moved aside and the rustup row's steps that succeeded stay.
     Failed(String),
-    /// A pinned file upstream no longer serves to this fetch (Ubuntu archived its release):
-    /// COULD NOT RUN, naming what changes that, with nothing left behind.
+    /// A pinned upstream file is unavailable (Ubuntu archived its release), or a
+    /// managed prerequisite has no supported host: COULD NOT RUN.
     CouldNotRun(String),
 }
 
@@ -216,10 +227,9 @@ pub struct Options {
     pub rows: Vec<String>,
     /// `--linux`: add the Linux lane's rows.
     pub linux: bool,
-    /// `--release`: add a release host's tools (source signing, the publication engine's
-    /// Python).
+    /// `--release`: add source signing, the publication engine's Python and Lean builder.
     pub release: bool,
-    /// `--check`: read only.
+    /// `--check`: authenticate installed bytes without installing payloads.
     pub check: bool,
     /// `-h`/`--help`.
     pub help: bool,
@@ -232,9 +242,10 @@ pub fn usage() -> String {
     format!(
         "targo --unverified verify provision [ROW...] [--linux] [--release] [--check]
 
-Fetch or build the tools this checkout pins into this user's cache, each placed whole
-or not at all beside a stamp.json; each download is held to a pinned sha256 (pwsh's
-also to Microsoft's Developer ID). The rustup
+Install gitleaks, cpython, openssl-signing and lean4 through atpkg's signed stable
+channel and authenticate their selected bytes with held leases. Other checkout
+tools are fetched or built whole into this user's cache with pinned SHA-256 and a
+stamp.json (pwsh also requires Microsoft's Developer ID). The rustup
 row copies the pinned rustup-init in as `rustup` (its self-install never runs, and
 nothing is written to CARGO_HOME), then has that copy add stable with clippy, its cross
 targets and the wasm32 pin to rustup's own home where they are missing (auto-install
@@ -244,13 +255,14 @@ off first in a home it never ran in). It reads the network.
   --linux     and the Linux lane's VM: lima, Ubuntu's pinned image for its own VM, and
               stable's aarch64-unknown-linux-musl std, which its guest agent is built against
   --release   and a release host's tools: OpenSSL 3 for source signing, and the
-              standalone CPython the publication engine runs on
-  --check     say what is missing; fetch and change nothing
+              standalone CPython and Lean project builder the publication engine runs on
+  --check     authenticate what is present; install no payloads (signed metadata
+              discovery and temporary leases still apply to managed prerequisites)
   ROW...      just these: {}
 
 Exit: 0 each row asked for and pinned here is in place, 1 a row failed (--check: is
-missing), 2 usage, 3 could not run (no $HOME, no row asked for is pinned here, or
-upstream no longer serves a pinned file).
+missing), 2 usage, 3 could not run (no $HOME, an unsupported managed host, no row
+asked for is pinned here, or upstream no longer serves a pinned file).
 ",
         names.join(" ")
     )
@@ -339,7 +351,6 @@ fn target(row: &Row, machine: &Machine) -> Option<Target> {
         Install::Unpack { .. }
         | Install::Build { .. }
         | Install::Configure { .. }
-        | Install::OpenSsl { .. }
         | Install::Files { .. }
         | Install::Rustup { .. } => {
             let tool = row.tool_row()?;
@@ -394,6 +405,7 @@ fn target(row: &Row, machine: &Machine) -> Option<Target> {
                 sizes: Vec::new(),
             })
         }
+        Install::Managed { .. } => None,
     }
 }
 
@@ -454,15 +466,19 @@ fn not_pinned(row: &Row, machine: &Machine) -> String {
     format!("{}: nothing is pinned for {}", row.name, machine.platform)
 }
 
-/// Where `row` stands on `machine`, read only, as a run with no flag sees it ([`check_for`]).
+/// Where `row` stands on `machine`, without payload installation, as a run with
+/// no flag sees it ([`check_for`]).
 pub fn check(row: &Row, machine: &Machine, host: &dyn Host) -> State {
     check_for(row, &Options::default(), machine, host)
 }
 
-/// Where `row` stands on `machine` for a run asked for `opts`, read only: in place, missing,
-/// or not pinned here. `--linux` holds the rustup row to the Linux lane's stable targets
-/// ([`stable::LINUX_LANE_TARGETS`]) too.
+/// Where `row` stands on `machine` for `opts`, without payload installation.
+/// Managed rows still authenticate metadata and take temporary leases.
+/// `--linux` also holds rustup to [`stable::LINUX_LANE_TARGETS`].
 pub fn check_for(row: &Row, opts: &Options, machine: &Machine, host: &dyn Host) -> State {
+    if let Install::Managed { prerequisite, .. } = row.install {
+        return managed_row(prerequisite, machine, host, false);
+    }
     let Some(t) = target(row, machine) else {
         return State::NotPinned(not_pinned(row, machine));
     };
@@ -538,6 +554,9 @@ pub fn provide_for(
     host: &dyn Host,
     say: &mut dyn FnMut(&str),
 ) -> State {
+    if let Install::Managed { prerequisite, .. } = row.install {
+        return managed_row(prerequisite, machine, host, true);
+    }
     let Some(t) = target(row, machine) else {
         return State::NotPinned(not_pinned(row, machine));
     };
@@ -573,17 +592,45 @@ pub fn provide_for(
         Install::Configure { source, patches } => {
             bash::build(&source, patches, &t, machine, host, say).map_err(Refused::from)
         }
-        Install::OpenSsl { source } => {
-            openssl::build(&source, &t, machine, host, say).map_err(Refused::from)
-        }
         Install::Browser(engine) => return browser_row(engine, &t, machine, host, say),
         Install::Rustup { .. } => unreachable!("rustup_row places it"),
+        Install::Managed { .. } => unreachable!("managed rows use the signed store"),
     };
     match done {
         Ok(exe) => State::Placed(exe),
         Err(Refused::Failed(why)) => State::Failed(format!("{} {}: {why}", row.name, t.version)),
         Err(Refused::CouldNotRun(why)) => {
             State::CouldNotRun(format!("{} {}: {why}", row.name, t.version))
+        }
+    }
+}
+
+fn managed_row(
+    want: atpkg::prerequisite::Prerequisite,
+    machine: &Machine,
+    host: &dyn Host,
+    install: bool,
+) -> State {
+    let recipe = want.recipe();
+    if !recipe.hosts.contains(&machine.platform.as_str()) {
+        return State::CouldNotRun(format!(
+            "{} is unavailable on {}",
+            recipe.name, machine.platform
+        ));
+    }
+    match host.managed(want, install) {
+        Ok((path, true)) => State::Present(path),
+        Ok((path, false)) => State::Placed(path),
+        Err(why) => {
+            let why = format!(
+                "{}: signed prerequisite: {why} (fix: `aterm pkg install {}`)",
+                recipe.name, recipe.name
+            );
+            if install {
+                State::Failed(why)
+            } else {
+                State::Missing(why)
+            }
         }
     }
 }
@@ -948,7 +995,7 @@ pub fn run(opts: &Options, machine: &Machine, host: &dyn Host, say: &mut dyn FnM
         crate::exit::FAILED
     } else if unserved > 0 {
         say(&format!(
-            "COULD NOT RUN — {unserved} of {} rows pin a file upstream no longer serves here",
+            "COULD NOT RUN — {unserved} of {} rows unavailable here",
             rows.len()
         ));
         crate::exit::COULD_NOT_RUN
@@ -969,6 +1016,7 @@ pub fn run(opts: &Options, machine: &Machine, host: &dyn Host, say: &mut dyn FnM
 pub struct System {
     repo: PathBuf,
     rustup: stable::System,
+    held: std::cell::RefCell<Vec<atpkg::prerequisite::HeldSet>>,
 }
 
 impl System {
@@ -978,6 +1026,7 @@ impl System {
         Self {
             repo: repo.to_path_buf(),
             rustup: stable::System,
+            held: std::cell::RefCell::default(),
         }
     }
 }
@@ -1024,6 +1073,28 @@ pub(crate) fn fetch_spawn(url: &str, dest: &Path, bytes: u64) -> Spawn {
 }
 
 impl Host for System {
+    fn managed(
+        &self,
+        want: atpkg::prerequisite::Prerequisite,
+        install: bool,
+    ) -> Result<(PathBuf, bool), String> {
+        let (held, current) = if install {
+            atpkg::prerequisite::provision(want, "verify provision")?
+        } else {
+            (
+                atpkg::prerequisite::configured(&[want], "verify provision --check")?,
+                true,
+            )
+        };
+        let tool = held
+            .tool(want)
+            .ok_or("the provision run did not acquire its prerequisite")?;
+        tool.validate()?;
+        let path = tool.path().to_path_buf();
+        self.held.borrow_mut().push(held);
+        Ok((path, current))
+    }
+
     fn fetch(&self, url: &str, dest: &Path, bytes: u64) -> Result<(), String> {
         self.run(&fetch_spawn(url, dest, bytes)).map(|_| ())
     }

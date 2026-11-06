@@ -8,11 +8,13 @@
 //! `agh::github::git`, M1's REST git-data API (commits, refs, trees).
 
 pub mod credential;
+mod fetch;
 pub mod grant;
 #[cfg(test)]
 mod grant_conformance_tests;
 mod run;
 
+pub use fetch::{FetchBatch, FetchRow};
 pub use run::{GitOp, GitOut, GitRun, HelperCommand};
 // `run` stays a private module; its runner is re-exported to the crate alone, so
 // `Github::run_git` (client.rs) calls it as `crate::git::run(self, run)`. The function and

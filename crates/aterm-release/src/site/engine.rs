@@ -12,11 +12,15 @@
 //!    ([`World::build_module`]);
 //! 2. its ES-module glue, from `verify glue`'s generator run in process
 //!    ([`aterm_verify::wasm_glue::glue`]);
-//! 3. the shipping `wasm-opt` pass over the bound module ([`World::optimise`]): a
-//!    module it left unchanged is refused, so nothing ships pre-opt;
-//! 4. refused when a remapped path survives in the module: a panic location must never
+//! 3. the bound module's identity record rewritten ([`aterm_stamp::rewrite`]) with the
+//!    clone's `[workspace.package]` version and the commit it was built from, so the engine
+//!    reports that version; a module that holds no record, or more than one, is refused;
+//! 4. the shipping `wasm-opt` pass over the stamped module ([`World::optimise`]): a
+//!    module it left unchanged is refused, so nothing ships pre-opt, and so is one whose
+//!    record text did not survive the pass;
+//! 5. refused when a remapped path survives in the module: a panic location must never
 //!    show a visitor the builder's home;
-//! 5. installed at `aterm_wasm.<sha12>.js` and `.wasm`, where `sha12` hashes the
+//! 6. installed at `aterm_wasm.<sha12>.js` and `.wasm`, where `sha12` hashes the
 //!    optimized WASM. Both names are immutable: existing non-link regular files must
 //!    match exactly. A JS-only generator change under the same WASM hash refuses and
 //!    needs a deliberate URL-contract change. The glue names the hashed module, and
@@ -52,18 +56,29 @@ fn usable_home(home: Option<&Path>) -> Option<&Path> {
     home.filter(|h| h.is_absolute() && h.parent().is_some())
 }
 
-/// Build the engine from `clone` on `pin` into `term`, binding and optimising in `work`
-/// (a scratch directory of the sync's): the pair's hash.
+/// What an engine is built from: the clone of the public commit, and that commit.
+#[derive(Clone, Copy, Debug)]
+pub struct Source<'a> {
+    /// The clone's root.
+    pub clone: &'a Path,
+    /// The commit it is a clone of, in full.
+    pub commit: &'a str,
+}
+
+/// Build the engine from `source` on `pin` into `term`, binding, stamping and optimising in
+/// `work` (a scratch directory of the sync's): the pair's hash.
 ///
 /// # Errors
-/// A build or `wasm-opt` that did not finish, a module the glue generator refuses, a
-/// `wasm-opt` that changed nothing, a builder's path left in the module, a glue that
+/// A build or `wasm-opt` that did not finish, a module the glue generator refuses, a clone
+/// whose `Cargo.toml` names no `[workspace.package]` version, a module that holds no identity
+/// record or more than one, or whose stamped record `wasm-opt` did not keep, a `wasm-opt` that
+/// changed nothing, a builder's path left in the module, a glue that
 /// never names its module: all before `term` is written. Asset or pointer publication
 /// can fail with the old pointer retained; new unreferenced assets may remain. A
 /// retirement error occurs after the new pointer and complete assets are installed.
 pub fn build(
     world: &mut dyn World,
-    clone: &Path,
+    source: Source<'_>,
     pin: &str,
     home: Option<&Path>,
     work: &Path,
@@ -71,6 +86,7 @@ pub fn build(
     out: &mut dyn Write,
 ) -> Result<String, String> {
     let home = usable_home(home);
+    let clone = source.clone;
     let resolved = clone.canonicalize().unwrap_or_else(|_| clone.to_path_buf());
     let module = world.build_module(&resolved, pin, &rustflags(&resolved, home), out)?;
     let mut files = wasm_glue::glue(&module, STEM)
@@ -84,11 +100,17 @@ pub fn build(
     };
     let js = String::from_utf8(take(format!("{STEM}.js"))?)
         .map_err(|_| format!("the glue {STEM}.js is not UTF-8"))?;
-    let bound = take(format!("{STEM}_bg.wasm"))?;
+    let mut bound = take(format!("{STEM}_bg.wasm"))?;
+    let stamp = source_stamp(source)?;
+    aterm_stamp::rewrite(&mut bound, &stamp)
+        .map_err(|e| format!("cannot stamp {STEM}.wasm as {}: {e}", stamp.build_id()))?;
+    let record = aterm_stamp::encode(&stamp)?;
+    let record_text = record.split(|&b| b == 0).next().unwrap_or_default();
     say(
         out,
         &format!(
-            "engine: {STEM}.wasm bound by verify glue's generator (web); wasm-opt {}",
+            "engine: {STEM}.wasm bound by verify glue's generator (web), stamped {}; wasm-opt {}",
+            stamp.build_id(),
             WASM_OPT_FLAGS.join(" ")
         ),
     );
@@ -105,6 +127,14 @@ pub fn build(
             at.display()
         ));
     }
+    if !wasm.windows(record_text.len()).any(|w| w == record_text) {
+        return Err(format!(
+            "wasm-opt did not keep {}'s identity record ({}), so the engine would report \
+             another version",
+            at.display(),
+            stamp.build_id()
+        ));
+    }
     if let Some(path) = leaked(&wasm, home.into_iter().chain([resolved.as_path(), clone])) {
         return Err(format!(
             "refusing: {} survived the path remapping in the module — a visitor's panic \
@@ -116,6 +146,28 @@ pub fn build(
     let js = rename_module(&js, &format!("{STEM}.{hash}.wasm"))?;
     install(term, &hash, &js, &wasm)?;
     Ok(hash)
+}
+
+/// The identity the engine built from `source` reports: its clone's `[workspace.package]`
+/// version and its commit, clean (the clone is the commit's own tree).
+///
+/// # Errors
+/// The clone's `Cargo.toml` cannot be read or names no `[workspace.package]` version.
+fn source_stamp(source: Source<'_>) -> Result<aterm_stamp::Stamp, String> {
+    let Source { clone, commit } = source;
+    let manifest = clone.join("Cargo.toml");
+    let toml = crate::durable::read_file(&manifest)
+        .map_err(|e| format!("cannot read {}: {e}", manifest.display()))?;
+    let version = crate::publish::workspace_version(&String::from_utf8_lossy(&toml))
+        .map_err(|e| format!("{}: {e}", manifest.display()))?;
+    // One record per engine build: its strings live as long as the sync.
+    let text = |s: &str| -> &'static str { Box::leak(s.to_owned().into_boxed_str()) };
+    Ok(aterm_stamp::Stamp {
+        app_version: text(&version),
+        git_commit: text(commit.get(..12).unwrap_or(commit)),
+        git_commit_full: text(commit),
+        ..aterm_stamp::Stamp::UNSTAMPED
+    })
 }
 
 fn leaked<'p>(module: &[u8], paths: impl IntoIterator<Item = &'p Path>) -> Option<&'p Path> {

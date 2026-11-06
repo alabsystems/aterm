@@ -24,7 +24,6 @@ mod debug_seam;
 mod doc_sentence;
 mod doors;
 mod eager_drop;
-mod export_content;
 mod export_includes;
 mod generated;
 mod github;
@@ -100,7 +99,6 @@ pub const GUARDS: &[Rule] = &[
     rules::STORE_CURRENT,
     keys::KEY_MATERIAL,
     captures::CAPTURE_PRIVACY,
-    export_content::EXPORT_CONTENT,
     export_includes::EXPORT_INCLUDES,
     build_path::BUILD_PATH_VALUE,
     doors::DEVTOOLS_DOOR,

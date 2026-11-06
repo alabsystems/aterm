@@ -9,6 +9,86 @@
 //! usage whether or not the sandbox stops it.
 
 use super::*;
+
+#[test]
+fn a_need_handoff_distinguishes_sleep_expiry_from_actual_native_completion() {
+    use std::cell::Cell;
+    struct Observe<'a> {
+        slept: &'a Cell<Option<u64>>,
+        finished: &'a Cell<bool>,
+        complete: bool,
+        needs: usize,
+    }
+    impl Owner for Observe<'_> {
+        fn need(&mut self, _: &str, _: &str, _: &str) {
+            self.needs += 1;
+            self.slept.set(Some(2_000_000_000));
+            self.finished.set(self.complete);
+        }
+        fn clear(&mut self) {}
+        fn say(&mut self, _: &str) {}
+    }
+    for (expired_at_entry, completed) in
+        [(true, false), (true, true), (false, false), (false, true)]
+    {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let slept = Cell::new(Some(0));
+        let finished = Cell::new(expired_at_entry && completed);
+        let awake = Instant::now();
+        let clock = || awake;
+        let continuous = || slept.get();
+        let deadline =
+            login_drive::Deadline::with_clocks(Duration::from_secs(1), &clock, &continuous);
+        if expired_at_entry {
+            slept.set(Some(2_000_000_000));
+        }
+        let gate = Gate {
+            state: tmp.path(),
+            home: Some(tmp.path()),
+            var: &|_| None,
+            program: (Path::new("/unused-signin"), &[]),
+            sandbox: None,
+            hang: Duration::from_secs(1),
+            wait: true,
+            ack: false,
+            stopped: &|| false,
+            now: &|| 1000,
+            begin: &|_, _| panic!("a handoff cannot begin another provider"),
+        };
+        let mut owner = Observe {
+            slept: &slept,
+            finished: &finished,
+            complete: completed,
+            needs: 0,
+        };
+        let mut approver = NeedApprover {
+            owner: &mut owner,
+            gate: &gate,
+            setup: None,
+            raised: false,
+            stopped: false,
+            elsewhere: None,
+        };
+        let result = approver.approve(&Handoff {
+            url: "https://accounts.x.ai/oauth2/device",
+            code: None,
+            completion: crate::ai::connector::Completion::Device,
+            hosts: &["accounts.x.ai"],
+            email: None,
+            finished: &|| finished.get(),
+            deadline,
+        });
+        if completed {
+            assert_eq!(result, Approval::Approved { page: false });
+        } else {
+            assert!(
+                matches!(result, Approval::NotRun(_)),
+                "expiry is not native approval: {result:?}"
+            );
+        }
+        assert_eq!(owner.needs, usize::from(!expired_at_entry));
+    }
+}
 #[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(target_os = "macos")]
@@ -252,6 +332,7 @@ struct Rung {
     email: Option<String>,
     left: Option<Duration>,
     saw_finished: bool,
+    signer: Option<super::super::accounts::Store>,
 }
 
 #[cfg(target_os = "macos")]
@@ -274,6 +355,7 @@ impl Rung {
             email: None,
             left: None,
             saw_finished: false,
+            signer: None,
         }
     }
 
@@ -299,6 +381,11 @@ impl Rung {
             answers: true,
             said,
             approve: Some(root.join("approve")),
+            signer: Some(super::super::accounts::Store::at_for(
+                &root.join("state"),
+                Cli::Grok,
+                &root.join("home"),
+            )),
             ..Rung::bare()
         }
     }
@@ -329,10 +416,27 @@ impl Auto for Rung {
         ladder
     }
 
-    fn approve(&mut self, handoff: &Handoff<'_>) -> Approval {
+    fn approve(
+        &mut self,
+        handoff: &Handoff<'_>,
+        begun: &super::super::sign_in_ladder::Begun,
+    ) -> Approval {
+        assert!(begun.names(Cli::Grok, LEDGER_ACCOUNT));
+        if let Some(store) = &self.signer {
+            assert!(
+                store.signin_now().unwrap().is_none(),
+                "the actual provider rung retains its original machine turn"
+            );
+            let behind = store.queue_manual_signin().unwrap();
+            assert_eq!(
+                behind.position().unwrap().ahead,
+                1,
+                "the same manual ticket remains ahead through approval"
+            );
+        }
         self.asked += 1;
         self.email = handoff.email.map(str::to_owned);
-        self.left = Some(handoff.deadline.remaining());
+        self.left = Some(handoff.deadline.remaining().unwrap_or_default());
         let wait_for_end = |rung: &mut Rung| {
             let until = Instant::now() + Duration::from_secs(60);
             while !(handoff.finished)() && Instant::now() < until {
@@ -433,9 +537,23 @@ fn gate_run_as(
     let var = vars(env);
     let home = bed.home();
     let state = bed.state();
-    let begin = |_: i64| -> Result<(), String> {
+    let begin = |_: i64,
+                 queued: &mut dyn FnMut(super::super::accounts::SigninPosition)|
+     -> Result<super::super::sign_in_ladder::Begun, String> {
         bed.begun.fetch_add(1, Ordering::SeqCst);
-        bed.refuse.lock().unwrap().clone().map_or(Ok(()), Err)
+        if let Some(why) = bed.refuse.lock().unwrap().clone() {
+            return Err(why);
+        }
+        let store = super::super::accounts::Store::at_for(&state, Cli::Grok, &home);
+        let (turn, _) = store
+            .manual_signin_while(|| !stopped(), queued)
+            .map_err(|why| why.to_string())?
+            .ok_or("cancelled")?;
+        Ok(super::super::sign_in_ladder::begun_fixture(
+            turn,
+            Cli::Grok,
+            LEDGER_ACCOUNT,
+        ))
     };
     let gate = Gate {
         state: &state,
@@ -1301,7 +1419,18 @@ fn a_waiter_is_told_of_a_sign_in_only_while_one_runs() {
                 ack: true,
                 stopped: &polled,
                 now: &clock,
-                begin: &|_| Ok(()),
+                begin: &|_, queued| {
+                    let store = super::super::accounts::Store::at_for(&state, Cli::Grok, &home);
+                    let (turn, _) = store
+                        .manual_signin_while(|| true, queued)
+                        .map_err(|why| why.to_string())?
+                        .ok_or("cancelled")?;
+                    Ok(super::super::sign_in_ladder::begun_fixture(
+                        turn,
+                        Cli::Grok,
+                        LEDGER_ACCOUNT,
+                    ))
+                },
             };
             let mut owner = Counted::new(&seen, Some(bed.root().join("approve")));
             run(&gate, &mut Rung::bare(), &mut owner, &mut |_| {})
@@ -2297,15 +2426,13 @@ fn the_live_rung_reads_the_profile_accounts_browser_opens() {
     );
 }
 
-/// The machine's rung takes the one sign-in lock every CLI's headless sign-ins share before its
-/// browser runs: while another of aterm's sign-ins holds it, the rung waits and, at its
-/// deadline, stops for a person, naming the lock; a grok that ends meanwhile ends the wait.
+/// The machine's rung borrows the gate's original sign-in rather than reacquiring
+/// its own machine lock and losing its manual FIFO place.
 /// Nothing here can launch a browser: the page's URL names two clients, which the approver
-/// refuses before any browser starts. CONTROL: the lock free, the approver is reached (and
-/// refuses that URL).
+/// refuses before any browser starts. A different operation's proof is refused first.
 #[cfg(unix)]
 #[test]
-fn the_live_rung_waits_for_the_machines_sign_in_lock() {
+fn the_live_rung_retains_the_gates_machine_turn_and_rejects_another_operation() {
     use super::super::accounts::Store;
     let tmp = aterm_tempfile::tempdir().expect("tmp");
     let home = tmp.path().join("home");
@@ -2341,93 +2468,42 @@ fn the_live_rung_waits_for_the_machines_sign_in_lock() {
         assert!(ladder.window, "fetchable with no browser installed");
     }
     let url = "https://accounts.x.ai/oauth2/device?client_id=a&client_id=b&user_code=WMRT-8KQZ";
-    let mut approve = |finished: &'static dyn Fn() -> bool, within: Duration| -> Approval {
-        let deadline = WakeDeadline::after(within);
-        live.approve(&Handoff {
-            url,
-            code: Some("WMRT-8KQZ"),
-            completion: crate::ai::connector::Completion::Device,
-            hosts: &["accounts.x.ai"],
-            email: Some("main@example.com"),
-            finished,
-            deadline,
-        })
+    let mut ticket = store.queue_manual_signin().unwrap();
+    let turn = match ticket.try_enter().unwrap() {
+        super::super::accounts::SigninAttempt::Acquired(turn) => turn,
+        other => panic!("free queue did not admit: {other:?}"),
     };
-    let held = store.signin_now().expect("lock").expect("free");
-    let said = approve(&|| false, Duration::from_millis(300));
-    assert!(
-        matches!(&said, Approval::NeedsYou(why) if why.starts_with(super::super::accounts::SIGNIN_HELD)),
-        "{said:?}"
-    );
-    let said = approve(&|| true, Duration::from_secs(60));
-    assert_eq!(
-        said,
-        Approval::Approved { page: false },
-        "grok ended the wait"
-    );
-    drop(held);
-    let said = approve(&|| false, Duration::from_secs(60));
+    let begun = super::super::sign_in_ladder::begun_fixture(turn, Cli::Grok, LEDGER_ACCOUNT);
+    let mut approve = |begun: &super::super::sign_in_ladder::Begun| -> Approval {
+        let within = Duration::from_secs(60);
+        let deadline = super::super::login_drive::Deadline::after(within);
+        live.approve(
+            &Handoff {
+                url,
+                code: Some("WMRT-8KQZ"),
+                completion: crate::ai::connector::Completion::Device,
+                hosts: &["accounts.x.ai"],
+                email: Some("main@example.com"),
+                finished: &|| false,
+                deadline,
+            },
+            begun,
+        )
+    };
+    let said = approve(&begun);
     assert!(
         matches!(&said, Approval::Refused(why) if why.contains("conflicting clients")),
         "CONTROL: {said:?}"
     );
-}
-
-/// THE LIVE RUNG'S WAIT FOR THE MACHINE'S SIGN-IN LOCK COUNTS THE TIME ITS HOST SLEPT
-/// (KI-1105-14): while another of aterm's sign-ins holds the lock, a rung with an hour's deadline
-/// whose host then slept two hours stops for a person at its first look, naming the lock.
-/// NEGATIVE CONTROL: that wait measured on the clock that stops in sleep alone waited the hour
-/// out, which the one-minute hang detector reports.
-#[cfg(unix)]
-#[test]
-fn the_live_rungs_wait_for_the_sign_in_lock_counts_the_time_its_host_slept() {
-    use super::super::accounts::Store;
-    const HOUR: Duration = Duration::from_secs(3600);
-    let tmp = aterm_tempfile::tempdir().expect("tmp");
-    let home = tmp.path().join("home");
-    let state = tmp.path().join("state");
-    std::fs::create_dir_all(&home).unwrap();
-    let roster = tmp.path().join("grok-accounts.toml");
-    std::fs::write(
-        &roster,
-        "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\nemail = \"main@example.com\"\n",
-    )
-    .unwrap();
-    let store = Store::at_for(&state, Cli::Grok, &home);
-    let _held = store.signin_now().expect("lock").expect("free");
-    let (tx, rx) = std::sync::mpsc::channel();
-    // The rung runs on this thread, which alone reads the sleep its first look says its host
-    // slept.
-    std::thread::spawn(move || {
-        let _seam = super::super::wake_deadline::SleepSeam::hold();
-        let mut live = LiveAuto::new(Some(roster), Some(store), Some(home), clock());
-        let _ = live.ladder(false, &|| false);
-        let slept = std::cell::Cell::new(false);
-        let finished = || {
-            if !slept.replace(true) {
-                super::super::wake_deadline::host_slept(2 * HOUR);
-            }
-            false
-        };
-        let said = live.approve(&Handoff {
-            url: "https://accounts.x.ai/oauth2/device?client_id=a&client_id=b&user_code=WMRT-8KQZ",
-            code: Some("WMRT-8KQZ"),
-            completion: crate::ai::connector::Completion::Device,
-            hosts: &["accounts.x.ai"],
-            email: Some("main@example.com"),
-            finished: &finished,
-            deadline: WakeDeadline::after(HOUR),
-        });
-        let _ = tx.send((said, slept.get()));
-    });
-    let (said, slept) = rx
-        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
-        .expect("the rung waited for the lock on the clock that stops in sleep, past the deadline its host slept through");
-    assert!(slept, "the rung looked at grok's end while it waited");
-    assert!(
-        matches!(&said, Approval::NeedsYou(why) if why.starts_with(super::super::accounts::SIGNIN_HELD)),
-        "{said:?}"
-    );
+    assert!(store.signin_now().unwrap().is_none());
+    let behind = store.queue_manual_signin().unwrap();
+    assert_eq!(behind.position().unwrap().ahead, 1);
+    let unrelated = aterm_tempfile::tempdir().unwrap();
+    let wrong_turn = Store::at(unrelated.path()).signin_now().unwrap().unwrap();
+    let wrong = super::super::sign_in_ladder::begun_fixture(wrong_turn, Cli::Grok, "another");
+    assert!(matches!(approve(&wrong), Approval::Refused(why) if why.contains("another operation")));
+    drop(begun);
+    assert_eq!(behind.position().unwrap().ahead, 0);
 }
 
 /// A CALLER'S WAIT FOR ANOTHER'S SIGN-IN COUNTS THE TIME ITS HOST SLEPT (KI-1105-14): a caller
@@ -2497,7 +2573,13 @@ fn the_persons_rung_ends_once_its_host_slept_past_its_deadline() {
         let seen = Seen::default();
         let var = vars(vec![("HOME", bed.home().into_os_string())]);
         let (home, state) = (bed.home(), bed.state());
-        let begin = |_: i64| -> Result<(), String> { Ok(()) };
+        let began = std::cell::Cell::new(false);
+        let begin = |_: i64,
+                     _: &mut dyn FnMut(super::super::accounts::SigninPosition)|
+         -> Result<super::super::sign_in_ladder::Begun, String> {
+            began.set(true);
+            Err("the person's rung cannot begin a provider".into())
+        };
         let gate = Gate {
             state: &state,
             home: Some(&home),
@@ -2522,7 +2604,7 @@ fn the_persons_rung_ends_once_its_host_slept_past_its_deadline() {
         };
         let slept = std::cell::Cell::new(false);
         let finished = || {
-            if !slept.replace(true) {
+            if seen.needs.load(Ordering::SeqCst) > 0 && !slept.replace(true) {
                 super::super::wake_deadline::host_slept(2 * HOUR);
             }
             false
@@ -2534,15 +2616,22 @@ fn the_persons_rung_ends_once_its_host_slept_past_its_deadline() {
             hosts: &["accounts.x.ai"],
             email: None,
             finished: &finished,
-            deadline: WakeDeadline::after(HOUR),
+            deadline: super::super::login_drive::Deadline::waking(
+                WakeDeadline::after(HOUR),
+                &Instant::now,
+            ),
         });
-        let _ = said.send((approval, need.raised));
+        let _ = said.send((approval, need.raised, began.get()));
     });
-    let (approval, raised) = waited
+    let (approval, raised, began) = waited
         .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
         .expect("the rung waited on the clock that stops in sleep, past the deadline its host slept through");
     assert!(raised, "the need went up before the wait");
-    assert_eq!(approval, Approval::Approved { page: false });
+    assert!(
+        matches!(approval, Approval::NotRun(_)),
+        "expiry is not approval"
+    );
+    assert!(!began, "waiting for a person cannot begin provider work");
 }
 
 /// The record never credits the automatic rung with an approval grok's end made: a rung that

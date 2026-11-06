@@ -25,6 +25,21 @@
 //! - The siblings are the ops no other replaces: one union of rows for the ops that are not
 //!   carries and one per class for the carries, each skipping an op already in it.
 //!
+//! The decisions are kernels of `aterm_mesh_core::convergence`, whose island proves law 5 (any
+//! two arrival orders of the same ops read the same register) for every number of ops of the fold
+//! that crate's `Register` follows step for step. Here, whether an op is a carry (`carries`),
+//! whether a sibling beats another (`beats`) and whether a sibling makes a conflict (`conflicts`)
+//! are asked as that fold asks them; which ops an op replaces (`replaces`) is asked with the
+//! arguments the unions fix (`replaces(true, carry, false)`: the op replaces every op in its
+//! past, so it joins the union of every class; `replaces(true, carry, true)`: only its own
+//! class's); and whether a carry is taken out (`drops`) is asked once per op, with whether an op
+//! of another class holds its rep, where the fold asks it of each pair, [`Register::live`]'s
+//! shortcuts skipping a set with no carry or of one class, where the spec's `drops` takes nothing
+//! out. So these folds read what the island's do only because each kernel is its spec
+//! (`convergence_binding_island.rs`) and the unions are the fold's sets: that is held, not
+//! proved, by the tests' differential (`oracle::check`), which checks every resolution a test runs
+//! against the replaced resolver and, up to `oracle::ISLAND_OPS` ops, against `Register`.
+//!
 //! So a register of `k` ops in a log of about `k` records costs `O(k^2 / 64)` row words for the
 //! pass, the lookups and the siblings, where scanning every earlier op against the newest found
 //! so far cost `O(k^3)` tests, plus what reading its distinct frontiers costs. That stays within
@@ -40,6 +55,7 @@
 
 use super::{CandidateOp, DecodedOp};
 use crate::membership_log::reach::{Frontier, Reach, holds, tally};
+use aterm_mesh_core::convergence::{beats, carries, conflicts, drops, replaces};
 use std::collections::{BTreeMap, HashMap};
 
 #[cfg(test)]
@@ -74,7 +90,29 @@ fn mutant(which: Mutant) -> bool {
     MUTANT.get() == Some(which)
 }
 
-/// What an op writes: two ops of one class write the same thing (`same_op`).
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// NEGATIVE CONTROL `entries-arrival-order`: no sibling beats another (the island's
+    /// `firstSeen`), so the first a Mac's log holds wins: two Macs that received concurrent
+    /// writes of one name in different orders read different values, which law 5 refutes.
+    pub(super) static ARRIVAL_ORDER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether [`ARRIVAL_ORDER`] is on, on this thread or for the process; never in a release
+/// build, which has neither switch.
+fn arrival_order() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    {
+        ARRIVAL_ORDER.with(std::cell::Cell::get)
+            || aterm_types::negative_control::on("entries-arrival-order")
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        false
+    }
+}
+
+/// What an op writes: two ops of one class write the same thing.
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 enum Writes<'a> {
     Delete,
@@ -211,11 +249,14 @@ impl<'a> Register<'a> {
         {
             self.last = Some(seen);
         }
-        let carried = match self.cands[k].op {
-            DecodedOp::Put(_) => seen.winner.filter(|&w| self.class[w] == self.class[k]),
-            DecodedOp::Delete => seen.winner.filter(|_| seen.deletes),
-        };
-        if let Some(w) = carried {
+        // The island's `carryAt` and `repAt`: a carry stands for its winner's rep.
+        let carry = carries(
+            matches!(self.cands[k].op, DecodedOp::Delete),
+            seen.winner.is_some(),
+            seen.winner.is_some_and(|w| self.class[w] == self.class[k]),
+            seen.deletes,
+        );
+        if let Some(w) = seen.winner.filter(|_| carry) {
             self.carries[k] = true;
             self.reps[k] = self.reps[w];
         }
@@ -279,41 +320,74 @@ impl<'a> Register<'a> {
         ops.iter()
             .copied()
             .filter(|&c| {
-                !self.carries[c] || {
+                // Whether an op of `ops` of another class has the carry's rep in its past.
+                let rep_below_other = self.carries[c] && {
                     let rep = cands[self.reps[c]].index;
                     let slot = words
                         .binary_search(&(rep / 64))
                         .expect("a carry's rep has its word");
-                    (twice[slot] >> (rep % 64)) & 1 == 0
-                }
+                    (twice[slot] >> (rep % 64)) & 1 == 1
+                };
+                !drops(self.carries[c], false, rep_below_other)
             })
             .collect()
     }
 
-    /// The op every Mac writes among `siblings`: the lowest id of what each stands for.
+    /// The op every Mac writes among `siblings`: the island's `win`, a fold that takes a sibling
+    /// only when it beats the one taken so far (the lowest id of what each stands for, then of
+    /// its own).
     pub(super) fn winner(&self, siblings: &[usize]) -> Option<usize> {
+        let first_seen = arrival_order();
+        siblings.iter().copied().reduce(|w, i| {
+            if !first_seen && self.beats(i, w) {
+                i
+            } else {
+                w
+            }
+        })
+    }
+
+    /// Whether the register is a conflict: a sibling of `siblings` writes otherwise than their
+    /// winner `w` (the island's `conflictOf`).
+    pub(super) fn conflict(&self, siblings: &[usize], w: usize) -> bool {
         siblings
             .iter()
-            .copied()
-            .min_by_key(|&i| (self.cands[self.reps[i]].record_id, self.cands[i].record_id))
+            .any(|&i| conflicts(self.class[i] == self.class[w]))
+    }
+
+    /// Whether op `i` beats op `w` in the winner order (`beats`).
+    fn beats(&self, i: usize, w: usize) -> bool {
+        let (rep_i, rep_w) = (
+            &self.cands[self.reps[i]].record_id,
+            &self.cands[self.reps[w]].record_id,
+        );
+        beats(
+            rep_i < rep_w,
+            rep_i == rep_w,
+            self.cands[i].record_id < self.cands[w].record_id,
+        )
     }
 
     /// The register's siblings. An op replaces what lies in its causal past, except that a carry
     /// replaces only ops writing the value it carries: a reseal after two concurrent edits keeps
     /// both as candidates instead of settling on one.
     ///
-    /// What the ops that are not carries replace is the union of their rows, and what the
-    /// carries of one class replace, among that class's ops, is the union of theirs.
+    /// The island's `replaced`, by rows: an op that `replaces` an op of another class in its past
+    /// (one that is no carry) replaces every op there, so what those replace is the union of
+    /// their rows; an op that replaces only its own class's (a carry) joins its class's union,
+    /// which replaces only that class's ops.
     pub(super) fn siblings(&self, reach: &Reach) -> Vec<usize> {
         let cands = self.cands;
         let (Some(first), Some(last)) = (cands.first(), cands.last()) else {
             return Vec::new();
         };
         let n = cands.len();
+        let any_class = |b: usize| replaces(true, self.carries[b], false);
+        let own_class = |b: usize| !any_class(b) && replaces(true, self.carries[b], true);
         let base = first.index / 64;
         let writers = pasts(
             cands,
-            (0..n).rev().filter(|&b| !self.carries[b]),
+            (0..n).rev().filter(|&b| any_class(b)),
             reach,
             base,
             last.index / 64 + 1 - base,
@@ -326,14 +400,14 @@ impl<'a> Register<'a> {
         let mut by_class: Vec<usize> = (0..n).collect();
         by_class.sort_by_key(|&o| (self.class[o], o));
         for same in by_class.chunk_by(|&a, &b| self.class[a] == self.class[b]) {
-            if !same.iter().any(|&o| self.carries[o]) {
+            if !same.iter().any(|&o| own_class(o)) {
                 continue;
             }
             let lo = cands[same[0]].index / 64;
             let hi = cands[same[same.len() - 1]].index / 64;
             let carried = pasts(
                 cands,
-                same.iter().rev().copied().filter(|&o| self.carries[o]),
+                same.iter().rev().copied().filter(|&o| own_class(o)),
                 reach,
                 lo,
                 hi + 1 - lo,

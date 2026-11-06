@@ -672,6 +672,9 @@ fn with_parked_fork<T>(f: impl FnOnce(i32) -> T) -> T {
     use std::os::fd::AsRawFd as _;
     let (go_r, go_w) = std::io::pipe().expect("pipe");
     let (go_fd, go_w_fd) = (go_r.as_raw_fd(), go_w.as_raw_fd());
+    // Held across the fork alone, so the child copies no neighbour's descriptor between its
+    // creation and its close-on-fork mark (`aterm_uds::kept_out`).
+    let spawning = aterm_uds::spawn_lock::spawning();
     // SAFETY: the child calls only async-signal-safe functions (`close`, `read`, `_exit`) on
     // descriptors opened before `fork`, then exits without unwinding.
     let pid = unsafe { libc::fork() };
@@ -692,6 +695,7 @@ fn with_parked_fork<T>(f: impl FnOnce(i32) -> T) -> T {
             libc::_exit(0);
         }
     }
+    drop(spawning);
     drop(go_r);
     let out = f(pid);
     drop(go_w);

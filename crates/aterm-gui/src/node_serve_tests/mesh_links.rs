@@ -92,7 +92,7 @@ impl MeshNode {
             prebound_listener: Some(prebound),
             tick_every: Duration::from_millis(40),
             wake_timeout: Duration::from_secs(1),
-            lan_may_go: || true,
+            lan_unavailable: || None,
             stop: Arc::clone(&stop),
             launcher: idle_launcher(),
             updates: None,

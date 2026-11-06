@@ -492,9 +492,10 @@ pub fn serve_until(
             .name("db-anti-entropy".into())
             .spawn(move || {
                 let mut repairs = BTreeMap::new();
+                let mut peer_list = Vec::new();
                 while running.load(Ordering::Acquire) {
-                    let peers = peers.lock().unwrap_or_else(|p| p.into_inner()).clone();
-                    for peer in &peers {
+                    peer_list.clone_from(&peers.lock().unwrap_or_else(|p| p.into_inner()));
+                    for peer in &peer_list {
                         if !running.load(Ordering::Acquire) {
                             break;
                         }
@@ -606,9 +607,10 @@ pub fn serve_fleet_until(
             .name("db-fleet-anti-entropy".into())
             .spawn(move || {
                 let mut repairs = BTreeMap::new();
+                let mut peer_list = Vec::new();
                 while running.load(Ordering::Acquire) {
-                    let peers = peers.lock().unwrap_or_else(|p| p.into_inner()).clone();
-                    for peer in &peers {
+                    peer_list.clone_from(&peers.lock().unwrap_or_else(|p| p.into_inner()));
+                    for peer in &peer_list {
                         if !running.load(Ordering::Acquire) {
                             break;
                         }

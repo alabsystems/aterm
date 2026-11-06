@@ -112,9 +112,11 @@ fn journal_open_matches_model_and_rejects_an_unflushed_success() {
     assert!(!model.check_invariant("Available", &unavailable));
 }
 
+/// A fresh open's directory barriers before its checkpoint's: the parent's, which names the
+/// journal's directory, and the empty log's. A failure in either leaves no checkpoint.
 #[test]
 fn early_fresh_directory_failures_leave_no_checkpoint_and_can_recover() {
-    for successful_barriers in 0..3 {
+    for successful_barriers in 0..2 {
         let dir = aterm_tempfile::tempdir().unwrap();
         let fault =
             aterm_durable::seam::FailingDirs::after(successful_barriers, aterm_durable::seam::EIO);
@@ -125,6 +127,21 @@ fn early_fresh_directory_failures_leave_no_checkpoint_and_can_recover() {
         recovered.finish_open().unwrap();
         recovered.append("app/1", vec![9]).unwrap();
     }
+}
+
+/// A fresh checkpoint whose own directory barrier failed is renamed into place by an open that
+/// refuses: the next open finds it, finishes its publication, and appends.
+#[test]
+fn a_fresh_checkpoint_whose_barrier_failed_is_finished_by_the_next_open() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let fault = aterm_durable::seam::FailingDirs::after(2, aterm_durable::seam::EIO);
+    assert!(open(dir.path()).is_err());
+    drop(fault);
+    assert!(identity(&dir.path().join("test.checkpoint")).is_some());
+    let mut recovered = open(dir.path()).unwrap();
+    recovered.finish_open().unwrap();
+    recovered.append("app/1", vec![9]).unwrap();
+    assert_eq!(recovered.read_range(Offset::ZERO, 8).unwrap().len(), 1);
 }
 
 #[test]

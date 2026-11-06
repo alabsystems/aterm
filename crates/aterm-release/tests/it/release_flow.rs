@@ -146,6 +146,8 @@ struct World {
     signal_at: Option<&'static str>,
     /// What the world does once `verify release` ends.
     after_verify: Option<fn(&mut World)>,
+    /// What the world does once a stage to the engine ends.
+    after_stage: Option<fn(&mut World)>,
     /// What the world does while the release next sleeps (an owner wait).
     after_sleep: Option<fn(&mut World)>,
     /// Tags in this clone only (a leftover).
@@ -271,6 +273,7 @@ impl World {
             signal: None,
             signal_at: None,
             after_verify: None,
+            after_stage: None,
             after_sleep: None,
             local_tags: BTreeSet::new(),
             real: None,
@@ -1018,6 +1021,9 @@ impl Backend for World {
                     "reconcile it by hand",
                 ));
             }
+            if let Some(then) = self.after_stage {
+                then(self);
+            }
             return Ok(ran(0));
         }
         Ok(ran(1))
@@ -1378,14 +1384,22 @@ fn a_bump_runs_every_step_in_order_and_ends_released() {
     );
 }
 
-/// A RELEASE CLAIMS ITS DISK ONCE, BEFORE ANYTHING OF IT WRITES, AND LETS GO WHEN VERIFY ENDS:
-/// one claim, sized from what this machine's recorded releases wrote (45 GiB, above the 30 GiB
-/// warm floor) or, with none recorded, the floor, taken before the stage and the build and ended
-/// as verify ends, passed or not, before the publish. A verified candidate and a dry run claim
-/// nothing; a refused claim stops the run at the stage before anything writes. NEGATIVE
-/// CONTROLS: ending the claim before verify, or sizing it without the record, fails here.
+/// A RELEASE CLAIMS ITS DISK BEFORE ANYTHING OF IT WRITES, UNTIL ITS VERIFY ENDS, AND A STAGE
+/// AFTER THAT CLAIMS ITS OWN: one claim, sized from what this machine's recorded releases wrote
+/// (45 GiB, above the 30 GiB warm floor) or, with none recorded, the floor, taken before the stage
+/// and the build and ended as verify ends, kept where it passed; a verify that cannot run ends it
+/// unrecorded. A stage outside it (again before the publish where the engine moved after verify,
+/// or of a candidate verified earlier) claims the 10 GiB a release that verified is held to, and
+/// ends that claim unrecorded as the stage ends: the 0.157.0 cut's unclaimed re-stage walked the
+/// clone twice. No claim is held through an owner's wait. A build and verify that a stage's
+/// refresh brings on (R's reservation spent while it staged) take the release's claim before they
+/// run. A verified candidate that stages nothing claims nothing; a dry run claims nothing and
+/// says each claim a real run would take. NEGATIVE CONTROLS: holding the claim through the
+/// publish, claiming a stage outside it as a whole release or not at all, a dry stage that says
+/// no claim, a rebuild that claims nothing, a second release claim where one is held, or sizing
+/// the claim without the record, fails here.
 #[test]
-fn a_release_claims_its_disk_once_before_it_writes_and_lets_go_when_verify_ends() {
+fn a_release_claims_its_disk_until_verify_ends_and_a_later_stage_claims_its_own() {
     let gib = 1u64 << 30;
     let mut w = World::new();
     w.disk_record.push(aterm_capacity::Footprint {
@@ -1398,7 +1412,14 @@ fn a_release_claims_its_disk_once_before_it_writes_and_lets_go_when_verify_ends(
     let (code, last) = w.run(bump());
     assert_eq!(code, 0, "{last}");
     let at = |w: &World, call: &str| w.calls.iter().position(|c| c == call);
-    assert_eq!(w.count("disk-claim 45"), 1, "{:?}", w.calls);
+    let claims = |w: &World| {
+        w.calls
+            .iter()
+            .filter(|c| c.starts_with("disk-claim"))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(claims(&w), ["disk-claim 45"], "{:?}", w.calls);
     assert!(
         at(&w, "disk-claim 45") < at(&w, "stage") && at(&w, "stage") < at(&w, "build"),
         "{:?}",
@@ -1411,13 +1432,38 @@ fn a_release_claims_its_disk_once_before_it_writes_and_lets_go_when_verify_ends(
         w.calls
     );
 
-    w.calls.clear();
-    assert_eq!(w.run(mac()).0, 0, "a verified candidate");
+    // The engine moved after verify: the publish stages R again, under a claim of its own.
+    let mut w = World::new();
+    w.after_verify = Some(|w| w.engine = "f3f3f3f3f3".into());
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 0, "{last}");
+    let staged: Vec<usize> = w
+        .calls
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.as_str() == "stage")
+        .map(|(i, _)| i)
+        .collect();
+    let (released, restage, ended) = (
+        at(&w, "disk-let-go true"),
+        at(&w, "disk-claim 10"),
+        at(&w, "disk-let-go false"),
+    );
     assert!(
-        !w.calls.iter().any(|c| c.starts_with("disk-claim")),
-        "{:?}",
+        claims(&w) == ["disk-claim 30", "disk-claim 10"]
+            && staged.len() == 2
+            && at(&w, "verify") < released
+            && released < restage
+            && restage < Some(staged[1])
+            && Some(staged[1]) < ended
+            && ended < at(&w, "publish"),
+        "the re-stage runs under a stage's claim, ended before the publish: {:?}",
         w.calls
     );
+
+    w.calls.clear();
+    assert_eq!(w.run(mac()).0, 0, "a verified candidate");
+    assert!(claims(&w).is_empty(), "{:?}", w.calls);
 
     let mut w = World::new();
     w.verify_passes = false;
@@ -1431,6 +1477,124 @@ fn a_release_claims_its_disk_once_before_it_writes_and_lets_go_when_verify_ends(
         w.calls
     );
 
+    // An owner's wait before the publish holds no claim; the re-stage after it claims again.
+    let mut w = World::new();
+    w.audits = VecDeque::from([owner_gap(), owner_gap(), passes()]);
+    w.after_sleep = Some(|w| w.engine = "f5f5f5f5f5".into());
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    let wait = at(&w, "sleep 600");
+    assert!(
+        at(&w, "disk-let-go true") < wait
+            && wait < at(&w, "disk-claim 10")
+            && at(&w, "disk-claim 10") < at(&w, "disk-let-go false")
+            && at(&w, "disk-let-go false") < at(&w, "publish"),
+        "{:?}",
+        w.calls
+    );
+
+    let mut w = World::new();
+    let (code, last) = w.run(ReleaseOptions {
+        prepare: true,
+        ..bump()
+    });
+    assert_eq!(code, 0, "{last}");
+    assert_eq!(
+        (claims(&w), w.count("disk-let-go true")),
+        (vec!["disk-claim 30".to_owned()], 1),
+        "a prepare's claim ends with its verify: {:?}",
+        w.calls
+    );
+    // publish/.out no longer attests R: its resume stages again, and only stages.
+    w.attested = None;
+    w.calls.clear();
+    let (code, last) = w.run(ReleaseOptions {
+        dry_run: true,
+        ..mac()
+    });
+    assert_eq!(code, 0, "{last}");
+    assert!(claims(&w).is_empty(), "{:?}", w.calls);
+    assert!(
+        w.out.iter().any(|l| l.contains("disk: would claim 10 GiB"))
+            && !w.out.iter().any(|l| l.contains("disk: would claim 30 GiB")),
+        "a dry run of a stage again says the stage's claim: {:#?}",
+        w.out
+    );
+    w.calls.clear();
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 0, "{last}");
+    assert!(
+        w.count("verify") == 0
+            && claims(&w) == ["disk-claim 10"]
+            && at(&w, "disk-claim 10") < at(&w, "stage")
+            && at(&w, "stage") < at(&w, "disk-let-go false")
+            && at(&w, "disk-let-go false") < at(&w, "publish"),
+        "{:?}",
+        w.calls
+    );
+
+    // Another release claims past R's reservation while the stage again runs: the build and
+    // verify that brings on run under the release's claim, which keeps what they wrote.
+    let mut w = World::new();
+    let (code, last) = w.run(ReleaseOptions {
+        prepare: true,
+        ..bump()
+    });
+    assert_eq!(code, 0, "{last}");
+    w.attested = None;
+    w.after_stage = Some(|w| w.tail = w.journal().unwrap().reserved.unwrap().build);
+    w.calls.clear();
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert!(
+        claims(&w) == ["disk-claim 10", "disk-claim 30"]
+            && at(&w, "stage") < at(&w, "disk-let-go false")
+            && at(&w, "disk-let-go false") < at(&w, "disk-claim 30")
+            && at(&w, "disk-claim 30") < at(&w, "build")
+            && at(&w, "verify") < at(&w, "disk-let-go true")
+            && at(&w, "disk-let-go true") < at(&w, "publish"),
+        "{:?}",
+        w.calls
+    );
+
+    let mut w = World::new();
+    w.after_verify = Some(|w| {
+        w.head_gate_refusals.insert(
+            BUMP.into(),
+            vec![Refusal::new(
+                "a gate of R's own tree refuses it",
+                "land the fix",
+            )],
+        );
+    });
+    let (code, last) = w.run(bump());
+    assert!(
+        last.starts_with("REFUSED at 8/11 publish"),
+        "{code}: {last}"
+    );
+    assert!(
+        w.count("publish") == 0 && at(&w, "verify") < at(&w, "disk-let-go true"),
+        "the claim ended with verify, what the run wrote kept: {:?}",
+        w.calls
+    );
+    w.after_verify = None;
+    w.head_gate_refusals.clear();
+    w.engine = "f1f1f1f1f1".into();
+    w.calls.clear();
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 0, "{last}");
+    let claim = at(&w, "disk-claim 10").expect("the publish's re-stage claims first");
+    assert!(
+        ["stage", "build", "verify"].map(|c| w.count(c)) == [1, 0, 0]
+            && claims(&w).len() == 1
+            && at(&w, "engine-now") < Some(claim)
+            && Some(claim) < at(&w, "stage")
+            && at(&w, "stage") < at(&w, "disk-let-go false")
+            && at(&w, "disk-let-go false") < at(&w, "publish"),
+        "{:?}",
+        w.calls
+    );
+
     let mut w = World::new();
     w.audits = VecDeque::from([owner_gap()]);
     let (code, last) = w.run(ReleaseOptions {
@@ -1438,13 +1602,10 @@ fn a_release_claims_its_disk_once_before_it_writes_and_lets_go_when_verify_ends(
         ..bump()
     });
     assert_eq!(code, 0, "{last}");
+    assert!(claims(&w).is_empty(), "{:?}", w.calls);
     assert!(
-        !w.calls.iter().any(|c| c.starts_with("disk-claim")),
-        "{:?}",
-        w.calls
-    );
-    assert!(
-        w.out.iter().any(|l| l.contains("disk: would claim 30 GiB")),
+        w.out.iter().any(|l| l.contains("disk: would claim 30 GiB"))
+            && !w.out.iter().any(|l| l.contains("disk: would claim 10 GiB")),
         "{:#?}",
         w.out
     );
@@ -2578,9 +2739,20 @@ fn a_second_run_in_the_same_clone_is_refused_naming_the_first() {
 /// not this one's ancestor, or one a live ancestor did not hand, refuses as another run's.
 /// NEGATIVE CONTROLS: take a claim over whatever its holder (the old pid test), and the re-run's
 /// own process is never its holder, so it refuses at 1/11; take it over from any live
-/// ancestor, handed or not, and the unhanded claim is adopted.
+/// ancestor, handed or not, and the unhanded claim is adopted. The re-run names the handing run's
+/// logs in a `handed` record (its first steps' seal calls are there); a run that adopted nothing
+/// names none.
 #[test]
 fn a_cutter_that_is_not_rs_own_reexecs_once_and_keeps_the_candidate() {
+    let handed_from = |w: &World| -> Vec<String> {
+        w.out
+            .iter()
+            .filter_map(|l| l.strip_prefix("release-event: "))
+            .filter_map(|json| aterm_json::from_str::<aterm_json::Value>(json).ok())
+            .filter(|event| event["event"].as_str() == Some("handed"))
+            .map(|event| event["from"].as_str().unwrap_or("?").to_owned())
+            .collect()
+    };
     let mut w = World::new();
     w.versions.insert(TIP.into(), "0.6.0".into());
     w.own_cutter = false;
@@ -2596,6 +2768,7 @@ fn a_cutter_that_is_not_rs_own_reexecs_once_and_keeps_the_candidate() {
         code == 1 && last.starts_with("REFUSED at 3/11 commit"),
         "a re-run that could not start: {last}"
     );
+    assert!(handed_from(&w).is_empty(), "{:#?}", w.out);
     assert!(
         !claim.exists(),
         "the claim no re-run took is this run's to remove"
@@ -2629,6 +2802,7 @@ fn a_cutter_that_is_not_rs_own_reexecs_once_and_keeps_the_candidate() {
     let (code, last) = w.run(tip.clone());
     assert_eq!((code, w.count("reexec")), (1, 0), "no loop: {last}");
     assert!(last.starts_with("REFUSED at 3/11 commit"), "{last}");
+    assert_eq!(handed_from(&w), ["/l"], "{:#?}", w.out);
     assert!(
         !claim.exists(),
         "the claim it took over is its own to remove"

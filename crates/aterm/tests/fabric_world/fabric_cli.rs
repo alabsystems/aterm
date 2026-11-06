@@ -353,11 +353,12 @@ fn a_node_ring_wider_than_its_ceiling_is_named_by_the_report() {
     assert!(
         named.len() == 1
             && named[0].starts_with(&format!("cap file {}: ", s.path("node.cap")))
-            && named[0].contains("ring[6]")
+            && named[0].contains(&format!("ring[{}]", rules.len()))
             && named[0].contains("rw:/f/t1/>"),
         "{named:?}"
     );
     let mut earlier = rules.clone();
+    earlier.retain(|grant| !grant.contains("/halt/"));
     earlier.extend([
         format!("ro:/f/t1/term/{node}/>"),
         format!("rw,p={node}:/f/t1/term/{node}/*/screen"),
@@ -1163,7 +1164,15 @@ fn a_live_broker_is_read_for_real_and_the_env_overrides_the_file() {
     assert_eq!(v["config"]["command"].as_str(), Some(env_cmd.as_str()));
     assert_eq!(
         arr(&v["config"], "cap_files")[0]["grants"].as_u64(),
-        Some(6)
+        Some(
+            u64::try_from(
+                std::fs::read_to_string(s.path("node.cap"))
+                    .unwrap()
+                    .lines()
+                    .count()
+            )
+            .unwrap()
+        )
     );
     let b = &v["broker"];
     assert_eq!(b["reachable"].as_bool(), Some(true));

@@ -491,7 +491,7 @@ fn writer_succession_keeps_old_requests_held_without_blocking_new_ids() {
         .unwrap();
     rounds(&lab);
     let config = lab.paths[0].home.join("harness.toml");
-    std::fs::write(&config, "").unwrap();
+    aterm_uds::atomic_file::write(&config, b"", 0o600).unwrap();
     let selected = crate::test_complete_writer_successor(
         lab._home.path(),
         &lab.paths[0],

@@ -907,8 +907,7 @@ fn thirty_hosts_render_within_the_budget_one_row_each() {
          aterm on that port",
         "another secret at 192.168.1.29:7100: the fleet rotated (join again with the new code) \
          or it left",
-        "no route to 192.168.1.30:7100 (on a Mac, local-network privacy: System Settings › \
-         Privacy & Security › Local Network)",
+        "no route to 192.168.1.30:7100: off the LAN, asleep or off",
     ];
     for (n, why) in reasons.iter().enumerate() {
         replies.push(unanswered(
@@ -1959,18 +1958,12 @@ fn one_cause_that_refused_every_peer_is_said_once() {
     assert_eq!(fleet_note(&[peer(NoRoute), answered]), None);
 }
 
-/// THE ON-LINK RULE IN A FLEET READ's NOTE, judged by each dial's address against this Mac's
-/// network and never by a network members were once on: a member on this phone hotspot refused
-/// with no route while none there answered is this Mac's Local Network privacy, not the away
-/// note; one refused while another there answered is that member's own (no note: its row says
-/// so), and so is one refused while another member's Mac there refused the connect (a host
-/// answered: privacy let this read onto the link); refusals off this network blame no privacy,
-/// at home and on a remembered network alike; a refusal with no address keeps the every-peer
-/// note.
-/// NEGATIVE CONTROLS: dropping `fleet_note_at`'s on-link privacy return gives the hotspot's
-/// on-link refusal the away note, and this test fails at "a member on this hotspot refused:
-/// this Mac's privacy"; `dial_of` reading a host that answered as `Dial::Other` fails at "another
-/// member's Mac there refused the connect: its own".
+/// THE ON-LINK RULE IN A FLEET READ's NOTE: a no-route whose address the rule could place (on
+/// this Mac's network, off the link now, or off it) is that member's own, which its row says, so
+/// the read takes no every-peer note, at home and on a remembered network alike; a refusal with no
+/// address keeps the every-peer note.
+/// NEGATIVE CONTROL: dropping `fleet_note_at`'s placed return keeps the every-peer note for placed
+/// refusals, and this test fails at "a member on the ALab LAN refused: its own".
 #[test]
 fn a_fleet_reads_no_route_is_judged_on_the_link() {
     let refused = |addr: &str| PeerSurvey {
@@ -1981,11 +1974,6 @@ fn a_fleet_reads_no_route_is_judged_on_the_link() {
         node: None,
         addr: Some(addr.to_owned()),
     };
-    let answered = |addr: &str| PeerSurvey {
-        answer: Ok(vec!["instance pid=1".to_owned()]),
-        fault: PeerFault::Other,
-        ..refused(addr)
-    };
     fn utc(_: i64) -> Option<i64> {
         Some(0)
     }
@@ -1993,27 +1981,12 @@ fn a_fleet_reads_no_route_is_judged_on_the_link() {
         now_ms: 1_800_000_060_000,
         zone: &utc,
     };
-    let privacy = Some(aterm_netplace::words::ON_LINK_PRIVACY_NOTE.to_owned());
-    let hotspot = aterm_netplace::sample::hotspot(1_800_000_000_000, 1_800_000_000_000);
-    assert_eq!(
-        fleet_note_at(
-            &[refused("172.20.10.5"), refused("192.168.4.9")],
-            Some(&hotspot),
-            &words
-        ),
-        privacy,
-        "a member on this hotspot refused: this Mac's privacy"
-    );
-    assert_eq!(
-        fleet_note_at(
-            &[refused("172.20.10.5"), answered("172.20.10.6")],
-            Some(&hotspot),
-            &words
-        ),
-        None,
-        "another member there answered: its own"
-    );
     let home = aterm_netplace::sample::home(1_800_000_000_000, 0);
+    assert_eq!(
+        fleet_note_at(&[refused("192.168.5.20")], Some(&home), &words),
+        None,
+        "a member on the ALab LAN refused: its own"
+    );
     assert_eq!(
         fleet_note_at(
             &[refused("10.9.9.9"), refused("10.9.9.8")],
@@ -2021,26 +1994,7 @@ fn a_fleet_reads_no_route_is_judged_on_the_link() {
             &words
         ),
         None,
-        "refusals off this network blame no privacy"
-    );
-    assert_eq!(
-        fleet_note_at(&[refused("192.168.5.20")], Some(&home), &words),
-        privacy,
-        "a member on the ALab LAN refused, none answering"
-    );
-    let host_answered = |addr: &str| PeerSurvey {
-        answer: Err("nothing listens there".to_owned()),
-        fault: PeerFault::HostAnswered,
-        ..refused(addr)
-    };
-    assert_eq!(
-        fleet_note_at(
-            &[refused("192.168.5.20"), host_answered("192.168.5.21")],
-            Some(&home),
-            &words
-        ),
-        None,
-        "another member's Mac there refused the connect: its own"
+        "refusals off this network: their own"
     );
     let once = aterm_netplace::Place {
         once_alab: true,
@@ -2051,12 +2005,7 @@ fn a_fleet_reads_no_route_is_judged_on_the_link() {
     assert_eq!(
         fleet_note_at(&[refused("10.9.9.9")], Some(&once), &words),
         None,
-        "a network members were once on makes no refusal off it privacy's"
-    );
-    assert_eq!(
-        fleet_note_at(&[refused("192.168.5.20")], Some(&once), &words),
-        privacy,
-        "nor one on it anything else"
+        "a network members were once on: their own"
     );
     let unplaced = PeerSurvey {
         addr: None,
@@ -2070,11 +2019,10 @@ fn a_fleet_reads_no_route_is_judged_on_the_link() {
 }
 
 /// Away from the ALab LAN (a phone hotspot), a fleet read no dialled peer answered says where this
-/// Mac is, whether every dial found no route (no Local Network privacy blame) or timed out (no
-/// note before); a sandbox that refused every connect is still the sandbox, a read a peer answered
+/// Mac is, whether every dial found no route or timed out (no note before); a sandbox that refused every connect is still the sandbox, a read a peer answered
 /// takes no note, and on the ALab LAN the no-route note stands.
-/// NEGATIVE CONTROL: returning `fleet_note`'s note whatever the place prints the privacy blame for
-/// the hotspot's no-route read, and this test fails at "no privacy blame away".
+/// NEGATIVE CONTROL: returning `fleet_note`'s note whatever the place prints the every-peer note
+/// for the hotspot's no-route read, and this test fails at "no-route away".
 #[test]
 fn a_fleet_read_from_another_network_says_where_this_mac_is() {
     let peer = |fault: PeerFault| PeerSurvey {
@@ -2103,11 +2051,7 @@ fn a_fleet_read_from_another_network_says_where_this_mac_is() {
             &words,
         )
     };
-    assert_eq!(
-        note(&[NoRoute, NoRoute], &away),
-        said,
-        "no privacy blame away"
-    );
+    assert_eq!(note(&[NoRoute, NoRoute], &away), said, "no-route away");
     assert_eq!(note(&[Other, Other], &away), said, "timeouts away");
     assert_eq!(
         note(&[NotPermitted, NotPermitted], &away).as_deref(),
@@ -2414,6 +2358,10 @@ fn a_peer_with_more_instances_than_one_read_says_so() {
     assert!(header(true, "2").ends_with(" · 0 sessions · 1 of 2 instances read trust=screen"));
     assert!(!header(true, "1").contains("instances read"));
     assert!(!header(false, "2").contains("instances read"));
+    // A node service that read every window says nothing went unread; one that read some says
+    // how many.
+    assert!(!header(true, "2 instances_read=2").contains("instances read"));
+    assert!(header(true, "3 instances_read=2").ends_with(" · 2 of 3 instances read trust=screen"));
 }
 
 #[test]

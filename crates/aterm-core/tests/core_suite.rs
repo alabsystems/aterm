@@ -6,6 +6,7 @@
 //! Run a single module with `targo --unverified test -p aterm-core --test core_suite -- <file>::`.
 
 mod alt_archive_claude_like;
+mod ascii_past_the_print_edge;
 mod chunked_process_equivalence;
 mod codex_insert_history_scrollback;
 mod color_scheme_follows_background;
@@ -57,6 +58,7 @@ mod sgr_rendition_parity;
 mod shell_mark_rows_across_resize;
 mod tab_stops_across_grid_seams;
 mod unicode_content_generation;
+mod unicode_run_differential;
 mod wide_glyph_halves;
 
 // OSC 1337 `File=` fixtures shared by the `image_*` modules.

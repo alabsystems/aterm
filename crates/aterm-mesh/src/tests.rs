@@ -38,12 +38,14 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// What every Mac of one test shares: the link clock, the wall clock, the address book the
-/// overlays dial from (less the Macs a partition cut off), and the keys every link seats.
+/// overlays dial from (less the Macs a partition cut off, and for each Mac the ones it is kept
+/// apart from), and the keys every link seats.
 struct Lab {
     clock: Arc<ManualClock>,
     wall: Arc<AtomicU64>,
     book: Arc<Mutex<BTreeMap<String, SocketAddr>>>,
     cut: Arc<Mutex<BTreeSet<String>>>,
+    apart: Arc<Mutex<BTreeSet<(String, String)>>>,
     seated: Arc<Mutex<Vec<NodeKey>>>,
 }
 
@@ -54,8 +56,17 @@ impl Lab {
             wall: Arc::new(AtomicU64::new(T0_MS)),
             book: Arc::default(),
             cut: Arc::default(),
+            apart: Arc::default(),
             seated: Arc::default(),
         }
+    }
+
+    /// Keep `a` and `b` from ever linking: neither overlay finds the other's address, so a lab of
+    /// three can be a line.
+    fn keep_apart(&self, a: &Mac, b: &Mac) {
+        let mut apart = lock(&self.apart);
+        apart.insert((a.principal.clone(), b.principal.clone()));
+        apart.insert((b.principal.clone(), a.principal.clone()));
     }
 
     /// Move the wall clock `by` milliseconds.
@@ -324,16 +335,23 @@ impl Mac {
             })
         };
         lock(&lab.book).insert(self.principal.clone(), addr);
-        let (book, cut) = (Arc::clone(&lab.book), Arc::clone(&lab.cut));
+        let (book, cut, apart) = (
+            Arc::clone(&lab.book),
+            Arc::clone(&lab.cut),
+            Arc::clone(&lab.apart),
+        );
         let principal = self.principal.clone();
         let hints: Hints = Arc::new(move || {
             let cut = lock(&cut).clone();
             if cut.contains(&principal) {
                 return Vec::new();
             }
+            let apart = lock(&apart).clone();
             lock(&book)
                 .iter()
-                .filter(|(node, _)| !cut.contains(*node))
+                .filter(|(node, _)| {
+                    !cut.contains(*node) && !apart.contains(&(principal.clone(), (*node).clone()))
+                })
                 .map(|(node, addr)| (node.clone(), *addr))
                 .collect()
         });

@@ -248,8 +248,19 @@ impl Kind {
             Self::Other(w) => w,
         }
     }
+}
 
-    fn parse(word: &str) -> Option<Self> {
+#[derive(Clone, Copy)]
+enum KindRef<'a> {
+    Command,
+    AgentCall,
+    Spawn,
+    Admission,
+    Other(&'a str),
+}
+
+impl<'a> KindRef<'a> {
+    fn parse(word: &'a str) -> Option<Self> {
         Some(match word {
             "command" => Self::Command,
             "agent-call" => Self::AgentCall,
@@ -257,9 +268,19 @@ impl Kind {
             "admission" => Self::Admission,
             // The log's own lines are no action.
             "host" | "gap" => return None,
-            w if is_word(w) => Self::Other(w.to_owned()),
+            w if is_word(w) => Self::Other(w),
             _ => return None,
         })
+    }
+
+    fn into_owned(self) -> Kind {
+        match self {
+            Self::Command => Kind::Command,
+            Self::AgentCall => Kind::AgentCall,
+            Self::Spawn => Kind::Spawn,
+            Self::Admission => Kind::Admission,
+            Self::Other(w) => Kind::Other(w.to_owned()),
+        }
     }
 }
 
@@ -550,14 +571,31 @@ fn push_fig_word<T: std::fmt::Display>(out: &mut String, fig: &Fig<T>) {
     }
 }
 
-fn fig_parse<T: std::str::FromStr>(word: &str) -> Option<Fig<T>> {
+#[derive(Clone, Copy)]
+enum FigRef<'a, T> {
+    Known(T),
+    Na,
+    Unknown(&'a str),
+}
+
+impl<'a, T> FigRef<'a, T> {
+    fn into_owned(self) -> Fig<T> {
+        match self {
+            Self::Known(v) => Fig::Known(v),
+            Self::Na => Fig::Na,
+            Self::Unknown(source) => Fig::Unknown(source.to_owned()),
+        }
+    }
+}
+
+fn fig_parse_ref<T: std::str::FromStr>(word: &str) -> Option<FigRef<'_, T>> {
     if word == "na" {
-        return Some(Fig::Na);
+        return Some(FigRef::Na);
     }
     if let Some(source) = word.strip_prefix('?') {
-        return is_word(source).then(|| Fig::Unknown(source.to_owned()));
+        return is_word(source).then_some(FigRef::Unknown(source));
     }
-    word.parse().ok().map(Fig::Known)
+    word.parse().ok().map(FigRef::Known)
 }
 
 fn push_opt_word<T: std::fmt::Display>(out: &mut String, v: Option<T>) {
@@ -635,7 +673,7 @@ impl Row {
     }
 
     pub(crate) fn body(&self) -> String {
-        let mut b = String::with_capacity(360);
+        let mut b = String::with_capacity(384);
         self.write_body(&mut b);
         b
     }
@@ -663,6 +701,13 @@ pub enum Line {
     },
 }
 
+pub(crate) enum LineSince {
+    Row(Row),
+    OldRow(u64),
+    Host(crate::facts::HostLine),
+    Gap { at_ms: u64, dropped: u64 },
+}
+
 /// The `key=value` words of a line's body, in order, into a stack buffer.
 pub(crate) fn words<'a>(body: &'a str, out: &mut [(&'a str, &'a str); 24]) -> Option<usize> {
     let mut len = 0;
@@ -687,6 +732,15 @@ pub(crate) fn find<'a>(words: &[(&'a str, &'a str)], key: &str) -> Option<&'a st
 /// a row missing a field schema 1 requires.
 #[must_use]
 pub fn parse_line(line: &str) -> Option<Line> {
+    match parse_line_since(line, 0)? {
+        LineSince::Row(row) => Some(Line::Row(row)),
+        LineSince::OldRow(_) => None,
+        LineSince::Host(host) => Some(Line::Host(host)),
+        LineSince::Gap { at_ms, dropped } => Some(Line::Gap { at_ms, dropped }),
+    }
+}
+
+pub(crate) fn parse_line_since(line: &str, since: u64) -> Option<LineSince> {
     let body = unseal(line)?;
     let mut buf = [("", ""); 24];
     let len = words(body, &mut buf)?;
@@ -696,16 +750,77 @@ pub fn parse_line(line: &str) -> Option<Line> {
     }
     let at_ms: u64 = find(w, "at")?.parse().ok()?;
     match find(w, "kind")? {
-        "host" => crate::facts::HostLine::parse(at_ms, w).map(Line::Host),
-        "gap" => Some(Line::Gap {
+        "host" => crate::facts::HostLine::parse(at_ms, w).map(LineSince::Host),
+        "gap" => Some(LineSince::Gap {
             at_ms,
             dropped: find(w, "dropped")?.parse().ok()?,
         }),
-        kind => parse_row(at_ms, Kind::parse(kind)?, w).map(Line::Row),
+        kind => {
+            let row = parse_row_ref(at_ms, KindRef::parse(kind)?, w)?;
+            if at_ms >= since {
+                Some(LineSince::Row(row.into_owned()))
+            } else {
+                Some(LineSince::OldRow(at_ms))
+            }
+        }
     }
 }
 
-fn parse_row(at_ms: u64, kind: Kind, w: &[(&str, &str)]) -> Option<Row> {
+struct RowRef<'a> {
+    at_ms: u64,
+    kind: KindRef<'a>,
+    key: Option<Digest>,
+    dir: Option<Digest>,
+    label: &'a str,
+    sid: Option<&'a str>,
+    host: &'a str,
+    facts: Digest,
+    wall_ms: FigRef<'a, u64>,
+    cpu_ms: FigRef<'a, u64>,
+    peak_bytes: FigRef<'a, u64>,
+    wait_ms: FigRef<'a, u64>,
+    cache: FigRef<'a, &'a str>,
+    outcome: Outcome,
+    stop: Stop,
+    code: Option<i32>,
+    sig: Option<i32>,
+    meter: Meter,
+}
+
+impl<'a> RowRef<'a> {
+    fn into_owned(self) -> Row {
+        Row {
+            at_ms: self.at_ms,
+            kind: self.kind.into_owned(),
+            key: self.key,
+            dir: self.dir,
+            label: self.label.to_owned(),
+            sid: self.sid.map(str::to_owned),
+            host: self.host.to_owned(),
+            facts: self.facts,
+            wall_ms: self.wall_ms.into_owned(),
+            cpu_ms: self.cpu_ms.into_owned(),
+            peak_bytes: self.peak_bytes.into_owned(),
+            wait_ms: self.wait_ms.into_owned(),
+            cache: match self.cache {
+                FigRef::Known(v) => Fig::Known(v.to_owned()),
+                FigRef::Na => Fig::Na,
+                FigRef::Unknown(s) => Fig::Unknown(s.to_owned()),
+            },
+            outcome: self.outcome,
+            stop: self.stop,
+            code: self.code,
+            sig: self.sig,
+            meter: self.meter,
+        }
+    }
+}
+
+fn parse_row_ref<'a>(
+    at_ms: u64,
+    kind: KindRef<'a>,
+    w: &[(&'a str, &'a str)],
+) -> Option<RowRef<'a>> {
     let mut key_w = None;
     let mut dir_w = None;
     let mut label_w = None;
@@ -790,26 +905,33 @@ fn parse_row(at_ms: u64, kind: Kind, w: &[(&str, &str)]) -> Option<Row> {
         }
     };
     let cache = match cache_w? {
-        v if v == "na" || v.starts_with('?') => fig_parse::<String>(v)?,
-        v if is_word(v) => Fig::Known(v.to_owned()),
+        "na" => FigRef::Na,
+        v if v.starts_with('?') => {
+            let source = &v[1..];
+            if !is_word(source) {
+                return None;
+            }
+            FigRef::Unknown(source)
+        }
+        v if is_word(v) => FigRef::Known(v),
         _ => return None,
     };
-    Some(Row {
+    Some(RowRef {
         at_ms,
         kind,
         key: opt_digest(key_w?)?,
         dir: opt_digest(dir_w?)?,
-        label: label_w?.to_owned(),
+        label: label_w?,
         sid: match sid_w? {
             "-" => None,
-            s => Some(s.to_owned()),
+            s => Some(s),
         },
-        host: host_w?.to_owned(),
+        host: host_w?,
         facts: Digest::parse(facts_w?)?,
-        wall_ms: fig_parse(wall_ms_w?)?,
-        cpu_ms: fig_parse(cpu_ms_w?)?,
-        peak_bytes: fig_parse(peak_bytes_w?)?,
-        wait_ms: fig_parse(wait_ms_w?)?,
+        wall_ms: fig_parse_ref(wall_ms_w?)?,
+        cpu_ms: fig_parse_ref(cpu_ms_w?)?,
+        peak_bytes: fig_parse_ref(peak_bytes_w?)?,
+        wait_ms: fig_parse_ref(wait_ms_w?)?,
         cache,
         outcome: Outcome::parse(outcome_w?)?,
         stop: Stop::parse(stop_w?)?,

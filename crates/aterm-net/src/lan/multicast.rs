@@ -5,10 +5,7 @@
 //! accepts multicast; the OS interface binding and multicast source constrain
 //! transmission. Received packets never grant membership or application access.
 
-use super::{
-    Attachment, BindFailure, Scope, listener, local_attachments, native, refuse, same_subnet,
-    unicast,
-};
+use super::{Attachment, Scope, listener, local_attachments, native, refuse, same_subnet, unicast};
 use std::{
     io,
     net::{Ipv4Addr, SocketAddr, UdpSocket},
@@ -38,60 +35,54 @@ pub struct Multicast {
 impl Multicast {
     /// Join an administrative-local group (239.255/16) on an explicit source.
     /// Peers use the same port; zero is useful for isolated tests. Loopback is
-    /// an explicit local/test policy and is never inferred as a LAN.
+    /// an explicit local/test policy and is never inferred as a LAN. For an attachment the root
+    /// LAN broker makes the socket and joins the group on macOS (`aterm_uds::lan::udp`); a
+    /// loopback socket is made in this process. An attachment's binds only the ports the broker
+    /// admits (`aterm_uds::lan::here::check_udp`); this process configures and checks either.
+    ///
+    /// # Errors
+    /// A refused group, source or attachment (`PermissionDenied`), for an attachment on macOS a
+    /// missing LAN broker (`NotConnected`), a port the broker does not bind, or the socket's error.
     pub fn bind(source: Ipv4Addr, group: Ipv4Addr, port: u16, scope: Scope) -> io::Result<Self> {
-        Self::try_bind(source, group, port, scope).map_err(|failure| failure.error)
-    }
-
-    /// [`Self::bind`], saying of a failure whether it reached its socket ([`BindFailure`]): a
-    /// join whose attachment changed before its re-check fails after its LAN syscall.
-    pub fn try_bind(
-        source: Ipv4Addr,
-        group: Ipv4Addr,
-        port: u16,
-        scope: Scope,
-    ) -> Result<Self, BindFailure> {
-        crate::loopback::check(crate::loopback::Reach::Listen((source, port).into()))
-            .map_err(BindFailure::before)?;
+        crate::loopback::check(crate::loopback::Reach::Listen((source, port).into()))?;
         if group.octets()[..2] != [239, 255] {
-            return Err(BindFailure::before(refuse(
+            return Err(refuse(
                 "discovery requires an administrative-local multicast group",
-            )));
+            ));
         }
         let local = SocketAddr::from((source, 0));
         let attachment = match scope {
             Scope::Lan => Some(
                 local_attachments(Some(local), None)
-                    .and_then(|attachments| listener::select(local, &attachments))
-                    .map_err(BindFailure::before)?,
+                    .and_then(|attachments| listener::select(local, &attachments))?,
             ),
             Scope::Loopback if source.is_loopback() => None,
             Scope::Loopback => {
-                return Err(BindFailure::before(refuse(
-                    "loopback discovery requires a loopback source",
-                )));
+                return Err(refuse("loopback discovery requires a loopback source"));
             }
         };
-        (|| {
-            let socket = native::multicast::bind(
-                source,
-                group,
-                port,
-                attachment.as_ref().map(|a| (a.index, a.name.as_str())),
-            )?;
-            let local = socket.local_addr()?;
-            let result = Self {
-                socket,
-                source,
-                destination: (group, local.port()).into(),
-                local,
-                attachment,
-                withdrawn: AtomicBool::new(false),
-            };
-            result.recheck()?;
-            Ok(result)
-        })()
-        .map_err(BindFailure::after)
+        let index = match &attachment {
+            Some(attachment) => attachment.index,
+            None => loopback_index()?,
+        };
+        let socket = native::multicast::bind(
+            source,
+            group,
+            port,
+            index,
+            attachment.as_ref().map(|a| a.name.as_str()),
+        )?;
+        let local = socket.local_addr()?;
+        let result = Self {
+            socket,
+            source,
+            destination: (group, local.port()).into(),
+            local,
+            attachment,
+            withdrawn: AtomicBool::new(false),
+        };
+        result.recheck()?;
+        Ok(result)
     }
 
     /// Joined receive port, including a kernel-assigned test port.
@@ -172,6 +163,15 @@ impl Multicast {
     }
 }
 
+/// The index of the loopback interface, where a loopback discovery joins its group.
+fn loopback_index() -> io::Result<u32> {
+    native::index(if cfg!(target_os = "linux") {
+        "lo"
+    } else {
+        "lo0"
+    })
+}
+
 fn source_allowed(
     source: std::net::IpAddr,
     local: std::net::IpAddr,
@@ -204,6 +204,92 @@ mod tests {
         socket.socket.set_multicast_ttl_v4(1).unwrap();
         assert!(socket.send(b"withdrawn").is_err());
         assert!(socket.receive().is_err());
+    }
+
+    /// The hint `socket` sends to its own group comes back to it (its sends loop back).
+    fn hears_its_own_hint(socket: &UdpSocket, policy: impl Fn(&UdpSocket) -> io::Result<()>) {
+        let port = socket.local_addr().unwrap().port();
+        socket.send_to(b"hint", (GROUP, port)).unwrap();
+        let until = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        let mut bytes = [0; MAX_PACKET];
+        let (length, from) = loop {
+            match socket.recv_from(&mut bytes) {
+                Ok(heard) => break heard,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("{error}"),
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "the hint never came back"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert_eq!(&bytes[..length], b"hint");
+        assert!(from.ip().is_loopback(), "{from}");
+        policy(socket).unwrap();
+    }
+
+    /// A loopback discovery socket reaches no LAN, so it is made here: with no LAN broker at all
+    /// (this thread's seam names a socket nothing serves) it binds and hears its own hint.
+    #[test]
+    fn a_loopback_socket_needs_no_broker() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let absent = aterm_uds::lan::Seam {
+            socket: Some(root.path().join("absent.sock")),
+            ..aterm_uds::lan::Seam::default()
+        };
+        aterm_uds::lan::seam_here(absent, || {
+            let socket = Multicast::bind(Ipv4Addr::LOCALHOST, GROUP, 0, Scope::Loopback).unwrap();
+            hears_its_own_hint(&socket.socket, |socket| {
+                native::multicast::policy(socket, Ipv4Addr::LOCALHOST, None)
+            });
+        });
+    }
+
+    /// An attachment's discovery socket is the LAN broker's (on macOS; elsewhere made here):
+    /// bound to its interface (loopback standing in for one), configured here, it carries a hint
+    /// to its group and back and keeps its policy.
+    #[test]
+    fn an_attachments_socket_is_the_brokers_and_carries_a_hint() {
+        let index = loopback_index().unwrap();
+        let name = if cfg!(target_os = "linux") {
+            "lo"
+        } else {
+            "lo0"
+        };
+        aterm_uds::lan::seam_here(crate::lan::tests::broker(), || {
+            let socket =
+                native::multicast::bind(Ipv4Addr::LOCALHOST, GROUP, 0, index, Some(name)).unwrap();
+            hears_its_own_hint(&socket, |socket| {
+                native::multicast::policy(socket, Ipv4Addr::LOCALHOST, Some(index))
+            });
+        });
+    }
+
+    /// Commons' discovery group binds the fixed port its peers share
+    /// (`aterm_uds::lan::here::COMMONS_PORT`, group 239.255.31.84), not the kernel's choice: the
+    /// LAN broker must make that socket for an attachment, or Commons has no LAN on macOS.
+    #[test]
+    fn an_attachment_binds_the_commons_port_through_the_broker() {
+        let index = loopback_index().unwrap();
+        let name = if cfg!(target_os = "linux") {
+            "lo"
+        } else {
+            "lo0"
+        };
+        let port = aterm_uds::lan::here::COMMONS_PORT;
+        aterm_uds::lan::seam_here(crate::lan::tests::broker(), || {
+            let socket = native::multicast::bind(
+                Ipv4Addr::LOCALHOST,
+                Ipv4Addr::new(239, 255, 31, 84),
+                port,
+                index,
+                Some(name),
+            )
+            .unwrap();
+            assert_eq!(socket.local_addr().unwrap().port(), port);
+            native::multicast::policy(&socket, Ipv4Addr::LOCALHOST, Some(index)).unwrap();
+        });
     }
 
     #[test]

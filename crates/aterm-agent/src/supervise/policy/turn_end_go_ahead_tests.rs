@@ -2504,7 +2504,7 @@ fn a_continuation_owed_at_a_break_is_cut_within_the_persons_hour() {
     st.took();
     assert_eq!(st.owed_at_break(), Some(RULE_COMPACT));
     assert_eq!(
-        st.owed_words(RULE_COMPACT, &cfg(), None, now),
+        st.owed_words(RULE_COMPACT, &cfg(), None, false, now),
         done_check_words(0),
         "no key: the whole check"
     );
@@ -2519,26 +2519,105 @@ fn a_continuation_owed_at_a_break_is_cut_within_the_persons_hour() {
     );
     assert!(st.go_ahead_held(now), "the person's key holds the hour");
     assert_eq!(
-        st.owed_words(RULE_COMPACT, &cfg(), None, now),
+        st.owed_words(RULE_COMPACT, &cfg(), None, false, now),
         checked_held(0),
         "within the hour"
     );
     assert_eq!(
-        st.owed_words(RULE_COMPACT, &cfg(), None, now + GO_AHEAD_HELD),
+        st.owed_words(RULE_COMPACT, &cfg(), None, false, now + GO_AHEAD_HELD),
         done_check_words(0),
         "past the hour"
     );
     let continuation = continuation_text(&cfg(), None);
     assert_eq!(
-        st.owed_words(RULE_CONTINUE, &cfg(), None, now),
+        st.owed_words(RULE_CONTINUE, &cfg(), None, false, now),
         super::super::go_ahead::unless_held(&continuation, true),
         "the continuation within the hour"
     );
     assert_eq!(
-        st.owed_words(RULE_CONTINUE, &cfg(), None, now + GO_AHEAD_HELD),
+        st.owed_words(RULE_CONTINUE, &cfg(), None, false, now + GO_AHEAD_HELD),
         continuation,
         "the continuation past it"
     );
+}
+
+/// AN OWED CONTINUATION SAYS NO GO-AHEAD WORD OVER A PARK ANSWERS OFF LEAVE TO THE PERSON
+/// (2026-11-06): the continuation a `/compact` owes goes ahead of the escalation answers off give
+/// a park on the person's go-ahead, at a point ([`TurnEndState::compact_owed_text`], and Cruise's
+/// continuation where no check was cut) and at a break ([`TurnEndState::owed_words`]), and there
+/// it leaves [`NEVER_A_NEED`] out, as Cruise's carry over such a park does: the person chose to
+/// answer the park themselves. NEGATIVE CONTROLS: answers on, the same park gets the whole words
+/// (the go-ahead answers it), and so does answers off with no park.
+#[test]
+fn an_owed_continuation_over_a_park_left_to_the_person_says_no_go_ahead_word() {
+    let context = |worked| walled(WallKind::Context, "Context limit reached", worked);
+    let compacted = |st: &mut TurnEndState, now: Instant| {
+        let a = act(st, &context(Some(5 * MIN)), now);
+        assert!(
+            matches!(
+                a,
+                TurnEndAction::TypeCommand {
+                    rule_id: RULE_COMPACT,
+                    ..
+                }
+            ),
+            "{a:?}"
+        );
+        st.took();
+        assert_eq!(st.owed_at_break(), Some(RULE_COMPACT));
+    };
+    let retyped = |text: String| TurnEndAction::Type {
+        text,
+        rule_id: RULE_COMPACT,
+    };
+    let parked = idle(INCIDENT, Some(3 * MIN));
+    let plain = idle("Conversation compacted.", Some(3 * MIN));
+    // The done check a full context cut.
+    let (mut st, mut now) = checked_at(t0());
+    now += 5 * MIN;
+    compacted(&mut st, now);
+    for (parks, cfg, want) in [
+        (true, no_answers(), checked_held(0)),
+        (true, cfg(), done_check_words(0)),
+        (false, no_answers(), done_check_words(0)),
+    ] {
+        let at = format!("parks={parks}, answers={}", cfg.answer_questions);
+        assert_eq!(
+            st.owed_words(RULE_COMPACT, &cfg, None, parks, now),
+            want,
+            "at a break: {at}"
+        );
+        let point = if parks { &parked } else { &plain };
+        assert_eq!(
+            at_under(&mut st.clone(), point, now + MIN, &cfg),
+            retyped(want.clone()),
+            "at a point: {at}"
+        );
+    }
+    // Cruise's own continuation, where the full context cut no check.
+    let continuation = continuation_text(&cfg(), None);
+    let mut st = TurnEndState::default();
+    compacted(&mut st, t0());
+    let now = t0() + MIN;
+    for (parks, cfg, held) in [
+        (true, no_answers(), true),
+        (true, cfg(), false),
+        (false, no_answers(), false),
+    ] {
+        let at = format!("parks={parks}, answers={}", cfg.answer_questions);
+        let want = super::super::go_ahead::unless_held(&continuation, held).into_owned();
+        assert_eq!(
+            st.owed_words(RULE_COMPACT, &cfg, None, parks, now),
+            want,
+            "at a break: {at}"
+        );
+        let point = if parks { &parked } else { &plain };
+        assert_eq!(
+            at_under(&mut st.clone(), point, now + MIN, &cfg),
+            retyped(want.clone()),
+            "at a point: {at}"
+        );
+    }
 }
 
 /// A KEY THE DECISION'S OWN `status` READ FINDS HOLDS THE HOUR AS AN OBSERVED ONE DOES
@@ -2686,7 +2765,7 @@ fn a_check_cut_within_the_persons_hour_is_typed_again_whole_past_it() {
         let mut at_break = at_break;
         at_break.took();
         assert_eq!(
-            at_break.owed_words(RULE_COMPACT, &cfg(), None, now),
+            at_break.owed_words(RULE_COMPACT, &cfg(), None, false, now),
             want,
             "at a break {after:?} after the check"
         );

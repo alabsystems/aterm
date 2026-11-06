@@ -158,7 +158,12 @@ fn exercise(cli: Cli, case: i64) -> (i64, [bool; 4]) {
         !state.pinned
             && state.active.is_none()
             && !state.account("work").walls.is_empty()
-            && state.pending_pin.as_ref().map(PinRequest::label) == (case == 2).then_some("work")
+            && state
+                .pending_pin
+                .as_ref()
+                .and_then(PendingSelection::account)
+                .map(PinRequest::label)
+                == (case == 2).then_some("work")
     };
     let after = files();
     let once = store

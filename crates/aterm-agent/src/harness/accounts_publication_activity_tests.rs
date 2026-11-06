@@ -417,7 +417,7 @@ fn success_generation_is_optional_but_never_exceeds_its_binding() {
 fn vendor_completion_clears_only_the_successful_accounts_captured_retry() {
     use super::super::cli::Renewal;
     for cli in [Cli::Codex, Cli::Kimi] {
-        for outcome in [Renewal::Renewed, Renewal::AuthFailed, Renewal::Busy] {
+        for outcome in [Renewal::Renewed, Renewal::AuthFailed, Renewal::SigninHeld] {
             let root = aterm_tempfile::TempDir::new().unwrap();
             let store = accounts::Store::at_for(root.path(), cli, &root.path().join("home"));
             let path = root.path().join(cli.accounts().roster_file);

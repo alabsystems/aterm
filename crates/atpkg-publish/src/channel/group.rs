@@ -33,8 +33,10 @@ pub enum Mode {
     DryRun,
     /// Pack and sign locally (unsigned on a keyless box), index locally; nothing uploaded.
     Stage,
-    /// Every step with its uploads.
-    Upload,
+    /// Pack, sign and upload to staging, leaving the public index unchanged.
+    StageUpload,
+    /// Publish the staged bytes and their canary evidence; never pack again.
+    PublishStaged,
 }
 
 /// One group publish.
@@ -348,7 +350,7 @@ pub fn preflight(ctx: &Ctx, req: &GroupRequest, parts: &Parts<'_>) -> Preflight 
         ..Preflight::default()
     };
     let seal = &req.seal;
-    let upload = req.mode == Mode::Upload;
+    let upload = req.mode == Mode::StageUpload;
 
     let exec = atpkg::toolchain::is_executable_file;
     let trustc_exec = exec(&seal.join("bin/trustc"));
@@ -409,13 +411,10 @@ pub fn preflight(ctx: &Ctx, req: &GroupRequest, parts: &Parts<'_>) -> Preflight 
             ctx.shown(&real)
         ));
     }
-    let comps: Vec<String> = real
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        .collect();
+    let comps: Vec<&std::ffi::OsStr> = real.components().map(|c| c.as_os_str()).collect();
     let live = comps.len() >= 3
         && comps[comps.len() - 1] == "stage2"
-        && comps[..comps.len() - 2].iter().any(|c| c == "build");
+        && comps[..comps.len() - 2].iter().any(|&c| c == "build");
     if live {
         if req.allow_build_tree_seal {
             pf.notes.push(format!(
@@ -625,40 +624,17 @@ pub fn preflight(ctx: &Ctx, req: &GroupRequest, parts: &Parts<'_>) -> Preflight 
     if upload {
         if !pf.have_key {
             pf.problems.push(format!(
-                "--upload needs a rostered machine key at {} (this box has none: stage here, \
+                "--stage-upload needs a rostered machine key at {} (this box has none: stage here, \
                  sign and upload on a rostered machine)",
                 ctx.shown(&ctx.identity.key)
             ));
-        }
-        if gh_serves(ctx, HostRole::Channel) {
-            match ctx.usable_token(&ctx.tokens.channel) {
-                Ok(true) => {}
-                Ok(false) => pf.problems.push(format!(
-                    "--upload needs the public owner's token at {} (the packs and the index are \
-                     published there)",
-                    ctx.shown(&ctx.tokens.channel)
-                )),
-                Err(why) => pf.problems.push(format!(
-                    "--upload needs the public owner's token at {}: {why}",
-                    ctx.shown(&ctx.tokens.channel)
-                )),
-            }
-        } else {
-            let slugs = std::iter::once(ctx.index_slug())
-                .chain(group_repos().map(|repo| ctx.public_slug(repo)));
-            if let Err((slug, e)) = preflight_each(&*ctx.hosts.channel, slugs) {
-                pf.problems.push(format!(
-                    "--upload needs the public owner's writer on {slug}: {e} (the packs and the \
-                     index are published there)"
-                ));
-            }
         }
         if !gh_serves(ctx, HostRole::Staging) {
             let slugs = std::iter::once(ctx.staging_slug(atpkg::manifest::INDEX_REPO))
                 .chain(group_repos().map(|repo| ctx.staging_slug(repo)));
             if let Err((slug, e)) = preflight_each(&*ctx.hosts.staging, slugs) {
                 pf.problems.push(format!(
-                    "--upload needs the staging owner's writer on {slug}: {e} (every pack is \
+                    "--stage-upload needs the staging owner's writer on {slug}: {e} (every pack is \
                      uploaded to {} first)",
                     ctx.accounts.staging
                 ));
@@ -667,13 +643,13 @@ pub fn preflight(ctx: &Ctx, req: &GroupRequest, parts: &Parts<'_>) -> Preflight 
             match ctx.usable_token(&ctx.tokens.staging) {
                 Ok(true) => {}
                 Ok(false) => pf.problems.push(format!(
-                    "--upload needs the staging owner's token at {} (every pack is uploaded to {} \
+                    "--stage-upload needs the staging owner's token at {} (every pack is uploaded to {} \
                  first, and a write never goes anonymously)",
                     ctx.shown(&ctx.tokens.staging),
                     ctx.accounts.staging
                 )),
                 Err(why) => pf.problems.push(format!(
-                    "--upload needs the staging owner's token at {}: {why}",
+                    "--stage-upload needs the staging owner's token at {}: {why}",
                     ctx.shown(&ctx.tokens.staging)
                 )),
             }
@@ -786,6 +762,12 @@ pub fn publish_group(
     parts: &Parts<'_>,
     log: &mut Log,
 ) -> Result<GroupOutcome> {
+    if req.mode == Mode::PublishStaged {
+        let out = req.out.as_deref().ok_or_else(|| {
+            Error::usage("--publish-staged needs --out (the staged group directory)")
+        })?;
+        return crate::canary::publish_staged(ctx, out, parts.indexer, log);
+    }
     let ctx = &Ctx {
         trust_repo: req.trust_repo.clone(),
         ..ctx.clone()
@@ -797,7 +779,8 @@ pub fn publish_group(
         match req.mode {
             Mode::DryRun => "dry-run",
             Mode::Stage => "stage",
-            Mode::Upload => "publish",
+            Mode::StageUpload => "stage-upload",
+            Mode::PublishStaged => "publish-staged",
         }
     ));
     log.say(format!(
@@ -840,7 +823,7 @@ pub fn publish_group(
     let trust_build = pf
         .trust_build
         .ok_or_else(|| Error::refused("the seal's trust build is unknown"))?;
-    let upload = req.mode == Mode::Upload;
+    let upload = req.mode == Mode::StageUpload;
     let signing = if pf.have_key {
         Signing::MachineKey
     } else {
@@ -967,6 +950,16 @@ pub fn publish_group(
             out,
         });
     }
+    if req.mode == Mode::StageUpload {
+        let text = aterm_toml::to_string(&builds).map_err(|e| Error::refused(e.to_string()))?;
+        crate::lane::report::write_atomic(&out.join("staged-builds.toml"), &text)?;
+        log.say(format!("staged: run canary trust={trust_build} --out {}/canary, then publish-group rustc --publish-staged --out {}", out.display(), out.display()));
+        return Ok(GroupOutcome {
+            builds,
+            index_build: None,
+            out,
+        });
+    }
     let mut delta = Delta::default();
     if triple == PIN_TRIPLE {
         delta.pins = builds.clone();
@@ -991,19 +984,7 @@ pub fn publish_group(
             pack_dir: None,
         },
     )?;
-    if upload {
-        log.say(format!(
-            "published: {} and atpkg-index-{}. Clients: aterm pkg update",
-            builds
-                .iter()
-                .map(|(p, b)| format!("{p} {b}"))
-                .collect::<Vec<_>>()
-                .join(", "),
-            published.index_build
-        ));
-    } else {
-        write_ready(ctx, req, &pf, &out, &builds, Some(published.index_build))?;
-    }
+    write_ready(ctx, req, &pf, &out, &builds, Some(published.index_build))?;
     Ok(GroupOutcome {
         builds,
         index_build: Some(published.index_build),
@@ -1025,7 +1006,7 @@ fn write_ready(
          Seed: {seed}.\n\
          {signed}\n\n\
          To publish from a rostered machine holding this seal:\n\n    \
-         atpkg-publish publish-group rustc --seal {seal} --upload\n",
+         atpkg-publish publish-group rustc --seal {seal} --stage-upload\n",
         commit = pf.seal_commit.chars().take(10).collect::<String>(),
         version = pf.seal_version,
         out = ctx.shown(out),
@@ -1054,7 +1035,7 @@ fn write_ready(
 pub fn parse_request(ctx: &Ctx, args: &[String]) -> Result<GroupRequest> {
     let Some((group, rest)) = args.split_first() else {
         return Err(Error::usage(
-            "publish-group rustc --seal <dir> [--dry-run | --upload]",
+            "publish-group rustc --seal <dir> [--dry-run | --stage-upload]",
         ));
     };
     if group != RUSTC_GROUP {
@@ -1072,7 +1053,7 @@ pub fn parse_request(ctx: &Ctx, args: &[String]) -> Result<GroupRequest> {
         out: None,
     };
     let mut seal = None;
-    let (mut dry, mut up) = (false, false);
+    let (mut dry, mut up, mut publish) = (false, false, false);
     let mut i = 0;
     while i < rest.len() {
         let flag = rest[i].as_str();
@@ -1094,7 +1075,8 @@ pub fn parse_request(ctx: &Ctx, args: &[String]) -> Result<GroupRequest> {
             }
             "--out" => req.out = Some(PathBuf::from(flag_value(rest, &mut i, flag)?)),
             "--dry-run" => dry = true,
-            "--upload" => up = true,
+            "--stage-upload" => up = true,
+            "--publish-staged" => publish = true,
             "--force-same-build" => req.force_same_build = true,
             "--allow-build-tree-seal" => req.allow_build_tree_seal = true,
             other => {
@@ -1105,12 +1087,25 @@ pub fn parse_request(ctx: &Ctx, args: &[String]) -> Result<GroupRequest> {
         }
         i += 1;
     }
-    req.mode = match (dry, up) {
-        (true, true) => return Err(Error::usage("--dry-run and --upload are two runs")),
-        (true, false) => Mode::DryRun,
-        (false, true) => Mode::Upload,
-        (false, false) => Mode::Stage,
+    req.mode = match (dry, up, publish) {
+        (true, false, false) => Mode::DryRun,
+        (false, true, false) => Mode::StageUpload,
+        (false, false, true) => Mode::PublishStaged,
+        (false, false, false) => Mode::Stage,
+        _ => {
+            return Err(Error::usage(
+                "choose one of --dry-run, --stage-upload, --publish-staged",
+            ));
+        }
     };
+    if req.mode == Mode::PublishStaged {
+        if seal.is_some() || req.out.is_none() {
+            return Err(Error::usage(
+                "--publish-staged needs --out and reads no --seal",
+            ));
+        }
+        return Ok(req);
+    }
     req.seal = seal.ok_or_else(|| {
         Error::usage("publish-group rustc needs --seal <the sealed toolchain dir>")
     })?;

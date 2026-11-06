@@ -97,8 +97,8 @@ impl Stores for VaultStores {
 
     fn ingest_members(&self, records: &[Vec<u8>]) -> Vec<Verdict> {
         let mut verdicts: Vec<Option<Verdict>> = vec![None; records.len()];
-        let mut decoded = Vec::new();
-        let mut at = Vec::new();
+        let mut decoded = Vec::with_capacity(records.len());
+        let mut at = Vec::with_capacity(records.len());
         for (i, bytes) in records.iter().enumerate() {
             match Record::decode(bytes) {
                 Ok(record) => {

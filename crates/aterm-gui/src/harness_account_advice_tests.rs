@@ -806,6 +806,7 @@ fn execution_work_read(
                 (case == 20).then(|| {
                     ["work-2", "unlisted-account"]
                         .map(|label| aterm_agent::harness::accounts_sync::LoginActivity {
+                            queued: None,
                             label: label.into(),
                             identity: activity_roster
                                 .row(label)
@@ -1303,6 +1304,7 @@ fn independent_execution_transition(
                     match before["activity"] {
                         0 => Some(Vec::new()),
                         1 => Some(vec![aterm_agent::harness::accounts_sync::LoginActivity {
+                            queued: None,
                             label: "work-2".into(),
                             route: Some("fixture-browser".into()),
                             active: true,
@@ -1316,6 +1318,7 @@ fn independent_execution_transition(
                         }]),
                         2 => None,
                         3 => Some(vec![aterm_agent::harness::accounts_sync::LoginActivity {
+                            queued: None,
                             label: "work-2".into(),
                             route: Some("fixture-browser".into()),
                             active: false,
@@ -1889,6 +1892,7 @@ fn a_repaired_execution_hold_becomes_history_at_its_monotonic_deadline() {
                 || (until, wall),
                 |_, _, _| {
                     Some(vec![aterm_agent::harness::accounts_sync::LoginActivity {
+                        queued: None,
                         label: "work-2".into(),
                         identity: Some(
                             aterm_agent::harness::accounts_sync::LoginIdentity::for_test(

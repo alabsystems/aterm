@@ -17,11 +17,9 @@
 //! an open vault's Commons on its only admin ([`aterm_secrets::client::commons_foundable`]).
 //! `sync.requests` runs this Mac's pass over the lab's credential requests, and the custodian's
 //! on a Mac that can sign with the vault's key ([`aterm_db::credentials`]).
-//! `sync.shared-data`, `sync.steward.revoke` and `sync.steward.lease` publish to the vault, so at
-//! a URL on macOS a pass that publishes on aterm's network waits while Local Network is untold or
-//! refused ([`lan_waits`]), and none asks. A subscriber pass handed to the installed app uses that
-//! app's answer; a held-copy fallback keeps its job's network, whose rounds reach the vault
-//! ([`publish_lan`]).
+//! `sync.shared-data`, `sync.steward.revoke` and `sync.steward.lease` publish to the vault, so for
+//! a vault on the LAN, which aterm reaches through the LAN broker on macOS, a pass waits while the
+//! broker does not answer ([`publish_waits`]).
 //! `sync.awake` starts the installed app's aCaffeine mug when none runs, so the subscriber's pass
 //! keeps a Mac with no window awake ([`aterm_acaffeine::cli::keep_installed_awake`], which first
 //! retires the old `aterm caffeine` name's login jobs no aterm will run again), retires those old
@@ -30,11 +28,10 @@
 //! at Startup's.
 
 use aterm_machines::init::{Base, BaseLock};
-use aterm_machines::sync::peers::Lan;
 use aterm_machines::sync::{
     AccountsRead, AwakeRead, FabricRead, FleetDone, FleetRead, GithubRead, IdentityRead, NodeRead,
-    PeersDone, PeersRead, Ports, Publisher, ReleaseRead, RequestsRead, SharedRead,
-    StewardLeaseRead, StewardRevokeRead, StewardStandbyServerRead, VaultRead,
+    PeersDone, PeersRead, Ports, ReleaseRead, RequestsRead, SharedRead, StewardLeaseRead,
+    StewardRevokeRead, StewardStandbyServerRead, VaultRead,
 };
 use aterm_secrets::client::Foundable;
 use std::path::{Path, PathBuf};
@@ -97,6 +94,13 @@ fn awake_of(
         Held::Off => off(),
         Held::Held { pid } => AwakeRead::Current(format!(
             "the mug (pid {pid}) holds macOS's idle-sleep assertion"
+        )),
+        Held::Paused { pid, why, .. } => AwakeRead::Current(format!(
+            "the mug (pid {pid}) runs, paused while {}",
+            match why {
+                aterm_acaffeine::model::Pause::LidClosed => "the lid is closed",
+                aterm_acaffeine::model::Pause::Asleep => "this Mac is in a dark wake",
+            }
         )),
         Held::NotHeld { pid, why } => AwakeRead::Asking(format!(
             "the mug (pid {pid}) runs and asks macOS again every minute{}",
@@ -218,28 +222,17 @@ fn repository_read<T>(
         .then_some(value))
 }
 
-/// Local Network as aterm last heard it: a use of it raises no question once macOS asked aterm
-/// before.
-#[cfg(target_os = "macos")]
-fn lan_heard() -> Lan {
-    use aterm_cli::macos_doctor::LocalNetworkHeard;
-    match aterm_cli::macos_doctor::local_network_heard() {
-        LocalNetworkHeard::On | LocalNetworkHeard::Asked => Lan::Allowed,
-        LocalNetworkHeard::Off => Lan::Refused,
-        LocalNetworkHeard::Untold => Lan::Untold,
-    }
-}
-
 /// What stands before `sync.peers`' join besides the vault: System State's plan (the Secrets
 /// vault left out, or a Stop holding it, keeps the vault out), a run of its that still owes its
-/// Secrets stage (which joins the vault itself), and Local Network as aterm last heard it
-/// ([`lan_heard`]).
+/// Secrets stage (which joins the vault itself), and a LAN broker that does not answer
+/// ([`aterm_machines::lan_reach::broker_unready`]), through which the look reaches the ALab
+/// vault's `.local` address.
 #[cfg(target_os = "macos")]
 fn peers_gate() -> aterm_machines::sync::peers::Gate {
     aterm_machines::sync::peers::Gate {
         off: vault_held(),
         owed: aterm_cli::macos_doctor::initial_setup_owes_secrets_stage().unwrap_or(true),
-        lan: lan_heard(),
+        broker: aterm_machines::lan_reach::broker_unready(),
     }
 }
 
@@ -263,13 +256,13 @@ const fn vault_held() -> Option<String> {
 /// github`), and says so in `aterm init`'s held line; a Stop, or records a newer aterm saved,
 /// hold the clone and keep it owed ([`aterm_machines::init::owed_clone`]).
 #[cfg(target_os = "macos")]
-fn setup_holds() -> aterm_machines::init::Holds {
+pub(super) fn setup_holds() -> aterm_machines::init::Holds {
     aterm_cli::macos_doctor::initial_setup_holds()
 }
 
 /// Elsewhere no System State runs, so nothing holds the repositories.
 #[cfg(not(target_os = "macos"))]
-const fn setup_holds() -> aterm_machines::init::Holds {
+pub(super) const fn setup_holds() -> aterm_machines::init::Holds {
     aterm_machines::init::Holds::NONE
 }
 
@@ -292,59 +285,41 @@ fn peers_gate() -> aterm_machines::sync::peers::Gate {
     aterm_machines::sync::peers::Gate {
         off: Some("System State joins a vault on macOS alone".to_owned()),
         owed: false,
-        lan: Lan::Untold,
+        broker: None,
     }
 }
 
-/// Elsewhere no Local Network question exists.
-#[cfg(not(target_os = "macos"))]
-const fn lan_heard() -> Lan {
-    Lan::Allowed
-}
-
-/// What a publication to `config`'s vault (a founding of its Commons, the steward's revoke repair
-/// or lease) goes through, out on `by`'s network: a vault at a path is no network use; at a URL,
-/// the vault subscriber's held-copy fallback publishes on its job's network, whose own rounds
-/// reach that vault. A subscriber pass handed to the installed app uses aterm's network and its
-/// own Local Network answer, as every other app pass does ([`lan_heard`]).
-fn publish_lan(config: &aterm_secrets::client::Config, by: Publisher) -> Lan {
-    let url = matches!(config.source, aterm_secrets::transport::Source::Url(_));
-    publish_through(url, by, lan_heard)
-}
-
-/// [`publish_lan`] for a vault at a URL (`url`) or a path, `heard` reading aterm's answer.
-fn publish_through(url: bool, by: Publisher, heard: impl FnOnce() -> Lan) -> Lan {
-    if url && by == Publisher::Aterm {
-        heard()
-    } else {
-        Lan::Allowed
+/// Why `what`, a publication to `config`'s vault (a founding of its Commons, the steward's revoke
+/// repair or lease), waits: a vault on the LAN ([`aterm_machines::lan_reach::on_the_lan`]) is
+/// reached through the LAN broker, so it waits while the broker does not answer (`broken`,
+/// [`aterm_machines::lan_reach::broker_unready`]'s reading, asked only then); a vault at a path,
+/// or at a URL off the LAN, waits for nothing.
+fn publish_waits(
+    config: &aterm_secrets::client::Config,
+    what: &str,
+    broken: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    let aterm_secrets::transport::Source::Url(url) = &config.source else {
+        return None;
+    };
+    if !aterm_machines::lan_reach::on_the_lan(url) {
+        return None;
     }
-}
-
-/// Why `what`, a publication to the vault, waits on macOS's Local Network answer `lan`: `None`
-/// where a use of it raises no question.
-fn lan_waits(lan: Lan, what: &str) -> Option<String> {
-    match lan {
-        Lan::Allowed => None,
-        Lan::Refused => Some(format!(
-            "macOS does not let aterm use the local network (Don't Allow, or turned off since), \
-             so {what} waits: System Settings > Privacy & Security > Local Network turns aterm on"
-        )),
-        Lan::Untold => Some(format!(
-            "macOS has not asked aterm about the local network yet, so {what} waits for System \
-             State's Local Network row to ask; no pass raises the question"
-        )),
-    }
+    broken().map(|why| format!("{why}, so {what} waits for it"))
 }
 
 /// `sync.shared-data`'s read of a Mac no control record reaches (`unseen` says so):
-/// `foundable`, through `lan`. Its vault's only admin founds an open vault's Commons once Local
-/// Network raises no question (Refused and Untold wait on a person) and nothing else holds it
-/// for a person ([`Foundable::Waiting`]: an approver that shares no root, which waits, naming
+/// `foundable`, `waits` saying why a founding would wait ([`publish_waits`]). Its vault's only
+/// admin founds an open vault's Commons once nothing waits and nothing else holds it for a
+/// person ([`Foundable::Waiting`]: an approver that shares no root, which waits, naming
 /// it); one that is not this Mac's to found reads unavailable, naming why where the read says,
 /// as does a read the vault's busy state lock put off to the next pass; and any other Mac (a
 /// member, or an admin whose root is published) reads unavailable as the observation says.
-fn unseen_read(unseen: String, foundable: Foundable, lan: Lan) -> SharedRead {
+fn unseen_read(
+    unseen: String,
+    foundable: Foundable,
+    waits: impl FnOnce(&str) -> Option<String>,
+) -> SharedRead {
     match foundable {
         Foundable::NotAdmin | Foundable::Founded => SharedRead::Unavailable(unseen),
         Foundable::Elsewhere(why) => SharedRead::Unavailable(format!("{unseen}; {why}")),
@@ -353,7 +328,7 @@ fn unseen_read(unseen: String, foundable: Foundable, lan: Lan) -> SharedRead {
             "{unseen}; the vault's state is changing, so the next pass reads whether this Mac \
              founds it"
         )),
-        Foundable::Due(due) => match lan_waits(lan, "the founding") {
+        Foundable::Due(due) => match waits("the founding") {
             None => SharedRead::Foundable(due),
             Some(why) => SharedRead::Deferred(format!("{due}; {why}")),
         },
@@ -1456,8 +1431,8 @@ fn release_elsewhere(own: Option<&Path>, apps_dirs: &[PathBuf]) -> Option<PathBu
 
 /// The installed app's run of a held copy's subscriber pass: `program args` on the held copy's
 /// own stdio (null under the subscriber's runner; a person's terminal gets the rows), as its own
-/// responsible process (the one place the converge pass disclaims responsibility, so macOS asks
-/// about its Local Network use as aterm.app's, not the held copy's that started it), and out of
+/// responsible process (the one place the converge pass disclaims responsibility, so macOS
+/// attributes what it does to aterm.app, not to the held copy that started it), and out of
 /// the background band the held copy starts its other children in ([`Ports::background`]), as
 /// the pass it runs takes the fleet book's lock.
 fn hand_off_command(program: &Path, args: &[String]) -> aterm_uds::spawnfd::Command {
@@ -1782,7 +1757,7 @@ impl Ports for Live {
         })
     }
 
-    fn steward_revoke(&self, by: Publisher) -> Result<StewardRevokeRead, String> {
+    fn steward_revoke(&self) -> Result<StewardRevokeRead, String> {
         use aterm_secrets::client::{StewardRevoke, steward_revoke_check};
         let paths = vault_paths()?;
         Ok(
@@ -1793,7 +1768,11 @@ impl Ports for Live {
                 }
                 StewardRevoke::Due { found, makes } => match vault_config(&paths)? {
                     Some(config) => {
-                        match lan_waits(publish_lan(&config, by), "the steward's revoke cascade") {
+                        match publish_waits(
+                            &config,
+                            "the steward's revoke cascade",
+                            aterm_machines::lan_reach::broker_unready,
+                        ) {
                             None => StewardRevokeRead::Due { found, makes },
                             Some(why) => StewardRevokeRead::Deferred(format!("{found}; {why}")),
                         }
@@ -1817,7 +1796,7 @@ impl Ports for Live {
         )
     }
 
-    fn steward_lease(&self, by: Publisher) -> Result<StewardLeaseRead, String> {
+    fn steward_lease(&self) -> Result<StewardLeaseRead, String> {
         use aterm_secrets::client::{StewardLease, steward_lease_check};
         let paths = vault_paths()?;
         let now_secs = aterm_time::unix_secs().unwrap_or(0);
@@ -1829,7 +1808,11 @@ impl Ports for Live {
                 }
                 StewardLease::Due { found, makes } => match vault_config(&paths)? {
                     Some(config) => {
-                        match lan_waits(publish_lan(&config, by), "the steward's lease") {
+                        match publish_waits(
+                            &config,
+                            "the steward's lease",
+                            aterm_machines::lan_reach::broker_unready,
+                        ) {
                             None => StewardLeaseRead::Due { found, makes },
                             Some(why) => StewardLeaseRead::Deferred(format!("{found}; {why}")),
                         }
@@ -1883,7 +1866,7 @@ impl Ports for Live {
         )
     }
 
-    fn shared_data(&self, by: Publisher) -> Result<SharedRead, String> {
+    fn shared_data(&self) -> Result<SharedRead, String> {
         use aterm_secrets::commons::{Observation, Unavailable};
         let config = aterm_types::dirs::aterm_config_path()
             .ok_or("no config path: neither $XDG_CONFIG_HOME nor $HOME is set")?;
@@ -1904,7 +1887,13 @@ impl Ports for Live {
                             unseen,
                             aterm_secrets::client::commons_foundable(&paths)
                                 .map_err(|why| why.to_string())?,
-                            publish_lan(&vault, by),
+                            |what| {
+                                publish_waits(
+                                    &vault,
+                                    what,
+                                    aterm_machines::lan_reach::broker_unready,
+                                )
+                            },
                         ),
                         None => SharedRead::Unavailable(unseen),
                     }
@@ -1939,6 +1928,7 @@ impl Ports for Live {
     }
 
     fn pass_requests(&self) -> Result<String, String> {
+        use std::fmt::Write as _;
         let paths = vault_paths()?;
         let pass = aterm_db::credentials::pass(&paths).map_err(|why| why.to_string())?;
         let mut said = format!(
@@ -1948,13 +1938,14 @@ impl Ports for Live {
         if let Some(custodian) =
             aterm_db::credentials::custodian_pass(&paths).map_err(|why| why.to_string())?
         {
-            said.push_str(&format!(
+            let _ = write!(
+                said,
                 "; custodian: {} published, {} handed to a person, {} retired, {} waiting",
                 custodian.published.len(),
                 custodian.asked.len(),
                 custodian.retired.len(),
                 custodian.waiting.len()
-            ));
+            );
         }
         Ok(said)
     }
@@ -2164,8 +2155,10 @@ impl Ports for Live {
             Kept::Running(_) => {}
         }
         let until = std::time::Instant::now() + AWAKE_SETTLE;
-        while !matches!(aterm_acaffeine::held::held(), Held::Held { .. })
-            && std::time::Instant::now() < until
+        while !matches!(
+            aterm_acaffeine::held::held(),
+            Held::Held { .. } | Held::Paused { .. }
+        ) && std::time::Instant::now() < until
         {
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
@@ -2186,23 +2179,43 @@ impl Ports for Live {
         )
     }
 
-    fn peers(&self, look: bool) -> Result<PeersRead, String> {
+    fn peers(&self, can_join: bool) -> Result<PeersRead, String> {
         let ops = aterm_machines::init_secrets::LiveSecrets::unattended(&vault_paths()?.home);
-        #[cfg(target_os = "macos")]
-        let looks: &dyn Fn() -> aterm_machines::sync::peers::Heard =
-            &aterm_cli::macos_doctor::look_for_the_alab_vault;
-        #[cfg(not(target_os = "macos"))]
-        let looks: &dyn Fn() -> aterm_machines::sync::peers::Heard =
-            &|| aterm_machines::sync::peers::Heard::Unreached("not macOS".to_owned());
-        aterm_machines::sync::peers::read(&ops, &peers_gate(), look.then_some(looks))
+        aterm_machines::sync::peers::read(&ops, &peers_gate(), can_join)
     }
 
     fn join_peers(&self) -> Result<PeersDone, String> {
+        #[cfg(target_os = "macos")]
+        let authorization = match aterm_cli::macos_doctor::BackgroundVaultAuthorization::capture() {
+            Ok(authorization) => authorization,
+            Err(why) => {
+                return Ok(PeersDone::Deferred(aterm_converge::StoodAside::Waiting(
+                    why,
+                )));
+            }
+        };
+        let current = || {
+            #[cfg(target_os = "macos")]
+            authorization.check()?;
+            let gate = peers_gate();
+            if let Some(why) = gate.off {
+                return Err(why);
+            }
+            if gate.owed {
+                return Err(aterm_machines::sync::peers::STAGE_OWED.to_owned());
+            }
+            gate.broker.map_or(Ok(()), Err)
+        };
+        if let Err(why) = current() {
+            return Ok(PeersDone::Deferred(aterm_converge::StoodAside::Waiting(
+                why,
+            )));
+        }
         let sys = aterm_machines::port::Live::new();
         let ctx = aterm_machines::init::initial_setup_context(&sys)?;
         let ops = aterm_machines::init_secrets::unattended(&ctx)?;
         let mut journal = aterm_machines::port::System::journal(&sys)?;
-        aterm_machines::sync::peers::join(&sys, &ctx, ops, journal.as_mut())
+        aterm_machines::sync::peers::join(&sys, &ctx, ops, journal.as_mut(), &current)
     }
 
     fn log(&self, line: &str) {
@@ -2495,6 +2508,17 @@ mod tests {
             awake_of(at, Held::NotHeld { pid: 7, why: None }),
             Ok(AwakeRead::Asking(_))
         ));
+        assert!(matches!(
+            awake_of(
+                at,
+                Held::Paused {
+                    pid: 7,
+                    why: aterm_acaffeine::model::Pause::LidClosed,
+                    lingering: false
+                }
+            ),
+            Ok(AwakeRead::Current(why)) if why.contains("lid is closed")
+        ));
         assert!(
             awake_of(
                 at,
@@ -2726,41 +2750,40 @@ mod tests {
     }
 
     /// A Mac no control record reaches founds its vault's Commons only where the read says due
-    /// and Local Network raises no question: refused or untold waits on a person, as a founding
-    /// held for a person (an old approver) does, whatever Local Network says. A read that is not
+    /// and nothing waits (the LAN broker answers, or the vault is not on the LAN); a founding
+    /// held for a person (an old approver) waits whatever the broker says. A read that is not
     /// this Mac's to found names why; a member's reads as the observation says.
-    /// NEGATIVE CONTROL: a read that skips the Local Network gate founds where macOS never asked;
-    /// one that reads a held founding as not this Mac's leaves it out of the pass's log line.
+    /// NEGATIVE CONTROL: a read that skips `waits` founds while the broker is absent; one that
+    /// reads a held founding as not this Mac's leaves it out of the pass's log line.
     #[test]
-    fn a_founding_waits_for_local_network_and_names_why_it_is_not_this_macs() {
+    fn a_founding_waits_for_the_lan_broker_and_names_why_it_is_not_this_macs() {
         let unseen = || "no Commons control entry is visible (control-not-visible)".to_owned();
         let found = "vault alab is open and has no Commons control";
         let due = || Foundable::Due(found.to_owned());
+        let free = |_: &str| None;
+        let absent = |what: &str| Some(format!("the LAN broker is not installed, so {what} waits"));
         assert_eq!(
-            unseen_read(unseen(), due(), Lan::Allowed),
+            unseen_read(unseen(), due(), free),
             SharedRead::Foundable(found.to_owned())
         );
-        for (lan, says) in [
-            (Lan::Refused, "Don't Allow"),
-            (Lan::Untold, "has not asked"),
-        ] {
-            let read = unseen_read(unseen(), due(), lan);
-            assert!(
-                matches!(&read, SharedRead::Deferred(why) if why.starts_with(found) && why.contains(says)),
-                "{lan:?}: {read:?}"
-            );
-        }
+        let read = unseen_read(unseen(), due(), absent);
+        assert!(
+            matches!(&read, SharedRead::Deferred(why)
+                if why.starts_with(found) && why.contains("the founding waits")),
+            "{read:?}"
+        );
         let held = "vault alab: this Mac's approver (/x/aterm, aterm 0.142.0) shares no root";
-        for lan in [Lan::Allowed, Lan::Refused, Lan::Untold] {
-            assert_eq!(
-                unseen_read(unseen(), Foundable::Waiting(held.to_owned()), lan),
-                SharedRead::Deferred(held.to_owned()),
-                "{lan:?}"
-            );
-        }
+        assert_eq!(
+            unseen_read(unseen(), Foundable::Waiting(held.to_owned()), free),
+            SharedRead::Deferred(held.to_owned())
+        );
+        assert_eq!(
+            unseen_read(unseen(), Foundable::Waiting(held.to_owned()), absent),
+            SharedRead::Deferred(held.to_owned())
+        );
         for foundable in [Foundable::NotAdmin, Foundable::Founded] {
             assert_eq!(
-                unseen_read(unseen(), foundable, Lan::Allowed),
+                unseen_read(unseen(), foundable, free),
                 SharedRead::Unavailable(unseen())
             );
         }
@@ -2768,17 +2791,62 @@ mod tests {
             unseen_read(
                 unseen(),
                 Foundable::Elsewhere("vault alab: it names 2 admins".to_owned()),
-                Lan::Allowed
+                free
             ),
             SharedRead::Unavailable(format!("{}; vault alab: it names 2 admins", unseen()))
         );
         assert!(
             matches!(
-                unseen_read(unseen(), Foundable::Busy, Lan::Allowed),
+                unseen_read(unseen(), Foundable::Busy, free),
                 SharedRead::Unavailable(why) if why.starts_with(&unseen())
             ),
             "a busy read founds nothing and fails nothing"
         );
+    }
+
+    /// Only a publication to a vault on the LAN (a `.local` or single-label name, a link-local
+    /// address or one on an attached subnet) waits for the LAN broker, which is read only then; a vault at a public
+    /// URL or at a path waits for nothing.
+    /// NEGATIVE CONTROL: a `publish_waits` that gates every URL defers the public vault.
+    #[test]
+    fn only_a_vault_on_the_lan_waits_for_the_lan_broker() {
+        use aterm_secrets::transport::Source;
+        let config = |source: Source| aterm_secrets::client::Config {
+            source,
+            mirrors: Vec::new(),
+            name: "alab".to_owned(),
+            signer: None,
+            followed: Vec::new(),
+            host: "m1".to_owned(),
+        };
+        for (source, lan) in [
+            (
+                Source::Url("http://alab-secrets.local:7484/v1/alab".into()),
+                true,
+            ),
+            (Source::Url("http://m11:7484/v1/alab".into()), true),
+            (
+                Source::Url("http://169.254.10.20:7484/v1/alab".into()),
+                true,
+            ),
+            (Source::Url("http://[fe80::1]:7484/v1/alab".into()), true),
+            (Source::Url("https://vault.example/v1/alab".into()), false),
+            (Source::Url("https://8.8.8.8/v1/alab".into()), false),
+            (Source::Path("/Volumes/Keys/team.vault".into()), false),
+        ] {
+            let reads = std::cell::Cell::new(0);
+            let waits = publish_waits(&config(source.clone()), "the founding", || {
+                reads.set(reads.get() + 1);
+                Some("the LAN broker is not installed".to_owned())
+            });
+            assert_eq!(waits.is_some(), lan, "{source:?}: {waits:?}");
+            assert_eq!(reads.get(), u32::from(lan), "{source:?}");
+            assert_eq!(
+                publish_waits(&config(source.clone()), "the founding", || None),
+                None,
+                "{source:?}"
+            );
+        }
     }
 
     /// A held copy's subscriber pass hands off to the installed release app: the first one the
@@ -2827,7 +2895,7 @@ mod tests {
     }
 
     /// The hand-off runs the installed app with the held copy's words, as its own responsible
-    /// process (so macOS asks about its Local Network use as aterm.app's), out of the background
+    /// process (so macOS attributes what it does to aterm.app), out of the background
     /// band the held copy starts its other children in (so the pass it runs lifts the fleet
     /// book's lock holder).
     /// NEGATIVE CONTROLS: a hand-off that keeps the held copy responsible, or that stays in the
@@ -2847,46 +2915,6 @@ mod tests {
             command.leaves_background_band(),
             "the pass handed off lifts its book lock's holder"
         );
-    }
-
-    /// The installed app's publications use its Local Network answer, including a subscriber
-    /// pass handed to it. A held-copy fallback keeps its job's network; a path vault uses none.
-    /// Untold and refused answers on the app's network defer the founding; allowed leaves it due.
-    /// NEGATIVE CONTROLS: a bypass admits an untold publication, and gating the fallback reads
-    /// an answer its job does not use.
-    #[test]
-    fn only_aterms_network_waits_on_its_local_network_answer() {
-        for heard in [Lan::Untold, Lan::Refused, Lan::Allowed] {
-            for (url, by, gated) in [
-                (true, Publisher::Aterm, true),
-                (true, Publisher::Subscriber, false),
-                (false, Publisher::Aterm, false),
-                (false, Publisher::Subscriber, false),
-            ] {
-                let reads = std::cell::Cell::new(0);
-                let lan = publish_through(url, by, || {
-                    reads.set(reads.get() + 1);
-                    heard
-                });
-                let want = if gated { heard } else { Lan::Allowed };
-                assert_eq!(lan, want, "url={url} {by:?} {heard:?}");
-                assert_eq!(
-                    reads.get(),
-                    u32::from(gated),
-                    "only this app's answer is read"
-                );
-                let commons = unseen_read(
-                    "no Commons control".to_owned(),
-                    Foundable::Due("found Commons".to_owned()),
-                    lan,
-                );
-                if want == Lan::Allowed {
-                    assert!(matches!(commons, SharedRead::Foundable(_)));
-                } else {
-                    assert!(matches!(commons, SharedRead::Deferred(_)));
-                }
-            }
-        }
     }
 
     /// `sync.node`'s read and its apply both answer a process that is not a shell of the

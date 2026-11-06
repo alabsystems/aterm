@@ -139,7 +139,8 @@ pub struct Spent {
     pub paint_tables: u64,
     /// `GSUB`/`GPOS` work units charged by the shaper, including any refused by the budget.
     pub layout_ops: u64,
-    /// Glyph advances summed and attachment links applied by `GPOS` attachment propagation.
+    /// Steps of `GPOS` attachment propagation: each glyph advance it reads (every read goes
+    /// through one counted accessor) and each attachment link it applies.
     pub attachment_steps: u64,
     /// Glyphs `GSUB` copied to move between a rule's positions, a rewind's shift of the input
     /// included.

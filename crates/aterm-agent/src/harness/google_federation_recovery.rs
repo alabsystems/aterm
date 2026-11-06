@@ -30,7 +30,10 @@ struct Candidate {
     predecessor: Option<[u8; 32]>,
 }
 
-struct RefreshGuard(FederationScope);
+struct RefreshGuard {
+    recovery: super::super::cli::shared_provider::KimiRecoveryContext,
+    scope: FederationScope,
+}
 impl std::fmt::Debug for RefreshGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("KimiRefreshGuard(opaque)")
@@ -38,10 +41,24 @@ impl std::fmt::Debug for RefreshGuard {
 }
 impl aterm_http::Guard for RefreshGuard {
     fn is_authorized(&self) -> bool {
-        self.0
+        self.scope
             .check_attempt()
-            .and_then(|()| self.0.current())
+            .and_then(|()| self.scope.current())
             .is_ok()
+    }
+}
+
+impl super::super::cli::shared_provider::KimiRefreshAuthority for RefreshGuard {
+    fn receipt_current(&self) -> bool {
+        self.scope
+            .check_attempt()
+            .and_then(|()| self.scope.binding_current())
+            .is_ok()
+    }
+    fn recovery_context(
+        &self,
+    ) -> Result<super::super::cli::shared_provider::KimiRecoveryContext, String> {
+        Ok(self.recovery.clone())
     }
 }
 
@@ -53,6 +70,7 @@ pub(in crate::harness) struct Journal {
     resumed: bool,
     rejection_observed: bool,
     fallback_cookies: Option<(SecretBytes, Option<[u8; 32]>)>,
+    refresh_recovery: super::super::cli::shared_provider::KimiRecoveryContext,
     _native_claim: std::sync::Arc<super::super::browser_window::ProfileLock>,
     scope: FederationScope,
 }
@@ -83,7 +101,7 @@ fn scope_digest(scope: &FederationScope) -> Result<[u8; 32], String> {
         .attempt
         .admission
         .as_ref()
-        .is_some_and(login_drive::RecoveryAdmission::is_shared_root)
+        .is_some_and(login_drive::RecoveryAuthority::is_shared_root)
     {
         hash.update(b"\0shared-root-admission.v1\0");
     }
@@ -221,20 +239,22 @@ impl Journal {
         request: &login_drive::Request<'_>,
         scope: &FederationScope,
         now: i64,
-        deadline: WakeDeadline,
+        deadline: login_drive::Deadline<'_>,
     ) -> Result<Option<KimiProof>, KimiNativeError> {
+        let recovery = self.refresh_recovery.clone();
         let journal = std::cell::RefCell::new(self);
-        // Kimi's native refresh is a leaf that takes an `Instant`, so it measures what is left of
-        // `deadline` on the clock that stops in sleep: each of its account checks takes 20 s at
-        // most, but its token refresh request has no cap of its own (KI-1105-14). The checks
-        // around it read both clocks.
+        // Refresh and its retained completion share the original sleep-aware
+        // work budget; completed response custody remains separate from publication authority.
         verify_or_refresh_kimi_with_rejection(
             request.staging,
             scope.region,
             &scope.expected,
             now,
-            deadline.instant(),
-            std::sync::Arc::new(RefreshGuard(scope.clone())),
+            deadline,
+            std::sync::Arc::new(RefreshGuard {
+                recovery,
+                scope: scope.clone(),
+            }),
             &|| journal.borrow_mut().checkpoint_rejected(request),
         )
     }
@@ -245,7 +265,7 @@ impl Journal {
         &mut self,
         request: &login_drive::Request<'_>,
         home: &Path,
-        deadline: WakeDeadline,
+        deadline: login_drive::Deadline<'_>,
     ) -> Result<Option<KimiProof>, super::super::cli::shared_provider::ObservationError> {
         use super::super::cli::shared_provider::{ObservationError, kimi_observation_error};
         self.check_context(request)
@@ -325,7 +345,7 @@ impl Journal {
                     .attempt
                     .admission
                     .as_ref()
-                    .is_some_and(login_drive::RecoveryAdmission::is_shared_root)
+                    .is_some_and(login_drive::RecoveryAuthority::is_shared_root)
                 {
                     "pending-native-kimi-google-shared"
                 } else {
@@ -346,6 +366,13 @@ impl Journal {
         let files = candidate
             .as_ref()
             .map(|c| (digest(c.config.as_slice()), digest(c.credential.as_slice())));
+        let refresh_recovery = super::super::cli::shared_provider::KimiRecoveryContext::new(
+            request.store,
+            &request.row.label,
+            key,
+            home,
+        )
+        .with_binding(scope_digest(&scope)?);
         Ok(Some(Self {
             scope,
             key,
@@ -355,6 +382,7 @@ impl Journal {
             resumed: false,
             rejection_observed: false,
             fallback_cookies: None,
+            refresh_recovery,
             _native_claim: std::sync::Arc::new(native_claim),
         }))
     }
@@ -501,7 +529,7 @@ impl Journal {
         &mut self,
         request: &login_drive::Request<'_>,
         home: &Path,
-        deadline: WakeDeadline,
+        deadline: login_drive::Deadline<'_>,
     ) -> Result<Option<KimiProof>, super::super::cli::shared_provider::ObservationError> {
         self.observe_existing_with(request, home, deadline, |journal, scope, now| {
             journal.renew_recorded(request, scope, now, deadline)
@@ -513,7 +541,7 @@ impl Journal {
         &mut self,
         request: &login_drive::Request<'_>,
         home: &Path,
-        deadline: WakeDeadline,
+        deadline: login_drive::Deadline<'_>,
         read: impl FnOnce(&FederationScope, i64) -> Result<Option<KimiProof>, KimiNativeError>,
     ) -> Result<Option<KimiProof>, super::super::cli::shared_provider::ObservationError> {
         self.observe_existing_with(request, home, deadline, |_, scope, now| read(scope, now))
@@ -523,7 +551,7 @@ impl Journal {
         &mut self,
         request: &login_drive::Request<'_>,
         home: &Path,
-        deadline: WakeDeadline,
+        deadline: login_drive::Deadline<'_>,
         read: impl FnOnce(
             &mut Self,
             &FederationScope,
@@ -545,7 +573,7 @@ impl Journal {
         let Some(candidate) = self.candidate.take() else {
             return Ok(None);
         };
-        if deadline.passed() {
+        if deadline.expired() {
             return Err(ObservationError::Unavailable(
                 "Kimi recovery deadline expired".into(),
             ));
@@ -584,7 +612,7 @@ impl Journal {
         for (path, bytes, predecessor) in replacements {
             self.check_context(request)
                 .map_err(ObservationError::Unavailable)?;
-            if deadline.passed() {
+            if deadline.expired() {
                 return Err(ObservationError::Unavailable(
                     "Kimi recovery deadline expired".into(),
                 ));
@@ -602,7 +630,7 @@ impl Journal {
         for (path, bytes) in missing {
             self.check_context(request)
                 .map_err(ObservationError::Unavailable)?;
-            if deadline.passed() {
+            if deadline.expired() {
                 return Err(ObservationError::Unavailable(
                     "Kimi recovery deadline expired".into(),
                 ));
@@ -621,7 +649,7 @@ impl Journal {
             }
         }
         self.check(request).map_err(ObservationError::Unavailable)?;
-        if deadline.passed() {
+        if deadline.expired() {
             return Err(ObservationError::Unavailable(
                 "Kimi recovery deadline expired".into(),
             ));
@@ -708,7 +736,7 @@ impl Journal {
         &mut self,
         request: &login_drive::Request<'_>,
         home: &Path,
-        deadline: WakeDeadline,
+        deadline: login_drive::Deadline<'_>,
     ) -> Result<Option<PendingFederation>, String> {
         self.resume_with(request, home, deadline, |journal, scope, now| {
             if scope
@@ -719,13 +747,12 @@ impl Journal {
             {
                 return journal.renew_recorded(request, scope, now, deadline);
             }
-            // As in `renew_recorded`: a leaf that takes an `Instant`.
             verify_native_kimi_classified(
                 request.staging,
                 scope.region,
                 &scope.expected,
                 now,
-                deadline.instant(),
+                deadline,
             )
         })
     }
@@ -735,7 +762,7 @@ impl Journal {
         &mut self,
         request: &login_drive::Request<'_>,
         home: &Path,
-        deadline: WakeDeadline,
+        deadline: login_drive::Deadline<'_>,
         read: impl FnOnce(&FederationScope, i64) -> Result<Option<KimiProof>, KimiNativeError>,
     ) -> Result<Option<PendingFederation>, String> {
         self.resume_with(request, home, deadline, |_, scope, now| read(scope, now))
@@ -745,7 +772,7 @@ impl Journal {
         &mut self,
         request: &login_drive::Request<'_>,
         home: &Path,
-        deadline: WakeDeadline,
+        deadline: login_drive::Deadline<'_>,
         read: impl FnOnce(
             &mut Self,
             &FederationScope,
@@ -768,7 +795,7 @@ impl Journal {
         let Some(candidate) = self.candidate.take() else {
             return Ok(None);
         };
-        if deadline.passed() {
+        if deadline.expired() {
             return Err("Kimi recovery deadline expired".into());
         }
         let credential_path = kimi_credential_path(request.staging, self.scope.region);
@@ -801,7 +828,7 @@ impl Journal {
         let scope = self.scope.clone();
         let result = read(self, &scope, now);
         self.check(request)?;
-        if deadline.passed() {
+        if deadline.expired() {
             return Err("Kimi recovery deadline expired".into());
         }
         let native = match result {

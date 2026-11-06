@@ -8,7 +8,7 @@
 
 use std::fmt;
 use std::io::{self, BufRead, Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -607,6 +607,19 @@ pub fn node_identity(dir: &Path) -> io::Result<NodeIdentity> {
         .map(|me| noting_in(dialing_by(me, mesh, MESH_VERDICT.get()), dir))
 }
 
+/// Observe an actual cold node-key mint under its book lock, before any key is written.
+/// The callback runs on the minting thread with the same priority lift as production.
+/// Existing identities are read without invoking it. This makes scheduler regressions
+/// measurable at the held effect boundary without a timing ceiling or a global test hook.
+/// # Errors
+/// The ordinary identity reader's path, lock, random source or write failure.
+#[cfg(any(test, debug_assertions))]
+pub fn node_identity_during_mint(dir: &Path, held: impl FnOnce()) -> io::Result<NodeIdentity> {
+    let mesh = aterm_types::mesh_switch::MESH;
+    node_identity_before_mint(dir, mesh, held)
+        .map(|me| noting_in(dialing_by(me, mesh, MESH_VERDICT.get()), dir))
+}
+
 /// The verdict this process's dialers judge an [`crate::fleet::ALPN_MESH`] listener by: the
 /// process that reads this Mac's membership log provides it once, at its start
 /// ([`judge_mesh_by`]), as aterm-net reads no log itself.
@@ -660,6 +673,14 @@ pub(crate) fn dialing_by(
 }
 
 fn node_identity_with_mesh(dir: &Path, mesh: bool) -> io::Result<NodeIdentity> {
+    node_identity_before_mint(dir, mesh, || {})
+}
+
+fn node_identity_before_mint(
+    dir: &Path,
+    mesh: bool,
+    held: impl FnOnce(),
+) -> io::Result<NodeIdentity> {
     if !mesh
         && let Ok(Some(node)) = read_legacy_node_id(dir)
         && let Ok(Some(seed)) = read_node_seed(dir)
@@ -671,6 +692,7 @@ fn node_identity_with_mesh(dir: &Path, mesh: bool) -> io::Result<NodeIdentity> {
     let seed = match read_node_seed(dir)? {
         Some(seed) => seed,
         None => {
+            held();
             let mut seed = [0u8; NODE_SEED_LEN];
             aterm_uds::rand::fill(&mut seed)?;
             let mut text = aterm_codec::hex::encode_lower(&seed);
@@ -5149,19 +5171,19 @@ pub fn heartbeat_members_while(
 /// WHETHER A DIAL THAT GOT NO ANSWER MET SOMETHING OTHER THAN SILENCE, for the network place's
 /// silent-round rule (`aterm_netplace::Round::blocked`): a host at the address answered (a
 /// refused connect, a connect that went on to a handshake, a proof or an exchange that failed or
-/// ran out of time), or this Mac's own way onto this network refused the connect (no route, no
-/// network or not permitted, to an address `on_this_network` says lies on the network this Mac
-/// is on: macOS's Local Network privacy, a sandbox, a firewall). Silence is the rest: a connect
-/// that timed out, a host down (no ARP answer), no route to an address off this network (the
-/// home LAN's addresses from a phone hotspot), and no address or lookup at all.
+/// ran out of time), or this Mac's own way onto this network refused the connect (no network or
+/// not permitted, to an address `on_this_network` says lies on the network this Mac is on: a
+/// sandbox, a firewall). Silence is the rest: a connect that timed out, a host down (no route to
+/// it: no ARP answer on this network, or the home LAN's addresses from a phone hotspot), and no
+/// address or lookup at all.
 #[must_use]
 pub fn dial_blocked(why: &Unreached, on_this_network: impl Fn(IpAddr) -> bool) -> bool {
     match why {
         Unreached::Connect(at, e) => match e.kind() {
             io::ErrorKind::ConnectionRefused => true,
-            io::ErrorKind::HostUnreachable
-            | io::ErrorKind::NetworkUnreachable
-            | io::ErrorKind::PermissionDenied => on_this_network(at.ip()),
+            io::ErrorKind::NetworkUnreachable | io::ErrorKind::PermissionDenied => {
+                on_this_network(at.ip())
+            }
             _ => false,
         },
         Unreached::Deadline(stage, _) => *stage != Stage::Connect,
@@ -6557,8 +6579,8 @@ impl Unreached {
         )
     }
 
-    /// Whether the connect failed with no route to the host (`EHOSTUNREACH`): what macOS's
-    /// local-network privacy gives an app the person has not allowed, and a host off the LAN.
+    /// Whether the connect failed with no route to the host (`EHOSTUNREACH`): a host off the LAN,
+    /// asleep or off.
     #[must_use]
     pub fn no_route(&self) -> bool {
         matches!(
@@ -6635,12 +6657,9 @@ impl fmt::Display for Unreached {
                     "{addr} reset the connection: its fleet listener closing or restarting; try \
                      again"
                 ),
-                io::ErrorKind::HostUnreachable => write!(
-                    f,
-                    "no route to {}: off the LAN, or not allowed in Privacy & Security › Local \
-                     Network",
-                    addr.ip()
-                ),
+                io::ErrorKind::HostUnreachable => {
+                    write!(f, "no route to {}: off the LAN, asleep or off", addr.ip())
+                }
                 io::ErrorKind::NetworkUnreachable => write!(
                     f,
                     "this machine has no route to {addr}: offline, or a VPN holds the LAN's route"
@@ -7444,11 +7463,22 @@ fn resolve_batches_with_admission(
     }
 }
 
+/// The longest one fleet lookup runs on its resolver thread ([`resolve`]); its caller's own
+/// deadline ends the caller's wait sooner.
+const LOOKUP_BOUND: Duration = Duration::from_secs(30);
+
+/// `name`'s addresses on `port` (IPv4 first, at most four), empty for a lookup that failed:
+/// `aterm_uds::lan::resolve`, which on macOS has the root LAN broker resolve a `.local` or
+/// single-label name and resolves any other name here, `localhost` (the loopback's, RFC 6761
+/// §6.3) included.
 fn resolve(name: &str, port: u16) -> Vec<SocketAddr> {
-    let Ok(found) = (name, port).to_socket_addrs() else {
+    let Ok(found) = aterm_uds::lan::resolve(name, LOOKUP_BOUND) else {
         return Vec::new();
     };
-    let mut found: Vec<SocketAddr> = found.collect();
+    let mut found: Vec<SocketAddr> = found
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect();
     found.sort_by_key(SocketAddr::is_ipv6);
     found.dedup();
     found.truncate(4);

@@ -25,14 +25,16 @@
 
 use crate::{
     Error, Result,
+    att::Refused,
+    database::Change,
     typed::{
         Collection, Column, Derive, Kind, Member, OnConflict, Table, Ty, Writer, Writers,
-        cell::{self, Cells},
+        cell::{self, CellKey, CellValue, Cells},
         keys,
     },
 };
 use aterm_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The registry's application word.
 pub const APPLICATION: &str = "alab";
@@ -298,9 +300,10 @@ crate::att_collection!(
 );
 
 crate::att_collection!(
-    /// A login or mail address, keyed `ad-<16hex>` from the address, which is the one value
-    /// typed `email` in the registry. Version 2 adds its mailbox `password`, a `Secret`, which
-    /// a `protected` row never holds.
+    /// A login or mail address, keyed `ad-<16hex>` from the address it was born with, which is
+    /// the one value typed `email` in the registry. A rename keeps the key, so a row is found
+    /// by what its `addr` says now ([`AddressIndex`]). Version 2 adds its mailbox `password`, a
+    /// `Secret`, which a `protected` row never holds.
     pub ADDRESS = Collection {
         name: "address",
         version: 2,
@@ -352,6 +355,433 @@ crate::att_collection!(
         max_row: 0,
     }
 );
+
+/// Which `address` row holds an address now. A rename keeps the row's `BirthSha256` key
+/// (docs/DESIGN-alab-one-mesh-2026-11-05.md §11 E1b), so an address's row is the one whose
+/// `addr` cell says it now, not the key the address derives ([`keys::address_pk`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AddressHolder<'a> {
+    /// The one live row whose `addr` says it, else, with none live, the one retired row that
+    /// does.
+    Row(&'a str),
+    /// Several live rows say it (or, with none live, several retired ones): nothing picks one.
+    /// `check` reports live rows whose unconflicted `addr` cells hold the same text
+    /// (`typed::check::Finding::Unique`); retired rows, a conflicted `addr`'s candidates and two
+    /// spellings of one address it does not.
+    Several(Vec<&'a str>),
+    /// No row says it. `derived` is its birth key; `taken`, whether a row holds that key anyway
+    /// (one renamed away from it, or one with no `addr`), so no row can be born for it.
+    Free { derived: String, taken: bool },
+}
+
+/// One projection's `address` rows by what their `addr` cells say now, built once: what every
+/// lookup of a row by its address reads (a `set` or a verb naming it, discovery's list, a
+/// `+tag`'s base, an alias's chain, the importer's match). It owns its strings, so a view keeps
+/// it beside the projection it was built from.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AddressIndex {
+    /// Each address in the claims spelling ([`keys::address`]) to the rows any candidate of
+    /// whose `addr` cell says it, as `(retired, key)`: live rows first, then by key. A
+    /// conflicted `addr` is found under each of its values.
+    by_addr: BTreeMap<String, Vec<(bool, String)>>,
+    /// Every row key the projection holds, for [`AddressHolder::Free`]'s `taken`.
+    keys: BTreeSet<String>,
+}
+
+impl AddressIndex {
+    /// Index `addresses`, the `address` projection.
+    pub fn of(addresses: &cell::Projection) -> Self {
+        let mut by_addr: BTreeMap<String, Vec<(bool, String)>> = BTreeMap::new();
+        for (pk, row) in &addresses.rows {
+            let retired = !row.live();
+            let candidates = row
+                .fields
+                .get("addr")
+                .map_or(&[][..], cell::Field::candidates);
+            if let [only] = candidates {
+                if let Some(address) = only.value.x.as_str().and_then(|t| keys::address(t).ok()) {
+                    by_addr
+                        .entry(address)
+                        .or_default()
+                        .push((retired, pk.clone()));
+                }
+            } else if !candidates.is_empty() {
+                let said: BTreeSet<String> = candidates
+                    .iter()
+                    .filter_map(|c| c.value.x.as_str())
+                    .filter_map(|text| keys::address(text).ok())
+                    .collect();
+                for address in said {
+                    by_addr
+                        .entry(address)
+                        .or_default()
+                        .push((retired, pk.clone()));
+                }
+            }
+        }
+        for holders in by_addr.values_mut() {
+            holders.sort_unstable();
+        }
+        Self {
+            by_addr,
+            keys: addresses.rows.keys().cloned().collect(),
+        }
+    }
+
+    /// Every row any candidate of whose `addr` says `raw`, live rows first, then by key; none
+    /// for a text that is not an address.
+    pub fn saying(&self, raw: &str) -> Vec<&str> {
+        keys::address_cow(raw)
+            .ok()
+            .and_then(|address| self.by_addr.get(address.as_ref()))
+            .map(|holders| holders.iter().map(|(_, pk)| pk.as_str()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Whether the projection holds row `pk`, in any column.
+    pub fn holds(&self, pk: &str) -> bool {
+        self.keys.contains(pk)
+    }
+
+    /// The row that says `raw` now ([`AddressHolder`]).
+    ///
+    /// # Errors
+    /// `raw` is not an address; the refusal never quotes it.
+    pub fn holder(&self, raw: &str) -> Result<AddressHolder<'_>> {
+        let address = keys::address_cow(raw)?;
+        let holders = self
+            .by_addr
+            .get(address.as_ref())
+            .map_or(&[][..], Vec::as_slice);
+        let live_len = holders.iter().take_while(|(retired, _)| !*retired).count();
+        match live_len {
+            1 => return Ok(AddressHolder::Row(&holders[0].1)),
+            n if n > 1 => {
+                return Ok(AddressHolder::Several(
+                    holders[..n].iter().map(|(_, pk)| pk.as_str()).collect(),
+                ));
+            }
+            _ => {}
+        }
+        match holders {
+            [(_, one)] => return Ok(AddressHolder::Row(one)),
+            [_, _, ..] => {
+                return Ok(AddressHolder::Several(
+                    holders.iter().map(|(_, pk)| pk.as_str()).collect(),
+                ));
+            }
+            [] => {}
+        }
+        let derived = keys::address_pk(&address)?;
+        let taken = self.keys.contains(&derived);
+        Ok(AddressHolder::Free { derived, taken })
+    }
+
+    /// [`Self::holder`]'s one row, else `None`: several rows, none, or not an address.
+    pub fn row(&self, raw: &str) -> Option<&str> {
+        match self.holder(raw).ok()? {
+            AddressHolder::Row(pk) => Some(pk),
+            AddressHolder::Several(_) | AddressHolder::Free { .. } => None,
+        }
+    }
+
+    /// The row an import of `raw` writes to: the row its derived key holds, whatever that row
+    /// says now (the import matches rows by key, and where the table and the sheet disagree the
+    /// table wins), else [`Self::holder`]'s.
+    ///
+    /// # Errors
+    /// `raw` is not an address; the refusal never quotes it.
+    pub fn matched(&self, raw: &str) -> Result<AddressHolder<'_>> {
+        let derived = keys::address_pk(raw)?;
+        match self.keys.get(&derived) {
+            Some(pk) => Ok(AddressHolder::Row(pk)),
+            None => self.holder(raw),
+        }
+    }
+}
+
+/// The registry's rules on what the owner writes (`att::Compiled::guard`), over `rows` (each
+/// row's changes, one record each) and the table's `cells` as they are under the writer, read as
+/// the table reads once the save lands ([`landed`]), so the table stays one an address lookup and
+/// an account's key can read whichever path wrote it: a grid save, `aterm db emails set`, an
+/// owner verb, a revert.
+///
+/// - An `address.addr` write is refused when another row says that address once the save lands,
+///   when the address's own birth key is another row's (a rename back to the row's birth address
+///   always passes), and when it renames a row a live account names as its `login` or
+///   `identity` once the save lands, since the account's key and the harness's names for it
+///   derive from the address it signs in as ([`keys::account_pk`]); it carries the row's
+///   `domain`, the part after its `@`, in the same record. An `address.domain` write that
+///   disagrees with the row's `addr` is refused.
+/// - A write of an account's `realm`, `login` or `identity`, or of its lifecycle to `live`, that
+///   leaves the account live is refused unless the account's key is the one its realm and the
+///   address it signs in as derive ([`signs_in`]: its identity row's address, else its login
+///   row's, as those rows say once the save lands) and no other live account of that realm signs
+///   in as that address. So an account keyed from an address its row no longer says (retired for
+///   a rename and brought back, or renamed past by two Macs' concurrent edits) is never made live
+///   again, and no second account is added beside it.
+///
+/// Every refusal names row keys and columns, never an address.
+///
+/// # Errors
+/// A change of an address or account row is not a typed cell.
+pub fn guard(rows: &mut [Vec<Change>], cells: &Cells) -> Result<Option<Refused>> {
+    // Each `addr` this save writes, by row: its record, the address (claims spelling) and value.
+    let mut renamed: BTreeMap<String, (usize, String, CellValue)> = BTreeMap::new();
+    let mut domains: Vec<(usize, String, Value)> = Vec::new();
+    // Each account this save writes a column of its key in, or makes live: the first such column.
+    let mut keyed: BTreeMap<String, String> = BTreeMap::new();
+    for (record, changes) in rows.iter().enumerate() {
+        for change in changes {
+            let account = change.collection == ACCOUNT.name;
+            if !account && change.collection != ADDRESS.name {
+                continue;
+            }
+            let key = CellKey::parse(&change.key)?;
+            // A restored absence (a revert of a birth) asks for no rule.
+            let Some(value) = change.value.as_ref().map(CellValue::decode).transpose()? else {
+                continue;
+            };
+            if account {
+                let makes_live =
+                    key.col == crate::typed::LIFECYCLE && value.x.as_str() == Some("live");
+                if makes_live || ["realm", "login", "identity"].contains(&key.col) {
+                    keyed
+                        .entry(key.pk.to_owned())
+                        .or_insert_with(|| key.col.to_owned());
+                }
+                continue;
+            }
+            match key.col {
+                "addr" => {
+                    if let Some(text) = value.x.as_str() {
+                        let Ok(address) = keys::address(text) else {
+                            return Ok(Some(refused(
+                                &ADDRESS,
+                                key.pk,
+                                "addr",
+                                "this row says no address".to_owned(),
+                            )));
+                        };
+                        renamed.insert(key.pk.to_owned(), (record, address, value));
+                    }
+                }
+                "domain" => domains.push((record, key.pk.to_owned(), value.x)),
+                _ => {}
+            }
+        }
+    }
+    if renamed.is_empty() && domains.is_empty() && keyed.is_empty() {
+        return Ok(None);
+    }
+    let addresses = cell::project(&ADDRESS, cells);
+    let landed = landed(rows, cells);
+    let after = cell::project(&ADDRESS, &landed);
+    let index = AddressIndex::of(&after);
+    let accounts = cell::project(&ACCOUNT, &landed);
+    for (pk, (record, address, value)) in &renamed {
+        let refuse = |rule: String| Ok(Some(refused(&ADDRESS, pk, "addr", rule)));
+        if let Some(other) = index
+            .saying(address)
+            .into_iter()
+            .find(|other| *other != pk.as_str())
+        {
+            return refuse(format!(
+                "email row {} holds that address; name that row, or rename it first",
+                safe(other)
+            ));
+        }
+        let derived = keys::address_pk(address)?;
+        if derived != *pk && after.rows.contains_key(&derived) {
+            return refuse(format!(
+                "that address's birth row {} says another address now; rename that row back \
+                 instead",
+                safe(&derived)
+            ));
+        }
+        let said = addresses
+            .rows
+            .get(pk)
+            .and_then(|row| row.fields.get("addr"))
+            .map(cell::Field::candidates_x)
+            .unwrap_or_default();
+        let renames = !said.is_empty()
+            && !said
+                .iter()
+                .filter_map(|x| x.as_str())
+                .any(|text| keys::address(text).ok().as_deref() == Some(address));
+        if renames
+            && let Some((account, _)) = accounts.rows.iter().find(|(_, row)| {
+                row.live()
+                    && ["login", "identity"].into_iter().any(|column| {
+                        row.fields.get(column).is_some_and(|field| {
+                            field
+                                .candidates_x()
+                                .iter()
+                                .any(|x| x.as_str() == Some(pk.as_str()))
+                        })
+                    })
+            })
+        {
+            return refuse(format!(
+                "account {} signs in with this row, and its key derives from the address: \
+                 retire that account (`aterm db alab retire account …`) and add it again under \
+                 the new address",
+                safe(account)
+            ));
+        }
+        // The domain follows, in the same record.
+        let domain = Value::from(address.split_once('@').map_or("", |(_, d)| d));
+        let follows = CellValue {
+            x: domain.clone(),
+            ..value.clone()
+        };
+        let changes = &mut rows[*record];
+        let at = format!("{pk}.domain");
+        match changes
+            .iter_mut()
+            .find(|c| c.collection == ADDRESS.name && c.key == at)
+        {
+            Some(change) => change.value = Some(follows.encode()),
+            None => {
+                let held = addresses
+                    .rows
+                    .get(pk)
+                    .and_then(|row| row.fields.get("domain"))
+                    .is_some_and(|field| field.candidates_x() == [&domain]);
+                if !held {
+                    changes.push(cell::change(
+                        &ADDRESS,
+                        CellKey {
+                            pk,
+                            col: "domain",
+                            elem: None,
+                        },
+                        &follows,
+                    )?);
+                }
+            }
+        }
+    }
+    for (_, pk, x) in domains {
+        if renamed.contains_key(&pk) {
+            continue;
+        }
+        let says = addresses
+            .rows
+            .get(&pk)
+            .and_then(|row| row.get("addr"))
+            .and_then(Value::as_str)
+            .and_then(|text| keys::address(text).ok());
+        if let Some(address) = says
+            && x.as_str() != address.split_once('@').map(|(_, d)| d)
+        {
+            return Ok(Some(refused(
+                &ADDRESS,
+                &pk,
+                "domain",
+                "the domain follows the row's addr; edit addr instead".to_owned(),
+            )));
+        }
+    }
+    for (pk, column) in &keyed {
+        let Some(row) = accounts.rows.get(pk).filter(|row| row.live()) else {
+            continue;
+        };
+        let refuse = |rule: String| Ok(Some(refused(&ACCOUNT, pk, column, rule)));
+        let Some((realm, email)) = signs_in(row, &after) else {
+            return refuse(
+                "a live account names a realm and a login row that says one address; fill them \
+                 in, or retire the row"
+                    .to_owned(),
+            );
+        };
+        let derived = keys::account_pk(realm, &email)?;
+        if derived != *pk {
+            return refuse(format!(
+                "this row's key derives from an address it no longer signs in as (the key now \
+                 is {}): add the account under the address it signs in as (`aterm db alab add \
+                 account …`) instead",
+                safe(&derived)
+            ));
+        }
+        if let Some((other, _)) = accounts.rows.iter().find(|(other, row)| {
+            *other != pk
+                && row.live()
+                && signs_in(row, &after).is_some_and(|(r, e)| r == realm && e == email)
+        }) {
+            return refuse(format!(
+                "live account {} of that realm signs in as this address too, keyed from an \
+                 address its rows no longer say; retire that row first",
+                safe(other)
+            ));
+        }
+    }
+    Ok(None)
+}
+
+/// A refusal of `collection.column` in row `pk` ([`crate::att::Refused`]).
+fn refused(collection: &Collection, pk: &str, column: &str, rule: String) -> Refused {
+    Refused {
+        collection: collection.name,
+        pk: pk.to_owned(),
+        column: column.to_owned(),
+        rule,
+    }
+}
+
+/// `cells`' address and account cells as they read once `rows` land: each cell the save writes
+/// holds that write alone, since an owner write follows every candidate it was made over and
+/// replaces them, and a restored absence reads as empty.
+fn landed(rows: &[Vec<Change>], cells: &Cells) -> Cells {
+    let ours = |collection: &str| collection == ADDRESS.name || collection == ACCOUNT.name;
+    let mut landed: Cells = cells
+        .iter()
+        .filter(|((collection, _), _)| ours(collection))
+        .map(|(key, cell)| (key.clone(), cell.clone()))
+        .collect();
+    for change in rows.iter().flatten().filter(|c| ours(&c.collection)) {
+        landed.insert(
+            (change.collection.clone(), change.key.clone()),
+            crate::database::Cell {
+                stopped: false,
+                candidates: vec![crate::database::Candidate {
+                    operation: [0; 32],
+                    value: change.value.clone().unwrap_or(Value::Null),
+                }],
+            },
+        );
+    }
+    landed
+}
+
+/// The realm and the address account `row` signs in as ([`keys::claims_email`]): its identity
+/// row's `addr`, else its login row's, each one unconflicted value of `addresses`; `None` where
+/// either is missing, conflicted or no address, or the realm is no known one.
+fn signs_in(row: &cell::Row, addresses: &cell::Projection) -> Option<(&'static str, String)> {
+    let one = |row: &cell::Row, column: &str| {
+        row.fields
+            .get(column)
+            .filter(|field| !field.conflicted())
+            .and_then(cell::Field::value)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    let address = |pk: &str| one(addresses.rows.get(pk)?, "addr");
+    let realm = keys::canonical_realm(&one(row, "realm")?)?;
+    let login = address(&one(row, "login")?)?;
+    let identity = match one(row, "identity") {
+        Some(pk) => Some(address(&pk)?),
+        None => None,
+    };
+    let email = keys::claims_email(identity.as_deref(), Some(&login)).ok()?;
+    Some((realm, email))
+}
+
+/// A row key as a refusal prints it.
+fn safe(pk: &str) -> &str {
+    crate::att::command::safe_key(pk)
+}
 
 crate::att_collection!(
     /// A mailbox that receives codes, keyed `mb-<16hex>` from its login address's key
@@ -917,8 +1347,10 @@ pub const GENERATIONS: [&Table; 2] = [&REGISTRY, &REGISTRY_2];
 
 /// The key a new grid row of `collection` is born under (design §5, §8), from the typed values
 /// the owner gave its cells: a mailbox's from its login address's key; a random key for a
-/// phone, never a digest of its number; an address's digest; **the canonical account key** from the account's realm and the
-/// address of its identity, else its login (`keys::claims_email`), read from `cells`; a
+/// phone, never a digest of its number; an address's digest, only while no row says that
+/// address and no row holds that key ([`AddressHolder::Free`]); **the canonical account key**
+/// from the account's realm and the address of its identity, else its login
+/// (`keys::claims_email`), read from `cells`; a
 /// sub-account from its account and observed key; a sign-in route from its account and method;
 /// a preference from its machine and account; a planned machine from its label, the sheet
 /// placeholder's birth identity. A provider, CLI, plan, model or source row is keyed by a lab
@@ -943,7 +1375,29 @@ pub fn birth(
     match collection.name {
         "mailbox" => keys::mailbox_pk(need("login")?),
         "phone" => keys::random_pk(keys::Random::Phone),
-        "address" => keys::address_pk(need("addr")?),
+        "address" => {
+            let addresses = cell::project(&ADDRESS, cells);
+            let index = AddressIndex::of(&addresses);
+            let refuse = |rule: String| Err(Error::new(&format!("address.addr: {rule}")));
+            match index.holder(need("addr")?)? {
+                AddressHolder::Free {
+                    derived,
+                    taken: false,
+                } => Ok(derived),
+                AddressHolder::Row(pk) => refuse(format!(
+                    "email row {} already holds this address; edit that row",
+                    safe(pk)
+                )),
+                AddressHolder::Several(_) => {
+                    refuse("more than one email row holds this address".to_owned())
+                }
+                AddressHolder::Free { derived, .. } => refuse(format!(
+                    "this address's key {} is held by a row that says another address now; \
+                     rename that row back instead",
+                    safe(&derived)
+                )),
+            }
+        }
         "machine" => Ok(keys::machine_pk(need("label")?)),
         "account" => {
             let addresses = cell::project(&ADDRESS, cells);
@@ -986,3 +1440,6 @@ pub fn account_label(pk: &str, row: &cell::Row) -> Option<String> {
             keys::default_account_label(realm, pk).ok()
         })
 }
+
+#[cfg(test)]
+mod tests;

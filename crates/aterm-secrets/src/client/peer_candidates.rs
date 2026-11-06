@@ -144,8 +144,7 @@ impl<'a> PeerDiscovery<'a> {
             #[cfg(test)]
             DiscoverySource::Supplied(found) => Pool::Ready(found(config)),
             DiscoverySource::Watching { bell, standing } if alab_vault(config) => {
-                super::note_lan_use();
-                let watch = standing.watch_or_start(|| Watch::start(bell, &[]));
+                let watch = standing.watch_or_start(|| Watch::start_look(bell, &[]));
                 let heard = watch.heard();
                 Pool::Names(if heard.is_empty() {
                     crate::discover::browse_names(budget).unwrap_or_default()
@@ -483,12 +482,7 @@ mod tests {
                 // order. This order would cancel a position-only rotation.
                 let mut arrivals = names.clone();
                 arrivals.rotate_right((pass * limit) % names.len());
-                let transcript: String = arrivals
-                    .iter()
-                    .map(|name| format!("08:30:01.200 Add 3 4 local. _alab-vault._tcp. {name}\n"))
-                    .collect();
-                let heard = crate::discover::parse_browse(&transcript);
-                assert_eq!(heard, arrivals);
+                let heard = arrivals.clone();
                 let fresh = AtomicUsize::new(0);
                 let plan = Plan::new(
                     "alab",

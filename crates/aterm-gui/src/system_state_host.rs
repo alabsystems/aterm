@@ -34,9 +34,9 @@ pub struct InitialSetupHandlers {
     pub check: fn(Plan) -> CheckStarted,
     pub restore: fn() -> bool,
     pub status: fn() -> SetupStatus,
-    /// Start one read-only, prompt-free observation of every row for `plan`
-    /// (managed rows decide which network reads run). Its result arrives in
-    /// a later `status()`. Never holds the setup slot.
+    /// Start one ordinary read-only observation of every row for `plan`; private readers
+    /// require the page in front, and managed rows decide which network reads run. Its result
+    /// arrives in a later `status()`. Never holds the setup slot.
     /// Returns whether the worker accepted the observation.
     pub observe: fn(Plan) -> bool,
     /// While the GitHub repositories need a person, look on a worker whether a token renewed
@@ -1040,7 +1040,6 @@ impl App {
             }
         }
         self.system_state_host.latest_status = status.clone();
-        self.refresh_pending_local_network_record();
         let (status, step) = self.project_system_state_status(status);
         // A stage running is a setup pass, whatever the window asked for last:
         // Check again and Restore never run one. A pass that took the worker
@@ -1140,12 +1139,6 @@ impl App {
     /// page in `wid`, whose rows are the remedy.
     pub(crate) fn review_vault_sync_in_window(&mut self, wid: crate::WindowId) -> bool {
         self.open_system_state_tab_in_window(wid)
-    }
-
-    /// The access step the page was last given ([`SetupStatus::access_step`]).
-    #[cfg(test)]
-    pub(crate) fn published_system_state_access_step(&self) -> Option<Access> {
-        self.system_state_host.access_step
     }
 
     /// Redraw only the windows that show a System State page: its status, its
@@ -1522,7 +1515,7 @@ impl App {
         self.person_present_within(PERSON_PRESENT_WITHIN, Instant::now()) && !(self.screen_away)()
     }
 
-    /// Ask the worker for a fresh, prompt-free reading of every row for the
+    /// Ask the worker for a fresh ordinary reading of every row for the
     /// plan in force (§3.5) when the page is shown: its managed rows decide
     /// which network reads run, so a page that does not know the plan yet
     /// waits for it. `false` while it waits.

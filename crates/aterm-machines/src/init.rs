@@ -81,7 +81,7 @@ aterm init --converge [--check] [--json] [--verbose] [--trigger subscriber|windo
   Run it as yourself, without sudo; safe to run again. Every Mac gets what `aterm doctor`
   restores, the ALab toolset, the Command Line Tools if missing (one sudo password), and
     {spotlight}
-    {secrets} (joins ALab's open vault on the LAN, over SSH too, asking nothing)
+    {secrets} (authenticated ALab members admit this Mac on its home LAN, over SSH too)
     {permissions} (a row for each grant to switch on)
   An ALab Mac runs these too (--no-<flag> leaves one out); elsewhere --<flag> adds one:
     --profile   {profile}
@@ -94,7 +94,7 @@ aterm init --converge [--check] [--json] [--verbose] [--trigger subscriber|windo
   off in System State (all after a Stop) stays as is unless a flag names it; one turned
   off mid-run stays as is. A setting you changed stays yours till Set up now or aterm
   doctor --apply. --plan reports, --check only reads, --json prints JSON, --verbose every
-  row. Agent and headless checks relay the coordinator's last published observation.
+  row. Agent and headless preference checks relay the coordinator's last observation.
   --only runs those ids, families or groups (base, github, dock, ...); --[no-]develop
   records or drops this checkout as a develop machine; --no-wait waits for no System State
   pass (else 10 min); --converge runs one pass now. Exit: 0 done, or left to the vault or
@@ -681,11 +681,9 @@ pub enum Decider {
     Person,
     /// aterm by itself: nobody ran `aterm init`, and aterm finishes setup after a package
     /// install or update a person typed ([`PACKAGE_FOLLOW_UP`]). Such a run puts no question of
-    /// macOS's on the screen: at this Mac's console its look for the ALab vault, and its reach
-    /// of the vault this Mac is in, wait until macOS has answered aterm's Local Network question
-    /// ([`crate::init_secrets::Here::Unbidden`]); in a remote shell of the console's login,
-    /// where macOS raises none, it looks as a typed `aterm init` there does
-    /// ([`crate::init_secrets::Here::Remote`]). Rust in Spotlight searches no folder of the
+    /// macOS's on the screen: its vault step asks nothing ([`crate::init_secrets::Here::Unbidden`])
+    /// and reaches the LAN only through the LAN broker, as every run does. Rust in Spotlight
+    /// searches no folder of the
     /// person's for build folders ([`crate::init_spotlight::Projects::Unread`]). Apple's Command
     /// Line Tools ask for the Mac password at most once per build, sharing System State's Mac Setup
     /// tab's ask, and never under the person's Stop, read as they run
@@ -3042,8 +3040,9 @@ fn report_json(
 /// Compute the exit status for `rows` under `action` (`0`, `75`, `77`, `69`, or `1`): a run
 /// left only by rows that stood aside exits with the first of 75, 77 and 69 one of them maps to
 /// ([`aterm_converge::StoodAside::exit_status`]). A row waiting on an admin counts as done
-/// ([`counts`]). Under `--check` a row left to a person or the vault ([`left`]) maps to 77, a
-/// permission: the check neither reads it as in place (0) nor as failed (1).
+/// ([`counts`]). Under `--check` the vault's own approval wait maps to 77, a permission:
+/// the check neither reads it as in place (0) nor as failed (1). Other typed stand-aside
+/// reasons keep their status; an untyped row left to a person or the vault ([`left`]) maps to 77.
 fn status(rows: &[ItemReport], action: Action) -> u8 {
     if complete(rows, action) {
         return 0;
@@ -3052,6 +3051,7 @@ fn status(rows: &[ItemReport], action: Action) -> u8 {
     let codes: Option<Vec<u8>> = incomplete
         .iter()
         .map(|row| match &row.stood_aside {
+            _ if action == Action::Check && waits_by_itself(row) => Some(77),
             Some(aside) => Some(aside.exit_status()),
             None => (action == Action::Check && left(row)).then_some(77),
         })
@@ -3203,6 +3203,8 @@ pub fn run_workstation_selected(
 
 /// Activate accepted Caps defaults on the new HID services only. The caller holds the setup
 /// profile lock and checks its exact-run Stop before each item, including this process's Stop.
+/// A requested service absent from the model or mapping census stays retryable; each one must
+/// be observed, including services whose explicit settings are intentionally left alone.
 ///
 /// # Errors
 /// Console identity, input observations or the local change journal cannot be resolved.
@@ -3221,31 +3223,34 @@ pub fn activate_keyboard_attachments(
     let items = crate::init_preferences::attachment_items(&ctx, registries)?;
     let mut journal = sys.journal()?;
     let mut ready = true;
-    for item in items {
-        if kept(&item.id()) {
-            continue;
-        }
+    let mut covered = crate::init_preferences::AttachmentCoverage::default();
+    for item in &items {
         if !continues() {
             return Ok(false);
         }
-        let rows = crate::engine::run_with(
-            &[item],
-            Mode::Apply,
+        if kept(&item.id()) {
+            covered.include(item.inspect_kept(sys)?);
+            continue;
+        }
+        let bound = crate::engine::bind(
+            [(
+                item as &dyn Item,
+                crate::engine::Place::fleet(item.family(), aterm_converge::Remedy::None),
+            )],
             sys,
             &ctx,
-            &aterm_converge::Remedy::None,
-            journal.as_mut(),
-            &mut |_| {},
-        )
-        .map_err(|why| why.to_string())?;
+        );
+        let rows = aterm_converge::run_with(&bound, Mode::Apply, journal.as_mut(), &mut |_| {})
+            .map_err(|why| why.to_string())?;
         ready &= rows.iter().all(|row| {
             matches!(
                 row.outcome,
                 Outcome::Ok | Outcome::Changed | Outcome::NotApplicable
             )
         });
+        covered.include(item.observed_services());
     }
-    Ok(ready)
+    Ok(ready && covered.covers(registries))
 }
 
 /// A workstation pass whose before-images and apply share one resolved account and item set.
@@ -3805,7 +3810,8 @@ pub fn run_initial_secrets_with(
 /// The converge pass's join of the ALab vault (`sync.peers`): [`run_initial_secrets_with`]
 /// with no password, except that the subscriber its join puts in place is a repair, never a
 /// person's On (`init_secrets::Vault::keeping_off`), so a turn-off recorded since the pass read
-/// this Mac stays.
+/// this Mac stays. `current` rechecks the background caller's setup authorization throughout
+/// the native exchange and under the vault's state lock before publication.
 ///
 /// # Errors
 /// As [`run_initial_secrets`].
@@ -3815,11 +3821,21 @@ pub(crate) fn run_converge_join(
     ops: Arc<dyn crate::init_secrets::SecretsOps>,
     source: &str,
     replaces: crate::init_secrets::Replaces,
-    wait: std::time::Duration,
     journal: &mut dyn Journal,
+    current: &(dyn Fn() -> Result<(), String> + Sync),
 ) -> Result<Vec<ItemReport>, String> {
-    let vault = crate::init_secrets::selected(ctx, ops, source, wait, replaces)?.keeping_off();
-    run_vault_item(vault, sys, ctx, &mut None, journal, &|| Ok(()))
+    let authority_ops = Arc::clone(&ops);
+    let admitted = || {
+        current()?;
+        if authority_ops.turned_off() {
+            return Err("the vault subscriber was turned off; background admission is held".into());
+        }
+        Ok(())
+    };
+    let vault =
+        crate::init_secrets::selected(ctx, ops, source, std::time::Duration::ZERO, replaces)?
+            .keeping_off();
+    run_vault_item(vault, sys, ctx, &mut None, journal, &admitted)
 }
 
 /// Run `vault`, the Secrets stage's vault item, as an apply journaled in `journal`, holding
@@ -3983,10 +3999,11 @@ type Prepare<'a> =
 /// them, building the Messages and FaceTime sign-outs with no terminal only for a person at the
 /// screen ([`Standing::present`]). The vault is read only when this run names its item. For a
 /// person at the console the Permissions phase lists aterm's grants. A run aterm decided
-/// ([`Decider::Aterm`]) puts no question of macOS's on the screen: at the console its vault look
-/// waits for macOS's Local Network answer (a remote shell, where macOS asks none, looks at once),
+/// ([`Decider::Aterm`]) puts no question of macOS's on the screen: its vault step asks nothing,
 /// and Rust in Spotlight searches no folder of the person's. A group that cannot be built is one
 /// row saying why ([`Unbuilt`]); the others run.
+/// Read-only runs use the actual console presence: an agent relays the coordinator's evidence
+/// for private preferences and accounts, and only a person's console run discovers projects.
 fn prepare_groups(
     sys: &dyn System,
     ctx: &Ctx,
@@ -4016,7 +4033,14 @@ fn prepare_groups_with(
     grants: Grants,
     secrets: impl FnOnce(&Ctx) -> Result<Arc<dyn crate::init_secrets::SecretsOps>, String>,
 ) -> Result<(Vec<Group>, Picked), String> {
-    let presence = init_presence(sys);
+    // Apply authority can include the person's agent; a read-only run must not turn that
+    // authority into permission to query private preferences from an agent or headless tool.
+    let console_presence = crate::console::presence(sys);
+    let presence = if mode == Mode::Plan {
+        console_presence
+    } else {
+        init_presence(sys)
+    };
     let observation = (mode == Mode::Plan)
         .then(|| standing.workstation_observation.clone())
         .flatten();
@@ -4030,6 +4054,7 @@ fn prepare_groups_with(
         flags_run,
     );
     let runs = picked.runs;
+    let observation = observation.map(|observation| observation.for_scope(runs.workstation()));
     let decided = standing.decided;
     if !sys.macos() {
         return Ok((
@@ -4037,6 +4062,10 @@ fn prepare_groups_with(
             picked,
         ));
     }
+    let projects = match (decided, console_presence) {
+        (Decider::Person, Presence::AtConsole) => crate::init_spotlight::Projects::Noted,
+        _ => crate::init_spotlight::Projects::Unread,
+    };
     let none = || crate::init_secrets::Secrets {
         items: Vec::new(),
         waited_on: None,
@@ -4061,7 +4090,7 @@ fn prepare_groups_with(
         // console, or nobody's, sets up nothing of this one.
         if presence == Presence::Remote {
             if runs.contains(Setting::Spotlight) {
-                groups.push((spotlight(ctx, decided), anywhere(Class::Asked)));
+                groups.push((spotlight(ctx, projects), anywhere(Class::Asked)));
             }
             let secrets = if runs.contains(Setting::Secrets) {
                 vault_items(sys, ctx, mode, vault, reading, Here::Remote, secrets)?
@@ -4088,15 +4117,16 @@ fn prepare_groups_with(
         none()
     };
     let github = github(&secrets);
-    // Off a terminal the sign-outs, which nothing undoes, run only for a person at the screen
-    // now: input within the last minute and the screen unlocked (design §6.4), read again as
-    // they start ([`converge`]). An agent's tab never runs them.
+    // Off a terminal an apply's sign-outs run only for a person at the screen now, checked
+    // again as they start. A read-only run never uses that apply authority to query another
+    // app's account data from a headless tool.
     let signs_out = picked.signs_out()
-        && (person || (presence == Presence::NoTerminal && (standing.present)()));
+        && (person
+            || (mode == Mode::Apply && presence == Presence::NoTerminal && (standing.present)()));
     let (mut groups, rows) = groups(
         ctx,
         presence,
-        decided,
+        projects,
         secrets,
         github,
         reading.keyboards,
@@ -4116,13 +4146,9 @@ fn prepare_groups_with(
 }
 
 /// Rust in Spotlight's items ([`crate::init_spotlight::items`]), or the one row saying why
-/// they could not be built: a background row, run wherever this login's shell is. A run aterm
-/// decided ([`Decider::Aterm`]) searches no folder of the person's for their build folders.
-fn spotlight(ctx: &Ctx, decided: Decider) -> Vec<Box<dyn Item>> {
-    let projects = match decided {
-        Decider::Person => crate::init_spotlight::Projects::Noted,
-        Decider::Aterm => crate::init_spotlight::Projects::Unread,
-    };
+/// they could not be built: a background row, run wherever this login's shell is. Only a
+/// person's own run at the console searches their project folders, as `projects` permits.
+fn spotlight(ctx: &Ctx, projects: crate::init_spotlight::Projects) -> Vec<Box<dyn Item>> {
     built(
         crate::init_spotlight::ID,
         "spotlight",
@@ -4279,14 +4305,32 @@ const AWAY: &str = "init.workstation";
 /// authorizing any change. Missing evidence is distinct from a genuine permission boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkstationObservation {
-    /// The coordinator reports no work left under its current plan.
-    Complete,
+    /// The coordinator reports completion, with these private rows currently verified as
+    /// wanted. Its saved plan or a group left as is proves no unobserved value.
+    Complete(Selection),
     /// Background work or an observation is still pending.
     Waiting(String),
     /// The coordinator observed a real step only a person can complete.
     Permission(String),
     /// No usable coordinator observation is available.
     Unavailable(String),
+}
+
+impl WorkstationObservation {
+    fn for_scope(self, requested: Selection) -> Self {
+        match self {
+            Self::Complete(verified)
+                if Setting::ALL
+                    .into_iter()
+                    .any(|setting| requested.contains(setting) && !verified.contains(setting)) =>
+            {
+                Self::Waiting(
+                    "background setup has not verified all requested preference rows".into(),
+                )
+            }
+            observation => observation,
+        }
+    }
 }
 
 /// Optional workstation inputs can raise privacy dialogs when read. Away from a person's
@@ -4313,8 +4357,8 @@ impl Item for AwayFromConsole {
     }
     fn probe(&self, _sys: &dyn System, _ctx: &Ctx) -> Probe {
         match &self.observation {
-            Some(WorkstationObservation::Complete) => Probe::Ok {
-                now: "background coordinator reports completion".into(),
+            Some(WorkstationObservation::Complete(_)) => Probe::Ok {
+                now: "background coordinator verified the requested preference rows".into(),
             },
             Some(
                 WorkstationObservation::Waiting(why)
@@ -4362,7 +4406,8 @@ fn observed_workstation(
     action: Action,
     check: &dyn Fn() -> WorkstationObservation,
 ) -> Option<WorkstationObservation> {
-    (action == Action::Check && sys.macos() && observes_background(init_presence(sys))).then(check)
+    (action == Action::Check && sys.macos() && observes_background(crate::console::presence(sys)))
+        .then(check)
 }
 
 /// Read in any shell of the account rather than blocked by the engine's console gate;
@@ -4450,7 +4495,7 @@ fn built(
 fn groups(
     ctx: &Ctx,
     presence: Presence,
-    decided: Decider,
+    projects: crate::init_spotlight::Projects,
     secrets: crate::init_secrets::Secrets,
     github: Vec<Box<dyn Item>>,
     keyboards: Option<&str>,
@@ -4560,10 +4605,10 @@ fn groups(
             ));
         }
     }
-    // Rust in Spotlight changes nothing on the screen and asks nothing: a background row, as
-    // the vault's join is (design §7).
+    // Background cache/toolchain maintenance searches no project folder; only the person's
+    // console run may also discover and note their indexed projects.
     if runs.contains(Setting::Spotlight) {
-        groups.push((spotlight(ctx, decided), place(Class::Asked)));
+        groups.push((spotlight(ctx, projects), place(Class::Asked)));
     }
     if person {
         let named = only.iter().any(|word| word == crate::init_fseventsd::ID);
@@ -5470,43 +5515,45 @@ fn complete(rows: &[ItemReport], action: Action) -> bool {
     !rows.is_empty() && rows.iter().all(|row| counts(row, action))
 }
 
-/// Whether `row` counts as done for `action`: a row that waits on an admin's approval does
-/// ([`waits_by_itself`]). For a run that is not `--check`, a grant only the person switches on
+/// Whether `row` counts as done for `action`. For a run that is not `--check`, a vault request
+/// its subscriber will finish after approval ([`waits_by_itself`]), a grant only the person switches on
 /// ([`is_grant`]), a row deferred to a person ([`waits_for_a_person`]), one that runs once
 /// this Mac is let into the vault ([`owed`]), and Apple's Command Line Tools deferred to an
 /// install under way, to Apple's installer window open for them or to a person at this Mac's
-/// console ([`crate::init_clt::deferred`]) are
-/// not this run's to finish, so an apply or a plan completes with them (exit 0), naming them;
+/// console ([`crate::init_clt::deferred`]), and the vault's look deferred until the LAN broker
+/// answers ([`crate::init_secrets::waits_for_lan_broker`]) are not this run's to finish, so an apply or a plan completes with them (exit 0), naming them;
 /// `--check` still reads them as not verified.
 fn counts(row: &ItemReport, action: Action) -> bool {
     matches!(
         row.outcome,
         Outcome::Ok | Outcome::Changed | Outcome::NotApplicable
     ) || (action == Action::Plan && row.outcome == Outcome::Planned)
-        || waits_by_itself(row)
-        || (action != Action::Check && left(row))
+        || (action != Action::Check && (waits_by_itself(row) || left(row)))
 }
 
 /// Whether `row` is not a run's to finish ([`counts`]): a grant only the person switches on
 /// ([`is_grant`]), a row deferred to a person ([`waits_for_a_person`]), one owed once this Mac
-/// is let into the vault ([`owed`]), or the Command Line Tools deferred
-/// ([`crate::init_clt::deferred`]). `--check` reads such a row as not in place and exits 77 for
-/// it ([`status`]): what is missing waits on a person's (or the vault's) permission, which is
-/// neither done nor a failure.
+/// is let into the vault ([`owed`]), the Command Line Tools deferred
+/// ([`crate::init_clt::deferred`]), or the vault's look deferred until the LAN broker, which
+/// setup's one elevation installs, answers ([`crate::init_secrets::waits_for_lan_broker`]).
+/// `--check` reads such a row as not in place and exits 77 for it ([`status`]): what is missing
+/// waits on a person's (or the vault's, or the elevation's) permission, which is neither done
+/// nor a failure.
 fn left(row: &ItemReport) -> bool {
-    is_grant(row) || waits_for_a_person(row) || owed(row) || crate::init_clt::deferred(row)
+    is_grant(row)
+        || waits_for_a_person(row)
+        || owed(row)
+        || crate::init_clt::deferred(row)
+        || (row.outcome == Outcome::Deferred && crate::init_secrets::waits_for_lan_broker(row))
 }
 
 /// Whether `row` is deferred to a person: the stand-in for the workstation rows a person at
-/// this Mac's console makes ([`AwayFromConsole`]), a sign-out that found nobody at the screen
-/// as it started ([`NOBODY_AT_THE_SCREEN`]), or the vault's look (or reach of a vault at a URL),
-/// which waits for a person to answer macOS's Local Network question
-/// ([`crate::init_secrets::waits_for_local_network`]).
+/// this Mac's console makes ([`AwayFromConsole`]), or a sign-out that found nobody at the screen
+/// as it started ([`NOBODY_AT_THE_SCREEN`]).
 fn waits_for_a_person(row: &ItemReport) -> bool {
     row.outcome == Outcome::Deferred
         && (row.id == AWAY
-            || (signs_out(&row.id) && row.why.as_deref() == Some(NOBODY_AT_THE_SCREEN))
-            || crate::init_secrets::waits_for_local_network(row))
+            || (signs_out(&row.id) && row.why.as_deref() == Some(NOBODY_AT_THE_SCREEN)))
 }
 
 /// Whether `row` is one of the Permissions phase's grants ([`Permission`]) waiting for the
@@ -6720,7 +6767,7 @@ mod tests {
         let groups = groups(
             &alice,
             Presence::AtConsole,
-            Decider::Person,
+            crate::init_spotlight::Projects::Noted,
             crate::init_secrets::Secrets {
                 items: Vec::new(),
                 waited_on: None,
@@ -7563,6 +7610,73 @@ mod tests {
     }
 
     #[test]
+    fn cached_completion_of_held_scope_does_not_verify_an_explicit_profile_check() {
+        let mut sys = alice_at(501);
+        sys.terminal = false;
+        sys.agent = Some("Codex");
+        let (ctx, _) = local_context(&sys).unwrap();
+        let options =
+            options(&["--profile", "--check", "--no-sign-out", "--no-clone"].map(OsString::from))
+                .unwrap();
+        let mut partial = Selection::none();
+        partial.set(Setting::CapsLock, true);
+        for (verified, ready) in [
+            (Selection::none(), false),
+            (partial, false),
+            (Selection::all().workstation(), true),
+        ] {
+            let mut standing = personal_standing();
+            for setting in Setting::ALL
+                .into_iter()
+                .filter(|setting| setting.is_workstation())
+            {
+                standing.holds.off.set(setting, !verified.contains(setting));
+            }
+            // A coordinator whose groups are all left as is legitimately reports completion,
+            // but has no observations proving the profile this command explicitly names.
+            standing.workstation_observation = Some(WorkstationObservation::Complete(verified));
+            let vault = crate::init_secrets::tests::Scripted::new(vec![Ok(
+                crate::init_secrets::tests::unconfigured(),
+            )]);
+            let (groups, picked) = prepare_groups_with(
+                &sys,
+                &ctx,
+                Mode::Plan,
+                None,
+                &Reading {
+                    keyboards: None,
+                    only: &[],
+                    picks: options.picks,
+                },
+                &standing,
+                no_grants,
+                move |_| Ok(vault as Arc<dyn crate::init_secrets::SecretsOps>),
+            )
+            .unwrap();
+            assert!(
+                picked.runs.contains(Setting::Dock),
+                "the explicit profile overrides its earlier hold"
+            );
+            let away = groups
+                .into_iter()
+                .filter(|(items, _)| items.iter().any(|item| item.id() == AWAY))
+                .collect::<Vec<_>>();
+            let before = sys.calls();
+            let rows = run(&sys, &ctx, Base::none(), &away, Mode::Plan, &mut NoJournal).unwrap();
+            assert_eq!(
+                complete(&rows, Action::Check),
+                ready,
+                "another observation scope cannot verify these preferences"
+            );
+            assert_eq!(
+                sys.calls(),
+                before,
+                "the check must not re-probe private preferences"
+            );
+        }
+    }
+
+    #[test]
     fn root_is_refused_without_running_any_command() {
         let sys = Fake::root();
         assert!(local_context(&sys).unwrap_err().contains("without sudo"));
@@ -7572,6 +7686,10 @@ mod tests {
     /// Alice's own shell, at a terminal in the console's graphic session, with the console
     /// owned by `console_uid`: what `local_context` reads to resolve her.
     fn alice_at(console_uid: u32) -> Fake {
+        alice_with_keyboard_census(console_uid, "Services:\n\nDevices:\n")
+    }
+
+    fn alice_with_keyboard_census(console_uid: u32, census: &str) -> Fake {
         let mut sys = Fake::root();
         sys.euid = 501;
         sys.logged_in(&crate::items::defaults::tests::user("alice", 501));
@@ -7588,9 +7706,53 @@ mod tests {
         );
         sys.on(
             &crate::facts::hidutil_keyboards().display(),
-            Ran::ok("Services:\n\nDevices:\n"),
+            Ran::ok(census),
         );
         sys
+    }
+
+    #[test]
+    fn attachment_activation_does_not_settle_an_unseen_requested_service() {
+        let sys = alice_at(501);
+        assert!(
+            !activate_keyboard_attachments(&sys, &[41], &|_| false, &|| true).unwrap(),
+            "a native service missing from the separate model census remains retryable"
+        );
+        assert!(sys.keyboard_changes().is_empty());
+    }
+
+    #[test]
+    fn held_attachments_cover_only_matching_services_without_probing_preferences() {
+        let census = format!(
+            "Services:\n{:<12}{:<12}{:<24}Built-In\n{:<12}{:<12}{:<24}0\n\nDevices:\n",
+            "VendorID", "ProductID", "Product", "0xfffe", "0xa9", "Fixture keyboard"
+        );
+        let sys = alice_with_keyboard_census(501, &census);
+        let who = crate::items::defaults::tests::user("alice", 501);
+        let get = crate::port::Cmd::new(aterm_uds::os_path!("hidutil"))
+            .args([
+                "property",
+                "--matching",
+                &crate::port::keyboard_usage::matching_model(65534, 169),
+                "--get",
+                "UserKeyMapping",
+            ])
+            .as_user(&who);
+        sys.on(
+            &get.display(),
+            Ran::ok("RegistryID Key Value\n29 UserKeyMapping (null)\n"),
+        );
+        assert!(activate_keyboard_attachments(&sys, &[41], &|_| true, &|| true).unwrap());
+        assert!(
+            !activate_keyboard_attachments(&sys, &[41, 42], &|_| true, &|| true).unwrap(),
+            "an observed held model cannot cover an unseen requested service"
+        );
+        assert!(sys.keyboard_changes().is_empty());
+        assert!(
+            sys.calls()
+                .iter()
+                .all(|call| { !call.contains("defaults") && !call.contains("dump services") })
+        );
     }
 
     #[test]
@@ -7600,7 +7762,9 @@ mod tests {
         sys.agent = None;
         let (ctx, _) = local_context(&sys).unwrap();
         let mut standing = personal_standing();
-        standing.workstation_observation = Some(WorkstationObservation::Complete);
+        standing.workstation_observation = Some(WorkstationObservation::Complete(
+            Selection::all().workstation(),
+        ));
         let before = sys.calls();
         for (mode, outcome) in [(Mode::Plan, Outcome::Ok), (Mode::Apply, Outcome::Deferred)] {
             let vault = crate::init_secrets::tests::Scripted::new(vec![Ok(
@@ -7639,8 +7803,12 @@ mod tests {
             );
         }
         assert_eq!(
-            observed_workstation(&sys, Action::Check, &|| WorkstationObservation::Complete),
-            Some(WorkstationObservation::Complete)
+            observed_workstation(&sys, Action::Check, &|| WorkstationObservation::Complete(
+                Selection::all().workstation()
+            )),
+            Some(WorkstationObservation::Complete(
+                Selection::all().workstation()
+            ))
         );
         let other = alice_at(502);
         assert!(
@@ -8026,11 +8194,10 @@ mod tests {
     }
 
     /// A run aterm decided at this Mac's console (the follow-up of a person's package install,
-    /// [`Decider::Aterm`]) puts no question of macOS's on the screen: before macOS has answered
-    /// its Local Network question the vault's look never runs and the row waits for a person
-    /// (deferred, the run exits 0), and Rust in Spotlight asks Spotlight for none of the
-    /// person's build folders. NEGATIVE CONTROL: the person's own run at the console looks for
-    /// the vault and searches for them.
+    /// [`Decider::Aterm`]) puts no question of macOS's on the screen: Rust in Spotlight asks
+    /// Spotlight for none of the person's build folders. Without the LAN broker the vault's look
+    /// never runs, whoever decided the run, and the row waits for the broker (deferred, the run
+    /// exits 0). NEGATIVE CONTROL: the person's own run at the console searches for them.
     #[test]
     fn a_run_aterm_decided_raises_no_question_of_macos() {
         const MDFIND: &str =
@@ -8047,7 +8214,7 @@ mod tests {
             let vault = crate::init_secrets::tests::Scripted::new(vec![Ok(
                 crate::init_secrets::tests::unconfigured(),
             )]);
-            vault.lan_unanswered();
+            vault.broker_absent();
             let port = Arc::clone(&vault);
             let standing = Standing {
                 decided,
@@ -8074,7 +8241,7 @@ mod tests {
                 &mut NoJournal,
             )
             .unwrap();
-            assert_eq!(vault.probes(), u32::from(asks), "{decided:?}: the look");
+            assert_eq!(vault.probes(), 0, "{decided:?}: no look");
             assert_eq!(
                 sys.calls().iter().any(|call| call == MDFIND),
                 asks,
@@ -8085,14 +8252,133 @@ mod tests {
                 .iter()
                 .find(|row| row.id.starts_with("init.secrets@"))
                 .expect("the vault row");
-            assert_eq!(
-                crate::init_secrets::waits_for_local_network(row),
-                !asks,
+            assert!(
+                crate::init_secrets::waits_for_lan_broker(row),
                 "{decided:?}: {row:?}"
             );
-            if !asks {
-                assert_eq!(row.outcome, Outcome::Deferred, "{row:?}");
-                assert_eq!(status(&rows, Action::Apply), 0, "{rows:?}");
+            assert_eq!(row.outcome, Outcome::Deferred, "{row:?}");
+            assert_eq!(status(&rows, Action::Apply), 0, "{rows:?}");
+        }
+    }
+
+    #[test]
+    fn agent_checks_relay_workstation_evidence_without_becoming_person_checks() {
+        for terminal in [false, true] {
+            let mut sys = alice_at(501);
+            sys.terminal = terminal;
+            sys.agent = Some("Codex");
+            let observation = observed_workstation(&sys, Action::Check, &|| {
+                WorkstationObservation::Complete(Selection::all().workstation())
+            });
+            assert_eq!(
+                observation,
+                Some(WorkstationObservation::Complete(
+                    Selection::all().workstation()
+                ))
+            );
+            let (ctx, _) = local_context(&sys).unwrap();
+            let standing = Standing {
+                workstation_observation: observation,
+                ..alab_standing()
+            };
+            let vault = crate::init_secrets::tests::Scripted::new(vec![Ok(
+                crate::init_secrets::tests::unconfigured(),
+            )]);
+            let (groups, _) = prepare_groups_with(
+                &sys,
+                &ctx,
+                Mode::Plan,
+                None,
+                &reading(&[]),
+                &standing,
+                no_grants,
+                move |_| Ok(vault as Arc<dyn crate::init_secrets::SecretsOps>),
+            )
+            .unwrap();
+            assert!(
+                groups
+                    .iter()
+                    .all(|(_, place)| place.class != Class::Preference)
+            );
+            let away = groups
+                .into_iter()
+                .filter(|(items, _)| items.iter().any(|item| item.id() == AWAY))
+                .collect::<Vec<_>>();
+            assert_eq!(away.len(), 1, "the check relays coordinator evidence");
+            let before = sys.calls();
+            let rows = run(&sys, &ctx, Base::none(), &away, Mode::Plan, &mut NoJournal).unwrap();
+            assert_eq!(status(&rows, Action::Check), 0);
+            assert_eq!(sys.calls(), before, "no private preference reader ran");
+        }
+    }
+
+    #[test]
+    fn only_a_persons_console_run_searches_spotlight_project_folders() {
+        const MDFIND: &str =
+            "alice$ /usr/bin/mdfind -onlyin /Users//alice -0 'kMDItemFSName == \"CACHEDIR.TAG\"'";
+        const TARGET: &str = "/Users//alice/Documents/demo/target";
+        for (terminal, agent, remote, decided, searches) in [
+            (true, None, false, Decider::Person, true),
+            (true, None, false, Decider::Aterm, false),
+            (true, Some("Codex"), false, Decider::Person, false),
+            (false, Some("Codex"), false, Decider::Person, false),
+            (false, None, false, Decider::Person, false),
+            (true, None, true, Decider::Person, false),
+        ] {
+            for mode in [Mode::Plan, Mode::Apply] {
+                let mut sys = alice_at(501);
+                sys.terminal = terminal;
+                sys.agent = agent;
+                sys.remote_login = remote;
+                for cache in [".ubd/cargo-build.noindex", "tooling.noindex"] {
+                    sys.create_dir_all(
+                        &Path::new("/Users//alice/Library/Caches/aterm").join(cache),
+                        0o755,
+                    )
+                    .unwrap();
+                }
+                sys.create_dir_all(Path::new(&format!("{TARGET}/debug")), 0o755)
+                    .unwrap();
+                sys.file(
+                    &format!("{TARGET}/CACHEDIR.TAG"),
+                    b"Signature: 8a477f597d28d172789f06886806bc55\n# created by cargo\n",
+                );
+                sys.file("/usr/bin/mdfind", b"")
+                    .on(MDFIND, Ran::ok(&format!("{TARGET}/CACHEDIR.TAG\0")));
+                let (ctx, _) = local_context(&sys).unwrap();
+                let standing = Standing {
+                    decided,
+                    ..personal_standing()
+                };
+                let only = ["spotlight".to_owned()];
+                let (groups, _) = prepare_groups_with(
+                    &sys,
+                    &ctx,
+                    mode,
+                    None,
+                    &reading(&only),
+                    &standing,
+                    no_grants,
+                    |_| panic!("a Spotlight-only run needs no vault"),
+                )
+                .unwrap();
+                let builds = groups
+                    .iter()
+                    .flat_map(|(items, _)| items)
+                    .find(|item| item.id() == "init.spotlight.build-noindex@alice")
+                    .expect("the real build-cache item");
+                let probe = builds.probe(&sys, &ctx);
+                assert!(matches!(probe, Probe::Ok { .. }), "{probe:?}");
+                assert_eq!(
+                    sys.calls().iter().any(|call| call == MDFIND),
+                    searches,
+                    "{terminal:?}/{agent:?}/{remote:?}/{decided:?}/{mode:?}: {probe:?}"
+                );
+                assert_eq!(
+                    matches!(probe, Probe::Ok { now } if now.contains(TARGET)),
+                    searches,
+                    "only the person's run reads and notes the protected cache tag"
+                );
             }
         }
     }
@@ -8142,7 +8428,7 @@ mod tests {
         assert!(signs_out.picks.choice(true).sign_out);
     }
 
-    /// Agent setup starts the vault look even before macOS has answered its network question.
+    /// Agent setup starts the vault look at once.
     #[test]
     fn an_agent_tab_starts_the_vault_look_without_waiting_for_a_second_command() {
         let mut sys = alice_at(501);
@@ -8153,7 +8439,6 @@ mod tests {
             crate::init_secrets::tests::unconfigured(),
         )]);
         vault.alab_answers();
-        vault.lan_unanswered();
         let port = Arc::clone(&vault);
         let groups = prepare_groups_with(
             &sys,
@@ -8517,11 +8802,12 @@ mod tests {
             id: "init.secrets@alice".into(),
             ..row(Outcome::Blocked, waiting())
         };
-        // A vault join an admin has yet to approve, made now or on an earlier run, is done
-        // for this run: the subscriber finishes it.
-        for action in [Action::Apply, Action::Check] {
+        // A vault join an admin has yet to approve is delegated for apply and plan:
+        // the subscriber finishes it. A check still reports that approval is missing.
+        for action in [Action::Apply, Action::Plan] {
             assert_eq!(status(&[done.clone(), vault()], action), 0);
         }
+        assert_eq!(status(&[done.clone(), vault()], Action::Check), 77);
         // A row waiting for that join is owed, and runs once this Mac is let in: no second
         // run is needed for it.
         assert_eq!(
@@ -8625,7 +8911,7 @@ mod tests {
             let groups = groups(
                 &ctx,
                 Presence::AtConsole,
-                Decider::Person,
+                crate::init_spotlight::Projects::Noted,
                 crate::init_secrets::Secrets {
                     items: Vec::new(),
                     waited_on: None,
@@ -8666,6 +8952,56 @@ mod tests {
         sys.on(&command.display(), Ran::ok("Services:\n"));
         sys.refuse_complete_stdout(&command.display(), "incomplete captured service list");
         assert!(local_context(&sys).unwrap().1.is_some());
+    }
+
+    #[test]
+    fn pending_vault_approval_is_not_a_complete_read_only_check() {
+        use crate::init_secrets::SecretsOps as _;
+        use crate::init_secrets::tests::{Scripted, configured, converged};
+        use aterm_secrets::client::Membership;
+
+        let mut sys = Fake::root();
+        sys.euid = 501;
+        let context = ctx(&[user("alice", 501)]);
+        for pending in [true, false] {
+            let vault = if pending {
+                let vault = Scripted::new(vec![Ok(configured(Membership::Pending))]);
+                // Arrange the subscriber that will finish this request after approval.
+                // The scripted service manager writes no real unit or state.
+                vault.install_subscriber().unwrap();
+                vault
+            } else {
+                converged()
+            };
+            let installs = vault.installs();
+            for action in [Action::Check, Action::Apply, Action::Plan] {
+                let mode = if action == Action::Apply {
+                    Mode::Apply
+                } else {
+                    Mode::Plan
+                };
+                let port = Arc::clone(&vault) as Arc<dyn crate::init_secrets::SecretsOps>;
+                let step = crate::init_secrets::items(&sys, &context, port, mode, None).unwrap();
+                let rows = crate::engine::run(&step.items, mode, &sys, &context, &mut NoJournal);
+                assert_eq!(rows.len(), 1);
+                if pending {
+                    assert!(waits_by_itself(&rows[0]), "{rows:?}");
+                    assert_eq!(rows[0].outcome, Outcome::Blocked);
+                } else {
+                    assert_eq!(rows[0].outcome, Outcome::Ok);
+                }
+                let ready = !pending || action != Action::Check;
+                assert_eq!(complete(&rows, action), ready, "{action:?}: {rows:?}");
+                assert_eq!(status(&rows, action), if ready { 0 } else { 77 });
+                let json =
+                    report_json(action, complete(&rows, action), rows, &Laps::start()).unwrap();
+                let json: aterm_json::Value = aterm_json::from_str(&json).unwrap();
+                assert_eq!(json["complete"], aterm_json::Value::Bool(ready));
+                assert!(vault.joins().is_empty());
+                assert_eq!(vault.installs(), installs);
+                assert_eq!(vault.probes(), 0, "a configured vault needs no discovery");
+            }
+        }
     }
 
     #[test]
@@ -10321,7 +10657,7 @@ mod tests {
             let groups = groups(
                 &alice,
                 Presence::AtConsole,
-                Decider::Person,
+                crate::init_spotlight::Projects::Noted,
                 crate::init_secrets::Secrets {
                     items: Vec::new(),
                     waited_on: None,
@@ -10404,7 +10740,7 @@ mod tests {
         let accounts = self::groups(
             &ctx,
             Presence::NoTerminal,
-            Decider::Person,
+            crate::init_spotlight::Projects::Unread,
             crate::init_secrets::Secrets {
                 items: Vec::new(),
                 waited_on: None,
@@ -10469,7 +10805,7 @@ mod tests {
         let groups = groups(
             &ctx,
             Presence::AtConsole,
-            Decider::Person,
+            crate::init_spotlight::Projects::Noted,
             crate::init_secrets::Secrets {
                 items: Vec::new(),
                 waited_on: None,

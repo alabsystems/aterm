@@ -28,27 +28,6 @@ pub fn lan_boundary_model() -> Model {
     }
 }
 
-/// A TCP connect syscall is attempted only with a live deadline and intact
-/// source-interface/hop policy. This does not attest to external packet paths.
-#[must_use]
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn lan_prepared_dial_model() -> Model {
-    aterm_spec::ty_model! {
-        NetLanPreparedDial {
-            const Buggy = 0;
-            var scenario = 0;
-            var attempted = 0;
-            action IPv4 when (scenario == 0) { scenario = 1; attempted = if Buggy == 1 { 0 } else { 1 }; }
-            action IPv6 when (scenario == 0) { scenario = 2; attempted = if Buggy == 2 { 0 } else { 1 }; }
-            action Expired when (scenario == 0) { scenario = 3; attempted = if Buggy == 3 { 1 } else { 0 }; }
-            action ChangedHops when (scenario == 0) { scenario = 4; attempted = if Buggy == 4 { 1 } else { 0 }; }
-            action WrongBinding when (scenario == 0) { scenario = 5; attempted = if Buggy == 5 { 1 } else { 0 }; }
-            invariant OnlyPreparedAttempts: attempted == 0 || scenario == 1 || scenario == 2;
-            invariant PreparedCanAttempt: scenario == 0 || scenario > 2 || attempted == 1;
-        }
-    }
-}
-
 /// A listening socket cannot start answering SYNs until its interface evidence,
 /// deadline, binding and hop limit have been checked.
 #[must_use]

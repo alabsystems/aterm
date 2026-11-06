@@ -46,7 +46,7 @@ pub const CHECKPOINT_CANON_VERSION: u32 = 2;
 pub const CONFIG_CANON_VERSION: u32 = 1;
 
 /// The version [`PaneStepCarry::canonical`] writes after its magic.
-pub const PANE_CARRY_CANON_VERSION: u32 = 6;
+pub const PANE_CARRY_CANON_VERSION: u32 = 7;
 
 /// The version [`policy_canonical`] writes after its magic.
 pub const POLICY_CANON_VERSION: u32 = 1;
@@ -3237,6 +3237,7 @@ impl PaneStepCarry {
             kitty_last_assigned_id,
             kitty_serial,
             live_image_charge: [charge_main, charge_alt],
+            history_image_room,
             last_osc_bel_terminated,
             pending_restore,
             foreground_job,
@@ -3284,6 +3285,7 @@ impl PaneStepCarry {
         w.u32(*kitty_serial);
         w.u64(*charge_main);
         w.u64(*charge_alt);
+        w.u64(*history_image_room);
         w.bool(*last_osc_bel_terminated);
         w.u8(*pending_restore);
         w.bool(*foreground_job);
@@ -3368,6 +3370,7 @@ impl PaneStepCarry {
         let kitty_serial = d.u32(f)?;
         let charge_main = d.u64(f)?;
         let charge_alt = d.u64(f)?;
+        let history_image_room = d.u64(f)?;
         let last_osc_bel_terminated = d.bool(f)?;
         let pending_restore = d.u8("pane_carry.pending_restore")?;
         if pending_restore > 2 {
@@ -3425,6 +3428,7 @@ impl PaneStepCarry {
             kitty_last_assigned_id,
             kitty_serial,
             live_image_charge: [charge_main, charge_alt],
+            history_image_room,
             last_osc_bel_terminated,
             pending_restore,
             foreground_job,
@@ -4170,6 +4174,14 @@ mod tests {
         assert_eq!(
             carry_replay.transient.live_image_charge,
             live.transient.live_image_charge
+        );
+        assert_eq!(
+            pane_replay.transient.history_image_room,
+            live.transient.history_image_room
+        );
+        assert_eq!(
+            carry_replay.transient.history_image_room,
+            live.transient.history_image_room
         );
 
         // Negative controls on canonical validation.

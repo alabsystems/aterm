@@ -485,6 +485,39 @@ fn signed(b: &Box3, env: &Env, secret: &Path, text: &str) -> (Vec<u8>, Vec<u8>) 
     (text.as_bytes().to_vec(), sig)
 }
 
+/// The name of a document the person chose can fit where its signature's temporary does not
+/// ([`crate::harness::upgrade_models::write_atomic`]), and the refusal names what to change.
+///
+/// NEGATIVE CONTROL (2026-11-05): with the write's own error passed on, the refusal reads
+/// `aterm ai fleet: File name too long (os error 63)` and the words' assertion fails.
+#[cfg(unix)]
+#[test]
+fn a_document_name_that_leaves_its_signature_no_room_says_so() {
+    let b = machine(&["codex"]);
+    let (env, secret, _) = fleet_machine(&b);
+    let doc = b.dir.path().join("d".repeat(240));
+    std::fs::write(&doc, "schema = 1\nseq = 3\npreferred = \"codex\"\n").expect("doc");
+    let (code, out, err) = run_cli(
+        &env,
+        &FakeRunner::quiet(),
+        &[
+            "fleet",
+            "sign",
+            doc.to_str().expect("utf8"),
+            "--key",
+            secret.to_str().expect("utf8"),
+        ],
+    );
+    assert_eq!(code, 1, "{out}");
+    assert!(err.contains("the document's name is too long"), "{err}");
+    let left: Vec<_> = std::fs::read_dir(b.dir.path())
+        .expect("folder")
+        .map(|entry| entry.expect("entry").file_name())
+        .filter(|name| name.to_string_lossy().contains("ddd"))
+        .collect();
+    assert_eq!(left.len(), 1, "only the document: {left:?}");
+}
+
 #[cfg(unix)]
 #[test]
 fn keygen_makes_a_private_key_once() {

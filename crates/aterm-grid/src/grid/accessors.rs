@@ -256,6 +256,7 @@ impl Grid {
         crate::OutputOrigin {
             abs_row: self.visible_to_absolute(cursor_row),
             overwrites: self.storage.cursor.col < occupied,
+            wrap_serial: self.storage.wrap_serial,
         }
     }
 
@@ -263,7 +264,7 @@ impl Grid {
     pub fn damage_selection_output(&mut self, origin: crate::OutputOrigin) {
         let to_abs = self.cursor_absolute_row();
         let single_row = origin.abs_row == to_abs;
-        if single_row && !origin.overwrites {
+        if single_row && !origin.overwrites && origin.wrap_serial == self.storage.wrap_serial {
             return;
         }
         if single_row && self.storage.last_output_damage_abs == Some(to_abs) {

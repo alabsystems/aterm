@@ -919,6 +919,25 @@ impl PublishPin {
     }
 }
 
+/// `inbox-owed`'s lines, one `<node> <offset>` each, in node order; a line naming no node is no
+/// one's ([`StateDir::inbox_owed`]).
+fn parse_owed(text: &str) -> Vec<(String, u64)> {
+    let owed: BTreeMap<String, u64> = text
+        .lines()
+        .filter_map(|line| {
+            let (node, off) = line.trim().split_once(' ')?;
+            Some((node.to_owned(), crate::parse_uint(off)?))
+                .filter(|(node, _)| crate::subject::is_principal(node))
+        })
+        .collect();
+    owed.into_iter().collect()
+}
+
+/// `node`'s handed-over inbox commit among `owed`.
+fn owed_of(owed: &[(String, u64)], node: &str) -> Option<u64> {
+    owed.iter().find(|(of, _)| of == node).map(|(_, off)| *off)
+}
+
 fn key_line(line: &str) -> io::Result<(&str, PublishPin)> {
     let (key, reservation) = line
         .split_once(char::is_whitespace)
@@ -1933,6 +1952,15 @@ impl StateDir {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
+    }
+
+    /// `name`'s text as [`Self::read`] reads it (trimmed, an empty file none), but an `Err` where
+    /// the file exists and cannot be read: `None` only where it truly is not there.
+    fn read_present(&self, name: &str) -> io::Result<Option<String>> {
+        Ok(self
+            .read_reservation(name)?
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty()))
     }
 
     fn read_reservation(&self, name: &str) -> io::Result<Option<String>> {
@@ -3722,6 +3750,12 @@ impl StateDir {
         self.read("node")
     }
 
+    /// [`Self::node`] for a reader that must not take a file it could not read for one that is not
+    /// there (the own-inbox move's gate, §11 C3b): `Err` where `node` exists and cannot be read.
+    pub(crate) fn node_present(&self) -> io::Result<Option<String>> {
+        self.read_present("node")
+    }
+
     /// The incarnation this node last used, as far as the local disk knows.
     #[must_use]
     pub fn incarnation(&self) -> u64 {
@@ -5283,38 +5317,71 @@ impl StateDir {
     /// The inbox-group commit a bridge of `node` owed when it exited with no broker connection to
     /// make it on (`Bridge::hand_over_inbox_commit`). Each node's is its own: a commit a bridge of
     /// another node left, one before this Mac's key rotated, is that node's group's, which the
-    /// node service's own-inbox move follows since (§11 C3b), and made on this node's group it
-    /// would pass this node's unread mail there.
+    /// node service makes before its own-inbox move follows that group (§11 C3b,
+    /// `federate::Routes`), and made on this node's group it would pass this node's unread mail
+    /// there.
     #[must_use]
     pub fn inbox_owed(&self, node: &str) -> Option<u64> {
-        self.owed_entry()
-            .filter(|(of, _)| of == node)
-            .map(|(_, off)| off)
+        owed_of(&self.owed_entries(), node)
     }
 
-    /// The node and offset of the inbox-group commit handed over, whichever node's.
-    fn owed_entry(&self) -> Option<(String, u64)> {
-        let text = self.read("inbox-owed")?;
-        let (node, off) = text.split_once(' ')?;
-        Some((node.to_owned(), crate::parse_uint(off)?))
-            .filter(|(node, _)| crate::subject::is_principal(node))
+    /// [`Self::inbox_owed`] for a reader that must not take a file it could not read for one that
+    /// is not there (the own-inbox move's gate, §11 C3b): `Err` where `inbox-owed` exists and
+    /// cannot be read.
+    pub(crate) fn inbox_owed_present(&self, node: &str) -> io::Result<Option<u64>> {
+        let text = self.read_present("inbox-owed")?;
+        Ok(owed_of(
+            &text.as_deref().map(parse_owed).unwrap_or_default(),
+            node,
+        ))
     }
 
-    /// Hand over `node`'s inbox-group commit through `off` ([`Self::inbox_owed`]), in place of
-    /// another node's.
+    /// Every node's handed-over inbox commit, one `<node> <offset>` line each, in node order;
+    /// a line naming no node is no one's.
+    fn owed_entries(&self) -> Vec<(String, u64)> {
+        self.read("inbox-owed")
+            .as_deref()
+            .map(parse_owed)
+            .unwrap_or_default()
+    }
+
+    /// Write `owed` as the handed-over inbox commits, or remove the file when none is left.
+    fn set_owed_entries(&self, owed: &[(String, u64)]) -> io::Result<()> {
+        if owed.is_empty() {
+            return match self.remove_path(&self.path("inbox-owed")) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            };
+        }
+        let text: String = owed
+            .iter()
+            .map(|(node, off)| format!("{node} {off}\n"))
+            .collect();
+        self.write("inbox-owed", &text)
+    }
+
+    /// Hand over `node`'s inbox-group commit through `off` ([`Self::inbox_owed`]), beside any
+    /// other node's.
     pub fn set_inbox_owed(&self, node: &str, off: u64) -> io::Result<()> {
-        if self.inbox_owed(node).is_some_and(|have| have >= off) {
+        let mut owed = self.owed_entries();
+        match owed.iter_mut().find(|(of, _)| of == node) {
+            Some((_, have)) if *have >= off => return Ok(()),
+            Some((_, have)) => *have = off,
+            None => owed.push((node.to_owned(), off)),
+        }
+        owed.sort_unstable();
+        self.set_owed_entries(&owed)
+    }
+
+    /// The inbox commit `node`'s bridge handed over has been made; any other node's stays.
+    pub fn clear_inbox_owed(&self, node: &str) -> io::Result<()> {
+        let mut owed = self.owed_entries();
+        let had = owed.len();
+        owed.retain(|(of, _)| of != node);
+        if owed.len() == had {
             return Ok(());
         }
-        self.write("inbox-owed", &format!("{node} {off}"))
-    }
-
-    /// The inbox commit handed over has been made.
-    pub fn clear_inbox_owed(&self) -> io::Result<()> {
-        match self.remove_path(&self.path("inbox-owed")) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-            _ => Ok(()),
-        }
+        self.set_owed_entries(&owed)
     }
 
     /// Forget the halt watermark.
@@ -5408,7 +5475,7 @@ impl StateDir {
             posts: post_resets,
         } = self.publication_offset_resets(keep_below)?;
         let in_flight = self.in_flight()?;
-        let owed = self.owed_entry().map(|(_, off)| off);
+        let owed = self.owed_entries();
         for path in seen_removed.into_iter().chain(unhandled_removed) {
             match self.remove_path(&path) {
                 Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
@@ -5435,8 +5502,10 @@ impl StateDir {
         // (`Bridge::remember_self_acks`).
         self.set_self_acked(&std::collections::BTreeSet::new(), head, 1)?;
         self.clear_halt_acked()?;
-        if !owed.is_some_and(kept) {
-            self.clear_inbox_owed()?;
+        let still: Vec<(String, u64)> =
+            owed.iter().filter(|(_, off)| kept(*off)).cloned().collect();
+        if still.len() != owed.len() {
+            self.set_owed_entries(&still)?;
         }
         self.forget_asks_where(kept)?;
         let mut dropped = Vec::new();
@@ -5561,6 +5630,44 @@ impl StateDir {
             }
         }
         out
+    }
+
+    /// Every fleet halt this node held in force under the old subject, of any fleet, as
+    /// `(fleet, human, halt)`: what the move to the mesh carries (§11 C4), since the mesh's one
+    /// fleet is seldom the one the halts were set on.
+    #[must_use]
+    pub fn old_standing_halts(&self) -> Vec<(String, String, StandingHalt)> {
+        let Some(body) = self.read("halts") else {
+            return Vec::new();
+        };
+        body.lines().filter_map(StandingHalt::parse).collect()
+    }
+
+    /// Forget every fleet halt held under the old subject, once the move carried them.
+    ///
+    /// # Errors
+    /// A write that fails.
+    pub fn clear_old_standing_halts(&self) -> io::Result<()> {
+        if self.read("halts").is_none() {
+            return Ok(());
+        }
+        self.write_durable("halts", "")
+    }
+
+    /// The halts this node applied with the mesh on ([`crate::halt::Halts`], its own text), or
+    /// `None` while it applied none.
+    #[must_use]
+    pub fn mesh_halts(&self) -> Option<String> {
+        self.read(crate::halt::STATE_FILE)
+    }
+
+    /// Replace the halts this node applied with the mesh on, flushed before it answers: a halt
+    /// is acknowledged only once it would stand across a crash.
+    ///
+    /// # Errors
+    /// A write that fails.
+    pub fn set_mesh_halts(&self, text: &str) -> io::Result<()> {
+        self.write_durable(crate::halt::STATE_FILE, text)
     }
 
     /// Replace `fleet`'s standing halts ([`StateDir::standing_halts`]).
@@ -5974,6 +6081,78 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&corrupt);
+    }
+
+    /// Each node's handed-over inbox commit is its own line: the hand-over of a bridge of the node
+    /// a key rotation gave this Mac keeps the one a bridge of the node before left, which the node
+    /// service's own-inbox move makes (§11 C3b); a raise keeps the higher; making one leaves the
+    /// other, and the file goes with the last. A bare offset, as a build before C3b wrote one,
+    /// is no node's.
+    #[test]
+    fn each_nodes_handed_over_inbox_commit_is_its_own() {
+        let dir = scratch("owed-per-node");
+        let st = StateDir::open(&dir).expect("open");
+        st.set_inbox_owed("n-a", 5).expect("the old node's");
+        st.set_inbox_owed("n-b", 9).expect("the new node's");
+        assert_eq!(
+            (st.inbox_owed("n-a"), st.inbox_owed("n-b")),
+            (Some(5), Some(9)),
+            "both kept"
+        );
+        st.set_inbox_owed("n-a", 3).expect("a lower one");
+        assert_eq!(st.inbox_owed("n-a"), Some(5), "the higher stays");
+        st.set_inbox_owed("n-a", 6).expect("a higher one");
+        assert_eq!(st.inbox_owed("n-a"), Some(6), "raised");
+        st.clear_inbox_owed("n-b").expect("made");
+        assert_eq!(
+            (st.inbox_owed("n-a"), st.inbox_owed("n-b")),
+            (Some(6), None),
+            "the other stays"
+        );
+        st.clear_inbox_owed("n-a").expect("made");
+        assert!(!dir.join("inbox-owed").exists(), "none left, no file");
+        std::fs::write(dir.join("inbox-owed"), "7\n").expect("a bare offset");
+        assert_eq!(
+            StateDir::open(&dir).expect("reopen").inbox_owed("n-a"),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE OWN-INBOX MOVE'S GATE READS NOTHING IT COULD NOT READ AS ABSENT (§11 C3b): `node` and
+    /// `inbox-owed` read through [`StateDir::node_present`] and [`StateDir::inbox_owed_present`]
+    /// are `None` only where the file is not there, and an `Err` where it exists and cannot be
+    /// read, which keeps the move shut; the lenient readers take the same file for none (the
+    /// control).
+    #[test]
+    fn the_gates_readers_take_an_unreadable_file_for_no_answer() {
+        let dir = scratch("gate-reads");
+        let st = StateDir::open(&dir).expect("open");
+        assert_eq!(st.node_present().expect("absent"), None);
+        assert_eq!(st.inbox_owed_present("n-a").expect("absent"), None);
+        st.name_node("n-a").expect("a node");
+        st.set_inbox_owed("n-a", 5).expect("a hand-over");
+        assert_eq!(st.node_present().expect("read").as_deref(), Some("n-a"));
+        assert_eq!(st.inbox_owed_present("n-a").expect("read"), Some(5));
+        assert_eq!(st.inbox_owed_present("n-b").expect("read"), None);
+        for name in ["node", "inbox-owed"] {
+            std::fs::remove_file(dir.join(name)).expect("the file");
+            std::fs::create_dir(dir.join(name)).expect("a file that cannot be read");
+        }
+        assert_eq!(
+            (st.node(), st.inbox_owed("n-a")),
+            (None, None),
+            "the lenient readers take it for none"
+        );
+        assert!(
+            st.node_present().is_err(),
+            "an unreadable node is no answer"
+        );
+        assert!(
+            st.inbox_owed_present("n-a").is_err(),
+            "an unreadable hand-over is no answer"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

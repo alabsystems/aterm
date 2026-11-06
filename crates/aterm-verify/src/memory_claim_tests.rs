@@ -9,9 +9,9 @@
 //! scratch ledger on a fixed machine: no test touches this user's own.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Mutex, OnceLock, PoisonError, atomic};
 
-use aterm_capacity::{Admit, Claim, Error, Fixed, Ledger, Need, Pace, Reading};
+use aterm_capacity::{Admit, Claim, Error, Fixed, Ledger, Machine, Need, Pace, Reading};
 use aterm_spec::wait::{MUST_HAPPEN, until_within};
 
 use crate::checks::Check;
@@ -1310,13 +1310,64 @@ fn this_process_at(cpu_ns: u64) -> aterm_capacity::Procs {
     }])
 }
 
-/// The machine [`stuck_admit`] admits on: [`machine`], its processes [`this_process_at`].
-fn stuck_machine() -> &'static Fixed {
-    static AT: OnceLock<Fixed> = OnceLock::new();
-    AT.get_or_init(|| {
-        let m = machine();
-        m.set_procs(Some(this_process_at(5)));
-        m
+/// The machine [`stuck_admit`] admits on: [`machine`], its processes this one alone
+/// ([`this_process_at`]). Its holder has made no progress, at 5 ns of CPU time, until
+/// [`StuckMachine::work`]; from then on each read of its processes finds 1 ns more than the read
+/// before, so the holder has worked between any two looks, however late either comes.
+struct StuckMachine {
+    at: Fixed,
+    working: atomic::AtomicBool,
+    /// The CPU time the next read finds once the holder works.
+    cpu_ns: atomic::AtomicU64,
+    /// When the first read found the holder working.
+    first: OnceLock<std::time::Instant>,
+    /// How many reads have found it working three bounds ([`STUCK_AFTER`]) or more after
+    /// [`Self::first`].
+    past_three_bounds: atomic::AtomicUsize,
+}
+
+impl StuckMachine {
+    /// The holder works from now on.
+    fn work(&self) {
+        self.working.store(true, atomic::Ordering::SeqCst);
+    }
+
+    /// Whether two looks, as many in a row as a wait reads a holder stuck before it gives up,
+    /// have found the holder working three bounds after the first look that did.
+    fn worked_past_three_bounds(&self) -> bool {
+        self.past_three_bounds.load(atomic::Ordering::SeqCst) >= 2
+    }
+}
+
+impl Machine for StuckMachine {
+    fn read(&self, path: Option<&Path>) -> Reading {
+        self.at.read(path)
+    }
+
+    fn procs(&self) -> Option<aterm_capacity::Procs> {
+        if !self.working.load(atomic::Ordering::SeqCst) {
+            return Some(this_process_at(5));
+        }
+        let now = std::time::Instant::now();
+        let first = *self.first.get_or_init(|| now);
+        if now.saturating_duration_since(first) >= STUCK_AFTER * 3 {
+            self.past_three_bounds
+                .fetch_add(1, atomic::Ordering::SeqCst);
+        }
+        let cpu_ns = self.cpu_ns.fetch_add(1, atomic::Ordering::SeqCst);
+        Some(this_process_at(cpu_ns))
+    }
+}
+
+/// The one [`StuckMachine`].
+fn stuck_machine() -> &'static StuckMachine {
+    static AT: OnceLock<StuckMachine> = OnceLock::new();
+    AT.get_or_init(|| StuckMachine {
+        at: machine(),
+        working: atomic::AtomicBool::new(false),
+        cpu_ns: atomic::AtomicU64::new(6),
+        first: OnceLock::new(),
+        past_three_bounds: atomic::AtomicUsize::new(0),
     })
 }
 
@@ -1352,12 +1403,11 @@ fn stuck_stage(_: &Ctx, spec: &StageSpec) -> Report {
 /// bound, and the run ends within the hang detector, COULD NOT RUN: the lint's row is NOT RUN,
 /// naming the holder and how long it made no progress, and the formatter passes; the holder's
 /// claim stays held, and the lint's has left the queue. NEGATIVE CONTROL: behind the same holder
-/// working (its CPU time moving between looks), the lint waits on past three bounds and runs
-/// once the holder lets go, and the run passes.
+/// working (its CPU time grown at each look), the lint waits on past three bounds (the holder
+/// lets go only once two of the lint's looks have found it working three bounds after its first)
+/// and runs once the holder has let go, with its own claim alone held, and the run passes.
 #[test]
 fn a_stage_waiting_behind_a_stuck_holder_is_not_run() {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
     let dir = aterm_tempfile::tempdir().expect("scratch");
     STUCK
         .ledger
@@ -1401,30 +1451,28 @@ fn a_stage_waiting_behind_a_stuck_holder_is_not_run() {
         .collect();
     assert_eq!(listed, ["lab linux exec: aterm-linux boot"], "{log}");
 
-    let moving = Arc::new(AtomicBool::new(true));
-    let mover = {
-        let moving = Arc::clone(&moving);
-        std::thread::spawn(move || {
-            let mut ns = 6;
-            while moving.load(Ordering::SeqCst) {
-                stuck_machine().set_procs(Some(this_process_at(ns)));
-                ns += 1;
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-        })
-    };
+    STUCK.clear();
+    stuck_machine().work();
     let lets_go = std::thread::spawn(move || {
-        // Three bounds of the condition under test, not a wait for anything.
-        std::thread::sleep(STUCK_AFTER * 3);
+        until_within(
+            MUST_HAPPEN,
+            "two of the lint's looks three bounds into the holder's work",
+            || stuck_machine().worked_past_three_bounds().then_some(()),
+        );
         drop(holder);
     });
     let (code, log) = run(dir.path(), Some(book(dir.path())), Admit::Wait, seams);
-    assert!(
-        lets_go.is_finished(),
-        "the lint ran before the holder let go:\n{log}"
+    assert_eq!(code, crate::exit::PASS, "{log}");
+    let lint = "tippy lint (-p aterm-gui)";
+    assert_eq!(
+        STUCK
+            .take()
+            .looked
+            .iter()
+            .find(|(title, _)| title == lint)
+            .map(|(_, held)| held.clone()),
+        Some(vec![(format!("verify {lint}"), 12 * GIB)]),
+        "the lint ran with only its own claim held, once the holder had let go:\n{log}"
     );
     lets_go.join().expect("the holder let go");
-    moving.store(false, Ordering::SeqCst);
-    mover.join().expect("the mover's end");
-    assert_eq!(code, crate::exit::PASS, "{log}");
 }

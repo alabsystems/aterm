@@ -4682,11 +4682,27 @@ fn title_run_over(
     refused: bool,
     transcript_over: Option<u64>,
 ) -> TitleRun {
+    title_run_on(title_mock(screens, titles, refused), transcript_over)
+}
+
+/// [`title_run`], each short settle standing still its whole [`SETTLE_CAP`] before it answers, so
+/// a held reply is read about every 1.5 s, as one a program keeps drawing is.
+fn title_run_paced(screens: Vec<Vec<String>>, titles: &[&str]) -> TitleRun {
+    let mut m = title_mock(screens, titles, false);
+    m.idle_after = std::iter::repeat_n(SETTLE_CAP, 400).collect();
+    title_run_on(m, None)
+}
+
+fn title_mock(screens: Vec<Vec<String>>, titles: &[&str], refused: bool) -> Mock {
     let mut m = Mock::new(screens);
     m.gone_on_next = true;
     m.stall_sleep = Some(Duration::from_secs(60));
     m.titles = titles.iter().map(|t| Some((*t).to_string())).collect();
     m.title_refused = refused;
+    m
+}
+
+fn title_run_on(mut m: Mock, transcript_over: Option<u64>) -> TitleRun {
     let clock = virtual_clock();
     m.run_on(&clock);
     let mut s = session(&mut m, None);
@@ -4783,7 +4799,7 @@ fn a_title_hold_holds_a_question_and_notes_its_hang() {
     assert!(r.took >= TITLE_HOLD, "{:?}", r.took);
     assert_eq!(r.noted.len(), 1, "{:#?}", r.noted);
     assert!(
-        r.noted[0].contains("title still said its run goes on 60 s into the hold"),
+        r.noted[0].contains("title still said its run goes on, its reply unchanged 60 s"),
         "{:#?}",
         r.noted
     );
@@ -4899,6 +4915,261 @@ fn a_claude_reply_drawn_under_a_status_line_ends_once_its_title_has_rested() {
         "{:#?}",
         r.requests
     );
+}
+
+/// A wait taken up again after a lost connection keeps the run an earlier wait of the turn saw:
+/// the turn read busy, or its reply was held under the running title, a call was lost while the
+/// reply went on drawing under a status line, and the first read back falls between the title's
+/// rest and the frame that draws the reply's last line (its done row comes in that same frame,
+/// so it is not drawn yet either). The turn ends on the done frame, one settle after the title
+/// read at rest, all four NEEDS YOU lines in it. NEGATIVE CONTROLS: an outage before any read of
+/// the turn, or one that took the first title read before it said the turn runs, leaves no run
+/// to keep, and the same frame under the resting title ends the turn at once.
+#[test]
+fn a_wait_taken_up_again_keeps_the_run_an_earlier_wait_saw() {
+    use aterm_phase::prompt::fixtures::{
+        STATUSLINE_LAST_LINE_HELD_2_1_311, STATUSLINE_MIDREPLY_2_1_311,
+        STATUSLINE_REPLY_DONE_2_1_311, screen,
+    };
+    let mid = screen(STATUSLINE_MIDREPLY_2_1_311);
+    let held = screen(STATUSLINE_LAST_LINE_HELD_2_1_311);
+    let done = screen(STATUSLINE_REPLY_DONE_2_1_311);
+    let run = |screens: Vec<Vec<String>>, titles: &[&str], lost: usize| {
+        let mut m = Mock::new(screens);
+        m.gone_on_next = true;
+        m.stall_sleep = Some(Duration::from_secs(60));
+        m.titles = titles.iter().map(|t| Some((*t).to_string())).collect();
+        m.by_index.insert(lost, closed());
+        let clock = virtual_clock();
+        m.run_on(&clock);
+        let mut s = quick(&mut m, Duration::from_secs(60));
+        s.set_fx(Fx::over(ClockSource::Scripted(Arc::clone(&clock))));
+        let mut log: Vec<u8> = Vec::new();
+        let turn = s
+            .await_turn_to(Duration::from_secs(600), &mut log)
+            .expect("turn");
+        drop(s);
+        let lost = m.requests[lost].clone();
+        (
+            turn,
+            m.requests,
+            String::from_utf8(log).expect("utf-8"),
+            lost,
+        )
+    };
+    let rest = ["✳ Claude Code"];
+    // Request 3 is the busy wait's `await gone`, after the busy read (1) and the `status` that
+    // reads the session log's head (2); the reconnect's probe reads the reply mid-draw.
+    let (turn, requests, log, lost) = run(
+        vec![busy_screen(), mid.clone(), held.clone(), done.clone()],
+        &rest,
+        3,
+    );
+    assert!(lost.starts_with("await gone "), "{requests:#?}");
+    assert!(log.starts_with("RECONNECT await gone "), "{log}");
+    assert_eq!(
+        (turn.phase, &turn.screen.rows, turn.timed_out),
+        (Phase::Idle, &done, false),
+        "{requests:#?}"
+    );
+    assert_eq!(needs_said(&turn.screen.rows), 4);
+    assert_eq!(title_reads(&requests), 1, "{requests:#?}");
+    // No busy read: the reply is first read mid-draw, held under its running title (request 2),
+    // and the title asked again after the settle (5) is lost.
+    let (turn, requests, log, lost) = run(
+        vec![
+            mid.clone(),
+            mid.clone(),
+            mid.clone(),
+            held.clone(),
+            done.clone(),
+        ],
+        &["◑ Claude Code", "✳ Claude Code"],
+        5,
+    );
+    assert_eq!(lost, "title", "{requests:#?}");
+    assert!(log.starts_with("RECONNECT title failed"), "{log}");
+    assert_eq!(
+        (turn.phase, &turn.screen.rows, turn.timed_out),
+        (Phase::Idle, &done, false),
+        "{requests:#?}"
+    );
+    assert_eq!(needs_said(&turn.screen.rows), 4);
+    // The outage takes the wait's first request (0), its `await gone` before any read.
+    let (turn, requests, log, lost) = run(vec![held.clone(), held.clone(), done.clone()], &rest, 0);
+    assert!(lost.starts_with("await gone "), "CONTROL: {requests:#?}");
+    assert!(log.starts_with("RECONNECT await gone "), "CONTROL: {log}");
+    assert_eq!(
+        (turn.phase, &turn.screen.rows, turn.timed_out),
+        (Phase::Idle, &held, false),
+        "CONTROL: {requests:#?}"
+    );
+    assert_eq!(title_reads(&requests), 1, "CONTROL: {requests:#?}");
+    // The outage takes the first title read (2), before the title said anything of the turn.
+    let (turn, requests, log, lost) = run(vec![mid.clone(), mid, held.clone(), done], &rest, 2);
+    assert_eq!(lost, "title", "CONTROL: {requests:#?}");
+    assert!(log.starts_with("RECONNECT title failed"), "CONTROL: {log}");
+    assert_eq!(
+        (turn.phase, &turn.screen.rows, turn.timed_out),
+        (Phase::Idle, &held, false),
+        "CONTROL: {requests:#?}"
+    );
+}
+
+/// [`TITLE_HOLD`] for an idle read under a running title counts from its reply's last change,
+/// never from the first held read: a status-line reply, alone or beside an agents panel, is held
+/// while its text grows past the hold and ends on the done frame, all four NEEDS YOU lines in
+/// it. A hold is spent only on the reply it held: a reply that stood unchanged until the read
+/// that would have spent the hold, and grew there, is held again from that change. NEGATIVE
+/// CONTROLS: the same reply unchanged while only its status line, or only the panel's elapsed
+/// timer, moves under the running title notes the hang at [`TITLE_HOLD`], as any read that moves
+/// the screen would never; so does the reply left standing at that read.
+#[test]
+fn a_title_hold_counts_from_the_replys_last_change_not_its_first_hold() {
+    use aterm_phase::prompt::fixtures::{
+        STATUSLINE_LAST_LINE_HELD_2_1_311, STATUSLINE_MIDREPLY_2_1_311,
+        STATUSLINE_REPLY_DONE_2_1_311, screen,
+    };
+    let mid = screen(STATUSLINE_MIDREPLY_2_1_311);
+    let held = screen(STATUSLINE_LAST_LINE_HELD_2_1_311);
+    let done = screen(STATUSLINE_REPLY_DONE_2_1_311);
+    let reader = aterm_phase::Program::Claude.reader();
+    // The reply `lines` rows longer, above the blank row over the composer.
+    let grown = |lines: usize| {
+        let mut rows = mid.clone();
+        let top = aterm_phase::phase::composer_rules(&rows)
+            .expect("a composer")
+            .0;
+        for k in 0..lines {
+            rows.insert(
+                top - 1,
+                format!("    placeholder words of the reply, line {k}."),
+            );
+        }
+        rows
+    };
+    let paneled = |rows: Vec<String>, secs: usize| {
+        let mut rows = rows;
+        rows.extend([
+            String::new(),
+            "  ⏺ main".to_string(),
+            format!(
+                "  ◯ general-purpose  bling probe                                    {secs}s · ↓ \
+                 6.2k tokens"
+            ),
+        ]);
+        rows
+    };
+    let restatused = |k: usize| {
+        let mut rows = mid.clone();
+        let line = rows
+            .iter_mut()
+            .find(|r| r.trim_end() == "  lab status line")
+            .expect("the status line");
+        *line = format!("  lab status line {k}");
+        rows
+    };
+    let growing: Vec<_> = (1..=70).map(grown).collect();
+    let panel_growing: Vec<_> = (1..=70).map(|k| paneled(grown(k), 20 + k)).collect();
+    let statused: Vec<_> = (1..=70).map(restatused).collect();
+    let panel_ticking: Vec<_> = (1..=70).map(|k| paneled(mid.clone(), 20 + k)).collect();
+    for (name, frames) in [
+        ("growing", &growing),
+        ("panel growing", &panel_growing),
+        ("statused", &statused),
+        ("panel ticking", &panel_ticking),
+    ] {
+        for rows in frames {
+            assert_eq!(reader.phase(rows), Phase::Idle, "fixture guard: {name}");
+            assert!(reader.phase_authoritative(rows, &Phase::Idle), "{name}");
+            assert!(
+                !reader.end_drawn(rows) && reader.wall(rows).is_none(),
+                "{name}"
+            );
+        }
+        let said: std::collections::BTreeSet<_> =
+            frames.iter().map(|rows| reader.said_tail(rows)).collect();
+        let moves = name.ends_with("growing");
+        assert_eq!(said.len(), if moves { 70 } else { 1 }, "{name}");
+    }
+    assert_eq!(reader.said_tail(&mid), reader.said_tail(&panel_ticking[0]));
+    let mut frames = growing;
+    frames.extend([held, done.clone()]);
+    let mut titles: Vec<&str> = ["◑ Claude Code", "◐ Claude Code"]
+        .into_iter()
+        .cycle()
+        .take(70)
+        .collect();
+    titles.push("✳ Claude Code");
+    let r = title_run_paced(frames, &titles);
+    assert_eq!(
+        (r.turn.phase.clone(), &r.turn.screen.rows, r.turn.timed_out),
+        (Phase::Idle, &done, false),
+        "{:#?}",
+        r.noted
+    );
+    assert_eq!(needs_said(&r.turn.screen.rows), 4);
+    assert!(r.took > TITLE_HOLD, "drawn past the hold: {:?}", r.took);
+    assert!(r.noted.is_empty(), "{:#?}", r.noted);
+    let mut frames = panel_growing;
+    frames.push(done.clone());
+    let r = title_run_paced(frames, &["◐ Claude Code"]);
+    assert_eq!(
+        (r.turn.phase.clone(), &r.turn.screen.rows, r.turn.timed_out),
+        (Phase::Idle, &done, false),
+        "{:#?}",
+        r.noted
+    );
+    assert!(r.took > TITLE_HOLD, "drawn past the hold: {:?}", r.took);
+    assert!(r.noted.is_empty(), "{:#?}", r.noted);
+    let hang = |r: &TitleRun, name: &str| {
+        assert_eq!(
+            (r.turn.phase.clone(), r.turn.timed_out),
+            (Phase::Idle, false),
+            "CONTROL {name}"
+        );
+        assert!(
+            r.took >= TITLE_HOLD && r.took < TITLE_HOLD + Duration::from_secs(5),
+            "CONTROL {name}: {:?}",
+            r.took
+        );
+        assert_eq!(r.noted.len(), 1, "CONTROL {name}: {:#?}", r.noted);
+        assert!(
+            r.noted[0].contains("title still said its run goes on, its reply unchanged 60 s"),
+            "CONTROL {name}: {:#?}",
+            r.noted
+        );
+    };
+    let r = title_run_paced(statused, &["◐ Claude Code"]);
+    hang(&r, "status line");
+    let r = title_run_paced(panel_ticking, &["◐ Claude Code"]);
+    hang(&r, "panel timer");
+    // A hold is spent only on the reply it held. The reply standing under the running title
+    // notes the hang at its `spent`th read; the same reply grown at that read, the held read's
+    // instant by then past the hold, is held again from the change and ends on the done frame.
+    let reads = |r: &TitleRun| {
+        r.requests
+            .iter()
+            .filter(|q| q.starts_with("text --json"))
+            .count()
+    };
+    let r = title_run_paced(vec![mid.clone()], &["◐ Claude Code"]);
+    hang(&r, "reply standing");
+    assert_eq!(r.turn.screen.rows, mid, "CONTROL reply standing");
+    let spent = reads(&r);
+    assert!(spent > 2, "{:#?}", r.requests);
+    let mut frames = vec![mid.clone(); spent - 1];
+    frames.extend([grown(1), done.clone()]);
+    let r = title_run_paced(frames, &["◐ Claude Code"]);
+    assert_eq!(
+        (r.turn.phase.clone(), &r.turn.screen.rows, r.turn.timed_out),
+        (Phase::Idle, &done, false),
+        "{:#?}",
+        r.noted
+    );
+    assert_eq!(reads(&r), spent + 1, "{:#?}", r.requests);
+    assert!(r.took > TITLE_HOLD, "held past the hold: {:?}", r.took);
+    assert!(r.noted.is_empty(), "{:#?}", r.noted);
 }
 
 /// A wall, and a carried wait the transcript says ended, decide as read: Claude Code's title
@@ -10410,6 +10681,79 @@ fn a_limit_episode_the_agent_worked_past_closes_at_its_break() {
                 .iter()
                 .any(|l| l.starts_with("EVENT limited seq=103")),
         "{walled:#?}"
+    );
+}
+
+/// A NEW LIMIT AFTER THE RESUMED TURN'S BREAK IS AN EPISODE OF ITS OWN (2026-11-06): the agent's
+/// own turn, read live once a named reset and its grace have passed, closes the episode and keeps
+/// its seq for the wall again within that turn ([`Retry`]); the settled break of its background
+/// work that the turn ends at ends it (`Session::limit_at_break`), so a wall read after it, hours
+/// on at a long background break or minutes, is escalated as a new episode, never as the old
+/// one's retry. Before, the retry stood until a point of another phase, which a turn ending at
+/// such a break never reaches, and the new limit was folded into the old episode
+/// (`again=the retry hit the wall again`), its escalation and the person's wait uncounted in the
+/// harness's stats. NEGATIVE CONTROL: the wall read straight after the live read, no break
+/// between, is still that episode's retry.
+#[test]
+fn a_new_limit_after_the_resumed_turns_break_is_an_episode_of_its_own() {
+    use crate::supervise::journal::AGAIN_RETRY;
+    let grace = i64::try_from(crate::harness::upgrade_drive::LIMIT_GRACE_S).expect("the grace");
+    let run = |tag: &str, screens: Vec<Vec<String>>| {
+        let (jdir, path) = journal_file(tag);
+        let mut m = Mock::new(screens);
+        m.vanish_after = Some(2);
+        let opts = SuperviseOpts {
+            journal: Some(path.clone()),
+            ..auto(30)
+        };
+        let _ = watch_lines_with(&mut m, &opts, |s| {
+            s.seeds_learned_state("a limit episode open before the loop's first read");
+            s.setup.background_settle = Duration::ZERO;
+            s.limit = Some(Episode {
+                seq: 101,
+                resumes_itself: false,
+                reset_unix: Some(TEST_NOW - grace - 60),
+                reset_text: "3pm".to_string(),
+                extended: false,
+                raised: true,
+                worked: false,
+                message: String::new(),
+            });
+        });
+        let (records, _) = journal_records(&path);
+        let _ = std::fs::remove_dir_all(&jdir);
+        records
+            .into_iter()
+            .map(|r| r.line)
+            .filter(|l| l.starts_with("ESCALATED ") || l.starts_with("CLEARED "))
+            .collect::<Vec<_>>()
+    };
+    let again = format!("again={AGAIN_RETRY}, the episode of seq=101");
+    let escalated = |lines: &[String]| -> Vec<String> {
+        lines
+            .iter()
+            .filter(|l| l.starts_with("ESCALATED "))
+            .cloned()
+            .collect()
+    };
+    let broke = run(
+        "retry-broke",
+        vec![busy_screen(), shell_break(), limited_screen()],
+    );
+    assert!(
+        broke[0].ends_with("the worker works again past the limit's reset"),
+        "PRECONDITION: the live read closed the episode: {broke:#?}"
+    );
+    let new = escalated(&broke);
+    assert!(
+        new.len() == 1 && !new[0].contains(" again="),
+        "a new episode: {broke:#?}"
+    );
+    let straight = run("retry-straight", vec![busy_screen(), limited_screen()]);
+    let retried = escalated(&straight);
+    assert!(
+        retried.len() == 1 && retried[0].ends_with(&again),
+        "NEGATIVE CONTROL: the retry hit the wall again: {straight:#?}"
     );
 }
 

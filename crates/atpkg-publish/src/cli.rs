@@ -25,6 +25,11 @@ pub struct Verb {
 /// Every verb, in `help` order.
 pub const VERBS: &[Verb] = &[
     Verb {
+        name: "canary",
+        synopsis: crate::canary::SYNOPSIS,
+        does: "install and execute the signed staged Trust pack; sign integrity evidence and consumer reports without publishing",
+    },
+    Verb {
         name: "pack",
         synopsis: "pack <program> --checkout <dir> [--triple T] [--build N] [--merge-from PKG] [--toolchain BIN] [--out DIR] [--trust-repo DIR] [--unsigned | --upload]",
         does: "build, gate, stage and sign one program for one target",
@@ -82,8 +87,8 @@ pub const VERBS: &[Verb] = &[
     },
     Verb {
         name: "publish-group",
-        synopsis: "publish-group rustc --seal <dir> [--trust-repo DIR] [--checkout NAME=DIR]… [--out DIR] [--dry-run | --upload] [--force-same-build] [--allow-build-tree-seal]",
-        does: "pack, sign and index the rustc coherence group from one seal; --upload publishes it",
+        synopsis: "publish-group rustc --seal <dir> [--trust-repo DIR] [--checkout NAME=DIR]… [--out DIR] [--dry-run | --stage-upload | --publish-staged] [--force-same-build] [--allow-build-tree-seal]",
+        does: "pack, sign and index the rustc coherence group from one seal; --stage-upload stages it; --publish-staged publishes canaried bytes",
     },
     Verb {
         name: "status",
@@ -237,7 +242,10 @@ fn live_identity_lookup(verb: &str, rest: &[String]) -> bool {
     }
     match verb {
         "upload" | "mirror" => true,
-        "pack" | "pack-bundle" | "pack-package" | "pack-bottle" | "index" | "publish-group" => {
+        "publish-group" => rest
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "--stage-upload" | "--publish-staged")),
+        "pack" | "pack-bundle" | "pack-package" | "pack-bottle" | "index" => {
             rest.iter().any(|arg| arg == "--upload")
         }
         "lane" => rest.first().is_some_and(|arg| arg == "run"),
@@ -252,6 +260,7 @@ fn live_identity_lookup(verb: &str, rest: &[String]) -> bool {
 /// The verb's error; Usage for an unknown verb, or for `agh` anywhere but first.
 pub fn dispatch(ctx: &Ctx, verb: &str, rest: &[String]) -> Result<()> {
     match verb {
+        "canary" => crate::canary::run(ctx, rest),
         "pack" => artifact::pack::run(ctx, rest),
         "pack-bundle" => artifact::bundle::run(ctx, rest),
         "pack-package" => artifact::package::run(ctx, rest),
@@ -288,12 +297,13 @@ fn unknown_verb(verb: &str) -> Error {
 /// Top-level help text.
 #[must_use]
 pub fn usage() -> String {
+    use std::fmt::Write as _;
     let mut s = String::from(
         "atpkg-publish — owner-side atpkg producer (never shipped)\n\n\
          usage: atpkg-publish [--host gh|agh-staging|agh] <verb> [args]\n\n",
     );
     for v in VERBS {
-        s.push_str(&format!("  {}\n      {}\n", v.synopsis, v.does));
+        let _ = writeln!(s, "  {}\n      {}", v.synopsis, v.does);
     }
     s.push_str("\nExit: 0 ok, 1 refused, 2 usage, 3 could not run.\n");
     s

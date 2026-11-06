@@ -59,38 +59,111 @@ pub fn codex_home(
 /// Lists all rollout files under `home/sessions/<y>/<m>/<d>/`, newest mtime first.
 #[must_use]
 pub fn rollouts_by_write(home: &Path) -> Vec<(PathBuf, SystemTime)> {
-    let dirs = |p: &Path| -> Vec<PathBuf> {
-        std::fs::read_dir(p)
-            .map(|d| {
-                d.flatten()
-                    .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-                    .map(|e| e.path())
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    let mut out = Vec::new();
-    for year in dirs(&home.join("sessions")) {
-        for month in dirs(&year) {
-            for day in dirs(&month) {
+    rollout_walk(home)
+        .listed
+        .into_iter()
+        .map(|l| (l.path, l.at))
+        .collect()
+}
+
+/// One rollout a [`rollout_walk`] found.
+struct Listed {
+    path: PathBuf,
+    /// Its directory entry's metadata (a link is not followed).
+    meta: std::fs::Metadata,
+    /// Its mtime.
+    at: SystemTime,
+}
+
+/// What a [`rollout_walk`] found.
+struct Walk {
+    /// Newest mtime first, ties by path, last first.
+    listed: Vec<Listed>,
+    /// Every directory and entry under `sessions/` could be read (an absent `sessions/` reads whole).
+    whole: bool,
+}
+
+/// Every `rollout-*.jsonl` under `home/sessions/<y>/<m>/<d>/` with its metadata, and whether nothing on the way could not be read.
+fn rollout_walk(home: &Path) -> Walk {
+    fn subdirs(dir: &Path, top: bool, whole: &mut bool) -> Vec<PathBuf> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                *whole &= top && e.kind() == std::io::ErrorKind::NotFound;
+                return Vec::new();
+            }
+        };
+        let mut out = Vec::new();
+        for e in entries {
+            match e.and_then(|e| e.file_type().map(|t| (e, t))) {
+                Ok((e, t)) if t.is_dir() => out.push(e.path()),
+                Ok(_) => {}
+                Err(_) => *whole = false,
+            }
+        }
+        out
+    }
+    let mut whole = true;
+    let mut listed = Vec::new();
+    for year in subdirs(&home.join("sessions"), true, &mut whole) {
+        for month in subdirs(&year, false, &mut whole) {
+            for day in subdirs(&month, false, &mut whole) {
                 let Ok(entries) = std::fs::read_dir(&day) else {
+                    whole = false;
                     continue;
                 };
-                for e in entries.flatten() {
+                for e in entries {
+                    let Ok(e) = e else {
+                        whole = false;
+                        continue;
+                    };
                     let file_name = e.file_name();
                     let name = file_name.to_string_lossy();
                     if !name.starts_with("rollout-") || !name.ends_with(".jsonl") {
                         continue;
                     }
-                    if let Ok(at) = e.metadata().and_then(|m| m.modified()) {
-                        out.push((e.path(), at));
+                    match e.metadata().and_then(|m| m.modified().map(|at| (m, at))) {
+                        // A regular file, or a link to one: a directory, a dangling link or
+                        // another kind of entry so named is no rollout, and nothing to read.
+                        Ok((meta, at))
+                            if meta.is_file()
+                                || (meta.file_type().is_symlink()
+                                    && std::fs::metadata(e.path()).is_ok_and(|m| m.is_file())) =>
+                        {
+                            listed.push(Listed {
+                                path: e.path(),
+                                meta,
+                                at,
+                            });
+                        }
+                        Ok(_) => {}
+                        Err(_) => whole = false,
                     }
                 }
             }
         }
     }
-    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
-    out
+    listed.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| b.path.cmp(&a.path)));
+    Walk { listed, whole }
+}
+
+/// The identity `meta` carries, where the platform keeps one in a file's metadata (Unix); `None` elsewhere, where only an open file tells it.
+#[cfg(unix)]
+fn identity_of(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    Some((meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn identity_of(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
+}
+
+fn mtime_ns(meta: &std::fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
 }
 
 /// Reads the last `bytes` of `path`, dropping a partial leading line.
@@ -531,6 +604,161 @@ pub(crate) fn stream_open_ends_ref(
     }
     out.complete = true;
     out
+}
+
+/// How far one rollout has been read (design §4.14 "Tokens"): the file's identity, where the next unread line starts, and the reader standing where those bytes left it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RolloutCursor {
+    /// The file read (device, file number); `None` before its first read, or where the platform tells none.
+    identity: Option<(u64, u64)>,
+    /// Where the next unread line starts: 0, or just past a newline.
+    pos: u64,
+    /// Its size and mtime (ns) at the last read.
+    size: u64,
+    mtime_ns: i64,
+    /// The last read reached the end the file had (a torn last line aside).
+    end: bool,
+    /// The reader, standing at `pos`.
+    reader: TurnReader,
+}
+
+impl RolloutCursor {
+    /// Read what `path` appended since the last call, handing `each` every turn of this rollout's own (`Row::Turn`). It reads whole lines until it has read `cap` bytes, and the line it is in then to that line's end (a line past [`crate::harness::usage::MAX_LINE_BYTES`] is skipped unparsed), so a read can pass `cap` by one line; a `cap` of 0 reads no line. A file replaced (another identity), shorter than the cursor, or whose byte before the cursor is no longer a newline is read again from its start with a fresh reader that keeps `top`, so turns it already handed read `Repeat`. A torn last line is read again next time. `read` counts the byte before the cursor it checks; `complete` says the read reached the end the file had when opened. `None` when it cannot be opened.
+    pub fn advance(
+        &mut self,
+        path: &Path,
+        cap: u64,
+        each: &mut dyn FnMut(&Turn),
+    ) -> Option<RolloutRead> {
+        use std::io::{Read as _, Seek as _};
+        let (mut file, meta) = crate::harness::footer::open_regular_with_meta(path)?;
+        let size = meta.len();
+        let id = crate::harness::session_usage::open_identity(&file, &meta);
+        let mut out = RolloutRead::default();
+        let mut replaced = matches!((self.identity, id), (Some(held), Some(now)) if held != now)
+            || size < self.pos;
+        if let (false, Some(at)) = (replaced, self.pos.checked_sub(1)) {
+            let mut byte = [0u8; 1];
+            let ok = file.seek(std::io::SeekFrom::Start(at)).is_ok()
+                && matches!(file.read(&mut byte), Ok(1));
+            out.read = 1;
+            replaced = !ok || byte[0] != b'\n';
+        }
+        if replaced {
+            self.restart();
+        }
+        self.identity = id;
+        let from = self.pos;
+        let mut reached = from >= size;
+        if cap > 0 {
+            let reader = &mut self.reader;
+            let mut last = None;
+            let streamed = stream_open_ends_ref(&file, from, None, u64::MAX, |_, end, line| {
+                if let Streamed::Line(Some(text)) = line
+                    && let Row::Turn(turn) = reader.line(text)
+                {
+                    each(&turn);
+                }
+                last = Some(end);
+                if end.saturating_sub(from) >= cap {
+                    std::ops::ControlFlow::Break(())
+                } else {
+                    std::ops::ControlFlow::Continue(())
+                }
+            });
+            self.pos = last.unwrap_or(from);
+            out.read = out.read.saturating_add(streamed.read);
+            out.long = streamed.long;
+            reached = from.saturating_add(streamed.read) >= size;
+        }
+        self.size = size;
+        self.mtime_ns = mtime_ns(&meta);
+        self.end = reached;
+        out.complete = reached;
+        Some(out)
+    }
+
+    /// Start over at the file's start with a fresh reader that keeps the running total it reached.
+    fn restart(&mut self) {
+        *self = Self {
+            reader: TurnReader {
+                top: self.reader.top,
+                ..TurnReader::default()
+            },
+            ..Self::default()
+        };
+    }
+
+    /// The last read reached the end of a file that still has this identity, size and mtime.
+    fn unchanged(&self, meta: &std::fs::Metadata) -> bool {
+        self.end
+            && identity_of(meta).is_none_or(|id| self.identity == Some(id))
+            && self.size == meta.len()
+            && self.mtime_ns == mtime_ns(meta)
+    }
+}
+
+/// The most rollouts one [`Rollouts`] follows; past it a new one is not read, and the fold is not caught up.
+pub const MAX_ROLLOUTS: usize = 16_384;
+
+/// The rollouts of one Codex home a long-lived reader follows, each with its own cursor.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Rollouts {
+    /// Each rollout's cursor, by its path.
+    files: std::collections::BTreeMap<PathBuf, RolloutCursor>,
+}
+
+impl Rollouts {
+    /// Fold what each rollout under `home`'s `sessions/` modified at or after `since` (Unix seconds) appended since the last fold, newest first, handing `each` the rollout's path and each turn served at or after `since`. It reads whole lines until `cap` bytes in all are read, and the line it is in then to that line's end ([`RolloutCursor::advance`]); a rollout with the identity, size and mtime its last read left, read to its end, is not opened. Cursors of rollouts gone, or older than `since`, are dropped once every directory could be listed. Answers whether every rollout it could open was read to the end it had (a torn last line aside), with every directory listed and none left unfollowed at [`MAX_ROLLOUTS`].
+    pub fn fold(
+        &mut self,
+        home: &Path,
+        since: i64,
+        cap: u64,
+        each: &mut dyn FnMut(&Path, &Turn),
+    ) -> bool {
+        let walk = rollout_walk(home);
+        let mut caught_up = walk.whole;
+        let recent: Vec<Listed> = walk
+            .listed
+            .into_iter()
+            .filter(|l| mtime_ns(&l.meta) / 1_000_000_000 >= since)
+            .collect();
+        if walk.whole {
+            let there: std::collections::BTreeSet<&Path> =
+                recent.iter().map(|l| l.path.as_path()).collect();
+            self.files.retain(|path, _| there.contains(path.as_path()));
+        }
+        let mut left = cap;
+        for listed in &recent {
+            if !self.files.contains_key(&listed.path) && self.files.len() >= MAX_ROLLOUTS {
+                caught_up = false;
+                continue;
+            }
+            let cursor = self.files.entry(listed.path.clone()).or_default();
+            if cursor.unchanged(&listed.meta) {
+                continue;
+            }
+            if left == 0 {
+                caught_up = false;
+                continue;
+            }
+            let path = listed.path.as_path();
+            let read = cursor.advance(path, left, &mut |turn| {
+                if turn.at >= since {
+                    each(path, turn);
+                }
+            });
+            // A rollout that cannot be opened (`None`) holds no turn this Mac can count, as a
+            // Claude transcript that cannot be read does not (`FoldReport::unread`); its cursor
+            // stays, so a later fold that opens it hands what it appended.
+            if let Some(read) = read {
+                left = left.saturating_sub(read.read);
+                caught_up &= read.complete;
+            }
+        }
+        caught_up
+    }
 }
 
 /// Maximum bytes read from a rollout's first line when inspecting `session_meta`.
@@ -1534,6 +1762,296 @@ mod tests {
         assert!(turns(&got).is_empty(), "{got:?}");
         assert_eq!(got.last(), Some(&Row::Copied));
         assert_eq!(shares(&other), Vec::<f64>::new());
+    }
+
+    fn append(path: &Path, text: &str) {
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .and_then(|mut f| f.write_all(text.as_bytes()))
+            .expect("append");
+    }
+
+    fn written_at(path: &Path, at: i64) {
+        let when = SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(u64::try_from(at).expect("after 1970"));
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .and_then(|f| f.set_modified(when))
+            .expect("set the mtime");
+    }
+
+    fn inputs(turns: &[Turn]) -> Vec<u64> {
+        turns.iter().map(|t| t.tokens.input).collect()
+    }
+
+    fn step(cursor: &mut RolloutCursor, path: &Path, cap: u64) -> (RolloutRead, Vec<Turn>) {
+        let mut got = Vec::new();
+        let read = cursor
+            .advance(path, cap, &mut |t| got.push(t.clone()))
+            .expect("the rollout opens");
+        (read, got)
+    }
+
+    #[test]
+    fn a_cursor_hands_each_appended_turn_once_and_a_rewrite_none_again() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("codex-cursor-")
+            .tempdir()
+            .expect("temp dir");
+        let path = dir.path().join("rollout.jsonl");
+        let head = [
+            meta(T0, ROOT, ROOT, None),
+            context(T0 + 1, "gpt-6-sol", None),
+        ]
+        .concat();
+        let one = count(T0 + 2, (10, 0, 1), (10, 0, 1));
+        let two = count(T0 + 3, (30, 0, 3), (20, 0, 2));
+        let three = count(T0 + 4, (60, 0, 6), (30, 0, 3));
+        std::fs::write(&path, format!("{head}{one}")).expect("write");
+        let mut cursor = RolloutCursor::default();
+        let (read, first) = step(&mut cursor, &path, u64::MAX);
+        assert_eq!(inputs(&first), [10]);
+        assert_eq!(read.read, (head.len() + one.len()) as u64);
+        assert!(read.complete);
+        append(&path, &two);
+        let (read, second) = step(&mut cursor, &path, u64::MAX);
+        assert_eq!(inputs(&second), [20]);
+        assert_eq!(
+            read.read,
+            two.len() as u64 + 1,
+            "the appended line and the byte before it"
+        );
+        let (read, third) = step(&mut cursor, &path, u64::MAX);
+        assert!(third.is_empty(), "{third:?}");
+        assert!(read.complete && read.read == 1, "{read:?}");
+        let (torn, rest) = three.split_at(three.len() / 2);
+        append(&path, torn);
+        let (read, none) = step(&mut cursor, &path, u64::MAX);
+        assert!(
+            none.is_empty() && read.complete,
+            "a torn line waits: {none:?}"
+        );
+        append(&path, rest);
+        assert_eq!(inputs(&step(&mut cursor, &path, u64::MAX).1), [30]);
+        let text = format!("{head}{one}{two}{three}");
+        let rewrite = dir.path().join("rewrite.jsonl");
+        std::fs::write(&rewrite, &text).expect("write");
+        std::fs::rename(&rewrite, &path).expect("rename over");
+        let (read, again) = step(&mut cursor, &path, u64::MAX);
+        assert_eq!(
+            read.read,
+            text.len() as u64,
+            "another identity: from its start"
+        );
+        assert!(again.is_empty(), "{again:?}");
+        let four = count(T0 + 5, (100, 0, 10), (40, 0, 4));
+        let shifted = format!(
+            "{}{}{one}{two}{three}{four}",
+            meta(T0, ROOT, ROOT, None),
+            context(T0 + 1, "gpt-6-sol-x", None)
+        );
+        std::fs::write(&path, &shifted).expect("rewrite in place");
+        let (read, moved) = step(&mut cursor, &path, u64::MAX);
+        assert_eq!(
+            read.read,
+            shifted.len() as u64 + 1,
+            "its line ends moved: from its start"
+        );
+        assert_eq!(inputs(&moved), [40], "only the turn it had not handed");
+        let fresh = step(&mut RolloutCursor::default(), &path, u64::MAX).1;
+        assert_eq!(
+            inputs(&fresh),
+            [10, 20, 30, 40],
+            "NEGATIVE CONTROL: a reader that kept no total hands them all"
+        );
+    }
+
+    #[test]
+    fn a_budgeted_cursor_hands_what_an_unbounded_one_does() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("codex-cursor-cap-")
+            .tempdir()
+            .expect("temp dir");
+        let path = dir.path().join("rollout.jsonl");
+        let text = [
+            meta(T0, ROOT, ROOT, None),
+            context(T0 + 1, "gpt-6-sol", None),
+            count(T0 + 2, (10, 0, 1), (10, 0, 1)),
+            message(T0 + 3),
+            count(T0 + 4, (30, 0, 3), (20, 0, 2)),
+            count(T0 + 5, (60, 0, 6), (30, 0, 3)),
+        ]
+        .concat();
+        std::fs::write(&path, &text).expect("write");
+        let whole = step(&mut RolloutCursor::default(), &path, u64::MAX).1;
+        assert_eq!(inputs(&whole), [10, 20, 30]);
+        let mut cursor = RolloutCursor::default();
+        let (read, none) = step(&mut cursor, &path, 0);
+        assert!(
+            none.is_empty() && read.read == 0 && !read.complete,
+            "a cap of 0 reads no line"
+        );
+        let lines = text.lines().count();
+        let mut got = Vec::new();
+        let mut reads = 0;
+        for _ in 0..lines {
+            let (read, turns) = step(&mut cursor, &path, 1);
+            reads += 1;
+            got.extend(turns);
+            if read.complete {
+                break;
+            }
+        }
+        assert_eq!(reads, lines, "one whole line a read");
+        assert_eq!(got, whole);
+    }
+
+    #[test]
+    fn rollouts_fold_hands_each_turn_once_and_lets_go_of_what_is_gone() {
+        let home = aterm_tempfile::Builder::new()
+            .prefix("codex-rollouts-")
+            .tempdir()
+            .expect("temp dir");
+        let day = home.path().join("sessions/2026/11/05");
+        std::fs::create_dir_all(&day).expect("mkdir");
+        let now = i64::try_from(aterm_time::unix_secs().expect("a clock")).expect("seconds");
+        let since = now - 3600;
+        let base = (now - 600) * 1000;
+        let body = |thread: &str| {
+            [
+                meta(base, thread, thread, None),
+                context(base + 1, "gpt-6-sol", None),
+                count(base + 2, (10, 0, 1), (10, 0, 1)),
+                count(base + 3, (30, 0, 3), (20, 0, 2)),
+            ]
+            .concat()
+        };
+        let file = |thread: &str, at: i64| {
+            let path = day.join(format!("rollout-2026-11-05T10-00-00-{thread}.jsonl"));
+            std::fs::write(&path, body(thread)).expect("write");
+            written_at(&path, at);
+            path
+        };
+        let a = file(ROOT, now - 120);
+        let b = file(OTHER, now - 60);
+        let old = file(SUB, since - 3600);
+        let fold = |rollouts: &mut Rollouts, since: i64| {
+            let mut got = Vec::new();
+            let caught_up = rollouts.fold(home.path(), since, u64::MAX, &mut |path, turn| {
+                got.push((path.to_path_buf(), turn.tokens.input));
+            });
+            (caught_up, got)
+        };
+        let mut rollouts = Rollouts::default();
+        let (caught_up, first) = fold(&mut rollouts, since);
+        assert!(caught_up);
+        assert_eq!(
+            first,
+            [
+                (b.clone(), 10),
+                (b.clone(), 20),
+                (a.clone(), 10),
+                (a.clone(), 20)
+            ],
+            "newest first, each turn once"
+        );
+        assert!(
+            !rollouts.files.contains_key(&old),
+            "older than `since`: not read"
+        );
+        let (caught_up, second) = fold(&mut rollouts, since);
+        assert!(caught_up && second.is_empty(), "{second:?}");
+        append(&a, &count(base + 4, (60, 0, 6), (30, 0, 3)));
+        assert_eq!(fold(&mut rollouts, since).1, [(a.clone(), 30)]);
+        append(&a, &count((since - 1) * 1000, (100, 0, 10), (40, 0, 4)));
+        assert!(
+            fold(&mut rollouts, since).1.is_empty(),
+            "served before `since`"
+        );
+        assert_eq!(
+            rollouts.files[&a].reader.top, 110,
+            "NEGATIVE CONTROL: it was read"
+        );
+        std::fs::remove_file(&b).expect("remove");
+        let (caught_up, none) = fold(&mut rollouts, since);
+        assert!(caught_up && none.is_empty(), "{none:?}");
+        assert!(
+            !rollouts.files.contains_key(&b),
+            "a rollout gone keeps no cursor"
+        );
+        let kept = rollouts.files[&a].clone();
+        let at = std::fs::metadata(&a)
+            .and_then(|m| m.modified())
+            .expect("mtime");
+        {
+            use std::io::{Seek as _, Write as _};
+            let mut f = std::fs::File::options().write(true).open(&a).expect("open");
+            f.seek(std::io::SeekFrom::End(-1)).expect("seek");
+            f.write_all(b"x").expect("overwrite its last newline");
+            f.set_modified(at).expect("put its mtime back");
+        }
+        let (caught_up, none) = fold(&mut rollouts, since);
+        assert!(caught_up && none.is_empty(), "{none:?}");
+        assert_eq!(
+            rollouts.files[&a], kept,
+            "the same identity, size and mtime: not opened"
+        );
+        written_at(&a, now - 30);
+        fold(&mut rollouts, since);
+        assert!(
+            rollouts.files[&a].pos < kept.pos,
+            "NEGATIVE CONTROL: opened, its moved line end reads it again from its start"
+        );
+        let (_, all) = fold(&mut Rollouts::default(), since - 7200);
+        assert_eq!(
+            all.iter().filter(|(path, _)| *path == old).count(),
+            2,
+            "NEGATIVE CONTROL: with `since` before it, the old rollout is read: {all:?}"
+        );
+    }
+
+    /// A directory or a dangling link named as a rollout is no rollout: the fold reads the real
+    /// one beside it and is caught up, where listing them would leave it short every fold.
+    #[cfg(unix)]
+    #[test]
+    fn an_entry_named_as_a_rollout_that_is_no_file_leaves_the_fold_caught_up() {
+        let home = aterm_tempfile::Builder::new()
+            .prefix("codex-rollouts-")
+            .tempdir()
+            .expect("temp dir");
+        let day = home.path().join("sessions/2026/11/05");
+        std::fs::create_dir_all(&day).expect("mkdir");
+        let now = i64::try_from(aterm_time::unix_secs().expect("a clock")).expect("seconds");
+        let base = (now - 600) * 1000;
+        let real = day.join(format!("rollout-2026-11-05T10-00-00-{ROOT}.jsonl"));
+        std::fs::write(
+            &real,
+            [
+                meta(base, ROOT, ROOT, None),
+                context(base + 1, "gpt-6-sol", None),
+                count(base + 2, (10, 0, 1), (10, 0, 1)),
+            ]
+            .concat(),
+        )
+        .expect("write");
+        std::fs::create_dir(day.join(format!("rollout-2026-11-05T10-00-01-{OTHER}.jsonl")))
+            .expect("a directory so named");
+        std::os::unix::fs::symlink(
+            day.join("gone"),
+            day.join(format!("rollout-2026-11-05T10-00-02-{SUB}.jsonl")),
+        )
+        .expect("a dangling link so named");
+        let mut rollouts = Rollouts::default();
+        let mut got = Vec::new();
+        let caught_up = rollouts.fold(home.path(), now - 3600, u64::MAX, &mut |path, turn| {
+            got.push((path.to_path_buf(), turn.tokens.input));
+        });
+        assert_eq!(got, [(real.clone(), 10)]);
+        assert!(caught_up, "an entry that is no rollout held the fold short");
+        assert_eq!(rollouts.files.len(), 1, "a cursor for the rollout alone");
     }
 
     #[test]

@@ -584,6 +584,19 @@ impl GridStorage {
         }
     }
 
+    /// Release the map extras of visible row `row` (physical row `phys`), which a full-screen
+    /// scroll has copied into history and is moving off the screen
+    /// ([`crate::CellExtras::release_scrolled_row`]).
+    #[inline]
+    pub(crate) fn release_scrolled_row_extras(&mut self, phys: usize, row: u16) {
+        if let Some(cells) = self.rows.get(phys) {
+            self.cursor_state
+                .presentation
+                .extras
+                .release_scrolled_row(row, cells.as_slice());
+        }
+    }
+
     #[inline]
     pub(crate) fn row_is_double_width(&self, row: u16) -> bool {
         self.row(row)

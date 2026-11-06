@@ -153,7 +153,7 @@ impl<'a> Users<'a> {
                 used: number("used").unwrap_or(limit.saturating_sub(remaining)),
             });
         }
-        snapshots.sort_by(|a, b| a.resource.cmp(&b.resource));
+        snapshots.sort_unstable_by(|a, b| a.resource.cmp(&b.resource));
         Ok(snapshots)
     }
 }

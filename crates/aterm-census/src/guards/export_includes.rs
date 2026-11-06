@@ -50,7 +50,7 @@ fn finding(path: &str, line: usize, detail: String) -> Finding {
 }
 
 /// The rule over `corpus`, with the export selecting what `manifest` does (everything
-/// outside the central denies when there is none, as the export-content guard reads it).
+/// outside the central denies when there is none, as the export scan reads it).
 fn held_to(corpus: &Corpus, manifest: Option<&str>, out: &mut Vec<Finding>) {
     let selection = match manifest.map_or_else(|| Ok(Selection::everything()), Selection::parse) {
         Ok(selection) => selection,

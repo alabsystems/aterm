@@ -2867,6 +2867,7 @@ pub fn collect_exit_status(pid: i32) -> Option<crate::ChildExit> {
     if waited != pid {
         return None;
     }
+    aterm_uds::deaths::note(pid, status);
     if libc::WIFEXITED(status) {
         return Some(crate::ChildExit::Code(libc::WEXITSTATUS(status)));
     }
@@ -2980,6 +2981,7 @@ fn reap_shell_draining(
         // SAFETY: `WNOHANG` `waitpid`; `&mut status` is a valid out-param.
         let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
         if r == pid {
+            aterm_uds::deaths::note(pid, status);
             return;
         }
         // Alive at the holdout tick is not "ignored SIGHUP": a shell handling its hang-up is
@@ -3043,6 +3045,9 @@ fn straggler_settled(identity: &ShellIdentity) -> bool {
     let mut status: libc::c_int = 0;
     // SAFETY: `WNOHANG` `waitpid` on the verified own child; a valid out-param.
     let r = unsafe { libc::waitpid(identity.pid, &mut status, libc::WNOHANG) };
+    if r == identity.pid {
+        aterm_uds::deaths::note(r, status);
+    }
     r == identity.pid
         || (r == -1 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted)
 }

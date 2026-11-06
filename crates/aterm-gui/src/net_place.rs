@@ -308,10 +308,7 @@ pub(crate) fn sys_view() -> Option<aterm_vitals::PlaceView> {
     latest().map(|place| sys_view_of(&place, &Words::now()))
 }
 
-/// The menu bar's Network row: the place's summary ([`words::summary`]). Whether a fleet read's
-/// no-route is this Mac's Local Network privacy is the read's own verdict, judged by each dial's
-/// address against this network ([`words::on_link`], the survey's note the fleet glance reads),
-/// so the row blames nothing and excuses nothing by where this Mac is.
+/// The menu bar's Network row: the place's summary ([`words::summary`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MenuLine {
     /// `Network — <summary>`.

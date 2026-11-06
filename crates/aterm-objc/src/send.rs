@@ -571,18 +571,6 @@ pub unsafe fn send_id_f64(recv: Id, sel: Sel, a: f64) -> Id {
     }
 }
 
-/// `-(id)sel:(CGFloat)a b:(CGFloat)b` — `+[NSFont monospacedDigitSystemFontOfSize:weight:]`.
-/// # Safety
-/// See the module note, including the ownership paragraph.
-#[must_use]
-pub unsafe fn send_id_f64_f64(recv: Id, sel: Sel, a: f64, b: f64) -> Id {
-    // SAFETY: the caller pins the prototype; this is the cast for it.
-    unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, f64, f64) -> Id = checked_msg();
-        f(recv, sel, a, b)
-    }
-}
-
 /// `-(id)sel:(NSRect)a` — `-[NSView initWithFrame:]` and friends.
 /// # Safety
 /// See the module note, including the ownership paragraph.

@@ -49,12 +49,9 @@ impl Fixture {
         );
         fs::create_dir_all(browser.parent().unwrap()).unwrap();
         fs::write(browser, b"inert browser fixture").unwrap();
-        let accounts::PinSelection::Renew(request) = store
-            .select_account_for(cli, &raw, &path, "work", NOW)
-            .unwrap()
-        else {
-            panic!("fixture needs a sign-in")
-        };
+        // An existing saved Account intent can arrive from another supported
+        // process/platform; these admission tests do not exercise menu capability.
+        let request = store.request_pin("work", NOW).unwrap();
         Self {
             _root: root,
             home,
@@ -123,6 +120,7 @@ impl Fixture {
             spawn,
             Some(&ladder),
             None,
+            &mut None,
         )
     }
 }
@@ -249,7 +247,10 @@ fn observe(cli: Cli, case: i64) -> (i64, [bool; 3]) {
     } else {
         let fresh = fixture.store.load_logins(NOW).unwrap().0;
         let rows = accounts::bound(&current_raw, &fresh);
-        let request = wanted.as_ref().unwrap_or(&fixture.request);
+        let request = wanted
+            .as_ref()
+            .and_then(accounts::PendingSelection::account)
+            .unwrap_or(&fixture.request);
         fixture
             .store
             .admit_renewal_attempt(
@@ -338,6 +339,7 @@ fn queued_selection_conforms_through_local_refusal_and_repair() {
 /// background, keeping it and dispatching nothing. A Grok row's starts none, whatever the lock
 /// (`Cli::renews_headlessly`, pinned in `accounts_sync_cli_tests.rs`).
 #[test]
+#[cfg(unix)]
 fn unreadable_signin_lock_preserves_saved_selection_without_dispatch() {
     let mut failures = Vec::new();
     for cli in Cli::ALL.into_iter().filter(|cli| cli.renews_headlessly()) {
@@ -349,16 +351,43 @@ fn unreadable_signin_lock_preserves_saved_selection_without_dispatch() {
         let refuse = |_: Box<dyn FnOnce() + Send>| {
             panic!("unreadable sign-in lock cannot dispatch authentication")
         };
+        let lifetime = super::super::account_work::Lifetime::default();
         let fx = UpkeepEffects {
-            scope: None,
+            scope: Some(lifetime.enter().unwrap()),
             renew_guard: &guard,
             spawn_renewal: &refuse,
             ..live_effects()
         };
-        let result =
-            resume_pending_pin_for(cli, &fixture.home, &fixture.state, &fixture.path, NOW, &fx);
+        // A scheduled manual waiter is Started before its signer can be read.
+        // Exercise that actual worker boundary directly to distinguish a true
+        // signer I/O refusal from contention, without dispatching a provider.
+        let owner = manual_owner_for(
+            cli,
+            &fixture.store,
+            &fixture.path,
+            fixture.request.clone().into(),
+            NOW,
+            &fx,
+        )
+        .unwrap();
+        let result = Some(manual_selection_owned(
+            cli,
+            &fixture.home,
+            &fixture.state,
+            &fixture.path,
+            owner,
+            NOW,
+            &fx,
+        ));
+        drop(fx);
+        assert!(lifetime.pause().unwrap().try_wait().is_ok());
         let retained = fixture.store.load(NOW).unwrap().0.pending_pin;
-        if result != Some(RenewalDispatch::Fenced) || retained.as_ref() != Some(&fixture.request) {
+        if result != Some(RenewalDispatch::Fenced)
+            || retained
+                .as_ref()
+                .and_then(accounts::PendingSelection::account)
+                != Some(&fixture.request)
+        {
             failures.push(format!(
                 "{cli:?}: {result:?}, retained={}",
                 retained.is_some()
@@ -366,6 +395,7 @@ fn unreadable_signin_lock_preserves_saved_selection_without_dispatch() {
         }
         assert!(!guard.lock().unwrap().in_flight);
         assert!(guard.lock().unwrap().last_attempt.is_empty());
+        assert!(guard.lock().unwrap().manual_selections.is_empty());
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
@@ -408,7 +438,7 @@ fn queued_selection(superseded: bool) {
         else {
             panic!("second selection needs a sign-in")
         };
-        Some(latest)
+        Some(latest.into())
     } else {
         None
     };
@@ -465,7 +495,7 @@ fn fallback_admission_failure_keeps_the_current_request() {
                             })
                             .unwrap();
                     } else if case == 3 && previous == 1 {
-                        return super::super::cli::Renewal::Busy;
+                        return super::super::cli::Renewal::SigninHeld;
                     } else if case == 4 {
                         return super::super::cli::Renewal::Deferred;
                     }
@@ -483,7 +513,7 @@ fn fallback_admission_failure_keeps_the_current_request() {
         );
         assert_eq!(
             fixture.store.load(NOW).unwrap().0.pending_pin,
-            (case != 0).then_some(fixture.request),
+            (case != 0).then_some(fixture.request.into()),
             "case {case}"
         );
         assert!(!guard.lock().unwrap().in_flight);
@@ -515,6 +545,7 @@ fn vendor_worker_keeps_selection_when_its_second_lock_take_is_unavailable() {
                 &guard,
                 &spawn,
                 None,
+                None,
             ),
             RenewalDispatch::Started
         );
@@ -526,7 +557,7 @@ fn vendor_worker_keeps_selection_when_its_second_lock_take_is_unavailable() {
         work();
         assert_eq!(
             fixture.store.load(NOW).unwrap().0.pending_pin,
-            Some(fixture.request.clone())
+            Some(fixture.request.clone().into())
         );
         assert!(!guard.lock().unwrap().in_flight);
         let after = fixture.records();
@@ -542,4 +573,183 @@ fn vendor_worker_keeps_selection_when_its_second_lock_take_is_unavailable() {
                 .exists()
         );
     }
+}
+
+#[test]
+#[cfg(unix)]
+fn a_permit_holding_background_worker_yields_to_the_same_manual_head_without_a_cooldown() {
+    assert!(
+        super::super::cli::AccountsHost::automatic_sign_in(
+            &super::super::cli::LiveAccounts::background(None)
+        ),
+        "standalone background work does not silently become manual"
+    );
+    {
+        let fixture = Fixture::new(Cli::Codex);
+        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        type Work = Box<dyn FnOnce() + Send>;
+        let queued: Arc<Mutex<Vec<Work>>> = Arc::default();
+        let into = queued.clone();
+        let spawn = move |work| {
+            into.lock().unwrap().push(work);
+            Ok(())
+        };
+        let lifetime = super::super::account_work::Lifetime::default();
+        let scope = lifetime.enter().unwrap();
+        let started = accounts::with_store_ladder(&[], || {
+            renew_requested_pin_for(
+                Cli::Codex,
+                &fixture.home,
+                &fixture.state,
+                &fixture.path,
+                fixture.request.clone(),
+                NOW,
+                &guard,
+                &spawn,
+                Some(&scope),
+                None,
+            )
+        });
+        assert_eq!(started, RenewalDispatch::Started);
+        assert!(
+            guard.lock().unwrap().in_flight,
+            "the actual queued work owns its permit"
+        );
+        let mut head = fixture.store.queue_manual_signin().unwrap();
+        let before = fixture.records();
+        let work = queued.lock().unwrap().pop().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("queue-background-control".into())
+            .spawn(scope.clone().wrap(move || {
+                work();
+                let _ = tx.send(());
+            }))
+            .unwrap();
+        let returned = rx.recv_timeout(std::time::Duration::from_secs(60));
+        // Always cancel and join before assertions. Even the old misclassified
+        // manual waiter sees this actual Scope, and the head stays held so no
+        // provider can start during recovery from the hang detector.
+        let paused = lifetime.pause();
+        drop(scope);
+        let joined = worker.join();
+        assert!(joined.is_ok());
+        returned
+            .expect("bounded background admission must return while the manual head remains live");
+        assert!(
+            paused.unwrap().try_wait().is_ok(),
+            "the original work and permit retired before Scope"
+        );
+        assert!(!guard.lock().unwrap().in_flight);
+        assert!(
+            !guard
+                .lock()
+                .unwrap()
+                .last_attempt
+                .contains_key("codex:work"),
+            "typed sign-in admission refusal creates no retry cooldown"
+        );
+        let after = fixture.records();
+        for index in [0, 1, 2, 3, 4, 6, 7] {
+            assert_eq!(after[index], before[index]);
+        }
+        assert!(
+            !fixture.raw.rows[0]
+                .dir
+                .as_deref()
+                .map(Path::new)
+                .unwrap()
+                .exists()
+        );
+        assert!(
+            matches!(
+                head.try_enter().unwrap(),
+                accounts::SigninAttempt::Acquired(_)
+            ),
+            "the SAME manual ticket proceeds after the background permit retires"
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn a_manual_turn_survives_preflight_refusal_and_moves_only_to_the_actual_attempt() {
+    let mut fixture = Fixture::new(Cli::Codex);
+    fixture.raw.rows[0].email = None;
+    fs::write(
+        &fixture.path,
+        accounts::append_rows_for(Cli::Codex, "", &fixture.raw.rows).unwrap(),
+    )
+    .unwrap();
+    let request = fixture.store.request_next(NOW + 1).unwrap();
+    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let owner = ManualSelectionOwner::claim(
+        &guard,
+        &fixture.store,
+        Cli::Codex,
+        accounts::PendingSelection::Next(request),
+        None,
+        NOW + 1,
+    )
+    .unwrap();
+    let mut head = fixture.store.queue_manual_signin().unwrap();
+    let turn = match head.try_enter().unwrap() {
+        accounts::SigninAttempt::Acquired(turn) => turn,
+        other => panic!("free manual head was not admitted: {other:?}"),
+    };
+    let behind = fixture.store.queue_manual_signin().unwrap();
+    let mut admission = Some((turn, owner));
+    let lifetime = super::super::account_work::Lifetime::default();
+    let scope = lifetime.enter().unwrap();
+    type Work = Box<dyn FnOnce() + Send>;
+    let queued: Mutex<Vec<Work>> = Mutex::default();
+    let spawn = |work: Work| {
+        queued
+            .lock()
+            .unwrap()
+            .push(Box::new(scope.clone().wrap(work)));
+        Ok(())
+    };
+    for (index, expected) in [(0, RenewalDispatch::Failed), (1, RenewalDispatch::Started)] {
+        let row = fixture.raw.rows[index].clone();
+        let result = spawn_row_renewal(
+            Cli::Codex,
+            &fixture.home,
+            &fixture.state,
+            &fixture.path,
+            fixture.raw.clone(),
+            &accounts::Logins::default(),
+            (
+                row.clone(),
+                crate::harness::sign_in_ladder::asked_fixture(Cli::Codex, &row.label),
+            ),
+            (None, true),
+            NOW + 1,
+            &guard,
+            &spawn,
+            None,
+            Some(&scope),
+            &mut admission,
+        );
+        assert_eq!(result, expected);
+        assert_eq!(
+            behind.position().unwrap().ahead,
+            1,
+            "the original head has not retired or requeued"
+        );
+        assert!(fixture.store.signin_now().unwrap().is_none());
+        assert_eq!(admission.is_some(), index == 0);
+    }
+    assert_eq!(
+        queued.lock().unwrap().len(),
+        1,
+        "only the admitted candidate owns work"
+    );
+    let paused = lifetime.pause().unwrap();
+    drop(scope);
+    queued.lock().unwrap().clear();
+    assert!(paused.try_wait().is_ok());
+    assert!(!guard.lock().unwrap().in_flight);
+    assert!(guard.lock().unwrap().manual_selections.is_empty());
+    assert_eq!(behind.position().unwrap().ahead, 0);
 }

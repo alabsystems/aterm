@@ -2776,6 +2776,47 @@ pub(super) mod tests {
             .collect()
     }
 
+    #[test]
+    fn private_inventory_branch_history_does_not_strand_new_checkouts() {
+        for cached in [aterm_json::json!("old-default"), aterm_json::Value::Null] {
+            let (sys, item) = listing(&["new".into()], &[]);
+            let mut value = repository("alice", "new", 1);
+            value
+                .as_object_mut()
+                .unwrap()
+                .insert("default_branch".into(), cached);
+            metadata(&sys, &item.user, aterm_json::json!([value]));
+            let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+            let rows = run(&sys, &context, Mode::Apply).unwrap();
+            assert_eq!(
+                stage(&rows).outcome,
+                crate::model::Outcome::Changed,
+                "{rows:?}"
+            );
+            assert_eq!(
+                Reading::of(stage(&rows)),
+                Some(Reading::Repositories {
+                    present: 1,
+                    count: 1,
+                    signed_in: true
+                })
+            );
+            assert!(
+                sys.stat(&Path::new(&item.user.home).join("new"))
+                    .unwrap()
+                    .dir
+            );
+            assert_eq!(
+                sys.calls()
+                    .iter()
+                    .filter(|call| call.contains(" clone "))
+                    .count(),
+                1
+            );
+            assert!(!sys.calls().iter().any(|call| call.contains(" agh GET ")));
+        }
+    }
+
     /// How many of `calls` ran git as alice in `path` with `args`.
     fn ran_in(calls: &[String], path: &Path, args: &str) -> usize {
         let at = format!("-C {} {args}", path.display());

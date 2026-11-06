@@ -1229,9 +1229,8 @@ impl AppRt for AppRtWindows {
             tooltips,
             ext,
             active,
-            pill,
         } = tabs;
-        toolbar::set_window_tabs(handle, titles, ids, metadata, tooltips, ext, active, pill);
+        toolbar::set_window_tabs(handle, titles, ids, metadata, tooltips, ext, active);
     }
 
     fn read_toolbar_chrome(&self, handle: &toolbar::ToolbarHandle) -> Option<String> {

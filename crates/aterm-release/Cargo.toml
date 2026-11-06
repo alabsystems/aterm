@@ -85,8 +85,8 @@ ring = { workspace = true, features = ["alloc"] }
 # trailing bits, so a pinned key has exactly one spelling.
 aterm-codec = { workspace = true }
 # The export's text rewrite (`aterm_census::export::rewrite`), defined once and
-# shared with the census's export-content guard, which reads the checkout as the
-# transforms leave it. std-only; its one dependency is aterm-regex.
+# shared with the census's export scan (`verify export-scan`), which reads the checkout as
+# the transforms leave it. std-only; its one dependency is aterm-regex.
 aterm-census = { workspace = true }
 # The harness versions gate and `ship harness-bump` read each harness's sources and version
 # file from the one place the build reads them (`aterm_phase::CliHarness`); the reader is

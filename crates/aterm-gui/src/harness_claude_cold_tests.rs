@@ -864,7 +864,7 @@ fn restore_through_a_platform_shell(case: i64) -> PlatformRestore {
     let mut h = hooks(&world, parking_body(&world));
     h.pause = Arc::new(|_| Duration::from_millis(1));
     let (said, seat) = (Arc::clone(&answers), c.seat.clone());
-    h.acts.account_cold = Arc::new(move |snapshot, mode| {
+    h.acts.account_cold = Arc::new(move |snapshot, mode, _| {
         let answer = account_cold_at(&seat, snapshot, mode, || PLATFORM_SHELL);
         said.lock().unwrap().push(
             answer
@@ -944,7 +944,7 @@ fn claude_cold_refusal_keeps_the_conversation_and_never_falls_back_to_its_old_li
     h.pause = Arc::new(|_| Duration::from_millis(1));
     let admitted = Arc::clone(&allowed);
     let seen = Arc::clone(&observations);
-    h.acts.account_cold = Arc::new(move |original, _| {
+    h.acts.account_cold = Arc::new(move |original, _, _| {
         seen.fetch_add(1, Ordering::SeqCst);
         if !admitted.load(Ordering::SeqCst) {
             return Err("held".into());
@@ -997,7 +997,7 @@ fn claude_cold_decision_is_rechecked_when_live_rotation_changes() {
     let mut h = hooks(&world, parking_body(&world));
     h.pause = Arc::new(|_| Duration::from_millis(1));
     let seen = Arc::clone(&observations);
-    h.acts.account_cold = Arc::new(move |snapshot, mode| {
+    h.acts.account_cold = Arc::new(move |snapshot, mode, _| {
         if seen.fetch_add(1, Ordering::SeqCst) == 0 {
             entered.send(()).unwrap();
             released
@@ -1107,4 +1107,141 @@ fn claude_cold_admission_onto_a_rows_own_login_notes_its_stretch_first() {
         "{result:?}"
     );
     assert!(default.a.state().login_dir_spans.is_empty(), "CONTROL");
+}
+
+/// RS1, THE OWNER'S RULE THAT MACHINES COME IN AND OUT: on a host whose native cold
+/// constructor is qualified (Apple Silicon), an agent that ended under an earlier aterm process
+/// (a reboot) is admitted now, on its recorded launch environment, for the typed resume line;
+/// only an agent that ended under this host is deferred to the constructor, whose death
+/// witness can prove only that one.
+#[test]
+fn a_qualified_host_admits_an_agent_of_an_earlier_host_now_and_defers_only_its_own() {
+    let c = cold_case(20, None);
+    let earlier = account_cold_decided(
+        &c.seat,
+        &c.original,
+        c.mode,
+        ColdEnd::EarlierHost,
+        true,
+        || PLATFORM_SHELL,
+    );
+    match earlier {
+        Ok(relaunch::ColdAdmission::Immediate(Some(chosen))) => {
+            assert_eq!(chosen.login.as_deref(), Some(c.original_dir.as_str()));
+            assert_eq!(chosen.session, c.original.session);
+        }
+        other => panic!(
+            "an earlier host's agent is admitted now: {:?}",
+            other.is_ok()
+        ),
+    }
+    // NEGATIVE CONTROL: this host's own agent still goes to the constructor.
+    match account_cold_decided(
+        &c.seat,
+        &c.original,
+        c.mode,
+        ColdEnd::ThisHost,
+        true,
+        || PLATFORM_SHELL,
+    ) {
+        Ok(relaunch::ColdAdmission::Deferred(intent)) => {
+            assert_eq!(intent.conversation, c.original.session);
+        }
+        other => panic!("this host's agent is deferred: {:?}", other.is_ok()),
+    }
+    // An unqualified host admits both now, as before.
+    for end in [ColdEnd::EarlierHost, ColdEnd::ThisHost] {
+        assert!(matches!(
+            account_cold_decided(&c.seat, &c.original, c.mode, end, false, || PLATFORM_SHELL),
+            Ok(relaunch::ColdAdmission::Immediate(Some(_)))
+        ));
+    }
+}
+
+/// What a restore through the qualified decision handed the relaunch: each attempt's login
+/// and whether it carried a deferred cold intent.
+type Handed = Arc<Mutex<Vec<(Option<String>, bool)>>>;
+
+/// A host restoring case 20's worker (a stored login, its launch environment recorded, its
+/// tab's shell the platform shell) through the qualified host's real decision
+/// ([`account_cold_decided`]), restored from the layout (`cold`) or not. The relaunch answers
+/// as the agent does: a typed line lands (`adopted`), a deferred intent for a tab whose shell
+/// is not its agent's waits on a witness it cannot have (the agent-side control
+/// `a_cold_intent_for_an_agent_of_an_earlier_host_waits_on_a_witness_it_cannot_have`).
+fn restore_qualified(cold: bool) -> (Arc<ColdCase>, Arc<World>, HostHandle, Handed) {
+    let c = Arc::new(cold_case(20, None));
+    let world = Arc::new(World::default());
+    let handed: Handed = Arc::default();
+    let mut h = hooks(&world, parking_body(&world));
+    h.pause = Arc::new(|_| Duration::from_millis(1));
+    let seat = c.seat.clone();
+    h.acts.account_cold = Arc::new(move |snapshot, mode, end| {
+        account_cold_decided(&seat, snapshot, mode, end, true, || PLATFORM_SHELL)
+    });
+    let recorded = Arc::clone(&handed);
+    h.acts.relaunch_restored = Arc::new(move |_, snapshot, _, _, launch| {
+        recorded
+            .lock()
+            .unwrap()
+            .push((snapshot.login.clone(), launch.deferred.is_some()));
+        if launch.deferred.is_some() {
+            "wait:native-crash-observation".into()
+        } else {
+            "adopted".into()
+        }
+    });
+    let mut cfg = on();
+    cfg.set("accounts", c.mode.as_str()).unwrap();
+    let host = HostHandle::start(cfg, false, false, h);
+    host.relaunch_restored(vec![RestoredAgent {
+        sid: c.original.tab.clone(),
+        snap: c.original.clone(),
+        place: "test".into(),
+        cold,
+        asked: None,
+        was: None,
+    }]);
+    (c, world, host, handed)
+}
+
+fn restored_over_noted(world: &World, sid: &str) -> bool {
+    world
+        .notes
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|note| matches!(note, HostNote::RestoredOver { sid: s } if s == sid))
+}
+
+/// RS1: A SUPERVISED WORKER RESTORED COLD AFTER A REBOOT RELAUNCHES ITS AGENT ON ITS RECORDED
+/// ENVIRONMENT AND KEEPS ITS TASK. Its relaunch is the typed resume line, under the login its
+/// recorded launch environment names, and the restore never tells the window its agent is not
+/// coming back (which turns the tab's task from `working` to `exited why=exit`). NEGATIVE
+/// CONTROL, the path the reboot of 2026-11-05 took: the same worker handed to the native cold
+/// constructor waits on `native-crash-observation` every try, launches nothing, and is over
+/// without its agent.
+#[test]
+fn a_worker_restored_cold_relaunches_on_its_recorded_environment_and_keeps_its_task() {
+    let (c, world, host, handed) = restore_qualified(true);
+    until("the restored worker's relaunch", || {
+        !handed.lock().unwrap().is_empty()
+    });
+    host.shutdown_and_join();
+    let handed = handed.lock().unwrap();
+    assert_eq!(
+        handed[0],
+        (Some(c.original_dir.clone()), false),
+        "the typed line on the recorded login, no deferred intent"
+    );
+    assert_eq!(handed.len(), 1, "one relaunch: {handed:?}");
+    assert!(!restored_over_noted(&world, &c.original.tab));
+
+    let (c, world, host, handed) = restore_qualified(false);
+    until("the constructor path is over without its agent", || {
+        restored_over_noted(&world, &c.original.tab)
+    });
+    host.shutdown_and_join();
+    let handed = handed.lock().unwrap();
+    assert!(handed.len() > 1, "it retried: {handed:?}");
+    assert!(handed.iter().all(|(_, deferred)| *deferred));
 }

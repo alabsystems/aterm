@@ -1376,6 +1376,182 @@ fn the_taps_row_reads_idle_and_keeps_the_mode_row_for_every_reader() {
     }
 }
 
+/// One Claude Code 2.1.318 capture of the tap's row in its week form (a stand-in statusLine
+/// command printing the tap's new words, `docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §5.2).
+struct WeekRow {
+    /// The capture's file name, for messages.
+    name: &'static str,
+    /// The capture.
+    capture: &'static str,
+    /// What the row under the composer's bottom rule shows from column 2 on; `None` where the
+    /// command printed nothing.
+    words: Option<&'static str>,
+    /// Claude's right-aligned notice and its row, counted from the bottom rule.
+    notice: Option<(&'static str, usize)>,
+    /// Whether a turn is running.
+    busy: bool,
+}
+
+/// The 2.1.318 captures, at a turn end, at launch and mid-turn.
+fn week_rows() -> [WeekRow; 15] {
+    const WEEK: &str = "week 63% used \u{b7} resets Sat 10:00";
+    const CREDITS: &str = "Now using usage credits";
+    macro_rules! row {
+        ($name:literal, $words:expr, $notice:expr, $busy:expr) => {
+            WeekRow {
+                name: $name,
+                capture: include_str!(concat!("../../../aterm-phase/src/fixtures/", $name)),
+                words: $words,
+                notice: $notice,
+                busy: $busy,
+            }
+        };
+    }
+    [
+        row!("claude-2.1.318-tap-row-week.txt", Some(WEEK), None, false),
+        row!(
+            "claude-2.1.318-tap-row-week-100col.txt",
+            Some(WEEK),
+            None,
+            false
+        ),
+        row!(
+            "claude-2.1.318-tap-row-week-70col.txt",
+            Some(WEEK),
+            None,
+            false
+        ),
+        row!(
+            "claude-2.1.318-tap-row-week-30col.txt",
+            Some("week 63% used \u{b7} resets Sa\u{2026}"),
+            None,
+            false
+        ),
+        row!(
+            "claude-2.1.318-tap-row-week-launch.txt",
+            Some(WEEK),
+            Some(("\u{25d0} medium \u{b7} /effort", 1)),
+            false
+        ),
+        row!(
+            "claude-2.1.318-tap-row-week-mid-turn.txt",
+            Some(WEEK),
+            None,
+            true
+        ),
+        row!(
+            "claude-2.1.318-tap-row-week-mid-turn-100col.txt",
+            Some(WEEK),
+            None,
+            true
+        ),
+        row!(
+            "claude-2.1.318-tap-row-week-mid-turn-70col.txt",
+            Some(WEEK),
+            None,
+            true
+        ),
+        row!(
+            "claude-2.1.318-tap-row-week-mid-tool.txt",
+            Some(WEEK),
+            None,
+            true
+        ),
+        row!(
+            "claude-2.1.318-tap-row-no-figure.txt",
+            Some("week \u{b7} no figure yet"),
+            None,
+            false
+        ),
+        row!(
+            "claude-2.1.318-tap-row-silent-command.txt",
+            None,
+            None,
+            false
+        ),
+        row!(
+            "claude-2.1.318-tap-row-week-credits.txt",
+            Some(WEEK),
+            Some((CREDITS, 1)),
+            false
+        ),
+        row!(
+            "claude-2.1.318-tap-row-week-credits-70col.txt",
+            Some(WEEK),
+            Some((CREDITS, 1)),
+            false
+        ),
+        row!(
+            "claude-2.1.318-tap-row-week-credits-50col.txt",
+            Some(WEEK),
+            Some((CREDITS, 3)),
+            false
+        ),
+        row!(
+            "claude-2.1.318-tap-row-week-credits-manual-60col.txt",
+            Some(WEEK),
+            Some((CREDITS, 1)),
+            false
+        ),
+    ]
+}
+
+/// THE WEEK ROW IS CLAUDE CODE 2.1.318'S ROW UNDER THE BOTTOM RULE, FOR EVERY READER (the real
+/// Claude Code's screens at 170, 100, 70 and 30 columns, at launch, at a turn end, while a reply
+/// streams and while a tool runs, beside its credits and effort notices): the row directly under
+/// the composer's bottom rule holds the tap's words from column 2, the mode row is the next row
+/// (the one under the rule where the command printed nothing), the phase reads idle or busy as the
+/// turn stands and never a wall, Claude's notice sits on the row's right two cells short of the
+/// edge (on a row of its own under the mode row when both do not fit), nothing of Claude's reaches
+/// the last two columns, and the words hold no guarded string of the vendor's.
+#[test]
+fn claude_2_1_318_keeps_the_week_row_under_the_bottom_rule_for_every_reader() {
+    use super::super::footer;
+    for case in week_rows() {
+        let name = case.name;
+        let rows = aterm_phase::prompt::fixtures::screen(case.capture);
+        let bottom = aterm_phase::phase::composer_bottom(&rows).expect("the composer");
+        let cols = rows[bottom].chars().count();
+        let mode = bottom + 1 + usize::from(case.words.is_some());
+        assert_eq!(footer::mode_row(&rows), Some(mode), "{name}");
+        assert_eq!(footer::live_repl_row(&rows), Some(mode), "{name}");
+        let read = aterm_phase::read(Some("claude"), &rows, None);
+        let phase = if case.busy {
+            aterm_phase::Phase::Busy
+        } else {
+            aterm_phase::Phase::Idle
+        };
+        assert_eq!(read.phase, phase, "{name}");
+        assert!(read.wall.is_none(), "{name}: {read:?}");
+        for row in &rows[bottom + 1..] {
+            assert!(row.chars().count() <= cols - 2, "{name}: {row:?}");
+        }
+        if let Some(words) = case.words {
+            let row = &rows[bottom + 1];
+            assert_eq!(
+                row.strip_prefix("  ").map(|r| r.starts_with(words)),
+                Some(true),
+                "{name}: {row:?}"
+            );
+            for anchor in aterm_phase::ANCHORS {
+                assert!(
+                    !words.contains(anchor.text),
+                    "{name}: {words} holds {}",
+                    anchor.id
+                );
+            }
+            if case.notice.is_none_or(|(_, at)| at != 1) {
+                assert_eq!(row.trim_end(), format!("  {words}"), "{name}");
+            }
+        }
+        if let Some((notice, at)) = case.notice {
+            let row = &rows[bottom + at];
+            assert!(row.ends_with(notice), "{name}: {row:?}");
+            assert_eq!(row.chars().count(), cols - 2, "{name}: {row:?}");
+        }
+    }
+}
+
 /// THE ONE BLOCK THAT ARMS THE TAP ([`Armed::arm`]), for the window's background lane and
 /// `aterm harness upgrade` alike: on when the switch is and there is an aterm to name, with
 /// the lone login the store binds to a one-row roster, else every login a roster of several

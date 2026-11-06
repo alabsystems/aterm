@@ -11,7 +11,7 @@ use aterm_agent::harness::acts::Act;
 use super::Chip;
 use super::gesture_tests::{
     BYPASS, Hosted, WHOLE_FACTS, app, cell_at, draw_claude, footer_fp, footer_row, frame, hit,
-    host, painted, publish_facts, publish_facts_at, row_text,
+    host, letter_ink, painted, publish_facts, publish_facts_at, row_text,
 };
 use crate::{App, WindowId};
 
@@ -99,8 +99,8 @@ fn an_acts_label_lights_beside_the_whole_facts_for_its_dwell_then_goes() {
     assert_eq!(check.ch, '\u{2713}');
     assert_eq!(
         check.fg,
-        crate::chrome_band::band_colors(app.theme).accent,
-        "Cruise's ink"
+        letter_ink(&app, wid, session, (row, col + 3)),
+        "Cruise's letter at its column"
     );
     assert_eq!(
         (

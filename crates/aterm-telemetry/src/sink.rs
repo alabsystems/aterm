@@ -89,39 +89,36 @@ impl Sink {
 fn run(log: &Log, rx: &Receiver<Msg>, counts: &Counts) {
     let mut told = 0u64;
     let mut flushes = Vec::new();
-    let mut batch = Vec::with_capacity(BATCH);
     let mut lines = Vec::with_capacity(BATCH + 1);
     while let Ok(first) = rx.recv() {
-        batch.clear();
         lines.clear();
-        let mut take = |msg: Msg, batch: &mut Vec<Row>| match msg {
-            Msg::Row(row) => batch.push(*row),
-            Msg::Flush(done) => flushes.push(done),
-        };
-        take(first, &mut batch);
-        while batch.len() < BATCH {
-            match rx.recv_timeout(Duration::ZERO) {
-                Ok(msg) => take(msg, &mut batch),
-                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
-            }
-        }
+        let mut rows = 0usize;
         let lost = counts.dropped.load(Ordering::Relaxed);
         if lost > told {
             lines.push(gap_line(crate::now_ms(), lost - told));
         }
-        lines.extend(batch.iter().map(Row::line));
+        let mut take = |msg: Msg, lines: &mut Vec<String>, rows: &mut usize| match msg {
+            Msg::Row(row) => {
+                lines.push(row.line());
+                *rows += 1;
+            }
+            Msg::Flush(done) => flushes.push(done),
+        };
+        take(first, &mut lines, &mut rows);
+        while rows < BATCH {
+            match rx.recv_timeout(Duration::ZERO) {
+                Ok(msg) => take(msg, &mut lines, &mut rows),
+                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
+            }
+        }
         if !lines.is_empty() {
             match log.append(&lines) {
                 Ok(_) => {
                     told = lost;
-                    counts
-                        .written
-                        .fetch_add(batch.len() as u64, Ordering::Relaxed);
+                    counts.written.fetch_add(rows as u64, Ordering::Relaxed);
                 }
                 Err(_) => {
-                    counts
-                        .dropped
-                        .fetch_add(batch.len() as u64, Ordering::Relaxed);
+                    counts.dropped.fetch_add(rows as u64, Ordering::Relaxed);
                 }
             }
         }

@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 #[cfg(any(test, debug_assertions))]
 use std::sync::{Mutex, PoisonError};
+use std::time::Duration;
 
 use aterm_sysprobe::volumes::{self, Table, Unread};
 
@@ -74,6 +75,10 @@ pub struct Reading {
     /// `aterm_sysprobe::memory_pressure`): at [`aterm_sysprobe::MemoryLevel::Critical`], about to
     /// end processes, no memory claim is admitted ([`crate::Short::Pressure`]). `None` off macOS.
     pub pressure: Option<aterm_sysprobe::MemoryLevel>,
+    /// How busy the GPU is, percent: the accelerator's own device utilization
+    /// (`aterm_sysprobe::gpu`), the work every process keeps on the GPU that timed work renders
+    /// on. `None` where it is unread.
+    pub gpu_busy: Option<u8>,
 }
 
 impl Reading {
@@ -103,7 +108,7 @@ impl Reading {
     }
 
     /// The reading in one line, as a log carries it: `load 3.2 on 14 cores, 30.1 GiB of 48 GiB
-    /// available, swap 0.3 GiB`; a figure this OS does not report is left out.
+    /// available, swap 0.3 GiB, GPU 4% busy`; a figure this OS does not report is left out.
     #[must_use]
     pub fn brief(&self) -> String {
         between(self, self)
@@ -111,8 +116,9 @@ impl Reading {
 }
 
 /// Two readings of one machine in one line, `from` then `to`, a figure shown once where it held:
-/// `load 3.2→5.1 on 14 cores, 30.1→29.8 GiB of 48 GiB available, swap 0.3 GiB`. What a run's
-/// log says the machine did while a step ran, so a step refused as starved explains itself.
+/// `load 3.2→5.1 on 14 cores, 30.1→29.8 GiB of 48 GiB available, swap 0.3 GiB, GPU 0→100%
+/// busy`. What a run's log says the machine did while a step ran, so a step refused as starved
+/// explains itself.
 #[must_use]
 pub fn between(from: &Reading, to: &Reading) -> String {
     use std::fmt::Write as _;
@@ -162,6 +168,21 @@ pub fn between(from: &Reading, to: &Reading) -> String {
             to.swap_used.map(tenths),
         );
         out.push_str(" GiB");
+    }
+    if from.gpu_busy.is_some() || to.gpu_busy.is_some() {
+        let pct = |out: &mut String, p: Option<u8>| match p {
+            Some(p) => {
+                let _ = write!(out, "{p}");
+            }
+            None => out.push('?'),
+        };
+        out.push_str(", GPU ");
+        pct(&mut out, from.gpu_busy);
+        if from.gpu_busy != to.gpu_busy {
+            out.push('→');
+            pct(&mut out, to.gpu_busy);
+        }
+        out.push_str("% busy");
     }
     out
 }
@@ -236,6 +257,7 @@ impl Reading {
             swap_total: Some(0),
             volume: None,
             pressure: None,
+            gpu_busy: None,
         }
     }
 
@@ -354,6 +376,9 @@ impl Procs {
     /// tree never holds another claimant's, so no process is credited to two claims.
     #[must_use]
     pub fn trees(&self, roots: &[u32]) -> HashMap<u32, TreeUse> {
+        if roots.is_empty() {
+            return HashMap::new();
+        }
         let mut parent: HashMap<u32, u32> = HashMap::with_capacity(self.procs.len());
         parent.extend(self.procs.iter().map(|p| (p.pid, p.ppid)));
         let mut out: HashMap<u32, TreeUse> = HashMap::with_capacity(roots.len());
@@ -407,6 +432,46 @@ pub trait Machine {
         let _ = pid;
         self.procs()
     }
+
+    /// How busy the GPU has been of late, percent: [`Reading::gpu_busy`] at its most over
+    /// [`GPU_WINDOW`], what a quiet claim's look holds to [`crate::QUIET_GPU_BUSY`]. One reading
+    /// can fall in a pause between another process's command buffers, which the window spans; the
+    /// read ends early at a reading above the bound, which decides it, at a GPU its first read
+    /// cannot read, or once `stopped` says so (an interrupt that ends the wait), with what it read
+    /// by then. By default one reading's.
+    fn gpu_busy(&self, stopped: &dyn Fn() -> bool) -> Option<u8> {
+        let _ = stopped;
+        self.read(None).gpu_busy
+    }
+}
+
+/// How long [`Live`]'s [`Machine::gpu_busy`] reads the GPU for: longer than the pause between
+/// the long command buffers of a load that starved paint takes at a fifth of the GPU's time
+/// (270 ms on, 1 s off; `docs/measured/quiet-burst-2026-10-29.md`), so the window holds one.
+pub const GPU_WINDOW: Duration = Duration::from_millis(1200);
+
+/// Between two of [`Live`]'s GPU reads across [`GPU_WINDOW`].
+const GPU_EVERY: Duration = Duration::from_millis(100);
+
+/// The busiest of `read`'s readings across [`GPU_WINDOW`], one every [`GPU_EVERY`] (`nap`
+/// between two): `None` where the first reads nothing, and a later one that reads nothing keeps
+/// what was read. It ends early at a reading above [`crate::QUIET_GPU_BUSY`], which decides it,
+/// or once `stopped` says so, with the most it read by then ([`Machine::gpu_busy`]).
+pub(crate) fn busiest(
+    read: &mut dyn FnMut() -> Option<u8>,
+    nap: &mut dyn FnMut(Duration),
+    stopped: &dyn Fn() -> bool,
+) -> Option<u8> {
+    let mut most = read()?;
+    let reads = GPU_WINDOW.as_millis() / GPU_EVERY.as_millis();
+    for _ in 0..reads {
+        if most > crate::QUIET_GPU_BUSY || stopped() {
+            break;
+        }
+        nap(GPU_EVERY);
+        most = read().map_or(most, |b| most.max(b));
+    }
+    Some(most)
 }
 
 /// The most parents [`Live`]'s lineage walks up: deeper than any shell, agent and build nest.
@@ -474,9 +539,14 @@ impl Machine for Live {
                     aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX));
                 let watch = crate::floor::Watch::kept();
                 let key = v.key.spelled();
+                let room = watch.room(&key, v.total, now_s);
                 Volume {
-                    floor: crate::floor::admission_floor(&watch.lines(&key, v.total, now_s)),
-                    room: watch.room(&key, v.total, now_s),
+                    floor: crate::floor::admission_floor(&crate::floor::lines(
+                        watch.knobs,
+                        Some(v.total),
+                        Some(room),
+                    )),
+                    room,
                     mount: v.mount,
                     total: v.total,
                     free: v.free,
@@ -493,7 +563,16 @@ impl Machine for Live {
             swap_total: detail.map(|d| d.swap_total),
             volume,
             pressure: detail.and_then(|d| d.pressure),
+            gpu_busy: aterm_sysprobe::gpu().and_then(|g| g.device_pct),
         }
+    }
+
+    fn gpu_busy(&self, stopped: &dyn Fn() -> bool) -> Option<u8> {
+        busiest(
+            &mut || aterm_sysprobe::gpu().and_then(|g| g.device_pct),
+            &mut std::thread::sleep,
+            stopped,
+        )
     }
 
     fn procs(&self) -> Option<Procs> {

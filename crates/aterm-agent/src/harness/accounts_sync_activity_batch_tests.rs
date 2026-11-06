@@ -164,6 +164,7 @@ fn duplicate_namespace_requests_are_one_observation_and_fixture_scopes_stay_exac
         next_at: None,
         diagnostic: None,
         identity: Some(LoginIdentity::of(&current)),
+        queued: None,
     };
     let fixture = LoginActivityBatch::for_test(
         [Some((&a, Vec::new())), Some((&b, vec![entry.clone()]))],

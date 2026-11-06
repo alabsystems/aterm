@@ -4,7 +4,7 @@
 //! FILES, WRITTEN THE CAREFUL WAY: the unix half of [`crate::atomic_file`], whose items it
 //! re-exports.
 
-use super::writer::write_landing;
+use super::writer::{best_effort, write_landing};
 #[cfg(test)]
 use super::writer::{
     create_temp_salted, sweep_temps_with, write_captured_landing, write_flushing_dir,
@@ -347,7 +347,7 @@ impl ConfigEdit<'_> {
             mode,
             || file.unchanged(),
             Some(aterm_durable::Flush::Durable),
-            flush_dir,
+            best_effort(flush_dir),
         )?
         .map_err(|flush| {
             io::Error::new(

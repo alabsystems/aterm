@@ -241,32 +241,38 @@ fn held_of_ops(operations: &[crate::documents::log::Operation]) -> Vec<Held> {
 
 /// For each writer, the last of its records this Mac holds.
 pub(crate) fn holdings(ops: &[Held]) -> BTreeMap<String, u64> {
-    let mut out: BTreeMap<String, u64> = BTreeMap::new();
+    let mut by_actor: BTreeMap<Actor, u64> = BTreeMap::new();
     for op in ops {
-        let last = out.entry(keys::actor_key(&op.actor)).or_default();
+        let last = by_actor.entry(op.actor).or_default();
         *last = (*last).max(op.sequence);
     }
-    out
+    by_actor
+        .into_iter()
+        .map(|(actor, last)| (keys::actor_key(&actor), last))
+        .collect()
 }
 
 /// For each writer, the last of its records a restatement of `ops` carries: the one before its
 /// first record this build cannot read, else its last. A writer's records here are a prefix of
 /// its chain, since each names its predecessor, so every record up to that one is carried.
 pub(crate) fn frontier(ops: &[Held]) -> BTreeMap<String, u64> {
-    let mut first_unread: BTreeMap<String, u64> = BTreeMap::new();
-    for op in ops.iter().filter(|op| op.unread) {
-        let first = first_unread
-            .entry(keys::actor_key(&op.actor))
-            .or_insert(u64::MAX);
-        *first = (*first).min(op.sequence);
+    let mut by_actor: BTreeMap<Actor, (u64, u64)> = BTreeMap::new();
+    for op in ops {
+        let (last, first_unread) = by_actor.entry(op.actor).or_insert((0, u64::MAX));
+        *last = (*last).max(op.sequence);
+        if op.unread {
+            *first_unread = (*first_unread).min(op.sequence);
+        }
     }
-    holdings(ops)
+    by_actor
         .into_iter()
-        .map(|(actor, last)| {
-            let covered = first_unread
-                .get(&actor)
-                .map_or(last, |first| last.min(first.saturating_sub(1)));
-            (actor, covered)
+        .map(|(actor, (last, first_unread))| {
+            let covered = if first_unread == u64::MAX {
+                last
+            } else {
+                last.min(first_unread.saturating_sub(1))
+            };
+            (keys::actor_key(&actor), covered)
         })
         .collect()
 }
@@ -332,8 +338,11 @@ pub(crate) fn covers(
                 item.get("a").and_then(Value::as_str),
                 item.get("s").and_then(Value::as_u64),
             ) {
-                let last = out.entry(actor.to_owned()).or_default();
-                *last = (*last).max(sequence);
+                if let Some(last) = out.get_mut(actor) {
+                    *last = (*last).max(sequence);
+                } else {
+                    out.insert(actor.to_owned(), sequence);
+                }
             }
         }
     }
@@ -873,33 +882,38 @@ impl Registry {
         let mut records = pack(body)?;
         records.extend(pack(cover_rows)?);
         let mut log = Log::read_with(&session, &store, to_descriptor.scope, decode)?;
+        let mut appended = BTreeMap::new();
         for changes in records {
             let request = typed::request_id(APPLICATION, to.table.role, &changes)?;
             let command = Command::Write { request, changes };
-            if log.retry(session.actor(), &command)?.is_some() {
+            if att::retry_or_appended(&log, session.actor(), &command, &appended)?.is_some() {
                 continue;
             }
-            application::append(&session, &mut store, &command.encode()?)?;
+            let receipt = application::append(&session, &mut store, &command.encode()?)?;
+            appended.insert(request, (receipt.id, command));
             rolled.records += 1;
-            log = Log::read_with(&session, &store, to_descriptor.scope, decode)?;
         }
         if old_view.ops.iter().any(|op| {
             op.changes
                 .iter()
                 .any(|change| change.collection == typed::SCHEMA)
         }) {
+            if rolled.records > 0 {
+                log = Log::read_with(&session, &store, to_descriptor.scope, decode)?;
+                appended.clear();
+            }
             for changes in pack(att::schema_rows(
                 to.table,
                 &View::read(to.table, &session, &log),
             ))? {
                 let request = typed::request_id(APPLICATION, to.table.role, &changes)?;
                 let command = Command::Write { request, changes };
-                if log.retry(session.actor(), &command)?.is_some() {
+                if att::retry_or_appended(&log, session.actor(), &command, &appended)?.is_some() {
                     continue;
                 }
-                application::append(&session, &mut store, &command.encode()?)?;
+                let receipt = application::append(&session, &mut store, &command.encode()?)?;
+                appended.insert(request, (receipt.id, command));
                 rolled.records += 1;
-                log = Log::read_with(&session, &store, to_descriptor.scope, decode)?;
             }
         }
         drop(log);

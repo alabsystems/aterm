@@ -21,10 +21,13 @@ path = "src/main.rs"
 # Only aterm's own std-only crates, so the censuses still run offline and build
 # in seconds: the regex engine (no dependencies of its own), which runs the
 # export's grep -E rows over decoded test captures (capture-privacy) and the
-# exported text (export-content), and the DEFLATE (astream-wire's CRC-32 its one
+# exported text (the export scan), and the DEFLATE (astream-wire's CRC-32 its one
 # dependency) and Zstandard decoders, because the engine greps a gzip or zstd
-# file in the export by what it decodes to. aterm-hash (astream-wire's FNV-1a its one
-# dependency) gives the offset and prime the seals and the mirror's digests fold with.
+# file in the export by what it decodes to, and aterm-codec's base64, because
+# the engine clears a hit in a base64 copy of an exported binary. aterm-hash
+# (astream-wire's FNV-1a its one dependency) gives the offset and prime the seals
+# and the mirror's digests fold with, and the FNV-1a the export scan keys the
+# export's binaries by.
 aterm-regex = { workspace = true }
 aterm-codec = { workspace = true }
 aterm-zstd = { workspace = true }

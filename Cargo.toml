@@ -24,8 +24,8 @@ default-members = [
     "crates/aterm-gpu-web", "crates/aterm-grapheme", "crates/aterm-grid",
     "crates/aterm-gui", "crates/aterm-gui-consent", "crates/aterm-gui-documents",
     "crates/aterm-gui-fabric", "crates/aterm-gui-tabs", "crates/aterm-gui-timing",
-    "crates/aterm-hash", "crates/aterm-http", "crates/aterm-journal", "crates/aterm-jpeg", "crates/aterm-json",
-    "crates/aterm-keeper", "crates/aterm-lexicon", "crates/aterm-libc",
+    "crates/aterm-hash", "crates/aterm-heap-count", "crates/aterm-http", "crates/aterm-journal", "crates/aterm-jpeg", "crates/aterm-json",
+    "crates/aterm-keeper", "crates/aterm-lan", "crates/aterm-lexicon", "crates/aterm-libc",
     "crates/aterm-link", "crates/aterm-log", "crates/aterm-machines", "crates/aterm-lz4",
     "crates/aterm-macro-support", "crates/aterm-mail", "crates/aterm-mail-bigint", "crates/aterm-mesh", "crates/aterm-mesh-core", "crates/aterm-messages", "crates/aterm-metrics", "crates/aterm-net", "crates/aterm-netplace", "crates/aterm-objc",
     "crates/aterm-models-agh", "crates/aterm-models-aos", "crates/aterm-models-atpkg", "crates/aterm-models-capacity", "crates/aterm-models-core", "crates/aterm-models-effects",
@@ -83,7 +83,7 @@ update_channel = "alabsystems/aterm"
 # record (crates/aterm-stamp); nothing depends on that package. Every library's own version is a
 # constant `0.0.0`, so a bump is an input of no library unit (census `identity-read`).
 [workspace.package]
-version = "0.158.0"
+version = "0.159.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -188,6 +188,7 @@ aterm-jpeg = { path = "crates/aterm-jpeg" }
 # First-party JSON serde Deserializer/Serializer, `Value`, and `json!`.
 aterm-json = { path = "crates/aterm-json" }
 aterm-keeper = { path = "crates/aterm-keeper" }
+aterm-lan = { path = "crates/aterm-lan" }
 # `aterm acaffeine` menu-bar keep-awake mug (macOS at run time).
 aterm-acaffeine = { path = "crates/aterm-acaffeine" }
 aterm-lexicon = { path = "crates/aterm-lexicon" }
@@ -469,6 +470,14 @@ opt-level = 2
 # Startup executable hashing (`aterm_hash::fx_hash_bytes` over ~245 MB debug
 # `aterm` binary: 0.69-0.73 s at opt-level 0 -> 12-15 ms at 2).
 [profile.dev.package.aterm-hash]
+opt-level = 2
+
+# The counting global allocator of `aterm-gui`'s lib tests stands on every allocation of the largest
+# test binary, and std's `System`, `Layout` and atomics are `#[inline]`, so all of it compiles at the
+# level of the crate that declares it. That whole binary alone, at a load of 60-80: this crate at
+# opt-level 0, 9.30T instructions; at 2, 8.71T. Only opt-level moves; debug assertions and overflow
+# checks stay on.
+[profile.dev.package.aterm-heap-count]
 opt-level = 2
 
 # SHA-256 (`astream-digest`) in dev for `aterm-gui` `seamless` screen and wire

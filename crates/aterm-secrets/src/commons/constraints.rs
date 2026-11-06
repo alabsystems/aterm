@@ -803,6 +803,19 @@ impl Constraints {
         )
     )]
     pub fn catalog(&self, table: Digest, index: &Index) -> Catalog {
+        self.catalog_with(table, index, &BTreeMap::new())
+    }
+
+    /// [`Self::catalog`], with `removals` as further cutoffs of `table`: the member-signed ones
+    /// of removed writers (docs/DESIGN-alab-one-mesh-2026-11-05.md §4.10), which the caller
+    /// passes only once its log shows each writer removed. They intersect with this history's
+    /// own `Fact::Cutoff`s and with each other exactly as those do.
+    pub fn catalog_with(
+        &self,
+        table: Digest,
+        index: &Index,
+        removals: &BTreeMap<Actor, Vec<Option<Frontier>>>,
+    ) -> Catalog {
         if self.legacy || table == [0; 32] {
             return Catalog {
                 visible: BTreeSet::new(),
@@ -825,6 +838,9 @@ impl Constraints {
                 }
                 _ => {}
             }
+        }
+        for (actor, frontiers) in removals {
+            cutoffs.entry(*actor).or_default().extend(frontiers);
         }
         retired.extend(self.bindings.iter().filter_map(|(actor, binding)| {
             self.retired_recipients

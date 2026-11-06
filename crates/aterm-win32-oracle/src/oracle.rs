@@ -46,13 +46,8 @@ pub fn words(args: &[&str]) -> Vec<String> {
 }
 pub fn tail(bytes: &[u8]) -> String {
     let s = String::from_utf8_lossy(bytes);
-    s.chars()
-        .rev()
-        .take(1800)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect()
+    let start = s.char_indices().rev().nth(1799).map_or(0, |(idx, _)| idx);
+    s[start..].to_string()
 }
 pub fn required(out: Output, label: &str) -> Result<Output> {
     if !out.status.success() {
@@ -140,8 +135,11 @@ pub fn nm(runner: &mut impl Runner, tools: &Tools, args: &[String], cwd: &Path) 
 pub fn referenced(text: &str) -> BTreeSet<String> {
     text.lines()
         .filter_map(|l| {
-            let p: Vec<_> = l.split_whitespace().collect();
-            (p.len() == 2 && p[0] == "U" && p[1].starts_with("__imp_")).then(|| p[1].to_string())
+            let mut p = l.split_whitespace();
+            let (Some("U"), Some(sym), None) = (p.next(), p.next(), p.next()) else {
+                return None;
+            };
+            sym.starts_with("__imp_").then(|| sym.to_string())
         })
         .collect()
 }
@@ -149,17 +147,16 @@ pub fn defined(text: &str) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     let mut member = None;
     for l in text.lines() {
-        if l.ends_with(':') && !l.starts_with(' ') {
-            member = Some(l.trim_end_matches(':').to_string());
+        if let Some(m) = l.strip_suffix(':').filter(|m| !m.starts_with(' ')) {
+            member = Some(m);
             continue;
         }
-        let p: Vec<_> = l.split_whitespace().collect();
-        if p.len() == 3
-            && p[1] == "T"
-            && p[2].starts_with("__imp_")
-            && let Some(m) = &member
+        let mut p = l.split_whitespace();
+        if let (Some(_), Some("T"), Some(sym), None) = (p.next(), p.next(), p.next(), p.next())
+            && sym.starts_with("__imp_")
+            && let Some(m) = member
         {
-            out.insert(p[2].to_string(), m.clone());
+            out.insert(sym.to_string(), m.to_string());
         }
     }
     out
@@ -337,19 +334,18 @@ pub fn copy_tree(from: &Path, to: &Path) -> Result<()> {
     std::fs::create_dir_all(to).map_err(|e| e.to_string())?;
     for e in std::fs::read_dir(from).map_err(|e| e.to_string())? {
         let e = e.map_err(|e| e.to_string())?;
-        if ["target", "__pycache__", ".git"]
-            .iter()
-            .any(|s| e.file_name() == *s)
-        {
+        let name = e.file_name();
+        if name == "target" || name == "__pycache__" || name == ".git" {
             continue;
         }
         let kind = e.file_type().map_err(|e| e.to_string())?;
+        let src = e.path();
         if kind.is_dir() {
-            copy_tree(&e.path(), &to.join(e.file_name()))?
+            copy_tree(&src, &to.join(&name))?
         } else if kind.is_file() {
             let (mut reader, meta) =
-                aterm_uds::regular_file::open(&e.path()).map_err(|e| e.to_string())?;
-            let dst = to.join(e.file_name());
+                aterm_uds::regular_file::open(&src).map_err(|e| e.to_string())?;
+            let dst = to.join(&name);
             let mut opts = std::fs::OpenOptions::new();
             opts.write(true).create_new(true);
             #[cfg(unix)]

@@ -35,6 +35,43 @@ impl TerminalHandler<'_> {
         self.transient.print_anchor = Some((cursor.row, col));
         self.transient.print_anchor_seq = self.transient.print_anchor_seq.wrapping_add(1);
     }
+
+    /// Print a run of printable ASCII outside VT52 addressing: `print_ascii_bulk`'s writer, which
+    /// the unicode run writer also calls for the ASCII the parser joins between the characters
+    /// of a run, wherever it does not write that ASCII itself.
+    #[allow(
+        clippy::inline_always,
+        reason = "measured: as a call (plain #[inline] kept it one) a line of ASCII cost 1.2% more \
+                  instructions than print_ascii_bulk's body inline"
+    )]
+    #[inline(always)]
+    pub(super) fn write_ascii_print(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+
+        if !self.charset.is_ascii_passthrough()
+            || self.modes.insert_mode
+            || !self.modes.auto_wrap
+            || self.grid.cursor_outside_margin_span()
+        {
+            for &byte in data {
+                self.write_char(byte as char);
+            }
+            self.stamp_print_anchor();
+            return;
+        }
+
+        let origin = self.grid.output_damage_origin();
+        if self.style.has_style_extras() || self.transient.has_transient_extras {
+            self.write_ascii_bulk_with_extras(data);
+        } else {
+            self.write_ascii_bulk_fast(data);
+        }
+        self.transient.last_combining_was_zwj = false;
+        self.grid.damage_selection_output(origin);
+        self.stamp_print_anchor();
+    }
 }
 
 impl ActionSink for TerminalHandler<'_> {
@@ -69,31 +106,7 @@ impl ActionSink for TerminalHandler<'_> {
             self.print(byte as char);
             data = rest;
         }
-        if data.is_empty() {
-            return;
-        }
-
-        if !self.charset.is_ascii_passthrough()
-            || self.modes.insert_mode
-            || !self.modes.auto_wrap
-            || self.grid.cursor_outside_margin_span()
-        {
-            for &byte in data {
-                self.write_char(byte as char);
-            }
-            self.stamp_print_anchor();
-            return;
-        }
-
-        let origin = self.grid.output_damage_origin();
-        if self.style.has_style_extras() || self.transient.has_transient_extras {
-            self.write_ascii_bulk_with_extras(data);
-        } else {
-            self.write_ascii_bulk_fast(data);
-        }
-        self.transient.last_combining_was_zwj = false;
-        self.grid.damage_selection_output(origin);
-        self.stamp_print_anchor();
+        self.write_ascii_print(data);
     }
 
     fn print_unicode_bulk(&mut self, chars: &Provenance<[char], Pty>) {
@@ -668,23 +681,9 @@ impl TerminalHandler<'_> {
     }
 
     /// Every image the Kitty store holds (images, frames, variants), by address.
+    #[inline]
     pub(in crate::terminal) fn kitty_store_images(&self) -> HashSet<*const ImageData> {
-        let t = &*self.transient;
-        t.kitty_images
-            .values()
-            .map(Arc::as_ptr)
-            .chain(
-                t.kitty_frames
-                    .values()
-                    .flat_map(|animation| animation.frames.iter().map(|f| Arc::as_ptr(&f.image))),
-            )
-            .chain(
-                t.kitty_variants
-                    .values()
-                    .flatten()
-                    .map(|v| Arc::as_ptr(&v.image)),
-            )
-            .collect()
+        self.transient.kitty_store_images()
     }
 
     fn kitty_placement_image(
@@ -2516,6 +2515,7 @@ fn charge_released_kitty(t: &mut TransientState, bytes: usize) {
     for charge in &mut t.live_image_charge {
         *charge = charge.saturating_add(bytes);
     }
+    t.history_image_room = t.history_image_room.saturating_sub(bytes);
 }
 
 #[inline]
@@ -2800,7 +2800,6 @@ impl TerminalHandler<'_> {
             self.transient.current_underline_color,
             extended_flags_bits,
             self.transient.current_hyperlink.as_ref(),
-            self.transient.current_hyperlink_id.as_ref(),
             &mut last_byte,
         );
 

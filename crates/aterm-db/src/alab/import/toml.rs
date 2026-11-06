@@ -515,8 +515,13 @@ impl Planner<'_> {
                 }
                 continue;
             };
-            let mb = self.mailbox(&login, kind, &login_at)?;
-            let login_pk = keys::address_pk(&login)?;
+            // The row the login names, and its mailbox: none where several rows say the login.
+            let (Some(mb), Some(login_pk)) = (
+                self.mailbox(&login, kind, &login_at)?,
+                self.address(&login, kind, &login_at),
+            ) else {
+                continue;
+            };
             for (header, at) in unknown {
                 self.toml_finding(Kind::Unmapped, MAILBOX.name, Some(&mb), &header, vec![at]);
             }

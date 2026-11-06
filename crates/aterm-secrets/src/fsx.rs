@@ -297,13 +297,26 @@ impl OwnedReader {
             .map_err(Unread::into_error)
     }
 
-    /// A changed descriptor is an interrupted observation, not a stable refusal.
+    /// A changed descriptor is an interrupted observation, not a stable refusal. A file that left
+    /// its path while it was read (its last link gone: a writer renamed a new file over it, as a
+    /// writer replacing the file whole does ([`write_atomic`]), or removed it) still holds the
+    /// bytes read, and that unlink is its one change: the system stamps the inode's change time
+    /// when its link count drops (measured on APFS, 2026-11-06: `mv` over a file held open moved
+    /// its `st_ctime` and left its inode, length and `st_mtime`), so it is taken when every other
+    /// field is unchanged. An append, a write in place and a file still linked whose change time
+    /// moved (renamed aside, say) are refused.
     pub(crate) fn check_unchanged_classified(&self) -> Result<(), Unread> {
         let metadata = self
             .file
             .metadata()
             .map_err(|e| Unread::Failed(Error::new(format!("{}: {e}", self.path.display()))))?;
-        if FileStamp::of(&metadata) != self.stamp {
+        let now = FileStamp::of(&metadata);
+        let unlinked = metadata.nlink() == 0
+            && FileStamp {
+                ctime_ns: self.stamp.ctime_ns,
+                ..now
+            } == self.stamp;
+        if now != self.stamp && !unlinked {
             return Err(Unread::Failed(Error::new(format!(
                 "{}: changed while reading membership records",
                 self.path.display()
@@ -528,8 +541,16 @@ pub fn stamp(path: &Path) -> Option<FileStamp> {
 /// # Errors
 /// The metadata read fails for any reason other than a missing path.
 pub(crate) fn stamp_if_present(path: &Path) -> crate::Result<Option<FileStamp>> {
+    Ok(kind_and_stamp_if_present(path)?.map(|(_, stamp)| stamp))
+}
+
+/// [`stamp_if_present`], with the [`Kind`] the same `lstat` found.
+///
+/// # Errors
+/// As [`stamp_if_present`].
+pub(crate) fn kind_and_stamp_if_present(path: &Path) -> crate::Result<Option<(Kind, FileStamp)>> {
     match std::fs::symlink_metadata(path) {
-        Ok(meta) => Ok(Some(FileStamp::of(&meta))),
+        Ok(meta) => Ok(Some((kind_of(&meta), FileStamp::of(&meta)))),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(Error::new(format!("{}: {error}", path.display()))),
     }
@@ -805,21 +826,22 @@ pub fn kind(path: &Path) -> crate::Result<Kind> {
 /// What is at `path` (`lstat`), together with its `(device, inode)` when present.
 pub fn kind_and_id(path: &Path) -> crate::Result<(Kind, Option<(u64, u64)>)> {
     match std::fs::symlink_metadata(path) {
-        Ok(meta) => {
-            let kind = meta.file_type();
-            let k = if kind.is_symlink() {
-                Kind::Symlink
-            } else if kind.is_dir() {
-                Kind::Dir
-            } else if kind.is_file() {
-                Kind::File
-            } else {
-                Kind::Other
-            };
-            Ok((k, Some((meta.dev(), meta.ino()))))
-        }
+        Ok(meta) => Ok((kind_of(&meta), Some((meta.dev(), meta.ino())))),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok((Kind::Missing, None)),
         Err(e) => Err(Error::new(format!("{}: {e}", path.display()))),
+    }
+}
+
+fn kind_of(meta: &std::fs::Metadata) -> Kind {
+    let kind = meta.file_type();
+    if kind.is_symlink() {
+        Kind::Symlink
+    } else if kind.is_dir() {
+        Kind::Dir
+    } else if kind.is_file() {
+        Kind::File
+    } else {
+        Kind::Other
     }
 }
 

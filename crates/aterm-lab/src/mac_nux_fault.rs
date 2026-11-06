@@ -541,7 +541,7 @@ fn dialogs_since(g: &Guest, since_ms: u64) -> Result<Value, Fail> {
     let census = read_census(&g.read(&format!("{GUEST_NUX}/census.txt"))?);
     Ok(match census.error {
         Some(why) => Value::Missing(format!("the census could not read the window list: {why}")),
-        None => Value::Text(super::dialog_text(&dialogs(&census, since_ms))),
+        None => Value::Text(super::dialog_text(&dialogs(&census, since_ms, &[]))),
     })
 }
 
@@ -869,7 +869,7 @@ fn dmg_open(g: &Guest, row: &mut Row, label: &str, volume: &str) -> Result<(), F
         },
     );
     let census = read_census(&g.read(&format!("{GUEST_NUX}/census.txt"))?);
-    let gatekeeper = dialogs(&census, at)
+    let gatekeeper = dialogs(&census, at, &[])
         .iter()
         .filter(|d| d.kind == "Gatekeeper")
         .map(|d| d.windows)

@@ -25,6 +25,10 @@ description = "aterm — the portable control-socket stream: pure type aliases t
 # `process::HeldNow::backed_up` reads. A pure model crate with no
 # dependencies of its own.
 aterm-vitals = { workspace = true }
+# aterm-stamp: the running binary's identity record, read at run time for the
+# build the LAN broker's hello names (`lan::hello_build`) where the front door set
+# none. No dependencies of its own, and a constant version.
+aterm-stamp = { workspace = true }
 
 [target.'cfg(any(unix, windows))'.dependencies]
 # aterm-sysprobe: `procargs`, the workspace's one `KERN_PROCARGS2` reader and

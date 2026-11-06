@@ -30,15 +30,8 @@
 //!   the member's words say (its shell expands `$NUX_PHRASE`, so the lane's command lines never
 //!   hold it; a join with no phrase has proved and asked by itself, never prompted, since
 //!   `f5eabf5697`), then its own subscriber (`aterm secrets watch`), as a joined Mac's agent runs
-//!   it. The ask is named no member (`--at`): each run finds the member as a
-//!   new Mac does, by `discover::browse_members` (`dns-sd -B`, `parse_browse_members_of`, `dns-sd
-//!   -L` of each instance, `parse_reached`), and asks it over the guest's network at the address
-//!   that resolve gives. The join with the phrase names the member at the address it listens at
-//!   (`--at <guest address>:<port>`, [`join_cmd`]): one that browsed again looked the member's
-//!   `.local` name up in aterm's own process, which macOS holds while its Local Network question
-//!   for aterm stands unanswered, and nobody at this console answers it (E3, 2026-11-05: the join
-//!   waited out its 5 s, `dscacheutil` resolving the same name at once). macOS does not hold
-//!   aterm's connect to the guest's own address.
+//!   it. Each joiner command discovers the member through the LAN broker on the run's lab
+//!   members service, never the live `_alab._tcp` service.
 //!
 //! Isolation, which is why the browse runs on a lab service. This Mac is a live ALab member, and
 //! mDNSResponder announces its own registrations (its members desk's `_alab._tcp`, its vault's
@@ -72,8 +65,11 @@
 //! found the member and nothing else ([`browse_verdict`]: the member asked over loopback, or the
 //! guest's browse heard no member or another one), or anything that reached beyond the guest
 //! ([`isolation_verdict`]: an ask from an address that is not the guest's, a listener beyond
-//! loopback but the member's, a registration but the member's lab one, a real-service advert
-//! that is not this Mac's own, or a browse whose transcript shows it never looked).
+//! loopback but the member's, a `dns-sd` registration but the member's lab one, a real-service
+//! advert that is not this Mac's own, or a browse whose transcript shows it never looked).
+//! aterm's own adverts are held by its LAN broker, so no `dns-sd` process shows them and the
+//! registration check reads only the lab's own `dns-sd` tools; an aterm advert of the live
+//! services is caught by the guest's browses of [`SERVICES`], whoever registered it.
 //!
 //! The lab's table ([`joiner_table`]): once the member is in, the seed founds the lab's
 //! membership log (Genesis v2, through the guest helper's `genesis`, as `lab mesh churn` founds
@@ -107,8 +103,8 @@ use aterm_secrets::discover::{LAB_MEMBER_SERVICE_ENV, MEMBER_SERVICE};
 use super::advert::{self, Split, Whose};
 use super::{
     ALAB_SERVICE, GUEST_HELPER, GUEST_NUX, Guest, LOCAL_VAULT, LOCAL_VAULT_PORT, Row, Value,
-    browse_adds, distinct_messages, drive_cells_within, guest_browse, guest_dns_sd, guest_heard,
-    host_guests, local_network_blocks, or_missing, secs_to_ms, squeeze,
+    browse_adds, drive_cells_within, guest_browse, guest_dns_sd, guest_heard, host_guests,
+    local_network_blocks, or_missing, secs_to_ms, squeeze,
 };
 use crate::mac::{POLL, STEP};
 use crate::{Fail, stop};
@@ -804,10 +800,10 @@ const LISTENERS: &str = "lsof -nP -a -iTCP -sTCP:LISTEN -c aterm 2>/dev/null || 
 const DNS_SD_PROCESSES: &str = "pgrep -lf dns-sd || true";
 
 /// The Bonjour registrations among [`DNS_SD_PROCESSES`]' lines: each `dns-sd` whose arguments
-/// hold `-R` or `-P` anywhere, as aterm registers (`aterm_secrets::server::registration_args`:
-/// `dns-sd -P …`, and `dns-sd -i en0 -P …` scoped to one interface on a Mac on several
-/// networks). One running is the guest advertising, whatever a browse hears. A browse
-/// (`dns-sd -B`), the `script` a browse runs under and the shell that ran `pgrep` are none.
+/// hold `-R` or `-P` anywhere (`dns-sd -i en0 -P …` included): the lab's own registrations, such
+/// as the guest helper's member advert. aterm registers through its LAN broker, so no `dns-sd`
+/// process shows its adverts. A browse (`dns-sd -B`), the `script` a browse runs under and the
+/// shell that ran `pgrep` are none.
 #[must_use]
 pub fn registrations(pgrep: &str) -> Vec<String> {
     pgrep
@@ -1357,9 +1353,10 @@ pub fn browse_verdict(saw: &Saw) -> Vec<String> {
 /// Why the run reached beyond its guest, each reason once: none when it did not. Every ask the
 /// member heard came from one of the guest's own addresses; both of the seed's ports were read
 /// listening and every aterm listener is on loopback but the member's, at the guest's own
-/// address; the guest's one registration is the member's of the run's lab service; the guest's
-/// browse of that service heard no advert that is not the guest's own; and every [`SERVICES`]
-/// browse ran and heard no advert but this Mac's own, in the guest (something in it or beyond it
+/// address; the guest's one `dns-sd` registration is the member's of the run's lab service
+/// (aterm's own, through its LAN broker, show in no `dns-sd` process); the guest's browse of
+/// that service heard no advert that is not the guest's own; and every [`SERVICES`] browse ran
+/// and heard no advert but this Mac's own, in the guest (something in it or beyond it
 /// advertising the live fleet's service) or from a guest on this Mac.
 #[must_use]
 pub fn isolation_verdict(saw: &Saw) -> Vec<String> {
@@ -1513,9 +1510,6 @@ fn await_phrase(g: &Guest, record: &str) -> Result<Result<Desk, String>, Fail> {
     }))
 }
 
-/// How many of mDNSResponder's messages of the ask's `dns-sd` a row names.
-const MDNS_SHOWN: usize = 8;
-
 /// Where the ask's pid is written ([`with_pid`]).
 const ASK_PID: &str = "phrase-ask.pid";
 
@@ -1601,25 +1595,6 @@ fn lan_cause_cells(
                 .join("; ")
         }),
     );
-    // What mDNSResponder said of the `dns-sd` the ask's browse ran: a client macOS keeps off the
-    // local network is refused there (PolicyDenied), whatever the ask printed.
-    let mdns = g.sh(
-        &format!(
-            "/usr/bin/log show --last {since_s}s --info --style ndjson --predicate \
-             'process == \"mDNSResponder\" AND eventMessage CONTAINS[c] \"dns-sd\"' \
-             2>/dev/null || true"
-        ),
-        STEP,
-    )?;
-    let said_of = distinct_messages(&mdns, MDNS_SHOWN);
-    row.cell(
-        "mDNSResponder of the ask's dns-sd",
-        Value::Text(if said_of.is_empty() {
-            "nothing".to_owned()
-        } else {
-            said_of.join(" | ")
-        }),
-    );
     row.cell(
         "why the member heard no ask",
         Value::Text(lan_cause(said, reached, pid, &blocks).to_owned()),
@@ -1644,9 +1619,9 @@ const NO_MEMBER_ANSWERS: &str = "no ALab member answers on this network";
 
 /// What a missing ask's readings say of its cause: what the ask `said`, `reached` (a plain
 /// connect got to the desk), the ask's `pid`, and macOS's Local Network holds. The ask's own
-/// words come first: a browse macOS refused names Local Network privacy
-/// ([`aterm_http::LOCAL_NETWORK_REFUSED`]), and one that heard nothing while the guest's own
-/// browse heard the member and a plain connect reached it puts the miss in the ask's browse. Pure.
+/// words come first: one that heard nothing while the guest's own browse heard the member and a
+/// plain connect reached it puts the miss in the ask's browse, which goes through the LAN broker
+/// (`docs/DESIGN-lan-broker-2026-11-05.md`). Pure.
 #[must_use]
 pub fn lan_cause(
     said: &str,
@@ -1655,14 +1630,10 @@ pub fn lan_cause(
     blocks: &[(Option<u64>, u32)],
 ) -> &'static str {
     let held = pid.is_some_and(|pid| blocks.iter().any(|(_, p)| *p == pid));
-    if said.contains(aterm_http::LOCAL_NETWORK_REFUSED) {
-        return "macOS's Local Network privacy: it refused the ask's browse while its question \
-                stood unanswered";
-    }
     if said.contains(NO_MEMBER_ANSWERS) && reached && !held {
         return "the ask's browse heard no member though the guest's own browse heard it and a \
-                plain connect reached it: macOS answered aterm's browse with nothing, and logged \
-                no refusal or hold";
+                plain connect reached it: the LAN broker's browse answered with nothing, and \
+                macOS logged no hold";
     }
     match (reached, held) {
         (true, true) => {
@@ -1684,13 +1655,12 @@ fn ask_cmd(me: &str) -> String {
     format!("{me} members join --no-wait")
 }
 
-/// The joiner's join with the phrase, `me` its command line ([`as_joiner`]), named the member at
-/// `at`, the guest address it listens at (the module doc says why the join does not browse
-/// again). A shell expands the phrase from `$NUX_PHRASE`, so this command line never holds it.
-fn join_cmd(me: &str, at: &str) -> String {
+/// The joiner's join with the phrase, `me` its command line ([`as_joiner`]). Its own lab
+/// service discovers the member. A shell expands `$NUX_PHRASE`, so this command never holds it.
+fn join_cmd(me: &str) -> String {
     format!(
         "/bin/sh -c {}",
-        crate::util::shell_quote(&format!("{me} members join --at {at} \"$NUX_PHRASE\""))
+        crate::util::shell_quote(&format!("{me} members join \"$NUX_PHRASE\""))
     )
 }
 
@@ -1980,7 +1950,7 @@ pub(super) fn vault_phrase(g: &Guest, run: &Path, row: &mut Row) -> Result<(), F
     let (join, join_out) = g.drive_within(
         "phrase-join",
         &format!("NUX_PHRASE={}", crate::util::shell_quote(&shown.words)),
-        &join_cmd(&me, &lab.listen),
+        &join_cmd(&me),
         HANG,
     )?;
     drive_cells_within(row, "join: ", &join, HANG);
@@ -2265,13 +2235,8 @@ mod tests {
         assert!(lan_cause(sent, true, Some(900), &held).starts_with("not the Local Network"));
         assert!(lan_cause(sent, false, Some(812), &held).starts_with("not established: the desk"));
         assert!(lan_cause(sent, true, None, &held).starts_with("not established: the ask's pid"));
-        // The ask's own words: a refused browse is Local Network privacy whatever else read; a
-        // browse that heard no member is named as such only where the desk was reachable.
-        let refused = format!(
-            "browsing _x._tcp: {}; this Mac's request waits",
-            aterm_http::LOCAL_NETWORK_REFUSED
-        );
-        assert!(lan_cause(&refused, false, None, &[]).starts_with("macOS's Local Network privacy"));
+        // The ask's own words: a browse that heard no member is named as such only where the
+        // desk was reachable.
         let none = "no ALab member answers on this network yet: x | this Mac's vault subscriber does not run";
         assert!(
             lan_cause(none, true, Some(900), &held).starts_with("the ask's browse heard no member")
@@ -3061,8 +3026,7 @@ mod tests {
     /// Every command of the joiner's (its ask, its join, its subscriber, its status) runs with
     /// `ATERM_LAB_MEMBER_SERVICE` naming the run's lab service, so each that browses finds the
     /// member by its own browse of that service, never of `_alab._tcp`; the seed's commands
-    /// carry neither. Only the join names the member (`--at`, the address it listens at), since
-    /// the ask's browse already found it (the module doc says why).
+    /// carry neither. The join also discovers the member through the broker.
     ///
     /// NEGATIVE CONTROL (2026-10-29): `as_joiner` without its `ATERM_LAB_MEMBER_SERVICE=` word
     /// (the joiner then browses the live fleet's `_alab._tcp`) fails here at the ask.
@@ -3070,7 +3034,7 @@ mod tests {
     fn every_command_of_the_joiners_browses_the_runs_lab_service_alone() {
         let me = as_joiner("/A/aterm", "/n/joiner", LAB);
         let ask = ask_cmd(&me);
-        let join = join_cmd(&me, "192.168.64.17:7486");
+        let join = join_cmd(&me);
         let watching = watch(&me, "/n/joiner");
         let status = status_now(&me);
         for cmd in [&ask, &join, &watching, &status] {
@@ -3080,17 +3044,13 @@ mod tests {
                     && words.contains(&"HOME=/n/joiner"),
                 "{cmd}"
             );
-            // The ask browses; only the join names the member, at the address it listens at.
-            assert_eq!(words.contains(&"--at"), cmd == &join, "{cmd}");
+            assert!(!words.contains(&"--at"), "{cmd}");
         }
         assert!(ask.ends_with(" members join --no-wait"), "{ask}");
         // The phrase reaches the join as its argument from the joiner's own shell, so the lane's
         // command line names the variable, never a phrase.
         assert!(join.starts_with("/bin/sh -c '"), "{join}");
-        assert!(
-            join.ends_with(" members join --at 192.168.64.17:7486 \"$NUX_PHRASE\"'"),
-            "{join}"
-        );
+        assert!(join.ends_with(" members join \"$NUX_PHRASE\"'"), "{join}");
         assert_eq!(
             watching,
             "(/usr/bin/env HOME=/n/joiner ATERM_LAB_MEMBER_SERVICE=_alab-lab-k3x9q2._tcp \

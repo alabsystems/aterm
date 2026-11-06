@@ -16,8 +16,6 @@ use super::*;
 
 /// The session the window's lights hold.
 const S: u64 = 7;
-/// The footer's mark accent, as a theme gives it.
-const ACCENT: [u8; 3] = [0, 128, 255];
 
 fn blank() -> RenderCell {
     RenderCell {
@@ -79,7 +77,8 @@ struct Framed {
 struct World {
     w: WindowLights,
     blank: RenderCell,
-    accent: [u8; 3],
+    /// Where the block stands and the glass it wears there.
+    chips: ChipAt,
     /// The keyboard's and the pointer's chips.
     focus: (Option<Chip>, Option<Chip>),
     room: usize,
@@ -107,7 +106,7 @@ impl World {
         Self {
             w,
             blank: blank(),
-            accent: ACCENT,
+            chips: ChipAt::cruise(blank()),
             focus: (None, None),
             room: 80,
             titled: false,
@@ -169,7 +168,7 @@ impl World {
                 S,
                 self.blank,
                 self.now,
-                self.accent,
+                self.chips,
                 self.focus.0,
                 self.focus.1,
                 (self.room, true),
@@ -194,15 +193,15 @@ impl World {
             .map(|&pane| {
                 let anew = self.anew();
                 let _ = crate::work_counts::take_footer_block_fits();
-                let (targets, blank, accent, room) =
-                    (self.targets(), self.blank, self.accent, self.room);
+                let (targets, blank, chips, room) =
+                    (self.targets(), self.blank, self.chips, self.room);
                 let w = &mut self.w;
                 let block = super::at_clock(self.now, || {
                     w.lend_block(
                         S,
                         pane,
                         blank,
-                        accent,
+                        chips,
                         targets,
                         (room, true),
                         at.map(TitleAt::Autopilot),
@@ -297,7 +296,8 @@ type Case = (&'static str, fn(&mut World), fn(&mut World));
 fn cases() -> Vec<Case> {
     vec![
         ("the pane's ground", nothing, |w| w.blank.bg = [10, 10, 40]),
-        ("the theme's accent", nothing, |w| w.accent = [255, 0, 128]),
+        ("the palette", nothing, |w| w.chips = ChipAt::land(w.blank)),
+        ("the chips' column", nothing, |w| w.chips.col += 20),
         ("the keyboard's chip", nothing, |w| {
             w.focus.0 = Some(Chip::Autopilot);
         }),
@@ -424,7 +424,7 @@ fn a_kept_block_costs_a_frame_nothing_and_each_pane_keeps_its_own() {
                     S,
                     pane,
                     world.blank,
-                    world.accent,
+                    world.chips,
                     world.targets(),
                     (world.room, true),
                     None,
@@ -457,7 +457,7 @@ fn a_kept_block_costs_a_frame_nothing_and_each_pane_keeps_its_own() {
             S,
             0,
             world.blank,
-            world.accent,
+            world.chips,
             world.targets(),
             (world.room, true),
             None,
@@ -469,7 +469,7 @@ fn a_kept_block_costs_a_frame_nothing_and_each_pane_keeps_its_own() {
             S,
             0,
             world.blank,
-            world.accent,
+            world.chips,
             world.targets(),
             (world.room, true),
             None,

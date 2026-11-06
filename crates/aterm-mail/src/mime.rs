@@ -21,11 +21,11 @@ pub fn parse(bytes: &[u8]) -> Result<Message, String> {
         subject,
         date,
         unread: false,
-        text: body_with_split(headers, content, 0)?,
+        text: body_with_split(&headers, content, 0)?,
     })
 }
 
-fn is_relevant_header(name: &str) -> bool {
+fn canonical_header(name: &str) -> Option<&'static str> {
     [
         "from",
         "to",
@@ -35,11 +35,11 @@ fn is_relevant_header(name: &str) -> bool {
         "content-disposition",
         "content-transfer-encoding",
     ]
-    .iter()
-    .any(|wanted| name.eq_ignore_ascii_case(wanted))
+    .into_iter()
+    .find(|wanted| name.eq_ignore_ascii_case(wanted))
 }
 
-fn split(bytes: &[u8]) -> (Vec<(String, String)>, &[u8]) {
+fn split(bytes: &[u8]) -> (Vec<(&'static str, String)>, &[u8]) {
     let (raw, body) = if let Some(body) = bytes.strip_prefix(b"\r\n") {
         (&[][..], body)
     } else if let Some(body) = bytes.strip_prefix(b"\n") {
@@ -51,7 +51,7 @@ fn split(bytes: &[u8]) -> (Vec<(String, String)>, &[u8]) {
     } else {
         (bytes, &[][..])
     };
-    let mut headers: Vec<(String, String)> = Vec::new();
+    let mut headers: Vec<(&'static str, String)> = Vec::new();
     let mut keep_last = false;
     for line in String::from_utf8_lossy(raw).lines() {
         if line.starts_with([' ', '\t']) {
@@ -60,23 +60,25 @@ fn split(bytes: &[u8]) -> (Vec<(String, String)>, &[u8]) {
                 value.push_str(line.trim());
             }
         } else if let Some((name, value)) = line.split_once(':') {
-            keep_last = is_relevant_header(name);
-            if keep_last {
-                headers.push((name.to_owned(), value.trim().to_owned()));
+            if let Some(canonical) = canonical_header(name) {
+                keep_last = true;
+                headers.push((canonical, value.trim().to_owned()));
+            } else {
+                keep_last = false;
             }
         }
     }
     (headers, body)
 }
 
-fn raw_header<'a>(headers: &'a [(String, String)], name: &str) -> &'a str {
+fn raw_header<'a>(headers: &'a [(&'static str, String)], name: &str) -> &'a str {
     headers
         .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .find(|(key, _)| *key == name || key.eq_ignore_ascii_case(name))
         .map_or("", |(_, value)| value)
 }
 
-fn header(headers: &[(String, String)], name: &str) -> String {
+fn header(headers: &[(&'static str, String)], name: &str) -> String {
     words(raw_header(headers, name))
 }
 
@@ -113,20 +115,20 @@ fn parameter<'a>(value: &'a str, key: &str) -> Option<&'a str> {
 
 fn body(bytes: &[u8], depth: usize) -> Result<String, String> {
     let (headers, content) = split(bytes);
-    body_with_split(headers, content, depth)
+    body_with_split(&headers, content, depth)
 }
 
 fn body_with_split(
-    headers: Vec<(String, String)>,
+    headers: &[(&'static str, String)],
     content: &[u8],
     depth: usize,
 ) -> Result<String, String> {
     if depth >= 16 {
         return Err("MIME nesting exceeds limit".into());
     }
-    let kind = raw_header(&headers, "content-type");
+    let kind = raw_header(headers, "content-type");
     let media = media_type(kind);
-    if media_type(raw_header(&headers, "content-disposition")).eq_ignore_ascii_case("attachment") {
+    if media_type(raw_header(headers, "content-disposition")).eq_ignore_ascii_case("attachment") {
         return Ok(String::new());
     }
     if media
@@ -139,9 +141,13 @@ fn body_with_split(
         if boundary.is_empty() || boundary.len() > 200 || boundary.chars().any(char::is_control) {
             return Err("Invalid MIME boundary".into());
         }
-        let close_delimiter = format!("--{boundary}--");
-        let close_bytes = close_delimiter.as_bytes();
-        let delimiter_bytes = &close_bytes[..close_bytes.len() - 2];
+        let mut close_buf = [0u8; 204];
+        let close_len = boundary.len() + 4;
+        close_buf[..2].copy_from_slice(b"--");
+        close_buf[2..2 + boundary.len()].copy_from_slice(boundary.as_bytes());
+        close_buf[2 + boundary.len()..close_len].copy_from_slice(b"--");
+        let close_bytes = &close_buf[..close_len];
+        let delimiter_bytes = &close_bytes[..close_len - 2];
         let mut parts = Vec::new();
         let mut start = None;
         let mut offset = 0usize;
@@ -184,7 +190,7 @@ fn body_with_split(
                 // whose inner payload is another MIME message after the part's own headers.
                 body(part_content, depth + 1)?
             } else {
-                body_with_split(part_headers, part_content, depth + 1)?
+                body_with_split(&part_headers, part_content, depth + 1)?
             };
             if is_alternative && is_plain_or_untyped && !text.is_empty() {
                 return Ok(text);
@@ -205,23 +211,27 @@ fn body_with_split(
     {
         return Ok(String::new());
     }
-    let transfer = media_type(raw_header(&headers, "content-transfer-encoding")).trim_matches('"');
+    let transfer = media_type(raw_header(headers, "content-transfer-encoding")).trim_matches('"');
     let decoded = if transfer.eq_ignore_ascii_case("base64") {
-        let compact: Vec<u8> = content
-            .iter()
-            .copied()
-            .filter(|b| !b.is_ascii_whitespace())
-            .collect();
-        aterm_codec::base64::decode(
-            std::str::from_utf8(&compact).map_err(|_| "Invalid MIME base64")?,
+        let compact: std::borrow::Cow<'_, [u8]> = if content.iter().any(u8::is_ascii_whitespace) {
+            let mut buf = Vec::with_capacity(content.len());
+            buf.extend(content.iter().copied().filter(|b| !b.is_ascii_whitespace()));
+            std::borrow::Cow::Owned(buf)
+        } else {
+            std::borrow::Cow::Borrowed(content)
+        };
+        std::borrow::Cow::Owned(
+            aterm_codec::base64::decode(
+                std::str::from_utf8(&compact).map_err(|_| "Invalid MIME base64")?,
+            )
+            .map_err(|_| "Invalid MIME base64")?,
         )
-        .map_err(|_| "Invalid MIME base64")?
     } else if transfer.eq_ignore_ascii_case("quoted-printable") {
-        quoted_printable(content, false)
+        std::borrow::Cow::Owned(quoted_printable(content, false))
     } else {
-        content.to_vec()
+        std::borrow::Cow::Borrowed(content)
     };
-    let text = charset(&decoded, parameter(kind, "charset").unwrap_or("utf-8"));
+    let text = charset(decoded, parameter(kind, "charset").unwrap_or("utf-8"));
     Ok(if media.eq_ignore_ascii_case("text/html") {
         html_text(&text)
     } else {
@@ -229,12 +239,16 @@ fn body_with_split(
     })
 }
 
-fn charset(bytes: &[u8], name: &str) -> String {
+fn charset(bytes: std::borrow::Cow<'_, [u8]>, name: &str) -> String {
     let base = name.split('*').next().unwrap_or(name);
     if base.eq_ignore_ascii_case("iso-8859-1") || base.eq_ignore_ascii_case("latin1") {
         bytes.iter().map(|b| char::from(*b)).collect()
     } else {
-        String::from_utf8_lossy(bytes).into_owned()
+        match bytes {
+            std::borrow::Cow::Owned(vec) => String::from_utf8(vec)
+                .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()),
+            std::borrow::Cow::Borrowed(slice) => String::from_utf8_lossy(slice).into_owned(),
+        }
     }
 }
 
@@ -301,7 +315,7 @@ pub fn words(mut input: &str) -> String {
     let mut pending: Option<(&str, Vec<u8>)> = None;
     let flush = |output: &mut String, pending: &mut Option<(&str, Vec<u8>)>| {
         if let Some((enc, bytes)) = pending.take() {
-            output.push_str(&charset(&bytes, enc));
+            output.push_str(&charset(std::borrow::Cow::Owned(bytes), enc));
         }
     };
     let mut predecoded: Option<(&str, Vec<u8>, &str)> = None;
@@ -414,36 +428,43 @@ pub fn html_text(html: &str) -> String {
             }
             continue;
         }
-        let mut chars = cursor.chars();
-        if let Some(ch) = chars.next() {
-            if hidden.is_empty() {
-                output.push(ch);
-            }
-            cursor = chars.as_str();
-        }
-    }
-    let mut decoded = String::with_capacity(output.len());
-    let mut rest = output.as_str();
-    while let Some(start) = rest.find('&') {
-        decoded.push_str(&rest[..start]);
-        rest = &rest[start..];
-        let entity = rest.get(1..).and_then(|tail| {
-            tail.bytes()
-                .take(33)
-                .position(|byte| byte == b';')
-                .map(|end| &tail[..end])
-        });
-        if let Some((entity, ch)) =
-            entity.and_then(|entity| html_entity(entity).map(|ch| (entity, ch)))
-        {
-            decoded.push(ch);
-            rest = &rest[entity.len() + 2..];
+        let span = if cursor.starts_with('<') {
+            1
         } else {
-            decoded.push('&');
-            rest = &rest[1..];
+            cursor.find('<').unwrap_or(cursor.len())
+        };
+        if hidden.is_empty() {
+            output.push_str(&cursor[..span]);
         }
+        cursor = &cursor[span..];
     }
-    decoded.push_str(rest);
+    let decoded = if output.contains('&') {
+        let mut decoded = String::with_capacity(output.len());
+        let mut rest = output.as_str();
+        while let Some(start) = rest.find('&') {
+            decoded.push_str(&rest[..start]);
+            rest = &rest[start..];
+            let entity = rest.get(1..).and_then(|tail| {
+                tail.bytes()
+                    .take(33)
+                    .position(|byte| byte == b';')
+                    .map(|end| &tail[..end])
+            });
+            if let Some((entity, ch)) =
+                entity.and_then(|entity| html_entity(entity).map(|ch| (entity, ch)))
+            {
+                decoded.push(ch);
+                rest = &rest[entity.len() + 2..];
+            } else {
+                decoded.push('&');
+                rest = &rest[1..];
+            }
+        }
+        decoded.push_str(rest);
+        decoded
+    } else {
+        output
+    };
     let mut text = String::with_capacity(decoded.len());
     for line in decoded.lines() {
         let mut line_started = false;

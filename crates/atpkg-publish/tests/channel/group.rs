@@ -548,7 +548,7 @@ fn the_trust_repo_must_hold_the_seals_commit() {
 fn no_floor_is_refused_by_a_cut_and_not_by_a_dry_run() {
     let c = cut("group-nofloor", &[], &[]);
     ok(&c, &request(&c, Mode::DryRun));
-    for mode in [Mode::Stage, Mode::Upload] {
+    for mode in [Mode::Stage, Mode::StageUpload] {
         let e = refused(&c, &request(&c, mode));
         assert!(e.contains("no floor index"), "{mode:?}: {e}");
     }
@@ -698,23 +698,25 @@ fn the_seed_receipt_is_required_unless_the_switch_reads_dormant() {
 }
 
 #[test]
-fn upload_needs_the_key_and_the_channel_token_and_a_keyless_stage_signs_nothing() {
+fn staging_needs_its_writer_and_key_but_never_a_public_writer() {
     let c = cut("group-identity", &FLOOR, &[]);
-    let e = refused(&c, &request(&c, Mode::Upload));
+    let e = refused(&c, &request(&c, Mode::StageUpload));
     assert!(
-        e.contains("--upload needs the staging owner's token at ~/.secrets/gh_access_token"),
+        e.contains("--stage-upload needs the staging owner's token at ~/.secrets/gh_access_token"),
         "{e}"
     );
     let control = cut("group-identity-ok", &FLOOR, &[]);
     std::fs::write(&control.rig.ctx.tokens.staging, "staging-token\n").expect("token");
-    let (o, _) = ok(&control, &request(&control, Mode::Upload));
-    assert_eq!(o.index_build, Some(35));
-    assert!(control.packs.indexes.borrow()[0].upload);
+    let (o, _) = ok(&control, &request(&control, Mode::StageUpload));
+    assert_eq!(o.index_build, None);
+    assert!(control.packs.indexes.borrow().is_empty());
 
     std::fs::remove_file(&c.rig.ctx.tokens.channel).expect("rm token");
-    assert!(refused(&c, &request(&c, Mode::Upload)).contains("needs the public owner's token"));
+    std::fs::write(&c.rig.ctx.tokens.staging, "staging-token\n").expect("token");
+    ok(&c, &request(&c, Mode::StageUpload));
+    c.packs.packs.borrow_mut().clear();
     std::fs::remove_file(&c.rig.ctx.identity.key).expect("rm key");
-    assert!(refused(&c, &request(&c, Mode::Upload)).contains("needs a rostered machine key"));
+    assert!(refused(&c, &request(&c, Mode::StageUpload)).contains("needs a rostered machine key"));
 
     let (o, _) = ok(&c, &request(&c, Mode::Stage));
     assert!(o.index_build.is_none());
@@ -795,7 +797,7 @@ impl ReleaseHost for RefusesOne {
 }
 
 #[test]
-fn upload_asks_both_writers_under_agh() {
+fn staging_asks_only_its_writers_under_agh() {
     let mut c = cut("group-writers", &FLOOR, &[]);
     std::fs::remove_file(&c.rig.ctx.tokens.channel).expect("rm token");
     c.rig.ctx = c.rig.ctx.clone().with_host_choice(HostChoice::Agh);
@@ -814,18 +816,18 @@ fn upload_asks_both_writers_under_agh() {
     };
 
     c.rig.host.fail_next(FakeOp::Preflight, FakeFail::Refuse);
-    let (r, _) = run(&c, &request(&c, Mode::Upload));
-    let e = r.expect_err("no channel writer");
+    let (r, _) = run(&c, &request(&c, Mode::StageUpload));
+    let e = r.expect_err("no staging writer");
     assert!(matches!(e, Error::Refused(_)), "{e}");
     let why = e.to_string();
     assert!(
-        why.contains(&format!("public owner's writer on {channel}")),
+        why.contains(&format!("staging owner's writer on {staging}")),
         "{why}"
     );
     assert!(why.contains("refused by the test"), "{why}");
-    assert!(!why.contains("staging owner's writer"), "{why}");
+    assert!(!why.contains("public owner's writer"), "{why}");
     assert!(
-        c.rig.host.calls().contains(&format!("preflight {channel}")),
+        !c.rig.host.calls().contains(&format!("preflight {channel}")),
         "{:?}",
         c.rig.host.calls()
     );
@@ -841,7 +843,7 @@ fn upload_asks_both_writers_under_agh() {
         }),
         channel: c.rig.host.clone(),
     };
-    let (r, _) = run(&c, &request(&c, Mode::Upload));
+    let (r, _) = run(&c, &request(&c, Mode::StageUpload));
     let e = r.expect_err("no staging writer on a program repository");
     assert!(matches!(e, Error::Refused(_)), "{e}");
     let why = e.to_string();
@@ -855,7 +857,7 @@ fn upload_asks_both_writers_under_agh() {
     assert!(calls.contains(&format!("preflight {staging}")), "{calls:?}");
     let public_trust = c.rig.ctx.public_slug("trust");
     assert!(
-        calls.contains(&format!("preflight {public_trust}")),
+        !calls.contains(&format!("preflight {public_trust}")),
         "{calls:?}"
     );
     nothing_ran(&c);

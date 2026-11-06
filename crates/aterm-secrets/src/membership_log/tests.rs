@@ -265,6 +265,31 @@ fn records_of_another_network_or_out_of_order_are_refused() {
     assert!(one.insert(forged).is_err());
 }
 
+/// The permutations of `0..n`, every one once, by Heap's algorithm: the arrival orders of `n`
+/// records.
+pub(in crate::membership_log) fn permutations(n: usize) -> Vec<Vec<usize>> {
+    let mut order: Vec<usize> = (0..n).collect();
+    let mut all = vec![order.clone()];
+    let mut counters = vec![0; n];
+    let mut at = 0;
+    while at < n {
+        if counters[at] < at {
+            if at % 2 == 0 {
+                order.swap(0, at);
+            } else {
+                order.swap(counters[at], at);
+            }
+            all.push(order.clone());
+            counters[at] += 1;
+            at = 0;
+        } else {
+            counters[at] = 0;
+            at += 1;
+        }
+    }
+    all
+}
+
 #[test]
 fn every_insertion_order_gives_the_same_log_and_membership() {
     let lab = found(&[(A, "m1"), (B, "m2"), (C, "m3")]);
@@ -278,14 +303,11 @@ fn every_insertion_order_gives_the_same_log_and_membership() {
     let bound = two.keep(node(&two, Y, 1));
     let records = [ax, rc, by, cz, named, bound];
     let mut want: Option<(Membership, Vec<RecordId>)> = None;
-    let mut order: Vec<usize> = (0..records.len()).collect();
-    let mut seen = 0;
-    // Every permutation, by Heap's algorithm.
-    let mut counters = vec![0; order.len()];
-    let mut at = 0;
-    loop {
+    let orders = permutations(records.len());
+    assert_eq!(orders.len(), 720);
+    for order in &orders {
         let mut log = lab.clone();
-        for &i in &order {
+        for &i in order {
             log.insert(records[i].clone()).unwrap();
         }
         let got = (log.membership(), log.heads());
@@ -293,23 +315,7 @@ fn every_insertion_order_gives_the_same_log_and_membership() {
             None => want = Some(got),
             Some(want) => assert_eq!(&got, want, "order {order:?}"),
         }
-        seen += 1;
-        while at < order.len() && counters[at] >= at {
-            counters[at] = 0;
-            at += 1;
-        }
-        if at == order.len() {
-            break;
-        }
-        if at % 2 == 0 {
-            order.swap(0, at);
-        } else {
-            order.swap(counters[at], at);
-        }
-        counters[at] += 1;
-        at = 0;
     }
-    assert_eq!(seen, 720);
     let (membership, _) = want.unwrap();
     assert_eq!(
         membership

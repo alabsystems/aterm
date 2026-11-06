@@ -5,6 +5,118 @@
 use super::*;
 
 #[test]
+fn mutable_extra_entries_cannot_hide_images_from_the_collection_hint() {
+    let image = Arc::new(ImageData {
+        bytes: vec![7; 4],
+        format: ImageFormat::Png,
+        cols: 1,
+        rows: 1,
+        z_index: 0,
+        band_lift_px: 0,
+        cell_offset_px: (0, 0),
+        scaling: ImageScaling::Fit,
+        source_rect: None,
+    });
+    for fresh in [false, true] {
+        let mut extras = CellExtras::new();
+        extras
+            .get_or_create(CellCoord::new(0, 0))
+            .set_fg_rgb(Some([1, 2, 3]));
+        assert!(
+            !extras.any_image(),
+            "style-only access must not leave a false positive"
+        );
+        let mut entry = CellExtra::default();
+        entry.set_image(Some(ImageRef {
+            image: image.clone(),
+            cell_row: 0,
+            cell_col: 0,
+            kitty: None,
+        }));
+        if fresh {
+            *extras.fresh(CellCoord::new(0, 0)) = entry;
+        } else {
+            *extras.get_or_create(CellCoord::new(0, 0)) = entry;
+        }
+        assert!(
+            extras.any_image(),
+            "whole-entry replacement must arm the image hint"
+        );
+        let cloned = extras.clone();
+        assert!(cloned.any_image());
+        extras.clear();
+        assert!(!extras.any_image());
+    }
+}
+
+#[test]
+fn image_absence_work_is_bounded_when_mutations_and_queries_alternate() {
+    use crate::extra_collection::image_hint_meter;
+
+    let mut extras = CellExtras::new();
+    for col in 0..4096 {
+        extras
+            .get_or_create(CellCoord::new(0, col))
+            .add_combining('\u{0301}');
+    }
+    let _ = image_hint_meter::take();
+    for col in 0..64 {
+        extras
+            .get_or_create(CellCoord::new(0, col))
+            .set_bg_rgb(Some([3, 2, 1]));
+        assert!(!extras.any_image());
+    }
+    let visits = image_hint_meter::take();
+    assert!(
+        visits <= 128,
+        "64 interleaved writes/queries visited {visits} of 4096 entries"
+    );
+    let cloned = extras.clone();
+    assert!(!cloned.any_image());
+    assert!(image_hint_meter::take() <= 1);
+}
+
+#[test]
+fn scoped_image_mutation_keeps_the_hint_sound_after_success_or_panic() {
+    let image = Arc::new(ImageData {
+        bytes: vec![7; 4],
+        format: ImageFormat::Png,
+        cols: 1,
+        rows: 1,
+        z_index: 0,
+        band_lift_px: 0,
+        cell_offset_px: (0, 0),
+        scaling: ImageScaling::Fit,
+        source_rect: None,
+    });
+    for panic_after in [false, true] {
+        let mut extras = CellExtras::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            extras.modify(CellCoord::new(1, 2), |extra| {
+                extra.set_image(Some(ImageRef {
+                    image: image.clone(),
+                    cell_row: 0,
+                    cell_col: 0,
+                    kitty: None,
+                }));
+                assert!(!panic_after, "controlled panic after installing an image");
+            });
+        }));
+        assert_eq!(result.is_err(), panic_after);
+        assert!(extras.any_image());
+        assert!(Arc::ptr_eq(
+            &extras
+                .get(CellCoord::new(1, 2))
+                .unwrap()
+                .image()
+                .unwrap()
+                .image,
+            &image
+        ));
+    }
+}
+
+#[test]
 fn cell_extra_stacks_image_layers_in_draw_order() {
     use crate::KittyPlacementTag;
     use crate::extra::MAX_IMAGE_LAYERS;
@@ -508,8 +620,10 @@ fn hyperlink_upper_bound_never_under_counts() {
         bg_rgb: None,
         underline_color: None,
         extended_flags: 0,
-        hyperlink: Some(&url),
-        hyperlink_id: None,
+        hyperlink: Some(&Arc::new(HyperlinkData {
+            url: url.clone(),
+            id: None,
+        })),
     };
     extras.set_range_uniform(1, 0, 10, &vals, 24, 80);
     check(&extras, "batch run");

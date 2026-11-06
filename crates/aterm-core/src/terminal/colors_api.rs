@@ -10,8 +10,11 @@ impl Terminal {
     /// The OSC 8 hyperlink URL applied to newly printed characters.
     #[must_use]
     #[inline]
-    pub const fn current_hyperlink(&self) -> Option<&Arc<str>> {
-        self.transient.current_hyperlink.as_ref()
+    pub fn current_hyperlink(&self) -> Option<&Arc<str>> {
+        self.transient
+            .current_hyperlink
+            .as_ref()
+            .map(|link| &link.url)
     }
 
     /// Get the hyperlink URL attached to a rendered cell, if any.

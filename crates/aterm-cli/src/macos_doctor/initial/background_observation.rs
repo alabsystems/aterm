@@ -4,6 +4,7 @@
 //! Prompt-free CLI observation of the coordinator which already owns workstation setup.
 
 use aterm_machines::init::WorkstationObservation;
+use aterm_types::macos_setup::Selection;
 use std::time::Duration;
 
 /// Read the running coordinator's published state without starting setup, selecting its tab,
@@ -49,9 +50,21 @@ fn observation(reply: &str) -> WorkstationObservation {
         .iter()
         .filter_map(|word| word.strip_prefix("setup="))
         .collect();
-    if schema != ["1"] || setup.len() != 1 {
+    let verified: Vec<_> = fields
+        .iter()
+        .filter_map(|word| word.strip_prefix("verified="))
+        .collect();
+    if schema != ["2"] || setup.len() != 1 || verified.len() != 1 {
         return unavailable();
     }
+    let Some(verified) = verified[0]
+        .parse::<u16>()
+        .ok()
+        .and_then(Selection::from_bits)
+        .filter(|verified| *verified == verified.workstation())
+    else {
+        return unavailable();
+    };
     let mut parts = setup[0].split(';');
     let head = parts.next().unwrap_or_default();
     let (done, pending) = match head {
@@ -94,7 +107,7 @@ fn observation(reply: &str) -> WorkstationObservation {
     } else if let Some(asking) = asking {
         WorkstationObservation::Waiting(format!("background setup is continuing: {asking}"))
     } else if done {
-        WorkstationObservation::Complete
+        WorkstationObservation::Complete(verified)
     } else {
         WorkstationObservation::Waiting(pending.map_or_else(
             || "background setup is checking".into(),
@@ -110,17 +123,21 @@ mod tests {
     #[test]
     fn background_observation_keeps_completion_waits_and_permissions_distinct() {
         assert_eq!(
-            observation("OK schema=1 sid=0 setup=done"),
-            WorkstationObservation::Complete
+            observation("OK schema=2 sid=0 setup=done verified=0"),
+            WorkstationObservation::Complete(Selection::none())
         );
+        let verified = Selection::all().workstation();
         assert_eq!(
-            observation("OK schema=1 setup=done;offered:lan"),
-            WorkstationObservation::Complete
+            observation(&format!(
+                "OK schema=2 setup=done;offered:lan verified={}",
+                verified.bits()
+            )),
+            WorkstationObservation::Complete(verified)
         );
         for reply in [
-            "OK schema=1 setup=pending",
-            "OK schema=1 setup=pending:repos",
-            "OK schema=1 setup=done;asking:vault;offered:lan",
+            "OK schema=2 setup=pending verified=0",
+            "OK schema=2 setup=pending:repos verified=0",
+            "OK schema=2 setup=done;asking:vault;offered:lan verified=0",
         ] {
             assert!(matches!(
                 observation(reply),
@@ -128,7 +145,7 @@ mod tests {
             ));
         }
         assert!(matches!(
-            observation("OK schema=1 setup=pending:lan;needs:lan"),
+            observation("OK schema=2 setup=pending:lan;needs:lan verified=0"),
             WorkstationObservation::Permission(_)
         ));
     }
@@ -138,14 +155,22 @@ mod tests {
         for reply in [
             "ERR auth",
             "OK schema=1",
+            "OK schema=1 setup=done",
+            "OK schema=1 setup=done verified=255",
             "OK schema=2 setup=done",
-            "OK schema=1 setup=-",
-            "OK schema=1 setup=done setup=pending",
-            "OK schema=1 setup=done;needs:lan",
-            "OK schema=1 setup=pending:repos;needs:lan",
-            "OK schema=1 setup=done;asking:",
-            "OK schema=1 setup=pending:repos,,vault",
-            "OK schema=1 setup=done\nERR failed",
+            "OK schema=2 setup=done verified=0 verified=255",
+            "OK schema=2 setup=done verified=256",
+            "OK schema=2 setup=done verified=65535",
+            "OK schema=2 setup=done verified=65536",
+            "OK schema=2 setup=done verified=-1",
+            "OK schema=2 setup=done verified=unknown",
+            "OK schema=2 setup=- verified=0",
+            "OK schema=2 setup=done setup=pending verified=0",
+            "OK schema=2 setup=done;needs:lan verified=0",
+            "OK schema=2 setup=pending:repos;needs:lan verified=0",
+            "OK schema=2 setup=done;asking: verified=0",
+            "OK schema=2 setup=pending:repos,,vault verified=0",
+            "OK schema=2 setup=done verified=0\nERR failed",
         ] {
             assert!(
                 matches!(observation(reply), WorkstationObservation::Unavailable(_)),

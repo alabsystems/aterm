@@ -1078,6 +1078,24 @@ mod tests {
         }
     }
 
+    /// Wait, without stepping, until no index probe is in flight unfinished.
+    /// A fake park charges a whole slice and does not wait for the probe's
+    /// worker, which runs on real time, so each step taken while it runs moves
+    /// the fake clock by time production would not spend: its park wakes on
+    /// the probe's hint and its completion.
+    fn settle_index_probe(runner: &Runner) {
+        let deadline = Instant::now() + HANG;
+        while runner
+            .index
+            .pending
+            .as_ref()
+            .is_some_and(|pending| !pending.done.load(Ordering::Acquire))
+        {
+            assert!(Instant::now() < deadline, "the index probe completed");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     /// The vendors every host in a test reads, and who asked them.
     #[derive(Default)]
     struct Vendors {
@@ -2133,12 +2151,12 @@ mod tests {
         crate::sig::Floor::new(l.floor())
             .check_and_record(43)
             .unwrap();
-        let deadline = Instant::now() + HANG;
-        while runner.index.pending.is_some() {
-            runner.step();
-            assert!(Instant::now() < deadline, "the probe completed");
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        settle_index_probe(&runner);
+        runner.step();
+        assert!(
+            runner.index.pending.is_none(),
+            "one step harvests the finished probe"
+        );
         assert!(passes.launched().is_empty(), "verified floor covers 43");
         let completed = runner.index.last_completed.expect("the probe ended");
         for _ in 0..3 {
@@ -2182,17 +2200,17 @@ mod tests {
         );
         let deadline = Instant::now() + HANG;
         while passes.launched().is_empty() {
+            settle_index_probe(&runner);
             runner.step();
             assert!(Instant::now() < deadline, "the near 43 launched a pass");
-            std::thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(passes.launched(), [WHOLE]);
         passes.end.store(true, Ordering::SeqCst);
         let started = time.mono_ms.load(Ordering::SeqCst);
         while passes.launched().len() == 1 {
+            settle_index_probe(&runner);
             runner.step();
             assert!(Instant::now() < deadline, "the higher 44 launched a pass");
-            std::thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(passes.launched(), [WHOLE, WHOLE]);
         assert!(

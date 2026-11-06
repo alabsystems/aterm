@@ -8,10 +8,8 @@
 //! It names no fleet source (`atpkg::peers::set_fleet`), so a download it runs races only the
 //! LAN peers a person wrote in `[packages] peers`, never this Mac's fleet members. The source the
 //! `aterm` binary sets (`crates/aterm/src/unit_peers.rs`) is not a call or two away: it reads
-//! `aterm-net`'s fleet book, which atpkg does not depend on, and holds every dial until macOS has
-//! asked about Local Network (`aterm_cli::macos_doctor::local_network_heard`), and `aterm-cli`
-//! depends on atpkg, so this package cannot link it. A copy without that hold could make a
-//! download raise macOS's Local Network question, which a download never does.
+//! `aterm-net`'s fleet book and the swarm's sharing switch, which atpkg does not depend on, and
+//! `aterm-cli` depends on atpkg, so this package cannot link it.
 
 use std::process::ExitCode;
 

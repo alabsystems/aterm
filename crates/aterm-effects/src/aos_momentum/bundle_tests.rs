@@ -204,6 +204,9 @@ impl Spread for Threads {
 /// that judges the rows in order, last first, half of them, or on threads.
 #[test]
 fn a_bundle_altered_at_two_rows_names_the_first_over_any_spread() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let mut b = accepted();
     let (t1, last) = (index_of("train-01"), b.rows.len() - 1);
     assert!(t1 < last);

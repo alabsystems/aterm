@@ -107,14 +107,30 @@ impl Backing {
         }
     }
 
-    /// Append `bytes` at the end of the file (the log only ever appends; a rollback
-    /// truncates with [`resize_file`](Self::resize_file) and re-seeks).
-    pub(crate) fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+    /// Append `bytes` at byte `at`, the end the log tracks (its durable length), by a
+    /// POSITIONAL write ([`write_all_at`]): the log only ever appends, and a rollback
+    /// truncates back to that end with [`resize_file`](Self::resize_file), so the next
+    /// append is written where the last one left off whatever moved the file cursor.
+    pub(crate) fn write_at(&self, bytes: &[u8], at: u64) -> io::Result<()> {
         match self {
-            Backing::Os(f) => (&**f).write_all(bytes),
+            Backing::Os(f) => write_all_at(f, bytes, at),
             #[cfg(any(test, debug_assertions))]
             Backing::Sim(s) => {
-                s.append(bytes);
+                s.write_at(at, bytes);
+                Ok(())
+            }
+        }
+    }
+
+    /// F24's NEGATIVE CONTROL: the append as it was before it was positional, at the file
+    /// cursor (a real file's, or the simulated device's, which its reads move as
+    /// Windows' `seek_read` moves a file's).
+    #[cfg(test)]
+    pub(crate) fn write_at_cursor(&self, bytes: &[u8]) -> io::Result<()> {
+        match self {
+            Backing::Os(f) => (&**f).write_all(bytes),
+            Backing::Sim(s) => {
+                s.write_at_cursor(bytes);
                 Ok(())
             }
         }
@@ -133,18 +149,6 @@ impl Backing {
                 op(s, len);
                 Ok(())
             }
-        }
-    }
-
-    /// Position the next write at the end of the file.
-    pub(crate) fn seek_end(&mut self) -> io::Result<()> {
-        match self {
-            Backing::Os(f) => {
-                let _ = (&**f).seek(SeekFrom::End(0))?;
-                Ok(())
-            }
-            #[cfg(any(test, debug_assertions))]
-            Backing::Sim(_) => Ok(()),
         }
     }
 
@@ -268,42 +272,11 @@ impl Backing {
         }
     }
 
-    /// `len` bytes from byte `start` (for the newest frame a clean close
-    /// fingerprints), leaving the next write at the end of the file.
-    pub(crate) fn read_range(&mut self, start: u64, len: usize) -> io::Result<Vec<u8>> {
-        match self {
-            Backing::Os(f) => {
-                let mut f: &File = f;
-                let mut buf = Vec::new();
-                f.seek(SeekFrom::Start(start))?;
-                let read = f.take(len as u64).read_to_end(&mut buf);
-                let mut f: &File = f;
-                f.seek(SeekFrom::End(0))?;
-                read?;
-                if buf.len() != len {
-                    return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
-                }
-                Ok(buf)
-            }
-            #[cfg(any(test, debug_assertions))]
-            Backing::Sim(s) => {
-                let mut all = Vec::new();
-                s.read_log(&mut all);
-                let start = usize::try_from(start).unwrap_or(usize::MAX);
-                all.get(start..start.saturating_add(len))
-                    .map(<[u8]>::to_vec)
-                    .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))
-            }
-        }
-    }
-
-    /// Exactly `len` bytes from byte `start`, by a POSITIONAL read. On Unix (`pread`) the
-    /// file offset the appends write at is never moved, so a reader holding only `&self` (a
-    /// cold record read under the log's shared borrow) cannot disturb the next write. On
-    /// Windows the read (`seek_read`) leaves that offset at the end of what it read, and the
-    /// appends ([`write_all`](Self::write_all), [`BatchOut::write_all`]) write at it, so
-    /// there a cold read followed by an append before any [`seek_end`](Self::seek_end)
-    /// writes the append inside the log.
+    /// Exactly `len` bytes from byte `start`, by a POSITIONAL read: a cold record read
+    /// under the log's shared borrow, and the newest frame a clean close fingerprints. On
+    /// Windows the read (`seek_read`) leaves the file cursor at the end of what it read;
+    /// no write depends on the cursor (every append is positional,
+    /// [`write_at`](Self::write_at), [`BatchOut::write_at`]), so that is harmless.
     pub(crate) fn read_at(&self, start: u64, len: usize) -> io::Result<Vec<u8>> {
         match self {
             Backing::Os(f) => {
@@ -312,14 +285,9 @@ impl Backing {
                 Ok(buf)
             }
             #[cfg(any(test, debug_assertions))]
-            Backing::Sim(s) => {
-                let mut all = Vec::new();
-                s.read_log(&mut all);
-                let start = usize::try_from(start).unwrap_or(usize::MAX);
-                all.get(start..start.saturating_add(len))
-                    .map(<[u8]>::to_vec)
-                    .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))
-            }
+            Backing::Sim(s) => s
+                .read_at(start, len)
+                .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof)),
         }
     }
 
@@ -334,10 +302,8 @@ impl Backing {
 
     /// Up to `buf.len()` bytes from byte `start`, by POSITIONAL reads, fewer only where the
     /// file ends: how many were read. The open's scan reads the log through it a window at
-    /// a time (`open_scan.rs`). On Unix (`pread`) that leaves the file offset the appends
-    /// write at where it was; on Windows (`seek_read`) it moves it to the end of each read,
-    /// as [`read_at`](Self::read_at) does, and the open puts it back at the end of the file
-    /// (`flush_open_phase1`'s [`seek_end`](Self::seek_end)) before its first append.
+    /// a time (`open_scan.rs`), which on Windows moves the file cursor as
+    /// [`read_at`](Self::read_at) does, as harmlessly.
     pub(crate) fn read_some_at(&self, start: u64, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             Backing::Os(f) => read_some_at(f, buf, start),
@@ -407,11 +373,66 @@ fn read_once_at(file: &File, buf: &mut [u8], start: u64) -> io::Result<usize> {
 }
 
 /// One positional read of `file` into `buf` from byte `start` (`seek_read`, which leaves the
-/// file offset at the end of what it read).
+/// file cursor at the end of what it read; nothing writes at the cursor).
 #[cfg(windows)]
 fn read_once_at(file: &File, buf: &mut [u8], start: u64) -> io::Result<usize> {
     use std::os::windows::fs::FileExt;
     file.seek_read(buf, start)
+}
+
+/// The whole of `bytes` into `file` from byte `at`, by positional writes, looping on a
+/// short one (and an interrupted one): `pwrite` on Unix.
+///
+/// WHY EVERY APPEND IS POSITIONAL (aterm F24). A cold read (`record_arc` →
+/// [`Backing::read_at`]) and the open's scan ([`Backing::read_some_at`]) read by position,
+/// and on Windows `seek_read` moves the file cursor to the end of what it read. An append
+/// written AT THE CURSOR then lands inside the log: a cold read under the log's lock
+/// followed by an un-batched append, or a cold read in the window where the writer
+/// writes a batch with the lock released ([`BatchOut`]), overwrites retained frames with
+/// the new ones — a torn log that the next open cuts or refuses. Writing every append at
+/// the end the log already tracks (its durable length, which a failed write's rollback
+/// truncates the file back to) makes no write depend on the cursor on any OS, and costs
+/// what the cursor write cost: one call per append, no handle, no lock and no second
+/// call. The alternatives each cost or miss something:
+///
+/// - AN APPEND-ONLY HANDLE (`FILE_APPEND_DATA` without `FILE_WRITE_DATA`; `O_APPEND`) is a
+///   second open of the file: it can fail where taking the shared descriptor cannot
+///   ([`Backing::flush_handle`] says why that matters), retention's rewrite replaces the
+///   file under it, and on Windows the whole-file exclusive lock the open takes
+///   (`LockFileEx` through the log's own handle, `lock_exclusive`) denies reads and writes
+///   through any other handle of the file, this process's included. And it writes at the
+///   FILE's end, not the log's: the rollback truncate would have to go through the other
+///   handle, since an append-only one may not shorten the file.
+/// - A SEPARATE READ HANDLE for the cold reads and the scan is the same second open, with
+///   the same lock in the way, and must be replaced in step with every retention rewrite.
+/// - A CURSOR RESTORE (seek back to the end after every read, under the lock) misses the
+///   batch written OUTSIDE the lock: the batch's write can run between a reader's read
+///   and its restore, at the cursor the read left, and a restore that runs while the
+///   batch is half written seeks to the end as it stands mid-batch. It also costs a seek
+///   per cold read and leaves a hazard every future reader of the file must remember.
+#[cfg(unix)]
+fn write_all_at(file: &File, bytes: &[u8], at: u64) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.write_all_at(bytes, at)
+}
+
+/// The whole of `bytes` into `file` from byte `at`, by `seek_write`s, looping on a short
+/// one (and an interrupted one). The Unix arm says why every append is positional.
+#[cfg(windows)]
+fn write_all_at(file: &File, mut bytes: &[u8], mut at: u64) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !bytes.is_empty() {
+        match file.seek_write(bytes, at) {
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
+            Ok(n) => {
+                bytes = bytes.get(n..).unwrap_or(&[]);
+                at = at.saturating_add(n as u64);
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// `pread` the whole of `buf` from byte `start` of `file`.
@@ -422,7 +443,7 @@ fn read_exact_at(file: &File, buf: &mut [u8], start: u64) -> io::Result<()> {
 }
 
 /// The whole of `buf` from byte `start` of `file`, by `seek_read`s, which leave the file
-/// offset at the end of what they read.
+/// cursor at the end of what they read (nothing writes at the cursor).
 #[cfg(windows)]
 fn read_exact_at(file: &File, mut buf: &mut [u8], mut start: u64) -> io::Result<()> {
     use std::os::windows::fs::FileExt;
@@ -495,32 +516,47 @@ impl FlushHandle {
 /// writer thread writes and flushes every batch on it while readers take the lock.
 ///
 /// WHY THE LOG'S OWN DESCRIPTOR, SHARED. The write lands exactly where a write under the
-/// lock would, at the end: the descriptor's file OFFSET is the one a rollback's
-/// truncate-and-seek positions, and the flush — full, or the ordering barrier — covers
-/// the vnode's dirty pages whichever descriptor wrote them, as a [`FlushHandle`]'s does.
-/// Shared and not a second descriptor, so taking one cannot fail and opens nothing
-/// ([`Backing::batch_out`]); and the `Arc` names the file the batch began on, which is
-/// the log's file at its end too (see below).
+/// lock would: positionally, at the end the log tracks when the batch began (its durable
+/// length, which a rollback truncates the file back to), and the flush — full, or the
+/// ordering barrier — covers the vnode's dirty pages whichever descriptor wrote them, as
+/// a [`FlushHandle`]'s does. Shared and not a second descriptor, so taking one cannot
+/// fail and opens nothing ([`Backing::batch_out`]); and the `Arc` names the file the
+/// batch began on, which is the log's file at its end too (see below).
 ///
-/// WHY NOTHING ELSE MOVES THAT OFFSET WHILE A BATCH IS WRITTEN. The writer thread is the
-/// only appender, and it is the thread writing here. What else touches the file under
-/// the lock refuses while a batch is staged — retention's rewrite (the one thing that
-/// replaces the file), the un-batched retirement, the fenced replica append, the clean
-/// close and its read-back of the newest frame (`staged` stays non-empty, and `writing`
-/// set, from the batch's begin to its end) — and the broker's retention calls also take
-/// the writer's batch lock first, so they wait for the batch instead. A cold read
-/// ([`Backing::read_at`]) runs under the lock while a batch is written, and moves the offset
-/// on Windows alone, where that holds only while no cold read runs.
+/// WHY NOTHING ELSE WRITES THE FILE OR MOVES ITS END WHILE A BATCH IS WRITTEN. The writer
+/// thread is the only appender, and it is the thread writing here. What else touches the
+/// file under the lock refuses while a batch is staged — retention's rewrite (the one
+/// thing that replaces the file), the un-batched retirement, the fenced replica append,
+/// the clean close and its read-back of the newest frame (`staged` stays non-empty, and
+/// `writing` set, from the batch's begin to its end) — and the broker's retention calls
+/// also take the writer's batch lock first, so they wait for the batch instead. A cold
+/// read ([`Backing::read_at`]) runs under the lock while a batch is written; it reads
+/// below the batch's start, and the file cursor it moves on Windows is nowhere any write
+/// lands ([`write_all_at`] says why every append is positional).
 pub(crate) struct BatchOut(HandleBacking);
 
 impl BatchOut {
-    /// Append `bytes` at the shared offset (the end of the file).
-    pub(crate) fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
+    /// Append `bytes` at byte `at`, the end the log tracked when the batch began, by a
+    /// positional write ([`write_all_at`]).
+    pub(crate) fn write_at(&self, bytes: &[u8], at: u64) -> io::Result<()> {
         match &self.0 {
-            HandleBacking::Os(f) => (&**f).write_all(bytes),
+            HandleBacking::Os(f) => write_all_at(f, bytes, at),
             #[cfg(any(test, debug_assertions))]
             HandleBacking::Sim(s) => {
-                s.append(bytes);
+                s.write_at(at, bytes);
+                Ok(())
+            }
+        }
+    }
+
+    /// F24's negative control: the batch's append at the file cursor, as
+    /// [`Backing::write_at_cursor`].
+    #[cfg(test)]
+    pub(crate) fn write_at_cursor(&self, bytes: &[u8]) -> io::Result<()> {
+        match &self.0 {
+            HandleBacking::Os(f) => (&**f).write_all(bytes),
+            HandleBacking::Sim(s) => {
+                s.write_at_cursor(bytes);
                 Ok(())
             }
         }

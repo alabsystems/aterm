@@ -1,13 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Instance-theme contrast floor tests across built-in and custom tab themes.
+//! Contrast floor tests of the glass's tokens (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md`
+//! §4.1) across built-in and custom tab themes, under every palette and none.
 
 use super::*;
 use crate::autopilot::AutopilotView;
 use aterm_effects::cli_marks::{ICON_CONTRAST, NAME_CONTRAST};
 use aterm_effects::color_math::contrast_ratio;
+use aterm_effects::glass_inks::VALUE_CONTRAST;
+use aterm_effects::harness_card::CardPalette;
 use aterm_types::scheme::{builtin, builtin_names};
+
+/// Every palette the glass wears, and none.
+const PALETTES: [Option<CardPalette>; 4] = [
+    Some(CardPalette::Cruise),
+    Some(CardPalette::Land),
+    Some(CardPalette::Off),
+    None,
+];
 
 fn pack(c: [u8; 3]) -> u32 {
     u32::from_be_bytes([0, c[0], c[1], c[2]])
@@ -17,20 +28,10 @@ fn reads(a: [u8; 3], b: [u8; 3]) -> f32 {
     contrast_ratio(pack(a), pack(b))
 }
 
-/// A value's ink at rest under a rule drawn in `gray` on `blank`'s pane, where it reads already:
-/// kept, unless the floor of its stub reads as loud, where it is lifted halfway to the lit ink
-/// (`true`).
-fn value_that_reads(gray: [u8; 3], blank: RenderCell) -> ([u8; 3], bool) {
-    let value = value_fg(gray, blank.fg);
-    if reads(greyed_on(gray, value, blank.bg), blank.bg) < reads(value, blank.bg) {
-        (value, false)
-    } else {
-        (mix(value, legible_on(blank.fg, blank.bg), 0.5), true)
-    }
-}
-
 struct Side {
     name: &'static str,
+    /// The system accent the theme's band gives: the agy and Muse transcripts' marks, which the
+    /// glass's tokens do not draw.
     accent: [u8; 3],
     blank: RenderCell,
 }
@@ -125,14 +126,36 @@ fn every_fact() -> footer::RuleFit {
     }
 }
 
+/// The facts every lit run of [`every_fact_mark_reads_on_every_ground`] and
+/// [`every_fact_word_reads_on_every_ground`] reads: none, then each.
+fn lit_runs() -> impl Iterator<Item = Option<FactKind>> {
+    std::iter::once(None).chain(
+        [
+            FactKind::Model,
+            FactKind::Effort,
+            FactKind::Path,
+            FactKind::Branch,
+            FactKind::Context,
+            FactKind::Usage,
+            FactKind::Account,
+        ]
+        .map(Some),
+    )
+}
+
+/// EVERY FACT MARK READS ON EVERY GROUND: under every palette and none, on every built-in tab
+/// over each rule grey, every fact's mark reads at 3:1 or more, lit at 4.5:1, and at rest wears
+/// the glass's marks ink of its own column ([`GlassInks::mark`]). CONTROLS: the mark the system
+/// accent once gave (Dracula's, mixed into the light rule grey) read under 3:1 on Default Light,
+/// and Dracula's accent floored for a graphic read under 4.5:1 there.
 #[test]
 fn every_fact_mark_reads_on_every_ground() {
     let sides = sides();
     let fit = every_fact();
     let room = 200;
+    let at = rule_at_room(room);
     let mut checked = 0usize;
-    let mut kept = 0usize;
-    let (mut lit_marks, mut lit_kept) = (0usize, 0usize);
+    let mut lit_marks = 0usize;
     let lit_mark = |kind: FactKind| match kind {
         FactKind::Model => Some(footer::MODEL_MARK),
         FactKind::Path => Some(footer::PATH_MARK),
@@ -142,73 +165,37 @@ fn every_fact_mark_reads_on_every_ground() {
         FactKind::Account => Some(footer::ACCOUNT_MARK),
         FactKind::Effort => None,
     };
-    for instance in &sides {
+    for palette in PALETTES {
         for tab in &sides {
             let blank = tab.blank;
             for rule in rule_greys(blank) {
-                let old = mix(instance.accent, rule.fg, 0.5);
-                for lit in std::iter::once(None).chain(
-                    [
-                        FactKind::Model,
-                        FactKind::Effort,
-                        FactKind::Path,
-                        FactKind::Branch,
-                        FactKind::Context,
-                        FactKind::Usage,
-                        FactKind::Account,
-                    ]
-                    .map(Some),
-                ) {
-                    let paint = compose_rule_spans(
-                        &fit,
-                        None,
-                        rule,
-                        blank,
-                        (instance.accent, WARN_FG),
-                        room,
-                        lit,
-                    );
-                    let marks: Vec<&RenderCell> = paint
+                let glass = rule_glass(palette, rule, blank);
+                for lit in lit_runs() {
+                    let paint =
+                        compose_rule_spans(&fit, None, rule, blank, (&glass, at), room, lit);
+                    let marks: Vec<(usize, &RenderCell)> = paint
                         .cells
                         .iter()
-                        .filter(|c| MARKS.contains(&c.ch))
+                        .enumerate()
+                        .filter(|(_, c)| MARKS.contains(&c.ch))
                         .collect();
                     assert_eq!(marks.len(), MARKS.len(), "every mark is on the line");
-                    for c in marks {
+                    for (col, c) in marks {
                         let k = reads(c.fg, blank.bg);
-                        assert!(
-                            k >= ICON_CONTRAST,
-                            "{}'s accent on {} over {:?}, {lit:?} lit: {:?} at {k:.2}:1",
-                            instance.name,
-                            tab.name,
-                            rule.fg,
-                            c.ch
+                        let what = format!(
+                            "{palette:?} on {} over {:?}, {lit:?} lit: {:?} at {k:.2}:1",
+                            tab.name, rule.fg, c.ch
                         );
-                        if lit.is_none() && reads(old, blank.bg) >= ICON_CONTRAST {
+                        assert!(k >= ICON_CONTRAST, "{what}");
+                        if lit.is_none() {
                             assert_eq!(
-                                c.fg, old,
-                                "{}'s accent on {} over {:?}: a mark that reads keeps its quietness",
-                                instance.name, tab.name, rule.fg
+                                c.fg,
+                                rgb_of(glass.mark(at.t(col))),
+                                "{what}: its column's marks ink"
                             );
-                            kept += 1;
                         }
                         if lit.and_then(lit_mark) == Some(c.ch) {
-                            assert!(
-                                k >= NAME_CONTRAST,
-                                "{}'s accent on {} over {:?}, {lit:?} lit: its {:?} at {k:.2}:1",
-                                instance.name,
-                                tab.name,
-                                rule.fg,
-                                c.ch
-                            );
-                            if reads(instance.accent, blank.bg) >= NAME_CONTRAST {
-                                assert_eq!(
-                                    c.fg, instance.accent,
-                                    "{}'s accent on {}: a lit accent that reads is kept",
-                                    instance.name, tab.name
-                                );
-                                lit_kept += 1;
-                            }
+                            assert!(k >= NAME_CONTRAST, "{what}: lit");
                             lit_marks += 1;
                         }
                         checked += 1;
@@ -217,14 +204,12 @@ fn every_fact_mark_reads_on_every_ground() {
             }
         }
     }
-    assert!(checked >= 17 * 17 * 3 * 7 * MARKS.len(), "{checked}");
-    assert!(kept > 0, "some theme's own mix reads and is kept");
+    assert!(checked >= 4 * 17 * 3 * 8 * MARKS.len(), "{checked}");
     assert_eq!(
         lit_marks,
-        sides.len() * sides.len() * 3 * 6,
+        PALETTES.len() * sides.len() * 3 * 6,
         "every lit fact's mark"
     );
-    assert!(lit_kept > 0, "some accent reads and is kept lit");
     let dracula = side(&sides, "Dracula").accent;
     let light = side(&sides, "Default Light").blank;
     let old = mix(dracula, [0x99; 3], 0.5);
@@ -241,7 +226,8 @@ fn every_fact_mark_reads_on_every_ground() {
     );
 }
 
-/// EVERY FACT WORD READS ON EVERY GROUND: a value at 4.5:1 and a hidden fact's stub at 4.5:1 and
+/// EVERY FACT WORD READS ON EVERY GROUND: under every palette and none, a value at rest in the
+/// glass's value ink at 7:1 (4.5:1 lit) and a hidden fact's stub in its quiet ink at 4.5:1 and
 /// quieter than the quietest value, by its ink. Every value is bold. On a light ground the stub
 /// keeps the values' weight, since a thin dark stroke at the subscript size covers no whole pixel
 /// and reads lighter than its ink; on a dark ground it stays thin (owner ruling 2026-10-28: the
@@ -266,38 +252,21 @@ fn every_fact_word_reads_on_every_ground() {
         .flat_map(|g| 1 + g.cell..1 + g.cell + g.cols)
         .collect();
     assert!(!stub_cells.is_empty(), "the line hides a fact");
-    let (mut values, mut stubs, mut kept_values, mut kept_stubs) = (0usize, 0usize, 0, 0);
-    let (mut lifted, mut thin_stubs, mut bold_stubs) = (0usize, 0usize, 0usize);
-    for instance in &sides {
+    let (mut values, mut stubs) = (0usize, 0usize);
+    let (mut thin_stubs, mut bold_stubs) = (0usize, 0usize);
+    let at = rule_at_room(room);
+    for palette in PALETTES {
         for &(tab, blank) in &tabs {
             let dark = crate::claude_card::dark_ground(blank);
             for rule in rule_greys(blank) {
-                let old_value = mix(rule.fg, blank.fg, VALUE_LIFT);
-                for lit in std::iter::once(None).chain(
-                    [
-                        FactKind::Model,
-                        FactKind::Effort,
-                        FactKind::Path,
-                        FactKind::Branch,
-                        FactKind::Context,
-                        FactKind::Usage,
-                        FactKind::Account,
-                    ]
-                    .map(Some),
-                ) {
-                    let paint = compose_rule_spans(
-                        &fit,
-                        None,
-                        rule,
-                        blank,
-                        (instance.accent, WARN_FG),
-                        room,
-                        lit,
-                    );
+                let glass = rule_glass(palette, rule, blank);
+                for lit in lit_runs() {
+                    let paint =
+                        compose_rule_spans(&fit, None, rule, blank, (&glass, at), room, lit);
                     let what = |c: &RenderCell| {
                         format!(
-                            "{}'s accent on {tab} over {:?}, {lit:?} lit: {:?}",
-                            instance.name, rule.fg, c.ch
+                            "{palette:?} on {tab} over {:?}, {lit:?} lit: {:?}",
+                            rule.fg, c.ch
                         )
                     };
                     // Each word's role is its glyph's: a hidden fact's stub, or a value.
@@ -305,7 +274,10 @@ fn every_fact_word_reads_on_every_ground() {
                         .cells
                         .iter()
                         .enumerate()
-                        .filter(|(_, c)| c.ch != ' ' && !MARKS.contains(&c.ch))
+                        .skip(paint.facts_at)
+                        .filter(|(_, c)| {
+                            c.ch != ' ' && c.ch != '\u{2500}' && !MARKS.contains(&c.ch)
+                        })
                         .map(|(at, c)| {
                             let set = at.checked_sub(paint.facts_at);
                             (set.is_some_and(|k| stub_cells.contains(&k)), c)
@@ -339,19 +311,13 @@ fn every_fact_word_reads_on_every_ground() {
                         }
                         if !stub {
                             assert!(k >= NAME_CONTRAST, "{}: a value at {k:.2}:1", what(c));
-                            if lit.is_none() && reads(old_value, blank.bg) >= NAME_CONTRAST {
-                                let (ink, crowded) = value_that_reads(rule.fg, blank);
-                                assert_eq!(
-                                    c.fg,
-                                    ink,
-                                    "{}: a value that reads ({crowded})",
+                            if lit.is_none() {
+                                assert_eq!(c.fg, rgb_of(glass.value()), "{}: the value", what(c));
+                                assert!(
+                                    k >= VALUE_CONTRAST - 0.01,
+                                    "{}: a value at rest at {k:.2}:1",
                                     what(c)
                                 );
-                                if crowded {
-                                    lifted += 1;
-                                } else {
-                                    kept_values += 1;
-                                }
                             }
                             values += 1;
                         } else {
@@ -365,11 +331,7 @@ fn every_fact_word_reads_on_every_ground() {
                                     "{}: a stub at {k:.2}:1, a value at {quietest_value:.2}:1",
                                     what(c)
                                 );
-                                let grey = reads(rule.fg, blank.bg);
-                                if grey >= NAME_CONTRAST && grey < quietest_value {
-                                    assert_eq!(c.fg, rule.fg, "{}: a grey that reads", what(c));
-                                    kept_stubs += 1;
-                                }
+                                assert_eq!(c.fg, rgb_of(glass.quiet()), "{}: quiet", what(c));
                             }
                             stubs += 1;
                         }
@@ -378,16 +340,15 @@ fn every_fact_word_reads_on_every_ground() {
             }
         }
     }
-    assert!(values >= sides.len() * tabs.len() * 3 * 7 * 20, "{values}");
     assert!(
-        lifted > 0,
-        "a value its stub's floor would match is lifted on some ground"
+        values >= PALETTES.len() * tabs.len() * 3 * 8 * 20,
+        "{values}"
     );
     assert!(
         reads(soft_tab().fg, soft_tab().bg) < NAME_CONTRAST,
         "CONTROL: only a tab whose own ink reads under the floor leaves no room"
     );
-    assert!(stubs >= sides.len() * tabs.len() * 3 * 7 * 10, "{stubs}");
+    assert!(stubs >= PALETTES.len() * tabs.len() * 3 * 8 * 10, "{stubs}");
     assert!(
         thin_stubs > 0 && bold_stubs > 0,
         "stubs on dark and light grounds: {thin_stubs} thin, {bold_stubs} bold"
@@ -396,10 +357,6 @@ fn every_fact_word_reads_on_every_ground() {
         crate::claude_card::dark_ground(side(&sides, "Default").blank)
             && !crate::claude_card::dark_ground(side(&sides, "Default Light").blank),
         "CONTROL: Default's ground is dark and Default Light's light"
-    );
-    assert!(
-        kept_values > 0 && kept_stubs > 0,
-        "a theme's own inks that read are kept: {kept_values} values, {kept_stubs} stubs"
     );
     let light = side(&sides, "Default Light").blank;
     let old_value = mix([0x99; 3], light.fg, VALUE_LIFT);
@@ -421,12 +378,7 @@ fn every_fact_word_reads_on_every_ground() {
     );
 }
 
-fn ghost_glyphs(
-    blank: RenderCell,
-    rule: RenderCell,
-    accent: [u8; 3],
-    lit: bool,
-) -> Vec<RenderCell> {
+fn ghost_glyphs(blank: RenderCell, rule: RenderCell, lit: bool) -> Vec<RenderCell> {
     let run = TopRun {
         col: 2,
         len: 60,
@@ -446,7 +398,10 @@ fn ghost_glyphs(
             switch: None,
             palette: None,
             blank,
-            mark_fg: accent,
+            field: PaneField {
+                col_off: 0,
+                cols: 64,
+            },
             face: KeyFace {
                 ghost: Some(lit),
                 tag: None,
@@ -471,56 +426,43 @@ fn ghost_glyphs(
         .collect()
 }
 
+/// THE KEY'S GHOST READS ON EVERY GROUND: on every tab over each rule grey, the lit ghost wears
+/// the glass's value ink, one ink, at 4.5:1 or more, and at rest its quiet ink, thin, at 4.5:1
+/// and quieter than lit, as a stub beside a value. CONTROL: the ghost as it was laid (Claude's
+/// light grey, lifted a third toward the ink) read under the floors on Default Light.
 #[test]
 fn the_keys_ghost_reads_on_every_ground() {
     let sides = sides();
     let tabs = tabs(&sides);
     let glyphs = aterm_primer::CLAUDE_TOP_EFFORT_KEY.len() + "off".len();
-    let (mut checked, mut kept) = (0usize, 0usize);
-    for instance in &sides {
-        for &(tab, blank) in &tabs {
-            for rule in rule_greys(blank) {
-                let what = format!("{}'s accent on {tab} over {:?}", instance.name, rule.fg);
-                let rest = ghost_glyphs(blank, rule, instance.accent, false);
-                let lit = ghost_glyphs(blank, rule, instance.accent, true);
-                assert_eq!((rest.len(), lit.len()), (glyphs, glyphs), "{what}");
-                let lit_k = reads(lit[0].fg, blank.bg);
-                let old_lit = value_fg(rule.fg, blank.fg);
-                for c in &lit {
-                    assert!(lit_k >= NAME_CONTRAST, "{what}: lit at {lit_k:.2}:1");
-                    assert_eq!(c.fg, lit[0].fg, "{what}: one ink");
-                    if reads(old_lit, blank.bg) >= NAME_CONTRAST {
-                        let (ink, crowded) = value_that_reads(rule.fg, blank);
-                        assert_eq!(
-                            c.fg, ink,
-                            "{what}: a lit ink that reads is kept ({crowded}: lifted)"
-                        );
-                    }
-                }
-                // As a stub's beside a value ([`every_fact_word_reads_on_every_ground`]).
-                let room = reads(blank.fg, blank.bg) >= NAME_CONTRAST;
-                for c in &rest {
-                    let k = reads(c.fg, blank.bg);
-                    assert!(
-                        k >= NAME_CONTRAST && (k < lit_k || (!room && k <= lit_k)) && !c.bold,
-                        "{what}: {:?} at rest at {k:.2}:1, lit at {lit_k:.2}:1",
-                        c.ch
-                    );
-                    let grey = reads(rule.fg, blank.bg);
-                    if grey >= NAME_CONTRAST && grey < lit_k {
-                        assert_eq!(c.fg, rule.fg, "{what}: a grey that reads is kept");
-                        kept += 1;
-                    }
-                    checked += 1;
-                }
+    let mut checked = 0usize;
+    for &(tab, blank) in &tabs {
+        for rule in rule_greys(blank) {
+            let what = format!("{tab} over {:?}", rule.fg);
+            let glass = rule_glass(None, rule, blank);
+            let rest = ghost_glyphs(blank, rule, false);
+            let lit = ghost_glyphs(blank, rule, true);
+            assert_eq!((rest.len(), lit.len()), (glyphs, glyphs), "{what}");
+            let lit_k = reads(lit[0].fg, blank.bg);
+            for c in &lit {
+                assert!(lit_k >= NAME_CONTRAST, "{what}: lit at {lit_k:.2}:1");
+                assert_eq!(c.fg, rgb_of(glass.value()), "{what}: the value ink");
+            }
+            // As a stub's beside a value ([`every_fact_word_reads_on_every_ground`]).
+            let room = reads(blank.fg, blank.bg) >= NAME_CONTRAST;
+            for c in &rest {
+                let k = reads(c.fg, blank.bg);
+                assert!(
+                    k >= NAME_CONTRAST && (k < lit_k || (!room && k <= lit_k)) && !c.bold,
+                    "{what}: {:?} at rest at {k:.2}:1, lit at {lit_k:.2}:1",
+                    c.ch
+                );
+                assert_eq!(c.fg, rgb_of(glass.quiet()), "{what}: the quiet ink");
+                checked += 1;
             }
         }
     }
-    assert!(
-        checked >= sides.len() * tabs.len() * 3 * glyphs,
-        "{checked}"
-    );
-    assert!(kept > 0, "a grey that reads is kept");
+    assert!(checked >= tabs.len() * 3 * glyphs, "{checked}");
     let light = side(&sides, "Default Light").blank;
     assert!(
         reads([0x99; 3], light.bg) < ICON_CONTRAST
@@ -529,36 +471,39 @@ fn the_keys_ghost_reads_on_every_ground() {
     );
 }
 
+/// THE CRUISE CHIP READS ON EVERY GROUND: on every built-in tab, at the left, the middle and the
+/// right of a pane, Cruise's `∞` wears the letter of its column, at 4.5:1 or more, whatever the
+/// system accent. CONTROL: Dracula's accent, which the chip once wore, reads under 1.5:1 on
+/// Default Light.
 #[test]
 fn the_cruise_chip_reads_on_every_ground() {
     let sides = sides();
     let mut checked = 0usize;
-    for instance in &sides {
-        for tab in &sides {
-            let block = crate::claude_lights::Block::of_autopilot(
-                AutopilotView::Cruise,
-                tab.blank,
-                instance.accent,
-            );
+    for tab in &sides {
+        for col in [0, 40, 79] {
+            let at = crate::claude_lights::ChipAt {
+                col,
+                ..crate::claude_lights::ChipAt::cruise(tab.blank)
+            };
+            let block =
+                crate::claude_lights::Block::of_autopilot(AutopilotView::Cruise, tab.blank, at);
             let glyph = block
                 .lights
                 .iter()
                 .find(|c| c.ch == '\u{221e}')
                 .expect("Cruise's `∞`");
             let k = reads(glyph.fg, tab.blank.bg);
-            assert!(
-                k >= NAME_CONTRAST,
-                "{}'s accent on {}: `∞` at {k:.2}:1",
-                instance.name,
+            assert!(k >= NAME_CONTRAST, "{} at {col}: `∞` at {k:.2}:1", tab.name);
+            assert_eq!(
+                glyph.fg,
+                at.letter_at(0),
+                "{} at {col}: its letter",
                 tab.name
             );
-            if reads(instance.accent, tab.blank.bg) >= NAME_CONTRAST {
-                assert_eq!(glyph.fg, instance.accent, "an accent that reads is kept");
-            }
             checked += 1;
         }
     }
-    assert!(checked >= 17 * 17, "{checked}");
+    assert!(checked >= 17 * 3, "{checked}");
     let dracula = side(&sides, "Dracula").accent;
     let light = side(&sides, "Default Light").blank;
     assert!(

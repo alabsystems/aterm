@@ -75,6 +75,7 @@ impl ParkWatch {
             let home = aterm_types::dirs::home_dir()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no home directory"))?;
             folders.extend(secrets_folders(&home));
+            input_files.extend(secrets_input_files(&home));
         }
         if watches.git {
             let tools = Path::new(aterm_machines::items::github::CLT_GIT)
@@ -85,10 +86,12 @@ impl ParkWatch {
             if let Some(layout) = atpkg::store::resolve_configured() {
                 folders.extend(packaged_git_folders(&layout.prefix));
             }
-            input_files = aterm_machines::init_github::repository_input_watch_paths(
-                &aterm_machines::port::Live::new(),
-            )
-            .map_err(io::Error::other)?;
+            input_files.extend(
+                aterm_machines::init_github::repository_input_watch_paths(
+                    &aterm_machines::port::Live::new(),
+                )
+                .map_err(io::Error::other)?,
+            );
             folders.extend(repository_input_folders(&input_files));
         }
         if !folders.is_empty() {
@@ -187,6 +190,14 @@ fn secrets_folders(home: &Path) -> Vec<FolderTarget> {
             follow_links: false,
         },
     ]
+}
+
+/// The canonical standing inputs also need leaf watches: an in-place write or permission
+/// repair need not change any parent directory entry.
+fn secrets_input_files(home: &Path) -> Vec<PathBuf> {
+    aterm_secrets::client::Paths::locate_for_home(home)
+        .standing_files()
+        .into()
 }
 
 /// Package activation writes `current` and its ready record under `store/git`, and
@@ -917,6 +928,46 @@ mod tests {
             Some(home.path()),
             "materialization refuses the symlink; only its replacement can make progress"
         );
+    }
+
+    static MEMBERSHIP_FIRED: AtomicUsize = AtomicUsize::new(0);
+
+    fn membership_fired() {
+        MEMBERSHIP_FIRED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_membership_permission_repair_is_heard_without_replacing_the_state_file() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let home = aterm_tempfile::TempDir::new().unwrap();
+        let paths = aterm_secrets::client::Paths::locate_for_home(home.path());
+        let state = paths
+            .standing_files()
+            .into_iter()
+            .find(|path| path.file_name().is_some_and(|name| name == "state.toml"))
+            .expect("the canonical standing inputs include the saved client state");
+        std::fs::create_dir_all(&paths.dir).unwrap();
+        std::fs::write(&state, "inert membership fixture").unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let inode = std::fs::metadata(&state).unwrap().ino();
+        let stop = Arc::new(AtomicBool::new(false));
+        let lost = Arc::new(AtomicBool::new(false));
+        let watcher = watch_paths(
+            secrets_folders(home.path()),
+            secrets_input_files(home.path()),
+            Arc::clone(&stop),
+            Arc::clone(&lost),
+            membership_fired,
+        )
+        .unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o600)).unwrap();
+        until("the in-place membership repair was never heard", || {
+            MEMBERSHIP_FIRED.load(Ordering::SeqCst) > 0
+        });
+        assert_eq!(std::fs::metadata(&state).unwrap().ino(), inode);
+        assert!(!lost.load(Ordering::Acquire));
+        stop.store(true, Ordering::Release);
+        watcher.wake().unwrap();
     }
 
     static REPLACED_FIRED: AtomicUsize = AtomicUsize::new(0);

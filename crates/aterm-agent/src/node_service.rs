@@ -182,19 +182,145 @@ mod mesh_discovery_tests {
 
     #[test]
     fn mesh_txt_has_only_protocol_node_and_port() {
+        let advert = mesh_advert("opaque", "n-0123456789abcdef", 7123);
         assert_eq!(
-            mesh_dns_sd_args("opaque", "n-0123456789abcdef", 7123),
+            (advert.name.as_str(), advert.service.as_str(), advert.port),
+            ("opaque", "_alab._tcp", 7123)
+        );
+        assert_eq!(
+            advert.txt,
             [
-                "-R",
-                "opaque",
-                "_alab._tcp",
-                "local",
-                "7123",
-                "v=2",
-                "id=n-0123456789abcdef",
-                "port=7123"
+                b"v=2".to_vec(),
+                b"id=n-0123456789abcdef".to_vec(),
+                b"port=7123".to_vec()
             ]
         );
+        assert_eq!((advert.host, advert.addresses), (None, Vec::new()));
+    }
+
+    /// A held advert that is still wanted and still registered stays, so a tick registers
+    /// nothing; a changed one, or one the broker ended, is withdrawn and registered again; an
+    /// advert no longer wanted is withdrawn; a registration that fails leaves nothing held.
+    /// NEGATIVE CONTROL: a reconcile that ignores `ended` keeps an advert the broker dropped.
+    #[test]
+    fn a_held_advert_is_kept_while_wanted_and_registered_and_renewed_otherwise() {
+        struct Held(std::rc::Rc<std::cell::Cell<bool>>);
+        impl HeldAdvert for Held {
+            fn ended(&mut self) -> bool {
+                self.0.get()
+            }
+        }
+        let ended = std::rc::Rc::new(std::cell::Cell::new(false));
+        let registered = std::cell::Cell::new(0);
+        let register = |_: &aterm_uds::lan::Advert| {
+            registered.set(registered.get() + 1);
+            Ok(Held(std::rc::Rc::clone(&ended)))
+        };
+        let first = mesh_advert("opaque", "n-0123456789abcdef", 7123);
+        let mut held = None;
+        reconcile_advert(&mut held, Some(first.clone()), &register);
+        reconcile_advert(&mut held, Some(first.clone()), &register);
+        assert_eq!(registered.get(), 1, "a held advert stays");
+        ended.set(true);
+        reconcile_advert(&mut held, Some(first.clone()), &register);
+        assert_eq!(
+            registered.get(),
+            2,
+            "one the broker ended is registered again"
+        );
+        ended.set(false);
+        reconcile_advert(
+            &mut held,
+            Some(mesh_advert("opaque", "n-0123456789abcdef", 7124)),
+            &register,
+        );
+        assert_eq!(registered.get(), 3, "a changed advert is registered again");
+        reconcile_advert(&mut held, None, &register);
+        assert!(held.is_none(), "an advert no longer wanted is withdrawn");
+        let refused = |_: &aterm_uds::lan::Advert| {
+            Err::<Held, _>(aterm_uds::lan::LanError::Unavailable(
+                aterm_uds::lan::Unavailable::NotInstalled,
+            ))
+        };
+        reconcile_advert(&mut held, Some(first), &refused);
+        assert!(held.is_none());
+    }
+
+    /// A stand-in broker at a fresh socket that registers each advert it is asked for and holds
+    /// that connection until the test says to drop it: the seam pointing this thread's client
+    /// there, and the sender that ends the next held registration.
+    fn registering_broker() -> (
+        aterm_uds::lan::Seam,
+        aterm_tempfile::TempDir,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        use aterm_uds::lan::wire::{self, Frame, Reader};
+        let root = aterm_tempfile::tempdir().unwrap();
+        let path = root.path().join("broker.sock");
+        let listener = aterm_uds::CtlListener::bind(&path).unwrap();
+        let (end, ends) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            while let Ok((stream, _)) = aterm_uds::accept(&listener) {
+                let hello = Frame::Hello {
+                    protocol: aterm_uds::lan::PROTOCOL,
+                    build: "stand-in".into(),
+                };
+                wire::send(&stream, &hello).unwrap();
+                let mut reader = Reader::new(0);
+                let deadline = Some(Instant::now() + Duration::from_secs(60));
+                assert!(matches!(
+                    reader.frame(&stream, deadline),
+                    Ok(Some(Frame::Hello { .. }))
+                ));
+                let Ok(Some(Frame::Request(wire::Request::Register(advert)))) =
+                    reader.frame(&stream, deadline)
+                else {
+                    panic!("not a registration");
+                };
+                let registered = aterm_uds::lan::Event::Registered {
+                    name: advert.name,
+                    service: advert.service,
+                    domain: "local.".into(),
+                };
+                wire::send(&stream, &Frame::Event(registered)).unwrap();
+                if ends.recv().is_err() {
+                    return;
+                }
+                drop(stream);
+            }
+        });
+        let seam = aterm_uds::lan::Seam {
+            socket: Some(path),
+            ..aterm_uds::lan::Seam::default()
+        };
+        (seam, root, end)
+    }
+
+    /// A live registration is not ended; once the broker drops its connection (a restart, an
+    /// upgrade) it is, and the next reconcile registers the advert again.
+    /// NEGATIVE CONTROL: `ended` as a zero-wait `next_within` (which returns before it polls)
+    /// never sees the broker's close, so the wait for it fails at its hang detector.
+    #[test]
+    fn a_registration_the_broker_dropped_is_ended_and_registered_again() {
+        let (seam, _root, end) = registering_broker();
+        aterm_uds::lan::seam_here(seam, || {
+            let register = aterm_uds::lan::broker::register;
+            let advert = mesh_advert("opaque", "n-0123456789abcdef", 7123);
+            let mut held = None;
+            reconcile_advert(&mut held, Some(advert.clone()), &register);
+            let (registration, _) = held.as_mut().expect("registered");
+            assert!(!registration.ended(), "a live registration is held");
+            end.send(()).unwrap();
+            let hang = Instant::now() + Duration::from_secs(60);
+            let (registration, _) = held.as_mut().unwrap();
+            while !registration.ended() {
+                assert!(Instant::now() < hang, "the broker's close was never seen");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            reconcile_advert(&mut held, Some(advert), &register);
+            let (registration, _) = held.as_mut().expect("registered again");
+            assert!(!registration.ended(), "the renewed registration is live");
+        });
     }
 }
 
@@ -220,7 +346,7 @@ impl MeshDiscovery {
         }
     }
 
-    /// Start at most one browse for this service, after local-network permission is ready.
+    /// Start at most one browse for this service.
     pub fn start(&mut self, own: &str) -> Option<std::sync::Arc<aterm_secrets::discover::Watch>> {
         if cfg!(test)
             || std::env::var_os(aterm_types::world::MARKER).is_some()
@@ -310,7 +436,8 @@ pub fn mesh_addresses(state: &Path) -> Vec<(String, std::net::SocketAddr)> {
 /// Maximum age (24 h) of this Mac's last ALab vault answer before `_alab._tcp` stops advertising.
 pub const ALAB_MEMBER_TTL_SECS: u64 = 24 * 60 * 60;
 
-/// Path to `dns-sd` on macOS.
+/// Path to `dns-sd` on macOS, for a lab guest's member advert (`aterm-lab`'s `guest::member`):
+/// aterm's own adverts are LAN broker registrations, and it runs no `dns-sd`.
 pub const DNS_SD: &str = aterm_uds::os_path!("dns-sd");
 
 /// Path to `launchctl` on macOS.
@@ -534,8 +661,39 @@ impl AlabTcpTxt {
     }
 }
 
-/// Arguments to `dns-sd` registering `_alab._tcp` on `local` with [`AlabTcpTxt`].
-/// `instance` must be an ephemeral opaque token (never a label, hostname, node id or version).
+/// The `_alab._tcp` advert on `local.` with [`AlabTcpTxt`], which the node holds through the LAN
+/// broker ([`AlabTcpAdvertiser`]). `instance` must be an ephemeral opaque token (never a label,
+/// hostname, node id or version).
+#[must_use]
+pub fn alab_tcp_advert(instance: &str, txt: AlabTcpTxt) -> aterm_uds::lan::Advert {
+    advert(instance, txt.fleet_port, txt.txt_pairs().to_vec())
+}
+
+/// The mesh advert carries a protocol revision and untrusted identity/address hints only.
+#[must_use]
+pub fn mesh_advert(instance: &str, node: &str, port: u16) -> aterm_uds::lan::Advert {
+    advert(
+        instance,
+        port,
+        vec!["v=2".into(), format!("id={node}"), format!("port={port}")],
+    )
+}
+
+/// `instance` of `_alab._tcp` on `local.` at `port`, its TXT record `txt`.
+fn advert(instance: &str, port: u16, txt: Vec<String>) -> aterm_uds::lan::Advert {
+    aterm_uds::lan::Advert {
+        name: instance.to_owned(),
+        service: ALAB_TCP_SERVICE.to_owned(),
+        domain: "local.".to_owned(),
+        port,
+        txt: txt.into_iter().map(String::into_bytes).collect(),
+        ..aterm_uds::lan::Advert::default()
+    }
+}
+
+/// The `dns-sd -R` arguments registering [`alab_tcp_advert`]'s `_alab._tcp` on `local`: the
+/// form a lab guest's own `dns-sd` advertises a member by; the node itself holds its advert
+/// through the LAN broker.
 #[must_use]
 pub fn alab_tcp_dns_sd_args(instance: &str, txt: AlabTcpTxt) -> Vec<String> {
     let mut args = vec![
@@ -547,21 +705,6 @@ pub fn alab_tcp_dns_sd_args(instance: &str, txt: AlabTcpTxt) -> Vec<String> {
     ];
     args.extend(txt.txt_pairs());
     args
-}
-
-/// The mesh advert carries a protocol revision and untrusted identity/address hints only.
-#[must_use]
-pub fn mesh_dns_sd_args(instance: &str, node: &str, port: u16) -> Vec<String> {
-    vec![
-        "-R".into(),
-        instance.into(),
-        ALAB_TCP_SERVICE.into(),
-        "local".into(),
-        port.to_string(),
-        "v=2".into(),
-        format!("id={node}"),
-        format!("port={port}"),
-    ]
 }
 
 /// Generate a fresh random opaque instance token (`alab-<8 hex>`) carrying no machine identity.
@@ -639,9 +782,11 @@ pub fn should_advertise_alab_tcp_with(
     (true, role)
 }
 
-/// The listener's direct LAN responder and one `_alab._tcp` registration helper, tied to this process by
-/// [`aterm_uds::spawnfd::Tether`], killed and reaped on drop or whenever this Mac stops
-/// advertising ([`advertises`]).
+/// The listener's direct LAN responder and one `_alab._tcp` advert, a
+/// [`aterm_uds::lan::Registration`] the root LAN
+/// broker holds for as long as this does (so macOS asks nobody whether aterm may use the local
+/// network), withdrawn on drop, whenever this Mac stops advertising ([`advertises`]), and by the
+/// broker itself if this process dies.
 pub struct AlabTcpAdvertiser {
     instance: String,
     mesh: bool,
@@ -650,7 +795,7 @@ pub struct AlabTcpAdvertiser {
 }
 
 struct AdvertiserInner {
-    child: Option<(aterm_uds::spawnfd::Child, Vec<String>)>,
+    held: Option<(aterm_uds::lan::Registration, aterm_uds::lan::Advert)>,
     #[cfg(unix)]
     lan: Option<crate::lan_members::Responder>,
 }
@@ -670,7 +815,7 @@ impl AlabTcpAdvertiser {
             mesh: DiscoveryPolicy::process_discovery().mesh,
             state: aterm_types::dirs::state_dir(),
             inner: Mutex::new(AdvertiserInner {
-                child: None,
+                held: None,
                 #[cfg(unix)]
                 lan: None,
             }),
@@ -692,7 +837,8 @@ impl AlabTcpAdvertiser {
         &self.instance
     }
 
-    /// Reconcile the `dns-sd` child with current ALab-network eligibility and [`AlabTcpTxt`].
+    /// Reconcile the held advert with current ALab-network eligibility and [`AlabTcpTxt`]. A
+    /// registration the broker could not make (none installed, say) is tried again next tick.
     pub fn tick(
         &self,
         vault_paths: &aterm_secrets::client::Paths,
@@ -760,9 +906,9 @@ impl AlabTcpAdvertiser {
                 if self.mesh {
                     let state = self.state.as_ref()?;
                     let node = aterm_net::fleet_member::read_node_identity(state).ok()??;
-                    Some(mesh_dns_sd_args(&self.instance, node.node(), fleet_port))
+                    Some(mesh_advert(&self.instance, node.node(), fleet_port))
                 } else {
-                    Some(alab_tcp_dns_sd_args(
+                    Some(alab_tcp_advert(
                         &self.instance,
                         AlabTcpTxt {
                             role,
@@ -773,20 +919,17 @@ impl AlabTcpAdvertiser {
                 }
             })
             .flatten();
-        reconcile_dns_sd(&mut guard.child, wanted, &spawn_dns_sd);
+        reconcile_advert(&mut guard.held, wanted, &aterm_uds::lan::register);
     }
 
-    /// Stop and join the LAN responder and reap any running `dns-sd` child.
+    /// Stop the LAN responder and withdraw the held advert.
     pub fn stop(&self) {
         let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         #[cfg(unix)]
         {
             guard.lan = None;
         }
-        if let Some((mut child, _)) = guard.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        guard.held.take();
     }
 }
 
@@ -796,48 +939,64 @@ impl Drop for AlabTcpAdvertiser {
     }
 }
 
-fn spawn_dns_sd(args: &[String]) -> std::io::Result<aterm_uds::spawnfd::Child> {
-    use aterm_uds::spawnfd::{Stdio, Tether as _};
-    aterm_uds::spawnfd::command(DNS_SD)
-        .tether()
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+/// An advert held while it lasts ([`reconcile_advert`]).
+trait HeldAdvert {
+    /// Whether the broker ended it (its connection closed, or it reported an error).
+    fn ended(&mut self) -> bool;
 }
 
-/// Run the advertiser's helper with private service arguments for a lifecycle probe.
-///
-/// # Errors
-/// The helper could not start.
-#[cfg(any(test, debug_assertions))]
-pub fn spawn_alab_advertisement_for_probe(
-    args: &[String],
-) -> std::io::Result<aterm_uds::spawnfd::Child> {
-    spawn_dns_sd(args)
+/// How long [`HeldAdvert::ended`] waits for the rest of a frame `poll(2)` already saw begin: a
+/// hang detector on a broker that stalls mid-frame, never a wait for news.
+const ADVERT_FRAME_HANG: Duration = Duration::from_secs(1);
+
+impl HeldAdvert for aterm_uds::lan::Registration {
+    /// Asks the broker's connection once without waiting: a connection with nothing to read is
+    /// live; whatever it holds is read (an event, such as a rename, keeps the advert), and its
+    /// end of stream or an error means the broker ended the advert. `Events::next_within` alone
+    /// cannot tell: an already passed deadline returns before it polls.
+    fn ended(&mut self) -> bool {
+        let events = self.events();
+        loop {
+            if !events.buffered() {
+                let watch = aterm_uds::ready::Watch::new(
+                    std::os::fd::AsFd::as_fd(&*events),
+                    aterm_uds::ready::Interest::Read,
+                );
+                match aterm_uds::ready::any_interests_now(&[watch]) {
+                    Ok(ready) if ready.is_empty() => return false,
+                    Ok(_) => {}
+                    Err(_) => return true,
+                }
+            }
+            match events.next_within(ADVERT_FRAME_HANG) {
+                Ok(Some(_)) => {}
+                Ok(None) => return false,
+                Err(_) => return true,
+            }
+        }
+    }
 }
 
-fn reconcile_dns_sd(
-    held: &mut Option<(aterm_uds::spawnfd::Child, Vec<String>)>,
-    wanted: Option<Vec<String>>,
-    spawn: &dyn Fn(&[String]) -> std::io::Result<aterm_uds::spawnfd::Child>,
+/// Hold `wanted` in `held`: an advert already held as wanted and not ended stays; any other is
+/// dropped (withdrawn), and `wanted` is registered in its place. A registration that fails
+/// leaves nothing held.
+fn reconcile_advert<T: HeldAdvert>(
+    held: &mut Option<(T, aterm_uds::lan::Advert)>,
+    wanted: Option<aterm_uds::lan::Advert>,
+    register: &dyn Fn(&aterm_uds::lan::Advert) -> Result<T, aterm_uds::lan::LanError>,
 ) {
-    if let (Some((child, prev_txt)), Some(txt)) = (held.as_mut(), wanted.as_ref())
-        && prev_txt == txt
-        && matches!(child.try_wait(), Ok(None))
+    if let (Some((registration, had)), Some(advert)) = (held.as_mut(), wanted.as_ref())
+        && had == advert
+        && !registration.ended()
     {
         return;
     }
-    if let Some((mut child, _)) = held.take() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    let Some(args) = wanted else {
+    *held = None;
+    let Some(advert) = wanted else {
         return;
     };
-    if let Ok(child) = spawn(&args) {
-        *held = Some((child, args));
+    if let Ok(registration) = register(&advert) {
+        *held = Some((registration, advert));
     }
 }
 

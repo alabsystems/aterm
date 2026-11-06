@@ -728,6 +728,47 @@ mod tests {
         }
     }
 
+    /// The lead Ink leaves under an exactly full row ([`lead`]) counts on the next row at the
+    /// reader's right margin too (`margin` 2, which
+    /// `said_lines_carry_the_lead_an_exactly_full_row_leaves` does not draw): `NEEDS YOU: x…`
+    /// fills the 48-cell box, so `A…` and `B…` (23 + 1 + 24 cells) overran the 47 left and are one
+    /// line with it. CONTROL: a short need's next row is a line of its own at either margin. (Lost
+    /// in the merge ff6b099179; restored as aa1c37ea3d wrote it.)
+    #[test]
+    fn said_lines_keep_exact_fill_leads() {
+        let line = format!(
+            "NEEDS YOU: {} {} {}",
+            "x".repeat(37),
+            "A".repeat(23),
+            "B".repeat(24)
+        );
+        let parts = crate::prompt::fixtures::ink_wrap(&line, 48);
+        assert_eq!(
+            parts,
+            [
+                format!("NEEDS YOU: {}", "x".repeat(37)),
+                "A".repeat(23),
+                "B".repeat(24)
+            ]
+        );
+        for margin in [0, 2] {
+            assert_eq!(
+                said_at(&parts, 48, margin),
+                line,
+                "the consumed blank counts on the next row at the same gutter; margin={margin}"
+            );
+            assert_eq!(
+                said_at(
+                    &["NEEDS YOU: the key".into(), "Settings are ready.".into()],
+                    48,
+                    margin
+                ),
+                "NEEDS YOU: the key\nSettings are ready.",
+                "control: a short new line is not a wrap; margin={margin}"
+            );
+        }
+    }
+
     /// Each reader's `said_lines` reads its measured 50-column reply's wrapped paragraph as one
     /// line, its first paragraph a line of its own, where `said_tail` reads a line a row; the turn's
     /// earlier message is read so too. NEGATIVE CONTROL: the wrapped paragraph's first row cut

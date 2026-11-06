@@ -21,19 +21,37 @@
 //! `everyone.waiting`, a later set's over an earlier one's, and each name it writes leaves every
 //! earlier pending set ([`pending_keeps`]). A vault pass signs only where no rotation is due, it
 //! opens the newest epoch, and every pending set reads ([`pass_signs`]); it leaves alone a write
-//! whose name a pending set writes (this Mac's own later edit of it), and signs a write only where
-//! the log does not hold its value yet and holds one of its bases, and never a take-back
-//! ([`write_signs`]): so it never reverts a value the edit never saw. A write the log holds as
-//! none of its bases was overtaken, and is dropped and recorded ([`write_overtaken`]).
+//! whose name a pending set writes (this Mac's own later edit of it) or a held draft of this Mac
+//! changes (an edit of it in flight), and every write while a held draft does not read; it signs
+//! a write only where the log does not hold its value yet and holds one of its bases, and never a
+//! take-back ([`write_signs`]): so it never reverts a value the edit never saw. A write the log
+//! holds as none of its bases was overtaken, and is dropped and recorded ([`write_overtaken`]).
+//!
+//! The reach rule rests on each server's compare-and-set, server.rs `takes_over`, and a path
+//! vault's, transport.rs `write_path_held`, whose answer is [`Takeover::of`]: a newer version that
+//! carries the held chain on and names the held head among its parents ([`takes_head`]), or a
+//! version whose pin was replaced, with no sequence check, which the island names as the
+//! environment premise it is (a server that took a version of its build's own line gives way to
+//! nothing until its build changes). The one unversioned hold a build before per-version holds
+//! kept goes only once the records store holds every record in it complete, at an adoption
+//! ([`hold_adopts`]) and at a settled head alike ([`unversioned_goes`]).
+//!
+//! A publish keeps its records only while its hold is there ([`drafted_keeps`]); a version whose
+//! hold went by descent before it landed settles the other holds by reach alone
+//! ([`spine_settles`]). A publish drafts in its turn, one at a time, and a write it makes wait is
+//! drafted over the values this Mac's held drafts leave; an edit is refused where this Mac's
+//! waiting writes or held drafts do not read ([`draft_refuses`]).
 //!
 //! The decisions are the scalar `contract!` kernels below; each states `ensures result ==
 //! spec_<name>(..) by <name>_is_exact`, where `spec_<name>` is a definition of
 //! `no_lost_edit_island.rs`. That island (every Trust build) proves, for every number of
 //! versions, servers, URLs, holds, pending sets, writes and names, for the Worlds that ask their
 //! kernels as parameters: a hold goes only on proof; no edit of a version a server may hold is
-//! lost (the descent rule's text inheritance stated as the obligation it is); a waiting write is
-//! signed only after a server took its version, and only over one of its bases; one is dropped as
-//! overtaken only by a value another Mac wrote; a stored version's write is never lost, with no
+//! lost (the descent rule's text inheritance stated as the obligation it is), a server's replaced
+//! pin included where it judges only at the start of its line; a waiting write is signed only
+//! after a server took its version, and only over one of its bases; one is dropped as overtaken
+//! only by a value another Mac wrote, or by a value this Mac drafted after it (never by one of
+//! this Mac's own earlier publishes); a stored version's write is never lost, with no
 //! bound on the pending sets and a set that does not open never read as none; and each rule W2
 //! and W3 replaced loses an edit, as a run the kernel evaluates. `no_lost_edit_binding_island.rs`
 //! proves each compiled kernel equal to its spec and closes the laws for the Worlds that ask the
@@ -93,6 +111,85 @@ contract! {
     pub fn write_overtaken(done: bool, stands_over: bool, take_back: bool) -> bool
     clauses [ensures result == spec_write_overtaken(done, stands_over, take_back) by write_overtaken_is_exact]
     { !done && (!stands_over || take_back) }
+}
+contract! {
+    /// A server takes an envelope as its head (server.rs `takes_over`): its pin holds, and the pin
+    /// was replaced (the held line gave way to the key the server's build names: no sequence and
+    /// no parents check), or the envelope is newer than the version held, carries the held handoff
+    /// chain on, and names the held head among its parents wherever it or the held vault names
+    /// parents.
+    pub fn takes_head(pin_ok: bool, replaced: bool, not_newer: bool, chain_ok: bool, names_parents: bool, held_parented: bool, among_parents: bool) -> bool
+    clauses [ensures result == spec_takes_head(pin_ok, replaced, not_newer, chain_ok, names_parents, held_parented, among_parents) by takes_head_is_exact]
+    { pin_ok && (replaced || (!not_newer && (chain_ok && ((!names_parents && !held_parented) || among_parents)))) }
+}
+contract! {
+    /// The envelope is the version the server holds (its sequence and its bytes), under a pin
+    /// that holds and was not replaced: the server keeps it, and nothing changes.
+    pub fn holds_version(pin_ok: bool, replaced: bool, not_newer: bool, same_version: bool) -> bool
+    clauses [ensures result == spec_holds_version(pin_ok, replaced, not_newer, same_version) by holds_version_is_exact]
+    { pin_ok && (!replaced && (not_newer && same_version)) }
+}
+contract! {
+    /// 409: the envelope is not newer than the version held, and is not that version.
+    pub fn refuses_not_newer(pin_ok: bool, replaced: bool, not_newer: bool, same_version: bool) -> bool
+    clauses [ensures result == spec_refuses_not_newer(pin_ok, replaced, not_newer, same_version) by refuses_not_newer_is_exact]
+    { pin_ok && (!replaced && (not_newer && !same_version)) }
+}
+contract! {
+    /// 403: the envelope is newer, but drops or changes a link of the held handoff chain.
+    pub fn refuses_chain(pin_ok: bool, replaced: bool, not_newer: bool, chain_ok: bool) -> bool
+    clauses [ensures result == spec_refuses_chain(pin_ok, replaced, not_newer, chain_ok) by refuses_chain_is_exact]
+    { pin_ok && (!replaced && (!not_newer && !chain_ok)) }
+}
+contract! {
+    /// 409: the envelope is newer and carries the chain on, but it or the held vault names
+    /// parents and its parents leave the held head out.
+    pub fn refuses_parents(pin_ok: bool, replaced: bool, not_newer: bool, chain_ok: bool, names_parents: bool, held_parented: bool, among_parents: bool) -> bool
+    clauses [ensures result == spec_refuses_parents(pin_ok, replaced, not_newer, chain_ok, names_parents, held_parented, among_parents) by refuses_parents_is_exact]
+    { pin_ok && (!replaced && (!not_newer && (chain_ok && ((names_parents || held_parented) && !among_parents)))) }
+}
+contract! {
+    /// A head takes a hold in (`adopt_held_draft`): the records store took the hold's records
+    /// with no error, and the head's stamp is complete with them.
+    pub fn hold_adopts(ingested: bool, completes: bool) -> bool
+    clauses [ensures result == spec_hold_adopts(ingested, completes) by hold_adopts_is_exact]
+    { ingested && completes }
+}
+contract! {
+    /// The unversioned hold a build before per-version holds kept (`records.drafted`) goes: it
+    /// reads, and the records store holds every record in it. Nothing else removes it: no answer
+    /// says whether its unnamed version was stored.
+    pub fn unversioned_goes(reads: bool, all_stored: bool) -> bool
+    clauses [ensures result == spec_unversioned_goes(reads, all_stored) by unversioned_goes_is_exact]
+    { reads && all_stored }
+}
+contract! {
+    /// A publish keeps its drafted records, once a server took its version, only while the
+    /// version's hold is there (`keep_drafted_until`): a hold gone by then went by adoption, whose
+    /// records the store holds already, or by descent, and kept after a descent the records would
+    /// put this version's values back over every edit drafted from the descending head's text.
+    pub fn drafted_keeps(held: bool) -> bool
+    clauses [ensures result == spec_drafted_keeps(held) by drafted_keeps_is_exact]
+    { held }
+}
+contract! {
+    /// A landed version settles the other holds by its parent spine (descent) only where it
+    /// drafted no records or kept them (`forget_landed_draft`): a version whose records stayed
+    /// where a descending head left them carries no edit of its own past that head, and a spine
+    /// read through it would drop a hold that head's spine may not name. Its servers settle the
+    /// holds by reach either way.
+    pub fn spine_settles(drafted: bool, kept: bool) -> bool
+    clauses [ensures result == spec_spine_settles(drafted, kept) by spine_settles_is_exact]
+    { !drafted || kept }
+}
+contract! {
+    /// An `[everyone]` edit whose writes wait (`writes`) is refused at its draft
+    /// (`draft_document_diff_with`) where this Mac's waiting writes do not read, or its held
+    /// drafts do not read (they are read where writes wait): what this Mac cannot read is never
+    /// read as none (W3).
+    pub fn draft_refuses(writes: bool, waiting_unread: bool, held_unread: bool) -> bool
+    clauses [ensures result == spec_draft_refuses(writes, waiting_unread, held_unread) by draft_refuses_is_exact]
+    { writes && (waiting_unread || held_unread) }
 }
 
 #[cfg(clean_islands)]
@@ -259,6 +356,93 @@ pub fn land(sets: &[(bool, &[usize])], names: usize) -> Landing {
         lands,
         keeps,
         waits,
+    }
+}
+
+/// What a server makes of an envelope against the version it holds (server.rs `takes_over`, the
+/// rule a PUT and a version at the vault's store file keep alike).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Takeover {
+    /// It becomes the head, under its pin ([`takes_head`]).
+    Takes,
+    /// It is the version held ([`holds_version`]).
+    Holds,
+    /// 403: the pin check refused it.
+    PinRefused,
+    /// 409: not newer than the version held ([`refuses_not_newer`]).
+    NotNewer,
+    /// 403: it drops or changes a link of the held handoff chain ([`refuses_chain`]).
+    BreaksChain,
+    /// 409: its parents leave the held head out ([`refuses_parents`]).
+    OffParents,
+}
+
+/// The scalar facts `takes_over` reads of an envelope and the version a server holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TakeoverFacts {
+    /// The pin check passed (`check_pin_with` against the held signer and its chain).
+    pub pin_ok: bool,
+    /// The pin it passed under is `Pin::Replaced`: the held line gave way to the build's key.
+    pub replaced: bool,
+    /// Its sequence is the held one or below.
+    pub not_newer: bool,
+    /// It is the version held: the held sequence and the held bytes.
+    pub same_version: bool,
+    /// It carries the held handoff chain on (`check_extends`).
+    pub chain_ok: bool,
+    /// It names parents.
+    pub names_parents: bool,
+    /// The held version, or an ancestor of it, named parents.
+    pub held_parented: bool,
+    /// Its parents name the held head.
+    pub among_parents: bool,
+}
+
+impl Takeover {
+    /// The answer to `facts`. The island proves that exactly one of the five kernels or a refused
+    /// pin holds for every argument (`takeover_partitions`), so the order asked is the code's
+    /// refusal order and changes nothing.
+    #[must_use]
+    pub fn of(facts: TakeoverFacts) -> Self {
+        let TakeoverFacts {
+            pin_ok,
+            replaced,
+            not_newer,
+            same_version,
+            chain_ok,
+            names_parents,
+            held_parented,
+            among_parents,
+        } = facts;
+        if takes_head(
+            pin_ok,
+            replaced,
+            not_newer,
+            chain_ok,
+            names_parents,
+            held_parented,
+            among_parents,
+        ) {
+            Self::Takes
+        } else if holds_version(pin_ok, replaced, not_newer, same_version) {
+            Self::Holds
+        } else if refuses_not_newer(pin_ok, replaced, not_newer, same_version) {
+            Self::NotNewer
+        } else if refuses_chain(pin_ok, replaced, not_newer, chain_ok) {
+            Self::BreaksChain
+        } else if refuses_parents(
+            pin_ok,
+            replaced,
+            not_newer,
+            chain_ok,
+            names_parents,
+            held_parented,
+            among_parents,
+        ) {
+            Self::OffParents
+        } else {
+            Self::PinRefused
+        }
     }
 }
 

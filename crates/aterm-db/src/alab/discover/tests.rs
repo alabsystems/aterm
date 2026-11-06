@@ -128,12 +128,11 @@ fn obs(rows: &[(String, Value)]) -> OwnedRead {
     }
 }
 
-fn run(listing: &Listing, keyed: Option<&str>, cells: &Cells, read: &OwnedRead, now: u64) -> Plan {
+fn run(listing: &Listing, cells: &Cells, read: &OwnedRead, now: u64) -> Plan {
     plan(
         &Input {
             uuid: ME,
             listing,
-            keyed,
             now_ms: now,
         },
         cells,
@@ -167,7 +166,6 @@ fn an_open_mailbox_lists_held_rows_and_births_the_target() {
     let held = cells(registry_cells());
     let plan = run(
         &listing(Some("new@example.test")),
-        None,
         &held,
         &OwnedRead::default(),
         NOW,
@@ -230,10 +228,10 @@ fn an_open_mailbox_lists_held_rows_and_births_the_target() {
     assert!(row.live());
 }
 
-/// The mailbox comes from the key its login derives where that row is here, else from the
+/// The mailbox comes from the key its login's row derives where that row is here, else from the
 /// owner's links: none is unknown and writes nothing, two hold the pass with a finding by key, a
 /// key whose row is not here yet falls back to the links, and a target the list does not receive,
-/// or that a retired row holds, is not born.
+/// or whose key a retired row holds, is not born.
 /// NEGATIVE CONTROL: with `identify` taking the first of several linked mailboxes (the `_` arm
 /// answering `Ok(linked.first())`), the ambiguous pass observes: `` left: Observed { .. } right:
 /// Held ``.
@@ -248,13 +246,22 @@ fn the_mailbox_is_keyed_or_linked_and_never_guessed() {
             .filter(|c| !c.key.contains("mailbox"))
             .collect(),
     );
-    let plan = run(&listing(None), None, &unlinked, &none, NOW);
+    let plan = run(&listing(None), &unlinked, &none, NOW);
     assert_eq!((plan.outcome, plan.changes.len()), (Outcome::Unknown, 0));
-    // The key names it with no link.
-    let plan = run(&listing(None), Some(MAILBOX_PK), &unlinked, &none, NOW);
+    // The key its login's row derives names it with no link.
+    let keyed = keys::mailbox_pk(&pk(LOGIN)).unwrap();
+    let with_key = cells(
+        registry_cells()
+            .into_iter()
+            .filter(|c| !c.key.contains("mailbox"))
+            .chain([put(&MAILBOX, &keyed, "label", json!("proton-9"))])
+            .collect(),
+    );
+    let plan = run(&listing(None), &with_key, &none, NOW);
     assert!(matches!(plan.outcome, Outcome::Observed { born: 0, .. }));
+    assert_eq!(written(&plan)["mailbox"], json!(keyed));
     // A key with no row here falls back to the links.
-    let plan = run(&listing(None), Some(OTHER_PK), &held, &none, NOW);
+    let plan = run(&listing(None), &held, &none, NOW);
     assert_eq!(written(&plan)["mailbox"], json!(MAILBOX_PK));
     // Two links name two mailboxes.
     let two = cells(
@@ -272,7 +279,7 @@ fn the_mailbox_is_keyed_or_linked_and_never_guessed() {
         ]
         .concat(),
     );
-    let plan = run(&listing(None), None, &two, &none, NOW);
+    let plan = run(&listing(None), &two, &none, NOW);
     assert_eq!(plan.outcome, Outcome::Held);
     assert!(plan.changes.is_empty());
     let mut both = vec![MAILBOX_PK.to_owned(), OTHER_PK.to_owned()];
@@ -287,7 +294,7 @@ fn the_mailbox_is_keyed_or_linked_and_never_guessed() {
     );
     // An unlisted target, a disabled one and a retired row are never born.
     for target in ["elsewhere@example.test", "off@example.test"] {
-        let plan = run(&listing(Some(target)), None, &held, &none, NOW);
+        let plan = run(&listing(Some(target)), &held, &none, NOW);
         assert!(matches!(plan.outcome, Outcome::Observed { born: 0, .. }));
     }
     let retired = cells(
@@ -302,13 +309,7 @@ fn the_mailbox_is_keyed_or_linked_and_never_guessed() {
         ]
         .concat(),
     );
-    let plan = run(
-        &listing(Some("new@example.test")),
-        None,
-        &retired,
-        &none,
-        NOW,
-    );
+    let plan = run(&listing(Some("new@example.test")), &retired, &none, NOW);
     assert!(
         plan.changes
             .iter()
@@ -328,10 +329,10 @@ fn the_mailbox_is_keyed_or_linked_and_never_guessed() {
 #[test]
 fn a_row_changes_monthly_and_a_birth_at_once() {
     let held = cells(registry_cells());
-    let first = run(&listing(None), None, &held, &OwnedRead::default(), NOW);
+    let first = run(&listing(None), &held, &OwnedRead::default(), NOW);
     let row = written(&first).clone();
     let mine = obs(&[(obs_key(), row.clone())]);
-    let again = run(&listing(None), None, &held, &mine, NOW + DAY * 5);
+    let again = run(&listing(None), &held, &mine, NOW + DAY * 5);
     assert_eq!(
         (again.outcome, again.changes.len()),
         (Outcome::Unchanged, 0)
@@ -348,21 +349,15 @@ fn a_row_changes_monthly_and_a_birth_at_once() {
         mailbox: MAILBOX_PK.into(),
     };
     for later in [1000, DAY, (REWRITE_DAYS - 1) * DAY] {
-        let plan = run(&more, None, &held, &mine, NOW + later);
+        let plan = run(&more, &held, &mine, NOW + later);
         assert_eq!(plan.outcome, rested, "{later}");
         assert!(plan.changes.is_empty());
     }
-    let month = run(&more, None, &held, &mine, NOW + REWRITE_DAYS * DAY);
+    let month = run(&more, &held, &mine, NOW + REWRITE_DAYS * DAY);
     assert!(matches!(month.outcome, Outcome::Observed { listed: 3, .. }));
     assert_eq!(written(&month)["n"], json!(2));
     // A birth is written the same day as the row's last change.
-    let born = run(
-        &listing(Some("new@example.test")),
-        None,
-        &held,
-        &mine,
-        NOW + 1000,
-    );
+    let born = run(&listing(Some("new@example.test")), &held, &mine, NOW + 1000);
     assert!(
         matches!(born.outcome, Outcome::Observed { born: 1, .. }),
         "{:?}",
@@ -374,18 +369,129 @@ fn a_row_changes_monthly_and_a_birth_at_once() {
         complete: false,
         ..listing(None)
     };
-    let plan = run(&partial, None, &held, &mine, NOW + REWRITE_DAYS * DAY);
+    let plan = run(&partial, &held, &mine, NOW + REWRITE_DAYS * DAY);
     assert_eq!(written(&plan)["complete"], json!(false));
     // A first list naming nothing held writes nothing.
-    let bare = cells(vec![put(&MAILBOX, MAILBOX_PK, "label", json!("proton-1"))]);
+    let bare = cells(vec![put(
+        &MAILBOX,
+        &keys::mailbox_pk(&pk(LOGIN)).unwrap(),
+        "label",
+        json!("proton-1"),
+    )]);
+    let plan = run(&listing(None), &bare, &OwnedRead::default(), NOW);
+    assert_eq!((plan.outcome, plan.changes.len()), (Outcome::Empty, 0));
+}
+
+/// The registry of [`registry_cells`] after the owner renamed `ann` to `ann2` and the mailbox's
+/// login to `owner2`, with a row `x` renamed onto `bob`'s address; and, where `keyed`, the mailbox
+/// row its login's row derives.
+fn renamed_registry(keyed: bool) -> Cells {
+    let mut book = Book::new();
+    let first = book.write(1, &[], registry_cells());
+    let mut renames = vec![
+        put(
+            &ADDRESS,
+            &pk("ann@example.test"),
+            "addr",
+            json!("ann2@example.test"),
+        ),
+        put(&ADDRESS, &pk(LOGIN), "addr", json!("owner2@proton.example")),
+        put(
+            &ADDRESS,
+            &pk("x@example.test"),
+            "addr",
+            json!("bob@example.test"),
+        ),
+    ];
+    if keyed {
+        renames.push(put(
+            &MAILBOX,
+            &keys::mailbox_pk(&pk(LOGIN)).unwrap(),
+            "label",
+            json!("proton-9"),
+        ));
+    }
+    book.write(2, &[first], renames);
+    book.cells()
+}
+
+/// The renamed mailbox's list: its login's new address, the twin, `ann`'s new address and its old
+/// one, `bob` and a fresh address.
+fn renamed_listing(target: Option<&str>) -> Listing {
+    Listing {
+        login: "owner2@proton.example".into(),
+        target: target.map(str::to_owned),
+        listed: vec![
+            listed("owner2@proton.example"),
+            listed("owner@pm.example"),
+            listed("ann2@example.test"),
+            listed("Ann@Example.test"),
+            listed("bob@example.test"),
+            listed("new@example.test"),
+        ],
+        complete: true,
+    }
+}
+
+/// A rename keeps the row's key, and discovery reads what each row says now: a list receiving a
+/// renamed row's new address lists that row's birth key and follows its owner link, the old
+/// address lists nothing, a renamed login still keys its mailbox, an address two rows say lists
+/// both, and a target equal to any address a row says, or to a renamed row's old address, is
+/// never born; a fresh one still is.
+/// NEGATIVE CONTROL: with the birth guard keyed by the target's derived key again (`Ok(pk) =
+/// keys::address_pk(&addr)` and `!addresses.rows.contains_key(&pk)`), the renamed row's new
+/// address is born a second row: `` left: Observed { mailbox: "mb-…", listed: 6, born: 1 }
+/// right: Observed { mailbox: "mb-…", listed: 5, born: 0 } ``.
+#[test]
+fn a_renamed_address_is_listed_by_its_row_and_never_reborn() {
+    let held = renamed_registry(true);
+    let none = OwnedRead::default();
+    let mailbox = keys::mailbox_pk(&pk(LOGIN)).unwrap();
+    for target in [
+        "ann2@example.test",
+        "Ann@Example.test",
+        "owner2@proton.example",
+        "bob@example.test",
+    ] {
+        let plan = run(&renamed_listing(Some(target)), &held, &none, NOW);
+        assert_eq!(
+            plan.outcome,
+            Outcome::Observed {
+                mailbox: mailbox.clone(),
+                listed: 5,
+                born: 0
+            },
+            "{target}"
+        );
+        assert!(
+            plan.changes
+                .iter()
+                .all(|c| c.collection == MAILBOX_OBS.name),
+            "{target}"
+        );
+    }
+    let plan = run(&renamed_listing(None), &held, &none, NOW);
+    let mut want = vec![
+        pk("ann@example.test"),
+        pk("bob@example.test"),
+        pk("x@example.test"),
+        pk(LOGIN),
+        pk("owner@pm.example"),
+    ];
+    want.sort();
+    assert_eq!(written(&plan)["addresses"], json!(want));
+    // The owner's link on the renamed row names the mailbox when the login keys none.
+    let unkeyed = renamed_registry(false);
+    let plan = run(&renamed_listing(None), &unkeyed, &none, NOW);
+    assert_eq!(written(&plan)["mailbox"], json!(MAILBOX_PK));
+    // A fresh target is born.
     let plan = run(
-        &listing(None),
-        Some(MAILBOX_PK),
-        &bare,
-        &OwnedRead::default(),
+        &renamed_listing(Some("new@example.test")),
+        &held,
+        &none,
         NOW,
     );
-    assert_eq!((plan.outcome, plan.changes.len()), (Outcome::Empty, 0));
+    assert!(matches!(plan.outcome, Outcome::Observed { born: 1, .. }));
 }
 
 fn lab_config(lab: &Lab) -> std::path::PathBuf {
@@ -416,12 +522,14 @@ fn a_pass_writes_one_record_within_policy_and_quota() {
     registry.open().unwrap();
     registry.write(vec![registry_cells()]).unwrap();
     let table = registry.table().unwrap().unwrap();
-    std::fs::write(
-        lab_config(&lab),
+    aterm_uds::atomic_file::write(
+        &lab_config(&lab),
         format!(
             "[commons]\nexclude_tables = [\"{}\"]\n",
             aterm_codec::hex::encode_lower(&table)
-        ),
+        )
+        .as_bytes(),
+        0o600,
     )
     .unwrap();
     let before = registry.view().unwrap().ops.len();
@@ -430,7 +538,7 @@ fn a_pass_writes_one_record_within_policy_and_quota() {
         .unwrap();
     assert_eq!((excluded.outcome, excluded.records), (Outcome::Excluded, 0));
     assert_eq!(registry.view().unwrap().ops.len(), before);
-    std::fs::write(lab_config(&lab), "").unwrap();
+    aterm_uds::atomic_file::write(&lab_config(&lab), b"", 0o600).unwrap();
     let done = registry
         .observe_mailbox(&lab_config(&lab), &target, NOW)
         .unwrap();
@@ -448,7 +556,8 @@ fn a_pass_writes_one_record_within_policy_and_quota() {
     );
     let addresses = view.project(&ADDRESS);
     let bob = pk("bob@example.test");
-    let reached = mail::effective(&addresses, &seen, &|_| None, &bob).unwrap();
+    let index = registry::AddressIndex::of(&addresses);
+    let reached = mail::effective(&addresses, &index, &seen, &|_| None, &bob).unwrap();
     assert_eq!(
         (reached.mailbox.as_str(), reached.how),
         (MAILBOX_PK, mail::How::Observed)
@@ -683,7 +792,6 @@ fn a_born_target_past_the_list_cap_stays_listed_and_the_login_keys_the_mailbox()
             listed: listed_items,
             complete: true,
         },
-        None,
         &held,
         &OwnedRead::default(),
         NOW,
@@ -704,7 +812,7 @@ fn a_born_target_past_the_list_cap_stays_listed_and_the_login_keys_the_mailbox()
 
     // `Registry::observe_mailbox` keys the mailbox by its login.
     let lab = Lab::new(&[Role::Writer]);
-    std::fs::write(lab_config(&lab), "").unwrap();
+    aterm_uds::atomic_file::write(&lab_config(&lab), b"", 0o600).unwrap();
     let registry = Registry::at(lab.paths[0].clone());
     registry.open().unwrap();
     let derived = keys::mailbox_pk(&pk(LOGIN)).unwrap();

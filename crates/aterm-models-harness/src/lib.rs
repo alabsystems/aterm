@@ -162,6 +162,7 @@ mod models_claude_cold_admission;
 mod models_claude_live_admission;
 mod models_claude_restore_auth;
 mod models_closed_restart;
+mod models_host_ended_relaunch;
 pub use models_closed_restart::closed_restart_model;
 mod models_continuation_phase;
 pub use models_continuation_phase::continuation_phase_model;
@@ -219,6 +220,7 @@ mod models_self_claim_fact;
 mod models_shared_disposition;
 mod models_shared_recovery;
 mod models_shared_renewal;
+mod models_sources;
 mod models_supervise;
 mod models_supervise_accounts;
 mod models_supervise_tape;
@@ -378,6 +380,7 @@ pub use models_harness_snapshot_read::harness_snapshot_read_model;
 pub use models_harness_state_collection::{
     harness_upgrade_state_collection_liveness, harness_upgrade_state_collection_model,
 };
+pub use models_host_ended_relaunch::host_ended_relaunch_model;
 pub use models_left::{left_write_liveness, left_write_model};
 pub use models_occupancy::{occupancy_door_liveness, occupancy_door_model};
 pub use models_program_queue::{
@@ -396,6 +399,9 @@ pub use models_shared_recovery::{
 pub use models_shared_renewal::{
     renewal_snapshot_model, shared_begin_model, shared_browser_model, shared_checkpoint_model,
     shared_renewal_model,
+};
+pub use models_sources::{
+    owner_tell_model, source_episode_liveness, source_episode_model, workflow_step_model,
 };
 pub use models_supervise::{
     supervisor_box_ask_model, supervisor_box_hold_model, supervisor_break_offer_model,

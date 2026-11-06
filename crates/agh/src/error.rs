@@ -224,12 +224,13 @@ pub struct ExitRow {
 /// The exit table: `(0, "ok", "done", "continue")`, then every kind of `Kind::ALL`.
 #[must_use]
 pub fn exit_rows() -> Vec<ExitRow> {
-    let mut rows = vec![ExitRow {
+    let mut rows = Vec::with_capacity(1 + Kind::ALL.len());
+    rows.push(ExitRow {
         exit: 0,
         slug: "ok",
         meaning: "done",
         next: "continue",
-    }];
+    });
     rows.extend(Kind::ALL.iter().map(|kind| ExitRow {
         exit: kind.exit(),
         slug: kind.slug(),

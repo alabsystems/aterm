@@ -727,41 +727,7 @@ enum Typed<'a> {
 /// `aterm ctl` with its words `typed`, under the isolation every test's client has.
 fn ctl_as(root: &Path, typed: Typed<'_>, stdin: Option<&[u8]>, env: &[(&str, &str)]) -> Output {
     headless_boot::until_served(|| {
-        let aterm = crate::launch_isolation::aterm_executable();
-        let mut cmd = match typed {
-            Typed::Words(args) => {
-                #[expect(
-                    clippy::disallowed_types,
-                    reason = "the binary under test, isolated by launch_isolation::apply (it inherits nothing)"
-                )]
-                let mut cmd = std::process::Command::new(&aterm);
-                cmd.arg("ctl").args(args);
-                cmd
-            }
-            Typed::Bash(line) => {
-                #[expect(
-                    clippy::disallowed_types,
-                    reason = "macOS's own bash running the binary under test, isolated by launch_isolation::apply (it inherits nothing)"
-                )]
-                let mut cmd = std::process::Command::new("/bin/bash");
-                // The binary is bash's `$0`: the isolation strips every `ATERM_*` variable.
-                cmd.args(["-c", &format!("exec \"$0\" ctl {line}")])
-                    .arg(&aterm);
-                cmd
-            }
-        };
-        cmd.stdin(stdin.map_or_else(Stdio::null, |_| Stdio::piped()))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        crate::launch_isolation::apply(&mut cmd, root);
-        cmd.env("ATERM_STATE_HOME", root.join("state"))
-            .env(aterm_net::loopback::SEAM, "1")
-            .env(ISSUER_WITHIN_SEAM, HANG.as_millis().to_string())
-            .env(HANDSHAKE_SEAM, HANG.as_millis().to_string())
-            .env(DRIVE_WITHIN_SEAM, HANG.as_millis().to_string())
-            .env(LOCK_WAIT_SEAM, HANG.as_millis().to_string())
-            .envs(env.iter().copied());
-        let mut child = cmd.spawn().expect("spawn aterm ctl");
+        let mut child = ctl_spawn(root, typed, stdin.is_some(), env);
         if let Some(bytes) = stdin {
             let mut pipe = child.stdin.take().expect("its stdin");
             pipe.write_all(bytes).expect("write its stdin");
@@ -769,6 +735,50 @@ fn ctl_as(root: &Path, typed: Typed<'_>, stdin: Option<&[u8]>, env: &[(&str, &st
         crate::child_output::wait_and_read(child, Instant::now() + HANG)
             .unwrap_or_else(|| panic!("aterm ctl {typed:?} did not exit"))
     })
+}
+
+/// The `aterm ctl` of [`ctl_as`] started, its stdin piped where `fed` says.
+fn ctl_spawn(
+    root: &Path,
+    typed: Typed<'_>,
+    fed: bool,
+    env: &[(&str, &str)],
+) -> std::process::Child {
+    let aterm = crate::launch_isolation::aterm_executable();
+    let mut cmd = match typed {
+        Typed::Words(args) => {
+            #[expect(
+                clippy::disallowed_types,
+                reason = "the binary under test, isolated by launch_isolation::apply (it inherits nothing)"
+            )]
+            let mut cmd = std::process::Command::new(&aterm);
+            cmd.arg("ctl").args(args);
+            cmd
+        }
+        Typed::Bash(line) => {
+            #[expect(
+                clippy::disallowed_types,
+                reason = "macOS's own bash running the binary under test, isolated by launch_isolation::apply (it inherits nothing)"
+            )]
+            let mut cmd = std::process::Command::new("/bin/bash");
+            // The binary is bash's `$0`: the isolation strips every `ATERM_*` variable.
+            cmd.args(["-c", &format!("exec \"$0\" ctl {line}")])
+                .arg(&aterm);
+            cmd
+        }
+    };
+    cmd.stdin(if fed { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    crate::launch_isolation::apply(&mut cmd, root);
+    cmd.env("ATERM_STATE_HOME", root.join("state"))
+        .env(aterm_net::loopback::SEAM, "1")
+        .env(ISSUER_WITHIN_SEAM, HANG.as_millis().to_string())
+        .env(HANDSHAKE_SEAM, HANG.as_millis().to_string())
+        .env(DRIVE_WITHIN_SEAM, HANG.as_millis().to_string())
+        .env(LOCK_WAIT_SEAM, HANG.as_millis().to_string())
+        .envs(env.iter().copied());
+    cmd.spawn().expect("spawn aterm ctl")
 }
 
 /// Where the aterm under `root` listens (its `[fleet] listen`): the member a join names with
@@ -3854,38 +3864,61 @@ fn a_drives_typed_turn_slower_than_its_deadline_lands_whole_or_writes_nothing() 
     );
 }
 
-/// A drive's typed turn into a Claude Code composer, its keys slower than the drive's 20 s
-/// allows (each held 400 ms on the driven node, `ATERM_DEBUG_TURN_KEY_LAG_MS`), lands whole: the
-/// composer takes the keys that fit and the rest as one paste, then an Enter moves the whole line
-/// up; and one whose first key does not fit writes nothing. The composer is then as the turn
-/// found it, so the next line is taken alone. As in the shell's drive above, what it judges is
-/// that property, never how soon the composer answers: a verified Enter is the composer's, and an
-/// Enter no look verified in its window says `pressed=`.
-/// NEGATIVE CONTROLS: cutting the typing at the deadline, as the turn did before its pace, answers
-/// `skipped reason=deadline typed=<n>` and leaves those keys in the composer (m14's drive of m108,
-/// 2026-11-04); the stand-in started as a plain program has its Enter verified by the screen,
-/// `submit_by=screen`.
-#[test]
-fn a_drives_typed_turn_into_claude_code_slower_than_its_deadline_lands_whole_or_writes_nothing() {
-    let (issuer, member, worker, target) =
-        driven_pair_with(("afci", "afcm"), &[("ATERM_DEBUG_TURN_KEY_LAG_MS", "400")]);
-    let at = format!("@{worker}");
-    let script = member.tmp.join("composer.sh");
-    std::fs::write(&script, crate::turn_submit_live_headless::COMPOSER).expect("the stand-in");
-    crate::turn_submit_live_headless::start(&member, &worker, &script, true, "takes");
-    let row = |n: usize| {
-        let screen = ctl_ok(&member, &[&at, "text"]);
+/// 72 graphemes, letters and spaces, one byte each, which fit an 80-column composer row.
+fn composer_line() -> &'static str {
+    "follow up on the notes abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVW"
+}
+
+/// The pair of [`driven_pair_with`], the driven node holding each typed key 400 ms before it goes
+/// (`ATERM_DEBUG_TURN_KEY_LAG_MS`), its worker running `turn_submit_live_headless`'s `COMPOSER`
+/// as Claude Code in `mode`, held from the start (reading nothing) where `held` says.
+struct ComposerDrive {
+    issuer: Instance,
+    member: Instance,
+    worker: String,
+    at: String,
+    target: String,
+    hold: PathBuf,
+}
+
+impl ComposerDrive {
+    fn new(tags: (&str, &str), mode: &str, held: bool) -> Self {
+        let (issuer, member, worker, target) =
+            driven_pair_with(tags, &[("ATERM_DEBUG_TURN_KEY_LAG_MS", "400")]);
+        let script = member.tmp.join("composer.sh");
+        std::fs::write(&script, crate::turn_submit_live_headless::COMPOSER).expect("the stand-in");
+        let hold = member.tmp.join("composer.sh.hold");
+        if held {
+            std::fs::write(&hold, "").expect("hold the stand-in");
+        }
+        crate::turn_submit_live_headless::start(&member, &worker, &script, true, mode);
+        let at = format!("@{worker}");
+        Self {
+            issuer,
+            member,
+            worker,
+            at,
+            target,
+            hold,
+        }
+    }
+
+    /// Row `n` (from 0) of the worker's screen.
+    fn row(&self, n: usize) -> String {
+        let screen = ctl_ok(&self.member, &[&self.at, "text"]);
         screen
             .lines()
             .nth(n)
             .unwrap_or_default()
             .trim_end()
             .to_owned()
-    };
-    let shows = |n: usize, want: &str| {
+    }
+
+    /// Once row `n` reads `want`, within the hang detector.
+    fn shows(&self, n: usize, want: &str) {
         let mut last = String::new();
         let shown = aterm_spec::wait::within(HANG, POLL_GAP, || {
-            last = row(n);
+            last = self.row(n);
             (last == want).then_some(())
         });
         assert!(
@@ -3893,33 +3926,49 @@ fn a_drives_typed_turn_into_claude_code_slower_than_its_deadline_lands_whole_or_
             "row {} never read {want:?}: {last:?}",
             n + 1
         );
-    };
-    let alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-    let line: String = format!("follow up on the notes {alphabet}")
-        .chars()
-        .take(72)
-        .collect();
-    let keys = line.chars().count();
-    // 72 keys 400 ms apart do not fit the drive's 20 s; the submit's share is half of it.
-    let sent = drive_in(
-        &issuer.tmp,
-        &target,
-        &[
-            &at,
-            "turn",
-            "typed=1",
-            "timeout=20000",
-            "settle=submitted",
-            "submit_window=10000",
-            &line,
-        ],
-    );
-    let verdict = String::from_utf8_lossy(&sent.stderr).into_owned();
-    // A turn whose Enter no look verified in its window ends `status=timeout`, which exits 124.
-    assert!(
-        sent.status.success() || sent.status.code() == Some(124),
-        "{sent:?}"
-    );
+    }
+
+    /// The drive's typed turn of `line`: 72 keys 400 ms apart do not fit the longest turn a drive
+    /// takes, 22 s, and the submit's share is the most a turn keeps for it, half.
+    fn turn_words(&self, line: &'static str) -> [String; 7] {
+        let max = aterm_types::control_verbs::DRIVE_TURN_MAX_MS;
+        [
+            self.at.clone(),
+            "turn".into(),
+            "typed=1".into(),
+            format!("timeout={max}"),
+            "settle=submitted".into(),
+            format!("submit_window={}", max / 2),
+            line.into(),
+        ]
+    }
+
+    /// [`Self::turn_words`] over the drive, and its verdict.
+    fn turn(&self, line: &'static str) -> String {
+        let words = self.turn_words(line);
+        let words: Vec<&str> = words.iter().map(String::as_str).collect();
+        let sent = drive_in(&self.issuer.tmp, &self.target, &words);
+        // A turn whose Enter no look verified in its window ends `status=timeout`: exit 124.
+        assert!(
+            sent.status.success() || sent.status.code() == Some(124),
+            "{sent:?}"
+        );
+        String::from_utf8_lossy(&sent.stderr).into_owned()
+    }
+}
+
+/// `verdict` is a typed turn of `keys` graphemes landed whole into a Claude Code composer: not
+/// skipped, the keys that fit and the rest as one paste, its Enter verified by the composer or,
+/// where no look verified it in its window, named `pressed=`. It judges that property, never how
+/// soon the composer answers.
+fn landed_whole(verdict: &str, keys: usize) {
+    landed(verdict, keys, Some("composer"));
+}
+
+/// [`landed_whole`], its verified Enter judged by `judge` (`submit_by=`), or by any judge for
+/// `None`.
+fn landed(verdict: &str, keys: usize, judge: Option<&str>) {
+    let judged = judge.is_none_or(|judge| verdict.contains(&format!(" submit_by={judge}")));
     let count = |name: &str| {
         field(verdict.trim_end(), name)
             .and_then(|n| n.parse::<usize>().ok())
@@ -3928,22 +3977,40 @@ fn a_drives_typed_turn_into_claude_code_slower_than_its_deadline_lands_whole_or_
     let (typed, pasted) = (count("typed"), count("pasted"));
     assert!(
         !verdict.contains(" turn skipped ")
-            && ((verdict.contains("submitted=1") && verdict.contains(" submit_by=composer"))
+            && ((verdict.contains("submitted=1") && judged)
                 || (verdict.contains("submitted=0") && verdict.contains(" pressed=")))
             && typed > 0
             && pasted > 0
             && typed + pasted == keys,
         "the keys that fit, then the rest as one paste and an Enter the composer took: {verdict}"
     );
-    // The whole line went up once, and the composer is empty.
-    shows(2, &format!("❯ {line}"));
-    shows(20, "❯");
+}
+
+/// A drive's typed turn into a Claude Code composer that turns DEC 2004 on, as Claude Code does,
+/// its keys slower than a drive's longest turn allows ([`ComposerDrive`]), lands whole: the composer
+/// takes the keys that fit and the rest as one bracketed paste, then an Enter moves the whole line
+/// up; and one whose first key does not fit writes nothing. The composer is then as the turn
+/// found it, so the next line is taken alone ([`landed_whole`]).
+/// NEGATIVE CONTROLS: cutting the typing at the deadline, as the turn did before its pace, answers
+/// `skipped reason=deadline typed=<n>` and leaves those keys in the composer (m14's drive of m108,
+/// 2026-11-04); the stand-in started as a plain program has its Enter verified by the screen,
+/// `submit_by=screen`; one that leaves DEC 2004 off is pasted no brackets, `bracketed pastes` never
+/// drawn.
+#[test]
+fn a_drives_typed_turn_into_claude_code_slower_than_its_deadline_lands_whole_or_writes_nothing() {
+    let drive = ComposerDrive::new(("afci", "afcm"), "takes plain bracketed", false);
+    let line = composer_line();
+    landed_whole(&drive.turn(line), line.chars().count());
+    // The whole line went up once, from one bracketed paste, and the composer is empty.
+    drive.shows(2, &format!("❯ {line}"));
+    drive.shows(20, "❯");
+    drive.shows(23, "bracketed pastes: 1");
     // A first key that does not fit: nothing is written.
     let (_, skipped) = drive_ok(
-        &issuer.tmp,
-        &target,
+        &drive.issuer.tmp,
+        &drive.target,
         &[
-            &at,
+            &drive.at,
             "turn",
             "typed=1",
             "cadence=2000",
@@ -3957,9 +4024,9 @@ fn a_drives_typed_turn_into_claude_code_slower_than_its_deadline_lands_whole_or_
         "{skipped}"
     );
     ctl_ok(
-        &member,
+        &drive.member,
         &[
-            &at,
+            &drive.at,
             "turn",
             "typed=1",
             "settle=submitted",
@@ -3968,8 +4035,142 @@ fn a_drives_typed_turn_into_claude_code_slower_than_its_deadline_lands_whole_or_
             "carry on",
         ],
     );
-    shows(3, "❯ carry on");
-    assert_eq!(row(2), format!("❯ {line}"), "the first line went up once");
+    drive.shows(3, "❯ carry on");
+    assert_eq!(
+        drive.row(2),
+        format!("❯ {line}"),
+        "the first line went up once"
+    );
+    assert_eq!(
+        drive.row(23),
+        "bracketed pastes: 1",
+        "nothing else was pasted"
+    );
+}
+
+/// A drive's typed turn into a starved Claude Code, as a loaded worker is: its keys go late on the
+/// driven node ([`ComposerDrive`]) and its composer reads none of them, its logo still, while they
+/// wait unread in its input. The turn types the keys that fit and pastes the rest, bracketed,
+/// behind them. The composer is held until the whole line waits unread, then past the echo's cap,
+/// so the turn's wait for the composer meets the input unread and goes on waiting; fed, the
+/// composer shows the line and the Enter goes then, or, where the turn's time ran out first, at
+/// its end, judged by the screen or by nothing (`pressed=`). While the composer is held, before
+/// the turn's time could be out, nothing but the line's one bracketed paste waits unread, and once
+/// fed the whole line moves up ([`landed`]), however late.
+/// NEGATIVE CONTROLS: cutting the typing at the deadline, as the turn did before its pace, answers
+/// `skipped reason=deadline typed=<n>` with only those keys in the input; an echo wait that does
+/// not count the unread input presses the Enter at the cap, one byte more waiting unread (85);
+/// the rest pasted as two bracketed writes, two brackets more (96).
+#[test]
+fn a_drives_typed_turn_into_a_starved_claude_code_lands_whole_once_it_reads() {
+    // The paste's two brackets: with one byte for each of the line's graphemes, the whole line's
+    // unread input is `keys + BRACKETS`.
+    const BRACKETS: usize = "\x1b[200~\x1b[201~".len();
+    let drive = ComposerDrive::new(("afsi", "afsm"), "takes still bracketed", true);
+    let line = composer_line();
+    let keys = line.chars().count();
+    // The driven turn begins after this, so its time is out no sooner than a drive's turn after it.
+    let out_after = std::time::Instant::now()
+        + std::time::Duration::from_millis(aterm_types::control_verbs::DRIVE_TURN_MAX_MS);
+    let unread = |read: &mut String| -> usize {
+        *read = status(&drive.member, &drive.worker);
+        field(read, "input_bytes")
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("input_bytes= in {read}"))
+    };
+    let (verdict, seen, early, read) = std::thread::scope(|scope| {
+        let turn = scope.spawn(|| drive.turn(line));
+        let mut read = String::new();
+        let seen = aterm_spec::wait::within(HANG, POLL_GAP, || {
+            let seen = unread(&mut read) >= keys + BRACKETS;
+            (seen || turn.is_finished()).then_some(seen)
+        })
+        .unwrap_or_else(|| panic!("neither the line waited unread nor the turn ended: {read}"));
+        // Held past the echo's cap: an Enter the turn pressed now would wait unread behind the
+        // line, as would a second write of it, and either read back before the turn's time could
+        // be out went while the composer showed nothing.
+        let mut early = None;
+        let held = std::time::Instant::now() + crate::turn_submit_live_headless::PAST_THE_ECHO_CAP;
+        while seen && early.is_none() && std::time::Instant::now() < held {
+            let n = unread(&mut read);
+            if n > keys + BRACKETS && std::time::Instant::now() < out_after {
+                early = Some(read.clone());
+            }
+            std::thread::sleep(POLL_GAP);
+        }
+        std::fs::remove_file(&drive.hold).expect("feed the stand-in");
+        (turn.join().expect("the drive's turn"), seen, early, read)
+    });
+    assert!(seen, "the whole line never waited unread: {read}");
+    assert_eq!(
+        early, None,
+        "more than the line's one bracketed paste waited unread (an Enter or a second write): \
+         {verdict}"
+    );
+    landed(&verdict, keys, None);
+    drive.shows(2, &format!("❯ {line}"));
+    drive.shows(20, "❯");
+    drive.shows(23, "bracketed pastes: 1");
+}
+
+/// A drive's typed turn whose issuer goes while the driven node types it, as one whose connection
+/// a slow or broken hop between two Macs drops does, lands whole there all the same: the driven
+/// Mac's relay shuts only its own writing side when the issuer goes and relays out what the turn
+/// answers, and the turn never reads its connection while it types, presses or verifies its
+/// Enter, so the hop can lose the verdict, never cut the typing. The issuer is killed once the
+/// composer shows the first of the keys ([`ComposerDrive`]), before the turn answers (it dies of
+/// the signal); the line then moves up whole, from one bracketed paste, and the driven Mac's
+/// ledger records the turn run to its Enter, verified or, where its time ran out first, not.
+/// NEGATIVE CONTROL: a relay that hangs up the driven connection when its issuer goes, with a typed
+/// turn that stops on its client's hang-up, leaves part of the line in the composer, which never
+/// moves up. Either alone keeps the line whole, so the leg judges the two together.
+#[test]
+fn a_drives_typed_turn_whose_issuer_goes_part_way_lands_whole_on_the_driven_mac() {
+    let drive = ComposerDrive::new(("afhi", "afhm"), "takes plain bracketed", false);
+    let line = composer_line();
+    let whole = format!("❯ {line}");
+    let words = drive.turn_words(line);
+    let mut args = vec!["--host", drive.target.as_str()];
+    args.extend(words.iter().map(String::as_str));
+    let mut issuer = ctl_spawn(&drive.issuer.tmp, Typed::Words(&args), false, &[]);
+    let mut part = String::new();
+    let begun = aterm_spec::wait::within(HANG, POLL_GAP, || {
+        part = drive.row(20);
+        (part.len() > "❯ ".len()).then_some(())
+    });
+    // SIGKILL: the issuer goes at once, its connection with it.
+    issuer.kill().expect("kill the issuer");
+    let gone = issuer.wait().expect("the issuer's end");
+    assert!(begun.is_some(), "the turn never began typing: {part:?}");
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&gone),
+        Some(9),
+        "the issuer went before the turn answered: {gone:?}"
+    );
+    assert!(
+        whole.starts_with(&part) && part.len() < whole.len(),
+        "the issuer went part-way through the typing: {part:?}"
+    );
+    drive.shows(2, &whole);
+    drive.shows(20, "❯");
+    drive.shows(23, "bracketed pastes: 1");
+    let text = format!("text={}", aterm_control::wire::pct_encode(line));
+    let mut ledger = String::new();
+    let recorded = aterm_spec::wait::within(HANG, POLL_GAP, || {
+        ledger = ctl_ok(&drive.member, &[&drive.at, "history"]);
+        ledger
+            .lines()
+            .rev()
+            .find(|rec| rec.starts_with("turn ") && rec.ends_with(&text))
+            .map(str::to_owned)
+    });
+    let rec = recorded.unwrap_or_else(|| panic!("no ledger record of the turn: {ledger}"));
+    // Its Enter verified or, where the turn's time ran out first, pressed unverified, which the
+    // ledger keeps as a timeout: the screen above shows the Enter went once.
+    assert!(
+        rec.contains(" submitted=1 ") || rec.contains(" submitted=0 status=timeout "),
+        "the turn ran to its Enter: {rec}"
+    );
 }
 
 #[test]

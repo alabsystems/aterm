@@ -573,7 +573,7 @@ pub fn run_io(
                 .count();
             let duplicates = if live_numbers >= 2 {
                 handle
-                    .view_sealed(|_, sealer| Ok(duplicate_numbers(&phones, sealer)))
+                    .with_sealer(|sealer| Ok(duplicate_numbers(&phones, sealer)))
                     .unwrap_or_default()
             } else {
                 Vec::new()
@@ -1297,9 +1297,22 @@ impl Sources<'_> {
 /// The plan fails against the registry this Mac holds; one it cannot open (no key here) is
 /// planned against an empty registry instead.
 fn dry_plan(handle: &Handle, sources: &Sources<'_>) -> Result<(Plan, &'static str, usize)> {
-    let planned = |view: &crate::att::View, sealer: &dyn Sealer| -> Result<_> {
+    let (plan, registry, seeds, _) = dry_plan_with(handle, sources, |_| ())?;
+    Ok((plan, registry, seeds))
+}
+
+fn dry_plan_with<T>(
+    handle: &Handle,
+    sources: &Sources<'_>,
+    extra: impl FnOnce(&crate::att::View) -> T,
+) -> Result<(Plan, &'static str, usize, Option<T>)> {
+    let planned = |view: &crate::att::View,
+                   sealer: &dyn Sealer,
+                   extra: &mut Option<T>|
+     -> Result<(Plan, &'static str, usize)> {
         let plan = import::plan(&sources.input(sealer), &view.cells)?;
         let seeds = crate::att::pack(super::seeds::rows_for(&view.cells)?)?.len();
+        let _ = extra;
         Ok((
             plan,
             if view.complete {
@@ -1310,13 +1323,21 @@ fn dry_plan(handle: &Handle, sources: &Sources<'_>) -> Result<(Plan, &'static st
             seeds,
         ))
     };
-    match handle.view_sealed(|view, sealer| Ok(planned(view, sealer))) {
-        Ok(planned) => planned,
+    let mut out_extra = None;
+    match handle.view_sealed(|view, sealer| {
+        let res = planned(view, sealer, &mut out_extra);
+        out_extra = Some(extra(view));
+        Ok(res)
+    }) {
+        Ok(planned) => {
+            let (plan, registry, seeds) = planned?;
+            Ok((plan, registry, seeds, out_extra))
+        }
         Err(_) => {
             let cells = Default::default();
             let plan = import::plan(&sources.input(&Unheld), &cells)?;
             let seeds = crate::att::pack(super::seeds::rows_for(&cells)?)?.len();
-            Ok((plan, "not held here", seeds))
+            Ok((plan, "not held here", seeds, None))
         }
     }
 }
@@ -1538,11 +1559,30 @@ fn compare_sheet(paths: &Paths, csv: &Path, vendors: &dyn Vendors, now_ms: u64) 
         now_ms,
         unread: &[],
     };
-    let (plan, registry, _) = dry_plan(&handle, &sources)?;
-    let addresses = handle
-        .view()
-        .map(|view| view.project(&registry::ADDRESS))
-        .unwrap_or_default();
+    let (plan, registry, _, addresses) =
+        dry_plan_with(&handle, &sources, |view| view.project(&registry::ADDRESS))?;
+    let addresses = match addresses {
+        Some(addresses) => addresses,
+        None => handle
+            .view()
+            .map(|view| view.project(&registry::ADDRESS))
+            .unwrap_or_default(),
+    };
+    // Each flagged address's row, as the import matches it: by key, else by what a row says now.
+    // One several rows say names none of them, and counts as missing.
+    let index = registry::AddressIndex::of(&addresses);
+    let mut unmatched = 0;
+    let flagged: std::collections::BTreeSet<String> = flagged
+        .iter()
+        .filter_map(|address| match index.matched(address) {
+            Ok(registry::AddressHolder::Row(pk)) => Some(pk.to_owned()),
+            Ok(registry::AddressHolder::Free { derived, .. }) => Some(derived),
+            Ok(registry::AddressHolder::Several(_)) | Err(_) => {
+                unmatched += 1;
+                None
+            }
+        })
+        .collect();
     let sealed = |pk: &String| {
         addresses
             .rows
@@ -1569,7 +1609,7 @@ fn compare_sheet(paths: &Paths, csv: &Path, vendors: &dyn Vendors, now_ms: u64) 
         json!({
             "set": set,
             "sealed_in_registry": held,
-            "missing_in_registry": flagged.len() - held,
+            "missing_in_registry": flagged.len() - held + unmatched,
             "no_address": unkeyed,
             "sealed_unflagged": unflagged,
         }),

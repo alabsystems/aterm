@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A private strict astream log whose acknowledgement includes a durable hash of
-//! its physical prefix. Lost acknowledged bytes refuse open; unacknowledged
-//! suffixes are archived before rollback. This protects accidental partial loss,
+//! A private astream log whose acknowledgement includes a durable hash of its
+//! physical prefix: an append is acknowledged only once the record and the
+//! checkpoint that attests it are on stable media ([`Log::append`]). That costs one
+//! full flush where astream serves the log Ordered (an Apple boot volume), and three
+//! where it serves it Strict (off Apple, off the boot volume, or once a barrier was
+//! refused), each write then flushed in full. Lost acknowledged bytes refuse open;
+//! unacknowledged suffixes are archived before rollback. This protects accidental partial loss,
 //! not rollback of the entire directory by a privileged adversary. The caller
 //! authenticates every replayed record and supplies an independently pinned anchor.
 //! One writer at a time holds the exclusive lock; readers take none, and see only
@@ -17,6 +21,7 @@
 
 use astream_broker::{BrokerLog, BrokerRecord, Durability, OpenOptions as LogOptions, Prepared};
 use astream_wire::Offset;
+use aterm_durable::Flush;
 use aterm_uds::private_file::{self, PrivateFileError};
 use std::{
     fs::{File, OpenOptions},
@@ -39,13 +44,14 @@ pub fn create_private_dir_durable(dir: &Path) -> io::Result<()> {
 }
 
 /// Write a private file and require the containing directory's durability
-/// barrier to succeed. A failure after rename is an uncertain outcome, so the
-/// caller must fence publication and reopen rather than assuming no write.
+/// barrier to succeed: the file and then the directory each take one full flush,
+/// and a directory whose entries cannot be flushed here is refused. A failure
+/// after rename is an uncertain outcome, so the caller must fence publication and
+/// reopen rather than assuming no write.
 /// # Errors
 /// Propagates private-path, file-write, rename and directory-barrier failures.
 pub fn write_private_durable(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
-    private_file::write_private(dir, name, bytes)?;
-    aterm_durable::durable_dir(dir)
+    private_file::write_private_flushed(dir, name, bytes, Flush::Durable)
 }
 
 /// Conservative framing allowance per append, in addition to body and subject.
@@ -224,19 +230,14 @@ impl Log {
         let identity = recover_uncommitted(dir, &layout, fresh)
             .map_err(|error| stage_error(&layout, "recovery", error))?;
         let mut checkpoint = None;
-        let log = BrokerLog::open_opts(
-            dir.join(&layout.astream),
-            LogOptions::new(Durability::Strict),
-            || {
-                let (checked, present, metadata) = Checkpoint::load(dir, &layout, fresh)?;
-                if metadata.len() != checked.length || (metadata.dev(), metadata.ino()) != identity
-                {
-                    return Err(io::Error::other("journal changed between its writer locks"));
-                }
-                checkpoint = Some((checked, present));
-                Ok(Prepared::Nothing)
-            },
-        )
+        let log = BrokerLog::open_opts(dir.join(&layout.astream), log_options(), || {
+            let (checked, present, metadata) = Checkpoint::load(dir, &layout, fresh)?;
+            if metadata.len() != checked.length || (metadata.dev(), metadata.ino()) != identity {
+                return Err(io::Error::other("journal changed between its writer locks"));
+            }
+            checkpoint = Some((checked, present));
+            Ok(Prepared::Nothing)
+        })
         .map_err(|error| stage_error(&layout, "astream open", error))?;
         let (checkpoint, present) =
             checkpoint.ok_or_else(|| io::Error::other("journal was not prepared"))?;
@@ -274,13 +275,23 @@ impl Log {
             }
             scan = Offset(scan.0 + page.len() as u64);
         }
+        // The open flushed the log in full, so a checkpoint written here is behind its bytes
+        // already. On a log astream serves Ordered its barriers order its own bytes ahead of
+        // its name, and the directory's full flush below makes both durable; where it
+        // serves Strict the device's barriers are not trusted to, so it is flushed in full.
         if !present {
-            checkpoint.save(dir, &layout)?;
+            let flush = if log.served().served == astream_broker::Tier::Ordered {
+                Flush::Ordered
+            } else {
+                Flush::Durable
+            };
+            checkpoint.save(dir, &layout, flush)?;
         }
         let (_, metadata) = private_file::open_private(dir, &layout.astream)
             .map_err(|_| io::Error::other("journal lost its private inode"))?;
         // An existing checkpoint may be visible after its previous writer failed the
-        // rename's directory barrier. Finish that publication even without rewriting it.
+        // rename's directory barrier, or its commit. Finish that publication even without
+        // rewriting it: the open's full flush, which covers this open's own checkpoint too.
         aterm_durable::durable_dir(dir)?;
         if (metadata.dev(), metadata.ino()) != identity {
             return Err(io::Error::other("journal inode changed during open"));
@@ -347,6 +358,11 @@ impl Log {
     pub fn bytes(&self) -> usize {
         self.log.stats().retained_bytes
     }
+    /// The tier astream serves this open's log at, and why it differs from the Ordered one
+    /// asked for: Strict off Apple, off the boot volume, or once a barrier was refused.
+    pub fn served(&self) -> astream_broker::ServedInfo {
+        self.log.served()
+    }
     /// The prefix this writer's checkpoint attests, comparable with what
     /// [`read_committed`] reports for the same bytes.
     pub fn acknowledged(&self) -> Acknowledged {
@@ -365,11 +381,149 @@ impl Log {
         }
         Ok(self.log.read_range(offset, count.min(256)))
     }
-    /// Acknowledge only after the strict astream append and prefix checkpoint.
+    /// Acknowledge only once the record and the prefix checkpoint that attests it
+    /// are on stable media. On a log astream serves Ordered the record and the
+    /// checkpoint each take barriers, in that order, and one full flush of the log
+    /// commits both (`BrokerLog::sync_full`); on a log it serves Strict the record
+    /// was flushed in full already, so the checkpoint is flushed in full too.
     /// # Errors
     /// Capacity and invalid input refuse before mutation. Any uncertain write
     /// fences this handle; reopen and retry the exact application bytes.
     pub fn append(&mut self, subject: &str, body: Vec<u8>) -> io::Result<Offset> {
+        self.append_inner(
+            subject,
+            body,
+            None::<(&Path, fn(Offset, Flush) -> io::Result<()>)>,
+        )
+    }
+
+    /// [`Self::append`] with one dependent write into the directory `dir`: a witness
+    /// of the prefix kept elsewhere, which a reader that takes no lock may trust as
+    /// the acknowledgement. It is written only once the commit has made the record
+    /// and its checkpoint durable, so whoever can read it finds them on stable media.
+    /// `write` gets the record's offset and the flush to finish every file and
+    /// directory it writes with. On an Ordered log and `dir` on the log's device that
+    /// is [`Flush::Ordered`]: its barriers order it ahead of the next record there,
+    /// whose commit makes it durable, so on stable media the log is never more than
+    /// this one append ahead of it, but a power loss before that commit can take it
+    /// while its record stays (the caller's custody takes that one record back).
+    /// Anywhere else it is [`Flush::Durable`], on stable media before the
+    /// acknowledgement.
+    /// # Errors
+    /// As [`Self::append`]; and `write`'s error, which fences this handle as an
+    /// uncertain append does.
+    pub fn append_then(
+        &mut self,
+        subject: &str,
+        body: Vec<u8>,
+        dir: &Path,
+        write: impl FnOnce(Offset, Flush) -> io::Result<()>,
+    ) -> io::Result<Offset> {
+        self.append_inner(subject, body, Some((dir, write)))
+    }
+
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "JournalAppend",
+            action = "Latch",
+            reason = "astream serves the log Strict: off Apple, off the boot volume, or a refused barrier"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "JournalAppend",
+            action = "Apart",
+            reason = "The caller's dependent directory is on another device than the log"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "JournalAppend",
+            action = "Crash",
+            reason = "The machine loses power during or after the append"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "JournalAppend",
+            action = "DropRecord",
+            reason = "The device loses the record's bytes that no full flush covered"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "JournalAppend",
+            action = "DropCheckpoint",
+            reason = "The device loses a checkpoint that no full flush covered"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "JournalAppend",
+            action = "DropWitness",
+            reason = "The device loses a dependent write that no full flush covered"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "JournalAppend",
+            action = "DropPrior",
+            reason = "The device loses the previous append's dependent write before a full flush"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "JournalAppend",
+            action = "Publish",
+            project = "aterm_journal::append_tests::transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "JournalAppend",
+            action = "Checkpoint",
+            project = "aterm_journal::append_tests::transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "JournalAppend",
+            action = "Witness",
+            project = "aterm_journal::append_tests::transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "JournalAppend",
+            action = "Commit",
+            project = "aterm_journal::append_tests::transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "JournalAppend",
+            action = "Ack",
+            project = "aterm_journal::append_tests::transition"
+        )
+    )]
+    fn append_inner(
+        &mut self,
+        subject: &str,
+        body: Vec<u8>,
+        then: Option<(&Path, impl FnOnce(Offset, Flush) -> io::Result<()>)>,
+    ) -> io::Result<Offset> {
         if self.is_poisoned() {
             return Err(io::Error::other(
                 "uncertain journal: reopen and retry exact bytes",
@@ -408,7 +562,7 @@ impl Log {
             Err(_) => {
                 self.poisoned = true;
                 return Err(io::Error::other(
-                    "uncertain strict journal append: reopen and retry exact bytes",
+                    "uncertain journal append: reopen and retry exact bytes",
                 ));
             }
         };
@@ -417,7 +571,12 @@ impl Log {
             return Err(io::Error::other("journal changed during append; reopen"));
         }
         #[cfg(test)]
-        tests::append_step(tests::Step::Published);
+        tests::append_step(tests::Step::Published, self.log.flush_counts());
+        // Read after the publish, which latches the log to Strict when the device refuses
+        // its barrier. A Strict record is durable already, so the commit's full flush
+        // below finds nothing to cover and skips: there the checkpoint is flushed in full
+        // itself. On an Ordered log it takes barriers, ordered behind the record's.
+        let ordered = self.served_ordered();
         if self
             .checkpoint
             .extend(
@@ -425,7 +584,10 @@ impl Log {
                 &self.layout,
                 self.log.stats().retained_bytes as u64,
             )
-            .and_then(|()| self.checkpoint.save(&self.dir, &self.layout))
+            .and_then(|()| {
+                self.checkpoint
+                    .save(&self.dir, &self.layout, self.checkpoint_flush(ordered))
+            })
             .is_err()
         {
             self.poisoned = true;
@@ -434,8 +596,261 @@ impl Log {
             ));
         }
         #[cfg(test)]
-        tests::append_step(tests::Step::Checkpointed);
+        tests::append_step(tests::Step::Checkpointed, self.log.flush_counts());
+        #[cfg(any(test, debug_assertions))]
+        let then = match then {
+            Some((_, write)) if seam::mutant() == seam::Mutant::WitnessFirst => {
+                self.dependent(offset, Flush::Ordered, write)?;
+                None
+            }
+            then => then,
+        };
+        self.commit()?;
+        if let Some((dir, write)) = then {
+            let flush = self.dependent_flush(ordered, dir);
+            self.dependent(offset, flush, write)?;
+        }
         Ok(offset)
+    }
+
+    /// Whether astream serves this open's log Ordered: off Apple, off the boot volume,
+    /// or once a barrier was refused, it serves Strict, every record flushed in full.
+    fn served_ordered(&self) -> bool {
+        self.log.served().served == astream_broker::Tier::Ordered
+    }
+
+    /// The flush that finishes an append's checkpoint: barriers on an Ordered log, the
+    /// commit's full flush making them durable; full flushes on a Strict one, whose
+    /// commit flushes nothing.
+    fn checkpoint_flush(&self, ordered: bool) -> Flush {
+        #[cfg(any(test, debug_assertions))]
+        match seam::mutant() {
+            seam::Mutant::Durable => return Flush::Durable,
+            seam::Mutant::BarrierCheckpoint => return Flush::Ordered,
+            seam::Mutant::None
+            | seam::Mutant::UnorderedRecord
+            | seam::Mutant::WitnessFirst
+            | seam::Mutant::AcksAtPublish => {}
+        }
+        if ordered {
+            Flush::Ordered
+        } else {
+            Flush::Durable
+        }
+    }
+
+    /// The flush a dependent write into `dir` takes after the commit
+    /// ([`Self::append_then`]): barriers only on an Ordered log and only on the log's
+    /// own device, whose barriers order it ahead of the next record and whose next
+    /// commit covers it; a full flush anywhere else.
+    fn dependent_flush(&self, ordered: bool, dir: &Path) -> Flush {
+        #[cfg(any(test, debug_assertions))]
+        if seam::mutant() == seam::Mutant::Durable || seam::is_apart() {
+            return Flush::Durable;
+        }
+        if ordered {
+            Flush::ordered_if_same_device(dir, &self.dir)
+        } else {
+            Flush::Durable
+        }
+    }
+
+    /// The caller's dependent write, fencing this handle when it fails.
+    fn dependent(
+        &mut self,
+        offset: Offset,
+        flush: Flush,
+        write: impl FnOnce(Offset, Flush) -> io::Result<()>,
+    ) -> io::Result<()> {
+        if let Err(error) = write(offset, flush) {
+            self.poisoned = true;
+            return Err(error);
+        }
+        #[cfg(test)]
+        tests::append_step(tests::Step::Witnessed, self.log.flush_counts());
+        Ok(())
+    }
+
+    /// The one full flush that acknowledges an append on an Ordered log: everything the
+    /// append wrote on the log's device before it, and the previous append's dependent
+    /// write, is then on stable media. On a Strict log the record's own flush covers the
+    /// head already, and astream skips it.
+    fn commit(&mut self) -> io::Result<()> {
+        #[cfg(any(test, debug_assertions))]
+        seam::before_commit();
+        if self.log.sync_full().is_err() {
+            self.poisoned = true;
+            return Err(io::Error::other(
+                "uncertain journal commit: reopen and retry exact bytes",
+            ));
+        }
+        #[cfg(test)]
+        tests::append_step(tests::Step::Committed, self.log.flush_counts());
+        Ok(())
+    }
+}
+
+/// What the journal's log is opened with: Ordered, with no horizon, so a record takes a
+/// barrier and nothing flushes it in full but its append's commit
+/// (`BrokerLog::sync_full`). astream serves it Strict where the device cannot promise
+/// the order, which [`Log::append`] reads. An append is acknowledged only after that
+/// commit (`Acks::FullFlush`), so a run that stopped without a clean close lost nothing it
+/// acknowledged: the next open, in another boot, moves no generation and says nothing.
+fn log_options() -> LogOptions {
+    let mut options = LogOptions::new(Durability::Ordered { horizon: None });
+    options.acks = astream_broker::Acks::FullFlush;
+    #[cfg(any(test, debug_assertions))]
+    let options = seam::options(options);
+    options
+}
+
+/// The journal's test seams, on this thread: a log judged off the boot volume (so astream
+/// serves it Strict), a boot to open in, a dependent directory taken for another device's,
+/// a hook just before each commit, and the negative controls of the append's ordering.
+#[cfg(any(test, debug_assertions))]
+pub mod seam {
+    use std::cell::{Cell, RefCell};
+
+    /// A mutation of the append, for a negative control.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub enum Mutant {
+        #[default]
+        None,
+        /// The checkpoint and the dependent write flushed in full, whatever the log
+        /// serves: the append as it was before one commit flushed its ordered writes.
+        Durable,
+        /// The checkpoint takes barriers only, whatever the log serves: on a Strict log
+        /// nothing then flushes it in full before the acknowledgement.
+        BarrierCheckpoint,
+        /// The log opens Relaxed, so the record takes no flush: its checkpoint can reach
+        /// the disk ahead of it.
+        UnorderedRecord,
+        /// The dependent write takes barriers before the commit: a reader that takes no
+        /// lock can then find it while its record is not yet durable.
+        WitnessFirst,
+        /// The log opens acking at its publishes (`Acks::Publish`), so astream judges a
+        /// run that stopped uncleanly as one that may have lost acked records.
+        AcksAtPublish,
+    }
+
+    #[derive(Clone, Copy, Default)]
+    struct Seams {
+        strict: bool,
+        apart: bool,
+        boot: Option<[u8; 16]>,
+        mutant: Mutant,
+    }
+
+    thread_local! {
+        static SEAMS: Cell<Seams> = const {
+            Cell::new(Seams { strict: false, apart: false, boot: None, mutant: Mutant::None })
+        };
+        static BEFORE_COMMIT: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
+    }
+
+    /// Restores the seams it changed when it drops.
+    #[must_use = "the seam stops when it drops"]
+    pub struct Guard {
+        outer: Seams,
+        _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            SEAMS.with(|seams| seams.set(self.outer));
+        }
+    }
+
+    fn change(f: impl FnOnce(&mut Seams)) -> Guard {
+        let outer = SEAMS.with(Cell::get);
+        let mut seams = outer;
+        f(&mut seams);
+        SEAMS.with(|cell| cell.set(seams));
+        Guard {
+            outer,
+            _thread: std::marker::PhantomData,
+        }
+    }
+
+    /// A journal this thread opens judges its log off the boot volume, which astream
+    /// serves Strict (`Volume::Other`).
+    pub fn serve_strict() -> Guard {
+        change(|seams| seams.strict = true)
+    }
+
+    /// A dependent write on this thread is taken for one on another device.
+    pub fn apart() -> Guard {
+        change(|seams| seams.apart = true)
+    }
+
+    /// A journal this thread opens is opened in the boot `boot` names (`Boot::Known`): two
+    /// opens in different ones stand in a reboot between them.
+    pub fn boot(boot: [u8; 16]) -> Guard {
+        change(|seams| seams.boot = Some(boot))
+    }
+
+    /// Stops running its hook when it drops.
+    #[must_use = "the hook stops when it drops"]
+    pub struct Hook {
+        _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+
+    impl Drop for Hook {
+        fn drop(&mut self) {
+            BEFORE_COMMIT.with(|hook| hook.borrow_mut().take());
+        }
+    }
+
+    /// `f` runs on this thread just before each append's commit, its one full flush: the
+    /// record and its checkpoint are written then and not yet durable, which is what a
+    /// reader that takes no lock may see of the append meanwhile.
+    pub fn before_each_commit(f: impl FnMut() + 'static) -> Hook {
+        BEFORE_COMMIT.with(|hook| *hook.borrow_mut() = Some(Box::new(f)));
+        Hook {
+            _thread: std::marker::PhantomData,
+        }
+    }
+
+    pub(super) fn before_commit() {
+        let taken = BEFORE_COMMIT.with(|hook| hook.borrow_mut().take());
+        if let Some(mut f) = taken {
+            f();
+            BEFORE_COMMIT.with(|hook| {
+                let mut hook = hook.borrow_mut();
+                if hook.is_none() {
+                    *hook = Some(f);
+                }
+            });
+        }
+    }
+
+    /// The appends, and the opens, of this thread run `mutant`.
+    pub fn mutate(mutant: Mutant) -> Guard {
+        change(|seams| seams.mutant = mutant)
+    }
+
+    pub(super) fn mutant() -> Mutant {
+        SEAMS.with(Cell::get).mutant
+    }
+
+    pub(super) fn is_apart() -> bool {
+        SEAMS.with(Cell::get).apart
+    }
+
+    pub(super) fn options(mut options: super::LogOptions) -> super::LogOptions {
+        let seams = SEAMS.with(Cell::get);
+        if seams.strict {
+            options.volume = astream_broker::Volume::Other;
+        }
+        if let Some(boot) = seams.boot {
+            options.boot = astream_broker::Boot::Known(boot);
+        }
+        match seams.mutant {
+            Mutant::UnorderedRecord => options.durability = super::Durability::Relaxed,
+            Mutant::AcksAtPublish => options.acks = astream_broker::Acks::Publish,
+            _ => {}
+        }
+        options
     }
 }
 
@@ -504,8 +919,11 @@ pub enum Committed {
 /// so it works beside a live writer. The checkpoint is read first; then exactly
 /// the bytes it counts are read from the astream file and must hash to it. A
 /// writer replaces the checkpoint by atomic rename only after the bytes it
-/// covers are durable, never rewrites bytes below it, and leaves a torn or
-/// unacknowledged tail only past it, so an append is wholly in or wholly out.
+/// covers are written and flushed ahead of it, never rewrites bytes below it,
+/// and leaves a torn or unacknowledged tail only past it, so an append is wholly
+/// in or wholly out. A checkpoint read before its append commits names bytes
+/// that are not yet durable: a reader can see an append its writer has yet to
+/// acknowledge, never one whose bytes it cannot read.
 /// A checkpoint renamed over while it was being opened or read is read again,
 /// a bounded number of times; past that, the one read last stands, which the
 /// newer one only extends.
@@ -712,7 +1130,13 @@ impl Drop for WriterLock {
     }
 }
 fn lock(dir: &Path, layout: &Layout, deadline: Instant) -> io::Result<(WriterLock, (u64, u64))> {
-    create_private_dir_durable(dir)?;
+    // The parent names the journal's directory. On the journal's device a barrier orders
+    // that name ahead of everything the open writes after it, and the open's last full
+    // flush makes it durable; on another device it is flushed in full here.
+    private_file::create_private_dir(dir)?;
+    if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Flush::ordered_if_same_device(parent, dir).dir(parent)?;
+    }
     match OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -861,8 +1285,10 @@ impl Checkpoint {
         bytes[8..].copy_from_slice(&self.hash.clone().finalize());
         bytes
     }
-    fn save(&self, dir: &Path, layout: &Layout) -> io::Result<()> {
-        write_private_durable(dir, &layout.checkpoint, &self.bytes())
+    /// Rename the checkpoint into place, finished by `flush`: its directory's flush must
+    /// succeed ([`private_file::write_private_flushed`]).
+    fn save(&self, dir: &Path, layout: &Layout, flush: Flush) -> io::Result<()> {
+        private_file::write_private_flushed(dir, &layout.checkpoint, &self.bytes(), flush)
     }
 }
 
@@ -978,6 +1404,8 @@ fn recover_uncommitted(dir: &Path, layout: &Layout, fresh: bool) -> io::Result<(
     Ok((opened.dev(), opened.ino()))
 }
 
+#[cfg(test)]
+mod append_tests;
 #[cfg(test)]
 mod open_tests;
 #[cfg(test)]

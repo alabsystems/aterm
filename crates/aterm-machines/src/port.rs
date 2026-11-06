@@ -10,6 +10,7 @@ use std::time::Duration;
 
 #[cfg(target_os = "macos")]
 mod accessibility;
+pub mod bonjour;
 pub mod claude_keychain;
 mod complete_input;
 mod console_session;
@@ -37,16 +38,31 @@ mod secret;
 pub(crate) mod spawns;
 mod staged_child;
 mod stops;
+mod tree;
 mod tty_wait;
 
+pub use bonjour::Bonjour;
 pub use github_rest::RestMethod;
 pub use scratch::Scratch;
 pub use secret::{SECRET_MAX, Secret, no_core_dumps};
 pub use staged_child::{START_BYTE, START_LIMIT, StagedChild};
 pub use stops::{name as stop_name, say_on_stop};
 
+/// How [`System::clone_tree`] made its copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cloned {
+    /// An APFS clone: the copy shares every block with its source.
+    Cloned,
+    /// The two were on different volumes, so Apple's `ditto` copied it byte for byte.
+    Copied,
+}
+
 /// Default deadline for a single tool run.
 pub const DEFAULT_BUDGET: Duration = Duration::from_secs(60);
+
+/// Apple's `ditto`, which copies a bundle whole (its links, modes and extended attributes) where
+/// no clone can ([`System::clone_tree`]).
+pub const DITTO: &str = "/usr/bin/ditto";
 
 pub(crate) fn deadline_after(budget: Duration) -> std::time::Instant {
     let now = std::time::Instant::now();
@@ -567,6 +583,19 @@ pub trait System: Sync {
     fn keyboard_service_ids(&self) -> Result<Vec<u64>, String> {
         Err("native keyboard service census is unavailable".into())
     }
+    /// What the Bonjour request `ask` hears within `within`, through the root LAN broker on
+    /// macOS ([`bonjour::live`]): every event it heard by then, in order.
+    ///
+    /// # Errors
+    /// One line: no LAN broker to ask, Bonjour off macOS, or the request's own failure.
+    fn bonjour(
+        &self,
+        ask: &Bonjour,
+        within: Duration,
+    ) -> Result<Vec<aterm_uds::lan::Event>, String> {
+        bonjour::live(ask, within)
+    }
+
     /// Read one GitHub API endpoint through `agh` as `user` with the admitted development
     /// credential.
     ///
@@ -1087,6 +1116,51 @@ pub trait System: Sync {
     /// or `None` outside a bundle or when it cannot be read.
     fn running_app(&self) -> Option<PathBuf> {
         None
+    }
+
+    /// The code identity of the executable at `path`
+    /// ([`aterm_uds::lan::install::CodeDirectories`]), read without root. The default reads the
+    /// whole file through [`System::stat`] and [`System::read_file`]; the live system reads only
+    /// its headers and signature.
+    ///
+    /// # Errors
+    /// The stat's or read's error (`NotFound` where nothing is there), or the parse's.
+    fn code_directories(
+        &self,
+        path: &Path,
+    ) -> io::Result<aterm_uds::lan::install::CodeDirectories> {
+        self.stat(path)?;
+        aterm_uds::lan::install::CodeDirectories::of_bytes(&self.read_file(path)?)
+    }
+
+    /// Clone the folder `from` to the new name `to` (APFS `clonefile(2)`, no extra space), owned
+    /// by this process's user, never following a link at `from`. Where the two are on different
+    /// volumes (`EXDEV`), Apple's `ditto` copies it instead ([`Cloned::Copied`]).
+    ///
+    /// # Errors
+    /// The clone's error, or the copy's in one line.
+    fn clone_tree(&self, from: &Path, to: &Path) -> io::Result<Cloned> {
+        let _ = (from, to);
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
+    /// Make `path` (with `tree`, everything below it too) owned by `root:wheel` with no group or
+    /// other write bit, never following a link.
+    ///
+    /// # Errors
+    /// The first I/O error.
+    fn root_own(&self, path: &Path, tree: bool) -> io::Result<()> {
+        let _ = (path, tree);
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
+    /// Exchange the names `a` and `b` atomically (APFS `RENAME_SWAP`).
+    ///
+    /// # Errors
+    /// The exchange's error, `NotFound` when either is missing.
+    fn exchange(&self, a: &Path, b: &Path) -> io::Result<()> {
+        let _ = (a, b);
+        Err(io::ErrorKind::Unsupported.into())
     }
 
     /// The awake clock in milliseconds ([`aterm_uds::process::awake_ms`]), which
@@ -2293,6 +2367,47 @@ impl System for Live {
             .map(Path::to_path_buf)
     }
 
+    fn code_directories(
+        &self,
+        path: &Path,
+    ) -> io::Result<aterm_uds::lan::install::CodeDirectories> {
+        aterm_uds::lan::install::CodeDirectories::of_file(path)
+    }
+
+    fn clone_tree(&self, from: &Path, to: &Path) -> io::Result<Cloned> {
+        match tree::clone(from, to) {
+            Ok(()) => Ok(Cloned::Cloned),
+            Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {
+                // No ACL or quarantine of the person's comes along, and the seal
+                // ([`tree::own`]) removes any ACL and set-id bit all the same. Extended
+                // attributes stay: they grant no access, and a signed non-Mach-O file keeps its
+                // signature in them.
+                let cmd = Cmd::new(DITTO)
+                    .args(["--noacl", "--noqtn"])
+                    .arg(from)
+                    .arg(to);
+                match self.run(&cmd) {
+                    Ok(ran) if ran.success() => Ok(Cloned::Copied),
+                    Ok(ran) => Err(io::Error::other(format!(
+                        "{}: {}",
+                        cmd.display(),
+                        ran.describe()
+                    ))),
+                    Err(e) => Err(io::Error::other(format!("{}: {e}", cmd.display()))),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn root_own(&self, path: &Path, tree: bool) -> io::Result<()> {
+        tree::own(path, 0, 0, tree)
+    }
+
+    fn exchange(&self, a: &Path, b: &Path) -> io::Result<()> {
+        tree::exchange(a, b)
+    }
+
     fn own_uuid(&self) -> Option<String> {
         let ran = self
             .run(&Cmd::new("/usr/sbin/ioreg").args(["-rd1", "-c", "IOPlatformExpertDevice"]))
@@ -2497,6 +2612,9 @@ mod fake {
         scroll_set_readback: Mutex<Option<bool>>,
         replies: Mutex<BTreeMap<String, Vec<Ran>>>,
         github_replies: Mutex<BTreeMap<String, Vec<Result<GithubResponse, GithubError>>>>,
+        /// What each [`System::bonjour`] request hears, by its [`Bonjour::key`]
+        /// ([`Fake::on_bonjour`]).
+        bonjour_replies: Mutex<BTreeMap<String, Result<Vec<aterm_uds::lan::Event>, String>>>,
         outputs: Mutex<BTreeMap<String, Vec<Output>>>,
         strict_refusals: Mutex<BTreeMap<String, String>>,
         /// The commands whose [`System::run`] gives no answer within its budget
@@ -3104,6 +3222,19 @@ mod fake {
             self
         }
 
+        /// Script what the Bonjour request `ask` hears; an unscripted one hears nothing.
+        pub fn on_bonjour(
+            &self,
+            ask: &super::Bonjour,
+            heard: Result<Vec<aterm_uds::lan::Event>, String>,
+        ) -> &Self {
+            self.bonjour_replies
+                .lock()
+                .unwrap()
+                .insert(ask.key(), heard);
+            self
+        }
+
         /// Script `reply` for the command whose display is `key`.
         pub fn on(&self, key: &str, reply: Ran) -> &Self {
             self.replies
@@ -3391,6 +3522,21 @@ mod fake {
             self
         }
 
+        fn bonjour(
+            &self,
+            ask: &super::Bonjour,
+            _within: std::time::Duration,
+        ) -> Result<Vec<aterm_uds::lan::Event>, String> {
+            let key = ask.key();
+            self.calls.lock().unwrap().push(key.clone());
+            self.bonjour_replies
+                .lock()
+                .unwrap()
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| Ok(Vec::new()))
+        }
+
         fn github_api(
             &self,
             user: &User,
@@ -3675,6 +3821,62 @@ mod fake {
 
         fn running_app(&self) -> Option<PathBuf> {
             self.running_app.clone()
+        }
+
+        fn clone_tree(&self, from: &Path, to: &Path) -> io::Result<super::Cloned> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("clone {} {}", from.display(), to.display()));
+            let mut files = self.files.lock().unwrap();
+            let below: Vec<(PathBuf, (Vec<u8>, u32))> = files
+                .iter()
+                .filter_map(|(p, v)| {
+                    p.strip_prefix(from)
+                        .ok()
+                        .map(|rest| (to.join(rest), v.clone()))
+                })
+                .collect();
+            if below.is_empty() {
+                return Err(io::ErrorKind::NotFound.into());
+            }
+            files.extend(below);
+            Ok(super::Cloned::Cloned)
+        }
+
+        fn root_own(&self, path: &Path, tree: bool) -> io::Result<()> {
+            self.calls.lock().unwrap().push(format!(
+                "root-own{} {}",
+                if tree { " -R" } else { "" },
+                path.display()
+            ));
+            Ok(())
+        }
+
+        fn exchange(&self, a: &Path, b: &Path) -> io::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("exchange {} {}", a.display(), b.display()));
+            let mut files = self.files.lock().unwrap();
+            let (mut under_a, mut under_b) = (Vec::new(), Vec::new());
+            for p in files.keys() {
+                if let Ok(rest) = p.strip_prefix(a) {
+                    under_a.push((p.clone(), b.join(rest)));
+                } else if let Ok(rest) = p.strip_prefix(b) {
+                    under_b.push((p.clone(), a.join(rest)));
+                }
+            }
+            if under_a.is_empty() || under_b.is_empty() {
+                return Err(io::ErrorKind::NotFound.into());
+            }
+            let moved: Vec<_> = under_a
+                .into_iter()
+                .chain(under_b)
+                .filter_map(|(from, to)| files.remove(&from).map(|v| (to, v)))
+                .collect();
+            files.extend(moved);
+            Ok(())
         }
 
         fn awake_ms(&self) -> Option<u64> {

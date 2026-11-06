@@ -917,6 +917,8 @@ pub struct PaneStepCarry {
     pub kitty_serial: u32,
     /// Live Kitty image byte charge `[primary, alternate]`.
     pub live_image_charge: [u64; 2],
+    /// Payload bytes the primary screen may still place before its history's images are measured again (`0` measures at the next placement).
+    pub history_image_room: u64,
     /// Whether the most recent OSC sequence was terminated by BEL (`0x07`) rather than ST.
     pub last_osc_bel_terminated: bool,
     /// Pending restore holder-lineage tag (`0 = None`, `1 = Untouched`, `2 = Touched`).
@@ -1029,6 +1031,7 @@ impl PaneStepCarry {
             kitty_last_assigned_id: 0,
             kitty_serial: 0,
             live_image_charge: [0, 0],
+            history_image_room: 0,
             last_osc_bel_terminated: false,
             pending_restore: 0,
             foreground_job: false,
@@ -1146,6 +1149,7 @@ impl PaneStepCarry {
             live_image_charge: t
                 .live_image_charge
                 .map(|n| u64::try_from(n).unwrap_or(u64::MAX)),
+            history_image_room: u64::try_from(t.history_image_room).unwrap_or(u64::MAX),
             last_osc_bel_terminated: t.last_osc_bel_terminated,
             pending_restore,
             foreground_job: term.shell.foreground_job,
@@ -1255,6 +1259,7 @@ impl PaneStepCarry {
             live_image_charge: c
                 .live_image_charge
                 .map(|n| u64::try_from(n).unwrap_or(u64::MAX)),
+            history_image_room: u64::try_from(c.history_image_room).unwrap_or(u64::MAX),
             last_osc_bel_terminated: c.last_osc_bel_terminated,
             pending_restore,
             foreground_job: c.foreground_job,
@@ -1819,6 +1824,7 @@ struct CapturedCarry {
     kitty_last_assigned_id: u32,
     kitty_serial: u32,
     live_image_charge: [usize; 2],
+    history_image_room: usize,
     last_osc_bel_terminated: bool,
     kitty_images: std::collections::HashMap<u32, std::sync::Arc<aterm_types::ImageData>>,
     kitty_frames: std::collections::HashMap<u32, super::transient_state::KittyAnimation>,
@@ -1883,6 +1889,7 @@ impl super::checkpoint_heap::Heap for CapturedCarry {
             kitty_last_assigned_id,
             kitty_serial,
             live_image_charge,
+            history_image_room,
             last_osc_bel_terminated,
             kitty_images,
             kitty_frames,
@@ -1954,6 +1961,7 @@ impl super::checkpoint_heap::Heap for CapturedCarry {
             kitty_last_assigned_id.heap(),
             kitty_serial.heap(),
             live_image_charge.heap(),
+            history_image_room.heap(),
             last_osc_bel_terminated.heap(),
             kitty_images.heap(),
             kitty_frames.heap(),
@@ -2531,6 +2539,7 @@ impl Terminal {
         to.live_image_charge = carry
             .live_image_charge
             .map(|n| usize::try_from(n).unwrap_or(usize::MAX));
+        to.history_image_room = usize::try_from(carry.history_image_room).unwrap_or(usize::MAX);
         to.last_osc_bel_terminated = carry.last_osc_bel_terminated;
         apply_kitty_carry(to, carry, origin);
         self.apply_placed_carry(carry);
@@ -2691,6 +2700,7 @@ impl Terminal {
             kitty_last_assigned_id: t.kitty_last_assigned_id,
             kitty_serial: t.kitty_serial,
             live_image_charge: t.live_image_charge,
+            history_image_room: t.history_image_room,
             last_osc_bel_terminated: t.last_osc_bel_terminated,
             kitty_images: t.kitty_images.clone(),
             kitty_frames: t.kitty_frames.clone(),
@@ -2782,6 +2792,7 @@ impl Terminal {
         to.kitty_last_assigned_id = captured.kitty_last_assigned_id;
         to.kitty_serial = captured.kitty_serial;
         to.live_image_charge = captured.live_image_charge;
+        to.history_image_room = captured.history_image_room;
         to.last_osc_bel_terminated = captured.last_osc_bel_terminated;
         to.kitty_images.clone_from(&captured.kitty_images);
         to.kitty_frames.clone_from(&captured.kitty_frames);

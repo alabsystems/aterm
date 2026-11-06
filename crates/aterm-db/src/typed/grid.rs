@@ -53,8 +53,12 @@ pub const MAX_BYTES: usize = amacs::table::MAX_TABLE_BYTES;
 /// characters of its local part, then `…@…`.
 pub fn mask(address: &str) -> String {
     let local = address.split('@').next().unwrap_or_default();
-    let head: String = local.chars().take(2).collect();
-    format!("{head}…@…")
+    let mut out = String::with_capacity(13);
+    for ch in local.chars().take(2) {
+        out.push(ch);
+    }
+    out.push_str("…@…");
+    out
 }
 
 /// `value` with every address its type can hold masked, unless `show`.
@@ -206,9 +210,14 @@ pub fn show_field(column: &Column, field: Option<&Field>, reveal: bool) -> Strin
 }
 
 fn show_raw_text(text: &str, reveal: bool) -> String {
-    match raw_masked(&Value::String(text.to_owned()), reveal) {
-        Value::String(masked) => masked,
-        other => compact(&other),
+    if super::secret::is_sealed(text) {
+        super::secret::MASK.to_owned()
+    } else if refused(text) {
+        REFUSED.to_owned()
+    } else if !reveal && text.contains('@') {
+        mask(text)
+    } else {
+        text.to_owned()
     }
 }
 
@@ -627,6 +636,7 @@ pub fn export_opened(
     let mut registers = registers(collection, cells);
     let columns = layout_with(collection, &projection, opened.is_some());
     let header: Vec<String> = columns.iter().map(GridColumn::header).collect();
+    let collection_name = collection.name.to_owned();
     let mut rows = Vec::new();
     'rows: for (pk, row) in &projection.rows {
         for filter in filters {
@@ -646,7 +656,10 @@ pub fn export_opened(
             let shown = match column.source {
                 Source::Schema(schema) if secret && !raw => {
                     let field = row.fields.get(&column.name);
-                    match opened.and_then(|o| o.get(&(pk.clone(), column.name.clone()))) {
+                    match opened
+                        .filter(|o| !o.is_empty())
+                        .and_then(|o| o.get(&(pk.clone(), column.name.clone())))
+                    {
                         Some(values) if !row_protected => show_opened(values),
                         _ => {
                             // Unopened, or a protected row's: masked, and never typed over.
@@ -660,12 +673,12 @@ pub fn export_opened(
                 }
                 Source::Pk => pk.clone(),
                 Source::Unknown => show_raw(
-                    cells.get(&(collection.name.to_owned(), format!("{pk}.{}", column.name))),
+                    cells.get(&(collection_name.clone(), format!("{pk}.{}", column.name))),
                     row.fields.get(&column.name),
                     reveal,
                 ),
                 Source::Schema(_) if raw => show_raw(
-                    cells.get(&(collection.name.to_owned(), format!("{pk}.{}", column.name))),
+                    cells.get(&(collection_name.clone(), format!("{pk}.{}", column.name))),
                     row.fields.get(&column.name),
                     reveal,
                 ),
@@ -686,7 +699,7 @@ pub fn export_opened(
     }
     let base = Base {
         table: format!("{}/{}", table.application, table.role),
-        collection: collection.name.to_owned(),
+        collection: collection_name,
         version: collection.version,
         reveal,
         header,
@@ -757,6 +770,11 @@ pub struct Edit {
     pub mine: String,
     /// The grid column's index.
     pub at: usize,
+    /// The record's index in the saved file: 0, the header's, for a row the save deleted,
+    /// which has none.
+    pub record: usize,
+    /// The 1-based text line that record starts on.
+    pub line: usize,
     /// A revealed `Secret` cell's edit: `x` is the owner's plaintext (or null) until [`seal`]
     /// seals it in the writing session, and `value` is written there. `Debug` never shows it.
     pub secret: bool,
@@ -781,6 +799,8 @@ impl std::fmt::Debug for Edit {
             .field("expected", &self.expected.len())
             .field("mine", &hidden(&self.mine))
             .field("at", &self.at)
+            .field("record", &self.record)
+            .field("line", &self.line)
             .field("secret", &self.secret)
             .finish()
     }
@@ -823,12 +843,16 @@ impl Reader<'_> {
             .unwrap_or_default()
     }
 
-    fn problem(&mut self, record: usize, column: usize, rule: impl Into<String>) {
-        let line = self
-            .sheet
+    /// The 1-based line record `record` starts on; 1 for one the file does not hold.
+    fn line(&self, record: usize) -> usize {
+        self.sheet
             .records
             .get(record)
-            .map_or(1, |r| line_of(self.text, r.raw.start));
+            .map_or(1, |r| line_of(self.text, r.raw.start))
+    }
+
+    fn problem(&mut self, record: usize, column: usize, rule: impl Into<String>) {
+        let line = self.line(record);
         self.problems.push(Problem {
             record,
             column,
@@ -853,6 +877,7 @@ impl Reader<'_> {
         out: &mut Vec<Edit>,
     ) {
         let collection = self.collection;
+        let line = self.line(record);
         let key = |elem: Option<&str>| {
             CellKey {
                 pk,
@@ -905,6 +930,8 @@ impl Reader<'_> {
                             .unwrap_or_default(),
                         mine: text.to_owned(),
                         at,
+                        record,
+                        line,
                         secret: false,
                     }),
                     (Err(error), _) | (_, Err(error)) => {
@@ -951,6 +978,8 @@ impl Reader<'_> {
                     expected: seen.map(|s| s.candidates.clone()).unwrap_or_default(),
                     mine: text.to_owned(),
                     at,
+                    record,
+                    line,
                     secret: true,
                 }),
                 Err(error) => self.problem(record, at, error.to_string()),
@@ -989,6 +1018,8 @@ impl Reader<'_> {
                 expected: seen.map(|s| s.candidates.clone()).unwrap_or_default(),
                 mine: text.to_owned(),
                 at,
+                record,
+                line,
                 secret: false,
             }),
             Err(error) => self.problem(record, at, error.to_string()),
@@ -1363,12 +1394,15 @@ pub fn holds_row(collection: &Collection, cells: &Cells, pk: &str) -> bool {
 /// already hold is stale.
 pub fn settle(collection: &Collection, plan: &Plan, cells: &Cells) -> Settled {
     let mut settled = Settled::default();
+    let mut lookup = (collection.name.to_owned(), String::new());
     for (pk, edits) in &plan.rows {
         let mut changes = Vec::new();
         let mut stale = BTreeSet::new();
         let taken = plan.born.contains(pk) && holds_row(collection, cells, pk);
         for edit in edits {
-            let cell = cells.get(&(collection.name.to_owned(), edit.key.clone()));
+            lookup.1.clear();
+            lookup.1.push_str(&edit.key);
+            let cell = cells.get(&lookup);
             let mut now: Vec<Digest> = cell
                 .map(|c| c.candidates.iter().map(|c| c.operation).collect())
                 .unwrap_or_default();
@@ -1376,7 +1410,7 @@ pub fn settle(collection: &Collection, plan: &Plan, cells: &Cells) -> Settled {
             let stopped = cell.is_some_and(|c| c.stopped);
             if !taken && !stopped && now == edit.expected {
                 changes.push(Change {
-                    collection: collection.name.to_owned(),
+                    collection: lookup.0.clone(),
                     key: edit.key.clone(),
                     value: Some(edit.value.clone()),
                 });
@@ -1407,7 +1441,7 @@ pub fn settle(collection: &Collection, plan: &Plan, cells: &Cells) -> Settled {
                 };
             if holds && imported && !taken {
                 changes.push(Change {
-                    collection: collection.name.to_owned(),
+                    collection: lookup.0.clone(),
                     key: edit.key.clone(),
                     value: Some(edit.value.clone()),
                 });

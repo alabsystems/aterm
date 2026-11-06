@@ -769,8 +769,6 @@ pub struct Keeper<'a> {
     pub here: &'a dyn Fn() -> Option<String>,
     /// This Mac's fleet node id, whose rows are this Mac's.
     pub own_node: &'a dyn Fn() -> Option<String>,
-    /// Whether to stop.
-    pub stop: &'a dyn Fn() -> bool,
 }
 
 /// The keeper's wait at each Mac that did not answer: its failures count until it answers, so
@@ -810,31 +808,31 @@ impl Backoff {
     }
 }
 
-/// Keep the board of the state folder `state` current until `keeper.stop` says to stop: while
-/// it holds the board's keeper lock (one keeper per board, whichever aterm took it first; the
+/// Keep the board of the state folder `state` current for the life of the process: while it holds the board's keeper lock (one keeper per board, whichever aterm took it first; the
 /// others ask for it again every [`KEEP_ELSEWHERE`]), wait on every open row its Macs were
 /// heard of within [`UNHEARD_ASKED`] and every row closed within [`CLOSED_ASKED`] (every
 /// [`CLOSED_ASKED_EVERY`]), one round of legs ([`crate::await_task`]'s keeper round) after
 /// another, and merge what they read. Each row's leg starts from the newest revision read of
 /// it, so news the board could not write is not read again at once. A Mac that does not answer
-/// is asked again later, backing off to [`KEEP_BACKOFF_MAX`].
+/// is asked again later, backing off to [`KEEP_BACKOFF_MAX`]. Between rounds it sleeps the whole
+/// period, a thread asleep until it is due: nothing ends a keeper but its process, so there is no
+/// stop to look at (ATERM-KI-1105-20: a look every 250 ms was 80 wakes in 20 s at rest).
 pub fn keep(state: &Path, keeper: &Keeper<'_>) {
     #[cfg(unix)]
     {
         use std::collections::HashMap;
         use std::time::Instant;
-        let stop = keeper.stop;
         let board = Board::in_state(state);
         let mut held = None;
         let mut backoff = Backoff::default();
         let mut edges: HashMap<String, u64> = HashMap::new();
         let mut closed_asked: HashMap<String, Instant> = HashMap::new();
         let mut pruned: Option<Instant> = None;
-        while !stop() {
+        loop {
             if held.is_none() {
                 held = board.keeper_lock();
                 if held.is_none() {
-                    sleep_unless(KEEP_ELSEWHERE, stop);
+                    std::thread::sleep(KEEP_ELSEWHERE);
                     continue;
                 }
             }
@@ -866,7 +864,7 @@ pub fn keep(state: &Path, keeper: &Keeper<'_>) {
                 })
                 .collect();
             if asked.is_empty() {
-                sleep_unless(KEEP_IDLE, stop);
+                std::thread::sleep(KEEP_IDLE);
                 continue;
             }
             for row in &mut asked {
@@ -905,22 +903,12 @@ pub fn keep(state: &Path, keeper: &Keeper<'_>) {
             // A round no Mac waited in (every leg answered or refused at once) waits before the
             // next.
             if changed == 0 && at.elapsed() < Duration::from_secs(1) {
-                sleep_unless(KEEP_IDLE, stop);
+                std::thread::sleep(KEEP_IDLE);
             }
         }
     }
     #[cfg(not(unix))]
     let _ = (state, keeper);
-}
-
-/// Sleep `total`, a second at a time, until `stop` says to stop.
-#[cfg(unix)]
-fn sleep_unless(total: Duration, stop: &dyn Fn() -> bool) {
-    let step = Duration::from_millis(250);
-    let start = std::time::Instant::now();
-    while !stop() && start.elapsed() < total {
-        std::thread::sleep(step.min(total.saturating_sub(start.elapsed())));
-    }
 }
 
 /// The header row of a read of a board: this Mac's host, its rows, those shown, those open, and

@@ -2,7 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use crate::status_item::{FleetLine, Glance, StatusAction, StatusRow, compose_status_menu};
 
 const SINCE_MS: u64 = 1_800_000_000_000;
 
@@ -12,93 +11,6 @@ fn utc(_: i64) -> Option<i64> {
 
 fn words_at(now_ms: u64) -> Words<'static> {
     Words { now_ms, zone: &utc }
-}
-
-fn in_fleet_no_route() -> FleetLine {
-    FleetLine::InFleet {
-        read: Some((0, 3, 0, SINCE_MS)),
-        reading: false,
-        failed: None,
-        no_route: true,
-        member_of: None,
-        unbound_issuer: None,
-    }
-}
-
-fn privacy_rows(rows: &[StatusRow]) -> usize {
-    rows.iter()
-        .filter(|row| {
-            matches!(
-                row,
-                StatusRow::Action {
-                    action: StatusAction::OpenLocalNetwork,
-                    ..
-                }
-            )
-        })
-        .count()
-}
-
-/// The menu bar says where this Mac is on the network in the place's own summary, and sends the
-/// person to the Local Network privacy setting exactly when the fleet read judged a no-route
-/// this Mac's privacy (its on-link verdict, `aterm_netplace::words::on_link`), wherever this Mac
-/// is: on a phone hotspot a member on the same hotspot refused with none there answering is this
-/// Mac's setting too, and a read that judged no such refusal (members off this network, or one
-/// gone off the link) points nowhere, at home as away.
-/// NEGATIVE CONTROL: gating the privacy row on the place again (`*no_route && !away`, with `away`
-/// the place being elsewhere) hides it under the hotspot's Network row, and this test fails at
-/// "the read's verdict, away from the ALab LAN too".
-#[test]
-fn the_menu_says_the_place_and_blames_privacy_only_on_the_reads_on_link_verdict() {
-    let now = SINCE_MS + 60_000;
-    let at = i64::try_from(now / 1000).unwrap_or(0);
-    let away = menu_line_of(
-        &aterm_netplace::sample::hotspot(SINCE_MS, SINCE_MS),
-        &words_at(now),
-    );
-    let home = menu_line_of(&aterm_netplace::sample::home(SINCE_MS, 0), &words_at(now));
-    let menu = |network: &MenuLine, no_route: bool| {
-        let fleet = match in_fleet_no_route() {
-            FleetLine::InFleet {
-                read,
-                reading,
-                failed,
-                member_of,
-                unbound_issuer,
-                ..
-            } => FleetLine::InFleet {
-                read,
-                reading,
-                failed,
-                no_route,
-                member_of,
-                unbound_issuer,
-            },
-            other => other,
-        };
-        compose_status_menu(
-            &Glance {
-                fleet,
-                network: Some(network.clone()),
-                ..Glance::default()
-            },
-            at,
-        )
-    };
-    let rows = menu(&away, true);
-    assert!(
-        rows.iter()
-            .any(|row| matches!(row, StatusRow::Info(label) if *label == away.label)),
-        "the Network row: {rows:?}"
-    );
-    assert_eq!(
-        privacy_rows(&rows),
-        1,
-        "the read's verdict, away from the ALab LAN too: {rows:?}"
-    );
-    assert_eq!(privacy_rows(&menu(&home, true)), 1, "on the ALab LAN");
-    assert_eq!(privacy_rows(&menu(&away, false)), 0, "no verdict, away");
-    assert_eq!(privacy_rows(&menu(&home, false)), 0, "no verdict, at home");
 }
 
 /// `sys`'s place is the place's own line and object, its unknown values `not_sampled` as every

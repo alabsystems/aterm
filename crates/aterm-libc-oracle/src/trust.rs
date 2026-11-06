@@ -150,10 +150,14 @@ pub fn stock(name: &str, host: &str) -> Result<Stock, CouldNotRun> {
         .unwrap_or_default();
     let rustup = discovery::rustup_home(std::env::var_os("RUSTUP_HOME").as_deref(), &home);
     let toolchains = rustup.join("toolchains");
-    [name.to_string(), format!("{name}-{host}")]
-        .iter()
-        .map(|dir| toolchains.join(dir))
-        .find(|dir| discovery::is_executable_file(&dir.join("bin/cargo")))
+    let bare = toolchains.join(name);
+    let candidate = if discovery::is_executable_file(&bare.join("bin/cargo")) {
+        Some(bare)
+    } else {
+        let host_dir = toolchains.join(format!("{name}-{host}"));
+        discovery::is_executable_file(&host_dir.join("bin/cargo")).then_some(host_dir)
+    };
+    candidate
         .map(|dir| Stock {
             name: name.to_string(),
             cargo: dir.join("bin/cargo"),

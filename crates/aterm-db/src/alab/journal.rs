@@ -33,7 +33,7 @@ pub(crate) mod flush;
 mod heard;
 mod relay;
 
-pub use book::Presence;
+pub use book::{AccountFacts, BookFacts, PlaceFacts, Presence};
 pub use event::{Event, Kind, Pk, Res, Source, SubKey, Window, Word};
 pub use spool::{Appended, Spool};
 
@@ -192,6 +192,16 @@ pub fn status(spool: &Spool, config: Option<&std::path::Path>) -> String {
         Some(why) => format!("local: {why}"),
         None => "on".to_owned(),
     }
+}
+
+/// What this Mac's book knows of the accounts it used and the places it holds, as of `now`
+/// (Unix seconds): the per-account facts the metrics publisher puts in each quota row, and the
+/// places it publishes (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.14). It reads
+/// `<spool>/book.json`, which the flusher saves, whichever process runs it; a book that is
+/// missing or does not read is an empty one. It reads no table and no network.
+#[must_use]
+pub fn book_facts(spool: &Spool, now: u64) -> BookFacts {
+    book::Book::load(spool).facts(now)
 }
 
 /// What the `aterm.toml` at `config` says of the journal.

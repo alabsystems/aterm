@@ -112,6 +112,59 @@ fn the_sessions_land_word_types_the_land_instruction_and_its_checks_landed_lands
     );
 }
 
+/// L19 THROUGH THE LOOP (the 2026-11-06 review): the land check's turn ends on a frame that draws
+/// no words under its message, and its `LANDED` is drawn on the next read with nothing busy
+/// between. The loop holds the empty frame's point, so the `LANDED` it reads next is the check's
+/// answer: DONE, never a back-off. Negative control: the empty frame judged where it ends (the
+/// hold removed), a short turn backed off.
+#[test]
+fn a_checks_landed_drawn_after_its_empty_end_lands() {
+    let (dir, journal) = journal_file("autopilot-land-unsaid");
+    let mut unsaid = rows(&["", "✻ Worked for 2s · done 4:25 PM", ""]);
+    unsaid.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
+    let mut m = Mock::new(vec![
+        busy_screen(),
+        worked("Fixed the parser; the suite is green."),
+        busy_screen(),
+        worked("Nothing left: all of it is merged into the remote main branch."),
+        busy_screen(),
+        unsaid,
+        worked("LANDED"),
+    ]);
+    m.history_served();
+    m.autopilot = Some("land");
+    m.turn_gates = vec![1, 3];
+    m.vanish_after = Some(4);
+    let opts = SuperviseOpts {
+        journal: Some(journal.clone()),
+        ..under(owners_policy())
+    };
+    let (lines, _) = watch_lines(&mut m, &opts);
+    let noted: Vec<String> = journal_records(&journal)
+        .0
+        .into_iter()
+        .map(|r| r.line)
+        .collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        count(&m, "turn"),
+        2,
+        "the instruction, then the check: {lines:#?}"
+    );
+    assert!(
+        noted
+            .iter()
+            .any(|l| l.starts_with("DONE seq=") && l.contains(&format!("rule={RULE_LAND} "))),
+        "the LANDED drawn late lands: {noted:#?} {lines:#?}"
+    );
+    assert!(
+        !noted
+            .iter()
+            .any(|l| l.starts_with("WAITING ") && l.contains("back-off")),
+        "no back-off at the empty end: {noted:#?}"
+    );
+}
+
 #[test]
 fn a_persons_greeting_under_land_is_left_to_them() {
     let greeting = "Hi! What would you like me to work on?";
@@ -1922,6 +1975,90 @@ fn a_limit_the_worker_answered_past_in_a_park_is_a_new_episode() {
         let (noted, _, _) = run(setup, limited_screen());
         assert!(escalated(&noted).contains(" again="), "{what}: {noted:#?}");
     }
+}
+
+/// AN OFF PARK'S RETRY ENDS AT THE SETTLED BREAK AFTER IT (2026-11-06; `Retry`): the Off park's
+/// start keeps a raised limit episode's seq for the wall again (`Session::lower_badges`), and the
+/// park's read of the agent busy at its own background work keeps it (`Session::park_while_off`,
+/// its `Phase::Busy` arm). Switched back to Cruise, the settled break of that work the agent's
+/// turn reaches ends that turn (`Session::host_steps_in_background`, `Session::limit_at_break`),
+/// so the wall after it opens an episode of its own, escalated as new. Before, the retry stood
+/// through such breaks, and a limit hours later was folded into the old episode
+/// (`again=the retry hit the wall again`). NEGATIVE CONTROL: the wall read straight after the
+/// same park, no break's steps between, is still the old episode's retry.
+#[test]
+fn an_off_parks_retry_ends_at_the_settled_break_after_it() {
+    let notice = "You've hit your session limit · resets 2am";
+    let entry = format!("{ATTENTION_PREFIX} {notice}");
+    let run = |broke: bool| {
+        let mut m = Mock::new(vec![shell_break()]);
+        m.attention = Some(entry.clone());
+        m.autopilot = Some("off");
+        m.autopilot_at = vec![(2, Some("cruise"))];
+        let meta = m.meta_line();
+        let mut notes = Notes::default();
+        let (kept, seq) = {
+            let mut s = session(&mut m, None);
+            s.note_meta(&meta);
+            s.attention_ours = Some(entry.clone());
+            s.setup.background_settle = Duration::ZERO;
+            s.limit = Some(Episode {
+                seq: 90,
+                resumes_itself: false,
+                reset_unix: None,
+                reset_text: "-".to_string(),
+                extended: false,
+                raised: true,
+                worked: false,
+                message: String::new(),
+            });
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let opts = under(owners_policy());
+            assert_eq!(s.park_while_off(100, deadline, &opts, &mut notes), Ok(()));
+            let kept = s.retry.clone();
+            if broke {
+                let screen = s.screen().expect("the break's read");
+                assert_eq!(
+                    s.host_steps_in_background(&screen, &mut None, Some(&opts.policy), &mut notes),
+                    Ok(())
+                );
+            }
+            assert_eq!(s.open_episode(102, notice, None, false, &mut notes), Ok(()));
+            (kept, s.limit.as_ref().map(|ep| ep.seq))
+        };
+        (notes.noted, kept, seq)
+    };
+    let escalated = |noted: &[String]| -> String {
+        noted
+            .iter()
+            .find(|l| l.starts_with("ESCALATED seq=102 "))
+            .cloned()
+            .unwrap_or_else(|| panic!("{noted:#?}"))
+    };
+    let (noted, kept, seq) = run(true);
+    assert!(
+        noted.iter().any(|l| l.starts_with("UNPARKED seq=")),
+        "PRECONDITION: the park ended on the Cruise word: {noted:#?}"
+    );
+    assert_eq!(
+        kept,
+        Some(Retry { seq: 90 }),
+        "PRECONDITION: the park's busy read kept the retry: {noted:#?}"
+    );
+    assert_eq!(seq, Some(102), "an episode of its own: {noted:#?}");
+    assert!(!escalated(&noted).contains(" again="), "{noted:#?}");
+
+    let (noted, kept, seq) = run(false);
+    assert_eq!(kept, Some(Retry { seq: 90 }), "{noted:#?}");
+    assert_eq!(
+        seq,
+        Some(90),
+        "NEGATIVE CONTROL: the old episode: {noted:#?}"
+    );
+    assert!(
+        escalated(&noted).ends_with(&format!("again={AGAIN_RETRY}, the episode of seq=90")),
+        "NEGATIVE CONTROL: the retry hit the wall again: {noted:#?}"
+    );
 }
 
 #[test]

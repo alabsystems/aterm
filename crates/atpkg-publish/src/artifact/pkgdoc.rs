@@ -251,6 +251,7 @@ fn render_row(row: &Row) -> Result<String> {
     if row.size == 0 {
         return Err(Error::refused(format!("{} is empty", row.asset)));
     }
+    use std::fmt::Write as _;
     let mut s = format!(
         "[[artifact]]\ntarget = \"{}\"\nkind = \"{}\"\nprotocol = \"github-release\"\n\
          asset = \"{}\"\nsha256 = \"{}\"\ntree_root = \"{}\"\nsize = {}\n",
@@ -265,18 +266,20 @@ fn render_row(row: &Row) -> Result<String> {
         // The only relocation policy the client accepts, inside the signed bytes.
         s.push_str("reloc = \"self-contained\"\n");
     }
-    s.push_str(&format!(
+    let _ = write!(
+        s,
         "[artifact.cost]\ndownload_bytes = {}\ndisk_installed = {}\nbuild_seconds = 0\n\
          [artifact.provenance]\n",
         row.size, row.disk_installed
-    ));
+    );
     for (k, v) in provenance_fields(&row.provenance) {
-        s.push_str(&format!("{k} = \"{v}\"\n"));
+        let _ = writeln!(s, "{k} = \"{v}\"");
     }
     Ok(s)
 }
 
 fn render_bottle_row(row: &BottleRow) -> Result<String> {
+    use std::fmt::Write as _;
     if row.kind == Kind::ElfBinary && row.triple.os() != Os::Linux {
         return Err(Error::refused("elf-binary rows require a GNU/Linux target"));
     }
@@ -304,10 +307,11 @@ fn render_bottle_row(row: &BottleRow) -> Result<String> {
     if row.kind == Kind::SysrootBundle {
         s.push_str("reloc = \"self-contained\"\n");
     }
-    s.push_str(&format!(
+    let _ = write!(
+        s,
         "[artifact.cost]\ndownload_bytes = {}\ndisk_installed = {}\nbuild_seconds = 0\n",
         row.size, row.disk_installed
-    ));
+    );
     Ok(s)
 }
 

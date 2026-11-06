@@ -5,10 +5,9 @@
 
 use std::time::{Duration, Instant};
 
-use aterm_messages::presence::drive::{self, Desk, Shown};
+use aterm_messages::presence::drive::{self, Desk};
 use aterm_session::SessionId;
 
-use crate::app_render::OverlayGlow;
 use crate::presence::{self, Facts, Hand, HoldFact, Link, StoryVerb, TurnFact, WindowView};
 use crate::{App, WindowId};
 
@@ -135,14 +134,6 @@ pub(crate) const fn chrome_regrids_grid(ws: &crate::WindowState) -> bool {
         return true;
     }
     ws.os_window.is_some()
-}
-
-/// What the macOS `NeedsPill` view (and the `chrome` reader) is handed with the strip.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct NeedsPillModel {
-    pub(crate) kind: presence::PillKind,
-    pub(crate) words: presence::PillWords,
-    pub(crate) session: u64,
 }
 
 impl App {
@@ -948,7 +939,7 @@ impl App {
         self.journal_owner_words(session);
     }
 
-    /// Project the window's most pressing session onto its view (`drive::refresh_window`).
+    /// Publish the window's front hold and record its look (`drive::refresh_window`).
     pub(crate) fn refresh_presence_window(&mut self, wid: WindowId) {
         drive::refresh_window(self, wid);
     }
@@ -958,12 +949,6 @@ impl App {
     pub(crate) fn refresh_presence_all_windows(&mut self) {
         self.rebuild_teams();
         drive::refresh_all(self);
-    }
-
-    /// The story read (`drive::human_acted`): the human acted in `wid`.
-    #[cfg(test)]
-    pub(crate) fn note_human_acted(&mut self, wid: WindowId) {
-        drive::human_acted(self, wid);
     }
 
     /// Keep activity pacing for every key or input-method callback, but known controller input
@@ -980,9 +965,7 @@ impl App {
             event,
             WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_)
         ) {
-            let now = Instant::now();
-            self.last_keystroke_at = Some(now);
-            crate::note_key_rest(None, true, now);
+            self.last_keystroke_at = Some(Instant::now());
         }
         if crate::is_person_input(event) && origin != aterm_window::event::InputOrigin::Posted {
             self.last_person_input_at = Some(Instant::now());
@@ -1068,61 +1051,9 @@ impl App {
         drive::deadline(self, now)
     }
 
-    /// The timer's tick (`drive::tick`): the windows that need a repaint.
-    pub(crate) fn presence_tick(&mut self, now: Instant) -> Vec<WindowId> {
-        drive::tick(self, now)
-    }
-
-    /// The border as an [`OverlayGlow`] for the frame path.
-    pub(crate) fn presence_overlay(&self, wid: WindowId) -> Option<OverlayGlow> {
-        let ws = self.windows.get(&wid)?;
-        let glow = ws.presence.rim_glow(|| {
-            crate::chrome_band::presence_tones(
-                self.chrome_palette(crate::app_render::ChromeSurface::Header),
-            )
-        })?;
-        Some(OverlayGlow {
-            accent: pack(glow.accent),
-            wash_a: glow.wash_a,
-            border_a: glow.border_a,
-            border_scale_q4: glow.border_scale_q4,
-        })
-    }
-
-    /// The repaint-key term for `wid`: 0 on a quiet window.
-    pub(crate) fn presence_fp(&self, wid: WindowId) -> u64 {
-        self.windows.get(&wid).map_or(0, |ws| ws.presence.fp())
-    }
-
-    /// The projected pill window `wid` shows now, as the strip carries it ([`NeedsPillModel`]).
-    pub(crate) fn presence_pill(&self, wid: WindowId) -> Option<NeedsPillModel> {
-        let pill = self.windows.get(&wid)?.presence.pill.as_ref()?;
-        Some(NeedsPillModel {
-            kind: pill.kind,
-            words: presence::pill_words(pill, Desk::clock(self)),
-            session: pill.session,
-        })
-    }
-
-    /// Whether window `wid`'s IN-GRID strip carries its needs pill.
-    pub(crate) fn strip_carries_pill(&self, wid: WindowId) -> bool {
-        !(cfg!(target_os = "macos")
-            && self
-                .windows
-                .get(&wid)
-                .is_some_and(|ws| ws.os_window.is_some()))
-    }
-
-    /// The in-grid strip's cache term for window `wid`'s pill.
-    pub(crate) fn presence_pill_key(&self, wid: WindowId) -> Option<(u64, Option<Instant>)> {
-        let view = &self.windows.get(&wid)?.presence;
-        let pill = view.pill.as_ref()?;
-        let now = Desk::clock(self);
-        Some((
-            view.fp(),
-            pill.since
-                .map(|since| aterm_messages::presence::pill_due(since, now)),
-        ))
+    /// The timer's tick (`drive::tick`).
+    pub(crate) fn presence_tick(&mut self, now: Instant) {
+        drive::tick(self, now);
     }
 
     /// Stamp each tab's mark onto the strip metadata.
@@ -1189,40 +1120,6 @@ impl App {
         }
     }
 
-    /// The pill's a11y message: the projected pill's words, a polite status with no bar row.
-    #[cfg(a11y_tree)]
-    pub(crate) fn presence_a11y_message(
-        &self,
-        wid: WindowId,
-    ) -> Option<crate::a11y_tree::GridMessage> {
-        let pill = self.windows.get(&wid)?.presence.pill.as_ref()?;
-        let now = Desk::clock(self);
-        let spoken = presence::pill_words(
-            &aterm_messages::presence::Pill {
-                since: None,
-                ..pill.clone()
-            },
-            now,
-        )
-        .text();
-        let aged = presence::pill_words(pill, now).text();
-        Some(crate::a11y_tree::GridMessage {
-            message: crate::a11y_tree::ChromeMessage::PresenceStatus,
-            context: None,
-            detail: (aged != spoken).then_some(aged),
-            text: spoken,
-            progress: None,
-            busy: false,
-            alarm: matches!(
-                pill.kind,
-                presence::PillKind::Need(presence::NeedSeverity::Stuck)
-            ),
-            activates: false,
-            bar_row: None,
-            capsules: Vec::new(),
-        })
-    }
-
     fn done_unseen(&self, session: u64) -> bool {
         self.task_done
             .get(&session)
@@ -1256,8 +1153,10 @@ impl App {
         let stood_in = false;
         self.frontmost_window == Some(wid)
             && (stood_in
-                || (self.windows.get(&wid).is_some_and(|ws| ws.os_key)
-                    && Desk::pill_visible(self, wid)))
+                || self
+                    .windows
+                    .get(&wid)
+                    .is_some_and(|ws| ws.os_key && crate::messages_host::band_on_screen(ws)))
     }
 
     /// `aterm ctl person …` on the main thread.
@@ -1382,10 +1281,8 @@ impl App {
             return;
         }
         self.mark_status_dirty();
+        self.request_redraw_all_windows();
         let windows: Vec<WindowId> = self.windows.keys().copied().collect();
-        for wid in &windows {
-            Desk::request_redraw(self, *wid);
-        }
         self.refresh_tab_chrome_windows(windows);
     }
 
@@ -1394,10 +1291,8 @@ impl App {
         #[cfg(test)]
         crate::work_counts::end_restamped();
         self.mark_status_dirty();
+        self.request_redraw_all_windows();
         let windows: Vec<WindowId> = self.windows.keys().copied().collect();
-        for wid in &windows {
-            Desk::request_redraw(self, *wid);
-        }
         self.refresh_tab_chrome_windows(windows);
     }
 
@@ -1503,10 +1398,8 @@ impl App {
         if let Some(front) = self.frontmost_window {
             self.note_done_seen(front);
         }
+        self.request_redraw_all_windows();
         let windows: Vec<WindowId> = self.windows.keys().copied().collect();
-        for wid in &windows {
-            Desk::request_redraw(self, *wid);
-        }
         self.refresh_tab_chrome_windows(windows);
     }
 
@@ -1629,137 +1522,11 @@ impl App {
         (!parts.is_empty()).then(|| parts.join(crate::native_ui::FACT_SEPARATOR))
     }
 
-    /// The native pill's click as its wake delivers it (`Wake::PillAct`).
-    pub(crate) fn on_pill_wake(&mut self, window: WindowId, session: u64, hit: presence::PillHit) {
-        self.fence_pointer_license(window);
-        self.settle_rename_edit(window);
-        self.on_pill_act(window, session, hit);
-    }
-
-    /// A click on window `window`'s pill landed on `hit`, the pill naming `session` when it was drawn.
-    pub(crate) fn on_pill_act(&mut self, window: WindowId, session: u64, hit: presence::PillHit) {
-        let Some(pill) = self
-            .windows
-            .get(&window)
-            .and_then(|ws| ws.presence.pill.as_ref())
-            .filter(|pill| pill.session == session)
-        else {
-            return;
-        };
-        match hit {
-            presence::PillHit::Go => {
-                let _ = self.focus_session_preferring(Some(window), session);
-            }
-            presence::PillHit::More if pill.more > 0 => {
-                let at = Desk::next_need_after(self, window, session).map_or(
-                    crate::app_overview::OverviewAt::Top,
-                    crate::app_overview::OverviewAt::Session,
-                );
-                if let Err(e) = self.open_overview_raised(window, at) {
-                    aterm_log::info!("pill +N: {e}");
-                }
-            }
-            presence::PillHit::Act(act) if pill.act == Some(act) => match act {
-                presence::PillAct::Restart => self.pill_restart(session),
-                presence::PillAct::Resume => self.pill_resume(session),
-                presence::PillAct::HandBack => self.hand_back_person(session),
-            },
-            presence::PillHit::More | presence::PillHit::Act(_) => {}
-        }
-    }
-
-    fn pill_restart(&mut self, session: u64) {
-        #[cfg(unix)]
-        {
-            let handle = self
-                .store
-                .read()
-                .unwrap_or_else(|p| p.into_inner())
-                .by_local(session)
-                .map(|h| (h.master, std::sync::Arc::clone(&h.ctx)));
-            if let Some((master, ctx)) = handle {
-                let spawned = std::thread::Builder::new()
-                    .name("aterm-pill-restart".into())
-                    .spawn(move || {
-                        let reply = crate::restart_act::restart(
-                            master,
-                            "if-stalled",
-                            &ctx,
-                            aterm_slog::Actor::Human,
-                        );
-                        aterm_log::info!("pill restart {session}: {}", reply.trim_end());
-                    });
-                if let Err(e) = spawned {
-                    aterm_log::warn!("pill restart {session}: no thread: {e}");
-                }
-            }
-        }
-        #[cfg(not(unix))]
-        let _ = session;
-    }
-
-    fn pill_resume(&mut self, session: u64) {
-        #[cfg(unix)]
-        {
-            let handle = self
-                .store
-                .read()
-                .unwrap_or_else(|p| p.into_inner())
-                .by_local(session)
-                .map(|h| (h.master, std::sync::Arc::clone(&h.ctx)));
-            if let Some((master, ctx)) = handle {
-                let spawned = std::thread::Builder::new()
-                    .name("aterm-pill-resume".into())
-                    .spawn(move || {
-                        let reply = resume_if_stopped(master, &ctx);
-                        aterm_log::info!("pill resume {session}: {}", reply.trim_end());
-                    });
-                if let Err(e) = spawned {
-                    aterm_log::warn!("pill resume {session}: no thread: {e}");
-                }
-            }
-        }
-        #[cfg(not(unix))]
-        let _ = session;
-    }
-
-    /// Re-project every window whose pill names `session`.
-    pub(crate) fn reproject_pill_of(&mut self, session: u64) {
-        let windows: Vec<WindowId> = self
-            .windows
-            .iter()
-            .filter(|(_, ws)| {
-                ws.presence
-                    .pill
-                    .as_ref()
-                    .is_some_and(|pill| pill.session == session)
-            })
-            .map(|(wid, _)| *wid)
-            .collect();
-        for wid in windows {
-            drive::refresh_window(self, wid);
-        }
-    }
-
-    /// Hand Back (the pill's, the Team chip's `✋`).
+    /// Hand Back (the Team chip's `✋`).
     pub(crate) fn hand_back_person(&mut self, session: u64) {
         if let Err(why) = self.hand_back_session(session) {
             aterm_log::info!("hand back {session}: {why}");
         }
-    }
-
-    /// The window's view, for the tests.
-    #[cfg(test)]
-    pub(crate) fn presence_view(&self, wid: WindowId) -> Option<&WindowView> {
-        self.windows.get(&wid).map(|ws| &ws.presence)
-    }
-
-    /// `chrome`'s presence line for the front window (the frontmost, else the first).
-    pub(crate) fn presence_chrome_line(&self) -> String {
-        let front = self
-            .frontmost_window
-            .or_else(|| self.windows.keys().next().copied());
-        drive::chrome_line(self, front)
     }
 
     /// A session's level as `status level=` reports it, for the tests ([`drive::session_level`]).
@@ -1909,42 +1676,8 @@ impl Desk for App {
         }
     }
 
-    fn view_of(&self, w: WindowId) -> Option<&WindowView> {
-        self.windows.get(&w).map(|ws| &ws.presence)
-    }
-
     fn view_of_mut(&mut self, w: WindowId) -> Option<&mut WindowView> {
         self.windows.get_mut(&w).map(|ws| &mut ws.presence)
-    }
-
-    fn front_session(&self, w: WindowId) -> Option<u64> {
-        self.focused_session_id(w)
-    }
-
-    fn shown(&self, w: WindowId) -> Vec<Shown> {
-        let Some(ws) = self.windows.get(&w) else {
-            return Vec::new();
-        };
-        let front = ws.tab_set.active_index();
-        let mut out = Vec::new();
-        for (tab, t) in ws.tab_set.tabs().iter().enumerate() {
-            t.root.any_leaf(&mut |view| {
-                if let Some(session) = self
-                    .view_store
-                    .get(*view)
-                    .copied()
-                    .and_then(crate::tab_model::View::terminal_session)
-                {
-                    out.push(Shown {
-                        session,
-                        tab,
-                        front_tab: Some(tab) == front,
-                    });
-                }
-                false
-            });
-        }
-        out
     }
 
     fn windows_showing(&self, session: u64) -> Vec<WindowId> {
@@ -1977,39 +1710,6 @@ impl Desk for App {
         Some(now + Duration::from_micros(at_us.saturating_sub(now_us)) + Duration::from_millis(1))
     }
 
-    fn pill_visible(&self, w: WindowId) -> bool {
-        self.windows
-            .get(&w)
-            .map(Box::as_ref)
-            .is_some_and(crate::messages_host::band_on_screen)
-    }
-
-    fn needs_shown(&self) -> bool {
-        false
-    }
-
-    fn label_of(&self, session: u64) -> String {
-        self.tab_label_of_session(session)
-    }
-
-    fn restart_offered(&self, session: u64) -> bool {
-        let sid = self
-            .store
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .by_local(session)
-            .map(|h| h.sid.clone());
-        sid.is_some_and(|sid| crate::harness_host::offered_now(&self.store, sid.as_str()).is_some())
-    }
-
-    fn sid_of(&self, session: u64) -> Option<String> {
-        self.store
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .by_local(session)
-            .map(|h| h.sid.as_str().to_string())
-    }
-
     fn herald_deadline(&self, now: Instant) -> Option<Instant> {
         let herald = match self.presence.herald.due(now) {
             (ready, _) if !ready.is_empty() => Some(now),
@@ -2028,33 +1728,8 @@ impl Desk for App {
         self.note_done_seen(w);
     }
 
-    fn request_redraw(&self, w: WindowId) {
-        if let Some(win) = self.windows.get(&w).and_then(|ws| ws.os_window.as_ref()) {
-            win.request_redraw();
-        }
-    }
-
     fn restamp_chips(&mut self, windows: Vec<WindowId>) {
         self.refresh_tab_chrome_windows(windows);
-    }
-
-    fn push_pill(&mut self, windows: Vec<WindowId>) -> Vec<WindowId> {
-        use crate::platform::AppRt as _;
-        let mut framed = Vec::new();
-        for wid in windows {
-            if self.strip_carries_pill(wid) {
-                framed.push(wid);
-                continue;
-            }
-            let held = self._toolbars.get(&wid).is_none_or(|handle| {
-                let pill = self.presence_pill(wid);
-                self.apprt.set_toolbar_pill(handle, pill.as_ref())
-            });
-            if !held {
-                self.refresh_window_tabs(wid);
-            }
-        }
-        framed
     }
 
     fn herald(&mut self, session: u64) {
@@ -2168,19 +1843,6 @@ pub(crate) fn driven_words(
         }
     };
     Some(words)
-}
-
-fn pack(c: [u8; 3]) -> u32 {
-    (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2])
-}
-
-/// THE PILL'S RESUME, fenced ([`App::pill_resume`]).
-#[cfg(unix)]
-pub(crate) fn resume_if_stopped(master: i32, ctx: &crate::SessionCtx) -> String {
-    if !crate::input_stall::fg_stopped(master) {
-        return "ERR not-stopped\n".to_string();
-    }
-    crate::control::signal_verb(master, "cont", ctx, aterm_slog::Actor::Human)
 }
 
 fn opened_at(started_ms: u64) -> Option<std::time::Instant> {
@@ -2413,7 +2075,7 @@ mod tests {
     use aterm_window::event::InputOrigin;
 
     use super::*;
-    use crate::presence::{ChipLevel, Rim};
+    use crate::presence::ChipLevel;
     use crate::task_record::{TaskMark, TaskState, mark_session_task};
     use crate::{App, WindowId};
     use std::sync::Arc;
@@ -2451,25 +2113,35 @@ mod tests {
         mark_session_task(ctx, local, &mark).expect("unfenced");
     }
 
-    fn view(app: &App, wid: WindowId) -> &WindowView {
-        app.presence_view(wid).expect("a window")
-    }
-
     #[test]
-    fn recorded_needs_keep_the_window_quiet() {
-        let (mut app, wid, sid, ctx) = app_with_stub();
+    fn an_ask_and_a_needs_you_line_each_publish_a_need() {
+        let (mut app, _wid, sid, ctx) = app_with_stub();
         for text in ["deploy to prod?", "NEEDS YOU: a routine decision"] {
             ask(&ctx, Some(text));
             app.refresh_presence_session(sid);
             assert!(ctx.timeline.lock().unwrap().need().need.is_some());
-            assert_eq!(view(&app, wid).rim, Rim::None);
-            assert!(app.presence_overlay(wid).is_none());
-            assert!(app.presence_pill(wid).is_none());
         }
-        task(&ctx, sid, TaskState::Stalled);
-        app.refresh_presence_session(sid);
-        assert_eq!(view(&app, wid).rim, Rim::None);
-        assert!(app.presence_overlay(wid).is_none());
+    }
+
+    /// A session in two tabs of a window is one projection there a refresh: the list
+    /// [`Desk::windows_showing`] hands `refresh_session` names that window once, as it names each
+    /// of two windows showing the session. NEGATIVE CONTROL: without the walk's `contains`, the
+    /// tabs repeat the window the focused walk already named.
+    #[test]
+    fn a_session_in_two_tabs_of_a_window_is_projected_there_once() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        app.switch_tab_in(wid, 0);
+        let twin = app
+            .open_active_session_in_new_window_logical()
+            .expect("share the session into a second window");
+        assert_eq!(Desk::windows_showing(&app, 0), [wid, twin], "once at each");
+
+        let _ = app.migrate_active_tab_to_next_window();
+        assert_eq!(app.windows.len(), 1, "the emptied share window closes");
+        assert_eq!(app.tabs_viewing_session(0).len(), 2, "two tabs show it");
+        assert_eq!(Desk::windows_showing(&app, 0), [wid], "the window, once");
     }
 
     #[test]
@@ -2478,13 +2150,10 @@ mod tests {
         let _ = second_tab(&mut app, wid);
         let rows = app.chrome_rows(wid);
         let _ = take_chrome_regrids_applied();
-        let mut lit = 0;
         for i in 0..100 {
             ask(&first_ctx, (i % 2 == 0).then_some("approve?"));
             app.refresh_presence_session(first);
-            lit += usize::from(view(&app, wid).rim == Rim::Decide);
         }
-        assert_eq!(lit, 0, "diagnostic changes never light a border");
         assert!(
             take_chrome_regrids_applied().is_empty(),
             "no flip re-gridded a pane"
@@ -2848,8 +2517,6 @@ mod tests {
                 })
             ));
             app.refresh_presence_session(sid);
-            assert_eq!(view(app, wid).rim, Rim::None, "{origin}: no border");
-            assert!(app.presence_pill(wid).is_none(), "{origin}: no pill");
             assert_eq!(
                 app.presence.slot(sid).map(|s| s.chip()),
                 Some(ChipLevel::Off),
@@ -2902,62 +2569,6 @@ mod tests {
             Some(OverviewItem::Manages { .. })
         ));
         assert_eq!(card.activate(), OverviewAct::Raise(manager));
-    }
-
-    #[test]
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    fn the_pills_resume_continues_only_a_job_still_stopped() {
-        use std::os::fd::IntoRawFd as _;
-        struct Leader {
-            child: std::process::Child,
-            master: i32,
-        }
-        impl Drop for Leader {
-            fn drop(&mut self) {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-                // SAFETY: the master fd this test opened and alone owns.
-                unsafe { libc::close(self.master) };
-            }
-        }
-        let (_app, _wid, _sid, ctx) = app_with_stub();
-        let (master, slave, child) = aterm_pty::spawn_session_leader_on_pty(|slave| {
-            let mut cmd = std::process::Command::new("/bin/sleep");
-            cmd.arg("60")
-                .stdout(std::process::Stdio::from(slave.try_clone()?))
-                .stderr(std::process::Stdio::from(slave.try_clone()?));
-            Ok(cmd)
-        })
-        .expect("spawn sleep");
-        drop(slave);
-        let led = Leader {
-            child,
-            master: master.into_raw_fd(),
-        };
-        let pid = libc::pid_t::try_from(led.child.id()).expect("pid");
-        let until = |what: &str, stopped: bool| {
-            aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, what, || {
-                (crate::input_stall::pid_stopped(pid) == Some(stopped)).then_some(())
-            });
-        };
-        aterm_spec::wait::until_within(
-            aterm_spec::wait::MUST_HAPPEN,
-            "the child leads the pty's foreground",
-            // SAFETY: `tcgetpgrp` only reads the live master's foreground group.
-            || (unsafe { libc::tcgetpgrp(led.master) } == pid).then_some(()),
-        );
-        until("the job runs", false);
-        assert_eq!(
-            resume_if_stopped(led.master, &ctx),
-            "ERR not-stopped\n",
-            "CONTROL: a running job is sent nothing"
-        );
-        // SAFETY: `pid` is this test's own live child.
-        assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
-        until("the job stops", true);
-        let reply = resume_if_stopped(led.master, &ctx);
-        assert!(reply.starts_with("OK signalled"), "{reply}");
-        until("the job is continued", false);
     }
 
     #[test]
@@ -3070,7 +2681,7 @@ mod tests {
         app.tell_story(sid, presence::StoryVerb::Chose)
             .expect("the stub is held");
         assert_eq!(app.presence_session_level(sid), presence::Level::Story);
-        app.note_human_acted(wid);
+        app.note_human_acted_on(wid, sid);
         assert_eq!(app.presence_session_level(sid), presence::Level::Quiet);
     }
 

@@ -197,7 +197,7 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
         } else {
             aterm_json::to_string(&value)
         } {
-            Ok(text) => {
+            Ok(mut text) => {
                 let code = if value
                     .as_object()
                     .and_then(|o| o.get("ok"))
@@ -208,7 +208,8 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
                 } else {
                     0
                 };
-                aterm_uds::stdout::answer_exit("aterm db", &format!("{text}\n"), code)
+                text.push('\n');
+                aterm_uds::stdout::answer_exit("aterm db", &text, code)
             }
             Err(_) => ExitCode::from(1),
         },

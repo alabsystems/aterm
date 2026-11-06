@@ -74,106 +74,13 @@ pub fn probe(_path: &Path) -> Owner {
 
 #[cfg(test)]
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
-pub(crate) mod tests {
+mod tests {
     use super::*;
-    use std::io::{Read as _, Write as _};
-
-    unsafe extern "C" {
-        fn read(fd: i32, buf: *mut core::ffi::c_void, count: usize) -> isize;
-        fn write(fd: i32, buf: *const core::ffi::c_void, count: usize) -> isize;
-    }
+    use crate::fork_window::Parked;
 
     fn release(file: std::fs::File) {
         file.unlock().expect("LOCK_UN");
         drop(file);
-    }
-
-    const SHELL: &str = crate::os_path!("sh");
-
-    const HANG: std::time::Duration = std::time::Duration::from_secs(60);
-
-    /// A child parked between `fork` and `exec`, holding a copy of every descriptor this
-    /// process had open: the state a sibling test's `pre_exec` spawn puts this process in for
-    /// milliseconds at a time, made deterministic.
-    pub(crate) struct Parked {
-        ours: std::os::unix::net::UnixStream,
-        spawner: Option<std::thread::JoinHandle<std::io::Result<std::process::ExitStatus>>>,
-    }
-
-    impl Parked {
-        /// Fork a child and return once it is parked. The child writes one byte, then waits
-        /// for one, under the hang detector on the shared socket, so even a dead parent cannot
-        /// strand it in `pre_exec`. A child never let go fails its spawn instead of its exec,
-        /// which would close its copies under a probe still to come and pass it unheld.
-        pub(crate) fn park() -> Self {
-            use std::os::fd::AsRawFd as _;
-            use std::os::unix::process::CommandExt as _;
-            let (ours, theirs) = std::os::unix::net::UnixStream::pair().expect("pair");
-            theirs.set_read_timeout(Some(HANG)).expect("timeout");
-            let theirs_fd = theirs.as_raw_fd();
-            let spawner = std::thread::spawn(move || {
-                let mut cmd = std::process::Command::new(SHELL);
-                cmd.args(["-c", "exit 0"])
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null());
-                // SAFETY: runs in the forked child before `exec` and calls only the
-                // async-signal-safe `write(2)` and `read(2)`, on a descriptor the parent keeps open
-                // (`theirs`, alive until `status` returns); its error is a raw code, no allocation.
-                unsafe {
-                    cmd.pre_exec(move || {
-                        let mut byte = 0u8;
-                        write(theirs_fd, (&raw const byte).cast(), 1);
-                        if read(theirs_fd, (&raw mut byte).cast(), 1) == 1 {
-                            Ok(())
-                        } else {
-                            Err(std::io::Error::from_raw_os_error(libc::ETIMEDOUT))
-                        }
-                    });
-                }
-                let status = cmd.status();
-                drop(theirs);
-                status
-            });
-            let mut parked = Self {
-                ours,
-                spawner: Some(spawner),
-            };
-            let mut byte = [0u8];
-            parked
-                .ours
-                .read_exact(&mut byte)
-                .expect("the child parked between fork and exec");
-            parked
-        }
-
-        /// Let the child exec and exit, and return how it exited.
-        pub(crate) fn release(mut self) -> std::process::ExitStatus {
-            self.let_go();
-            let spawner = self.spawner.take().expect("released once");
-            match spawner.join().expect("the spawner thread") {
-                Ok(status) => status,
-                Err(e) => panic!(
-                    "spawning `{SHELL} -c 'exit 0'` for the parked child failed: {e} \
-                     (the child forks and parks before its exec, so this is the exec, or a \
-                     park the test held past the hang detector)"
-                ),
-            }
-        }
-
-        fn let_go(&mut self) {
-            let _ = self.ours.write_all(b"g");
-            let _ = self.ours.shutdown(std::net::Shutdown::Write);
-        }
-    }
-
-    impl Drop for Parked {
-        fn drop(&mut self) {
-            if let Some(spawner) = self.spawner.take() {
-                self.let_go();
-                let _ = spawner.join();
-            }
-        }
     }
 
     #[test]

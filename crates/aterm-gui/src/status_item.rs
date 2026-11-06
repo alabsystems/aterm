@@ -54,8 +54,6 @@ pub(crate) enum StatusAction {
     ReadFleet,
     /// Read the Fleet Now: a fresh fleet glance, whatever the last one's age.
     ReadFleetNow,
-    /// The degrade line's click: the Local Network privacy pane.
-    OpenLocalNetwork,
     /// A fleet need's Read This Session ([`Glance::peers`]).
     PeerRead(Pick),
     /// A fleet need's Screen Sharing to its Mac ([`Glance::peers`]).
@@ -97,7 +95,6 @@ impl StatusAction {
             Self::HandBackAll => 9,
             Self::ReadFleet => 10,
             Self::ReadFleetNow => 11,
-            Self::OpenLocalNetwork => 12,
             Self::OpenSystemState => 13,
             Self::ShowException(id) => packed(4, id),
             Self::Go(pick) => packed(5, pick.packed()),
@@ -123,7 +120,6 @@ impl StatusAction {
             9 => Some(Self::HandBackAll),
             10 => Some(Self::ReadFleet),
             11 => Some(Self::ReadFleetNow),
-            12 => Some(Self::OpenLocalNetwork),
             13 => Some(Self::OpenSystemState),
             t if t >= TAG_BAND => {
                 let payload = u64::try_from(t % TAG_BAND).ok()?;
@@ -394,7 +390,7 @@ pub(crate) struct Escalation {
     /// The engine's sequence of the program's own `blocked` report a program-claim need stands
     /// on ([`crate::needs::Need::report`]): the box [`crate::box_banner`] keeps to one banner.
     pub report: Option<u64>,
-    /// Each need an ask stands for, by its own words ([`need_ids`]); empty for every other kind and for a fleet need, which keep one notice per transition.
+    /// Each need an ask stands for, by its own words ([`need_ids`], or a fleet peer's `need_ids=`, `fleet_glance::escalation`); empty for every other kind and for a fleet need its peer names no needs for, which keep one notice per transition.
     pub needs: Vec<NeedId>,
     /// The owner's turn in the tab as the row read it ([`SessionRow::owner_turn`]); `0` for a fleet need.
     pub owner_turn: u64,
@@ -614,7 +610,7 @@ struct HeraldSlot {
 /// The most need ids one session's told memory keeps ([`Told`]); the oldest goes first, and its need can be told again.
 pub(crate) const TOLD_MAX: usize = 32;
 
-/// ONE SESSION'S TOLD-ONCE MEMORY (design §14.18): the ids ([`NeedId`]) of the asks its owner was told of — a notice queued, or spent on their look, the program's own notification or alerts off — since their last turn in the tab ([`Escalation::owner_turn`]) and the agent's last take-down (the escalation gone), with each told escalation's key. Process-local: an update carries only whether the standing need was told ([`StatusCarry::told`]), which marks that escalation's ids told in the successor, and the needs it counts without naming them once a read under its key names them ([`Herald::note_spent`]).
+/// ONE SESSION'S TOLD-ONCE MEMORY (design §14.18): the ids ([`NeedId`]) of the asks its owner was told of — a notice queued, or spent on their look, the program's own notification or alerts off — since their last turn in the tab ([`Escalation::owner_turn`]) and the agent's last take-down (the escalation gone), with each told escalation's key. A seamless update carries its ids in the session's status row ([`StatusCarry::told_ids`]) and a quit in the tab's restore leaf (`TerminalLeafRestore::told`), and the next process keeps them ([`Herald::adopt`]) until the owner's first turn there, or a take-down after the first need it notes.
 #[derive(Debug, Default)]
 struct Told {
     /// The owner's turn the memory is kept under.
@@ -627,6 +623,8 @@ struct Told {
     posted: Vec<u64>,
     /// The key of an adopted told escalation that counts needs it does not name (an entry read alone, [`Herald::note_spent`]): the outgoing process told the set standing under it, so the first read under that key that names every need it counts marks them told.
     adopted: Option<u64>,
+    /// These ids came from the process before this one ([`Herald::adopt`]) and no escalation has been noted here since: a note with nothing standing is the restart's gap, not the agent's take-down, so it keeps them, and the first need noted here judges them by the owner's turn (`0` here: no plain Enter in this process).
+    carried: bool,
 }
 
 impl Told {
@@ -660,7 +658,65 @@ impl Told {
         self.ids.clear();
         self.posted.clear();
         self.adopted = None;
+        self.carried = false;
     }
+}
+
+/// A told memory's ids as a restart or an update carries them ([`Told`]): each id in hex, oldest first, comma-separated; `None` for none.
+#[must_use]
+pub(crate) fn told_ids_row(ids: &[u64]) -> Option<String> {
+    (!ids.is_empty()).then(|| {
+        ids.iter()
+            .map(|id| format!("{id:016x}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    })
+}
+
+/// One id as [`told_ids_row`] spells it: one to sixteen hex digits naming an id other than `0`.
+fn hex_id(part: &str) -> Option<u64> {
+    if !(1..=16).contains(&part.len()) || !part.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(part, 16).ok().filter(|id| *id != 0)
+}
+
+/// [`told_ids_row`]'s ids read back, in its order, a part that does not read ([`hex_id`]) dropped, at most [`TOLD_MAX`] of them, the newest kept.
+#[must_use]
+pub(crate) fn parse_told_ids(row: &str) -> Vec<u64> {
+    let ids: Vec<u64> = row.split(',').filter_map(hex_id).collect();
+    ids[ids.len().saturating_sub(TOLD_MAX)..].to_vec()
+}
+
+/// The most needs a survey row publishes for one ask ([`need_ids_row`]) and a reader reads ([`parse_need_ids`]): the needs one session's told memory can keep, and the key of a count past them.
+pub(crate) const NEED_IDS_MAX: usize = TOLD_MAX + 1;
+
+/// THE NEEDS A PEER'S HERALD TELLS ONCE (design §14.18): a content survey row's `need_ids=` for `need`, each need [`need_ids`] reads, in its order, at most [`NEED_IDS_MAX`], comma-separated, each as this herald read it ([`NeedRead`]): `<id>` read whole, `<id>/<entry>` read whole beside an entry that cuts it to the words whose id is `<entry>`, `/<id>` read from the entry alone; ids in hex as [`told_ids_row`] spells them. So a fleet peer's herald (`fleet_glance::escalation`) names each need as this one does, and a first need read from the entry alone before its told set came is the same need read whole after. `None` for any need but an ask.
+#[must_use]
+pub(crate) fn need_ids_row(need: &crate::needs::Need) -> Option<String> {
+    let ids: Vec<String> = need_ids("", need, "")
+        .into_iter()
+        .take(NEED_IDS_MAX)
+        .map(|need| match need.read {
+            NeedRead::Whole => format!("{:016x}", need.id),
+            NeedRead::Cut(entry) => format!("{:016x}/{entry:016x}", need.id),
+            NeedRead::Entry => format!("/{:016x}", need.id),
+        })
+        .collect();
+    (!ids.is_empty()).then(|| ids.join(","))
+}
+
+/// A survey row's `need_ids=` ([`need_ids_row`]) read back: each need's id and how the peer read it, in its order, at most [`NEED_IDS_MAX`]; a part that does not read ([`hex_id`]) is dropped.
+#[must_use]
+pub(crate) fn parse_need_ids(row: &str) -> Vec<(u64, NeedRead)> {
+    row.split(',')
+        .filter_map(|part| match part.split_once('/') {
+            None => Some((hex_id(part)?, NeedRead::Whole)),
+            Some(("", entry)) => Some((hex_id(entry)?, NeedRead::Entry)),
+            Some((whole, entry)) => Some((hex_id(whole)?, NeedRead::Cut(hex_id(entry)?))),
+        })
+        .take(NEED_IDS_MAX)
+        .collect()
 }
 
 /// What a told escalation marks ([`Told::mark`]): each need it stands for ([`NeedId::marks`]), and its key.
@@ -707,16 +763,27 @@ pub(crate) struct Herald {
     told_off: bool,
 }
 
+/// Dev seam (`ATERM_DEV_HERALD_TOLD_OFF=1`, read once; debug and dev-seams builds only): the herald before told once, one notice per transition, so a windowed lab's negative control (`aterm-lab told-once`) sees the repeats told once keeps quiet. Tests set [`Herald::told_off`] instead.
+#[cfg(not(test))]
+fn told_off_seam() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| {
+        aterm_types::dev_seam!("ATERM_DEV_HERALD_TOLD_OFF").is_some_and(|v| v == "1")
+    })
+}
+
 /// How long a seamless successor takes what its outgoing process had told the owner as already told ([`Herald::adopt`], and `App::herald_fleet`'s first fresh read): room for every standing need to be published again — the stall watch's re-detection (`input_backlog::STALL_AFTER`, stretched under load, then `input_stall::RECHECK`) and an issuer's first fleet read (`fleet_glance::POLL_EVERY` and its timeout).
 pub(crate) const ADOPT_SETTLE: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// What the status item knew of one session, carried across a seamless update as one row (`SessionRecord::status_seen`): the published need and since when it stood, whether the herald had told it (posted, or spent it on a looking owner or alerts off: nothing owed), the hold and since when, and the done the owner looked at, by when its task entered it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// What the status item knew of one session, carried across a seamless update as one row (`SessionRecord::status_seen`): the published need and since when it stood, whether the herald had told it (posted, or spent it on a looking owner or alerts off: nothing owed), the ids its told-once memory holds, the hold and since when, and the done the owner looked at, by when its task entered it. A quit's restore leaf carries the told ids alone (`TerminalLeafRestore::told`), read back as a carry with nothing else.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct StatusCarry {
     /// The need's word and since when it stood (unix seconds).
     pub need: Option<(NeedWord, i64)>,
     /// The herald told that need: nothing is owed for it.
     pub told: bool,
+    /// The ids the session's told-once memory holds, oldest first ([`Told`]): every need its owner was told of in the stretch, standing or not.
+    pub told_ids: Vec<u64>,
     /// The hold's word and since when it stood (unix seconds).
     pub held: Option<(HoldWord, i64)>,
     /// The done the owner looked at: its task's `since_unix_ms`, the wall-clock instant the record entered it (carried exactly, unlike its entry rev).
@@ -726,9 +793,9 @@ pub(crate) struct StatusCarry {
 }
 
 impl StatusCarry {
-    /// The row: `need=<word>@<unix s>`, `told=1`, `hold=<word>@<unix s>`, `done=<unix ms>`
-    /// and an actual queued banner's `box=<kind>@<source episode>`, each only when it holds;
-    /// `None` for nothing known.
+    /// The row: `need=<word>@<unix s>`, `told=1`, `told_ids=<hex>[,<hex>…]` ([`told_ids_row`]),
+    /// `hold=<word>@<unix s>`, `done=<unix ms>` and an actual queued banner's
+    /// `box=<kind>@<source episode>`, each only when it holds; `None` for nothing known.
     #[cfg(any(unix, test))]
     pub(crate) fn row(&self) -> Option<String> {
         let mut parts = Vec::new();
@@ -737,6 +804,9 @@ impl StatusCarry {
             if self.told {
                 parts.push("told=1".to_string());
             }
+        }
+        if let Some(ids) = told_ids_row(&self.told_ids) {
+            parts.push(format!("told_ids={ids}"));
         }
         if let Some((word, at)) = self.held {
             parts.push(format!("hold={}@{at}", word.word()));
@@ -769,6 +839,7 @@ impl StatusCarry {
                         stamped(value).and_then(|(w, at)| Some((NeedWord::parse(&w)?, at)));
                 }
                 "told" => carry.told = value == "1",
+                "told_ids" => carry.told_ids = parse_told_ids(value),
                 "hold" => {
                     carry.held =
                         stamped(value).and_then(|(w, at)| Some((HoldWord::parse(&w)?, at)));
@@ -871,7 +942,7 @@ impl Herald {
         moved
     }
 
-    /// A seamless update adopted `session` with what its outgoing process knew of it (`carry`, `SessionRecord::status_seen`), at `now_unix` / `now`: for [`ADOPT_SETTLE`], its first need published here takes the carried age when it is the carried word ([`Self::observe`]), and is no transition when it is the need the herald had told ([`Self::note_spent`]), each need of it marked told (§14.18) — an update is no new need, and the owner was told once.
+    /// A seamless update adopted `session` with what its outgoing process knew of it (`carry`, `SessionRecord::status_seen`), or a restore after a quit brought it back with the told ids its leaf carried, at `now_unix` / `now`: for [`ADOPT_SETTLE`], its first need published here takes the carried age when it is the carried word ([`Self::observe`]), and is no transition when it is the need the herald had told ([`Self::note_spent`]), each need of it marked told (§14.18) — an update is no new need, and the owner was told once. The carried told ids are this session's memory here ([`Told::carried`]): kept until the owner's first plain Enter in this process, or a take-down after the first need noted here, so a need told before the restart is told once across it.
     pub(crate) fn adopt(
         &mut self,
         session: u64,
@@ -879,6 +950,14 @@ impl Herald {
         now_unix: i64,
         now: std::time::Instant,
     ) {
+        if !carry.told_ids.is_empty() {
+            let told = &mut self.slots.entry(session).or_default().told;
+            if told.ids.is_empty() {
+                told.turn = 0;
+                told.carried = true;
+            }
+            told.mark(carry.told_ids.iter().copied());
+        }
         let settle = i64::try_from(ADOPT_SETTLE.as_secs()).unwrap_or(i64::MAX);
         self.adopted.insert(
             session,
@@ -905,10 +984,19 @@ impl Herald {
         StatusCarry {
             need: since.need.map(|(word, _, at)| (word, at)),
             told,
+            told_ids: self.told_ids(session),
             held: since.held,
             done: None,
             box_receipt: None,
         }
+    }
+
+    /// The ids `session`'s told-once memory holds, oldest first ([`Told`]): what a quit's restore leaf and a seamless update's status row carry.
+    pub(crate) fn told_ids(&self, session: u64) -> Vec<u64> {
+        self.slots
+            .get(&session)
+            .map(|slot| slot.told.ids.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     /// Whether `session`'s notice for the need `(kind, key)` is shown and owed nothing: told (or looked at, or held back by the setting, which owe nothing either) — what a seamless update's carry calls told.
@@ -1033,6 +1121,14 @@ impl Herald {
             project = "aterm_gui::status_item::herald_told_once_conformance::Rig::project"
         )
     )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "HeraldToldOnce",
+            action = "Restart",
+            project = "aterm_gui::status_item::herald_told_once_conformance::Rig::project"
+        )
+    )]
     pub(crate) fn note_spent(
         &mut self,
         session: u64,
@@ -1058,13 +1154,22 @@ impl Herald {
         let Some(esc) = current else {
             slot.shown = None;
             slot.owed = 0;
-            // No need stands: the agent took it down, so one raised again is news (§14.18).
-            slot.told = Told::default();
+            // No need stands: the agent took it down, so one raised again is news (§14.18). A
+            // memory the process before this one carried has met no need here yet: nothing here
+            // was taken down, so it waits for the first.
+            if !slot.told.carried {
+                slot.told = Told::default();
+            }
             return HeraldOutcome {
                 row_moved,
                 ..HeraldOutcome::default()
             };
         };
+        // The carried memory meets its first need here: kept only if the owner has had no turn
+        // in this process (§14.18).
+        if std::mem::take(&mut slot.told.carried) && slot.told.turn != esc.owner_turn {
+            slot.told.forget();
+        }
         if let Some(told) = self
             .adopted
             .get_mut(&session)
@@ -1089,9 +1194,10 @@ impl Herald {
             slot.told.forget();
         }
         #[cfg(test)]
-        let telling = !esc.needs.is_empty() && !self.told_off;
+        let told_off = self.told_off;
         #[cfg(not(test))]
-        let telling = !esc.needs.is_empty();
+        let told_off = told_off_seam();
+        let telling = !esc.needs.is_empty() && !told_off;
         if let Some(key) = slot.told.adopted {
             if key != esc.key {
                 slot.told.adopted = None;
@@ -1692,8 +1798,6 @@ pub(crate) enum FleetLine {
         reading: bool,
         /// Why the last read failed, when it did.
         failed: Option<String>,
-        /// Every peer refused with no route.
-        no_route: bool,
         /// The issuer a member's book names: what it alone reaches.
         member_of: Option<String>,
         /// The issuer a member's book binds no key to: no Mac's key is proven here until this Mac joins again (`fleet_glance::BookFacts::unbound_issuer`).
@@ -2200,7 +2304,6 @@ impl Glance {
             read,
             reading: fleet.reading,
             failed: fleet.error.clone(),
-            no_route: fleet.snapshot.as_ref().is_some_and(|s| s.no_route),
             member_of: fleet.book.issuer_label.clone(),
             unbound_issuer: fleet.book.unbound_issuer.clone(),
         }
@@ -3124,7 +3227,6 @@ pub(crate) fn compose_status_menu(g: &Glance, now_unix: i64) -> Vec<StatusRow> {
             read,
             reading,
             failed,
-            no_route,
             member_of,
             unbound_issuer,
         } => {
@@ -3133,11 +3235,7 @@ pub(crate) fn compose_status_menu(g: &Glance, now_unix: i64) -> Vec<StatusRow> {
             rows.push(StatusRow::FleetSubmenu {
                 label: fleet_line(read.as_ref(), *reading, failed.is_some(), now_unix),
             });
-            // `no_route` is the read's own on-link verdict (`aterm_netplace::words::on_link`): a
-            // member on this network refused with no member there answering, wherever this Mac
-            // is; one off this network, or gone off the link, never sets it.
             rows.extend(degrade_rows(
-                *no_route,
                 (member_of.as_deref(), unbound_issuer.as_deref()),
                 failed.as_deref(),
             ));
@@ -3206,18 +3304,10 @@ fn fleet_line(
 
 #[cfg(any(target_os = "macos", test))]
 fn degrade_rows(
-    no_route: bool,
     (member_of, unbound): (Option<&str>, Option<&str>),
     failed: Option<&str>,
 ) -> Vec<StatusRow> {
     let mut rows = Vec::new();
-    if no_route {
-        rows.push(act(
-            "No route to any fleet Mac: allow aterm in System Settings \u{25b8} Privacy & \
-             Security \u{25b8} Local Network",
-            StatusAction::OpenLocalNetwork,
-        ));
-    }
     if let Some(issuer) = member_of {
         rows.push(StatusRow::Info(fold_clip(
             &format!("This Mac knows only its issuer {issuer}: update aterm on {issuer} to share its book"),
@@ -3374,8 +3464,9 @@ fn mac_row(
     }
     if mac.instances_unread > 0 {
         rows.push(StatusRow::Info(format!(
-            "1 of {} aterm instances read",
-            mac.instances_unread.saturating_add(1)
+            "{} of {} aterm instances read",
+            mac.instances_read,
+            mac.instances_read.saturating_add(mac.instances_unread)
         )));
     }
     rows.push(StatusRow::Separator);
@@ -3461,7 +3552,6 @@ pub(crate) fn compose_fleet_menu(
 ) -> Vec<StatusRow> {
     let unbound = slot.book.unbound_issuer.as_deref();
     let mut rows = degrade_rows(
-        slot.snapshot.as_ref().is_some_and(|s| s.no_route),
         (slot.book.issuer_label.as_deref(), unbound),
         slot.error.as_deref(),
     );
@@ -6389,7 +6479,6 @@ mod tests {
             StatusAction::RaiseSibling(p),
             StatusAction::ReadFleet,
             StatusAction::ReadFleetNow,
-            StatusAction::OpenLocalNetwork,
             StatusAction::PeerRead(p),
             StatusAction::PeerScreen(p),
             StatusAction::PeerSsh(p),
@@ -6617,6 +6706,7 @@ mod tests {
         let full = StatusCarry {
             need: Some((NeedWord::Frozen, 100)),
             told: true,
+            told_ids: vec![0x1f, u64::MAX],
             held: Some((HoldWord::Local, 90)),
             done: Some(1_000_000),
             box_receipt: crate::box_banner::Receipt::parse("permission@7"),
@@ -6654,6 +6744,17 @@ mod tests {
             StatusCarry::parse("need=zapped@100 told=1 hold=local@x later=1 done=-3"),
             StatusCarry::default()
         );
+        assert_eq!(
+            StatusCarry::parse("told_ids=0,zz,00000000000000001f,a,").told_ids,
+            vec![0xa],
+            "an id of 0, not hex, or past 16 digits is dropped"
+        );
+        let many: Vec<u64> = (1..=u64::try_from(TOLD_MAX + 3).unwrap_or(u64::MAX)).collect();
+        assert_eq!(
+            parse_told_ids(&told_ids_row(&many).expect("a row")),
+            many[3..].to_vec(),
+            "at most the bound, the newest kept"
+        );
     }
 
     #[test]
@@ -6674,7 +6775,7 @@ mod tests {
             let out = herald_note(&mut h, &reboxed, false, at);
             (h, out)
         };
-        let (mut h, adopted) = successor(told, t0);
+        let (mut h, adopted) = successor(told.clone(), t0);
         assert!(
             adopted.notice.is_none() && !adopted.transition,
             "{adopted:?}"
@@ -6690,12 +6791,12 @@ mod tests {
 
         let untold = StatusCarry {
             told: false,
-            ..told
+            ..told.clone()
         };
         assert!(successor(untold, t0).1.notice.is_some(), "owed: told now");
         let other = StatusCarry {
             need: Some((NeedWord::Ask, 100)),
-            ..told
+            ..told.clone()
         };
         assert!(successor(other, t0).1.notice.is_some(), "another need");
         assert!(
@@ -6803,7 +6904,6 @@ mod tests {
                     dial: "mac-22".to_string(),
                     why: "no connection in 3 s".to_string(),
                 }],
-                no_route: false,
             })),
             book: crate::fleet_glance::BookFacts {
                 in_fleet: true,
@@ -6839,6 +6939,7 @@ mod tests {
                     what: None,
                     claim: None,
                     carries_on: false,
+                    ids: Vec::new(),
                 })
                 .collect(),
             ..crate::fleet_glance::FleetMac::default()
@@ -6859,7 +6960,7 @@ mod tests {
                     "program_kind":"shell", "needs":needs
                 }]
             }]);
-            let snapshot = crate::fleet_glance::parse(&wire.to_string(), false, None, 10_000)
+            let snapshot = crate::fleet_glance::parse(&wire.to_string(), None, 10_000)
                 .expect("a peer's reported instance coverage");
             let slot = crate::fleet_glance::FleetSlot {
                 generation: 3,
@@ -7118,17 +7219,6 @@ mod tests {
             "1 older"
         );
         assert_eq!(tail(&menu), Some(StatusAction::ReadFleetNow));
-        let mut dark = slot.clone();
-        if let Some(snap) = dark.snapshot.as_mut() {
-            std::sync::Arc::make_mut(snap).no_route = true;
-        }
-        assert!(matches!(
-            compose_fleet_menu(&dark, 10).first(),
-            Some(StatusRow::Action {
-                action: StatusAction::OpenLocalNetwork,
-                ..
-            })
-        ));
         let mut unread = slot.clone();
         unread.snapshot = None;
         assert_eq!(
@@ -7266,6 +7356,7 @@ mod tests {
                 what: None,
                 claim: None,
                 carries_on,
+                ids: Vec::new(),
             }
         };
         let slot = fleet_slot(

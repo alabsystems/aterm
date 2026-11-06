@@ -315,15 +315,6 @@ pub(crate) const PLATFORM_BAR_BASE: BarBase = BarBase::Fixed {
 #[cfg(not(target_os = "linux"))]
 pub(crate) const PLATFORM_BAR_BASE: BarBase = BarBase::Blend;
 
-/// The presence tones: the needs border's two alarm hues and the person's dim outline.
-pub(crate) use aterm_messages::presence::PresenceTones;
-
-/// The presence tones for `theme` on its band.
-pub(crate) fn presence_tones(p: impl Into<ChromePalette>) -> PresenceTones {
-    let p = p.into();
-    aterm_messages::presence::tones(rgb(p.theme.bg), &band_colors(p), forced_chrome())
-}
-
 /// Build one render cell for compact chrome.
 pub(crate) use aterm_render::band::cell;
 

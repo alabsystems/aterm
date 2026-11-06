@@ -19,7 +19,7 @@ mod models_resize_row_reuse;
 mod models_run_loop_waker;
 mod models_sandbox;
 
-pub use models_lan::{lan_boundary_model, lan_prepared_dial_model, lan_prepared_listen_model};
+pub use models_lan::{lan_boundary_model, lan_prepared_listen_model};
 mod models_screen_generation;
 mod models_text_selection_lifecycle;
 

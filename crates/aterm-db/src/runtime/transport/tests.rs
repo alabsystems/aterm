@@ -121,6 +121,21 @@ fn accept_ready(listener: &Listener) -> Connection {
     }
 }
 
+/// Waits until a connection waits in `listener`'s queue, a hang detector of
+/// [`aterm_spec::wait::MUST_HAPPEN`]. A loopback `connect` can return before the kernel queues
+/// the connection at its listener, and a tick tries each listener's accept once, without
+/// blocking, so a test that judges what one tick accepts ticks only once the connection is
+/// queued.
+fn queued(listener: &Listener) {
+    assert!(
+        listener
+            .pending_within(aterm_spec::wait::MUST_HAPPEN)
+            .unwrap(),
+        "a connection to {} reaches its queue",
+        listener.local_addr().unwrap()
+    );
+}
+
 #[test]
 fn one_discovered_address_repairs_both_directions_and_cancellation_drains() {
     let lab = Lab::new();
@@ -200,11 +215,11 @@ fn one_discovered_address_repairs_both_directions_and_cancellation_drains() {
         completed: VecDeque::new(),
         push: None,
         failure: None,
-        bound: false,
         stand_in: None,
-        permission: None,
+        delivering: None,
         observed: std::collections::BTreeMap::new(),
         finished_rounds: 0,
+        memory: None,
     };
     let control = transport.workers[0].channel.clone();
     // Whether stop wins before install or during TLS, it cannot be undone.
@@ -329,6 +344,125 @@ fn cancellation_before_socket_install_cannot_be_reversed() {
     assert!(channel.socket.is_none());
 }
 
+/// One real round: `client` dials `listener`, whose side `server` serves; the dialling worker,
+/// then the serving one.
+fn round_at(
+    client: &Arc<Endpoint>,
+    server: &Arc<Endpoint>,
+    listener: &Listener,
+    repair: Repair,
+) -> (Worker, Worker) {
+    let address = listener.local_addr().unwrap();
+    let dialled =
+        Worker::start(client.clone(), None, Some(address), Scope::Loopback, repair).unwrap();
+    let served = Worker::start(
+        server.clone(),
+        Some(accept_ready(listener)),
+        None,
+        Scope::Loopback,
+        Repair::default(),
+    )
+    .unwrap();
+    (dialled, served)
+}
+
+/// A peer whose endpoint here keeps refusing (it came back on another port) dials in and completes
+/// a round: its endpoints here drop their backoff, as one this side dialled would (CR1). Once per
+/// failure streak: when the endpoint it pulled in refuses again, it is dead, and the peer's later
+/// rounds leave its backoff to grow.
+/// MUTANT (`UNVOUCHED`, as before CR1): the refused endpoint keeps its backoff.
+/// MUTANT (`REPULLS`, CR1's first cut): every round from the peer pulls the dead endpoint in.
+#[test]
+fn an_inbound_round_from_a_peer_ends_its_endpoints_backoff() {
+    for unvouched in [false, true] {
+        let lab = Lab::new();
+        let mut a = loopback_mode(None, 0, [71; 32]);
+        let old = Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
+        let ours = Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
+        let address = old.local_addr().unwrap();
+        let mut now = Instant::now();
+        a.hints
+            .observe(&Hints::new([72; 32]).wire(address.port()), address, now);
+        // A dials B until a round moves nothing: B's endpoint here is verified.
+        for _ in 0..3 {
+            let (chosen, repair) = a.hints.next(now).unwrap();
+            assert_eq!(chosen, address);
+            let (dialled, served) = round_at(&lab.endpoints[0], &lab.endpoints[1], &old, repair);
+            assert!(served.task.join().unwrap().2);
+            a.finish(dialled, now);
+            now += Duration::from_millis(500);
+            if !a.hints.follow_up_contains(address) {
+                break;
+            }
+        }
+        assert!(a.hints.established(address));
+        // B goes away and comes back on another port: its old one refuses each dial.
+        drop(old);
+        for _ in 0..3 {
+            now = a.hints.next_at(address).max(now);
+            let (chosen, repair) = a.hints.next(now).unwrap();
+            assert_eq!(chosen, address);
+            let dialled = Worker::start(
+                lab.endpoints[0].clone(),
+                None,
+                Some(address),
+                Scope::Loopback,
+                repair,
+            )
+            .unwrap();
+            a.finish(dialled, now);
+        }
+        assert!(a.hints.next_at(address) > now + Duration::from_secs(10));
+        // B dials A and completes a round.
+        let (dialled, served) = round_at(
+            &lab.endpoints[1],
+            &lab.endpoints[0],
+            &ours,
+            Repair::default(),
+        );
+        assert!(dialled.task.join().unwrap().2);
+        UNVOUCHED.with(|flag| flag.set(unvouched));
+        a.finish(served, now);
+        UNVOUCHED.with(|flag| flag.set(false));
+        let quiet = a.hints.next_at(address) <= now + Duration::from_secs(5);
+        assert_eq!(quiet, !unvouched, "MUTANT {unvouched}: the backoff ended");
+        if unvouched {
+            continue;
+        }
+        // The endpoint pulled in refuses again, and B goes on dialling in.
+        now = a.hints.next_at(address).max(now);
+        let (chosen, repair) = a.hints.next(now).unwrap();
+        assert_eq!(chosen, address);
+        let dialled = Worker::start(
+            lab.endpoints[0].clone(),
+            None,
+            Some(address),
+            Scope::Loopback,
+            repair,
+        )
+        .unwrap();
+        a.finish(dialled, now);
+        for repulls in [false, true] {
+            let (dialled, served) = round_at(
+                &lab.endpoints[1],
+                &lab.endpoints[0],
+                &ours,
+                Repair::default(),
+            );
+            assert!(dialled.task.join().unwrap().2);
+            crate::runtime::discovery::REPULLS.with(|flag| flag.set(repulls));
+            a.finish(served, now);
+            crate::runtime::discovery::REPULLS.with(|flag| flag.set(false));
+            // An ordinary interval is under 5 s; the first backoff step is 5 s or more.
+            let backing_off = a.hints.next_at(address) >= now + Duration::from_secs(5);
+            assert_eq!(
+                backing_off, !repulls,
+                "MUTANT {repulls}: pulled in once per streak"
+            );
+        }
+    }
+}
+
 #[test]
 fn repeated_listener_restarts_do_not_pin_failed_verified_discovery_ports() {
     let lab = Lab::new();
@@ -444,9 +578,10 @@ fn incoming_acceptance_rotates_after_a_connection_not_idle_ticks() {
         source: second.ip(),
         listener: Some(listener),
         hints: Multicast::bind(Ipv4Addr::LOCALHOST, GROUP, 0, Scope::Loopback).unwrap(),
-        permission: None,
+        delivering: None,
     });
     let mut held = vec![std::net::TcpStream::connect(first).unwrap()];
+    queued(transport.links[0].listener.as_ref().unwrap());
     let now = Instant::now();
     transport.tick(now).unwrap();
     assert_eq!(transport.workers.len(), 1);
@@ -459,15 +594,9 @@ fn incoming_acceptance_rotates_after_a_connection_not_idle_ticks() {
     }
     held.push(std::net::TcpStream::connect(first).unwrap());
     held.push(std::net::TcpStream::connect(second).unwrap());
-    // A loopback `connect` can return before the kernel queues the connection at its listener;
-    // tick only once each attachment really holds one waiting.
+    // Tick only once each attachment really holds one waiting.
     for link in &transport.links {
-        let listener = link.listener.as_ref().unwrap();
-        assert!(
-            listener.pending_within(Duration::from_secs(60)).unwrap(),
-            "a connection to {} reaches its queue",
-            listener.local_addr().unwrap()
-        );
+        queued(link.listener.as_ref().unwrap());
     }
     transport.tick(now + Duration::from_millis(400)).unwrap();
     let accepted: Vec<_> = transport
@@ -541,6 +670,7 @@ fn stalled_outgoing_repairs_leave_room_for_an_incoming_peer() {
         let mut transport = transport;
         let incoming =
             tasks.spawn(move || peer.exchange(connection, Side::Initiator, &mut Repair::default()));
+        queued(transport.links[0].listener.as_ref().unwrap());
         transport.tick(now + Duration::from_secs(2)).unwrap();
         assert!(
             transport.workers.iter().any(|worker| worker.incoming),
@@ -762,7 +892,7 @@ fn loopback_mode(endpoint: Option<Arc<Endpoint>>, port: u16, token: [u8; 32]) ->
             source: Ipv4Addr::LOCALHOST.into(),
             listener,
             hints,
-            permission: None,
+            delivering: None,
         }],
         hints: Hints::new(token),
         workers: vec![],
@@ -777,11 +907,11 @@ fn loopback_mode(endpoint: Option<Arc<Endpoint>>, port: u16, token: [u8; 32]) ->
         completed: VecDeque::new(),
         push: None,
         failure: None,
-        bound: false,
         stand_in: None,
-        permission: None,
+        delivering: None,
         observed: std::collections::BTreeMap::new(),
         finished_rounds: 0,
+        memory: None,
     }
 }
 
@@ -1410,7 +1540,7 @@ fn failed_transport_observation_replaces_the_active_reason_and_retains_history()
     let active: Vec<_> = modes
         .iter()
         .map(|mode| {
-            observe_transport(&mut observer, &transport, *mode, false);
+            observe_transport(&mut observer, &transport, *mode);
             let state = handle.snapshot();
             assert_eq!(state.visibility, Visibility::Active);
             state.detail
@@ -1424,7 +1554,7 @@ fn failed_transport_observation_replaces_the_active_reason_and_retains_history()
         .iter()
         .enumerate()
         .map(|(index, mode)| {
-            observe_transport(&mut observer, &transport, *mode, false);
+            observe_transport(&mut observer, &transport, *mode);
             let state = handle.snapshot();
             assert_eq!(state.visibility, Visibility::Unavailable);
             assert!(!state.detail.is_empty());
@@ -1434,19 +1564,6 @@ fn failed_transport_observation_replaces_the_active_reason_and_retains_history()
             assert_eq!(state.peers[0].identity, identity);
             assert_eq!(state.peers[0].last_seen_ms, contact_ms);
             assert_eq!(state.peers[0].reachability, Reachability::Unknown);
-            observe_transport(&mut observer, &transport, *mode, true);
-            let refused = handle.snapshot();
-            assert_eq!(
-                refused.visibility,
-                Visibility::Unavailable,
-                "a heard refusal"
-            );
-            assert!(
-                refused.detail.starts_with(super::super::LAN_REFUSED),
-                "failed links with a refusal heard: {}",
-                refused.detail
-            );
-            assert_eq!(refused.peers[0].identity, identity);
             state.detail
         })
         .collect();
@@ -1455,42 +1572,35 @@ fn failed_transport_observation_replaces_the_active_reason_and_retains_history()
     assert!(!transport.unavailable());
     assert!(transport.failure().is_none());
     for (index, mode) in modes.iter().enumerate() {
-        observe_transport(&mut observer, &transport, *mode, false);
+        observe_transport(&mut observer, &transport, *mode);
         let state = handle.snapshot();
         assert_eq!(state.visibility, Visibility::Offline);
         assert_ne!(state.detail, active[index]);
         assert_ne!(state.detail, unavailable[index]);
         assert_eq!(state.peers[0].identity, identity);
         assert_eq!(state.peers[0].last_seen_ms, contact_ms);
-        observe_transport(&mut observer, &transport, *mode, true);
-        let heard = handle.snapshot();
-        assert_eq!(heard.visibility, Visibility::Offline, "a heard refusal");
-        assert_eq!(
-            heard.detail, state.detail,
-            "with no address, no usable interface is the cause, whatever the records heard"
-        );
     }
 }
 
-/// The OS refuses an app the LAN by failing its sends (EHOSTUNREACH) while its sockets bind. Once
-/// the person turns aterm off, the link's next beacon fails and the link is dropped; each poll's
-/// refresh binds it again, and it fails its first beacon there, so between a refresh and the next
-/// tick it never reads as a usable interface. A refused transport stays Unavailable through every
-/// poll, saying the refusal its records hear, and a retained peer's presence history takes no
-/// sample from it. Once the OS allows the sends again, the next refresh opens the link.
+/// A network that fails a link's sends (EHOSTUNREACH) while its sockets bind: the link's next
+/// beacon fails and the link is dropped; each poll's refresh binds it again, and it fails its
+/// first beacon there, so between a refresh and the next tick it never reads as a usable
+/// interface. The transport stays Unavailable through every poll, and a retained peer's presence
+/// history takes no sample from it. Once the sends are delivered again, the next refresh opens
+/// the link.
 #[test]
-fn a_refused_link_never_reads_active_between_its_refresh_and_its_send() {
-    use super::super::{LAN_REFUSED, ObservationMode, TICK, observe_transport};
+fn an_undelivered_link_never_reads_active_between_its_refresh_and_its_send() {
+    use super::super::{ObservationMode, TICK, observe_transport};
     use crate::network_state::{ObservationHandle, Observer};
     use aterm_types::network_state::{MachineIdentity, Visibility};
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    let permission = Arc::new(AtomicBool::new(true));
-    let mut transport = Transport::isolated(None, 0, Some(permission.clone())).unwrap();
+    let delivering = Arc::new(AtomicBool::new(true));
+    let mut transport = Transport::isolated(None, 0, Some(delivering.clone())).unwrap();
     assert_eq!(
         transport.interfaces(),
         1,
-        "allowed: its first beacon went out"
+        "delivered: its first beacon went out"
     );
     let root = aterm_tempfile::tempdir().unwrap();
     let handle = ObservationHandle::default();
@@ -1501,10 +1611,10 @@ fn a_refused_link_never_reads_active_between_its_refresh_and_its_send() {
         label: None,
     };
     observer.contact(identity, aterm_time::unix_millis().unwrap(), Instant::now());
-    permission.store(false, Ordering::Release);
+    delivering.store(false, Ordering::Release);
     transport.tick(Instant::now() + BEACON).unwrap();
-    assert!(transport.unavailable(), "its next beacon refused");
-    observe_transport(&mut observer, &transport, ObservationMode::Discovery, true);
+    assert!(transport.unavailable(), "its next beacon undelivered");
+    observe_transport(&mut observer, &transport, ObservationMode::Discovery);
     let samples = handle.snapshot().peers[0].samples.clone();
     let loopback = [SocketAddr::from((Ipv4Addr::LOCALHOST, 0))];
     for poll in 0..3 {
@@ -1513,7 +1623,7 @@ fn a_refused_link_never_reads_active_between_its_refresh_and_its_send() {
         transport.refresh(&loopback);
         for tick in 0..2 {
             transport.tick(now + TICK * tick).unwrap();
-            observe_transport(&mut observer, &transport, ObservationMode::Discovery, true);
+            observe_transport(&mut observer, &transport, ObservationMode::Discovery);
             let state = handle.snapshot();
             assert_eq!(
                 state.visibility,
@@ -1521,72 +1631,30 @@ fn a_refused_link_never_reads_active_between_its_refresh_and_its_send() {
                 "poll {poll}, tick {tick}: {}",
                 state.detail
             );
-            assert!(state.detail.starts_with(LAN_REFUSED), "{}", state.detail);
+            assert!(
+                state
+                    .detail
+                    .starts_with("Local network sockets unavailable"),
+                "{}",
+                state.detail
+            );
             assert_eq!(
                 state.peers[0].samples, samples,
                 "poll {poll}, tick {tick}: no presence sample"
             );
         }
     }
-    permission.store(true, Ordering::Release);
+    delivering.store(true, Ordering::Release);
     let now = Instant::now();
     transport.refresh(&loopback);
     transport.tick(now).unwrap();
     assert_eq!(
         transport.interfaces(),
         1,
-        "allowed: the next refresh opens it"
+        "delivered: the next refresh opens it"
     );
-    observe_transport(&mut observer, &transport, ObservationMode::Discovery, true);
+    observe_transport(&mut observer, &transport, ObservationMode::Discovery);
     assert_eq!(handle.snapshot().visibility, Visibility::Active);
-}
-
-/// Peers a repairing transport heard before the OS refused it the LAN mid-session (the person
-/// turned aterm off in System Settings) do not hide that refusal: with no link left nothing is
-/// heard now, and with no link to dial them the transport keeps their hints for good. From its
-/// first failed beacon on, through every later poll, its observation says the refusal its records
-/// hear.
-#[test]
-fn a_refusal_made_mid_session_is_said_whatever_peers_were_heard_before_it() {
-    use super::super::{LAN_REFUSED, ObservationMode, POLL, observe_transport};
-    use crate::network_state::{ObservationHandle, Observer};
-    use aterm_types::network_state::Visibility;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    let lab = Lab::new();
-    let permission = Arc::new(AtomicBool::new(true));
-    let mut transport = Transport::unopened(None, Scope::Loopback, 0).unwrap();
-    transport.endpoint = Some(lab.endpoints[0].clone());
-    transport.permission = Some(permission.clone());
-    let loopback = [SocketAddr::from((Ipv4Addr::LOCALHOST, 0))];
-    transport.refresh(&loopback);
-    assert_eq!(transport.interfaces(), 1, "allowed: its link opened");
-    let now = Instant::now();
-    transport.hints.observe(
-        &Hints::new([9; 32]).wire(1234),
-        "127.0.0.1:1".parse().unwrap(),
-        now,
-    );
-    assert_eq!(transport.peers(), 1, "a peer heard while allowed");
-    let root = aterm_tempfile::tempdir().unwrap();
-    let handle = ObservationHandle::default();
-    let mut observer = Observer::open(&root.path().join("config"), handle.clone()).unwrap();
-    permission.store(false, Ordering::Release);
-    transport.tick(now + BEACON).unwrap();
-    assert!(transport.unavailable(), "its next beacon refused");
-    assert_eq!(transport.peers(), 1, "the hint outlives the link");
-    for poll in 0..4u32 {
-        // Past every hint's expiry by the last poll.
-        let at = now + BEACON + POLL * poll + Duration::from_secs(300) * poll;
-        if poll > 0 {
-            transport.refresh(&loopback);
-            transport.tick(at).unwrap();
-        }
-        observe_transport(&mut observer, &transport, ObservationMode::Repair, true);
-        let state = handle.snapshot();
-        assert_eq!(state.visibility, Visibility::Unavailable, "poll {poll}");
-        assert_eq!(state.detail, LAN_REFUSED, "poll {poll}");
-    }
 }
 
 /// A peer whose port refuses the connection is dialed later each time, through the real tick,
@@ -1665,28 +1733,4 @@ fn panicked_worker_releases_the_hint_slot_for_retry() {
             .next(now + Duration::from_secs(10))
             .is_some()
     );
-}
-
-/// A bind that failed once its socket was made is a LAN use ([`Transport::bound`]): its bind or
-/// join ran, and the OS may have asked its Local Network question there, as when an attachment
-/// changes between the join and its re-check. Its link opens nothing, yet the transport reached
-/// the LAN, so a host that held a dialog slot for that use keeps holding it for the question.
-#[test]
-fn a_bind_that_failed_after_its_socket_reached_the_lan() {
-    // A socket with no address reuse holds the group's port: the join's socket binds and fails.
-    let held = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
-    let mut transport = Transport::isolated(None, held.local_addr().unwrap().port(), None).unwrap();
-    assert_eq!(transport.interfaces(), 0, "no link opened");
-    assert!(transport.bound(), "its socket was made: a LAN use");
-    assert!(transport.unavailable());
-    assert!(
-        transport.failure().unwrap().contains("multicast bind"),
-        "{:?}",
-        transport.failure()
-    );
-    drop(held);
-    transport.refresh(&["127.0.0.1:0".parse().unwrap()]);
-    assert_eq!(transport.interfaces(), 1, "the released port opens");
-    assert!(!transport.unavailable());
-    assert!(transport.failure().is_none(), "no stale bind error");
 }

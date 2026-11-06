@@ -923,6 +923,65 @@ fn read_batches_refuse_membership_or_custody_changes_before_returning() {
     }
 }
 
+/// Under a log, with no generation, a read's currency is the log's answer, and a scope is held to
+/// the journal's trust. A session with a generation asks that generation, whose check can wait.
+///
+/// NEGATIVE CONTROLS (2026-11-05): with the log arm's comparison of trust gone, the scope of another
+/// trust is answered (`unwrap_err` on an `Ok` at the first refusal); with `self.generation.is_some()`
+/// gone from the arm's condition, the session whose generation has run out of time is answered
+/// (`unwrap_err` on an `Ok` at the second).
+#[test]
+fn a_log_backed_read_context_holds_a_scope_to_its_trust_and_asks_a_generation() {
+    let lab = Lab::with_foundation(&[Role::Writer]);
+    client::seed_vault_genesis(&lab.paths[0], &lab._home.path().join("genesis.v2")).unwrap();
+    let bootstrap = lab.bootstrap(0);
+    let mut session = Session::observe(&bootstrap).unwrap();
+    assert!(session.is_log_backed(), "CONTROL: the seeded log backs it");
+    assert!(session.generation.is_none(), "CONTROL: not a candidate");
+    let scope = Scope::fresh(session.journal.trust()).unwrap();
+    session.read_context(scope).unwrap();
+
+    let mut trust = scope.trust();
+    trust.genesis[0] ^= 1;
+    let another = Scope::new(trust, *scope.table(), scope.generation()).unwrap();
+    let refused = session.read_context(another).unwrap_err().to_string();
+    assert!(refused.contains("another trust context"), "{refused}");
+
+    session.generation = Some(
+        crate::generation::Observation::observe(
+            &lab.paths[0],
+            std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        )
+        .unwrap(),
+    );
+    session.read_context(scope).unwrap();
+    session.generation_deadline = Some(std::time::Instant::now());
+    let refused = session.read_context(scope).unwrap_err().to_string();
+    assert!(refused.contains("writer generation"), "{refused}");
+}
+
+/// A journal-backed session's read context asks the handle it holds, which a fresh read of the
+/// journal cannot answer for: the writer lease replaced under a held writer leaves the journal
+/// reading as it did, and that handle uncertain.
+///
+/// NEGATIVE CONTROL (2026-11-05): with `!self.access.is_log_backed()` gone from the arm's condition,
+/// the uncertain handle is not asked and the context is answered (`unwrap_err` on an `Ok`).
+#[test]
+fn a_journal_backed_read_context_asks_the_handle_it_holds() {
+    let lab = Lab::new(&[Role::Writer]);
+    let bootstrap = lab.bootstrap(0);
+    let session = Session::open(&bootstrap).unwrap();
+    assert!(!session.is_log_backed(), "CONTROL: its journal backs it");
+    let scope = session.scope().unwrap();
+    session.read_context(scope).unwrap();
+
+    let lease = bootstrap.journal_dir().join("control.lock");
+    let bytes = std::fs::read(&lease).unwrap();
+    aterm_secrets::fsx::write_atomic(&lease, &bytes, 0o600).unwrap();
+    let refused = session.read_context(scope).unwrap_err().to_string();
+    assert!(refused.contains("stale membership"), "{refused}");
+}
+
 pub(crate) mod frontier;
 mod storage;
 
@@ -1285,6 +1344,48 @@ fn a_removal_mints_one_audience_once_the_gate_holds() {
 ///
 /// NEGATIVE CONTROL: before the handoff the late member cannot authenticate the row, and repair
 /// names the fold epoch among the history it needs.
+/// Opening a table seals its pending writes; a seal whose append is uncertain poisons the handle,
+/// so the open fails with that append's own error rather than handing back a store every later
+/// call refuses. CONTROL: while the new epoch has not arrived the seal is refused before it
+/// appends, and the open stands with the write still pending.
+#[test]
+fn an_open_whose_seal_append_is_uncertain_fails_with_its_error() {
+    use aterm_secrets::{client::save_records, membership_log::encode_records};
+    let (lab, removal, _, dir, scope) = removal_lab(true);
+    save_records(&lab.paths[1], &encode_records(&removal[..1])).unwrap();
+    let b1 = lab.bootstrap(1);
+    let session = Session::open(&b1).unwrap();
+    let kept = store::Store::open(&session, &dir, scope)
+        .unwrap()
+        .commit_catalog(&session, b"during")
+        .unwrap_err();
+    assert!(kept.is_write_pending(), "{kept}");
+    let held = store::Store::open(&session, &dir, scope).expect("CONTROL: the open stands");
+    assert!(
+        !held.pending_epochs(&session).unwrap().is_empty(),
+        "CONTROL: still pending"
+    );
+    drop((held, session));
+
+    save_records(&lab.paths[1], &encode_records(&removal)).unwrap();
+    let session = Session::open(&b1).unwrap();
+    store::APPEND_FAILS.with(|fails| fails.set(true));
+    let opened = store::Store::open(&session, &dir, scope);
+    store::APPEND_FAILS.with(|fails| fails.set(false));
+    let Err(error) = opened else {
+        panic!("the open fails with the append's error");
+    };
+    assert!(
+        error.to_string().contains("injected append failure"),
+        "{error}"
+    );
+    let store = store::Store::open(&session, &dir, scope).unwrap();
+    assert!(
+        store.pending_epochs(&session).unwrap().is_empty(),
+        "the next open seals it"
+    );
+}
+
 #[test]
 fn under_the_fold_a_pending_write_applies_under_the_new_everyone_epoch_and_reads_everywhere() {
     use aterm_secrets::{
@@ -1324,8 +1425,9 @@ fn under_the_fold_a_pending_write_applies_under_the_new_everyone_epoch_and_reads
     let new = *session.access.basis();
     assert_ne!(new, old);
     assert!(fold_epoch(&lab.paths[1], &new));
-    let mut store = store::Store::open(&session, &dir, scope).unwrap();
-    assert_eq!(store.seal_pending(&session).unwrap(), 1);
+    // Opening the table for writing seals the write its new epoch was waiting on.
+    let store = store::Store::open(&session, &dir, scope).unwrap();
+    assert!(store.pending_epochs(&session).unwrap().is_empty());
     let rows = store.catalog(&session).unwrap();
     let during = rows.iter().find(|r| r.payload() == b"during").unwrap();
     assert_eq!(*during.roster(), new);
@@ -1502,9 +1604,10 @@ fn a_table_write_on_a_mac_holding_a_remove_stays_pending_until_the_new_epoch_arr
         !basis_wraps(&lab, &new, recipient4),
         "CONTROL: the new epoch reaches m4 no more"
     );
+    // Opening the table for writing seals it, with no write of its own to carry it.
     let mut store = store::Store::open(&session, &dir, scope).unwrap();
-    assert_eq!(store.seal_pending(&session).unwrap(), 1);
     assert!(store.pending_epochs(&session).unwrap().is_empty());
+    assert_eq!(store.seal_pending(&session).unwrap(), 0, "sealed once");
     drop(store);
     assert_eq!(
         sealed_under(&session, &dir, scope, b"during"),

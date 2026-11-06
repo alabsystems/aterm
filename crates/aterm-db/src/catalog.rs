@@ -22,6 +22,7 @@ pub(crate) mod policy;
 pub mod release;
 pub(crate) mod ring;
 pub use descriptor::Descriptor;
+pub(crate) use descriptor::application_scope;
 use policy::Policy;
 
 /// The catalog has its own slot; applications cannot displace it.
@@ -43,6 +44,7 @@ pub(crate) const CATALOG_SLOTS: usize = MAX_TABLES - ring::RING_SLOTS - RESERVED
 /// reserved table is subscribed whatever its causal order and whoever declared it, while there
 /// is storage room at all. Its descriptor is matched exactly: any other declaration at its
 /// identity conflicts as for every table.
+#[cfg(test)]
 pub(crate) fn reserved(trust: Trust) -> [Descriptor; RESERVED_SLOTS] {
     let generation = |table: &crate::typed::Table| {
         Descriptor::application(
@@ -239,11 +241,23 @@ impl Directory {
     }
     /// The identities of this lab's reserved tables ([`reserved`]).
     fn reserved_ids(&self) -> [Digest; RESERVED_SLOTS] {
-        reserved(self.trust).map(|descriptor| descriptor.scope.digest())
+        crate::alab::registry::GENERATIONS.map(|table| {
+            descriptor::application_scope(self.trust, table.application, table.role)
+                .expect("the registry's declaration is valid")
+                .digest()
+        })
     }
     /// Whether `descriptor` is one of this lab's reserved tables, exactly.
     fn is_reserved(&self, descriptor: &Descriptor) -> bool {
-        reserved(self.trust).contains(descriptor)
+        descriptor.deterministic
+            && descriptor.name.is_none()
+            && descriptor.version == crate::alab::registry::VERSION
+            && crate::alab::registry::GENERATIONS.iter().any(|table| {
+                descriptor.application == table.application
+                    && descriptor.role == table.role
+                    && descriptor::application_scope(self.trust, table.application, table.role)
+                        .is_ok_and(|scope| descriptor.scope == scope)
+            })
     }
     /// The lab this directory's tables belong to.
     pub(crate) const fn trust(&self) -> Trust {
@@ -859,24 +873,33 @@ impl Directory {
         session: &Session<'_>,
         catalog: &Store,
     ) -> Result<Vec<crate::table::Record>> {
-        let mut records = catalog.catalog(session)?;
-        let mut seen: BTreeSet<_> = records.iter().map(|r| r.header().id).collect();
-        let (retained, _) = self.retained()?;
-        for evidence in catalog.metadata_evidence(session)? {
-            if evidence.catalog_eligible || retained.is_empty() {
-                continue;
-            }
-            let Some(record) = evidence.record else {
-                continue;
-            };
-            if seen.contains(&record.header().id) {
-                continue;
-            }
-            let Ok(descriptor) = Descriptor::decode(self.trust, record.payload()) else {
-                continue;
-            };
-            if retained.contains(&descriptor.scope.digest()) && seen.insert(record.header().id) {
-                records.push(record);
+        let (mut records, evidence) = catalog.catalog_and_evidence(session)?;
+        if evidence
+            .iter()
+            .any(|e| !e.catalog_eligible && e.record.is_some())
+        {
+            let (retained, _) = self.retained()?;
+            if !retained.is_empty() {
+                let mut seen: BTreeSet<_> = records.iter().map(|r| r.header().id).collect();
+                for evidence in evidence {
+                    if evidence.catalog_eligible {
+                        continue;
+                    }
+                    let Some(record) = evidence.record else {
+                        continue;
+                    };
+                    if seen.contains(&record.header().id) {
+                        continue;
+                    }
+                    let Ok(descriptor) = Descriptor::decode(self.trust, record.payload()) else {
+                        continue;
+                    };
+                    if retained.contains(&descriptor.scope.digest())
+                        && seen.insert(record.header().id)
+                    {
+                        records.push(record);
+                    }
+                }
             }
         }
         // The eligible prefix keeps its original causal order and new-table
@@ -937,11 +960,10 @@ impl Directory {
         let (retained, mut total) = self.retained()?;
         let count = self.catalog_count(session, &retained, total);
         let mut free = (CATALOG_SLOTS + 1).saturating_sub(count);
-        let compiled = reserved(self.trust);
         let mut reserved = BTreeSet::new();
         for (id, entry) in &mut snapshot.entries {
             let first = &entry.declarations[0].descriptor;
-            if compiled.contains(first) {
+            if self.is_reserved(first) {
                 reserved.insert(*id);
             }
             entry.state = if entry.declarations.iter().any(|d| &d.descriptor != first) {

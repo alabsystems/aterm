@@ -29,9 +29,9 @@ pub(crate) struct HarnessStatsReport {
     pub(crate) sibling_tabs: Vec<TabSpreadsheetRow>,
     pub(crate) remote_computers: Vec<TabComputer>,
     pub(crate) remote_tabs: Vec<TabSpreadsheetRow>,
-    /// Why this reading looked for no computer on the local network ([`LAN_WAITS`]), where it
-    /// did not.
-    pub(crate) lan_waits: Option<&'static str>,
+    /// Why this reading looked for no computer on the local network ([`LAN_SHARING_OFF`], or the
+    /// LAN broker's own words), where it did not.
+    pub(crate) lan_waits: Option<String>,
     /// The build-slot minutes idle while a session's hold was ready, over the day the facts
     /// ring (`<state>/occupancy/facts.ring`) holds; `None` with no ring.
     pub(crate) idle_ready_min: Option<u64>,
@@ -589,8 +589,8 @@ pub(crate) struct TabControlState {
     /// What of the fleet this reading could look at.
     pub(crate) fleet: FleetScope,
     /// Why the reading looked for no computer on the local network, where it did not
-    /// ([`LAN_WAITS`]).
-    pub(crate) lan_waits: Option<&'static str>,
+    /// ([`LAN_SHARING_OFF`], or the LAN broker's own words).
+    pub(crate) lan_waits: Option<String>,
 }
 
 /// Pure projection rendered by Settings ▸ Harness ▸ Tab Control (`/tabs`).
@@ -638,8 +638,8 @@ impl TabControlState {
                     format!("other computers and aterm instances are not read here: {why}"),
                 ));
             }
-            if let Some(why) = self.lan_waits {
-                rows.push(("Local network".to_string(), why.to_string()));
+            if let Some(why) = &self.lan_waits {
+                rows.push(("Local network".to_string(), why.clone()));
             }
             rows.extend([
                 (
@@ -932,9 +932,17 @@ impl HarnessState {
             lead = std::mem::take(&mut rest);
         }
         let Some(first) = lead.first_mut() else {
-            return Some((TODAY_NOTHING_YET.to_string(), String::new()));
+            let note = if today.is_partial() {
+                TODAY_UNKNOWN
+            } else {
+                TODAY_NOTHING_YET
+            };
+            return Some((note.to_string(), String::new()));
         };
         first.push_str(" today");
+        if today.is_partial() {
+            rest.push("history may be incomplete".to_string());
+        }
         Some((
             lead.join(crate::native_ui::FACT_SEPARATOR),
             rest.join(crate::native_ui::FACT_SEPARATOR),
@@ -1061,7 +1069,7 @@ impl HarnessState {
         })
     }
 
-    /// WHAT THE HARNESS DID's rows (§10.3, §12.4.6, §14.6): each count with a week, today's and the week's (`Approved  31 today · 212 in 7 days`), with its part under it where the part's week has one (`no safe rule`, `Forced continues`); [`NEEDED_YOU`]'s count and wait in one row ([`waited_for_you`]); every count whose week is 0 named in one last count row ([`NONE_IN_7_DAYS`]); then the waits at limits, the occupancy door's rows, a row of its own for each agent that supervises itself ([`self_claimed_rows`]), and the reading's own.
+    /// WHAT THE HARNESS DID's rows (§10.3, §12.4.6, §14.6): each count with a week, today's and the week's (`Approved  31 today · 212 in 7 days`), with its part under it where the part's week has one (`no safe rule`, `Forced continues`); [`NEEDED_YOU`]'s count and wait in one row ([`waited_for_you`]); each zero count of a complete week named in one last row ([`NONE_IN_7_DAYS`]); then the waits at limits, the occupancy door's rows, a row of its own for each agent that supervises itself ([`self_claimed_rows`]), and the reading's own.
     fn did_rows(&self) -> Vec<(String, String)> {
         let row = |label: &str, value: String| (label.to_string(), value);
         let Some(report) = self.stats.report.as_deref() else {
@@ -1080,10 +1088,13 @@ impl HarnessState {
             .as_ref()
             .map(|why| row("Last check", format!("failed: {why}")));
         let (today, week) = (&report.today, &report.week);
+        let incomplete_week = week.is_partial();
         let mut rows = Vec::new();
         let others = self_claimed_rows(today, week);
         if week.is_empty() {
-            let words = if others.is_empty() {
+            let words = if incomplete_week {
+                "activity could not be established"
+            } else if others.is_empty() {
                 "nothing yet: no supervised session has acted"
             } else {
                 "nothing yet: aterm's harness has not acted"
@@ -1097,9 +1108,9 @@ impl HarnessState {
                     |d| format!("{} {d}", duration_words(w)),
                 )
             };
-            // A count whose week is 0 is named once, in NONE_IN_7_DAYS' row, in the order the
-            // rows stand. A part of the row over it (`no safe rule`, `Forced continues`) stands only
-            // where its week has one, and is never named there.
+            // A complete reading names each zero count once in NONE_IN_7_DAYS, in row order.
+            // A part of the row over it (`no safe rule`, `Forced continues`) stands only where
+            // its week has one, and is never named there.
             let mut none = Vec::new();
             let mut count = |rows: &mut Vec<(String, String)>, words: CountWords, value| match value
             {
@@ -1151,7 +1162,7 @@ impl HarnessState {
                 NEEDS_TOLD,
                 counts(today.needs_told, week.needs_told),
             );
-            if !none.is_empty() {
+            if !incomplete_week && !none.is_empty() {
                 rows.push(row(
                     NONE_IN_7_DAYS,
                     none.join(crate::native_ui::FACT_SEPARATOR),
@@ -1198,13 +1209,10 @@ impl HarnessState {
                 "the harness has acted since this reading; reading again".to_string(),
             ));
         }
-        if today.cut || week.cut {
+        if today.is_partial() || incomplete_week {
             rows.push(row(
                 "Partial",
-                format!(
-                    "only the last {} actions are kept",
-                    aterm_agent::supervise::approvals::KEEP_ROWS
-                ),
+                "this reading may omit earlier or unreadable history".to_string(),
             ));
         }
         rows.push(row(
@@ -1246,10 +1254,13 @@ pub(crate) const TODAY_NOTHING_YET: &str = "nothing yet today";
 /// STATUS's today line before the first reading: a note, no count.
 pub(crate) const TODAY_READING: &str = "reading\u{2026}";
 
-/// Whether STATUS's today `line` counts (`37 approved today · …`), as against one of its notes ([`TODAY_NOTHING_YET`], [`TODAY_READING`]): only a line of counts is drawn in Hero type ( owner-eye-7).
+/// STATUS's today line when incomplete history establishes no activity: a note, no count.
+pub(crate) const TODAY_UNKNOWN: &str = "activity unknown today";
+
+/// Whether STATUS's today `line` counts (`37 approved today · …`), as against one of its notes ([`TODAY_NOTHING_YET`], [`TODAY_READING`], [`TODAY_UNKNOWN`]): only a line of counts is drawn in Hero type ( owner-eye-7).
 #[must_use]
 pub(crate) fn today_counts(line: &str) -> bool {
-    line != TODAY_NOTHING_YET && line != TODAY_READING
+    line != TODAY_NOTHING_YET && line != TODAY_READING && line != TODAY_UNKNOWN
 }
 
 /// The families of acts a day says, in the order it says them: landed, approved, kept going, answered, resumed, land prompts, declined, relaunched, upgraded.
@@ -2635,7 +2646,7 @@ impl App {
                         r.sibling_tabs.clone(),
                         r.remote_computers.clone(),
                         r.remote_tabs.clone(),
-                        r.lan_waits,
+                        r.lan_waits.clone(),
                     )
                 },
             );
@@ -3103,7 +3114,7 @@ impl App {
                     report.sibling_tabs.clone_from(&last.sibling_tabs);
                     report.remote_computers.clone_from(&last.remote_computers);
                     report.remote_tabs.clone_from(&last.remote_tabs);
-                    report.lan_waits = last.lan_waits;
+                    report.lan_waits.clone_from(&last.lan_waits);
                 }
                 screen.stats.report = Some(std::sync::Arc::from(report));
                 screen.stats.unavailable = None;
@@ -3652,7 +3663,7 @@ fn collect_fleet_and_sibling_tabs(
     Vec<TabSpreadsheetRow>,
     Vec<TabComputer>,
     Vec<TabSpreadsheetRow>,
-    Option<&'static str>,
+    Option<String>,
 ) {
     if !ask.fleet {
         return (Vec::new(), Vec::new(), Vec::new(), None);
@@ -4169,11 +4180,7 @@ fn try_load_monitor_swarm_census()
 
 fn collect_remote_machines_tabs(
     local_vitals: bool,
-) -> (
-    Vec<TabComputer>,
-    Vec<TabSpreadsheetRow>,
-    Option<&'static str>,
-) {
+) -> (Vec<TabComputer>, Vec<TabSpreadsheetRow>, Option<String>) {
     let custom_names = load_custom_host_names();
     let census_loaded = try_load_monitor_swarm_census();
     let in_swarm_census = census_loaded.is_some();
@@ -4206,9 +4213,9 @@ fn collect_remote_machines_tabs(
         );
     }
     #[cfg(target_os = "macos")]
-    let lan_waits = sweep_lan_after_the_step(
-        aterm_types::macos_setup::lan_first_use::sharing_on(),
-        aterm_types::macos_setup::lan_first_use::may_use,
+    let lan_waits = sweep_lan_through_the_broker(
+        aterm_types::macos_setup::sharing::is_on(),
+        crate::network_moved::lan_unavailable,
         || {
             discover_bonjour_lan_computers(
                 &mut computers,
@@ -4263,37 +4270,28 @@ fn configured_hosts_in(
     configured
 }
 
-/// What Tab Control says while it looks for no computer on the local network because System
-/// State's Local Network step is still to come ([`sweep_lan_after_the_step`]).
-#[cfg(target_os = "macos")]
-pub(crate) const LAN_WAITS: &str = "computers on this network are looked for once System State \
-    has asked macOS's Local Network question, which comes first";
-
 /// What Tab Control says while it looks for no computer on the local network because
-/// `[swarm] enabled = false` turned sharing off ([`sweep_lan_after_the_step`]).
+/// `[swarm] enabled = false` turned sharing off ([`sweep_lan_through_the_broker`]).
 #[cfg(target_os = "macos")]
 pub(crate) const LAN_SHARING_OFF: &str = "computers on this network are not looked for while \
     sharing is off ([swarm] enabled = false in aterm.toml)";
 
-/// Run the Bonjour `sweep` of the local network (its `dns-sd` browses, `.local` lookups and SSH
-/// probes put macOS's Local Network question on screen where macOS never asked aterm) only where
-/// this process `may_use` the LAN ([`aterm_types::macos_setup::lan_first_use::may_use`]): not
-/// while `[swarm] enabled = false` turns sharing off (`sharing`), nor while System State's Local
-/// Network step is still to come, which asks that question first. `may_use` is asked last,
-/// right before the sweep: past the step's wait it is the door that takes the dialog slot for
-/// macOS's question. The words the page says instead ([`LAN_SHARING_OFF`], [`LAN_WAITS`]),
-/// where it did not run.
+/// Run the Bonjour `sweep` of the local network (its browses, `.local` lookups and SSH probes,
+/// each through the root LAN broker on macOS) only where it can go: not while `[swarm] enabled =
+/// false` turns sharing off (`sharing`), nor while the broker does not answer (`broker` gives its
+/// words, [`crate::network_moved::lan_unavailable`]), asked last, right before the sweep. The
+/// words the page says instead ([`LAN_SHARING_OFF`], or the broker's own), where it did not run.
 #[cfg(target_os = "macos")]
-fn sweep_lan_after_the_step(
+fn sweep_lan_through_the_broker(
     sharing: bool,
-    may_use: impl FnOnce() -> bool,
+    broker: impl FnOnce() -> Option<String>,
     sweep: impl FnOnce(),
-) -> Option<&'static str> {
+) -> Option<String> {
     if !sharing {
-        return Some(LAN_SHARING_OFF);
+        return Some(LAN_SHARING_OFF.to_owned());
     }
-    if !may_use() {
-        return Some(LAN_WAITS);
+    if let Some(why) = broker() {
+        return Some(why);
     }
     sweep();
     None
@@ -5080,84 +5078,111 @@ fn parse_loadavg_gui(text: &str) -> Option<[u32; 3]> {
     Some([l1, l5, l15])
 }
 
-/// `dns-sd`, which never ends by itself, for `wait_ms`: tethered, so a window killed outright
-/// takes it along.
+/// What the broker's Bonjour request `events` hears within `wait`, each event given to `heard`
+/// until it says it has what it wanted (`true`) or `wait` runs out; the request ends as `events`
+/// drops. A request the broker refused, or an error mid-way, hears no more.
 #[cfg(target_os = "macos")]
-fn run_dns_sd_bounded(args: &[&str], wait_ms: u64, stop_substr: Option<&str>) -> String {
-    use aterm_uds::spawnfd::Tether as _;
-    use std::io::{BufRead, BufReader, Read};
-    let Ok((reader, writer)) = std::io::pipe() else {
-        return String::new();
+fn hear_within(
+    events: Result<aterm_uds::lan::Events, aterm_uds::lan::LanError>,
+    wait: std::time::Duration,
+    mut heard: impl FnMut(aterm_uds::lan::Event) -> bool,
+) {
+    let Ok(mut events) = events else {
+        return;
     };
-    let mut cmd = aterm_uds::spawnfd::command("/usr/bin/dns-sd");
-    cmd.args(args)
-        .stdin(aterm_uds::spawnfd::Stdio::null())
-        .stdout(aterm_uds::spawnfd::Stdio::from(writer))
-        .stderr(aterm_uds::spawnfd::Stdio::null())
-        .tether();
-    let Ok(mut child) = cmd.spawn() else {
-        return String::new();
-    };
-    drop(cmd);
-    let (finished, finish) = std::sync::mpsc::channel();
-    let watcher = std::thread::spawn(move || {
-        let _ = finish.recv_timeout(std::time::Duration::from_millis(wait_ms));
-        let _ = child.kill();
-        let _ = child.wait();
-    });
-    let mut out = String::new();
-    let mut buf = BufReader::new(reader.take(64 * 1024));
+    let deadline = Instant::now() + wait;
     loop {
-        let mut line = String::new();
-        match buf.read_line(&mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {
-                if !line.ends_with('\n') {
-                    break;
-                }
-                out.push_str(&line);
-                if let Some(needle) = stop_substr
-                    && line.contains(needle)
-                {
-                    break;
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        match events.next_within(left) {
+            Ok(Some(event)) => {
+                if heard(event) {
+                    return;
                 }
             }
+            Ok(None) | Err(_) => return,
         }
     }
-    let _ = finished.send(());
-    let _ = watcher.join();
+}
+
+/// The instances of `service` (`_ssh._tcp`) a browse of `local.` through the LAN broker hears
+/// within `wait` ([`hear_within`]): each once, whatever its case, and none the browse heard leave.
+#[cfg(target_os = "macos")]
+fn browse_service_instances(service: &str, wait: std::time::Duration) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    hear_within(aterm_uds::lan::browse(service, "local."), wait, |event| {
+        match event {
+            aterm_uds::lan::Event::Added(instance) => {
+                note_instance(&mut out, instance.name, true);
+            }
+            aterm_uds::lan::Event::Removed(instance) => {
+                note_instance(&mut out, instance.name, false);
+            }
+            _ => {}
+        }
+        false
+    });
     out
 }
 
+/// `name` heard come (`added`) or go: listed once whatever its case, or no longer listed.
 #[cfg(target_os = "macos")]
-fn parse_bonjour_service_instances(text: &str, want_svc: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for line in text.lines() {
-        let line = line.trim_end_matches('\r');
-        let mut cols = line.split_whitespace();
-        let Some(_ts) = cols.next() else { continue };
-        let Some(ar) = cols.next() else { continue };
-        let Some(_flags) = cols.next() else { continue };
-        let Some(_ifx) = cols.next() else { continue };
-        let Some(_dom) = cols.next() else { continue };
-        let Some(svc) = cols.next() else { continue };
-        if svc != want_svc {
-            continue;
+fn note_instance(out: &mut Vec<String>, name: String, added: bool) {
+    if added {
+        if !out.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+            out.push(name);
         }
-        let rest: Vec<&str> = cols.collect();
-        if rest.is_empty() {
-            continue;
-        }
-        let inst_name = rest.join(" ");
-        if ar == "Add" {
-            if !out.iter().any(|n| n.eq_ignore_ascii_case(&inst_name)) {
-                out.push(inst_name);
-            }
-        } else if ar == "Rmv" {
-            out.retain(|n| !n.eq_ignore_ascii_case(&inst_name));
-        }
+    } else {
+        out.retain(|n| !n.eq_ignore_ascii_case(&name));
     }
-    out
+}
+
+/// The host and port the SSH service instance `name` resolves to in `local.` through the LAN
+/// broker, within `wait` ([`bonjour_ssh_target`] judges the answer).
+#[cfg(target_os = "macos")]
+fn resolve_ssh_target(name: &str, wait: std::time::Duration) -> Option<(String, u16)> {
+    let mut target = None;
+    hear_within(
+        aterm_uds::lan::resolve_service(name, "_ssh._tcp", "local."),
+        wait,
+        |event| {
+            if let aterm_uds::lan::Event::Resolved { host, port, .. } = event {
+                target = bonjour_ssh_target(&host, port);
+            }
+            target.is_some()
+        },
+    );
+    target
+}
+
+/// The DNS record type of a TXT record.
+#[cfg(target_os = "macos")]
+const TXT: u16 = 16;
+
+/// The model and Darwin version the `_device-info._tcp` TXT record of instance `name` carries,
+/// queried through the LAN broker within `wait` ([`parse_bonjour_device_txt`]).
+#[cfg(target_os = "macos")]
+fn device_info(name: &str, wait: std::time::Duration) -> (Option<String>, Option<u32>) {
+    let mut facts = (None, None);
+    hear_within(
+        aterm_uds::lan::query(&format!("{name}._device-info._tcp.local."), TXT),
+        wait,
+        |event| match event {
+            aterm_uds::lan::Event::Record {
+                rrtype: TXT,
+                rdata,
+                added: true,
+                ..
+            } => {
+                facts = parse_bonjour_device_txt(&rdata);
+                true
+            }
+            _ => false,
+        },
+    );
+    facts
 }
 
 #[cfg(target_os = "macos")]
@@ -5241,20 +5266,25 @@ fn probe_host_facts(hostname: &str, port: u16) -> (HostFacts, bool) {
 
 #[cfg(target_os = "macos")]
 fn resolve_host_ipv4_banner_and_rtt(hostname: &str, port: u16) -> HostFacts {
-    use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-    let ipv4 = (hostname, port).to_socket_addrs().ok().and_then(|addrs| {
-        let v4s: Vec<std::net::Ipv4Addr> = addrs
-            .filter_map(|a| match a {
-                SocketAddr::V4(v4) => Some(*v4.ip()),
-                SocketAddr::V6(_) => None,
-            })
-            .collect();
-        v4s.iter()
-            .copied()
-            .find(|ip| !ip.is_loopback() && !ip.is_unspecified())
-            .or_else(|| v4s.first().copied())
-            .map(|ip| ip.to_string())
-    });
+    use std::net::{IpAddr, SocketAddr};
+    // A `.local` name resolves through the root LAN broker, every other name here
+    // (`aterm_uds::lan::resolve`).
+    let ipv4 = aterm_uds::lan::resolve(hostname, std::time::Duration::from_millis(200))
+        .ok()
+        .and_then(|addrs| {
+            let v4s: Vec<std::net::Ipv4Addr> = addrs
+                .into_iter()
+                .filter_map(|a| match a {
+                    IpAddr::V4(v4) => Some(v4),
+                    IpAddr::V6(_) => None,
+                })
+                .collect();
+            v4s.iter()
+                .copied()
+                .find(|ip| !ip.is_loopback() && !ip.is_unspecified())
+                .or_else(|| v4s.first().copied())
+                .map(|ip| ip.to_string())
+        });
     let mut rtt_us = None;
     let banner = ipv4
         .as_deref()
@@ -5262,8 +5292,9 @@ fn resolve_host_ipv4_banner_and_rtt(hostname: &str, port: u16) -> HostFacts {
         .and_then(|ip| {
             let addr = SocketAddr::from((ip, port));
             let t0 = Instant::now();
+            // A local-network address is dialled by the root LAN broker (`aterm_uds::connect_tcp`).
             let stream =
-                TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(120)).ok()?;
+                aterm_uds::connect_tcp(&addr, std::time::Duration::from_millis(120)).ok()?;
             rtt_us = u64::try_from(t0.elapsed().as_micros().max(1)).ok();
             read_ssh_banner(
                 &stream,
@@ -5308,62 +5339,33 @@ fn read_ssh_banner(mut stream: &std::net::TcpStream, deadline: Instant) -> Optio
     None
 }
 
+/// The SSH endpoint a service resolve answered (`host`, `port`), where it is one to dial: a host
+/// name of letters, digits, `.`, `-` and `_` that starts with neither `.` nor `-` (its root dot
+/// dropped), on a port other than 0.
 #[cfg(target_os = "macos")]
-fn bonjour_ssh_target(text: &str) -> Option<(String, u16)> {
-    for line in text.lines() {
-        let Some((_, rest)) = line.split_once(" can be reached at ") else {
-            continue;
-        };
-        let hostport = rest.split(" (interface ").next()?.trim();
-        let Some((host, port)) = hostport.rsplit_once(':') else {
-            continue;
-        };
-        let host = host.trim_end_matches('.');
-        let Some(port) = port
+fn bonjour_ssh_target(host: &str, port: u16) -> Option<(String, u16)> {
+    let host = host.trim_end_matches('.');
+    (port != 0
+        && !host.is_empty()
+        && !host.starts_with(['.', '-'])
+        && host
             .bytes()
-            .all(|b| b.is_ascii_digit())
-            .then(|| port.parse::<u16>().ok())
-            .flatten()
-            .filter(|&p| p != 0)
-        else {
-            continue;
-        };
-        if !host.is_empty()
-            && !host.starts_with(['.', '-'])
-            && host
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
-        {
-            return Some((host.to_owned(), port));
-        }
-    }
-    None
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_')))
+    .then(|| (host.to_owned(), port))
 }
 
+/// The model (letters, digits and commas: `Mac14,2`) and Darwin version a `_device-info._tcp`
+/// TXT record's data names, its strings each led by its length byte (RFC 6763 §6).
 #[cfg(target_os = "macos")]
-fn parse_bonjour_device_txt(text: &str) -> (Option<String>, Option<u32>) {
-    let mut decoded = String::from(text);
-    for line in text.lines() {
-        if let Some((_, hex_part)) = line.split_once("bytes:") {
-            decoded.push(' ');
-            for tok in hex_part.split_whitespace() {
-                if tok.len() == 2
-                    && tok.bytes().all(|b| b.is_ascii_hexdigit())
-                    && let Ok(b) = u8::from_str_radix(tok, 16)
-                {
-                    if (0x21..=0x7e).contains(&b) {
-                        decoded.push(b as char);
-                    } else {
-                        decoded.push(' ');
-                    }
-                }
-            }
-        }
-    }
+fn parse_bonjour_device_txt(rdata: &[u8]) -> (Option<String>, Option<u32>) {
     let mut model = None;
     let mut osxvers = None;
-    for tok in decoded.split(|c: char| c.is_whitespace() || c == '\\') {
-        if let Some(m) = tok.strip_prefix("model=") {
+    let mut rest = rdata;
+    while let Some((&len, tail)) = rest.split_first() {
+        let (string, after) = tail.split_at(usize::from(len).min(tail.len()));
+        rest = after;
+        let string = String::from_utf8_lossy(string);
+        if let Some(m) = string.strip_prefix("model=") {
             let clean: String = m
                 .chars()
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == ',')
@@ -5371,7 +5373,7 @@ fn parse_bonjour_device_txt(text: &str) -> (Option<String>, Option<u32>) {
             if !clean.is_empty() {
                 model = Some(clean);
             }
-        } else if let Some(v) = tok.strip_prefix("osxvers=") {
+        } else if let Some(v) = string.strip_prefix("osxvers=") {
             let digits: String = v.chars().take_while(|c| c.is_ascii_digit()).collect();
             if let Ok(n) = digits.parse::<u32>() {
                 osxvers = Some(n);
@@ -5412,34 +5414,27 @@ fn cached_bonjour_browse() -> (Vec<String>, Vec<String>, Vec<String>, BonjourRes
             c.resolved.clone(),
         );
     }
-    let (ssh_txt, sftp_txt, rfb_txt) = std::thread::scope(|s| {
-        let h1 = s.spawn(|| run_dns_sd_bounded(&["-B", "_ssh._tcp", "local."], 140, None));
-        let h2 = s.spawn(|| run_dns_sd_bounded(&["-B", "_sftp-ssh._tcp", "local."], 140, None));
-        let h3 = s.spawn(|| run_dns_sd_bounded(&["-B", "_rfb._tcp", "local."], 140, None));
+    let browse_wait = std::time::Duration::from_millis(140);
+    let (mut lan_names, sftp_names, rfb_names) = std::thread::scope(|s| {
+        let h1 = s.spawn(|| browse_service_instances("_ssh._tcp", browse_wait));
+        let h2 = s.spawn(|| browse_service_instances("_sftp-ssh._tcp", browse_wait));
+        let h3 = s.spawn(|| browse_service_instances("_rfb._tcp", browse_wait));
         (
             h1.join().unwrap_or_default(),
             h2.join().unwrap_or_default(),
             h3.join().unwrap_or_default(),
         )
     });
-    let mut lan_names = parse_bonjour_service_instances(&ssh_txt, "_ssh._tcp.");
-    let sftp_names = parse_bonjour_service_instances(&sftp_txt, "_sftp-ssh._tcp.");
-    let rfb_names = parse_bonjour_service_instances(&rfb_txt, "_rfb._tcp.");
     lan_names.sort_by_key(|n| natural_lan_sort_key(n));
     let resolved_pairs: Vec<(String, BonjourResolvedEntry)> = std::thread::scope(|s| {
         let handles: Vec<_> = lan_names
             .iter()
             .map(|inst_name| {
                 s.spawn(move || {
-                    let resolve_out = run_dns_sd_bounded(
-                        &["-L", inst_name, "_ssh._tcp", "local."],
-                        100,
-                        Some("can be reached at"),
-                    );
-                    let (dot_local, port) = bonjour_ssh_target(&resolve_out)?;
-                    let txt_q = format!("{inst_name}._device-info._tcp.local.");
-                    let txt_out = run_dns_sd_bounded(&["-Q", &txt_q, "TXT"], 80, Some("bytes:"));
-                    let (model_id, osxvers) = parse_bonjour_device_txt(&txt_out);
+                    let (dot_local, port) =
+                        resolve_ssh_target(inst_name, std::time::Duration::from_millis(100))?;
+                    let (model_id, osxvers) =
+                        device_info(inst_name, std::time::Duration::from_millis(80));
                     Some((inst_name.clone(), (dot_local, port, model_id, osxvers)))
                 })
             })
@@ -5485,9 +5480,10 @@ fn discover_bonjour_lan_computers(
         .or_else(|| resolved_map.get(&raw_local))
         .map(|(_, _, m, o)| (m.clone(), *o))
         .unwrap_or_else(|| {
-            let local_txt_q = format!("{}._device-info._tcp.local.", raw_local.replace('-', " "));
-            let local_txt = run_dns_sd_bounded(&["-Q", &local_txt_q, "TXT"], 80, Some("bytes:"));
-            parse_bonjour_device_txt(&local_txt)
+            device_info(
+                &raw_local.replace('-', " "),
+                std::time::Duration::from_millis(80),
+            )
         });
     let local_hw = describe_gui_hardware(local_model.as_deref());
     let local_os_str = match local_osx {

@@ -247,12 +247,10 @@ While the vault is at Set up and no Stop holds the run, each launch and every 30
 minutes after quietly installs again a sync process whose copy of aterm is gone, or one
 a join could not install, never over sync turned off. Rows are read without changing
 anything when the tab is shown, after each step and on Check again; GitHub repositories
-is read only while it is set up, or on Check again. macOS never tells an app whether it
-may use the local network: Local Network reads On once aterm reached the LAN, Off once
-macOS refused it (your answer, which aterm leaves), and otherwise shows — with a short
-note, so System State never waits on it. The newest answer wins: a later Local Network
-question aterm raised, or a later look, replaces an old refusal, and Check again looks
-again without ever asking. Completed setup preserves later local changes: a line
+is read only while it is set up, or on Check again. aterm's own LAN traffic goes
+through the root LAN broker that setup's one Mac password installs, so macOS asks no
+Local Network question about aterm and System State has no row for it; Check again
+looks for the vault again through the broker. Completed setup preserves later local changes: a line
 turned on later sets only its own preferences, and a Join or a line turned off sets
 none. So it is after an older aterm's setup: its plan gains aterm's
 permissions, and a choice never resets its Dock or signs out again. A setting you changed
@@ -549,7 +547,7 @@ GOTCHAS
     },
     Topic {
         name: "needs",
-        tagline: "what needs you: the words, the ❯ badge, the border and pill, Take Over",
+        tagline: "what needs you: the words, the ❯ menu, the tab hover, Take Over",
         body: Some(NEEDS_PAGE),
     },
     Topic {
@@ -671,17 +669,24 @@ STATUS & RESTORE
     },
     Topic {
         name: "acaffeine",
-        tagline: "the menu-bar keep-awake mug — starts with aterm (on | off | status | startup | quit)",
+        tagline: "the menu-bar keep-awake mug — starts with aterm (on | off | status | lid | startup | quit)",
         body: Some(
             r#"acaffeine — menu-bar keep-awake mug (`aterm acaffeine`, macOS only).
 
 WHAT IT DOES
   While full, the mug's launchd process holds an idle-sleep assertion (`pmset -g
-  assertions`): neither the system nor the display idle-sleeps (closing the lid or
-  choosing Sleep still sleeps). A click toggles it; a right-click or Control-click
-  opens the menu: its one-line about (version, what it does, who made it), then
-  Activate for 1 Hour, 8 Hours, 24 Hours or Forever (the checked span's row says what
-  is left of it), Enable at Startup and Quit aCaffeine. Timed spans count time asleep,
+  assertions`): neither the system nor the display idle-sleeps (choosing Sleep
+  still sleeps). With the lid closed it holds nothing: the mode stays on, the
+  tooltip and menu say it is paused, and it holds again when the lid opens (a
+  timed span keeps counting meanwhile); the system's own sleep and a dark wake
+  pause it too. Keep Awake with Lid Closed (the menu's checkbox, `aterm acaffeine
+  lid on`; off by default) also holds PreventSystemSleep, so the Mac keeps running
+  with its lid closed; macOS honours that only on AC power, and on battery a
+  closed lid still sleeps it. A click toggles the mug; a right-click or
+  Control-click opens the menu: its one-line about (version, what it does, who
+  made it), then Activate for 1 Hour, 8 Hours, 24 Hours or Forever (the checked
+  span's row says what is left of it), Keep Awake with Lid Closed, Enable at
+  Startup and Quit aCaffeine. Timed spans count time asleep,
   and a change of the date or time neither lengthens nor shortens one; at its end the
   span turns the mug off and the Mac may sleep again, a reboot included. With no saved
   state it keeps the Mac awake forever. Enable at Startup works
@@ -713,12 +718,13 @@ STARTING WITH ATERM
 
 VERBS (`aterm acaffeine --help` has each one)
   aterm acaffeine [start] | on [1h|8h|24h|forever|<n>h|<n>m] | off | status
-  aterm acaffeine startup [on|off] | quit [own]
+  aterm acaffeine lid [on|off] | startup [on|off] | quit [own]
 
 FILES
   Runs from an isolated bundle copy in
   `~/Library/Application Support/aterm/acaffeine-code.noindex/`, with state in
-  `acaffeine.state`, lock in `acaffeine.lock`, update bridge pid in
+  `acaffeine.state`, Keep Awake with Lid Closed in `acaffeine.lid`, lock in
+  `acaffeine.lock`, update bridge pid in
   `acaffeine.bridge`, and its job's plist in `acaffeine/<label>.plist` beside them
   (`~/Library/LaunchAgents/<label>.plist` while Enable at Startup is on). The job's
   stderr goes to `~/Library/Logs/aterm/acaffeine.log`; why the mug turned off or
@@ -1242,8 +1248,8 @@ VERBS
               (Apple's Command Line Tools from the built-in baseline, reading no file)
 
   Exit status: 0 nothing failed; 1 something failed; 2 some hosts were unreachable, or
-  the command line was refused. If no LAN host answers, grant aterm Local Network in
-  System Settings ▸ Privacy & Security."#,
+  the command line was refused. If no LAN host answers, `aterm doctor` says whether the
+  LAN broker that carries aterm's LAN traffic is installed."#,
         ),
     },
     Topic {
@@ -1412,7 +1418,7 @@ AUTOPILOT — how far the harness carries a session's work
   codex-alab does not tell it shows no hold.
 
   NEEDS YOU: a report line starting `NEEDS YOU: <what only a person can give>` puts an
-  `owner=needs kind=ask` entry on the menu bar (`❯`) and window border while the
+  `owner=needs kind=ask` entry on the menu bar (`❯`) while the
   agent works on everything else; `NEEDS YOU: nothing`, a `Nothing left:` defense,
   someone else's turn, or Autopilot `off` clears it. The menu bar's row says the
   first need whole and gives the next two a row each one level in (8 such rows in
@@ -1427,7 +1433,7 @@ AUTOPILOT — how far the harness carries a session's work
   owner's standing go-ahead (`go-ahead@v1`), which covers that work only, grants
   nothing outward, destructive or another's and lifts no hold the person gave, and
   tell the agent to drop that line now. A line aterm answers with the standing
-  go-ahead never goes on the menu bar, the border or the hover; it comes back once
+  go-ahead never goes on the menu bar or the hover; it comes back once
   aterm no longer answers it. For an hour after the person types in the tab none
   is typed, whatever they wrote: no words of theirs are read for a hold, and a
   park the hour held is answered once it ends. A park three such answers or
@@ -1613,8 +1619,7 @@ THE FOOTER
   harness presses, a question, a frozen or stalled agent or another owner's request
   comes before a NEEDS YOU report its agent carries on past, however old the report
   (stuck before decide, then local before another aterm's before the fleet's, oldest
-  first). The window's pressing session (`presence pressing=` in `aterm ctl chrome`),
-  the pill's `+N` and Next That Needs You (⇧⌘J) start there too. A report's row says on
+  first). Next That Needs You (⇧⌘J) starts there too. A report's row says on
   hover `<program> carries on meanwhile`, or `<program>'s landing waits on this alone`
   where that need is all that holds its Land session.
 
@@ -1647,9 +1652,8 @@ WHAT IT IS
   ends that run, when its input and its error output are both your terminal, it runs as
   you (not as root) in your own login and home, and not under CI (`CI` set); `--help`, a
   Command Line Tools install, a program built into aterm, a `--wait-lock` and `--no-init`
-  (type it to skip setup) never do. At a Mac's screen that run looks for the vault, or
-  reaches a vault at a URL, only once macOS has answered its Local Network question; over
-  ssh, where macOS asks nothing, it looks at once (see `aterm help setup`).
+  (type it to skip setup) never do. On a Mac that run looks for the vault, or reaches a
+  vault on the LAN, only once the LAN broker answers (see `aterm help setup`).
 
 KEY USAGE (`aterm pkg --help` lists every verb, plumbing included)
   aterm pkg install --default-set
@@ -2482,7 +2486,7 @@ fn overview_page() -> String {
                 "the PTY keeper: shells that outlive a crashed window (start | stop | status | serve; macOS)"
             }
             crate::Verb::Acaffeine => {
-                "the menu-bar keep-awake mug: a click keeps this Mac awake (on | off | status | startup | quit; macOS)"
+                "the menu-bar keep-awake mug: a click keeps this Mac awake (on | off | status | lid | startup | quit; macOS)"
             }
             crate::Verb::Theme => {
                 "list, write, check and import colour themes (`aterm help themes`)"
@@ -2898,7 +2902,6 @@ THE KEY ROSTER
     [harness]                      aterm help harness
     [disk]                         aterm help harness
     [fabric]                       aterm help fabric
-    [presence]                     aterm help needs
     [fleet]                        aterm help fleet
     [render] repaint_nudge         below, THE REPAINT NUDGE
     [sparkle_words.tricks]         aterm help kitty
@@ -3366,21 +3369,21 @@ GOTCHAS
     agent (`[harness] enabled`, `headless` or `autopilot`, or `[harness.<agent>]`)."#
 );
 
-/// `aterm help needs`: what the window and the menu bar say needs the person,
-/// and how they step in.
+/// `aterm help needs`: what aterm says needs the person, where it says so, and
+/// how they step in.
 const NEEDS_PAGE: &str = r#"needs — what needs you, where it shows, and stepping in with Take Over
 
 WHAT IT IS
   A NEED is a session that requires a person now for something aterm cannot settle on its
-  own. One verdict per session drives the macOS menu bar item's menu (`❯`), the window border
-  and tab-strip pill, tab marks, optional desktop notifications, and `aterm ctl @<sid>
-  status` (`needs=`). Waits (`limit`, `api`, `overloaded`, `memory-restart`, `login`,
-  and `entry`, a script's own `kind=wait`) show under ❯ ▸ Waiting and light no need.
+  own. One verdict per session drives the macOS menu bar item's menu (`❯`), the tab's hover,
+  Overview and `aterm ctl @<sid> status` (`needs=`). Waits (`limit`, `api`, `overloaded`,
+  `memory-restart`, `login`, and `entry`, a script's own `kind=wait`) show under ❯ ▸ Waiting
+  and light no need.
 
 THE WORDS
   Stuck (red, first match wins):
     frozen     program is not reading its tty input (remedy: Restart)
-    stopped    foreground job is stopped with input queued (remedy: Resume / `signal cont`)
+    stopped    foreground job is stopped with input queued (remedy: `signal cont`)
     stalled    worker task never started or sat 2 min at an unknown screen
     login      logged out; only a person can sign in
     memory     critical memory pressure when automatic restart is off
@@ -3391,35 +3394,32 @@ THE WORDS
     approval   permission box with no active supervisor (Autopilot off, held tab, etc.)
     question   question dialog under the same conditions
 
-THE BADGE, BORDER, PILL AND MARKS
+WHERE IT SHOWS
   * Menu bar (`❯`): a stable entry to diagnostics whose title never changes; open it to see
     Needs you and To look at.
-  * Window border: red (stuck) or amber (decide) for the window's most pressing
-    session (`View ▸ Show Needs in Windows` or `[presence] rim` toggles).
-  * Tab-strip pill: unanswered approvals, questions and other direct requests. A
-    worker's `NEEDS YOU:` report has no pill of its own (it shows in the menu bar,
-    Overview, tab hover and border); a visible pill's `+N` counts other sessions'
-    reports, and a direct request outranks a report in the same session.
-  * Tab marks: `◆` stuck, `◇` decide, `□` held by you, `•` unviewed landing/done,
-    `–` failed command. `Agents ▸ Next That Needs You` (`⇧⌘J`) cycles through active needs.
+  * Tab hover: what the tab needs. A worker's `NEEDS YOU:` report shows here, in the menu
+    bar and in Overview, and a direct request outranks a report in the same session.
+  * Overview: each session's chip opens with its mark, `◆` stuck or `◇` decide.
+  * Tab strip: `□` on a tab you hold. A need draws no mark there. `Agents ▸ Next That Needs
+    You` (`⇧⌘J`) cycles through active needs.
 
 TAKE OVER, HAND BACK AND HOLD COST
   `Agents ▸ Take Over This Tab` (or a right-click on the tab, or `t` in Overview) sets
   a person's hold (`hold_by=person`): the harness parks, and socket writes to that tab
   answer `ERR halted reason=taken-over origin=person`. Only Hand Back (the menu, the
-  pill, the `✋ you` chip, or `❯ ▸ Hand Back All`) lifts it. While any tab is held, the
+  `✋ you` chip, or `❯ ▸ Hand Back All`) lifts it. While any tab is held, the
   UI-driving verbs (`invoke`, `tab`, `pane`, `hwkey`, `pointer`, `confirm`) and no-tty
   `sudo` are refused across the instance, so no agent can click Hand Back itself.
 
-NOTIFY ME WHEN I'M NEEDED
-  Desktop notifications are off by default: turn them on with `❯ ▸ Notify Me When I'm
-  Needed` or `desktop_alerts = true` in `aterm.toml` (on macOS aterm must run from
-  `/Applications` or `~/Applications`, with Notifications allowed).
+DESKTOP NOTICES
+  aterm posts no automatic desktop notice, whatever `desktop_alerts` says: a need waits
+  where this page says it shows. A program's own notification reaches the desktop when
+  `allow_notifications` admits it.
 
 FOR SCRIPTS AND AGENTS
   aterm ctl @<sid> status    `needs=`, `hold_by=`, `typed_by=`, `typed_ms=`
   aterm ctl survey           per-session `needs=`, `hold_by=`, `typed_by=`, `held_from=`
-  aterm ctl chrome           `statusitem`, `statusmenu` rows, and `presence rim=… pill=…`
+  aterm ctl chrome           `statusitem` and `statusmenu` rows
   aterm ctl meta set attention owner=<k> kind=ask|wait <text>
   NEEDS YOU: <what only a person can give>
                              in an agent's report under `cruise` or `land`: raises
@@ -3782,7 +3782,7 @@ const NAME_PAGE: &str = r#"name — this machine's name: its NAME (`m8`, or `m0`
 WHAT IT SAYS
   One line, `m8 Heron  class=seeded fleet=in node=<node id>`: the NAME and nickname this
   machine goes by, how the NAME was claimed (`auto`, aterm picked it; `chosen`, a person
-  did; `seeded`, from an older build's names), whether it is in a fleet (`fleet=in`: a
+  did; `seeded`, from the bound registry row or an older build's names), whether it is in a fleet (`fleet=in`: a
   member of its vault, or it holds a fleet key that reads and its vault did not take it
   out; `fleet=joining`: let in, asking, or waiting for a seat; `fleet=out`; `fleet=unread`:
   the vault's state cannot be read, as `aterm members status` would say), a migration from an older build's names not
@@ -3796,32 +3796,46 @@ WHAT IT SAYS
 
 CHANGING THE NAME
   On macOS, click the machine name beside the version and choose Rename This Mac….
-  Enter the number and nickname, for example `m86 MissBunny`. Change Nickname… changes
-  only the nickname.
+  Type a number (`m86` or `86`), a nickname, or both into their two fields; a field you
+  leave alone or empty keeps what this Mac has, so a nickname alone keeps the number.
+  The line under the fields says, as you type, whether the number is free, this Mac's
+  own, or held, and by what: another machine's signed name, or a label, seat or role its
+  vault gives another Mac. Rename is unavailable while it is held; a number the line
+  could not check stays available, and Rename checks it. A number
+  this Mac shows but has not claimed yet leaves the Number field empty: type it to claim
+  it. Change Nickname… changes only the nickname, and can draw a random noun.
 
-  From a shell, `aterm name set m86 --nick MissBunny` chooses that number and nickname.
+  From a shell, `aterm name set m86 --nick Marigold` chooses that number and nickname.
   Leave out `--nick` to keep the nickname. The number must be positive; `m0` means the
-  machine has not been numbered. A number another known machine holds is refused.
-  `--dry-run` reports the proposed name without changing it.
+  machine has not been numbered. A number another known machine holds is refused, and so
+  is one its vault gives another Mac or role, with what holds it. `--dry-run` reports the
+  proposed name without changing it. A real change also updates the naming policy and
+  checked fleet name. On macOS, one system-password prompt covers ComputerName,
+  LocalHostName and HostName; Details shows the exact authorized operation. A failed
+  later step reports publication pending; repeat the command to resume.
 
 THE NICKNAME
   `aterm name nick Heron` sets the nickname (one argument: quote `"Blue Heron"`), and
   `--random` draws another noun, drawn again up to eight times while it is one that other
   machines' records in view carry or the one held. Either is `chosen`, so it never changes
-  by itself; the NAME, its class and `since` stay as they were, and `rev` rises once a
-  name record has seeded the file. It prints the name as it then stands, says so on
+  by itself; the NAME, its class and `since` stay as they were, and `rev` rises on a change.
+  It prints the name as it then stands, says so on
   stderr when the nickname was held already or another machine in view goes by it too
   (two may share one), and `--dry-run` changes no nickname (a first run still makes the
   name, as any read does). Who asked is kept beside it: an agent when the command runs in
   an aterm session whose `status` names an agent program or an agent's state, a person
-  otherwise, or when that session does not answer within 2 seconds. Clearing the
-  nickname waits for name records to travel.
+  otherwise, or when that session does not answer within 2 seconds. A nickname must be non-empty.
 
 THE FIRST RUN
   The first reader to find no `machine-name.toml` makes it, under its lock, so every other
-  reader reads the same name back. It takes this machine's own newest name record that its
-  key signed in its fleet books (`made=floor`), else what an older build kept: the NAME in
-  `fleet-name` or the vault roster's label, and a word in `fleet-name` as the nickname,
+  reader reads the same name back. A live registry machine row bound by this Mac's own facts
+  supplies its canonical number and nickname first (`made=registry`). The nickname retains
+  its spelling and automatic or chosen status; a null nickname draws a local noun. A pending
+  registry read or a bound row with a conflicted or invalid name creates nothing. Existing
+  local names remain unchanged. Private debug instances and tests read no live registry.
+
+  With no bound registry row, it takes the vault roster's label, else the NAME an older
+  build kept in `fleet-name`, and a word in `fleet-name` as the nickname,
   pending migration (`made=evidence`), else `m0` and a short noun drawn at random, drawn
   again up to eight times while another machine's record in view carries it as its
   nickname (`made=drawn`). A `fleet-name`, node key or vault roster that cannot be read
@@ -5196,7 +5210,7 @@ fn agent_page(sid: Option<&str>) -> String {
          that in a few lines starting `Nothing left:` and the agent answers aterm's short land\n  \
          check with only `LANDED`; off types nothing.\n  \
          NEEDS YOU: a report line starting `NEEDS YOU:` puts that need on the person's menu bar\n  \
-         and window border (`NEEDS YOU: nothing` takes it down); the work goes on. Your own\n  \
+         (`NEEDS YOU: nothing` takes it down); the work goes on. Your own\n  \
          reversible work needs no one's go-ahead: cruise and land answer a park on one with\n  \
          the owner's standing go-ahead (`go-ahead@v1`), which lifts no hold a person gave. A\n  \
          line they answer with that go-ahead never reaches the person's menu bar. A decision\n  \
@@ -6821,9 +6835,8 @@ mod tests {
         }
     }
 
-    /// `aterm help needs`, where the window's IN THE WINDOW lines and the ❯
-    /// item point, answers to the words someone types for a need, stepping in
-    /// and the notices' opt-in.
+    /// `aterm help needs`, where the ❯ item points, answers to the words someone
+    /// types for a need, stepping in and desktop notices.
     #[test]
     fn the_needs_page_answers_to_its_words() {
         let (page, code) = render(Some("needs"), None);

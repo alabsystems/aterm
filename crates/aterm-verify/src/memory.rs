@@ -130,7 +130,6 @@ pub const fn compiles(id: StageId) -> bool {
         | StageId::Export
         | StageId::LibcOracle
         | StageId::SpecCheck
-        | StageId::CheckersCompile
         | StageId::MeasurePrebuild
         | StageId::ForeignCells
         | StageId::WasmSmoke
@@ -143,6 +142,7 @@ pub const fn compiles(id: StageId) -> bool {
         StageId::Test
         | StageId::Formatting
         | StageId::Census
+        | StageId::ExportScan
         | StageId::SpecCheckers
         | StageId::MeasuringTests
         | StageId::GuiSmoke
@@ -456,7 +456,6 @@ pub const fn reads_selection(id: StageId, cells_pulled: bool) -> bool {
         | StageId::Test
         | StageId::Doctests
         | StageId::Tippy
-        | StageId::CheckersCompile
         | StageId::SpecCheckers => true,
         StageId::ForeignCells | StageId::WasmSmoke | StageId::WasmGlue | StageId::BrowserLane => {
             cells_pulled
@@ -503,9 +502,7 @@ impl StageKey for Key {
         let cells_narrowed = ctx.cells_pulled
             || (id == StageId::ForeignCells
                 && matches!(ctx.scope, crate::scope::Scope::Packages(_)));
-        let mut key = if matches!(id, StageId::CheckersCompile | StageId::SpecCheckers) {
-            Key::of(id, &crate::stages::spec_checkers_scope(&ctx.scope))
-        } else if reads_selection(id, cells_narrowed) {
+        let mut key = if reads_selection(id, cells_narrowed) {
             Key::of(id, &ctx.scope)
         } else {
             Key::of(id, &Scope::workspace())

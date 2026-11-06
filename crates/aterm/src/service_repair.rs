@@ -81,26 +81,21 @@ fn parse_cli_input(args: Vec<OsString>) -> Result<CliInput> {
         .map(|s| s.into_string().map_err(|_| fail("arguments must be UTF-8")))
         .collect::<Result<Vec<_>>>()?;
     let mut out = Vec::with_capacity(raw.len());
-    let mut i = 0;
-    while i < raw.len() {
-        let token = raw[i].as_str();
-        if VALUE_FLAGS.contains(&token) {
-            out.push(raw[i].clone());
-            if let Some(value) = raw.get(i + 1) {
-                out.push(value.clone());
-                i += 2;
-                continue;
+    let mut iter = raw.into_iter();
+    while let Some(token) = iter.next() {
+        if VALUE_FLAGS.contains(&token.as_str()) {
+            out.push(token);
+            if let Some(value) = iter.next() {
+                out.push(value);
             }
-            i += 1;
             continue;
         }
-        if matches!(token, "--help" | "-h") || (out.is_empty() && token == "help") {
+        if matches!(token.as_str(), "--help" | "-h") || (out.is_empty() && token == "help") {
             return Ok(CliInput::Help);
         }
         if token != "--json" {
-            out.push(raw[i].clone());
+            out.push(token);
         }
-        i += 1;
     }
     Ok(CliInput::Command(out))
 }
@@ -409,13 +404,13 @@ fn execute_with_live(
                 .map_err(fail)?;
             let verified = aterm_update_core::verify_roster(
                 aterm_update_core::pins::PAPER_MASTER_PUBKEYS,
-                signed.roster.clone(),
+                signed.roster,
                 &signed.roster_signature,
             )
             .map_err(|e| fail(format!("{e:?}")))?;
             let roster =
                 aterm_update_core::Roster::parse(&verified).map_err(|e| fail(format!("{e:?}")))?;
-            aterm_secrets::fsx::write_atomic(&dir.join("authority.json"),&aterm_json::to_vec(&json!({"roster":roster.roster_seq,"bytes":signed.roster,"signature":signed.roster_signature})).map_err(fail)?,0o600)?;
+            aterm_secrets::fsx::write_atomic(&dir.join("authority.json"),&aterm_json::to_vec(&json!({"roster":roster.roster_seq,"bytes":verified.as_slice(),"signature":signed.roster_signature})).map_err(fail)?,0o600)?;
             aterm_json::to_value(receipt).map_err(fail)
         }
         "inspect" => {
@@ -538,11 +533,14 @@ pub(super) fn run(args: Vec<OsString>) -> ExitCode {
                     .or_else(|| value["verdict"].as_str())
                     .is_none_or(|v| v == "committed" || (recovering && v == "rolled-back"));
             match aterm_json::to_string(&value) {
-                Ok(text) => aterm_uds::stdout::answer_exit(
-                    "aterm secrets service-repair",
-                    &format!("{text}\n"),
-                    if passed { 0 } else { 1 },
-                ),
+                Ok(mut text) => {
+                    text.push('\n');
+                    aterm_uds::stdout::answer_exit(
+                        "aterm secrets service-repair",
+                        &text,
+                        if passed { 0 } else { 1 },
+                    )
+                }
                 Err(e) => {
                     eprintln!("service repair: {e}");
                     ExitCode::FAILURE

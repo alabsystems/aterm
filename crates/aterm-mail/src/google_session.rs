@@ -9,6 +9,12 @@ use std::time::{Duration, Instant};
 #[cfg(any(unix, test))]
 use zeroize::Zeroizing;
 
+/// How long one renewal retries a grant store another process holds (its lease is taken with no
+/// wait). A caller's end is an `Instant` on the clock that stops in sleep, often what is left of a
+/// sign-in's whole budget, so these retries hold a sign-in that sleep ended this long at most
+/// after the host wakes (KI-1105-14).
+const BUSY_RETRY: Duration = Duration::from_secs(30);
+
 struct Grant {
     email: String,
     client_id: String,
@@ -29,18 +35,19 @@ pub struct Session {
 }
 
 fn email(value: &str) -> Result<String, String> {
-    let value = value.trim().to_ascii_lowercase();
-    let (local, domain) = value.split_once('@').ok_or("Invalid Google mail account")?;
+    let trimmed = value.trim();
+    let (local, domain) = trimmed
+        .split_once('@')
+        .ok_or("Invalid Google mail account")?;
     if local.is_empty()
         || domain.is_empty()
         || domain.contains('@')
-        || value.len() > 320
-        || value.chars().any(char::is_whitespace)
-        || value.chars().any(char::is_control)
+        || trimmed.len() > 320
+        || trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
     {
         return Err("Invalid Google mail account".into());
     }
-    Ok(value)
+    Ok(trimmed.to_ascii_lowercase())
 }
 
 fn location(home: &Path, email: &str) -> PathBuf {
@@ -246,7 +253,7 @@ pub fn accounts(home: &Path) -> Vec<String> {
             loaded.map(|grant| grant.email)
         })
         .collect();
-    accounts.sort();
+    accounts.sort_unstable();
     accounts.dedup();
     accounts
 }
@@ -318,25 +325,49 @@ impl Session {
         self.renew_until(Instant::now() + Duration::from_secs(30))
     }
 
+    /// [`Self::renew`] by `end`. A grant store another process holds, or a save of a rotated grant
+    /// that failed (kept to be saved first next time), is retried until `end` or [`BUSY_RETRY`]
+    /// after this call began, whichever comes first; the request keeps its own cap within `end`
+    /// (`refresh_until`).
     pub fn renew_until(&mut self, end: Instant) -> Result<bool, Error> {
-        loop {
-            if Instant::now() >= end {
-                return Err(Error {
-                    kind: ErrorKind::Transport,
-                });
-            }
-            let result = self.renew_with(|grant| {
+        self.renew_until_on(
+            end,
+            Instant::now,
+            |grant, end| {
                 super::refresh_until(
                     &grant.client_id,
                     grant.client_secret.as_ref().map(Secret::expose),
                     &grant.refresh,
                     end,
                 )
-            });
+            },
+            std::thread::sleep,
+        )
+    }
+
+    /// [`Self::renew_until`] on the clock `now`, renewing through `request` and waiting out a held
+    /// grant store with `pause`.
+    fn renew_until_on(
+        &mut self,
+        end: Instant,
+        now: impl Fn() -> Instant,
+        mut request: impl FnMut(&Grant, Instant) -> Result<Tokens, Error>,
+        mut pause: impl FnMut(Duration),
+    ) -> Result<bool, Error> {
+        let retry_end = now()
+            .checked_add(BUSY_RETRY)
+            .map_or(end, |cap| end.min(cap));
+        loop {
+            if now() >= retry_end {
+                return Err(Error {
+                    kind: ErrorKind::Transport,
+                });
+            }
+            let result = self.renew_with(|grant| request(grant, end));
             if matches!(&result, Err(error) if error.kind == ErrorKind::Storage) {
-                let remaining = end.saturating_duration_since(Instant::now());
+                let remaining = retry_end.saturating_duration_since(now());
                 if !remaining.is_zero() {
-                    std::thread::sleep(remaining.min(Duration::from_millis(250)));
+                    pause(remaining.min(Duration::from_millis(250)));
                 }
                 continue;
             }
@@ -663,6 +694,59 @@ mod tests {
         drop((first, second));
         assert!(Session::load(&home.0, "me@example.test").unwrap().is_some());
     }
+    /// A RENEWAL RETRIES A BUSY GRANT STORE FOR ITS OWN CAP AT MOST (KI-1105-14): handed a day
+    /// (what was left of a long sign-in) while another process holds the grant store, a renewal
+    /// gives up [`BUSY_RETRY`] after it began, and by a shorter end at that end, on a clock the
+    /// test moves. Once the store is free its request is handed the caller's end, which
+    /// `refresh_until` caps itself.
+    #[cfg(unix)]
+    #[test]
+    fn a_renewal_retries_a_busy_grant_store_for_at_most_its_own_cap() {
+        let home = Home::new();
+        let base = Instant::now();
+        let clock = std::cell::Cell::new(base);
+        let budget = base + Duration::from_secs(86_400);
+        let short = base + Duration::from_secs(5);
+        let mut busy = home.session();
+        let held = crate::session::acquire(&home.0, "google:me@example.test").unwrap();
+        for (end, gives_up) in [(budget, base + BUSY_RETRY), (short, short)] {
+            clock.set(base);
+            let error = busy
+                .renew_until_on(
+                    end,
+                    || clock.get(),
+                    |_, _| panic!("the grant store is held"),
+                    |pause| {
+                        let next = clock.get() + pause;
+                        assert!(next <= gives_up, "a busy grant store held the renewal on");
+                        clock.set(next);
+                    },
+                )
+                .unwrap_err();
+            assert_eq!(error.kind, ErrorKind::Transport);
+            assert_eq!(clock.get(), gives_up, "it retried until then");
+        }
+        drop(held);
+        for end in [short, budget] {
+            clock.set(base);
+            let mut free = home.session();
+            let mut handed = None;
+            let renewed = free
+                .renew_until_on(
+                    end,
+                    || clock.get(),
+                    |_, end| {
+                        handed = Some(end);
+                        Ok(tokens())
+                    },
+                    |_| panic!("a free grant store needs no pause"),
+                )
+                .unwrap();
+            assert!(renewed);
+            assert_eq!(handed, Some(end), "the request is handed its caller's end");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn renewal_refreshes_when_wall_clock_advances_across_sleep() {

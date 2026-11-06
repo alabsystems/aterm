@@ -79,24 +79,33 @@ pub fn kind_words(kind: Kind) -> &'static str {
     }
 }
 
+fn where_words_cow(place: &Place) -> std::borrow::Cow<'static, str> {
+    use std::borrow::Cow;
+    match place.at {
+        Where::Network(Kind::Lan) => Cow::Borrowed("a LAN"),
+        Where::Network(kind) => Cow::Borrowed(kind_words(kind)),
+        Where::AlabLan => Cow::Borrowed("ALab LAN"),
+        Where::Remote(_) if place.once_alab => {
+            Cow::Borrowed("remote (a network members were once on)")
+        }
+        Where::Remote(kind) => Cow::Owned(format!("remote ({})", kind_words(kind))),
+        Where::Offline => Cow::Borrowed("offline"),
+        Where::Checking(Checking::Moved) => {
+            Cow::Borrowed("checking (moved; reading the new network)")
+        }
+        Where::Checking(Checking::Learning) => Cow::Borrowed("checking (ALab LAN not learned yet)"),
+        Where::Checking(Checking::Unidentified) => Cow::Borrowed(
+            "checking (network not identified: its router's hardware address is unread)",
+        ),
+        Where::Checking(Checking::NoIpv4) => Cow::Borrowed("checking (no IPv4 route)"),
+    }
+}
+
 /// Where this Mac is, for a person: `ALab LAN`, `remote (phone hotspot)`, `offline`,
 /// `checking (…)`, or with no fleet to learn from `a LAN`, `VPN`.
 #[must_use]
 pub fn where_words(place: &Place) -> String {
-    match place.at {
-        Where::Network(Kind::Lan) => "a LAN".to_owned(),
-        Where::Network(kind) => kind_words(kind).to_owned(),
-        Where::AlabLan => "ALab LAN".to_owned(),
-        Where::Remote(_) if place.once_alab => "remote (a network members were once on)".to_owned(),
-        Where::Remote(kind) => format!("remote ({})", kind_words(kind)),
-        Where::Offline => "offline".to_owned(),
-        Where::Checking(Checking::Moved) => "checking (moved; reading the new network)".to_owned(),
-        Where::Checking(Checking::Learning) => "checking (ALab LAN not learned yet)".to_owned(),
-        Where::Checking(Checking::Unidentified) => {
-            "checking (network not identified: its router's hardware address is unread)".to_owned()
-        }
-        Where::Checking(Checking::NoIpv4) => "checking (no IPv4 route)".to_owned(),
-    }
+    where_words_cow(place).into_owned()
 }
 
 /// ` since 11:14`, ` since before 11:14`, or nothing with no stay.
@@ -202,7 +211,7 @@ pub fn summary(place: &Place, words: &Words<'_>) -> String {
     };
     let mut out = format!(
         "{}{since} · {} · {}",
-        where_words(place),
+        where_words_cow(place),
         internet_short(place),
         alab_short(place, words)
     );
@@ -225,7 +234,7 @@ pub fn summary(place: &Place, words: &Words<'_>) -> String {
 pub fn line(place: &Place, words: &Words<'_>) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(192);
-    out.push_str(&where_words(place));
+    out.push_str(&where_words_cow(place));
     if let Some(ms) = place.since_ms {
         let _ = write!(
             out,
@@ -464,7 +473,7 @@ pub fn band(place: &Place) -> (String, String) {
         ),
         Where::Offline => (format!("Offline{known}"), "Offline".to_owned()),
         Where::Network(kind) => (
-            format!("{}{known}", where_words(place)),
+            format!("{}{known}", where_words_cow(place)),
             kind.word().to_owned(),
         ),
         Where::Checking(_) => (
@@ -496,41 +505,26 @@ pub fn on_this_network(place: &Place, addr: std::net::IpAddr) -> bool {
 /// One dial of a fleet read, as the on-link rule reads it ([`on_link`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dial {
-    /// A member answered from this address.
-    Answered(std::net::IpAddr),
     /// The connect found no route to this address (`EHOSTUNREACH`); `None` where the read kept
     /// no address.
     NoRoute(Option<std::net::IpAddr>),
-    /// A host at this address answered the dial though no member's answer came back: it refused
-    /// the connect (no aterm listening), or its handshake, proof or reply failed. Local Network
-    /// privacy would have refused the connect with no route, so on this network it proves this
-    /// process was let onto the link, as an answer does.
-    Reached(std::net::IpAddr),
-    /// Anything else: a timeout, a dial never made, a host that answered at an address the read
-    /// did not keep.
+    /// Anything else: an answer, a refused connect or failed handshake, a timeout, a dial never
+    /// made.
     Other,
 }
 
 /// THE ON-LINK RULE's verdict on one fleet read's no-route dials, which `fleet peers`,
-/// `ctl survey --fleet` and the menu bar (through the survey's note and rows) say alike. Local
-/// Network privacy refuses an app's connections to addresses on the link with no route, and
-/// only those, so a no-route dial is judged by its address against the network this Mac is on
-/// now, never by a network members were once on:
+/// `ctl survey --fleet` and the menu bar (through the survey's note and rows) say alike. A
+/// no-route dial is judged by its address against the network this Mac is on now, never by a
+/// network members were once on:
 ///
-/// - to an address on this network while nothing here answered the read: this Mac's own privacy
-///   setting ([`Self::privacy`], [`ON_LINK_PRIVACY_NOTE`]), wherever this Mac is, a member on
-///   the same phone hotspot included;
-/// - to an address on this network while another member's Mac here answered the same read (a
-///   member's answer, or a host's refusal or failed handshake, [`Dial::Reached`]): privacy let
-///   this process onto the link, so it is that member's own error, off the link now
-///   ([`Self::gone`], [`GONE_FROM_THE_LINK`]): neither the privacy setting nor being away;
-/// - to an address off this network: the route's, never privacy ([`Self::elsewhere`]);
+/// - to an address on this network: that member's own, off the link now ([`Self::gone`],
+///   [`GONE_FROM_THE_LINK`]), not being away;
+/// - to an address off this network: the route's ([`Self::elsewhere`]);
 /// - with no address to judge ([`Self::unplaced`]): the caller's rule from before.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct OnLink {
-    /// No-route dials on this network with nothing here answering.
-    pub privacy: usize,
-    /// No-route dials on this network while another member's Mac here answered.
+    /// No-route dials on this network.
     pub gone: usize,
     /// No-route dials to an address off this network.
     pub elsewhere: usize,
@@ -539,8 +533,7 @@ pub struct OnLink {
 }
 
 impl OnLink {
-    /// Whether a no-route dial to `addr` is one of [`Self::gone`]: on this network, while another
-    /// member's Mac here answered the read.
+    /// Whether a no-route dial to `addr` is one of [`Self::gone`]: on this network.
     #[must_use]
     pub fn gone_at(&self, place: &Place, addr: std::net::IpAddr) -> bool {
         self.gone > 0 && on_this_network(place, addr)
@@ -550,43 +543,26 @@ impl OnLink {
 /// [`OnLink`] for the `dials` of one fleet read, this Mac at `place`.
 #[must_use]
 pub fn on_link(place: &Place, dials: impl IntoIterator<Item = Dial>) -> OnLink {
-    let (mut answered_here, mut no_route_here) = (0usize, 0usize);
     let mut out = OnLink::default();
     for dial in dials {
         match dial {
-            Dial::Answered(addr) | Dial::Reached(addr) if on_this_network(place, addr) => {
-                answered_here += 1;
-            }
-            Dial::NoRoute(Some(addr)) if on_this_network(place, addr) => no_route_here += 1,
+            Dial::NoRoute(Some(addr)) if on_this_network(place, addr) => out.gone += 1,
             Dial::NoRoute(Some(_)) => out.elsewhere += 1,
             Dial::NoRoute(None) => out.unplaced += 1,
-            Dial::Answered(_) | Dial::Reached(_) | Dial::Other => {}
+            Dial::Other => {}
         }
-    }
-    if answered_here == 0 {
-        out.privacy = no_route_here;
-    } else {
-        out.gone = no_route_here;
     }
     out
 }
 
-/// The note a fleet read ends with when [`OnLink::privacy`] counts a dial: what refused it and
-/// where it is allowed.
-pub const ON_LINK_PRIVACY_NOTE: &str = "The members on this Mac's network had no route, and \
-     nothing there answered: on a Mac, Local Network privacy refuses an app's LAN connections this way \
-     until they are allowed (System Settings › Privacy & Security › Local Network: aterm, or the \
-     terminal this runs in).";
-
 /// A row's words for a member [`OnLink::gone_at`] names.
-pub const GONE_FROM_THE_LINK: &str = "no route to it on this Mac's network while another \
-     member's Mac there answered: it is off the link now (asleep, off or moved), not this Mac's \
-     Local Network privacy";
+pub const GONE_FROM_THE_LINK: &str = "no route to it on this Mac's network: it is off the link \
+     now (asleep, off or moved)";
 
 /// THE WHY a fleet read gives when this Mac dialled members and none answered while it is away
 /// from the ALab LAN (timeouts, the hotspot case): which network it is on and since when. `None`
 /// on the ALab LAN, offline (the offline note says that), while checking, and on a remembered
-/// network that fell silent ([`Place::once_alab`]: it may be home with Local Network turned
+/// network that fell silent ([`Place::once_alab`]: it may be home with every member asleep or
 /// off).
 #[must_use]
 pub fn why_away(place: &Place, words: &Words<'_>) -> Option<String> {
@@ -655,7 +631,7 @@ pub const AWAY_ENTRY_AFTER_MS: u64 = 2 * 60_000;
 /// [`AWAY_ENTRY_AFTER_MS`], so a first run that has learned nothing, a place still checking, a
 /// blip, home, offline (a router reboot longer than the dwell puts every Mac at home there, and
 /// no person need move anything), and a remembered network that fell silent (it may be home
-/// with Local Network turned off: "rejoin" would be wrong there) raise nothing.
+/// with every member asleep or off: "rejoin" would be wrong there) raise nothing.
 #[must_use]
 pub fn away_entry(place: &Place, words: &Words<'_>) -> Option<AwayEntry> {
     let (Alab::Away { since_ms }, Where::Remote(kind)) = (place.alab, place.at) else {
@@ -884,7 +860,7 @@ mod tests {
     }
 
     /// A remembered network that fell silent ("a network members were once on") may be home
-    /// with Local Network turned off: no why, no survey note and no away entry say this Mac is
+    /// with every member asleep or off: no why, no survey note and no away entry say this Mac is
     /// elsewhere; a member on the network this Mac is on is one being away never explains.
     /// NEGATIVE CONTROL: `why_away` without its `once_alab` return fails "no why on a network
     /// members were once on".
@@ -920,70 +896,32 @@ mod tests {
     }
 
     /// THE ON-LINK RULE judges a no-route dial by its address against the network this Mac is on
-    /// now: on this network with no member here answering, this Mac's own privacy setting (a
-    /// member on the same phone hotspot, and on a network members were once on alike); on this
-    /// network while another member here answered, that member's own (off the link now), and so
-    /// while another member's Mac here refused the connect or failed its handshake (a host
-    /// answered: privacy let this process onto the link); off this network, or with no route
-    /// read, never privacy; with no address, unplaced.
-    /// NEGATIVE CONTROLS: `on_link` counting every no-route here as privacy (its
-    /// `answered_here == 0` test made `true`) fails "another member here answered: its own";
-    /// counting a reached host as nothing (`Dial::Reached` out of the answered arm) fails "a
-    /// member here refused the connect: its own".
+    /// now: on this network, that member's own (off the link now), a network members were once
+    /// on alike; off this network, or with no route read, elsewhere; with no address, unplaced.
+    /// NEGATIVE CONTROL: `on_link` counting every addressed no-route as gone fails "off this
+    /// network".
     #[test]
     fn a_no_route_dial_is_judged_by_its_address_on_the_network_this_mac_is_on() {
         use std::net::IpAddr;
         let ip = |a, b, c, d| IpAddr::V4(Ipv4Addr::new(a, b, c, d));
-        let (here, neighbour, home) = (ip(172, 20, 10, 5), ip(172, 20, 10, 6), ip(192, 168, 4, 9));
+        let (here, home) = (ip(172, 20, 10, 5), ip(192, 168, 4, 9));
         let hotspot = place(
             Where::Remote(Kind::Hotspot { by_range: false }),
             Alab::Away { since_ms: Some(7) },
         );
-        assert_eq!(
-            on_link(&hotspot, [Dial::NoRoute(Some(here)), Dial::Other]),
-            OnLink {
-                privacy: 1,
-                ..OnLink::default()
-            },
-            "a member on this hotspot refused: this Mac's privacy setting"
-        );
-        let gone = on_link(
-            &hotspot,
-            [Dial::NoRoute(Some(here)), Dial::Answered(neighbour)],
-        );
+        let gone = on_link(&hotspot, [Dial::NoRoute(Some(here)), Dial::Other]);
         assert_eq!(
             gone,
             OnLink {
                 gone: 1,
                 ..OnLink::default()
             },
-            "another member here answered: its own"
+            "a member on this hotspot with no route: its own"
         );
         assert!(gone.gone_at(&hotspot, here));
-        assert_eq!(
-            on_link(
-                &hotspot,
-                [Dial::NoRoute(Some(here)), Dial::Reached(neighbour)]
-            ),
-            OnLink {
-                gone: 1,
-                ..OnLink::default()
-            },
-            "a member here refused the connect: its own"
-        );
-        assert_eq!(
-            on_link(&hotspot, [Dial::NoRoute(Some(here)), Dial::Reached(home)]).privacy,
-            1,
-            "a host off this network proves nothing of the link"
-        );
         assert!(
             !gone.gone_at(&hotspot, home),
             "off this network is not gone"
-        );
-        assert_eq!(
-            on_link(&hotspot, [Dial::NoRoute(Some(here)), Dial::Answered(home)]).privacy,
-            1,
-            "an answer off this network proves nothing of the link"
         );
         assert_eq!(
             on_link(&hotspot, [Dial::NoRoute(Some(home))]),
@@ -991,7 +929,7 @@ mod tests {
                 elsewhere: 1,
                 ..OnLink::default()
             },
-            "off this network: never privacy"
+            "off this network"
         );
         assert_eq!(
             on_link(&hotspot, [Dial::NoRoute(None)]),
@@ -1006,14 +944,9 @@ mod tests {
             ..place(Where::Remote(Kind::Lan), Alab::Away { since_ms: Some(7) })
         };
         assert_eq!(
-            on_link(&once, [Dial::NoRoute(Some(here))]).privacy,
+            on_link(&once, [Dial::NoRoute(Some(here))]).gone,
             1,
             "a network members were once on changes nothing"
-        );
-        assert_eq!(
-            on_link(&once, [Dial::NoRoute(Some(home))]).privacy,
-            0,
-            "nor does it make an address off it privacy's"
         );
         let unrouted = Place {
             route: None,

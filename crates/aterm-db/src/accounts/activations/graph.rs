@@ -36,6 +36,9 @@ impl History {
             ignored: 0,
         };
         for evidence in store.metadata_evidence(session)? {
+            if evidence.cutoff {
+                continue;
+            }
             let Some(record) = evidence.record else {
                 history.unavailable += 1;
                 continue;

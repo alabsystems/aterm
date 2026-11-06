@@ -106,7 +106,7 @@ pub fn answer(
     let moved = || Sub::Moved {
         to: header(headers, "location").unwrap_or_default().to_string(),
     };
-    let of = |kind: Kind| Error::new(kind, why.clone());
+    let of = |kind: Kind| Error::new(kind, why);
     let error = match status {
         301 => of(Kind::Conflict).with_sub(moved()),
         300..=399 => of(Kind::CouldNotRun).with_sub(Sub::Protocol),

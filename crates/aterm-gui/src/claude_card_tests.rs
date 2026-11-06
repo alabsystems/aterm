@@ -3670,6 +3670,18 @@ fn the_chips_write_no_rule_glyph() {
         line > 40,
         "CONTROL: the card's line is on the glass ({line})"
     );
+    // Under the card's palette line D's `─` run wears the arc (Claude's grey on the bare
+    // glass, which wears none), so a pass writes it with the rule.
+    let grey = bare.windows[&bare_wid].input_scratch.cells[strip_rows(&bare, bare_wid) + 22]
+        .iter()
+        .find(|c| c.ch == '\u{2500}')
+        .expect("the bare rule")
+        .fg;
+    let arc = app.windows[&wid].input_scratch.cells[strip_rows(&app, wid) + 22]
+        .iter()
+        .filter(|c| c.ch == '\u{2500}' && c.fg != grey)
+        .count();
+    assert!(arc > 80, "CONTROL: the run wears the arc ({arc})");
     for (i, key) in b"typing".iter().enumerate() {
         keystroke(&mut app, wid, session, *key);
         keystroke(&mut bare, bare_wid, bare_session, *key);
@@ -3678,10 +3690,11 @@ fn the_chips_write_no_rule_glyph() {
         let floor = crate::work_counts::take_footer_cells_written();
         let _ = pass_cost(&mut app, wid);
         let cells = crate::work_counts::take_footer_cells_written();
-        let chips = cells.checked_sub(floor + line);
+        let chips = cells.checked_sub(floor + line + arc);
         assert!(
             chips.is_some_and(|c| (1..=8).contains(&c)),
-            "pass {i}: {cells} cells written, the bare footer's {floor} and the line's {line}"
+            "pass {i}: {cells} cells written, the bare footer's {floor}, the line's {line} and \
+             the arc's {arc}"
         );
         assert_eq!(
             app.windows[&wid]
@@ -3697,6 +3710,32 @@ fn the_chips_write_no_rule_glyph() {
         .filter(|c| *c == '\u{2500}')
         .count();
     assert!(glyphs > 80, "CONTROL: the rule between them: {glyphs}");
+    // The supervised pane's glass wears Cruise, so its `∞` (after the rule's lead and a blank)
+    // is Cruise's letter at its own column.
+    let scratch = &app.windows[&wid].input_scratch;
+    let (row, col) = (0..scratch.cells.len())
+        .find_map(|r| {
+            let cells = &scratch.cells[r];
+            (2..cells.len())
+                .find(|&c| {
+                    cells[c].ch == '\u{221e}'
+                        && cells[c - 1].ch == ' '
+                        && cells[c - 2].ch == '\u{2500}'
+                })
+                .map(|c| (r, c))
+        })
+        .expect("the Autopilot chip on line D");
+    let at = |palette| crate::claude_lights::ChipAt {
+        col,
+        cols: scratch.cols,
+        ..crate::claude_lights::ChipAt::test(palette, scratch.implicit_blank)
+    };
+    let cruise = at(Some(aterm_effects::harness_card::CardPalette::Cruise)).letter_at(0);
+    assert_eq!(
+        scratch.cells[row][col].fg, cruise,
+        "Cruise's letter at its column"
+    );
+    assert_ne!(cruise, at(None).letter_at(0), "CONTROL: not the lit ink");
     set_now(None);
     host.shutdown_and_join();
 }

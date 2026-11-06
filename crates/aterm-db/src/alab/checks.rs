@@ -78,7 +78,7 @@ pub fn facts(read: &OwnedRead, live: &BTreeSet<String>, machines: &Projection) -
     };
     shared("facts-bind-one-machine", by_machine, &mut found);
     shared("hw-hint-clone", by_hint, &mut found);
-    found.sort();
+    found.sort_unstable();
     found
 }
 
@@ -119,6 +119,7 @@ pub fn mailbox_obs(
         }
     }
     let seen = super::mail::observed(read.rows.iter().map(|(k, r)| (k.as_str(), &r.value)));
+    let index = super::registry::AddressIndex::of(addresses);
     for (pk, mbs) in &seen {
         if mbs.len() > 1 && addresses.rows.get(pk).is_some_and(cell::Row::live) {
             let mut pks = Vec::with_capacity(1 + mbs.len());
@@ -140,7 +141,7 @@ pub fn mailbox_obs(
                     .cloned()
                     .collect(),
                 None if row.get("alias_of").is_none() => {
-                    super::mail::listed_base(addresses, &seen, pk)
+                    super::mail::listed_base(addresses, &index, &seen, pk)
                         .into_iter()
                         .map(|(_, mb)| mb)
                         .filter(|mb| mb != owner_mb)
@@ -148,7 +149,7 @@ pub fn mailbox_obs(
                 }
                 None => Vec::new(),
             };
-            differs.sort();
+            differs.sort_unstable();
             differs.dedup();
             if !differs.is_empty() {
                 let mut pks = Vec::with_capacity(2 + differs.len());
@@ -163,7 +164,7 @@ pub fn mailbox_obs(
             }
         }
     }
-    found.sort();
+    found.sort_unstable();
     found.dedup();
     found
 }
@@ -279,8 +280,27 @@ pub fn lab(cells: &Cells) -> (Vec<Finding>, Vec<check::Finding>) {
         }
     }
     // Addresses: the owner's mailbox and the lead's guess disagree; an alias link leads nowhere
-    // live, or back to itself.
+    // live, or back to itself; a row says an address whose birth key another row holds, so the
+    // importer, which matches by key, and every lookup, which goes by the address a row says
+    // now, would name two rows (a rename refuses it, but two Macs' concurrent edits can make it).
     for (pk, row) in addresses.rows.iter().filter(|(_, r)| r.live()) {
+        let elsewhere: BTreeSet<String> = row
+            .fields
+            .get("addr")
+            .map(cell::Field::candidates_x)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(Value::as_str)
+            .filter_map(|text| keys::address_pk(text).ok())
+            .filter(|derived| derived != pk && addresses.rows.contains_key(derived))
+            .collect();
+        for derived in elsewhere {
+            found.push(Finding {
+                kind: "address-key-elsewhere",
+                collection: ADDRESS.name,
+                pks: vec![pk.clone(), derived],
+            });
+        }
         if let Some(target) = text(row, "alias_of")
             && retired(addresses, target)
         {
@@ -335,7 +355,7 @@ pub fn lab(cells: &Cells) -> (Vec<Finding>, Vec<check::Finding>) {
             });
         }
     }
-    found.sort();
+    found.sort_unstable();
     found.dedup();
     (found, generic)
 }

@@ -228,11 +228,8 @@ pub fn helper_sha256(exe: &Path) -> Result<String, String> {
     if let Some((_, sha)) = content_dir(exe) {
         return Ok(sha.to_string());
     }
-    let bytes = crate::read_regular_bounded(exe, MAX_HELPER_BYTES)
-        .map_err(|e| format!("could not read {} ({e})", exe.display()))?;
-    let mut h = aterm_digest::Sha256::new();
-    h.update(&bytes);
-    Ok(crate::hex(&h.finalize()))
+    crate::sha256_regular_bounded(exe, MAX_HELPER_BYTES)
+        .map_err(|e| format!("could not read {} ({e})", exe.display()))
 }
 
 /// The lab is about to start a helper from `exe`: its copy must now prove it ran before it
@@ -374,7 +371,7 @@ pub fn reclaim(host: &Path, keep: &str, record: Option<&Record>) -> Vec<PathBuf>
         }
         drop(held);
     }
-    removed.sort();
+    removed.sort_unstable();
     removed
 }
 

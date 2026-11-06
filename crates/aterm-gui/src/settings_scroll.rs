@@ -2761,9 +2761,8 @@ impl ScrollPlan {
     /// seat (`None`); before it, for a stop that starts its run bare (whole only with its
     /// run's caption scrolled off, [`Self::starts_bare`]), the seat that draws the caption over
     /// it, the stop cut under it, so every heading is read whole on a screen the wheel and the
-    /// page keys reach (Window & Tabs' Presence rim at 1x in 178x152, which Page Down skipped);
-    /// after it, for a stop taller than the room, a seat each room further into it until its
-    /// end shows ([`Self::tall_steps`]).
+    /// page keys reach; after it, for a stop taller than the room, a seat each room further into
+    /// it until its end shows ([`Self::tall_steps`]).
     pub(super) fn landings(&self, top: usize) -> Vec<Option<Seat>> {
         if self.len() == 0 {
             return vec![None];

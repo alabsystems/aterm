@@ -5,6 +5,8 @@
 //! Export file [`Selection`] and text [`rewrite`] transforms for publication content guards,
 //! and the [`plaintext`] the engine reads of a compressed or BOM'd file.
 
+use std::borrow::Cow;
+
 use aterm_regex::Regex;
 
 pub mod plaintext;
@@ -183,52 +185,97 @@ pub fn astream_carries(path: &str) -> bool {
 }
 
 /// The developer account the export renames.
+#[cfg(test)]
 const ACCOUNT: &str = concat!("aya", "tes");
+const HOME: &[u8] = concat!("/Users/", "aya", "tes").as_bytes();
+const AT: &[u8] = concat!("aya", "tes", "@").as_bytes();
 
 /// The private org, which becomes the public one.
-const PRIVATE_ORG: &str = concat!("andrew", "yatesai");
+pub(crate) const PRIVATE_ORG: &str = concat!("andrew", "yatesai");
 
 /// The toolchain checkouts a home path names.
 const TILDE_TRUST: &str = concat!("~", "/trust");
 const TILDE_CLEAN: &str = concat!("~", "/clean");
 
-/// Replace every `from` in `text` with `to`.
-fn replace_all(text: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(text.len());
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    let first = *needle.first()?;
     let mut i = 0;
-    while i < text.len() {
-        if text[i..].starts_with(from) {
-            out.extend_from_slice(to);
-            i += from.len();
+    while let Some(rel) = haystack.get(i..)?.iter().position(|&b| b == first) {
+        let pos = i + rel;
+        if haystack[pos..].starts_with(needle) {
+            return Some(pos);
+        }
+        i = pos + 1;
+    }
+    None
+}
+
+/// Replace every `from` in `text` with `to`, borrowing `text` when `from` is absent.
+fn replace_all<'a>(text: Cow<'a, [u8]>, from: &[u8], to: &[u8]) -> Cow<'a, [u8]> {
+    let Some(first) = find_subslice(&text, from) else {
+        return text;
+    };
+    let mut out = Vec::with_capacity(text.len());
+    out.extend_from_slice(&text[..first]);
+    out.extend_from_slice(to);
+    let mut i = first + from.len();
+    while let Some(rel) = find_subslice(&text[i..], from) {
+        let pos = i + rel;
+        out.extend_from_slice(&text[i..pos]);
+        out.extend_from_slice(to);
+        i = pos + from.len();
+    }
+    out.extend_from_slice(&text[i..]);
+    Cow::Owned(out)
+}
+
+fn double_users_slash(text: Cow<'_, [u8]>) -> Cow<'_, [u8]> {
+    let mut search = 0;
+    let first = loop {
+        let Some(rel) = find_subslice(&text[search..], b"/Users/") else {
+            return text;
+        };
+        let pos = search + rel;
+        if text.get(pos + 7).is_some_and(u8::is_ascii_alphabetic) {
+            break pos;
+        }
+        search = pos + 1;
+    };
+    let mut doubled = Vec::with_capacity(text.len() + 8);
+    doubled.extend_from_slice(&text[..first]);
+    doubled.extend_from_slice(b"/Users//");
+    let mut i = first + 7;
+    let mut search = i;
+    while let Some(rel) = find_subslice(&text[search..], b"/Users/") {
+        let pos = search + rel;
+        if text.get(pos + 7).is_some_and(u8::is_ascii_alphabetic) {
+            doubled.extend_from_slice(&text[i..pos]);
+            doubled.extend_from_slice(b"/Users//");
+            i = pos + 7;
+            search = i;
         } else {
-            out.push(text[i]);
-            i += 1;
+            search = pos + 1;
         }
     }
-    out
+    doubled.extend_from_slice(&text[i..]);
+    Cow::Owned(doubled)
+}
+
+/// The export's text rewrites, borrowing `text` when nothing changes.
+#[must_use]
+pub fn rewrite_cow(text: &[u8]) -> Cow<'_, [u8]> {
+    let mut t = replace_all(Cow::Borrowed(text), PRIVATE_ORG.as_bytes(), b"alabsystems");
+    t = replace_all(t, HOME, b"/Users//example");
+    t = double_users_slash(t);
+    t = replace_all(t, TILDE_TRUST.as_bytes(), b"$HOME/trust");
+    t = replace_all(t, TILDE_CLEAN.as_bytes(), b"$HOME/clean");
+    replace_all(t, AT, b"user@")
 }
 
 /// The export's text rewrites.
 #[must_use]
 pub fn rewrite(text: &[u8]) -> Vec<u8> {
-    let home = format!("/Users/{ACCOUNT}");
-    let at = format!("{ACCOUNT}@");
-    let mut t = replace_all(text, PRIVATE_ORG.as_bytes(), b"alabsystems");
-    t = replace_all(&t, home.as_bytes(), b"/Users//example");
-    let mut doubled = Vec::with_capacity(t.len());
-    let mut i = 0;
-    while i < t.len() {
-        if t[i..].starts_with(b"/Users/") && t.get(i + 7).is_some_and(u8::is_ascii_alphabetic) {
-            doubled.extend_from_slice(b"/Users//");
-            i += 7;
-        } else {
-            doubled.push(t[i]);
-            i += 1;
-        }
-    }
-    t = replace_all(&doubled, TILDE_TRUST.as_bytes(), b"$HOME/trust");
-    t = replace_all(&t, TILDE_CLEAN.as_bytes(), b"$HOME/clean");
-    replace_all(&t, at.as_bytes(), b"user@")
+    rewrite_cow(text).into_owned()
 }
 
 #[cfg(test)]

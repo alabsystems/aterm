@@ -187,7 +187,7 @@ pub fn held_lengths(paths: &Paths) -> Result<Vec<(Digest, bool, u64)>> {
                 names.push((table, name));
             }
         }
-        names.sort();
+        names.sort_unstable();
         for (table, name) in names {
             let Ok(claim) = private_file::read_private(&claim_dir, &name, CLAIM_LEN) else {
                 continue;

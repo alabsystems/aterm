@@ -12,6 +12,7 @@ use aterm_uds::spawnfd::{Command, Stdio, command};
 pub(crate) struct Tools {
     openssl: PathBuf,
     keys: PathBuf,
+    prerequisites: crate::managed_prerequisites::Tools,
 }
 
 impl Tools {
@@ -20,6 +21,7 @@ impl Tools {
         Self {
             openssl: "/fixture/openssl".into(),
             keys: "/fixture/keys".into(),
+            prerequisites: crate::managed_prerequisites::Tools::Simulated,
         }
     }
 
@@ -30,23 +32,21 @@ impl Tools {
         now: i64,
         prepared: Option<&Path>,
     ) -> Result<Self, String> {
-        let explicit = std::env::var_os("PUBLISH_OPENSSL");
-        let mut candidates = Vec::new();
-        if let Some(path) = aterm_uds::host::tool("openssl-signing").find() {
-            candidates.push(path);
-        }
-        if let Some(path) = aterm_uds::host::tool("openssl").find() {
-            candidates.push(path);
-        }
-        candidates.extend([
-            PathBuf::from("/opt/homebrew/bin/openssl"),
-            PathBuf::from("/usr/local/bin/openssl"),
-            PathBuf::from("/opt/homebrew/opt/openssl/bin/openssl"),
-            PathBuf::from("/opt/homebrew/opt/openssl@3/bin/openssl"),
-        ]);
-        let openssl = select_openssl(explicit.as_deref(), &candidates, |path| {
-            run(path, &[OsString::from("version")])
-        })?;
+        let prerequisites = crate::managed_prerequisites::Tools::acquire(
+            &[atpkg::prerequisite::Prerequisite::OpenSslSigning],
+            "source-attestation preflight",
+        )?;
+        Self::probe_held(repo, home, now, prepared, prerequisites)
+    }
+
+    pub(crate) fn probe_held(
+        repo: &Path,
+        home: &Path,
+        now: i64,
+        prepared: Option<&Path>,
+        prerequisites: crate::managed_prerequisites::Tools,
+    ) -> Result<Self, String> {
+        let openssl = prerequisites.openssl()?.to_path_buf();
         let keys = match std::env::var_os("ATPKG_KEYS").filter(|v| !v.is_empty()) {
             Some(path) => absolute(&path, "ATPKG_KEYS")?,
             None => prepared.map(Path::to_path_buf).or_else(|| {
@@ -58,12 +58,16 @@ impl Tools {
                 helper.is_file().then_some(helper)
             }).ok_or("source signing needs this checkout's atpkg-keys helper: run `targo --unverified ship provision --id <machine-id>`, or set ATPKG_KEYS to its absolute executable path")?,
         };
-        let tools = Self { openssl, keys };
+        let tools = Self {
+            openssl,
+            keys,
+            prerequisites,
+        };
         tools.check_ring(
             home,
             now,
             aterm_update_core::pins::PAPER_MASTER_PUBKEYS,
-            run,
+            |program, args| tools.run(program, args),
         )?;
         Ok(tools)
     }
@@ -71,6 +75,12 @@ impl Tools {
     pub(crate) fn apply(&self, cmd: &mut Command) {
         cmd.env("PUBLISH_OPENSSL", &self.openssl)
             .env("ATPKG_KEYS", &self.keys);
+    }
+
+    fn run(&self, program: &Path, args: &[OsString]) -> Result<Vec<u8>, String> {
+        let mut cmd = command(program);
+        self.prerequisites.apply(&mut cmd)?;
+        run(cmd, program, args)
     }
 
     /// Inspect the canonical ring without building helpers, signing, or writing files.
@@ -341,36 +351,7 @@ fn absolute(value: &OsStr, name: &str) -> Result<PathBuf, String> {
     }
 }
 
-fn select_openssl(
-    explicit: Option<&OsStr>,
-    candidates: &[PathBuf],
-    version: impl Fn(&Path) -> Result<Vec<u8>, String>,
-) -> Result<PathBuf, String> {
-    let paths = match explicit.filter(|v| !v.is_empty()) {
-        Some(path) => vec![absolute(path, "PUBLISH_OPENSSL")?],
-        None => candidates.to_vec(),
-    };
-    for path in paths {
-        if let Ok(bytes) = version(&path) {
-            let line = String::from_utf8_lossy(&bytes);
-            if line
-                .strip_prefix("OpenSSL ")
-                .and_then(|s| s.split('.').next())
-                .filter(|s| {
-                    !s.is_empty() && !s.starts_with('0') && s.bytes().all(|b| b.is_ascii_digit())
-                })
-                .and_then(|s| s.parse::<u32>().ok())
-                .is_some_and(|major| major >= 3)
-            {
-                return Ok(path);
-            }
-        }
-    }
-    Err("source signing needs OpenSSL 3 or newer; run `targo --unverified verify provision --release`, or set PUBLISH_OPENSSL to its absolute executable path (Apple's LibreSSL serves a different signing purpose)".into())
-}
-
-fn run(program: &Path, args: &[OsString]) -> Result<Vec<u8>, String> {
-    let mut cmd = command(program);
+fn run(mut cmd: Command, program: &Path, args: &[OsString]) -> Result<Vec<u8>, String> {
     cmd.args(args).stdin(Stdio::null());
     let out = aterm_uds::deadline::output_within(&mut cmd, std::time::Duration::from_secs(60))
         .map_err(|e| {
@@ -459,36 +440,12 @@ mod tests {
     }
 
     #[test]
-    fn openssl_selection_rejects_libressl_and_respects_explicit_choice() {
-        let old = PathBuf::from("/system/openssl");
-        let new = PathBuf::from("/tools/openssl");
-        let candidates = [old.clone(), new.clone()];
-        let version = |p: &Path| {
-            Ok(if p == old {
-                b"LibreSSL 3.3.6".to_vec()
-            } else {
-                b"OpenSSL 4.0.0".to_vec()
-            })
-        };
-        assert_eq!(select_openssl(None, &candidates, version).unwrap(), new);
-        assert!(select_openssl(Some(old.as_os_str()), &candidates, version).is_err());
-        assert!(select_openssl(Some(OsStr::new("relative")), &candidates, version).is_err());
-        for non_canonical in [&b"OpenSSL +3.0.0"[..], &b"OpenSSL 03.0.0"[..]] {
-            assert!(
-                select_openssl(None, std::slice::from_ref(&new), |_| Ok(
-                    non_canonical.to_vec()
-                ))
-                .is_err()
-            );
-        }
-    }
-
-    #[test]
     fn missing_ring_refuses_before_running_a_signer() {
         let home = aterm_tempfile::tempdir().unwrap();
         let tools = Tools {
             openssl: "/openssl".into(),
             keys: "/keys".into(),
+            prerequisites: crate::managed_prerequisites::Tools::Simulated,
         };
         assert!(
             tools
@@ -560,6 +517,7 @@ mod tests {
             Tools {
                 openssl: "/fixture/openssl".into(),
                 keys: "/fixture/keys".into(),
+                prerequisites: crate::managed_prerequisites::Tools::Simulated,
             }
         }
 

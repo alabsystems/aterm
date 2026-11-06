@@ -7,7 +7,7 @@
 use super::*;
 
 /// `chrome` as a headless instance printed it with one supervised tab
-/// needing its person: the strip, the chip, the menu, the presence line.
+/// needing its person: the strip, the chip, the menu.
 const CHROME: &str = r#"toolbar (none)
 toolbar-tabs count=2 selected=1 labels=["aterm", "land-a"] icons=[None, None] states=[[], ["selected", "busy", "attention"]] tooltips=[None, Some("land-a\nactivity: idle\nNeeds you: rotate the deploy key\ndriven by aterm (land)")]
 menu (none)
@@ -24,8 +24,7 @@ statusmenu "✓ land-ab — landed 2m" enabled=yes checked=no at=6
 statusmenu --- at=7
 statusmenu "To look at (1)" enabled=no at=8
 statusmenu "Claude Code is not installed" enabled=yes checked=no at=9
-statusmenu "Notify Me When I’m Needed" enabled=yes checked=no tip="One notice when something needs you, never for a wait." at=10
-presence rim=decide pressing=@s-aa pill="""#;
+statusmenu "Notify Me When I’m Needed" enabled=yes checked=no tip="One notice when something needs you, never for a wait." at=10"#;
 
 /// `inspect app/v1 view <id> text` of Settings ▸ Harness, two sessions.
 const PAGE: &str = r#"text key="harness/status/row/sessions" role=Group label="Sessions: 2 of 2 supervised · 1 need you"
@@ -347,7 +346,7 @@ fn a_chip_line_is_read_and_its_cells_held_to_its_face() {
 #[test]
 fn quoted_values_read_their_escapes_back() {
     assert_eq!(
-        quoted(r#"a pill="x \"y\" \\ z" b=1"#, "pill").as_deref(),
+        quoted(r#"a title="x \"y\" \\ z" b=1"#, "title").as_deref(),
         Some(r#"x "y" \ z"#)
     );
     assert_eq!(

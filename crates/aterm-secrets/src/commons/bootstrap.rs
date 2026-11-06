@@ -36,24 +36,25 @@ fn custody_digest(path: &Path) -> Result<[u8; 32]> {
 }
 
 fn established_files(paths: &Paths) -> Result<()> {
+    use aterm_uds::private_file::JudgedDir;
     let commons = paths.dir.join("commons");
     let control = commons.join("control");
-    for dir in [&paths.dir, &commons, &control] {
-        aterm_uds::private_file::check_private_dir(dir)?;
-    }
-    for path in [
-        paths.dir.join("identity"),
-        paths.dir.join("commons.claim"),
-        paths.dir.join("commons.lock"),
-        paths.dir.join("commons-device.lock"),
-        commons.join("device.age"),
-        commons.join("device.claim"),
-        commons.join("default.pin"),
-        control.join("control.anchor"),
+    // One verdict for each directory, every file in it still opened and judged on its descriptor.
+    let state = JudgedDir::private(&paths.dir)?;
+    let device = JudgedDir::private(&commons)?;
+    let journal = JudgedDir::private(&control)?;
+    for (dir, name) in [
+        (&state, "identity"),
+        (&state, "commons.claim"),
+        (&state, "commons.lock"),
+        (&state, "commons-device.lock"),
+        (&device, "device.age"),
+        (&device, "device.claim"),
+        (&device, "default.pin"),
+        (&journal, "control.anchor"),
     ] {
-        let parent = path.parent().unwrap();
-        let name = path.file_name().and_then(|name| name.to_str()).unwrap();
-        let (_, metadata) = aterm_uds::private_file::open_private(parent, name)
+        let (_, metadata) = dir
+            .open(name)
             .map_err(|_| Error::new("existing Commons custody file is unavailable"))?;
         if metadata.nlink() != 1 || metadata.len() > MAX_DEVICE as u64 {
             return Err(Error::new(

@@ -106,7 +106,7 @@ fn with_bus(state: &Path, bus: Option<BusKeeperConfig>) -> NodeServeConfig {
         prebound_listener: None,
         tick_every: Duration::from_millis(40),
         wake_timeout: Duration::from_secs(1),
-        lan_may_go: || true,
+        lan_unavailable: || None,
         stop: Arc::new(AtomicBool::new(false)),
         launcher: idle_launcher(),
         updates: None,

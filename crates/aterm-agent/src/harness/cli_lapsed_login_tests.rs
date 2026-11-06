@@ -284,3 +284,76 @@ fn a_pick_judges_a_lapsed_row_by_the_hydrated_state() {
         "NEGATIVE CONTROL"
     );
 }
+
+/// Claude Code's pool of a default row (no `dir`) whose default home `<home>/.claude` holds the
+/// lab's dead login, beside a live row with a directory of its own.
+fn default_pool() -> (Tmp, Env) {
+    let (root, env) = pool(
+        Cli::Claude,
+        &[Shape {
+            label: "live",
+            body: CLAUDE_LIVE,
+            refused: false,
+        }],
+    );
+    let home = env.home.clone().expect("a home").join(".claude");
+    std::fs::create_dir_all(&home).expect("mkdir");
+    std::fs::write(home.join(".credentials.json"), CLAUDE_DEAD).expect("write credential");
+    let roster = env.accounts_roster_for(Cli::Claude).expect("a roster path");
+    let live = root.path().join("logins").join("live");
+    let rows = [
+        accounts::Row {
+            label: "default".into(),
+            ..accounts::Row::default()
+        },
+        accounts::Row {
+            label: "live".into(),
+            dir: Some(live.to_str().expect("a UTF-8 path").to_owned()),
+            ..accounts::Row::default()
+        },
+    ];
+    std::fs::write(
+        &roster,
+        accounts::append_rows_for(Cli::Claude, "", &rows).expect("the rows"),
+    )
+    .expect("write roster");
+    (root, env)
+}
+
+/// AN EXPIRED CLAUDE CODE DEFAULT LOGIN READS SIGNED-OUT WHERE THE PLATFORM KEEPS IT IN A FILE
+/// (Linux: `<home>/.claude/.credentials.json`), in the survey and the report, and no launch takes
+/// it; WHERE IT KEEPS IT IN THE KEYCHAIN (macOS) aterm reads nothing for it and it stays
+/// `unseen`. Both platforms are picked on this thread
+/// ([`crate::ai::connector::test_on_login_platform`]), so either OS runs both arms. NEGATIVE
+/// CONTROL: on the file platform with the lapse unread
+/// ([`crate::ai::connector::test_without_lapse`]) both readers say `unseen` for it, the defect.
+#[test]
+fn an_expired_claude_default_login_reads_signed_out_where_it_is_a_file() {
+    use crate::ai::connector::{test_on_login_platform, test_without_lapse};
+    let (_root, env) = default_pool();
+
+    let ((survey, report, next), reads) = crate::harness::provider_read::captured(|| {
+        test_on_login_platform(true, || both(Cli::Claude, &env))
+    });
+    assert_eq!(reads, [], "a local read asks no provider");
+    let want = owned(&[("default", true, "signed-out"), ("live", true, "unseen")]);
+    assert_eq!(survey, want, "the survey, file platform");
+    assert_eq!(report, want, "the report, file platform");
+    assert_eq!(next, Value::from("live"), "no launch takes a lapsed login");
+
+    let unseen = owned(&[("default", true, "unseen"), ("live", true, "unseen")]);
+    let (survey, report, _) = test_on_login_platform(false, || both(Cli::Claude, &env));
+    assert_eq!(
+        (survey, report),
+        (unseen.clone(), unseen.clone()),
+        "the keychain platform reads nothing for the default login"
+    );
+
+    let (survey, report, _) =
+        test_on_login_platform(true, || test_without_lapse(|| both(Cli::Claude, &env)));
+    assert_eq!(
+        (survey, report),
+        (unseen.clone(), unseen),
+        "NEGATIVE CONTROL"
+    );
+}

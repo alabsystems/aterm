@@ -199,9 +199,9 @@ impl Terminal {
         OutputStateRepr {
             rep: t.last_graphic_char,
             underline_color: t.current_underline_color,
-            hyperlink: t.current_hyperlink.as_deref().map(|uri| HyperlinkRepr {
-                uri: uri.to_owned(),
-                id: t.current_hyperlink_id.as_deref().map(str::to_owned),
+            hyperlink: t.current_hyperlink.as_deref().map(|link| HyperlinkRepr {
+                uri: link.url.to_string(),
+                id: link.id.as_deref().map(str::to_owned),
             }),
             vt52_address: match t.vt52_cursor_state {
                 Vt52CursorState::None => None,
@@ -265,7 +265,6 @@ impl Terminal {
             })
             .collect();
         self.transient.current_hyperlink = None;
-        self.transient.current_hyperlink_id = None;
         let known: Vec<SavedModeRepr> = {
             let (_parser, mut handler) = self.split_for_process();
             if let Some(link) = &repr.hyperlink {

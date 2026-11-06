@@ -27,6 +27,28 @@ impl Grid {
                 .is_some_and(|store| store.any_image(selected))
     }
 
+    /// Every inline-image span history holds (hot tier, staged rows, then ring), oldest row first.
+    pub fn history_images(&self) -> impl Iterator<Item = &aterm_scrollback::ImageSpan> {
+        self.storage
+            .scrollback
+            .iter()
+            .flat_map(ScrollbackStorage::images)
+            .chain(self.storage.lazy_buffer.images())
+            .chain(self.storage.ring_extras.images())
+    }
+
+    /// Rows [`Self::history_images`] walks, whether or not they hold a span (and
+    /// [`Self::retain_history_images`] walks again): its work besides the spans it yields.
+    #[must_use]
+    pub fn history_image_rows(&self) -> usize {
+        self.storage
+            .scrollback
+            .as_ref()
+            .map_or(0, ScrollbackStorage::image_lines)
+            .saturating_add(self.storage.lazy_buffer.len())
+            .saturating_add(self.storage.ring_extras.len())
+    }
+
     /// Retains accepted image spans in ring, staged and hot history, preserving text and row order.
     /// Returns whether any image span was removed and invalidates history render caches on change.
     pub fn retain_history_images(

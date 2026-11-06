@@ -169,7 +169,14 @@ fn the_survey_answers_a_header_and_a_row_per_session() {
     let row = facts.lines().nth(3).expect("the claude row");
     assert_eq!(fields(row)["doing"], "Bash");
     for key in [
-        "title=", "cwd=", "branch=", "prompt=", "said=", "cmd=", "rows=",
+        "title=",
+        "cwd=",
+        "branch=",
+        "prompt=",
+        "said=",
+        "cmd=",
+        "rows=",
+        "need_ids=",
     ] {
         assert!(!row.contains(&format!(" {key}")), "{key} at facts: {row}");
     }
@@ -798,6 +805,7 @@ fn each_level_emits_exactly_its_fields() {
         "said",
         "cmd",
         "rows",
+        "need_ids",
     ];
     let keys = |row: &str| -> Vec<String> {
         row.split(' ')
@@ -1001,6 +1009,54 @@ fn a_harness_report_says_needs_by_harness_and_a_direct_ask_does_not() {
         ("ask".to_string(), "-".to_string()),
         "CONTROL: a direct ask"
     );
+}
+
+/// A CONTENT ROW NAMES ITS ASK'S NEEDS AS THE HERALD READS THEM (§14.18, `need_ids=`): a
+/// harness ask's row carries `status_item::need_ids_row` of its published need, so a fleet peer's
+/// herald tells each need once; CONTROL: a row with no ask says `need_ids=-`.
+#[test]
+fn a_content_row_names_its_asks_need_ids() {
+    use aterm_types::needs::AttentionKind;
+    let row_of = |text: Option<&str>| {
+        let store = crate::session_store::new_store();
+        let h = crate::session_store::test_handle(5);
+        claude_session(&h);
+        h.ctx
+            .meta
+            .lock()
+            .unwrap()
+            .set_attention_kind(
+                crate::harness_host::NEEDS_ATTENTION_OWNER,
+                text.map(str::to_string),
+                text.map(|_| AttentionKind::Ask),
+            )
+            .expect("a slot");
+        let attention = h.ctx.meta.lock().unwrap().attention_owners.kinded();
+        let verdict = crate::needs::of(&crate::needs::NeedFacts {
+            attention,
+            ..Default::default()
+        });
+        let want = verdict
+            .need
+            .as_ref()
+            .and_then(crate::status_item::need_ids_row);
+        h.ctx.timeline.lock().unwrap().set_need(verdict);
+        store.write().unwrap().register(h);
+        let reply = survey_rows(&store, SurveyLevel::Content, usize::MAX, &here());
+        (
+            fields(reply.lines().nth(2).unwrap())["need_ids"].clone(),
+            want,
+        )
+    };
+    let (said, want) = row_of(Some(
+        "claude needs you: the release credential (+1 more) \u{2014} carrying on",
+    ));
+    assert_eq!(Some(said), want, "the row names what the herald reads");
+    assert!(
+        want.is_some_and(|ids| ids.contains(',')),
+        "the need and the count's key"
+    );
+    assert_eq!(row_of(None).0, "-", "CONTROL: no ask");
 }
 
 #[test]

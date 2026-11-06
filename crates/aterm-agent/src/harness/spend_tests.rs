@@ -1766,3 +1766,208 @@ fn two_threads_served_the_same_counts_each_count() {
     };
     assert_eq!(key(&one), key(&two), "one fingerprint");
 }
+
+/// One [`Served`] as a test keeps it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Sample {
+    key: Option<u64>,
+    at: i64,
+    model: String,
+    tokens: TokenUsage,
+}
+
+fn sample(id: &str, at: i64, model: &str, tokens: TokenUsage) -> Sample {
+    Sample {
+        key: Some(aterm_hash::fnv1a_64(id.as_bytes())),
+        at,
+        model: model.to_owned(),
+        tokens,
+    }
+}
+
+fn fold_each(spend: &mut Spend, now: i64) -> (FoldReport, Vec<Sample>) {
+    let mut got = Vec::new();
+    let report = spend.fold_claude_home_each(&table(), now, Limits::none(), &mut |s| {
+        got.push(Sample {
+            key: s.key,
+            at: s.at,
+            model: s.model.to_owned(),
+            tokens: s.tokens,
+        });
+    });
+    (report, got)
+}
+
+#[test]
+fn two_messages_appended_to_a_transcript_yield_exactly_two_samples_and_a_third_fold_none() {
+    let home = Home::new("served-two");
+    let now = now();
+    let opus = "claude-opus-5-5";
+    let path = home.transcript("-p/s.jsonl");
+    let mut spend = spend_of(&home);
+    append(&path, &row("msg_a", opus, now - 90, mtok_in(), ""));
+    let (first, a) = fold_each(&mut spend, now);
+    append(&path, &row("msg_b", opus, now - 60, out(500), ""));
+    let (second, b) = fold_each(&mut spend, now);
+    assert_eq!((first.messages, second.messages), (1, 1));
+    assert_eq!(a, [sample("msg_a", now - 90, opus, mtok_in())]);
+    assert_eq!(b, [sample("msg_b", now - 60, opus, out(500))]);
+    let (third, none) = fold_each(&mut spend, now);
+    assert!(none.is_empty(), "{none:?}");
+    assert_eq!(
+        (third.read, third.messages),
+        (0, 0),
+        "unchanged: not opened"
+    );
+    written_at(&path, now - 5);
+    let (touched, none) = fold_each(&mut spend, now);
+    assert_eq!(
+        touched.read, 1,
+        "opened: the byte before its cursor checked"
+    );
+    assert!(none.is_empty(), "{none:?}");
+    append(&path, &row("msg_c", opus, now - 30, out(7), ""));
+    let (_, c) = fold_each(&mut spend, now);
+    assert_eq!(
+        c,
+        [sample("msg_c", now - 30, opus, out(7))],
+        "NEGATIVE CONTROL: the sink still hands what is appended"
+    );
+}
+
+#[test]
+fn a_streamed_message_hands_its_growth_under_one_key() {
+    let home = Home::new("served-raise");
+    let now = now();
+    let (opus, fable) = ("claude-opus-5-5", "claude-fable-5-1");
+    let path = home.transcript("-p/s.jsonl");
+    let mut spend = spend_of(&home);
+    append(&path, &row("msg_s", opus, now - 60, out(10), ""));
+    let (_, first) = fold_each(&mut spend, now);
+    assert_eq!(first, [sample("msg_s", now - 60, opus, out(10))]);
+    append(&path, &row("msg_s", opus, now - 59, out(50), ""));
+    let (raised, grown) = fold_each(&mut spend, now);
+    assert_eq!((raised.messages, raised.duplicates), (0, 1));
+    assert_eq!(grown, [sample("msg_s", now - 59, opus, out(50))]);
+    append(&path, &row("msg_s", opus, now - 58, out(40), ""));
+    let (flat, none) = fold_each(&mut spend, now);
+    assert_eq!(flat.duplicates, 1, "NEGATIVE CONTROL: the row was folded");
+    assert!(none.is_empty(), "a row that grows nothing: {none:?}");
+    append(&path, &row("msg_s", fable, now - 57, mtok_in(), ""));
+    let (_, moved) = fold_each(&mut spend, now);
+    let largest = mtok_in().plus(&out(50));
+    assert_eq!(
+        moved,
+        [sample("msg_s", now - 57, fable, largest)],
+        "the row's model, each class at its largest"
+    );
+    assert_eq!(
+        everything(&spend, now).tokens,
+        largest,
+        "the last sample of the key is what the buckets hold"
+    );
+}
+
+#[test]
+fn a_copy_in_a_second_transcript_hands_nothing() {
+    let home = Home::new("served-copy");
+    let now = now();
+    let opus = "claude-opus-5-5";
+    let a = row("msg_a", opus, now - 300, mtok_in(), "");
+    let b = row("msg_b", opus, now - 200, mtok_in(), "");
+    append(&home.transcript("-p/s1.jsonl"), &format!("{a}{b}"));
+    let mut spend = spend_of(&home);
+    let (_, first) = fold_each(&mut spend, now);
+    assert_eq!(first.len(), 2, "{first:?}");
+    let c = row("msg_c", opus, now - 100, mtok_in(), "");
+    append(&home.transcript("-p/s2.jsonl"), &format!("{a}{b}{c}"));
+    let mut forgot = spend.clone();
+    forgot.seen.clear();
+    let (copies, got) = fold_each(&mut spend, now);
+    assert_eq!(copies.duplicates, 2, "both copies were read");
+    assert_eq!(got, [sample("msg_c", now - 100, opus, mtok_in())]);
+    let (_, again) = fold_each(&mut forgot, now);
+    assert_eq!(
+        again.len(),
+        3,
+        "NEGATIVE CONTROL: a home that forgot what it counted hands the copies: {again:?}"
+    );
+}
+
+#[test]
+fn an_id_less_row_hands_one_sample_with_no_key() {
+    let home = Home::new("served-bare");
+    let now = now();
+    let opus = "claude-opus-5-5";
+    let path = home.transcript("-p/s.jsonl");
+    let mut spend = spend_of(&home);
+    append(&path, &row("", opus, now - 60, out(30), ""));
+    let (report, got) = fold_each(&mut spend, now);
+    assert_eq!(report.messages, 1);
+    let bare = Sample {
+        key: None,
+        ..sample("", now - 60, opus, out(30))
+    };
+    assert_eq!(got, [bare]);
+    let long = "m".repeat(MAX_ID_BYTES + 1);
+    let edge = "m".repeat(MAX_ID_BYTES);
+    append(&path, &row(&long, opus, now - 50, out(30), ""));
+    append(&path, &row(&edge, opus, now - 40, out(30), ""));
+    let (_, got) = fold_each(&mut spend, now);
+    let keys: Vec<Option<u64>> = got.iter().map(|s| s.key).collect();
+    assert_eq!(
+        keys,
+        [None, Some(aterm_hash::fnv1a_64(edge.as_bytes()))],
+        "an id past the limit reads as none; NEGATIVE CONTROL: one at it is kept"
+    );
+}
+
+#[test]
+fn the_fold_with_a_sink_leaves_what_the_plain_fold_leaves() {
+    let home = Home::new("served-same");
+    let now = now();
+    let (opus, fable) = ("claude-opus-5-5", "claude-fable-5-1");
+    let main = home.transcript("-p/s.jsonl");
+    let sub = home.transcript("-p/s/subagents/agent-a.jsonl");
+    let untimed =
+        row("msg_u", opus, now - 40, out(9), "").replacen("\"timestamp\":", "\"stamp\":", 1);
+    let past = row("msg_old", opus, now - HORIZON_S - HOUR, out(5), "");
+    let copy = row("msg_b", fable, now - 70, out(3), "");
+    let rounds = [
+        [
+            row("msg_a", opus, now - 90, out(10), ""),
+            row("", fable, now - 80, mtok_in(), ""),
+            untimed,
+            past,
+        ]
+        .concat(),
+        [row("msg_a", opus, now - 89, out(70), ""), copy.clone()].concat(),
+    ];
+    let mut plain = spend_of(&home);
+    let mut each = spend_of(&home);
+    let mut samples = Vec::new();
+    for (round, text) in rounds.iter().enumerate() {
+        append(&main, text);
+        if round == 1 {
+            append(&sub, &copy);
+        }
+        let a = plain.fold_claude_home(&table(), now, Limits::none());
+        let (b, got) = fold_each(&mut each, now);
+        assert_eq!(a, b, "round {round}");
+        assert_eq!(plain, each, "round {round}");
+        samples.extend(got);
+    }
+    let keys: BTreeSet<Option<u64>> = samples.iter().map(|s| s.key).collect();
+    assert_eq!(
+        (samples.len(), keys.len()),
+        (4, 3),
+        "NEGATIVE CONTROL: msg_a, the id-less row, msg_a's raise and msg_b were handed: {samples:?}"
+    );
+    assert!(
+        samples
+            .iter()
+            .all(|s| s.key != Some(aterm_hash::fnv1a_64(b"msg_u"))
+                && s.key != Some(aterm_hash::fnv1a_64(b"msg_old"))),
+        "an untimed row and one past the horizon hand nothing"
+    );
+}

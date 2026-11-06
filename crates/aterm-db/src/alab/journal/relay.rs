@@ -200,7 +200,7 @@ impl Heard {
         if entries.is_empty() {
             return Ok(None);
         }
-        entries.sort();
+        entries.sort_unstable();
         let values: Vec<Value> = entries
             .iter()
             .map(|(kind, _, account, e)| {

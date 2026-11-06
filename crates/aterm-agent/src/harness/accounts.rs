@@ -17,6 +17,13 @@ use crate::ai::connector::{Flow, Region, RowKeys, Seam};
 
 use super::one_line;
 
+#[path = "accounts_signin_queue.rs"]
+mod signin_queue;
+pub use signin_queue::{
+    ManualSigninCapability, SigninAttempt, SigninBlocker, SigninPosition, SigninTicket, SigninTurn,
+    manual_signin_capability,
+};
+
 #[path = "accounts_auth_scope.rs"]
 mod auth_scope;
 pub(super) use auth_scope::note_auth_for_observed_row;
@@ -1184,6 +1191,44 @@ pub fn row_text(row: &Row) -> Option<String> {
     Some(out)
 }
 
+/// Stable metadata witness for a pool view and later native admission. This is
+/// not an account identity or a credential capability: the writer must recheck
+/// its source, current policy and the selected row's provider identity.
+/// # Errors
+/// A raw roster row cannot be represented canonically.
+pub fn pool_authority_revision(raw: &Roster, logins: &Logins) -> Result<String, String> {
+    let rows = raw
+        .rows
+        .iter()
+        .map(|row| {
+            row_text(row)
+                .map(|text| aterm_json::json!({"row": text, "was": row.was}))
+                .ok_or_else(|| "pool authority row cannot be represented".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let bindings = logins
+        .labels
+        .iter()
+        .map(|(label, binding)| {
+            aterm_json::json!({"label": label, "dir": binding.dir,
+            "renewal_generation": binding.renewal_generation,
+            "last_success_generation": binding.last_success_generation,
+            "proved_email": binding.proved_email, "proved_dir": binding.proved_dir,
+            "proved_by": binding.proved_by.map(Proof::as_str),
+            "ended_at": binding.ended_at, "wrong_at": binding.wrong_at,
+            "was": binding.was})
+        })
+        .collect::<Vec<_>>();
+    let bytes = aterm_json::to_vec(
+        &aterm_json::json!({"domain": "aterm-codex-pool-authority-v1",
+        "rows": rows, "generation_clock": logins.generation_clock, "bindings": bindings}),
+    )
+    .map_err(|_| "pool authority metadata cannot be encoded".to_string())?;
+    Ok(aterm_codec::hex::encode_lower(
+        &aterm_digest::Sha256::digest(bytes),
+    ))
+}
+
 /// Formats a single account row as an inline TOML table.
 #[must_use]
 pub fn row_inline(label: &str, class: Class, dir: Option<&str>) -> Option<String> {
@@ -2071,6 +2116,7 @@ impl RenewalParent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RenewalCheckpoint {
+    pub enrollment: Option<super::codex_enrollment::Request>,
     pub region: Option<Region>,
     pub label: String,
     pub email: String,
@@ -2161,6 +2207,37 @@ pub(super) fn write_renewal_checkpoint_for(
         None,
         checked_at,
         logins,
+        None,
+    )
+}
+
+/// Codex enrollment completion remains bound to its durable operation during recovery.
+pub(super) fn write_enrollment_checkpoint(
+    request: &super::codex_enrollment::Request,
+    email: &str,
+    staging: &str,
+    proof: Proof,
+    now: i64,
+    logins: &Logins,
+) -> io::Result<()> {
+    logins
+        .enrollment
+        .require_running(request)
+        .map_err(io::Error::other)?;
+    write_checkpoint(
+        Cli::Codex,
+        None,
+        &request.label,
+        email,
+        staging,
+        None,
+        Some(proof),
+        None,
+        None,
+        None,
+        now,
+        logins,
+        Some(request),
     )
 }
 
@@ -2199,6 +2276,7 @@ pub(super) fn write_google_renewal_checkpoint(
         Some(grant.checkpoint_scope().map_err(io::Error::other)?),
         checked_at,
         logins,
+        None,
     )
 }
 
@@ -2219,10 +2297,12 @@ fn write_checkpoint(
     google_binding_scope: Option<[u8; 32]>,
     checked_at: i64,
     logins: &Logins,
+    enrollment: Option<&super::codex_enrollment::Request>,
 ) -> io::Result<()> {
     let staging = Path::new(staging_text);
     std::fs::canonicalize(staging)?;
     let checkpoint = RenewalCheckpoint {
+        enrollment: enrollment.cloned(),
         region,
         label: label.to_owned(),
         email: email.to_owned(),
@@ -2250,7 +2330,9 @@ fn write_checkpoint(
     let mut doc = Map::new();
     doc.insert(
         "schema".into(),
-        Value::from(if google_principal.is_some() {
+        Value::from(if enrollment.is_some() {
+            6
+        } else if google_principal.is_some() {
             5
         } else if region.is_some() {
             3
@@ -2258,6 +2340,12 @@ fn write_checkpoint(
             2
         }),
     );
+    if let Some(request) = enrollment {
+        doc.insert(
+            "enrollment".into(),
+            aterm_json::to_value(request).map_err(io::Error::other)?,
+        );
+    }
     doc.insert("program".into(), Value::from(cli.id()));
     if let Some(region) = region {
         doc.insert("region".into(), Value::from(region.as_str()));
@@ -2423,9 +2511,23 @@ fn decode_renewal_checkpoint(cli: Cli, bytes: &[u8]) -> Option<RenewalCheckpoint
         (2, cli) if !matches!(cli, Cli::Kimi | Cli::Agy) => None,
         (3, Cli::Kimi) => Some(Region::parse(doc.get("region")?.as_str()?)?),
         (5, Cli::Agy) => None,
+        (6, Cli::Codex) => None,
         _ => return None,
     };
     let checkpoint = RenewalCheckpoint {
+        enrollment: if doc.get("schema")?.as_u64()? == 6 {
+            let request: super::codex_enrollment::Request =
+                aterm_json::from_value(doc.get("enrollment")?.clone()).ok()?;
+            if !request.valid() || request.label != doc.get("label")?.as_str()? {
+                return None;
+            }
+            Some(request)
+        } else {
+            if doc.get("enrollment").is_some() {
+                return None;
+            }
+            None
+        },
         region,
         label: doc.get("label")?.as_str()?.to_owned(),
         email: doc.get("email")?.as_str()?.to_owned(),
@@ -2479,6 +2581,10 @@ pub(super) fn checkpoint_current(
 
     let account = state.accounts.get(&row.label);
     proof.parent.matches(logins, &row.label)
+        && proof
+            .enrollment
+            .as_ref()
+            .is_none_or(|request| logins.enrollment.require_running(request).is_ok())
         && proof.google_binding_scope.is_none_or(|scope| {
             #[cfg(unix)]
             {
@@ -2866,6 +2972,8 @@ impl NativeRotationRetirement {
 /// Machine-local `logins.json` map from account label to [`Binding`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Logins {
+    /// Durable native enrollment operation custody; never an alternate credential store.
+    pub enrollment: super::codex_enrollment::Operations,
     /// Last allocated renewal generation. Retained even when labels move or disappear;
     /// only the store transaction allocates from this machine-local counter.
     pub generation_clock: u64,
@@ -2921,22 +3029,27 @@ impl Logins {
         let mut o = Map::new();
         o.insert(
             "schema".to_owned(),
-            Value::from(
-                if self
-                    .labels
-                    .values()
-                    .any(|binding| binding.google_principal.is_some())
-                {
-                    6
-                } else if !self.native_rotations.is_empty() {
-                    5
-                } else if self.shared.is_empty() {
-                    LOGINS_SCHEMA
-                } else {
-                    4
-                },
-            ),
+            Value::from(if self.enrollment.has_rejected() {
+                8
+            } else if !self.enrollment.is_empty() {
+                7
+            } else if self
+                .labels
+                .values()
+                .any(|binding| binding.google_principal.is_some())
+            {
+                6
+            } else if !self.native_rotations.is_empty() {
+                5
+            } else if self.shared.is_empty() {
+                LOGINS_SCHEMA
+            } else {
+                4
+            }),
         );
+        if !self.enrollment.is_empty() {
+            o.insert("enrollment".into(), self.enrollment.encode());
+        }
         if !self.shared.is_empty() {
             o.insert("shared".into(), self.shared.to_json());
         }
@@ -3048,18 +3161,18 @@ impl Logins {
         }
         let schema = doc.get("schema").and_then(Value::as_u64);
         let legacy = match schema {
-            Some(4..=6) => false,
+            Some(4..=8) => false,
             Some(2 | LOGINS_SCHEMA) => false,
             Some(1) => true,
             Some(other) => {
                 return Err(Unread::NotOurs(format!(
-                    "schema {other}; this build reads schemas 1, 2, {LOGINS_SCHEMA}, 4, 5 and 6"
+                    "schema {other}; this build reads schemas 1, 2, {LOGINS_SCHEMA}, 4, 5, 6, 7 and 8"
                 )));
             }
             None => return Err(Unread::NotOurs("names no schema".to_string())),
         };
         let shared = if schema == Some(4)
-            || (matches!(schema, Some(5 | 6)) && doc.get("shared").is_some())
+            || (matches!(schema, Some(5..=8)) && doc.get("shared").is_some())
         {
             shared::State::from_json(&doc["shared"]).map_err(Unread::NotOurs)?
         } else {
@@ -3071,7 +3184,9 @@ impl Logins {
             shared::State::default()
         };
         let mut native_rotations = BTreeMap::new();
-        if schema == Some(5) || (schema == Some(6) && doc.get("native_rotations").is_some()) {
+        if schema == Some(5)
+            || (matches!(schema, Some(6..=8)) && doc.get("native_rotations").is_some())
+        {
             let entries = doc
                 .get("native_rotations")
                 .and_then(Value::as_object)
@@ -3211,7 +3326,7 @@ impl Logins {
                 )));
             }
             if binding.google_principal.is_some()
-                && (schema != Some(6)
+                && (!matches!(schema, Some(6..=8))
                     || binding.proved_by != Some(Proof::Status)
                     || binding.proved_email.is_none()
                     || binding.proved_dir.is_none()
@@ -3260,8 +3375,26 @@ impl Logins {
                 sign_in_receipts.insert(label.clone(), receipt);
             }
         }
+        let enrollment = if matches!(schema, Some(7 | 8)) {
+            let book = super::codex_enrollment::Operations::decode(&doc["enrollment"])
+                .map_err(Unread::NotOurs)?;
+            if schema == Some(7) && book.has_rejected() {
+                return Err(Unread::NotOurs(
+                    "opaque rejected intent requires schema 8".into(),
+                ));
+            }
+            book
+        } else {
+            if doc.get("enrollment").is_some() {
+                return Err(Unread::NotOurs(
+                    "enrollment custody requires schema 7 or 8".into(),
+                ));
+            }
+            super::codex_enrollment::Operations::default()
+        };
         let (workflow_clock, workflows) = workflow_scope::from_json(&doc)?;
         Ok(Logins {
+            enrollment,
             labels,
             generation_clock,
             workflow_clock,
@@ -3411,6 +3544,9 @@ fn advance_renewal_generations(
         }
         clock = next;
     }
+    after
+        .enrollment
+        .commit(&before.enrollment, &renewed, &after.labels)?;
     after.generation_clock = clock;
     after.sign_in_clock = before.sign_in_clock;
     after
@@ -3520,7 +3656,10 @@ pub fn bound(roster: &Roster, logins: &Logins) -> Roster {
 /// Derived renewal state of a roster account's login on this machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoginState {
-    /// A login wall was seen on it ([`Auth::SignedOut`] on record).
+    /// It is signed out here ([`signed_out_here`]): its login's last word on record is
+    /// [`Auth::SignedOut`] (one word for a login wall, a displacement by the vendor's own sign-in
+    /// and a check that found no login), or its own credential file here shows it lapsed
+    /// ([`State::lapsed_logins`]).
     Expired,
     /// Its forecast end ([`forecast`]) is within [`DUE_S`].
     Due {
@@ -3599,9 +3738,48 @@ pub fn login_ended_at(row: &Row, logins: &Logins, state: &State) -> Option<i64> 
     auth_scope::lifetime_ended(row, logins)
 }
 
-/// Computes the [`LoginState`] of `row` at `now` from `logins` and `state`.
+/// Whether `row`'s own credential file here shows its login lapsed ([`State::lapsed_logins`],
+/// which `Store::hydrate_auth_contexts` fills from [`crate::ai::connector::stored_login_lapsed`]):
+/// read from that file alone, never from a process, the network, a browser or the keychain. A
+/// state nothing hydrated (a plain [`Store::load`]) holds no lapse, and nothing records one: it is
+/// a runtime reading, not an observation.
+#[must_use]
+pub fn lapsed_here(row: &Row, state: &State) -> bool {
+    state.lapsed_logins.contains(&row.label)
+}
+
+/// THE ONE RULE for whether `row`'s login is signed out on this machine, which [`condition`]
+/// reads as [`Condition::SignedOut`] (for a row enrolled here) and [`login_state`] as
+/// [`LoginState::Expired`]: its own credential file here shows it lapsed ([`lapsed_here`]), or
+/// its login's last word on record is [`Auth::SignedOut`] (one word for a wall a session or a
+/// read met, [`strike`] and [`note_login_end`], a displacement by the vendor's own sign-in,
+/// [`note_displaced`], and a check that found no login). A keychain-held default login is never
+/// lapsed here (its store names no file for it, [`Store::default_login_home`]), so it reads by
+/// its record alone.
+#[must_use]
+pub fn signed_out_here(row: &Row, state: &State) -> bool {
+    lapsed_here(row, state)
+        || state
+            .accounts
+            .get(&row.label)
+            .is_some_and(|account| account.current_auth(row) == Auth::SignedOut)
+}
+
+/// Computes the [`LoginState`] of `row` at `now` from `logins` and `state`: [`LoginState::Expired`]
+/// exactly where [`signed_out_here`] holds, whatever its records forecast, and otherwise what its
+/// records say (`recorded_login_state`).
 #[must_use]
 pub fn login_state(row: &Row, logins: &Logins, state: &State, now: i64) -> LoginState {
+    if signed_out_here(row, state) {
+        return LoginState::Expired;
+    }
+    recorded_login_state(row, logins, state, now)
+}
+
+/// The [`LoginState`] of `row` by its records alone, blind to a lapse its credential file shows
+/// ([`lapsed_here`]): what [`login_state`] answers of a row not signed out here, and the only
+/// reading the renewal door takes ([`renewal_reading`]).
+fn recorded_login_state(row: &Row, logins: &Logins, state: &State, now: i64) -> LoginState {
     let account = state.accounts.get(&row.label);
     let auth = account.map_or(Auth::Unseen, |account| account.current_auth(row));
     if auth == Auth::SignedOut {
@@ -3758,13 +3936,15 @@ impl OtherMacs {
 /// Whether `row`'s login is one this Mac's upkeep renews by itself: the row names an `email`, no
 /// other host holds it, it is not one of `others` (the rows with no login here whose account the
 /// source gives to other Macs alone, or whose source this Mac cannot compare, [`OtherMacs`]:
-/// §4.15 rule 3), this Mac uses it ([`used_here`]), and its login has ended or comes due
-/// ([`LoginState::Expired`], [`LoginState::Due`]). A login whose directory has gone since a
-/// session here ran on it counts: that session's run is the proof the login was made here, and
-/// the sync records a login it finds gone signed out, which is an ended one. A login no session
-/// here has run on for a week, or that another Mac holds the senior claim of, is not: it stays as
-/// it is until a person signs it in, or a session here runs on it and loses its login
-/// (`DESIGN-alab-one-mesh-2026-11-05.md` §4.15 rule 4).
+/// §4.15 rule 3), this Mac uses it ([`used_here`]), and its records say its login has ended or
+/// comes due ([`LoginState::Expired`], [`LoginState::Due`] by `recorded_login_state`). A login
+/// whose directory has gone since a session here ran on it counts: that session's run is the
+/// proof the login was made here, and the sync records a login it finds gone signed out, which is
+/// an ended one. A login no session here has run on for a week, or that another Mac holds the
+/// senior claim of, is not: it stays as it is until a person signs it in, or a session here runs
+/// on it and loses its login (`DESIGN-alab-one-mesh-2026-11-05.md` §4.15 rule 4). Nor is a login
+/// whose credential file alone shows it lapsed ([`lapsed_here`]): it reads expired
+/// ([`login_state`]) and waits for a person's sign-in or a session here that meets its wall.
 #[must_use]
 pub fn renewal_due(
     row: &Row,
@@ -3778,9 +3958,47 @@ pub fn renewal_due(
         && !others.holds(&row.label)
         && used_here(state, &row.label, now)
         && matches!(
-            login_state(row, logins, state, now),
+            renewal_reading(row, logins, state, now),
             LoginState::Expired | LoginState::Due { .. }
         )
+}
+
+/// The [`LoginState`] the renewal door ([`renewal_due`]) opens on: the records'
+/// ([`recorded_login_state`]), not [`login_state`]'s. What the store records opens it: a sign-out
+/// on record (a wall a session or a read met, a displacement by the vendor's own sign-in, or a
+/// used login's directory the sync found gone, `DESIGN-alab-one-mesh-2026-11-05.md` §4.15 rule 4)
+/// or a forecast end a renewal or a notice set. A lapse its credential file alone shows
+/// ([`lapsed_here`]) is on no record: the upkeep reads that file for every row on its timer, and
+/// the owner's rule for one-mesh AC1 is that the upkeep starts no renewal or sign-in on its own
+/// for a lapsed file login (sign-ins are local, never by a process that polls, and never raise a
+/// prompt). So a lapse adds no renewal and takes none away; the test
+/// `the_upkeep_starts_nothing_for_a_lapsed_login` (`accounts_no_sweep_tests.rs`) holds it.
+fn renewal_reading(row: &Row, logins: &Logins, state: &State, now: i64) -> LoginState {
+    #[cfg(any(test, debug_assertions))]
+    if RENEWAL_ON_LOGIN_STATE.with(std::cell::Cell::get) {
+        return login_state(row, logins, state, now);
+    }
+    recorded_login_state(row, logins, state, now)
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static RENEWAL_ON_LOGIN_STATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// NEGATIVE CONTROL seam: runs `body` with [`renewal_due`] reading [`login_state`] on this thread,
+/// as a renewal door that a credential file's lapse opens would, so a test can show its own
+/// assertion that the upkeep starts nothing for a lapsed login fails without the records' reading.
+#[cfg(any(test, debug_assertions))]
+pub fn with_renewal_on_login_state<R>(body: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            RENEWAL_ON_LOGIN_STATE.with(|on| on.set(self.0));
+        }
+    }
+    let _restore = Restore(RENEWAL_ON_LOGIN_STATE.with(|on| on.replace(true)));
+    body()
 }
 
 /// The labels of `roster`'s rows whose logins this Mac's upkeep renews by itself, in roster order
@@ -4628,7 +4846,10 @@ pub fn move_accounts(
             state
                 .pending_pin
                 .iter_mut()
-                .map(|request| &mut request.label),
+                .filter_map(|request| match request {
+                    PendingSelection::Account(request) => Some(&mut request.label),
+                    PendingSelection::Next(_) => None,
+                }),
         )
         .chain(state.probe.iter_mut().map(|claim| &mut claim.account))
         .chain(state.reset.iter_mut().map(|claim| &mut claim.account))
@@ -4657,6 +4878,7 @@ pub(super) fn label_is_retained(state: &State, logins: &Logins, label: &str) -> 
         || state
             .pending_pin
             .as_ref()
+            .and_then(PendingSelection::account)
             .is_some_and(|pin| pin.label() == label)
         || state
             .sessions
@@ -5729,10 +5951,76 @@ pub struct ResetClaim {
 }
 
 /// An explicit account selection awaiting a verified login on this machine.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PinRequest {
     label: String,
     nonce: String,
+}
+
+/// An explicit request to choose the next eligible account, identified independently of its row.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct NextRequest {
+    nonce: String,
+}
+
+/// The single pending manual selection; a newer choice replaces either kind.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PendingSelection {
+    /// A specific account selected by the person.
+    Account(PinRequest),
+    /// The next eligible account, selected after admission.
+    Next(NextRequest),
+}
+
+impl PendingSelection {
+    /// The specific-account request, if this selection names one.
+    #[must_use]
+    pub const fn account(&self) -> Option<&PinRequest> {
+        match self {
+            Self::Account(request) => Some(request),
+            Self::Next(_) => None,
+        }
+    }
+
+    /// The next-account request, if this selection asks for one.
+    #[must_use]
+    pub const fn next(&self) -> Option<&NextRequest> {
+        match self {
+            Self::Next(request) => Some(request),
+            Self::Account(_) => None,
+        }
+    }
+
+    fn from_json(value: &Value) -> Result<Self, Unread> {
+        let invalid = || Unread::NotOurs("invalid pending account selection".to_owned());
+        let object = value.as_object().ok_or_else(invalid)?;
+        let nonce = object
+            .get("nonce")
+            .and_then(Value::as_str)
+            .ok_or_else(invalid)?;
+        if !aterm_codec::hex::is_hex(nonce, 32) {
+            return Err(invalid());
+        }
+        if object.len() == 2 && object.get("kind").and_then(Value::as_str) == Some("next") {
+            return Ok(Self::Next(NextRequest {
+                nonce: nonce.to_owned(),
+            }));
+        }
+        if object.len() == 2
+            && let Some(label) = object.get("label").and_then(Value::as_str)
+        {
+            return PinRequest::new(label, nonce.to_owned())
+                .map(Self::Account)
+                .ok_or_else(invalid);
+        }
+        Err(invalid())
+    }
+}
+
+impl From<PinRequest> for PendingSelection {
+    fn from(request: PinRequest) -> Self {
+        Self::Account(request)
+    }
 }
 
 impl PinRequest {
@@ -5826,7 +6114,8 @@ pub struct State {
     pub excluded_accounts: BTreeSet<String>,
     /// Runtime local read: the rows whose own credential file here shows their login lapsed
     /// ([`Store::hydrate_auth_contexts`], [`crate::ai::connector::stored_login_lapsed`]), which
-    /// [`condition`] reads as [`Condition::SignedOut`]; not an observation, history or policy.
+    /// [`signed_out_here`] reads, so [`condition`] says [`Condition::SignedOut`] and
+    /// [`login_state`] [`LoginState::Expired`]; not an observation, history or policy.
     #[doc(hidden)]
     pub lapsed_logins: BTreeSet<String>,
     /// Machine-local: the one account this home runs on.
@@ -5844,8 +6133,8 @@ pub struct State {
     pub undo: Vec<Undo>,
     /// Machine-local: `active` is the owner's word.
     pub pinned: bool,
-    /// Machine-local: only this explicit selection may pin after signing in.
-    pub pending_pin: Option<PinRequest>,
+    /// Machine-local: the one explicit account or next-account selection still awaiting admission.
+    pub pending_pin: Option<PendingSelection>,
     /// Machine-local: the supervised sessions, by session id.
     pub sessions: BTreeMap<String, SessionRow>,
     /// Machine-local: when each Claude Code conversation ran under a login of a row's own
@@ -6438,8 +6727,17 @@ impl State {
         o.insert("pinned".to_owned(), Value::from(self.pinned));
         if let Some(request) = &self.pending_pin {
             let mut pending = Map::new();
-            pending.insert("label".to_owned(), Value::from(request.label.as_str()));
-            pending.insert("nonce".to_owned(), Value::from(request.nonce.as_str()));
+            let nonce = match request {
+                PendingSelection::Account(request) => {
+                    pending.insert("label".to_owned(), Value::from(request.label.as_str()));
+                    &request.nonce
+                }
+                PendingSelection::Next(request) => {
+                    pending.insert("kind".to_owned(), Value::from("next"));
+                    &request.nonce
+                }
+            };
+            pending.insert("nonce".to_owned(), Value::from(nonce.as_str()));
             o.insert("pending_pin".to_owned(), Value::Object(pending));
         }
         o.insert(
@@ -6629,7 +6927,8 @@ impl State {
     ///
     /// [`Unread::Torn`]: not JSON, including a file cut short.
     /// [`Unread::NotOurs`]: JSON but not an object, or naming no schema or one other than
-    /// [`SCHEMA`] or [`PREPARED_STATE_SCHEMA`]: a file this build must not guess at or write over.
+    /// [`SCHEMA`] or [`PREPARED_STATE_SCHEMA`], or a malformed or unknown pending selection:
+    /// a file this build must not guess at or write over.
     pub fn from_json(text: &str, now: i64) -> Result<State, Unread> {
         let doc: Value = aterm_json::from_str(text)
             .map_err(|e| Unread::Torn(format!("not JSON ({})", shown(&e.to_string()))))?;
@@ -6876,12 +7175,10 @@ impl State {
             canary,
             undo,
             pinned: doc.get("pinned").and_then(Value::as_bool).unwrap_or(false),
-            pending_pin: doc.get("pending_pin").and_then(|pending| {
-                PinRequest::new(
-                    pending.get("label")?.as_str()?,
-                    pending.get("nonce")?.as_str()?.to_owned(),
-                )
-            }),
+            pending_pin: doc
+                .get("pending_pin")
+                .map(PendingSelection::from_json)
+                .transpose()?,
             sessions: sessions.into_iter().collect(),
             login_dir_spans: login_dir_spans.into_iter().collect(),
             rotations,
@@ -7083,8 +7380,9 @@ pub fn mint_machine() -> io::Result<String> {
 pub enum Condition {
     /// No login was made for it on this machine ([`login_made`]).
     NotEnrolled,
-    /// Its login's last word on record is [`Auth::SignedOut`] ([`strike`]), or its own credential
-    /// file here shows it lapsed ([`State::lapsed_logins`]).
+    /// It is signed out here ([`signed_out_here`]): its login's last word on record is
+    /// [`Auth::SignedOut`] ([`strike`]), or its own credential file here shows it lapsed
+    /// ([`State::lapsed_logins`]).
     SignedOut,
     /// A wall stands, until this instant.
     Limited {
@@ -7127,22 +7425,20 @@ impl Condition {
 }
 
 /// Computes the [`Condition`] of `row` at `now` given `state` and whether its login is `enrolled`:
-/// an enrolled row whose credential file shows its login lapsed ([`State::lapsed_logins`]) is
-/// [`Condition::SignedOut`] whatever its records say, so no launch picks it.
+/// an enrolled row signed out here ([`signed_out_here`], the rule [`login_state`] reads as
+/// [`LoginState::Expired`]) is [`Condition::SignedOut`], a lapsed credential file whatever its
+/// records say, so no launch picks it.
 #[must_use]
 pub fn condition(row: &Row, state: &State, enrolled: bool, now: i64) -> Condition {
     if !enrolled {
         return Condition::NotEnrolled;
     }
-    if state.lapsed_logins.contains(&row.label) {
+    if signed_out_here(row, state) {
         return Condition::SignedOut;
     }
     let Some(account) = state.accounts.get(&row.label) else {
         return Condition::Unseen;
     };
-    if account.current_auth(row) == Auth::SignedOut {
-        return Condition::SignedOut;
-    }
     if let Some(until) = account.limited_until(now) {
         return Condition::Limited { until };
     }
@@ -10078,7 +10374,12 @@ pub(super) fn complete_requested_pin(
     request: &PinRequest,
     now: i64,
 ) -> Option<Event> {
-    if state.pending_pin.as_ref() != Some(request) {
+    if state
+        .pending_pin
+        .as_ref()
+        .and_then(PendingSelection::account)
+        != Some(request)
+    {
         return None;
     }
     pin(state, roster, enrolled, request.label(), now).ok()
@@ -10171,6 +10472,10 @@ pub struct Store {
     ladder: &'static [std::time::Duration],
     /// The CLI whose pool it holds ([`Store::at_for`]).
     cli: Cli,
+    /// The user home a Claude Code store opened by [`Store::at_for`] reads its default login
+    /// under ([`Store::default_login_home`]); `None` for a [`Store::at`] store and every other
+    /// CLI's, whose user home is [`Store::user_home`].
+    claude_user_home: Option<PathBuf>,
 }
 
 /// The account a process observation was read against. The row is from a bound roster;
@@ -10342,6 +10647,15 @@ pub struct Lock(std::fs::File);
 // Inspect the opened handle before using it as a lock or publication witness. Unix opens
 // must neither follow a link nor wait on a special file before the caller can reject it.
 fn open_retained_file(path: &Path, kind: &str) -> io::Result<std::fs::File> {
+    open_retained_file_by(path, kind, false)
+}
+
+#[cfg(unix)]
+fn create_retained_file(path: &Path, kind: &str) -> io::Result<std::fs::File> {
+    open_retained_file_by(path, kind, true)
+}
+
+fn open_retained_file_by(path: &Path, kind: &str, exclusive: bool) -> io::Result<std::fs::File> {
     let not_regular = || {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -10355,7 +10669,10 @@ fn open_retained_file(path: &Path, kind: &str) -> io::Result<std::fs::File> {
         _ => {}
     }
     let mut open = std::fs::OpenOptions::new();
-    open.create(true).truncate(false).write(true);
+    open.create(!exclusive)
+        .create_new(exclusive)
+        .truncate(false)
+        .write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -10423,21 +10740,27 @@ impl Store {
             dir,
             ladder: store_ladder(),
             cli: Cli::Claude,
+            claude_user_home: None,
         }
     }
 
-    /// Opens `cli`'s [`Store`] ([`Cli`]): Claude Code's is [`Store::at`]; another CLI's is
+    /// Opens `cli`'s [`Store`] ([`Cli`]): Claude Code's is [`Store::at`] that reads its default
+    /// login under `user_home` ([`Store::default_login_home`]); another CLI's is
     /// `<harness_state>/<store_dir>`, its rows' logins under `<user_home>/.aterm/logins/<cli>`,
     /// a path that names the CLI and that its own sandbox lets it read.
     #[must_use]
     pub fn at_for(harness_state: &Path, cli: Cli, user_home: &Path) -> Store {
         match cli {
-            Cli::Claude => Store::at(harness_state),
+            Cli::Claude => Store {
+                claude_user_home: Some(user_home.to_path_buf()),
+                ..Store::at(harness_state)
+            },
             _ => Store {
                 dir: harness_state.join(cli.accounts().store_dir),
                 logins: user_home.join(".aterm").join("logins").join(cli.id()),
                 ladder: store_ladder(),
                 cli,
+                claude_user_home: None,
             },
         }
     }
@@ -10453,6 +10776,24 @@ impl Store {
     #[must_use]
     pub fn default_home(&self) -> Option<PathBuf> {
         Some(self.user_home()?.join(self.cli.accounts().default_home))
+    }
+
+    /// The directory whose credential file holds the CLI's default login (a row with no `dir`),
+    /// read for its lapse ([`Store::hydrate_lapsed`]): another CLI's [`Store::default_home`];
+    /// for Claude Code's store opened under a user home ([`Store::at_for`]), `<home>/.claude`,
+    /// the default home a process judged on the default login has (no `CLAUDE_CONFIG_DIR`,
+    /// [`judged_label`]), where the platform keeps that login in its `.credentials.json`
+    /// ([`crate::ai::connector::claude_default_login_in_file`]). `None` for Claude Code's on
+    /// macOS, whose default login is in the keychain, and for a [`Store::at`] store, which knows
+    /// no user home: that row is then read by its records alone.
+    #[must_use]
+    pub fn default_login_home(&self) -> Option<PathBuf> {
+        if self.cli != Cli::Claude {
+            return self.default_home();
+        }
+        let home = self.claude_user_home.as_deref()?;
+        crate::ai::connector::claude_default_login_in_file()
+            .then(|| home.join(self.cli.accounts().default_home))
     }
 
     /// Captures local credentials and routing without refreshing or changing the login.
@@ -10507,8 +10848,8 @@ impl Store {
     /// Hydrates only runtime applicability; it creates neither observations nor writes. Every
     /// CLI's [`State::lapsed_logins`] is the rows of `roster` whose own credential file shows its
     /// login lapsed ([`crate::ai::connector::stored_login_lapsed`]): a row's own directory, or
-    /// for the default login the CLI's default home ([`Store::default_home`]; Claude Code's store
-    /// knows none, so its default row is read by its records alone).
+    /// for the default login the directory [`Store::default_login_home`] names (where it names
+    /// none, as for Claude Code's on macOS, the default row is read by its records alone).
     pub(crate) fn hydrate_auth_contexts(&self, state: &mut State, roster: &Roster) {
         self.hydrate_lapsed(state, roster);
         if self.cli != Cli::Codex {
@@ -10521,7 +10862,7 @@ impl Store {
     /// transaction's edit judges rows by, so an edit that picks a row (a restart's advice) skips
     /// a lapsed one as the report and the launch do.
     pub(crate) fn hydrate_lapsed(&self, state: &mut State, roster: &Roster) {
-        let default = self.default_home();
+        let default = self.default_login_home();
         state.lapsed_logins = roster
             .rows
             .iter()
@@ -10684,11 +11025,13 @@ impl Store {
     /// Takes the machine-wide sign-in lock ([`SIGNIN_LOCK_FILE`] in [`Store::shared_dir`]) on
     /// this store's ladder: one sign-in at a time on this machine, for every CLI, since a
     /// headless browser's profile admits one process and Codex's login listens on one fixed
-    /// port. `None` when it stayed held past the ladder.
+    /// port. On Unix, live manual FIFO owners also hold background admission.
+    /// `None` when either admission stayed held past the ladder. Other platforms
+    /// retain kernel exclusion; the private manual FIFO is separately unavailable.
     /// # Errors
     /// The directory or lock file cannot be made, the opened path is not a regular file,
     /// the platform refuses a link, or the lock failed.
-    pub fn signin_within(&self) -> io::Result<Option<Lock>> {
+    pub fn signin_within(&self) -> io::Result<Option<SigninTurn>> {
         self.signin_on(self.ladder)
     }
 
@@ -10696,8 +11039,21 @@ impl Store {
     /// holds it.
     /// # Errors
     /// As [`Store::signin_within`].
-    pub fn signin_now(&self) -> io::Result<Option<Lock>> {
+    pub fn signin_now(&self) -> io::Result<Option<SigninTurn>> {
         self.signin_on(&[])
+    }
+
+    fn signin_on(&self, ladder: &[std::time::Duration]) -> io::Result<Option<SigninTurn>> {
+        if let Some(lock) = self.try_background_signin()? {
+            return Ok(Some(lock));
+        }
+        for pause in ladder {
+            std::thread::sleep(*pause);
+            if let Some(lock) = self.try_background_signin()? {
+                return Ok(Some(lock));
+            }
+        }
+        Ok(None)
     }
 
     #[cfg_attr(
@@ -10716,22 +11072,10 @@ impl Store {
             project = "aterm_agent::harness::cli::tests::signin_lock::lock_transition"
         )
     )]
-    fn signin_on(&self, ladder: &[std::time::Duration]) -> io::Result<Option<Lock>> {
+    fn signin_kernel_now(&self) -> io::Result<Option<Lock>> {
         let shared = self.shared_dir();
         aterm_types::fs_restricted::ensure_private_dir(&shared)?;
-        let mut file =
-            match Self::try_take(open_retained_file(&shared.join(SIGNIN_LOCK_FILE), "lock")?)? {
-                Ok(lock) => return Ok(Some(lock)),
-                Err(file) => file,
-            };
-        for pause in ladder {
-            std::thread::sleep(*pause);
-            file = match Self::try_take(file)? {
-                Ok(lock) => return Ok(Some(lock)),
-                Err(file) => file,
-            };
-        }
-        Ok(None)
+        Ok(Self::try_take(open_retained_file(&shared.join(SIGNIN_LOCK_FILE), "lock")?)?.ok())
     }
 
     /// Overrides the ladder of this store's bounded lock takes: a seat's own ladder, as the
@@ -10953,7 +11297,16 @@ impl Store {
     )]
     pub fn load_logins(&self, now: i64) -> Result<(Logins, Option<String>), String> {
         let receipt = self.sync_read_receipt()?;
-        let result = match read_bounded(&self.logins_file(), MAX_LOGINS_BYTES) {
+        let result = self.logins_as_stored(now);
+        self.check_sync_read_receipt(&receipt)?;
+        result
+    }
+
+    /// [`Self::load_logins`] without its receipt check, for a caller whose own check spans this
+    /// read ([`Self::recover_account_records_with`]) or who holds the writer lock past a recovery,
+    /// so that no publication can begin or be pending ([`Self::transact_images_held`]).
+    fn logins_as_stored(&self, now: i64) -> Result<(Logins, Option<String>), String> {
+        match read_bounded(&self.logins_file(), MAX_LOGINS_BYTES) {
             Ok(None) => self.absent_logins(),
             Ok(Some(text)) => match Logins::from_json(&text, now) {
                 Ok(logins) => Ok((logins, None)),
@@ -10962,9 +11315,7 @@ impl Store {
                 }
             },
             Err(e) => Err(format!("{LOGINS_FILE}: {e}")),
-        };
-        self.check_sync_read_receipt(&receipt)?;
-        result
+        }
     }
 
     /// Checks that local state and login bindings can be read before starting a sign-in.
@@ -11062,6 +11413,53 @@ impl Store {
         self.read_account_records_with(roster_path, now, || {})
     }
 
+    /// Observe cached account metadata without recovering publication or reading
+    /// credentials. A pending or overlapping publication fails closed.
+    /// # Errors
+    /// As [`Self::read_account_records`]; no interrupted publication is repaired.
+    pub fn peek_account_records(
+        &self,
+        roster_path: &Path,
+        now: i64,
+    ) -> Result<AccountRecords, RosterReadError> {
+        self.peek_account_records_with(roster_path, now, || {})
+    }
+
+    fn peek_account_records_with(
+        &self,
+        roster_path: &Path,
+        now: i64,
+        after_roster: impl FnOnce(),
+    ) -> Result<AccountRecords, RosterReadError> {
+        let receipt = self.sync_read_receipt().map_err(RosterReadError::Records)?;
+        let before = roster_text(roster_path).map_err(RosterReadError::Roster)?;
+        let raw = before
+            .as_deref()
+            .map_or(Ok(Roster::default()), |text| {
+                Roster::parse_for(self.cli, text)
+            })
+            .map_err(RosterReadError::Roster)?;
+        after_roster();
+        let (logins, login_note) = self.load_logins(now).map_err(RosterReadError::Records)?;
+        let (state, state_note) = self.load(now).map_err(RosterReadError::Records)?;
+        let roster = bound(&raw, &logins);
+        if roster_text(roster_path).map_err(RosterReadError::Roster)? != before {
+            return Err(RosterReadError::Roster(
+                "account roster changed during observation".into(),
+            ));
+        }
+        self.check_sync_read_receipt(&receipt)
+            .map_err(RosterReadError::Records)?;
+        Ok(AccountRecords {
+            raw_roster: raw,
+            roster,
+            roster_present: before.is_some(),
+            state,
+            logins,
+            notes: state_note.into_iter().chain(login_note).collect(),
+        })
+    }
+
     /// Captures usage attribution, including the implicit default when no rows exist.
     /// Its source path and mode travel with the observation until writer admission.
     /// # Errors
@@ -11137,8 +11535,13 @@ impl Store {
         after_raw();
         let result = (|| {
             let (raw, roster_present) = raw.map_err(RosterReadError::Roster)?;
-            let (logins, login_note) = self.load_logins(now).map_err(RosterReadError::Records)?;
-            let (mut state, state_note) = self.load(now).map_err(RosterReadError::Records)?;
+            // The receipt read above and checked below spans both, so neither checks its own.
+            let (logins, login_note) = self
+                .logins_as_stored(now)
+                .map_err(RosterReadError::Records)?;
+            let (mut state, state_note, _) = self
+                .state_as_stored(now)
+                .map_err(RosterReadError::Records)?;
             let roster = bound(&raw, &logins);
             self.hydrate_auth_contexts(&mut state, &roster);
             Ok(AccountRecords {
@@ -11188,7 +11591,7 @@ impl Store {
             if raw.rows.is_empty() {
                 return Ok(raw);
             }
-            self.load_logins(now)
+            self.logins_as_stored(now)
                 .map(|(logins, _)| bound(&raw, &logins))
                 .map_err(RosterReadError::Records)
         })();
@@ -11364,6 +11767,15 @@ impl Store {
     )]
     pub fn load(&self, now: i64) -> Result<(State, Option<String>), String> {
         let receipt = self.sync_read_receipt()?;
+        let (state, note, _) = self.state_as_stored(now)?;
+        self.check_sync_read_receipt(&receipt)?;
+        Ok((state, note))
+    }
+
+    /// [`Self::load`] without its receipt check, as [`Self::logins_as_stored`] is
+    /// [`Self::load_logins`], and whether [`Self::machine_file`] named the state's machine: that
+    /// file, once linked, is never rewritten, so [`Self::machine_id`] would read the same id again.
+    fn state_as_stored(&self, now: i64) -> Result<(State, Option<String>, bool), String> {
         let mut state = match read_bounded(&self.state_file(), MAX_STATE_BYTES) {
             Ok(None) => self.absent_state()?,
             Ok(Some(text)) => State::from_json(&text, now)
@@ -11371,8 +11783,12 @@ impl Store {
             Err(e) => return Err(format!("{STATE_FILE}: {e}")),
         };
         let mut note = None;
+        let mut kept = false;
         match self.kept_machine() {
-            Ok(Some(id)) => state.machine = id,
+            Ok(Some(id)) => {
+                state.machine = id;
+                kept = true;
+            }
             Ok(None) if !state.machine.is_empty() => {}
             Ok(None) => match mint_machine() {
                 Ok(id) => state.machine = id,
@@ -11389,7 +11805,6 @@ impl Store {
                 });
             }
         }
-        self.check_sync_read_receipt(&receipt)?;
         if self.cli == Cli::Codex {
             state.contextual_auth = true;
             for account in state
@@ -11400,7 +11815,7 @@ impl Store {
                 account.auth_projection = AuthProjection::Unknown;
             }
         }
-        Ok((state, note))
+        Ok((state, note, kept))
     }
 
     /// Path to the `<dir>/machine` identifier file.
@@ -11695,8 +12110,30 @@ impl Store {
         let request = PinRequest::new(label, nonce)
             .ok_or_else(|| "invalid account selection request".to_owned())?;
         self.transact_within(&LOCK_LADDER, now, &mut None, |state| {
-            state.pending_pin = Some(request.clone());
+            state.pending_pin = Some(request.clone().into());
             Ok(Vec::new())
+        })?;
+        Ok(request)
+    }
+
+    /// Unpins the preferred account and atomically replaces the pending selection with a
+    /// fresh request to choose the next eligible account after admission.
+    /// # Errors
+    /// Unavailable manual queue, unavailable entropy or a bounded state transaction error. This does not start provider work;
+    /// a publication error retains the transaction's ordinary recovery semantics.
+    pub fn request_next(&self, now: i64) -> Result<NextRequest, String> {
+        if manual_signin_capability() == ManualSigninCapability::Unavailable {
+            return Err(
+                "manual sign-in queue is unavailable on this platform; nothing selected".into(),
+            );
+        }
+        let nonce =
+            aterm_uds::rand::hex_token::<16>().map_err(|e| format!("account selection: {e}"))?;
+        let request = NextRequest { nonce };
+        self.transact_within(&LOCK_LADDER, now, &mut None, |state| {
+            let events = unpin(state, "manual-next", now).into_iter().collect();
+            state.pending_pin = Some(PendingSelection::Next(request.clone()));
+            Ok(events)
         })?;
         Ok(request)
     }
@@ -11706,7 +12143,7 @@ impl Store {
     /// `accounts.lock`; the row must still equal its captured configuration. Publication uses
     /// a durable receipt, including its history and notification.
     /// # Errors
-    /// An unknown label, a sign-in target without an email, unavailable entropy, or a bounded
+    /// An unknown label, a sign-in target without an email or available manual queue, unavailable entropy, or a bounded
     /// state/login transaction refusal, a changed row, or a different provider's store.
     /// A store error never becomes a sign-in request. An admitted interrupted write fences
     /// readers until its exact images recover.
@@ -11786,6 +12223,9 @@ impl Store {
                         Err(why.message(label))
                     }
                     Some(why @ (PinRefusal::NotEnrolled | PinRefusal::SignedOut)) => {
+                        if manual_signin_capability() == ManualSigninCapability::Unavailable {
+                            return Err("manual sign-in queue is unavailable on this platform; nothing selected".into());
+                        }
                         if let Some(row) = roster.row(label)
                             && logins.shared.required(row)?.is_some()
                         {
@@ -11805,7 +12245,7 @@ impl Store {
                             .map_err(|e| format!("account selection: {e}"))?;
                         let request = PinRequest::new(label, nonce)
                             .ok_or_else(|| "invalid account selection request".to_owned())?;
-                        state.pending_pin = Some(request.clone());
+                        state.pending_pin = Some(request.clone().into());
                         selected = PinSelection::Renew(request);
                         Ok(Vec::new())
                     }
@@ -11843,8 +12283,38 @@ impl Store {
                 return Err("this account requires a fresh root-authorized shared renewal".into());
             }
             admitted = request.is_none_or(|request| {
-                request.label() == policy.row.label && state.pending_pin.as_ref() == Some(request)
+                request.label() == policy.row.label
+                    && state
+                        .pending_pin
+                        .as_ref()
+                        .and_then(PendingSelection::account)
+                        == Some(request)
             });
+            Ok(Vec::new())
+        })?;
+        Ok(admitted)
+    }
+
+    /// Rechecks the same renewal policy and exact manual intent after FIFO admission.
+    /// Next supplies no account authority: the caller still provides the freshly
+    /// selected row and its full configured/bound policy.
+    /// # Errors
+    /// As [`Self::admit_renewal_attempt`].
+    pub(in crate::harness) fn admit_manual_renewal_attempt(
+        &self,
+        policy: RenewalPolicy<'_>,
+        request: &PendingSelection,
+        now: i64,
+    ) -> Result<bool, String> {
+        let mut admitted = false;
+        self.transact_renewal_within(self.ladder, now, &mut None, policy, |state, logins| {
+            if logins.shared.required(policy.row)?.is_some() {
+                return Err("this account requires a fresh root-authorized shared renewal".into());
+            }
+            admitted = state.pending_pin.as_ref() == Some(request)
+                && request
+                    .account()
+                    .is_none_or(|pin| pin.label() == policy.row.label);
             Ok(Vec::new())
         })?;
         Ok(admitted)
@@ -11878,7 +12348,12 @@ impl Store {
             now,
             &mut None,
             |raw, state, logins| {
-                if state.pending_pin.as_ref() != Some(request) {
+                if state
+                    .pending_pin
+                    .as_ref()
+                    .and_then(PendingSelection::account)
+                    != Some(request)
+                {
                     return Ok(Vec::new());
                 }
                 let roster = bound(raw, logins);
@@ -11902,7 +12377,26 @@ impl Store {
     /// A bounded state transaction refusal.
     pub fn cancel_pin_request(&self, request: &PinRequest, now: i64) -> Result<(), String> {
         self.transact_within(&LOCK_LADDER, now, &mut None, |state| {
-            if state.pending_pin.as_ref() == Some(request) {
+            if state
+                .pending_pin
+                .as_ref()
+                .and_then(PendingSelection::account)
+                == Some(request)
+            {
+                state.pending_pin = None;
+            }
+            Ok(Vec::new())
+        })?;
+        Ok(())
+    }
+
+    /// Retires only this exact next-selection attempt, without changing a preferred pin.
+    /// # Errors
+    /// A bounded state transaction refusal. An admitted publication error can
+    /// retain its durable receipt and must not be treated as proof of no edit.
+    pub fn cancel_next_request(&self, request: &NextRequest, now: i64) -> Result<(), String> {
+        self.transact_within(&LOCK_LADDER, now, &mut None, |state| {
+            if state.pending_pin.as_ref().and_then(PendingSelection::next) == Some(request) {
                 state.pending_pin = None;
             }
             Ok(Vec::new())
@@ -13061,6 +13555,10 @@ mod renewal_commit_tests;
 mod selection_commit_tests;
 
 #[cfg(test)]
+#[path = "accounts_pending_selection_tests.rs"]
+mod pending_selection_tests;
+
+#[cfg(test)]
 #[path = "accounts_generation_tests.rs"]
 mod generation_tests;
 
@@ -13110,3 +13608,7 @@ mod auth_context_tests;
 #[cfg(test)]
 #[path = "accounts_checkpoint_read_tests.rs"]
 mod checkpoint_read_tests;
+
+#[cfg(test)]
+#[path = "accounts_lapsed_rule_tests.rs"]
+mod lapsed_rule_tests;

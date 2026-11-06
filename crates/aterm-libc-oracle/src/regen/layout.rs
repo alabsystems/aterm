@@ -82,10 +82,11 @@ fn check(record: &Record, measured_cell: &Measured, out: &mut Vec<String>) -> Re
     let size = measured(&measured_cell.size, name, "size")?;
     let align = measured(&measured_cell.align, name, "alignment")?;
     let repr = record.repr.clone().unwrap_or_default();
-    let offset_of = |field: &str| {
-        measured_cell
-            .offset
-            .get(&(name.to_string(), field.to_string()))
+    let mut key = (record.name.clone(), String::new());
+    let mut offset_of = |field: &str| {
+        key.1.clear();
+        key.1.push_str(field);
+        measured_cell.offset.get(&key).copied()
     };
     let fields: Vec<(&str, &str)> = record
         .fields
@@ -101,7 +102,7 @@ fn check(record: &Record, measured_cell: &Measured, out: &mut Vec<String>) -> Re
         let mut offsets = Vec::new();
         for (field, ty) in &fields {
             let (field_size, field_align) = shape(ty, &measured_cell.field_types, repr.packed)?;
-            let want = *offset_of(field)
+            let want = offset_of(field)
                 .ok_or_else(|| format!("{name}.{field}: its offset was not measured"))?;
             let natural = up(end, field_align)
                 .ok_or_else(|| format!("{name}.{field}: natural offset overflowed u64"))?;
@@ -139,7 +140,7 @@ fn check(record: &Record, measured_cell: &Measured, out: &mut Vec<String>) -> Re
         offsets
     };
     for ((field, _), offset) in fields.iter().zip(computed) {
-        if let Some(&want) = offset_of(field).filter(|want| **want != offset) {
+        if let Some(want) = offset_of(field).filter(|want| *want != offset) {
             out.push(format!(
                 "OFFSET MISMATCH {name}.{field}: computed {offset}, measured {want}"
             ));

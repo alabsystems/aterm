@@ -30,7 +30,7 @@ use aterm_uds::spawnfd::Stdio;
 use crate::aos_gpu_bench::{Watch, clean_commit, watch};
 use crate::aos_learn::{LabLog, LabStore, Summary, guarded, make_dirs};
 use crate::instance::take_value;
-use crate::lab_build::{LAB_BUILD, check_build};
+use crate::lab_build::{PIN, check_build, lab_build, lab_commit};
 use crate::paths::{from_caller, paths};
 use crate::stop::{check, install, ring, sleep};
 use crate::sys::{await_exit, digest_file};
@@ -346,7 +346,7 @@ pub fn decide(i: &Inputs) -> Gates {
     let mut g = Gates::default();
     let mut fail = |gate: &'static str, why: String| g.failed.push((gate, why));
     let [a, b] = &i.children;
-    // G0: one clean commit, the stamps equal, the lab unchanged, the profile declared.
+    // G0: one clean commit, the children naming it, the lab unchanged, the profile declared.
     let commit = i.build.rsplit_once("+g").map_or("", |(_, c)| c);
     if !clean_commit(commit) {
         fail(
@@ -760,34 +760,29 @@ fn tests_log_digest(path: &Path, commit: &str) -> Result<Digest, Fail> {
     Ok(Digest::of(TESTS_LOG_DOMAIN, &[&bytes]))
 }
 
-/// The copied lab's own build and profile, from `aos-learn build`, which labels nothing.
-fn lab_stamp(lab: &Path) -> Result<(String, String), String> {
-    let mut cmd = aterm_uds::spawnfd::command(lab);
-    cmd.args(["aos-learn", "build"]).stdin(Stdio::null());
-    let out = aterm_uds::deadline::output_within(&mut cmd, Duration::from_secs(60))
-        .map_err(|e| format!("{}: {e}", lab.display()))?;
-    if !out.status.success() {
-        return Err(format!(
-            "{} aos-learn build exited {}",
-            lab.display(),
-            out.status
-        ));
+/// Refuses (G0) a lab `lab`, whose digest is `lab_digest`, that is not the runner `runner`'s own
+/// build byte for byte: the lab's children name the runner's commit ([`run_child`]), so only the
+/// runner's own bytes may run under it.
+/// # Errors
+/// Exit 1: the runner cannot be read, or its digest is not the lab's.
+fn own_build(lab: &Path, lab_digest: Digest, runner: &Path) -> Result<(), Fail> {
+    let own = digest_file(runner, LAB_DOMAIN)
+        .map_err(|e| Fail::die(format!("aos-learn-bench: refused G0: the runner: {e}")))?;
+    if lab_digest == own {
+        return Ok(());
     }
-    parse_stamp(&String::from_utf8_lossy(&out.stdout))
-        .ok_or_else(|| format!("{} printed no build and profile", lab.display()))
+    Err(Fail::die(format!(
+        "aos-learn-bench: refused G0: the lab {} is not the runner's own build ({})",
+        lab.display(),
+        runner.display()
+    )))
 }
 
-/// `aos-learn build`'s two lines.
-fn parse_stamp(text: &str) -> Option<(String, String)> {
-    let mut lines = text.lines();
-    let build = lines.next()?.strip_prefix("build ")?.to_owned();
-    let profile = lines.next()?.strip_prefix("profile ")?.to_owned();
-    lines.next().is_none().then_some((build, profile))
-}
-
-/// Runs `lab` with `args`, its output to `out/<name>.stdout` and `.stderr`, watched at the
-/// deadline; then reads its summary.
-fn run_child(lab: &Path, name: &str, args: &[String], out: &Path) -> Child {
+/// Runs `lab` with `args` and the runner's commit `commit` as its [`PIN`], its output to
+/// `out/<name>.stdout` and `.stderr`, watched at the deadline; then reads its summary. The lab
+/// is the runner's own build, byte for byte, so it names the runner's commit rather than read
+/// the checkout as it is when it starts.
+fn run_child(lab: &Path, commit: &str, name: &str, args: &[String], out: &Path) -> Child {
     let mut c = Child {
         name: name.to_owned(),
         spawned: true,
@@ -805,6 +800,7 @@ fn run_child(lab: &Path, name: &str, args: &[String], out: &Path) -> Child {
     };
     let mut cmd = aterm_uds::spawnfd::command(lab);
     cmd.args(args)
+        .env(PIN, commit)
         .stdin(Stdio::null())
         .stdout(Stdio::from(o))
         .stderr(Stdio::from(e));
@@ -859,8 +855,8 @@ fn run_child(lab: &Path, name: &str, args: &[String], out: &Path) -> Child {
 
 fn run(a: &Args) -> Res {
     install();
-    check_build(LAB_BUILD)?;
-    let commit = env!("ATERM_LAB_GIT_COMMIT");
+    check_build(lab_build())?;
+    let commit = lab_commit();
     if !clean_commit(commit) {
         return Err(Fail::die(format!(
             "aos-learn-bench: refused G0: the runner's commit {commit} is not clean"
@@ -891,14 +887,7 @@ fn run(a: &Args) -> Res {
     let lab_digest = digest_file(&lab, LAB_DOMAIN)
         .map_err(|e| Fail::usage(format!("aos-learn-bench: --lab {e}")))?;
     let profile = env!("ATERM_LAB_PROFILE");
-    let stamp =
-        lab_stamp(&lab).map_err(|e| Fail::die(format!("aos-learn-bench: refused G0: {e}")))?;
-    if stamp != (LAB_BUILD.to_owned(), profile.to_owned()) {
-        return Err(Fail::die(format!(
-            "aos-learn-bench: refused G0: the lab is {} ({}), the runner {LAB_BUILD} ({profile})",
-            stamp.0, stamp.1
-        )));
-    }
+    own_build(&lab, lab_digest, &paths().exe)?;
     let tests_log = tests_log_digest(&regular_file(&a.tests_log, "--tests-log")?, commit)?;
     let p = paths();
     let home = p
@@ -941,14 +930,14 @@ fn run(a: &Args) -> Res {
     };
     let mut args_a = session("A");
     args_a.extend(["--threads".to_owned(), "8".to_owned()]);
-    let child_a = run_child(&lab, "A", &args_a, &out);
+    let child_a = run_child(&lab, commit, "A", &args_a, &out);
     let child_b = if child_a.ok() {
         let mut args_b = session("B");
         args_b.extend([
             "--replay".to_owned(),
             out.join("A").to_string_lossy().into_owned(),
         ]);
-        run_child(&lab, "B", &args_b, &out)
+        run_child(&lab, commit, "B", &args_b, &out)
     } else {
         Child {
             name: "B".to_owned(),
@@ -956,7 +945,7 @@ fn run(a: &Args) -> Res {
         }
     };
     let stores = (child_a.ok() && child_b.ok()).then(|| {
-        compare_stores(&out.join("A"), &out.join("B"), LAB_BUILD).unwrap_or_else(|e| vec![e])
+        compare_stores(&out.join("A"), &out.join("B"), lab_build()).unwrap_or_else(|e| vec![e])
     });
 
     // The ledger, once the children have let it go, waited for by the stop rule's sleep, so an
@@ -979,7 +968,7 @@ fn run(a: &Args) -> Res {
     let stopped = child_a.interrupted || child_b.interrupted || check().is_err();
     let inputs = Inputs {
         pair: a.pair,
-        build: LAB_BUILD.to_owned(),
+        build: lab_build().to_owned(),
         profile: profile.to_owned(),
         lab: (lab_digest, lab_end),
         tests_log,

@@ -4146,7 +4146,7 @@ impl crate::App {
 }
 
 /// Handles `chrome`, dumping the front window's native chrome (toolbar, menu bar or menu model),
-/// the drawn autopilot chips, the status-item menu and the presence line.
+/// the drawn autopilot chips and the status-item menu.
 pub(crate) fn cmd_chrome(proxy: &EventLoopProxy<Wake>) -> String {
     let lines = match call_main(proxy, |tx| Wake::ReadChrome { reply: tx }) {
         Ok(lines) => lines,

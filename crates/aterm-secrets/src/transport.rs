@@ -32,16 +32,6 @@ impl std::fmt::Debug for Source {
     }
 }
 
-/// What an actual request to a `.local` vault heard of this process's Local Network switch.
-/// This is an observation, independent of the vault's signature or the sync's later result.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LocalNetworkHeard {
-    /// HTTP status and headers arrived, even if the response body or vault later failed.
-    Reached,
-    /// This Mac's resolver explicitly refused this process the `.local` name.
-    Refused,
-}
-
 /// What a fetch got.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fetched {
@@ -397,16 +387,10 @@ pub fn describe(url: &str) -> String {
     }
 }
 
-/// A server's reason: its first line, sanitized, without the words aterm reads as macOS's Local
-/// Network refusal ([`crate::client::refused_by_local_network`]), which only this Mac's own
-/// lookup says, so a server quoting them reads as no refusal.
+/// A server's reason: its first line, sanitized.
 pub fn reason(body: &[u8]) -> String {
-    one_line(body, REASON_CHARS).replace(aterm_http::LOCAL_NETWORK_REFUSED, QUOTED_REFUSAL)
+    one_line(body, REASON_CHARS)
 }
-
-/// What stands in a server's reason for the words of macOS's Local Network refusal ([`reason`]):
-/// shorter than they are, so the reason stays within its cap.
-const QUOTED_REFUSAL: &str = "[a refusal the server quoted]";
 
 /// The first line of `bytes`, at most `cap` characters, each byte outside printable ASCII a `?`.
 fn one_line(bytes: &[u8], cap: usize) -> String {
@@ -441,39 +425,46 @@ fn refused(what: &str, url: &str, status: u16, body: &[u8]) -> Error {
 
 fn client(timeout: Duration) -> Client {
     Client::new(Trust::PlatformVerifier, ProxyMode::Direct, timeout)
-        .with_connector(Arc::new(LanNoting))
+        .with_connector(Arc::new(LanConnector))
 }
 
-/// aterm-http's own connector, which also keeps where a connect found no route to a LAN
-/// address ([`no_route_on_the_lan`]) in the error it returns ([`NoRoute`]), for
-/// [`transport_error`] to tell.
-#[derive(Debug)]
-struct LanNoting;
+/// The connector every vault request dials through. A local name
+/// ([`aterm_uds::lan::is_local_name`]: `alab-secrets.local`, a Mac's `<host>.local`, a single
+/// label) is resolved and dialled by [`aterm_uds::lan::connect`], which on macOS has the root LAN
+/// broker resolve it, so this process makes no `.local` lookup macOS's Local Network privacy
+/// judges; without a broker the connect fails with the broker's words
+/// ([`aterm_uds::lan::LanError::into_io`]), never a lookup here. Any other name, and every name
+/// off Unix, goes to aterm-http's own connector, whose connect sends a local-network address
+/// through the broker ([`aterm_uds::connect_tcp`]).
+#[derive(Clone, Copy, Debug, Default)]
+struct LanConnector;
 
-impl aterm_http::Connect for LanNoting {
+impl aterm_http::Connect for LanConnector {
     fn connect(
         &self,
         host: &str,
         port: u16,
         deadline: aterm_http::Deadline,
     ) -> std::io::Result<std::net::TcpStream> {
-        let mut last = None;
-        aterm_http::TcpConnector
-            .connect_noting(host, port, deadline, &mut |addr, error| {
-                last = no_route_on_the_lan(addr.ip(), error).then_some(addr);
-            })
-            .map_err(|error| match last {
-                // The error is that connect's own, not a deadline spent after it.
-                Some(addr) if no_route_on_the_lan(addr.ip(), &error) => {
-                    std::io::Error::new(error.kind(), NoRoute { addr, error })
-                }
-                _ => error,
-            })
+        #[cfg(unix)]
+        if aterm_uds::lan::is_local_name(host) {
+            let within = deadline.remaining_or_timeout()?;
+            let (stream, _) = aterm_uds::lan::connect(
+                &aterm_uds::lan::Target::Host(host.to_owned()),
+                port,
+                within,
+                aterm_uds::lan::ConnectOptions::default(),
+            )
+            .map_err(aterm_uds::lan::LanError::into_io)?;
+            stream.set_nodelay(true)?;
+            return Ok(stream);
+        }
+        aterm_http::TcpConnector.connect(host, port, deadline)
     }
 }
 
-/// [`LanNoting`] that also keeps the address of the server its last connect reached, so a reader
-/// can say which server answered it ([`wait_joins_from`]).
+/// [`LanConnector`], which also keeps the address of the server its last connect reached, so a
+/// reader can say which server answered it ([`wait_joins_from`]).
 #[derive(Debug, Default)]
 struct PeerNoting(std::sync::Mutex<Option<SocketAddr>>);
 
@@ -492,96 +483,14 @@ impl aterm_http::Connect for PeerNoting {
         deadline: aterm_http::Deadline,
     ) -> std::io::Result<std::net::TcpStream> {
         use aterm_types::MutexExt as _;
-        let stream = aterm_http::Connect::connect(&LanNoting, host, port, deadline)?;
+        let stream = LanConnector.connect(host, port, deadline)?;
         *self.0.lock_or_recover() = stream.peer_addr().ok();
         Ok(stream)
     }
 }
 
-/// A connect that found no route to a LAN address: the error, and where it went.
-#[derive(Debug)]
-struct NoRoute {
-    addr: SocketAddr,
-    error: std::io::Error,
-}
-
-impl std::fmt::Display for NoRoute {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} (to {})", self.error, self.addr.ip())
-    }
-}
-
-impl std::error::Error for NoRoute {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.error)
-    }
-}
-
-/// Whether a connect to `ip` that failed with `error` found no route (`EHOSTUNREACH`,
-/// `ENETUNREACH`) to a private or link-local address (IPv4 RFC 1918 or 169.254/16, IPv6 unique
-/// local or link-local, either one mapped): what macOS's Local Network gate answers aterm, and
-/// what a LAN host that is down, or a LAN this Mac has left, answers too ([`LanGate`]).
-fn no_route_on_the_lan(ip: IpAddr, error: &std::io::Error) -> bool {
-    use std::io::ErrorKind::{HostUnreachable, NetworkUnreachable};
-    let lan = match ip.to_canonical() {
-        IpAddr::V4(ip) => ip.is_private() || ip.is_link_local(),
-        IpAddr::V6(ip) => ip.is_unique_local() || ip.is_unicast_link_local(),
-    };
-    lan && matches!(error.kind(), HostUnreachable | NetworkUnreachable)
-}
-
-/// Where this process reads whether macOS's Local Network switch is known on for aterm
-/// ([`set_local_network_granted`]); unset, it is not known.
-static LOCAL_NETWORK_GRANTED: std::sync::OnceLock<fn() -> bool> = std::sync::OnceLock::new();
-
-/// Read whether macOS's Local Network switch is known on for aterm from `granted` (a look that
-/// reached the LAN heard it on, which System State keeps): once it is, no route to a LAN address
-/// is a vault host that did not answer, not the gate ([`LanGate`]). The first call wins.
-pub fn set_local_network_granted(granted: fn() -> bool) {
-    let _ = LOCAL_NETWORK_GRANTED.set(granted);
-}
-
-/// What no route to a LAN address says here (docs/DESIGN-fluid-swarm-2026-10-28.md F4).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LanGate {
-    /// Nothing gates the local network (not macOS): a host that does not answer (EHOSTUNREACH
-    /// once its ARP goes unanswered), any other error, which backs off as one.
-    None,
-    /// macOS's Local Network switch is not known on for aterm: the gate, most likely
-    /// ([`ErrorKind::LocalNetworkPending`]).
-    Unknown,
-    /// The switch is known on: the vault host did not answer (it is down, or this Mac is on
-    /// another network), any other error, which blames no setting.
-    Granted,
-}
-
-/// [`LanGate`] on macOS (`macos`) or elsewhere, `granted` read only on macOS.
-fn lan_gate(macos: bool, granted: impl FnOnce() -> bool) -> LanGate {
-    match (macos, macos && granted()) {
-        (false, _) => LanGate::None,
-        (true, false) => LanGate::Unknown,
-        (true, true) => LanGate::Granted,
-    }
-}
-
-/// A failure to talk to the server. On macOS, no route to a LAN address is
-/// [`ErrorKind::LocalNetworkPending`] and says where the gate is, until the Local Network switch
-/// is known on ([`LanGate`]); a request past its deadline is [`ErrorKind::TimedOut`].
+/// A failure to talk to the server; a request past its deadline is [`ErrorKind::TimedOut`].
 fn transport_error(what: &str, url: &str, error: &aterm_http::Error) -> Error {
-    transport_error_on(what, url, error, &|| {
-        lan_gate(cfg!(target_os = "macos"), || {
-            LOCAL_NETWORK_GRANTED.get().is_some_and(|granted| granted())
-        })
-    })
-}
-
-/// [`transport_error`], `gate` (read only for no route to a LAN address) saying what that is.
-fn transport_error_on(
-    what: &str,
-    url: &str,
-    error: &aterm_http::Error,
-    gate: &dyn Fn() -> LanGate,
-) -> Error {
     let text = format!(
         "{what} {}: {}",
         describe(url),
@@ -593,37 +502,10 @@ fn transport_error_on(
             }
         )
     );
-    if no_route_to_lan(error) {
-        match gate() {
-            LanGate::Unknown => {
-                return Error::of_kind(
-                    ErrorKind::LocalNetworkPending,
-                    format!(
-                        "{text}; macOS lets aterm reach the local network only once allowed (Privacy & Security > Local Network)"
-                    ),
-                );
-            }
-            LanGate::Granted => {
-                return Error::new(format!(
-                    "{text}; the vault host did not answer (aterm may reach the local network, \
-                     so the host is down or this Mac is on another network)"
-                ));
-            }
-            LanGate::None => {}
-        }
-    }
     if matches!(error, aterm_http::Error::Io(io) if io.kind() == std::io::ErrorKind::TimedOut) {
         return Error::of_kind(ErrorKind::TimedOut, text);
     }
     Error::new(text)
-}
-
-/// Whether `error` is a connect that found no route to a LAN address ([`NoRoute`]).
-fn no_route_to_lan(error: &aterm_http::Error) -> bool {
-    matches!(
-        error,
-        aterm_http::Error::Io(io) if io.get_ref().is_some_and(|inner| inner.is::<NoRoute>())
-    )
 }
 
 /// The header a subscriber's GET sends so the server records when it was last heard (`age1…`).
@@ -743,25 +625,13 @@ pub(crate) fn fetch_as_observed(
     wait: Duration,
     subscriber: Option<&str>,
 ) -> crate::Result<ObservedFetch> {
-    fetch_as_observed_hearing(source, after, wait, subscriber).0
-}
-
-/// The same single fetch, with an endpoint-free observation of its actual transport result.
-pub(crate) fn fetch_as_observed_hearing(
-    source: &Source,
-    after: Option<u64>,
-    wait: Duration,
-    subscriber: Option<&str>,
-) -> (crate::Result<ObservedFetch>, Option<LocalNetworkHeard>) {
     match source {
         Source::Url(url) => {
             let client = client(wait.saturating_add(fetch_margin()));
-            let (sent, heard) = with_local_network_heard(source, || {
-                get_request(&client, url, after, None, subscriber, false, false)
-                    .limit(MAX_ENVELOPE)
-                    .send_phased(&[])
-            });
-            let fetched = classify_get_response(
+            let sent = get_request(&client, url, after, None, subscriber, false, false)
+                .limit(MAX_ENVELOPE)
+                .send_phased(&[]);
+            classify_get_response(
                 sent,
                 url,
                 after,
@@ -769,58 +639,15 @@ pub(crate) fn fetch_as_observed_hearing(
                 subscriber,
             )
             .map_err(|unheard| unheard.why)
-            .and_then(ObservedAnswer::fetched);
-            (fetched, heard)
+            .and_then(ObservedAnswer::fetched)
         }
-        Source::Path(path) => (
-            read_path(path).map(|bytes| ObservedFetch {
-                fetched: bytes.map_or(Fetched::Missing, Fetched::Body),
-                #[cfg(any(unix, test))]
-                http204: None,
-            }),
-            None,
-        ),
+        Source::Path(path) => read_path(path).map(|bytes| ObservedFetch {
+            fetched: bytes.map_or(Fetched::Missing, Fetched::Body),
+            #[cfg(any(unix, test))]
+            http204: None,
+        }),
     }
 }
-
-/// Observe only the request to this original source, without rereading configuration or
-/// starting another request. HTTP errors cannot quote themselves into a resolver refusal.
-fn with_local_network_heard<T>(
-    source: &Source,
-    send: impl FnOnce() -> Result<T, aterm_http::SendError>,
-) -> (Result<T, aterm_http::SendError>, Option<LocalNetworkHeard>) {
-    let sent = send();
-    let local = match source {
-        Source::Url(url) => {
-            Uri::parse(base(url)).is_some_and(|uri| aterm_http::is_local_name(uri.host()))
-        }
-        Source::Path(_) => false,
-    };
-    let heard = local
-        .then(|| match &sent {
-            Ok(_)
-            | Err(aterm_http::SendError {
-                phase: aterm_http::Phase::Answered,
-                ..
-            }) => Some(LocalNetworkHeard::Reached),
-            Err(aterm_http::SendError {
-                phase: aterm_http::Phase::NotSent,
-                error: aterm_http::Error::Io(error),
-            }) if error
-                .to_string()
-                .contains(aterm_http::LOCAL_NETWORK_REFUSED) =>
-            {
-                Some(LocalNetworkHeard::Refused)
-            }
-            Err(_) => None,
-        })
-        .flatten();
-    (sent, heard)
-}
-
-#[cfg(test)]
-#[path = "transport/local_network_observation_tests.rs"]
-mod local_network_observation_tests;
 
 /// [`fetch`] of the vault at `url` as one try of a bounded wait: the whole request, lookup to
 /// last byte, within `total`, with no [`FETCH_MARGIN`], so a long-poll the server holds for its
@@ -1016,16 +843,10 @@ pub fn get(url: &str, after: Option<u64>, wait: Duration) -> crate::Result<Answe
 pub struct Unheard {
     /// What failed, as [`get`] says it.
     pub why: Error,
-    /// A timeout (a lookup with no answer in time, or a connect or request past its deadline)
-    /// or no route to the host: how macOS holds the lookups and LAN connects of an app whose
-    /// Local Network question nobody has answered yet, so a try after the answer can succeed,
-    /// and how it refuses them after a Don't Allow (a slow network, a host that sleeps and a
-    /// server that stalls look the same).
-    pub held: bool,
 }
 
 /// [`get`], with its DNS lookup, connect and TLS handshake bounded by `connect` within the
-/// request's deadline, saying of a failure whether it is [`Unheard::held`].
+/// request's deadline.
 pub fn get_bounded(
     url: &str,
     after: Option<u64>,
@@ -1264,7 +1085,6 @@ fn classify_get_response(
         Err(aterm_http::SendError { error, .. }) => {
             return Err(Unheard {
                 why: transport_error("fetching", url, &error),
-                held: held(&error),
             });
         }
     };
@@ -1290,7 +1110,6 @@ fn classify_get_response(
         status => {
             return Err(Unheard {
                 why: refused("fetching", url, status, response.body()),
-                held: false,
             });
         }
     };
@@ -1317,22 +1136,6 @@ pub(crate) fn test_classify_get_response(
 fn held_past_deadline(failed: &aterm_http::SendError) -> bool {
     failed.phase == aterm_http::Phase::Sent
         && matches!(&failed.error, aterm_http::Error::Io(io) if io.kind() == std::io::ErrorKind::TimedOut)
-}
-
-/// Whether `error` is [`Unheard::held`]: aterm-http's resolver gives up on a lookup with no
-/// answer as `TimedOut` (a definite "no such name" is another kind), a connect macOS refuses an
-/// app it has not let onto the LAN fails `HostUnreachable`, and so does a lookup of a `.local`
-/// name mDNSResponder refuses that app, which aterm-http names so (`getaddrinfo` reports the
-/// refusal as "no such name"); no route to a LAN address ([`no_route_to_lan`]) is held too.
-fn held(error: &aterm_http::Error) -> bool {
-    no_route_to_lan(error)
-        || matches!(
-            error,
-            aterm_http::Error::Io(error) if matches!(
-                error.kind(),
-                std::io::ErrorKind::TimedOut | std::io::ErrorKind::HostUnreachable
-            )
-        )
 }
 
 /// The seq an `ETag` names: `"<seq>"`, as the server sends it; anything else names none.
@@ -2112,7 +1915,8 @@ fn replace_path(path: &std::path::Path, envelope: &[u8], _over: &[u8]) -> crate:
     write_path(path, envelope)
 }
 
-/// A path keeps the server's rule (its 409), checked and renamed under [`PublishLock`].
+/// A path keeps the server's rule (its 403 and 409, [`write_path_held`]), checked and renamed
+/// under [`PublishLock`].
 #[cfg(unix)]
 fn write_path(path: &std::path::Path, envelope: &[u8]) -> crate::Result<()> {
     let _held = PublishLock::take(path)?;
@@ -2315,50 +2119,104 @@ impl Drop for PublishLock {
     }
 }
 
-/// [`write_path`] with its [`PublishLock`] held.
+#[cfg(all(unix, any(test, debug_assertions)))]
+thread_local! {
+    /// The negative control of a path's compare-and-set (one-mesh P3, [`write_path_held`]): while
+    /// set, the path judges a version of the vault it holds by its sequence and parents alone, as
+    /// before it asked P3's kernels, so a version whose signer the held key never handed off to,
+    /// or one that drops a link of the held handoff chain, takes the path over where a server
+    /// refuses it. A test sets it for its thread; a lab instance turns it on for its whole process
+    /// with `path-sequence-only` in `ATERM_TEST_NEGATIVE_CONTROL`
+    /// ([`aterm_types::negative_control::on`]).
+    pub(crate) static PATH_SEQUENCE_ONLY: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Whether [`PATH_SEQUENCE_ONLY`] is on: set on this thread, or named for this process
+/// (`path-sequence-only`); never in a release build, which has neither switch.
+#[cfg(unix)]
+fn path_sequence_only() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    {
+        PATH_SEQUENCE_ONLY.with(std::cell::Cell::get)
+            || aterm_types::negative_control::on("path-sequence-only")
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        false
+    }
+}
+
+/// [`write_path`] with its [`PublishLock`] held. A version of the vault the path holds is judged
+/// as a server judges a PUT (server.rs `takes_over`), by P3's kernels
+/// ([`Takeover::of`](aterm_mesh_core::no_lost_edit::Takeover::of)): the pin the held version's
+/// key and chain give, the chain it must carry on, its sequence and its parents. A refusal of the
+/// pin or the chain is [`ErrorKind::Refused`](crate::ErrorKind::Refused), as a server's 403 is:
+/// nothing was stored, and the version can never take the path over. One by sequence or parents is
+/// [`ErrorKind::NotStored`](crate::ErrorKind::NotStored), as a server's 409 is: another version
+/// holds the path. A path that holds no envelope, or another vault's, is written.
 #[cfg(unix)]
 fn write_path_held(path: &std::path::Path, envelope: &[u8]) -> crate::Result<()> {
-    if let (Ok(new), Some(held)) = (crate::envelope::parse(envelope), read_path(path)?) {
-        if held == envelope {
-            return Ok(());
-        }
-        if let Ok(held) = crate::envelope::parse(&held)
-            && held.name == new.name
-        {
-            let held_followed: Vec<[u8; 32]> = held.handoff.iter().map(|(k, _)| *k).collect();
-            let replaced = matches!(
-                new.check_pin_with(
-                    &held.signer,
-                    &held_followed,
-                    &crate::envelope::Retired::compiled()
+    use aterm_mesh_core::no_lost_edit::{Takeover, TakeoverFacts};
+    if let (Ok(new), Some(held_bytes)) = (crate::envelope::parse(envelope), read_path(path)?)
+        && let Ok(held) = crate::envelope::parse(&held_bytes)
+        && held.name == new.name
+    {
+        let followed: Vec<[u8; 32]> = held.handoff.iter().map(|(key, _)| *key).collect();
+        let pin = new.check_pin_with(
+            &held.signer,
+            &followed,
+            &crate::envelope::Retired::compiled(),
+        );
+        let extends = new.check_extends(&held.signer, &held.handoff);
+        let keys_unread = path_sequence_only();
+        let facts = TakeoverFacts {
+            pin_ok: pin.is_ok() || keys_unread,
+            replaced: matches!(pin, Ok(crate::envelope::Pin::Replaced(_))),
+            not_newer: new.seq <= held.seq,
+            same_version: new.seq == held.seq && held_bytes == envelope,
+            chain_ok: extends.is_ok() || keys_unread,
+            names_parents: !new.parents.is_empty(),
+            // A path's parent-CAS starts at the first version with parents: every later one
+            // it took names the version before it.
+            held_parented: !held.parents.is_empty(),
+            among_parents: new.parents.contains(&held.digest()),
+        };
+        let refused = |error: Option<Error>| {
+            Error::of_kind(
+                crate::ErrorKind::Refused,
+                format!(
+                    "{}: {}",
+                    path.display(),
+                    error.map_or_else(String::new, |e| e.0)
                 ),
-                Ok(crate::envelope::Pin::Replaced(_))
-            );
-            if !replaced {
-                if held.seq >= new.seq {
-                    return Err(Error::of_kind(
-                        crate::ErrorKind::NotStored,
-                        format!(
-                            "seq {} is not newer than seq {}, which {} holds",
-                            new.seq,
-                            held.seq,
-                            path.display()
-                        ),
-                    ));
-                }
-                let held_head = held.digest();
-                if (!new.parents.is_empty() || !held.parents.is_empty())
-                    && !new.parents.contains(&held_head)
-                {
-                    return Err(Error::of_kind(
-                        crate::ErrorKind::NotStored,
-                        format!(
-                            "head at seq {} in {} is not among the envelope's parents",
-                            held.seq,
-                            path.display()
-                        ),
-                    ));
-                }
+            )
+        };
+        match Takeover::of(facts) {
+            Takeover::Takes => {}
+            Takeover::Holds => return Ok(()),
+            Takeover::PinRefused => return Err(refused(pin.err())),
+            Takeover::BreaksChain => return Err(refused(extends.err())),
+            Takeover::NotNewer => {
+                return Err(Error::of_kind(
+                    crate::ErrorKind::NotStored,
+                    format!(
+                        "seq {} is not newer than seq {}, which {} holds",
+                        new.seq,
+                        held.seq,
+                        path.display()
+                    ),
+                ));
+            }
+            Takeover::OffParents => {
+                return Err(Error::of_kind(
+                    crate::ErrorKind::NotStored,
+                    format!(
+                        "head at seq {} in {} is not among the envelope's parents",
+                        held.seq,
+                        path.display()
+                    ),
+                ));
             }
         }
     }
@@ -3036,20 +2894,6 @@ mod tests {
         assert_eq!(reason("caf\u{e9}".as_bytes()), "caf??");
         assert_eq!(reason(&[b'x'; 500]).len(), 200);
         assert_eq!(reason(b""), "");
-        // A server quoting macOS's Local Network refusal is no refusal of this Mac's.
-        let quoted = format!("oops: {}", aterm_http::LOCAL_NETWORK_REFUSED);
-        assert_eq!(
-            reason(quoted.as_bytes()),
-            "oops: [a refusal the server quoted]"
-        );
-        // The client, which reads the refusal, builds on unix only.
-        #[cfg(unix)]
-        assert!(!crate::client::refused_by_local_network(&refused(
-            "fetching",
-            "http://alab-secrets.local:7484/v1/alab",
-            500,
-            quoted.as_bytes()
-        )));
     }
 
     /// This machine's own failure to reach a server keeps a remedy a server's reason would have
@@ -3136,6 +2980,94 @@ mod tests {
         std::fs::write(&path, b"not an envelope\n").expect("write");
         publish(&source, &first).expect("replaced");
         held(&first);
+    }
+
+    /// Version `seq` of vault `alab` signed by `seed`, carrying `handoff`, one admin locker
+    /// holding `body`.
+    #[cfg(unix)]
+    fn version_by(
+        seq: u64,
+        seed: &[u8; 32],
+        handoff: Vec<([u8; 32], [u8; 64])>,
+        body: &[u8],
+    ) -> Vec<u8> {
+        use crate::envelope::{Locker, Unsigned, sign, test_armor};
+        let unsigned = Unsigned {
+            name: "alab".to_owned(),
+            seq,
+            time: 1_792_530_000 + seq,
+            handoff,
+            parents: Vec::new(),
+            lockers: vec![Locker {
+                label: "admin".to_owned(),
+                armored: test_armor(body),
+            }],
+        };
+        sign(&unsigned, seed).expect("signed")
+    }
+
+    /// A path judges a version as a server does (P3's `Takeover::of`, server.rs `takes_over`): one
+    /// whose signer the held version's key never handed off to is refused as a server's 403 is
+    /// ([`ErrorKind::Refused`]: nothing was stored), and so is one that drops a link of the held
+    /// version's handoff chain; neither is written, and a handoff the held key endorsed takes
+    /// over.
+    ///
+    /// NEGATIVE CONTROL, run in the test: [`PATH_SEQUENCE_ONLY`] (`path-sequence-only`, the
+    /// path's rule before it asked the kernels: sequence and parents alone) writes both.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_refuses_what_a_server_refuses() {
+        use crate::envelope::{endorse, signer_public};
+        let (seven, nine) = ([7u8; 32], [9u8; 32]);
+        let first = version(41, b"one admin's text");
+        let stranger = version_by(42, &[8u8; 32], Vec::new(), b"a stranger's text");
+        let to_nine = signer_public(&nine).expect("public");
+        let link = (
+            signer_public(&seven).expect("public"),
+            endorse(&seven, "alab", &to_nine).expect("endorsed"),
+        );
+        let rotated = version_by(43, &nine, vec![link], b"rotated");
+        let dropped = version_by(44, &nine, Vec::new(), b"the chain dropped");
+        // A fresh path holding `first`: its file, and what each publish answered.
+        let run = |cuts: &[&Vec<u8>]| {
+            let root = aterm_tempfile::tempdir().expect("tempdir");
+            let path = root.path().join("alab.vault");
+            let source = Source::Path(path.clone());
+            publish(&source, &first).expect("published");
+            let answers: Vec<_> = cuts.iter().map(|cut| publish(&source, cut)).collect();
+            (answers, std::fs::read(&path).expect("vault"))
+        };
+
+        let (answers, held) = run(&[&stranger]);
+        let error = answers[0]
+            .as_ref()
+            .expect_err("the pin refuses another key");
+        assert_eq!(error.kind(), crate::ErrorKind::Refused, "{error}");
+        assert_eq!(held, first);
+
+        let (answers, held) = run(&[&rotated]);
+        answers[0]
+            .as_ref()
+            .expect("a handoff the held key endorsed takes over");
+        assert_eq!(held, rotated);
+
+        let (answers, held) = run(&[&rotated, &dropped]);
+        let error = answers[1].as_ref().expect_err("the chain only grows");
+        assert_eq!(error.kind(), crate::ErrorKind::Refused, "{error}");
+        assert!(error.0.contains("handoff chain only grows"), "{error}");
+        assert_eq!(held, rotated);
+
+        PATH_SEQUENCE_ONLY.with(|cell| cell.set(true));
+        let (stranger_taken, dropped_taken) = (run(&[&stranger]), run(&[&rotated, &dropped]));
+        PATH_SEQUENCE_ONLY.with(|cell| cell.set(false));
+        assert!(
+            stranger_taken.0[0].is_ok() && stranger_taken.1 == stranger,
+            "CONTROL: by sequence and parents alone, a stranger's key takes the path over"
+        );
+        assert!(
+            dropped_taken.0[1].is_ok() && dropped_taken.1 == dropped,
+            "CONTROL: by sequence and parents alone, a cut that drops the chain takes it over"
+        );
     }
 
     /// A vault path whose folder is missing (mistyped, or a volume not mounted) is refused naming
@@ -3459,137 +3391,6 @@ mod tests {
         assert!(paused.borrow().is_empty());
     }
 
-    /// No route on the LAN is told by where a connect went and how it failed: no route to a
-    /// LAN address, and nothing else.
-    #[cfg(unix)]
-    #[test]
-    fn no_route_is_told_by_a_lan_address_and_an_unreachable_errno() {
-        let lan = [
-            "10.0.0.5",
-            "172.16.4.2",
-            "172.31.255.254",
-            "192.168.1.20",
-            "169.254.10.1",
-            "fe80::1",
-            "fd12:3456::1",
-            "::ffff:192.168.1.20",
-        ];
-        let elsewhere = [
-            "8.8.8.8",
-            "192.0.2.1",
-            "172.32.0.1",
-            "100.64.0.1",
-            "127.0.0.1",
-            "::1",
-            "2001:db8::1",
-            "::ffff:8.8.8.8",
-        ];
-        let gated = [libc::EHOSTUNREACH, libc::ENETUNREACH];
-        let other = [
-            libc::ECONNREFUSED,
-            libc::ETIMEDOUT,
-            libc::ECONNRESET,
-            libc::EADDRNOTAVAIL,
-        ];
-        for (addresses, on_lan) in [(&lan, true), (&elsewhere, false)] {
-            for address in addresses {
-                let ip: IpAddr = address.parse().expect(address);
-                for (errnos, no_route) in [(&gated[..], true), (&other[..], false)] {
-                    for &errno in errnos {
-                        let error = std::io::Error::from_raw_os_error(errno);
-                        assert_eq!(
-                            no_route_on_the_lan(ip, &error),
-                            on_lan && no_route,
-                            "{address} errno {errno}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn a_connect_with_no_route_on_the_lan_is_told_as_pending_and_others_are_not() {
-        let addr: SocketAddr = "192.168.1.20:7484".parse().expect("addr");
-        let unreachable = || std::io::Error::from(std::io::ErrorKind::HostUnreachable);
-        let gated = aterm_http::Error::Io(std::io::Error::new(
-            std::io::ErrorKind::HostUnreachable,
-            NoRoute {
-                addr,
-                error: unreachable(),
-            },
-        ));
-        let url = "http://alab-secrets.local:7484/v1/alab?token=x";
-        let error = transport_error_on("fetching", url, &gated, &|| LanGate::Unknown);
-        assert_eq!(error.kind(), ErrorKind::LocalNetworkPending);
-        assert!(
-            error
-                .0
-                .starts_with("fetching http://alab-secrets.local:7484/v1/alab: "),
-            "{error}"
-        );
-        assert!(error.0.contains("192.168.1.20"), "{error}");
-        assert!(error.0.contains("Local Network"), "{error}");
-        assert!(!error.0.contains("token"), "{error}");
-        // CONTROL: the same failure with no LAN address behind it is any other error.
-        let plain = aterm_http::Error::Io(unreachable());
-        assert_eq!(
-            transport_error_on("fetching", url, &plain, &|| LanGate::Unknown).kind(),
-            ErrorKind::Other
-        );
-        // Off macOS, nothing gates the local network: a LAN host that does not answer is any
-        // other error, which still names the address, and blames no macOS setting.
-        let elsewhere = transport_error_on("fetching", url, &gated, &|| LanGate::None);
-        assert_eq!(elsewhere.kind(), ErrorKind::Other);
-        assert!(elsewhere.0.contains("192.168.1.20"), "{elsewhere}");
-        assert!(!elsewhere.0.contains("macOS"), "{elsewhere}");
-        assert_eq!(
-            transport_error("fetching", url, &gated).kind() == ErrorKind::LocalNetworkPending,
-            cfg!(target_os = "macos")
-        );
-    }
-
-    /// No route to a LAN address is the Local Network gate only until the switch is known on:
-    /// after, it is a vault host that did not answer (a LAN this Mac has left, a host that is
-    /// down), any other error, which still names the address and blames no setting. The switch
-    /// is read only on macOS, and only for no route to a LAN address.
-    /// NEGATIVE CONTROL: the old classification (any no route on macOS is the gate) fails the
-    /// `Granted` half.
-    #[test]
-    fn no_route_to_a_lan_address_is_the_gate_only_before_the_grant_is_known() {
-        let addr: SocketAddr = "192.168.1.20:7484".parse().expect("addr");
-        let unreachable = || std::io::Error::from(std::io::ErrorKind::HostUnreachable);
-        let gated = aterm_http::Error::Io(std::io::Error::new(
-            std::io::ErrorKind::HostUnreachable,
-            NoRoute {
-                addr,
-                error: unreachable(),
-            },
-        ));
-        let url = "http://alab-secrets.local:7484/v1/alab";
-        let before = transport_error_on("fetching", url, &gated, &|| LanGate::Unknown);
-        assert_eq!(before.kind(), ErrorKind::LocalNetworkPending);
-        assert!(before.0.contains("Local Network"), "{before}");
-        let after = transport_error_on("fetching", url, &gated, &|| LanGate::Granted);
-        assert_eq!(after.kind(), ErrorKind::Other);
-        assert!(after.0.contains("the vault host did not answer"), "{after}");
-        assert!(after.0.contains("192.168.1.20"), "{after}");
-        assert!(!after.0.contains("Privacy"), "{after}");
-        // CONTROL: the gate is read only for no route to a LAN address.
-        let timed_out = aterm_http::Error::Io(std::io::Error::from(std::io::ErrorKind::TimedOut));
-        let read = std::cell::Cell::new(false);
-        let error = transport_error_on("fetching", url, &timed_out, &|| {
-            read.set(true);
-            LanGate::Granted
-        });
-        assert_eq!(error.kind(), ErrorKind::TimedOut);
-        assert!(!read.get(), "the switch is not read for a timeout");
-        // The switch is read on macOS alone.
-        assert_eq!(lan_gate(false, || panic!("read off macOS")), LanGate::None);
-        assert_eq!(lan_gate(true, || false), LanGate::Unknown);
-        assert_eq!(lan_gate(true, || true), LanGate::Granted);
-    }
-
     #[test]
     fn a_refusal_names_the_status_and_a_sanitized_reason() {
         let mut response = b"HTTP/1.1 409 Conflict\r\nContent-Length: 300\r\n\r\n".to_vec();
@@ -3666,47 +3467,16 @@ mod tests {
         }
     }
 
-    /// A lookup that got no answer and a host with no route are held: how macOS holds an app
-    /// it has not let onto the LAN. A refusal, a definite "no such name", no network at all, a
-    /// malformed reply and a request that cannot be made are not.
+    /// Over real sockets: a port nobody listens on and a server's `503` say what failed, and a
+    /// server that takes the request and never answers fails once the request's deadline passes
+    /// (here a short one, not [`get_bounded`]'s `wait` plus [`FETCH_MARGIN`]).
     #[test]
-    fn only_a_lookup_with_no_answer_and_no_route_are_held() {
-        use std::io::ErrorKind;
-        let io = |kind, text: &str| aterm_http::Error::Io(std::io::Error::new(kind, text));
-        assert!(held(&io(
-            ErrorKind::TimedOut,
-            "dns: no answer within 8000ms"
-        )));
-        assert!(held(&io(ErrorKind::HostUnreachable, "No route to host")));
-        for kind in [
-            ErrorKind::ConnectionRefused,
-            ErrorKind::NetworkUnreachable,
-            ErrorKind::NotFound,
-            ErrorKind::Other,
-            ErrorKind::PermissionDenied,
-        ] {
-            let error = io(
-                kind,
-                "dns: alab-secrets.local: nodename nor servname provided",
-            );
-            assert!(!held(&error), "{kind:?}");
-        }
-        assert!(!held(&aterm_http::Error::Protocol("2x".into())));
-        assert!(!held(&aterm_http::Error::Invalid("no host".into())));
-        assert!(!held(&aterm_http::Error::TooLarge { limit: 1 }));
-    }
-
-    /// Over real sockets: a port nobody listens on and a server's `503` are not held, and a
-    /// server that takes the request and never answers is, once the request's deadline
-    /// passes (here a short one, not [`get_bounded`]'s `wait` plus [`FETCH_MARGIN`]).
-    #[test]
-    fn a_get_says_which_failures_are_held() {
+    fn a_get_says_what_failed() {
         let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let url = format!("http://{}/v1/alab", closed.local_addr().expect("addr"));
         drop(closed);
         let refused =
             get_bounded(&url, None, HANG_DETECTOR, Some(LOOK_CONNECT)).expect_err("no listener");
-        assert!(!refused.held, "{refused:?}");
         assert!(
             refused.why.0.starts_with(&format!("fetching {url}")),
             "{refused:?}"
@@ -3716,7 +3486,7 @@ mod tests {
             stub(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n".to_vec());
         let busy = get_bounded(&url, None, HANG_DETECTOR, Some(LOOK_CONNECT)).expect_err("503");
         server.join().expect("stub");
-        assert!(!busy.held && busy.why.0.contains("503"), "{busy:?}");
+        assert!(busy.why.0.contains("503"), "{busy:?}");
 
         let silent = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let url = format!("http://{}/v1/alab", silent.local_addr().expect("addr"));
@@ -3728,18 +3498,18 @@ mod tests {
             None,
         )
         .expect_err("silent");
-        assert!(unanswered.held, "{unanswered:?}");
+        assert_eq!(unanswered.why.kind(), ErrorKind::TimedOut, "{unanswered:?}");
         drop(silent);
     }
 
-    /// A connector that answers every connect as a lookup macOS holds would, and keeps the
-    /// time its deadline left it.
+    /// A connector that answers every connect as a lookup with no answer, and keeps the time
+    /// its deadline left it.
     #[derive(Debug, Default)]
-    struct HeldLookup {
+    struct UnansweredLookup {
         left: std::sync::Mutex<Vec<Duration>>,
     }
 
-    impl aterm_http::Connect for HeldLookup {
+    impl aterm_http::Connect for UnansweredLookup {
         fn connect(
             &self,
             _host: &str,
@@ -3756,17 +3526,16 @@ mod tests {
     }
 
     /// A look's try gives its DNS lookup and connect [`LOOK_CONNECT`] of a much longer
-    /// request deadline, and a lookup that gets no answer in it is held. Negative control:
-    /// with no connect bound the lookup has the whole deadline.
+    /// request deadline. Negative control: with no connect bound the lookup has the whole
+    /// deadline.
     #[test]
-    fn a_looks_lookup_and_connect_get_the_connect_bound_and_a_hung_one_is_held() {
-        let held = std::sync::Arc::new(HeldLookup::default());
+    fn a_looks_lookup_and_connect_get_the_connect_bound() {
+        let held = std::sync::Arc::new(UnansweredLookup::default());
         let client =
             client(HANG_DETECTOR.saturating_add(FETCH_MARGIN)).with_connector(held.clone());
         let url = "http://alab-secrets.local:7484/v1/alab";
         let bounded =
             get_via(&client, url, None, Some(LOOK_CONNECT), None).expect_err("held lookup");
-        assert!(bounded.held, "{bounded:?}");
         assert!(
             bounded.why.0.starts_with(
                 "fetching http://alab-secrets.local:7484/v1/alab: dns: no answer within"
@@ -3774,7 +3543,7 @@ mod tests {
             "{bounded:?}"
         );
         let unbounded = get_via(&client, url, None, None, None).expect_err("held lookup");
-        assert!(unbounded.held, "{unbounded:?}");
+        assert_eq!(unbounded.why.kind(), ErrorKind::TimedOut, "{unbounded:?}");
         let left = held.left.lock().expect("lock").clone();
         assert_eq!(left.len(), 2);
         assert!(left[0] <= LOOK_CONNECT, "{left:?}");
@@ -3921,5 +3690,107 @@ mod tests {
             assert!(parse_join_line(&bad).is_err(), "{bad:?}");
         }
         assert!(post_join("http://127.0.0.1:9/v1/alab", "nonsense").is_err());
+    }
+
+    /// A stand-in LAN broker on a fresh socket that answers one resolve of a local name with
+    /// `addrs`, and hands back the name it was asked; the seam that points this thread there.
+    #[cfg(target_os = "macos")]
+    fn resolving_broker(
+        addrs: Vec<IpAddr>,
+    ) -> (
+        aterm_uds::lan::Seam,
+        aterm_tempfile::TempDir,
+        std::thread::JoinHandle<Option<String>>,
+    ) {
+        use aterm_uds::lan::wire::{self, Frame, Reader, Request};
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let path = root.path().join("broker.sock");
+        let listener = aterm_uds::CtlListener::bind(&path).expect("bind");
+        let served = std::thread::spawn(move || {
+            let (stream, _) = aterm_uds::accept(&listener).expect("accept");
+            wire::send(
+                &stream,
+                &Frame::Hello {
+                    protocol: aterm_uds::lan::PROTOCOL,
+                    build: "stand-in".into(),
+                },
+            )
+            .expect("hello");
+            let mut reader = Reader::new(0);
+            let deadline = Some(std::time::Instant::now() + HANG_DETECTOR);
+            let hello = reader.frame(&stream, deadline).expect("their hello");
+            assert!(matches!(hello, Some(Frame::Hello { .. })), "{hello:?}");
+            match reader.frame(&stream, deadline).expect("request") {
+                Some(Frame::Request(Request::Resolve { name, .. })) => {
+                    wire::send(&stream, &Frame::Addresses(addrs)).expect("answer");
+                    Some(name)
+                }
+                _ => None,
+            }
+        });
+        let seam = aterm_uds::lan::Seam {
+            socket: Some(path),
+            ..aterm_uds::lan::Seam::default()
+        };
+        (seam, root, served)
+    }
+
+    /// A vault URL on a local name is resolved by the LAN broker, never by a lookup in this
+    /// process (which macOS's Local Network privacy would gate), and its server is then reached.
+    /// Negative control: with aterm-http's own connector in [`client`], the broker hears no
+    /// resolve (`vault-holder.local` then fails in this process's own lookup).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_local_name_is_resolved_by_the_lan_broker() {
+        let (url, server) = stub(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec());
+        let port = url
+            .trim_start_matches("http://127.0.0.1:")
+            .split('/')
+            .next()
+            .expect("port")
+            .to_owned();
+        let local = format!("http://vault-holder.local:{port}/v1/alab");
+        let (seam, _root, broker) = resolving_broker(vec![IpAddr::from([127, 0, 0, 1])]);
+        aterm_uds::lan::seam_here(seam, || get_within(&local, HANG_DETECTOR))
+            .expect("the server the broker's answer named");
+        assert_eq!(
+            broker.join().expect("broker").as_deref(),
+            Some("vault-holder.local")
+        );
+        let head = server.join().expect("stub");
+        assert!(
+            head.contains(&format!("vault-holder.local:{port}")),
+            "{head}"
+        );
+    }
+
+    /// With no LAN broker, a vault URL on a local name fails with the broker's own words, and
+    /// no lookup or connect happens here. Negative control: the same fetch by address reaches
+    /// the server.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn without_a_broker_a_local_name_fails_with_the_brokers_words() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let seam = aterm_uds::lan::Seam {
+            socket: Some(root.path().join("absent.sock")),
+            ..aterm_uds::lan::Seam::default()
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let failed = aterm_uds::lan::seam_here(seam, || {
+            get_within(
+                &format!("http://vault-holder.local:{port}/v1/alab"),
+                HANG_DETECTOR,
+            )
+        })
+        .expect_err("no broker");
+        let words = aterm_uds::lan::Unavailable::NotInstalled.to_string();
+        assert!(failed.0.contains(&words), "{failed:?}");
+        listener.set_nonblocking(true).expect("nonblocking");
+        assert!(listener.accept().is_err(), "nothing connected");
+        drop(listener);
+        let (url, server) = stub(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec());
+        get_within(&url, HANG_DETECTOR).expect("by address");
+        server.join().expect("stub");
     }
 }

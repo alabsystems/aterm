@@ -16,7 +16,7 @@
 use super::journal::place::{Places, Why};
 use super::{
     mail,
-    registry::{self, ACCOUNT, ADDRESS, MACHINE, PREFERENCE},
+    registry::{self, ACCOUNT, ADDRESS, AddressIndex, MACHINE, PREFERENCE},
 };
 use crate::typed::{
     cell::{self, Cells, Projection},
@@ -25,12 +25,26 @@ use crate::typed::{
 use aterm_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// The registry nickname's value and provenance, without applying terminal naming grammar.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum MachineNickname {
+    /// The cell is missing or explicitly null.
+    #[default]
+    Unset,
+    /// One value, with its original spelling and automatic-write provenance.
+    Named { word: String, automatic: bool },
+    /// Concurrent values conflict, or the field cannot be interpreted as nullable text.
+    Conflict,
+}
+
 /// A machine row, by its key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Machine {
     pub pk: String,
-    /// `m22`; `None` while the label is conflicted.
+    /// `m22`; `None` while the label is conflicted or unreadable.
     pub label: Option<String>,
+    /// The nickname's text, automatic-write provenance and conflict state.
+    pub nickname: MachineNickname,
     pub aliases: Vec<String>,
     pub live: bool,
 }
@@ -103,11 +117,38 @@ pub struct LabView {
     /// Live preferences on live machines, by machine key then rank.
     pub preferences: Vec<Preference>,
     addresses: Projection,
+    /// `addresses` by what each row's `addr` says now: how an address names its row.
+    address_index: AddressIndex,
     observed: mail::Observed,
 }
 
 fn text(row: &cell::Row, column: &str) -> Option<String> {
     row.get(column).and_then(Value::as_str).map(str::to_owned)
+}
+
+fn unconflicted_text(row: &cell::Row, column: &str) -> Option<String> {
+    if row.raw.contains(column) || row.fields.get(column)?.conflicted() {
+        return None;
+    }
+    text(row, column)
+}
+
+fn machine_nickname(row: &cell::Row) -> MachineNickname {
+    if row.raw.contains("nickname") {
+        return MachineNickname::Conflict;
+    }
+    match row.fields.get("nickname") {
+        None => MachineNickname::Unset,
+        Some(cell::Field::Value(candidate)) => match &candidate.value.x {
+            Value::Null => MachineNickname::Unset,
+            Value::String(word) => MachineNickname::Named {
+                word: word.clone(),
+                automatic: candidate.value.a,
+            },
+            _ => MachineNickname::Conflict,
+        },
+        Some(_) => MachineNickname::Conflict,
+    }
 }
 
 /// The ordering key of a machine label's number, so `m3` sorts before `m22`.
@@ -140,7 +181,8 @@ impl LabView {
                     .collect();
                 let machine = Machine {
                     pk: pk.clone(),
-                    label: text(&row, "label"),
+                    label: unconflicted_text(&row, "label"),
+                    nickname: machine_nickname(&row),
                     aliases,
                     live: row.live(),
                 };
@@ -212,6 +254,7 @@ impl LabView {
             ))
         });
         let observed = mail::observed(obs.rows.iter().map(|(key, row)| (key.as_str(), &row.value)));
+        let address_index = AddressIndex::of(&addresses);
         Self {
             me,
             bound,
@@ -219,6 +262,7 @@ impl LabView {
             accounts,
             preferences,
             addresses,
+            address_index,
             observed,
         }
     }
@@ -230,7 +274,15 @@ impl LabView {
 
     /// This Mac's label.
     pub fn my_label(&self) -> Option<&str> {
-        self.machine_label(self.me.as_deref()?)
+        self.my_machine()?.label.as_deref()
+    }
+
+    /// The live machine row this Mac's own facts bind, when one is available. Labels and
+    /// nicknames are kept as projected: naming policy belongs to the caller.
+    pub fn my_machine(&self) -> Option<&Machine> {
+        self.machines
+            .get(self.me.as_deref()?)
+            .filter(|machine| machine.live)
     }
 
     /// The accounts `machine` prefers, smaller rank first and an unranked one last.
@@ -338,14 +390,21 @@ impl LabView {
         pk: &str,
         routes: &dyn Fn(&str) -> Option<String>,
     ) -> Option<mail::Effective> {
-        mail::effective(&self.addresses, &self.observed, routes, pk)
+        mail::effective(
+            &self.addresses,
+            &self.address_index,
+            &self.observed,
+            routes,
+            pk,
+        )
     }
 
     /// Every live address, lower-cased, whose codes the lab itself places in one mailbox, to
     /// that mailbox's key: the address's `mailbox` column, through `alias_of`, or a mailbox's own
     /// complete address list ([`mail::effective`] with no routes, a guess left out). What the
     /// harness's mail routes take before any `receives` pattern (step 11, "a route keyed by
-    /// `mailbox`"), on a Mac that can name the mailbox's login.
+    /// `mailbox`"), on a Mac that can name the mailbox's login. An address is placed only by the
+    /// one row it names ([`AddressIndex::row`]), so an address several rows say is placed nowhere.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -361,13 +420,23 @@ impl LabView {
             .filter(|(_, row)| row.live())
             .filter_map(|(pk, row)| {
                 let addr = text(row, "addr")?;
-                let found = mail::effective(&self.addresses, &self.observed, &|_| None, pk)?;
+                (self.address_index.row(&addr) == Some(pk.as_str())).then_some(())?;
+                let found = mail::effective(
+                    &self.addresses,
+                    &self.address_index,
+                    &self.observed,
+                    &|_| None,
+                    pk,
+                )?;
                 (found.how != mail::How::Hint).then(|| (addr.to_ascii_lowercase(), found.mailbox))
             })
             .collect()
     }
 
-    /// Every address with an `alias_of` link, lower-cased, to [`Self::alias_targets`] of it.
+    /// Every address with an `alias_of` link, lower-cased, to the live addresses its row is an
+    /// alias of, as [`Self::alias_targets`] reads them: only from the one row the address names
+    /// ([`AddressIndex::row`]), so an address several rows say routes nowhere, as
+    /// [`Self::mailboxes`] places it nowhere.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -379,23 +448,28 @@ impl LabView {
     pub fn aliases(&self) -> BTreeMap<String, Vec<String>> {
         self.addresses
             .rows
-            .values()
-            .filter(|row| row.live() && row.get("alias_of").is_some())
-            .filter_map(|row| text(row, "addr"))
-            .map(|addr| {
-                let targets = self.alias_targets(&addr);
-                (addr.to_ascii_lowercase(), targets)
-            })
+            .iter()
+            .filter(|(_, row)| row.live() && row.get("alias_of").is_some())
+            .filter_map(|(pk, row)| Some((pk, text(row, "addr")?)))
+            .filter(|(pk, addr)| self.address_index.row(addr) == Some(pk.as_str()))
+            .map(|(pk, addr)| (addr.to_ascii_lowercase(), self.alias_targets_of(pk)))
             .filter(|(_, targets)| !targets.is_empty())
             .collect()
     }
 
     /// The live addresses `address` is an alias of, nearest first, following `alias_of` (§0):
-    /// the addresses whose mail routes receive its auth codes. Stops at a retired link or a cycle.
+    /// the addresses whose mail routes receive its auth codes, from the one row whose `addr`
+    /// says `address` now ([`AddressIndex::row`]). Stops at a retired link or a cycle.
     pub fn alias_targets(&self, address: &str) -> Vec<String> {
-        let Ok(mut at) = crate::typed::keys::address_pk(address) else {
-            return Vec::new();
-        };
+        self.address_index
+            .row(address)
+            .map(|pk| self.alias_targets_of(pk))
+            .unwrap_or_default()
+    }
+
+    /// [`Self::alias_targets`] from row `pk`.
+    fn alias_targets_of(&self, pk: &str) -> Vec<String> {
+        let mut at = pk.to_owned();
         let mut seen = BTreeSet::from([at.clone()]);
         let mut out = Vec::new();
         while let Some(next) = self

@@ -163,7 +163,9 @@ impl TerminalHandler<'_> {
                 if canceled {
                     self.sixel.decoder.abort();
                 } else if let Some(image) = self.sixel.decoder.unhook() {
-                    self.place_sixel_image(&image);
+                    // The image is the raster `dcs_put` charged, cut to its painted extent in
+                    // place: unhook allocates nothing that charge does not already cover.
+                    self.place_sixel_image(image);
                     self.sixel.next_id += 1;
                 }
             }

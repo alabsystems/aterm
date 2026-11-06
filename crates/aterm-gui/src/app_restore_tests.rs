@@ -1865,6 +1865,7 @@ fn bare_leaf() -> restore::TerminalLeafRestore {
         not_claim_worker: false,
         claim_worker: None,
         task: None,
+        told: None,
     }
 }
 
@@ -2599,6 +2600,109 @@ fn a_restored_claim_worker_gets_a_task_record() {
     );
 }
 
+/// A QUIT CARRIES EACH TAB'S TOLD-ONCE IDS TO THE TAB A COLD RESTORE BRINGS BACK (design §14.18,
+/// ATERM-KI-1105-5): the quit's leaf names the ids its session's herald holds
+/// (`TerminalLeafRestore::told`), and so does the crash journal's, through the layout's own
+/// encoding, and the session that fills that leaf takes them as its herald's memory at its first
+/// publication. CONTROL: a leaf that names none gives its session no carry.
+#[test]
+fn a_quit_carries_each_tabs_told_ids_to_its_cold_restore() {
+    let told = vec![0x7_u64, 0x9];
+    let mut parent = App::headless_for_test();
+    let now = std::time::Instant::now();
+    parent.presence.herald.adopt(
+        0,
+        crate::status_item::StatusCarry {
+            told_ids: told.clone(),
+            ..crate::status_item::StatusCarry::default()
+        },
+        0,
+        now,
+    );
+    assert_eq!(parent.presence.herald.told_ids(0), told, "PRECONDITION");
+    let mut manifest = parent.capture_restore_manifest();
+    parent.quit_agents(&mut manifest, false);
+    let leaf = manifest.windows[0].restored_tabs[0]
+        .root
+        .first_terminal_leaf()
+        .expect("the tab's leaf");
+    assert_eq!(
+        leaf.told.as_deref(),
+        crate::status_item::told_ids_row(&told).as_deref(),
+        "the quit's leaf names the told ids"
+    );
+    // The crash journal's image names them too, so a crash's restore carries them as a quit's.
+    #[cfg(unix)]
+    {
+        let journal_dir = crate::crash_journal::tests::scratch("cj-told");
+        parent.crash_journal = crate::crash_journal::Lane::new(
+            Some(journal_dir.path().to_path_buf()),
+            crate::crash_journal::tests::reaped_pid(),
+        );
+        parent.first_present_done = true;
+        let journal = parent.crash_journal.journal_id();
+        parent.tick_crash_journal(std::time::Instant::now());
+        let (_, image) = aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the journal's image",
+            || {
+                std::fs::read_to_string(journal_dir.path().join(journal.file_name()))
+                    .ok()
+                    .and_then(|text| crate::crash_journal::decode(&text).ok())
+            },
+        );
+        assert_eq!(
+            image.windows[0].restored_tabs[0]
+                .root
+                .first_terminal_leaf()
+                .and_then(|leaf| leaf.told.clone()),
+            crate::status_item::told_ids_row(&told),
+            "the crash journal's leaf names the told ids"
+        );
+        parent.crash_journal = crate::crash_journal::Lane::inert();
+        crate::crash_journal::tests::await_released(&journal_dir.path().join(journal.lock_name()));
+    }
+    let restored = |manifest: &restore::RestoreManifest| {
+        let header = crate::crash_journal::JournalHeader::now(std::process::id(), false);
+        let text = crate::crash_journal::encode(manifest, &header).expect("encoded");
+        let (_, mut read) = crate::crash_journal::decode(&text).expect("decoded");
+        let mut cold = App::headless_for_test();
+        cold.restore_into_window(WindowId(0), read.windows.remove(0));
+        let filled = cold
+            .focused_session_id(WindowId(0))
+            .expect("the restored tab");
+        (cold, filled)
+    };
+    let (mut cold, filled) = restored(&manifest);
+    let sid = cold
+        .pool
+        .get(filled)
+        .expect("its session")
+        .ctx
+        .self_id
+        .as_str()
+        .to_string();
+    assert_eq!(
+        cold.status_carry
+            .get(&sid)
+            .map(|carry| carry.told_ids.clone()),
+        Some(told.clone()),
+        "the restored session's carry"
+    );
+    cold.herald_session(filled);
+    assert_eq!(
+        cold.presence.herald.told_ids(filled),
+        told,
+        "its herald's memory after its first publication"
+    );
+    // CONTROL: a leaf with no told ids.
+    let mut bare = manifest.clone();
+    bare.fill_told(&|_| None);
+    let (cold, filled) = restored(&bare);
+    assert!(cold.presence.herald.told_ids(filled).is_empty());
+    assert!(cold.status_carry.is_empty(), "no carry");
+}
+
 /// A CLAIM WORKER THE PTY KEEPER HANDS BACK KEEPS ITS TIME (2026-11-02 review): after a crash the
 /// keeper reattaches the worker's shell with its Claude Code still running there, so a leaf whose
 /// image caught no agent for it names no worker that is gone: its tab gets `working
@@ -3137,6 +3241,64 @@ fn a_handoff_leaf_with_a_pending_agent_is_relaunched_by_the_successor() {
     );
     successor.queue_carried_restored_agents();
     assert!(successor.take_restored_agents().is_empty(), "one-shot");
+}
+
+/// A layout's agent ended under an earlier aterm process, so its relaunch is told so (the native mark of a live host does not hold it, RS1),
+/// a restart stamp the layout carried included; one this process stranded or rolled back is not: control.
+#[cfg(unix)]
+#[test]
+fn a_cold_restored_agent_relaunches_as_ended_under_an_earlier_host() {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, bool, bool)>::new()));
+    let (s, stamped) = (std::sync::Arc::clone(&seen), std::sync::Arc::clone(&seen));
+    let host = crate::harness_host::HostHandle::for_restored_test_with_stamped(
+        std::sync::Arc::new(move |sid, _, _, _, launch| {
+            s.lock()
+                .unwrap()
+                .push((sid.to_string(), launch.earlier, false));
+            "adopted".to_string()
+        }),
+        std::sync::Arc::new(move |sid, _, _, _, _, asked, how, _| {
+            assert!(!how.carried, "a restored exit is no Autopilot's carry");
+            stamped
+                .lock()
+                .unwrap()
+                .push((sid.to_string(), how.earlier, asked.is_some()));
+            "adopted".to_string()
+        }),
+    );
+    let agent = |sid: &str, cold: bool, asked| crate::harness_host::RestoredAgent {
+        sid: sid.into(),
+        snap: owed_relaunch(sid),
+        place: "in tab 1".into(),
+        cold,
+        asked,
+        was: None,
+    };
+    let stamp = Some(aterm_agent::harness::restart_stamp::Cause::Asked);
+    host.relaunch_restored(vec![
+        agent("s-cold", true, None),
+        agent("s-cold-asked", true, stamp),
+        agent("s-warm", false, None),
+        agent("s-warm-asked", false, stamp),
+    ]);
+    let mut got = aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "every restored relaunch",
+        || {
+            let g = seen.lock().unwrap();
+            (g.len() >= 4).then(|| g.clone())
+        },
+    );
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            ("s-cold".to_string(), true, false),
+            ("s-cold-asked".to_string(), true, true),
+            ("s-warm".to_string(), false, false),
+            ("s-warm-asked".to_string(), false, true),
+        ]
+    );
 }
 
 #[cfg(unix)]

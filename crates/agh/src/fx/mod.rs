@@ -1405,7 +1405,22 @@ impl Fx {
             Seam::Simulated(clock) => {
                 child::check(spec)?;
                 clock.log(spec);
-                child::run(spec)
+                #[cfg(unix)]
+                let hook = clock.take_git_hook(spec);
+                #[cfg(unix)]
+                let after = hook.map(|hook| {
+                    (hook.before)();
+                    hook.after
+                });
+                #[cfg(unix)]
+                let mut result = child::run(spec);
+                #[cfg(not(unix))]
+                let result = child::run(spec);
+                #[cfg(unix)]
+                if let Some(after) = after {
+                    after(&mut result);
+                }
+                result
             }
             Seam::Recording { seam, sink } => {
                 self.latched()?;
@@ -1429,6 +1444,33 @@ impl Fx {
                     |_| Ok(()),
                 )?,
         }
+    }
+
+    /// Tests: intercept one exact real Git child on a simulated client. The
+    /// child still executes; callbacks model a concurrent fixture ref change
+    /// or a lost acknowledgement without a timing race or a shell stand-in.
+    ///
+    /// # Panics
+    /// Unless this is simulated, or if another interception is pending.
+    #[cfg(all(unix, any(test, debug_assertions)))]
+    #[must_use]
+    pub fn with_git_intercept_once_for_tests(
+        self,
+        program: std::path::PathBuf,
+        args: Vec<std::ffi::OsString>,
+        before: impl FnOnce() + Send + 'static,
+        after: impl FnOnce(&mut Result<child::ChildOut>) + Send + 'static,
+    ) -> Self {
+        let Seam::Simulated(clock) = &self.seam else {
+            panic!("Git interception requires simulated Fx");
+        };
+        clock.set_git_hook(sim::GitHook {
+            program,
+            args,
+            before: Box::new(before),
+            after: Box::new(after),
+        });
+        self
     }
 
     /// Tests: the same simulated `Fx`, answering `child` from `children` in order.

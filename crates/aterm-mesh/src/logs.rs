@@ -333,7 +333,7 @@ impl Standings {
     }
 }
 
-fn principal_buf(key: &[u8; 32]) -> [u8; 18] {
+pub(crate) fn principal_buf(key: &[u8; 32]) -> [u8; 18] {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = [0u8; 18];
     out[0] = b'n';
@@ -345,7 +345,7 @@ fn principal_buf(key: &[u8; 32]) -> [u8; 18] {
     out
 }
 
-fn principal_str(buf: &[u8; 18]) -> &str {
+pub(crate) fn principal_str(buf: &[u8; 18]) -> &str {
     std::str::from_utf8(buf).unwrap_or("")
 }
 
@@ -393,20 +393,17 @@ impl Verdict {
             .collect();
         let all: Vec<[u8; 32]> = std::iter::once(*me).chain(others).collect();
         let mut classes: BTreeMap<u64, usize> = BTreeMap::new();
-        let mut names: Vec<String> = Vec::new();
-        let mut principal_of: BTreeMap<String, usize> = BTreeMap::new();
+        let mut names: Vec<[u8; 18]> = Vec::with_capacity(all.len());
+        let mut principal_of: BTreeMap<[u8; 18], usize> = BTreeMap::new();
         let keys: Vec<aterm_mesh_core::relay::Key> = all
             .iter()
             .map(|key| {
                 let next = classes.len();
                 let class = *classes.entry(class(key)).or_insert(next);
                 let buf = principal_buf(key);
-                let name = principal_str(&buf);
-                let principal = principal_of.get(name).copied().unwrap_or_else(|| {
+                let principal = *principal_of.entry(buf).or_insert_with(|| {
                     let idx = names.len();
-                    let owned = name.to_owned();
-                    principal_of.insert(owned.clone(), idx);
-                    names.push(owned);
+                    names.push(buf);
                     idx
                 });
                 let gone = read.removed.contains(key) || read.retired.contains(key);
@@ -431,7 +428,8 @@ impl Verdict {
             principals: names
                 .into_iter()
                 .enumerate()
-                .filter_map(|(p, name)| verdict.is_principal_revoked(p).then_some(name))
+                .filter(|&(p, _)| verdict.is_principal_revoked(p))
+                .map(|(_, buf)| principal_str(&buf).to_owned())
                 .collect(),
         }
     }
@@ -1032,6 +1030,22 @@ impl Mesh {
     /// [`Self::retire_due`]). This Mac's own key and principal are never revoked. Broker state is a
     /// function of the read: a key's principal is revoked or lifted with the class it stands in,
     /// never with one key's change. Answers whether anything changed.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "FabricRouting",
+            action = "RevokeB",
+            project = "aterm_link::federate::conformance::routing_projection"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "FabricRouting",
+            action = "UnrevokeB",
+            project = "aterm_link::federate::conformance::routing_projection"
+        )
+    )]
     pub fn apply(&self, read: Standings) -> bool {
         let mut applied = self.applied.lock_or_recover();
         if applied.read.as_ref() == Some(&read) {
@@ -1189,9 +1203,10 @@ impl Mesh {
         if RETIRE_REFUSED.with(std::cell::Cell::get) {
             return Err(io::Error::other("a test refused the retirement"));
         }
-        let principal = astream_broker::identity_principal(key);
-        let pid = astream_broker::producer_id_of(&principal);
-        let filter = MeshLog::retired_filter(&principal);
+        let buf = principal_buf(key);
+        let principal = principal_str(&buf);
+        let pid = astream_broker::producer_id_of(principal);
+        let filter = MeshLog::retired_filter(principal);
         let hosted = &self.metrics;
         let mut client =
             hosted.client(&self.me, &format!("rw:{filter}"), Some(relay::IO_WITHIN))?;
@@ -1209,8 +1224,9 @@ impl Mesh {
         let Some(host) = self.applied.lock_or_recover().bus.clone() else {
             return;
         };
-        let principal = astream_broker::identity_principal(key);
-        let retired = host.retire_halts_of(self.me.key, &principal);
+        let buf = principal_buf(key);
+        let principal = principal_str(&buf);
+        let retired = host.retire_halts_of(self.me.key, principal);
         let mut applied = self.applied.lock_or_recover();
         // The host may have been replaced meanwhile: only its own retirement counts.
         if !applied
@@ -1372,9 +1388,10 @@ impl Mesh {
             Some(false) => return incoming.refuse("out"),
             Some(true) => {}
         }
-        let peer = astream_broker::identity_principal(&key);
+        let peer_buf = principal_buf(&key);
+        let peer = principal_str(&peer_buf);
         let hosted = self.hosted(log);
-        let grants = match hosted.grants_for(&peer) {
+        let grants = match hosted.grants_for(peer) {
             Ok(grants) => grants,
             Err(e) => {
                 aterm_log::warn!("mesh: no grants for {peer}: {e}");
@@ -1414,12 +1431,13 @@ impl Mesh {
             Some(false) => return incoming.refuse("out"),
             Some(true) => {}
         }
-        let peer = astream_broker::identity_principal(&key);
+        let peer_buf = principal_buf(&key);
+        let peer = principal_str(&peer_buf);
         let olds = self
             .standings()
             .map(|read| retired_of(&read, &key))
             .unwrap_or_default();
-        let grants = match host.ring_for(&self.me.principal, &peer, &olds) {
+        let grants = match host.ring_for(&self.me.principal, peer, &olds) {
             Ok(grants) => grants,
             Err(e) => {
                 aterm_log::warn!("mesh: no bus.log ring for {peer}: {e}");
@@ -1554,16 +1572,11 @@ pub fn ring(fleet: &str, me: &str, peer: &str, olds: &BTreeSet<String>) -> Vec<S
 /// seat write as that other Mac.
 #[must_use]
 pub fn retired_of(read: &Standings, key: &[u8; 32]) -> BTreeSet<String> {
-    let seated: BTreeSet<String> = read
-        .current
-        .iter()
-        .map(astream_broker::identity_principal)
-        .collect();
     read.rotated
         .iter()
         .filter(|(_, now)| *now == key)
+        .filter(|(old, _)| !read.current.iter().any(|cur| cur[..8] == old[..8]))
         .map(|(old, _)| astream_broker::identity_principal(old))
-        .filter(|old| !seated.contains(old))
         .collect()
 }
 
@@ -1582,13 +1595,9 @@ pub fn lineage(read: &Standings, me: &[u8; 32]) -> Vec<(u64, Vec<u64>)> {
             continue;
         }
         lineage
-            .entry(astream_cap::producer_id_of(
-                &astream_broker::identity_principal(now),
-            ))
+            .entry(class_of(now))
             .or_default()
-            .push(astream_cap::producer_id_of(
-                &astream_broker::identity_principal(old),
-            ));
+            .push(class_of(old));
     }
     lineage.into_iter().collect()
 }

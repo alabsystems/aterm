@@ -2694,7 +2694,7 @@ type SelfSnapshotFn =
     dyn Fn(&str, &self_claimed::Copy, &self_claimed::Resume) -> Option<Snapshot> + Send + Sync;
 /// One attempt at the relaunch of tab `sid`'s agent that left ([`Acts::relaunch`]): its grace, its
 /// snapshot, what its exit left, whether it may upgrade, the restart stamp that asked for it, and
-/// whether an Autopilot carries it ([`relaunch::Carried::Yes`]: [`relaunch::after_carried_exit`]).
+/// how it is carried ([`ExitHow`]).
 /// The optional admission callback applies only when planning a new command.
 type RelaunchFn = dyn Fn(
         &str,
@@ -2703,7 +2703,7 @@ type RelaunchFn = dyn Fn(
         &ExitRecord,
         bool,
         Option<restart_stamp::Cause>,
-        bool,
+        ExitHow,
         Option<&relaunch::Admission<'_>>,
     ) -> String
     + Send
@@ -2725,16 +2725,26 @@ type CarryFn = dyn Fn(&str, u32, aterm_agent::harness::upgrade::Agent, Option<u3
 /// How long a person's keys hold that restart's line, under tab `sid`'s grace ([`Acts::line_grace`]).
 type LineGraceFn =
     dyn Fn(&str, u32, aterm_agent::harness::upgrade::Agent, Option<u32>) -> u32 + Send + Sync;
+/// How an exit's relaunch is carried ([`RelaunchFn`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ExitHow {
+    /// An Autopilot carries it ([`relaunch::Carried::Yes`]: [`relaunch::after_carried_exit`]).
+    pub(crate) carried: bool,
+    /// Its agent ended under an earlier aterm process (a restored tab whose layout carried its
+    /// restart stamp, [`RestoredAgent::cold`]): [`relaunch::after_earlier_host_ended`].
+    pub(crate) earlier: bool,
+}
+/// How a restored agent's relaunch is admitted ([`RestoredFn`]).
+#[derive(Clone, Copy)]
+pub(crate) struct RestoredLaunch<'a> {
+    /// The cold intent whose admission the relaunch defers, if any.
+    pub(crate) deferred: Option<&'a aterm_agent::harness::native_act::ColdIntent>,
+    /// The agent ended under an earlier aterm process (the layout's snapshot, [`RestoredAgent::cold`]).
+    pub(crate) earlier: bool,
+}
 /// The relaunch of an agent whose tab a crash of aterm took.
-type RestoredFn = dyn Fn(
-        &str,
-        &Snapshot,
-        bool,
-        Option<&str>,
-        Option<&aterm_agent::harness::native_act::ColdIntent>,
-    ) -> String
-    + Send
-    + Sync;
+type RestoredFn =
+    dyn Fn(&str, &Snapshot, bool, Option<&str>, RestoredLaunch<'_>) -> String + Send + Sync;
 /// A cold restore reopened tab `sid` from the tab `was` its agent ran in ([`upgrade_drive::note_earlier_tab`]).
 type EarlierTabFn = dyn Fn(&str, &str) + Send + Sync;
 /// Whether the agent the relaunch of tab `sid`'s conversation (`snap`'s) adopted is gone.
@@ -2909,8 +2919,23 @@ type BackgroundFn = dyn Fn(u32) -> bool + Send + Sync;
 /// An account move made, written where the session's loop reads it ([`Acts::account_made`]).
 type AccountMadeFn = dyn Fn(&str, &str, AccountAt) + Send + Sync;
 /// Admission of a retained Claude relaunch; an error holds its conversation without executing it.
-type AccountColdFn =
-    dyn Fn(&Snapshot, accounts::Mode) -> Result<relaunch::ColdAdmission, String> + Send + Sync;
+type AccountColdFn = dyn Fn(&Snapshot, accounts::Mode, ColdEnd) -> Result<relaunch::ColdAdmission, String>
+    + Send
+    + Sync;
+
+/// Where the agent a cold admission relaunches ended ([`Acts::account_cold`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ColdEnd {
+    /// Under this aterm process, whose tab shell outlived it: the native cold constructor's
+    /// death witness (registered with this host's epoch, naming that shell) can prove it.
+    ThisHost,
+    /// Under an earlier aterm process: a tab restored from the layout ([`RestoredAgent::cold`]),
+    /// after a reboot, a kill or an update's owed relaunch. No witness of this host names it
+    /// and its tab's shell is not the one it ran under, so the constructor refuses it by
+    /// construction (`native-crash-observation`) and the relaunch is the typed resume line,
+    /// admitted here on its recorded launch environment.
+    EarlierHost,
+}
 /// A checked cold Codex relaunch: `Ok(None)` keeps the saved login, while an error retains
 /// the pending conversation without executing it ([`Acts::codex_cold`]).
 type CodexColdFn = dyn Fn(&Snapshot) -> Result<Option<Snapshot>, String> + Send + Sync;
@@ -6307,7 +6332,7 @@ impl IdleHost for WorkerIdle {
                 let Some(look) = self.account_look(&roster) else {
                     return wait();
                 };
-                (roster, look, accounts::Store::at(&seat.state))
+                (roster, look, seat.claude_store())
             } else {
                 let roster = match pool.bound_roster(cli) {
                     Ok(roster) if roster.rows.is_empty() => return None,
@@ -6507,7 +6532,7 @@ impl IdleHost for WorkerIdle {
         if look.label.is_none() {
             return Some(RosterWord::Unlisted);
         }
-        let Ok((state, _)) = accounts::Store::at(&seat.state).load(seat.now) else {
+        let Ok((state, _)) = seat.claude_store().load(seat.now) else {
             return Some(RosterWord::Unread);
         };
         let enrolled = accounts::enrolled(&roster);
@@ -7106,7 +7131,8 @@ impl WorkerIdle {
         seat: &AccountSeat,
         pid: u32,
     ) -> Result<Option<(accounts::UsageRoster, AccountLook)>, &'static str> {
-        let captured = accounts::Store::at(&seat.state)
+        let captured = seat
+            .claude_store()
             .read_usage_roster(seat.roster.as_deref(), seat.now)
             .map_err(|_| TAP_NOT_OWN)?;
         let Some(look) = self.account_look(captured.roster()) else {
@@ -7976,7 +8002,8 @@ impl WorkerIdle {
         let Some(row) = look.judged(&roster).and_then(|label| roster.row(label)) else {
             return true;
         };
-        if accounts::Store::at(&seat.state)
+        if seat
+            .claude_store()
             .load(seat.now)
             .is_ok_and(|(state, _)| seen.noted(&state, seat.now))
         {
@@ -8215,7 +8242,8 @@ impl WorkerIdle {
         let Some(label) = renewable_own(roster, look) else {
             return;
         };
-        let fresh = accounts::Store::at(&seat.state)
+        let fresh = seat
+            .claude_store()
             .bounded_by(seat.ladder)
             .read_account_records(seat.roster.as_deref(), seat.now)
             .ok()
@@ -8442,7 +8470,7 @@ impl WorkerIdle {
             );
             return Some(AccountAdvice::Move { to, yields: None });
         }
-        let store = accounts::Store::at(&seat.state);
+        let store = seat.claude_store();
         if at == accounts::Point::LoginEnded {
             self.login_ended(&seat, &roster, &look);
         }
@@ -8654,12 +8682,8 @@ impl WorkerIdle {
     ) -> Result<Vec<accounts::Event>, String> {
         self.reset_flush(seat);
         let current = current_account_seat(&self.hooks, seat)?;
-        accounts::Store::at(&seat.state).observe_usage_within(
-            seat.ladder,
-            current.now,
-            captured,
-            who,
-            |state| {
+        seat.claude_store()
+            .observe_usage_within(seat.ladder, current.now, captured, who, |state| {
                 Ok(edit(state, current.now)?
                     .into_iter()
                     .map(|event| match event.sid {
@@ -8667,8 +8691,7 @@ impl WorkerIdle {
                         None => event.with_sid(&self.sid),
                     })
                     .collect())
-            },
-        )
+            })
     }
 
     /// An account-wide observation, retaining attribution across credential renewal.
@@ -8682,7 +8705,7 @@ impl WorkerIdle {
         self.reset_flush(seat);
         let current = current_account_seat(&self.hooks, seat)?;
         let now = current.now;
-        accounts::Store::at(&seat.state).observe_account_within(
+        seat.claude_store().observe_account_within(
             seat.ladder,
             now,
             accounts::LoginObservation {
@@ -8938,7 +8961,8 @@ impl WorkerIdle {
         if self.reset_flush(&seat) == Flushed::Held {
             return Err(NoReset::LockHeld);
         }
-        let answered = accounts::Store::at(&seat.state)
+        let answered = seat
+            .claude_store()
             .load(seat.now)
             .ok()
             .and_then(|(state, _)| state.reset)
@@ -9011,7 +9035,8 @@ impl WorkerIdle {
     /// commit a pre-admission refusal saves nothing and an interrupted publication fences reads until
     /// recovery, so this is a belt for any path that saved the claim without its outcome.
     fn reset_unclaim(&self, seat: &AccountSeat, look: &AccountLook, label: &str, until: i64) {
-        let open = accounts::Store::at(&seat.state)
+        let open = seat
+            .claude_store()
             .load(seat.now)
             .ok()
             .and_then(|(state, _)| state.reset)
@@ -9067,7 +9092,7 @@ impl WorkerIdle {
         let Some(label) = look.judged(&roster) else {
             return unread(NoReset::NotStored.as_str());
         };
-        let Ok((state, _)) = accounts::Store::at(&seat.state).load(seat.now) else {
+        let Ok((state, _)) = seat.claude_store().load(seat.now) else {
             return not_yet(NoReset::State);
         };
         let claim = state.reset.as_ref().filter(|claim| {
@@ -9140,7 +9165,7 @@ impl WorkerIdle {
 
     /// The advice of a session on a machine that lists no account.
     fn reset_advice(&self, seat: &AccountSeat, point: AccountPoint) -> Option<AccountAdvice> {
-        let store = accounts::Store::at(&seat.state);
+        let store = seat.claude_store();
         if !store.state_file().exists() {
             return None;
         }
@@ -9298,7 +9323,7 @@ impl WorkerIdle {
             return RestartAnswer::unread(CHANGED);
         };
         let (point, wall) = account_point(&seat, &look, advised.point, seen);
-        let Ok((state, _)) = accounts::Store::at(&seat.state).load_judged(seat.now, &roster) else {
+        let Ok((state, _)) = seat.claude_store().load_judged(seat.now, &roster) else {
             return RestartAnswer::unread(STATE);
         };
         let enrolled = accounts::enrolled(&roster);
@@ -11074,7 +11099,10 @@ fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
                 &left,
                 job.switches.upgrade(),
                 cause.get(),
-                carried_exit.get(),
+                ExitHow {
+                    carried: carried_exit.get(),
+                    earlier: false,
+                },
                 admit,
             )
         });
@@ -14072,7 +14100,12 @@ fn restored_step(shared: &Shared, hooks: &Hooks, taken: &RestoredTaken, relaunch
     }
     let cold_mode = switches.accounts();
     let admitted = if accounts_for(agent.snap.agent().program()) {
-        cold(&agent.snap, cold_mode)
+        let end = if agent.cold {
+            ColdEnd::EarlierHost
+        } else {
+            ColdEnd::ThisHost
+        };
+        cold(&agent.snap, cold_mode, end)
     } else if agent.cold
         || agent
             .snap
@@ -14124,7 +14157,10 @@ fn restored_step(shared: &Shared, hooks: &Hooks, taken: &RestoredTaken, relaunch
                     &ExitRecord::Unread,
                     switches.upgrade(),
                     Some(cause),
-                    false,
+                    ExitHow {
+                        carried: false,
+                        earlier: agent.cold,
+                    },
                     deferred.map(|_| &deferred_admit as &relaunch::Admission<'_>),
                 ),
                 None => act(
@@ -14132,7 +14168,10 @@ fn restored_step(shared: &Shared, hooks: &Hooks, taken: &RestoredTaken, relaunch
                     snap,
                     switches.upgrade(),
                     agent.was.as_deref(),
-                    deferred,
+                    RestoredLaunch {
+                        deferred,
+                        earlier: agent.cold,
+                    },
                 ),
             }
         }
@@ -18804,13 +18843,23 @@ fn live_acts(
         end_asked: Arc::new(move |sid, group, began| end_asked(&end_store, sid, group, began)),
         driven: Arc::new(move |sid| driven(&driven_store, sid)),
         relaunch: Arc::new(
-            move |sid, grace, snap, left, upgrade, asked, carried, admit| {
+            move |sid, grace, snap, left, upgrade, asked, how: ExitHow, admit| {
                 let Some(o) = o5(sid, grace) else {
                     return "refused:no-home".to_string();
                 };
-                let r = if let Some(admit) = admit {
-                    relaunch::after_exit_admitting(&o, snap, left, upgrade, asked, carried, admit)
-                } else if carried {
+                let r = if how.earlier {
+                    relaunch::after_earlier_host_ended(&o, snap, upgrade, None, asked, admit)
+                } else if let Some(admit) = admit {
+                    relaunch::after_exit_admitting(
+                        &o,
+                        snap,
+                        left,
+                        upgrade,
+                        asked,
+                        how.carried,
+                        admit,
+                    )
+                } else if how.carried {
                     relaunch::after_carried_exit(&o, snap, left, upgrade)
                 } else {
                     relaunch::after_exit(&o, snap, left, upgrade, asked)
@@ -18836,17 +18885,25 @@ fn live_acts(
             }
             r.step
         }),
-        relaunch_restored: Arc::new(move |sid, snap, upgrade, was, cold| {
+        relaunch_restored: Arc::new(move |sid, snap, upgrade, was, launch| {
             let Some(o) = o14(sid, 0) else {
                 return "refused:no-home".to_string();
             };
-            let r = match cold {
-                Some(intent) => {
-                    relaunch::after_host_ended_admitting(&o, snap, upgrade, was, &|_| {
-                        Ok(relaunch::ColdAdmission::Deferred(intent.clone()))
-                    })
+            let deferred = |_: &Snapshot| match launch.deferred {
+                Some(intent) => Ok(relaunch::ColdAdmission::Deferred(intent.clone())),
+                None => Ok(relaunch::ColdAdmission::Immediate(None)),
+            };
+            let admit = launch
+                .deferred
+                .map(|_| &deferred as &relaunch::Admission<'_>);
+            let r = match (launch.earlier, admit) {
+                (true, admit) => {
+                    relaunch::after_earlier_host_ended(&o, snap, upgrade, was, None, admit)
                 }
-                None => relaunch::after_host_ended_from(&o, snap, upgrade, was),
+                (false, Some(admit)) => {
+                    relaunch::after_host_ended_admitting(&o, snap, upgrade, was, admit)
+                }
+                (false, None) => relaunch::after_host_ended_from(&o, snap, upgrade, was),
             };
             w8(sid, RESTORED_LINE, &r);
             r.step
@@ -19002,30 +19059,20 @@ fn live_acts(
                 aterm_log::info!("harness @{sid}: account move to {to}: not written for its loop");
             }
         }),
-        account_cold: Arc::new(move |snap, mode| {
+        account_cold: Arc::new(move |snap, mode, end| {
             if !accounts_for(snap.agent().program()) {
                 return Ok(relaunch::ColdAdmission::Immediate(None));
             }
             let seat = account_seat_live(cold_home.as_deref())
                 .ok_or("cold Claude account context unavailable")?;
-            if !crate::native_session_policy::cold_restart_qualified() {
-                return account_cold_at(&seat, snap, mode, || {
-                    atpkg::caller_shell::process_args(snap.shell).map(|args| args.env)
-                })
-                .map(relaunch::ColdAdmission::immediate);
-            }
-            Ok(relaunch::ColdAdmission::Deferred(
-                aterm_agent::harness::native_act::ColdIntent {
-                    login: snap.login.clone(),
-                    home: snap.home.clone(),
-                    auth_observed: snap.auth_observed,
-                    stored_login: snap.stored_login,
-                    conversation: snap.session.clone(),
-                    profile: snap.profile.clone(),
-                    mode,
-                    billing: aterm_agent::harness::native_act::ColdBilling::Keep,
-                },
-            ))
+            account_cold_decided(
+                &seat,
+                snap,
+                mode,
+                end,
+                crate::native_session_policy::cold_restart_qualified(),
+                || atpkg::caller_shell::process_args(snap.shell).map(|args| args.env),
+            )
         }),
         codex_cold: Arc::new(move |snap| {
             if snap.codex().is_none() {
@@ -20079,6 +20126,20 @@ impl AccountContext {
 }
 
 impl AccountSeat {
+    /// Claude Code's accounts store for this seat, which reads the default login under the
+    /// seat's home where that login is a file ([`accounts::Store::at_for`]), so every pick,
+    /// advice and record this host makes judges a lapsed default login as the report does.
+    fn claude_store(&self) -> accounts::Store {
+        accounts::Store::at_for(&self.state, accounts::Cli::Claude, &self.home)
+    }
+
+    /// [`Self::claude_store`] bounded by the seat's lock ladder: the store [`roster_read`] and
+    /// the account-progress inventory read, so they judge a lapsed default login as the picks
+    /// and advice do.
+    fn bounded_claude_store(&self) -> accounts::Store {
+        self.claude_store().bounded_by(self.ladder)
+    }
+
     fn context(&self) -> AccountContext {
         AccountContext {
             roster: self.roster.clone(),
@@ -20234,15 +20295,16 @@ fn account_transact_of(
 ) -> Result<Vec<accounts::Event>, String> {
     let now = current_account_seat(hooks, seat)?.now;
     let mut note = None;
-    accounts::Store::at(&seat.state).transact_within(seat.ladder, now, &mut note, |state| {
-        Ok(edit(state, now)?
-            .into_iter()
-            .map(|event| match event.sid {
-                Some(_) => event,
-                None => event.with_sid(sid),
-            })
-            .collect())
-    })
+    seat.claude_store()
+        .transact_within(seat.ladder, now, &mut note, |state| {
+            Ok(edit(state, now)?
+                .into_iter()
+                .map(|event| match event.sid {
+                    Some(_) => event,
+                    None => event.with_sid(sid),
+                })
+                .collect())
+        })
 }
 
 /// Records a roster-based decision only while its policy and writer context remain current.
@@ -20278,7 +20340,7 @@ fn roster_transact_of(
     edit: impl FnOnce(&mut accounts::State, i64) -> Result<Vec<accounts::Event>, String>,
 ) -> Result<Vec<accounts::Event>, String> {
     let current = current_account_seat(hooks, seat)?;
-    accounts::Store::at(&seat.state).observe_roster_within(
+    seat.claude_store().observe_roster_within(
         seat.ladder,
         current.now,
         seat.roster.as_deref().ok_or("account roster is missing")?,
@@ -20348,11 +20410,8 @@ fn login_transact_of(
         row: roster.row(label).ok_or("observed account is missing")?,
         who: &look.who,
     };
-    accounts::Store::at(&seat.state).observe_login_within(
-        seat.ladder,
-        now,
-        observation,
-        |state, logins| {
+    seat.claude_store()
+        .observe_login_within(seat.ladder, now, observation, |state, logins| {
             Ok(edit(state, logins, now)?
                 .into_iter()
                 .map(|event| match event.sid {
@@ -20360,8 +20419,7 @@ fn login_transact_of(
                     None => event.with_sid(sid),
                 })
                 .collect())
-        },
-    )
+        })
 }
 
 /// An account move whose relaunch nobody saw land, looked at again ([`AccountKept::flying`]).
@@ -20788,6 +20846,45 @@ fn cold_admission_needed(seat: &AccountSeat, snap: &Snapshot) -> bool {
                 .session
                 .as_deref()
                 .is_some_and(|session| upgrade_drive::conversation_under(&seat.home, session)))
+}
+
+/// The cold admission of `snap`'s relaunch, its agent ended at `end`, on a host whose native
+/// cold constructor is `qualified`: deferred to that constructor only for an agent that ended
+/// under this host (the one case its death witness can prove), and otherwise admitted now on
+/// the tab shell's environment, or the agent's recorded launch environment, as an
+/// unqualified host admits every one ([`account_cold_at`]).
+fn account_cold_decided(
+    seat: &AccountSeat,
+    snap: &Snapshot,
+    mode: accounts::Mode,
+    end: ColdEnd,
+    qualified: bool,
+    shell_env: impl FnOnce() -> Option<Vec<String>>,
+) -> Result<relaunch::ColdAdmission, String> {
+    if !qualified || end == ColdEnd::EarlierHost {
+        if qualified {
+            aterm_log::info!(
+                "harness @{}: its agent ended under an earlier aterm process, which no death \
+                 witness of this one names (rule: native cold restart needs a live-host \
+                 witness); it resumes on the typed line, admitted on its recorded environment",
+                snap.tab
+            );
+        }
+        return account_cold_at(seat, snap, mode, shell_env)
+            .map(relaunch::ColdAdmission::immediate);
+    }
+    Ok(relaunch::ColdAdmission::Deferred(
+        aterm_agent::harness::native_act::ColdIntent {
+            login: snap.login.clone(),
+            home: snap.home.clone(),
+            auth_observed: snap.auth_observed,
+            stored_login: snap.stored_login,
+            conversation: snap.session.clone(),
+            profile: snap.profile.clone(),
+            mode,
+            billing: aterm_agent::harness::native_act::ColdBilling::Keep,
+        },
+    ))
 }
 
 /// Admit the effective stored login before restoring a Claude conversation.
@@ -21486,7 +21583,7 @@ fn note_cold_conversation(
     let (Some(login), Some(session)) = (login.filter(|login| !login.is_empty()), session) else {
         return Ok(());
     };
-    accounts::Store::at(&seat.state)
+    seat.claude_store()
         .transact_within(seat.ladder, seat.now, &mut None, |state| {
             accounts::note_on_login_dir(state, session, seat.now, seat.now);
             Ok(Vec::new())
@@ -21573,7 +21670,7 @@ fn account_roster_or_own(seat: &AccountSeat) -> Option<accounts::Roster> {
 
 /// One bounded read of `seat`'s roster file.
 fn roster_read(seat: &AccountSeat) -> Result<accounts::Roster, RosterUnread> {
-    let store = accounts::Store::at(&seat.state).bounded_by(seat.ladder);
+    let store = seat.bounded_claude_store();
     match read_account_roster(seat.roster.as_deref(), &store, seat.now) {
         Ok(roster) if roster.rows.is_empty() => Err(RosterUnread::Nothing),
         Ok(roster) => Ok(roster),
@@ -21680,7 +21777,7 @@ fn accounts_said(
         Ok(roster) => roster,
         Err(unread) => return Some(unread.into()),
     };
-    let store = accounts::Store::at(&seat.state);
+    let store = seat.claude_store();
     let records = store
         .read_account_records(seat.roster.as_deref(), seat.now)
         .ok()?;
@@ -22761,7 +22858,7 @@ fn account_relaunch(
     }
     let admit = |snapshot: &Snapshot| {
         let mode = job.switches.accounts();
-        let chosen = (hooks.acts.account_cold)(snapshot, mode)?;
+        let chosen = (hooks.acts.account_cold)(snapshot, mode, ColdEnd::ThisHost)?;
         if !job.admitted() || !job.left.is(Word::Left) || job.switches.accounts() != mode {
             return Err("live account controls or exit changed during admission".into());
         }
@@ -25540,22 +25637,6 @@ pub(crate) enum AccountsUpkeep {
 }
 
 impl AccountsUpkeep {
-    /// Continue an already admitted operation without opening a second epoch admission.
-    pub(crate) fn make_scoped(
-        &self,
-        scope: aterm_agent::harness::account_work::Scope,
-        step: UpkeepStep,
-    ) {
-        if scope.cancelled() {
-            return;
-        }
-        match self {
-            Self::Live(_) => maintain_accounts_live(scope, step),
-            Self::Inert => {}
-            #[cfg(test)]
-            Self::Made(upkeep) => upkeep(step),
-        }
-    }
     /// Make the upkeep's `step`.
     pub(crate) fn make(&self, step: UpkeepStep) {
         match self {
@@ -26684,7 +26765,7 @@ impl Acts {
             account_restart: Arc::new(|_, _| None),
             background: Arc::new(|_| false),
             account_made: Arc::new(|_, _, _| {}),
-            account_cold: Arc::new(|_, _| Ok(relaunch::ColdAdmission::Immediate(None))),
+            account_cold: Arc::new(|_, _, _| Ok(relaunch::ColdAdmission::Immediate(None))),
             codex_cold: Arc::new(|_| Ok(None)),
             hold: Arc::new(|_, _| true),
             route: Arc::new(|_, _, _| Route::Custom("inert".to_string())),
@@ -26761,6 +26842,17 @@ impl HostHandle {
     #[cfg(unix)]
     pub(crate) fn for_restored_test_with_open_tabs(act: Arc<RestoredFn>) -> Self {
         Self::restored_test_host(act, Arc::new(|_| true))
+    }
+
+    /// [`Self::for_restored_test_with_open_tabs`] whose relaunch of a stamped exit ([`Acts::relaunch`]) is `stamped`.
+    #[cfg(unix)]
+    pub(crate) fn for_restored_test_with_stamped(
+        act: Arc<RestoredFn>,
+        stamped: Arc<RelaunchFn>,
+    ) -> Self {
+        let mut acts = Acts::inert();
+        acts.relaunch = stamped;
+        Self::restored_test_host_with(act, Arc::new(|_| true), acts)
     }
 
     /// [`Self::for_restored_test`] whose note of a restored agent's earlier tab ([`Acts::earlier_tab`]) is recorded in `noted`.

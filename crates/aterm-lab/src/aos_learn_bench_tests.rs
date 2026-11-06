@@ -805,6 +805,31 @@ fn the_record_claims_only_a_real_pairs_session_of_record() {
 }
 
 #[test]
+fn only_the_runners_own_bytes_run_as_its_lab() {
+    let dir = aterm_tempfile::tempdir().expect("a scratch dir");
+    let runner = dir.path().join("runner");
+    let copy = dir.path().join("copy");
+    let other = dir.path().join("other");
+    fs::write(&runner, b"the runner's build").expect("runner");
+    fs::write(&copy, b"the runner's build").expect("copy");
+    fs::write(&other, b"another build").expect("other");
+    let digest = |p: &Path| digest_file(p, LAB_DOMAIN).expect("a digest");
+    assert!(own_build(&copy, digest(&copy), &runner).is_ok());
+    for (lab, runner, why) in [
+        (&other, runner.clone(), "the lab is another build"),
+        (&copy, dir.path().join("gone"), "the runner cannot be read"),
+    ] {
+        let f = own_build(lab, digest(lab), &runner).expect_err(why);
+        assert_eq!(f.code, 1, "{why}");
+        let msg = f.msg.unwrap_or_default();
+        assert!(
+            msg.starts_with("aos-learn-bench: refused G0: "),
+            "{why}: {msg}"
+        );
+    }
+}
+
+#[test]
 fn the_runner_takes_its_flags_alone() {
     let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
     assert_eq!(
@@ -854,18 +879,6 @@ fn the_runner_takes_its_flags_alone() {
         ],
     ] {
         assert_eq!(parse(&args(bad)).err().map(|f| f.code), Some(2), "{bad:?}");
-    }
-    assert_eq!(
-        parse_stamp(&format!("build {BUILD}\nprofile debug\n")),
-        Some((BUILD.to_owned(), "debug".to_owned()))
-    );
-    for bad in [
-        "",
-        "build x\n",
-        "profile debug\nbuild x\n",
-        "build x\nprofile y\nmore\n",
-    ] {
-        assert_eq!(parse_stamp(bad), None, "{bad:?}");
     }
     let mut help = Vec::new();
     assert_eq!(cmd_to(&args(&["--help"]), &mut help).ok(), Some(0));

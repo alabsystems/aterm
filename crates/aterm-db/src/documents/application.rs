@@ -84,17 +84,72 @@ pub(crate) fn with_store_guarded_until<T>(
     let (bootstrap, journal) =
         Bootstrap::required_with_journal_until(paths, deadline).map_err(crate::table::failure)?;
     let session = Session::from_admitted_journal_until(&bootstrap, journal, Some(deadline))?;
+    in_session(
+        &bootstrap,
+        &session,
+        create,
+        descriptor,
+        deadline,
+        before_publication,
+        action,
+    )
+}
+
+/// [`with_store_until`], waiting for another local writer of the control journal until
+/// `deadline`: the journal's own bounded wait ([`Session::open_until`]), which still refuses as
+/// busy past it. Custody and the writer generation's selection come first, under the ordinary
+/// admission ([`admission_deadline`], never past `deadline`), and custody is let go before that
+/// wait, so a long wait never keeps `commons.lock` from the observations that expect it within a
+/// second. Past `deadline` every wait ends and the open is refused; once the journal's writer is
+/// taken, the session's later generation checks each take a fresh admission, as
+/// [`Session::open_until`]'s do.
+pub(crate) fn with_store_awaiting_journal<T>(
+    paths: &Paths,
+    create: bool,
+    descriptor: impl FnOnce(&Bootstrap) -> Result<Descriptor>,
+    deadline: std::time::Instant,
+    action: impl FnOnce(&Session<'_>, &mut Store, Scope) -> Result<T>,
+) -> Result<T> {
     pass_current(deadline)?;
-    let descriptor = descriptor(&bootstrap)?;
-    let directory = Directory::new(paths, bootstrap.trust());
-    before_publication(&session, &directory, &descriptor)?;
+    let custody = deadline.min(admission_deadline());
+    let paths = crate::application_paths_until(paths, custody)?;
+    let paths = &paths;
+    let bootstrap = Bootstrap::required_until(paths, custody).map_err(crate::table::failure)?;
+    let session = Session::open_until(&bootstrap, deadline)?;
+    in_session(
+        &bootstrap,
+        &session,
+        create,
+        descriptor,
+        deadline,
+        |_, _, _| Ok(()),
+        action,
+    )
+}
+
+/// The admitted session's half of an open in `bootstrap`'s custody: `before_publication`, then
+/// the descriptor's table, published when `create` and checked against the directory, then
+/// `action`. Past `deadline` it is refused, checked before the descriptor, the store and `action`.
+fn in_session<T>(
+    bootstrap: &Bootstrap,
+    session: &Session<'_>,
+    create: bool,
+    descriptor: impl FnOnce(&Bootstrap) -> Result<Descriptor>,
+    deadline: std::time::Instant,
+    before_publication: impl FnOnce(&Session<'_>, &Directory, &Descriptor) -> Result<()>,
+    action: impl FnOnce(&Session<'_>, &mut Store, Scope) -> Result<T>,
+) -> Result<T> {
+    pass_current(deadline)?;
+    let descriptor = descriptor(bootstrap)?;
+    let directory = Directory::new(bootstrap.paths(), bootstrap.trust());
+    before_publication(session, &directory, &descriptor)?;
     if create {
-        directory.publish(&session, &descriptor)?;
+        directory.publish(session, &descriptor)?;
     }
     let snapshot = if create {
-        directory.snapshot(&session)?
+        directory.snapshot(session)?
     } else {
-        directory.snapshot_existing(&session)?
+        directory.snapshot_existing(session)?
     };
     let entry = snapshot
         .entries
@@ -112,12 +167,12 @@ pub(crate) fn with_store_guarded_until<T>(
     }
     pass_current(deadline)?;
     let mut store = Store::open(
-        &session,
+        session,
         &directory.path(descriptor.scope)?,
         descriptor.scope,
     )?;
     pass_current(deadline)?;
-    action(&session, &mut store, descriptor.scope)
+    action(session, &mut store, descriptor.scope)
 }
 
 /// Observe an initialized application without initializing custody or acquiring

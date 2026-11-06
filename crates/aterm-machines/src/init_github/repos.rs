@@ -1228,11 +1228,16 @@ pub(super) fn with_hooks(probe: Probe, hooks: &[String]) -> Probe {
     }
 }
 
-/// The run of `clone`'s [`HOOK_INSTALLER`] ([`install_hooks`]).
+/// The run of `clone`'s [`HOOK_INSTALLER`] ([`install_hooks`]). On a Mac with no developer
+/// tools it names a `DEVELOPER_DIR` that does not exist
+/// ([`crate::items::github::NO_DEVELOPER_DIR`]): the setup clones before it installs the tools,
+/// and an installer's `/usr/bin` shim (clean's runs `python3`) would otherwise put Apple's
+/// install dialog in front of a person in the middle of it; the shim fails at once instead, and
+/// the row says what the installer made of that.
 pub(super) fn installer_command(sys: &dyn System, user: &User, clone: &Path) -> Cmd {
     let git = crate::items::github::git_program_for_user(sys, user);
     let bin = git.parent().unwrap_or_else(|| Path::new("/usr/bin"));
-    Cmd::new(BASH)
+    let command = Cmd::new(BASH)
         .as_user(user)
         .current_dir(clone)
         .env(
@@ -1241,7 +1246,12 @@ pub(super) fn installer_command(sys: &dyn System, user: &User, clone: &Path) -> 
         )
         .env("GIT_TERMINAL_PROMPT", "0")
         .budget(HOOK_INSTALLER_BUDGET)
-        .arg(HOOK_INSTALLER)
+        .arg(HOOK_INSTALLER);
+    if crate::items::github::shims_ask_for_tools(sys) {
+        command.env("DEVELOPER_DIR", crate::items::github::NO_DEVELOPER_DIR)
+    } else {
+        command
+    }
 }
 
 /// What a [`HOOK_INSTALLER`]'s run says, in one line: the first line it printed when it
@@ -1320,25 +1330,17 @@ fn clone_one_with(
     )?;
     let source = remote(&source)?;
     if let Some(head) = &source.head {
-        let expected = repo
-            .default_branch
+        // The private inventory selects this repository, not a permanent branch.
+        // Its saved default may precede a rename or the repository's first commit.
+        let expected = source
+            .branch
             .as_ref()
-            .ok_or("nonempty GitHub repository has no default branch")?;
-        if source.branch.as_ref() != Some(expected)
-            || source.refs.get(&format!("refs/heads/{expected}")) != Some(head)
-        {
-            return Err(
-                "GitHub's default branch changed during enumeration; run init again".into(),
-            );
+            .ok_or("nonempty GitHub repository has no advertised default branch")?;
+        if source.refs.get(&format!("refs/heads/{expected}")) != Some(head) {
+            return Err("GitHub's advertised default branch does not match its HEAD".into());
         }
     } else if !source.refs.is_empty() {
         return Err("GitHub repository has references but no usable default HEAD".into());
-    } else if source
-        .branch
-        .as_ref()
-        .is_some_and(|branch| repo.default_branch.as_ref() != Some(branch))
-    {
-        return Err("the empty GitHub repository's default branch changed; run init again".into());
     }
     // Refuse a changed route before allocating staging; check again after staging is
     // ready so the eventual network command does not reuse an earlier admission.
@@ -1473,6 +1475,9 @@ fn verify_new(
     clone: &Path,
     source: &Remote,
 ) -> Result<(), String> {
+    // A fresh advertisement chooses the new checkout's branch. Only a truly empty
+    // remote that advertises no unborn HEAD needs the inventory's saved fallback.
+    let default_branch = source.branch.as_ref().or(repo.default_branch.as_ref());
     verify_integrity(sys, user, clone)?;
     let head = sys
         .run_complete_stdout(&git(sys, user, Some(clone)).args([
@@ -1488,7 +1493,7 @@ fn verify_new(
                     .ok()
                     .is_some_and(|value| value.trim() == expected) => {}
         None if matches!(head.status, Some(1 | 128)) && head.stdout.is_empty() => {
-            if let Some(branch) = &repo.default_branch {
+            if let Some(branch) = default_branch {
                 text(
                     sys,
                     &git(sys, user, Some(clone)).args([
@@ -1529,7 +1534,7 @@ fn verify_new(
         );
         wanted.insert(target, oid.clone());
     }
-    if let (Some(branch), Some(head)) = (&repo.default_branch, &source.head) {
+    if let (Some(branch), Some(head)) = (default_branch, &source.head) {
         wanted.insert(format!("refs/heads/{branch}"), head.clone());
         wanted.insert("refs/remotes/origin/HEAD".into(), head.clone());
     }
@@ -1539,12 +1544,12 @@ fn verify_new(
         );
     }
     let symbolic = git_read(sys, user, clone, &["symbolic-ref", "--quiet", "HEAD"])?;
-    if let Some(branch) = &repo.default_branch
+    if let Some(branch) = default_branch
         && symbolic.trim() != format!("refs/heads/{branch}")
     {
         return Err("the cloned checkout is not on GitHub's default branch".into());
     }
-    if let (Some(branch), Some(_)) = (&repo.default_branch, &source.head) {
+    if let (Some(branch), Some(_)) = (default_branch, &source.head) {
         let origin_head = git_read(
             sys,
             user,
@@ -1599,6 +1604,7 @@ pub(super) mod tests {
     use std::path::PathBuf;
 
     mod clone_route_tests;
+    mod default_branch_tests;
     mod hook_installer_tests;
     mod staging_tests;
 

@@ -406,13 +406,13 @@ pub(crate) struct LetterGuard {
     px_ground: Vec<u32>,
     px_ink: Vec<u32>,
     /// A cell read by its glyph's own pixels ([`ring`]): its reading, the under-text lights'
-    /// first light per box pixel and every later one ([`Self::lay_lights`]), and the box
-    /// composited at the share being weighed ([`Self::paint_ring`]): the ground under the
-    /// under-text lights, and each text pixel as the frame draws it.
+    /// first light per box pixel and every later one and whether any lies on the box
+    /// ([`Self::lay_lights`]), and each pixel a reading reads as the frame draws it at the share
+    /// being weighed ([`Self::paint_ring`]).
     ring: ring::RingCell,
     first_under: Vec<u32>,
     more_under: Vec<LitPx>,
-    px_under: Vec<u32>,
+    lit_under: bool,
     px_text: Vec<u32>,
     /// Where the letter's glyph lays less than its colour whole ([`Judge::cover`]): its colour
     /// under the over-text lights, and that colour's luminance per inner ring box pixel.
@@ -464,7 +464,12 @@ pub(crate) struct LetterGuard {
     /// `1.0` uncut) by its [`Self::cell_key`]: the last frame's, sorted,
     /// and this frame's as they are judged. A cell whose ring box, text
     /// and lights are the last frame's takes its verdict back, so a frame
-    /// judges only the cells its changed lights reach.
+    /// judges only the cells its changed lights reach. A verdict is the
+    /// weighing's, as [`Self::judge`] read those: what
+    /// [`CursorGlow::verify_cuts`] lowers it to reads what the key does not
+    /// (a neighbour's feather, the flames' and night grounds), so it stays
+    /// that frame's, and the next frame's reading lowers it again if its
+    /// own frame asks.
     verdicts: Vec<(u64, f32)>,
     fresh: Vec<(u64, f32)>,
     /// The ring boxes (corner, [`box_at`]) of the cells kept
@@ -477,6 +482,8 @@ pub(crate) struct LetterGuard {
     stacked: Vec<[u16; 4]>,
     /// The last frame the guard read ([`FrameMemo`]).
     memo: Option<Box<FrameMemo>>,
+    /// This frame is drawn nowhere ([`CursorGlow::set_frame_unseen`]).
+    unseen: bool,
     /// A test's counters: the cells judged afresh, the cells whose
     /// verdict was the last frame's, and the frames that took the last
     /// frame's streams back.
@@ -536,7 +543,7 @@ impl LetterGuard {
         ring: ring::RingCell::EMPTY,
         first_under: Vec::new(),
         more_under: Vec::new(),
-        px_under: Vec::new(),
+        lit_under: false,
         px_text: Vec::new(),
         px_fg: Vec::new(),
         cover_lum: Vec::new(),
@@ -571,6 +578,7 @@ impl LetterGuard {
         near_whole_fresh: Vec::new(),
         stacked: Vec::new(),
         memo: None,
+        unseen: false,
         #[cfg(any(test, debug_assertions))]
         judged: 0,
         #[cfg(any(test, debug_assertions))]
@@ -870,13 +878,13 @@ fn collect_row(
 /// their key ([`LetterGuard::cell_key`]'s `model`: the face's table, and each cell's colours,
 /// fill and glyph). `None` for a cell read otherwise.
 #[inline]
-fn ring_cells<'a>(
-    (text, inks): (&FrameText, &'a aterm_render::GlyphInk),
+fn ring_cells(
+    (text, inks): (&FrameText, &aterm_render::GlyphInk),
     (row, col): (i32, i32),
     ground: u32,
     (caret, caret_block): CaretCell,
     (trail, trail_color): Trail<'_>,
-) -> Option<(u64, [ring::Neighbour<'a>; 9])> {
+) -> Option<(u64, [ring::Neighbour; 9])> {
     #[inline]
     fn raster_of<'a>(
         inks: &'a aterm_render::GlyphInk,
@@ -915,10 +923,10 @@ fn ring_cells<'a>(
                 glyph: None,
             },
             Some((Some(fg), _)) => match raster_of(inks, text, r, c) {
-                Some(raster) => ring::Neighbour::Known {
+                Some(_) => ring::Neighbour::Known {
                     ground: g,
                     base,
-                    glyph: Some((raster, fg & 0x00FF_FFFF)),
+                    glyph: Some((text.glyph(r, c), fg & 0x00FF_FFFF)),
                 },
                 None => ring::Neighbour::Opaque,
             },
@@ -1339,36 +1347,6 @@ const fn layer(
     }
 }
 
-/// [`layer`] over the colours already in `out`, pixel by pixel: each pixel's own base.
-#[inline(always)]
-const fn layer_onto(
-    out: &mut [u32],
-    w: usize,
-    first: &[u32],
-    more: &[LitPx],
-    rows: &[(u32, u32)],
-    s: Share,
-) {
-    let mut y = 0;
-    while y < rows.len() {
-        let (lo, hi) = rows[y];
-        let (a, b) = (y * w + lo as usize, y * w + hi as usize);
-        let mut k = a;
-        while k < b {
-            out[k] = over_packed(out[k], first[k], s);
-            k += 1;
-        }
-        y += 1;
-    }
-    let mut mi = 0;
-    while mi < more.len() {
-        let m = more[mi];
-        let k = m.k as usize;
-        out[k] = over_packed(out[k], m.v, s);
-        mi += 1;
-    }
-}
-
 impl LetterGuard {
     /// Composite the ring box under the cell's lights at share `s` (`1.0`,
     /// or a share in `(0, 1)` [`Self::share`] weighs), so each pixel meets
@@ -1493,58 +1471,59 @@ impl LetterGuard {
         }
     }
 
-    /// Composite the ring box of a cell read by its glyph's own pixels ([`Judge::ring`]) under
-    /// its lights at share `s`, as the renderer draws the frame: into [`Self::px_ground`] the
-    /// ground under every light; into [`Self::px_under`] the ground under the under-text lights
-    /// alone; and into [`Self::px_text`] the frame, each pixel a glyph lays text on drawn over
-    /// the light beneath it ([`ring::RingCell::text`], as `blend_text` lays it) with the
-    /// over-text lights and the halos laid over it, every other pixel the ground under every
-    /// light.
+    /// Composite what a reading reads of the ring box of a cell read by its glyph's own pixels
+    /// ([`Judge::ring`]) under its lights at share `s`, as the renderer draws the frame, into
+    /// [`Self::px_text`]: each pixel a glyph lays text on drawn over the light beneath it (the
+    /// under-text lights on the frame's ground, a trail cell's fill) with the over-text lights
+    /// and the halos laid over it, every other pixel the ground under every light. Each light
+    /// laid on a pixel no reading reads leaves a value nothing reads.
     #[inline]
-    fn paint_ring(&mut self, j: Judge, s: f32, has_over: bool) {
-        let w = (j.x1 - j.x0) as usize;
-        let n = w * (j.y1 - j.y0) as usize;
+    fn paint_ring(&mut self, s: f32, w: usize, has_over: bool) {
         let share = Share::of(s);
         let whole = s >= 1.0;
-        let rows = self.lit_rows.as_slice();
         let mut ground = std::mem::take(&mut self.px_ground);
-        let mut under = std::mem::take(&mut self.px_under);
         let mut text = std::mem::take(&mut self.px_text);
-        // Every pixel starts from the frame's ground under the lights (a trail cell's fill).
-        let base = self.ring.base();
-        ground[..n].copy_from_slice(&base[..n]);
-        under[..n].copy_from_slice(&base[..n]);
-        layer_onto(
-            &mut ground[..n],
-            w,
-            &self.first_ground[..n],
-            &self.more_ground,
-            rows,
-            share,
-        );
-        layer_onto(
-            &mut under[..n],
-            w,
-            &self.first_under[..n],
-            &self.more_under,
-            rows,
-            share,
-        );
-        text.clear();
-        text.extend_from_slice(&under[..n]);
-        for &(k, level) in self.ring.text() {
+        for &(k, base) in self.ring.plain_px() {
             let k = k as usize;
-            text[k] = level.over(text[k]);
+            let first = self.first_ground[k];
+            ground[k] = if first == 0 {
+                base
+            } else {
+                over_packed(base, first, share)
+            };
+        }
+        for m in &self.more_ground {
+            ground[m.k as usize] = over_packed(ground[m.k as usize], m.v, share);
+        }
+        if self.lit_under {
+            for &(k, base, _) in self.ring.text_px() {
+                let k = k as usize;
+                text[k] = over_packed(base, self.first_under[k], share);
+            }
+            for m in &self.more_under {
+                text[m.k as usize] = over_packed(text[m.k as usize], m.v, share);
+            }
+            for &(k, level) in self.ring.text() {
+                let k = k as usize;
+                text[k] = level.over(text[k]);
+            }
+        } else {
+            // No light beneath the text: at every share it is what the read laid on the ground.
+            for &(k, _, on_base) in self.ring.text_px() {
+                text[k as usize] = on_base;
+            }
         }
         if has_over {
-            layer_onto(
-                &mut text[..n],
-                w,
-                &self.first_ink[..n],
-                &self.more_ink,
-                rows,
-                share,
-            );
+            for &(k, _, _) in self.ring.text_px() {
+                let k = k as usize;
+                let first = self.first_ink[k];
+                if first != 0 {
+                    text[k] = over_packed(text[k], first, share);
+                }
+            }
+            for m in &self.more_ink {
+                text[m.k as usize] = over_packed(text[m.k as usize], m.v, share);
+            }
         }
         // The halos come after every quad and the text.
         for l in &self.laid {
@@ -1579,18 +1558,15 @@ impl LetterGuard {
                 }
             }
         }
-        for k in 0..n {
-            if !self.ring.has_text(k) {
-                text[k] = ground[k];
-            }
+        for &(k, _) in self.ring.plain_px() {
+            text[k as usize] = ground[k as usize];
         }
         self.px_ground = ground;
-        self.px_under = under;
         self.px_text = text;
     }
 
     /// Whether a cell read by its glyph's own pixels ([`Judge::ring`]) reads at least `bar`
-    /// with its lights at share `s`: its reading ([`ring::RingCell::reading`]) on the frame
+    /// with its lights at share `s`: its reading ([`ring::RingCell::holds`]) on the frame
     /// [`Self::paint_ring`] composites.
     #[inline]
     fn holds_ring(&mut self, j: Judge, s: f32, bar: f32, has_over: bool) -> bool {
@@ -1601,9 +1577,9 @@ impl LetterGuard {
                 self.0[k]
             }
         }
-        self.paint_ring(j, s, has_over);
+        self.paint_ring(s, (j.x1 - j.x0) as usize, has_over);
         let text = std::mem::take(&mut self.px_text);
-        let held = self.ring.reading(&Frame(&text)) >= bar;
+        let held = self.ring.holds(&Frame(&text), bar);
         self.px_text = text;
         held
     }
@@ -1803,6 +1779,7 @@ impl LetterGuard {
             self.first_under.resize(n, 0);
         }
         self.more_under.clear();
+        self.lit_under = false;
         self.laid.clear();
         self.wts.clear();
         self.lit_rows.clear();
@@ -1889,6 +1866,7 @@ impl LetterGuard {
                         }
                     }
                     if under {
+                        self.lit_under = true;
                         if self.first_under[k] == 0 {
                             self.first_under[k] = v;
                         } else {
@@ -1900,6 +1878,12 @@ impl LetterGuard {
                 }
             }
         }
+        // A cell read by its glyph's own pixels takes every pixel from these two.
+        if j.ring {
+            self.px_ground.resize(n, 0);
+            self.px_text.resize(n, 0);
+            return;
+        }
         // The pixels no light reaches, bare at every share, laid once.
         let table = crate::color_math::relative_luminance_table();
         self.bare_lum = (
@@ -1908,10 +1892,6 @@ impl LetterGuard {
         );
         self.px_ground.clear();
         self.px_ground.resize(n, j.ground);
-        if j.ring {
-            self.px_under.clear();
-            self.px_under.resize(n, j.ground);
-        }
         self.lum.clear();
         self.lum.resize(n, self.bare_lum.0);
         if has_over {
@@ -3720,6 +3700,9 @@ impl CursorGlow {
         (geom, cfg): (Geom, &GlowConfig),
         trail: Trail<'_>,
     ) -> u64 {
+        if self.letter_guard.unseen {
+            return 0;
+        }
         let style = cfg.style;
         #[cfg(any(test, debug_assertions))]
         let trail = if self.letter_guard.trail_off {
@@ -4006,11 +3989,11 @@ impl CursorGlow {
                             (caret, caret_block),
                             trail,
                         )
-                        .map(|(model, cells)| (model, cells, inks.corrected()))
+                        .map(|(model, cells)| (model, cells, inks))
                     });
                     let model = ringed.as_ref().map(|r| r.0);
                     // A cell whose ring box, text and lights are the last
-                    // frame's keeps the last frame's verdict.
+                    // frame's keeps the last frame's weighing.
                     let cover = if model.is_some() {
                         None
                     } else {
@@ -4025,13 +4008,13 @@ impl CursorGlow {
                     let share = if let Some(share) = guard.verdict(key) {
                         share
                     } else {
-                        if let Some((_, cells, corrected)) = &ringed {
+                        if let Some((_, cells, inks)) = &ringed {
                             guard.ring.read(
                                 ((cx1 - cx0) as usize, (ry1 - ry0) as usize),
                                 (cw as usize, ch as usize),
                                 RING as usize,
                                 cells,
-                                *corrected,
+                                (inks.raster_table(), inks.corrected()),
                             );
                         }
                         let share = guard.judge(
@@ -4306,7 +4289,7 @@ impl CursorGlow {
                 (cw as usize, ch as usize),
                 RING as usize,
                 &cells,
-                inks.corrected(),
+                (inks.raster_table(), inks.corrected()),
             );
             let bar = letter_bar(guard.ring.own, false);
             let j = Judge::ring((cx0, ry0, cx1, ry1), (c.ink, c.ground));
@@ -4340,9 +4323,6 @@ impl CursorGlow {
                     }
                 }
             }
-            if let Some(v) = guard.fresh.iter_mut().find(|v| v.0 == c.key) {
-                v.1 = less;
-            }
             lowered = true;
         }
         guard.ramp_rows = ramp_rows;
@@ -4373,6 +4353,17 @@ impl CursorGlow {
     #[inline]
     pub const fn set_letter_guard_room(&mut self, on: bool) {
         self.letter_guard.no_room = !on;
+    }
+
+    /// Whether the coming frames only carry the engines on to a later one, drawn nowhere (a
+    /// Settings card replays its scene up to the frame it shows), so the guard spends nothing on
+    /// them. What it cuts is the frame's own, and what it remembers is keyed on the exact lights
+    /// and text it read: the frame shown is the one a replay guarding every step gives
+    /// (`aterm-gui`'s `a_card_is_the_frame_it_would_be_with_every_step_before_it_guarded` and
+    /// `a_card_in_the_host_s_face_carries_nothing_over_from_a_step_it_guarded`).
+    #[inline]
+    pub const fn set_frame_unseen(&mut self, unseen: bool) {
+        self.letter_guard.unseen = unseen;
     }
 
     /// A test's negative control: lights drawn without the letter guard.
@@ -5425,6 +5416,302 @@ mod tests {
             lapses[4] > 0,
             "control: no cell's core read only where its glyph lays ink"
         );
+    }
+
+    /// The ring box's cell, px, for [`a_ring_cell_is_painted_as_every_pixel_composited`]: the
+    /// size [`random_cell`] gives most of its boxes.
+    const RING_CELL: (usize, usize) = (18, 38);
+
+    /// Rasters of a [`RING_CELL`] cell: strokes of full coverage with a part-covered edge, and a
+    /// rim so faint it rounds to the ground, which a ring can hold.
+    fn ring_rasters() -> ring::RasterTable {
+        let (cw, ch) = RING_CELL;
+        let raster = |x: std::ops::Range<usize>, y: std::ops::Range<usize>| {
+            let mut cov = vec![0u8; cw * ch];
+            for yy in y.clone() {
+                for xx in x.clone() {
+                    cov[yy * cw + xx] = 255;
+                }
+                cov[yy * cw + x.end] = 120;
+                cov[yy * cw + x.start - 1] = 1;
+            }
+            Some(aterm_render::GlyphRaster::placed(&cov, cw, (0, 0)).expect("ink"))
+        };
+        vec![
+            raster(4..6, 6..30),
+            raster(2..16, 18..20),
+            raster(8..11, 2..36),
+            raster(1..17, 30..33),
+        ]
+        .into()
+    }
+
+    /// A cell's neighbourhood: `ground` under its glyph, most neighbours on that ground, some
+    /// lettered, some on another ground or under a fill, some opaque.
+    fn random_hood(mix: &mut Mix, ground: u32, ink: u32) -> [ring::Neighbour; 9] {
+        std::array::from_fn(|i| {
+            let glyph = |mix: &mut Mix| Some((mix.below(4) as u8, ink));
+            if i == 4 {
+                return ring::Neighbour::Known {
+                    ground,
+                    base: if mix.chance(2) {
+                        ink ^ 0x0040_4040
+                    } else {
+                        ground
+                    },
+                    glyph: glyph(mix),
+                };
+            }
+            if mix.chance(1) {
+                return ring::Neighbour::Opaque;
+            }
+            let g = if mix.chance(2) {
+                ground ^ 0x0020_1008
+            } else {
+                ground
+            };
+            ring::Neighbour::Known {
+                ground: g,
+                base: if mix.chance(2) { g ^ 0x0008_1020 } else { g },
+                glyph: if mix.chance(4) { glyph(mix) } else { None },
+            }
+        })
+    }
+
+    /// A ring box's frame at share `s`, every pixel in `read` composited light by light as the
+    /// renderer draws it: on its neighbour's base, a pixel a glyph lays text on takes the
+    /// under-text lights, its glyphs' levels in draw order, then the over-text lights; any other
+    /// pixel takes every quad; both take the halos last.
+    fn ring_frame_by_every_pixel(
+        (j, cells, table): (Judge, &[ring::Neighbour; 9], &ring::RasterTable),
+        (cell, streams): (&[(Stream, u32)], Streams<'_>),
+        read: &[usize],
+        s: f32,
+    ) -> Vec<u32> {
+        let (cw, ch) = (RING_CELL.0 as i64, RING_CELL.1 as i64);
+        let (w, r) = ((j.x1 - j.x0) as i64, i64::from(RING));
+        let h = i64::from(j.y1 - j.y0);
+        let side = |v: i64, cell: i64| {
+            if v < r {
+                0
+            } else if v < r + cell {
+                1
+            } else {
+                2
+            }
+        };
+        // What no reading reads holds nothing a reading could use.
+        let mut frame = vec![0x00C0_0FFEu32; (w * h) as usize];
+        for &k in read {
+            let (bx, by) = (k as i64 % w, k as i64 / w);
+            let (x, y) = (j.x0 + bx as i32, j.y0 + by as i32);
+            let at = (side(by, ch) * 3 + side(bx, cw)) as usize;
+            let ring::Neighbour::Known { base, .. } = cells[at] else {
+                panic!("a read pixel in an opaque cell");
+            };
+            // The levels the neighbourhood's glyphs lay here, in draw order.
+            let mut levels = Vec::new();
+            for (i, cell) in cells.iter().enumerate() {
+                let ring::Neighbour::Known {
+                    ground: g,
+                    glyph: Some((glyph, fg)),
+                    ..
+                } = *cell
+                else {
+                    continue;
+                };
+                let raster = table[usize::from(glyph)].as_ref().expect("a raster");
+                let ox = r + (i as i64 % 3 - 1) * cw + i64::from(raster.x);
+                let oy = r + (i as i64 / 3 - 1) * ch + i64::from(raster.y);
+                let (rx, ry) = (bx - ox, by - oy);
+                if (0..raster.w as i64).contains(&rx) && (0..raster.h() as i64).contains(&ry) {
+                    let cov = raster.cov[ry as usize * raster.w + rx as usize];
+                    if cov != 0 {
+                        levels.push(aterm_render::TextLevel::new(fg, g, cov, false));
+                    }
+                }
+            }
+            let covers = |q: &GlowQuad| {
+                x >= i32::from(q.x)
+                    && x < i32::from(q.x) + i32::from(q.w)
+                    && y >= i32::from(q.y)
+                    && y < i32::from(q.y) + i32::from(q.h)
+            };
+            let quads_over = |mut p: u32, ground: bool, over: bool| {
+                for &(st, i) in cell {
+                    if matches!(st, Stream::HaloAdd | Stream::HaloOver)
+                        || (st.on_ground() && !ground)
+                        || (!st.on_ground() && !over)
+                    {
+                        continue;
+                    }
+                    let q = streams.quad(st, i as usize);
+                    if covers(q) {
+                        let (c, a) = quad_at(q, x, s);
+                        if (c, a) != (0, 0) {
+                            p = aterm_render::over_premul(p, c, a);
+                        }
+                    }
+                }
+                p
+            };
+            let mut p = if levels.is_empty() {
+                quads_over(base, true, true)
+            } else {
+                let under = quads_over(base, true, false);
+                let on = levels.iter().fold(under, |p, level| level.over(p));
+                quads_over(on, false, true)
+            };
+            for &(st, i) in cell {
+                if !matches!(st, Stream::HaloAdd | Stream::HaloOver) {
+                    continue;
+                }
+                let hl = &streams.halos[i as usize];
+                let reaches = x >= i32::from(hl.x)
+                    && x < i32::from(hl.x) + i32::from(hl.w)
+                    && y >= i32::from(hl.y)
+                    && y < i32::from(hl.y) + i32::from(hl.h);
+                let wt = if reaches { halo_wt(hl, x, y) } else { 0 };
+                if wt == 0 {
+                    continue;
+                }
+                let rgb = hl.color & 0x00FF_FFFF;
+                if st == Stream::HaloAdd {
+                    let c = if s >= 1.0 { rgb } else { scale_rgb(rgb, s) };
+                    p = aterm_render::add_sat(p, aterm_render::premul_rgb(c, wt));
+                } else if let Some(cap) = over_cap(hl.color, s) {
+                    p = aterm_render::over_rgb(p, rgb, wt.min(cap));
+                }
+            }
+            frame[k] = p;
+        }
+        frame
+    }
+
+    /// A RING CELL IS PAINTED AND WEIGHED AS EVERY PIXEL COMPOSITED. Over randomized neighbourhoods
+    /// under randomized lights, at the shares the bisection tries: every pixel a reading reads
+    /// ([`LetterGuard::paint_ring`]) is the one [`ring_frame_by_every_pixel`] composes light by
+    /// light, [`LetterGuard::holds_ring`] answers as the reading of that frame does either side of
+    /// it, and the guard's share is that frame's bisection. A paint of those pixels alone is exact
+    /// only if a reading reads no other, which the poison in every other pixel of its frame shows.
+    /// NEGATIVE CONTROLS (2026-11-05), each fails its pixel comparison: no light beneath the text
+    /// taken for read (`lit_under` never set), a read of the solid ink's pixels without their rings
+    /// (on a ring pixel), a dropped `more_under` (on a pixel under two lights), and text levels
+    /// left off a cell lit under its text. A third of the cases lose their lights beneath the text,
+    /// for the arm of the paint that takes the text as the read laid it, which random lights seldom
+    /// reach: a read laying that text on the cell's ground and not its neighbour's base fired "case 6
+    /// share 1: box pixel 443 (x 3, y 20)", and that arm leaving the text off fired "case 0 share 1:
+    /// box pixel 444 (x 4, y 20)".
+    #[test]
+    fn a_ring_cell_is_painted_as_every_pixel_composited() {
+        struct Px<'a>(&'a [u32]);
+        impl ring::FramePx for Px<'_> {
+            fn at(&self, k: usize) -> u32 {
+                self.0[k]
+            }
+        }
+        let table = ring_rasters();
+        let mut mix = Mix(0x7269_6E67);
+        let mut guard = LetterGuard::default();
+        let (cw, ch) = RING_CELL;
+        let (w, h) = (cw + 2 * RING as usize, ch + 2 * RING as usize);
+        let (mut weighed, mut cut, mut under, mut over, mut halos_on, mut rim, mut bare) =
+            (0, 0, 0, 0, 0, 0, 0);
+        for case in 0..240 {
+            let (j0, _, quads, halos, mut cell) = random_cell(&mut mix);
+            if (j0.x1 - j0.x0, j0.y1 - j0.y0) != (w as i32, h as i32) {
+                continue;
+            }
+            // Nearly every random cell has a light beneath its text, so some are left with none:
+            // a letter under a cursor trail's fading fill, whose text lies on its neighbour's base.
+            if case % 3 == 0 {
+                cell.retain(|&(st, _)| !st.on_ground());
+                if cell.is_empty() {
+                    continue;
+                }
+            }
+            let j = Judge::ring((j0.x0, j0.y0, j0.x1, j0.y1), (j0.ink, j0.ground));
+            let cells = random_hood(&mut mix, j.ground, j.ink);
+            let streams = Streams {
+                quads: [&quads[0], &quads[1], &quads[2], &quads[3]],
+                halos: &halos,
+            };
+            guard
+                .ring
+                .read((w, h), (cw, ch), RING as usize, &cells, (&table, false));
+            let read = guard.ring.read_pixels();
+            if read.is_empty() {
+                continue;
+            }
+            weighed += 1;
+            let has_over = cell.iter().any(|&(st, _)| !st.on_ground());
+            over += usize::from(has_over);
+            halos_on += usize::from(!halos.is_empty());
+            rim += usize::from(guard.ring.ring_text);
+            guard.cell.clear();
+            guard.cell.extend_from_slice(&cell);
+            guard.lay_lights(j, streams, has_over);
+            under += usize::from(guard.lit_under);
+            bare += usize::from(!guard.lit_under);
+            let frame_at =
+                |s: f32| ring_frame_by_every_pixel((j, &cells, &table), (&cell, streams), &read, s);
+            for s in [1.0, 0.5, 0.75, 0.25, 0.125, 0.875, 1.0 / 128.0] {
+                let want = frame_at(s);
+                guard.paint_ring(s, w, has_over);
+                for &k in &read {
+                    assert_eq!(
+                        guard.px_text[k] & 0x00FF_FFFF,
+                        want[k],
+                        "case {case} share {s}: box pixel {k} (x {}, y {})",
+                        k % w,
+                        k / w
+                    );
+                }
+                let reading = guard.ring.reading(&Px(&want));
+                for (bar, holds) in [
+                    (reading.next_down(), true),
+                    (reading, true),
+                    (reading.next_up(), reading.is_infinite()),
+                ] {
+                    assert_eq!(
+                        guard.holds_ring(j, s, bar, has_over),
+                        holds,
+                        "case {case} share {s}: holds {bar} on a reading of {reading}"
+                    );
+                }
+            }
+            let bar = letter_bar(guard.ring.own, false);
+            let holds =
+                |guard: &mut LetterGuard, s: f32| guard.ring.reading(&Px(&frame_at(s))) >= bar;
+            let want = if holds(&mut guard, 1.0) {
+                1.0
+            } else {
+                let (mut lo, mut hi) = (0.0f32, 1.0f32);
+                for _ in 0..STEPS {
+                    let mid = 0.5 * (lo + hi);
+                    if holds(&mut guard, mid) {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                lo
+            };
+            let got = guard.share(j, bar, streams);
+            assert_eq!(got.to_bits(), want.to_bits(), "case {case}: {got} {want}");
+            cut += usize::from(got < 1.0);
+        }
+        for (what, n) in [
+            ("weighed", weighed),
+            ("cut", cut),
+            ("lit under its text", under),
+            ("with no light beneath its text", bare),
+            ("lit over it", over),
+            ("under a halo", halos_on),
+            ("with text on a ring", rim),
+        ] {
+            assert!(n > 0, "no cell {what}");
+        }
     }
 
     /// A quad's light read with no division ([`quad_light`]) is the

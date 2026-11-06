@@ -38,6 +38,9 @@ aterm-sysprobe = { workspace = true }
 aterm-update-core = { workspace = true }
 # The workspace clock.
 aterm-time = { workspace = true }
+# `info!` into the window's aterm.log: the vault look's line for each instance it heard,
+# which `lab mac nux`'s first-launch-vault reads. std only.
+aterm-log = { workspace = true }
 # The flush a wiped file gets before it is removed (`durable_data`).
 aterm-durable = { workspace = true }
 # HTTP(S) GET/PUT/POST to the vault's URL: plain HTTP on the LAN (the payload is

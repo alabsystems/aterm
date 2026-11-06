@@ -67,6 +67,8 @@ pub struct Global {
     pub as_profile: Option<String>,
     /// `--anonymous`.
     pub anonymous: bool,
+    /// `--no-anonymous-api`: reject anonymous API sends, including routing fallbacks.
+    pub no_anonymous_api: bool,
     /// `--timeout`.
     pub timeout: Option<Duration>,
     /// `--meta`.
@@ -637,6 +639,7 @@ impl Parser {
             "--repo" => self.global.repo = Some(text),
             "--as" | "--profile" => self.global.as_profile = Some(text),
             "--anonymous" => self.global.anonymous = true,
+            "--no-anonymous-api" => self.global.no_anonymous_api = true,
             "--timeout" => {
                 let timeout = parse_duration(&text)
                     .filter(|d| *d <= TIMEOUT_MAX)

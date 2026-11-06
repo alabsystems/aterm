@@ -549,6 +549,23 @@ fn a_seeded_landing_holds_over_someone_elses_edits_until_a_turn() {
     }
 }
 
+/// A restart reading a seeded landing whose words were the check's `LANDED` keeps it over edits
+/// that are someone else's, as a defense's words do: those words are all it has to stand on.
+///
+/// NEGATIVE CONTROL (2026-11-05): with the answer out of `words_hold`, this fails where the check is typed in place of
+/// `Nothing`. With the repository or the earlier need out of `seed_clean`, the tests beside this one
+/// fail (`a_seeded_landing_holds_over_someone_elses_edits_until_a_turn` and
+/// `a_seeded_landings_own_words_hold_past_a_need_the_turn_retracted`).
+#[test]
+fn a_seeded_landing_holds_on_its_landed_answer_over_someone_elses_edits() {
+    let mut st = TurnEndState::default();
+    st.seed_landed(said_mark(Some(LANDED_WORD)));
+    let r = over_repo(land(idle(LANDED_WORD, None)), uncommitted_repo());
+    let a = at(&mut st, &r, t0());
+    assert_eq!(a, TurnEndAction::Nothing);
+    assert!(st.landed() && st.task_done(), "{a:?}");
+}
+
 #[test]
 fn a_report_read_in_part_or_a_need_said_earlier_lands_nothing() {
     let after_instruction = |r: TurnEndReading| {
@@ -938,6 +955,33 @@ fn a_seeded_landings_own_words_hold_over_a_turn_read_cut() {
     let (a, _) = until_acted(&mut st, &r, t0());
     assert!(!st.landed(), "{a:?}");
     assert!(matches!(a, TurnEndAction::Type { .. }), "{a:?}");
+}
+
+/// A LANDING SEEDED WITH NO WORDS OF ITS OWN stands on the reply it is read at, so that reply read
+/// in part holds nothing: a clean defense whose read was cut re-arms Land, and the record's
+/// landing does not hold. The whole reply holds both.
+///
+/// NEGATIVE CONTROL (2026-11-05): with `!reading.said_cut` gone from `seed_clean`, the cut reply
+/// lands and the harness types nothing (`cut: Nothing`).
+#[test]
+fn a_landing_seeded_with_no_words_holds_nothing_on_a_defense_read_in_part() {
+    let seeded_over = |r: TurnEndReading| {
+        let mut st = TurnEndState::default();
+        st.seed_landed(None);
+        let a = at(&mut st, &r, t0());
+        (st, a)
+    };
+    let (st, a) = seeded_over(land(idle(DEFENSE, None)));
+    assert_eq!(a, TurnEndAction::Nothing);
+    assert!(st.landed() && st.task_done(), "whole: {a:?}");
+    assert!(st.record_landing_holds(), "whole: {a:?}");
+    let (st, a) = seeded_over(TurnEndReading {
+        said_cut: true,
+        ..land(idle(DEFENSE, None))
+    });
+    assert!(matches!(a, TurnEndAction::Type { .. }), "cut: {a:?}");
+    assert!(!st.landed() && !st.task_done(), "cut: {a:?}");
+    assert!(!st.record_landing_holds(), "cut: {a:?}");
 }
 
 /// A NEED THE TURN RETRACTED HOLDS NO LANDING BACK (the post-landing review, 2026-11-01): a

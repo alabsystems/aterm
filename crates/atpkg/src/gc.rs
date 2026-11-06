@@ -2291,6 +2291,12 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_toolchain_build_in_use_leased_or_unaccounted_for_stays_where_it_is() {
+        #[cfg(unix)]
+        if !crate::testdir::isolated_lifecycle(
+            "gc::tests::a_toolchain_build_in_use_leased_or_unaccounted_for_stays_where_it_is",
+        ) {
+            return;
+        }
         let l = layout("aside-keep");
         let old = seed_toolchain(&l, "trust", 8590, false);
         seed_toolchain(&l, "trust", 9192, true);
@@ -2324,7 +2330,7 @@ mod tests {
             "a run holds it"
         );
         assert!(report.leased.is_empty(), "a move reclaims nothing to keep");
-        drop(lease);
+        lease.release();
 
         let report = run_with(&l, &|_| None, &|| Some(Vec::new()));
         assert_eq!(
@@ -2500,6 +2506,12 @@ mod tests {
 
     #[test]
     fn a_leased_build_is_kept_until_its_run_ends() {
+        #[cfg(unix)]
+        if !crate::testdir::isolated_lifecycle(
+            "gc::tests::a_leased_build_is_kept_until_its_run_ends",
+        ) {
+            return;
+        }
         let l = layout("leased");
         for b in [8580u64, 8590, 8595] {
             seed(&l, "trust", b, false);
@@ -2526,7 +2538,7 @@ mod tests {
                 ])
             )]
         );
-        drop(lease);
+        lease.release();
         let report = run_with(&l, &|_| None, &|| Some(Vec::new()));
         assert_eq!(report.reclaimed, vec![("trust".to_string(), vec![8590u64])]);
         assert!(report.leased.is_empty());

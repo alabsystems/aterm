@@ -15,6 +15,7 @@ mod extras_performance;
 mod history_link_budget;
 mod horizontal_margin_scope;
 mod link_translation_accessors;
+mod narrow_run;
 mod reflow;
 mod resize_row_reuse;
 mod scroll_damage;

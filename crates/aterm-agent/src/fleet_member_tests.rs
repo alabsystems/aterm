@@ -17,6 +17,57 @@ use std::sync::atomic::{AtomicBool, Ordering};
 const HANG: Duration = Duration::from_secs(60);
 
 #[test]
+fn canonical_name_publication_rejects_a_superseded_number() {
+    use aterm_types::machine_name::Number;
+    let world = World::new("canonical-name-publication");
+    aterm_uds::private_file::ensure_private_dir(&world.places.state).unwrap();
+    crate::machine_name::ensure(
+        &world.places.state,
+        || Ok(Some("m59".into())),
+        |_| false,
+        1000,
+    )
+    .unwrap();
+    assert!(
+        set_primary_name(
+            &world.places,
+            "m58",
+            &Writer::Canonical(Number::new(58).unwrap())
+        )
+        .is_err()
+    );
+    assert_eq!(
+        member::read_primary_name(&world.places.state).unwrap(),
+        None
+    );
+    set_primary_name(
+        &world.places,
+        "m59",
+        &Writer::Canonical(Number::new(59).unwrap()),
+    )
+    .unwrap();
+    crate::machine_name::file::replace(&world.places.state, |name| {
+        name.num = Number::new(60);
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        set_primary_name(
+            &world.places,
+            "m59",
+            &Writer::Canonical(Number::new(59).unwrap())
+        )
+        .is_err()
+    );
+    assert_eq!(
+        member::read_primary_name(&world.places.state)
+            .unwrap()
+            .as_deref(),
+        Some("m59")
+    );
+}
+
+#[test]
 fn peer_scans_record_their_authenticated_replies() {
     let (issuer, code, _serving) = issuing("probe-evidence-issuer");
     let newcomer = World::new("probe-evidence-reader");
@@ -1941,9 +1992,7 @@ fn a_new_mac_joins_through_an_advertised_member_while_the_code_names_one_away() 
             })
         },
     );
-    adverts.feed(
-        "16:02:11.123  Add        3   1 local.               _alab._tcp.          alab-other\n",
-    );
+    adverts.hear(true, 1, "alab-other");
     let newcomer = World::new("advert-new");
     let opts = Opts {
         port: Some(closed_port()),
@@ -3291,7 +3340,7 @@ fn a_join_after_a_leave_waits_for_this_machines_listener_to_serve_the_new_key() 
         "{joined}"
     );
     assert!(
-        !joined.contains(FOLLOWS) && joined.contains("\nOn a Mac, the local-network consent"),
+        !joined.contains(FOLLOWS),
         "no close that says it listens: {joined}"
     );
     drop(stuck);
@@ -6459,7 +6508,7 @@ fn a_failed_join_is_advised_by_its_kind() {
         ),
         (dial(libc::EPERM), Advice::Sandbox),
         (dial(libc::EACCES), Advice::Sandbox),
-        (dial(libc::EHOSTUNREACH), Advice::LocalNetwork),
+        (dial(libc::EHOSTUNREACH), Advice::NoRoute),
         (dial(libc::ENETUNREACH), Advice::NoNetwork),
         (JoinFailed::OtherKey("ab".repeat(16)), Advice::IssuerKey),
         (JoinFailed::Unproved("ab".repeat(16)), Advice::IssuerKey),
@@ -6600,12 +6649,13 @@ fn a_failed_join_is_advised_by_its_kind() {
             Finish::Person,
         )
     };
-    assert!(refused("192.168.1.23:7100").contains("local network"));
-    let looped = refused("127.0.0.1:7100");
-    assert!(
-        looped.contains("start aterm on the issuer") && !looped.contains("local network"),
-        "a loopback dial asks no consent: {looped}"
-    );
+    for at in ["192.168.1.23:7100", "127.0.0.1:7100"] {
+        let said = refused(at);
+        assert!(
+            said.contains("start aterm on the issuer") && !said.contains("local network"),
+            "no dial asks a person's consent: {said}"
+        );
+    }
 }
 
 #[test]
@@ -12130,20 +12180,13 @@ fn roster_identities_and_names_this_machine_bind_node_keys_and_enforce_deny_list
 }
 
 /// THE ON-LINK RULE IN `fleet peers` AND THE SURVEY'S ROWS: on a phone hotspot, a member on the
-/// hotspot this read found no route to while another member there answered is that member's own
-/// (off the link now): its row says so with the dial's address, and no note blames this Mac's
-/// privacy setting, and so while another member's Mac there refused the connect (a host
-/// answered: privacy let this read onto the link), whose row is a host that answered; with
-/// nothing there answering, the same no-route is this Mac's Local Network privacy; a no-route off
-/// this network is never privacy; with no place read, every peer not reached having had no route
-/// still says that privacy.
-/// NEGATIVE CONTROLS: `gone_off_the_link` answering `false` fails "another member there
-/// answered: its own"; `privacy_note` keeping the every-peer rule with a place read fails
-/// "another member there answered: no privacy note"; `on_link_of` reading every other failure as
-/// `Dial::Other` (no `met_host`) fails "another member's Mac there refused: its own".
+/// hotspot this read found no route to is that member's own (off the link now), whatever the
+/// other members did: its row says so with the dial's address; a no-route off this network is
+/// not; a member's Mac that refused the connect is a host that answered.
+/// NEGATIVE CONTROL: `gone_off_the_link` answering `false` fails "alone on the hotspot: its own".
 #[test]
-fn a_no_route_on_this_network_is_its_own_while_another_member_there_answered() {
-    use aterm_netplace::words::{GONE_FROM_THE_LINK, ON_LINK_PRIVACY_NOTE};
+fn a_no_route_on_this_network_is_that_members_own() {
+    use aterm_netplace::words::GONE_FROM_THE_LINK;
     let hotspot = aterm_netplace::sample::hotspot(1_000, 900);
     let no_route = |ip: [u8; 4]| {
         Unreached::Connect(
@@ -12152,16 +12195,10 @@ fn a_no_route_on_this_network_is_its_own_while_another_member_there_answered() {
         )
     };
     let gone = no_route([172, 20, 10, 5]);
-    let neighbour: Result<IpAddr, &Unreached> = Ok(IpAddr::from([172, 20, 10, 6]));
-    let on_link = on_link_of(&hotspot, [Err(&gone), neighbour]);
+    let alone = on_link_of(&hotspot, [Err(&gone)]);
     assert!(
-        gone_off_the_link(&gone, Some(&hotspot), Some(&on_link)),
-        "another member there answered: its own"
-    );
-    assert_eq!(
-        privacy_note(Some(&on_link), (1, 1)),
-        None,
-        "another member there answered: no privacy note"
+        gone_off_the_link(&gone, Some(&hotspot), Some(&alone)),
+        "alone on the hotspot: its own"
     );
     let peer = manual_peer("m7".to_owned(), member::DEFAULT_PORT);
     let row = peer_survey(
@@ -12181,23 +12218,10 @@ fn a_no_route_on_this_network_is_its_own_while_another_member_there_answered() {
         std::net::SocketAddr::from(([172, 20, 10, 6], 7100)),
         std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
     );
-    let met = on_link_of(&hotspot, [Err(&gone), Err(&refused)]);
-    assert!(
-        gone_off_the_link(&gone, Some(&hotspot), Some(&met)),
-        "another member's Mac there refused: its own"
-    );
-    assert_eq!(privacy_note(Some(&met), (2, 2)), None);
     let refused_row = peer_survey(&peer, Err(refused), (&[], None, None), false);
     assert_eq!(
         (refused_row.fault, refused_row.addr.as_deref()),
         (aterm_ctl::PeerFault::HostAnswered, Some("172.20.10.6"))
-    );
-    let alone = on_link_of(&hotspot, [Err(&gone)]);
-    assert!(!gone_off_the_link(&gone, Some(&hotspot), Some(&alone)));
-    assert_eq!(
-        privacy_note(Some(&alone), (1, 1)),
-        Some(ON_LINK_PRIVACY_NOTE),
-        "none there answering: this Mac's privacy"
     );
     let home_member = no_route([192, 168, 4, 9]);
     let elsewhere = on_link_of(&hotspot, [Err(&home_member)]);
@@ -12206,21 +12230,12 @@ fn a_no_route_on_this_network_is_its_own_while_another_member_there_answered() {
         Some(&hotspot),
         Some(&elsewhere)
     ));
-    assert_eq!(
-        privacy_note(Some(&elsewhere), (1, 1)),
-        None,
-        "a no-route off this network blames no privacy"
-    );
-    assert!(privacy_note(None, (1, 1)).is_some(), "no place: every peer");
-    assert_eq!(privacy_note(None, (1, 2)), None);
 }
 
-/// On a phone hotspot, a member dialled on the hotspot itself that this Mac found no route to
-/// was refused by this Mac's own Local Network privacy: `fleet peers` blames that, not being
-/// away; one off the hotspot (the home LAN's address) is what being away explains.
+/// On a phone hotspot, a member dialled on the hotspot itself that this Mac found no route to is
+/// not explained by this Mac being away; one off the hotspot (the home LAN's address) is.
 /// NEGATIVE CONTROL: `no_route_on_this_network` answering `false` whatever the address leaves
-/// the on-hotspot member's refusal to the away why, and "this Mac's privacy refused a member on
-/// this network" fails.
+/// the on-hotspot member's no-route to the away why, and "a member on this network" fails.
 #[test]
 fn a_no_route_to_a_member_on_this_network_is_never_explained_by_being_away() {
     let hotspot = aterm_netplace::sample::hotspot(1_000, 900);
@@ -12232,7 +12247,7 @@ fn a_no_route_to_a_member_on_this_network_is_never_explained_by_being_away() {
     };
     assert!(
         no_route_on_this_network(&no_route([172, 20, 10, 5]), Some(&hotspot)),
-        "this Mac's privacy refused a member on this network"
+        "a member on this network"
     );
     assert!(!no_route_on_this_network(
         &no_route([192, 168, 4, 9]),

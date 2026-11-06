@@ -13,7 +13,8 @@
 //! - **Its place on the home ALab LAN.** The connection came from another host on the network
 //!   this member reads as its home ALab LAN (`members::desk::Local::automatically_admits`: the
 //!   default route's Ethernet or Wi-Fi subnet, never a hotspot, a VPN or a bridge, with fresh
-//!   member evidence there, `crate::home_lan`). Being there is the admission: a Mac no seat binds
+//!   member evidence there, `crate::home_lan`; in a debug build, on a lab's own vault, the network
+//!   that vault names, `members::lab_lan`). Being there is the admission: a Mac no seat binds
 //!   takes a new seat under the next free label, with no hourly or daily share, and a seat whose
 //!   node key it proves moves to its new key as below, whatever binds that key.
 //! - **Its seat's node key.** The log binds its fleet node key to a seat by authority: the genesis
@@ -61,8 +62,8 @@
 //!   the label decided, with the node key it proved.
 
 use super::admit::{
-    LogAdmission, held_audiences, held_log, labels_taken, log_bundle, node_removal, removal_naming,
-    roster_keeps_out, wraps_lacking,
+    HandedVault, LogAdmission, held_audiences, held_log, labels_taken, log_bundle, node_removal,
+    removal_naming, roster_keeps_out, wraps_lacking,
 };
 use super::*;
 use crate::commons::binding::Request;
@@ -998,7 +999,8 @@ fn unclaimed(log: &Log, node: &[u8; 32]) -> bool {
 /// or local signer, so an unauthenticated caller learns nothing more of the log or of a copied
 /// recipient and triggers no server read. Past that, a lab identity's proof (`proving.lab`) to a
 /// member whose vault is pinned to the live ALab genesis is refused with
-/// [`crate::members::desk::LAB_REFUSED`], which names nothing of the log (A12).
+/// [`crate::members::desk::LAB_REFUSED`], which names nothing of the log (A12), and a member whose
+/// vault no new Mac can reach (one it reads from a path) says so, as it hands no log bundle.
 fn pre_possession_pass(
     paths: &Paths,
     proving: &crate::members::desk::Proving<'_>,
@@ -1016,6 +1018,12 @@ fn pre_possession_pass(
     // possession challenge and before any server read.
     if proving.lab && super::live_genesis_store(&store) {
         return Err(Some(crate::members::desk::LAB_REFUSED.to_owned()));
+    }
+    // A vault no new Mac can reach (one read from a path) hands no log bundle: refused before the
+    // possession challenge, so the Mac tries the next member, as [`admit_by_proof`] refuses it
+    // before it signs.
+    if let Err(why) = HandedVault::of(super::config(paths).map_err(|_| None)?) {
+        return Err(Some(why.to_owned()));
     }
     let source = records_bound(paths, &store).map_err(|_| None)?;
     if !proven.reader.can_take(source) {
@@ -1122,7 +1130,9 @@ fn admitted_name(asked: &str) -> String {
 /// clock): read the vault's newest records (within [`FRESH_WITHIN`]; a member that reads none
 /// signs nothing new), [`decide`], then under this Mac's state lock sign what the decision says and keep it
 /// only where the evaluator seats the new key as decided, and hand the log bundle, with an
-/// `Allowed` this member signs for the approvers 0.145 Macs read. Its records go to every vault
+/// `Allowed` this member signs for the approvers 0.145 Macs read. What the bundle names of the
+/// vault is read before anything is signed, so a vault no new Mac can reach (one read from a
+/// path, or none pinned) is refused with nothing signed or kept. Its records go to every vault
 /// server off the caller's thread. Nothing here waits on a person, and nothing runs on a window's
 /// main thread: the callers are the fleet listener's connection threads.
 ///
@@ -1150,6 +1160,12 @@ pub fn admit_by_proof(paths: &Paths, proven: &Proven<'_>, now_ms: u64) -> crate:
     };
     let Some((mut store, mut log, _, opened)) = held_log(paths)? else {
         return Ok(Readmit::NotHere);
+    };
+    // What the log bundle names, read before anything is signed: a vault no new Mac can reach
+    // (one read from a path) refuses here, so no `Admit` is kept that hands the Mac nothing.
+    let vault = match HandedVault::of(super::config(paths)?) {
+        Ok(vault) => vault,
+        Err(why) => return Ok(Readmit::Refused(why.to_owned())),
     };
     let source = records_bound(paths, &store)?;
     if !proven.reader.can_take(source) {
@@ -1307,7 +1323,7 @@ pub fn admit_by_proof(paths: &Paths, proven: &Proven<'_>, now_ms: u64) -> crate:
     }
     let allowed = device.with_seed(|seed| Allowed::sign(binding, &name, seed))?;
     let bundle = log_bundle(
-        paths,
+        vault,
         &allowed,
         LogAdmission {
             records: store.encode_held(),
@@ -1389,3 +1405,7 @@ fn post_aside(paths: &Paths) {
 #[cfg(test)]
 #[path = "readmit_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "readmit_lab_tests.rs"]
+mod lab_tests;

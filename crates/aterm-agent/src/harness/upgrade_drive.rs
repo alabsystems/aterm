@@ -3981,6 +3981,12 @@ pub(super) struct St {
     /// Persisted before any native dispatch; terminal receipts never restore raw fallback.
     pub(super) native_coordination: bool,
     pub(super) native_record: super::native_record::Baseline,
+    /// This relaunch is a fresh plan for an agent that ended under an earlier aterm process,
+    /// admitted now and proven gone by its kernel start, with no native operation unresolved
+    /// ([`super::relaunch::host_ended_fresh`]): no native authority outlived that process, so
+    /// the record's [`Self::native_coordination`] (kept, never cleared) gates no typed line of
+    /// it. Never written to the record: it holds for this one relaunch.
+    pub(super) host_ended_fresh: bool,
     /// A NotGranted retirement, never a launch grant.
     pub(super) native_retired_unissued: bool,
     /// Unconfirmed account successor; the original binding and recipe remain above.
@@ -5388,6 +5394,7 @@ impl St {
         };
         let mut st = St {
             native_record: super::native_record::Baseline::default(),
+            host_ended_fresh: false,
             phase,
             from: s("from"),
             to: s("to"),

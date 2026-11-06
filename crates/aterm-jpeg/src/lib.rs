@@ -8,7 +8,7 @@ mod huffman;
 mod idct;
 
 use color::{ColorModel, Plane};
-use huffman::{BitReader, HuffmanTable};
+use huffman::{BitReader, HuffmanTable, has_coded_data};
 
 const ZIGZAG: [usize; 64] = [
     0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20,
@@ -18,6 +18,13 @@ const ZIGZAG: [usize; 64] = [
 
 /// The file name extensions of the format this crate reads, lower case.
 pub const EXTENSIONS: &[&str] = &["jpg", "jpeg", "jpe", "jfif"];
+
+/// The most scans a progressive frame may have, counting empty ones. A scan
+/// can walk every block it covers in a few bits (one end-of-band run codes
+/// 32,767 blocks), so the count bounds the decode, as libjpeg-turbo's scan
+/// limit does. The libjpeg progressive script writes at most 18 scans, and
+/// mozjpeg's whole scan search for a YCbCr image is 64 candidates.
+const MAX_PROGRESSIVE_SCANS: usize = 64;
 
 /// Decode a JPEG to packed straight RGBA8 (alpha 255), upright, returning `(rgba, width, height)`.
 #[inline]
@@ -49,11 +56,17 @@ struct Component {
     dc_table: usize,
     ac_table: usize,
     dc_pred: i32,
-    /// Sequential: the samples, written block by block as scans decode.
+    /// Sequential: a scan has coded this component, which T.81 does once.
+    coded: bool,
+    /// Sequential: the samples, written block by block as scans decode; a
+    /// block no data reaches stays mid grey, as all-zero coefficients decode.
     samples: Vec<u8>,
     /// Progressive: every block's coefficients, zigzag positions already in
     /// natural order, dequantized only once all scans are in.
     coefficients: Vec<i16>,
+    /// Progressive: per block, bit `k` set while zigzag coefficient `k` of
+    /// `1..=63` is nonzero, so a refinement visits only those.
+    nonzero: Vec<u64>,
 }
 
 struct Frame {
@@ -81,6 +94,8 @@ struct Decoder<'a> {
     jfif: bool,
     orientation: u16,
     eob_run: u32,
+    /// The frame's scan headers so far.
+    scans: usize,
     /// At least one scan's data was read.
     scanned: bool,
 }
@@ -104,6 +119,7 @@ impl<'a> Decoder<'a> {
             jfif: false,
             orientation: 1,
             eob_run: 0,
+            scans: 0,
             scanned: false,
         })
     }
@@ -293,13 +309,19 @@ impl<'a> Decoder<'a> {
                 dc_table: 0,
                 ac_table: 0,
                 dc_pred: 0,
+                coded: false,
                 samples: if progressive {
                     Vec::new()
                 } else {
-                    vec![0; samples]
+                    vec![128; samples]
                 },
                 coefficients: if progressive {
                     vec![0; samples]
+                } else {
+                    Vec::new()
+                },
+                nonzero: if progressive {
+                    vec![0; blocks]
                 } else {
                     Vec::new()
                 },
@@ -321,6 +343,16 @@ impl<'a> Decoder<'a> {
         let payload = self.segment()?;
         let frame = self.frame.as_ref()?;
         let progressive = frame.progressive;
+        // T.81 codes each component of a sequential frame in exactly one scan.
+        let limit = if progressive {
+            MAX_PROGRESSIVE_SCANS
+        } else {
+            self.components.len()
+        };
+        self.scans += 1;
+        if self.scans > limit {
+            return None;
+        }
         let count = usize::from(*payload.first()?);
         if count == 0
             || count > 4
@@ -336,7 +368,7 @@ impl<'a> Decoder<'a> {
                 .components
                 .iter()
                 .position(|component| component.id == spec[0])?;
-            if members.contains(&index) {
+            if members.contains(&index) || self.components[index].coded {
                 return None;
             }
             let component = &mut self.components[index];
@@ -373,8 +405,15 @@ impl<'a> Decoder<'a> {
             high,
             low,
         };
+        if !has_coded_data(self.data, self.pos) {
+            // Every MCU codes at least one bit, so a scan without a data byte
+            // codes nothing; decoding it would read every block from zeros.
+            return Some(false);
+        }
         for &index in &scan.members {
-            self.components[index].dc_pred = 0;
+            let component = &mut self.components[index];
+            component.dc_pred = 0;
+            component.coded = !progressive;
         }
         self.eob_run = 0;
         let mut reader = BitReader::new(self.data, self.pos);
@@ -402,14 +441,24 @@ impl<'a> Decoder<'a> {
                     && done > 0
                     && done.is_multiple_of(self.restart_interval)
                 {
-                    reader.restart();
+                    if !reader.restart() {
+                        return Some(());
+                    }
                     for &index in &scan.members {
                         self.components[index].dc_pred = 0;
                     }
                     self.eob_run = 0;
                 }
                 done += 1;
-                for &index in &scan.members {
+                if reader.exhausted() {
+                    // What the file does not hold stays uncoded until the next
+                    // restart, as in libjpeg, rather than read from zero bits.
+                    if self.restart_interval == 0 {
+                        return Some(());
+                    }
+                    continue;
+                }
+                'mcu: for &index in &scan.members {
                     let (blocks_h, blocks_v) = if single {
                         (1, 1)
                     } else {
@@ -417,6 +466,9 @@ impl<'a> Decoder<'a> {
                     };
                     for by in 0..blocks_v {
                         for bx in 0..blocks_h {
+                            if reader.exhausted() {
+                                break 'mcu;
+                            }
                             let (block_x, block_y) = if single {
                                 (unit_x, unit_y)
                             } else {
@@ -449,6 +501,10 @@ impl<'a> Decoder<'a> {
         let mut block = [0i32; 64];
         let category = u32::from(reader.decode(dc)?);
         let diff = reader.receive_extend(category);
+        if reader.exhausted() {
+            // Nothing read past the data is stored; the block stays mid grey.
+            return Some(());
+        }
         let prediction = component.dc_pred.wrapping_add(diff);
         block[0] = dequantize(prediction, quant[0]);
         let mut k = 1;
@@ -463,12 +519,12 @@ impl<'a> Decoder<'a> {
                 continue;
             }
             k += run;
-            if k > 63 {
-                let _ = reader.receive_extend(size);
+            let value = reader.receive_extend(size);
+            if k > 63 || reader.exhausted() {
                 break;
             }
             let natural = ZIGZAG[k];
-            block[natural] = dequantize(reader.receive_extend(size), quant[natural]);
+            block[natural] = dequantize(value, quant[natural]);
             k += 1;
         }
         let component = &mut self.components[index];
@@ -493,13 +549,17 @@ impl<'a> Decoder<'a> {
         if block_x >= component.blocks_w || block_y >= component.blocks_h {
             return Some(());
         }
-        let at = (block_y * component.blocks_w + block_x) * 64;
+        let block = block_y * component.blocks_w + block_x;
+        let at = block * 64;
         if scan.start == 0 {
             // DC first or refining.
             if scan.high == 0 {
                 let dc = self.dc_tables[component.dc_table].as_ref()?;
                 let category = u32::from(reader.decode(dc)?);
                 let diff = reader.receive_extend(category);
+                if reader.exhausted() {
+                    return Some(());
+                }
                 let component = &mut self.components[index];
                 component.dc_pred = component.dc_pred.wrapping_add(diff);
                 let value = component.dc_pred.wrapping_shl(scan.low);
@@ -511,11 +571,13 @@ impl<'a> Decoder<'a> {
             return Some(());
         }
         let ac = self.ac_tables[component.ac_table].as_ref()?;
-        let coefficients = self.components[index].coefficients.get_mut(at..at + 64)?;
+        let component = &mut self.components[index];
+        let coefficients = component.coefficients.get_mut(at..at + 64)?;
+        let nonzero = component.nonzero.get_mut(block)?;
         if scan.high == 0 {
-            ac_first(coefficients, ac, scan, reader, &mut self.eob_run)
+            ac_first(coefficients, nonzero, ac, scan, reader, &mut self.eob_run)
         } else {
-            ac_refine(coefficients, ac, scan, reader, &mut self.eob_run)
+            ac_refine(coefficients, nonzero, ac, scan, reader, &mut self.eob_run)
         }
     }
 
@@ -618,6 +680,7 @@ fn dequantize(value: i32, quant: u16) -> i32 {
 
 fn ac_first(
     coefficients: &mut [i16],
+    nonzero: &mut u64,
     table: &HuffmanTable,
     scan: &Scan,
     reader: &mut BitReader<'_>,
@@ -640,53 +703,75 @@ fn ac_first(
             continue;
         }
         k += run as usize;
-        if k > scan.end {
-            let _ = reader.receive_extend(size);
+        let value = reader.receive_extend(size).wrapping_shl(scan.low) as i16;
+        if k > scan.end || reader.exhausted() {
             break;
         }
-        let value = reader.receive_extend(size).wrapping_shl(scan.low);
-        coefficients[ZIGZAG[k]] = value as i16;
+        coefficients[ZIGZAG[k]] = value;
+        if value == 0 {
+            *nonzero &= !(1 << k);
+        } else {
+            *nonzero |= 1 << k;
+        }
         k += 1;
     }
     Some(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The coefficients this thread's refinements have corrected, passed or placed.
+    static REFINE_EXAMINED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// One block of a successive-approximation AC scan (T.81 G.1.2.3): each
+/// nonzero coefficient of the band takes a correction bit, and a new one goes
+/// to the zero coefficient its run reaches. `nonzero` says where those are,
+/// so the work is the coefficients corrected and the zeros a run passes.
 fn ac_refine(
     coefficients: &mut [i16],
+    nonzero: &mut u64,
     table: &HuffmanTable,
     scan: &Scan,
     reader: &mut BitReader<'_>,
     eob_run: &mut u32,
 ) -> Option<()> {
     let bit: i16 = 1 << scan.low;
-    let refine = |slot: &mut i16, reader: &mut BitReader<'_>| {
-        if reader.bit() && (*slot & bit) == 0 {
-            *slot = if *slot >= 0 {
-                slot.wrapping_add(bit)
-            } else {
-                slot.wrapping_sub(bit)
-            };
-        }
-    };
-    if *eob_run > 0 {
-        *eob_run -= 1;
-        for k in scan.start..=scan.end {
-            let slot = &mut coefficients[ZIGZAG[k]];
-            if *slot != 0 {
-                refine(slot, reader);
+    // Corrects the coefficients at `positions`, all nonzero, in zigzag order,
+    // while the data lasts: a correction bit past it would be a zero, no change.
+    let correct = |positions: u64, coefficients: &mut [i16], reader: &mut BitReader<'_>| {
+        #[cfg(test)]
+        REFINE_EXAMINED.set(REFINE_EXAMINED.get() + u64::from(positions.count_ones()));
+        let mut pending = positions;
+        while pending != 0 && !reader.exhausted() {
+            let slot = &mut coefficients[ZIGZAG[pending.trailing_zeros() as usize]];
+            pending &= pending - 1;
+            if reader.bit() && (*slot & bit) == 0 {
+                *slot = if *slot >= 0 {
+                    slot.wrapping_add(bit)
+                } else {
+                    slot.wrapping_sub(bit)
+                };
             }
         }
+    };
+    let band = (u64::MAX >> (63 - scan.end)) & (u64::MAX << scan.start);
+    if *eob_run > 0 {
+        *eob_run -= 1;
+        correct(*nonzero & band, coefficients, reader);
         return Some(());
     }
     let mut k = scan.start;
     while k <= scan.end {
         let rs = reader.decode(table)?;
-        let (mut run, size) = (u32::from(rs >> 4), u32::from(rs & 15));
+        let (run, size) = (u32::from(rs >> 4), u32::from(rs & 15));
+        let rest = band & (u64::MAX << k);
         let mut value: i16 = 0;
         if size == 0 {
             if run < 15 {
                 *eob_run = (1 << run) - 1 + reader.bits(run);
-                run = 64;
+                correct(*nonzero & rest, coefficients, reader);
+                break;
             }
         } else {
             if size != 1 {
@@ -694,19 +779,31 @@ fn ac_refine(
             }
             value = if reader.bit() { bit } else { -bit };
         }
-        while k <= scan.end {
-            let slot = &mut coefficients[ZIGZAG[k]];
-            k += 1;
-            if *slot != 0 {
-                refine(slot, reader);
-            } else {
-                if run == 0 {
-                    *slot = value;
-                    break;
-                }
-                run -= 1;
-            }
+        if reader.exhausted() {
+            break;
         }
+        // Pass `run` zero coefficients; the next takes `value` (a ZRL's 0).
+        #[cfg(test)]
+        REFINE_EXAMINED.set(REFINE_EXAMINED.get() + u64::from(run) + 1);
+        let mut zeros = !*nonzero & rest;
+        for _ in 0..run {
+            zeros &= zeros.wrapping_sub(1);
+        }
+        if zeros == 0 {
+            correct(*nonzero & rest, coefficients, reader);
+            break;
+        }
+        let target = zeros.trailing_zeros() as usize;
+        correct(
+            *nonzero & rest & !(u64::MAX << target),
+            coefficients,
+            reader,
+        );
+        coefficients[ZIGZAG[target]] = value;
+        if value != 0 {
+            *nonzero |= 1 << target;
+        }
+        k = target + 1;
     }
     Some(())
 }
@@ -755,7 +852,207 @@ fn exif_orientation(tiff: &[u8]) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_rgba8, exif_orientation};
+    use super::huffman::DECODED;
+    use super::{MAX_PROGRESSIVE_SCANS, REFINE_EXAMINED, decode_rgba8, exif_orientation};
+
+    /// A scan header's `(Ss, Se, Ah << 4 | Al)` and the data after it.
+    type ScanBytes<'a> = ((u8, u8, u8), &'a [u8]);
+
+    /// [`framed`] grey, with no restart interval.
+    fn generated(
+        progressive: bool,
+        side: u8,
+        symbols: [u8; 2],
+        scans: &[ScanBytes<'_>],
+    ) -> Vec<u8> {
+        framed(progressive, side, &[0x11], 0, symbols, scans)
+    }
+
+    /// A `side`-square frame of one component per `sampling` entry (its
+    /// `H << 4 | V`), quantizer 1, a restart every `restart_interval` MCUs (0
+    /// for none), whose DC and AC tables code `symbols` each as the one-bit
+    /// code `0`; then one SOS per entry of `scans`, a DC or sequential one
+    /// over every component and an AC one over the first.
+    fn framed(
+        progressive: bool,
+        side: u8,
+        sampling: &[u8],
+        restart_interval: u8,
+        symbols: [u8; 2],
+        scans: &[ScanBytes<'_>],
+    ) -> Vec<u8> {
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xDB, 0x00, 0x43, 0x00];
+        jpeg.extend([1u8; 64]);
+        let count = sampling.len() as u8;
+        let sof = if progressive { 0xC2 } else { 0xC0 };
+        jpeg.extend([0xFF, sof, 0x00, 8 + 3 * count, 0x08]);
+        jpeg.extend([0x00, side, 0x00, side, count]);
+        for (id, &factors) in (1u8..).zip(sampling) {
+            jpeg.extend([id, factors, 0x00]);
+        }
+        for (class, symbol) in [0x00, 0x10].into_iter().zip(symbols) {
+            jpeg.extend([0xFF, 0xC4, 0x00, 0x14, class, 0x01]);
+            jpeg.extend([0u8; 15]);
+            jpeg.push(symbol);
+        }
+        if restart_interval > 0 {
+            jpeg.extend([0xFF, 0xDD, 0x00, 0x04, 0x00, restart_interval]);
+        }
+        for &((start, end, approximation), data) in scans {
+            let members = if start == 0 { count } else { 1 };
+            jpeg.extend([0xFF, 0xDA, 0x00, 6 + 2 * members, members]);
+            for id in 1..=members {
+                jpeg.extend([id, 0x00]);
+            }
+            jpeg.extend([start, end, approximation]);
+            jpeg.extend_from_slice(data);
+        }
+        jpeg.extend([0xFF, 0xD9]);
+        jpeg
+    }
+
+    /// One data byte, then `intervals` restart markers with nothing between.
+    fn byte_then_restarts(intervals: usize) -> Vec<u8> {
+        let mut data = vec![0x00];
+        for marker in (0xD0..=0xD7).cycle().take(intervals) {
+            data.extend([0xFF, marker]);
+        }
+        data
+    }
+
+    /// Whether every pixel outside the top-left 8x8 block of a `side`-wide image is mid grey.
+    fn grey_past_the_first_block(rgba: &[u8], side: usize) -> bool {
+        rgba.as_chunks::<4>()
+            .0
+            .iter()
+            .enumerate()
+            .all(|(i, pixel)| (i % side < 8 && i / side < 8) || *pixel == [128, 128, 128, 255])
+    }
+
+    #[test]
+    fn a_sequential_frame_codes_each_component_in_one_scan() {
+        let scan = ((0, 63, 0), &[0x00][..]);
+        assert!(decode_rgba8(&generated(false, 16, [0, 0], &[scan]), 64).is_some());
+        assert!(
+            decode_rgba8(&generated(false, 16, [0, 0], &[scan, scan]), 64).is_none(),
+            "a second scan of a coded component"
+        );
+        // The review's crasher, small: header after header with no data between.
+        let empty = vec![((0, 63, 0), &[][..]); 1300];
+        assert!(decode_rgba8(&generated(false, 16, [0, 0], &empty), 64).is_none());
+    }
+
+    #[test]
+    fn a_scan_that_codes_nothing_is_passed_over() {
+        // The AC code `0` is a size-8 coefficient, so reading the empty scan's
+        // missing bits as zeros would paint every block.
+        let dc = ((0, 0, 0), &[0x00][..]);
+        let ac = ((1, 63, 0), &[][..]);
+        let (without, ..) =
+            decode_rgba8(&generated(true, 16, [0, 0x08], &[dc]), 64).expect("DC alone");
+        let (with, ..) =
+            decode_rgba8(&generated(true, 16, [0, 0x08], &[dc, ac]), 64).expect("with it");
+        assert!(with == without, "the empty AC scan changed the image");
+    }
+
+    #[test]
+    fn a_progressive_frame_has_at_most_its_scan_limit() {
+        let first = ((0, 0, 0x01), &[0x00][..]);
+        let refine = ((0, 0, 0x10), &[0x00][..]);
+        let mut scans = vec![first];
+        scans.resize(MAX_PROGRESSIVE_SCANS, refine);
+        assert!(decode_rgba8(&generated(true, 16, [0, 0], &scans), 64).is_some());
+        scans.push(refine);
+        assert!(decode_rgba8(&generated(true, 16, [0, 0], &scans), 64).is_none());
+    }
+
+    #[test]
+    fn a_scan_stops_where_its_data_does() {
+        // An AC coefficient takes nine bits, so the two bytes run out in the
+        // first block; the other three keep what the DC scan gave them.
+        let dc = ((0, 0, 0), &[0x00][..]);
+        let ac = ((1, 63, 0), &[0x00, 0x00][..]);
+        let (without, ..) = decode_rgba8(&generated(true, 16, [0, 0x08], &[dc]), 64).expect("DC");
+        let (with, ..) = decode_rgba8(&generated(true, 16, [0, 0x08], &[dc, ac]), 64).expect("AC");
+        assert!(with != without, "the first block took its coefficients");
+        let (got, kept) = (with.as_chunks::<4>().0, without.as_chunks::<4>().0);
+        for (i, (got, kept)) in got.iter().zip(kept).enumerate() {
+            let first_block = i % 16 < 8 && i / 16 < 8;
+            assert!(
+                first_block || got == kept,
+                "pixel {i} past the data changed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sequential_block_no_data_reaches_is_mid_grey() {
+        // A DC difference takes nine bits, so the byte runs out in the first block.
+        let scan = ((0, 63, 0), &[0x00][..]);
+        let (rgba, ..) =
+            decode_rgba8(&generated(false, 16, [0x08, 0], &[scan]), 64).expect("decodes");
+        for (i, pixel) in rgba.as_chunks::<4>().0.iter().enumerate() {
+            let first_block = i % 16 < 8 && i / 16 < 8;
+            assert!(
+                first_block || *pixel == [128, 128, 128, 255],
+                "pixel {i}: {pixel:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_restart_interval_without_data_decodes_nothing() {
+        // 64 blocks and a restart after each: the AC scan's one byte codes
+        // four coefficients (two bits each) of the first block, and the other
+        // 63 intervals hold only their markers. Read as zero bits, they would
+        // give each block 63 coefficients.
+        let data = byte_then_restarts(63);
+        let jpeg = framed(true, 64, &[0x11], 1, [0, 0x01], &[((1, 63, 0), &data[..])]);
+        DECODED.set(0);
+        let (rgba, ..) = decode_rgba8(&jpeg, 64).expect("decodes");
+        let decoded = DECODED.get();
+        assert!(decoded <= 2 * 64, "{decoded} symbols for 64 blocks");
+        assert!(
+            grey_past_the_first_block(&rgba, 64),
+            "a block past the data changed"
+        );
+    }
+
+    #[test]
+    fn an_interleaved_mcu_stops_where_its_data_does() {
+        // 4:2:0 has six blocks an MCU; 16 MCUs and a restart after each. A DC
+        // difference takes nine bits, so the one byte runs out in the first
+        // block and the other 15 intervals hold only their markers. Read as
+        // zero bits, they would give every block a DC difference.
+        let data = byte_then_restarts(15);
+        let scan = ((0, 0, 0), &data[..]);
+        let jpeg = framed(true, 64, &[0x22, 0x11, 0x11], 1, [0x08, 0], &[scan]);
+        DECODED.set(0);
+        let (rgba, ..) = decode_rgba8(&jpeg, 64).expect("decodes");
+        let decoded = DECODED.get();
+        assert!(decoded <= 16, "{decoded} symbols for 16 MCUs of 6 blocks");
+        let pixels = rgba.as_chunks::<4>().0;
+        assert!(
+            pixels.iter().all(|pixel| *pixel == [128, 128, 128, 255]),
+            "a block past the data changed"
+        );
+    }
+
+    #[test]
+    fn a_refinement_touches_only_the_coefficients_it_codes() {
+        // 64 blocks with no nonzero AC coefficient, each refinement an end of
+        // band: there is nothing to correct, so nothing to walk.
+        let bits = [0x00; 8];
+        let mut scans = vec![((0, 0, 0), &bits[..]), ((1, 63, 0x01), &bits[..])];
+        scans.extend([((1, 63, 0x10), &bits[..]); 8]);
+        REFINE_EXAMINED.set(0);
+        assert!(decode_rgba8(&generated(true, 64, [0, 0], &scans), 64).is_some());
+        let examined = REFINE_EXAMINED.get();
+        assert!(
+            examined <= 8 * 64,
+            "{examined} coefficients for 8 x 64 blocks"
+        );
+    }
 
     #[test]
     fn what_is_not_a_framed_jpeg_is_refused() {

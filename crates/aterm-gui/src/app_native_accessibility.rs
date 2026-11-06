@@ -1821,6 +1821,49 @@ mod tests {
             .collect()
     }
 
+    /// A real frame of a plain terminal window tells a client the words it composed.
+    #[test]
+    fn a_terminal_frame_publishes_the_words_it_composed() {
+        let mut app = crate::scripted_redraw_fixture::scripted_app();
+        let wid = WindowId(0);
+        app.windows.get_mut(&wid).unwrap().a11y_active = true;
+        crate::scripted_redraw_fixture::feed(&app, b"spoken words");
+        app.redraw_window(wid);
+        let sent = app.windows[&wid]
+            .a11y_sent
+            .last()
+            .expect("the frame's tree");
+        assert!(
+            terminal_text(sent)
+                .iter()
+                .any(|text| text.contains("spoken words")),
+            "{:?}",
+            terminal_text(sent)
+        );
+    }
+
+    /// A real frame of a split window tells a client each pane's words.
+    #[test]
+    fn a_split_frame_publishes_each_panes_words() {
+        let mut app = crate::scripted_redraw_fixture::scripted_app();
+        let wid = WindowId(0);
+        let second = app.split_active_stub_tab(wid);
+        app.windows.get_mut(&wid).unwrap().a11y_active = true;
+        for (session, words) in [(0, &b"left words"[..]), (second, &b"right words"[..])] {
+            let term = app.pool.get(session).expect("the pane").term.clone();
+            crate::term_lock(&term).process(words);
+        }
+        app.redraw_window(wid);
+        let sent = app.windows[&wid]
+            .a11y_sent
+            .last()
+            .expect("the frame's tree");
+        let text = terminal_text(sent);
+        for words in ["left words", "right words"] {
+            assert!(text.iter().any(|t| t.contains(words)), "{words}: {text:?}");
+        }
+    }
+
     /// A window whose terminal tab composed last, with a Settings and terminal tab behind it:
     /// the app, the window and that tab's index.
     fn mixed_tab_behind_a_terminal_tab() -> (App, WindowId, usize) {

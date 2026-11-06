@@ -1453,7 +1453,8 @@ pub fn stored_login_file(c: &Connector, home: &std::path::Path) -> Option<std::p
         .map(|(_, _, path)| path)
 }
 
-/// The most bytes of a Claude Code credential file [`stored_login_lapsed`] reads.
+/// The most bytes of a Claude Code credential file [`stored_login_lapsed`] and
+/// [`stored_login_held`] read.
 const CLAUDE_CREDENTIAL_MAX: u64 = 1 << 20;
 
 /// Whether the stored login file under `home` ([`stored_login_file`]) shows its own login
@@ -1477,8 +1478,25 @@ pub fn stored_login_lapsed(c: &Connector, home: &std::path::Path) -> bool {
     };
     match c.id {
         "grok" => !crate::harness::grok_signin::login_accepted(&file),
-        "claude" => claude_credentials_lapsed(&file),
+        "claude" => claude_credentials_held(&file) == Some(false),
         _ => false,
+    }
+}
+
+/// Whether the stored login file under `home` ([`stored_login_file`]) holds its own login, read
+/// from that file alone, as [`stored_login_lapsed`] reads it (no value leaves this function, and
+/// no process, network, browser or keychain is asked). For Claude Code's `.credentials.json`:
+/// `Some(true)` where its `claudeAiOauth` holds a non-empty access token or refresh token (one
+/// that keeps a refresh token is held whatever its access token's expiry: the CLI renews it),
+/// `Some(false)` where it holds neither. `None` is no answer: `home` holds no stored login file
+/// (as a keychain-held login leaves it), the file is one these rules cannot read (unreadable,
+/// oversized, unparsed, or with no `claudeAiOauth`), or the CLI is another.
+#[must_use]
+pub fn stored_login_held(c: &Connector, home: &std::path::Path) -> Option<bool> {
+    let file = stored_login_file(c, home)?;
+    match c.id {
+        "claude" => claude_credentials_held(&file),
+        _ => None,
     }
 }
 
@@ -1509,31 +1527,64 @@ pub(crate) fn test_without_lapse<R>(read: impl FnOnce() -> R) -> R {
     read()
 }
 
-/// Whether Claude Code's credential file `file` holds a `claudeAiOauth` login with neither a
-/// non-empty `accessToken` nor a non-empty `refreshToken` ([`stored_login_lapsed`]). The bytes
-/// and the parsed tree are scrubbed before it returns.
-fn claude_credentials_lapsed(file: &std::path::Path) -> bool {
+/// Whether Claude Code keeps its default login (a launch with no `CLAUDE_SECURESTORAGE_CONFIG_DIR`)
+/// in a file, `.credentials.json` under its default home, which [`stored_login_lapsed`] can read:
+/// on every OS but macOS. On macOS it keeps that login in the login keychain, which aterm never
+/// reads, so the default login there has no local answer. A test picks either platform on its
+/// thread ([`test_on_login_platform`]).
+#[must_use]
+pub fn claude_default_login_in_file() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(file) = LOGIN_PLATFORM.with(std::cell::Cell::get) {
+        return file;
+    }
+    !cfg!(target_os = "macos")
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static LOGIN_PLATFORM: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `read` with [`claude_default_login_in_file`] answering `file` on this thread: `true` is a
+/// platform that keeps Claude Code's default login in a file (Linux), `false` one that keeps it
+/// in the keychain (macOS), whatever OS the test runs on.
+#[cfg(any(test, debug_assertions))]
+pub fn test_on_login_platform<R>(file: bool, read: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LOGIN_PLATFORM.with(|platform| platform.set(self.0));
+        }
+    }
+    let _restore = Restore(LOGIN_PLATFORM.with(|platform| platform.replace(Some(file))));
+    read()
+}
+
+/// Whether Claude Code's credential file `file` holds a login: `Some(true)` where its
+/// `claudeAiOauth` holds a non-empty `accessToken` or a non-empty `refreshToken`, `Some(false)`
+/// where it holds neither (lapsed, [`stored_login_lapsed`]), and `None` for a file that is not a
+/// regular file of at most [`CLAUDE_CREDENTIAL_MAX`] bytes, cannot be read or parsed, or has no
+/// `claudeAiOauth` object ([`stored_login_held`]). The bytes and the parsed tree are scrubbed
+/// before it returns.
+fn claude_credentials_held(file: &std::path::Path) -> Option<bool> {
     if !std::fs::symlink_metadata(file)
         .is_ok_and(|m| m.is_file() && m.len() <= CLAUDE_CREDENTIAL_MAX)
     {
-        return false;
+        return None;
     }
-    let Ok(bytes) = std::fs::read(file) else {
-        return false;
-    };
-    let bytes = aterm_uds::secret::Secret::from_vec(bytes);
-    let Ok(value) = aterm_json::from_slice::<aterm_json::Value>(bytes.expose()) else {
-        return false;
-    };
-    let held = |name: &str| {
+    let bytes = aterm_uds::secret::Secret::from_vec(std::fs::read(file).ok()?);
+    let value = aterm_json::from_slice::<aterm_json::Value>(bytes.expose()).ok()?;
+    let token = |name: &str| {
         value["claudeAiOauth"][name]
             .as_str()
             .is_some_and(|token| !token.is_empty())
     };
-    let lapsed =
-        value["claudeAiOauth"].is_object() && !held("accessToken") && !held("refreshToken");
+    let held = value["claudeAiOauth"]
+        .is_object()
+        .then(|| token("accessToken") || token("refreshToken"));
     crate::harness::cli::shared_provider::wipe_json(value);
-    lapsed
+    held
 }
 
 /// Whose OAuth login the home path `name` (`~/…`) is, by the product's name, as the connector

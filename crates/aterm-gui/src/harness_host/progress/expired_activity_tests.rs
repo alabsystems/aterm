@@ -208,6 +208,7 @@ pub(super) fn entry(prepared: &Prepared, row: &accounts::Row, active: bool) -> L
         .value
         .clone();
     LoginActivity {
+        queued: None,
         label: row.label.clone(),
         route: Some("mailbox".into()),
         active,

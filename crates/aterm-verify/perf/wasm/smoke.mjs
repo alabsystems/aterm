@@ -15,14 +15,17 @@
 //   notices actual CPU/GPU constructors and restore share one random source despite
 //           equal wall times; missing or throwing Web Crypto disables conditional
 //           settlement without blocking posting, and never re-enables that source.
+//   version the CPU module reports the version verify stamped into its identity
+//           record (the checkout's [workspace.package] version, as `ship site`
+//           stamps the module it ships): XTVERSION answers aterm(<version>).
 //   panic   a constructor installs aterm_wasm_abi::panic_hook; a panic then
 //           reaches console.error ONCE with the panic message, then
 //           "\n\nStack:\n\n", a JS stack that names a wasm frame, then "\n\n"
 //           (console_error_panic_hook 0.1.7's format), and the call throws.
 //
-// One line per check on the console; `run({ cpu, gpu, font })` (the two
-// modules' ES module glue and the font, by URL) answers { failures }, 0 only
-// when every check held.
+// One line per check on the console; `run({ cpu, gpu, font, version })` (the
+// two modules' ES module glue and the font, by URL, and the CPU module's stamped
+// version) answers { failures }, 0 only when every check held.
 
 let font
 const THEME = [0x00e0e0e0, 0x00101010, 0x00e0e0e0, 0x00404060]
@@ -144,6 +147,19 @@ async function unavailableConfirmationSmoke(label, url, className) {
   }
 }
 
+// The constructor installs the module's identity record; XTVERSION (CSI > 0 q)
+// then answers with the version it names.
+function versionSmoke(label, Terminal, version) {
+  const terminal = new Terminal(2, 20, font, 16.0, ...THEME)
+  try {
+    terminal.process(new TextEncoder().encode('\x1b[>0q'))
+    const reply = terminal.take_response()
+    const got = reply ? new TextDecoder().decode(reply) : null
+    const want = `\x1bP>|aterm(${version})\x1b\\`
+    check(`${label} reports its stamped version ${version}`, got === want, JSON.stringify(got))
+  } finally { terminal.free() }
+}
+
 function panicSmoke(label, mod, Terminal) {
   if (typeof mod.atermSmokePanic !== 'function') {
     check(`${label} panic`, false, 'no atermSmokePanic export: is this a debug build?')
@@ -194,6 +210,7 @@ export async function run(urls) {
   confirmationSmoke('gpu', gpu, gpu.AtermGpuTerminal)
   await unavailableConfirmationSmoke('cpu', urls.cpu, 'AtermTerminal')
   await unavailableConfirmationSmoke('gpu', urls.gpu, 'AtermGpuTerminal')
+  versionSmoke('cpu', cpu.AtermTerminal, urls.version)
   panicSmoke('cpu', cpu, cpu.AtermTerminal)
   panicSmoke('gpu', gpu, gpu.AtermGpuTerminal)
   console.error(`wasm-smoke: ${failures === 0 ? 'PASS' : `FAIL (${failures})`}`)

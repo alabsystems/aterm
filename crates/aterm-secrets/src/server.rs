@@ -21,10 +21,15 @@ mod reply_tests;
 #[path = "server/crossing_tests.rs"]
 mod crossing_tests;
 
+#[cfg(test)]
+#[path = "server/takes_over_tests.rs"]
+mod takes_over_tests;
+
 use crate::envelope::{self, MAX_ENVELOPE};
 use crate::transport::{JoinRequest, parse_join_line};
 use crate::wake::{Bell, Wake};
 use crate::{Error, fsx};
+use aterm_mesh_core::no_lost_edit as nle;
 use aterm_uds::power::Power;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, Read, Write};
@@ -115,8 +120,6 @@ const HEARD_FLUSH_SECS: u64 = 60;
 pub const MAX_VAULTS: usize = 64;
 /// The mDNS service type advertised.
 pub const SERVICE_TYPE: &str = "_alab-vault._tcp";
-/// macOS's mDNS command.
-pub const DNS_SD: &str = aterm_uds::os_path!("dns-sd");
 /// macOS's sleep assertion command.
 pub const CAFFEINATE: &str = aterm_uds::os_path!("caffeinate");
 /// How often the advertised address is checked.
@@ -254,7 +257,7 @@ fn take_held_stamp(path: &Path) -> Option<HeldStamp> {
 /// registration of `alab-secrets` it holds in `slot` is still up, at the highest `seq` its TXT
 /// advertises. A registration a will-sleep took ([`take_for_sleep`]), or one that ended by
 /// itself, leaves none.
-fn held_alab(slot: &mut DnsSdSlot, now_ms: u64) -> Option<HeldStamp> {
+fn held_alab(slot: &mut AdvertSlot, now_ms: u64) -> Option<HeldStamp> {
     if slot.held_name.as_deref() != Some(crate::alab_advertised()) {
         return None;
     }
@@ -262,7 +265,7 @@ fn held_alab(slot: &mut DnsSdSlot, now_ms: u64) -> Option<HeldStamp> {
         .iter_mut()
         .filter_map(|(_, txt, child)| {
             let seq = txt.as_ref()?.seq;
-            matches!(child.try_wait(), Ok(None)).then_some(seq)
+            (!child.ended()).then_some(seq)
         })
         .max()
         .map(|seq| HeldStamp { at_ms: now_ms, seq })
@@ -314,7 +317,7 @@ impl AlabNameWatcher {
 
     /// This server's `alab-secrets` registration ended by itself while it held the name, and
     /// another device answers to it ([`reregister_roles`]). mDNS keeps one host per name, and
-    /// `dns-sd -P` gives a name up to a device that already answers to it. That device's
+    /// mDNSResponder gives a proxy host name up to a device that already answers to it. That device's
     /// registration also hides this server's `_alab-vault._tcp` instance, so neither holder
     /// hears the other and the (`seq`, `label`) order in [`Self::decide`] never meets them:
     /// the name stays with the one mDNS kept. This lets it go and listens again. The
@@ -749,6 +752,14 @@ impl Running {
     /// How many long-polls it holds now.
     #[cfg(test)]
     pub(crate) fn waiting(&self) -> usize {
+        self.test_waiting()
+    }
+
+    /// Observe the actual held-request counter in an isolated protocol qualification.
+    /// No request is started or woken by this reading.
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn test_waiting(&self) -> usize {
         self.shared.waiting.load(Ordering::SeqCst)
     }
 
@@ -932,7 +943,7 @@ fn launch(listener: TcpListener, options: &Options, tuning: Tuning) -> crate::Re
         untaken: crate::membership_log::untaken::Untaken::new(),
         advertiser: Mutex::new(None),
         records_boot: aterm_uds::rand::hex_token::<16>()?,
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         waiting: AtomicUsize::new(0),
         #[cfg(test)]
         served: AtomicUsize::new(0),
@@ -1171,7 +1182,7 @@ struct Shared {
     /// The bell the `vault-tend` thread naps on when advertising, rung so a new version updates
     /// its TXT at once.
     advertiser: Mutex<Option<Arc<Bell>>>,
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     waiting: AtomicUsize,
     /// Connections admitted since the start.
     #[cfg(test)]
@@ -2991,7 +3002,7 @@ fn park_until_news<'s>(
 ) -> MutexGuard<'s, State> {
     let deadline = Instant::now().checked_add(shared.hold);
     let every = shared.tuning.liveness_every;
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     shared.waiting.fetch_add(1, Ordering::SeqCst);
     loop {
         if done(&mut state) || shared.stopping.load(Ordering::SeqCst) {
@@ -3015,7 +3026,7 @@ fn park_until_news<'s>(
             break;
         }
     }
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     shared.waiting.fetch_sub(1, Ordering::SeqCst);
     state
 }
@@ -3272,6 +3283,11 @@ fn admit(
 
 /// Whether `envelope` (its bytes `body`) takes over `held`: the rule a PUT and a version at the
 /// store file keep alike. The pin it is taken under, `None` when it is `held`, or the refusal.
+/// The answer is P3's kernels' ([`nle::Takeover::of`]), the compare-and-set the island's reach
+/// rule rests on; this reads the facts and words the reply. The chain check is pure and cheap (a
+/// comparison of at most 64 links, no signature), so it runs for every envelope, and the kernels
+/// decide which refusal stands, in the order they always did: the pin, then, for a pin that was
+/// not replaced, the sequence, the chain and the parents.
 fn takes_over(
     envelope: &envelope::Envelope,
     body: &[u8],
@@ -3279,38 +3295,40 @@ fn takes_over(
     retired: &envelope::Retired,
 ) -> Result<Option<envelope::Pin>, Reply> {
     let followed: Vec<[u8; 32]> = held.handoff.iter().map(|(key, _)| *key).collect();
-    let pin = envelope
-        .check_pin_with(&held.signer, &followed, retired)
-        .map_err(|e| Reply::text(403, e.0))?;
-    if !matches!(pin, envelope::Pin::Replaced(_)) {
-        if envelope.seq <= held.seq {
-            if envelope.seq == held.seq && held.bytes.as_slice() == body {
-                return Ok(None);
-            }
-            return Err(Reply::conflict_with_head(
-                held,
-                format!(
-                    "seq {} is not newer than seq {}, which this server holds",
-                    envelope.seq, held.seq
-                ),
-            ));
-        }
-        envelope
-            .check_extends(&held.signer, &held.handoff)
-            .map_err(|e| Reply::text(403, e.0))?;
-        if (!envelope.parents.is_empty() || held.parented) && !envelope.parents.contains(&held.head)
-        {
-            return Err(Reply::conflict_with_head(
-                held,
-                format!(
-                    "head {} at seq {} is not among the envelope's parents",
-                    hex32_encode(&held.head),
-                    held.seq
-                ),
-            ));
-        }
+    let pin = envelope.check_pin_with(&held.signer, &followed, retired);
+    let extends = envelope.check_extends(&held.signer, &held.handoff);
+    let facts = nle::TakeoverFacts {
+        pin_ok: pin.is_ok(),
+        replaced: matches!(pin, Ok(envelope::Pin::Replaced(_))),
+        not_newer: envelope.seq <= held.seq,
+        same_version: envelope.seq == held.seq && held.bytes.as_slice() == body,
+        chain_ok: extends.is_ok(),
+        names_parents: !envelope.parents.is_empty(),
+        held_parented: held.parented,
+        among_parents: envelope.parents.contains(&held.head),
+    };
+    let refused = |error: Option<Error>| Reply::text(403, error.map_or_else(String::new, |e| e.0));
+    match nle::Takeover::of(facts) {
+        nle::Takeover::Takes => Ok(pin.ok()),
+        nle::Takeover::Holds => Ok(None),
+        nle::Takeover::PinRefused => Err(refused(pin.err())),
+        nle::Takeover::BreaksChain => Err(refused(extends.err())),
+        nle::Takeover::NotNewer => Err(Reply::conflict_with_head(
+            held,
+            format!(
+                "seq {} is not newer than seq {}, which this server holds",
+                envelope.seq, held.seq
+            ),
+        )),
+        nle::Takeover::OffParents => Err(Reply::conflict_with_head(
+            held,
+            format!(
+                "head {} at seq {} is not among the envelope's parents",
+                hex32_encode(&held.head),
+                held.seq
+            ),
+        )),
     }
-    Ok(Some(pin))
 }
 
 /// Hold a newer version an admin published at the vault's store file itself (an admin whose
@@ -4776,12 +4794,6 @@ impl VaultTxt {
             label,
         })
     }
-
-    /// Parse a `dns-sd -L` TXT line (whitespace-separated `key=value` attributes).
-    #[must_use]
-    pub fn from_resolve_line(line: &str) -> Option<Self> {
-        Self::from_txt(line.split_whitespace())
-    }
 }
 
 fn valid_fingerprint(text: &str) -> bool {
@@ -4864,28 +4876,8 @@ fn advertised_vault(
     })
 }
 
-/// Arguments to `dns-sd` registering `<name>.local` at `ip` and the vault service on `port`, with
-/// `txt`'s vault name, signer fingerprint, `seq` and `head` digest beside `path=/v1` once a vault
-/// is held (`path=/v1` alone while the store holds none).
-pub fn dns_sd_args(name: &str, port: u16, ip: Ipv4Addr, txt: Option<&VaultTxt>) -> Vec<String> {
-    let mut args = vec![
-        "-P".to_owned(),
-        name.to_owned(),
-        SERVICE_TYPE.to_owned(),
-        "local".to_owned(),
-        port.to_string(),
-        format!("{name}.local"),
-        ip.to_string(),
-        "path=/v1".to_owned(),
-    ];
-    if let Some(txt) = txt {
-        args.extend(txt.txt_pairs());
-    }
-    args
-}
-
-/// Where one `dns-sd -P` registration is made: the address it names and the LAN interface it is
-/// scoped to ([`advert_targets`]). Proxy records never register on every interface.
+/// Where one registration of the vault's advert is made: the address it names and, on a Mac on
+/// several networks at once, the interface it is scoped to ([`advert_targets`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
     /// The interface (`en0`) the registration is made on alone. An absent scope cannot register.
@@ -4894,39 +4886,68 @@ pub struct Target {
     pub ip: Ipv4Addr,
 }
 
-/// [`dns_sd_args`] for a registration at `target`, with `-i <interface>` first. `dns-sd` refuses
-/// an interface that disappeared before it starts rather than registering on every interface.
+/// The advert registering `<name>.local` at `target`'s address and the vault service on `port`
+/// (the proxy form: the host record beside the service), on `target`'s interface alone where it
+/// is scoped, with `txt`'s vault name, signer fingerprint, `seq` and `head` digest beside
+/// `path=/v1` once a vault is held (`path=/v1` alone while the store holds none).
 ///
 /// # Errors
-/// The target names no interface, or its scope is not an interface name.
-pub fn registration_args(
+/// The scope is missing or malformed (`InvalidInput`), or names an interface this Mac does
+/// not have (`NotFound`).
+pub fn vault_advert(
     target: &Target,
     name: &str,
     port: u16,
     txt: Option<&VaultTxt>,
-) -> io::Result<Vec<String>> {
-    let interface = target
+) -> io::Result<aterm_uds::lan::Advert> {
+    let scope = target
         .scope
         .as_deref()
         .filter(|name| advert_interface(name))
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "no LAN interface for vault advertisement",
+                "a vault advert needs a LAN interface",
             )
         })?;
-    let mut args = vec!["-i".to_owned(), interface.to_owned()];
-    args.extend(dns_sd_args(name, port, target.ip, txt));
-    Ok(args)
+    let interface = Some(interface_index(scope)?);
+    let txt = std::iter::once("path=/v1".to_owned())
+        .chain(txt.map(VaultTxt::txt_pairs).unwrap_or_default())
+        .map(String::into_bytes)
+        .collect();
+    Ok(aterm_uds::lan::Advert {
+        name: name.to_owned(),
+        service: SERVICE_TYPE.to_owned(),
+        domain: "local".to_owned(),
+        port,
+        txt,
+        interface,
+        host: Some(format!("{name}.local")),
+        addresses: vec![IpAddr::V4(target.ip)],
+    })
 }
 
-/// An interface name rather than a numeric index or a `dns-sd` option: special interface
-/// indexes must never turn a proxy record into an all-interface or loopback registration.
+/// Whether `name` is a plain interface name, never an option or a wildcard.
 fn advert_interface(name: &str) -> bool {
     name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+/// The index of the interface named `name` (`en0`), as this Mac lists its links.
+fn interface_index(name: &str) -> io::Result<u32> {
+    aterm_sysprobe::net_links()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|link| link.name == name && link.index != 0)
+        .map(|link| link.index)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("this Mac has no interface {name}"),
+            )
+        })
 }
 
 /// Where this Mac advertises its vault now ([`advert_targets`] over its interfaces and
@@ -5018,8 +5039,8 @@ pub fn primary_ipv4() -> Option<Ipv4Addr> {
 ///
 /// On macOS it is read from the route to mDNS's group in the routing table
 /// ([`aterm_uds::network::route_source_ipv4`]), never by a UDP connect to the group: that connect
-/// is a use of the local network, which puts macOS's Local Network question on screen before
-/// System State's step asks it (every converge pass and vault subscriber reads these routes).
+/// would be a use of the local network outside the LAN broker, which macOS asks its Local Network
+/// question about (every converge pass and vault subscriber reads these routes).
 fn lan_ipv4() -> Option<Ipv4Addr> {
     #[cfg(target_os = "macos")]
     let routed = aterm_uds::network::route_source_ipv4(MDNS_GROUP);
@@ -5061,18 +5082,184 @@ struct Children {
     bell: Mutex<Option<Arc<Bell>>>,
 }
 
-/// The `dns-sd -P` registrations of one name ([`reregister_slot`]).
+/// How long [`Registered::ended`] waits on a broker registration's connection for a frame: long
+/// enough that the poll is asked, never a wait for something to come.
+const REGISTRATION_PEEK: Duration = Duration::from_millis(1);
+
+/// Where a registration the LAN broker makes for this server stands
+/// ([`Registered::through_broker`]).
+enum Brokered {
+    /// mDNSResponder has not confirmed it yet: a thread of its own waits for that.
+    #[cfg(target_os = "macos")]
+    Starting,
+    /// Confirmed, and held while this is.
+    Held(aterm_uds::lan::Registration),
+    /// It failed before it was confirmed, ended by itself, or was ended: nothing is held.
+    Gone,
+}
+
+/// One registration of the vault's advert this server holds: the LAN broker's, which lasts while
+/// it is held ([`aterm_uds::lan::register`]), or a test's stand-in.
+enum Registered {
+    /// The broker's registration, shared with the thread that waits for its confirmation.
+    Broker(Arc<Mutex<Brokered>>),
+    /// A test's stand-in: a child that is up while the registration is.
+    #[cfg(test)]
+    StandIn(aterm_uds::spawnfd::Child),
+}
+
+impl Registered {
+    /// Start registering `advert` through the LAN broker, which holds it while this lives, and
+    /// return once the broker answered its hello, not once mDNSResponder confirmed the advert:
+    /// that takes its probing (the proxy form probes the host record too), and the round that
+    /// starts it holds the children's lock a will-sleep waits on ([`take_for_sleep`]). A thread
+    /// of its own waits for the confirmation and notes a registration that failed; one ended
+    /// before it was confirmed is dropped, and so withdrawn, as the confirmation comes.
+    ///
+    /// # Errors
+    /// The broker is unavailable (its words say what installs it), or the thread could not
+    /// start; off macOS, the registration's own refusal.
+    fn through_broker(advert: &aterm_uds::lan::Advert) -> io::Result<Self> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            aterm_uds::lan::register(advert)
+                .map(|registration| {
+                    Self::Broker(Arc::new(Mutex::new(Brokered::Held(registration))))
+                })
+                .map_err(aterm_uds::lan::LanError::into_io)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            aterm_uds::lan::broker::hello().map_err(aterm_uds::lan::LanError::into_io)?;
+            let state = Arc::new(Mutex::new(Brokered::Starting));
+            let confirmed = Arc::clone(&state);
+            let advert = advert.clone();
+            #[cfg(any(test, debug_assertions))]
+            let seam = aterm_uds::lan::seam();
+            std::thread::Builder::new()
+                .name("vault-register".to_owned())
+                .spawn(move || {
+                    let register = || aterm_uds::lan::register(&advert);
+                    #[cfg(any(test, debug_assertions))]
+                    let registered = aterm_uds::lan::seam_here(seam, register);
+                    #[cfg(not(any(test, debug_assertions)))]
+                    let registered = register();
+                    let mut state = confirmed.lock().unwrap_or_else(PoisonError::into_inner);
+                    if !matches!(*state, Brokered::Starting) {
+                        // Ended while it started: the registration drops here, withdrawn.
+                        return;
+                    }
+                    *state = match registered {
+                        Ok(registration) => Brokered::Held(registration),
+                        Err(e) => {
+                            note(&format!("could not advertise {}.local: {e}", advert.name));
+                            Brokered::Gone
+                        }
+                    };
+                })?;
+            Ok(Self::Broker(state))
+        }
+    }
+
+    /// Whether it ended by itself: mDNSResponder gave the host name up to a device that answers
+    /// to it (the broker's error frame ends the registration, or its confirmation never came),
+    /// or the broker's connection ended. One still starting has not ended. Every frame already
+    /// waiting is read; a zero wait would read none (an expired deadline asks no poll), so each
+    /// read waits [`REGISTRATION_PEEK`] for what is already there.
+    fn ended(&mut self) -> bool {
+        match self {
+            Self::Broker(state) => {
+                let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+                let Brokered::Held(registration) = &mut *state else {
+                    return matches!(*state, Brokered::Gone);
+                };
+                let ended = loop {
+                    match registration.events().next_within(REGISTRATION_PEEK) {
+                        // A later event (a rename) leaves it registered; read on.
+                        Ok(Some(_)) => {}
+                        Ok(None) => break false,
+                        Err(_) => break true,
+                    }
+                };
+                if ended {
+                    *state = Brokered::Gone;
+                }
+                ended
+            }
+            #[cfg(test)]
+            Self::StandIn(child) => matches!(child.try_wait(), Ok(Some(_))),
+        }
+    }
+
+    /// End it now, at once: the broker withdraws a held advert as its connection closes, and one
+    /// still starting as its confirmation comes ([`Self::through_broker`]).
+    fn end(&mut self) {
+        match self {
+            Self::Broker(state) => {
+                let ended = std::mem::replace(
+                    &mut *state.lock().unwrap_or_else(PoisonError::into_inner),
+                    Brokered::Gone,
+                );
+                drop(ended);
+            }
+            #[cfg(test)]
+            Self::StandIn(child) => end(child),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Registered {
+    /// The stand-in's child, which a test reads and ends as it would the registration.
+    fn stand_in(&mut self) -> &mut aterm_uds::spawnfd::Child {
+        match self {
+            Self::StandIn(child) => child,
+            Self::Broker(_) => panic!("a test holds stand-ins"),
+        }
+    }
+
+    /// The stand-in's pid.
+    fn id(&self) -> u32 {
+        match self {
+            Self::StandIn(child) => child.id(),
+            Self::Broker(_) => panic!("a test holds stand-ins"),
+        }
+    }
+
+    /// Kill the stand-in, as mDNSResponder ending the registration would.
+    fn kill(&mut self) -> io::Result<()> {
+        self.stand_in().kill()
+    }
+
+    /// Reap the stand-in.
+    fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+        self.stand_in().wait()
+    }
+
+    /// Whether the stand-in exited.
+    fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.stand_in().try_wait()
+    }
+}
+
+/// A test's stand-in registration: `program` with `args`, up while the registration would be.
+#[cfg(test)]
+fn quiet_advert(program: &str, args: &[String]) -> io::Result<Registered> {
+    quiet(program, args).map(Registered::StandIn)
+}
+
+/// The registrations of one name ([`reregister_slot`]).
 #[derive(Default)]
-struct DnsSdSlot {
-    /// Each registration running: where, its TXT, and the `dns-sd -P` that holds it.
-    held: Vec<(Target, Option<VaultTxt>, aterm_uds::spawnfd::Child)>,
+struct AdvertSlot {
+    /// Each registration running: where, its TXT, and what holds it.
+    held: Vec<(Target, Option<VaultTxt>, Registered)>,
     /// The instance label currently held by [`Self::held`].
     held_name: Option<String>,
     /// The addresses last logged as advertised, so TXT refreshes on new seqs stay quiet.
     logged: Vec<Ipv4Addr>,
-    /// A registration ended by itself (`dns-sd -P` gives up a name another device on the
+    /// A registration ended by itself (mDNSResponder gives up a name another device on the
     /// network answers to), so the log said so, until every one stays up.
-    dns_sd_lost: bool,
+    lost: bool,
     /// What woke the round that last started a registration (`None`: the first round, as the
     /// server started), so a test can tell which source moved the advert.
     started_by: Option<Option<Wake>>,
@@ -5085,9 +5272,9 @@ struct ChildSet {
     /// The last start of [`CAFFEINATE`] failed, so the log said so ([`tend_awake`]).
     awake_failed: bool,
     /// The registration of `--advertise`'s own name.
-    dns: DnsSdSlot,
+    dns: AdvertSlot,
     /// Secondary lease-followed registration for `alab-secrets.local` (§8.3).
-    alab_dns: DnsSdSlot,
+    alab_dns: AdvertSlot,
     /// The log said a held `alab-secrets` registration lost the name ([`reregister_roles`]),
     /// so it says so again only after a later one stays up for a round.
     alab_lost_said: bool,
@@ -5518,7 +5705,6 @@ fn probe_alab_endpoint(
     holding_alab_name: bool,
     shared: &Shared,
 ) -> Option<u64> {
-    use std::net::ToSocketAddrs;
     let raw_url = if target.starts_with("http://") || target.starts_with("https://") {
         target.to_owned()
     } else {
@@ -5534,17 +5720,16 @@ fn probe_alab_endpoint(
         && !here.is_empty()
         && trimmed_dns_host(uri.host()).eq_ignore_ascii_case("alab-secrets.local")
     {
-        let addrs = (trimmed_dns_host(uri.host()), uri.port())
-            .to_socket_addrs()
-            .ok()?;
+        let addrs =
+            aterm_uds::lan::resolve(trimmed_dns_host(uri.host()), ALAB_PROBE_BUDGET).ok()?;
         let mut best: Option<u64> = None;
-        for addr in addrs {
+        for addr in addrs.into_iter().map(|ip| SocketAddr::new(ip, uri.port())) {
             if is_self_addr(addr, own_port, here) {
                 continue;
             }
             let direct = format!("http://{addr}/v1/{}", crate::ALAB_VAULT);
             if let Ok(crate::transport::Fetched::Body(bytes)) =
-                crate::transport::observe_after_nowait(&direct, None, Duration::from_secs(3))
+                crate::transport::observe_after_nowait(&direct, None, ALAB_PROBE_BUDGET)
                 && let Some(seq) = verify_probed_alab_envelope(&bytes, shared)
             {
                 best = Some(best.map_or(seq, |prev| prev.max(seq)));
@@ -5553,15 +5738,18 @@ fn probe_alab_endpoint(
         return best;
     }
     let Ok(crate::transport::Fetched::Body(bytes)) =
-        crate::transport::observe_after_nowait(&raw_url, None, Duration::from_secs(3))
+        crate::transport::observe_after_nowait(&raw_url, None, ALAB_PROBE_BUDGET)
     else {
         return None;
     };
     if !ip_literal
         && !here.is_empty()
-        && let Ok(addrs) = (trimmed_dns_host(uri.host()), uri.port()).to_socket_addrs()
+        && let Ok(addrs) = aterm_uds::lan::resolve(trimmed_dns_host(uri.host()), ALAB_PROBE_BUDGET)
     {
-        let all_addrs: Vec<SocketAddr> = addrs.collect();
+        let all_addrs: Vec<SocketAddr> = addrs
+            .into_iter()
+            .map(|ip| SocketAddr::new(ip, uri.port()))
+            .collect();
         if !all_addrs.is_empty()
             && all_addrs
                 .iter()
@@ -5659,24 +5847,23 @@ type ProbeAlab = fn(&str, u16, Option<&str>, &[Target], bool, &Shared) -> Option
 /// now ([`Seams::name_answered`]).
 type NameAnswered = dyn Fn(&str, &[Target]) -> bool + Send;
 
-/// Start one `dns-sd -P` of a name and port at a target with a TXT ([`Seams::spawn`]).
-type SpawnAdvert =
-    dyn Fn(&str, u16, &Target, Option<&VaultTxt>) -> io::Result<aterm_uds::spawnfd::Child> + Send;
+/// Register one advert of a name and port at a target with a TXT ([`Seams::spawn`]).
+type SpawnAdvert = dyn Fn(&str, u16, &Target, Option<&VaultTxt>) -> io::Result<Registered> + Send;
 
 /// Hear this Mac's sleep and wake until the bell given is gone, handing each to the handler
 /// given; whether it hears them ([`Seams::power`]).
 type ListenPower =
     dyn FnOnce(Box<dyn FnMut(Power) + Send>) -> Option<aterm_uds::power::Listening> + Send;
 
-/// End one registration's `dns-sd -P` as this Mac goes to sleep ([`Seams::end_for_sleep`]).
-type EndAdvert = dyn Fn(&mut aterm_uds::spawnfd::Child) + Send + Sync;
+/// End one registration as this Mac goes to sleep ([`Seams::end_for_sleep`]).
+type EndAdvert = dyn Fn(&mut Registered) + Send + Sync;
 
 /// Start the standing browse that rings this server's bell, with its own names excluded.
 /// A test returns an idle watch and observes its lifetime without using DNS.
 type StartBrowse = dyn Fn(&Arc<Bell>, &[&str]) -> Arc<crate::discover::Watch> + Send;
 
 /// How long a will-sleep waits for this server's registrations to end before it lets the Mac
-/// sleep anyway ([`SleepYield`]). Ending a `dns-sd` takes milliseconds; macOS itself waits at
+/// sleep anyway ([`SleepYield`]). Ending a registration takes milliseconds; macOS itself waits at
 /// most 30 s for every process it told before it sleeps.
 const SLEEP_YIELD_BOUND: Duration = Duration::from_secs(2);
 
@@ -5691,14 +5878,14 @@ struct Seams {
     browse: Option<Box<StartBrowse>>,
     /// Where this Mac advertises now ([`lan_targets`]).
     targets: Box<dyn Fn() -> Vec<Target> + Send>,
-    /// Start one `dns-sd -P` of a name and port at a target with a TXT.
+    /// Register one advert of a name and port at a target with a TXT.
     spawn: Box<SpawnAdvert>,
     /// The longest nap between two looks.
     every: Duration,
     /// Hears this Mac's sleep and wake ([`aterm_uds::power::listen`]); a test's arm hears
     /// none, or what the test hands it.
     power: Box<ListenPower>,
-    /// Ends a registration as this Mac goes to sleep ([`end`]).
+    /// Ends a registration as this Mac goes to sleep ([`Registered::end`]).
     end_for_sleep: Arc<EndAdvert>,
     /// How long a will-sleep waits for that ([`SLEEP_YIELD_BOUND`]).
     sleep_bound: Duration,
@@ -5716,8 +5903,8 @@ struct Seams {
 }
 
 impl Seams {
-    /// This Mac's own: its route socket, its standing browse, its interfaces, `dns-sd` and its
-    /// root power domain.
+    /// This Mac's own: its route socket, its standing browse, its interfaces, the LAN broker's
+    /// registrations and its root power domain.
     fn this_mac() -> Seams {
         Seams {
             routes: crate::wake::route_changes()
@@ -5727,11 +5914,11 @@ impl Seams {
             })),
             targets: Box::new(lan_targets),
             spawn: Box::new(|name, port, target, txt| {
-                quiet(DNS_SD, &registration_args(target, name, port, txt)?)
+                Registered::through_broker(&vault_advert(target, name, port, txt)?)
             }),
             every: ADVERTISE_EVERY,
             power: Box::new(aterm_uds::power::listen),
-            end_for_sleep: Arc::new(end),
+            end_for_sleep: Arc::new(Registered::end),
             sleep_bound: SLEEP_YIELD_BOUND,
             probe: probe_alab_endpoint,
             name_answered: Box::new(|name, own| name_answered_here(name, own, NAME_CHECK_BUDGET)),
@@ -5750,48 +5937,37 @@ impl Seams {
     }
 }
 
-/// How long [`name_answered_here`] waits for macOS to resolve a name: a device that answers to
-/// it does within milliseconds, and the check runs only on a round after a registration of
-/// `alab-secrets` ended by itself.
+/// How long [`name_answered_here`] waits for the LAN broker to resolve a name: a device that
+/// answers to it does within milliseconds, and the check runs only on a round after a
+/// registration of `alab-secrets` ended by itself.
 const NAME_CHECK_BUDGET: Duration = Duration::from_secs(1);
 
+/// How long [`probe_alab_endpoint`] gives each of its acts: a resolve of the name it probes
+/// (through the LAN broker for a local name, where a sleeping holder's mDNS answer can take
+/// seconds) and each fetch of the vault there.
+const ALAB_PROBE_BUDGET: Duration = Duration::from_secs(3);
+
 /// Whether a device other than this Mac (whose addresses are `own`) answers to `<name>.local`
-/// now: macOS resolves the name within `budget` to an address that is not this Mac's. A lookup
-/// that fails, or has no answer in time, finds none.
+/// now: the LAN broker resolves the name within `budget` to an address that is not this Mac's. A
+/// lookup that fails (no broker included), or has no answer in time, finds none.
 fn name_answered_here(name: &str, own: &[Target], budget: Duration) -> bool {
-    use std::net::ToSocketAddrs;
-    let host = format!("{name}.local:0");
-    let (answer, answered) = sync_channel(1);
-    let spawned = std::thread::Builder::new()
-        .name("vault-name-check".to_owned())
-        .spawn(move || {
-            // A lookup that outlives its budget finds the receiver gone, and its answer is
-            // dropped.
-            let _ = answer.send(host.to_socket_addrs().map(Iterator::collect::<Vec<_>>));
-        });
-    if spawned.is_err() {
-        return false;
-    }
-    let Ok(Ok(addrs)) = answered.recv_timeout(budget) else {
+    let Ok(addrs) = aterm_uds::lan::resolve(&format!("{name}.local"), budget) else {
         return false;
     };
     addrs
         .iter()
-        .any(|addr| !addr.ip().is_loopback() && !own.iter().any(|t| IpAddr::V4(t.ip) == addr.ip()))
+        .any(|ip| !ip.is_loopback() && !own.iter().any(|t| IpAddr::V4(t.ip) == *ip))
 }
 
-/// Whether a registration of `alab-secrets` this server holds ended by itself (its
-/// `dns-sd -P` exited). The `vault-tend` round then asks whether another device answers to
+/// Whether a registration of `alab-secrets` this server holds ended by itself
+/// ([`Registered::ended`]). The `vault-tend` round then asks whether another device answers to
 /// the name ([`Seams::name_answered`]) before it takes the children's lock for
 /// [`reregister_roles`]: a will-sleep waits on that lock ([`take_for_sleep`]).
 fn alab_registration_ended(set: &Mutex<ChildSet>) -> bool {
     let mut set = set.lock().unwrap_or_else(PoisonError::into_inner);
     let slot = &mut set.alab_dns;
     slot.held_name.as_deref() == Some(crate::alab_advertised())
-        && slot
-            .held
-            .iter_mut()
-            .any(|(_, _, child)| matches!(child.try_wait(), Ok(Some(_))))
+        && slot.held.iter_mut().any(|(_, _, held)| held.ended())
 }
 
 /// What the server does as the system announces sleep and wake ([`Seams::power`],
@@ -5799,8 +5975,8 @@ fn alab_registration_ended(set: &Mutex<ChildSet>) -> bool {
 /// to a Bonjour Sleep Proxy on the LAN (an Apple TV, a HomePod), which then answers for them
 /// while the Mac sleeps. A holder's `alab-secrets` record answered that way can keep the name
 /// from every other server (each probes it and stays off while it answers, and a registration
-/// of the name loses to the proxy's), while nothing serves `:7484`. So a will-sleep ends every `dns-sd -P` this server holds, its own name's and
-/// `alab-secrets`', before the Mac is let sleep, and a wake rings the advert's bell: its next
+/// of the name loses to the proxy's), while nothing serves `:7484`. So a will-sleep ends every registration this server holds, its own
+/// name's and `alab-secrets`', before the Mac is let sleep, and a wake rings the advert's bell: its next
 /// round registers its own name again and competes for `alab-secrets` as any server that does
 /// not hold it does ([`AlabNameWatcher::slept`]).
 struct SleepYield {
@@ -5887,10 +6063,7 @@ impl SleepYield {
 /// the ones held now, and so every one a round started before (each round looks at `asleep`
 /// under the same lock, [`reregister_awake`]). Each comes with the name it was registered
 /// under. The next round lets `alab-secrets` go ([`ChildSet::slept`]).
-fn take_for_sleep(
-    set: &Mutex<ChildSet>,
-    asleep: &AtomicBool,
-) -> Vec<(Option<String>, aterm_uds::spawnfd::Child)> {
+fn take_for_sleep(set: &Mutex<ChildSet>, asleep: &AtomicBool) -> Vec<(Option<String>, Registered)> {
     let mut guard = set.lock().unwrap_or_else(PoisonError::into_inner);
     let set = &mut *guard;
     if set.closed || !asleep.load(Ordering::SeqCst) {
@@ -5906,7 +6079,7 @@ fn take_for_sleep(
                 .map(|(_, _, child)| (name.clone(), child)),
         );
         slot.logged.clear();
-        slot.dns_sd_lost = false;
+        slot.lost = false;
     }
     taken
 }
@@ -5950,7 +6123,7 @@ impl Children {
                 note("keep-awake is macOS only; ignored");
             }
             if advertise.is_some() {
-                note("--advertise is macOS only (dns-sd); ignored");
+                note("--advertise is macOS only (Bonjour); ignored");
             }
             return;
         }
@@ -6191,7 +6364,7 @@ fn tend_awake(set: &mut ChildSet, spawn: &dyn Fn() -> io::Result<aterm_uds::spaw
 /// that device ([`AlabNameWatcher::lost_name`]): this round ends it and starts none in its
 /// place, where [`reregister_slot`] alone would start one on every round, each losing the same
 /// way. One that ended with no other device answering (`alab_answered` is `Some(false)`:
-/// mDNSResponder restarting ends every `dns-sd`) lost nothing, and this round registers the
+/// mDNSResponder restarting ends every registration) lost nothing, and this round registers the
 /// name again. `alab_answered` is what the round heard when it asked
 /// ([`alab_registration_ended`]); `None`, not asked, reads as a lost name. The log says each
 /// once, and again only after a later hold of the name stays up for a round.
@@ -6222,9 +6395,7 @@ fn reregister_roles(
         Some(true) if alab_answered == Some(false) => {
             // The ended registrations were reaped as they were looked at; the rest stay, and
             // `reregister_slot` starts the missing ones afresh.
-            set.alab_dns
-                .held
-                .retain_mut(|(_, _, child)| !matches!(child.try_wait(), Ok(Some(_))));
+            set.alab_dns.held.retain_mut(|(_, _, held)| !held.ended());
             if !std::mem::replace(&mut set.alab_again_said, true) {
                 note(&format!(
                     "the registration of {alab_name}.local ended and no other device answers to \
@@ -6301,7 +6472,7 @@ fn reregister_awake(
 /// Whether one of `slot`'s registrations that `want` still wants under `name` (its target and
 /// TXT, as [`reregister_slot`] keeps one) ended by itself: `None` when it holds none so wanted.
 fn wanted_ended(
-    slot: &mut DnsSdSlot,
+    slot: &mut AdvertSlot,
     name: &str,
     want: Option<&(Vec<Target>, Option<VaultTxt>)>,
 ) -> Option<bool> {
@@ -6309,53 +6480,52 @@ fn wanted_ended(
     let mut ended = None;
     for (target, held_txt, child) in &mut slot.held {
         if targets.contains(target) && txt == held_txt {
-            let gone = matches!(child.try_wait(), Ok(Some(_)));
+            let gone = child.ended();
             ended = Some(ended.unwrap_or(false) || gone);
         }
     }
     ended
 }
 
-/// Keep `slot`'s `dns-sd -P` registrations (each started by `spawn`) at `want`'s targets and
+/// Keep `slot`'s registrations (each started by `spawn`) at `want`'s targets and
 /// TXT: a live registration at a target still wanted with the same TXT stays, and every other
 /// one is replaced cleanly. One that ended by itself gave the name up to another device on the
 /// network, which new Macs may then reach in place of this vault: the log says so once, and
 /// again once every registration stays up. A round that starts one names `why` it ran (`None`:
-/// the first, as the server started) in its log line, and keeps it ([`DnsSdSlot::started_by`]).
+/// the first, as the server started) in its log line, and keeps it ([`AdvertSlot::started_by`]).
 fn reregister_slot(
-    slot: &mut DnsSdSlot,
+    slot: &mut AdvertSlot,
     name: &str,
     want: Option<(Vec<Target>, Option<VaultTxt>)>,
     why: Option<Wake>,
-    spawn: &dyn Fn(&Target, Option<&VaultTxt>) -> io::Result<aterm_uds::spawnfd::Child>,
+    spawn: &dyn Fn(&Target, Option<&VaultTxt>) -> io::Result<Registered>,
 ) {
     let same_name = slot.held_name.as_deref() == Some(name);
     let mut gave_up = false;
     let mut kept = Vec::new();
-    for (target, held_txt, mut child) in std::mem::take(&mut slot.held) {
+    for (target, held_txt, mut held) in std::mem::take(&mut slot.held) {
         let wanted = same_name
             && want
                 .as_ref()
                 .is_some_and(|(targets, txt)| targets.contains(&target) && *txt == held_txt);
-        match child.try_wait() {
-            Ok(None) if wanted => {
-                kept.push((target, held_txt, child));
+        if wanted {
+            if !held.ended() {
+                kept.push((target, held_txt, held));
                 continue;
             }
-            Ok(Some(_)) if wanted => gave_up = true,
-            _ => {}
+            gave_up = true;
         }
-        end(&mut child);
+        held.end();
     }
     slot.held = kept;
     if !same_name {
         slot.logged.clear();
-        slot.dns_sd_lost = false;
+        slot.lost = false;
     }
-    if gave_up && !slot.dns_sd_lost {
-        slot.dns_sd_lost = true;
+    if gave_up && !slot.lost {
+        slot.lost = true;
         note(&format!(
-            "{DNS_SD} gave up advertising {name}.local: another device on this network answers \
+            "mDNSResponder gave up advertising {name}.local: another device on this network answers \
              to that name, so new Macs may reach it in place of this vault (--advertise <name> \
              picks another); trying again every {}s",
             ADVERTISE_EVERY.as_secs()
@@ -6364,7 +6534,7 @@ fn reregister_slot(
     let Some((targets, txt)) = want else {
         slot.held_name = None;
         slot.logged.clear();
-        slot.dns_sd_lost = false;
+        slot.lost = false;
         return;
     };
     let missing: Vec<&Target> = targets
@@ -6372,7 +6542,7 @@ fn reregister_slot(
         .filter(|target| !slot.held.iter().any(|(held, _, _)| held == *target))
         .collect();
     if missing.is_empty() {
-        if !gave_up && std::mem::take(&mut slot.dns_sd_lost) {
+        if !gave_up && std::mem::take(&mut slot.lost) {
             note(&format!(
                 "advertising {name}.local at {} again",
                 addresses(&slot.logged)
@@ -6383,13 +6553,13 @@ fn reregister_slot(
     for target in missing {
         match spawn(target, txt.as_ref()) {
             Ok(child) => slot.held.push((target.clone(), txt.clone(), child)),
-            Err(e) => note(&format!("could not start {DNS_SD}: {e}")),
+            Err(e) => note(&format!("could not advertise {name}.local: {e}")),
         }
     }
     slot.held_name = (!slot.held.is_empty()).then(|| name.to_owned());
     slot.started_by = Some(why);
     let ips: Vec<Ipv4Addr> = slot.held.iter().map(|(target, _, _)| target.ip).collect();
-    if !slot.dns_sd_lost && !ips.is_empty() && slot.logged != ips {
+    if !slot.lost && !ips.is_empty() && slot.logged != ips {
         note(&advertising_line(name, &ips, why));
     }
     slot.logged = ips;
@@ -6426,8 +6596,8 @@ impl Drop for Children {
             end(&mut child);
         }
         for slot in [&mut set.dns, &mut set.alab_dns] {
-            for (_, _, mut child) in slot.held.drain(..) {
-                end(&mut child);
+            for (_, _, mut held) in slot.held.drain(..) {
+                held.end();
             }
         }
         drop(guard);
@@ -7592,22 +7762,45 @@ mod tests {
         running.stop();
     }
 
+    /// An advert's TXT strings, as text.
+    fn txt_strings(advert: &aterm_uds::lan::Advert) -> Vec<String> {
+        advert
+            .txt
+            .iter()
+            .map(|string| String::from_utf8(string.clone()).expect("UTF-8"))
+            .collect()
+    }
+
+    /// The vault's advert names its service, its port, the proxy host `<name>.local` at the
+    /// target's address, and `path=/v1` before the held vault's TXT. A missing scope or an
+    /// interface this Mac lacks is refused.
+    /// The keep-awake child's argv is exact.
     #[test]
-    fn the_children_argv_is_exact() {
-        let ip = Ipv4Addr::new(192, 168, 1, 22);
-        let empty = dns_sd_args("alab-secrets", 7484, ip, None);
+    fn the_advert_and_the_childrens_argv_are_exact() {
+        let at = Target {
+            scope: Some(
+                if cfg!(target_os = "macos") {
+                    "lo0"
+                } else {
+                    "lo"
+                }
+                .to_owned(),
+            ),
+            ip: Ipv4Addr::new(192, 168, 1, 22),
+        };
+        let empty = vault_advert(&at, "alab-secrets", 7484, None).expect("loopback scope");
         assert_eq!(
             empty,
-            [
-                "-P",
-                "alab-secrets",
-                "_alab-vault._tcp",
-                "local",
-                "7484",
-                "alab-secrets.local",
-                "192.168.1.22",
-                "path=/v1"
-            ]
+            aterm_uds::lan::Advert {
+                name: "alab-secrets".to_owned(),
+                service: "_alab-vault._tcp".to_owned(),
+                domain: "local".to_owned(),
+                port: 7484,
+                txt: vec![b"path=/v1".to_vec()],
+                interface: Some(interface_index(at.scope.as_deref().unwrap()).unwrap()),
+                host: Some("alab-secrets.local".to_owned()),
+                addresses: vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 22))],
+            }
         );
         let raw = envelope(&OLD, 79);
         let parsed = crate::envelope::parse(&raw).expect("envelope");
@@ -7618,35 +7811,48 @@ mod tests {
             head: parsed.digest(),
             label: None,
         };
-        let with_txt = dns_sd_args("alab-secrets", 7484, ip, Some(&txt));
+        let with_txt = txt_strings(&vault_advert(&at, "alab-secrets", 7484, Some(&txt)).unwrap());
         let head_hex = hex32_encode(&txt.head);
         assert_eq!(
             with_txt,
             [
-                "-P",
-                "alab-secrets",
-                "_alab-vault._tcp",
-                "local",
-                "7484",
-                "alab-secrets.local",
-                "192.168.1.22",
-                "path=/v1",
-                "vault=alab",
-                &format!("signer={}", txt.signer),
-                "seq=79",
-                &format!("head={head_hex}"),
+                "path=/v1".to_owned(),
+                "vault=alab".to_owned(),
+                format!("signer={}", txt.signer),
+                "seq=79".to_owned(),
+                format!("head={head_hex}"),
             ]
         );
         assert!(
-            with_txt[7..].iter().all(|pair| pair.len() <= 255),
+            with_txt.iter().all(|pair| pair.len() <= 255),
             "every TXT string fits RFC 6763's 255-byte limit"
+        );
+        let nowhere = Target {
+            scope: Some("no-such-interface0".to_owned()),
+            ..at
+        };
+        assert_eq!(
+            vault_advert(&nowhere, "alab-secrets", 7484, None)
+                .expect_err("no such interface")
+                .kind(),
+            io::ErrorKind::NotFound
         );
         assert_eq!(caffeinate_args(4242), ["-i", "-w", "4242"]);
     }
 
     #[test]
     fn vault_txt_round_trips_and_rejects_old_or_malformed_args() {
-        let ip = Ipv4Addr::new(192, 168, 1, 22);
+        let at = Target {
+            scope: Some(
+                if cfg!(target_os = "macos") {
+                    "lo0"
+                } else {
+                    "lo"
+                }
+                .to_owned(),
+            ),
+            ip: Ipv4Addr::new(192, 168, 1, 22),
+        };
         let raw = envelope(&OLD, 79);
         let parsed = crate::envelope::parse(&raw).expect("envelope");
         let signer_public = parsed.signer;
@@ -7657,24 +7863,23 @@ mod tests {
             head: parsed.digest(),
             label: None,
         };
-        let args = dns_sd_args("alab-secrets", 7484, ip, Some(&txt));
+        let mut strings =
+            txt_strings(&vault_advert(&at, "alab-secrets", 7484, Some(&txt)).unwrap());
         assert_eq!(
-            VaultTxt::from_txt(args[7..].iter().map(String::as_str)),
+            VaultTxt::from_txt(strings.iter().map(String::as_str)),
             Some(txt.clone())
         );
-        let resolve_line = format!("  {} extra=ignored seq=999", args[7..].join(" "));
+        strings.extend(["extra=ignored".to_owned(), "seq=999".to_owned()]);
         assert_eq!(
-            VaultTxt::from_resolve_line(&resolve_line),
+            VaultTxt::from_txt(strings.iter().map(String::as_str)),
             Some(txt.clone()),
             "RFC 6763: first occurrence of a key wins and unknown keys are ignored"
         );
 
-        // Negative control: old 0.145 args carry only `path=/v1` and never parse as a `VaultTxt`.
-        let old_args = dns_sd_args("alab-secrets", 7484, ip, None);
-        assert_eq!(
-            VaultTxt::from_txt(old_args[7..].iter().map(String::as_str)),
-            None
-        );
+        // Negative control: an old 0.145 advert carries only `path=/v1` and never parses as a
+        // `VaultTxt`.
+        let old = txt_strings(&vault_advert(&at, "alab-secrets", 7484, None).unwrap());
+        assert_eq!(VaultTxt::from_txt(old.iter().map(String::as_str)), None);
 
         let head_hex = hex32_encode(&txt.head);
         for malformed in [
@@ -7761,9 +7966,10 @@ mod tests {
             advertised_vault(&state, "alab-secrets", Some("m22"), &[]),
             Some(labelled_txt.clone())
         );
-        let labelled_args = dns_sd_args("alab-secrets", 7484, ip, Some(&labelled_txt));
+        let labelled =
+            txt_strings(&vault_advert(&at, "alab-secrets", 7484, Some(&labelled_txt)).unwrap());
         assert_eq!(
-            VaultTxt::from_txt(labelled_args[7..].iter().map(String::as_str)),
+            VaultTxt::from_txt(labelled.iter().map(String::as_str)),
             Some(labelled_txt)
         );
     }
@@ -9021,9 +9227,9 @@ mod tests {
         let pids = {
             let mut set = children.lock();
             let caffeinate = quiet(sleep, &["60".to_owned()]).expect("a stand-in");
-            let dns_sd = quiet(sleep, &["60".to_owned()]).expect("a stand-in");
+            let advert = quiet_advert(sleep, &["60".to_owned()]).expect("a stand-in");
             let alab = hold(&mut set.alab_dns, crate::alab_advertised(), sleep);
-            let pids = [caffeinate.id(), dns_sd.id(), alab];
+            let pids = [caffeinate.id(), advert.id(), alab];
             set.caffeinate = Some(caffeinate);
             set.dns.held.push((
                 Target {
@@ -9031,7 +9237,7 @@ mod tests {
                     ip: Ipv4Addr::LOCALHOST,
                 },
                 None,
-                dns_sd,
+                advert,
             ));
             pids
         };
@@ -9072,14 +9278,15 @@ mod tests {
         );
     }
 
-    /// A registration that ends by itself (dns-sd giving up a name another device answers to)
+    /// A registration that ends by itself (mDNSResponder giving up a name another device answers
+    /// to)
     /// is said once, and started again; once one stays up, that is said too. Negative control:
     /// one this server ends at an address or TXT change is no conflict.
     #[test]
     fn an_advertisement_that_gives_up_its_name_is_said_once() {
         let sleep = aterm_uds::deadline::stand_in(Path::new("/bin/sleep"));
         let sleep = sleep.to_str().expect("a UTF-8 path");
-        let spawn = |_: &Target, _: Option<&VaultTxt>| quiet(sleep, &["60".to_owned()]);
+        let spawn = |_: &Target, _: Option<&VaultTxt>| quiet_advert(sleep, &["60".to_owned()]);
         let children = Children::default();
         let mut set = children.lock();
         let at = |ip| {
@@ -9116,31 +9323,25 @@ mod tests {
         };
 
         round(&mut set, &here, None);
-        assert!(set.dns.held.len() == 1 && !set.dns.dns_sd_lost);
+        assert!(set.dns.held.len() == 1 && !set.dns.lost);
         let before_txt = pid(&set);
         round(&mut set, &here, txt_at(1));
         let at_seq_1 = pid(&set);
-        assert_ne!(at_seq_1, before_txt, "a new TXT restarts dns-sd");
-        assert!(!set.dns.dns_sd_lost, "a TXT refresh is no conflict");
+        assert_ne!(at_seq_1, before_txt, "a new TXT registers afresh");
+        assert!(!set.dns.lost, "a TXT refresh is no conflict");
         round(&mut set, &there, txt_at(1));
-        assert!(
-            !set.dns.dns_sd_lost,
-            "a move to another address is no conflict"
-        );
+        assert!(!set.dns.lost, "a move to another address is no conflict");
         assert_eq!(set.dns.held.len(), 1, "the old address is given up");
 
         let (_, _, gone) = set.dns.held.first_mut().expect("registered");
         gone.kill().expect("killed");
         gone.wait().expect("reaped");
         round(&mut set, &there, txt_at(1));
-        assert!(
-            set.dns.dns_sd_lost,
-            "a registration that ended by itself is said"
-        );
+        assert!(set.dns.lost, "a registration that ended by itself is said");
         let again = pid(&set);
         assert_eq!(again.len(), 1, "started again");
         round(&mut set, &there, txt_at(1));
-        assert!(!set.dns.dns_sd_lost, "one that stays up is said");
+        assert!(!set.dns.lost, "one that stays up is said");
         assert_eq!(pid(&set), again);
     }
 
@@ -9197,14 +9398,18 @@ mod tests {
             };
             assert_eq!(targets, [first, second], "routed by {routed:?}");
         }
-        let args = registration_args(&scoped("en7", [192, 168, 1, 5]), "alab-secrets", 7484, None)
-            .unwrap();
-        assert_eq!(
-            args[..4],
-            ["-i", "en7", "-P", "alab-secrets"],
+        // Every Mac has a loopback interface to scope to.
+        let scoped_advert =
+            vault_advert(&scoped("lo0", [192, 168, 1, 5]), "alab-secrets", 7484, None)
+                .expect("lo0 is there");
+        assert!(
+            scoped_advert.interface.is_some_and(|index| index != 0),
             "a scoped registration is made on its interface alone"
         );
-        assert_eq!(args[8], "192.168.1.5");
+        assert_eq!(
+            scoped_advert.addresses,
+            [IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5))]
+        );
 
         let routed = Some(Ipv4Addr::new(192, 168, 1, 5));
         let one_lan = [
@@ -9219,9 +9424,9 @@ mod tests {
             "an unmatched route never replaces the interface's own address"
         );
         assert_eq!(
-            registration_args(&single[0], "alab-secrets", 7484, None).unwrap(),
-            args,
-            "one LAN stays scoped too, so its proxy record never claims loopback"
+            vault_advert(&scoped("lo0", [192, 168, 1, 5]), "alab-secrets", 7484, None).unwrap(),
+            scoped_advert,
+            "one LAN stays scoped too"
         );
         assert_eq!(
             advert_targets(&[wired], None),
@@ -9262,7 +9467,7 @@ mod tests {
                 ip: Ipv4Addr::new(192, 0, 2, 5),
             };
             assert_eq!(
-                registration_args(&target, "aterm-scope-test", 7484, None)
+                vault_advert(&target, "aterm-scope-test", 7484, None)
                     .unwrap_err()
                     .kind(),
                 io::ErrorKind::InvalidInput,
@@ -9305,10 +9510,10 @@ mod tests {
                     let here = Arc::clone(&here);
                     move || here.lock().expect("targets").clone()
                 }),
-                spawn: Box::new(move |_, _, _, _| quiet(&sleep, &["60".to_owned()])),
+                spawn: Box::new(move |_, _, _, _| quiet_advert(&sleep, &["60".to_owned()])),
                 every: ADVERTISE_EVERY,
                 power: Box::new(|_| None),
-                end_for_sleep: Arc::new(end),
+                end_for_sleep: Arc::new(Registered::end),
                 sleep_bound: SLEEP_YIELD_BOUND,
                 probe: |_, _, _, _, _, _| None,
                 name_answered: Box::new(|_, _| false),
@@ -9396,10 +9601,10 @@ mod tests {
                     let here = here.clone();
                     move || vec![here.clone()]
                 }),
-                spawn: Box::new(move |_, _, _, _| quiet(&sleep, &["60".to_owned()])),
+                spawn: Box::new(move |_, _, _, _| quiet_advert(&sleep, &["60".to_owned()])),
                 every: ADVERTISE_EVERY,
                 power: Box::new(|_| None),
-                end_for_sleep: Arc::new(end),
+                end_for_sleep: Arc::new(Registered::end),
                 sleep_bound: SLEEP_YIELD_BOUND,
                 probe: |_, _, _, _, _, _| None,
                 name_answered: Box::new(|_, _| false),
@@ -9527,10 +9732,10 @@ mod tests {
     }
 
     #[test]
-    fn per_tick_role_decider_restarts_or_stops_dns_sd_as_role_changes() {
+    fn per_tick_role_decider_restarts_or_stops_the_registration_as_role_changes() {
         let sleep = aterm_uds::deadline::stand_in(Path::new("/bin/sleep"));
         let sleep = sleep.to_str().expect("a UTF-8 path");
-        let spawn = |_: &Target, _: Option<&VaultTxt>| quiet(sleep, &["60".to_owned()]);
+        let spawn = |_: &Target, _: Option<&VaultTxt>| quiet_advert(sleep, &["60".to_owned()]);
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let running = run(&options(root.path(), Duration::from_millis(100)));
         let here = [Target {
@@ -9541,7 +9746,7 @@ mod tests {
         let children = Children::default();
         let mut set = children.lock();
 
-        // Tick 1: role decider returns `None` -> no primary `dns-sd` started, pins untouched.
+        // Tick 1: role decider returns `None` -> no primary registration made, pins untouched.
         let mut decide_none: RoleDecider = Box::new(|_| None);
         let (p1, s1) = tend_role_targets(
             &mut decide_none,
@@ -9605,10 +9810,10 @@ mod tests {
             .expect("restarted");
         assert_ne!(
             pid_m22, pid_alab,
-            "changing advertised label restarts dns-sd"
+            "changing advertised label registers afresh"
         );
         assert_eq!(set.dns.held_name.as_deref(), Some("m22"));
-        assert!(!set.dns.dns_sd_lost);
+        assert!(!set.dns.lost);
         assert!(!aterm_uds::process::pid_alive(pid_alab));
 
         // Tick 4: role becomes `None` -> `reregister_slot` ends the child cleanly.
@@ -9623,12 +9828,12 @@ mod tests {
     }
 
     /// A laptop (`m5`) that took `alab-secrets` after 90 s off the network comes back to a LAN
-    /// where `m22` holds the name at the same `seq`. Its `dns-sd -P` loses the host name and
-    /// ends at once, so `m22` never hears its `_alab-vault._tcp` instance, and the (`seq`,
+    /// where `m22` holds the name at the same `seq`. Its registration loses the host name
+    /// and ends at once, so `m22` never hears its `_alab-vault._tcp` instance, and the (`seq`,
     /// `label`) order, which ranks `m5` first, never meets the two. `m5` lets the name go and
     /// stays off while `m22` answers there, and starts no further registration of it.
     /// NEGATIVE CONTROL: without [`AlabNameWatcher::lost_name`] in [`reregister_roles`], `m5`
-    /// holds on every round and each round starts another `dns-sd -P` that loses again.
+    /// holds on every round and each round starts another registration that loses again.
     #[test]
     fn a_holder_whose_registration_loses_the_name_lets_it_go() {
         let sleep = aterm_uds::deadline::stand_in(Path::new("/bin/sleep"));
@@ -9644,7 +9849,7 @@ mod tests {
                 } else {
                     "60"
                 };
-                quiet(&sleep, &[lasts.to_owned()])
+                quiet_advert(&sleep, &[lasts.to_owned()])
             }
         });
         let alab_started = || {
@@ -9765,7 +9970,7 @@ mod tests {
 
     /// One registration of `alab-secrets` in `slot` advertising ALab at `seq`, a stand-in
     /// `sleep 60`.
-    fn hold_advertising(slot: &mut DnsSdSlot, seq: u64, sleep: &str) {
+    fn hold_advertising(slot: &mut AdvertSlot, seq: u64, sleep: &str) {
         hold(slot, crate::alab_advertised(), sleep);
         slot.held[0].1 = Some(VaultTxt {
             vault: crate::ALAB_VAULT.to_owned(),
@@ -9802,11 +10007,11 @@ mod tests {
             }),
             spawn: Box::new(move |name, _, _, _| {
                 started.lock().expect("started").push(name.to_owned());
-                quiet(&sleep, &["60".to_owned()])
+                quiet_advert(&sleep, &["60".to_owned()])
             }),
             every: Duration::from_secs(3600),
             power: Box::new(|_| None),
-            end_for_sleep: Arc::new(end),
+            end_for_sleep: Arc::new(Registered::end),
             sleep_bound: SLEEP_YIELD_BOUND,
             probe: |_, _, _, _, _, _| None,
             name_answered,
@@ -9875,7 +10080,7 @@ mod tests {
         running.stop();
     }
 
-    /// mDNSResponder restarting (a crash, an OS update) ends every `dns-sd`, the holder's
+    /// mDNSResponder restarting (a crash, an OS update) ends every registration, the holder's
     /// registration of `alab-secrets` among them, and no other device answers to the name
     /// then: the holder registers it again on its next round. Before, any end of that
     /// registration read as the name lost to another device, so the name stayed unheld until
@@ -9922,7 +10127,7 @@ mod tests {
         let started = Arc::new(Mutex::new(Vec::<String>::new()));
         let rounds = Arc::new(AtomicUsize::new(0));
         let children = Children::default();
-        // When told to, a round ends the registration's `dns-sd` as it starts, as mDNSResponder
+        // When told to, a round ends the registration's stand-in as it starts, as mDNSResponder
         // restarting ends it.
         let end_next = Arc::new(AtomicBool::new(false));
         let mut seams = member_seams(&sleep, &started, &rounds, name_answered);
@@ -10121,8 +10326,8 @@ mod tests {
             hold_advertising(&mut set.alab_dns, 81, &sleep);
         }
         let asleep = AtomicBool::new(true);
-        for (_, mut child) in take_for_sleep(&children.set, &asleep) {
-            end(&mut child);
+        for (_, mut held) in take_for_sleep(&children.set, &asleep) {
+            held.end();
         }
         drop(children);
         assert!(
@@ -10132,8 +10337,8 @@ mod tests {
     }
 
     /// One registration of `name` in `slot`, a stand-in `sleep 60`: its pid.
-    fn hold(slot: &mut DnsSdSlot, name: &str, sleep: &str) -> u32 {
-        let child = quiet(sleep, &["60".to_owned()]).expect("a stand-in");
+    fn hold(slot: &mut AdvertSlot, name: &str, sleep: &str) -> u32 {
+        let child = quiet_advert(sleep, &["60".to_owned()]).expect("a stand-in");
         let pid = child.id();
         let target = Target {
             scope: None,
@@ -10202,7 +10407,8 @@ mod tests {
                 hold(&mut set.alab_dns, alab, &sleep),
             ]
         };
-        let (yielding, asleep, _bell) = yielding(&children, Arc::new(end), HANG_DETECTOR);
+        let (yielding, asleep, _bell) =
+            yielding(&children, Arc::new(Registered::end), HANG_DETECTOR);
         let mut alive_when_allowed = None;
         aterm_uds::power::answer(
             aterm_uds::power::Message::WillSleep,
@@ -10220,7 +10426,7 @@ mod tests {
             let started = Arc::clone(&started);
             move |_, _, _, _| {
                 started.fetch_add(1, Ordering::SeqCst);
-                quiet(&sleep, &["60".to_owned()])
+                quiet_advert(&sleep, &["60".to_owned()])
             }
         });
         let here = vec![Target {
@@ -10300,7 +10506,7 @@ mod tests {
             let started = Arc::clone(&started);
             move |name, _, _, _| {
                 started.lock().expect("started").push(name.to_owned());
-                quiet(&sleep, &["60".to_owned()])
+                quiet_advert(&sleep, &["60".to_owned()])
             }
         });
         let alab_started = || {
@@ -10339,7 +10545,8 @@ mod tests {
         }
         assert!(watcher.is_holding());
         let children = Children::default();
-        let (yielding, asleep, bell) = yielding(&children, Arc::new(end), HANG_DETECTOR);
+        let (yielding, asleep, bell) =
+            yielding(&children, Arc::new(Registered::end), HANG_DETECTOR);
         let probed = std::cell::Cell::new(0usize);
         let mut round = |watcher: &mut AlabNameWatcher, why| {
             after_sleep(&children.set, watcher);
@@ -10432,7 +10639,7 @@ mod tests {
             let _ = entered.send(());
             // Held until the test lets it go, after the Mac was let sleep (or the test ended).
             let _ = released.lock().expect("released").recv();
-            end(child);
+            child.end();
         });
         let (yielding, _asleep, _bell) = yielding(&children, stuck, Duration::from_millis(50));
         let (answering, allows) = announce(yielding, aterm_uds::power::Message::WillSleep);
@@ -10569,7 +10776,7 @@ mod tests {
                     let started = Arc::clone(&started);
                     move |_, _, _, _| {
                         started.fetch_add(1, Ordering::SeqCst);
-                        quiet(&sleep, &["60".to_owned()])
+                        quiet_advert(&sleep, &["60".to_owned()])
                     }
                 }),
                 // No timer round comes during the test: only a ring starts one.
@@ -10581,7 +10788,7 @@ mod tests {
                         Some(aterm_uds::power::Listening::inert())
                     }
                 }),
-                end_for_sleep: Arc::new(end),
+                end_for_sleep: Arc::new(Registered::end),
                 sleep_bound: HANG_DETECTOR,
                 probe: |_, _, _, _, _, _| None,
                 name_answered: Box::new(|_, _| false),
@@ -14399,6 +14606,202 @@ mod tests {
         assert!(
             !model.check_invariant("FileHoldsCompleteOnly", &bad_state),
             "an id-ordered tail torn after its first frame holds FileHoldsCompleteOnly"
+        );
+    }
+
+    /// What a stand-in broker does with the registration it was asked for, once told.
+    #[cfg(target_os = "macos")]
+    enum Told {
+        /// Confirm it (mDNSResponder registered it).
+        Confirm,
+        /// End it with mDNSResponder's error frame (a host-record conflict).
+        Conflict,
+        /// Close the connection.
+        Close,
+    }
+
+    /// A stand-in LAN broker on a fresh socket that takes one registration and does what it is
+    /// told with it, in turn, until its client closes the connection; the seam that points this
+    /// thread there. Its thread answers whether the client closed the connection.
+    #[cfg(target_os = "macos")]
+    fn registering_broker() -> (
+        aterm_uds::lan::Seam,
+        aterm_tempfile::TempDir,
+        std::sync::mpsc::Sender<Told>,
+        std::thread::JoinHandle<bool>,
+    ) {
+        use aterm_uds::lan::wire::{self, Event, Frame, Reader, Request};
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let path = root.path().join("broker.sock");
+        let listener = aterm_uds::CtlListener::bind(&path).expect("bind");
+        let (tell, told) = std::sync::mpsc::channel();
+        let served = std::thread::spawn(move || {
+            // The hello `through_broker` checks first, on a connection of its own.
+            let (hello, _) = aterm_uds::accept(&listener).expect("accept hello");
+            let hi = Frame::Hello {
+                protocol: aterm_uds::lan::PROTOCOL,
+                build: "stand-in".into(),
+            };
+            wire::send(&hello, &hi).expect("hello");
+            let deadline = Some(Instant::now() + HANG_DETECTOR);
+            let theirs = Reader::new(0).frame(&hello, deadline).expect("their hello");
+            assert!(matches!(theirs, Some(Frame::Hello { .. })), "{theirs:?}");
+            drop(hello);
+            let (stream, _) = aterm_uds::accept(&listener).expect("accept");
+            wire::send(&stream, &hi).expect("hello");
+            let mut reader = Reader::new(0);
+            let theirs = reader.frame(&stream, deadline).expect("their hello");
+            assert!(matches!(theirs, Some(Frame::Hello { .. })), "{theirs:?}");
+            let Some(Frame::Request(Request::Register(advert))) =
+                reader.frame(&stream, deadline).expect("request")
+            else {
+                panic!("not a registration");
+            };
+            while let Ok(what) = told.recv_timeout(HANG_DETECTOR) {
+                match what {
+                    Told::Confirm => wire::send(
+                        &stream,
+                        &Frame::Event(Event::Registered {
+                            name: advert.name.clone(),
+                            service: advert.service.clone(),
+                            domain: "local.".into(),
+                        }),
+                    )
+                    .expect("registered"),
+                    Told::Conflict => wire::send(
+                        &stream,
+                        &Frame::Error {
+                            code: -65548,
+                            words: "the host name is in use".into(),
+                        },
+                    )
+                    .expect("error"),
+                    Told::Close => return false,
+                }
+            }
+            matches!(reader.frame(&stream, deadline), Ok(None))
+        });
+        let seam = aterm_uds::lan::Seam {
+            socket: Some(path),
+            ..aterm_uds::lan::Seam::default()
+        };
+        (seam, root, tell, served)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn broker_advert() -> aterm_uds::lan::Advert {
+        let at = Target {
+            scope: Some(
+                if cfg!(target_os = "macos") {
+                    "lo0"
+                } else {
+                    "lo"
+                }
+                .to_owned(),
+            ),
+            ip: Ipv4Addr::new(192, 168, 1, 5),
+        };
+        vault_advert(&at, "alab-secrets", 7484, None).expect("advert")
+    }
+
+    /// Wait until `registered` is confirmed and held.
+    #[cfg(target_os = "macos")]
+    fn until_held(registered: &Registered) {
+        let Registered::Broker(state) = registered else {
+            panic!("a broker registration");
+        };
+        let started = Instant::now();
+        while !matches!(*state.lock().expect("state"), Brokered::Held(_)) {
+            assert!(started.elapsed() < HANG_DETECTOR, "never confirmed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// A registration the LAN broker holds is seen to end by itself, whether mDNSResponder's
+    /// error frame ends it or the broker's connection closes. Negative controls: while the
+    /// broker holds it, it has not ended; and a zero-wait read, which asks no poll, does not see
+    /// a connection the broker has already closed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_broker_registration_is_seen_to_end() {
+        let advert = broker_advert();
+        for close in [false, true] {
+            let (seam, _root, tell, served) = registering_broker();
+            let mut served = Some(served);
+            let mut registered = aterm_uds::lan::seam_here(seam, || {
+                Registered::through_broker(&advert).expect("registered")
+            });
+            tell.send(Told::Confirm).expect("tell");
+            until_held(&registered);
+            assert!(!registered.ended(), "held");
+            if close {
+                tell.send(Told::Close).expect("tell");
+                let served = served.take().expect("served");
+                assert!(!served.join().expect("broker"));
+                let Registered::Broker(state) = &registered else {
+                    panic!("a broker registration");
+                };
+                let mut state = state.lock().expect("state");
+                let Brokered::Held(registration) = &mut *state else {
+                    panic!("held");
+                };
+                assert!(
+                    matches!(registration.events().next_within(Duration::ZERO), Ok(None)),
+                    "a zero wait reads nothing"
+                );
+            } else {
+                tell.send(Told::Conflict).expect("tell");
+            }
+            let started = Instant::now();
+            while !registered.ended() {
+                assert!(started.elapsed() < HANG_DETECTOR, "never seen to end");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(registered.ended(), "an end stays an end");
+            registered.end();
+            if let Some(served) = served {
+                drop(tell);
+                assert!(served.join().expect("broker"), "the client closed it");
+            }
+        }
+    }
+
+    /// Starting a broker registration returns before mDNSResponder confirms it, so a round that
+    /// starts one under the children's lock never keeps a will-sleep waiting on that lock for
+    /// the confirmation; one ended while it starts has not ended by itself before, and is
+    /// withdrawn (its connection closed) as the confirmation comes. Negative control: a broker
+    /// that is not there fails the start at once, in its own words.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_broker_registration_starts_without_waiting_for_its_confirmation() {
+        let advert = broker_advert();
+        let (seam, _root, tell, served) = registering_broker();
+        let mut registered = aterm_uds::lan::seam_here(seam, || {
+            Registered::through_broker(&advert).expect("started unconfirmed")
+        });
+        assert!(!registered.ended(), "still starting");
+        registered.end();
+        assert!(registered.ended(), "ended");
+        tell.send(Told::Confirm).expect("tell");
+        drop(tell);
+        assert!(
+            served.join().expect("broker"),
+            "the confirmed registration is withdrawn"
+        );
+
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let absent = aterm_uds::lan::Seam {
+            socket: Some(root.path().join("absent.sock")),
+            ..aterm_uds::lan::Seam::default()
+        };
+        let Err(missing) =
+            aterm_uds::lan::seam_here(absent, || Registered::through_broker(&advert))
+        else {
+            panic!("no broker, no registration");
+        };
+        assert_eq!(
+            missing.to_string(),
+            aterm_uds::lan::Unavailable::NotInstalled.to_string()
         );
     }
 }

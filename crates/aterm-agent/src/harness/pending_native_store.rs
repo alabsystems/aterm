@@ -28,14 +28,60 @@ impl Store {
         home: &Path,
         max: usize,
     ) -> Result<(Self, Option<SecretBytes>), &'static str> {
+        Self::open_using(directory, home, max, true)?.ok_or(UNAVAILABLE)
+    }
+
+    /// Claim an existing response without creating a directory or machine key.
+    pub(super) fn open_existing(
+        directory: &Path,
+        home: &Path,
+        max: usize,
+    ) -> Result<Option<(Self, Option<SecretBytes>)>, &'static str> {
+        Self::open_using(directory, home, max, false)
+    }
+
+    fn open_using(
+        directory: &Path,
+        home: &Path,
+        max: usize,
+        prepare: bool,
+    ) -> Result<Option<(Self, Option<SecretBytes>)>, &'static str> {
         if !directory.is_absolute() || !home.is_absolute() {
             return Err(UNAVAILABLE);
         }
-        aterm_secrets::fsx::ensure_private_dir(directory).map_err(|_| UNAVAILABLE)?;
+        if prepare {
+            aterm_secrets::fsx::ensure_private_dir(directory).map_err(|_| UNAVAILABLE)?;
+        } else {
+            match std::fs::symlink_metadata(directory) {
+                Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {}
+                Ok(_) => return Err(UNAVAILABLE),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    return Ok(None);
+                }
+                Err(_) => return Err(UNAVAILABLE),
+            }
+        }
+        let path = directory.join("candidate.age");
+        // Absence authorizes no exchange. Do not require writable new custody for a
+        // read-only observation; a refresh will claim and re-read through open().
+        if !prepare
+            && aterm_secrets::fsx::read_private(&path, max)
+                .map_err(|_| UNAVAILABLE)?
+                .is_none()
+        {
+            return Ok(None);
+        }
         let claim = super::browser_window::ProfileLock::claim(directory)
             .map_err(|_| "Native completion is held or unavailable")?;
-        let path = directory.join("candidate.age");
         let ciphertext = aterm_secrets::fsx::read_private(&path, max).map_err(|_| UNAVAILABLE)?;
+        if !prepare && ciphertext.is_none() {
+            return Ok(None);
+        }
         let paths = aterm_secrets::client::Paths::for_home(home);
         let machine = if ciphertext.is_some() {
             aterm_secrets::client::read_machine_identity(&paths)
@@ -51,7 +97,7 @@ impl Store {
                     .map_err(|_| "Protected native completion failed decryption")
             })
             .transpose()?;
-        Ok((
+        Ok(Some((
             Self {
                 expected: ciphertext.as_ref().map(|bytes| digest(bytes.as_slice())),
                 path,
@@ -61,7 +107,7 @@ impl Store {
                 _claim: claim,
             },
             plaintext,
-        ))
+        )))
     }
 
     pub(super) fn unchanged(&self) -> Result<(), &'static str> {

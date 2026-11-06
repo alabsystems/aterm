@@ -233,11 +233,12 @@ impl LaneState {
         targets: &[Triple],
         pins: &BTreeMap<String, Build>,
     ) -> Result<()> {
+        use std::fmt::Write as _;
         super::report::write_atomic(&self.index_seen, &format!("{index}\n"))?;
         let mut text = stamp_of(targets);
         text.push('\n');
         for (p, b) in pins {
-            text.push_str(&format!("{p} {b}\n"));
+            let _ = writeln!(text, "{p} {b}");
         }
         super::report::write_atomic(&self.pins_seen, &text)
     }

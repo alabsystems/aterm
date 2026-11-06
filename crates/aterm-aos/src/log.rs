@@ -357,6 +357,18 @@ impl<S: Schema> EventLog<S> {
         }
     }
 
+    /// An empty log holding at most `max_events` inputs, preallocating `capacity` slots.
+    #[inline]
+    #[must_use]
+    pub fn with_capacity(header: LogHeader, max_events: usize, capacity: usize) -> Self {
+        EventLog {
+            header,
+            inputs: Vec::with_capacity(capacity.min(max_events)),
+            max_events,
+            broken: None,
+        }
+    }
+
     /// Appends an input and returns its cursor ([`LogFull`]).
     pub fn push(&mut self, i: S::Input) -> Result<u64, LogFull> {
         let full = LogFull {
@@ -467,19 +479,19 @@ impl<S: Schema> EventLog<S> {
         Ok(self.digest_inputs(schema, from, to, inputs))
     }
 
-    fn seal_digest(&self, schema: &S) -> Digest {
-        let (from, to) = (self.header.first_cursor, self.end_cursor());
-        self.digest_inputs(schema, from, to, &self.inputs)
+    fn trace_hasher(schema: &S, header: &LogHeader, from: u64, to: u64) -> DigestBuilder {
+        let mut b = DigestBuilder::new(TRACE_DOMAIN);
+        b.part(&schema.id().digest.0);
+        b.part(&header.identity.digest().0);
+        b.part(&header.ancestor.0);
+        b.part(&header.log_epoch.to_le_bytes());
+        b.part(&from.to_le_bytes());
+        b.part(&to.to_le_bytes());
+        b
     }
 
     fn digest_inputs(&self, schema: &S, from: u64, to: u64, inputs: &[S::Input]) -> Digest {
-        let mut b = DigestBuilder::new(TRACE_DOMAIN);
-        b.part(&schema.id().digest.0);
-        b.part(&self.header.identity.digest().0);
-        b.part(&self.header.ancestor.0);
-        b.part(&self.header.log_epoch.to_le_bytes());
-        b.part(&from.to_le_bytes());
-        b.part(&to.to_le_bytes());
+        let mut b = Self::trace_hasher(schema, &self.header, from, to);
         let mut e = Enc::new();
         for i in inputs {
             e.clear();
@@ -502,12 +514,19 @@ impl<S: Schema> EventLog<S> {
         body.digest(&self.header.ancestor);
         body.bool(self.broken.is_some());
         put_record(&mut out, 0, body.as_bytes())?;
+        let mut seal_hasher = Self::trace_hasher(
+            schema,
+            &self.header,
+            self.header.first_cursor,
+            self.end_cursor(),
+        );
         for (k, i) in self.inputs.iter().enumerate() {
             let step = len_u64(k).saturating_add(1);
             body.clear();
             body.u8(RECORD_VERSION);
             body.u8(KIND_EVENT);
             schema.encode_input(i, &mut body);
+            seal_hasher.part(&body.as_bytes()[2..]);
             put_record(&mut out, step, body.as_bytes())?;
         }
         let n = len_u64(self.inputs.len());
@@ -515,7 +534,7 @@ impl<S: Schema> EventLog<S> {
         body.u8(RECORD_VERSION);
         body.u8(KIND_SEAL);
         body.u64(n);
-        body.digest(&self.seal_digest(schema));
+        body.digest(&seal_hasher.finish());
         put_record(&mut out, n.saturating_add(1), body.as_bytes())?;
         Ok(out)
     }
@@ -588,14 +607,7 @@ impl<S: Schema> EventLog<S> {
         let mut seal_hasher = seal.as_ref().map(|_| {
             let from = header.first_cursor;
             let to = from.saturating_add(n);
-            let mut b = DigestBuilder::new(TRACE_DOMAIN);
-            b.part(&schema.id().digest.0);
-            b.part(&header.identity.digest().0);
-            b.part(&header.ancestor.0);
-            b.part(&header.log_epoch.to_le_bytes());
-            b.part(&from.to_le_bytes());
-            b.part(&to.to_le_bytes());
-            b
+            Self::trace_hasher(schema, &header, from, to)
         });
         for (step, range) in events {
             let body = bytes.get(range.clone()).ok_or(LogFault::MissingHeader)?;
@@ -614,7 +626,7 @@ impl<S: Schema> EventLog<S> {
         if broken {
             log.mark_broken(DECODED_BREAK);
         }
-        let Some((step, range)) = seal else {
+        let (Some((step, range)), Some(seal_hasher)) = (seal, seal_hasher) else {
             let tail = match tail {
                 Tail::Clean => Tail::Unsealed {
                     events: log.inputs.len(),
@@ -628,9 +640,7 @@ impl<S: Schema> EventLog<S> {
         if sealed != n {
             return Err(LogFault::SealCount { sealed, found: n });
         }
-        let found = seal_hasher
-            .map(DigestBuilder::finish)
-            .unwrap_or_else(|| log.seal_digest(schema));
+        let found = seal_hasher.finish();
         if digest != found {
             return Err(LogFault::SealDigest {
                 sealed: digest,

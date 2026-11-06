@@ -9,53 +9,28 @@
 //! The join is System State's own: its Secrets stage's vault item over the unattended port
 //! ([`crate::init::run_initial_secrets_with`]'s, as `crate::init::run_converge_join` runs it),
 //! at the ALab vault's address, with no password and replacing only the "no vault" the read saw,
-//! then a wait of [`JOIN_WAIT`] for the vault to let this Mac in. The subscriber it puts in place
-//! is a repair, never a person's On, so a turn-off recorded since the read stays. An open vault does. A vault that asks a join password or an admin's approval
+//! leaving confirmation to the subscriber. The subscriber it puts in place
+//! is a repair, never a person's On, so a turn-off recorded since the read stays. The read is
+//! local: the join tries authenticated members before any vault lookup. An unconfirmed native
+//! exchange or an unavailable vault retains its typed wait and the subscriber's continuation.
+//! A vault that asks a join password or an admin's approval
 //! keeps the request and this Mac waits: no pass joins it again (it reads deferred), and the
 //! subscriber the join installed finishes it once a person gives the rest, as after System
-//! State's own join. Nothing asks macOS's Local Network question: the look runs only once macOS
-//! asked aterm before, and an answer of Don't Allow is the person's, so no pass looks again.
+//! State's own join. The look reaches the LAN through the root LAN broker (`aterm_uds::lan`), so
+//! it runs only while the broker answers; until then the read waits for it, never for a person.
 
 use super::{PeersDone, PeersRead};
 use crate::engine::Journal;
 use crate::init_secrets::{Replaces, SecretsOps};
 use crate::items::Ctx;
 use crate::port::System;
+use aterm_converge::StoodAside;
 use aterm_secrets::client::Membership;
 use std::sync::Arc;
-use std::time::Duration;
-
-/// How long a join waits for the vault to let this Mac in, as System State's Secrets stage
-/// waits for its approver.
-pub const JOIN_WAIT: Duration = Duration::from_secs(20);
-
-/// Local Network as aterm last heard it (a look at the LAN, or the window's own step).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Lan {
-    /// A look reached the LAN, or macOS asked aterm already: a look raises no question.
-    Allowed,
-    /// macOS refused a look the LAN: the person answered Don't Allow, or turned aterm off since.
-    Refused,
-    /// Nothing says, and macOS has not asked aterm: a look could raise its question.
-    Untold,
-}
-
-/// What a look for the ALab vault on this network heard (System State's own look).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Heard {
-    /// The ALab vault answered under the key built into aterm.
-    Found,
-    /// Something else answered at its address, or a kept look on this network says so.
-    Elsewhere,
-    /// Nothing answered: why.
-    Unreached(String),
-    /// macOS refused the look the LAN.
-    Refused,
-}
 
 /// What stands before a join besides the vault: a person's choice that keeps it out (System
 /// State's plan leaving the Secrets vault out, or a system System State does not run on), a run
-/// of System State's that still owes its Secrets stage, and Local Network as last heard.
+/// of System State's that still owes its Secrets stage, and a LAN broker that does not answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Gate {
     /// Why no vault is joined here, where a choice says so.
@@ -63,18 +38,14 @@ pub struct Gate {
     /// A run System State admitted still owes its Secrets stage, which joins the vault itself
     /// (`aterm_cli::macos_doctor::initial_setup_owes_secrets_stage`).
     pub owed: bool,
-    /// Local Network as last heard.
-    pub lan: Lan,
+    /// Why the LAN broker, through which a look reaches the LAN on macOS, does not answer
+    /// (`aterm_uds::lan::broker::hello`'s error); `None` where it answers, or where the system
+    /// needs none.
+    pub broker: Option<String>,
 }
 
-/// What `sync.peers` says once macOS refused aterm the local network.
-pub const LAN_REFUSED: &str = "macOS does not let aterm use the local network (Don't Allow, or \
-     turned off since), so no pass looks for a vault or asks again: System Settings > Privacy & \
-     Security > Local Network turns aterm on";
-
-/// What it says while macOS has not asked aterm about the local network.
-pub const LAN_UNTOLD: &str = "macOS has not asked aterm about the local network yet: System \
-     State's Local Network row asks, and no pass raises the question";
+/// What `sync.peers` adds to why the LAN broker does not answer ([`Gate::broker`]).
+pub const BROKER_WAIT: &str = "no pass looks for the ALab vault until it answers";
 
 /// What it says while a run of System State's still owes its Secrets stage.
 pub const STAGE_OWED: &str = "System State's run has its Secrets stage still to do, and that \
@@ -82,7 +53,7 @@ pub const STAGE_OWED: &str = "System State's run has its Secrets stage still to 
 
 /// What it says to a pass that does not look: only the window's does.
 pub const NOT_LOOKED: &str = "no vault is configured: the aterm window's pass looks for the \
-     ALab vault and joins it, where Local Network is aterm.app's";
+     ALab vault and joins it";
 
 /// `sync.peers`' read over `ops`, the vault as System State's Secrets stage reads it. A vault
 /// configured here reads joined once it let this Mac in, and deferred while it has not (it waits
@@ -90,17 +61,13 @@ pub const NOT_LOOKED: &str = "no vault is configured: the aterm window's pass lo
 /// [`not_let_in`]) or once this Mac was removed from it, or a rotation dropped it (its words say
 /// to set the vault folder aside and come back as a new Mac): a pass never joins it again.
 /// With none, the person's turn-off or `gate`'s choice reads off, and a run of System State's
-/// that owes its Secrets stage, or Local Network refused or untold, reads deferred without a
-/// look; only then is `look` asked (`None`: this pass does not look), and the ALab vault
-/// answering reads joinable.
+/// that owes its Secrets stage, or a LAN broker that does not answer, reads deferred without a
+/// LAN use. Only an applying window pass (`can_join`) reads eligible for automatic admission;
+/// that admission, including discovery and its pinned-vault fallback, belongs to apply alone.
 ///
 /// # Errors
 /// The vault's local state cannot be read.
-pub fn read(
-    ops: &dyn SecretsOps,
-    gate: &Gate,
-    look: Option<&dyn Fn() -> Heard>,
-) -> Result<PeersRead, String> {
+pub fn read(ops: &dyn SecretsOps, gate: &Gate, can_join: bool) -> Result<PeersRead, String> {
     if ops.configured().map_err(|why| why.to_string())?.is_some() {
         let status = ops.status().map_err(|why| why.to_string())?;
         let name = status
@@ -143,37 +110,32 @@ pub fn read(
     if gate.owed {
         return Ok(PeersRead::Deferred(STAGE_OWED.to_owned()));
     }
-    match gate.lan {
-        Lan::Refused => return Ok(PeersRead::Deferred(LAN_REFUSED.to_owned())),
-        Lan::Untold => return Ok(PeersRead::Deferred(LAN_UNTOLD.to_owned())),
-        Lan::Allowed => {}
+    if let Some(why) = &gate.broker {
+        return Ok(PeersRead::Deferred(format!("{why}; {BROKER_WAIT}")));
     }
-    let Some(look) = look else {
+    if !can_join {
         return Ok(PeersRead::Deferred(NOT_LOOKED.to_owned()));
-    };
-    Ok(match look() {
-        Heard::Found => PeersRead::Joinable("the ALab vault answers on this network".to_owned()),
-        Heard::Elsewhere => PeersRead::Off("no ALab vault on this network".to_owned()),
-        Heard::Unreached(why) => PeersRead::Off(format!(
-            "nothing answered at the ALab vault's address ({why}); the next pass looks again"
-        )),
-        Heard::Refused => PeersRead::Deferred(LAN_REFUSED.to_owned()),
-    })
+    }
+    Ok(PeersRead::Joinable(
+        "no vault is configured; ALab admission is ready to try".to_owned(),
+    ))
 }
 
 /// `sync.peers`' apply: System State's join of the ALab vault over `ops`, with no password,
-/// replacing only the "no vault" the read saw, journaled in `journal`, then a wait of
-/// [`JOIN_WAIT`] for the vault to let this Mac in. In: joined. A vault no member's Allow, join
-/// password or admin's approval let this Mac into within the wait leaves it waiting
-/// ([`not_let_in`] says for what): its request stands, and no pass sends another.
+/// replacing only the "no vault" the read saw, journaled in `journal` and confirmed by its
+/// subscriber. In: joined. A retained automatic request, an offline source
+/// or a missing prerequisite preserves the stage's typed stand-aside. No second HTTP approval
+/// wait follows a native exchange, including one that wrote only part of its local source.
 ///
 /// # Errors
-/// The join failed (the vault did not answer it, its subscriber did not start, say).
+/// The guarded stage failed or its local state cannot be read. Ordinary pending and offline
+/// states preserve their typed stand-aside instead.
 pub fn join(
     sys: &dyn System,
     ctx: &Ctx,
     ops: Arc<dyn SecretsOps>,
     journal: &mut dyn Journal,
+    current: &(dyn Fn() -> Result<(), String> + Sync),
 ) -> Result<PeersDone, String> {
     let rows = crate::init::run_converge_join(
         sys,
@@ -181,36 +143,46 @@ pub fn join(
         Arc::clone(&ops),
         aterm_types::macos_setup::DEFAULT_VAULT_URL,
         Replaces::Read(None),
-        JOIN_WAIT,
         journal,
+        current,
     )?;
+    if let Some(row) = rows.iter().find(|row| row.outcome.is_failure()) {
+        return Err(row
+            .why
+            .clone()
+            .unwrap_or_else(|| "the ALab vault join failed".to_owned()));
+    }
+    if let Some(aside) = rows.iter().find_map(|row| row.stood_aside.as_ref()) {
+        return Ok(PeersDone::Deferred(aside.clone()));
+    }
+    if let Some(row) = rows
+        .iter()
+        .find(|row| row.outcome == crate::model::Outcome::NotApplicable)
+    {
+        return Ok(PeersDone::Deferred(StoodAside::Waiting(
+            row.why
+                .clone()
+                .unwrap_or_else(|| "current setup holds background admission".to_owned()),
+        )));
+    }
     let status = ops.status().map_err(|why| why.to_string())?;
     let name = status.config.as_ref().map_or_else(
         || "the ALab vault".to_owned(),
         |config| format!("vault {}", config.name),
     );
-    let inside = match status.membership {
-        Membership::In { .. } | Membership::Plain => true,
-        // A join sent with no password waits for a person: an open vault lets in no Mac that
-        // only asks (docs/DESIGN-fluid-swarm-2026-10-28.md F10), so the wait sees an Allow or
-        // an approval that lands within it, and otherwise the request stands.
-        Membership::Pending => ops.await_approval(JOIN_WAIT, &|| false),
-        Membership::Unconfigured | Membership::Revoked { .. } => {
-            return Err(rows
-                .iter()
-                .find_map(|row| row.outcome.is_failure().then(|| row.why.clone()).flatten())
-                .unwrap_or_else(|| format!("{name} was not joined")));
+    match status.membership {
+        Membership::In { .. } | Membership::Plain => {
+            Ok(PeersDone::Joined(format!("joined {name}, nothing typed")))
         }
-    };
-    Ok(if inside {
-        PeersDone::Joined(format!("joined {name}, nothing typed"))
-    } else {
-        PeersDone::Waiting(not_let_in(
+        Membership::Pending => Ok(PeersDone::Deferred(StoodAside::Waiting(not_let_in(
             &name,
             (waits_for(&status), &|| ops.join_place()),
-            "its request stands, and no pass sends another",
-        ))
-    })
+            "its request stands, and the subscriber confirms it",
+        )))),
+        Membership::Unconfigured | Membership::Revoked { .. } => {
+            Err(format!("{name} was not joined"))
+        }
+    }
 }
 
 /// What a Mac a vault has not let in waits for ([`waits_for`]).
@@ -267,12 +239,11 @@ mod tests {
     use crate::items::defaults::tests::{ctx, user};
     use aterm_secrets::alab_join::JoinPlace;
     use aterm_secrets::client::JoinOutcome;
-    use std::cell::Cell;
 
     const ALLOWED: Gate = Gate {
         off: None,
         owed: false,
-        lan: Lan::Allowed,
+        broker: None,
     };
 
     fn sys() -> crate::port::Fake {
@@ -289,16 +260,12 @@ mod tests {
             &ctx(&[user("alice", 501)]),
             port,
             &mut crate::engine::NoJournal,
+            &|| Ok(()),
         )
     }
 
-    /// A read over `ops` that counts its looks, each hearing `heard`.
-    fn looked(ops: &Arc<Scripted>, gate: &Gate, heard: &Heard, looks: &Cell<u32>) -> PeersRead {
-        let look = || {
-            looks.set(looks.get() + 1);
-            heard.clone()
-        };
-        read(ops.as_ref(), gate, Some(&look)).expect("a read")
+    fn observed(ops: &Arc<Scripted>, gate: &Gate) -> PeersRead {
+        read(ops.as_ref(), gate, true).expect("a local read")
     }
 
     fn pending() -> JoinOutcome {
@@ -308,20 +275,135 @@ mod tests {
         }
     }
 
+    #[test]
+    fn native_recovery_is_eligible_without_a_vault_preflight() {
+        let ops = Scripted::new(vec![Ok(unconfigured())]);
+        let prepared = read(ops.as_ref(), &ALLOWED, true).unwrap();
+        assert!(matches!(prepared, PeersRead::Joinable(_)), "{prepared:?}");
+        assert_eq!(ops.probes(), 0);
+        assert!(ops.joins().is_empty());
+        assert_eq!(ops.installs(), 0);
+    }
+
+    #[test]
+    fn unconfirmed_native_admission_keeps_its_automatic_wait_instead_of_failing() {
+        for saved in [None, Some(configured(Membership::Pending))] {
+            let ops = Scripted::new(vec![Ok(unconfigured())]);
+            ops.bootstraps_as(aterm_secrets::client::NativeAdmission::Uncertain, saved);
+            assert!(matches!(observed(&ops, &ALLOWED), PeersRead::Joinable(_)));
+            let done = joined(&ops);
+            assert!(
+                matches!(&done, Ok(PeersDone::Deferred(StoodAside::Waiting(why)))
+                if why.contains(crate::init_secrets::NATIVE_ADMISSION_PENDING)),
+                "{done:?}"
+            );
+            assert_eq!(ops.installs(), 1);
+            assert_eq!(ops.probes(), 0);
+            assert!(ops.joins().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_new_setup_hold_reaches_the_background_native_publication_guard() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stopped = Arc::new(AtomicBool::new(false));
+        let ops = Scripted::new(vec![Ok(unconfigured())]);
+        ops.stops_during_bootstrap(Arc::clone(&stopped));
+        let current = || {
+            if stopped.load(Ordering::SeqCst) {
+                Err("setup stopped during the background proof".to_owned())
+            } else {
+                Ok(())
+            }
+        };
+        let done = join(
+            &sys(),
+            &ctx(&[user("alice", 501)]),
+            ops.clone(),
+            &mut crate::engine::NoJournal,
+            &current,
+        );
+        assert!(
+            matches!(&done, Ok(PeersDone::Deferred(StoodAside::Waiting(why)))
+            if why.contains("setup stopped")),
+            "{done:?}"
+        );
+        assert_eq!(ops.installs(), 0);
+        assert_eq!(ops.probes(), 0);
+        assert!(ops.joins().is_empty());
+    }
+
+    #[test]
+    fn subscriber_off_after_the_read_prevents_background_enrollment() {
+        for during_native in [false, true] {
+            let ops = Scripted::new(vec![Ok(unconfigured())]);
+            ops.alab_answers();
+            ops.joins_as(
+                Some(configured(Membership::In { seq: 7, heard: 1 })),
+                Ok(JoinOutcome::Joined {
+                    seq: 7,
+                    names: Vec::new(),
+                }),
+            );
+            assert!(matches!(observed(&ops, &ALLOWED), PeersRead::Joinable(_)));
+            if during_native {
+                ops.turns_off_during_bootstrap();
+            } else {
+                ops.turn_off();
+            }
+            let done = joined(&ops);
+            assert!(
+                matches!(&done, Ok(PeersDone::Deferred(StoodAside::Waiting(_)))),
+                "{done:?}"
+            );
+            assert_eq!(ops.installs(), 0);
+            assert_eq!(ops.probes(), 0);
+            assert!(ops.joins().is_empty());
+            assert_eq!(ops.status().unwrap().membership, Membership::Unconfigured);
+        }
+    }
+
+    #[test]
+    fn an_offline_native_miss_keeps_its_retry_class_and_a_real_join_failure_stays_failed() {
+        let ops = Scripted::new(vec![Ok(unconfigured())]);
+        let done = joined(&ops);
+        assert!(
+            matches!(&done, Ok(PeersDone::Deferred(StoodAside::Offline(_)))),
+            "{done:?}"
+        );
+        assert_eq!(ops.installs(), 1);
+        assert_eq!(ops.probes(), 1);
+        assert!(ops.joins().is_empty());
+
+        let ops = Scripted::new(vec![Ok(unconfigured())]);
+        ops.alab_answers();
+        ops.joins_as(
+            None,
+            Err(aterm_secrets::Error::new("credential request refused")),
+        );
+        let why = joined(&ops).unwrap_err();
+        assert!(why.contains("credential request refused"), "{why}");
+        assert_eq!(ops.joins().len(), 1);
+    }
+
     /// An unjoined Mac whose look hears the open ALab vault reads joinable, and its join sends
     /// no password and nothing a person types, at the ALab vault's address, and is let in
-    /// within the wait.
+    /// by its completed join operation.
     #[test]
     fn an_open_vault_joins_with_nothing_typed() {
         let ops = Scripted::new(vec![Ok(unconfigured())]);
         ops.alab_answers();
-        let looks = Cell::new(0);
-        let read = looked(&ops, &ALLOWED, &Heard::Found, &looks);
+        let read = observed(&ops, &ALLOWED);
         assert!(matches!(read, PeersRead::Joinable(_)), "{read:?}");
-        assert_eq!(looks.get(), 1);
+        assert_eq!(ops.probes(), 0);
 
-        ops.joins_as(Some(configured(Membership::Pending)), Ok(pending()));
-        ops.approves(vec![true]);
+        ops.joins_as(
+            Some(configured(Membership::In { seq: 7, heard: 1 })),
+            Ok(JoinOutcome::Joined {
+                seq: 7,
+                names: vec!["gh_access_token".into()],
+            }),
+        );
         let done = joined(&ops);
         assert!(matches!(done, Ok(PeersDone::Joined(_))), "{done:?}");
         assert_eq!(
@@ -333,7 +415,6 @@ mod tests {
             "one join, nobody asked"
         );
         assert_eq!(ops.passwords(), [false], "no password sent");
-        assert_eq!(ops.windows(), [JOIN_WAIT]);
     }
 
     /// A vault that asks a join password (or an admin's approval) does not let this Mac in: the
@@ -345,18 +426,24 @@ mod tests {
         ops.alab_answers();
         ops.joins_as(Some(configured(Membership::Pending)), Ok(pending()));
         let done = joined(&ops);
-        assert!(matches!(done, Ok(PeersDone::Waiting(_))), "{done:?}");
+        assert!(
+            matches!(done, Ok(PeersDone::Deferred(StoodAside::Waiting(_)))),
+            "{done:?}"
+        );
         assert_eq!(ops.passwords(), [false], "no password sent");
 
-        let looks = Cell::new(0);
         for _ in 0..2 {
-            let read = looked(&ops, &ALLOWED, &Heard::Found, &looks);
+            let read = observed(&ops, &ALLOWED);
             assert!(
                 matches!(&read, PeersRead::Deferred(why) if why.contains("join password")),
                 "{read:?}"
             );
         }
-        assert_eq!(looks.get(), 0, "a vault configured here is not looked for");
+        assert_eq!(
+            ops.probes(),
+            1,
+            "only the original join looks for the fallback vault"
+        );
         assert_eq!(ops.joins().len(), 1, "never joined again");
     }
 
@@ -383,19 +470,14 @@ mod tests {
             let ops = Scripted::new(vec![Ok(unconfigured())]);
             ops.alab_answers();
             ops.joins_as(Some(status.clone()), Ok(pending()));
-            assert_eq!(
-                joined(&ops),
-                Ok(PeersDone::Waiting(not_let_in(
-                    "vault alab",
-                    (waits, &|| JoinPlace::Home),
-                    "its request stands, and no pass sends another"
-                ))),
-                "{waits:?}"
+            let done = joined(&ops);
+            assert!(
+                matches!(done, Ok(PeersDone::Deferred(StoodAside::Waiting(_)))),
+                "{waits:?}: {done:?}"
             );
             let ops = Scripted::new(vec![Ok(status)]);
-            let looks = Cell::new(0);
             assert_eq!(
-                looked(&ops, &ALLOWED, &Heard::Found, &looks),
+                observed(&ops, &ALLOWED),
                 PeersRead::Deferred(not_let_in(
                     "vault alab",
                     (waits, &|| JoinPlace::Home),
@@ -407,8 +489,7 @@ mod tests {
         }
         let ops = Scripted::new(vec![Ok(alab_pending())]);
         ops.placed(JoinPlace::Away);
-        let looks = Cell::new(0);
-        let read = looked(&ops, &ALLOWED, &Heard::Found, &looks);
+        let read = observed(&ops, &ALLOWED);
         assert!(
             matches!(&read, PeersRead::Deferred(why)
                 if why.contains(aterm_secrets::alab_join::LET_IN_AWAY)
@@ -426,13 +507,12 @@ mod tests {
     fn a_dropped_mac_reads_deferred_with_how_it_comes_back() {
         let ops = Scripted::new(vec![Ok(configured(Membership::Revoked { seq: 9 }))]);
         ops.drops(DROPPED);
-        let looks = Cell::new(0);
         assert_eq!(
-            looked(&ops, &ALLOWED, &Heard::Found, &looks),
+            observed(&ops, &ALLOWED),
             PeersRead::Deferred(format!("vault alab: {DROPPED}; no pass joins it again"))
         );
         assert_eq!(ops.dropped_asks(), [9]);
-        assert_eq!(looks.get(), 0, "a vault configured here is not looked for");
+        assert_eq!(ops.probes(), 0);
         assert!(ops.joins().is_empty(), "no pass joins it");
     }
 
@@ -443,8 +523,7 @@ mod tests {
     #[test]
     fn a_mac_an_admin_removed_reads_deferred_not_joined() {
         let ops = Scripted::new(vec![Ok(configured(Membership::Revoked { seq: 9 }))]);
-        let looks = Cell::new(0);
-        let read = looked(&ops, &ALLOWED, &Heard::Found, &looks);
+        let read = observed(&ops, &ALLOWED);
         let PeersRead::Deferred(why) = &read else {
             panic!("{read:?}");
         };
@@ -452,102 +531,77 @@ mod tests {
             why.contains("this Mac was removed from vault alab"),
             "{why}"
         );
-        assert_eq!(looks.get(), 0, "a vault configured here is not looked for");
+        assert_eq!(ops.probes(), 0);
         assert!(ops.joins().is_empty(), "no pass joins it");
         let ops = Scripted::new(vec![Ok(configured(Membership::In { seq: 9, heard: 1 }))]);
         assert_eq!(
-            looked(&ops, &ALLOWED, &Heard::Found, &looks),
+            observed(&ops, &ALLOWED),
             PeersRead::Joined("in vault alab".to_owned())
         );
     }
 
-    /// Once macOS refused aterm the local network no pass looks or asks: a refusal on record
-    /// reads deferred without a look, as does a look macOS refused; an untold Local Network
-    /// is not looked at either (a look could raise the question), nor is anything looked for
-    /// by a pass other than the window's.
+    /// While the LAN broker does not answer no pass looks: the read waits for the broker,
+    /// deferred and naming why, and looks once it answers (a look macOS refused waits for the
+    /// next); nor is anything looked for by a pass other than the window's. NEGATIVE CONTROL: a
+    /// read that ignores `broker` looks.
     #[test]
-    fn a_refused_local_network_is_never_looked_at_again() {
+    fn no_look_runs_until_the_lan_broker_answers() {
         let ops = Scripted::new(vec![Ok(unconfigured())]);
-        let looks = Cell::new(0);
-        let refused = Gate {
-            lan: Lan::Refused,
+        let absent = Gate {
+            broker: Some(aterm_uds::lan::Unavailable::NotInstalled.to_string()),
             ..ALLOWED
         };
         for _ in 0..2 {
             assert_eq!(
-                looked(&ops, &refused, &Heard::Found, &looks),
-                PeersRead::Deferred(LAN_REFUSED.to_owned())
+                observed(&ops, &absent),
+                PeersRead::Deferred(format!(
+                    "{}; {BROKER_WAIT}",
+                    aterm_uds::lan::Unavailable::NotInstalled
+                ))
             );
         }
-        let untold = Gate {
-            lan: Lan::Untold,
-            ..ALLOWED
-        };
+        assert!(matches!(observed(&ops, &ALLOWED), PeersRead::Joinable(_)));
         assert_eq!(
-            looked(&ops, &untold, &Heard::Found, &looks),
-            PeersRead::Deferred(LAN_UNTOLD.to_owned())
-        );
-        assert_eq!(looks.get(), 0, "no look");
-
-        assert_eq!(
-            looked(&ops, &ALLOWED, &Heard::Refused, &looks),
-            PeersRead::Deferred(LAN_REFUSED.to_owned())
-        );
-        assert_eq!(looks.get(), 1);
-        assert_eq!(
-            read(ops.as_ref(), &ALLOWED, None),
+            read(ops.as_ref(), &ALLOWED, false),
             Ok(PeersRead::Deferred(NOT_LOOKED.to_owned()))
         );
+        assert_eq!(ops.probes(), 0);
+        assert_eq!(ops.installs(), 0);
         assert!(ops.joins().is_empty());
     }
 
-    /// A person's choice keeps the vault out before any look: the subscriber turned off, or
-    /// System State's plan without the Secrets vault; a network with no ALab vault reads off.
+    /// A person's choice keeps the vault out before any effect: the subscriber turned off, or
+    /// System State's plan without the Secrets vault.
     #[test]
-    fn a_choice_or_a_network_without_the_vault_reads_off() {
+    fn a_choice_keeps_automatic_admission_off() {
         let ops = Scripted::new(vec![Ok(unconfigured())]);
-        let looks = Cell::new(0);
         let chosen = Gate {
             off: Some("System State's plan leaves the Secrets vault out".to_owned()),
             ..ALLOWED
         };
-        assert!(matches!(
-            looked(&ops, &chosen, &Heard::Found, &looks),
-            PeersRead::Off(_)
-        ));
-        assert_eq!(looks.get(), 0);
-        for heard in [Heard::Elsewhere, Heard::Unreached("timed out".to_owned())] {
-            let read = looked(&ops, &ALLOWED, &heard, &looks);
-            assert!(matches!(read, PeersRead::Off(_)), "{heard:?}: {read:?}");
-        }
+        assert!(matches!(observed(&ops, &chosen), PeersRead::Off(_)));
         ops.turn_off();
-        assert!(matches!(
-            looked(&ops, &ALLOWED, &Heard::Found, &looks),
-            PeersRead::Off(_)
-        ));
-        assert_eq!(looks.get(), 2);
+        assert!(matches!(observed(&ops, &ALLOWED), PeersRead::Off(_)));
+        assert_eq!(ops.probes(), 0);
+        assert_eq!(ops.installs(), 0);
+        assert!(ops.joins().is_empty());
     }
 
     /// While a run of System State's owes its Secrets stage, the window's pass leaves the join
-    /// to that stage: deferred, with no look; once the stage is done it looks and joins.
-    /// NEGATIVE CONTROL: a read that ignores `owed` looks and reads the vault joinable beside
-    /// the stage.
+    /// to that stage: deferred, with no effect; once the stage is done a later pass is eligible.
+    /// NEGATIVE CONTROL: ignoring `owed` permits admission beside the pending stage.
     #[test]
     fn a_run_that_owes_its_secrets_stage_keeps_the_join() {
         let ops = Scripted::new(vec![Ok(unconfigured())]);
-        let looks = Cell::new(0);
         let owed = Gate {
             owed: true,
             ..ALLOWED
         };
         assert_eq!(
-            looked(&ops, &owed, &Heard::Found, &looks),
+            observed(&ops, &owed),
             PeersRead::Deferred(STAGE_OWED.to_owned())
         );
-        assert_eq!(looks.get(), 0, "no look");
-        assert!(matches!(
-            looked(&ops, &ALLOWED, &Heard::Found, &looks),
-            PeersRead::Joinable(_)
-        ));
+        assert_eq!(ops.probes(), 0);
+        assert!(matches!(observed(&ops, &ALLOWED), PeersRead::Joinable(_)));
     }
 }

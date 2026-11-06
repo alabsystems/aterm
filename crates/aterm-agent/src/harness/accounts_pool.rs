@@ -364,7 +364,7 @@ struct GoogleSelection {
     mode: Mode,
     pinned: bool,
     active: Option<String>,
-    pending_pin: Option<accounts::PinRequest>,
+    pending_pin: Option<accounts::PendingSelection>,
 }
 
 #[cfg(unix)]
@@ -393,10 +393,11 @@ impl GoogleSelection {
     fn permits(&self, row: &Row, state: &accounts::State, now: i64) -> Result<(), String> {
         if row.held_by.is_some()
             || (self.pinned && self.active.as_deref() != Some(row.label.as_str()))
-            || self
-                .pending_pin
-                .as_ref()
-                .is_some_and(|pin| pin.label() != row.label)
+            || self.pending_pin.as_ref().is_some_and(|selection| {
+                selection
+                    .account()
+                    .is_some_and(|pin| pin.label() != row.label)
+            })
         {
             return Err(
                 "Native Google worker no longer matches its permitted account selection".into(),

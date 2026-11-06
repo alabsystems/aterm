@@ -45,6 +45,9 @@ pub struct Baseline {
     /// `[[defaults]]`: the raw escape hatch.
     #[serde(default)]
     pub defaults: Vec<items::defaults::Row>,
+    /// `[lan]`.
+    #[serde(default)]
+    pub lan: Option<items::lan::Table>,
     /// `[developer]`.
     #[serde(default)]
     pub developer: Option<items::developer::Table>,

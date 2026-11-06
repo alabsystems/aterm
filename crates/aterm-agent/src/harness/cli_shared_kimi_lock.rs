@@ -27,7 +27,10 @@ struct Lease {
     inode: (u64, u64),
     modified: SystemTime,
     updated: Instant,
-    deadline: Instant,
+    updated_continuous: Option<u64>,
+    deadline: crate::harness::auth_deadline::Bounds,
+    #[cfg(test)]
+    slept_ns: Arc<std::sync::atomic::AtomicU64>,
     active: bool,
 }
 
@@ -48,6 +51,15 @@ fn identity(meta: &Metadata) -> (u64, u64) {
 }
 
 impl Lease {
+    fn continuous(&self) -> Option<u64> {
+        let now = aterm_uds::process::continuous_ns();
+        #[cfg(test)]
+        let now = now.map(|now| {
+            now.saturating_add(self.slept_ns.load(std::sync::atomic::Ordering::Acquire))
+        });
+        now
+    }
+
     fn owns_path(&self) -> bool {
         self.path
             .parent()
@@ -59,14 +71,32 @@ impl Lease {
     }
 
     fn current(&self) -> bool {
+        let continuous = self.continuous();
+        !self
+            .deadline
+            .remaining(Instant::now(), continuous)
+            .is_zero()
+            && self.authority_current()
+    }
+
+    fn authority_current(&self) -> bool {
+        let continuous_fresh = match (self.updated_continuous, self.continuous()) {
+            (Some(then), Some(now)) => now
+                .checked_sub(then)
+                .is_some_and(|age| Duration::from_nanos(age) < STALE),
+            _ => true,
+        };
         self.active
-            && Instant::now() < self.deadline
+            && continuous_fresh
             && self.updated.elapsed() < STALE
+            && SystemTime::now()
+                .duration_since(self.modified)
+                .is_ok_and(|age| age < STALE)
             && self.owns_path()
     }
 
     fn heartbeat(&mut self) -> bool {
-        if !self.current() {
+        if !self.authority_current() {
             self.active = false;
             return false;
         }
@@ -83,6 +113,7 @@ impl Lease {
         };
         self.modified = modified;
         self.updated = Instant::now();
+        self.updated_continuous = self.continuous();
         self.active = self.owns_path();
         self.active
     }
@@ -101,12 +132,13 @@ pub(in crate::harness) struct NativeLock {
     lease: Arc<Mutex<Lease>>,
     stop: mpsc::Sender<()>,
     worker: Option<std::thread::JoinHandle<()>>,
+    authority: Arc<dyn Authority>,
 }
 
 #[derive(Debug)]
 struct Guard {
-    authority: Arc<dyn aterm_http::Guard>,
     lease: Arc<Mutex<Lease>>,
+    authority: Arc<dyn Authority>,
 }
 
 impl aterm_http::Guard for Guard {
@@ -116,7 +148,53 @@ impl aterm_http::Guard for Guard {
     }
 }
 
+impl Authority for Guard {
+    fn receipt_current(&self) -> bool {
+        self.authority.receipt_current()
+            && self
+                .lease
+                .lock()
+                .is_ok_and(|lease| lease.authority_current())
+    }
+    fn binding_current(&self) -> bool {
+        self.authority.binding_current()
+    }
+    fn recovery_context(&self) -> Result<RecoveryContext, String> {
+        self.authority.recovery_context()
+    }
+    fn checkpoint_started(&self, config: [u8; 32], predecessor: [u8; 32]) -> Result<(), String> {
+        if !aterm_http::Guard::is_authorized(self) {
+            return Err("Kimi native lease is unavailable".into());
+        }
+        self.authority.checkpoint_started(config, predecessor)
+    }
+    fn checkpoint_completed(&self, status: u16, received: i64, body: &[u8]) -> Result<(), String> {
+        if !self.binding_current() {
+            return Err("Kimi account authority is unavailable".into());
+        }
+        self.authority.checkpoint_completed(status, received, body)
+    }
+    fn checkpoint_unstarted(&self) -> Result<(), String> {
+        self.authority.checkpoint_unstarted()
+    }
+    fn checkpoint_dispatching(&self) -> Result<(), String> {
+        self.authority.checkpoint_dispatching()
+    }
+    fn checkpoint_applied(&self) -> Result<(), String> {
+        if !self.receipt_current() {
+            return Err("Kimi native lease is unavailable".into());
+        }
+        self.authority.checkpoint_applied()
+    }
+}
+
 impl NativeLock {
+    #[cfg(test)]
+    pub(super) fn observe_clock(&self, clock: Option<Arc<std::sync::atomic::AtomicU64>>) {
+        if let Some(clock) = clock {
+            self.lease.lock().unwrap().slept_ns = clock;
+        }
+    }
     pub(in crate::harness) fn check_current(&self) -> Result<(), String> {
         if self.lease.lock().is_ok_and(|lease| lease.current()) {
             Ok(())
@@ -128,10 +206,11 @@ impl NativeLock {
     pub(super) fn acquire(
         staging: &Path,
         region: Region,
-        deadline: Instant,
+        deadline: login_drive::Deadline<'_>,
+        authority: Arc<dyn Authority>,
     ) -> Result<Self, NativeError> {
         let started = Instant::now();
-        if Instant::now() >= deadline {
+        if deadline.expired() {
             return Err(NativeError::Temporary);
         }
         check_directory(staging)?;
@@ -178,7 +257,10 @@ impl NativeLock {
             inode: identity(&meta),
             modified: meta.modified().map_err(|_| NativeError::Temporary)?,
             updated: Instant::now(),
-            deadline,
+            updated_continuous: aterm_uds::process::continuous_ns(),
+            deadline: deadline.bounds(),
+            #[cfg(test)]
+            slept_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             active: true,
         };
         if started.elapsed() >= STALE || !lease.current() {
@@ -213,15 +295,13 @@ impl NativeLock {
             lease,
             stop,
             worker: Some(worker),
+            authority,
         })
     }
 
-    pub(super) fn guard(
-        &self,
-        authority: Arc<dyn aterm_http::Guard>,
-    ) -> Arc<dyn aterm_http::Guard> {
+    pub(super) fn guard(&self) -> Arc<dyn Authority> {
         Arc::new(Guard {
-            authority,
+            authority: self.authority.clone(),
             lease: self.lease.clone(),
         })
     }

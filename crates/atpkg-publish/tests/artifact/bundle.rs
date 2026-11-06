@@ -843,6 +843,14 @@ fn trust_mc_proves_its_hello_against_the_trust_sysroot_its_compiler_came_from() 
 /// as the pack lives: the hello runs its compiler, and gc must not reclaim it then.
 #[test]
 fn a_store_built_hello_sysroot_is_leased_while_the_pack_lives() {
+    // A parallel test can fork this descriptor before exec. Create the store
+    // only after an owned exact-case exec, so dropping this pack is the last close.
+    #[cfg(unix)]
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "artifact::bundle::a_store_built_hello_sysroot_is_leased_while_the_pack_lives",
+    ) {
+        return;
+    }
     let w = world("bundle-hello-lease");
     let (mut req, _) = trust_mc(&w);
     let hs = w.ctx.pkg_prefix.join("store/trust/7");

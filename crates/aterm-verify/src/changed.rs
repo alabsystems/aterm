@@ -794,6 +794,15 @@ pub fn git(dir: &Path, path_env: &OsStr) -> Command {
     c
 }
 
+/// Every path changed since the merge-base of HEAD and `base`: committed, staged, unstaged and
+/// untracked ([`flag_hidden_edits`] too).
+///
+/// # Errors
+/// This is no git checkout, HEAD and `base` share no merge-base, or git cannot list the files.
+pub fn changed_since(root: &Path, path_env: &OsStr, base: &str) -> Result<Vec<String>, String> {
+    changed_paths(root, path_env, base).map(|(_, paths)| paths)
+}
+
 /// The merge-base of HEAD and `base`, and every path changed since it ([`flag_hidden_edits`]).
 fn changed_paths(
     root: &Path,

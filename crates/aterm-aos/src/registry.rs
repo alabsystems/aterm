@@ -300,7 +300,10 @@ impl Listing {
     /// The listing's head line.
     #[must_use]
     pub fn line(&self) -> String {
-        format!(
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(128 + self.task.len() + self.code.len());
+        let _ = write!(
+            out,
             "slot={} kind={} task={} code={} attached={} paused={} rev={} log_epoch={} log={} \
              waiting={} kept={} rows={} dropped={}",
             self.slot,
@@ -316,7 +319,8 @@ impl Listing {
             self.kept,
             self.timeline.len(),
             self.timeline.dropped()
-        )
+        );
+        out
     }
 }
 

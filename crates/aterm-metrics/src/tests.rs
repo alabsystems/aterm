@@ -1229,6 +1229,69 @@ fn the_quota_merge_never_sums() {
     }
 }
 
+/// AN ENDED ROW IS NO READING: a Mac whose roster no longer lists an account ends its row once
+/// ([`QuotaRow::ended`]), and the account view leaves that Mac out, its figure and wall with it,
+/// while a Mac that still holds the account stays; once every Mac has ended it, the account is
+/// not listed. NEGATIVE CONTROL: the same row under another condition word is a Mac's row again.
+#[test]
+fn an_account_its_macs_removed_is_left_out_of_the_view() {
+    let now = 1_793_000_000;
+    let reset = now + 86_400;
+    let (a, b) = (node(1), node(2));
+    let live = quota_row(now - 60, Some(70), Some(reset));
+    let mut walled = quota_row(now - 30, Some(95), Some(reset));
+    walled.walled_until = Some(now + 600);
+    fn offer(s: &mut Snapshots, n: Node, seq: u64, row: &QuotaRow) {
+        s.offer(row.subject(n).expect("claude"), seq, &row.encode())
+            .expect("a quota row is taken");
+    }
+    let mut s = Snapshots::new();
+    offer(&mut s, a, 1, &live);
+    offer(&mut s, b, 1, &walled);
+
+    let ended = walled.ended(now);
+    assert!(ended.removed());
+    assert_eq!(
+        (
+            ended.pct5,
+            ended.pct7,
+            ended.walled_until,
+            ended.last_used,
+            ended.plan.as_ref()
+        ),
+        (None, None, None, None, None),
+        "an ended row carries no figure"
+    );
+    offer(&mut s, b, 2, &ended);
+    offer(&mut s, a, 2, &live);
+    let views = s.accounts(now);
+    assert_eq!(views.len(), 1, "a Mac still holds the account");
+    let macs: Vec<Node> = views[0].macs.iter().map(|m| m.node).collect();
+    assert_eq!(macs, [a], "the Mac that removed it is left out");
+    assert_eq!(views[0].wall, None, "its wall went with it");
+    assert_eq!(
+        views[0].week,
+        Some(Usage::Current {
+            pct: 70,
+            reset: Some(reset),
+            read: now - 60,
+            by: a,
+        })
+    );
+
+    offer(&mut s, a, 3, &live.ended(now));
+    assert!(s.accounts(now).is_empty(), "every Mac removed it");
+
+    let mut control = live.ended(now);
+    control.condition = word("unseen");
+    offer(&mut s, a, 4, &control);
+    assert_eq!(
+        s.accounts(now).len(),
+        1,
+        "a row under another word is shown"
+    );
+}
+
 /// THE SNAPSHOT RULES on an injected clock: a late lower-sequence row never replaces a newer
 /// one; each Mac's row shows its age; a window whose every reset passed with nothing read
 /// since says so; a reading made since speaks for the new window; a group a whole window

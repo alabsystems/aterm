@@ -143,7 +143,7 @@ pub struct Tally {
     pub last_escalated_ms: Option<i64>,
     /// [`HarnessStats::self_claimed`]'s share: what each self-claim's holder did in the session.
     pub self_claimed: BTreeMap<String, SelfClaimed>,
-    /// The session's own ledger or journal may have lost the window's start.
+    /// The session's own ledger or journal may be incomplete for this window.
     pub cut: bool,
 }
 
@@ -326,12 +326,17 @@ impl HarnessStats {
         }
     }
 
-    /// No row of aterm's own harness fell in the window (a self-claim's rows are in
-    /// [`Self::self_claimed`], never in [`Self::rows`]): the page says aterm's harness has done
-    /// nothing there yet.
+    /// No row of aterm's own harness was counted in the window. Check [`Self::is_partial`]
+    /// before treating this as complete history; self-claimed rows stay separate.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.rows == 0
+    }
+
+    /// History may be missing or contain rows whose activity could not be read.
+    #[must_use]
+    pub const fn is_partial(&self) -> bool {
+        self.cut || self.bad > 0
     }
 
     /// The window's [`FORCED_CONTINUES`]: its acts of [`FORCED_CONTINUE_RULES`].
@@ -1559,57 +1564,81 @@ struct Listed {
     kind: DriveFile,
     sid: String,
     modified_ms: Option<i64>,
+    /// The candidate's file type could not be established during discovery.
+    cut: bool,
 }
 
-fn drive_files_under(state_dir: &Path, since_ms: i64) -> Vec<Listed> {
-    if !matches!(
-        super::upgrade_drive::check_owned_plain_dir_existing(state_dir),
-        Ok(true)
-    ) {
-        return Vec::new();
-    }
-    drive_files(&state_dir.join("drive"), since_ms)
+/// A discovery may keep readable files while another entry could not be identified.
+#[derive(Default)]
+struct Discovered {
+    files: Vec<Listed>,
+    cut: bool,
 }
 
-fn drive_files(drive: &Path, since_ms: i64) -> Vec<Listed> {
-    if !matches!(
-        super::upgrade_drive::check_owned_plain_dir_existing(drive),
-        Ok(true)
-    ) {
-        return Vec::new();
-    }
-    let Ok(entries) = std::fs::read_dir(drive) else {
-        return Vec::new();
+fn drive_files_under(state_dir: &Path, since_ms: i64) -> Discovered {
+    let scan = || -> std::io::Result<Discovered> {
+        if !super::upgrade_drive::check_owned_plain_dir_existing(state_dir)? {
+            return Ok(Discovered::default());
+        }
+        let drive = state_dir.join("drive");
+        if !super::upgrade_drive::check_owned_plain_dir_existing(&drive)? {
+            return Ok(Discovered::default());
+        }
+        Ok(drive_files(std::fs::read_dir(drive)?, since_ms, |entry| {
+            entry.file_type().map(|kind| kind.is_file())
+        }))
     };
-    let mut out: Vec<Listed> = entries
-        .filter_map(Result::ok)
-        .filter_map(|e| {
-            let name = e.file_name();
-            let name = name.to_str()?;
-            let kind = if name.ends_with(DriveFile::Journal.suffix()) {
-                DriveFile::Journal
-            } else if name.ends_with(DriveFile::Ledger.suffix()) {
-                DriveFile::Ledger
-            } else {
-                return None;
-            };
-            if !e.file_type().is_ok_and(|t| t.is_file()) {
-                return None;
+    scan().unwrap_or_else(|_| Discovered {
+        cut: true,
+        ..Discovered::default()
+    })
+}
+
+fn drive_files(
+    entries: impl IntoIterator<Item = std::io::Result<std::fs::DirEntry>>,
+    since_ms: i64,
+    mut is_file: impl FnMut(&std::fs::DirEntry) -> std::io::Result<bool>,
+) -> Discovered {
+    let mut out = Discovered::default();
+    for entry in entries {
+        let e = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                out.cut = true;
+                continue;
             }
-            let modified_ms = e.metadata().ok().and_then(meta_modified_ms);
-            if untouched(modified_ms, since_ms) {
-                return None;
-            }
-            let sid = name.strip_suffix(kind.suffix()).unwrap_or(name).to_string();
-            Some(Listed {
-                path: e.path(),
-                kind,
-                sid,
-                modified_ms,
-            })
-        })
-        .collect();
-    out.sort_by(|a, b| a.path.cmp(&b.path));
+        };
+        let name = e.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let kind = if name.ends_with(DriveFile::Journal.suffix()) {
+            DriveFile::Journal
+        } else if name.ends_with(DriveFile::Ledger.suffix()) {
+            DriveFile::Ledger
+        } else {
+            continue;
+        };
+        let cut = match is_file(&e) {
+            Ok(true) => false,
+            Ok(false) => continue,
+            // Keep the candidate for the nonblocking, no-follow regular-file reader.
+            // A later missing file cannot establish what this failed inspection hid.
+            Err(_) => true,
+        };
+        let modified_ms = e.metadata().ok().and_then(meta_modified_ms);
+        if untouched(modified_ms, since_ms) {
+            continue;
+        }
+        out.files.push(Listed {
+            path: e.path(),
+            kind,
+            sid: name.strip_suffix(kind.suffix()).unwrap_or(name).to_string(),
+            modified_ms,
+            cut,
+        });
+    }
+    out.files.sort_by(|a, b| a.path.cmp(&b.path));
     out
 }
 
@@ -1639,19 +1668,21 @@ fn upgrade_ledger(harness_state: &Path) -> PathBuf {
     harness_state.join("upgrade").join("ledger.jsonl")
 }
 
-fn checked_upgrade_ledger(harness_state: &Path) -> Option<PathBuf> {
+fn checked_upgrade_ledger(harness_state: &Path) -> std::io::Result<Option<PathBuf>> {
     super::upgrade_drive::check_upgrade_tree(harness_state, None)
-        .ok()
-        .flatten()
-        .map(|_| upgrade_ledger(harness_state))
+        .map(|tree| tree.map(|_| upgrade_ledger(harness_state)))
 }
 
 /// WHAT THE HARNESS DID since `since_ms` (unix ms), read from the files it keeps.
 #[must_use]
 pub fn stats_under(state_dir: &Path, harness_state: &Path, since_ms: i64) -> HarnessStats {
     let mut acc = HarnessStats::new(since_ms);
-    for file in drive_files_under(state_dir, since_ms) {
+    let discovered = drive_files_under(state_dir, since_ms);
+    acc.cut = discovered.cut;
+    for file in discovered.files {
+        acc.cut |= file.cut;
         let Ok(lines) = tail_lines(&file.path, READ_MAX_ROWS) else {
+            acc.cut = true;
             continue;
         };
         match file.kind {
@@ -1678,16 +1709,24 @@ pub fn stats_under(state_dir: &Path, harness_state: &Path, since_ms: i64) -> Har
             }
         }
     }
-    if let Some(path) = checked_upgrade_ledger(harness_state)
+    let upgrade = checked_upgrade_ledger(harness_state).unwrap_or_else(|_| {
+        acc.cut = true;
+        None
+    });
+    if let Some(path) = upgrade
         && !untouched_since(&path, since_ms)
-        && let Ok(lines) = tail_lines(&path, READ_MAX_ROWS)
     {
-        let oldest = lines
-            .iter()
-            .find_map(|l| row_and_time(l, "t").map(|(_, t)| t.saturating_mul(1000)));
-        acc.cut |= window_cut(lines.len(), DISK_LEDGER_KEEP_ROWS, oldest, since_ms);
-        for line in &lines {
-            fold_upgrade_line(&mut acc, line);
+        match tail_lines(&path, READ_MAX_ROWS) {
+            Ok(lines) => {
+                let oldest = lines
+                    .iter()
+                    .find_map(|l| row_and_time(l, "t").map(|(_, t)| t.saturating_mul(1000)));
+                acc.cut |= window_cut(lines.len(), DISK_LEDGER_KEEP_ROWS, oldest, since_ms);
+                for line in &lines {
+                    fold_upgrade_line(&mut acc, line);
+                }
+            }
+            Err(_) => acc.cut = true,
         }
     }
     acc
@@ -1714,14 +1753,44 @@ fn stats_windows_with(
     week_ms: i64,
     read: &mut dyn FnMut(&Path) -> std::io::Result<Vec<String>>,
 ) -> (HarnessStats, HarnessStats) {
+    stats_windows_from(
+        drive_files_under(state_dir, today_ms.min(week_ms)),
+        || checked_upgrade_ledger(harness_state),
+        today_ms,
+        week_ms,
+        read,
+    )
+}
+
+fn stats_windows_from(
+    discovered: Discovered,
+    upgrade: impl FnOnce() -> std::io::Result<Option<PathBuf>>,
+    today_ms: i64,
+    week_ms: i64,
+    read: &mut dyn FnMut(&Path) -> std::io::Result<Vec<String>>,
+) -> (HarnessStats, HarnessStats) {
     let mut today = HarnessStats::per_session(today_ms);
     let mut week = HarnessStats::new(week_ms);
-    for file in drive_files_under(state_dir, today_ms.min(week_ms)) {
+    today.cut = discovered.cut;
+    week.cut = discovered.cut;
+    for file in discovered.files {
         let wants = [
             !untouched(file.modified_ms, today_ms),
             !untouched(file.modified_ms, week_ms),
         ];
+        if file.cut {
+            for (acc, wanted) in [(&mut today, wants[0]), (&mut week, wants[1])] {
+                if wanted {
+                    acc.cut_of(&file.sid);
+                }
+            }
+        }
         let Ok(lines) = read(&file.path) else {
+            for (acc, wanted) in [(&mut today, wants[0]), (&mut week, wants[1])] {
+                if wanted {
+                    acc.cut_of(&file.sid);
+                }
+            }
             continue;
         };
         match file.kind {
@@ -1770,33 +1839,49 @@ fn stats_windows_with(
             }
         }
     }
-    if let Some(path) = checked_upgrade_ledger(harness_state) {
+    let upgrade = upgrade().unwrap_or_else(|_| {
+        today.cut = true;
+        week.cut = true;
+        None
+    });
+    if let Some(path) = upgrade {
         let modified = modified_ms(&path);
         let wants = [
             !untouched(modified, today_ms),
             !untouched(modified, week_ms),
         ];
-        if wants.contains(&true)
-            && let Ok(lines) = read(&path)
-        {
-            let mut oldest = None;
-            for line in &lines {
-                let row = row_and_time(line, "t");
-                if oldest.is_none() {
-                    oldest = row.as_ref().map(|(_, t)| t.saturating_mul(1000));
-                }
-                for (acc, wanted) in [(&mut today, wants[0]), (&mut week, wants[1])] {
-                    match &row {
-                        Some((v, t)) if wanted => fold_upgrade_row(acc, v, *t),
-                        None if wanted => bump(&mut acc.bad),
-                        _ => {}
+        if wants.contains(&true) {
+            match read(&path) {
+                Ok(lines) => {
+                    let mut oldest = None;
+                    for line in &lines {
+                        let row = row_and_time(line, "t");
+                        if oldest.is_none() {
+                            oldest = row.as_ref().map(|(_, t)| t.saturating_mul(1000));
+                        }
+                        for (acc, wanted) in [(&mut today, wants[0]), (&mut week, wants[1])] {
+                            match &row {
+                                Some((v, t)) if wanted => fold_upgrade_row(acc, v, *t),
+                                None if wanted => bump(&mut acc.bad),
+                                _ => {}
+                            }
+                        }
+                    }
+                    for (acc, wanted) in [(&mut today, wants[0]), (&mut week, wants[1])] {
+                        // The upgrade ledger is every session's: its cut is the window's.
+                        if wanted
+                            && window_cut(lines.len(), DISK_LEDGER_KEEP_ROWS, oldest, acc.since_ms)
+                        {
+                            acc.cut = true;
+                        }
                     }
                 }
-            }
-            for (acc, wanted) in [(&mut today, wants[0]), (&mut week, wants[1])] {
-                // The upgrade ledger is every session's: its cut is the window's.
-                if wanted && window_cut(lines.len(), DISK_LEDGER_KEEP_ROWS, oldest, acc.since_ms) {
-                    acc.cut = true;
+                Err(_) => {
+                    for (acc, wanted) in [(&mut today, wants[0]), (&mut week, wants[1])] {
+                        if wanted {
+                            acc.cut = true;
+                        }
+                    }
                 }
             }
         }

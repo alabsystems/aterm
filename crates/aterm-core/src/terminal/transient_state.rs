@@ -7,7 +7,7 @@
 use super::response_rate_limiter::ResponseRateLimiter;
 use super::types::SgrStackEntry;
 use aterm_types::{PipelineTimestamps, Rgb};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use aterm_grid::ImageData;
@@ -66,10 +66,8 @@ pub(super) struct TransientState {
     pub(super) response_rate_limiter: ResponseRateLimiter,
     /// Last graphic character received (for REP - CSI b).
     pub(super) last_graphic_char: Option<char>,
-    /// Current hyperlink (OSC 8).
-    pub(super) current_hyperlink: Option<Arc<str>>,
-    /// Current hyperlink ID (OSC 8 `id=` parameter).
-    pub(super) current_hyperlink_id: Option<Arc<str>>,
+    /// Shared current hyperlink URL and optional ID (OSC 8).
+    pub(super) current_hyperlink: Option<Arc<aterm_grid::HyperlinkData>>,
     /// Current underline color (SGR 58).
     pub(super) current_underline_color: Option<u32>,
     /// VT52 cursor addressing state.
@@ -179,6 +177,8 @@ pub(super) struct TransientState {
     pub(super) kitty_pending: Option<crate::terminal::kitty_graphics::KittyCommand>,
     /// Per screen (`[main, alternate]`, indexed by `modes.alternate_screen`), an upper bound on the payload bytes of the inline images that screen shows, held under `MAX_LIVE_IMAGE_BYTES` by `TerminalHandler::admit_live_image` (which explains the bound).
     pub(super) live_image_charge: [usize; 2],
+    /// Payload bytes the primary screen may still place before its history's images are measured again (`TerminalHandler::admit_live_image`, which explains the bound). 0, as after a restore, measures at the next placement.
+    pub(super) history_image_room: usize,
     /// Edge-triggered BEL flag set by `handle_bell()` (after rate limiting) and drained by `Terminal::drain_bell()`, for polling hosts. A reset keeps it: the bell rang before it.
     pub(super) bell_pending: bool,
     /// App-event queue of OSC payloads `(code, payload)` the host polls via `Terminal::take_osc_event`: OSC 52 decoded clipboard, OSC 7 cwd, OSC 133 marks. A reset keeps every event, as `clear` does: they happened before it, and a reset renumbers no row (an A, B or C's `row=` names the row its mark was made on, as after ED 2 and ED 3).
@@ -193,9 +193,31 @@ pub(super) struct TransientState {
     pub(super) kitty_unscrolls: u64,
     /// Monotonic count of live host query answers (`OSC 52 ; ?` clipboard reads and `WindowCallback` responses) that pure replay cannot reproduce; never reset.
     pub(super) host_io_ordinal: u64,
+    /// Test seam: print multi-byte runs the reference way, one narrow glyph at a time from runs that hold no ASCII ([`Terminal::set_reference_print_path`](super::Terminal::set_reference_print_path)).
+    #[cfg(any(test, debug_assertions))]
+    pub(super) reference_print_path: bool,
 }
 
 impl TransientState {
+    /// Every image the Kitty store holds (images, frames, variants), by address.
+    pub(super) fn kitty_store_images(&self) -> HashSet<*const ImageData> {
+        self.kitty_images
+            .values()
+            .map(Arc::as_ptr)
+            .chain(
+                self.kitty_frames
+                    .values()
+                    .flat_map(|animation| animation.frames.iter().map(|f| Arc::as_ptr(&f.image))),
+            )
+            .chain(
+                self.kitty_variants
+                    .values()
+                    .flatten()
+                    .map(|v| Arc::as_ptr(&v.image)),
+            )
+            .collect()
+    }
+
     pub(super) fn new() -> Self {
         Self {
             response_buffer: Vec::new(),
@@ -203,7 +225,6 @@ impl TransientState {
             response_rate_limiter: ResponseRateLimiter::new(),
             last_graphic_char: None,
             current_hyperlink: None,
-            current_hyperlink_id: None,
             current_underline_color: None,
             vt52_cursor_state: Vt52CursorState::None,
             sync_start: None,
@@ -261,6 +282,7 @@ impl TransientState {
             kitty_total_bytes: 0,
             kitty_pending: None,
             live_image_charge: [0; 2],
+            history_image_room: 0,
             bell_pending: false,
             osc_events: OscEventQueue::default(),
             print_anchor: None,
@@ -268,6 +290,8 @@ impl TransientState {
             kitty_commands: 0,
             kitty_unscrolls: 0,
             host_io_ordinal: 0,
+            #[cfg(any(test, debug_assertions))]
+            reference_print_path: false,
         }
     }
 
@@ -300,7 +324,6 @@ impl TransientState {
     pub(super) fn reset(&mut self) {
         self.last_graphic_char = None;
         self.current_hyperlink = None;
-        self.current_hyperlink_id = None;
         self.current_underline_color = None;
         self.vt52_cursor_state = Vt52CursorState::default();
         if self.sync_start.is_some() {
@@ -350,6 +373,7 @@ impl TransientState {
         self.kitty_total_bytes = 0;
         self.kitty_pending = None;
         self.live_image_charge = [0; 2];
+        self.history_image_room = 0;
     }
 }
 

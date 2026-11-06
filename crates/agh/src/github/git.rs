@@ -94,7 +94,7 @@ impl<'a> Git<'a> {
         let mut listing = walked
             .map(|value| from_json::<T>(&value))
             .map_err(|e| e.with_repo(self.slug.to_string()))?;
-        listing.items.sort_by(|a, b| name(a).cmp(name(b)));
+        listing.items.sort_unstable_by(|a, b| name(a).cmp(name(b)));
         limit_after_sort(&mut listing, opts.limit);
         Ok(listing)
     }

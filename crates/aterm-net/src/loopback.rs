@@ -67,6 +67,13 @@ pub(crate) fn forced<R>(on: bool, f: impl FnOnce() -> R) -> R {
     ran
 }
 
+/// Whether this process runs under the guard: every fleet listen, dial, lookup and browse it
+/// makes stays on the loopback ([`check`]), so none of its fleet traffic is local network.
+#[must_use]
+pub fn confined() -> bool {
+    on()
+}
+
 fn on() -> bool {
     #[cfg(test)]
     {

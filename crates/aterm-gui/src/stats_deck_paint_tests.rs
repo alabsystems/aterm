@@ -23,7 +23,8 @@ pub(crate) const MIN_MS: i64 = 60_000;
 pub(crate) const GIB: f64 = 1_073_741_824.0;
 /// The front tab's key.
 pub(crate) const FRONT: u64 = 2;
-const LONG_TAB: &str = "release build of the whole workspace now";
+/// T-G4's worst tab name.
+pub(crate) const LONG_TAB: &str = "release build of the whole workspace now";
 const EPS: f64 = 0.01;
 
 /// The scenes the spec's mockups and tests read.
@@ -2465,8 +2466,9 @@ fn a_box_column_is_its_mean_and_its_tick_its_max() {
 /// at least a device px of ground under the row above (v2 defect 8: a 1× cap touched or entered
 /// it). Row 0's caps stand under the header's axis rail and ticks, which end on one foot: a
 /// device px of ground between at 2×, flush at 1× (A1 §3 as built: the rail cannot rise into the
-/// header words' descenders). On every read box of every strip, every box over, of Full and
-/// Folded at five widths, at 1× and 2×.
+/// header words' descenders), where the rail breaks over the cap
+/// (`the_rail_breaks_over_a_cap_it_would_touch`). On every read box of every strip, every box
+/// over, of Full and Folded at five widths, at 1× and 2×.
 #[test]
 fn the_over_cap_sits_outside_the_plate_and_clear_of_the_row_above() {
     let m = FaceMetrics::helvetica_neue();
@@ -2496,12 +2498,9 @@ fn the_over_cap_sits_outside_the_plate_and_clear_of_the_row_above() {
                     let rects = multi_scale_slot_rects(&strip, s, 0.0);
                     let (sx0, sx1) = (px(strip.x, s), px(strip.end(), s));
                     // The axis rail's foot, where the ticks end too.
-                    let rail = laid.prims.iter().find_map(|p| match *p {
-                        DrawPrim::Panel {
-                            x, y, w, h, fill, ..
-                        } if fill == grid && h == 1.0 && x == sx0 && x + w == sx1 => Some(y + 1.0),
-                        _ => None,
-                    });
+                    let rail = rail_pieces(&laid.prims, grid, (sx0, sx1), px(rows.top(0), s))
+                        .first()
+                        .map(|p| p.2 + 1.0);
                     let rail = rail.unwrap_or_else(|| {
                         panic!("CONTROL {form:?} {w} pt at {s}×: the strip's axis rail")
                     });
@@ -2576,6 +2575,421 @@ fn the_over_cap_sits_outside_the_plate_and_clear_of_the_row_above() {
         caps.iter().all(|&n| n > 100),
         "CONTROL: caps were read ({caps:?})"
     );
+}
+
+/// The axis rail's pieces over `strip`: every 1 device px tall `grid` panel inside the strip and
+/// above its first row's top `y_row0`, as `(x0, x1, y)`.
+fn rail_pieces(
+    prims: &[DrawPrim],
+    grid: crate::widget::Rgba,
+    (sx0, sx1): (f32, f32),
+    y_row0: f32,
+) -> Vec<(f32, f32, f32)> {
+    prims
+        .iter()
+        .filter_map(|p| match *p {
+            DrawPrim::Panel {
+                x, y, w, h, fill, ..
+            } if fill == grid && h == 1.0 && x >= sx0 && x + w <= sx1 && y < y_row0 => {
+                Some((x, x + w, y))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Where the axis rail on row `rail_y` breaks over row 0's over caps on `strip` at scale `s`
+/// (`y_row0` row 0's top): each cap that would touch the rail, a device px wider either side, with
+/// its box's band, as `(x0, x1, band)`; and how many caps row 0 drew. A cap is an over panel in the
+/// strip, wholly above its plates and under the rail.
+fn rail_breaks(
+    prims: &[DrawPrim],
+    over: crate::widget::Rgba,
+    strip: &Strip,
+    s: f64,
+    y_row0: f32,
+    rail_y: f32,
+) -> (Vec<(f32, f32, u8)>, usize) {
+    let (sx0, sx1) = (px(strip.x, s), px(strip.end(), s));
+    let boxes = multi_scale_slot_rects(strip, s, 0.0);
+    let slots = strip.spec.slots();
+    let caps: Vec<(f32, f32, f32, f32, u8)> = prims
+        .iter()
+        .filter_map(|p| match *p {
+            DrawPrim::Panel {
+                x, y, w, h, fill, ..
+            } if fill == over && x >= sx0 && x + w <= sx1 && y + h <= y_row0 && y > rail_y => {
+                let &(i, ..) = boxes
+                    .iter()
+                    .find(|b| b.1 <= x && x + w <= b.1 + b.2)
+                    .expect("a cap stands over its box");
+                Some((x, y, w, h, slots[i].band))
+            }
+            _ => None,
+        })
+        .collect();
+    let breaks = caps
+        .iter()
+        .filter(|c| c.1 <= rail_y + 1.0)
+        .map(|c| (c.0 - 1.0, c.0 + c.2 + 1.0, c.4))
+        .collect();
+    (breaks, caps.len())
+}
+
+/// A1 §3, row 0's over cap under the axis rail (the R3 lens fixes, 2026-11-06): where a cap would
+/// touch the rail (at 1× it stands in the device row under it), the rail breaks over it and keeps a
+/// device px of ground either side, so the cap reads as its box's and not as the rail's edge. A
+/// piece under 3 px left between two breaks of one band's caps goes too, and every other px of the
+/// strip keeps the rail: a piece across a gate stays, however short. At 2× a cap keeps a px of
+/// ground under the rail, and the rail is whole. Full and Folded at five widths, every box half
+/// over and wholly over. NEGATIVE CONTROLS: an unbroken rail at 1× stands on the px over every cap;
+/// with the specks between one band's caps kept, or with every short piece dropped, the rail's
+/// px differ from the rule's (`specks` and `gate_pieces` count where each would show).
+#[test]
+fn the_rail_breaks_over_a_cap_it_would_touch() {
+    let m = FaceMetrics::helvetica_neue();
+    let snap = scene(Scene::Calm);
+    let (mut touching, mut specks, mut gate_pieces) = (0_usize, 0_usize, 0_usize);
+    for form in [DeckForm::Full, DeckForm::Folded] {
+        for w in [1119.0, 700.0, 420.0, 250.0, 180.0] {
+            if ground_only(w, form, &m) {
+                continue;
+            }
+            for (s, share) in [1.0, 2.0]
+                .into_iter()
+                .flat_map(|s| [(s, 1.0_f32), (s, 0.5)])
+            {
+                let input = scene_input(&snap, form);
+                let over = rgba(input.inks.over, 0xFF);
+                let grid = rgba(input.inks.grid, 0xFF);
+                let mut words = DeckWords::new(&input, &m);
+                for row in &mut words.rows {
+                    row.live_over = share;
+                    for slots in &mut row.multi_scale {
+                        for slot in slots {
+                            slot.cell.over = share;
+                        }
+                    }
+                }
+                let laid = lay(&geom(w, s, form), &input, &words, &m, true);
+                for (strip, rows, _) in strips(w, form, &m) {
+                    let tag = format!(
+                        "{form:?} {w} pt at {s}×, over {share}, strip at {}",
+                        strip.x
+                    );
+                    let (sx0, sx1) = (px(strip.x, s), px(strip.end(), s));
+                    let y_row0 = px(rows.top(0), s);
+                    let pieces = rail_pieces(&laid.prims, grid, (sx0, sx1), y_row0);
+                    let Some(&(_, _, rail_y)) = pieces.first() else {
+                        panic!("CONTROL {tag}: the strip's axis rail");
+                    };
+                    assert!(
+                        pieces.iter().all(|p| p.2 == rail_y),
+                        "{tag}: the rail stands on one row: {pieces:?}"
+                    );
+                    let (breaks, caps) = rail_breaks(&laid.prims, over, &strip, s, y_row0, rail_y);
+                    assert!(caps > 0, "CONTROL {tag}: row 0's caps");
+                    if s > 1.0 {
+                        assert!(breaks.is_empty(), "{tag}: a px of ground under the rail");
+                    }
+                    touching += breaks.len();
+                    let broken = |x: i32| {
+                        let x = x as f32;
+                        breaks.iter().find(|b| b.0 <= x && x < b.1).map(|b| b.2)
+                    };
+                    let (x0, x1) = (sx0 as i32, sx1 as i32);
+                    let mut x = x0;
+                    while x < x1 {
+                        if broken(x).is_some() {
+                            x += 1;
+                            continue;
+                        }
+                        // A run of px no break covers, and the bands of the breaks either side.
+                        let start = x;
+                        while x < x1 && broken(x).is_none() {
+                            x += 1;
+                        }
+                        let (before, after) = (broken(start - 1), broken(x));
+                        let short = x - start < 3 && before.is_some() && after.is_some();
+                        let speck = short && before == after;
+                        specks += usize::from(speck);
+                        gate_pieces += usize::from(short && !speck);
+                        for k in start..x {
+                            let kf = k as f32;
+                            let inked = pieces.iter().any(|p| p.0 <= kf && kf < p.1);
+                            assert_eq!(
+                                inked, !speck,
+                                "{tag}: the rail at x {k} px, breaks {breaks:?}, pieces {pieces:?}"
+                            );
+                        }
+                    }
+                    for b in &breaks {
+                        assert!(
+                            !pieces.iter().any(|p| p.0 < b.1 && b.0 < p.1),
+                            "{tag}: the rail over the break {b:?}: {pieces:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        touching > 100 && specks > 10 && gate_pieces > 10,
+        "CONTROL: 1× caps touched the rail ({touching}), left specks ({specks}) and short pieces \
+         across gates ({gate_pieces})"
+    );
+}
+
+/// A1 §3, row 0's over cap under the axis rail where a time gap crosses it (the R3 lens fixes'
+/// review, 2026-11-06, and its own review): every px a gap lays above row 0 is judged, its notches'
+/// included. On the rail's row the gap's ink stands on exactly the px the grid's rail inks inside
+/// its span and on no px outside it, so it breaks over every cap it would touch and drops each
+/// speck between two caps of one band the grid's rail drops. Each end of the span keeps its notch
+/// over the rail, whose foot on the rail's row is the gap's rail itself, so a notch over a break
+/// stands a device px of ground clear of its cap, and nothing of the gap's ink stands on the
+/// caps' row under the rail. Full and Folded at five widths at 1×, every box half over and wholly
+/// over, under three gaps: a paused one 4 s long that its 10 s box keeps its reading under, a
+/// paused one 5 s long that its 1 min box keeps its reading under, and a crash across several
+/// 1 min boxes. A gap's px are the panels of its ink the deck lays with the gaps and not without
+/// them: the header's ticks stand in `words2`, the paused gap's ink, down to the rail's row.
+/// NEGATIVE CONTROLS: a gap's rail drawn as one unbroken rect over its span stands on the px over
+/// the caps of the boxes that keep their readings under it; a notch drawn whole, its foot on the
+/// rail's row wherever it falls, stands on the px over a cap where it falls in a break.
+#[test]
+fn a_time_gaps_rail_breaks_where_the_axis_rail_does() {
+    let m = FaceMetrics::helvetica_neue();
+    let mut snap = scene(Scene::Calm);
+    let bare = snap.clone();
+    let gap = |from_s: i64, to_s: i64, kind| aterm_vitals::TimeGap {
+        start_ms: AT - from_s * 1000,
+        end_ms: AT - to_s * 1000,
+        kind,
+    };
+    snap.time_gaps = vec![
+        gap(370, 170, GapKind::Crash),
+        gap(130, 125, GapKind::Paused),
+        gap(36, 32, GapKind::Paused),
+    ];
+    assert!(
+        bare.time_gaps.is_empty(),
+        "CONTROL: the scene has no gaps of its own"
+    );
+    let s = 1.0;
+    let (mut crossed, mut inked, mut notches, mut over_breaks) =
+        (0_usize, 0_usize, 0_usize, 0_usize);
+    for form in [DeckForm::Full, DeckForm::Folded] {
+        for w in [1119.0, 700.0, 420.0, 250.0, 180.0] {
+            if ground_only(w, form, &m) {
+                continue;
+            }
+            for share in [1.0_f32, 0.5] {
+                let lay_on = |snap: &Snapshot| {
+                    let input = scene_input(snap, form);
+                    let mut words = DeckWords::new(&input, &m);
+                    for row in &mut words.rows {
+                        row.live_over = share;
+                        for slots in &mut row.multi_scale {
+                            for slot in slots {
+                                slot.cell.over = share;
+                            }
+                        }
+                    }
+                    lay(&geom(w, s, form), &input, &words, &m, true)
+                };
+                let input = scene_input(&snap, form);
+                let (over, grid) = (rgba(input.inks.over, 0xFF), rgba(input.inks.grid, 0xFF));
+                let inks = [
+                    (GapKind::Crash, rgba(input.inks.critical_text, 0xFF)),
+                    (GapKind::Paused, rgba(input.inks.words2, 0xFF)),
+                ];
+                let (laid, without) = (lay_on(&snap), lay_on(&bare));
+                for (strip, rows, _) in strips(w, form, &m) {
+                    let tag = format!("{form:?} {w} pt, over {share}, strip at {}", strip.x);
+                    let (sx0, sx1) = (px(strip.x, s), px(strip.end(), s));
+                    let y_row0 = px(rows.top(0), s);
+                    let rail = rail_pieces(&laid.prims, grid, (sx0, sx1), y_row0);
+                    let Some(&(_, _, rail_y)) = rail.first() else {
+                        panic!("CONTROL {tag}: the strip's axis rail");
+                    };
+                    let (breaks, _) = rail_breaks(&laid.prims, over, &strip, s, y_row0, rail_y);
+                    // Each gap's span of the rail, as the deck places it: from its end's age to
+                    // its start's, each rounded to a device px inside the strip.
+                    let horizon = strip.spec.horizon_ms();
+                    let x_at = |at_ms: i64| {
+                        let x = strip.x_at_age_ms((AT - at_ms).clamp(0, horizon))?;
+                        Some(((x * s) as f32).round().clamp(sx0, sx1))
+                    };
+                    let spans: Vec<(f32, f32, GapKind)> = snap
+                        .time_gaps
+                        .iter()
+                        .filter(|g| g.end_ms > AT - horizon && g.start_ms < AT)
+                        .filter_map(|g| {
+                            let (a, b) = (x_at(g.end_ms)?, x_at(g.start_ms)?);
+                            (a.max(b) > a.min(b)).then_some((a.min(b), a.max(b), g.kind))
+                        })
+                        .collect();
+                    crossed += breaks
+                        .iter()
+                        .filter(|b| spans.iter().any(|g| b.0 < g.1 && g.0 < b.1))
+                        .count();
+                    let on = |x: f32| rail.iter().any(|p| p.2 == rail_y && p.0 <= x && x < p.1);
+                    // The panels of `ink` over the strip and above row 0, as `(x, y, w, h)`.
+                    let panels = |prims: &[DrawPrim], ink| -> Vec<Rect> {
+                        prims
+                            .iter()
+                            .filter_map(|p| match *p {
+                                DrawPrim::Panel {
+                                    x, y, w, h, fill, ..
+                                } if fill == ink && x >= sx0 && x + w <= sx1 && y < y_row0 => {
+                                    Some((x, y, w, h))
+                                }
+                                _ => None,
+                            })
+                            .collect()
+                    };
+                    for (kind, ink) in inks {
+                        // The gap's own: those the deck lays with the gaps and not without them.
+                        let mut laid_by_gaps = panels(&laid.prims, ink);
+                        for p in panels(&without.prims, ink) {
+                            let Some(i) = laid_by_gaps.iter().position(|&q| q == p) else {
+                                panic!(
+                                    "CONTROL {tag}: the {kind:?} ink's {p:?} stands with the gaps"
+                                );
+                            };
+                            laid_by_gaps.swap_remove(i);
+                        }
+                        let ink_at = |x: f32, y: f32| {
+                            laid_by_gaps.iter().any(|&(px, py, pw, ph)| {
+                                px <= x && x < px + pw && py <= y && y < py + ph
+                            })
+                        };
+                        for k in sx0 as i32..sx1 as i32 {
+                            let x = k as f32;
+                            let within = spans.iter().any(|g| g.2 == kind && g.0 <= x && x < g.1);
+                            let want = within && on(x);
+                            inked += usize::from(want);
+                            assert_eq!(
+                                ink_at(x, rail_y),
+                                want,
+                                "{tag}: the {kind:?} gap's ink on the rail's row at x {k} px, \
+                                 spans {spans:?}, breaks {breaks:?}, the axis rail {rail:?}"
+                            );
+                            assert!(
+                                !ink_at(x, rail_y + 1.0),
+                                "{tag}: the {kind:?} gap's ink under the rail at x {k} px"
+                            );
+                        }
+                        for g in spans.iter().filter(|g| g.2 == kind) {
+                            // A span 1 px wide has one notch.
+                            let ends = if g.1 - g.0 >= 2.0 { 2 } else { 1 };
+                            for nx in [g.0, g.1 - 1.0].into_iter().take(ends) {
+                                assert!(
+                                    ink_at(nx, rail_y - 1.0),
+                                    "{tag}: the {kind:?} gap's notch over the rail at x {nx} px, \
+                                     its span {g:?}"
+                                );
+                                notches += 1;
+                                over_breaks += usize::from(!on(nx));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        crossed > 20 && inked > 100 && notches > 60 && over_breaks > 30,
+        "CONTROL: 1× caps under a gap's span broke the rail ({crossed}), gaps' rails inked \
+         ({inked} px), and gaps' notches stood ({notches}), over a break ({over_breaks})"
+    );
+}
+
+/// A1 §3, "States": an event line's ground keyline parts it from the boxes it crosses, never from
+/// another event's line (the R3 lens fixes, 2026-11-06). A crash and a restart whose lines stand
+/// side by side (touching: 1 px apart at 1×, 2 px at 2×, the nearest the deck draws two events)
+/// each keep every px of their line in their own ink, Full and Folded at 1119 pt, at 1× and 2×.
+/// NEGATIVE CONTROL: a keyline drawn with its own event's line puts the restart's keyline, drawn
+/// after the crash's line, on the crash's line.
+#[test]
+fn an_events_keyline_never_cuts_another_events_line() {
+    let m = FaceMetrics::helvetica_neue();
+    let w = 1119.0;
+    for form in [DeckForm::Full, DeckForm::Folded] {
+        for s in [1.0_f64, 2.0] {
+            let (strip, rows, _) = strips(w, form, &m).swap_remove(0);
+            let lw = (0.85 * s).round().max(1.0) as f32;
+            // Where an event at `age` draws its line, and the px its overlap rule keys it by.
+            let line = |age: i64| {
+                let ex = (strip.x_at_age_ms(age)? * s) as f32;
+                Some(((ex - lw / 2.0).round(), ex.round() as i32))
+            };
+            let crash_age = 150_000;
+            let (crash_x, crash_key) = line(crash_age).expect("on the strip");
+            // The nearest a restart's line stands: touching the crash's, on either side, and its
+            // px kept apart from the crash's by the deck's overlap rule.
+            let restart_age = (10_000..crash_age + 1_800_000)
+                .step_by(100)
+                .find(|&age| {
+                    line(age).is_some_and(|(x, key)| {
+                        (x - crash_x).abs() == lw && (key - crash_key).abs() >= 2
+                    })
+                })
+                .unwrap_or_else(|| panic!("CONTROL {form:?} {s}×: a restart beside the crash"));
+            let restart_x = line(restart_age).expect("on the strip").0;
+            let mut snap = scene(Scene::Calm);
+            snap.strip_events = vec![
+                aterm_vitals::StripEvent {
+                    at_unix_ms: AT - crash_age,
+                    kind: aterm_vitals::StripEventKind::Crash,
+                    label: "aterm crash".into(),
+                },
+                aterm_vitals::StripEvent {
+                    at_unix_ms: AT - restart_age,
+                    kind: aterm_vitals::StripEventKind::Restart,
+                    label: "aterm restart".into(),
+                },
+            ];
+            let input = scene_input(&snap, form);
+            let words = DeckWords::new(&input, &m);
+            let g = geom(w, s, form);
+            let laid = lay(&g, &input, &words, &m, true);
+            let (rgba8, pw, _) = crate::tray_raster::rasterize_tray(
+                &laid.prims,
+                g.w as u32,
+                g.h as u32,
+                1.0,
+                [0; 4],
+            );
+            let at = |x: f32, y: f32| {
+                let i = (y as usize * pw as usize + x as usize) * 4;
+                [rgba8[i], rgba8[i + 1], rgba8[i + 2]]
+            };
+            let (ground, crash) = (input.inks.ground, input.inks.critical_text);
+            // Mid row 0, where the lines cross the boxes.
+            let y = px(rows.top(0) + rows.cell / 2.0, s);
+            let tag = format!("{form:?} {s}×, crash at {crash_x} px, restart at {restart_x} px");
+            for k in 0..lw as i32 {
+                let k = k as f32;
+                assert_eq!(at(crash_x + k, y), crash, "{tag}: the crash's line at +{k}");
+                assert_ne!(
+                    at(restart_x + k, y),
+                    ground,
+                    "{tag}: the restart's line at +{k}"
+                );
+            }
+            let (left, right) = (crash_x.min(restart_x), crash_x.max(restart_x));
+            assert_eq!(
+                at(left - 1.0, y),
+                ground,
+                "{tag}: the left line's outer keyline"
+            );
+            assert_eq!(
+                at(right + lw, y),
+                ground,
+                "{tag}: the right line's outer keyline"
+            );
+        }
+    }
 }
 
 /// The live box (A1 §3, "Live box"; `ResourceView::live_box`), as the deck paints it: its tick

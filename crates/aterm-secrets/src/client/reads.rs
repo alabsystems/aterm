@@ -9,7 +9,8 @@
 //! The device files and the lock are read outside it, the journal holds its own files, and a pinned
 //! records layout opens its data file twice, validated and then read.
 //!
-//! A writer's own files change under it, so a [`Reads`] never lives across a write.
+//! A writer's own files change under it, so nothing read from a [`Reads`] is used after a write:
+//! a step that writes ends it, and the next read makes another.
 
 use super::{
     Config, Paths, State, chain_cache, config_with, envelope, fsx, load_records_for, load_state,
@@ -29,6 +30,7 @@ pub(super) struct Reads<'a> {
     state: OnceCell<Result<State>>,
     identity: OnceCell<Result<Option<Identity>>>,
     vault: OnceCell<Result<Option<Arc<chain_cache::Parsed>>>>,
+    claim: OnceCell<Result<Option<bool>>>,
     enrollment: OnceCell<Result<retained_history::Enrollment>>,
     lineage: RefCell<Vec<(Config, KeyLine)>>,
     acknowledged: RefCell<Vec<(Config, Result<Option<HeldLog>>)>>,
@@ -86,6 +88,7 @@ impl<'a> Reads<'a> {
             state: OnceCell::new(),
             identity: OnceCell::new(),
             vault: OnceCell::new(),
+            claim: OnceCell::new(),
             enrollment: OnceCell::new(),
             lineage: RefCell::new(Vec::new()),
             acknowledged: RefCell::new(Vec::new()),
@@ -156,10 +159,17 @@ impl<'a> Reads<'a> {
             .map_err(Clone::clone)
     }
 
+    /// The enrollment claim: `None` with none, or whether it is ready.
+    pub(super) fn claim(&self) -> Result<Option<bool>> {
+        self.claim
+            .get_or_init(|| retained_history::claim_ready(self.paths))
+            .clone()
+    }
+
     /// The enrollment claim and the journal it establishes.
     pub(super) fn enrollment(&self) -> Result<&retained_history::Enrollment> {
         self.enrollment
-            .get_or_init(|| retained_history::read_enrollment(self.paths))
+            .get_or_init(|| retained_history::read_enrollment(self))
             .as_ref()
             .map_err(Clone::clone)
     }

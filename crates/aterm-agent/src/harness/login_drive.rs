@@ -17,8 +17,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-use super::wake_deadline::WakeDeadline;
 use crate::ai::connector::{Cli, Completion, Drive, Flow, Grammar, Region, Route, Seam, SignIn};
+
+pub use super::auth_deadline::Deadline;
 
 /// The hang detector of one sign-in: the vendors' device codes live 15 minutes (Codex's) to
 /// 30 (Kimi's), and a sign-in the page never approved is ended at this.
@@ -556,9 +557,8 @@ pub struct Handoff<'a> {
     pub email: Option<&'a str>,
     /// Whether the CLI already said it is done, or closed its output.
     pub finished: &'a dyn Fn() -> bool,
-    /// When the sign-in's hang detector ends it, on both clocks: it counts the time the host
-    /// slept ([`WakeDeadline`]).
-    pub deadline: WakeDeadline,
+    /// The original sign-in budget, including time the host slept.
+    pub deadline: Deadline<'a>,
 }
 
 /// What an [`Approver`] made of the page.
@@ -611,7 +611,7 @@ pub trait Approver {
     fn resume(
         &mut self,
         _request: &Request<'_>,
-        _deadline: WakeDeadline,
+        _deadline: Deadline<'_>,
     ) -> Result<Resume, String> {
         Ok(Resume::Fresh)
     }
@@ -631,7 +631,7 @@ pub trait Approver {
         &mut self,
         _request: &Request<'_>,
         _outcome: &Outcome,
-        _deadline: WakeDeadline,
+        _deadline: Deadline<'_>,
     ) -> Result<(), String> {
         Ok(())
     }
@@ -649,6 +649,9 @@ pub enum Outcome {
         /// The page showed the row's email.
         page: bool,
     },
+    /// A complete native response was saved, but work ended before fresh approval.
+    /// The artifact remains in its original staging directory; this grants no adoption authority.
+    CompletedHeld,
     /// It ended without saying it is done, or with another exit (`None`: a signal ended it).
     Exited(Option<i32>),
     /// The URL it named is not `https` on a pinned host: nothing was opened, and it was ended.
@@ -685,6 +688,7 @@ impl Outcome {
     pub fn word(&self) -> String {
         match self {
             Outcome::SignedIn { .. } => "signed-in".to_owned(),
+            Outcome::CompletedHeld => "completed-held".to_owned(),
             Outcome::Exited(Some(code)) => format!("exited-{code}"),
             Outcome::Exited(None) => "signalled".to_owned(),
             Outcome::OffPin => "off-pin".to_owned(),
@@ -743,7 +747,7 @@ pub struct Spec<'a> {
     pub hosts: &'a [&'a str],
     /// The row's email, for the approver.
     pub email: Option<&'a str>,
-    /// The hang detector ([`HANG`]): [`drive`] measures it on both clocks ([`WakeDeadline`]), so it
+    /// The hang detector ([`HANG`]): [`drive`] measures it on both clocks ([`Deadline`]), so it
     /// counts the time the host slept.
     pub hang: Duration,
 }
@@ -823,11 +827,15 @@ fn spawn_reader(
 
 /// Runs `spec`'s child, hands its page to `approver` once its grammar named the URL (and, for a
 /// device flow, the code), and waits for it to say it is done and exit, all within
-/// [`Spec::hang`], which counts the time the host slept ([`WakeDeadline`]): a sign-in the host
+/// [`Spec::hang`], which counts the time the host slept ([`Deadline`]): a sign-in the host
 /// slept past is ended at its first look after the host wakes. The child is tied to this process ([`super::align::tie`]), so a quit, an exec
 /// in its place, a crash or a `SIGKILL` of this process ends it too; where this process's
 /// executable was replaced since it started, so the tie cannot hold, it is not run.
 pub fn drive(spec: &Spec<'_>, approver: &mut dyn Approver) -> Drove {
+    drive_until(spec, approver, Deadline::after(spec.hang))
+}
+
+fn drive_until(spec: &Spec<'_>, approver: &mut dyn Approver, deadline: Deadline<'_>) -> Drove {
     use aterm_uds::spawnfd::Stdio;
     let mut cmd = aterm_uds::spawnfd::command(spec.program);
     cmd.args(spec.lead)
@@ -844,6 +852,9 @@ pub fn drive(spec: &Spec<'_>, approver: &mut dyn Approver) -> Drove {
         outcome: Outcome::NotRun(why),
         host: None,
     };
+    if deadline.expired() {
+        return not_run("native sign-in deadline expired".into());
+    }
     let work = approver.work_scope();
     if work
         .as_ref()
@@ -860,6 +871,9 @@ pub fn drive(spec: &Spec<'_>, approver: &mut dyn Approver) -> Drove {
     {
         return not_run("automatic account work is cancelled".into());
     }
+    if deadline.expired() {
+        return not_run("native sign-in deadline expired".into());
+    }
     let mut child = match cmd.spawn() {
         Ok(child) => ProviderOwner(child),
         Err(e) => return not_run(format!("{}: {e}", spec.program.display())),
@@ -871,7 +885,6 @@ pub fn drive(spec: &Spec<'_>, approver: &mut dyn Approver) -> Drove {
             host: None,
         };
     }
-    let deadline = WakeDeadline::after(spec.hang);
     let (tx, rx) = mpsc::channel::<Option<(usize, String)>>();
     let said_done = Arc::new(AtomicBool::new(false));
     let closed = Arc::new(AtomicUsize::new(0));
@@ -936,8 +949,7 @@ pub fn drive(spec: &Spec<'_>, approver: &mut dyn Approver) -> Drove {
                 host,
             };
         }
-        // Its first look after the approver returns, or after the host woke, reads both clocks.
-        let left = deadline.remaining();
+        let left = deadline.remaining().unwrap_or_default();
         if left.is_zero() {
             end(&mut child);
             return Drove {
@@ -950,6 +962,13 @@ pub fn drive(spec: &Spec<'_>, approver: &mut dyn Approver) -> Drove {
             Ok(None) => open = open.saturating_sub(1),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => open = 0,
+        }
+        if deadline.expired() {
+            end(&mut child);
+            return Drove {
+                outcome: Outcome::Hung,
+                host,
+            };
         }
         if !handed
             && let Some(url) = scan.url.clone()
@@ -1091,6 +1110,47 @@ pub struct RecoveryAdmission {
     kimi: std::sync::Arc<std::sync::Mutex<Option<PoolKimiProof>>>,
 }
 
+/// Immutable validation authority, without custody of a subsequently retained proof.
+/// A proof may retain this view without forming a cycle through its admission's slot.
+#[cfg(unix)]
+#[derive(Clone)]
+pub(super) struct RecoveryAuthority {
+    domain: RecoveryDomain,
+    key: RecoveryKey,
+    check: std::sync::Arc<RecoveryCheck>,
+    native_entry: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(unix)]
+impl RecoveryAuthority {
+    pub(super) fn key(&self) -> RecoveryKey {
+        self.key
+    }
+    pub(super) fn is_shared_root(&self) -> bool {
+        self.domain == RecoveryDomain::SharedRoot
+    }
+    pub(super) fn current(&self, principal: Option<[u8; 32]>) -> Result<(), String> {
+        (self.check)(principal)
+    }
+}
+#[cfg(unix)]
+impl std::fmt::Debug for RecoveryAuthority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RecoveryAuthority(opaque)")
+    }
+}
+#[cfg(unix)]
+impl PartialEq for RecoveryAuthority {
+    fn eq(&self, other: &Self) -> bool {
+        self.domain == other.domain
+            && self.key == other.key
+            && std::sync::Arc::ptr_eq(&self.check, &other.check)
+            && std::sync::Arc::ptr_eq(&self.native_entry, &other.native_entry)
+    }
+}
+#[cfg(unix)]
+impl Eq for RecoveryAuthority {}
+
 #[cfg(unix)]
 struct PoolKimiProof {
     native: super::cli::shared_provider::KimiProof,
@@ -1098,6 +1158,15 @@ struct PoolKimiProof {
 }
 
 impl RecoveryAdmission {
+    #[cfg(unix)]
+    pub(super) fn authority(&self) -> RecoveryAuthority {
+        RecoveryAuthority {
+            domain: self.domain,
+            key: self.key,
+            check: self.check.clone(),
+            native_entry: self.native_entry.clone(),
+        }
+    }
     pub(super) fn new(
         key: RecoveryKey,
         native_entry: bool,
@@ -1350,7 +1419,7 @@ pub fn no_desk_argv(program: &Path, lead: &[OsString]) -> Vec<OsString> {
 /// `req`'s sign-in run as `program` (after `lead`), its `PATH` `path` (else the opener-free
 /// one, where the CLI's [`SignIn::no_opener`]), its other variables from `var`
 /// ([`child_env`]), its page handed to `approver`, within `hang`, which counts the time the host
-/// slept ([`WakeDeadline`]). Where the CLI's
+/// slept ([`Deadline`]). Where the CLI's
 /// [`SignIn::no_desk`] names this system, the child runs under the sandbox `no_desk` names
 /// ([`no_desk_argv`]). A retained completion is revalidated before native setup. Otherwise
 /// no child runs where its sandbox is not a file, cannot apply here ([`sandbox_refusal`]),
@@ -1363,6 +1432,26 @@ pub fn sign_in_with(
     var: &dyn Fn(&str) -> Option<OsString>,
     approver: &mut dyn Approver,
     hang: Duration,
+) -> Drove {
+    sign_in_until(
+        req,
+        (program, lead),
+        path,
+        no_desk,
+        var,
+        approver,
+        Deadline::after(hang),
+    )
+}
+
+fn sign_in_until(
+    req: &Request<'_>,
+    (program, lead): (&Path, &[OsString]),
+    path: Option<&OsStr>,
+    no_desk: Option<&Path>,
+    var: &dyn Fn(&str) -> Option<OsString>,
+    approver: &mut dyn Approver,
+    deadline: Deadline<'_>,
 ) -> Drove {
     let not_run = |why: String| Drove {
         outcome: Outcome::NotRun(why),
@@ -1381,9 +1470,11 @@ pub fn sign_in_with(
     if matches!(req.route.drive, Drive::NativeGoogle) {
         return not_run("native Google login requires its typed grant driver".into());
     }
-    let deadline = WakeDeadline::after(hang);
-    if deadline.passed() {
+    if deadline.expired() {
         return not_run("native sign-in deadline expired".into());
+    }
+    if !matches!(req.route.drive, Drive::Lines { .. }) && deadline.wake_parent().is_none() {
+        return not_run("the injected sign-in clock has no transferable native deadline".into());
     }
     if req
         .admission
@@ -1410,6 +1501,7 @@ pub fn sign_in_with(
                 },
                 deadline,
                 true,
+                CompletionCustody::Ordinary,
             );
         }
         Ok(Resume::Fresh) => false,
@@ -1429,12 +1521,23 @@ pub fn sign_in_with(
         },
         host: None,
     };
+    if deadline.expired() {
+        return not_run("native sign-in deadline expired".into());
+    }
     let Drive::Lines {
         grammar,
         completion,
         ..
     } = &req.route.drive
     else {
+        let Some(native_deadline) = deadline.wake_parent() else {
+            return not_run(
+                "the injected sign-in clock has no transferable native deadline".into(),
+            );
+        };
+        if native_deadline.passed() {
+            return not_run("native sign-in deadline expired".into());
+        }
         if let Err(why) = approver.begin(req).and_then(|()| req.check_admission()) {
             return not_run(why);
         }
@@ -1443,9 +1546,14 @@ pub fn sign_in_with(
             approver,
             req.hosts,
             req.row.email.as_deref(),
-            deadline,
+            native_deadline,
         );
-        return complete_sign_in(req, approver, drove, deadline, retained);
+        let custody = if matches!(drove.outcome, Outcome::SignedIn { .. }) {
+            CompletionCustody::NativeSaved
+        } else {
+            CompletionCustody::Ordinary
+        };
+        return complete_sign_in(req, approver, drove, deadline, retained, custody);
     };
     let sandbox = if signin.no_desk.contains(&std::env::consts::OS) {
         let Some(sandbox) = no_desk.filter(|sandbox| sandbox.is_file()) else {
@@ -1490,13 +1598,13 @@ pub fn sign_in_with(
     let env = child_env(req.cli, signin, req.staging, &path, var);
     let email = req.row.email.as_deref();
     let args = child_args(req.route, req.row.vendor.region);
-    if deadline.passed() {
+    if deadline.expired() {
         return not_run("native sign-in deadline expired".into());
     }
     if let Err(why) = approver.begin(req).and_then(|()| req.check_admission()) {
         return not_run(why);
     }
-    let drove = drive(
+    let drove = drive_until(
         &Spec {
             program,
             lead,
@@ -1507,29 +1615,71 @@ pub fn sign_in_with(
             completion: *completion,
             hosts: req.hosts,
             email,
-            hang: deadline.remaining(),
+            hang: deadline.remaining().unwrap_or_default(),
         },
         approver,
+        deadline,
     );
-    complete_sign_in(req, approver, drove, deadline, retained)
+    complete_sign_in(
+        req,
+        approver,
+        drove,
+        deadline,
+        retained,
+        CompletionCustody::Ordinary,
+    )
+}
+
+/// Evidence supplied only by the native Codex return boundary after its durable save.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompletionCustody {
+    Ordinary,
+    NativeSaved,
 }
 
 fn complete_sign_in(
     req: &Request<'_>,
     approver: &mut dyn Approver,
     mut drove: Drove,
-    deadline: WakeDeadline,
+    deadline: Deadline<'_>,
     retained: bool,
+    custody: CompletionCustody,
 ) -> Drove {
+    if drove.outcome == Outcome::CompletedHeld {
+        return drove;
+    }
     if retained && let Outcome::NotRun(why) | Outcome::PageNotOpened(why) = &drove.outcome {
         drove.outcome = Outcome::Unverified(why.clone());
     }
+    let native_saved = custody == CompletionCustody::NativeSaved;
+    let stopped = |approver: &dyn Approver| {
+        deadline.expired() || approver.work_scope().is_some_and(|scope| scope.cancelled())
+    };
+    if native_saved && stopped(approver) {
+        drove.outcome = Outcome::CompletedHeld;
+        return drove;
+    }
     if let Err(why) = req.check_admission() {
-        drove.outcome = Outcome::Unverified(why);
+        drove.outcome = if native_saved {
+            Outcome::CompletedHeld
+        } else {
+            Outcome::Unverified(why)
+        };
+        return drove;
+    }
+    if native_saved && stopped(approver) {
+        drove.outcome = Outcome::CompletedHeld;
         return drove;
     }
     if let Err(why) = approver.complete(req, &drove.outcome, deadline) {
-        drove.outcome = Outcome::Unverified(why);
+        drove.outcome = if native_saved {
+            Outcome::CompletedHeld
+        } else {
+            Outcome::Unverified(why)
+        };
+    }
+    if native_saved && stopped(approver) {
+        drove.outcome = Outcome::CompletedHeld;
     }
     drove
 }

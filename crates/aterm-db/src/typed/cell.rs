@@ -487,13 +487,18 @@ impl Field {
         }
     }
 
+    /// Every candidate of a register: one, or each of a conflict's; none for a set.
+    pub fn candidates(&self) -> &[Candidate] {
+        match self {
+            Self::Value(candidate) => std::slice::from_ref(candidate),
+            Self::Conflict { candidates, .. } => candidates,
+            Self::Set(_) => &[],
+        }
+    }
+
     /// Every candidate's value of a register: one, or each of a conflict's; none for a set.
     pub fn candidates_x(&self) -> Vec<&Value> {
-        match self {
-            Self::Value(candidate) => vec![&candidate.value.x],
-            Self::Conflict { candidates, .. } => candidates.iter().map(|c| &c.value.x).collect(),
-            Self::Set(_) => Vec::new(),
-        }
+        self.candidates().iter().map(|c| &c.value.x).collect()
     }
 
     /// Whether this register holds different concurrent values.
@@ -607,7 +612,7 @@ fn provisional(rule: OnConflict, candidates: &[Candidate]) -> Option<Value> {
 /// as an import's because an import wrote the same value too (an import writes only over its
 /// own, [`import_step`]); different ones stay a conflict.
 fn field(rule: OnConflict, mut candidates: Vec<Candidate>) -> Option<Field> {
-    candidates.sort_by_key(|c| (c.value.s.is_some(), c.value.a, c.operation));
+    candidates.sort_unstable_by_key(|c| (c.value.s.is_some(), c.value.a, c.operation));
     let mut distinct: Vec<Candidate> = Vec::new();
     for candidate in candidates {
         if !distinct
@@ -776,7 +781,7 @@ pub fn project(collection: &Collection, cells: &Cells) -> Projection {
             projection.malformed += 1;
             continue;
         }
-        let mut candidates = Vec::new();
+        let mut candidates = Vec::with_capacity(cell.candidates.len());
         let mut unreadable = false;
         let mut decode_candidate = |operation: Digest, value: &Value| {
             // A revert that restores absence leaves a bare null: the cell reads as empty.
@@ -800,7 +805,10 @@ pub fn project(collection: &Collection, cells: &Cells) -> Projection {
                 None => decode_candidate(candidate.operation, &candidate.value),
             }
         }
-        let row = projection.rows.entry(parsed.pk.to_owned()).or_default();
+        if !projection.rows.contains_key(parsed.pk) {
+            projection.rows.insert(parsed.pk.to_owned(), Row::default());
+        }
+        let row = projection.rows.get_mut(parsed.pk).expect("inserted row");
         let column = collection.column(parsed.col);
         let rule = column.map_or(OnConflict::Show, |c| c.on_conflict);
         let readable = !unreadable
@@ -821,11 +829,11 @@ pub fn project(collection: &Collection, cells: &Cells) -> Projection {
         };
         match parsed.elem {
             Some(elem) => {
-                let set = row
-                    .fields
-                    .entry(parsed.col.to_owned())
-                    .or_insert_with(|| Field::Set(BTreeMap::new()));
-                if let Field::Set(elements) = set {
+                if !row.fields.contains_key(parsed.col) {
+                    row.fields
+                        .insert(parsed.col.to_owned(), Field::Set(BTreeMap::new()));
+                }
+                if let Some(Field::Set(elements)) = row.fields.get_mut(parsed.col) {
                     elements.insert(elem.to_owned(), field);
                 } else {
                     row.raw.insert(parsed.col.to_owned());

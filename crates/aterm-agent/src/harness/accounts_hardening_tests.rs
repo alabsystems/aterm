@@ -125,6 +125,7 @@ fn a_renewal_reads_the_machine_only_through_its_guard() {
             &spawn,
             None,
             None,
+            &mut None,
         )
     };
     let inert = Arc::new(Mutex::new(AutoRenewGuard::default()));
@@ -689,7 +690,9 @@ fn an_auto_rotate_click_obeys_the_configs_switches() {
         let cooldown = Mutex::new(None);
         let rediscovery = Mutex::new(Rediscovery::default());
         let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
-        let fx = upkeep_effects(&fetch, &spawn, &cooldown, &rediscovery, &guard);
+        let lifetime = crate::harness::account_work::Lifetime::default();
+        let mut fx = upkeep_effects(&fetch, &spawn, &cooldown, &rediscovery, &guard);
+        fx.scope = lifetime.enter();
         assert_eq!(
             auto_renew_next_account_interactive_with(
                 Cli::Claude,

@@ -91,7 +91,8 @@ fn resolve(
     (resolved, WORK.get())
 }
 
-/// How many of `registers` the resolver resolves otherwise than the replaced one, reading
+/// How many of `registers` the resolver resolves otherwise than the replaced one, or the
+/// island's fold (up to [`oracle::ISLAND_OPS`] ops) otherwise than the replaced one, reading
 /// causality from a depth-first walk of `parents`.
 fn disagreements(parents: &[Vec<usize>], registers: &[Vec<CandidateOp>]) -> usize {
     let past = walked(parents);
@@ -99,8 +100,11 @@ fn disagreements(parents: &[Vec<usize>], registers: &[Vec<CandidateOp>]) -> usiz
     got.iter()
         .zip(registers)
         .filter(|(got, cands)| {
-            let (want, _) = oracle::resolve(cands, &|a, b| past[b][a], usize::MAX);
-            want.as_ref() != Ok(*got)
+            let before = |a: usize, b: usize| past[b][a];
+            let (want, _) = oracle::resolve(cands, &before, usize::MAX);
+            let fold = oracle::island(cands, &before);
+            oracle::ISLAND_CHECKED.set(oracle::ISLAND_CHECKED.get() + usize::from(fold.is_some()));
+            want.as_ref() != Ok(*got) || fold.is_some_and(|fold| want.as_ref() != Ok(&fold))
         })
         .count()
 }
@@ -126,8 +130,10 @@ fn with_mutants<T>(
 }
 
 /// On 200 seeded histories (forks, merges of up to 64 parents, forks at the genesis) with up to
-/// five concurrent registers each, every op's carry and rep and every register's siblings are
-/// what the replaced resolver gives, reading causality from a depth-first walk.
+/// five concurrent registers each, every op's carry and rep and every register's siblings,
+/// winner and conflict are what the replaced resolver gives, reading causality from a
+/// depth-first walk, and so is what the island's fold gives on each register of at most
+/// [`oracle::ISLAND_OPS`] ops.
 /// NEGATIVE CONTROLS: what a writer held keeping every carry, an op reading the last op's
 /// frontier, and frontiers that ignore what the parents dominate each disagree.
 #[test]
@@ -158,6 +164,7 @@ fn two_hundred_histories_resolve_as_the_replaced_resolver_did() {
         (Some(Mutant::ReuseFrontier), None),
         (None, Some(reach::Mutant::IgnoreParents)),
     ] {
+        oracle::ISLAND_CHECKED.set(0);
         let wrong: usize = with_mutants(register, index, || {
             cases
                 .iter()
@@ -165,7 +172,14 @@ fn two_hundred_histories_resolve_as_the_replaced_resolver_did() {
                 .sum()
         });
         match (register, index) {
-            (None, None) => assert_eq!(wrong, 0, "the resolver is exact"),
+            (None, None) => {
+                assert_eq!(wrong, 0, "the resolver and the island's fold are exact");
+                let island = oracle::ISLAND_CHECKED.get();
+                assert!(
+                    island > 300,
+                    "the island's fold resolved registers: {island}"
+                );
+            }
             _ => assert!(wrong > 0, "{register:?} {index:?} goes unnoticed"),
         }
     }

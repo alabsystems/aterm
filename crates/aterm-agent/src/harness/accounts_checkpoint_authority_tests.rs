@@ -147,7 +147,7 @@ fn observations(case: u8) -> Vec<aterm_spec::interp::State> {
             &bed.path,
             &bed.guard(),
             NOW,
-            (&[], &authority),
+            (&[], &authority, None),
             || {},
         )
     };

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Sixel (DEC graphics) DCS decoder producing packed-RGBA [`SixelImage`] rasters bounded by
+//! Sixel (DEC graphics) DCS decoder producing RGBA [`SixelImage`] rasters bounded by
 //! [`SIXEL_MAX_DIMENSION`] and [`MAX_COLOR_REGISTERS`].
 
 #![forbid(unsafe_code)]
@@ -27,37 +27,77 @@ pub const SIXEL_MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 
 const SIXEL_MAX_PARAMS: usize = 8;
 
-const TRANSPARENT: u32 = 0;
+/// One RGBA pixel, the raster's element.
+type Rgba = [u8; 4];
 
-/// A decoded sixel raster image.
+const TRANSPARENT: Rgba = [0; 4];
+
+/// A decoded sixel image: a `width` × `height` footprint whose painted pixels form a
+/// `raster_width` × `raster_height` RGBA raster at its top-left corner. The rest of the footprint
+/// (an area the DECGRA declaration reserves but no data paints) is transparent and holds no bytes.
 #[derive(Debug, Clone)]
 pub struct SixelImage {
     width: usize,
     height: usize,
-    /// Row-major packed `0xAARRGGBB`, length == `width * height`.
-    pixels: Vec<u32>,
+    raster_width: usize,
+    raster_height: usize,
+    /// Row-major RGBA over `raster_width`, length == `raster_width * raster_height`.
+    rgba: Vec<Rgba>,
 }
 
 impl SixelImage {
-    /// Image width in pixels.
+    /// Footprint width in pixels: the painted extent, widened to the declared raster.
     #[inline]
     #[must_use]
     pub const fn width(&self) -> usize {
         self.width
     }
 
-    /// Image height in pixels.
+    /// Footprint height in pixels: the painted extent, deepened to the declared raster.
     #[inline]
     #[must_use]
     pub const fn height(&self) -> usize {
         self.height
     }
 
-    /// Packed `0xAARRGGBB` pixels, row-major, length `width * height`.
+    /// Width of the painted raster (`<= width`), 0 when nothing was painted.
     #[inline]
     #[must_use]
-    pub const fn pixels(&self) -> &[u32] {
-        self.pixels.as_slice()
+    pub const fn raster_width(&self) -> usize {
+        self.raster_width
+    }
+
+    /// Height of the painted raster (`<= height`), 0 when nothing was painted.
+    #[inline]
+    #[must_use]
+    pub const fn raster_height(&self) -> usize {
+        self.raster_height
+    }
+
+    /// The painted raster as row-major RGBA bytes, `4 * raster_width * raster_height` long.
+    #[inline]
+    #[must_use]
+    pub fn rgba(&self) -> &[u8] {
+        self.rgba.as_flattened()
+    }
+
+    /// The painted raster's RGBA bytes, handing over the decoder's buffer without a copy.
+    #[inline]
+    #[must_use]
+    pub fn into_rgba(self) -> Vec<u8> {
+        self.rgba.into_flattened()
+    }
+
+    /// Footprint pixel `(x, y)` as packed `0xAARRGGBB`: 0 (transparent) outside the painted raster.
+    #[must_use]
+    pub fn pixel(&self, x: usize, y: usize) -> u32 {
+        if x >= self.raster_width {
+            return 0;
+        }
+        let at = y.saturating_mul(self.raster_width).saturating_add(x);
+        self.rgba
+            .get(at)
+            .map_or(0, |&[r, g, b, a]| u32::from_be_bytes([a, r, g, b]))
     }
 
     /// Number of grid rows this image spans given a cell height in pixels.
@@ -111,8 +151,8 @@ pub struct SixelDecoder {
     /// Which introducer we are collecting parameters for.
     mode: ParamMode,
 
-    /// Packed `0xAARRGGBB` raster, row-major over `alloc_width`.
-    raster: Vec<u32>,
+    /// RGBA raster, row-major over `alloc_width`.
+    raster: Vec<Rgba>,
     /// Allocated raster width (stride).
     alloc_width: usize,
     /// Allocated raster height.
@@ -122,9 +162,11 @@ pub struct SixelDecoder {
     x: usize,
     /// Top pixel row of the current 6-px band (y).
     band_top: usize,
-    /// Exclusive max x written (for final width).
+    /// Exclusive max x reached, painted or not (for the footprint width).
     max_x: usize,
-    /// Exclusive max y written (for final height).
+    /// Exclusive max x painted (for the raster width).
+    paint_x: usize,
+    /// Exclusive max y painted (for both heights).
     max_y: usize,
 
     /// Declared raster width from `"` DECGRA (0 = none).
@@ -173,6 +215,7 @@ impl SixelDecoder {
             x: 0,
             band_top: 0,
             max_x: 0,
+            paint_x: 0,
             max_y: 0,
             declared_w: 0,
             declared_h: 0,
@@ -193,6 +236,7 @@ impl SixelDecoder {
         self.x = 0;
         self.band_top = 0;
         self.max_x = 0;
+        self.paint_x = 0;
         self.max_y = 0;
         self.declared_w = 0;
         self.declared_h = 0;
@@ -259,6 +303,9 @@ impl SixelDecoder {
     }
 
     /// Finalize the sequence and return the image, if one was produced.
+    ///
+    /// The image takes the raster `put` grew (and the engine charged) in place, cut to the painted
+    /// extent: a declared but unpainted area allocates nothing here, and no pixel is copied out.
     #[must_use]
     pub fn unhook(&mut self) -> Option<SixelImage> {
         if !self.active {
@@ -276,25 +323,41 @@ impl SixelDecoder {
         }
         const _: () = assert!(SIXEL_MAX_PIXELS * 4 <= SIXEL_MAX_IMAGE_BYTES);
 
-        let stride = self.alloc_width;
-        let total = total.min(SIXEL_MAX_PIXELS);
-        let mut pixels = Vec::with_capacity(total);
-        let in_w = width.min(stride);
-        let pad = width.saturating_sub(in_w);
-        for y in 0..height.min(self.alloc_height) {
-            let start = y.saturating_mul(stride);
-            if let Some(row) = self.raster.get(start..start.saturating_add(in_w)) {
-                pixels.extend_from_slice(row);
-            }
-            pixels.resize(pixels.len().saturating_add(pad).min(total), TRANSPARENT);
-        }
-        pixels.resize(total, TRANSPARENT);
+        let (raster_width, raster_height, rgba) = self.take_painted();
         self.release();
         Some(SixelImage {
             width,
             height,
-            pixels,
+            raster_width,
+            raster_height,
+            rgba,
         })
+    }
+
+    /// Take the raster cut to its painted extent: each row slides left over the stride's
+    /// unpainted tail and the buffer is truncated, so the result reuses the raster's memory.
+    fn take_painted(&mut self) -> (usize, usize, Vec<Rgba>) {
+        let stride = self.alloc_width;
+        let mut raster = core::mem::take(&mut self.raster);
+        let rows = if let Some(s) = NonZeroUsize::new(stride) {
+            raster.len() / s
+        } else {
+            0
+        };
+        let w = self.paint_x.min(stride);
+        let h = self.max_y.min(self.alloc_height).min(rows);
+        if w == 0 || h == 0 {
+            return (0, 0, Vec::new());
+        }
+        if w < stride {
+            for y in 1..h {
+                let from = y.saturating_mul(stride);
+                raster.copy_within(from..from.saturating_add(w), y.saturating_mul(w));
+            }
+        }
+        raster.truncate(w.saturating_mul(h));
+        raster.shrink_to_fit();
+        (w, h, raster)
     }
 
     /// Abort the current sequence, dropping all buffers without allocating a copy.
@@ -310,7 +373,7 @@ impl SixelDecoder {
     pub const fn pixel_alloc_bytes(&self) -> usize {
         self.raster
             .len()
-            .saturating_mul(core::mem::size_of::<u32>())
+            .saturating_mul(core::mem::size_of::<Rgba>())
     }
 
     fn release(&mut self) {
@@ -405,7 +468,13 @@ impl SixelDecoder {
             self.max_x = self.max_x.max(next_x);
             return;
         }
-        let color = self.palette.get(self.current_color).copied().unwrap_or(0) & 0x00FF_FFFF;
+        let [_, r, g, b] = self
+            .palette
+            .get(self.current_color)
+            .copied()
+            .unwrap_or(0)
+            .to_be_bytes();
+        let pixel = [r, g, b, 0xFF];
         let highest_row = (u8::BITS - 1 - bits.leading_zeros()) as usize;
         let want_y = self.band_top.saturating_add(highest_row);
         let extent_y = want_y.saturating_add(1).min(SIXEL_MAX_DIMENSION);
@@ -415,7 +484,6 @@ impl SixelDecoder {
             if self.raster.len() == stride.saturating_mul(self.alloc_height) {
                 let run_end = self.x.saturating_add(count).min(self.alloc_width);
                 if run_end > self.x {
-                    let pixel = 0xFF00_0000 | color;
                     if run_end.saturating_sub(self.x) == 1 {
                         for (row, mask) in SIXEL_ROW_MASKS.into_iter().enumerate() {
                             if bits & mask == 0 {
@@ -449,18 +517,19 @@ impl SixelDecoder {
                     }
                 }
             } else {
-                self.paint_pixelwise(bits, count, color, stride);
+                self.paint_pixelwise(bits, count, pixel, stride);
             }
         }
         self.x = next_x;
         self.max_x = self.max_x.max(next_x);
+        self.paint_x = self.paint_x.max(next_x);
         self.max_y = self.max_y.max(extent_y);
     }
 
     /// Cold fallback per-pixel paint when `raster.len() != alloc_width * alloc_height`.
     #[cold]
     #[inline(never)]
-    fn paint_pixelwise(&mut self, bits: u8, count: usize, color: u32, stride: usize) {
+    fn paint_pixelwise(&mut self, bits: u8, count: usize, pixel: Rgba, stride: usize) {
         for col in 0..count {
             let px = self.x.saturating_add(col);
             if px >= self.alloc_width {
@@ -476,7 +545,7 @@ impl SixelDecoder {
                 }
                 let idx = py.saturating_mul(stride).saturating_add(px);
                 if let Some(slot) = self.raster.get_mut(idx) {
-                    *slot = 0xFF00_0000 | color;
+                    *slot = pixel;
                 }
             }
         }
@@ -543,11 +612,11 @@ impl SixelDecoder {
             return;
         }
         if new_w == self.alloc_width {
-            self.raster.resize(new_len, 0);
+            self.raster.resize(new_len, TRANSPARENT);
             self.alloc_height = new_h;
             return;
         }
-        let mut new_raster = vec![0u32; new_len];
+        let mut new_raster = vec![TRANSPARENT; new_len];
         let old_stride = self.alloc_width;
         if old_stride != 0 && new_w != 0 {
             let dst_rows = new_raster.chunks_mut(new_w);

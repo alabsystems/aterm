@@ -679,20 +679,17 @@ pub fn newest_published_source(mappings_json: &str) -> Result<PublishedSource> {
         .ok_or_else(|| Error::new("the publication ledger has no `mappings.aterm` rows"))?;
     rows.iter()
         .filter(|(sha, _)| aterm_codec::hex::is_hex(sha, 40))
-        .map(|(sha, row)| PublishedSource {
-            commit: sha.clone(),
-            verified_at: row
+        .map(|(sha, row)| {
+            let verified_at = row
                 .get("verified_at")
                 .and_then(aterm_json::Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
+                .unwrap_or_default();
+            (sha.as_str(), verified_at)
         })
-        .max_by(|a, b| {
-            (rfc3339_instant(&a.verified_at), &a.verified_at, &a.commit).cmp(&(
-                rfc3339_instant(&b.verified_at),
-                &b.verified_at,
-                &b.commit,
-            ))
+        .max_by_key(|&(sha, verified_at)| (rfc3339_instant(verified_at), verified_at, sha))
+        .map(|(commit, verified_at)| PublishedSource {
+            commit: commit.to_string(),
+            verified_at: verified_at.to_string(),
         })
         .ok_or_else(|| Error::new("the publication ledger has no aterm row with a commit key"))
 }
@@ -1245,9 +1242,17 @@ impl Precheck {
     /// `ship check`'s exit: 0 every gate passed, 1 one would refuse, 3 none refused but one could not run.
     #[must_use]
     pub fn exit_code(&self) -> i32 {
-        if !self.refused().is_empty() {
+        if self
+            .gates
+            .iter()
+            .any(|g| matches!(g.outcome, Outcome::Refuse(_)))
+        {
             1
-        } else if !self.not_run().is_empty() {
+        } else if self
+            .gates
+            .iter()
+            .any(|g| matches!(g.outcome, Outcome::CouldNotRun(_)))
+        {
             3
         } else {
             0
@@ -1267,6 +1272,7 @@ impl Precheck {
     /// One gate's lines: `ok` with its line, or `REFUSE` / `NOT RUN` with why, the detail and the fix.
     #[must_use]
     pub fn gate_lines(gate: &PrecheckGate) -> String {
+        use std::fmt::Write as _;
         let (word, r) = match &gate.outcome {
             Outcome::Pass(line) => return format!("  ok      {line}\n"),
             Outcome::Refuse(r) => ("REFUSE ", r),
@@ -1278,10 +1284,10 @@ impl Precheck {
             r.why.replace('\n', "\n          ")
         );
         for line in &r.detail {
-            out.push_str(&format!("          {line}\n"));
+            let _ = writeln!(out, "          {line}");
         }
         if !r.remedy.is_empty() {
-            out.push_str(&format!("          fix: {}\n", r.remedy));
+            let _ = writeln!(out, "          fix: {}", r.remedy);
         }
         out
     }
@@ -2277,7 +2283,7 @@ impl GateTree<'_> {
                         desks.push(entry.file_name().to_string_lossy().into_owned());
                     }
                 }
-                desks.sort();
+                desks.sort_unstable();
                 Ok(Some(desks))
             }
             GateTree::Commit { git, commit } => {

@@ -356,6 +356,7 @@ pub(super) mod tests {
                     || (Instant::now(), Some(NOW)),
                     |_, _, _| {
                         Some(vec![LoginActivity {
+                            queued: None,
                             label: row.label.clone(),
                             route: Some("mailbox".into()),
                             active: true,

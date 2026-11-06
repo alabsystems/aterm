@@ -19,7 +19,7 @@ impl Bed {
         let home = root.path().join("home");
         let config = home.join(".config/aterm/aterm.toml");
         fs::create_dir_all(config.parent().unwrap()).unwrap();
-        fs::write(&config, "[fleet]\nmachine = \"m1\"\n").unwrap();
+        aterm_uds::atomic_file::write(&config, b"[fleet]\nmachine = \"m1\"\n", 0o600).unwrap();
         let env = Env {
             state: root.path().join("state"),
             aterm_state: None,

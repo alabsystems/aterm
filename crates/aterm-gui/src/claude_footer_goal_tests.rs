@@ -46,7 +46,10 @@ fn key(program: aterm_phase::Program, len: usize, palette: Option<CardPalette>) 
         switch: Some(LIT),
         palette,
         blank: blank(),
-        mark_fg: [0xd7, 0x77, 0x57],
+        field: PaneField {
+            col_off: 0,
+            cols: 240,
+        },
         face: KeyFace::default(),
         cell: (7, 14),
         clip: aterm_core::render::PxRect::EVERYWHERE,
@@ -156,7 +159,11 @@ fn the_goal_sits_between_the_lockup_and_the_switch_and_moves_neither() {
             );
             let mark = top.cells[cols.start + 1 - top.col];
             assert_eq!(mark.ch, GOAL_MARK);
-            assert_eq!(mark.fg, key.mark_fg, "{at}: the mark's ink");
+            assert_eq!(
+                mark.fg,
+                key.mark_ink_at(cols.start + 1),
+                "{at}: its column's marks ink"
+            );
             let word = top.cells[cols.start + 3 - top.col];
             assert_eq!(word.bg, key.run.rule.bg, "{at}: on the line's own ground");
             assert_ne!(

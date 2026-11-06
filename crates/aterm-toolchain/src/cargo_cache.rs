@@ -9,7 +9,8 @@
 
 use std::{io, path::Path};
 
-/// An actual owned shared Cargo source-cache lock, released by its final descriptor close.
+/// An actual owned shared Cargo source-cache lock, released by `LOCK_UN` when dropped, so a
+/// child forked meanwhile, which holds a copy of the descriptor until its exec, keeps nothing.
 /// No descriptor, unlock, cloning or path-only recovery authority escapes this guard.
 #[derive(Debug)]
 #[must_use = "keep the actual guard until all source-cache users have settled"]
@@ -107,6 +108,14 @@ mod imp {
         }
     }
 
+    impl Drop for Held {
+        /// Let go by `LOCK_UN` before the close (clippy.toml's flock release rule): the lock lives
+        /// on the open file description, which a child between fork and exec still shares.
+        fn drop(&mut self) {
+            let _ = self.file.unlock();
+        }
+    }
+
     fn supported_filesystem(file: &File) -> io::Result<()> {
         let mut info = std::mem::MaybeUninit::<libc::statfs>::uninit();
         // SAFETY: the file descriptor is live; fstatfs initializes the writable
@@ -135,7 +144,7 @@ mod imp {
         acquire_with(cargo_home, supported_filesystem, |file| {
             #[expect(
                 clippy::disallowed_methods,
-                reason = "the strict owned Cargo shared source-cache guard's actual kernel acquisition; no best-effort fallback"
+                reason = "the strict owned Cargo shared source-cache guard's actual kernel acquisition, released by `Held`'s Drop (`LOCK_UN`); no best-effort fallback"
             )]
             let result = file.try_lock_shared();
             result.map_err(|error| match error {

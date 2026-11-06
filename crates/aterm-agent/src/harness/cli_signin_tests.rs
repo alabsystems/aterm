@@ -65,6 +65,10 @@ struct SignInHost {
     at_tidy: Cell<Option<(i32, bool)>>,
     /// Run inside an [`Script::Ends`] sign-in ([`During`]).
     during: Option<During>,
+    automatic: bool,
+    cancel_on_queue: bool,
+    cancelled: Cell<bool>,
+    queued: RefCell<Vec<accounts::SigninPosition>>,
 }
 
 impl SignInHost {
@@ -92,6 +96,10 @@ impl SignInHost {
             marked_at_window: Cell::new(None),
             at_tidy: Cell::new(None),
             during: None,
+            automatic: false,
+            cancel_on_queue: false,
+            cancelled: Cell::new(false),
+            queued: RefCell::new(Vec::new()),
         }
     }
 
@@ -121,6 +129,18 @@ impl Approver for Approves<'_> {
 }
 
 impl AccountsHost for SignInHost {
+    fn automatic_sign_in(&self) -> bool {
+        self.automatic
+    }
+    fn work_cancelled(&self) -> bool {
+        self.cancelled.get()
+    }
+    fn signin_queued(&self, position: accounts::SigninPosition) {
+        self.queued.borrow_mut().push(position);
+        if self.cancel_on_queue {
+            self.cancelled.set(true);
+        }
+    }
     fn stdin_is_terminal(&self) -> bool {
         self.terminal
     }
@@ -495,7 +515,7 @@ fn unavailable_browser_records_codex_renewal_failure_without_a_person_task() {
 /// `a_sign_in_that_needs_an_overlay_runs_nothing_where_aterm_makes_no_links` holds the refusal.
 #[cfg(unix)]
 #[test]
-fn a_second_sign_in_waits_for_the_machines_lock_then_reports_it_held() {
+fn a_bounded_background_sign_in_reports_the_machine_held_without_starting() {
     let (tmp, env) = kimi_env("signin-lock");
     let home = tmp.path().join("home");
     let store = env.accounts_store_for(Cli::Kimi).expect("kimi's store");
@@ -503,7 +523,10 @@ fn a_second_sign_in_waits_for_the_machines_lock_then_reports_it_held() {
         .signin_within()
         .expect("the lock")
         .expect("free at first");
-    let host = SignInHost::new(Script::Kimi("kimi 0"), &home);
+    let host = SignInHost {
+        automatic: true,
+        ..SignInHost::new(Script::Kimi("kimi 0"), &home)
+    };
     let (code, out, err) = renew("accounts renew kimi-one --cli kimi", &env, &host);
     assert_eq!(code, exit(1), "{out}{err}");
     assert!(
@@ -1329,11 +1352,21 @@ fn accounts_browser_refuses_without_a_terminal_over_ssh_under_a_held_lock_or_an_
         );
         assert!(host.opened.borrow().is_empty());
     }
-    let held_by = SignInHost::desk(&home);
+    let held_by = SignInHost {
+        cancel_on_queue: true,
+        ..SignInHost::desk(&home)
+    };
     let held = store.signin_within().expect("lock").expect("free");
     let (code, out, err) = renew(line, &env, &held_by);
     assert_eq!(code, exit(1), "{out}{err}");
-    assert!(err.contains("kimi-one: held"), "{err}");
+    assert!(err.contains("cancelled"), "{err}");
+    assert_eq!(
+        held_by.queued.borrow().as_slice(),
+        &[accounts::SigninPosition {
+            ahead: 0,
+            blocker: accounts::SigninBlocker::UnscheduledSignin,
+        }]
+    );
     assert!(held_by.opened.borrow().is_empty());
     drop(held);
 
@@ -2673,7 +2706,7 @@ fn sheet_of_other_macs(tmp: &Tmp, env: &Env, cells: &str, address: &str, compute
     let secrets = tmp.path().join("home/.secrets");
     let config = env.config.clone().expect("a config path");
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
-    std::fs::write(&config, "[fleet]\nmachine = \"m16\"\n").unwrap();
+    aterm_uds::atomic_file::write(&config, b"[fleet]\nmachine = \"m16\"\n", 0o600).unwrap();
     aterm_types::fs_restricted::ensure_private_dir(&secrets).unwrap();
     std::fs::write(
         secrets.join(crate::harness::accounts_sync::ACCOUNTS_CSV_FILE),

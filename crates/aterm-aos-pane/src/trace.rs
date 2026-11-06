@@ -341,7 +341,7 @@ impl PaneRecording {
                 parent: None,
             },
         );
-        let mut log = EventLog::<PaneSchema>::new(
+        let mut log = EventLog::<PaneSchema>::with_capacity(
             LogHeader {
                 identity: identity.clone(),
                 log_epoch: 0,
@@ -349,6 +349,7 @@ impl PaneRecording {
                 ancestor: checkpoint.digest(),
             },
             PANE_MAX_EVENTS,
+            self.inputs.len(),
         );
         for i in &self.inputs {
             log.push(i.clone()).map_err(PaneTraceFault::Full)?;

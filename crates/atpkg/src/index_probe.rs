@@ -73,7 +73,7 @@ fn standard_public_source(owner: &str, repo: &str) -> bool {
 /// Whether [`successor_reporting_near_with`] probes this store's index source at all.
 #[must_use]
 pub fn probes_this_source() -> bool {
-    if !crate::enabled() || crate::cli::registry_seam().is_some() {
+    if !crate::enabled() || crate::source::registry_seam().is_some() {
         return false;
     }
     let source = crate::discovery::resolve_account(crate::config::cached().account());

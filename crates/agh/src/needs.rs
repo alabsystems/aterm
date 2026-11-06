@@ -141,7 +141,10 @@ pub fn raise(dirs: &Dirs, need: &Need) -> std::io::Result<()> {
         }
         // The key names the file and is what `list` and `clear` find it by, so it is refused,
         // never redacted: a key `shapes` would change is written by no one.
-        if Redactor::shapes(&need.key) != need.key {
+        if matches!(
+            Redactor::shapes_cow(&need.key),
+            std::borrow::Cow::Owned(s) if s != need.key
+        ) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "a need's key is shaped like a credential; it names the file and is never \
@@ -260,7 +263,7 @@ pub fn list(dirs: &Dirs) -> std::io::Result<Vec<Need>> {
                 needs.push(need);
             }
         }
-        needs.sort_by(|a, b| a.key.cmp(&b.key));
+        needs.sort_unstable_by(|a, b| a.key.cmp(&b.key));
         Ok(needs)
     }
     #[cfg(not(unix))]

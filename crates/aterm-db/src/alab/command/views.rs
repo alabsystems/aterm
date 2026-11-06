@@ -43,7 +43,7 @@ use crate::{
     typed::{
         Collection, Ty,
         cell::{self, CellKey, CellValue},
-        check, grid, keys,
+        check, grid,
         secret::Secret,
     },
 };
@@ -526,8 +526,10 @@ fn trim_piped_line(bytes: &mut Vec<u8>) {
     }
 }
 
-/// The row `name` names in `noun`'s collection: its key, or an address (`emails`), a machine
-/// label (`computers`), a phone's label, or an account's label.
+/// The row `name` names in `noun`'s collection: its key, or an address (`emails`: the row whose
+/// `addr` says it now, [`registry::AddressIndex`], so a renamed row goes by its new address and
+/// never by the one it was born with), a machine label (`computers`), a phone's label, or an
+/// account's label. A refusal never quotes the address.
 fn row_named(view: &att::View, noun: Noun, name: &str) -> Result<String> {
     let collection = noun.collection();
     let projection = view.project(collection);
@@ -536,13 +538,27 @@ fn row_named(view: &att::View, noun: Noun, name: &str) -> Result<String> {
     }
     match noun {
         Noun::Emails => {
-            let pk = keys::address_pk(name)
-                .map_err(|_| Error::new("an email row is named by its key or its address"))?;
-            projection
-                .rows
-                .contains_key(&pk)
-                .then_some(pk)
-                .ok_or_else(|| Error::new("no email row holds that address"))
+            let index = registry::AddressIndex::of(&projection);
+            match index
+                .holder(name)
+                .map_err(|_| Error::new("an email row is named by its key or its address"))?
+            {
+                registry::AddressHolder::Row(pk) => Ok(pk.to_owned()),
+                registry::AddressHolder::Several(_) => Err(Error::new(
+                    "more than one email row holds that address: name the row by its key",
+                )),
+                registry::AddressHolder::Free {
+                    derived,
+                    taken: true,
+                } => Err(Error::new(&format!(
+                    "no email row holds that address now (row {} was born with it and says \
+                     another): name a row by its key",
+                    att::command::safe_key(&derived)
+                ))),
+                registry::AddressHolder::Free { .. } => {
+                    Err(Error::new("no email row holds that address"))
+                }
+            }
         }
         Noun::Computers => {
             let empty = crate::typed::owned::OwnedRead::default();
@@ -566,7 +582,10 @@ fn row_named(view: &att::View, noun: Noun, name: &str) -> Result<String> {
 
 /// `set <row> <column> [<value> | --stdin]`: one owner write. A `Secret` value comes only from
 /// stdin, is refused when shaped like a flag and on a protected row, and is sealed inside the
-/// writing session; any other value is read in the grid's spelling of its type.
+/// writing session; any other value is read in the grid's spelling of its type. Every write
+/// passes the registry's rules on the owner's writes ([`registry::guard`]): an `emails … addr`
+/// that another row says, whose birth key another row holds, or that renames an account's login
+/// is refused, and one that passes writes the row's `domain` in the same record.
 fn set(
     handle: &Handle,
     noun: Noun,

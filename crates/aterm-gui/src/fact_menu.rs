@@ -359,6 +359,10 @@ pub(crate) struct FactMenuFacts {
     pub(crate) accounts_refused: Option<String>,
     /// Account choices are being read off the event-loop thread.
     pub(crate) accounts_loading: bool,
+    /// The exact saved manual selection's last observed queue place, without an ETA.
+    pub(crate) account_queue: Option<String>,
+    /// Manual queue capability is unavailable; this does not disable existing-account pins.
+    pub(crate) manual_signin_unavailable: bool,
     /// This CLI pool on this machine has no committed account pin (`!state.pinned`).
     /// A pending selection may still exist; this is not session recovery authority.
     pub(crate) pool_unpinned: bool,
@@ -845,6 +849,14 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                 out.push(MenuRow::note("Loading account choices…"));
                 return out;
             }
+            if !facts.manual_signin_unavailable
+                && let Some(queue) = &facts.account_queue
+            {
+                out.push(MenuRow::note(queue.clone()));
+            }
+            if facts.manual_signin_unavailable {
+                out.push(MenuRow::note("Manual sign-in is unavailable on this platform; signed-in accounts can still be selected."));
+            }
             if let Some(why) = &facts.accounts_refused {
                 out.push(MenuRow::note(format!("Account state unavailable: {why}")));
                 out.push(MenuRow::Item {
@@ -893,7 +905,7 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                         cli.connector().product
                     ),
                     act: MenuAct::Fact(fact, FactAct::AutoRotate),
-                    enabled: true,
+                    enabled: !facts.manual_signin_unavailable,
                     checked: false,
                 });
                 out.push(MenuRow::Item {
@@ -933,7 +945,7 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                     cli.connector().product
                 ),
                 act: MenuAct::Fact(fact, FactAct::AutoRotate),
-                enabled: true,
+                enabled: !facts.manual_signin_unavailable,
                 checked: facts.pool_unpinned,
             });
             out.push(MenuRow::Item {
@@ -1162,38 +1174,81 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// The account rows of another CLI's pool, read by the account-menu worker: its
-/// roster beside `config` (`accounts-<cli>.toml`), bound to the logins its renewals made, each
-/// row's condition from its own store (`accounts::Store::at_for`); a row is enrolled once its
-/// login file exists, a default-home row's in the CLI's default home (`accounts::enrolled_in`).
-/// A row with an email offers an automatic sign-in only where the CLI's renewal starts in the
-/// background (`Cli::renews_headlessly`). No roster, or a refused one, is no rows.
+/// Reads the pool's roster, judged state and queue observation off the event-loop thread.
+/// Claude keeps its existing enrollment and session-week projection; other providers use
+/// their own default home and headless sign-in policy.
 /// # Errors
-/// The roster, state or login bindings could not be read.
+/// The roster, state or login bindings could not be read, or a provider needs an unavailable home.
 pub(crate) fn pool_menu_rows(
     cli: aterm_agent::harness::accounts::Cli,
-    (config, state_dir, home): (&std::path::Path, &std::path::Path, &std::path::Path),
+    (config, state_dir, home): (&std::path::Path, &std::path::Path, Option<&std::path::Path>),
     (session_account, session_email): (Option<&str>, Option<&str>),
+    week: SessionWeek,
     now: i64,
-) -> Result<(Vec<AccountMenuRow>, bool), String> {
+) -> crate::account_menu_read::ResultRows {
     use aterm_agent::harness::accounts;
     let path =
         accounts::roster_beside_for(config, cli).ok_or("account roster path is unavailable")?;
     let roster = accounts::Roster::load_for(cli, &path)?;
-    let store = accounts::Store::at_for(state_dir, cli, home);
+    let store = match (cli, home) {
+        (_, Some(home)) => accounts::Store::at_for(state_dir, cli, home),
+        (accounts::Cli::Claude, None) => accounts::Store::at(state_dir),
+        (_, None) => return Err("account home is unavailable".into()),
+    };
     let roster = store.bound(&roster, now)?;
     let (state, _) = store.load_judged(now, &roster)?;
-    let enrolled = accounts::enrolled_in(cli, &roster, home);
-    Ok(account_menu_rows_from(
+    let enrolled = if cli == accounts::Cli::Claude {
+        accounts::enrolled(&roster)
+    } else {
+        accounts::enrolled_in(cli, &roster, home.ok_or("account home is unavailable")?)
+    };
+    let (mut rows, unpinned) = account_menu_rows_from(
         &roster,
         &state,
         &enrolled,
-        cli.renews_headlessly(),
+        cli == accounts::Cli::Claude || cli.renews_headlessly(),
         session_account,
         session_email,
-        SessionWeek::default(),
+        if cli == accounts::Cli::Claude {
+            week
+        } else {
+            SessionWeek::default()
+        },
         now,
-    ))
+    );
+    apply_manual_signin_capability(
+        &mut rows,
+        &roster,
+        &state,
+        &enrolled,
+        now,
+        accounts::manual_signin_capability(),
+    );
+    let queue = crate::account_menu_read::queue_status(&store, cli, &roster, &state, now);
+    Ok((rows, unpinned, queue))
+}
+
+fn apply_manual_signin_capability(
+    rows: &mut [AccountMenuRow],
+    roster: &aterm_agent::harness::accounts::Roster,
+    state: &aterm_agent::harness::accounts::State,
+    enrolled: &std::collections::BTreeSet<String>,
+    now: i64,
+    capability: aterm_agent::harness::accounts::ManualSigninCapability,
+) {
+    use aterm_agent::harness::accounts;
+    if capability == accounts::ManualSigninCapability::Unavailable {
+        for entry in rows {
+            if let Some(row) = roster.row(entry.account.as_str())
+                && matches!(
+                    accounts::condition(row, state, enrolled.contains(&row.label), now),
+                    accounts::Condition::SignedOut | accounts::Condition::NotEnrolled
+                )
+            {
+                entry.enabled = false;
+            }
+        }
+    }
 }
 
 /// Selects `label` in `cli`'s pool from the fact menu: pins an eligible row at once, or saves a
@@ -1211,8 +1266,8 @@ pub(crate) fn select_menu_account_for(
 ) -> bool {
     use aterm_agent::harness::accounts;
     let store = match (cli, home) {
-        (accounts::Cli::Claude, _) => accounts::Store::at(state_dir),
         (_, Some(home)) => accounts::Store::at_for(state_dir, cli, home),
+        (accounts::Cli::Claude, None) => accounts::Store::at(state_dir),
         (_, None) => return false,
     };
     let Ok(roster) = accounts::Roster::load_for(cli, roster_path) else {
@@ -1410,6 +1465,8 @@ impl App {
         };
         let state = self.claude_facts.get(&session);
         let mut out = FactMenuFacts {
+            manual_signin_unavailable: aterm_agent::harness::accounts::manual_signin_capability()
+                == aterm_agent::harness::accounts::ManualSigninCapability::Unavailable,
             title: format!("{what} \u{b7} {place}"),
             name,
             room: autopilot_menu::MAX_CONTENT,
@@ -1526,9 +1583,10 @@ impl App {
             };
             if cli.is_some() {
                 match self.account_menu_rows_cached(session) {
-                    Some(Ok((accounts, pool_unpinned))) => {
+                    Some(Ok((accounts, pool_unpinned, queue))) => {
                         out.accounts.clone_from(accounts);
                         out.pool_unpinned = *pool_unpinned;
+                        out.account_queue.clone_from(queue);
                     }
                     Some(Err(why)) => out.accounts_refused = Some(why.clone()),
                     None => out.accounts_loading = true,
@@ -1887,7 +1945,7 @@ impl App {
                                 .spawn(scope.clone().wrap(move || {
                                     let worker_store =
                                         accounts::Store::at_for(&worker_state, cli, &worker_home);
-                                    let dispatched = aterm_agent::harness::accounts_sync::auto_renew_account_by_label_for_scoped(
+                                    let dispatched = aterm_agent::harness::accounts_sync::manual_renew_account_for_scoped(
                                         scope,
                                         cli,
                                         &worker_home,
@@ -1909,11 +1967,17 @@ impl App {
                                 .map_err(|_| ())
                         },
                     ) {
+                        self.account_menu_selection_changed();
                         self.redraw_claude_footer(session);
                     }
                 }
             }
             FactAct::AutoRotate => {
+                if aterm_agent::harness::accounts::manual_signin_capability()
+                    == aterm_agent::harness::accounts::ManualSigninCapability::Unavailable
+                {
+                    return;
+                }
                 let Some(scope) = self.account_work.enter() else {
                     return;
                 };
@@ -1927,47 +1991,45 @@ impl App {
                 if let Some(state_dir) = crate::harness_host::harness_state() {
                     let home = aterm_primer::home_dir();
                     let store = match (cli, home.as_deref()) {
-                        (accounts::Cli::Claude, _) => Some(accounts::Store::at(&state_dir)),
                         (_, Some(h)) => Some(accounts::Store::at_for(&state_dir, cli, h)),
+                        (accounts::Cli::Claude, None) => Some(accounts::Store::at(&state_dir)),
                         (_, None) => None,
                     };
                     if let Some(store) = store {
-                        let mut note = None;
-                        let _ = store.transact_within(
-                            &accounts::LOCK_LADDER,
-                            now,
-                            &mut note,
-                            |state| {
-                                Ok(accounts::unpin(state, "fact-menu", now)
-                                    .into_iter()
-                                    .collect())
-                            },
-                        );
                         let roster_path = if cli == accounts::Cli::Claude {
                             accounts::default_roster_path()
                         } else {
                             aterm_types::dirs::aterm_config_path()
                                 .and_then(|cfg| accounts::roster_beside_for(&cfg, cli))
                         };
-                        let upkeep =
-                            crate::harness_host::live_accounts_upkeep(self.account_work.clone());
-                        let _ = std::thread::Builder::new()
-                            .name("aterm-acct-rotate".to_string())
-                            .spawn(scope.clone().wrap(move || {
-                                upkeep.make_scoped(scope.clone(), aterm_agent::harness::accounts_sync::UpkeepStep::Both);
-                                if matches!(upkeep, crate::harness_host::AccountsUpkeep::Live(_))
-                                    && let (Some(home), Some(roster_path)) = (home, roster_path)
-                                {
-                                    let _ = aterm_agent::harness::accounts_sync::auto_renew_next_account_interactive_for_scoped(
-                                        scope,
-                                        cli,
-                                        &home,
-                                        &state_dir,
-                                        &roster_path,
-                                        now,
-                                    );
+                        let live = matches!(
+                            crate::harness_host::live_accounts_upkeep(self.account_work.clone()),
+                            crate::harness_host::AccountsUpkeep::Live(_)
+                        );
+                        if let Ok(request) = store.request_next(now) {
+                            self.account_menu_selection_changed();
+                            if let (true, Some(home), Some(roster_path)) = (live, home, roster_path)
+                            {
+                                let worker_request = request.clone();
+                                let spawned = std::thread::Builder::new()
+                                    .name("aterm-acct-rotate".to_string())
+                                    .spawn(scope.clone().wrap(move || {
+                                        let worker_store = accounts::Store::at_for(&state_dir, cli, &home);
+                                        let dispatched = aterm_agent::harness::accounts_sync::manual_renew_next_for_scoped(
+                                            scope, cli, &home, &state_dir, &roster_path, worker_request.clone(), now,
+                                        );
+                                        if dispatched == aterm_agent::harness::accounts_sync::RenewalDispatch::Failed {
+                                            let now_done = aterm_agent::supervise::limit::unix_now().max(now);
+                                            let _ = worker_store.cancel_next_request(&worker_request, now_done);
+                                        }
+                                    }));
+                                if spawned.is_err() {
+                                    let _ = store.cancel_next_request(&request, now);
                                 }
-                            }));
+                            } else {
+                                let _ = store.cancel_next_request(&request, now);
+                            }
+                        }
                         self.redraw_claude_footer(session);
                     }
                 }

@@ -96,7 +96,7 @@ fn click_at(app: &mut App, wid: WindowId, cell: (usize, usize)) {
 /// would land in the label's slot, read off the live screen (at once: the background work the row
 /// waits on is no wait of a press's); a press writes the one-shot press of that build; a refused
 /// word says why in the slot until the refusal's few seconds pass; an accepted one turns the
-/// arrow to `◐`, the label as it was, and a second press asks nothing. The refusal takes the
+/// arrow to `◌`, the label as it was, and a second press asks nothing. The refusal takes the
 /// label's own cells (`alab v0.5 (v<build>)`), which hold its reason alone, not its preamble.
 /// CONTROL: a skipped build shows no arrow.
 #[test]
@@ -191,8 +191,8 @@ fn the_arrow_asks_for_the_move_and_says_why_it_was_refused() {
     let arrow = b.arrow.clone().expect("the asked arrow");
     assert_eq!(
         app.windows[&wid].input_scratch.cells[b.frame_row][arrow.start + 1].ch,
-        '\u{25d0}',
-        "asked: ◐"
+        '\u{25cc}',
+        "asked: ◌"
     );
     assert_eq!(
         slot(&app, wid),

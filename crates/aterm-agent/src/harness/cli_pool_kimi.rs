@@ -22,10 +22,26 @@ pub(super) struct Attempt<'a> {
 }
 
 #[derive(Debug)]
-struct Guard(super::super::login_drive::RecoveryAdmission);
+struct Guard {
+    admission: super::super::login_drive::RecoveryAuthority,
+    recovery: shared_provider::KimiRecoveryContext,
+    work: Option<super::super::account_work::Scope>,
+}
 impl aterm_http::Guard for Guard {
     fn is_authorized(&self) -> bool {
-        self.0.current(None).is_ok()
+        !self
+            .work
+            .as_ref()
+            .is_some_and(super::super::account_work::Scope::cancelled)
+            && self.admission.current(None).is_ok()
+    }
+}
+impl shared_provider::KimiRefreshAuthority for Guard {
+    fn receipt_current(&self) -> bool {
+        self.admission.current(None).is_ok()
+    }
+    fn recovery_context(&self) -> Result<shared_provider::KimiRecoveryContext, String> {
+        Ok(self.recovery.clone())
     }
 }
 
@@ -127,7 +143,18 @@ impl Attempt<'_> {
             expected,
             self.now,
             deadline,
-            std::sync::Arc::new(Guard(admission.clone())),
+            std::sync::Arc::new(Guard {
+                admission: admission.authority(),
+                recovery: shared_provider::KimiRecoveryContext::new(
+                    self.store,
+                    &self.row.label,
+                    key,
+                    self.store
+                        .user_home()
+                        .ok_or_else(|| unavailable("Kimi account recovery home is unavailable"))?,
+                ),
+                work: host.work_scope(),
+            }),
         ) {
             Err(ObservationError::ReauthenticationRequired(_)) => {
                 admission.current(None).map_err(unavailable)?;

@@ -30,6 +30,7 @@ static BOUND: Mutex<Vec<Arc<Bound>>> = Mutex::new(Vec::new());
 pub(crate) struct Bound {
     identity: Identity,
     pub(crate) command: String,
+    pub(crate) purpose: Option<String>,
     pub(crate) client_pid: i32,
     tickets: Mutex<Option<Arc<AskpassTicket>>>,
 }
@@ -143,6 +144,30 @@ fn sheet_text(cwd: &str, words: &[String]) -> String {
     )
 }
 
+/// A purpose derived from exact, bounded operations, never a caller-supplied description.
+fn rename_purpose(words: &[String]) -> Option<String> {
+    let [program, verb, field, number] = words else {
+        return None;
+    };
+    let scutil = program == "/usr/sbin/scutil"
+        && verb == "--set"
+        && matches!(
+            field.as_str(),
+            "ComputerName" | "LocalHostName" | "HostName"
+        );
+    let own = std::env::current_exe().ok();
+    let batch = own.as_deref() == Some(std::path::Path::new(program))
+        && verb == "name"
+        && field == "apply-system";
+    if !scutil && !batch {
+        return None;
+    }
+    let number = aterm_types::machine_name::Number::parse(number).ok()?;
+    Some(format!(
+        "Enter your system sudo password to change your system name to {number}."
+    ))
+}
+
 /// The caller's stdin, stdout and stderr, sent as one message once it read the admission.
 fn receive_stdio(stream: &CtlStream) -> Option<[Stdio; 3]> {
     let deadline = Instant::now() + STDIO_WAIT;
@@ -182,6 +207,7 @@ fn exit_line(status: std::process::ExitStatus) -> String {
 fn run_bound(
     mut command: Command,
     sheet: String,
+    purpose: Option<String>,
     client_pid: i32,
     grace: Duration,
     hung_up: &mut dyn FnMut() -> bool,
@@ -199,6 +225,7 @@ fn run_bound(
     let bound = Arc::new(Bound {
         identity,
         command: sheet,
+        purpose,
         client_pid,
         tickets: Mutex::new(None),
     });
@@ -309,6 +336,7 @@ pub(crate) fn serve(
     run_bound(
         command,
         sheet_text(&cwd, &words),
+        rename_purpose(&words),
         client_pid,
         aterm_uds::process::END_GRACE,
         &mut || crate::control::caller_hung_up(),
@@ -321,6 +349,34 @@ mod tests {
 
     fn words(list: &[&str]) -> Vec<String> {
         list.iter().map(|word| (*word).to_string()).collect()
+    }
+
+    #[test]
+    fn rename_summary_requires_a_fixed_operation_and_valid_number() {
+        for field in ["ComputerName", "LocalHostName", "HostName"] {
+            assert!(
+                rename_purpose(&words(&["/usr/sbin/scutil", "--set", field, "m59"]))
+                    .unwrap()
+                    .ends_with("m59.")
+            );
+        }
+        for args in [
+            words(&["/tmp/scutil", "--set", "HostName", "m59"]),
+            words(&["/usr/sbin/scutil", "--get", "HostName", "m59"]),
+            words(&["/usr/sbin/scutil", "--set", "HostName", "m59; do more"]),
+            words(&["/usr/sbin/scutil", "--set", "HostName", "m59", "extra"]),
+        ] {
+            assert_eq!(rename_purpose(&args), None);
+        }
+        let exe = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(rename_purpose(&words(&[&exe, "name", "apply-system", "m59"])).is_some());
+        assert_eq!(
+            rename_purpose(&words(&["/tmp/aterm", "name", "apply-system", "m59"])),
+            None
+        );
     }
 
     #[test]
@@ -406,17 +462,24 @@ mod tests {
         command.stdout(writer);
         let marker = "/bin/bound-for-its-life".to_owned();
         let mut seen: Option<u32> = None;
-        let line = run_bound(command, marker, 4242, Duration::from_secs(60), &mut || {
-            let table = BOUND.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some(bound) = table
-                .iter()
-                .find(|b| b.command == "/bin/bound-for-its-life")
-            {
-                seen = Some(bound.identity.pid);
-                assert_eq!(bound.client_pid, 4242);
-            }
-            false
-        });
+        let line = run_bound(
+            command,
+            marker,
+            None,
+            4242,
+            Duration::from_secs(60),
+            &mut || {
+                let table = BOUND.lock().unwrap_or_else(PoisonError::into_inner);
+                if let Some(bound) = table
+                    .iter()
+                    .find(|b| b.command == "/bin/bound-for-its-life")
+                {
+                    seen = Some(bound.identity.pid);
+                    assert_eq!(bound.client_pid, 4242);
+                }
+                false
+            },
+        );
         assert_eq!(line, "OK sudo exit=7\n");
         let output = std::io::read_to_string(reader).expect("the command's stdout");
         assert_eq!(output, "ran\n");
@@ -438,6 +501,7 @@ mod tests {
         let line = run_bound(
             stand_in("exec sleep 60"),
             marker,
+            None,
             4243,
             Duration::from_secs(60),
             &mut || {
@@ -476,6 +540,7 @@ mod tests {
         let line = run_bound(
             command,
             marker,
+            None,
             4244,
             Duration::from_millis(200),
             &mut || {

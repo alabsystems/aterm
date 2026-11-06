@@ -332,6 +332,7 @@ pub fn recording_cmd(serial: &Cmd, config: &str) -> Cmd {
     let mut c = crate::compile_account::with_message_format(serial.clone());
     c.args
         .splice(0..0, [OsString::from("--config"), OsString::from(config)]);
+    c.args = aterm_toolchain::build_cache::configs_after_subcommand(&c.args);
     c
 }
 
@@ -344,6 +345,55 @@ pub struct TestExe {
     /// them only while it compiles a test, so the run hands them over (`aterm_tempfile::bin_exe`
     /// reads them).
     pub bin_env: Vec<(OsString, OsString)>,
+    /// Its manifest says it runs libtest's harness ([`harness_of`]), so libtest's flags reach a
+    /// libtest `main` and never a custom one.
+    pub harness: bool,
+}
+
+/// Whether the target `name` of `kinds` runs libtest's harness, as `manifest` (its package's
+/// parsed `Cargo.toml`, `None` where it could not be read) declares it: the `harness` of its
+/// `[lib]`, or of the one `[[test]]`, `[[bench]]`, `[[bin]]` or `[[example]]` entry of its name
+/// (an entry with no `name` is named by its `path`'s stem), true where none declares it (an
+/// autodiscovered target). An unreadable manifest, or a name two entries share, is false.
+fn harness_of(manifest: Option<&aterm_toml::Value>, kinds: &[&str], name: &str) -> bool {
+    use aterm_toml::Value;
+    const LIB: [&str; 6] = ["lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"];
+    let Some(manifest) = manifest else {
+        return false;
+    };
+    // An entry's own word: true where it says nothing, false where it says something not a bool.
+    let declared = |entry: &Value| entry.get("harness").map_or(Some(true), Value::as_bool);
+    let said = if kinds.iter().any(|k| LIB.contains(k)) {
+        manifest.get("lib").map(declared)
+    } else {
+        let Some(table) = kinds.first().and_then(|k| match *k {
+            "test" | "bench" | "bin" | "example" => Some(*k),
+            _ => None,
+        }) else {
+            return false;
+        };
+        let entries: Vec<&Value> = manifest
+            .get(table)
+            .and_then(Value::as_array)
+            .map(|all| {
+                all.iter()
+                    .filter(|e| {
+                        e.get("name").and_then(Value::as_str).or_else(|| {
+                            e.get("path")
+                                .and_then(Value::as_str)
+                                .and_then(|p| Path::new(p).file_stem()?.to_str())
+                        }) == Some(name)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        match entries.as_slice() {
+            [] => None,
+            [one] => Some(declared(one)),
+            _ => return false,
+        }
+    };
+    said.is_none_or(|harness| harness.unwrap_or(false))
 }
 
 /// cargo's re-run flag for a target of these kinds and this name.
@@ -370,6 +420,7 @@ fn target_flag(kinds: &[&str], name: &str) -> Option<String> {
 pub fn take_test_executables(log: &mut String) -> Result<Vec<TestExe>, String> {
     let mut exes = Vec::new();
     let mut bins: Vec<(String, OsString, OsString)> = Vec::new();
+    let mut manifests: BTreeMap<String, Option<aterm_toml::Value>> = BTreeMap::new();
     let mut bad = None;
     let mut kept = String::with_capacity(log.len());
     for line in log.split_inclusive('\n') {
@@ -431,12 +482,26 @@ pub fn take_test_executables(log: &mut String) -> Result<Vec<TestExe>, String> {
                 continue;
             }
         };
+        let manifest = v
+            .get("manifest_path")
+            .and_then(aterm_json::Value::as_str)
+            .and_then(|path| {
+                manifests
+                    .entry(path.to_owned())
+                    .or_insert_with(|| {
+                        let text = std::fs::read_to_string(path).ok()?;
+                        aterm_toml::from_str::<aterm_toml::Value>(&text).ok()
+                    })
+                    .clone()
+            });
+        let harness = harness_of(manifest.as_ref(), &kinds, name);
         match target_flag(&kinds, name) {
             Some(flag) => exes.push((
                 TestExe {
                     exe: PathBuf::from(exe),
                     flag,
                     bin_env: Vec::new(),
+                    harness,
                 },
                 package.map(str::to_owned),
             )),
@@ -494,6 +559,8 @@ pub struct Binary {
     /// cargo's re-run spec.
     pub spec: String,
     pub record: Record,
+    /// It runs libtest's harness ([`TestExe::harness`]).
+    pub harness: bool,
 }
 
 /// The `Running` headers of a cargo test log, in order, with each one's path.
@@ -560,6 +627,7 @@ pub fn plan(records: Vec<Record>, log: &str, exes: &[TestExe]) -> Result<Vec<Bin
                 header,
                 spec,
                 record,
+                harness: found.harness,
             })
         })
         .collect()
@@ -592,6 +660,7 @@ where
     .map(|pooled| {
         pooled.unwrap_or_else(|| {
             let run = Run {
+                stopped_at: None,
                 ok: false,
                 output: "aterm-verify: this test binary was never run (a gate defect)\n".into(),
                 code: None,
@@ -775,6 +844,9 @@ fn binary_event(
     };
     let outcome = if run.ok {
         Outcome::Ok
+    } else if run.stopped_at.is_some() {
+        // Stopped at a decisive red case: a FAIL by construction (`libtest::decisive`).
+        Outcome::Fail(Severity::GateFailed)
     } else if unavailable.is_some() {
         Outcome::Fail(Severity::CouldNotRun)
     } else {
@@ -793,7 +865,14 @@ fn binary_event(
             "peak_bytes": usage.map(|u| u.peak_bytes),
             "width": width, "tests": tests,
             "failures": failures,
-            "detail": if run.ok { String::new() } else { unavailable.unwrap_or_else(|| first_error(&run.output)) },
+            "detail": if run.ok {
+                String::new()
+            } else if let Some(stopped) = &run.stopped_at {
+                stopped_detail(stopped, combined.as_ref().map_or("", |c| c.output.as_str()))
+            } else {
+                unavailable.unwrap_or_else(|| first_error(&run.output))
+            },
+            "stopped_at": run.stopped_at.as_ref().map(|s| s.case.as_str()),
             "exe_sha256": exe_sha256, "carried": false,
         })
     );
@@ -811,15 +890,44 @@ fn binary_event(
     (outcome, event, sample)
 }
 
+/// A stopped binary's detail: its red case and the first line of what its block says panicked
+/// (or the block's first line), as `<case>: <line>`.
+fn stopped_detail(stopped: &crate::libtest_json::Stopped, log: &str) -> String {
+    let block = crate::libtest::failed_tests(log)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|t| t.name == stopped.case)
+        .map(|t| t.block)
+        .unwrap_or_default();
+    let mut lines = block.lines().map(str::trim).filter(|l| !l.is_empty());
+    let mut line = lines.clone().next().unwrap_or("its block said nothing");
+    while let Some(l) = lines.next() {
+        if l.starts_with("thread '") && l.contains("panicked") {
+            if let Some(next) = lines.next() {
+                line = next;
+            }
+            break;
+        }
+    }
+    format!(
+        "{}: {}",
+        stopped.case,
+        line.chars().take(200).collect::<String>()
+    )
+}
+
 /// Whether a binary's run measured what it takes, so its history keeps a sample of it: it was
 /// `started` (the run's ceiling left it time: [`not_started`]), nothing outside it ended it (no
 /// [`Run::spawn_error`]: a spawn refused, an interrupt that came before it started, a stuck
 /// holder it waited behind, a wait for it that failed) and no interrupt was ending the run as it
 /// ended ([`crate::exec::ending`]), which cuts a binary short at a point that says nothing of it.
 /// A binary the run's ceiling ended keeps its sample, a lower bound of what it takes; one that
-/// never ran would keep a wall of about 0 ms, and push a measured sample out of its row.
+/// never ran would keep a wall of about 0 ms, and push a measured sample out of its row. A binary
+/// verify stopped at its first red case ([`Run::stopped_at`]) keeps none either: its wall is where
+/// verify ended it, and a sample with no wall is one the history's schema-1 readers (an older
+/// checkout's verify, sharing the per-user file) cannot decode, so they would empty the file.
 fn measured(run: &Run, started: bool) -> bool {
-    started && run.spawn_error.is_none() && !crate::exec::ending()
+    started && run.stopped_at.is_none() && run.spawn_error.is_none() && !crate::exec::ending()
 }
 
 /// The run's long poles: its own wall, then its slowest binaries by their own
@@ -883,22 +991,36 @@ where
         .collect()
 }
 
-/// The command that runs `b` as cargo would have, with `threads` test threads and its `Running` header at the head of its log.
+/// The command that runs `b` as cargo would have, with `threads` test threads, the run's checker
+/// policy and its `Running` header at the head of its log, its cases read as they end
+/// ([`exec::CaseWatch`]): in libtest's JSON format, its flags right after the executable, where
+/// `watch` says libtest took it and `b` may run with it ([`json_fits`]).
 #[must_use]
-pub fn binary_cmd(b: &Binary, threads: u32) -> Cmd {
+pub fn binary_cmd(b: &Binary, threads: u32, checkers: bool, watch: Watch) -> Cmd {
     let mut env: Vec<(OsString, OsString)> = b
         .record
         .env
         .iter()
-        .filter(|(k, _)| k != "RUST_TEST_THREADS")
+        .filter(|(k, _)| k != "RUST_TEST_THREADS" && k != crate::stages::CHECKERS_ENV)
         .cloned()
         .collect();
     env.push(("RUST_TEST_THREADS".into(), threads.to_string().into()));
     let mut command = Cmd::replayed(&b.record.argv, &b.record.cwd, env)
         .preamble(format!("{}\n", b.header))
         .counting_waits();
-    command.test_progress = Some(b.spec.clone());
-    command
+    let json = watch.json && json_fits(b);
+    if json {
+        let at = 0..0;
+        command
+            .args
+            .splice(at, JSON_FLAGS.iter().map(OsString::from));
+    }
+    command.test_cases = Some(exec::CaseWatch {
+        spec: b.spec.clone(),
+        json,
+        stop_at_red: watch.stop_at_red,
+    });
+    crate::stages::with_checkers(command, checkers)
 }
 
 /// The one log cargo would have written for these runs, in declared order, except that a run with
@@ -918,7 +1040,13 @@ pub fn combined(bins: &[Binary], runs: &[Run]) -> Run {
             continue;
         }
         output.push_str(&format!("error: test failed, to rerun pass `{}`\n", b.spec));
-        if r.code != Some(101) {
+        if let Some(stopped) = &r.stopped_at {
+            // Verify ended it, by design: no abnormal exit to say.
+            output.push_str(&format!(
+                "note: verify ended this binary at its first red case `{}`\n",
+                stopped.case
+            ));
+        } else if r.code != Some(101) {
             let argv: Vec<String> = b
                 .record
                 .argv
@@ -947,6 +1075,7 @@ pub fn combined(bins: &[Binary], runs: &[Run]) -> Run {
         }
     }
     Run {
+        stopped_at: None,
         ok: failed.is_empty(),
         output,
         code: Some(if failed.is_empty() { 0 } else { 101 }),
@@ -969,6 +1098,7 @@ pub fn summary(bins: &[Binary], jobs: usize, threads: u32) -> String {
 #[must_use]
 pub fn not_started(b: &Binary, limit: Duration) -> Run {
     Run {
+        stopped_at: None,
         ok: false,
         output: format!(
             "{}\n{} — not started: the test run's {:.1}s wall-clock ceiling was spent before \
@@ -1057,93 +1187,18 @@ fn decide_runs(
     }
 }
 
-/// What a rerun of one binary of `command` adds to that binary's `-p <crate> <target>` spec: the
-/// command's feature flags, and `-p` for each package a `<package>/<feature>` among them names,
-/// because cargo refuses that feature beside a selection with no direct dependency on the package.
-pub(crate) fn feature_args(command: &Cmd) -> String {
-    let mut kept = Vec::new();
-    let mut providers: Vec<String> = Vec::new();
-    let mut note = |value: &str| {
-        for feature in value.split([',', ' ']) {
-            if let Some((package, _)) = feature.split_once('/') {
-                let package = package.trim_end_matches('?');
-                if !providers.iter().any(|p| p == package) {
-                    providers.push(package.to_string());
-                }
-            }
-        }
-    };
-    let mut args = command.args.iter();
-    while let Some(arg) = args.next() {
-        let arg = arg.to_string_lossy();
-        if arg == "--" {
-            break;
-        }
-        if matches!(arg.as_ref(), "--features" | "-F") {
-            kept.push(arg.into_owned());
-            if let Some(value) = args.next() {
-                let value = value.to_string_lossy();
-                note(&value);
-                kept.push(crate::findings::shell_word(&value));
-            }
-        } else if matches!(arg.as_ref(), "--all-features" | "--no-default-features")
-            || arg.starts_with("--features=")
-            || arg.starts_with("-F=")
-        {
-            if let Some((_, value)) = arg.split_once('=') {
-                note(value);
-            }
-            kept.push(crate::findings::shell_word(&arg));
-        }
-    }
-    providers
-        .iter()
-        .map(|package| format!("-p {package}"))
-        .chain(kept)
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-pub(crate) fn serial_feature_reruns(run: &mut Run, features: &str) {
-    if features.is_empty() {
-        return;
-    }
-    run.output = run
-        .output
-        .split_inclusive('\n')
-        .map(|line| {
-            for prefix in [
-                "error: test failed, to rerun pass `",
-                "error: doctest failed, to rerun pass `",
-            ] {
-                if let Some((spec, tail)) = line
-                    .strip_prefix(prefix)
-                    .and_then(|rest| rest.split_once('`'))
-                {
-                    return format!("{prefix}{spec} {features}`{tail}");
-                }
-            }
-            line.to_string()
-        })
-        .collect();
-}
-
-fn binary_features(bins: &mut [Binary], features: &str) {
-    if !features.is_empty() {
-        for binary in bins {
-            binary.spec.push(' ');
-            binary.spec.push_str(features);
-        }
-    }
-}
-
-/// Record Cargo's current test invocations and run them with the admitted parallelism. The first
-/// binary that fails ends the run when its halt is armed ([`crate::Ctx::halt`], named for `check`):
-/// no binary starts after it, and those it stopped are one NOT RUN row with the halt's words. A
-/// binary verify could not start or ended unrun otherwise is a NOT RUN row of its own, and the
-/// binaries that ran decide the run's row ([`decide_runs`]). A binary's `test … FAILED` line
-/// sets nothing while it runs: that case may yet read as its machine's refusal or a full disk,
-/// which libtest's report of it says only at the binary's end.
+/// Record Cargo's current test invocations and run them with the admitted parallelism
+/// ([`run_planned`]). Each binary that runs libtest's harness runs in libtest's JSON format where
+/// libtest takes it ([`probe_json`]), so each failed case's block is read as the case ends. The
+/// first proven red ends the run when its halt is armed ([`crate::Ctx::halt`], named for
+/// `check`): a failed case whose block, with those before it, makes its binary a FAIL
+/// (`libtest::decisive`) ends that binary there, its log rendered as libtest's report of the cases
+/// that finished ([`crate::libtest_json::render`]); a case that refused its machine or hit a full
+/// disk ends nothing. A binary run in the human format (no harness, a refused probe, its own
+/// output flags) is decided at its end. No binary starts after the red, and those it stopped are
+/// one NOT RUN row with the halt's words. A binary verify could not start or ended unrun
+/// otherwise is a NOT RUN row of its own, and the binaries that ran decide the run's row
+/// ([`decide_runs`]).
 pub fn run_tests(
     ctx: &crate::Ctx,
     r: &mut Report,
@@ -1211,9 +1266,9 @@ pub fn run_tests(
         || serial.clone(),
         |threads| serial.clone().env("RUST_TEST_THREADS", threads.to_string()),
     );
-    serial = serial.env(SUBPROCESS_SLOTS_ENV, slots.path());
+    let checkers = check == crate::checks::Check::Checkers || ctx.checkers_in_tests;
+    serial = crate::stages::with_checkers(serial, checkers).env(SUBPROCESS_SLOTS_ENV, slots.path());
     let serial = &serial;
-    let features = feature_args(serial);
     #[cfg(unix)]
     match aterm_uds::host::open_file_room(4096) {
         Ok(room) => {
@@ -1232,8 +1287,7 @@ pub fn run_tests(
         r.raw(format!(
             "  test binaries: run by cargo, one at a time — {why}"
         ));
-        let mut out = exec::run(serial, ctx.exec_env());
-        serial_feature_reruns(&mut out, &features);
+        let out = exec::run(serial, ctx.exec_env());
         r.raw(out.output.as_str());
         decide(ctx, r, &out, label, &env);
     };
@@ -1286,7 +1340,6 @@ pub fn run_tests(
                  used (a runner in the caller's cargo config outranks it)",
             );
         }
-        serial_feature_reruns(&mut pass, &features);
         r.raw(pass.output.as_str());
         decide(ctx, r, &pass, label, &env);
         return;
@@ -1311,14 +1364,199 @@ pub fn run_tests(
             first_error(&pass.output)
         ))
     };
-    let mut bins = match bins {
+    let bins = match bins {
         Ok(bins) => bins,
         Err(why) => {
             serially(r, &why);
             return;
         }
     };
-    binary_features(&mut bins, &features);
+    let preface: String = pass
+        .output
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("Running "))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let planned = Planned {
+        bins,
+        jobs,
+        threads,
+        cores: usize::try_from(granted_cores).unwrap_or(1),
+        checkers,
+        preface,
+    };
+    run_planned(ctx, r, label, planned, check, &env);
+}
+
+/// What [`run_tests`] planned for its binaries' runs.
+pub(crate) struct Planned {
+    /// The binaries, in declared order.
+    pub(crate) bins: Vec<Binary>,
+    /// How many run at once.
+    pub(crate) jobs: usize,
+    /// The test threads each runs at.
+    pub(crate) threads: u32,
+    /// The cores the run was granted (a resume's hashing width, [`carry`]).
+    pub(crate) cores: usize,
+    /// The run's checker policy ([`crate::stages::with_checkers`]).
+    pub(crate) checkers: bool,
+    /// The recording pass's log, its `Running` headers dropped, at the head of a whole run's
+    /// report.
+    pub(crate) preface: String,
+}
+
+/// What [`probe_json`] learned of libtest's JSON format.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Probe {
+    /// A binary listed its cases in it.
+    Took,
+    /// A binary ran and exited without it: what libtest said, its first line.
+    Refused(String),
+    /// No binary it asked answered (a spawn refused, a crash, a run already ending): why the
+    /// last one did not.
+    Unanswered(String),
+}
+
+/// What a binary's run reads of libtest's JSON format, by [`probe_json`]: whether its binaries
+/// may run with it, and why not.
+fn json_ladder(probe: &Probe) -> String {
+    match probe {
+        Probe::Took => "  test cases: seen as they fail (libtest JSON)".to_owned(),
+        Probe::Refused(why) => {
+            format!("  test cases: decided at each binary's end — libtest refused JSON: {why}")
+        }
+        Probe::Unanswered(why) => format!(
+            "  test cases: decided at each binary's end — no binary answered libtest's JSON \
+             probe: {why}"
+        ),
+    }
+}
+
+/// libtest's JSON flags, which go right after the executable.
+const JSON_FLAGS: [&str; 4] = ["-Z", "unstable-options", "--format", "json"];
+
+/// The binaries [`probe_json`] asks before it takes no answer for one.
+const PROBE_TRIES: usize = 3;
+
+/// Ask the binaries that run libtest's harness ([`Binary::harness`]), in order, to list their
+/// cases in libtest's JSON format until one answers, at most [`PROBE_TRIES`] of them: `None`
+/// where no binary runs the harness. A binary that exited with a code answers: [`Probe::Took`]
+/// where it exited 0 and printed a suite `discovery` event, else [`Probe::Refused`] with its first
+/// line, what libtest said in refusing. One that verify could not start or ended
+/// ([`Run::spawn_error`]), that a signal ended, or that ended as the run was ending says nothing
+/// of libtest, so the next is asked; with none left, [`Probe::Unanswered`].
+fn probe_json(ctx: &crate::Ctx, bins: &[Binary]) -> Option<Probe> {
+    let first_line = |run: &Run| -> String {
+        run.output
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("no output")
+            .trim()
+            .chars()
+            .take(200)
+            .collect()
+    };
+    let mut unanswered = None;
+    for b in bins.iter().filter(|b| b.harness).take(PROBE_TRIES) {
+        let mut argv = vec![b.record.exe().as_os_str().to_owned()];
+        argv.extend(JSON_FLAGS.iter().map(OsString::from));
+        argv.push("--list".into());
+        let mut cmd = Cmd::replayed(&argv, &b.record.cwd, b.record.env.clone());
+        cmd.capture = exec::Capture::Emit;
+        let run = exec::run(&cmd, ctx.exec_env());
+        if let Some(why) = &run.spawn_error {
+            unanswered = Some(format!("{}: {why}", b.spec));
+            continue;
+        }
+        if run.code.is_none() || crate::exec::ending() {
+            unanswered = Some(format!("{}: {}", b.spec, first_line(&run)));
+            continue;
+        }
+        let discovered = run.output.lines().any(|l| {
+            crate::libtest_json::parse_event(l).is_some_and(|ev| {
+                ev.kind == crate::libtest_json::Kind::Suite && ev.event == "discovery"
+            })
+        });
+        return Some(if run.ok && discovered {
+            Probe::Took
+        } else {
+            Probe::Refused(first_line(&run))
+        });
+    }
+    unanswered.map(Probe::Unanswered)
+}
+
+/// Whether `b` may run with libtest's JSON flags: it runs libtest's harness, nothing its record
+/// hands it already chooses an output (a format, quiet, a list, uncaptured output, a log file, a
+/// benchmark run), which the flags would contradict or a reader of the events would miss, and
+/// nothing would change what it runs once `-Z unstable-options` lets libtest read its unstable
+/// inputs: no `-Z` of its own (which every unstable flag, `--shuffle`, `--ensure-time`, …, needs)
+/// and no `RUST_TEST_SHUFFLE`/`RUST_TEST_SHUFFLE_SEED`, which libtest reads only then and which
+/// would reorder its cases and add a `shuffle_seed` to its events.
+fn json_fits(b: &Binary) -> bool {
+    const CHOSEN: [&str; 9] = [
+        "--format",
+        "-q",
+        "--quiet",
+        "--list",
+        "--nocapture",
+        "--no-capture",
+        "--show-output",
+        "--logfile",
+        "--bench",
+    ];
+    b.harness
+        && !b.record.argv.iter().skip(1).any(|a| {
+            let a = a.to_string_lossy();
+            CHOSEN
+                .iter()
+                .any(|c| *a == **c || a.strip_prefix(c).is_some_and(|r| r.starts_with('=')))
+        })
+        && !b
+            .record
+            .argv
+            .iter()
+            .skip(1)
+            .any(|a| a.to_string_lossy().starts_with("-Z"))
+        && [
+            "RUST_TEST_NOCAPTURE",
+            "RUST_TEST_SHUFFLE",
+            "RUST_TEST_SHUFFLE_SEED",
+        ]
+        .iter()
+        .all(|k| b.record.var(k).is_none())
+}
+
+/// How the run reads its binaries' cases ([`binary_cmd`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Watch {
+    /// libtest took its JSON format ([`probe_json`]).
+    pub json: bool,
+    /// The run halts at its first red ([`crate::sched::Halt::armed`]).
+    pub stop_at_red: bool,
+}
+
+/// Run the planned binaries: each through [`pool`], its cases read as they end ([`Watch`]), and
+/// decide the run's rows ([`decide_runs`]). The first binary that fails ends the run when its halt
+/// is armed: a JSON run ends that binary at its first decisive red case (`exec`'s `LiveCases`), a
+/// human one at its end; no binary starts after it, and those it stopped are one NOT RUN row with
+/// the halt's words.
+pub(crate) fn run_planned(
+    ctx: &crate::Ctx,
+    r: &mut Report,
+    label: &str,
+    planned: Planned,
+    check: crate::checks::Check,
+    env: &[(OsString, OsString)],
+) {
+    let Planned {
+        bins,
+        jobs,
+        threads,
+        cores,
+        checkers,
+        preface,
+    } = planned;
     // A release hashes each binary's executable (its record's key for a resume, A19); a dev run
     // keeps none, so it pays nothing for it.
     let hashed = AtomicU64::new(0);
@@ -1333,12 +1571,7 @@ pub fn run_tests(
         carried,
         known,
     } = match &ctx.passed_binaries {
-        Some(passed) => carry(
-            passed,
-            bins,
-            hash,
-            usize::try_from(granted_cores).unwrap_or(1),
-        ),
+        Some(passed) => carry(passed, bins, hash, cores),
         None => Carried {
             run: bins,
             carried: Vec::new(),
@@ -1348,6 +1581,14 @@ pub fn run_tests(
     for (binary, sha) in &carried {
         emit(ctx, &carried_event(binary, sha));
     }
+    let probe = probe_json(ctx, &bins);
+    if let Some(probe) = &probe {
+        r.raw(json_ladder(probe));
+    }
+    let watch = Watch {
+        json: probe == Some(Probe::Took),
+        stop_at_red: ctx.halt.armed(),
+    };
     let shas = Mutex::new(known);
     let ceiling = ctx.exec_env().child_ceiling;
     let started = Instant::now();
@@ -1365,7 +1606,7 @@ pub fn run_tests(
                     output: String::new(),
                     code: None,
                     spawn_error: Some(words.to_owned()),
-                    usage: None,
+                    ..Run::default()
                 };
             }
             let known = shas
@@ -1389,7 +1630,13 @@ pub fn run_tests(
                 }
                 env.child_ceiling = Some(left);
             }
-            exec::run(&binary_cmd(b, t), env)
+            let cmd = binary_cmd(b, t, checkers, watch);
+            let mut run = exec::run(&cmd, env);
+            if cmd.test_cases.as_ref().is_some_and(|w| w.json) {
+                // The raw events were the child's log; every reader takes libtest's report.
+                run.output = crate::libtest_json::render(&run.output, run.stopped_at.as_ref());
+            }
+            run
         },
         |binary, run, waiting, execution| {
             let never_started = unstarted
@@ -1480,7 +1727,7 @@ pub fn run_tests(
             r.raw(combined(&bins, &runs).output);
             // The golden test may be among those stopped, and the run is red already.
             decide_runs(r, &bins, &runs, label, |r, rest| {
-                r.decide_test_child(rest, label, &env);
+                r.decide_test_child(rest, label, env);
             });
         }
         r.cannot_run(format!(
@@ -1490,12 +1737,6 @@ pub fn run_tests(
         ));
         return;
     }
-    let preface: String = pass
-        .output
-        .lines()
-        .filter(|l| !l.trim_start().starts_with("Running "))
-        .map(|l| format!("{l}\n"))
-        .collect();
     r.raw(preface);
     r.raw(summary(&bins, jobs, threads));
     accounted(r);
@@ -1507,7 +1748,7 @@ pub fn run_tests(
         ));
     }
     decide_runs(r, &bins, &runs, label, |r, rest| {
-        decide(ctx, r, rest, label, &env);
+        decide(ctx, r, rest, label, env);
     });
 }
 
@@ -1672,6 +1913,7 @@ mod tests {
         let bins: Vec<_> = ["slow", "failed"]
             .into_iter()
             .map(|name| Binary {
+                harness: false,
                 header: name.into(),
                 spec: name.into(),
                 record: rec("/r/test", "test"),
@@ -1699,6 +1941,7 @@ mod tests {
                     );
                 }
                 Run {
+                    stopped_at: None,
                     ok: binary.spec == "slow",
                     output: String::new(),
                     code: Some(i32::from(binary.spec != "slow")),
@@ -1722,11 +1965,13 @@ mod tests {
     #[test]
     fn a_passing_binary_cannot_forge_a_failure_event_in_its_output() {
         let binary = Binary {
+            harness: false,
             header: "test".into(),
             spec: "-p test".into(),
             record: rec("/r/test", "test"),
         };
         let mut run = Run {
+            stopped_at: None,
             ok: true,
             output: "test counterfeit ... FAILED".into(),
             code: Some(0),
@@ -1774,6 +2019,7 @@ mod tests {
     #[test]
     fn a_resume_carries_only_unchanged_binaries_that_passed_and_never_the_golden_package() {
         let bin = |exe: &str, pkg: &str| Binary {
+            harness: false,
             header: format!("     Running unittests src/lib.rs ({exe})"),
             spec: format!("-p {pkg} --lib"),
             record: rec(exe, pkg),
@@ -1873,6 +2119,7 @@ mod tests {
         )
         .with_events(Some(crate::event_log::EventLog::open(&at).unwrap()));
         let binary = Binary {
+            harness: false,
             header: String::new(),
             spec: "-p aterm-db --lib".into(),
             record: Record {
@@ -2008,6 +2255,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn recording_keeps_the_runner_with_command_local_workspace_features() {
+        let serial = Cmd::new("targo").args([
+            "--unverified",
+            "test",
+            "--config",
+            "resolver.feature-unification=\"workspace\"",
+            "--tests",
+            "--",
+            "--skip",
+            "x",
+        ]);
+        let command = recording_cmd(&serial, "RUNNER");
+        let args = command.argv();
+        assert_eq!(
+            &args[1..7],
+            [
+                "--unverified",
+                "test",
+                "--config",
+                "RUNNER",
+                "--config",
+                "resolver.feature-unification=\"workspace\""
+            ]
+        );
+        assert!(args.ends_with(&["--".to_owned(), "--skip".to_owned(), "x".to_owned()]));
+    }
+
     /// THE COMPILE'S LIST, AND THE LOG WITHOUT IT: only test-mode executables
     /// count, each with cargo's own flag, and every JSON line leaves the text
     /// the ladder shows — the diagnostics and progress lines stay, in order.
@@ -2108,11 +2383,13 @@ mod tests {
                    \x20    Running tests/bridge_e2e.rs (target/debug/deps/bridge_e2e-2)\n";
         let exes = [
             TestExe {
+                harness: false,
                 exe: "/r/target/debug/deps/aterm_link-1".into(),
                 flag: "--lib".into(),
                 bin_env: Vec::new(),
             },
             TestExe {
+                harness: false,
                 exe: "/r/target/debug/deps/bridge_e2e-2".into(),
                 flag: "--test bridge_e2e".into(),
                 bin_env: Vec::new(),
@@ -2132,6 +2409,7 @@ mod tests {
         let in_build_dir: Vec<TestExe> = exes
             .iter()
             .map(|e| TestExe {
+                harness: false,
                 exe: Path::new("/cache/r/.cargo-build/debug/deps")
                     .join(e.exe.file_name().expect("a file name")),
                 flag: e.flag.clone(),
@@ -2179,6 +2457,7 @@ mod tests {
     fn binaries_share_the_pool_and_answer_in_declared_order() {
         let bins: Vec<Binary> = (0..9)
             .map(|i| Binary {
+                harness: false,
                 header: format!("     Running tests/t{i}.rs (target/debug/deps/t{i}-1)"),
                 spec: format!("-p x --test t{i}"),
                 record: rec(&format!("/r/t{i}"), "x"),
@@ -2200,6 +2479,7 @@ mod tests {
                     ));
                     running.fetch_sub(1, Ordering::SeqCst);
                     Run {
+                        stopped_at: None,
                         ok: true,
                         output: format!("{}\nran {}\n", b.header, b.spec),
                         code: Some(0),
@@ -2230,6 +2510,7 @@ mod tests {
         let secs = [3, 41, 0, 7, 12, 1, 2, 5, 9, 4];
         let bins: Vec<Binary> = (0..secs.len())
             .map(|i| Binary {
+                harness: false,
                 header: format!("     Running tests/t{i}.rs (target/debug/deps/t{i}-1)"),
                 spec: format!("-p x --test t{i}"),
                 record: rec(&format!("/r/t{i}"), "x"),
@@ -2253,6 +2534,7 @@ mod tests {
     #[test]
     fn a_binary_the_ceiling_left_no_time_for_is_a_fail() {
         let b = Binary {
+            harness: false,
             header: "     Running tests/late.rs (target/debug/deps/late-1)".into(),
             spec: "-p x --test late".into(),
             record: rec("/r/late", "x"),
@@ -2288,12 +2570,14 @@ mod tests {
         let bins: Vec<Binary> = ["a", "b", "c"]
             .iter()
             .map(|n| Binary {
+                harness: false,
                 header: format!("     Running tests/{n}.rs (target/debug/deps/{n}-1)"),
                 spec: format!("-p x --test {n}"),
                 record: rec(&format!("/r/target/debug/deps/{n}-1"), "x"),
             })
             .collect();
         let pass = |b: &Binary| Run {
+            stopped_at: None,
             ok: true,
             output: format!(
                 "{}\n\nrunning 1 test\ntest ok_one ... ok\n\ntest result: ok. 1 passed; 0 \
@@ -2305,6 +2589,7 @@ mod tests {
             usage: None,
         };
         let fail = |b: &Binary| Run {
+            stopped_at: None,
             ok: false,
             output: format!(
                 "{}\n\nrunning 1 test\ntest t::broke ... FAILED\n\nfailures:\n\n\
@@ -2341,35 +2626,6 @@ mod tests {
             event["failures"][0]["output"].as_str(),
             Some(tests[0].block.as_str())
         );
-        let command = Cmd::new("targo").args([
-            "test",
-            "--features",
-            "aterm-spec/checkers",
-            "--no-default-features",
-            "--",
-            "--features",
-            "child-option",
-        ]);
-        let features = feature_args(&command);
-        assert_eq!(
-            features,
-            "-p aterm-spec --features aterm-spec/checkers --no-default-features"
-        );
-        let mut serial_failure = all.clone();
-        serial_feature_reruns(&mut serial_failure, &features);
-        let mut featured = bins.clone();
-        binary_features(&mut featured, &features);
-        let parallel_failure = combined(&featured, &runs);
-        for output in [&serial_failure.output, &parallel_failure.output] {
-            let findings = crate::findings::test_findings("checkers", output, &[]);
-            assert_eq!(findings.len(), 1);
-            assert_eq!(
-                findings[0].rerun.as_deref(),
-                Some(
-                    "targo --unverified test -p x --test b -p aterm-spec --features aterm-spec/checkers --no-default-features -- t::broke --exact"
-                )
-            );
-        }
         let findings = crate::findings::test_findings("targo test --tests", &all.output, &[]);
         assert_eq!(findings[0].id, "-p x --test b -- t::broke");
         assert!(
@@ -2382,6 +2638,7 @@ mod tests {
         assert!(a < b && b < c, "declared order");
 
         let crashed = Run {
+            stopped_at: None,
             ok: false,
             output: format!("{}\n\nrunning 1 test\n", bins[1].header),
             code: None,
@@ -2401,6 +2658,7 @@ mod tests {
 
         let sentinel = crate::libtest::COULD_NOT_RUN_SENTINEL;
         let refused = Run {
+            stopped_at: None,
             ok: false,
             output: fail(&bins[1])
                 .output
@@ -2458,7 +2716,7 @@ mod tests {
         let header = "     Running tests/it.rs (target/debug/deps/it-1)\n";
         let bins = plan(vec![record], header, &exes).expect("a plan");
         assert_eq!(
-            named(&binary_cmd(&bins[0], 1).envs),
+            named(&binary_cmd(&bins[0], 1, false, Watch::default()).envs),
             ["CARGO_BIN_EXE_x-tool=/r/target/debug/x-tool"],
             "the compile's binary, once, in place of the stale one"
         );
@@ -2475,12 +2733,14 @@ mod tests {
         let bins: Vec<Binary> = ["a", "b", "c"]
             .iter()
             .map(|n| Binary {
+                harness: false,
                 header: format!("     Running tests/{n}.rs (target/debug/deps/{n}-1)"),
                 spec: format!("-p x --test {n}"),
                 record: rec(&format!("/r/target/debug/deps/{n}-1"), "x"),
             })
             .collect();
         let pass = |b: &Binary| Run {
+            stopped_at: None,
             ok: true,
             output: format!(
                 "{}\n\nrunning 1 test\ntest ok_one ... ok\n\ntest result: ok. 1 passed; 0 \
@@ -2492,6 +2752,7 @@ mod tests {
             usage: None,
         };
         let fail = |b: &Binary| Run {
+            stopped_at: None,
             ok: false,
             output: format!(
                 "{}\n\nrunning 1 test\ntest t::broke ... FAILED\n\nfailures:\n\n\
@@ -2506,6 +2767,7 @@ mod tests {
         };
         let why = "the run was interrupted before this child started";
         let unrun = |b: &Binary| Run {
+            stopped_at: None,
             ok: false,
             output: format!("{}\naterm-verify: cannot run {}: {why}", b.header, b.spec),
             code: None,
@@ -2539,6 +2801,7 @@ mod tests {
         );
 
         let crashed = Run {
+            stopped_at: None,
             ok: false,
             output: format!("{}\n\nrunning 1 test\n", bins[1].header),
             code: None,
@@ -2569,14 +2832,171 @@ mod tests {
         assert_eq!(r.outcomes().count(), 1, "{}", r.render());
     }
 
+    /// The compile's artifacts carry their manifest's harness: a `[[test]]` that says
+    /// `harness = false` is false and its autodiscovered sibling true, read from the
+    /// `manifest_path` each message names. NEGATIVE CONTROL: an artifact with no manifest path
+    /// is false.
+    #[test]
+    fn each_test_executable_carries_its_manifests_harness() {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let manifest = dir.path().join("Cargo.toml");
+        std::fs::write(
+            &manifest,
+            "[package]\nname = \"x\"\n[[test]]\nname = \"custom\"\nharness = false\n",
+        )
+        .expect("a manifest");
+        let with = |line: String| {
+            line.replacen(
+                "\"reason\":\"compiler-artifact\",",
+                &format!(
+                    "\"reason\":\"compiler-artifact\",\"manifest_path\":{},",
+                    aterm_json::json!(manifest.to_str().expect("utf-8"))
+                ),
+                1,
+            )
+        };
+        let mut log = [
+            with(artifact("/r/t/custom-1", "test", "custom", true)),
+            with(artifact("/r/t/plain-1", "test", "plain", true)),
+            artifact("/r/t/bare-1", "test", "bare", true),
+        ]
+        .concat();
+        let exes = take_test_executables(&mut log).expect("read");
+        assert_eq!(
+            exes.iter()
+                .map(|e| (e.flag.as_str(), e.harness))
+                .collect::<Vec<_>>(),
+            [
+                ("--test custom", false),
+                ("--test plain", true),
+                ("--test bare", false)
+            ]
+        );
+    }
+
+    /// A TARGET'S HARNESS IS ITS MANIFEST'S WORD: `harness = false` under `[lib]`, `[[test]]` or
+    /// `[[bench]]` keeps libtest's flags from it; an autodiscovered target, and one whose entry
+    /// says nothing, runs the harness; a name two entries share, and a manifest that could not be
+    /// read, are false, so a JSON flag never reaches a custom main. NEGATIVE CONTROL: the
+    /// entries' siblings, harness unsaid, read true.
+    #[test]
+    fn a_targets_harness_is_its_manifests_word() {
+        let manifest = aterm_toml::from_str::<aterm_toml::Value>(
+            "[package]\nname = \"x\"\n[lib]\nharness = false\n\
+             [[test]]\nname = \"custom\"\nharness = false\n\
+             [[test]]\nname = \"plain\"\n\
+             [[test]]\npath = \"tests/stem.rs\"\nharness = false\n\
+             [[bench]]\nname = \"speed\"\nharness = false\n\
+             [[bin]]\nname = \"twice\"\n[[bin]]\nname = \"twice\"\n",
+        )
+        .expect("a manifest");
+        let m = Some(&manifest);
+        assert!(!harness_of(m, &["lib"], "x"));
+        assert!(!harness_of(m, &["rlib", "lib"], "x"));
+        assert!(!harness_of(m, &["test"], "custom"));
+        assert!(harness_of(m, &["test"], "plain"));
+        assert!(!harness_of(m, &["test"], "stem"));
+        assert!(harness_of(m, &["test"], "autodiscovered"));
+        assert!(!harness_of(m, &["bench"], "speed"));
+        assert!(harness_of(m, &["bench"], "other"));
+        assert!(!harness_of(m, &["bin"], "twice"), "an ambiguous name");
+        assert!(harness_of(m, &["bin"], "once"));
+        assert!(!harness_of(None, &["test"], "plain"), "an unread manifest");
+        let bare = aterm_toml::from_str::<aterm_toml::Value>("[package]\nname = \"y\"\n")
+            .expect("a manifest");
+        assert!(harness_of(Some(&bare), &["lib"], "y"));
+    }
+
     #[test]
     fn the_replayed_command_is_the_record_with_its_thread_count() {
-        let b = Binary {
+        let mut b = Binary {
             header: "     Running tests/a.rs (target/debug/deps/a-1)".into(),
             spec: "-p x --test a".into(),
             record: rec("/r/target/debug/deps/a-1", "x"),
+            harness: true,
         };
-        let cmd = binary_cmd(&b, 7);
+        b.record
+            .env
+            .push((crate::stages::CHECKERS_ENV.into(), "1".into()));
+        let cmd = binary_cmd(&b, 7, false, Watch::default());
+        let json = binary_cmd(
+            &b,
+            7,
+            false,
+            Watch {
+                json: true,
+                stop_at_red: true,
+            },
+        );
+        assert_eq!(
+            json.argv(),
+            [
+                "/r/target/debug/deps/a-1",
+                "-Z",
+                "unstable-options",
+                "--format",
+                "json",
+                "--skip",
+                "slow::"
+            ]
+        );
+        assert_eq!(
+            json.test_cases,
+            Some(crate::exec::CaseWatch {
+                spec: "-p x --test a".into(),
+                json: true,
+                stop_at_red: true
+            })
+        );
+        b.harness = false;
+        assert_eq!(
+            binary_cmd(
+                &b,
+                7,
+                false,
+                Watch {
+                    json: true,
+                    stop_at_red: true
+                }
+            )
+            .argv(),
+            cmd.argv(),
+            "no JSON flag reaches a custom main"
+        );
+        b.harness = true;
+        let armed = Watch {
+            json: true,
+            stop_at_red: true,
+        };
+        for var in ["RUST_TEST_SHUFFLE", "RUST_TEST_SHUFFLE_SEED"] {
+            let mut shuffled = b.clone();
+            shuffled.record.env.push((var.into(), "1".into()));
+            assert!(
+                !binary_cmd(&shuffled, 7, false, armed)
+                    .argv()
+                    .iter()
+                    .any(|a| a == "-Z"),
+                "{var} is read only once -Z unstable-options is passed"
+            );
+        }
+        let mut unstable = b.clone();
+        unstable.record.argv.push("-Zunstable-options".into());
+        unstable.record.argv.push("--shuffle".into());
+        assert_eq!(
+            binary_cmd(&unstable, 7, false, armed).argv().len(),
+            unstable.record.argv.len(),
+            "a record that already passes -Z keeps its own flags alone"
+        );
+        for required in [false, true] {
+            let cmd = binary_cmd(&b, 7, required, Watch::default());
+            let policy: Vec<_> = cmd
+                .envs
+                .iter()
+                .filter(|(k, _)| k == crate::stages::CHECKERS_ENV)
+                .map(|(_, v)| v.to_str().unwrap())
+                .collect();
+            assert_eq!(policy, [if required { "1" } else { "0" }]);
+        }
         assert_eq!(cmd.argv(), ["/r/target/debug/deps/a-1", "--skip", "slow::"]);
         assert_eq!(cmd.cwd.as_deref(), Some(Path::new("/r/crates/x")));
         assert!(cmd.exact_env);
@@ -2606,11 +3026,13 @@ mod tests {
         let log = "     Running tests/a.rs (target/debug/deps/a-1)\n";
         let exes = vec![
             TestExe {
+                harness: false,
                 exe: PathBuf::from("/other/target/debug/deps/a-1"),
                 flag: "--lib".to_string(),
                 bin_env: Vec::new(),
             },
             TestExe {
+                harness: false,
                 exe: PathBuf::from("/r/target/debug/deps/a-1"),
                 flag: "--test a".to_string(),
                 bin_env: Vec::new(),

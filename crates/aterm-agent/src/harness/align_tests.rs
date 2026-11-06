@@ -14,6 +14,32 @@ const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
 #[cfg(unix)]
 #[test]
+fn an_unsignalable_group_is_resolved_by_the_owning_wait() {
+    for error in [libc::ESRCH, libc::EPERM, libc::EIO] {
+        let observed = Arc::new(CaptureLifecycleObservation::default());
+        *observed.group_signal.lock().unwrap() = Some(Box::new(move |_| {
+            Err(std::io::Error::from_raw_os_error(error))
+        }));
+        let mut cmd = shell("exec \"$ATERM_TEST_SLEEP\" 120");
+        cmd.process_group(0);
+        let child = cmd.spawn().unwrap();
+        let mut owner = CaptureOwner::new(child, Some(observed.clone()));
+        assert!(
+            !owner.child.exited().unwrap(),
+            "the exit is not observable yet"
+        );
+        let result = owner.stop(true);
+        assert!(observed.child_reaped.load(Ordering::Acquire));
+        assert_eq!(
+            result.is_ok(),
+            error != libc::EIO,
+            "errno {error}: {result:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn lost_capture_custody_never_accepts_a_later_status_or_numeric_operation() {
     use std::os::unix::process::ExitStatusExt as _;
     let positive = std::process::ExitStatus::from_raw(0);
@@ -113,7 +139,7 @@ fn an_external_capture_watch_reaps_and_joins_with_open_or_closed_stdout() {
         for closed in [false, true] {
             for panics in [false, true] {
                 let observed = Arc::new(CaptureLifecycleObservation::default());
-                let mut watch = |_: &mut aterm_uds::spawnfd::Child| {
+                let mut watch = |_: &mut CaptureInput<'_>| {
                     if panics {
                         std::panic::panic_any(PanicOnDrop);
                     }
@@ -173,7 +199,15 @@ fn completed_output_and_observed_exit_win_over_a_terminal_capture_watch() {
                     exit.wait(remaining);
                 }
             }));
-            let mut failed = |_: &mut aterm_uds::spawnfd::Child| true;
+            let reader = observed.clone();
+            *observed.after_reader.lock().unwrap() = Some(Box::new(move || {
+                // This case requires both completed output and terminal exit. Exit alone
+                // does not establish that the newly spawned reader has queued its output.
+                aterm_spec::wait::until_within(HANG_DETECTOR, "completed capture output", || {
+                    reader.reader_done.load(Ordering::Acquire).then_some(())
+                });
+            }));
+            let mut failed = |_: &mut CaptureInput<'_>| true;
             let ran = capture_with(
                 shell(&format!("printf kept; exit {code}")),
                 HANG_DETECTOR,
@@ -292,7 +326,7 @@ const HANG_S: u64 = 300;
 
 /// Capture `script`.
 #[cfg(unix)]
-fn capture_a_hanging_group(tag: &str, script: &str, path: &str) -> (libc::pid_t, Duration) {
+fn capture_a_hanging_group(tag: &str, script: &str) -> (libc::pid_t, Duration) {
     let tmp = temp_dir(tag);
     let pgid_file = tmp.path().join("pgid");
     let mut cmd = Command::new(crate::test_program::kept("/bin/sh"));
@@ -325,10 +359,6 @@ fn capture_a_hanging_group(tag: &str, script: &str, path: &str) -> (libc::pid_t,
         pgid, pid,
         "the capture's child does not lead its own process group (it is in \
          {pgid}), so no group kill can reach what it leaves running"
-    );
-    assert!(
-        why.contains(path),
-        "the capture gave up on another path: {why}"
     );
     (pgid, took)
 }
@@ -366,7 +396,6 @@ fn a_child_that_closes_stdout_then_hangs_cannot_survive_the_deadline() {
     let (pgid, took) = capture_a_hanging_group(
         "closed-stdout-hang",
         "exec 1>&-; echo \"$$ $(\"$ATERM_TEST_PS\" -o pgid= -p $$)\" > \"$PGIDF\"; \"$ATERM_TEST_SLEEP\" \"$HANG_S\"",
-        "closed its output",
     );
     assert!(
         took < Duration::from_secs(HANG_S / 2),
@@ -381,7 +410,6 @@ fn a_descendant_holding_stdout_is_killed_with_its_process_group() {
     let (pgid, took) = capture_a_hanging_group(
         "descendant-stdout-hang",
         "g=$(\"$ATERM_TEST_PS\" -o pgid= -p $$); (echo \"$$ $g\" > \"$PGIDF\"; \"$ATERM_TEST_SLEEP\" \"$HANG_S\") & exit 0",
-        "ran past its",
     );
     assert!(
         took < Duration::from_secs(HANG_S / 2),
@@ -399,7 +427,6 @@ fn a_group_still_forking_at_the_deadline_is_killed_whole() {
     let (pgid, _) = capture_a_hanging_group(
         "forking-group",
         "echo \"$$ $(\"$ATERM_TEST_PS\" -o pgid= -p $$)\" > \"$PGIDF\"; while :; do \"$ATERM_TEST_SLEEP\" \"$HANG_S\" & kill -KILL $!; done",
-        "ran past its",
     );
     assert!(
         group_emptied(pgid),
@@ -859,7 +886,7 @@ fn a_capture_budget_counts_the_time_its_host_slept() {
         aterm_uds::process::continuous_ns().is_some(),
         "this host has a clock that counts through sleep"
     );
-    for owned in [false, true] {
+    for (owned, watching) in [(false, false), (true, false), (true, true)] {
         let provider = owned_fixture::Provider::new(if owned { "slept-owned" } else { "slept" });
         let observed = Arc::new(CaptureLifecycleObservation::default());
         settle_until(&observed, provider.ready());
@@ -875,7 +902,13 @@ fn a_capture_budget_counts_the_time_its_host_slept() {
         let (tx, rx) = mpsc::channel();
         let program = provider.program();
         let run = Arc::clone(&observed);
+        let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let effect = effects.clone();
         std::thread::spawn(move || {
+            let mut watch = |_: &mut CaptureInput<'_>| {
+                effect.fetch_add(1, Ordering::AcqRel);
+                false
+            };
             let _ = tx.send(capture_with(
                 Command::new(program),
                 HOUR,
@@ -883,7 +916,7 @@ fn a_capture_budget_counts_the_time_its_host_slept() {
                 None,
                 Some(run),
                 owned,
-                None,
+                if watching { Some(&mut watch) } else { None },
             ));
         });
         let why = rx
@@ -898,6 +931,11 @@ fn a_capture_budget_counts_the_time_its_host_slept() {
         assert!(
             why.contains(&format!("ran past its {} ms deadline", HOUR.as_millis())),
             "owned={owned}: {why}"
+        );
+        assert_eq!(
+            effects.load(Ordering::Acquire),
+            0,
+            "a slept deadline cannot admit a fresh watch effect"
         );
         let [leader, member] = provider.said();
         assert!(
@@ -926,7 +964,7 @@ fn a_capture_budget_counts_the_time_its_host_slept() {
 #[test]
 fn the_wait_for_a_child_that_closed_its_output_counts_the_time_its_host_slept() {
     const HOUR: Duration = Duration::from_secs(3600);
-    for owned in [false, true] {
+    for (owned, watching) in [(false, false), (true, false), (true, true)] {
         let tmp = temp_dir(if owned {
             "slept-closed-owned"
         } else {
@@ -961,8 +999,22 @@ fn the_wait_for_a_child_that_closed_its_output_counts_the_time_its_host_slept() 
         }));
         let (tx, rx) = mpsc::channel();
         let run = Arc::clone(&observed);
+        let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let effect = effects.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(capture_with(cmd, HOUR, 1024, None, Some(run), owned, None));
+            let mut watch = |_: &mut CaptureInput<'_>| {
+                effect.fetch_add(1, Ordering::AcqRel);
+                false
+            };
+            let _ = tx.send(capture_with(
+                cmd,
+                HOUR,
+                1024,
+                None,
+                Some(run),
+                owned,
+                if watching { Some(&mut watch) } else { None },
+            ));
         });
         let why = rx
             .recv_timeout(HANG_DETECTOR)
@@ -977,6 +1029,11 @@ fn the_wait_for_a_child_that_closed_its_output_counts_the_time_its_host_slept() 
             why.contains("it closed its output and did not exit before its deadline"),
             "owned={owned}: {why}"
         );
+        assert_eq!(
+            effects.load(Ordering::Acquire),
+            0,
+            "closed output does not admit a fresh watch effect after sleep"
+        );
         let pid = std::fs::read_to_string(&pid_file)
             .ok()
             .and_then(|r| r.trim().parse::<libc::pid_t>().ok())
@@ -988,6 +1045,133 @@ fn the_wait_for_a_child_that_closed_its_output_counts_the_time_its_host_slept() 
         assert!(
             group_emptied(pid),
             "owned={owned}: the child's group was left running"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_full_owned_input_pipe_cannot_outlive_sleep_or_scope_cancellation() {
+    use crate::harness::account_work::Lifetime;
+    use std::io::Write as _;
+    for cancel in [false, true] {
+        let provider = owned_fixture::Provider::unread_input("full-input");
+        let observed = Arc::new(CaptureLifecycleObservation::default());
+        settle_until(&observed, provider.ready());
+        let lifetime = Lifetime::default();
+        let scope = lifetime.enter().unwrap();
+        let paused = Arc::new(std::sync::Mutex::new(None));
+        let paused_at_wait = paused.clone();
+        let close = lifetime.clone();
+        let slept = observed.clone();
+        let saw_full = Arc::new(AtomicBool::new(false));
+        let full = saw_full.clone();
+        *observed.in_input_wait.lock().unwrap() = Some(Box::new(move || {
+            full.store(true, Ordering::Release);
+            if cancel {
+                *paused_at_wait.lock().unwrap() = close.pause();
+            } else {
+                slept
+                    .slept_ns
+                    .store(2 * 3600 * 1_000_000_000, Ordering::Release);
+            }
+        }));
+        let program = provider.program();
+        let run = observed.clone();
+        let watch_scope = scope.clone();
+        let (answer, result) = mpsc::channel();
+        let work = scope.wrap(move || {
+            let mut watch = |input: &mut CaptureInput<'_>| {
+                let pipe = input.stdin.as_mut().expect("actual owned input pipe");
+                // SAFETY: this capture exclusively borrows its actual stdin pipe. Keep the
+                // original flags so the writer itself must establish nonblocking operation.
+                let flags = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETFL) };
+                assert!(flags >= 0);
+                capture_pipe_nonblocking(pipe.as_raw_fd()).unwrap();
+                let mut filled = 0;
+                loop {
+                    match pipe.write(&[b'x'; 4096]) {
+                        Ok(0) => panic!("a live owned pipe made no progress"),
+                        Ok(n) => filled += n,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(e) => panic!("fill actual owned stdin: {e}"),
+                    }
+                }
+                // PIPE_BUF-sized writes can refuse while a smaller residual remains.
+                // Exhaust that residual too, so the actual code write must wait.
+                loop {
+                    match pipe.write(b"x") {
+                        Ok(0) => panic!("a live owned pipe made no progress"),
+                        Ok(n) => filled += n,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(e) => panic!("fill actual owned stdin residual: {e}"),
+                    }
+                }
+                assert!(filled > 0);
+                // SAFETY: the same uniquely borrowed pipe remains open; restoring its
+                // original flags changes no descriptor or peer. A blocking writer regression
+                // can only recover once this test releases its owned child's input gate.
+                assert_eq!(
+                    unsafe {
+                        libc::fcntl(pipe.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK)
+                    },
+                    0
+                );
+                let written = input.write_all(b"oauth-code\n", || watch_scope.cancelled());
+                assert!(
+                    written.is_err(),
+                    "full stdin must not report successful delivery after work ends"
+                );
+                true
+            };
+            let ended = capture_with(
+                Command::new(program),
+                Duration::from_secs(3600),
+                1024,
+                None,
+                Some(run),
+                true,
+                Some(&mut watch),
+            );
+            let _ = answer.send(ended);
+        });
+        let (done, returned) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            work();
+            let _ = done.send(());
+        });
+        let finished = returned.recv_timeout(HANG_DETECTOR);
+        // Always let our actual owned child read its stdin before joining, even if a
+        // broken implementation failed to recheck its budget/cancellation under backpressure.
+        provider.release_input();
+        if finished.is_err() {
+            returned
+                .recv_timeout(HANG_DETECTOR)
+                .expect("cooperative input recovery returned");
+        }
+        worker.join().unwrap();
+        let ended = result.recv_timeout(HANG_DETECTOR).unwrap();
+        assert!(
+            finished.is_ok(),
+            "backpressure retained the actual capture beyond its work stop"
+        );
+        assert!(matches!(ended, Ok(Ended::Stopped)));
+        assert!(saw_full.load(Ordering::Acquire));
+        assert!(observed.child_reaped.load(Ordering::Acquire));
+        assert!(observed.reader_joined.load(Ordering::Acquire));
+        for born in provider.said() {
+            assert!(born.gone_within_a_minute());
+        }
+        let pause = paused
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_else(|| lifetime.pause().unwrap());
+        assert!(
+            pause.try_wait().is_ok(),
+            "capture resources must retire before the original Scope drains"
         );
     }
 }

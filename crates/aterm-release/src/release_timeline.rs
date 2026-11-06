@@ -6,14 +6,15 @@
 //! events in `transcript.log`, and in every step log the `step-child-finished` record of each
 //! child (`wait4`'s CPU and peak), verify's `stage-started`/`stage-finished`, the slices'
 //! `build-child-finished`, `compile-finished`, the inputs seal's `inputs`, verify's `disk`
-//! record and the publish step's `publish-line` arrivals.
+//! record and the publish step's `publish-line` arrivals. A run that another handed the release
+//! (a re-run as R's own cutter) counts that run's seal calls and walks with its own.
 //!
 //! Planning data only, never a verdict. What no record says is `null`, never `0`: an older
 //! run's logs carry none of the newer records.
 
 use std::collections::BTreeMap;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The longest record line read; a longer line is skipped, never retained.
 const LINE_LIMIT: usize = 64 * 1024;
@@ -37,6 +38,10 @@ struct ChildTotals {
     children: u64,
 }
 
+/// The cutter's own log in a run's logs: its lines, and, since it arms the seal's log there
+/// ([`crate::build_inputs::arm`]), its own seal calls' records.
+pub const TRANSCRIPT: &str = "transcript.log";
+
 /// The accumulated timeline of one run.
 #[derive(Default)]
 pub struct Timeline {
@@ -50,6 +55,15 @@ pub struct Timeline {
     first_red: Option<aterm_json::Value>,
     hashed: Option<u64>,
     rechecked: Option<u64>,
+    /// A seal call's record was read from [`TRANSCRIPT`]: the cutter's own calls reach its logs,
+    /// so a mode none of the run's records names is one no call took.
+    own_seal: bool,
+    /// The logs of the run that handed this one the release (a `handed` record in
+    /// [`TRANSCRIPT`]): its first steps, its seal call among them, are in them.
+    handed_from: Option<PathBuf>,
+    /// Whether the handing run's own seal calls reached its logs, once [`Timeline::of_logs`]
+    /// read them; `None` where it did not (none named, or a read of the records alone).
+    handing_seal: Option<bool>,
     disk_walks: Option<u64>,
     units_fresh: Option<u64>,
     units_compiled: Option<u64>,
@@ -157,15 +171,22 @@ impl Timeline {
                 );
                 add_u(&mut self.output_bytes, event["output_bytes"].as_u64());
             }
-            Some("test-case-failed") => {
+            // A case its block spares (refused, out of disk) reads NOT RUN and is no red.
+            Some("test-case-failed") if event["outcome"].as_str() == Some("FAIL") => {
                 let at = event["at_unix_ms"].as_u64();
                 self.red(at, event);
             }
-            Some("inputs") => match event["mode"].as_str() {
-                Some("hashed") => add_u(&mut self.hashed, Some(1)),
-                Some("rechecked" | "adopted") => add_u(&mut self.rechecked, Some(1)),
-                _ => {}
-            },
+            Some("inputs") => {
+                match event["mode"].as_str() {
+                    Some("hashed") => add_u(&mut self.hashed, Some(1)),
+                    Some("rechecked" | "adopted") => add_u(&mut self.rechecked, Some(1)),
+                    _ => return,
+                }
+                self.own_seal |= log == TRANSCRIPT;
+            }
+            Some("handed") if log == TRANSCRIPT => {
+                self.handed_from = event["from"].as_str().map(PathBuf::from);
+            }
             Some("disk") => add_u(&mut self.disk_walks, event["walks"].as_u64()),
             Some("publish-line") => {
                 if let (Some(at), Some(line)) =
@@ -319,10 +340,27 @@ impl Timeline {
         }
     }
 
-    /// Read `logs`'s transcript and every step log (`NN-<step>*.log`), in name order.
+    /// Read `logs`'s transcript and every step log (`NN-<step>*.log`), in name order, and where
+    /// another run handed this one the release, the seal calls and walks its logs record: the
+    /// release's, though another run made them.
     /// # Errors
     /// The directory cannot be listed, or a log present cannot be read.
     pub fn of_logs(logs: &Path) -> std::io::Result<Self> {
+        let mut timeline = Self::of_run(logs)?;
+        if let Some(from) = timeline.handed_from.clone() {
+            let handing = Self::of_run(&from).ok();
+            timeline.handing_seal = Some(handing.as_ref().is_some_and(|h| h.own_seal));
+            if let Some(handing) = handing {
+                add_u(&mut timeline.hashed, handing.hashed);
+                add_u(&mut timeline.rechecked, handing.rechecked);
+                add_u(&mut timeline.disk_walks, handing.disk_walks);
+            }
+        }
+        Ok(timeline)
+    }
+
+    /// One run's logs, `logs`, as [`Timeline::of_logs`] reads them, none other followed.
+    fn of_run(logs: &Path) -> std::io::Result<Self> {
         let mut timeline = Self::default();
         let mut names: Vec<String> = std::fs::read_dir(logs)?
             .filter_map(Result::ok)
@@ -334,11 +372,10 @@ impl Timeline {
                     && name.as_bytes()[2] == b'-'
             })
             .collect();
-        names.sort();
-        names.insert(0, "transcript.log".to_owned());
-        for name in names {
-            match crate::durable::open_regular_file(&logs.join(&name)) {
-                Ok(file) => timeline.read(&name, file)?,
+        names.sort_unstable();
+        for name in std::iter::once(TRANSCRIPT).chain(names.iter().map(String::as_str)) {
+            match crate::durable::open_regular_file(&logs.join(name)) {
+                Ok(file) => timeline.read(name, file)?,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
             }
@@ -422,6 +459,11 @@ impl Timeline {
             .first_red_at_unix_ms
             .zip(self.run_started_at_unix_s)
             .map(|(red, start)| red.saturating_sub(start.saturating_mul(1000)) as f64 / 1000.0);
+        // Every seal call of the release reached a log where the cutter's own did, and the handing
+        // run's too where one handed it on: a mode no record names, no call took.
+        let seal_known =
+            self.own_seal && (self.handed_from.is_none() || self.handing_seal == Some(true));
+        let seal_count = |n: Option<u64>| if seal_known { Some(n.unwrap_or(0)) } else { n };
         let units = match (self.units_fresh, self.units_compiled) {
             (None, None) => aterm_json::Value::Null,
             (fresh, compiled) => aterm_json::json!({"fresh": fresh, "compiled": compiled}),
@@ -433,8 +475,8 @@ impl Timeline {
             "first_red": self.first_red,
             "steps": steps,
             "branches": self.branches,
-            "full_hashes": self.hashed,
-            "seal_rechecks": self.rechecked,
+            "full_hashes": seal_count(self.hashed),
+            "seal_rechecks": seal_count(self.rechecked),
             "disk_walks": self.disk_walks,
             "units": units,
             "output_bytes": self.output_bytes,
@@ -550,8 +592,88 @@ mod tests {
         assert_eq!(value["output_bytes"].as_u64(), Some(1024));
     }
 
+    /// A RELEASE COUNTS NO FULL HASH ONLY WHERE EVERY CUTTER OF IT LOGGED ITS OWN SEAL CALL: the
+    /// cutter's call in its transcript makes a mode no record names known, 0 (A2's "0 on a warm
+    /// machine"); a run's children's records alone (an older run, whose cutter's calls reached
+    /// its terminal only) leave it null; a run handed the release counts the handing run's seal
+    /// calls and walks with its own, and is null where those cannot be read or that run's own call
+    /// reached no log. NEGATIVE CONTROLS: making any call's record know both counts reads 0 for the
+    /// older run, and reading the re-run's logs alone reads 0 for a release that hashed once.
+    #[test]
+    fn a_release_counts_no_full_hash_only_where_every_cutter_logged_its_own_seal_call() {
+        let call = |mode: &str| {
+            format!(
+                "release-event: {}\n",
+                aterm_json::json!({"schema":1,"event":"inputs","mode":mode,"entries":9,"secs":0.5})
+            )
+        };
+        let handed = |from: &Path| {
+            format!(
+                "release-event: {}\n",
+                aterm_json::json!({"schema":1,"event":"handed","from":from.display().to_string()})
+            )
+        };
+        let counts = |value: &aterm_json::Value| {
+            (
+                value["full_hashes"].as_u64(),
+                value["seal_rechecks"].as_u64(),
+                value["disk_walks"].as_u64(),
+            )
+        };
+        let write = |logs: &[(&str, String)]| {
+            let dir = aterm_tempfile::tempdir().unwrap();
+            for (name, text) in logs {
+                std::fs::write(dir.path().join(name), text).unwrap();
+            }
+            dir
+        };
+        let of = |dir: &Path| Timeline::of_logs(dir).unwrap().value();
+
+        let warm = write(&[
+            (TRANSCRIPT, call("adopted")),
+            ("05-build.log", call("rechecked")),
+        ]);
+        assert_eq!(counts(&of(warm.path())), (Some(0), Some(2), None));
+
+        let older = write(&[(
+            "05-build.log",
+            [call("adopted"), call("rechecked")].concat(),
+        )]);
+        assert_eq!(counts(&of(older.path())), (None, Some(2), None));
+
+        // A bump release: the outer cutter hashed at step 1, then handed the release to R's own.
+        let outer = write(&[
+            (TRANSCRIPT, call("hashed")),
+            (
+                "01-checks.log",
+                "verify-event: {\"schema\":1,\"event\":\"disk\",\"mode\":\"claimed\",\"walks\":1}\n"
+                    .to_owned(),
+            ),
+        ]);
+        let rerun = write(&[
+            (TRANSCRIPT, [handed(outer.path()), call("adopted")].concat()),
+            ("06-verify.log", call("rechecked")),
+        ]);
+        assert_eq!(counts(&of(rerun.path())), (Some(1), Some(2), Some(1)));
+
+        let gone = outer.path().join("gone");
+        let lost = write(&[(TRANSCRIPT, [handed(&gone), call("adopted")].concat())]);
+        assert_eq!(counts(&of(lost.path())), (None, Some(1), None));
+
+        let unlogged = write(&[("01-checks.log", call("adopted"))]);
+        let after_unlogged = write(&[(
+            TRANSCRIPT,
+            [handed(unlogged.path()), call("adopted")].concat(),
+        )]);
+        assert_eq!(counts(&of(after_unlogged.path())), (None, Some(2), None));
+
+        let none = write(&[(TRANSCRIPT, String::new())]);
+        assert_eq!(counts(&of(none.path())), (None, None, None));
+    }
+
     /// A failed test case dates the red when libtest reported it, before its stage ends; a stage
-    /// that states when it ended is dated by that.
+    /// that states when it ended is dated by that. A case its block spared (NOT RUN: refused, out
+    /// of disk), said earlier, dates nothing.
     #[test]
     fn a_failed_case_dates_the_red_before_its_stage_ends() {
         let transcript = [
@@ -561,6 +683,7 @@ mod tests {
         .concat();
         let verify = [
             "verify-event: {\"schema\":1,\"event\":\"stage-started\",\"stage_index\":3,\"stage\":\"test\",\"started_at_unix_ms\":2001000}\n",
+            "verify-event: {\"schema\":1,\"event\":\"test-case-failed\",\"outcome\":\"NOT RUN\",\"test\":\"-p x --lib\",\"case\":\"spared\",\"at_unix_ms\":2010000}\n",
             "verify-event: {\"schema\":1,\"event\":\"test-case-failed\",\"outcome\":\"FAIL\",\"test\":\"-p x --lib\",\"case\":\"t\",\"at_unix_ms\":2042000}\n",
             "verify-event: {\"schema\":1,\"event\":\"stage-finished\",\"stage_index\":3,\"stage\":\"test\",\"ended_at_unix_ms\":2500000,\"execution_s\":10.0,\"decisions\":[{\"outcome\":\"FAIL\",\"detail\":\"x\"}]}\n",
         ]

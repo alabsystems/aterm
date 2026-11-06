@@ -7,7 +7,6 @@ use crate::age::{self, Identity, Recipient};
 use crate::envelope::{self, Envelope, Floor, Locker, Pin, Retired, Unsigned, Verdict};
 use crate::materialize::{self, Manifest, Report};
 use crate::text::{self, Audience, Document, Entry};
-pub use crate::transport::LocalNetworkHeard;
 use crate::transport::{self, Fetched, Source};
 use crate::{Error, SecretBytes, fsx, join};
 use std::collections::{BTreeMap, BTreeSet};
@@ -59,6 +58,8 @@ mod network_refresh;
 mod open_migration;
 mod own_head;
 mod peer_candidates;
+mod projection;
+pub use projection::{SubscriberInputs, on_subscriber_inputs};
 mod readmit;
 mod reads;
 mod records_cache;
@@ -155,11 +156,12 @@ pub use readmit::{
 };
 use reads::{HeldLog, Reads};
 pub use remove::{
-    ListedMac, MemberRemoval, NodePass, NodePassHost, NodePassPace, NodePassReceipt, NodePassSaid,
-    RemovedNote, RemovedNotes, UndoOffer, UndoShare, epoch_convergence_environment,
-    gap_heal_environment, member_list, node_pass_receipt, read_after_cutoff_lines, remove_member,
-    removed_notes, removes_by_log, reseal_waits, revoke_by_log, run_node_pass, tend_epochs,
-    tend_epochs_at, undo_offers, undo_removals, vault_admin_named, vault_pass_at,
+    CutPass, ListedMac, MemberRemoval, NodePass, NodePassHost, NodePassPace, NodePassReceipt,
+    NodePassSaid, RemovedNote, RemovedNotes, TableCuts, UndoOffer, UndoShare, cut_own_removals,
+    epoch_convergence_environment, gap_heal_environment, member_list, node_pass_receipt,
+    on_table_cuts, read_after_cutoff_lines, remove_member, removed_notes, removes_by_log,
+    reseal_waits, revoke_by_log, run_node_pass, tend_epochs, tend_epochs_at, undo_offers,
+    undo_removals, vault_admin_named, vault_pass_at,
 };
 #[cfg(any(test, debug_assertions))]
 pub use remove::{test_put_everyone, test_remove_unposted};
@@ -670,6 +672,11 @@ impl std::fmt::Display for JoinEvent<'_> {
 enum ExpectedConfig<'a> {
     Any,
     Read(Option<&'a Config>),
+    AdmittedAny(&'a (dyn Fn() -> crate::Result<()> + Sync)),
+    AdmittedRead(
+        Option<&'a Config>,
+        &'a (dyn Fn() -> crate::Result<()> + Sync),
+    ),
     /// A background join over the source read, held whenever sharing is off.
     WhileSharing(Option<&'a Config>),
 }
@@ -678,8 +685,10 @@ impl ExpectedConfig<'_> {
     fn check(self, paths: &Paths) -> crate::Result<()> {
         self.check_sharing(paths)?;
         let expected = match self {
-            Self::Any => return Ok(()),
-            Self::Read(expected) | Self::WhileSharing(expected) => expected,
+            Self::Any | Self::AdmittedAny(_) => return Ok(()),
+            Self::Read(expected)
+            | Self::AdmittedRead(expected, _)
+            | Self::WhileSharing(expected) => expected,
         };
         if config(paths)?.as_ref() != expected {
             return Err(Error::new(
@@ -692,6 +701,9 @@ impl ExpectedConfig<'_> {
     /// After this join saved its configuration, only its automatic permission is checked.
     /// The original source expectation no longer describes that committed state.
     fn check_sharing(self, paths: &Paths) -> crate::Result<()> {
+        if let Self::AdmittedAny(current) | Self::AdmittedRead(_, current) = self {
+            current()?;
+        }
         if matches!(self, Self::WhileSharing(_)) && !crate::swarm::enabled_in_home(&paths.home)? {
             return Err(Error::new("sharing is off; ALab bootstrap is paused"));
         }
@@ -877,11 +889,21 @@ impl StateLock {
         Self::take_at(paths, &paths.lock_file())?.recovered(paths)
     }
 
-    /// Finish only a storage transition a previous writer already prepared.
+    /// Finish only a storage transition a previous writer already prepared. This lock keeps
+    /// every writer out, so with nothing to finish one read serves the whole recovery, as it
+    /// does every take: only a step that wrote makes the next read afresh.
     fn recovered(self, paths: &Paths) -> crate::Result<Self> {
         crate::records_storage::recover_pending(&paths.records_file())?;
-        retained_history::recover_enrollment(paths)?;
-        retained_history::acknowledge(paths, &load_records(paths)?)?;
+        let mut reads = Reads::new(paths);
+        if retained_history::recover_enrollment(&reads)? {
+            reads = Reads::new(paths);
+        }
+        let config = reads.config()?;
+        let (vault, store) = records_store_selected(&reads, config)?;
+        let store = records_cache::read(paths, vault, store)?;
+        if let Some(config) = config {
+            retained_history::acknowledge_under(&reads, &store, config)?;
+        }
         Ok(self)
     }
 
@@ -1122,8 +1144,31 @@ impl StateLock {
 
     /// Classify one nonblocking read without another filesystem probe or permission repair.
     fn observe_classified(paths: &Paths) -> crate::Result<StateObservation> {
+        Self::classify(paths, Self::open_existing(paths, false)?)
+    }
+
+    /// [`Self::narrow_owned`] and then [`Self::observe_classified`], on one open of the lock
+    /// unless it needs narrowing.
+    fn observe_narrowed(paths: &Paths) -> crate::Result<StateObservation> {
         use std::os::unix::fs::MetadataExt as _;
-        let Some((file, metadata)) = Self::open_existing(paths, false)? else {
+        let opened = Self::open_existing(paths, false)?;
+        if opened
+            .as_ref()
+            .is_some_and(|(_, metadata)| metadata.mode() & 0o6077 != 0)
+        {
+            drop(opened);
+            Self::narrow_owned(paths)?;
+            return Self::observe_classified(paths);
+        }
+        Self::classify(paths, opened)
+    }
+
+    fn classify(
+        paths: &Paths,
+        opened: Option<(std::fs::File, std::fs::Metadata)>,
+    ) -> crate::Result<StateObservation> {
+        use std::os::unix::fs::MetadataExt as _;
+        let Some((file, metadata)) = opened else {
             return Ok(StateObservation::Absent);
         };
         let file: std::fs::File = file;
@@ -1685,7 +1730,8 @@ pub fn start_over_lab_identity_as(
 impl crate::Making {
     /// What this process is, read now ([`crate::lab_identity`]): a test binary by its executable's
     /// name (`aterm_uds::test_binary::is_test_binary`), a build with debug assertions on, a
-    /// process a lab lane marked (`ATERM_LAB_MEMBER_SERVICE` set, whatever its value), and
+    /// process a lab lane marked ([`Self::lab_lane_of`]: `ATERM_LAB_MEMBER_SERVICE` or
+    /// `ATERM_LAB_VAULT_SERVICE` set, whatever its value), and
     /// whether it runs inside a virtual machine (macOS's `kern.hv_vmm_present`,
     /// [`aterm_sysprobe::hv_vmm_present`]), as [`Self::reading`] reads them.
     #[must_use]
@@ -1694,6 +1740,14 @@ impl crate::Making {
             std::env::current_exe().is_ok_and(|exe| aterm_uds::test_binary::is_test_binary(&exe)),
             aterm_sysprobe::hv_vmm_present,
         )
+    }
+
+    /// Whether a lab lane marked a process whose environment has each variable `set` says it
+    /// has: [`crate::discover::LAB_MEMBER_SERVICE_ENV`] or
+    /// [`crate::discover::LAB_VAULT_SERVICE_ENV`], whatever its value (one this build cannot take
+    /// browses for nothing, and still marks the process a lab's).
+    pub(crate) fn lab_lane_of(set: impl Fn(&str) -> bool) -> bool {
+        set(crate::discover::LAB_MEMBER_SERVICE_ENV) || set(crate::discover::LAB_VAULT_SERVICE_ENV)
     }
 
     /// [`Self::now`] for a process that is a test binary or not (`test_binary`), its
@@ -1707,7 +1761,7 @@ impl crate::Making {
         Self {
             test_binary,
             debug_build: cfg!(debug_assertions),
-            lab_lane: std::env::var_os(crate::discover::LAB_MEMBER_SERVICE_ENV).is_some(),
+            lab_lane: Self::lab_lane_of(|knob| std::env::var_os(knob).is_some()),
             virtual_machine: !test_binary && virtual_machine() == Some(true),
         }
     }
@@ -2589,6 +2643,21 @@ pub fn read_verdict(paths: &Paths) -> crate::Result<bool> {
 /// # Errors
 /// As [`read_verdict`]'s, and a source that did not answer within `total`.
 pub fn read_verdict_within(paths: &Paths, total: Duration) -> crate::Result<bool> {
+    read_verdict_within_admitted(paths, total, &|| Ok(()))
+}
+
+/// Read an admitted join's password verdict within `total`, retaining the caller's authority
+/// before the fetch and before recording a refusal under the vault lock. `current` must be
+/// read-only and acquire neither that lock nor one that waits for it.
+///
+/// # Errors
+/// As [`read_verdict_within`], or the caller's authority is withdrawn.
+pub fn read_verdict_within_admitted(
+    paths: &Paths,
+    total: Duration,
+    current: &(dyn Fn() -> crate::Result<()> + Sync),
+) -> crate::Result<bool> {
+    current()?;
     let Some(config) = config(paths)? else {
         return Ok(false);
     };
@@ -2612,7 +2681,7 @@ pub fn read_verdict_within(paths: &Paths, total: Duration) -> crate::Result<bool
         .iter()
         .any(|(key, refused)| *key == recipient && *refused == tag);
     if refused && state.refused.as_deref() != Some(tag.as_str()) {
-        change_request(paths, &config, |state| {
+        change_request_until_admitted(paths, &config, None, current, |state| {
             if state.proof.as_deref() != Some(proof.as_str()) {
                 return false;
             }
@@ -3554,33 +3623,33 @@ fn is_envelope(bytes: &[u8]) -> bool {
 pub enum Look {
     /// A vault answers at the URL or path.
     Answers,
-    /// Transient transport failure or unreached source.
+    /// Transient transport failure or unreached source; on macOS a source on the local network
+    /// whose LAN broker is unavailable, in the broker's words.
     Unreached(String),
-    /// Unreached, the last failure [`transport::Unheard::held`], as macOS fails this app's LAN
-    /// traffic while its Local Network question is unanswered or denied (aterm-http names a
-    /// `.local` lookup mDNSResponder refuses as no route). A host that is off or a server that
-    /// stalls fails alike, so this is a hint to name the setting, never a finding.
-    Held(String),
     /// The endpoint or path holds no vault.
     NoVault(String),
 }
 
+/// How long a look waits between two asks of the LAN broker while it is unavailable.
 const LOOK_PAUSE: Duration = Duration::from_secs(2);
 
 /// How long one try of the look before a join or a sync ([`look`]'s `wait`) waits for the vault.
 pub const REACH_WAIT: Duration = Duration::from_secs(30);
 
-/// How long that look keeps trying ([`look`]'s `patience`) while macOS holds this app's lookups
-/// and LAN connects for a person's answer to its Local Network question.
+/// The patience a setup's look takes ([`look`]'s `patience`): how long it waits for this Mac's
+/// LAN broker to answer before it says the broker is unavailable.
 pub const CONSENT_WAIT: Duration = Duration::from_secs(3 * 60);
 
-/// The longest a [`look`] with [`CONSENT_WAIT`]'s patience and [`REACH_WAIT`]'s tries runs: the
-/// patience, then one last try and its pause. A watcher of a setup that runs one waits this long
+/// The longest a [`look`] with [`CONSENT_WAIT`]'s patience and [`REACH_WAIT`]'s try runs: the
+/// patience, its last pause, then the try. A watcher of a setup that runs one waits this long
 /// before its own hang detector starts to count.
 pub const PATIENT_LOOK_MAX: Duration =
     Duration::from_secs(CONSENT_WAIT.as_secs() + REACH_WAIT.as_secs() + LOOK_PAUSE.as_secs());
 
 trait Tries {
+    /// Whether the LAN broker `url` needs answers: `Err` in its words while it is unavailable,
+    /// `Ok` once it answers, or when `url` needs no broker.
+    fn broker(&mut self, url: &str) -> Result<(), String>;
     fn get(&mut self, url: &str, wait: Duration) -> Result<transport::Answer, transport::Unheard>;
     fn now(&mut self) -> Instant;
     fn pause(&mut self, pause: Duration);
@@ -3588,7 +3657,35 @@ trait Tries {
 
 struct LiveTries;
 
+/// Whether `url` is reached through the LAN broker: on macOS, a host [`aterm_uds::lan`] names
+/// local network (a `.local` or single-label name, or a local-network address).
+fn needs_broker(url: &str) -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    let Some(uri) = aterm_http::Uri::parse(url) else {
+        return false;
+    };
+    let host = uri.host().trim_start_matches('[').trim_end_matches(']');
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => aterm_uds::lan::is_local_network(&ip),
+        Err(_) => aterm_uds::lan::is_local_name(host),
+    }
+}
+
 impl Tries for LiveTries {
+    fn broker(&mut self, url: &str) -> Result<(), String> {
+        if !needs_broker(url) {
+            return Ok(());
+        }
+        match aterm_uds::lan::broker::hello() {
+            Err(aterm_uds::lan::LanError::Unavailable(why)) => Err(why.to_string()),
+            // A broker that answered, or an exchange that failed otherwise: the try says what
+            // the vault answers.
+            Ok(_) | Err(aterm_uds::lan::LanError::Io(_)) => Ok(()),
+        }
+    }
+
     fn get(&mut self, url: &str, wait: Duration) -> Result<transport::Answer, transport::Unheard> {
         if crate::is_alab_default_url(url)
             && alab_signer_built_in()
@@ -3608,7 +3705,11 @@ impl Tries for LiveTries {
     }
 }
 
-/// Probe whether a vault answers at `source` within `wait` without modifying local state.
+/// Probe whether a vault answers at `source` within `wait` without modifying local state. A URL
+/// on the local network goes through this Mac's LAN broker: while it is unavailable the look
+/// waits for its socket to answer, asking again every 2 s for up to `patience`, and `held` hears
+/// the broker's words once as the wait starts; a broker still unavailable then is
+/// [`Look::Unreached`] in its words. The look's one try runs as soon as the broker answers.
 pub fn look(source: &Source, wait: Duration, patience: Duration, held: &dyn Fn(&str)) -> Look {
     look_with(source, wait, patience, held, &mut LiveTries)
 }
@@ -3628,30 +3729,25 @@ fn look_with(
         Source::Url(url) => {
             let start = tries.now();
             let mut told = false;
-            loop {
-                match tries.get(url, wait) {
-                    Ok(transport::Answer::Fetched(fetched)) => break fetched,
-                    Ok(transport::Answer::Foreign(why)) => return Look::NoVault(why),
-                    // macOS refusing the `.local` name is the person's Don't Allow, an answer
-                    // no wait changes: only a hold is tried again.
-                    Err(unheard)
-                        if unheard.held
-                            && !refused_by_local_network(&unheard.why)
-                            && tries
-                                .now()
-                                .saturating_duration_since(start)
-                                .saturating_add(LOOK_PAUSE)
-                                < patience =>
-                    {
-                        if !told {
-                            told = true;
-                            held(&unheard.why.0);
-                        }
-                        tries.pause(LOOK_PAUSE);
-                    }
-                    Err(unheard) if unheard.held => return Look::Held(unheard.why.0),
-                    Err(unheard) => return Look::Unreached(unheard.why.0),
+            while let Err(why) = tries.broker(url) {
+                if tries
+                    .now()
+                    .saturating_duration_since(start)
+                    .saturating_add(LOOK_PAUSE)
+                    >= patience
+                {
+                    return Look::Unreached(why);
                 }
+                if !told {
+                    told = true;
+                    held(&why);
+                }
+                tries.pause(LOOK_PAUSE);
+            }
+            match tries.get(url, wait) {
+                Ok(transport::Answer::Fetched(fetched)) => fetched,
+                Ok(transport::Answer::Foreign(why)) => return Look::NoVault(why),
+                Err(unheard) => return Look::Unreached(unheard.why.0),
             }
         }
         Source::Path(_) => match transport::fetch(source, None, wait) {
@@ -4066,21 +4162,6 @@ pub fn sync(paths: &Paths, wait: Option<Duration>) -> crate::Result<SyncOutcome>
     sync_repairing(paths, wait, None)
 }
 
-/// [`sync`], reporting what each actual request to its captured `.local` source heard of
-/// this process's Local Network switch. Observation asks no additional network question and
-/// does not reread a changed configuration to choose a different source. A recursive retry
-/// reports only its own request; a failure before transport reports nothing.
-///
-/// # Errors
-/// The same configuration, network, verification and materialization failures as [`sync`].
-pub fn sync_observing_local_network(
-    paths: &Paths,
-    wait: Option<Duration>,
-    mut hear: impl FnMut(LocalNetworkHeard),
-) -> crate::Result<SyncOutcome> {
-    sync_repairing_hearing(paths, wait, None, &[], true, None, None, &mut hear)
-}
-
 /// [`sync`] of a subscriber's pass: a source that fails or holds nothing newer gives way to the
 /// highest verified seq among the vault servers `found` (`docs/DESIGN-fluid-swarm-2026-10-28.md`
 /// F5), the source still its first choice. It keeps in `said` what the source itself said.
@@ -4249,10 +4330,13 @@ pub fn load_acknowledged_and_ahead(paths: &Paths) -> crate::Result<AcknowledgedR
 /// One read of the store, projected under the configured vault; with `ahead`, the raw store kept
 /// where the projection dropped records.
 fn acknowledged_read(paths: &Paths, ahead: bool) -> crate::Result<AcknowledgedRecords> {
-    let reads = Reads::new(paths);
+    acknowledged_under(&Reads::new(paths), ahead)
+}
+
+fn acknowledged_under(reads: &Reads<'_>, ahead: bool) -> crate::Result<AcknowledgedRecords> {
     let config = reads.config()?;
-    let (vault, store) = records_store_selected(&reads, config)?;
-    let raw = records_cache::read(paths, vault, store)?;
+    let (vault, store) = records_store_selected(reads, config)?;
+    let raw = records_cache::read(reads.paths(), vault, store)?;
     let Some(config) = config else {
         return Ok(AcknowledgedRecords {
             acknowledged: raw,
@@ -4260,7 +4344,7 @@ fn acknowledged_read(paths: &Paths, ahead: bool) -> crate::Result<AcknowledgedRe
         });
     };
     let kept = ahead.then(|| raw.clone());
-    let acknowledged = retained_history::project_store(&reads, config, raw)?;
+    let acknowledged = retained_history::project_store(reads, config, raw)?;
     let heads =
         |store: &crate::membership_log::Store| store.log().map(crate::membership_log::Log::heads);
     let ahead = kept.filter(|raw| heads(raw) != heads(&acknowledged));
@@ -5899,38 +5983,11 @@ thread_local! {
 fn sync_repairing_inner(
     paths: &Paths,
     wait: Option<Duration>,
-    repaired: Option<&mut Repaired>,
-    extra_peers: &[String],
-    allow_mirror: bool,
-    subscribing: Option<(Found<'_>, &std::cell::Cell<SourceSaid>)>,
-    posts_by: Option<Instant>,
-) -> crate::Result<SyncOutcome> {
-    sync_repairing_hearing(
-        paths,
-        wait,
-        repaired,
-        extra_peers,
-        allow_mirror,
-        subscribing,
-        posts_by,
-        &mut |_| {},
-    )
-}
-
-/// Keep the observer with the actual pass through its recursive source retries.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the transport observer accompanies the existing sync context through recursive passes"
-)]
-fn sync_repairing_hearing(
-    paths: &Paths,
-    wait: Option<Duration>,
     mut repaired: Option<&mut Repaired>,
     extra_peers: &[String],
     allow_mirror: bool,
     subscribing: Option<(Found<'_>, &std::cell::Cell<SourceSaid>)>,
     posts_by: Option<Instant>,
-    hear: &mut dyn FnMut(LocalNetworkHeard),
 ) -> crate::Result<SyncOutcome> {
     let config = configured(paths)?;
     let before = load_state(paths)?;
@@ -5963,25 +6020,20 @@ fn sync_repairing_hearing(
         let http204_request =
             http204_observation::Request::start(paths, &config, after, subscriber.as_deref());
         let asked = Instant::now();
-        let (observed, heard) = match (&config.source, wait) {
-            (Source::Url(_), Some(wait)) if !pending_records => {
-                transport::fetch_as_observed_hearing(
-                    &config.source,
-                    after,
-                    wait.saturating_add(Duration::from_secs(10)),
-                    subscriber.as_deref(),
-                )
-            }
-            _ => transport::fetch_as_observed_hearing(
+        let observed = match (&config.source, wait) {
+            (Source::Url(_), Some(wait)) if !pending_records => transport::fetch_as_observed(
+                &config.source,
+                after,
+                wait.saturating_add(Duration::from_secs(10)),
+                subscriber.as_deref(),
+            ),
+            _ => transport::fetch_as_observed(
                 &config.source,
                 None,
                 Duration::from_secs(30),
                 subscriber.as_deref(),
             ),
         };
-        if let Some(heard) = heard {
-            hear(heard);
-        }
         refresh.observed(&observed);
         let http204 = observed.as_ref().ok().and_then(|observed| observed.http204);
         let mut primary_result = observed.map(|observed| observed.fetched);
@@ -6083,7 +6135,7 @@ fn sync_repairing_hearing(
                         let mirror_urls = read_only().servers(primary_url, peers);
                         if log_entries::mirror_log_to_servers(paths, &mirror_urls)?.is_some() {
                             refresh.delegated();
-                            return sync_repairing_hearing(
+                            return sync_repairing_inner(
                                 paths,
                                 None,
                                 repaired,
@@ -6091,7 +6143,6 @@ fn sync_repairing_hearing(
                                 false,
                                 subscribing,
                                 posts_by,
-                                hear,
                             );
                         }
                     }
@@ -6123,7 +6174,7 @@ fn sync_repairing_hearing(
             let mirror_urls = read_only().servers(primary_url, peer_urls());
             if let Ok(Some(_)) = log_entries::mirror_log_to_servers(paths, &mirror_urls) {
                 refresh.delegated();
-                return sync_repairing_hearing(
+                return sync_repairing_inner(
                     paths,
                     None,
                     repaired,
@@ -6131,7 +6182,6 @@ fn sync_repairing_hearing(
                     false,
                     subscribing,
                     posts_by,
-                    hear,
                 );
             }
         }
@@ -6161,7 +6211,7 @@ fn sync_repairing_hearing(
             let mirror_urls = read_only().servers(primary_url, peer_urls());
             if let Ok(Some(_)) = log_entries::mirror_log_to_servers(paths, &mirror_urls) {
                 refresh.delegated();
-                return sync_repairing_hearing(
+                return sync_repairing_inner(
                     paths,
                     None,
                     repaired,
@@ -6169,7 +6219,6 @@ fn sync_repairing_hearing(
                     false,
                     subscribing,
                     posts_by,
-                    hear,
                 );
             }
             // A carry that could not complete (a head whose records no server has, every server
@@ -6213,7 +6262,7 @@ fn sync_repairing_hearing(
                     let mirror_urls = read_only().servers(primary_url, peers);
                     if log_entries::mirror_log_to_servers(paths, &mirror_urls)?.is_some() {
                         refresh.delegated();
-                        return sync_repairing_hearing(
+                        return sync_repairing_inner(
                             paths,
                             None,
                             repaired,
@@ -6221,7 +6270,6 @@ fn sync_repairing_hearing(
                             false,
                             subscribing,
                             posts_by,
-                            hear,
                         );
                     }
                 }
@@ -6305,6 +6353,56 @@ pub fn sync_within(paths: &Paths, total: Duration) -> crate::Result<SyncOutcome>
     })
 }
 
+/// Confirm an admitted join through its selected source within `total`, retaining the same
+/// caller authority across the HTTP wait and locked materialization. Broader peer repair
+/// remains the subscriber's work; this does not grant ordinary maintenance new authority.
+/// `current` must be read-only and acquire neither the vault lock nor a lock that waits for it.
+///
+/// # Errors
+/// As [`sync_within`], or the caller's authority is withdrawn before a subsequent effect.
+pub fn sync_within_admitted(
+    paths: &Paths,
+    total: Duration,
+    current: &(dyn Fn() -> crate::Result<()> + Sync),
+) -> crate::Result<SyncOutcome> {
+    sync_join_approval(paths, Some(total), ExpectedConfig::AdmittedAny(current))
+}
+
+/// Fetch this admitted setup's selected source immediately and materialize under its current
+/// authority. No long-poll or independent maintenance pass borrows the setup's permission.
+/// `current` has the same read-only, lock-free contract as [`sync_within_admitted`].
+///
+/// # Errors
+/// As [`sync_within_admitted`].
+pub fn sync_admitted(
+    paths: &Paths,
+    current: &(dyn Fn() -> crate::Result<()> + Sync),
+) -> crate::Result<SyncOutcome> {
+    current()?;
+    let config = configured(paths)?;
+    let before = load_state(paths)?;
+    let attempt =
+        network_observation::Attempt::start(paths, &config, VaultNetworkSource::ConfiguredUrl);
+    let observed = transport::fetch_as_observed(
+        &config.source,
+        None,
+        servers_within(Duration::from_secs(30)),
+        subscriber_recipient(paths).as_deref(),
+    );
+    current()?;
+    let fetched = observed?.fetched;
+    let body = attempt.and_then(|attempt| attempt.received(&fetched));
+    apply_until_admitted(
+        paths,
+        config,
+        before,
+        ApplyInput::Response(Ok(network_observation::Received { fetched, body })),
+        None,
+        None,
+        (false, current),
+    )
+}
+
 /// The seq a long-poll waits past (`?after=`): the one this Mac holds, once it is bound to
 /// the source and has nothing of that version left to write.
 fn long_poll_after(config: &Config, before: &State) -> Option<u64> {
@@ -6316,8 +6414,8 @@ fn long_poll_after(config: &Config, before: &State) -> Option<u64> {
     .then_some(before.seq)
 }
 
-/// [`sync`] of the envelope a join fetched and verified from the configured source already, in
-/// place of a fetch of its own.
+/// Apply a test's supplied response through the ordinary sync admission and locked readback.
+#[cfg(test)]
 fn sync_with(paths: &Paths, bytes: Vec<u8>) -> crate::Result<SyncOutcome> {
     let config = configured(paths)?;
     let before = load_state(paths)?;
@@ -6392,14 +6490,35 @@ enum ApplyInput {
 
 fn apply_until(
     paths: &Paths,
-    mut config: Config,
+    config: Config,
     before: State,
     input: ApplyInput,
     repaired: Option<&mut Repaired>,
     deadline: Option<Instant>,
     repair_requested: bool,
 ) -> crate::Result<SyncOutcome> {
+    apply_until_admitted(
+        paths,
+        config,
+        before,
+        input,
+        repaired,
+        deadline,
+        (repair_requested, &|| Ok(())),
+    )
+}
+
+fn apply_until_admitted(
+    paths: &Paths,
+    mut config: Config,
+    before: State,
+    input: ApplyInput,
+    repaired: Option<&mut Repaired>,
+    deadline: Option<Instant>,
+    (repair_requested, current): (bool, &(dyn Fn() -> crate::Result<()> + Sync)),
+) -> crate::Result<SyncOutcome> {
     let lock = bounded::take(paths, deadline)?;
+    current()?;
     if self::config(paths)?.as_ref() != Some(&config) {
         return Ok(SyncOutcome::Unchanged { seq: before.seq });
     }
@@ -6408,6 +6527,7 @@ fn apply_until(
     if matches!(&input, ApplyInput::Cached | ApplyInput::Response(Err(_)))
         && let Some(configured) = peer_selection::configured_log_recovery(paths, &config, &state)
     {
+        current()?;
         return apply_configured_log(paths, &config, &mut state, configured);
     }
     let network_observation::Received {
@@ -6468,6 +6588,7 @@ fn apply_until(
         Fetched::NoNewer(served) => {
             if now().saturating_sub(state.heard) >= 60 {
                 state.heard = now();
+                current()?;
                 save_state(paths, &state)?;
             }
             let older = served.filter(|served| {
@@ -6478,6 +6599,7 @@ fn apply_until(
                     .and_then(|served| Some((served, publishable_copy(paths, &config, &state)?)))
             {
                 drop(lock);
+                current()?;
                 transport::publish(&config.source, &copy).map_err(|error| {
                     Error::of_kind(
                         error.kind(),
@@ -6515,6 +6637,7 @@ fn apply_until(
                 && fsx::kind(&paths.cache_file())? == fsx::Kind::Missing
                 && let Some(configured) = log_entries::trusted_configured_log(paths, &config)?
             {
+                current()?;
                 return apply_configured_log(paths, &config, &mut state, configured);
             } else {
                 return Ok(SyncOutcome::Unchanged { seq: state.seq });
@@ -6525,6 +6648,7 @@ fn apply_until(
                 && fsx::kind(&paths.cache_file())? == fsx::Kind::Missing
                 && let Some(configured) = log_entries::trusted_configured_log(paths, &config)?
             {
+                current()?;
                 return apply_configured_log(paths, &config, &mut state, configured);
             }
             let copy = match config.source {
@@ -6538,6 +6662,7 @@ fn apply_until(
                 return Ok(SyncOutcome::Unchanged { seq: state.seq });
             }
             drop(lock);
+            current()?;
             transport::publish(&config.source, &copy).map_err(|error| {
                 Error::of_kind(
                     error.kind(),
@@ -6607,14 +6732,17 @@ fn apply_until(
             && repaired.is_some_and(|repaired| !put_back_due(paths, &state, version, repaired))
         {
             state.heard = now();
+            current()?;
             save_state(paths, &state)?;
             return Ok(SyncOutcome::Unchanged { seq: 0 });
         }
+        current()?;
         let report = apply_entries(paths, &mut state, &entries)?;
         state.membership = Stored::Plain;
         state.failed = apply_failed(&report);
         state.source_identity = (!state.failed).then(|| source_identity(&config));
         state.heard = now();
+        current()?;
         save_state(paths, &state)?;
         if quiet(&report) {
             return Ok(SyncOutcome::Unchanged { seq: 0 });
@@ -6651,6 +6779,7 @@ fn apply_until(
                 return Ok(SyncOutcome::Unchanged { seq: state.seq });
             }
             drop(lock);
+            current()?;
             transport::publish(&config.source, &copy).map_err(|failed| {
                 Error::of_kind(
                     failed.kind(),
@@ -6675,6 +6804,7 @@ fn apply_until(
     if log_entries::waiting_pending(paths)
         && let Ok(Some(identity)) = read_identity(paths)
     {
+        current()?;
         let _ = log_entries::land_waiting_held(
             paths,
             &identity,
@@ -6687,6 +6817,7 @@ fn apply_until(
         next_config.followed = envelope.reached_from();
     }
     if matches!(pinned, Pin::Rotated(_)) {
+        current()?;
         retained_history::acknowledge_for(
             paths,
             &load_records_for(&Reads::new(paths), &next_config)?,
@@ -6725,6 +6856,7 @@ fn apply_until(
                     )
                 })))
     {
+        current()?;
         network_observation::record(
             paths,
             &lock,
@@ -6751,6 +6883,7 @@ fn apply_until(
     // A version this Mac published whose records it held back when the publish was cut short
     // after a server stored it: taken in here, the next records pass sends them to every server
     // that lacks them, and every other Mac's log then reads the version too.
+    current()?;
     if base == log_entries::LogBase::Behind
         && log_entries::adopt_held_draft(paths, &envelope, &identity)?
     {
@@ -6762,10 +6895,12 @@ fn apply_until(
         )?;
     }
     if base == log_entries::LogBase::Behind {
+        current()?;
         save_state(paths, &state)?;
         return Ok(SyncOutcome::Unchanged { seq: state.seq });
     }
     if let Pin::Replaced(_) = pinned {
+        current()?;
         retained_history::acknowledge_replacement(
             paths,
             &load_records_for(&Reads::new(paths), &next_config)?,
@@ -6776,6 +6911,7 @@ fn apply_until(
         state.records_digest = None;
     }
     if let Pin::Rotated(_) | Pin::Replaced(_) = pinned {
+        current()?;
         prepare_materialization(paths, &mut state)?;
         config = next_config;
         save_config(paths, &config)?;
@@ -6808,6 +6944,7 @@ fn apply_until(
     state.seq = envelope.seq;
     state.digest = Some(envelope.digest());
     state.records_digest = applied_records_digest;
+    current()?;
     fsx::write_atomic(&paths.cache_file(), envelope.raw(), 0o600)?;
     let Some(entries) = opened else {
         state.membership = match state.membership {
@@ -6815,20 +6952,24 @@ fn apply_until(
             _ => Stored::Pending,
         };
         state.source_identity = Some(source_identity(&config));
+        current()?;
         save_state(paths, &state)?;
         return Ok(SyncOutcome::NotIn);
     };
+    current()?;
     let report = apply_entries(paths, &mut state, &entries)?;
     if state.membership != Stored::In
         || (handover::holds_allowed(paths) && log_entries::addressed_to(&envelope, &identity)?)
     {
         // In now: the Allow a member handed it has done its work. A Mac the membership log let
         // in holds it until an admin's approver names it in `[machines]`, which its locker shows.
+        current()?;
         handover::forget_allowed(paths);
     }
     state.membership = Stored::In;
     state.failed = apply_failed(&report);
     state.source_identity = Some(source_identity(&config));
+    current()?;
     network_observation::record(
         paths,
         &lock,
@@ -7296,16 +7437,16 @@ fn start_converge(_exe: &Path, _log: &dyn Fn(&str)) -> Option<aterm_uds::spawnfd
 /// [`crate::server::route_sources`], or a test's own.
 struct Converging<'a> {
     /// Start the runner of the program at this path, without waiting for it.
-    start: &'a dyn Fn(&Path) -> Option<aterm_uds::spawnfd::Child>,
+    start: &'a (dyn Fn(&Path) -> Option<aterm_uds::spawnfd::Child> + Sync),
     /// This Mac's routes.
-    routes: &'a dyn Fn() -> crate::converge::Routes,
+    routes: &'a (dyn Fn() -> crate::converge::Routes + Sync),
 }
 
 /// What the subscriber's loop hears of the network (`docs/DESIGN-fluid-swarm-2026-10-28.md`
 /// §3.5.2): the vault servers its standing `_alab-vault._tcp` browse found, which a pass whose
 /// source fails or holds nothing newer reads ([`sync_found`]), and the bell its nap after an
 /// error waits on, which this process's route changes and that browse ring ([`crate::wake`]).
-/// [`subscriber_loop`]'s are this Mac's; a test hands [`subscriber_loop_until`] its own.
+/// [`subscriber_loop`]'s are this Mac's; a test hands its own to `subscriber_loop_until`.
 struct Hearing<'a> {
     found: Found<'a>,
     bell: &'a crate::wake::Bell,
@@ -7532,17 +7673,26 @@ fn subscriber_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<
         hold: &hold,
         away: &away,
     };
-    let run = || subscriber_loop_until(paths, log, &|| false, &converging, &hearing);
-    match crate::wake::route_changes() {
-        Some(changes) => {
-            member_routes::while_hearing(paths, &hearing.members, &ask, log, changes, run)
-        }
-        None => run(),
-    }
+    let projection = projection::Projection::observing(&converging, projection::inputs(paths));
+    let run = || subscriber_loop_projecting(paths, log, &|| false, &hearing, &projection);
+    member_routes::while_hearing(
+        paths,
+        &hearing.members,
+        &ask,
+        log,
+        &|event| match event {
+            member_routes::ProjectionEvent::Admitted => projection.admitted(),
+            member_routes::ProjectionEvent::Observe => projection.poll(),
+            member_routes::ProjectionEvent::BrokerReady => bell.ring(crate::wake::Wake::Broker),
+        },
+        member_routes::NativeChanges::new(),
+        run,
+    )
 }
 
-/// The subscriber's standing `_alab-vault._tcp` browse (a `dns-sd -B` child, a Local Network
-/// use): started the first time a pass of the ALab vault asks ([`browsed`]), dropped while
+/// The subscriber's standing vault browse ([`crate::discover::Watch::start_look`]: of
+/// `_alab-vault._tcp`, or a lab's vault service, through the LAN broker): started the
+/// first time a pass of the ALab vault asks ([`browsed`]), dropped while
 /// `[swarm] enabled` holds the rounds ([`Hearing::hold`]), and started afresh by the first pass
 /// once sharing is on again.
 #[derive(Default)]
@@ -7584,30 +7734,6 @@ impl StandingBrowse {
     }
 }
 
-/// What runs once, at this process's subscriber's first Local Network use ([`on_lan_first_use`]).
-static LAN_FIRST_USE: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
-
-/// Whether this process's subscriber made a Local Network use yet ([`note_lan_use`]).
-static LAN_USED: AtomicBool = AtomicBool::new(false);
-
-/// Register what runs once, the first time this process's subscriber uses the local network (its
-/// `_alab-vault._tcp` browse), which puts macOS's Local Network question to aterm if nothing did
-/// before: aterm keeps that for this Mac and app, so a window's System State step reads the
-/// question as asked and raises no second hold. The first registration wins.
-pub fn on_lan_first_use(used: fn()) {
-    let _ = LAN_FIRST_USE.set(used);
-}
-
-/// Note this process's subscriber's Local Network use, running [`on_lan_first_use`]'s the first
-/// time.
-fn note_lan_use() {
-    if !LAN_USED.swap(true, Ordering::AcqRel)
-        && let Some(used) = LAN_FIRST_USE.get()
-    {
-        used();
-    }
-}
-
 /// The ALab vault servers this Mac's `standing` browse found for `config`'s vault, which starts
 /// the first time a pass of the ALab vault asks (and again after `[swarm]` held the rounds) and
 /// then rings `bell` ([`Hearing`]); none for another vault. While it has heard none yet (it has
@@ -7620,10 +7746,9 @@ fn browsed(
     if !alab_vault(config) {
         return Vec::new();
     }
-    note_lan_use();
     // Every vault server it hears counts, this Mac's own included: the server here is one more
     // place this subscriber may read.
-    let watch = standing.watch_or_start(|| crate::discover::Watch::start(bell, &[]));
+    let watch = standing.watch_or_start(|| crate::discover::Watch::start_look(bell, &[]));
     if watch.heard().is_empty() {
         return crate::discover::browse_alab(PROBE_DEADLINE).unwrap_or_default();
     }
@@ -7634,6 +7759,7 @@ fn browsed(
 /// before the pause or nap that ends one, its converge runner started and its routes read
 /// through `converging`, its passes reading the vault servers `hearing` found, and its naps
 /// after an error ended by what `hearing` hears.
+#[cfg(test)]
 fn subscriber_loop_until(
     paths: &Paths,
     log: &(dyn Fn(&str) + Sync),
@@ -7641,50 +7767,36 @@ fn subscriber_loop_until(
     converging: &Converging<'_>,
     hearing: &Hearing<'_>,
 ) -> crate::Result<()> {
+    let projection = projection::Projection::new(converging);
+    subscriber_loop_projecting(paths, log, stop, hearing, &projection)
+}
+
+fn subscriber_loop_projecting(
+    paths: &Paths,
+    log: &(dyn Fn(&str) + Sync),
+    stop: &dyn Fn() -> bool,
+    hearing: &Hearing<'_>,
+    projection: &projection::Projection<'_>,
+) -> crate::Result<()> {
     let mut backoff = Duration::from_secs(5);
     let mut failing = FIRST_RETRY;
     let mut repaired = None;
     let mut last_error = String::new();
     let mut repeated = String::new();
-    // The loaded image, not the first disk sample, anchors the watch: an update may
-    // already have replaced its path before this subscriber's first round.
-    let program = crate::program_watch::ProgramWatch::current();
-    if program.replaced() {
+    if projection.replaced() {
         log("this program was replaced on disk; exiting so the service starts the new one");
         return Ok(());
     }
-    // The converge pass's runner: started as this subscriber starts (after an update replaced
-    // its program, launchd starts it again), after each version it applies, and when a healthy
-    // round finds it due; one at a time, never waited for.
-    let mut converge = crate::converge::Due::default();
-    let mut runner: Option<aterm_uds::spawnfd::Child> = None;
     let mut notary = release::NotaryRounds::default();
-    let converge_clock = Instant::now();
-    let now_ms = || u64::try_from(converge_clock.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let converge_if = |due: bool,
-                       converge: &mut crate::converge::Due,
-                       runner: &mut Option<aterm_uds::spawnfd::Child>| {
-        if let (true, Some(exe)) = (due, program.path()) {
-            *runner = (converging.start)(exe);
-            if runner.is_none() {
-                converge.reaped(crate::converge::Last::Failed, now_ms());
-            }
-        }
-    };
     // `[swarm] enabled = false` holds every round: no ask, long-poll, apply or converge pass
     // until it is on again, looked at each [`SWARM_LOOK`] at the cost of one `stat`.
     let mut swarm = crate::swarm::Switch::new(&paths.home);
     let mut held = false;
     if swarm_lets(&mut swarm, &mut held, "this subscriber", log) {
-        let due = converge.at_start(
-            now_ms(),
-            (converging.routes)(),
-            crate::converge::Last::of(&mut runner),
-        );
-        converge_if(due, &mut converge, &mut runner);
+        projection.start();
     } else {
         // The first healthy pass once sharing is on starts it.
-        converge.failed();
+        projection.failed();
     }
     loop {
         if stop() {
@@ -7693,13 +7805,13 @@ fn subscriber_loop_until(
         // Every round, healthy or not, reaps a runner that ended (how it ended is kept for the
         // next healthy round's due check): one started while the vault cannot be reached is no
         // zombie for as long as that lasts.
-        converge.reaped(crate::converge::Last::of(&mut runner), now_ms());
-        if program.replaced() {
+        projection.reap();
+        if projection.replaced() {
             log("this program was replaced on disk; exiting so the service starts the new one");
             return Ok(());
         }
         if !swarm_lets(&mut swarm, &mut held, "this subscriber", log) {
-            converge.failed();
+            projection.failed();
             (hearing.hold)();
             std::thread::sleep(SWARM_LOOK);
             continue;
@@ -7749,15 +7861,7 @@ fn subscriber_loop_until(
                 // keeping a profile that already authenticates.
                 notary.after_round(paths, &config, log);
                 // A version applied, or (its own route read) moved routes or the recheck.
-                let due = converge_after_pass(
-                    &mut converge,
-                    &outcome,
-                    now_ms(),
-                    (converging.routes)(),
-                    crate::converge::Last::of(&mut runner),
-                    pass.source,
-                );
-                converge_if(due, &mut converge, &mut runner);
+                projection.after_pass(&outcome, pass.source);
                 let requested = || load_state(paths).ok().map(|state| state.requested);
                 let before = requested();
                 ask_again_if_due(paths, &config, log);
@@ -7792,24 +7896,19 @@ fn subscriber_loop_until(
                     last_error = line;
                 }
                 // The first healthy pass after this one starts a converge runner.
-                converge.failed();
+                projection.failed();
                 if stop() {
                     return Ok(());
                 }
                 let moved = nap_after_failing(hearing, routes, backoff, log);
-                // Until macOS lets aterm onto the LAN, asking again soon is what joins.
-                backoff = if error.kind() == crate::ErrorKind::LocalNetworkPending {
-                    FIRST_RETRY
-                } else {
-                    retry_after(backoff, moved, (hearing.away)())
-                };
+                backoff = retry_after(backoff, moved, (hearing.away)());
             }
         }
     }
 }
 
 /// A subscriber's nap of `backoff` after a pass that failed, or read only the servers found: a
-/// vault server the browse heard ends it, and so does a route change once this Mac's routes
+/// broker arrival or vault server the browse heard ends it, and so does a route change once this Mac's routes
 /// moved from `routes`, where they were as the pass began. Whether one ended it, said in `log`.
 fn nap_after_failing(
     hearing: &Hearing<'_>,
@@ -7817,12 +7916,28 @@ fn nap_after_failing(
     backoff: Duration,
     log: &(dyn Fn(&str) + Sync),
 ) -> bool {
+    nap_after_failing_with(
+        hearing,
+        backoff,
+        || crate::server::route_sources() != routes,
+        log,
+    )
+}
+
+fn nap_after_failing_with(
+    hearing: &Hearing<'_>,
+    backoff: Duration,
+    mut routes_moved: impl FnMut() -> bool,
+    log: &(dyn Fn(&str) + Sync),
+) -> bool {
     let woke = std::cell::Cell::new(None);
     let moved = nap_unless_moved(
         backoff,
         &mut || {
-            woke.get() == Some(crate::wake::Wake::Browse)
-                || crate::server::route_sources() != routes
+            matches!(
+                woke.get(),
+                Some(crate::wake::Wake::Browse | crate::wake::Wake::Broker)
+            ) || routes_moved()
         },
         &mut |most| wait_for_a_ring(hearing, &woke, most),
     );
@@ -10222,8 +10337,7 @@ pub enum ProbeOutcome {
 }
 
 /// Check whether `url` serves a vault verified under `pin`: one GET, all of it within `total`
-/// ([`transport::get_within`]); on macOS, no route to a LAN address is
-/// [`crate::ErrorKind::LocalNetworkPending`] (elsewhere it is [`crate::ErrorKind::Other`]).
+/// ([`transport::get_within`]).
 pub fn probe(url: &str, pin: &[u8; 32], total: Duration) -> crate::Result<ProbeOutcome> {
     let base_url = unpinned(url);
     let name = transport::vault_name(&Source::Url(base_url.to_string()))?;
@@ -10266,18 +10380,6 @@ fn probe_answer(
         },
     }
 }
-
-/// Whether `error`, a failed [`probe`] or fetch, is macOS's Local Network privacy refusing this
-/// app a `.local` name: a definite answer that the person turned aterm off (or answered Don't
-/// Allow), unlike a lookup nobody answered, which proves nothing.
-#[must_use]
-pub fn refused_by_local_network(error: &crate::Error) -> bool {
-    error.0.contains(LOCAL_NETWORK_REFUSED)
-}
-
-/// The words a failure carries when macOS's Local Network privacy refused this app a `.local`
-/// name ([`refused_by_local_network`]), as aterm-http names that refusal.
-pub const LOCAL_NETWORK_REFUSED: &str = aterm_http::LOCAL_NETWORK_REFUSED;
 
 /// [`probe`] of the vault at `url` (a `#<signer>` pin allowed) under its pin: the URL's own,
 /// else the key built in for the ALab vault's URL. A URL with neither is refused, since only a
@@ -10352,17 +10454,21 @@ fn probe_candidates_with(
     )
 }
 
-/// [`probe_candidates_with`] of the ALab vault at [`crate::ALAB_DEFAULT_URLS`] and the servers a
-/// browse `discovered`, under `pin`, all within `total`, each answer read by `look`: the look
-/// [`probe_default`] and a bounded join's probe both take.
+/// [`probe_candidates_with`] of the ALab vault at the compiled-in addresses the look asks
+/// ([`crate::discover::look_default_urls`]: [`crate::ALAB_DEFAULT_URLS`], none in a lab's
+/// process) and the servers a browse `discovered`, under `pin`, all within `total`, each answer
+/// read by `look`: the look [`probe_default`] and a bounded join's probe both take.
 fn probe_alab(
     pin: &[u8; 32],
     discovered: &[crate::discover::DiscoveredVault],
     total: Duration,
     look: impl Fn(&str, Duration, usize) -> Looked + Sync,
 ) -> crate::Result<ProbeOutcome> {
-    let urls =
-        crate::discover::candidate_urls(crate::ALAB_DEFAULT_URLS, discovered, crate::ALAB_VAULT);
+    let urls = crate::discover::candidate_urls(
+        crate::discover::look_default_urls(),
+        discovered,
+        crate::ALAB_VAULT,
+    );
     probe_candidates_with(&urls, pin, total, default_or_discovered, look)
 }
 
@@ -10377,10 +10483,8 @@ type Looked = crate::Result<transport::Pulled<transport::Answer>>;
 /// joining trusts none of the servers a browse names, so nothing it probes holds more unverified
 /// bodies than that at once. Each outcome is what [`probe`] says of that server's answer, in
 /// `urls`' order, and a read that failed is the error it failed with, as `look` said it (one
-/// `total` left no time for, [`fan_out::reads_within`]'s [`crate::ErrorKind::TimedOut`] one): the
-/// fold ([`select_probed_outcome`]) tells a Local Network refusal, a read macOS holds for a
-/// Local Network answer ([`crate::ErrorKind::LocalNetworkPending`]) and any other failure apart
-/// by them.
+/// `total` left no time for, [`fan_out::reads_within`]'s [`crate::ErrorKind::TimedOut`] one),
+/// which the fold ([`select_probed_outcome`]) answers with when no server answered.
 fn probes_within(
     urls: &[String],
     pin: &[u8; 32],
@@ -10421,11 +10525,9 @@ fn select_probed_outcome(
     let mut defaults = 0usize;
     let mut defaults_elsewhere = 0usize;
     let mut default_elsewhere = None;
-    let mut refused: Option<crate::Error> = None;
     let mut saw_absent = false;
     let mut another: Option<String> = None;
     let mut foreign: Option<String> = None;
-    let mut pending_lan: Option<crate::Error> = None;
     let mut first_err: Option<crate::Error> = None;
 
     for (origin, outcome) in outcomes {
@@ -10453,12 +10555,6 @@ fn select_probed_outcome(
                 foreign.get_or_insert(why);
             }
             Err(err) => {
-                if refused_by_local_network(&err) {
-                    refused.get_or_insert_with(|| err.clone());
-                }
-                if err.kind() == crate::ErrorKind::LocalNetworkPending {
-                    pending_lan.get_or_insert_with(|| err.clone());
-                }
                 first_err.get_or_insert(err);
             }
         }
@@ -10466,9 +10562,6 @@ fn select_probed_outcome(
 
     if let Some(probed) = best_found {
         return Ok(ProbeOutcome::Found(probed));
-    }
-    if let Some(err) = refused {
-        return Err(err);
     }
     // A timeout or a 404 at any authoritative address proves nothing about a vault that may
     // wake there later. Discovery cannot complete this certificate, or mask a complete one.
@@ -10487,7 +10580,7 @@ fn select_probed_outcome(
     if let Some(why) = foreign {
         return Ok(ProbeOutcome::NotThisVault(why));
     }
-    if let Some(err) = pending_lan.or(first_err) {
+    if let Some(err) = first_err {
         return Err(err);
     }
     Ok(ProbeOutcome::Absent)
@@ -10495,17 +10588,16 @@ fn select_probed_outcome(
 
 /// [`probe_within`] of the ALab vault across [`crate::ALAB_DEFAULT_URLS`] and `_alab-vault._tcp`
 /// mDNS browse under the compiled-in signer ([`ProbeOutcome::Absent`] when none is compiled in),
-/// taking the highest verified `seq`.
+/// taking the highest verified `seq`. In a lab's process
+/// ([`crate::discover::LAB_VAULT_SERVICE_ENV`] set) it asks only what the lab's browse heard
+/// ([`probe_alab`]).
 pub fn probe_default(total: Duration) -> crate::Result<ProbeOutcome> {
     let Some(pin) = decode_key32(crate::ALAB_SIGNER) else {
         return Ok(ProbeOutcome::Absent);
     };
     let started = Instant::now();
-    let discovered = match crate::discover::browse_alab(total) {
-        Ok(found) => found,
-        Err(err) if refused_by_local_network(&err) => return Err(err),
-        Err(_) => Vec::new(),
-    };
+    // A browse that cannot run (no LAN broker) finds none: the defaults are still asked.
+    let discovered = crate::discover::browse_alab(total).unwrap_or_default();
     let left = total
         .saturating_sub(started.elapsed())
         .max(Duration::from_millis(100).min(total));
@@ -10517,86 +10609,6 @@ pub fn probe_default(total: Duration) -> crate::Result<ProbeOutcome> {
 #[must_use]
 pub fn alab_signer_built_in() -> bool {
     decode_key32(crate::ALAB_SIGNER).is_some()
-}
-
-/// Cadence at which System State re-probes the LAN after raising macOS's Local Network question
-/// until a server answers, macOS refuses, or [`LOCAL_NETWORK_GRANT_PROBE_WINDOW`] elapses.
-pub const LOCAL_NETWORK_GRANT_PROBE_EVERY: Duration = Duration::from_secs(1);
-
-/// Maximum window over which System State re-probes the LAN for a Local Network grant.
-pub const LOCAL_NETWORK_GRANT_PROBE_WINDOW: Duration = Duration::from_secs(30);
-
-/// Number of 1 s probes within [`LOCAL_NETWORK_GRANT_PROBE_WINDOW`].
-pub const LOCAL_NETWORK_GRANT_PROBE_TRIES: usize = 30;
-
-/// Outcome of re-probing the LAN after raising macOS's Local Network question.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LanGrantProbe {
-    /// A LAN server answered: the person allowed Local Network.
-    Granted(ProbeOutcome),
-    /// macOS refused a `.local` lookup (`-65570`): the person answered Don't Allow or turned it off.
-    Refused,
-    /// The window elapsed (or was canceled) with no definite answer.
-    Unanswered,
-}
-
-/// Re-probe the ALab vault every [`LOCAL_NETWORK_GRANT_PROBE_EVERY`] (1 s) for up to
-/// [`LOCAL_NETWORK_GRANT_PROBE_WINDOW`] (30 s) until a LAN endpoint answers or macOS refuses.
-pub fn probe_lan_for_grant(canceled: impl FnMut() -> bool) -> LanGrantProbe {
-    if !alab_signer_built_in() {
-        return LanGrantProbe::Unanswered;
-    }
-    let canceled = std::cell::RefCell::new(canceled);
-    let stop_sleep = std::cell::Cell::new(false);
-    probe_lan_for_grant_with(
-        || stop_sleep.get() || (canceled.borrow_mut())(),
-        probe_default,
-        Instant::now,
-        |mut left| {
-            const SLICE: Duration = Duration::from_millis(50);
-            while !left.is_zero() {
-                if (canceled.borrow_mut())() {
-                    stop_sleep.set(true);
-                    break;
-                }
-                let step = left.min(SLICE);
-                std::thread::sleep(step);
-                left = left.saturating_sub(step);
-            }
-        },
-    )
-}
-
-/// Testable loop behind [`probe_lan_for_grant`]: runs up to [`LOCAL_NETWORK_GRANT_PROBE_TRIES`]
-/// probes paced at [`LOCAL_NETWORK_GRANT_PROBE_EVERY`] slots.
-pub fn probe_lan_for_grant_with(
-    mut canceled: impl FnMut() -> bool,
-    mut probe: impl FnMut(Duration) -> crate::Result<ProbeOutcome>,
-    mut now: impl FnMut() -> Instant,
-    mut pause: impl FnMut(Duration),
-) -> LanGrantProbe {
-    for attempt in 0..LOCAL_NETWORK_GRANT_PROBE_TRIES {
-        if canceled() {
-            return LanGrantProbe::Unanswered;
-        }
-        let started = now();
-        match probe(LOCAL_NETWORK_GRANT_PROBE_EVERY) {
-            Ok(outcome) => return LanGrantProbe::Granted(outcome),
-            Err(why) if refused_by_local_network(&why) => return LanGrantProbe::Refused,
-            Err(_) => {
-                if attempt + 1 < LOCAL_NETWORK_GRANT_PROBE_TRIES {
-                    let elapsed = now().saturating_duration_since(started);
-                    if let Some(left) = LOCAL_NETWORK_GRANT_PROBE_EVERY
-                        .checked_sub(elapsed)
-                        .filter(|left| !left.is_zero())
-                    {
-                        pause(left);
-                    }
-                }
-            }
-        }
-    }
-    LanGrantProbe::Unanswered
 }
 
 /// Who asks to join, which says what [`request_join`] records.
@@ -10625,6 +10637,18 @@ fn request_join_until(
     asker: Asker,
     deadline: Option<Instant>,
 ) -> crate::Result<String> {
+    request_join_until_admitted(paths, config, proof, asker, deadline, &|| Ok(()))
+}
+
+fn request_join_until_admitted(
+    paths: &Paths,
+    config: &Config,
+    proof: Option<String>,
+    asker: Asker,
+    deadline: Option<Instant>,
+    current: &(dyn Fn() -> crate::Result<()> + Sync),
+) -> crate::Result<String> {
+    current()?;
     refuse_pending_native_enrollment(paths, config)?;
     // A12: an ask nobody typed (the subscriber's re-ask, the handover's ask with its `Allowed`)
     // goes to ALab's vault only from an identity that is no lab identity. A join a person typed
@@ -10632,13 +10656,17 @@ fn request_join_until(
     if asker == Asker::Again && alab_vault(config) {
         refuse_lab_identity(paths)?;
     }
-    let identity = machine_identity(paths)?;
+    let identity = {
+        let _lock = bounded::take(paths, deadline)?;
+        current()?;
+        machine_identity(paths)?
+    };
     let recipient = identity.recipient();
     let code = join_code(&recipient);
     // A join keeps its new proof before it asks: a request cut short (no answer, an interrupt,
     // the change gap's pause) leaves the proof the next ask sends, never the one before it.
     if asker == Asker::Join {
-        change_request_until(paths, config, deadline, |state| {
+        change_request_until_admitted(paths, config, deadline, current, |state| {
             if state.proof != proof {
                 state.refused = None;
             }
@@ -10649,6 +10677,7 @@ fn request_join_until(
             true
         })?;
     }
+    current()?;
     let posted = match &config.source {
         Source::Url(_) => {
             let mut line = format!("{} {} {code}", recipient.to_bech32(), config.host);
@@ -10664,7 +10693,7 @@ fn request_join_until(
     };
     let queued = posted.is_ok();
     // Only while the proof sent is still this machine's (a later join may have changed it).
-    let recorded = change_request_until(paths, config, deadline, |state| {
+    let recorded = change_request_until_admitted(paths, config, deadline, current, |state| {
         if state.proof != proof {
             return false;
         }
@@ -10688,7 +10717,18 @@ fn change_request_until(
     deadline: Option<Instant>,
     change: impl FnOnce(&mut State) -> bool,
 ) -> crate::Result<()> {
+    change_request_until_admitted(paths, config, deadline, &|| Ok(()), change)
+}
+
+fn change_request_until_admitted(
+    paths: &Paths,
+    config: &Config,
+    deadline: Option<Instant>,
+    current: &(dyn Fn() -> crate::Result<()> + Sync),
+    change: impl FnOnce(&mut State) -> bool,
+) -> crate::Result<()> {
     let _lock = bounded::take(paths, deadline)?;
+    current()?;
     let current = self::config(paths)?;
     if current
         .as_ref()
@@ -10726,6 +10766,41 @@ pub fn join_if_unchanged(
     expected: Option<&Config>,
 ) -> crate::Result<JoinOutcome> {
     join_live(paths, options, ExpectedConfig::Read(expected))
+}
+
+/// Join under the caller's current authority, without constraining its source choice.
+/// `current` is read-only and must acquire neither the vault lock nor another lock that can
+/// wait for it: publication checks call it while holding the vault lock. It must retain the
+/// same admission throughout this operation rather than accepting a later allowed choice.
+///
+/// # Errors
+/// As [`fn@join`], or the caller's authority is withdrawn before a subsequent effect.
+pub fn join_admitted(
+    paths: &Paths,
+    options: &JoinOptions<'_>,
+    current: &(dyn Fn() -> crate::Result<()> + Sync),
+) -> crate::Result<JoinOutcome> {
+    join_live(paths, options, ExpectedConfig::AdmittedAny(current))
+}
+
+/// Join only over the configuration the caller read, under its current authority.
+/// As [`join_admitted`], `current` is checked under the vault lock and must remain read-only
+/// without acquiring that lock. After this join saves its source, further effects recheck
+/// `current`; they do not require the old `expected` configuration to remain in place.
+///
+/// # Errors
+/// As [`join_if_unchanged`], or the caller's authority is withdrawn.
+pub fn join_if_unchanged_admitted(
+    paths: &Paths,
+    options: &JoinOptions<'_>,
+    expected: Option<&Config>,
+    current: &(dyn Fn() -> crate::Result<()> + Sync),
+) -> crate::Result<JoinOutcome> {
+    join_live(
+        paths,
+        options,
+        ExpectedConfig::AdmittedRead(expected, current),
+    )
 }
 
 fn join_live(
@@ -10811,6 +10886,7 @@ fn join_with_until(
     fetch: impl FnOnce(&Source) -> crate::Result<Fetched>,
     deadline: Option<Instant>,
 ) -> crate::Result<JoinOutcome> {
+    expected.check_sharing(paths)?;
     let typed = options.source.trim();
     let typed = if typed.is_empty() {
         crate::ALAB_DEFAULT_URL
@@ -10898,16 +10974,20 @@ fn join_with_until(
             state.digest = None;
             state.records_digest = None;
             state.membership = Stored::Plain;
+            expected.check_sharing(paths)?;
             prepare_materialization(paths, &mut state)?;
+            expected.check_sharing(paths)?;
             save_config(paths, &config)?;
             identity
         };
         announce(&identity);
         expected.check_sharing(paths)?;
-        match deadline {
-            Some(deadline) => sync_reader_until(paths, deadline)?,
-            None => sync(paths, None)?,
-        };
+        let fetched = transport::fetch(
+            &config.source,
+            None,
+            bounded::budget(deadline, servers_within(PROBE_DEADLINE))?,
+        )?;
+        apply_join_fetched(paths, fetched, expected, deadline)?;
         return Ok(JoinOutcome::Plain {
             names: registered_names(paths)?,
         });
@@ -10990,6 +11070,7 @@ fn join_with_until(
             state.membership = Stored::None;
             state.proof = None;
             state.requested = in_flight();
+            expected.check_sharing(paths)?;
             prepare_materialization(paths, &mut state)?;
         } else if previous.as_ref() != Some(&config) {
             if previous
@@ -10999,8 +11080,10 @@ fn join_with_until(
                 state.proof = None;
                 state.requested = in_flight();
             }
+            expected.check_sharing(paths)?;
             prepare_materialization(paths, &mut state)?;
         }
+        expected.check_sharing(paths)?;
         save_config(paths, &config)?;
         identity
     };
@@ -11009,23 +11092,19 @@ fn join_with_until(
     let code = join_code(&identity.recipient());
     expected.check_sharing(paths)?;
     // The envelope just verified is the version this join applies: no second fetch.
-    let synced = match deadline {
-        Some(deadline) => apply_fetched_until(
-            paths,
-            configured(paths)?,
-            load_state(paths)?,
-            Fetched::Body(bytes),
-            None,
-            Some(deadline),
-        ),
-        None => sync_with(paths, bytes),
-    }
-    .inspect_err(|_| {
-        let _ = change_request_until(paths, &config, deadline, |state| {
-            state.requested = 0;
-            true
+    let synced =
+        apply_join_fetched(paths, Fetched::Body(bytes), expected, deadline).inspect_err(|_| {
+            let _ = change_request_until_admitted(
+                paths,
+                &config,
+                deadline,
+                &|| expected.check_sharing(paths),
+                |state| {
+                    state.requested = 0;
+                    true
+                },
+            );
         });
-    });
     if let SyncOutcome::Applied { seq, report } = synced? {
         return Ok(JoinOutcome::Joined {
             seq,
@@ -11052,7 +11131,14 @@ fn join_with_until(
             };
             by_password = key.is_some();
             expected.check_sharing(paths)?;
-            request_join_until(paths, &config, key.map(prove), Asker::Join, deadline)?;
+            request_join_until_admitted(
+                paths,
+                &config,
+                key.map(prove),
+                Asker::Join,
+                deadline,
+                &|| expected.check_sharing(paths),
+            )?;
             (options.say)(&JoinEvent::Asked {
                 vault: &name,
                 code: &code,
@@ -11064,6 +11150,7 @@ fn join_with_until(
         }
         Source::Path(_) => {
             let _lock = bounded::take(paths, deadline)?;
+            expected.check_sharing(paths)?;
             let mut state = load_state(paths)?;
             state.membership = Stored::Pending;
             save_state(paths, &state)?;
@@ -11074,16 +11161,24 @@ fn join_with_until(
             });
         }
     }
+    expected.check_sharing(paths)?;
     (options.requested)();
     if !options.wait.is_zero() {
         (options.say)(&JoinEvent::Waiting);
         let deadline = Instant::now() + options.wait.min(Duration::from_secs(365 * 24 * 60 * 60));
         let mut pause = Duration::ZERO;
         while Instant::now() < deadline {
+            expected.check_sharing(paths)?;
             // An admin Mac's verdict (which also ends the server's long-poll): a refused
             // password is asked again at once, or ends a wait that cannot ask. Without one, a
             // look that came back within 5 s waits out the rest of them before the next.
-            if by_password && read_verdict(paths).unwrap_or(false) {
+            let refused = by_password
+                && read_verdict_within_admitted(paths, Duration::MAX, &|| {
+                    expected.check_sharing(paths)
+                })
+                .unwrap_or(false);
+            expected.check_sharing(paths)?;
+            if refused {
                 (options.say)(&JoinEvent::Refused { vault: &name });
                 let JoinPassword::Ask(ask) = &options.password else {
                     break;
@@ -11091,7 +11186,14 @@ fn join_with_until(
                 match ask() {
                     Some(password) => {
                         let key = join::Key::derive(&name, password.as_slice());
-                        request_join(paths, &config, Some(prove(key)), Asker::Join)?;
+                        request_join_until_admitted(
+                            paths,
+                            &config,
+                            Some(prove(key)),
+                            Asker::Join,
+                            None,
+                            &|| expected.check_sharing(paths),
+                        )?;
                         (options.say)(&JoinEvent::Asked {
                             vault: &name,
                             code: &code,
@@ -11111,7 +11213,7 @@ fn join_with_until(
                 Source::Url(_) => Some(left),
                 Source::Path(_) => None,
             };
-            match sync(paths, wait) {
+            match sync_join_approval(paths, wait, expected) {
                 Ok(SyncOutcome::Applied { seq, report }) => {
                     return Ok(JoinOutcome::Joined {
                         seq,
@@ -11129,6 +11231,59 @@ fn join_with_until(
         }
     }
     Ok(JoinOutcome::Pending { code, host })
+}
+
+fn apply_join_fetched(
+    paths: &Paths,
+    fetched: Fetched,
+    expected: ExpectedConfig<'_>,
+    deadline: Option<Instant>,
+) -> crate::Result<SyncOutcome> {
+    apply_until_admitted(
+        paths,
+        configured(paths)?,
+        load_state(paths)?,
+        ApplyInput::Response(Ok(fetched.into())),
+        None,
+        deadline,
+        (false, &|| expected.check_sharing(paths)),
+    )
+}
+
+/// An admitted join's bounded confirmation reads only its selected source. Its subscriber
+/// owns broader peer repair; every received response still checks the same authority under
+/// the materialization lock. Ordinary explicit joins keep their existing sync policy.
+fn sync_join_approval(
+    paths: &Paths,
+    wait: Option<Duration>,
+    expected: ExpectedConfig<'_>,
+) -> crate::Result<SyncOutcome> {
+    if !matches!(
+        expected,
+        ExpectedConfig::AdmittedAny(_) | ExpectedConfig::AdmittedRead(..)
+    ) {
+        return sync(paths, wait);
+    }
+    expected.check_sharing(paths)?;
+    let config = configured(paths)?;
+    let before = load_state(paths)?;
+    let fetched = match &config.source {
+        Source::Url(url) => transport::fetch_within(
+            url,
+            wait.and_then(|_| long_poll_after(&config, &before)),
+            wait.unwrap_or(servers_within(Duration::from_secs(30))),
+        )?,
+        Source::Path(_) => transport::fetch(&config.source, None, servers_within(PROBE_DEADLINE))?,
+    };
+    apply_until_admitted(
+        paths,
+        config,
+        before,
+        ApplyInput::Response(Ok(fetched.into())),
+        None,
+        None,
+        (false, &|| expected.check_sharing(paths)),
+    )
 }
 
 fn refuse_pending_native_enrollment(paths: &Paths, config: &Config) -> crate::Result<()> {
@@ -12598,6 +12753,28 @@ fn publish_as_with_removal(
             },
         )?;
     }
+    // The servers the version may reach, found before the draft: no other publish of this Mac
+    // waits on this one's discovery for its turn below.
+    let bounded_found = PeerDiscovery::empty();
+    let (urls, reach) = match &admin.config.source {
+        Source::Url(_) => {
+            let urls = ledger_publish::publish_candidate_urls(
+                paths,
+                &admin.config,
+                &admin.published_doc,
+                doc,
+                extra_urls,
+                if deadline.is_some() {
+                    Some(&bounded_found)
+                } else {
+                    found
+                },
+            );
+            let reach = urls.clone();
+            (urls, reach)
+        }
+        Source::Path(path) => (Vec::new(), vec![path.display().to_string()]),
+    };
     // The edit is drafted into this Mac's log before the envelope is sealed, and the envelope's
     // stamp names the log's heads with it in: a Mac whose log lacks them reads the envelope's
     // lockers or waits (`log_entries::readable_log`), so a version that reaches a Mac before its
@@ -12605,6 +12782,10 @@ fn publish_as_with_removal(
     // are kept once a server took the envelope, so a refused ordinary edit leaves nothing
     // behind. An explicit revoke prepares the entire security operation and keeps it atomically
     // after sealing but before publication: failed publication cannot undo its retirement.
+    // One-mesh P3: no other publish of this Mac drafts from before this draft reads the log until
+    // its records are held and its pending set is written (`log_entries::draft_turn`), so a
+    // waiting write either publish drafts reads the other's values in the log or its hold.
+    let turn = log_entries::draft_turn(paths, deadline)?;
     // One-mesh W3: no vault pass signs this Mac's waiting writes from before the draft reads the
     // log until the pending set is written (`log_entries::claim_draft`).
     let claim = log_entries::claim_draft(paths, deadline)?;
@@ -12741,26 +12922,6 @@ fn publish_as_with_removal(
     // the same opened version was told meanwhile.
     publication_current(deadline)?;
     let version = envelope::parse(&bytes)?.digest();
-    let bounded_found = PeerDiscovery::empty();
-    let (urls, reach) = match &admin.config.source {
-        Source::Url(_) => {
-            let urls = ledger_publish::publish_candidate_urls(
-                paths,
-                &admin.config,
-                &admin.published_doc,
-                doc,
-                extra_urls,
-                if deadline.is_some() {
-                    Some(&bounded_found)
-                } else {
-                    found
-                },
-            );
-            let reach = urls.clone();
-            (urls, reach)
-        }
-        Source::Path(path) => (Vec::new(), vec![path.display().to_string()]),
-    };
     if let Some(drafted) = &drafted {
         log_entries::hold_drafted(paths, drafted, seq, &version, &reach)?;
     }
@@ -12781,6 +12942,7 @@ fn publish_as_with_removal(
         deadline,
     )?;
     drop(claim);
+    drop(turn);
     // A publish whose deadline ends here sent nothing: its set goes, where the state lock is free
     // now, rather than hold back the names it writes for good (`log_entries::forget_unsent`).
     if let Err(error) = publication_current(deadline) {
@@ -12807,6 +12969,10 @@ fn publish_as_with_removal(
                 return Err(Error::new(
                     "test: the publish ended after the servers answered",
                 ));
+            }
+            #[cfg(test)]
+            if let Some(hook) = AFTER_STORE.with(|hook| hook.borrow_mut().take()) {
+                hook();
             }
             if !outcomes.iter().any(|(_, r)| r.is_ok()) {
                 let mut not_stored = None;
@@ -12851,18 +13017,24 @@ fn publish_as_with_removal(
             let posts_by = LANDED_POSTS_BY
                 .with(std::cell::Cell::take)
                 .unwrap_or(posts_by);
-            if let Some(drafted) = &drafted {
-                let answered = answered_puts(&outcomes);
-                log_entries::keep_drafted_until(
-                    paths,
-                    drafted,
-                    &answered,
-                    deadline,
-                    Some(posts_by),
-                )?;
-            }
-            // Its records kept, where it drafted any, this version is this Mac's head: its hold
-            // goes, and the others are settled with its parents and the servers that took it.
+            let kept = match &drafted {
+                Some(drafted) => {
+                    let answered = answered_puts(&outcomes);
+                    log_entries::keep_drafted_until(
+                        paths,
+                        drafted,
+                        (seq, &version),
+                        &answered,
+                        deadline,
+                        Some(posts_by),
+                    )?
+                }
+                None => true,
+            };
+            // Its records kept, where it drafted any and its hold stood, this version is this
+            // Mac's head, or the parent of the head that settled its hold by descent: its hold
+            // goes, and the others are settled with the servers that took it, and with its
+            // parents where its records were kept (`log_entries::forget_landed_draft`).
             let took: Vec<String> = outcomes
                 .iter()
                 .filter(|(_, result)| result.is_ok())
@@ -12875,6 +13047,7 @@ fn publish_as_with_removal(
                 parents,
                 &took,
                 drafted.is_some(),
+                kept,
                 deadline,
             );
             // Best effort: a sync or mirror that reads this version lands them where this does not.
@@ -12916,13 +13089,22 @@ fn publish_as_with_removal(
                 log_entries::forget_waiting(paths, &version);
             }
             published?;
-            if let Some(drafted) = &drafted {
-                log_entries::keep_drafted_until(paths, drafted, &[], deadline, None)?;
-            }
+            let kept = match &drafted {
+                Some(drafted) => log_entries::keep_drafted_until(
+                    paths,
+                    drafted,
+                    (seq, &version),
+                    &[],
+                    deadline,
+                    None,
+                )?,
+                None => true,
+            };
             // Best effort, as above: the vault's file took this version. After its records are
             // kept, as above, so a pass never signs again a write those records sign.
             log_entries::land_published(paths, &identity, seq, &version, parents, &reach, deadline);
-            // As above: this version is this Mac's head, and the vault's file took it.
+            // As above: this version is this Mac's head, or the parent of the head that settled
+            // its hold, and the vault's file took it.
             log_entries::forget_landed_draft(
                 paths,
                 seq,
@@ -12930,6 +13112,7 @@ fn publish_as_with_removal(
                 parents,
                 &reach,
                 drafted.is_some(),
+                kept,
                 deadline,
             );
             match deadline {
@@ -13013,6 +13196,16 @@ thread_local! {
     /// A test's cut: the next publish on this thread ends once the servers answered, before it
     /// keeps its records, as a process that ends there does.
     static CUT_AFTER_STORE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's hook, run once by the next publish to servers on this thread once they answered
+    /// and before it keeps its records (`log_entries::keep_drafted_until`): another publish of
+    /// this Mac drafting while this one's version is stored and its records are held, not kept,
+    /// as one in another process may. The publish then goes on as it would have.
+    pub(crate) static AFTER_STORE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -14284,6 +14477,7 @@ mod tests {
     }
 
     struct ScriptedTries {
+        brokers: std::collections::VecDeque<Result<(), String>>,
         answers: std::collections::VecDeque<Result<transport::Answer, transport::Unheard>>,
         now: Instant,
         took: Duration,
@@ -14292,11 +14486,15 @@ mod tests {
     }
 
     impl ScriptedTries {
+        /// Each try takes `took`; the broker answers as `brokers` say (then answers), and each
+        /// GET as `answers` say.
         fn new(
             took: Duration,
+            brokers: impl IntoIterator<Item = Result<(), String>>,
             answers: impl IntoIterator<Item = Result<transport::Answer, transport::Unheard>>,
         ) -> Self {
             Self {
+                brokers: brokers.into_iter().collect(),
                 answers: answers.into_iter().collect(),
                 now: Instant::now(),
                 took,
@@ -14307,6 +14505,11 @@ mod tests {
     }
 
     impl Tries for ScriptedTries {
+        fn broker(&mut self, url: &str) -> Result<(), String> {
+            assert_eq!(url, "http://alab-secrets.local:7484/v1/alab");
+            self.brokers.pop_front().unwrap_or(Ok(()))
+        }
+
         fn get(
             &mut self,
             url: &str,
@@ -14334,10 +14537,9 @@ mod tests {
         }
     }
 
-    fn unheard(why: &str, held: bool) -> Result<transport::Answer, transport::Unheard> {
+    fn unheard(why: &str) -> Result<transport::Answer, transport::Unheard> {
         Err(transport::Unheard {
             why: Error::new(why),
-            held,
         })
     }
 
@@ -14351,40 +14553,60 @@ mod tests {
         Source::Url("http://alab-secrets.local:7484/v1/alab".into())
     }
 
+    /// The broker's words while it is not installed.
+    fn not_installed() -> Result<(), String> {
+        Err(aterm_uds::lan::Unavailable::NotInstalled.to_string())
+    }
+
+    /// A look waits for the LAN broker while it is unavailable, saying its words once, and runs
+    /// its one try as soon as the broker answers; a broker still unavailable once the patience
+    /// is spent is the look's answer, in its words, and no GET runs. A failed try is unreached
+    /// at once: nothing waits on a person.
+    /// NEGATIVE CONTROL: a look that tries the vault before the broker answers takes the
+    /// script's GET while the broker is still unavailable, and `gets` is 1 in the second case.
     #[test]
-    fn a_look_held_for_the_local_network_answer_hears_the_vault_after_it() {
+    fn a_look_waits_for_the_lan_broker_and_then_tries_once() {
         let said = std::cell::RefCell::new(Vec::new());
         let say = |why: &str| said.borrow_mut().push(why.to_owned());
         let patience = Duration::from_secs(180);
         let mut tries = ScriptedTries::new(
             transport::LOOK_CONNECT,
-            [
-                unheard("dns: no answer within 8000ms", true),
-                unheard("dns: no answer within 7999ms", true),
-                served_vault(),
-            ],
+            [not_installed(), not_installed()],
+            [served_vault()],
         );
         assert_eq!(
             look_with(&alab(), HANG_DETECTOR, patience, &say, &mut tries),
             Look::Answers
         );
-        assert_eq!(tries.gets, 3);
+        assert_eq!(tries.gets, 1);
         assert_eq!(tries.pauses, [LOOK_PAUSE, LOOK_PAUSE]);
-        assert_eq!(*said.borrow(), ["dns: no answer within 8000ms"]);
+        assert_eq!(*said.borrow(), [not_installed().unwrap_err()]);
 
         said.borrow_mut().clear();
         let mut tries = ScriptedTries::new(
             transport::LOOK_CONNECT,
-            [
-                unheard("dns: no answer within 8000ms", true),
-                served_vault(),
-            ],
+            std::iter::repeat_with(not_installed).take(100),
+            [served_vault()],
         );
-        assert_eq!(
+        let Look::Unreached(why) = look_with(
+            &alab(),
+            HANG_DETECTOR,
+            Duration::from_secs(10),
+            &say,
+            &mut tries,
+        ) else {
+            panic!("a broker still unavailable is unreached");
+        };
+        assert_eq!(why, not_installed().unwrap_err());
+        assert_eq!((tries.gets, tries.pauses.len()), (0, 4));
+
+        said.borrow_mut().clear();
+        let mut tries =
+            ScriptedTries::new(transport::LOOK_CONNECT, [not_installed()], [served_vault()]);
+        assert!(matches!(
             look_with(&alab(), HANG_DETECTOR, Duration::ZERO, &say, &mut tries),
-            Look::Held("dns: no answer within 8000ms".into())
-        );
-        assert_eq!((tries.gets, tries.pauses.len()), (1, 0));
+            Look::Unreached(_)
+        ));
         assert!(
             said.borrow().is_empty(),
             "a look that gives up says nothing held"
@@ -14392,95 +14614,25 @@ mod tests {
 
         let mut tries = ScriptedTries::new(
             transport::LOOK_CONNECT,
-            [
-                unheard("dns: no answer within 8000ms", true),
-                unheard("fetching …: Connection refused", false),
-                served_vault(),
-            ],
+            [],
+            [unheard("dns: no answer within 8000ms"), served_vault()],
         );
         assert_eq!(
             look_with(&alab(), HANG_DETECTOR, patience, &say, &mut tries),
-            Look::Unreached("fetching …: Connection refused".into()),
-            "a held look ends at the first failure that is not held"
-        );
-        assert_eq!((tries.gets, tries.pauses.len()), (2, 1));
-        assert_eq!(*said.borrow(), ["dns: no answer within 8000ms"]);
-
-        said.borrow_mut().clear();
-        let mut tries = ScriptedTries::new(
-            Duration::from_secs(5),
-            [
-                unheard(
-                    "dns: alab-secrets.local: nodename nor servname provided",
-                    false,
-                ),
-                served_vault(),
-            ],
-        );
-        assert_eq!(
-            look_with(&alab(), HANG_DETECTOR, patience, &say, &mut tries),
-            Look::Unreached("dns: alab-secrets.local: nodename nor servname provided".into())
+            Look::Unreached("dns: no answer within 8000ms".into()),
+            "a try that fails is the answer"
         );
         assert_eq!((tries.gets, tries.pauses.len()), (1, 0));
-        assert!(said.borrow().is_empty());
-    }
-
-    /// macOS refusing the vault's `.local` name (Don't Allow) ends a look at once, held, so the
-    /// row names the setting: no wait changes that answer. Negative control: trying a refusal
-    /// again, as a hold, takes the script's second answer.
-    #[test]
-    fn a_look_macos_refused_the_local_network_ends_at_once() {
-        let refused = format!(
-            "dns: alab-secrets.local: {}",
-            aterm_http::LOCAL_NETWORK_REFUSED
-        );
-        let said = std::cell::RefCell::new(Vec::new());
-        let say = |why: &str| said.borrow_mut().push(why.to_owned());
-        let mut tries = ScriptedTries::new(
-            transport::LOOK_CONNECT,
-            [unheard(&refused, true), served_vault()],
-        );
-        assert_eq!(
-            look_with(
-                &alab(),
-                HANG_DETECTOR,
-                Duration::from_secs(180),
-                &say,
-                &mut tries
-            ),
-            Look::Held(refused)
-        );
-        assert_eq!((tries.gets, tries.pauses.len()), (1, 0));
-        assert!(said.borrow().is_empty(), "nothing waits on a refusal");
-    }
-
-    #[test]
-    fn a_held_look_ends_with_its_patience_or_at_a_foreign_answer() {
-        let patience = Duration::from_secs(60);
-        let reasons: Vec<String> = (1..=6).map(|n| format!("try {n}")).collect();
-        let mut tries = ScriptedTries::new(
-            transport::LOOK_CONNECT,
-            reasons.iter().map(|why| unheard(why, true)),
-        );
-        assert_eq!(
-            look_with(&alab(), HANG_DETECTOR, patience, &|_| {}, &mut tries),
-            Look::Held("try 6".into())
-        );
-        assert_eq!(tries.gets, 6, "tries at 0, 10, 20, 30, 40 and 50 s");
-        assert_eq!(tries.pauses, [LOOK_PAUSE; 5]);
 
         let mut tries = ScriptedTries::new(
             transport::LOOK_CONNECT,
-            [
-                unheard("dns: no answer within 8000ms", true),
-                Ok(transport::Answer::Foreign("a login page".into())),
-            ],
+            [],
+            [Ok(transport::Answer::Foreign("a login page".into()))],
         );
         assert_eq!(
             look_with(&alab(), HANG_DETECTOR, patience, &|_| {}, &mut tries),
             Look::NoVault("a login page".into())
         );
-        assert_eq!(tries.gets, 2);
     }
 
     #[test]
@@ -16257,6 +16409,23 @@ mod tests {
             )
         );
         assert!(refuse_lab_member_browse_as(&paths, None, in_vm).is_err());
+    }
+
+    /// A12: either lab knob set, whatever its value, marks the process a lab lane's, so the
+    /// identity it makes is a lab identity and a live-vault join is refused; neither set marks
+    /// nothing.
+    ///
+    /// NEGATIVE CONTROL: `lab_lane_of` reading `LAB_MEMBER_SERVICE_ENV` alone fails at the vault
+    /// knob.
+    #[test]
+    fn either_lab_knob_marks_the_process_a_lab_lanes() {
+        for knob in [
+            crate::discover::LAB_MEMBER_SERVICE_ENV,
+            crate::discover::LAB_VAULT_SERVICE_ENV,
+        ] {
+            assert!(crate::Making::lab_lane_of(|set| set == knob), "{knob}");
+        }
+        assert!(!crate::Making::lab_lane_of(|_| false));
     }
 
     /// A12: a release build on a Mac's own hardware that holds an identity a debug build or a
@@ -18085,7 +18254,16 @@ mod tests {
                 .expect("retained"),
         )
         .expect("sealed");
-        transport::publish(&opened.config.source, &cut).expect("written");
+        // A build before chains wrote a path vault judging only the sequence and the parents,
+        // which the cut passes. This build's path judges the chain as a server does and refuses
+        // the cut, so it is written here as that build wrote it.
+        assert_eq!(
+            transport::publish(&opened.config.source, &cut)
+                .expect_err("this build's path refuses the cut")
+                .kind(),
+            crate::ErrorKind::Refused
+        );
+        fsx::write_atomic(&shared, &cut, 0o644).expect("written as a build before chains wrote it");
 
         let error = sync(&reader, None).expect_err("refused");
         assert!(
@@ -20163,13 +20341,8 @@ mod commons_tests {
 
 #[cfg(test)]
 mod edit_scratch_tests {
-    use super::{
-        LOCAL_NETWORK_GRANT_PROBE_EVERY, LOCAL_NETWORK_GRANT_PROBE_TRIES, LanGrantProbe, Paths,
-        ProbeOutcome, Scratch, extract_machine_tag, probe_lan_for_grant_with,
-    };
-    use crate::Error;
+    use super::{Paths, Scratch, extract_machine_tag};
     use std::os::unix::fs::PermissionsExt;
-    use std::time::{Duration, Instant};
 
     #[test]
     fn an_unpublished_edit_and_unclaimed_files_survive_later_edits() {
@@ -20285,89 +20458,6 @@ mod edit_scratch_tests {
         assert_eq!(extract_machine_tag("Mac-mini-M4"), None);
         assert_eq!(extract_machine_tag("Mac-mini-M4.local"), None);
         assert_eq!(extract_machine_tag("mac-mini-m4"), None);
-    }
-
-    #[test]
-    fn lan_grant_probe_reprobes_every_second_for_thirty_seconds_and_stops_within_one_second_of_answer()
-     {
-        let epoch = Instant::now();
-        let clock = std::cell::Cell::new(epoch);
-        let probes = std::cell::Cell::new(0usize);
-        // Simulate 4 gated attempts (returning in 5ms) followed by Allow at t = 3.4s, so the
-        // 5th probe at t = 4.0s (0.6s <= 1.0s after Allow) hears the vault.
-        let outcome = probe_lan_for_grant_with(
-            || false,
-            |budget| {
-                assert_eq!(budget, LOCAL_NETWORK_GRANT_PROBE_EVERY);
-                let n = probes.get();
-                probes.set(n + 1);
-                clock.set(clock.get() + Duration::from_millis(5));
-                if n < 4 {
-                    Err(Error::of_kind(
-                        crate::ErrorKind::LocalNetworkPending,
-                        "no route to LAN",
-                    ))
-                } else {
-                    Ok(ProbeOutcome::Absent)
-                }
-            },
-            || clock.get(),
-            |d| clock.set(clock.get() + d),
-        );
-        assert_eq!(outcome, LanGrantProbe::Granted(ProbeOutcome::Absent));
-        assert_eq!(probes.get(), 5);
-        let grant_at = epoch + Duration::from_millis(3_400);
-        let detected_delay = clock.get().saturating_duration_since(grant_at);
-        assert!(
-            detected_delay <= Duration::from_secs(1),
-            "grant detected {detected_delay:?} after Allow (> 1s)"
-        );
-
-        // Refusal (Don't Allow) ends immediately without waiting out the 30s window.
-        let clock_refused = std::cell::Cell::new(epoch);
-        let refused_probes = std::cell::Cell::new(0usize);
-        let refused = probe_lan_for_grant_with(
-            || false,
-            |_| {
-                let n = refused_probes.get();
-                refused_probes.set(n + 1);
-                if n == 0 {
-                    Err(Error::of_kind(
-                        crate::ErrorKind::LocalNetworkPending,
-                        "no route",
-                    ))
-                } else {
-                    Err(Error::new(format!(
-                        "browsing _alab-vault._tcp: {}",
-                        aterm_http::LOCAL_NETWORK_REFUSED
-                    )))
-                }
-            },
-            || clock_refused.get(),
-            |d| clock_refused.set(clock_refused.get() + d),
-        );
-        assert_eq!(refused, LanGrantProbe::Refused);
-        assert_eq!(refused_probes.get(), 2);
-
-        // Negative control: 30 unanswered 1s probes stop cleanly at 30s without claiming a grant.
-        let clock_unanswered = std::cell::Cell::new(epoch);
-        let unanswered_probes = std::cell::Cell::new(0usize);
-        let unanswered = probe_lan_for_grant_with(
-            || false,
-            |_| {
-                unanswered_probes.set(unanswered_probes.get() + 1);
-                clock_unanswered.set(clock_unanswered.get() + Duration::from_millis(200));
-                Err(Error::of_kind(crate::ErrorKind::TimedOut, "timeout"))
-            },
-            || clock_unanswered.get(),
-            |d| clock_unanswered.set(clock_unanswered.get() + d),
-        );
-        assert_eq!(unanswered, LanGrantProbe::Unanswered);
-        assert_eq!(unanswered_probes.get(), LOCAL_NETWORK_GRANT_PROBE_TRIES);
-        assert_eq!(
-            clock_unanswered.get().saturating_duration_since(epoch),
-            Duration::from_secs(29) + Duration::from_millis(200)
-        );
     }
 }
 

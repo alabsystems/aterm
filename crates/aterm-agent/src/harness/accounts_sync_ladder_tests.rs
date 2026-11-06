@@ -430,6 +430,7 @@ fn a_repaired_profile_reopens_non_ladder_admission_inside_the_wrong_account_wait
             &spawn,
             None,
             None,
+            &mut None,
         );
         assert_eq!(admitted.progressed(), repaired);
         assert_eq!(

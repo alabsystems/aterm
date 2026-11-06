@@ -651,7 +651,7 @@ fn observed_lineage_never_repairs_custody_or_runs_recovery() {
 
 #[test]
 fn a_running_successor_materializes_later_vault_values_without_a_manual_sync() {
-    use crate::runtime::{Diagnostic, LanGate, Runtime, Status};
+    use crate::runtime::{Diagnostic, Runtime, Status};
     use aterm_secrets::text::Audience;
 
     let mut lab = Lab::new(&[Role::Writer, Role::Writer]);
@@ -695,7 +695,6 @@ fn a_running_successor_materializes_later_vault_values_without_a_manual_sync() {
             observer_config: observer.path().join("aterm.toml"),
             recover_writer: false,
         },
-        LanGate::open(),
         move |status| {
             let _ = ready.send(status);
         },

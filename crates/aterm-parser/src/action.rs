@@ -75,7 +75,9 @@ pub trait ActionSink {
         }
     }
 
-    /// Bulk print a run of two or more decoded non-ASCII characters.
+    /// Bulk print a run of two or more decoded characters that begins with a non-ASCII one and may
+    /// hold printable ASCII (0x20-0x7E) after it: the spaces and punctuation between words, which
+    /// the parser joins into the run where a multi-byte sequence follows them.
     #[inline]
     fn print_unicode_bulk(&mut self, chars: &Provenance<[char], Pty>) {
         for &c in chars.as_ref() {

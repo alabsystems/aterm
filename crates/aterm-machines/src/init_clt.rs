@@ -229,24 +229,27 @@ pub const TAB_NOT_ADMIN: &str = "Only an administrator of this Mac can install A
                                  Line Tools. Ask one to install them from their own login.";
 
 /// The one line the tab says before macOS asks for the password, with the tools missing.
-pub const TAB_INTRO: &str = "aterm is installing Apple's Command Line Tools for building software \
-                             and turning on developer mode. macOS asks for your Mac password once.";
+pub const TAB_INTRO: &str = "aterm is installing Apple's Command Line Tools for building software, \
+                             turning on developer mode, and setting up its local network helper. \
+                             macOS asks for your Mac password once.";
 
 /// [`TAB_INTRO`] on a Mac that has the tools, where the elevation runs for its other root steps
 /// ([`crate::root_steps::Owed`]).
 pub const TAB_INTRO_SETUP: &str = "aterm is finishing the part of this Mac's setup only an \
-                                   administrator can do: developer mode for debuggers, and the \
-                                   Mac's name. macOS asks for your Mac password once.";
+                                   administrator can do: developer mode for debuggers, the Mac's \
+                                   name, and its local network helper. macOS asks for your Mac \
+                                   password once.";
 
 /// The one line a run outside the tab says right before `sudo` asks for the Mac password, so the
 /// prompt never comes bare after whatever the terminal showed last (a package install's output).
 pub const INTRO: &str = "aterm init: installing Apple's Command Line Tools (git, cc, the macOS \
-                         SDK) and turning on developer mode; sudo asks for your Mac password once";
+                         SDK), turning on developer mode and setting up the local network \
+                         helper; sudo asks for your Mac password once";
 
 /// [`INTRO`] on a Mac that has the tools.
 pub const INTRO_SETUP: &str = "aterm init: finishing the administrator's part of setup \
-                               (developer mode, the Mac's name); sudo asks for your Mac password \
-                               once";
+                               (developer mode, the Mac's name, the local network helper); sudo \
+                               asks for your Mac password once";
 
 /// The password prompt (`sudo -p`), in the tab and outside it.
 pub const TAB_PROMPT: &str = "Mac password: ";
@@ -420,14 +423,15 @@ impl CommandLineTools {
     /// [`Self::baseline`], with the Mac's Computer Name, Local hostname and host name set to
     /// `name` where it is a [`plain_name`] (`--name`): the one password that installs the tools
     /// also gives the Mac the name its vault and fleet know it by. Every run of it turns on
-    /// developer mode ([`crate::root_steps::DeveloperMode`]) and puts the rule in place that
-    /// names the Mac at an admission that comes later ([`crate::root_steps::NameRule`]), so the
+    /// developer mode ([`crate::root_steps::DeveloperMode`]), puts the rule in place that names
+    /// the Mac at an admission that comes later ([`crate::root_steps::NameRule`]), and installs
+    /// the root LAN broker ([`crate::items::lan::LanBroker`]) before the tools' download, so the
     /// one password does every root step setup has.
     #[must_use]
     pub fn baseline_named(name: Option<&str>) -> String {
         let mut text = format!(
             "schema = {}\n\n[developer]\ncommand_line_tools = true\ndebugger = true\n\n\
-             [names]\nadmitted_name_rule = true\n",
+             [lan]\nbroker = true\n\n[names]\nadmitted_name_rule = true\n",
             crate::SCHEMA
         );
         if let Some(name) = name.and_then(plain_name) {
@@ -1100,6 +1104,7 @@ mod tests {
         let parsed = crate::baseline::parse(&CommandLineTools::baseline()).unwrap();
         assert_eq!(parsed.developer.and_then(|t| t.debugger), Some(true));
         assert_eq!(parsed.names.and_then(|t| t.admitted_name_rule), Some(true));
+        assert_eq!(parsed.lan.and_then(|t| t.broker), Some(true));
 
         let refused = console();
         refused.on(&argv(), Ran::exit(1, "Sorry, try again."));

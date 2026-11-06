@@ -474,7 +474,7 @@ fn collect_cells(text: &str, rel: &str, out: &mut Vec<Cell>) {
             .map_or("lazy", |t| t.trim_end_matches('<'))
             .to_string();
         out.push(Cell {
-            name,
+            name: name.to_string(),
             kind,
             span: format!("{rel}:{}", i + 1),
             deref_lazy,
@@ -549,7 +549,7 @@ fn field_cell_name(code: &str) -> Option<String> {
 }
 
 /// The identifier a `[pub[(..)]] static [mut] NAME…` line declares.
-fn static_name(code: &str) -> Option<String> {
+fn static_name(code: &str) -> Option<&str> {
     let t = code.trim_start();
     let t = if let Some(rest) = t.strip_prefix("pub(") {
         rest.split_once(") ").map(|(_, after)| after.trim_start())?
@@ -558,11 +558,10 @@ fn static_name(code: &str) -> Option<String> {
     };
     let rest = t.strip_prefix("static ")?;
     let rest = rest.strip_prefix("mut ").unwrap_or(rest);
-    let name: String = rest
-        .chars()
-        .take_while(|c| c.is_alphanumeric() || *c == '_')
-        .collect();
-    if name.is_empty() { None } else { Some(name) }
+    let len = rest
+        .find(|c: char| !c.is_alphanumeric() && c != '_')
+        .unwrap_or(rest.len());
+    (!rest[..len].is_empty()).then_some(&rest[..len])
 }
 
 /// The `static` declaration starting at `line_idx`, up to and including its terminating `;`.
@@ -649,14 +648,16 @@ fn collect_touches_and_inits(
             if !mentions_ident(code, &cell.name) {
                 continue;
             }
-            if declares.as_deref() == Some(cell.name.as_str()) {
+            if declares == Some(cell.name.as_str()) {
                 let decl = declaration_text(text, i);
                 for ctor in LAZY_CTORS {
-                    let needle = format!("{ctor}(");
-                    let Some(off) = decl.find(&needle) else {
+                    let Some(off) = decl
+                        .find(ctor)
+                        .filter(|&off| decl.as_bytes().get(off + ctor.len()) == Some(&b'('))
+                    else {
                         continue;
                     };
-                    let before = &decl[..off + needle.len() - 1];
+                    let before = &decl[..off + ctor.len()];
                     let dl = before.matches('\n').count();
                     let col = before.rsplit('\n').next().map_or(0, str::len);
                     let abs = line_starts.get(i + dl).map_or(0, |s| s + col);
@@ -823,12 +824,11 @@ fn enclosing_fns(lines: &[&str]) -> Vec<Option<String>> {
         let def_line = crate::strip_line_comment(lines[i]);
         let opens = def_line.matches('{').count();
         let single_line = opens > 0 && opens == def_line.matches('}').count();
-        let close = format!("{}}}", " ".repeat(indent));
         let mut end = i;
         if !single_line {
             let mut j = i + 1;
             while j < lines.len() {
-                if lines[j] == close {
+                if crate::is_closing_brace_at_indent(lines[j], indent) {
                     end = j;
                     break;
                 }

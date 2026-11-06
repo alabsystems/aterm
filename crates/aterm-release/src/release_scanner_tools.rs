@@ -26,8 +26,9 @@ impl Report {
 
 /// Preserve the actual publication command's environment, including removals and
 /// alternate export PATH, without carrying its operation or an older report.
-fn probe_command(publication: &Command) -> Command {
+fn probe_command(publication: &Command, engine_prefix_len: usize) -> Command {
     let mut cmd = command(publication.get_program());
+    cmd.args(publication.get_args().take(engine_prefix_len));
     if let Some(dir) = publication.get_current_dir() {
         cmd.current_dir(dir);
     }
@@ -52,12 +53,13 @@ pub(super) fn run(cmd: &mut Command) -> Result<std::process::Output, String> {
 
 pub(super) fn prepare(
     publication: &Command,
+    engine_prefix_len: usize,
     destination: &Path,
     candidates: &[&Path],
     probe: impl FnOnce(&mut Command) -> Result<std::process::Output, String>,
 ) -> Result<Report, String> {
     let path = outside_candidate(destination, candidates)?;
-    let mut cmd = probe_command(publication);
+    let mut cmd = probe_command(publication, engine_prefix_len);
     let output = probe(&mut cmd)?;
     if !output.status.success() {
         let detail = [&output.stderr, &output.stdout]
@@ -172,6 +174,7 @@ mod tests {
             .arg("stage");
         let report = prepare(
             &publication,
+            0,
             &dir.path().join("report.json"),
             &[&candidate],
             |cmd| {
@@ -200,6 +203,33 @@ mod tests {
                 .any(|(name, value)| name == ENV && value == Some(report.path.as_os_str()))
         );
         assert_eq!(std::fs::read_dir(&candidate).unwrap().count(), 0);
+        // The probe preserves the interpreter prefix and replaces only the
+        // engine operation, never asking Python to execute scanner-preflight.
+        let mut interpreted = command("/held/python3.14");
+        interpreted.args(["-I", "/engine/bin/pub", "stage", "aterm"]);
+        interpreted
+            .current_dir(&candidate)
+            .env("PATH", "/held:/usr/bin");
+        prepare(
+            &interpreted,
+            2,
+            &dir.path().join("interpreted.json"),
+            &[&candidate],
+            |probe| {
+                assert_eq!(probe.get_program(), interpreted.get_program());
+                assert_eq!(
+                    probe.get_args().collect::<Vec<_>>(),
+                    ["-I", "/engine/bin/pub", "scanner-preflight"]
+                );
+                assert_eq!(probe.get_current_dir(), interpreted.get_current_dir());
+                assert_eq!(
+                    probe.get_envs().find(|(name, _)| *name == "PATH"),
+                    interpreted.get_envs().find(|(name, _)| *name == "PATH")
+                );
+                Ok(test_output())
+            },
+        )
+        .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -219,6 +249,7 @@ mod tests {
         assert!(
             prepare(
                 &cmd,
+                0,
                 &candidate.join("report.json"),
                 &[&candidate],
                 |_| panic!("must refuse before launching")
@@ -230,26 +261,42 @@ mod tests {
             b"{}",
             b"{\"schema\":1,\"kind\":\"publication-scanner-tools\",\"tools\":{}}",
         ] {
-            let result = prepare(&cmd, &dir.path().join("report.json"), &[&candidate], |_| {
-                let mut out = test_output();
-                out.stdout = bytes.to_vec();
-                Ok(out)
-            });
+            let result = prepare(
+                &cmd,
+                0,
+                &dir.path().join("report.json"),
+                &[&candidate],
+                |_| {
+                    let mut out = test_output();
+                    out.stdout = bytes.to_vec();
+                    Ok(out)
+                },
+            );
             assert!(result.is_err());
             assert!(!dir.path().join("report.json").exists());
         }
         assert!(
-            prepare(&cmd, &dir.path().join("report.json"), &[&candidate], |_| {
-                Err("missing or broken engine".into())
-            })
+            prepare(
+                &cmd,
+                0,
+                &dir.path().join("report.json"),
+                &[&candidate],
+                |_| { Err("missing or broken engine".into()) }
+            )
             .is_err()
         );
         assert!(
-            prepare(&cmd, &dir.path().join("report.json"), &[&candidate], |_| {
-                let mut out = test_output();
-                out.stdout = vec![b' '; MAX_REPORT + 1];
-                Ok(out)
-            })
+            prepare(
+                &cmd,
+                0,
+                &dir.path().join("report.json"),
+                &[&candidate],
+                |_| {
+                    let mut out = test_output();
+                    out.stdout = vec![b' '; MAX_REPORT + 1];
+                    Ok(out)
+                }
+            )
             .is_err()
         );
         #[cfg(unix)]
@@ -257,9 +304,13 @@ mod tests {
             let alias = dir.path().join("candidate-alias");
             std::os::unix::fs::symlink(&candidate, &alias).unwrap();
             assert!(
-                prepare(&cmd, &alias.join("report.json"), &[&candidate], |_| panic!(
-                    "alias must refuse before launching"
-                ))
+                prepare(
+                    &cmd,
+                    0,
+                    &alias.join("report.json"),
+                    &[&candidate],
+                    |_| panic!("alias must refuse before launching")
+                )
                 .is_err()
             );
         }

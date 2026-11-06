@@ -137,16 +137,17 @@ fn defined_in(text: &str) -> Imports {
     let mut out = Imports::new();
     let mut member = None;
     for l in text.lines() {
-        if l.ends_with(':') && !l.starts_with(' ') {
-            member = Some(l.trim_end_matches(':').to_string());
+        if let Some(m) = l.strip_suffix(':').filter(|m| !m.starts_with(' ')) {
+            member = Some(m);
             continue;
         }
-        let p: Vec<_> = l.split_whitespace().collect();
-        if p.len() == 3
-            && p[1] == "T"
-            && let Some(m) = &member
+        let mut p = l.split_whitespace();
+        if let (Some(_), Some("T"), Some(sym), None) = (p.next(), p.next(), p.next(), p.next())
+            && let Some(m) = member
         {
-            out.entry(p[2].to_string()).or_default().insert(m.clone());
+            out.entry(sym.to_string())
+                .or_default()
+                .insert(m.to_string());
         }
     }
     out

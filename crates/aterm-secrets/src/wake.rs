@@ -8,6 +8,7 @@
 //! subscriber's error nap) naps on that bell, and the nap says which source woke it. Nothing
 //! carries the signal between processes: each process hears its own sources.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -20,6 +21,8 @@ pub enum Wake {
     Route,
     /// The standing browse heard a vault server it had not heard ([`crate::discover::Watch`]).
     Browse,
+    /// The local LAN broker began answering its verified hello.
+    Broker,
     /// The server stored a new version, which its advert names.
     Put,
     /// This Mac woke from a sleep ([`aterm_uds::power::Power::Woke`]), before which the server
@@ -37,6 +40,7 @@ impl Wake {
             Wake::Timer => "its timer",
             Wake::Route => "a route change",
             Wake::Browse => "a vault server the browse heard",
+            Wake::Broker => "the LAN broker becoming ready",
             Wake::Put => "a new version stored",
             Wake::Resumed => "this Mac waking from sleep",
             Wake::Stop => "its end",
@@ -45,10 +49,11 @@ impl Wake {
 }
 
 /// A wake-up that any source rings and one consumer naps on. A ring that comes while nobody
-/// naps is kept for the next nap. Of several rings before one nap, the first is kept.
+/// naps is kept for the next nap. Distinct causes are retained in arrival order;
+/// repeated rings from the same source coalesce until the consumer takes it.
 #[derive(Debug, Default)]
 pub struct Bell {
-    rung: Mutex<Option<Wake>>,
+    rung: Mutex<VecDeque<Wake>>,
     cond: Condvar,
 }
 
@@ -57,7 +62,7 @@ impl Bell {
     #[must_use]
     pub const fn new() -> Bell {
         Bell {
-            rung: Mutex::new(None),
+            rung: Mutex::new(VecDeque::new()),
             cond: Condvar::new(),
         }
     }
@@ -65,7 +70,9 @@ impl Bell {
     /// Ring: the nap under way, or else the next one, ends with `why`.
     pub fn ring(&self, why: Wake) {
         let mut rung = self.rung.lock().unwrap_or_else(PoisonError::into_inner);
-        rung.get_or_insert(why);
+        if !rung.contains(&why) {
+            rung.push_back(why);
+        }
         self.cond.notify_all();
     }
 
@@ -75,7 +82,7 @@ impl Bell {
         let deadline = Instant::now() + most.min(MAX_NAP);
         let mut rung = self.rung.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
-            if let Some(why) = rung.take() {
+            if let Some(why) = rung.pop_front() {
                 return why;
             }
             let left = deadline.saturating_duration_since(Instant::now());
@@ -90,12 +97,13 @@ impl Bell {
         }
     }
 
-    /// Forget a ring that no nap took: one that came before what the next nap waits for.
+    /// Forget rings that no nap took: facts the next pass will read itself.
+    /// Returns the first discarded cause, when any was pending.
     pub fn clear(&self) -> Option<Wake> {
-        self.rung
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
+        let mut rung = self.rung.lock().unwrap_or_else(PoisonError::into_inner);
+        let first = rung.pop_front();
+        rung.clear();
+        first
     }
 }
 
@@ -157,19 +165,23 @@ mod tests {
 
     const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
-    /// A ring ends the nap under way and says why, a ring with nobody napping ends the next
-    /// nap, the first of two rings is the one kept, and a nap nobody rings ends by its timer.
+    /// Rings wake a nap or remain queued. Distinct causes survive an earlier
+    /// route hint; repeats coalesce, and an empty queue waits for its timer.
     #[test]
     fn a_nap_ends_with_the_first_ring_or_its_timer() {
         let bell = Arc::new(Bell::default());
         assert_eq!(bell.nap(Duration::from_millis(10)), Wake::Timer);
         bell.ring(Wake::Route);
         bell.ring(Wake::Browse);
+        bell.ring(Wake::Broker);
+        bell.ring(Wake::Route);
         assert_eq!(
             bell.nap(HANG_DETECTOR),
             Wake::Route,
             "kept for the next nap"
         );
+        assert_eq!(bell.nap(HANG_DETECTOR), Wake::Browse);
+        assert_eq!(bell.nap(HANG_DETECTOR), Wake::Broker);
         assert_eq!(bell.nap(Duration::from_millis(10)), Wake::Timer, "taken");
         let ringer = {
             let bell = Arc::clone(&bell);

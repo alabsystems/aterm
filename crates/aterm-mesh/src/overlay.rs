@@ -112,14 +112,19 @@ impl Overlay {
 
     /// A dial of `node` ended with no link to it at `now`: it waits its back-off before the next.
     pub fn failed(&mut self, node: &str, now: Duration) {
-        let last = self.retry.get(node).map_or(Duration::ZERO, |(_, b)| *b);
-        let backoff = if last.is_zero() {
-            DIAL_FIRST
+        if let Some(slot) = self.retry.get_mut(node) {
+            let backoff = if slot.1.is_zero() {
+                DIAL_FIRST
+            } else {
+                slot.1.saturating_mul(2).min(DIAL_MAX)
+            };
+            *slot = (now.saturating_add(backoff), backoff);
         } else {
-            last.saturating_mul(2).min(DIAL_MAX)
-        };
-        self.retry
-            .insert(node.to_owned(), (now.saturating_add(backoff), backoff));
+            self.retry.insert(
+                node.to_owned(),
+                (now.saturating_add(DIAL_FIRST), DIAL_FIRST),
+            );
+        }
     }
 
     /// The earliest time past `now` the overlay would plan something new by itself: the next swap
@@ -383,8 +388,9 @@ fn principal_of(link: &Link) -> String {
 /// another key of a seated principal would pass for the seat; the seat's link is the one whose
 /// key is the seat's, as `Mesh::admits` takes a stream by the key alone.
 pub(crate) fn stands_for_its_node(key: &[u8; 32], seats: &BTreeMap<String, [u8; 32]>) -> bool {
+    let buf = crate::logs::principal_buf(key);
     seats
-        .get(&astream_broker::identity_principal(key))
+        .get(crate::logs::principal_str(&buf))
         .is_none_or(|seat| seat == key)
 }
 
@@ -617,16 +623,17 @@ impl Runtime {
             return false;
         }
         let mut dials = self.dials.lock_or_recover();
-        if !dials.dialing.insert(node.to_owned()) {
+        if dials.dialing.contains(node) {
             return true;
         }
+        let named = node.to_owned();
+        dials.dialing.insert(named.clone());
         let addrs: Vec<SocketAddr> = hinted
             .iter()
             .filter(|(named, _)| named == node)
             .map(|(_, addr)| *addr)
             .collect();
         let runtime = Arc::clone(self);
-        let named = node.to_owned();
         let started = std::thread::Builder::new()
             .name("aterm-mesh-dial".to_owned())
             .spawn(move || {

@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use aterm_grid::{ImageData, ImageFormat, ImageRef, ImageScaling, KittyPlacementTag};
+use aterm_grid::{Grid, ImageData, ImageFormat, ImageRef, ImageScaling, KittyPlacementTag};
 
 use super::handler::TerminalHandler;
 
@@ -44,6 +44,161 @@ pub(super) const MAX_LIVE_IMAGE_BYTES: usize = 128 * 1024 * 1024;
 /// the screen's images is at least that many placed bytes after the last and
 /// the counting stays linear in the bytes placed.
 const LIVE_IMAGE_TRIM_BYTES: usize = MAX_LIVE_IMAGE_BYTES / 2;
+
+/// The least payload the primary screen places between two measures of its history's images,
+/// so a history held near its budget is not measured on every placement.
+const HISTORY_IMAGE_MIN_ROOM: usize = 1024 * 1024;
+
+/// The byte budget for the inline images the primary screen's history (hot tier, staged rows and
+/// ring) holds and its screen does not show: the scrollback store's own budget, so a pressure
+/// shed that lowers one lowers the other.
+pub(super) fn history_image_budget(grid: &Grid) -> usize {
+    grid.scrollback_memory_budget()
+        .unwrap_or(aterm_scrollback::DEFAULT_MEMORY_BUDGET)
+}
+
+/// What [`measure_history_images`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct HistoryImages {
+    /// Payload bytes of the images history holds and the screen does not show, each once: after
+    /// the measure took the oldest off, when it did.
+    pub(super) held: usize,
+    /// Payload bytes of the images the screen shows, each once: history's when they scroll off.
+    shown: usize,
+    /// Screen extras entries, image layers, history rows and spans the measure visited: its work.
+    visits: usize,
+}
+
+impl HistoryImages {
+    /// How many payload bytes the primary screen may place before the next measure: what keeps
+    /// history within `budget` once the screen's images have scrolled into it too, and never less
+    /// than this measure's work in span bytes, so the measures' work stays linear in the bytes
+    /// placed.
+    pub(super) fn room(self, budget: usize) -> usize {
+        budget
+            .saturating_sub(self.held.saturating_add(self.shown))
+            .max(
+                self.visits
+                    .saturating_mul(std::mem::size_of::<aterm_scrollback::ImageSpan>()),
+            )
+            .max(HISTORY_IMAGE_MIN_ROOM)
+    }
+}
+
+/// The images `grid`'s history holds that its visible rows do not show, each once (those in
+/// `stored` excepted), and the work of finding them.
+struct HistoryCensus {
+    /// Each image with its payload bytes, the one whose first row is oldest first.
+    held: Vec<(*const ImageData, usize)>,
+    /// Payload bytes of the images the screen shows, each once.
+    shown: usize,
+    /// Screen extras entries, image layers, history rows and spans visited.
+    visits: usize,
+    /// History rows and spans walked: what a pass that retains spans walks again.
+    walked: usize,
+}
+
+impl HistoryCensus {
+    fn of(grid: &Grid, stored: &HashSet<*const ImageData>) -> Self {
+        let (rows, cols) = (grid.rows(), grid.cols());
+        let mut visits = 0usize;
+        let mut shown: HashSet<*const ImageData> = HashSet::new();
+        let mut shown_bytes = 0usize;
+        for (at, extra) in grid.extras().iter() {
+            visits = visits.saturating_add(1);
+            if at.row >= rows || at.col >= cols {
+                continue;
+            }
+            for layer in extra.images() {
+                visits = visits.saturating_add(1);
+                let image = Arc::as_ptr(&layer.image);
+                if shown.insert(image) && !stored.contains(&image) {
+                    shown_bytes = shown_bytes.saturating_add(layer.image.payload_bytes());
+                }
+            }
+        }
+        let mut seen: HashSet<*const ImageData> = HashSet::new();
+        let mut held: Vec<(*const ImageData, usize)> = Vec::new();
+        let mut spans = 0usize;
+        for span in grid.history_images() {
+            spans = spans.saturating_add(1);
+            let image = Arc::as_ptr(&span.image);
+            if !stored.contains(&image) && !shown.contains(&image) && seen.insert(image) {
+                held.push((image, span.image.payload_bytes()));
+            }
+        }
+        let walked = spans.saturating_add(grid.history_image_rows());
+        Self {
+            held,
+            shown: shown_bytes,
+            visits: visits.saturating_add(walked),
+            walked,
+        }
+    }
+}
+
+/// Count the payload bytes of the images `grid`'s history holds that its visible rows do not
+/// show (each once, those in `stored` excepted) and, past `budget`, take whole images off history
+/// down to half of it: the one whose first row is oldest first, as output placed it earliest.
+///
+/// Rows of history share one payload, so a picture cut down to a single row still counts whole.
+pub(super) fn measure_history_images(
+    grid: &mut Grid,
+    stored: &HashSet<*const ImageData>,
+    budget: usize,
+) -> HistoryImages {
+    let HistoryCensus {
+        held,
+        shown,
+        mut visits,
+        walked,
+    } = HistoryCensus::of(grid, stored);
+    let mut total = held
+        .iter()
+        .fold(0usize, |sum, &(_, bytes)| sum.saturating_add(bytes));
+    if total > budget {
+        let mut gone: HashSet<*const ImageData> = HashSet::new();
+        for &(image, bytes) in &held {
+            if total <= budget / 2 {
+                break;
+            }
+            gone.insert(image);
+            total = total.saturating_sub(bytes);
+        }
+        grid.retain_history_images(&mut |span| !gone.contains(&Arc::as_ptr(&span.image)));
+        visits = visits.saturating_add(walked);
+    }
+    HistoryImages {
+        held: total,
+        shown,
+        visits,
+    }
+}
+
+/// What taking the images `grid`'s history holds and its screen does not show (each once,
+/// those in `stored` excepted) off history frees beyond the tiered store's budgeted bytes: their
+/// payload bytes less the share of each that a hot-tier line holding it already books there
+/// ([`aterm_scrollback::ImageSpan::memory_used`]).
+pub(super) fn unbooked_history_image_bytes(
+    grid: &Grid,
+    stored: &HashSet<*const ImageData>,
+) -> usize {
+    let census = HistoryCensus::of(grid, stored);
+    let held: HashSet<*const ImageData> = census.held.iter().map(|&(image, _)| image).collect();
+    let booked = grid
+        .scrollback()
+        .into_iter()
+        .flat_map(aterm_scrollback::ScrollbackStorage::images)
+        .filter(|span| held.contains(&Arc::as_ptr(&span.image)))
+        .fold(0usize, |sum, span| {
+            sum.saturating_add(span.image.per_row_bytes())
+        });
+    census
+        .held
+        .iter()
+        .fold(0usize, |sum, &(_, bytes)| sum.saturating_add(bytes))
+        .saturating_sub(booked)
+}
 
 /// A requested image dimension from the `width=`/`height=` argument.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -362,6 +517,12 @@ impl TerminalHandler<'_> {
     }
 
     /// Trim older live-screen images if needed and return whether `image` fits [`MAX_LIVE_IMAGE_BYTES`].
+    ///
+    /// On the primary screen, also hold its history's images to [`history_image_budget`]. Every
+    /// image history holds was on this screen first, placed here (or released by the Kitty
+    /// store, which charges it), so history's image bytes never exceed what the last measure
+    /// found on screen and in history plus what was placed since: measuring again once the
+    /// transient `history_image_room` runs out bounds them.
     pub(super) fn admit_live_image(
         &mut self,
         image: &Arc<ImageData>,
@@ -378,6 +539,24 @@ impl TerminalHandler<'_> {
             self.trim_live_images(image).saturating_add(add)
         } else {
             charge
+        };
+        if !self.modes.alternate_screen {
+            self.admit_history_image(add);
+        }
+    }
+
+    /// Charge `add` placed bytes to the primary history's room, measuring it when they overrun.
+    fn admit_history_image(&mut self, add: usize) {
+        self.transient.history_image_room = match self.transient.history_image_room.checked_sub(add)
+        {
+            Some(room) => room,
+            None => {
+                let stored = self.kitty_store_images();
+                let budget = history_image_budget(self.grid);
+                measure_history_images(self.grid, &stored, budget)
+                    .room(budget)
+                    .saturating_sub(add)
+            }
         };
     }
 
@@ -482,8 +661,9 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Place a decoded sixel raster as an [`ImageFormat::RawRgba8`] [`ImageData`].
-    pub(super) fn place_sixel_image(&mut self, image: &crate::sixel::SixelImage) {
+    /// Place a decoded sixel as an [`ImageFormat::RawRgba8`] [`ImageData`] holding its painted
+    /// raster (taken without a copy) over the footprint the image spans.
+    pub(super) fn place_sixel_image(&mut self, image: crate::sixel::SixelImage) {
         let (cell_w, cell_h) = self.iterm2.cell_px;
         let (cell_w, cell_h) = (cell_w.max(1), cell_h.max(1));
         let grid_cols = self.grid.cols();
@@ -496,20 +676,14 @@ impl TerminalHandler<'_> {
             return;
         }
 
-        let raw_w = u16::try_from(image.width()).unwrap_or(u16::MAX);
-        let raw_h = u16::try_from(image.height()).unwrap_or(u16::MAX);
-
-        let image_bytes = (image.width() as u64)
-            .saturating_mul(image.height() as u64)
-            .saturating_mul(4);
-        if image_bytes > MAX_IMAGE_BYTES as u64 {
+        let raster = (image.raster_width(), image.raster_height());
+        let (raw_w, raw_h, bytes) = match (u16::try_from(raster.0), u16::try_from(raster.1)) {
+            (Ok(w), Ok(h)) if w > 0 && h > 0 => (w, h, image.into_rgba()),
+            // Nothing painted: one transparent pixel stands for the declared area.
+            _ => (1, 1, vec![0; 4]),
+        };
+        if bytes.len() > MAX_IMAGE_BYTES {
             return;
-        }
-
-        let mut bytes: Vec<u8> = Vec::with_capacity(image.pixels().len() * 4);
-        for &px in image.pixels() {
-            let [a, r, g, b] = px.to_be_bytes();
-            bytes.extend_from_slice(&[r, g, b, a]);
         }
 
         let image_data = Arc::new(ImageData {

@@ -4796,7 +4796,7 @@ fn a_review_reads_a_lone_walled_row_only_on_its_way_to_start_on_it() {
     };
     let run = |config: &str, cwd: &Path, asker: Asker, args: &[&str]| {
         let cfg = pool.config.join("aterm.toml");
-        std::fs::write(&cfg, config).unwrap();
+        aterm_uds::atomic_file::write(&cfg, config.as_bytes(), 0o600).unwrap();
         let env = crate::ai::cli::Env {
             now: ReviewPool::NOW,
             home: Some(pool.b.home.clone()),

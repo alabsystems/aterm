@@ -674,13 +674,12 @@ impl OverviewState {
         self.clamp_scroll();
     }
 
-    /// Move the cursor to `session`.
-    pub(crate) fn select_session(&mut self, session: u64, as_manager: bool) -> bool {
+    /// Move the cursor to `session`'s manages line, else to its chip.
+    pub(crate) fn select_session(&mut self, session: u64) -> bool {
         let items = self.items();
         let line = items.iter().position(|item| {
-            as_manager
-                && matches!(item, OverviewItem::Manages { line }
-                    if self.manages.get(*line).and_then(|m| m.manager_local) == Some(session))
+            matches!(item, OverviewItem::Manages { line }
+                if self.manages.get(*line).and_then(|m| m.manager_local) == Some(session))
         });
         let chip = || {
             items
@@ -1435,14 +1434,12 @@ mod tests {
     fn select_session_lands_on_the_manages_line_or_the_chip() {
         let mut s = state();
         s.move_selection(1);
-        assert!(s.select_session(1, true));
+        assert!(s.select_session(1));
         assert_eq!(s.selected_item(), Some(OverviewItem::Manages { line: 0 }));
         assert_eq!(s.activate(), OverviewAct::Raise(1), "its manager");
-        assert!(s.select_session(1, false));
-        assert_eq!(s.selected_chip().map(|c| c.local_id), Some(1));
-        assert!(s.select_session(2, true), "control: no manages line");
+        assert!(s.select_session(2), "control: no manages line");
         assert_eq!(s.selected_chip().map(|c| c.local_id), Some(2));
-        assert!(!s.select_session(9, false));
+        assert!(!s.select_session(9));
         assert_eq!(s.selected_chip().map(|c| c.local_id), Some(2), "unmoved");
     }
 

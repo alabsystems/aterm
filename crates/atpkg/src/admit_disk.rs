@@ -86,7 +86,7 @@ pub struct Run {
 /// THE MACHINE'S RECORD OF A KIND WHOSE DIRECTORIES ARE EACH CHECKOUT'S OWN (verify's build
 /// directory and `<target>/verify`): a fresh worktree's hold no run of anything, so its record
 /// beside them ([`Run::record`]) has none to read, and a run of a scope run in another checkout
-/// claims what that run bounds ([`aterm_capacity::MachineFootprints::cover`]) instead of the
+/// claims what that run bounds ([`aterm_capacity::MachineFootprints::cover_by`]) instead of the
 /// cold budget. Kept only for a run that did all its work ([`Admitted::finish_whole`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Machinewide {
@@ -94,6 +94,10 @@ pub struct Machinewide {
     pub record: PathBuf,
     /// What the run builds, as the record keeps it.
     pub selection: Selection,
+    /// The words of the kind's work each of which adds work to the same directories and takes
+    /// none away (verify's checks that build), so a run kept that did the run's work and more of
+    /// them bounds it too.
+    pub more: Vec<String>,
 }
 
 /// WHAT A FINISHED RUN TOOK, AND WHICH RECORDS TOOK IT ([`Admitted::finish_here`],
@@ -226,7 +230,7 @@ pub fn admit_on(
     let across = run
         .machine
         .as_ref()
-        .map(|m| (MachineFootprints::load(&m.record), m.selection.clone()));
+        .map(|m| (MachineFootprints::load(&m.record), m.clone()));
     let estimate = need_of(&kept, across.as_ref(), holds, run.cold, tag, scope);
     let mut sizing = Sizing {
         relief,
@@ -473,7 +477,7 @@ struct Sizing<'a> {
     kept: Footprints,
     /// What its kind's runs took in this machine's checkouts, and what it builds, where its kind
     /// keeps them ([`Run::machine`]).
-    across: Option<(MachineFootprints, Selection)>,
+    across: Option<(MachineFootprints, Machinewide)>,
     /// What its kind writes into empty directories.
     cold: u64,
     /// What its directories held at the last measure.
@@ -488,18 +492,18 @@ struct Sizing<'a> {
 
 /// What a run claims when its directories, tagged `tag`, hold `holds` and it builds `scope`: what
 /// its kind's runs on them (`kept`) bound ([`Footprints::need`]), or, with none of its scope, what
-/// the machine's runs (`across`: its record and the run's selection) bound where lower
-/// ([`Estimate::or_machine`]).
+/// the machine's runs (`across`: its record, and the run's selection and the words that add
+/// work) bound where lower ([`Estimate::or_machine`]).
 fn need_of(
     kept: &Footprints,
-    across: Option<&(MachineFootprints, Selection)>,
+    across: Option<&(MachineFootprints, Machinewide)>,
     holds: u64,
     cold: u64,
     tag: u64,
     scope: Option<u64>,
 ) -> Estimate {
     kept.need(holds, cold, tag, scope)
-        .or_machine(across.and_then(|(m, selection)| m.cover(selection, holds, cold)))
+        .or_machine(across.and_then(|(m, w)| m.cover_by(&w.selection, holds, cold, &w.more)))
 }
 
 impl Relief for Sizing<'_> {

@@ -889,7 +889,7 @@ impl Bed {
 struct RenewalAdmission {
     bed: Bed,
     guard: Arc<Mutex<AutoRenewGuard>>,
-    held: Option<accounts::Lock>,
+    held: Option<accounts::SigninTurn>,
     start: Instant,
 }
 

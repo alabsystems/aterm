@@ -494,8 +494,9 @@ struct Built {
     scratch: PathBuf,
     ceiling: Option<Duration>,
     /// How a session that takes the desk admits a quiet machine of its own ([`desk_claim`]):
-    /// `browser-drive`'s. `None` takes no claim of its own: a verify run's stage holds the run's
-    /// quiet machine ([`takes_the_desk`]), or the run takes none.
+    /// `browser-drive`'s, as its `--admit` says ([`DriveArgs::admit`]). `None` takes no claim of
+    /// its own: a verify run's stage holds the run's quiet machine ([`takes_the_desk`]), or the
+    /// run takes none.
     quiet: Option<aterm_capacity::Admit>,
 }
 
@@ -571,40 +572,99 @@ pub fn site_main(args: &[String], cwd: &Path) -> i32 {
     finish(&r)
 }
 
-/// `verify browser-drive SITE OUT [--engine NAME]...`.
-pub fn drive_main(args: &[String]) -> i32 {
-    let usage = |why: String| {
-        eprintln!(
-            "verify browser-drive: {why} (verify browser-drive SITE OUT [--engine {}]...)",
-            ENGINES.join("|")
-        );
-        exit::USAGE
-    };
-    let mut paths = Vec::new();
-    let mut wanted: Vec<String> = Vec::new();
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        if a == "--engine" {
-            let Some(name) = it.next().filter(|n| ENGINES.contains(&n.as_str())) else {
-                return usage("--engine names a session".to_string());
-            };
-            if !wanted.contains(name) {
-                wanted.push(name.clone());
-            }
-        } else if a.starts_with('-') {
-            return usage(format!("unknown option `{a}`"));
-        } else {
-            paths.push(PathBuf::from(a));
+/// What `verify browser-drive` was asked for.
+struct DriveArgs {
+    site: PathBuf,
+    work: PathBuf,
+    /// The sessions `--engine` named, each once, in order.
+    wanted: Vec<String>,
+    /// `--admit wait|now` (wait by default), as verify's own: how a session that takes the desk
+    /// admits its quiet machine ([`Built::quiet`]).
+    admit: aterm_capacity::Admit,
+}
+
+impl DriveArgs {
+    /// The run's shared state, its sessions' scratch under `scratch`.
+    fn built(&self, scratch: PathBuf) -> Built {
+        Built {
+            site: self.site.clone(),
+            work: self.work.clone(),
+            cost: None,
+            scratch,
+            ceiling: Some(crate::exec::DEFAULT_CHILD_CEILING),
+            quiet: Some(self.admit),
         }
     }
-    let [site, work] = &paths[..] else {
-        return usage("takes a site and an output directory".to_string());
+}
+
+/// Parse `verify browser-drive SITE OUT [--engine NAME]... [--admit wait|now]`. A flag's value
+/// follows it or is joined by `=`, as in verify's own arguments.
+///
+/// # Errors
+/// An unknown option, a flag without its value, an `--engine` that names no session, an
+/// `--admit` other than `wait` or `now`, or other than a site and an output directory.
+fn drive_args(args: &[String]) -> Result<DriveArgs, String> {
+    let mut paths = Vec::new();
+    let mut wanted: Vec<String> = Vec::new();
+    let mut admit = aterm_capacity::Admit::Wait;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let (flag, inline) = match a.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f, Some(v.to_string())),
+            _ => (a.as_str(), None),
+        };
+        let mut value = || match inline.clone().or_else(|| it.next().cloned()) {
+            Some(v) if v.starts_with('-') => Err(format!("{flag} needs a value, not `{v}`")),
+            Some(v) if !v.is_empty() => Ok(v),
+            _ => Err(format!("{flag} needs a value")),
+        };
+        match flag {
+            "--engine" => {
+                let name = value()?;
+                if !ENGINES.contains(&name.as_str()) {
+                    return Err(format!("--engine names a session, not `{name}`"));
+                }
+                if !wanted.contains(&name) {
+                    wanted.push(name);
+                }
+            }
+            aterm_capacity::Admit::FLAG => {
+                let v = value()?;
+                admit = aterm_capacity::Admit::parse(&v)
+                    .ok_or_else(|| format!("--admit takes now or wait, not `{v}`"))?;
+            }
+            f if f.starts_with('-') => return Err(format!("unknown option `{a}`")),
+            _ => paths.push(PathBuf::from(a)),
+        }
+    }
+    let [site, work] = <[PathBuf; 2]>::try_from(paths)
+        .map_err(|_| "takes a site and an output directory".to_string())?;
+    Ok(DriveArgs {
+        site,
+        work,
+        wanted,
+        admit,
+    })
+}
+
+/// `verify browser-drive SITE OUT [--engine NAME]... [--admit wait|now]`.
+pub fn drive_main(args: &[String]) -> i32 {
+    let asked = match drive_args(args) {
+        Ok(asked) => asked,
+        Err(why) => {
+            eprintln!(
+                "verify browser-drive: {why} (verify browser-drive SITE OUT [--engine {}]... \
+                 [--admit wait|now])",
+                ENGINES.join("|")
+            );
+            return exit::USAGE;
+        }
     };
-    if let Some(missing) = site_lacks(site) {
+    if let Some(missing) = site_lacks(&asked.site) {
         eprintln!(
             "verify browser-drive: COULD NOT RUN — {} holds no {missing}: lay it with `verify \
              browser-site`",
-            site.display()
+            asked.site.display()
         );
         return exit::COULD_NOT_RUN;
     }
@@ -615,15 +675,9 @@ pub fn drive_main(args: &[String]) -> i32 {
             return exit::COULD_NOT_RUN;
         }
     };
-    let built = Built {
-        site: site.clone(),
-        work: work.clone(),
-        cost: None,
-        scratch: scratch.clone(),
-        ceiling: Some(crate::exec::DEFAULT_CHILD_CEILING),
-        quiet: Some(aterm_capacity::Admit::Wait),
-    };
-    let mut r = Report::new(format!("browser-drive ({})", site.display()));
+    let built = asked.built(scratch.clone());
+    let wanted = asked.wanted;
+    let mut r = Report::new(format!("browser-drive ({})", asked.site.display()));
     let named = |name: &str| wanted.iter().any(|w| w == name);
     let webkit = if named("webkit") {
         Windowed::Run(webkit::find())
@@ -1373,11 +1427,11 @@ fn drive_safari(safari: &safari::Safari, site: &Path, work: &Path) -> Result<Ses
 }
 
 /// The quiet machine for a session that takes the desk ([`Engine::takes_the_desk`]) in
-/// `browser-drive`, admitted as `mode` says ([`crate::admit_live`]), with how it was admitted:
-/// one windowed session at a time, on a machine quiet enough for it. `browser-drive` holds no
-/// other claim while it waits; a verify run's stage takes the run's quiet machine before its
-/// memory instead ([`takes_the_desk`]) and hands no mode. `None` only where the
-/// caller explicitly leaves this session untimed or its outer stage owns the desk. An
+/// `browser-drive`, admitted as `mode` (its `--admit`) says ([`crate::admit_live`]), with how it
+/// was admitted: one windowed session at a time, on a machine quiet enough for it.
+/// `browser-drive` holds no other claim while it waits; a verify run's stage takes the run's
+/// quiet machine before its memory instead ([`takes_the_desk`]) and hands no mode. `None` only
+/// where the caller explicitly leaves this session untimed or its outer stage owns the desk. An
 /// unavailable, immediate, forced or expired requested Timing claim starts no session.
 ///
 /// # Errors
@@ -1759,6 +1813,54 @@ mod tests {
             );
         }
         assert_eq!(site_main(&s(&[]), dir.path()), exit::USAGE);
+        assert_eq!(
+            drive_main(&s(&[
+                &site_arg, "/o", "--engine", "safari", "--admit", "now"
+            ])),
+            exit::COULD_NOT_RUN,
+            "--admit is browser-drive's option"
+        );
+        assert_eq!(
+            drive_main(&s(&[&site_arg, "/o", "--admit", "soon"])),
+            exit::USAGE
+        );
+    }
+
+    /// `--admit` reaches the quiet claim of a session that takes the desk, wait by default, and
+    /// an unknown option or an `--admit` without `wait` or `now` still refuses.
+    #[test]
+    fn browser_drive_s_admit_reaches_its_desk_claim() {
+        let s = |v: &[&str]| v.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
+        let quiet = |v: &[&str]| drive_args(&s(v)).map(|a| a.built(PathBuf::new()).quiet);
+        assert_eq!(
+            quiet(&["site", "out", "--engine", "safari"]),
+            Ok(Some(aterm_capacity::Admit::Wait))
+        );
+        for now in [&["--admit", "now"][..], &["--admit=now"]] {
+            let args = [&["site", "out", "--engine", "safari"][..], now].concat();
+            assert_eq!(
+                quiet(&args),
+                Ok(Some(aterm_capacity::Admit::Now)),
+                "{now:?}"
+            );
+        }
+        assert_eq!(
+            quiet(&["--admit", "now", "site", "--admit", "wait", "out"]),
+            Ok(Some(aterm_capacity::Admit::Wait)),
+            "the last --admit"
+        );
+        let asked = drive_args(&s(&["s", "o", "--engine=safari", "--engine", "safari"]));
+        assert_eq!(asked.map(|a| a.wanted), Ok(vec!["safari".to_string()]));
+        for refused in [
+            &["s", "o", "--fast"][..],
+            &["s", "o", "--admit"],
+            &["s", "o", "--admit", "soon"],
+            &["s", "o", "--admit=", "now"],
+            &["s", "o", "--admit", "--engine", "safari"],
+            &["s", "--admit", "now"],
+        ] {
+            assert!(drive_args(&s(refused)).is_err(), "{refused:?}");
+        }
     }
 
     /// A posted answer parses, and a page's error is a finding naming it.

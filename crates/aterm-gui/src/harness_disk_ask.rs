@@ -519,7 +519,17 @@ pub(super) fn before_pass(sids: &[String], store: &Store) {
     };
     let key = reading.key.spelled();
     let host = ask::HostId::this();
-    let lease = ask::read(&state);
+    let lease = match ask::read(&state) {
+        Ok(lease) => lease,
+        Err(e) => {
+            aterm_log::debug!(
+                "harness disk watch: the lease in {} could not be read ({e}); the step after \
+                 the pass tries again",
+                state.display()
+            );
+            return;
+        }
+    };
     let open = lease.entry(&key).is_some_and(|e| e.episode_ms.is_some());
     if !open {
         return;
@@ -876,7 +886,8 @@ fn out_raises_low(said: &ask::Said, level: Level, floor: u64, done: Option<ask::
 fn look_rests(state: &Path, key: &str, level: Level, projected: bool) -> bool {
     level < Level::Short
         && !projected
-        && ask::rests(&ask::read(state), key, typed_last(key).map(|t| t.at_ms))
+        && ask::read(state)
+            .is_ok_and(|lease| ask::rests(&lease, key, typed_last(key).map(|t| t.at_ms)))
 }
 
 /// Journal what a worker step decided, and act on it: a claim of this host's starts the worker
@@ -2799,7 +2810,7 @@ mod tests {
         };
         let now = now_ms();
         owed_at(state.path(), &key, &host, &sid, now);
-        let before = ask::read(state.path());
+        let before = ask::read(state.path()).expect("valid fixture lease");
         let owed = crate::disk_board::AskOwed {
             key: key.clone(),
             text: "the line".to_owned(),
@@ -2826,7 +2837,7 @@ mod tests {
             );
         }
         assert_eq!(
-            ask::read(state.path()),
+            ask::read(state.path()).expect("valid fixture lease"),
             before,
             "unclaimed, and owed until the look gives it back to the episode"
         );
@@ -3026,7 +3037,11 @@ mod tests {
                 .expect("nobody holds its lock");
             (
                 said,
-                ask::read(state.path()).entry(&key).cloned().expect("entry"),
+                ask::read(state.path())
+                    .expect("valid fixture lease")
+                    .entry(&key)
+                    .cloned()
+                    .expect("entry"),
             )
         };
         let pick = ask::Pick {
@@ -3290,7 +3305,11 @@ mod tests {
                 .expect("nobody holds its lock");
             (
                 said,
-                ask::read(state.path()).entry(&key).cloned().expect("entry"),
+                ask::read(state.path())
+                    .expect("valid fixture lease")
+                    .entry(&key)
+                    .cloned()
+                    .expect("entry"),
             )
         };
         let minute = 60_000;
@@ -4088,6 +4107,25 @@ mod tests {
             .expect("nobody holds its lock");
     }
 
+    #[test]
+    fn lease_read_failure_does_not_count_as_an_idle_lease() {
+        let state = aterm_tempfile::TempDir::new().expect("lease directory");
+        let path = state.path().join(ask::LEASE_FILE);
+        let key = "dev:failed-lease-read";
+        assert!(look_rests(state.path(), key, Level::Ok, false));
+        std::fs::write(&path, ask::Lease::default().encode()).expect("valid empty lease");
+        assert!(look_rests(state.path(), key, Level::Ok, false));
+        for text in ["not json", r#"{"schema":2,"volumes":[]}"#] {
+            std::fs::write(&path, text).expect("bad lease");
+            assert!(!look_rests(state.path(), key, Level::Ok, false));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        }
+        std::fs::remove_file(&path).expect("remove owned fixture");
+        std::fs::create_dir(&path).expect("non-file lease");
+        assert!(!look_rests(state.path(), key, Level::Ok, false));
+        assert!(path.is_dir());
+    }
+
     const GIB: u64 = 1 << 30;
 
     #[test]
@@ -4119,7 +4157,7 @@ mod tests {
                 level: Level::Short,
             };
             assert_eq!(at.step(|| "typed".to_owned(), || measured), "typed");
-            let lease = ask::read(state.path());
+            let lease = ask::read(state.path()).expect("valid fixture lease");
             assert!(
                 matches!(
                     &lease.entry(key).expect("entry").phase,
@@ -4143,7 +4181,7 @@ mod tests {
         let now = now_ms();
         let key = "dev:held-break";
         owed_at(state.path(), key, &host, "s-held", now);
-        let before = ask::read(state.path());
+        let before = ask::read(state.path()).expect("valid fixture lease");
         let owed = crate::disk_board::AskOwed {
             key: key.to_owned(),
             text: "the line".to_owned(),
@@ -4169,7 +4207,7 @@ mod tests {
             );
         }
         assert_eq!(
-            ask::read(state.path()),
+            ask::read(state.path()).expect("valid fixture lease"),
             before,
             "unclaimed, so its time is not stretched, and still owed"
         );
@@ -4181,7 +4219,10 @@ mod tests {
         );
         assert!(
             !matches!(
-                ask::read(state.path()).entry(key).map(|e| &e.phase),
+                ask::read(state.path())
+                    .expect("valid fixture lease")
+                    .entry(key)
+                    .map(|e| &e.phase),
                 Some(ask::Phase::Owed { .. })
             ),
             "released"
@@ -4308,6 +4349,7 @@ mod tests {
         assert!(holds, "recorded: the look rests");
         assert_eq!(
             ask::read(state.path())
+                .expect("valid fixture lease")
                 .entry(key)
                 .and_then(|e| e.last_ask_ms),
             Some(at),

@@ -325,7 +325,6 @@ impl TerminalHandler<'_> {
         self.transient.conhost_alt_screen_left_up = false;
         self.kitty_keyboard.switch_screen(true);
         self.transient.current_hyperlink = None;
-        self.transient.current_hyperlink_id = None;
         self.transient.update_has_transient_extras();
         self.sixel.pending_image = None;
         let mut new_grid = self
@@ -399,7 +398,6 @@ impl TerminalHandler<'_> {
 
         self.kitty_keyboard.switch_screen(false);
         self.transient.current_hyperlink = None;
-        self.transient.current_hyperlink_id = None;
         self.transient.update_has_transient_extras();
         self.sixel.pending_image = None;
         let tab_stops = self.grid.tab_stops().to_vec();
@@ -483,7 +481,6 @@ impl TerminalHandler<'_> {
         self.kitty_keyboard.switch_screen(true);
         self.sixel.pending_image = None;
         self.transient.current_hyperlink = None;
-        self.transient.current_hyperlink_id = None;
         self.transient.update_has_transient_extras();
         let mut new_grid = Grid::with_scrollback(self.grid.rows(), self.grid.cols(), 0);
         new_grid.set_resize_law(self.grid.resize_law());
@@ -536,7 +533,6 @@ impl TerminalHandler<'_> {
         self.kitty_keyboard.switch_screen(false);
         self.sixel.pending_image = None;
         self.transient.current_hyperlink = None;
-        self.transient.current_hyperlink_id = None;
         self.transient.update_has_transient_extras();
         let tab_stops = self.grid.tab_stops().to_vec();
         let tab_suppressed = self.grid.tab_defaults_suppressed();

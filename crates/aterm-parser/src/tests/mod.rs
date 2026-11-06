@@ -19,6 +19,7 @@ mod subparams;
 mod tmux;
 mod utf8_errors;
 mod utf8_parity;
+mod utf8_runs;
 
 /// Records every action.
 #[derive(Debug, Default, PartialEq)]

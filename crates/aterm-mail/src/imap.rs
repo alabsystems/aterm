@@ -264,7 +264,7 @@ impl Reader {
             let name = if let Some(bytes) = line_literal {
                 String::from_utf8(bytes).map_err(|_| "Invalid folder name")?
             } else {
-                string_token(rest.trim_start())?.0
+                string_token(rest.trim_start())?.0.into_owned()
             };
             let display_name = folder_name(&name);
             folders.push(Folder {
@@ -536,12 +536,19 @@ impl Session {
                         challenged = true;
                         break;
                     }
-                    let raw = String::from_utf8_lossy(&line);
-                    let text = raw.trim_end_matches(['\r', '\n']);
-                    if let Some(status) = text
-                        .strip_prefix(tag)
-                        .and_then(|rest| rest.strip_prefix(' '))
+                    let mut trimmed = line.as_slice();
+                    while let Some((&last, rest)) = trimmed.split_last() {
+                        if matches!(last, b'\r' | b'\n') {
+                            trimmed = rest;
+                        } else {
+                            break;
+                        }
+                    }
+                    if let Some(status) = trimmed
+                        .strip_prefix(tag.as_bytes())
+                        .and_then(|rest| rest.strip_prefix(b" "))
                     {
+                        let status = String::from_utf8_lossy(status);
                         if status
                             .split_whitespace()
                             .next()
@@ -549,15 +556,15 @@ impl Session {
                         {
                             return Ok(());
                         }
-                        return Err(auth_status_error(status));
+                        return Err(auth_status_error(&status));
                     }
-                    if text
+                    if trimmed
                         .get(..5)
-                        .is_some_and(|p| p.eq_ignore_ascii_case("* BYE"))
+                        .is_some_and(|p| p.eq_ignore_ascii_case(b"* BYE"))
                     {
                         return Err(ConnectError::Other("IMAP server closed the session".into()));
                     }
-                    if !text.starts_with("* ") {
+                    if !trimmed.starts_with(b"* ") {
                         return Err(ConnectError::Other(
                             "Invalid IMAP authentication challenge".into(),
                         ));
@@ -869,7 +876,7 @@ fn extract_inline_fetch_body(line: &str) -> Result<Option<(String, Vec<u8>)>, St
                     attributes.push(' ');
                 }
                 attributes.push_str(tail);
-                return Ok(Some((attributes, decoded.into_bytes())));
+                return Ok(Some((attributes, decoded.into_owned().into_bytes())));
             }
             if value_part
                 .get(..3)
@@ -954,7 +961,7 @@ impl Mailbox for Imap {
     }
 }
 
-fn string_token(text: &str) -> Result<(String, &str), String> {
+fn string_token(text: &str) -> Result<(std::borrow::Cow<'_, str>, &str), String> {
     if let Some(rest) = text.strip_prefix('"') {
         let mut out: Option<String> = None;
         let mut escaped = false;
@@ -970,7 +977,10 @@ fn string_token(text: &str) -> Result<(String, &str), String> {
                 });
                 escaped = true;
             } else if ch == '"' {
-                let decoded = out.unwrap_or_else(|| rest[..at].to_owned());
+                let decoded = out.map_or(
+                    std::borrow::Cow::Borrowed(&rest[..at]),
+                    std::borrow::Cow::Owned,
+                );
                 return Ok((decoded, &rest[at + 1..]));
             } else if let Some(buf) = out.as_mut() {
                 buf.push(ch);
@@ -982,7 +992,7 @@ fn string_token(text: &str) -> Result<(String, &str), String> {
         if end == 0 {
             return Err("Missing IMAP string".into());
         }
-        Ok((text[..end].to_owned(), &text[end..]))
+        Ok((std::borrow::Cow::Borrowed(&text[..end]), &text[end..]))
     }
 }
 

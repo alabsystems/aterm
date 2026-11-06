@@ -129,10 +129,12 @@ unsafe fn sockaddr_ip(at: *const libc::sockaddr, family: i32) -> Option<IpAddr> 
 
 /// This machine's default IPv4 gateway's hardware (link-layer) address, read from the kernel's
 /// routing and neighbour tables with no packet sent: the route table names the default route's
-/// gateway, and the ARP/NDP table its hardware address. `None` where there is no default route,
-/// where the gateway is not an IPv4 next hop, or where the gateway has no neighbour entry yet.
-/// On macOS only the unscoped primary route counts, and its neighbour entry must belong to
-/// that same interface, even when another attached network uses the same gateway address.
+/// gateway, and the ARP/NDP table its hardware address (on macOS, where the table's dump leaves
+/// the entry out, the kernel's answer to a lookup of it: [`default_routes`]). `None` where there
+/// is no default route, where the gateway is not an IPv4 next hop, or where the gateway has no
+/// neighbour entry yet. On macOS only the unscoped primary route counts, and its neighbour entry
+/// must belong to that same interface, even when another attached network uses the same gateway
+/// address.
 /// The hardware address tells one network from another far more sharply than its subnet does:
 /// two routers both numbering a LAN `192.168.1.0/24` have different hardware addresses, so a
 /// fact kept against one does not stand on the other.
@@ -143,8 +145,9 @@ pub fn default_gateway_hw() -> Option<Box<[u8]>> {
     {
         primary_gateway_hardware(
             &route_table(NET_RT_DUMP, 0)?,
-            &route_table(NET_RT_FLAGS, RTF_LLINFO)?,
+            &route_table(NET_RT_FLAGS, RTF_LLINFO).unwrap_or_default(),
             interface_name,
+            gateway_hardware_asked,
         )
     }
     #[cfg(target_os = "linux")]
@@ -182,8 +185,8 @@ pub struct DefaultRoute {
     pub interface: String,
     /// Its IPv4 next hop; `None` for a route straight onto a link (a VPN's `utun`).
     pub gateway: Option<Ipv4Addr>,
-    /// That next hop's hardware address in the ARP table, on that same interface; `None` before
-    /// ARP resolves it (after a wake or a join) or with no IPv4 next hop.
+    /// That next hop's hardware address in the kernel's ARP entry for it on that same interface;
+    /// `None` before ARP resolves it (after a wake or a join) or with no IPv4 next hop.
     pub gateway_hw: Option<Box<[u8]>>,
 }
 
@@ -205,6 +208,13 @@ pub struct DefaultRoutes {
 /// This machine's IPv4 default routes ([`DefaultRoutes`]), read with no packet: on macOS from
 /// `sysctl`'s routing and ARP tables, on Linux from `/proc/net/route` and `/proc/net/arp` (which
 /// keep no scoped defaults). Empty where neither is read, or with no default route.
+///
+/// On macOS a gateway the ARP table's dump leaves out is looked up in the kernel instead
+/// ([`gateway_hardware_asked`]): macOS 27.2 dumps a process outside Apple's own tools no
+/// neighbour entry at all (`NET_RT_FLAGS`/`RTF_LLINFO` reads empty, `NET_RT_DUMP` holds no
+/// `RTF_LLINFO` route, while `arp -an` lists them; measured 2026-11-05 on m9 and m113,
+/// `docs/measured/e2e-emails-table-2026-11-05.md`), yet answers a routing socket's `RTM_GET` of
+/// the gateway with its entry, as `route -n get` reads it.
 #[must_use]
 pub fn default_routes() -> DefaultRoutes {
     #[cfg(target_os = "macos")]
@@ -213,7 +223,7 @@ pub fn default_routes() -> DefaultRoutes {
             return DefaultRoutes::default();
         };
         let arp = route_table(NET_RT_FLAGS, RTF_LLINFO).unwrap_or_default();
-        default_routes_of(&table, &arp, interface_name)
+        default_routes_of(&table, &arp, interface_name, gateway_hardware_asked)
     }
     #[cfg(target_os = "linux")]
     {
@@ -247,8 +257,11 @@ fn primary_gateway_hardware(
     table: &[u8],
     arp: &[u8],
     name_of: impl Fn(u16) -> Option<String>,
+    ask: impl Fn(Ipv4Addr, u16) -> Option<Box<[u8]>>,
 ) -> Option<Box<[u8]>> {
-    default_routes_of(table, arp, name_of).primary?.gateway_hw
+    default_routes_of(table, arp, name_of, ask)
+        .primary?
+        .gateway_hw
 }
 
 /// The name of the interface whose index is `index` (`if_indextoname`), `None` for none.
@@ -266,13 +279,16 @@ fn interface_name(index: u16) -> Option<String> {
 }
 
 /// [`default_routes`] of a `NET_RT_DUMP` `table` and a `NET_RT_FLAGS`/`RTF_LLINFO` `arp` table,
-/// each route's interface named by `name_of` from its index. A route whose interface has no
-/// name is passed over: it cannot be told apart from another.
+/// each route's interface named by `name_of` from its index, and a gateway the `arp` table does
+/// not name on its route's interface looked up by `ask` (the gateway and that interface's index:
+/// [`gateway_hardware_asked`]). A route whose interface has no name is passed over: it cannot be
+/// told apart from another.
 #[cfg(target_os = "macos")]
 fn default_routes_of(
     table: &[u8],
     arp: &[u8],
     name_of: impl Fn(u16) -> Option<String>,
+    ask: impl Fn(Ipv4Addr, u16) -> Option<Box<[u8]>>,
 ) -> DefaultRoutes {
     let mut routes = DefaultRoutes::default();
     for_each_route_at(table, |index, flags, addrs, block| {
@@ -289,7 +305,9 @@ fn default_routes_of(
         let gateway = (flags & RTF_GATEWAY != 0)
             .then(|| sockaddr_ipv4(gw))
             .flatten();
-        let gateway_hw = gateway.and_then(|gateway| gateway_hardware_on(arp, gateway, index));
+        let gateway_hw = gateway.and_then(|gateway| {
+            gateway_hardware_on(arp, gateway, index).or_else(|| ask(gateway, index))
+        });
         let route = DefaultRoute {
             interface,
             gateway,
@@ -568,6 +586,36 @@ const ROUTE_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(60
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn route_source_ipv4(to: Ipv4Addr) -> Option<Ipv4Addr> {
+    route_get(to, None, route_get_answer).flatten()
+}
+
+/// The hardware address of the kernel's ARP entry for `gateway` on the interface whose index is
+/// `index`: the answer to a routing socket's `RTM_GET` of `gateway` scoped to that interface
+/// ([`route_get_request`]), read only where it is that interface's neighbour entry for that host
+/// with a hardware address in it ([`route_get_link`]), as `route -n get -ifscope` reads it. It
+/// sends no packet and resolves nothing: `None` before ARP resolves the gateway, where the
+/// kernel answers with the interface's route instead, or where its answer does not come within
+/// [`ROUTE_ANSWER_WAIT`]. [`default_routes`] asks it for a gateway the ARP table's dump leaves
+/// out.
+#[cfg(target_os = "macos")]
+fn gateway_hardware_asked(gateway: Ipv4Addr, index: u16) -> Option<Box<[u8]>> {
+    route_get(gateway, Some(index), |message, pid, sequence| {
+        route_get_link(message, pid, sequence, index)
+    })
+    .flatten()
+}
+
+/// Write one `RTM_GET` of `to` ([`route_get_request`], scoped to the interface whose index is
+/// `on` where one is named) to a fresh routing socket and read the kernel's answer: the first
+/// message `read` takes as the answer to this process's lookup (its pid and sequence), `None`
+/// where the socket or the write fails (a destination no route takes fails the write, `ESRCH`) or
+/// no answer comes within [`ROUTE_ANSWER_WAIT`].
+#[cfg(target_os = "macos")]
+fn route_get<T>(
+    to: Ipv4Addr,
+    on: Option<u16>,
+    read: impl Fn(&[u8], i32, i32) -> Option<T>,
+) -> Option<T> {
     use std::os::fd::FromRawFd as _;
     static SEQUENCE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
     let pid = i32::try_from(std::process::id()).ok()?;
@@ -591,7 +639,7 @@ pub fn route_source_ipv4(to: Ipv4Addr) -> Option<Ipv4Addr> {
     })
     .ok()?;
     let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
-    let request = route_get_request(to, sequence);
+    let request = route_get_request(to, sequence, on);
     // SAFETY: `request` is live and readable for its whole length. A destination no route takes
     // fails the write (`ESRCH`).
     let wrote = unsafe { libc::write(raw, request.as_ptr().cast(), request.len()) };
@@ -620,21 +668,23 @@ pub fn route_source_ipv4(to: Ipv4Addr) -> Option<Ipv4Addr> {
             continue;
         }
         // SAFETY: `buf` is live and writable for its whole length.
-        let read = unsafe { libc::recv(raw, buf.as_mut_ptr().cast(), buf.len(), 0) };
-        let Ok(read) = usize::try_from(read) else {
+        let got = unsafe { libc::recv(raw, buf.as_mut_ptr().cast(), buf.len(), 0) };
+        let Ok(got) = usize::try_from(got) else {
             return None;
         };
-        if let Some(answer) = route_get_answer(&buf[..read], pid, sequence) {
-            return answer;
+        if let Some(answer) = read(&buf[..got], pid, sequence) {
+            return Some(answer);
         }
     }
 }
 
-/// The `RTM_GET` [`route_source_ipv4`] writes for `to` as `sequence`: the head, `to` as the
-/// destination, and an empty link-layer sockaddr in the interface's slot, which asks the kernel to
-/// name the route's interface and its address in the answer, as `route -n get` asks.
+/// The `RTM_GET` [`route_get`] writes for `to` as `sequence`: the head, `to` as the destination,
+/// and an empty link-layer sockaddr in the interface's slot, which asks the kernel to name the
+/// route's interface and its address in the answer, as `route -n get` asks. With `on`, the lookup
+/// is scoped to the interface of that index (`RTF_IFSCOPE` and `rtm_index`), as `route -n get
+/// -ifscope` asks: two networks whose gateways share an address keep one entry each.
 #[cfg(target_os = "macos")]
-fn route_get_request(to: Ipv4Addr, sequence: i32) -> Vec<u8> {
+fn route_get_request(to: Ipv4Addr, sequence: i32, on: Option<u16>) -> Vec<u8> {
     let header = std::mem::size_of::<RtMsghdr>();
     let mut destination = [0u8; std::mem::size_of::<libc::sockaddr_in>()];
     destination[0] = destination.len() as u8;
@@ -651,20 +701,29 @@ fn route_get_request(to: Ipv4Addr, sequence: i32) -> Vec<u8> {
     let mut put = |offset: usize, value: i32| {
         message[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
     };
-    put(std::mem::offset_of!(RtMsghdr, rtm_flags), RTF_UP | RTF_HOST);
+    let scope = if on.is_some() { RTF_IFSCOPE } else { 0 };
+    put(
+        std::mem::offset_of!(RtMsghdr, rtm_flags),
+        RTF_UP | RTF_HOST | scope,
+    );
     put(std::mem::offset_of!(RtMsghdr, rtm_addrs), RTA_DST | RTA_IFP);
     put(std::mem::offset_of!(RtMsghdr, rtm_seq), sequence);
+    if let Some(index) = on {
+        let at = std::mem::offset_of!(RtMsghdr, rtm_index);
+        message[at..at + 2].copy_from_slice(&index.to_ne_bytes());
+    }
     message.extend_from_slice(&destination);
     message.extend_from_slice(&interface);
     message
 }
 
-/// What one message a routing socket read says to the `RTM_GET` process `pid` wrote as
+/// The answer one message a routing socket read is to the `RTM_GET` process `pid` wrote as
 /// `sequence` ([`route_get_request`]): `None` when it answers something else (another process's
-/// lookup, another of this one's, a change of a route), else the address of the route found
-/// (`RTA_IFA`), `Some(None)` where the kernel found none or that address is no usable IPv4 one.
+/// lookup, another of this one's, a change of a route), else `Some((head, block))`, the found
+/// route's head (a [`RtMsghdr`]'s bytes) and its address block, `Some(None)` where the kernel
+/// found no route (`rtm_errno`).
 #[cfg(target_os = "macos")]
-fn route_get_answer(message: &[u8], pid: i32, sequence: i32) -> Option<Option<Ipv4Addr>> {
+fn route_get_reply(message: &[u8], pid: i32, sequence: i32) -> Option<Option<(&[u8], &[u8])>> {
     let header = std::mem::size_of::<RtMsghdr>();
     let msglen = usize::from(u16::from_ne_bytes([*message.first()?, *message.get(1)?]));
     if msglen < header || msglen > message.len() {
@@ -680,10 +739,53 @@ fn route_get_answer(message: &[u8], pid: i32, sequence: i32) -> Option<Option<Ip
     if read(std::mem::offset_of!(RtMsghdr, rtm_errno)) != 0 {
         return Some(None);
     }
-    let addrs = read(std::mem::offset_of!(RtMsghdr, rtm_addrs));
+    Some(Some((&message[..header], &message[header..msglen])))
+}
+
+/// The `i32` field at `offset` of a route message's head.
+#[cfg(target_os = "macos")]
+fn head_i32(head: &[u8], offset: usize) -> i32 {
+    i32::from_ne_bytes(head[offset..offset + 4].try_into().unwrap())
+}
+
+/// What one message a routing socket read says to [`route_source_ipv4`]'s lookup
+/// ([`route_get_reply`]): `None` when it is not its answer, else the address of the route found
+/// (`RTA_IFA`), `Some(None)` where the kernel found none or that address is no usable IPv4 one.
+#[cfg(target_os = "macos")]
+fn route_get_answer(message: &[u8], pid: i32, sequence: i32) -> Option<Option<Ipv4Addr>> {
     Some(
-        sockaddr_ipv4(route_sockaddr(&message[header..msglen], addrs, RTA_IFA))
-            .filter(|ip| !ip.is_unspecified() && !ip.is_loopback()),
+        route_get_reply(message, pid, sequence)?.and_then(|(head, block)| {
+            let addrs = head_i32(head, std::mem::offset_of!(RtMsghdr, rtm_addrs));
+            sockaddr_ipv4(route_sockaddr(block, addrs, RTA_IFA))
+                .filter(|ip| !ip.is_unspecified() && !ip.is_loopback())
+        }),
+    )
+}
+
+/// What one message a routing socket read says to [`gateway_hardware_asked`]'s lookup on the
+/// interface whose index is `index` ([`route_get_reply`]): `None` when it is not its answer, else
+/// the hardware address of the neighbour entry found, `Some(None)` where the kernel found none or
+/// found anything but that interface's ARP entry for one host with an address in it: a route
+/// that is no host route (`RTF_HOST`) of the link layer (`RTF_LLINFO`), as the interface's own
+/// route answers for a host ARP has not resolved; one on another interface; an incomplete entry.
+#[cfg(target_os = "macos")]
+fn route_get_link(
+    message: &[u8],
+    pid: i32,
+    sequence: i32,
+    index: u16,
+) -> Option<Option<Box<[u8]>>> {
+    Some(
+        route_get_reply(message, pid, sequence)?.and_then(|(head, block)| {
+            let flags = head_i32(head, std::mem::offset_of!(RtMsghdr, rtm_flags));
+            let at = std::mem::offset_of!(RtMsghdr, rtm_index);
+            let on = u16::from_ne_bytes([head[at], head[at + 1]]);
+            let neighbour = flags & RTF_HOST != 0 && flags & RTF_LLINFO != 0 && on == index;
+            let addrs = head_i32(head, std::mem::offset_of!(RtMsghdr, rtm_addrs));
+            neighbour
+                .then(|| sockaddr_dl_hardware(route_sockaddr(block, addrs, RTA_GATEWAY)))
+                .flatten()
+        }),
     )
 }
 
@@ -1146,7 +1248,7 @@ mod gateway_tests {
             &[&sockaddr_in(Ipv4Addr::UNSPECIFIED), &sockaddr_in(gw)],
         );
         let read = |table: &[u8]| {
-            default_routes_of(table, &[], |_| Some("en0".into()))
+            default_routes_of(table, &[], |_| Some("en0".into()), |_, _| None)
                 .primary
                 .and_then(|route| route.gateway)
         };
@@ -1216,15 +1318,15 @@ mod gateway_tests {
             7 => Some("en7".to_owned()),
             _ => None,
         };
-        let routes = default_routes_of(&table, &arp, name);
+        let routes = default_routes_of(&table, &arp, name, |_, _| None);
         // The home-LAN evidence reader must use this same primary/interface pairing.
         // The former reader chose the first scoped route and the first matching ARP entry.
         assert_eq!(
-            primary_gateway_hardware(&table, &arp, name).as_deref(),
+            primary_gateway_hardware(&table, &arp, name, |_, _| None).as_deref(),
             Some(wifi_mac.as_slice())
         );
         assert_eq!(
-            primary_gateway_hardware(&table, &arp_on(7, &wired_mac), name),
+            primary_gateway_hardware(&table, &arp_on(7, &wired_mac), name, |_, _| None),
             None
         );
         let primary = routes.primary.expect("the unscoped default");
@@ -1252,13 +1354,16 @@ mod gateway_tests {
             ),
             9,
         );
-        let routes = default_routes_of(&utun, &arp, |_| Some("utun4".to_owned()));
+        let routes = default_routes_of(&utun, &arp, |_| Some("utun4".to_owned()), |_, _| None);
         let primary = routes.primary.expect("the tunnel's default");
         assert_eq!(
             (primary.interface.as_str(), primary.gateway),
             ("utun4", None)
         );
-        assert_eq!(default_routes_of(&[], &arp, name), DefaultRoutes::default());
+        assert_eq!(
+            default_routes_of(&[], &arp, name, |_, _| None),
+            DefaultRoutes::default()
+        );
     }
 
     #[test]
@@ -1288,6 +1393,170 @@ mod gateway_tests {
         assert_eq!(gateway_hardware_on(&incomplete, gw, 0), None);
     }
 
+    /// A gateway the ARP table's dump leaves out (macOS 27.2 dumps a third-party process no
+    /// neighbour entry) is looked up on its own route's interface, and only there: the primary's
+    /// gateway takes the hardware address the lookup on its interface's index answers, never the
+    /// one another interface's entry would, and an entry the dump holds is taken without a lookup.
+    /// NEGATIVE CONTROL: dropping the `.or_else(|| ask(gateway, index))` fallback in
+    /// `default_routes_of` leaves the primary's `gateway_hw` `None`, and this test fails at
+    /// "the lookup on the primary's own interface" (`left: None`, `right: Some([170, 187, 204,
+    /// 17, 34, 51])`).
+    #[test]
+    fn a_gateway_the_arp_dump_leaves_out_is_looked_up_on_its_own_interface() {
+        let gw = Ipv4Addr::new(192, 168, 1, 1);
+        let wifi_mac = [0xaa, 0xbb, 0xcc, 0x11, 0x22, 0x33];
+        let wired_mac = [0xde, 0xad, 0xbe, 0xef, 0x00, 0x07];
+        let default_on = |index: u16, flags: i32| {
+            on_interface(
+                route_message(
+                    flags,
+                    RTA_DST | RTA_GATEWAY,
+                    &[&sockaddr_in(Ipv4Addr::UNSPECIFIED), &sockaddr_in(gw)],
+                ),
+                index,
+            )
+        };
+        let mut table = default_on(4, RTF_UP | RTF_GATEWAY);
+        table.extend_from_slice(&default_on(7, RTF_UP | RTF_GATEWAY | RTF_IFSCOPE));
+        let name = |index: u16| match index {
+            4 => Some("en0".to_owned()),
+            7 => Some("en7".to_owned()),
+            _ => None,
+        };
+        let asked = std::cell::RefCell::new(Vec::new());
+        let ask = |at: Ipv4Addr, index: u16| {
+            asked.borrow_mut().push((at, index));
+            match index {
+                4 => Some(Box::from(wifi_mac.as_slice())),
+                7 => Some(Box::from(wired_mac.as_slice())),
+                _ => None,
+            }
+        };
+        let routes = default_routes_of(&table, &[], name, ask);
+        assert_eq!(
+            routes
+                .primary
+                .as_ref()
+                .and_then(|r| r.gateway_hw.as_deref()),
+            Some(wifi_mac.as_slice()),
+            "the lookup on the primary's own interface"
+        );
+        assert_eq!(
+            routes.scoped.first().and_then(|r| r.gateway_hw.as_deref()),
+            Some(wired_mac.as_slice()),
+            "never another interface's entry"
+        );
+        assert_eq!(*asked.borrow(), [(gw, 4), (gw, 7)]);
+        // A lookup that finds no entry on the primary's interface leaves it unknown.
+        let only_wired =
+            |_: Ipv4Addr, index: u16| (index == 7).then(|| Box::from(wired_mac.as_slice()));
+        assert_eq!(
+            primary_gateway_hardware(&table, &[], name, only_wired),
+            None
+        );
+        // An entry the dump holds stands: nothing is asked for it.
+        let arp = on_interface(
+            route_message(
+                0,
+                RTA_DST | RTA_GATEWAY,
+                &[&sockaddr_in(gw), &sockaddr_dl(&wifi_mac)],
+            ),
+            4,
+        );
+        let never = |_: Ipv4Addr, index: u16| -> Option<Box<[u8]>> {
+            assert_ne!(index, 4, "the dump's own entry is asked again");
+            None
+        };
+        assert_eq!(
+            primary_gateway_hardware(&table, &arp, name, never).as_deref(),
+            Some(wifi_mac.as_slice())
+        );
+    }
+
+    /// The gateway's lookup is scoped to the route's interface (`RTF_IFSCOPE` and its index, as
+    /// `route -n get -ifscope` asks), and reads a hardware address only from the answer to its
+    /// own lookup that is that interface's ARP entry for one host: the interface's own route
+    /// (what the kernel answers before ARP resolves the gateway), an entry on another interface,
+    /// an incomplete entry, a refused lookup, and another lookup's answer give none.
+    /// NEGATIVE CONTROL: dropping `&& on == index` from `route_get_link` reads the other
+    /// interface's entry, and this test fails at "another interface's entry" (`left:
+    /// Some(Some([144, 65, 178, 120, 90, 158]))`, `right: Some(None)`).
+    #[test]
+    fn a_neighbour_lookup_reads_only_its_own_interfaces_entry() {
+        let gw = Ipv4Addr::new(192, 168, 1, 1);
+        let mac = [0x90, 0x41, 0xb2, 0x78, 0x5a, 0x9e];
+        let request = route_get_request(gw, 9, Some(8));
+        let field = |message: &[u8], offset: usize| {
+            i32::from_ne_bytes(message[offset..offset + 4].try_into().unwrap())
+        };
+        let flags = field(&request, std::mem::offset_of!(RtMsghdr, rtm_flags));
+        assert_eq!(flags & RTF_IFSCOPE, RTF_IFSCOPE, "scoped to the interface");
+        let at = std::mem::offset_of!(RtMsghdr, rtm_index);
+        assert_eq!(u16::from_ne_bytes([request[at], request[at + 1]]), 8);
+        assert_eq!(
+            field(
+                &route_get_request(gw, 9, None),
+                std::mem::offset_of!(RtMsghdr, rtm_flags)
+            ) & RTF_IFSCOPE,
+            0,
+            "an unscoped lookup names no interface"
+        );
+
+        let answer = |pid: i32, sequence: i32, errno: i32, flags: i32, index: u16, hw: &[u8]| {
+            let sockaddrs: Vec<Vec<u8>> = vec![sockaddr_in(gw), sockaddr_dl(hw)];
+            let sockaddrs: Vec<&[u8]> = sockaddrs.iter().map(Vec::as_slice).collect();
+            let mut message = on_interface(
+                route_message(flags, RTA_DST | RTA_GATEWAY, &sockaddrs),
+                index,
+            );
+            message[std::mem::offset_of!(RtMsghdr, rtm_type)] = RTM_GET;
+            for (offset, value) in [
+                (std::mem::offset_of!(RtMsghdr, rtm_pid), pid),
+                (std::mem::offset_of!(RtMsghdr, rtm_seq), sequence),
+                (std::mem::offset_of!(RtMsghdr, rtm_errno), errno),
+            ] {
+                message[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+            }
+            message
+        };
+        let neighbour = RTF_UP | RTF_HOST | RTF_LLINFO | RTF_IFSCOPE;
+        assert_eq!(
+            route_get_link(&answer(41, 9, 0, neighbour, 8, &mac), 41, 9, 8)
+                .flatten()
+                .as_deref(),
+            Some(mac.as_slice()),
+            "its interface's entry for the gateway"
+        );
+        assert_eq!(
+            route_get_link(&answer(41, 9, 0, neighbour, 15, &mac), 41, 9, 8),
+            Some(None),
+            "another interface's entry"
+        );
+        assert_eq!(
+            route_get_link(&answer(41, 9, 0, RTF_UP | RTF_IFSCOPE, 8, &[]), 41, 9, 8),
+            Some(None),
+            "the interface's own route, before ARP resolves the gateway"
+        );
+        assert_eq!(
+            route_get_link(&answer(41, 9, 0, neighbour, 8, &[]), 41, 9, 8),
+            Some(None),
+            "an incomplete entry"
+        );
+        assert_eq!(
+            route_get_link(&answer(41, 9, libc::ESRCH, neighbour, 8, &mac), 41, 9, 8),
+            Some(None),
+            "a refused lookup"
+        );
+        assert_eq!(
+            route_get_link(&answer(42, 9, 0, neighbour, 8, &mac), 41, 9, 8),
+            None
+        );
+        assert_eq!(
+            route_get_link(&answer(41, 10, 0, neighbour, 8, &mac), 41, 9, 8),
+            None
+        );
+    }
+
     /// `route_source_ipv4`'s lookup asks the kernel for the route to its destination with the
     /// interface's slot set, as `route -n get` does, and reads the route's address only from the
     /// answer to its own lookup: another process's, another sequence's, or a route change is
@@ -1295,7 +1564,7 @@ mod gateway_tests {
     #[test]
     fn a_route_lookup_asks_for_the_interface_and_reads_only_its_own_answer() {
         let to = Ipv4Addr::new(224, 0, 0, 251);
-        let request = route_get_request(to, 7);
+        let request = route_get_request(to, 7, None);
         let field = |message: &[u8], offset: usize| {
             i32::from_ne_bytes(message[offset..offset + 4].try_into().unwrap())
         };

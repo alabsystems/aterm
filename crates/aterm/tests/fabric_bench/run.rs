@@ -1945,6 +1945,41 @@ fn attach_rows(
     Some(AttachRows { node, sessions })
 }
 
+/// The kill window's posts as the log holds them ([`attach`]: the live mail, and with a backlog
+/// the note to every other session), which the new bridge's first drain published: the first's
+/// offset and the last's (critic item G04).
+fn kill_window_posts(recs: &[Rec], r: &Round, node: &str) -> Option<(u64, u64)> {
+    let lanes = format!("/f/{FLEET}/in/{node}/");
+    let others = format!("{}-to-", r.mail);
+    let mut offs = recs
+        .iter()
+        .filter(|rec| {
+            rec.seq >= r.mark
+                && rec.subject.starts_with(&lanes)
+                && rec.subject.ends_with("/note")
+                && (rec.text == r.mail || rec.text.starts_with(&others))
+        })
+        .map(|rec| rec.seq);
+    let first = offs.next()?;
+    Some(offs.fold((first, first), |(lo, hi), off| (lo.min(off), hi.max(off))))
+}
+
+/// The bus mirror's first snapshot at or past `mark` (a `v=2` row of the mirror on one of the
+/// node's session `ev` faces, `/f/<fleet>/pub/<node>/<sid>/ev`), the first send of the new
+/// bridge's mirror after the kill (critic item G04, the row F07 named missing).
+fn mirror_first_send(recs: &[Rec], mark: u64, node: &str) -> Option<u64> {
+    let faces = format!("/f/{FLEET}/pub/{node}/");
+    recs.iter()
+        .find(|rec| {
+            rec.seq >= mark
+                && rec.subject.starts_with(&faces)
+                && rec.subject.ends_with("/ev")
+                && rec.subject.split('/').count() == 7
+                && rec.head.starts_with("v=2 ")
+        })
+        .map(|rec| rec.seq)
+}
+
 /// The attach's stop signal, with nothing asked of the broker inside the timed window.
 fn await_attach(
     watch: &mut Subscription,
@@ -2212,12 +2247,12 @@ fn tier_report(backlogs: &[Backlog], md: &mut Vec<String>) {
          `Broker::tier_tally`, read where the cold reads are. Pushes are the records promoted; \
          lookups the one-record reads by index (a cold read takes two); walks the reads of a \
          range of summaries a page at a time (a filtered read's pass is one, `Tier::passing`, \
-         and takes no lookup) and rows the records they read; subject walks (the pending wills) \
-         and the pages naming the subject they read; pages passed the pages a filtered read \
-         passed whole, wanting none of their subjects (F11c), and verdicts the times it asked \
-         its filter of a subject (at most once a page a subject, and again in a later page once \
-         another subject took its slot of 256, so not the backlog's distinct subjects); wide the \
-         values read from the tier's maps of values no column holds.\n"
+         and takes no lookup) and rows the records they read; pages passed the pages a filtered \
+         read passed whole, wanting none of their subjects (F11c), and verdicts the times it \
+         asked its filter of a subject (at most once a page a subject, and again in a later page \
+         once another subject took its slot of 256, so not the backlog's distinct subjects); \
+         wide the values read from the tier's maps of values no column holds. The pending wills \
+         read no page since F19 (astream's latest-will map), so no column counts them.\n"
             .to_string(),
     );
     if backlogs
@@ -2258,9 +2293,15 @@ fn held_json(held: &backlog::Held) -> Value {
     })
 }
 
+/// How many series a size's attach rows hold ([`ATTACH_ROWS`]).
+const ATTACH_SERIES: usize = 13;
+
 /// The attach table's rows, in the order of a size's series: the last two
-/// ([`ATTACH_BACKLOG_ROWS`] on) are the backlog's (B09).
-const ATTACH_ROWS: [&str; 10] = [
+/// ([`ATTACH_BACKLOG_ROWS`] on) are the backlog's (B09). The three before them split "every row
+/// acked -> the live mail visible": when the new bridge's drain had its first and its last post
+/// of the kill window acked, and when the bus mirror's first snapshot after the kill was (critic
+/// item G04, the rows F07 named missing).
+const ATTACH_ROWS: [&str; ATTACH_SERIES] = [
     "**pid -> every row acked (attach)**",
     "pid -> node row acked",
     "node row -> last session row",
@@ -2269,17 +2310,24 @@ const ATTACH_ROWS: [&str; 10] = [
     "pid -> every row durable",
     "**kill -> the first live mail visible**",
     "every row acked -> the live mail visible (the mirror's start, the refill, the drain)",
+    "every row acked -> the drain's first post acked (the kill window's)",
+    "every row acked -> the drain's last post acked (the kill window's)",
+    "every row acked -> the mirror's first send acked (its first snapshot past the kill)",
     "**kill -> every session's live mail visible** (the backlog's: every refill done)",
     "kill -> the kill window's posts answered (the backlog's)",
 ];
 
 /// The first of the backlog's own rows in [`ATTACH_ROWS`].
-const ATTACH_BACKLOG_ROWS: usize = 8;
+const ATTACH_BACKLOG_ROWS: usize = 11;
 
 /// One size's rows of the attach table: every row, an empty one as `0 | – …`
 /// (a head that never landed is a hole the table shows), but the backlog's
 /// own two on a run without a backlog, which entries before it never had.
-fn attach_table_rows(size: usize, series: &[Vec<f64>; 10], backlog: usize) -> Vec<String> {
+fn attach_table_rows(
+    size: usize,
+    series: &[Vec<f64>; ATTACH_SERIES],
+    backlog: usize,
+) -> Vec<String> {
     ATTACH_ROWS
         .iter()
         .zip(series)
@@ -2510,7 +2558,7 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     let fired = census::will_firings(&recs);
 
     let mut by_size: BTreeMap<usize, Vec<Value>> = BTreeMap::new();
-    let mut series: BTreeMap<usize, [Vec<f64>; 10]> = BTreeMap::new();
+    let mut series: BTreeMap<usize, [Vec<f64>; ATTACH_SERIES]> = BTreeMap::new();
     let steady_subject = backlog::steady_subject();
     let mut records: BTreeMap<usize, AttachRecords> = BTreeMap::new();
     for r in &rounds {
@@ -2572,9 +2620,15 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         s[5].extend(ms_opt(Some(r.t_pid), t_all_durable));
         s[6].push(ms(r.t_kill, r.t_mail_seen));
         s[7].extend(ms_opt(t_all, Some(r.t_mail_seen)));
-        s[8].extend(ms_opt(Some(r.t_kill), r.t_every_mail_seen));
+        let drained = kill_window_posts(&recs, r, &w.node);
+        let mirror_first = mirror_first_send(&recs, r.mark, &w.node);
+        let landed = |off: Option<u64>| off.and_then(|off| heads.acked.landed(off));
+        s[8].extend(ms_opt(t_all, landed(drained.map(|(first, _)| first))));
+        s[9].extend(ms_opt(t_all, landed(drained.map(|(_, last)| last))));
+        s[10].extend(ms_opt(t_all, landed(mirror_first)));
+        s[11].extend(ms_opt(Some(r.t_kill), r.t_every_mail_seen));
         if r.t_every_mail_seen.is_some() {
-            s[9].push(ms(r.t_kill, r.t_posted));
+            s[12].push(ms(r.t_kill, r.t_posted));
         }
         by_size.entry(r.sessions).or_default().push(json!({
             "mark": r.mark,
@@ -2582,6 +2636,9 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             "node_offset": found.node,
             "last_offset": last,
             "live_mail_offset": mail_seq,
+            "drain_first_and_last_offsets": drained
+                .map_or(Value::Null, |(first, last)| json!([first, last])),
+            "mirror_first_offset": mirror_first.map_or(Value::Null, |off| json!(off)),
             "records": c.total,
             "fired_wills": fired_here,
             "kill_to_pid_ms": stats::round3(ms(r.t_kill, r.t_pid)),
@@ -2619,7 +2676,11 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
              drain publishes it, after the presence rows, the bus mirror's start (over a \
              retaining broker at `--log auto`) and the refill the rows owe; \"kill -> the first \
              live mail visible\" ends when its `await inbox` answers, and its record is \
-             left out of the attach's census. {} restart(s) per size.\n",
+             left out of the attach's census. Read off the log the same way: \"the drain's first \
+             post acked\" and \"last post acked\" are when the acked head first passed the first and \
+             the last of the kill window's posts, and \"the mirror's first send acked\" when it \
+             passed the mirror's first snapshot (a `v=2` row on a session's `ev` face) at or \
+             past the kill, each from every row acked (critic item G04). {} restart(s) per size.\n",
             spec.rounds
         ),
         "| sessions | measure (ms) | n | mean | p50 | p95 | p99 |".to_string(),
@@ -2669,8 +2730,11 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             "attach_durable_ms": stats::to_json(&s[5]),
             "kill_to_live_mail_ms": stats::to_json(&s[6]),
             "attach_to_live_mail_ms": stats::to_json(&s[7]),
-            "kill_to_every_live_mail_ms": stats::to_json(&s[8]),
-            "kill_to_posted_ms": stats::to_json(&s[9]),
+            "attach_to_first_post_acked_ms": stats::to_json(&s[8]),
+            "attach_to_last_post_acked_ms": stats::to_json(&s[9]),
+            "attach_to_mirror_first_acked_ms": stats::to_json(&s[10]),
+            "kill_to_every_live_mail_ms": stats::to_json(&s[11]),
+            "kill_to_posted_ms": stats::to_json(&s[12]),
             "records_per_attach": stats::to_json(&recs_per),
             "commit_records_per_attach": stats::to_json(&commits_per),
             "records_by_kind_mean": Value::Object(by_kind),
@@ -2975,7 +3039,7 @@ mod tests {
     fn the_attach_table_keeps_an_empty_row_and_names_the_backlogs_only_with_one() {
         use super::*;
 
-        let mut series: [Vec<f64>; 10] = Default::default();
+        let mut series: [Vec<f64>; ATTACH_SERIES] = Default::default();
         for (i, s) in series.iter_mut().enumerate() {
             if i != 5 && i < ATTACH_BACKLOG_ROWS {
                 s.push(1.0);
@@ -2994,6 +3058,61 @@ mod tests {
             backlog[ATTACH_BACKLOG_ROWS..]
                 .iter()
                 .all(|row| row.contains("the backlog's") && row.contains("| 0 |"))
+        );
+    }
+
+    /// The drain's rows read the kill window's posts alone, at or past the round's mark: the
+    /// live mail and every `<mail>-to-<i>` note, never another round's mail (`live-1` beside
+    /// `live-10`) or a record before the kill; the mirror's row reads the first `v=2` row on a
+    /// session's `ev` face at or past the mark, never the node's own `ev` face or an `ev`
+    /// event's `v=1` row.
+    #[test]
+    fn the_drains_and_the_mirrors_rows_read_the_kill_windows_records_alone() {
+        use super::*;
+
+        let node = "n-bench";
+        let rec = |seq: u64, subject: String, text: &str, head: &str| Rec {
+            seq,
+            producer: (1, seq),
+            subject,
+            text: text.to_string(),
+            head: head.to_string(),
+            commit: None,
+            bytes: 0,
+        };
+        let note = |sid: &str| format!("/f/{FLEET}/in/{node}/{sid}/{node}/note");
+        let ev = |sid: &str| format!("/f/{FLEET}/pub/{node}/{sid}/ev");
+        let recs = vec![
+            rec(3, note("s-a"), "live-1", "v=1"),
+            rec(4, ev("s-a"), "", "v=2 t=1 ep=1 seq=1"),
+            rec(10, note("s-a"), "live-10", "v=1"),
+            rec(11, format!("/f/{FLEET}/pub/{node}/ev"), "", "v=2 t=2"),
+            rec(12, ev("s-b"), "", "v=1 t=2 ev=log-refused"),
+            rec(13, note("s-b"), "live-1-to-1", "v=1"),
+            rec(14, ev("s-b"), "", "v=2 t=3 ep=1 seq=4"),
+            rec(15, note("s-a"), "live-1", "v=1"),
+            rec(17, note("s-c"), "live-1-to-2", "v=1"),
+        ];
+        let round = Round {
+            sessions: 3,
+            mark: 5,
+            pid: 1,
+            t_kill: 0,
+            t_pid: 0,
+            sids: vec!["s-a".into(), "s-b".into(), "s-c".into()],
+            mail: "live-1".to_string(),
+            t_mail_seen: 0,
+            t_every_mail_seen: None,
+            t_posted: 0,
+            cold_reads: 0,
+            tier: None,
+        };
+        assert_eq!(kill_window_posts(&recs, &round, node), Some((13, 17)));
+        assert_eq!(mirror_first_send(&recs, round.mark, node), Some(14));
+        assert_eq!(mirror_first_send(&recs, 0, node), Some(4));
+        assert_eq!(
+            kill_window_posts(&recs, &Round { mark: 18, ..round }, node),
+            None
         );
     }
 

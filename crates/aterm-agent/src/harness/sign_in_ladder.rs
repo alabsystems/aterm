@@ -370,7 +370,7 @@ fn run_words(renewal: super::cli::Renewal, code: Option<i32>) -> String {
         },
         Renewal::WrongAccount => "another account signed in".to_owned(),
         Renewal::Failed => "the sign-in did not finish".to_owned(),
-        Renewal::Busy => "another sign-in held the sign-in lock, so nothing ran".to_owned(),
+        Renewal::SigninHeld => "sign-in admission was held, so nothing ran".to_owned(),
         Renewal::Deferred => {
             "local sign-in state changed or was unavailable; deferred for a fresh attempt"
                 .to_owned()
@@ -704,8 +704,8 @@ impl Ladder {
     /// starts again from the first wait, and each row's backoff ends, keeping its step, so a row
     /// that fails again the same way waits longer. A refresh running now runs on, and its
     /// result cannot delay the next refresh on the changed network. A row a page stopped waits on
-    /// ([`Self::page_stopped`]): most of what counts as a move has no new address behind it (macOS's
-    /// Local Network answer soon after most launches, a fleet's peers all day), and ending that wait
+    /// ([`Self::page_stopped`]): most of what counts as a move has no new address behind it (a fleet's
+    /// peers all day), and ending that wait
     /// on each would load the page back to back.
     #[cfg_attr(
         any(test, debug_assertions),
@@ -749,8 +749,8 @@ impl Ladder {
 // THE SIGN-IN DOOR (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.15 rule 4). A provider is
 // signed in to for an account only on a Mac using that account, only because it is in use, and
 // never in a burst. Every sign-in this harness starts takes a [`SignIn`], minted by one of these:
-// a row a session here runs on whose login is signed out here (and the row a launch here starts
-// on, whose login was refused), a person naming the account, and one due login this Mac uses
+// a row a session here runs on whose login is on record as signed out here (and the row a launch
+// here starts on, whose login was refused), a person naming the account, and one due login this Mac uses
 // ([`super::accounts::renewal_due`]). A timer holds none of that evidence, so it can mint nothing.
 // The token starts its sign-in under the machine-wide sign-in lock, and an automatic one only
 // [`SPACING_S`] after another account's: the spacing clock is a file beside the lock, so every
@@ -845,8 +845,8 @@ pub(super) fn last_started(store: &super::accounts::Store) -> std::io::Result<Op
 /// Why this Mac may start one sign-in. There is no other reason to start one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Why {
-    /// A session on this Mac runs on the row, or a launch here starts on it, and its login is
-    /// signed out here.
+    /// A session on this Mac runs on the row and its login is on record as signed out here, or a
+    /// launch here starts on it and its own check refused its login.
     Session,
     /// A person named the account: `accounts login|renew <label>`, `harness agy login
     /// <account>`, `signin --cli grok` (the default home, whose device code goes to them), or a
@@ -876,6 +876,8 @@ pub(super) struct SignIn {
     cli: super::accounts::Cli,
     label: String,
     why: Why,
+    turn: Option<super::accounts::SigninTurn>,
+    selection_owner: Option<super::accounts_sync::ManualSelectionOwner>,
 }
 
 /// Why [`SignIn::begin`] started nothing.
@@ -909,9 +911,13 @@ impl Refused {
     }
 }
 
-/// Whether a session on this Mac runs on `row`, whose login is signed out here, and no other
-/// Mac's warm set holds it: what [`SignIn::session_sign_in`] admits, for a ranking that mints
-/// nothing.
+/// Whether a session on this Mac runs on `row`, whose login's last word on record here is
+/// [`super::accounts::Auth::SignedOut`], and no other Mac's warm set holds it: what
+/// [`SignIn::session_sign_in`] admits, for a ranking that mints nothing. A lapse its credential
+/// file alone shows ([`super::accounts::lapsed_here`]), which
+/// [`super::accounts::signed_out_here`] counts, admits nothing here: the upkeep starts no sign-in
+/// on its own for a lapsed file login (one-mesh AC1). Once the session meets its wall, which
+/// records the sign-out, this door admits the row.
 #[must_use]
 pub(super) fn session_signed_out(
     row: &super::accounts::Row,
@@ -926,9 +932,9 @@ pub(super) fn session_signed_out(
 }
 
 /// Whether a door the upkeep holds admits `row` (of the bound roster), so aterm signs it in by
-/// itself with nobody asking: a session here runs on it and its login is signed out here
-/// ([`session_signed_out`]), or this Mac used its login within a week, it has ended or comes due,
-/// and it is not one of `others`, the rows whose account may be another Mac's
+/// itself with nobody asking: a session here runs on it and its login is on record as signed out
+/// here ([`session_signed_out`]), or this Mac used its login within a week, its records say it has
+/// ended or comes due, and it is not one of `others`, the rows whose account may be another Mac's
 /// ([`super::accounts::renewal_due`]). What a report reads before it promises a sign-in.
 #[must_use]
 pub(super) fn upkeep_signs_in(
@@ -946,7 +952,9 @@ pub(super) fn upkeep_signs_in(
 /// Why neither door the upkeep holds admits `row` ([`upkeep_signs_in`] false), in a report's
 /// words: the first condition of [`super::accounts::renewal_due`] it fails, `others` being the
 /// rows whose account the source gives to other Macs alone or whose source this Mac cannot
-/// compare.
+/// compare. Where it fails only the last (its records say its login has neither ended nor comes
+/// due) and its own credential file shows the login lapsed ([`super::accounts::lapsed_here`]),
+/// the words name that file.
 #[must_use]
 pub(super) fn upkeep_waits_because(
     row: &super::accounts::Row,
@@ -969,14 +977,19 @@ pub(super) fn upkeep_waits_because(
             .unread_why
             .unwrap_or(super::accounts::UnreadWhy::Source)
             .words()
+    } else if super::accounts::lapsed_here(row, state) {
+        // It reads expired ([`super::accounts::login_state`]), but the renewal door opens only on
+        // its records ([`super::accounts::renewal_due`]), never on the file alone.
+        "its credential file here shows its login lapsed, and a file alone never starts aterm's \
+         own sign-in"
     } else {
         "its login is not on record as ended or due here"
     }
 }
 
 impl SignIn {
-    /// The upkeep's door for a row a session on this Mac runs on whose login is signed out here
-    /// (and that no other Mac's warm set holds): [`session_signed_out`].
+    /// The upkeep's door for a row a session on this Mac runs on whose login is on record as
+    /// signed out here (and that no other Mac's warm set holds): [`session_signed_out`].
     #[must_use]
     pub(super) fn session_sign_in(
         cli: super::accounts::Cli,
@@ -987,6 +1000,8 @@ impl SignIn {
             cli,
             label: row.label.clone(),
             why: Why::Session,
+            turn: None,
+            selection_owner: None,
         })
     }
 
@@ -1009,6 +1024,8 @@ impl SignIn {
             cli,
             label: row.label.clone(),
             why: Why::Due,
+            turn: None,
+            selection_owner: None,
         })
     }
 
@@ -1019,6 +1036,8 @@ impl SignIn {
             cli,
             label,
             why: Why::Asked,
+            turn: None,
+            selection_owner: None,
         }
     }
 
@@ -1030,10 +1049,17 @@ impl SignIn {
         request: &super::accounts::PinRequest,
         state: &super::accounts::State,
     ) -> Option<Self> {
-        (state.pending_pin.as_ref() == Some(request)).then(|| Self {
+        (state
+            .pending_pin
+            .as_ref()
+            .and_then(super::accounts::PendingSelection::account)
+            == Some(request))
+        .then(|| Self {
             cli,
             label: request.label().to_owned(),
             why: Why::Asked,
+            turn: None,
+            selection_owner: None,
         })
     }
 
@@ -1049,6 +1075,8 @@ impl SignIn {
             cli,
             label: label.to_owned(),
             why: Why::Session,
+            turn: None,
+            selection_owner: None,
         }
     }
 
@@ -1064,6 +1092,8 @@ impl SignIn {
             cli,
             label: label.to_owned(),
             why: Why::Granted,
+            turn: None,
+            selection_owner: None,
         }
     }
 
@@ -1074,6 +1104,8 @@ impl SignIn {
             cli,
             label: label.to_owned(),
             why,
+            turn: None,
+            selection_owner: None,
         }
     }
 
@@ -1081,6 +1113,38 @@ impl SignIn {
     #[must_use]
     pub(super) fn names(&self, cli: super::accounts::Cli, label: &str) -> bool {
         self.cli == cli && self.label == label
+    }
+
+    /// Retain the already acquired manual turn with this one-use authority token.
+    /// An existing admission is never replaced; a refused operation retires both guards.
+    pub(super) fn admitted(
+        mut self,
+        turn: super::accounts::SigninTurn,
+        owner: super::accounts_sync::ManualSelectionOwner,
+    ) -> Result<Self, Refused> {
+        if self.turn.is_some() || self.selection_owner.is_some() {
+            return Err(Refused::Record(
+                "sign-in admission is already retained".into(),
+            ));
+        }
+        self.turn = Some(turn);
+        self.selection_owner = Some(owner);
+        Ok(self)
+    }
+
+    pub(super) fn has_turn(&self) -> bool {
+        self.turn.is_some()
+    }
+
+    pub(super) fn selection(&self) -> Option<&super::accounts::PendingSelection> {
+        self.selection_owner
+            .as_ref()
+            .map(super::accounts_sync::ManualSelectionOwner::selection)
+    }
+
+    /// Transfer retained admission exactly once into the existing provider-plan guard.
+    pub(super) fn take_turn(&mut self) -> Option<super::accounts::SigninTurn> {
+        self.turn.take()
     }
 
     /// When it may start, where not now ([`spaced_until`]), as `store`'s record reads: a check
@@ -1115,13 +1179,22 @@ impl SignIn {
         self,
         cli: super::accounts::Cli,
         label: &str,
-        signin: super::accounts::Lock,
+        signin: super::accounts::SigninTurn,
         store: &super::accounts::Store,
         now: i64,
     ) -> Result<Begun, Refused> {
         if !self.names(cli, label) {
             return Err(Refused::Another);
         }
+        if self.turn.is_some() {
+            return Err(Refused::Record(
+                "retained admission must move into the provider plan".into(),
+            ));
+        }
+        #[cfg(unix)]
+        signin
+            .check_store(store)
+            .map_err(|error| Refused::Record(error.to_string()))?;
         if let Some(until) = self.spaced(store, now)? {
             return Err(Refused::Spaced { until });
         }
@@ -1134,6 +1207,7 @@ impl SignIn {
             signin,
             cli: self.cli,
             label: self.label,
+            selection_owner: self.selection_owner,
         })
     }
 }
@@ -1143,12 +1217,18 @@ impl SignIn {
 #[derive(Debug)]
 #[must_use]
 pub(super) struct Begun {
-    signin: super::accounts::Lock,
+    signin: super::accounts::SigninTurn,
     cli: super::accounts::Cli,
     label: String,
+    selection_owner: Option<super::accounts_sync::ManualSelectionOwner>,
 }
 
 impl Begun {
+    pub(super) fn selection(&self) -> Option<&super::accounts::PendingSelection> {
+        self.selection_owner
+            .as_ref()
+            .map(super::accounts_sync::ManualSelectionOwner::selection)
+    }
     /// The sign-in lock it holds.
     #[must_use]
     pub(super) fn lock(&self) -> &super::accounts::Lock {
@@ -1172,7 +1252,7 @@ pub(super) fn asked_fixture(cli: super::accounts::Cli, label: &str) -> SignIn {
 /// below [`SignIn::begin`]; it records no start.
 #[cfg(test)]
 pub(super) fn begun_fixture(
-    signin: super::accounts::Lock,
+    signin: super::accounts::SigninTurn,
     cli: super::accounts::Cli,
     label: &str,
 ) -> Begun {
@@ -1180,6 +1260,7 @@ pub(super) fn begun_fixture(
         signin,
         cli,
         label: label.to_owned(),
+        selection_owner: None,
     }
 }
 

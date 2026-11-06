@@ -1013,8 +1013,7 @@ fn stats_under_reads_every_sessions_files_and_creates_nothing() {
     assert_eq!(listing(&root), before);
 }
 
-/// NEGATIVE CONTROL: a missing or symlinked `drive` or `upgrade` directory reads empty and
-/// never follows a symlink outside the owned state root.
+/// Missing history is complete and empty; reading it creates no state.
 #[test]
 fn a_missing_state_dir_is_empty_and_stays_missing() {
     let root = ScratchDir::new("stats", "missing");
@@ -1023,35 +1022,360 @@ fn a_missing_state_dir_is_empty_and_stays_missing() {
     let acc = stats_under(&state, &harness, 0);
     assert!(acc.is_empty());
     assert_eq!((acc.rows, acc.bad, acc.sessions, acc.cut), (0, 0, 0, false));
+    for acc in stats_pair(&state, &harness) {
+        assert_eq!((acc.rows, acc.bad, acc.sessions, acc.cut), (0, 0, 0, false));
+    }
     assert!(!state.exists() && !harness.exists(), "nothing was made");
     assert!(listing(&root).is_empty());
     std::fs::create_dir_all(state.join("drive")).expect("drive");
     assert!(stats_under(&state, &harness, 0).is_empty());
     assert!(!harness.exists());
-    #[cfg(unix)]
+    std::fs::create_dir_all(harness.join("upgrade")).unwrap();
+    let before = listing(&root);
+    for acc in std::iter::once(stats_under(&state, &harness, 0)).chain(stats_pair(&state, &harness))
     {
-        let planted = root.join("planted");
-        std::fs::create_dir_all(&planted).expect("planted");
-        std::fs::write(
-            planted.join("s-1.jsonl"),
-            format!("{}\n", typed(1_000, RULE_CONTINUE, "keep going")),
-        )
-        .expect("planted drive row");
-        std::fs::write(
-            planted.join("ledger.jsonl"),
-            "{\"t\":1,\"pid\":42,\"tab\":\"s-1\",\"session\":\"c-1\",\"from\":\"1\",\"to\":\"2\",\"step\":\"relaunched\",\"detail\":\"-\"}\n",
-        )
-        .expect("planted upgrade row");
-        let linked_state = root.join("linked-state");
-        let linked_harness = root.join("linked-harness");
-        std::fs::create_dir_all(&linked_state).expect("linked_state");
-        std::fs::create_dir_all(&linked_harness).expect("linked_harness");
-        std::os::unix::fs::symlink(&planted, linked_state.join("drive")).expect("symlink drive");
-        std::os::unix::fs::symlink(&planted, linked_harness.join("upgrade"))
-            .expect("symlink upgrade");
-        let refused = stats_under(&linked_state, &linked_harness, 0);
-        assert!(refused.is_empty(), "{refused:#?}");
-        assert_eq!(refused.rows, 0);
+        assert_eq!((acc.rows, acc.bad, acc.sessions, acc.cut), (0, 0, 0, false));
+    }
+    assert_eq!(listing(&root), before, "no optional ledger was created");
+}
+
+fn stats_pair(state: &Path, harness: &Path) -> [HarnessStats; 2] {
+    let (day, week) = stats_windows(state, harness, 500, 0);
+    [day, week]
+}
+
+fn refused_discovery(tree: &str, refuse: impl Fn(&Path, &Path)) {
+    for at_root in [false, true] {
+        let root = ScratchDir::new("stats", "discovery-refused");
+        let state = root.join("state");
+        let harness = root.join("harness");
+        let planted_state = root.join("planted-state");
+        let planted_harness = root.join("planted-harness");
+        let drive = planted_state.join("drive/s-1.jsonl");
+        let upgrade = planted_harness.join("upgrade/ledger.jsonl");
+        let body = typed(1_000, RULE_CONTINUE, "keep going") + "\n";
+        let upgraded =
+            "{\"t\":1,\"tab\":\"s-1\",\"from\":\"1\",\"to\":\"2\",\"step\":\"relaunched\"}\n";
+        for (path, text) in [(&drive, body.as_str()), (&upgrade, upgraded)] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let control = stats_under(&planted_state, &planted_harness, 0);
+        assert_eq!((control.rows, control.cut), (2, false));
+        let (base, planted) = if tree == "drive" {
+            (&state, &planted_state)
+        } else {
+            (&harness, &planted_harness)
+        };
+        let (path, target) = if at_root {
+            (base.clone(), planted.clone())
+        } else {
+            std::fs::create_dir_all(base).unwrap();
+            (base.join(tree), planted.join(tree))
+        };
+        refuse(&path, &target);
+        let before = listing(&root);
+        for acc in
+            std::iter::once(stats_under(&state, &harness, 0)).chain(stats_pair(&state, &harness))
+        {
+            assert!(acc.cut, "refused {tree}, root={at_root}");
+            assert_eq!((acc.rows, acc.bad, acc.sessions), (0, 0, 0));
+            assert!(acc.by_session.is_none_or(|shares| shares.is_empty()));
+        }
+        assert_eq!(listing(&root), before, "discovery changes no state");
+        assert_eq!(std::fs::read(&drive).unwrap(), body.as_bytes());
+        assert_eq!(std::fs::read(&upgrade).unwrap(), upgraded.as_bytes());
+    }
+}
+
+#[test]
+fn statistics_discovery_refused_drive_is_partial() {
+    refused_discovery("drive", |path, _| {
+        std::fs::write(path, "not a directory\n").unwrap();
+    });
+    #[cfg(unix)]
+    refused_discovery("drive", |path, target| {
+        std::os::unix::fs::symlink(target, path).unwrap();
+    });
+}
+
+#[test]
+fn statistics_discovery_refused_upgrade_is_partial() {
+    refused_discovery("upgrade", |path, _| {
+        std::fs::write(path, "not a directory\n").unwrap();
+    });
+    #[cfg(unix)]
+    refused_discovery("upgrade", |path, target| {
+        std::os::unix::fs::symlink(target, path).unwrap();
+    });
+}
+
+#[test]
+fn statistics_discovery_unidentified_errors_keep_known_activity_and_settle_choices() {
+    let at = now_ms();
+    let root = ScratchDir::new("stats", "discovery-entries");
+    let state = root.join("state");
+    let harness = root.join("harness");
+    let drive = state.join("drive");
+    std::fs::create_dir_all(&drive).unwrap();
+    std::fs::write(
+        drive.join("s-1.jsonl"),
+        typed(at, RULE_CONTINUE, "keep going"),
+    )
+    .unwrap();
+    let choice = journal(&format!(
+        "{at} s-2 CHOSE seq=40 rule=answer-recommended@v1 policy=recommended Q → A"
+    ))
+    .pop()
+    .unwrap()
+    .to_json();
+    std::fs::write(drive.join("s-2.journal.jsonl"), choice).unwrap();
+    let (control_day, control_week) = stats_windows(&state, &harness, at - 60_000, 0);
+    assert!(!control_day.cut && !control_week.cut);
+    assert_eq!((control_day.rows, control_day.sessions), (2, 2));
+    assert_eq!(control_day.decided.as_ref().unwrap().rows.len(), 1);
+    for fault in 0..6 {
+        let mut entries: Vec<_> = std::fs::read_dir(&drive).unwrap().collect();
+        entries.sort_by_key(|entry| entry.as_ref().unwrap().file_name());
+        if (1..=3).contains(&fault) {
+            entries.insert(
+                fault - 1,
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "fixture entry discovery refusal",
+                )),
+            );
+        }
+        let discovered = drive_files(entries, 0, |entry| {
+            entry.file_type().map(|kind| kind.is_file())
+        });
+        assert_eq!(discovered.cut, (1..=3).contains(&fault));
+        let upgrade = if fault == 4 {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "fixture upgrade discovery refusal",
+            ))
+        } else {
+            Ok(None)
+        };
+        let mut reads = BTreeMap::new();
+        let (day, week) = stats_windows_from(
+            discovered,
+            || {
+                if fault == 5 {
+                    checked_upgrade_ledger(&harness)
+                } else {
+                    upgrade
+                }
+            },
+            at - 60_000,
+            0,
+            &mut |path| {
+                *reads.entry(path.to_path_buf()).or_insert(0) += 1;
+                if fault == 5 && !harness.exists() {
+                    // The upgrade tree changes while another source is being read.
+                    std::fs::write(&harness, "no directory here\n").unwrap();
+                }
+                tail_lines(path, READ_MAX_ROWS)
+            },
+        );
+        assert_eq!((day.cut, week.cut), (fault != 0, fault != 0));
+        assert_eq!(counts(&day), counts(&control_day));
+        assert_eq!(counts(&week), counts(&control_week));
+        assert_eq!((day.rows, day.bad, day.sessions), (2, 0, 2));
+        assert_eq!(
+            day.decided, control_day.decided,
+            "the final join is settled"
+        );
+        let shares = day.by_session.unwrap();
+        assert_eq!(shares.len(), 2);
+        assert!(shares.values().all(|share| !share.cut));
+        assert_eq!(reads.len(), 2);
+        assert!(reads.values().all(|count| *count == 1));
+    }
+}
+
+#[test]
+fn statistics_discovery_missing_file_types_keep_candidates_and_proven_scope() {
+    let at = now_ms();
+    let today = at - 3_600_000;
+    let week = at - 7 * 86_400_000;
+    let old_ms = at - 2 * 86_400_000;
+    let root = ScratchDir::new("stats", "discovery-type");
+    let drive = root.join("drive");
+    std::fs::create_dir(&drive).unwrap();
+    let recent = drive.join("s-good.jsonl");
+    let old = drive.join("s-old.journal.jsonl");
+    std::fs::write(
+        &recent,
+        row(
+            at,
+            "s-good",
+            RULE_CONTINUE,
+            Outcome::Typed,
+            "keep going",
+            "",
+        ),
+    )
+    .unwrap();
+    let choice = journal(&format!(
+        "{old_ms} s-old CHOSE seq=40 rule=answer-recommended@v1 policy=recommended Q → A"
+    ))
+    .pop()
+    .unwrap()
+    .to_json();
+    std::fs::write(&old, choice).unwrap();
+    set_modified(
+        &old,
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(u64::try_from(old_ms).unwrap()),
+    );
+    std::fs::create_dir(drive.join("irrelevant.jsonl")).unwrap();
+    std::fs::write(drive.join("README.txt"), "not history").unwrap();
+    for (failed, vanished) in [
+        (None, false),
+        (Some(&old), false),
+        (Some(&recent), false),
+        (Some(&old), true),
+    ] {
+        let discovered = drive_files(std::fs::read_dir(&drive).unwrap(), week, |entry| {
+            assert_ne!(entry.file_name(), "README.txt", "filter the name first");
+            if failed.is_some_and(|path| path == &entry.path()) {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "fixture file type refusal",
+                ))
+            } else {
+                entry.file_type().map(|kind| kind.is_file())
+            }
+        });
+        assert!(!discovered.cut, "the uncertain candidate has a known name");
+        assert_eq!(discovered.files.len(), 2);
+        let mut reads = BTreeMap::new();
+        let (day, seven) = stats_windows_from(discovered, || Ok(None), today, week, &mut |path| {
+            *reads.entry(path.to_path_buf()).or_insert(0) += 1;
+            if vanished && path == old {
+                Ok(Vec::new())
+            } else {
+                tail_lines(path, READ_MAX_ROWS)
+            }
+        });
+        assert_eq!(
+            (day.cut, seven.cut),
+            (failed == Some(&recent), failed.is_some())
+        );
+        assert_eq!((day.continued, seven.continued), (1, 1));
+        assert_eq!((day.answered, seven.answered), (0, u64::from(!vanished)));
+        assert_eq!(
+            (day.rows, seven.rows, day.bad, seven.bad),
+            (1, 1 + u64::from(!vanished), 0, 0)
+        );
+        let shares = day.by_session.unwrap();
+        assert_eq!(shares.len(), 1);
+        assert_eq!(shares["s-good"].cut, failed == Some(&recent));
+        assert_eq!(reads.len(), 2);
+        assert!(reads.values().all(|count| *count == 1));
+    }
+}
+
+#[test]
+fn statistics_read_failures_are_partial_and_leave_history_unchanged() {
+    let at = now_ms();
+    let loop_row = journal(&format!(
+        "{at} s-1 CHOSE seq=40 rule=answer-recommended@v1 policy=recommended Q → A"
+    ))
+    .pop()
+    .unwrap()
+    .to_json();
+    let upgrade = format!(
+        "{{\"t\":{},\"tab\":\"s-1\",\"from\":\"1\",\"to\":\"2\",\"step\":\"relaunched\"}}",
+        at / 1000
+    );
+    for (kind, body) in [typed(at, RULE_CONTINUE, "keep going"), loop_row, upgrade]
+        .into_iter()
+        .enumerate()
+    {
+        let root = ScratchDir::new("stats", "read-failure");
+        let state = root.join("state");
+        let harness = root.join("harness");
+        let path = match kind {
+            0 => state.join("drive/s-1.jsonl"),
+            1 => state.join("drive/s-1.journal.jsonl"),
+            _ => harness.join("upgrade/ledger.jsonl"),
+        };
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, body + "\n").unwrap();
+        let since = at - 60_000;
+        let control = stats_under(&state, &harness, since);
+        assert_eq!((control.rows, control.bad, control.cut), (1, 0, false));
+        std::fs::write(&path, b"\xff\n").unwrap();
+        let before = listing(&root);
+        let single = stats_under(&state, &harness, since);
+        assert!(single.cut, "selected unreadable file kind={kind}");
+        assert_eq!((single.rows, single.bad, single.sessions), (0, 0, 0));
+        let (today, week) = stats_windows(&state, &harness, since, since - 86_400_000);
+        assert!(today.cut && week.cut);
+        assert_eq!((today.rows, today.bad, week.rows, week.bad), (0, 0, 0, 0));
+        let shares = today.by_session.unwrap();
+        if kind < 2 {
+            assert!(shares["s-1"].cut);
+        } else {
+            assert!(shares.is_empty(), "an unread upgrade has no proven session");
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), b"\xff\n");
+        assert_eq!(listing(&root), before);
+    }
+}
+
+#[test]
+fn statistics_read_failures_mark_only_wanted_windows_and_failed_sessions() {
+    let at = now_ms();
+    let today = at - 3_600_000;
+    let week = at - 7 * 86_400_000;
+    let root = ScratchDir::new("stats", "read-failure-windows");
+    let state = root.join("state");
+    let harness = root.join("harness");
+    let good = state.join("drive/s-good.jsonl");
+    let recent = state.join("drive/s-failed.journal.jsonl");
+    let old = state.join("drive/s-old.jsonl");
+    let upgrade = harness.join("upgrade/ledger.jsonl");
+    for path in [&good, &recent, &old, &upgrade] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "{}\n").unwrap();
+    }
+    std::fs::write(&good, typed(at, RULE_CONTINUE, "keep going") + "\n").unwrap();
+    let old_time = std::time::UNIX_EPOCH
+        + std::time::Duration::from_millis(u64::try_from(at - 2 * 86_400_000).unwrap());
+    for path in [&old, &upgrade] {
+        set_modified(path, old_time);
+    }
+    for (failed, wanted_today) in [(&old, false), (&recent, true), (&upgrade, false)] {
+        let mut reads = BTreeMap::new();
+        let (day, seven) = stats_windows_with(&state, &harness, today, week, &mut |path| {
+            *reads.entry(path.to_path_buf()).or_insert(0) += 1;
+            if path == failed {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "fixture history refusal",
+                ))
+            } else if path == good {
+                tail_lines(path, READ_MAX_ROWS)
+            } else {
+                Ok(Vec::new())
+            }
+        });
+        assert_eq!((day.cut, seven.cut), (wanted_today, true), "{failed:?}");
+        assert_eq!((day.continued, seven.continued), (1, 1));
+        assert_eq!((day.rows, day.bad, seven.rows, seven.bad), (1, 0, 1, 0));
+        let shares = day.by_session.unwrap();
+        assert!(!shares["s-1"].cut, "the readable row's session stays whole");
+        assert!(!shares.contains_key("s-old"));
+        if wanted_today {
+            assert!(shares["s-failed"].cut);
+        } else {
+            assert!(!shares.contains_key("s-failed"));
+        }
+        assert_eq!(reads.len(), 4);
+        assert!(reads.values().all(|count| *count == 1));
     }
 }
 

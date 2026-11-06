@@ -6,10 +6,29 @@
 //! scripted children with the log of every child spec the doors were handed.
 
 use std::collections::VecDeque;
+#[cfg(unix)]
+use std::ffi::OsString;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
+#[cfg(unix)]
+use super::child::ChildOut;
 use super::child::{ChildSpec, ScriptedChild};
+
+#[cfg(unix)]
+type AfterGit = Box<dyn FnOnce(&mut crate::error::Result<ChildOut>) + Send>;
+
+/// One exact real Git child around which a fixture changes its local world or
+/// loses an acknowledgement. It is consumed before invoking either callback.
+#[cfg(unix)]
+pub(super) struct GitHook {
+    pub(super) program: PathBuf,
+    pub(super) args: Vec<OsString>,
+    pub(super) before: Box<dyn FnOnce() + Send>,
+    pub(super) after: AfterGit,
+}
 
 /// Simulated monotonic and wall clock advanced only by `sleep`.
 pub(super) struct SimClock {
@@ -20,6 +39,8 @@ pub(super) struct SimClock {
     scripted: Mutex<VecDeque<ScriptedChild>>,
     /// Every spec `Fx::child` or `Fx::git` accepted (one `child::check` passed), in call order.
     run: Mutex<Vec<ChildSpec>>,
+    #[cfg(unix)]
+    git_hook: Mutex<Option<GitHook>>,
 }
 
 impl SimClock {
@@ -30,6 +51,8 @@ impl SimClock {
             state: Mutex::new((Duration::ZERO, Vec::new())),
             scripted: Mutex::new(VecDeque::new()),
             run: Mutex::new(Vec::new()),
+            #[cfg(unix)]
+            git_hook: Mutex::new(None),
         }
     }
 
@@ -89,5 +112,25 @@ impl SimClock {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    #[cfg(unix)]
+    pub(super) fn set_git_hook(&self, hook: GitHook) {
+        let mut slot = self.git_hook.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(slot.is_none(), "one pending Git interception");
+        *slot = Some(hook);
+    }
+
+    #[cfg(unix)]
+    pub(super) fn take_git_hook(&self, spec: &ChildSpec) -> Option<GitHook> {
+        let mut slot = self.git_hook.lock().unwrap_or_else(PoisonError::into_inner);
+        if slot
+            .as_ref()
+            .is_some_and(|h| h.program == spec.program && h.args == spec.args)
+        {
+            slot.take()
+        } else {
+            None
+        }
     }
 }

@@ -590,6 +590,36 @@ pub struct PaintReport {
     pub bench_band: super::instance::Band,
     /// The session's replay checks at the end ([`super::instance::replay_checks`]).
     pub checks: String,
+    /// The subject's own frames on the GPU over the take.
+    pub subject_gpu: SubjectGpu,
+}
+
+/// The subject's frames on the GPU over one take, as `ctl metrics` reads them (`n_gpu_time`,
+/// `gpu_time_p99_ms`, `max_gpu_time_ms`): each frame's command buffers' spans on the device,
+/// summed, each from when the device started it to when it ended it, so time the device gave
+/// other work in between counts. A take whose frames came late says by them whether the device
+/// ran its frames long. `None` where the subject does not report one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SubjectGpu {
+    /// The frames it timed.
+    pub frames: Option<u64>,
+    /// Their 99th percentile, microseconds.
+    pub p99_us: Option<u64>,
+    /// The longest, microseconds.
+    pub max_us: Option<u64>,
+}
+
+impl SubjectGpu {
+    /// The figures of one `ctl metrics` reply `line`.
+    #[must_use]
+    pub fn of_metrics(line: &str) -> SubjectGpu {
+        use super::rewind::ms_field_us;
+        SubjectGpu {
+            frames: super::instance::uint_field(line, "n_gpu_time"),
+            p99_us: ms_field_us(line, "gpu_time_p99_ms"),
+            max_us: ms_field_us(line, "max_gpu_time_ms"),
+        }
+    }
 }
 
 /// Each frame the engine claimed the resident pet on and the scanner found no pet at its claimed
@@ -614,7 +644,7 @@ pub fn pet_missing_at(ledger: &Ledger, s: &ScanReport) -> String {
     }
 }
 
-fn opt(v: Option<usize>) -> String {
+fn opt(v: Option<impl std::fmt::Display>) -> String {
     v.map_or_else(|| "none".to_string(), |v| v.to_string())
 }
 
@@ -634,7 +664,8 @@ impl std::fmt::Display for PaintReport {
              companion_min_h={} companion_max_h={} companion_height_bounds_pct={} \
              fx_under_frames={} reach={} reach_frames={} reach_px={} \
              reach_min_px={} reach_max_px={} reach_bounds_pct={} cell_h={} row_bottom={} \
-             typed_gap_ms={:?} driven_ms={} alt_wait_ms={} wall_us={} sched_ticks={} \
+             typed_gap_ms={:?} driven_ms={} alt_wait_ms={} wall_us={} subject_gpu_frames={} \
+             subject_gpu_p99_us={} subject_gpu_max_us={} sched_ticks={} \
              sched_late_max_us={} sched_window_ticks={} sched_window_late_max_us={} qos={:?} \
              subject_band={} bench_band={} starved={:?} reason=\"{}\" shape={:?} verdict={:?} {}",
             r.scene.name(),
@@ -703,6 +734,9 @@ impl std::fmt::Display for PaintReport {
                 .map_or_else(|| "none".to_string(), |(lo, hi)| format!("{lo}:{hi}")),
             self.alt_wait_ms,
             self.wall_us,
+            opt(self.subject_gpu.frames),
+            opt(self.subject_gpu.p99_us),
+            opt(self.subject_gpu.max_us),
             self.sched.ticks,
             self.sched.late_max_us,
             self.sched.win_ticks,

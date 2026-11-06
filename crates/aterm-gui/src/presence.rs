@@ -12,13 +12,13 @@ use aterm_window::event_loop::EventLoopProxy;
 
 use crate::Wake;
 
-pub(crate) use aterm_messages::presence::{
-    ChipLevel, Hand, HoldFact, Link, NeedFact, NeedSeverity, PillAct, PillHit, PillKind, PillWords,
-    StopCause, StoryVerb, TOLD_TEXT_MAX_BYTES, TurnFact, WallAnswer, fmt_dur, pill_words,
-    prompt_band_word, prompt_kind_words, short_sid, state_line,
-};
 #[cfg(test)]
-pub(crate) use aterm_messages::presence::{Level, Rim};
+pub(crate) use aterm_messages::presence::Level;
+pub(crate) use aterm_messages::presence::{
+    ChipLevel, Hand, HoldFact, Link, NeedFact, NeedSeverity, StopCause, StoryVerb,
+    TOLD_TEXT_MAX_BYTES, TurnFact, WallAnswer, fmt_dur, prompt_band_word, prompt_kind_words,
+    short_sid, state_line,
+};
 
 /// The engine's presence slot, pinned to this host's seam.
 pub(crate) type Slot = aterm_messages::presence::Slot<Native>;
@@ -46,7 +46,6 @@ pub(crate) fn need_fact(need: &crate::needs::Need) -> NeedFact {
         },
         key: (need.word as u8, need.key),
         what: need.what.clone(),
-        show_pill: need.harness.is_none(),
     }
 }
 
@@ -328,7 +327,7 @@ pub(crate) fn with_retry_plan(
 /// The server's agent verdict on one screen.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AgentVerdict {
-    /// The foreground program is not an identified agent: `agent=-`, no band phase, no rim.
+    /// The foreground program is not an identified agent: `agent=-`, no band phase.
     NotAgent,
     /// An identified agent's reading.
     Agent {

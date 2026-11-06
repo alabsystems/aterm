@@ -1656,7 +1656,7 @@ fn a_shim_env_manifest_lays_an_exporting_shim_and_a_bad_one_is_refused() {
         tree_root: String::new(),
         aliases: Aliases::Off,
     };
-    rollback_member(&l, "ay", &staged);
+    rollback_member(&l, "ay", &staged).unwrap();
     assert!(
         crate::platform::resolve_shim(&shim).is_some_and(|t| t.starts_with(l.build_dir("ay", 18)))
     );
@@ -3210,6 +3210,7 @@ fn a_tree_laid_from_bytes_that_miss_their_signed_digest_aborts_the_group() {
         failed,
         during_flip,
         why,
+        ..
     } = &report.groups[0].1
     else {
         panic!("the group must abort: {:?}", report.groups[0].1);
@@ -4331,6 +4332,7 @@ fn a_program_naming_the_retired_requires_is_refused_on_both_lanes() {
             failed: "ay".into(),
             during_flip: false,
             why: FlowError::RequiresRetired("ay".into()).to_string(),
+            rolled_back: Vec::new(),
         }
     );
     assert!(
@@ -4815,7 +4817,7 @@ fn rollback_restores_a_tool_the_new_build_dropped() {
         aliases: Aliases::Off,
         tree_root: String::new(),
     };
-    rollback_member(&l, "ay", &staged);
+    rollback_member(&l, "ay", &staged).unwrap();
 
     for t in ["ay", "aylint"] {
         let target = crate::platform::resolve_shim(&l.shim(&tool(t)))
@@ -4871,7 +4873,7 @@ fn a_trust_rollback_never_takes_another_programs_shim() {
         aliases: Aliases::Alab,
         tree_root: String::new(),
     };
-    rollback_member(&l, "trust", &staged);
+    rollback_member(&l, "trust", &staged).unwrap();
 
     let into = |name: &str| crate::platform::resolve_shim(&l.shim(&tool(name)));
     let owned_by_ty = |label: &str| {
@@ -4952,7 +4954,7 @@ fn a_rollback_never_takes_a_foreign_alias_of_a_listing_name() {
         aliases: Aliases::Alab,
         tree_root: String::new(),
     };
-    rollback_member(&l, "trust", &staged);
+    rollback_member(&l, "trust", &staged).unwrap();
 
     let into = |name: &str| crate::platform::resolve_shim(&l.shim(&tool(name)));
     assert!(
@@ -5011,7 +5013,7 @@ fn a_rollback_respects_a_program_installed_without_a_current_link() {
             aliases: Aliases::Off,
             tree_root: String::new(),
         };
-        rollback_member(&l, "trust", &staged);
+        rollback_member(&l, "trust", &staged).unwrap();
         let laid = crate::platform::resolve_shim(&l.shim(&tool("ay")));
         if complete {
             assert_eq!(laid, None, "the installed ay's name was taken for trust");
@@ -5068,7 +5070,7 @@ fn rollback_to_an_affected_trust_build_lays_its_root_and_routes() {
         aliases: Aliases::Off,
         tree_root: String::new(),
     };
-    rollback_member(&l, "trust", &staged);
+    rollback_member(&l, "trust", &staged).unwrap();
 
     let target = b8590.join("bin").join("tippy");
     assert_eq!(crate::platform::resolve_shim(&tippy), Some(target.clone()));
@@ -5115,7 +5117,7 @@ fn aliases_are_rolled_back_and_tombstoned_with_their_primary() {
         tree_root: String::new(),
         aliases: Aliases::Alab,
     };
-    rollback_member(&l, "ay", &staged);
+    rollback_member(&l, "ay", &staged).unwrap();
     for t in ["ay", "alab-ay"] {
         let target = crate::platform::resolve_shim(&l.shim(&tool(t)))
             .unwrap_or_else(|| panic!("{t} is restored by the rollback"));
@@ -5145,7 +5147,7 @@ fn aliases_are_rolled_back_and_tombstoned_with_their_primary() {
         tree_root: String::new(),
         aliases: Aliases::Alab,
     };
-    rollback_member(&l, "ay", &fresh);
+    rollback_member(&l, "ay", &fresh).unwrap();
     assert!(std::fs::symlink_metadata(l.shim(&tool("ay"))).is_err());
     assert!(std::fs::symlink_metadata(l.shim(&tool("alab-ay"))).is_err());
 
@@ -5194,7 +5196,7 @@ fn rollback_repoints_the_front_of_path_agents_twin() {
         tree_root: String::new(),
         aliases: Aliases::Off,
     };
-    rollback_member(&l, "claude", &staged);
+    rollback_member(&l, "claude", &staged).unwrap();
 
     assert_eq!(
         crate::platform::resolve_shim(&l.shim(&claude)),
@@ -5218,7 +5220,7 @@ fn rollback_repoints_the_front_of_path_agents_twin() {
         tree_root: String::new(),
         aliases: Aliases::Off,
     };
-    rollback_member(&l, "claude", &fresh);
+    rollback_member(&l, "claude", &fresh).unwrap();
     assert!(
         std::fs::symlink_metadata(l.shim(&claude)).is_err(),
         "fixture: the fresh-install undo removed the primary"
@@ -5257,13 +5259,19 @@ fn a_failed_flip_points_the_witness_back_at_the_prior_build() {
         aliases: Aliases::Off,
         tree_root: String::new(),
     };
-    let flipped = flip_member_with(&l, "ay", &staged, None, |layout, _| {
+    let refused = flip_member_with(&l, "ay", &staged, None, |layout, _| {
         crate::platform::remove_link(&layout.program_current("ay"));
         Err(std::io::Error::other(
             "mklink failed after the junction was removed",
         ))
-    });
-    assert!(!flipped, "the flip must report failure");
+    })
+    .expect_err("the flip must report failure")
+    .to_string();
+    assert!(
+        refused.contains("mklink failed after the junction was removed")
+            && refused.contains(&l.program_current("ay").display().to_string()),
+        "the failure names the link it was writing and its own error: {refused}"
+    );
     assert_eq!(
         std::fs::read_link(l.program_current("ay")).expect("the witness is repaired"),
         b18,
@@ -5295,10 +5303,201 @@ fn a_failed_fresh_install_flip_removes_the_witness_link() {
             "the junction was made, then the write reported failure",
         ))
     });
-    assert!(!flipped);
+    assert!(flipped.is_err());
     assert!(
         std::fs::symlink_metadata(l.program_current("ay")).is_err(),
         "no witness link survives a failed fresh install"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A flip whose shim cannot be laid says where it was laying it and the write's own error, which
+/// names no path, and is undone onto the prior build; the undo cannot re-lay the occupied shim
+/// either, and the error names that shim too. With the shim's place free the flip goes live.
+#[cfg(unix)]
+#[test]
+fn a_flip_that_cannot_lay_its_shims_names_where_and_is_undone() {
+    let dir = scratch("flip-shims");
+    let l = layout(&dir);
+    let b18 = bare_build(&l, "ay", 18, &["ay"]);
+    let b19 = bare_build(&l, "ay", 19, &["ay"]);
+    activate_build(&l, &b18).unwrap();
+    let occupant = l.shim(&tool("ay"));
+    std::fs::create_dir_all(occupant.join("kept")).unwrap();
+    let probe = dir.join("probe");
+    std::fs::write(&probe, b"").unwrap();
+    let write_error = std::fs::rename(&probe, &occupant)
+        .expect_err("a file is never renamed over a directory that holds one")
+        .to_string();
+    let staged = Staged {
+        build: 19,
+        build_dir: b19.clone(),
+        exposes: vec![tool("ay")],
+        prior_build: Some(18),
+        was_live: false,
+        was_held: false,
+        reloc: None,
+        aliases: Aliases::Off,
+        tree_root: String::new(),
+    };
+    let refused = flip_member(&l, "ay", &staged, None)
+        .expect_err("an occupied shim refuses the lay")
+        .to_string();
+    assert!(
+        !write_error.contains(&l.bin_dir().display().to_string())
+            && refused.contains(&l.bin_dir().display().to_string())
+            && refused.contains(&write_error),
+        "{refused}"
+    );
+    assert!(
+        refused.contains(&occupant.display().to_string()),
+        "the undo that could not re-lay the shim names it: {refused}"
+    );
+    assert_eq!(std::fs::read_link(l.program_current("ay")).unwrap(), b18);
+    std::fs::remove_dir_all(&occupant).unwrap();
+    flip_member(&l, "ay", &staged, None).unwrap();
+    assert_eq!(std::fs::read_link(l.program_current("ay")).unwrap(), b19);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A rollback that cannot put a step back says which and its own error, and still does every
+/// other step: a shim it cannot re-lay, a shim of a dropped tool it cannot remove, and a fresh
+/// install's `current` it cannot take away. With every place free, the same rollback is clean.
+#[cfg(unix)]
+#[test]
+fn a_rollback_that_cannot_put_a_step_back_names_it() {
+    let dir = scratch("rb-stuck");
+    let l = layout(&dir);
+    let b17 = bare_build(&l, "ay", 17, &["ay"]);
+    let b18 = bare_build(&l, "ay", 18, &["ay", "ayx"]);
+    let staged = |prior_build| Staged {
+        build: 18,
+        build_dir: b18.clone(),
+        exposes: vec![tool("ay"), tool("ayx")],
+        prior_build,
+        was_live: false,
+        was_held: false,
+        reloc: None,
+        aliases: Aliases::Off,
+        tree_root: String::new(),
+    };
+    let occupy = |path: &Path| std::fs::create_dir_all(path.join("kept")).unwrap();
+    let probe = dir.join("probe");
+    std::fs::write(&probe, b"").unwrap();
+    occupy(&dir.join("occupied"));
+    let relay_error = std::fs::rename(&probe, dir.join("occupied"))
+        .expect_err("a file is never renamed over a directory that holds one")
+        .to_string();
+    let unlink_error = std::fs::remove_file(dir.join("occupied"))
+        .expect_err("a directory is never unlinked as a file")
+        .to_string();
+
+    activate_build(&l, &b18).unwrap();
+    let (ay, ayx) = (shim_of(&l, "ay"), shim_of(&l, "ayx"));
+    occupy(&ay);
+    occupy(&ayx);
+    let stuck = rollback_member(&l, "ay", &staged(Some(17))).expect_err("both shims are occupied");
+    assert!(
+        stuck.contains(&format!("{}: {relay_error}", ay.display()))
+            && stuck.contains(&format!("{}: {unlink_error}", ayx.display())),
+        "{stuck}"
+    );
+    assert_eq!(
+        std::fs::read_link(l.program_current("ay")).unwrap(),
+        b17,
+        "the link was still re-pointed"
+    );
+
+    std::fs::remove_dir_all(&ay).unwrap();
+    std::fs::remove_dir_all(&ayx).unwrap();
+    activate_build(&l, &b18).unwrap();
+    rollback_member(&l, "ay", &staged(Some(17))).unwrap();
+    assert_eq!(std::fs::read_link(l.program_current("ay")).unwrap(), b17);
+    assert_eq!(
+        crate::platform::resolve_shim(&ay),
+        Some(tool_bin(&b17, "ay"))
+    );
+    assert!(std::fs::symlink_metadata(&ayx).is_err(), "ayx's shim went");
+
+    let current = l.program_current("ay");
+    std::fs::remove_file(&current).unwrap();
+    occupy(&current);
+    let stuck = rollback_member(&l, "ay", &staged(None)).expect_err("current is occupied");
+    assert!(stuck.contains(&current.display().to_string()), "{stuck}");
+    std::fs::remove_dir_all(&current).unwrap();
+    rollback_member(&l, "ay", &staged(None)).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A group member whose rollback fails after a later member's flip failed is reported as not
+/// rolled back, with its own error, and is where that error says: ay's `current` cannot be
+/// re-pointed once ay flipped, so ay stays on its new build. The same group with ay's store
+/// writable rolls ay back (`a_failed_group_flip_names_its_cause`).
+#[cfg(unix)]
+#[test]
+fn a_group_member_whose_rollback_fails_is_not_reported_rolled_back() {
+    use crate::activate::agents_checkpoint::{self, Event};
+    let dir = scratch("flip-rb-stuck");
+    let fake = group_fixture_of(&dir, &[], &["trust"]);
+    let layout = layout(&dir);
+    let installed = live_toolchain(&layout);
+    let store_ay = layout.program_current("ay").parent().unwrap().to_path_buf();
+    let probe = store_ay.join("probe");
+    let locked = store_ay.clone();
+    let _watch = agents_checkpoint::watch(
+        &layout,
+        std::sync::Arc::new(move |event| {
+            if matches!(event, Event::Written("ay")) {
+                set_mode(&locked, 0o555);
+            }
+        }),
+    );
+    let report = with_resolve_check(
+        std::sync::Arc::new(|_: &Path, _: &[ToolName]| {
+            Err(FlowError::Activate("resolve check: refused".into()))
+        }),
+        || {
+            apply_channel(
+                &fake,
+                &layout,
+                &anchor(),
+                "stable",
+                TRIPLE,
+                &installed,
+                &[],
+                fl(0),
+                0,
+            )
+            .unwrap()
+        },
+    );
+    let denied = std::fs::write(&probe, b"")
+        .expect_err("ay's store is still read-only")
+        .to_string();
+    set_mode(&store_ay, 0o755);
+    let TxnOutcome::Aborted {
+        failed,
+        during_flip: true,
+        rolled_back,
+        ..
+    } = &report.groups[0].1
+    else {
+        panic!("trust's flip aborts the group: {:?}", report.groups[0].1);
+    };
+    assert_eq!(failed, "trust");
+    let [(member, Err(stuck))] = rolled_back.as_slice() else {
+        panic!("ay's rollback failed and says so: {rolled_back:?}");
+    };
+    assert_eq!(member, "ay");
+    assert!(
+        stuck.contains(&layout.program_current("ay").display().to_string())
+            && stuck.contains(&denied),
+        "{stuck}"
+    );
+    assert_eq!(
+        std::fs::read_link(layout.program_current("ay")).unwrap(),
+        layout.build_dir("ay", 18),
+        "ay is where its rollback's error says"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -5341,17 +5540,25 @@ fn a_bundle_resolve_check_runs_from_its_stage_and_the_flip_takes_its_verdict() {
     );
     release.send(()).unwrap();
     assert!(bundle_resolve_check(&b19, &[tool("ay")]).is_ok());
+    let refused = flip_member(&l, "ay", &bundle("self-contained"), Some(check))
+        .expect_err("the failed verdict from the stage refuses the flip")
+        .to_string();
     assert!(
-        !flip_member(&l, "ay", &bundle("self-contained"), Some(check)),
-        "the failed verdict from the stage refuses the flip"
+        refused.contains("resolve check: ahead of the flip"),
+        "{refused}"
     );
     assert_eq!(
         crate::ops::which(&l, "ay").unwrap(),
         tool_bin(&b18, "ay"),
         "rolled back to the prior build"
     );
+    let unwired = flip_member(&l, "ay", &bundle("rpath-fixup"), None)
+        .expect_err("a bundle whose wiring is unknown is never flipped")
+        .to_string();
+    assert!(unwired.contains("reloc=rpath-fixup"), "{unwired}");
+    assert_eq!(crate::ops::which(&l, "ay").unwrap(), tool_bin(&b18, "ay"));
     let ok = ResolveAhead::start_with(&bundle("self-contained"), |_, _| Ok(())).unwrap();
-    assert!(flip_member(&l, "ay", &bundle("self-contained"), Some(ok)));
+    flip_member(&l, "ay", &bundle("self-contained"), Some(ok)).unwrap();
     assert_eq!(crate::ops::which(&l, "ay").unwrap(), tool_bin(&b19, "ay"));
     let mut plain = bundle("self-contained");
     plain.reloc = None;
@@ -5428,6 +5635,67 @@ fn a_group_starts_a_bundles_resolve_check_before_the_next_member_stages() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A group whose flip fails says why in its outcome, the words `packages.log` and the update
+/// notice carry: on 2026-11-04 trust's flip rolled back pass after pass for five hours, each
+/// saying only that a flip failed, so nobody could tell a refused bundle from a locked file.
+#[test]
+fn a_failed_group_flip_names_its_cause() {
+    let dir = scratch("flip-cause");
+    let fake = group_fixture_of(&dir, &[], &["trust"]);
+    let layout = layout(&dir);
+    let installed = live_toolchain(&layout);
+    let pass = |verdict: Result<(), String>| {
+        with_resolve_check(
+            std::sync::Arc::new(move |_: &Path, _: &[ToolName]| {
+                verdict.clone().map_err(FlowError::Activate)
+            }),
+            || {
+                apply_channel(
+                    &fake,
+                    &layout,
+                    &anchor(),
+                    "stable",
+                    TRIPLE,
+                    &installed,
+                    &[],
+                    fl(0),
+                    0,
+                )
+                .unwrap()
+            },
+        )
+    };
+    let refused = pass(Err("resolve check: libLLVM.dylib was not found".into()));
+    let TxnOutcome::Aborted {
+        failed,
+        during_flip: true,
+        why,
+        rolled_back,
+    } = &refused.groups[0].1
+    else {
+        panic!("trust's flip aborts the group: {:?}", refused.groups[0].1);
+    };
+    assert_eq!(failed, "trust");
+    assert!(why.contains("libLLVM.dylib was not found"), "{why}");
+    assert_eq!(
+        rolled_back,
+        &[("ay".to_string(), Ok(()))],
+        "ay had flipped, and its rollback put it back"
+    );
+    assert_eq!(
+        crate::ops::active_builds(&layout),
+        installed,
+        "both members are back on their prior builds"
+    );
+    let applied = pass(Ok(()));
+    assert_eq!(
+        applied.groups[0].1,
+        TxnOutcome::Applied(vec!["ay".into(), "trust".into()]),
+        "the same group with a passing check flips"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Where the link write fails atomically (POSIX: `store/<program>/` read-only), the link is
 /// as it was and the repair re-writes the same target.
 #[cfg(unix)]
@@ -5454,7 +5722,7 @@ fn an_atomic_link_write_failure_leaves_the_witness_on_the_prior_build() {
     };
     let flipped = flip_member(&l, "ay", &staged, None);
     set_mode(&store_ay, 0o755);
-    assert!(!flipped, "the flip must report failure");
+    assert!(flipped.is_err(), "the flip must report failure");
     assert_eq!(std::fs::read_link(l.program_current("ay")).unwrap(), b18);
     let _ = std::fs::remove_dir_all(&dir);
 }

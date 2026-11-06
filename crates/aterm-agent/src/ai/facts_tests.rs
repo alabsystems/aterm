@@ -689,6 +689,78 @@ fn a_grok_pool_with_no_email_still_names_its_next_row() {
     assert_eq!(kimi.next, None, "CONTROL");
 }
 
+/// A LAPSED ROW WITH NO EMAIL IS OFFERED FOR SIGN-IN, judged as the report judges it: a Grok row
+/// whose `auth.json` aterm marked refused, with no email and no signed-out word on record, is the
+/// pool's `unaddressed` row and its next sign-in (`accounts login`), as `condition` calls it
+/// signed out. NEGATIVE CONTROL: with the lapse rule answering `false`
+/// ([`crate::ai::connector::test_without_lapse`]) the row reads as a live login and is offered
+/// nothing, the defect of a suggestion that judged by the recorded word alone.
+#[test]
+fn a_lapsed_row_with_no_email_is_offered_for_sign_in() {
+    use crate::harness::accounts::{Auth, Cli, Condition, Store};
+    let b = machine(&["grok"]);
+    let var = |_: &str| -> Option<String> { None };
+    let config = b.dir.path().join("config");
+    std::fs::create_dir_all(&config).expect("config");
+    let m = Machine {
+        now: 1_800_000_000,
+        home: Some(b.home.clone()),
+        var: &var,
+        pkg: Some(b.pkg.clone()),
+        exclude: Vec::new(),
+        records: Records::default(),
+        harness_state: Some(b.state.clone()),
+        roster: Some(config.join("accounts.toml")),
+        accounts_mode: None,
+        config: None,
+    };
+    let dir = b.dir.path().join("logins/lapsed");
+    let credential = dir.join(GROK.stores[0]);
+    std::fs::create_dir_all(credential.parent().expect("a folder")).expect("login dir");
+    std::fs::write(&credential, "{\"opaque\":\"credential\"}").expect("grok login");
+    crate::harness::grok_signin::mark_refused(&credential).expect("mark refused");
+    let roster = config.join("accounts-grok.toml");
+    std::fs::write(
+        &roster,
+        format!(
+            "[[account]]\nlabel = \"lapsed\"\nclass = \"dedicated\"\ndir = {:?}\n",
+            dir.display().to_string()
+        ),
+    )
+    .expect("grok roster");
+    let records = Store::at_for(&b.state, Cli::Grok, &b.home)
+        .read_account_records(Some(&roster), m.now)
+        .expect("the records");
+    let row = records.roster.row("lapsed").expect("the row");
+    assert!(row.email.is_none(), "no email");
+    assert!(
+        records
+            .state
+            .accounts
+            .get("lapsed")
+            .is_none_or(|a| a.current_auth(row) != Auth::SignedOut),
+        "no signed-out word on record"
+    );
+    assert_eq!(
+        crate::harness::accounts::condition(row, &records.state, true, m.now),
+        Condition::SignedOut,
+        "the report calls it signed out"
+    );
+
+    let grok = gather(&m, &GROK).pool.expect("grok's pool");
+    assert_eq!(grok.unaddressed.as_deref(), Some("lapsed"));
+    assert_eq!(grok.next.as_deref(), Some("lapsed"));
+
+    let grok = crate::ai::connector::test_without_lapse(|| gather(&m, &GROK))
+        .pool
+        .expect("grok's pool");
+    assert_eq!(
+        (grok.unaddressed, grok.next),
+        (None, None),
+        "NEGATIVE CONTROL"
+    );
+}
+
 #[test]
 fn unreadable_account_state_or_bindings_yield_no_actionable_facts() {
     use crate::harness::accounts::{Cli, Store};
@@ -2153,9 +2225,10 @@ fn the_next_sign_in_is_never_another_macs_account() {
     let pool = DoctorPool::new(true, None);
     let work = pool.b.home.join(".aterm/logins/codex/work");
     let other = pool.b.home.join(".aterm/logins/codex/other");
-    std::fs::write(
-        pool.config.join("aterm.toml"),
-        "[fleet]\nmachine = \"m16\"\n",
+    aterm_uds::atomic_file::write(
+        &pool.config.join("aterm.toml"),
+        b"[fleet]\nmachine = \"m16\"\n",
+        0o600,
     )
     .expect("config");
     std::fs::write(
@@ -2202,9 +2275,10 @@ fn the_next_sign_in_is_never_another_macs_account() {
     let other_dir = store.login_dir("other").expect("other dir");
     std::fs::create_dir_all(&other_dir).expect("mkdir other");
     let roster_path = b.dir.path().join("accounts.toml");
-    std::fs::write(
-        b.dir.path().join("aterm.toml"),
-        "[fleet]\nmachine = \"m16\"\n",
+    aterm_uds::atomic_file::write(
+        &b.dir.path().join("aterm.toml"),
+        b"[fleet]\nmachine = \"m16\"\n",
+        0o600,
     )
     .expect("config");
     let roster_toml = format!(
@@ -2293,9 +2367,10 @@ fn a_serving_row_of_another_macs_is_refused_unless_a_person_pinned_it() {
     let other_dir = store.login_dir("other").expect("other dir");
     std::fs::create_dir_all(&other_dir).expect("mkdir other");
     let roster_path = b.dir.path().join("accounts.toml");
-    std::fs::write(
-        b.dir.path().join("aterm.toml"),
-        "[fleet]\nmachine = \"m16\"\n",
+    aterm_uds::atomic_file::write(
+        &b.dir.path().join("aterm.toml"),
+        b"[fleet]\nmachine = \"m16\"\n",
+        0o600,
     )
     .expect("config");
     std::fs::write(
@@ -2350,9 +2425,10 @@ fn a_serving_row_of_another_macs_is_refused_unless_a_person_pinned_it() {
 
     let pool = DoctorPool::new(true, None);
     let other = pool.b.home.join(".aterm/logins/codex/other");
-    std::fs::write(
-        pool.config.join("aterm.toml"),
-        "[fleet]\nmachine = \"m16\"\n",
+    aterm_uds::atomic_file::write(
+        &pool.config.join("aterm.toml"),
+        b"[fleet]\nmachine = \"m16\"\n",
+        0o600,
     )
     .expect("config");
     std::fs::write(

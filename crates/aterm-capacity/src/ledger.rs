@@ -281,20 +281,22 @@ impl Record {
 
     /// The line an admission adds.
     fn held_line(held: Held) -> String {
-        let mut o = Map::new();
-        o.insert("admitted_ms".to_owned(), Value::from(held.admitted_ms));
-        o.insert("cores".to_owned(), Value::from(held.cores));
         if held.alone {
-            o.insert("alone".to_owned(), Value::from(true));
+            format!(
+                "{{\"admitted_ms\":{},\"alone\":true,\"cores\":{}}}\n",
+                held.admitted_ms, held.cores
+            )
+        } else {
+            format!(
+                "{{\"admitted_ms\":{},\"cores\":{}}}\n",
+                held.admitted_ms, held.cores
+            )
         }
-        line_of(o)
     }
 
     /// The line a quiet waiter adds when it is first next for the quiet machine ([`Self::next_ms`]).
     pub(crate) fn next_line(ms: u64) -> String {
-        let mut o = Map::new();
-        o.insert("next_ms".to_owned(), Value::from(ms));
-        line_of(o)
+        format!("{{\"next_ms\":{ms}}}\n")
     }
 
     pub(crate) fn timing_line(evidence: crate::TimingEvidence) -> String {
@@ -1200,7 +1202,7 @@ impl Ledger {
                 live.push(record);
             }
         }
-        live.sort_by_key(Record::order);
+        live.sort_unstable_by_key(Record::order);
         Ok(live)
     }
 
@@ -1343,10 +1345,18 @@ fn ignored_claim_entry(e: &io::Error) -> bool {
 
 /// The pid the admissions' lock at `path` names: its holder's, unless it was let go meanwhile.
 fn lock_holder(path: &Path) -> Option<u32> {
-    let file = crate::open_regular_reader(path).ok()?;
-    let mut bytes = Vec::with_capacity(65);
-    file.take(64).read_to_end(&mut bytes).ok()?;
-    let text = std::str::from_utf8(&bytes).ok()?.trim();
+    let mut file = crate::open_regular_reader(path).ok()?;
+    let mut bytes = [0u8; 64];
+    let mut len = 0usize;
+    while len < bytes.len() {
+        match file.read(&mut bytes[len..]) {
+            Ok(0) => break,
+            Ok(n) => len += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+    let text = std::str::from_utf8(&bytes[..len]).ok()?.trim();
     (!text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()))
         .then(|| text.parse::<u32>().ok().filter(|&p| p > 0))
         .flatten()

@@ -153,21 +153,23 @@ pub fn resolve_table(raw: &str) -> Result<(&'static str, &'static str)> {
 }
 
 fn digits_only(raw: &str) -> String {
-    let mut d: String = raw.chars().filter(char::is_ascii_digit).collect();
+    let mut d = String::with_capacity(raw.len());
+    for b in raw.bytes().filter(u8::is_ascii_digit) {
+        d.push(char::from(b));
+    }
     if d.len() == 11 && d.starts_with('1') {
         d.remove(0);
     }
     d
 }
 
-/// Normalize a US 10-digit phone number to `XXX-XXX-XXXX`, leaving non-10-digit strings trimmed.
-pub fn normalize_phone_key(raw: &str) -> String {
+fn with_normalized_phone_key<R>(raw: &str, f: impl FnOnce(&str) -> R) -> R {
     let trimmed = raw.trim();
     let mut digits = [0u8; 12];
     let mut len = 0;
     for b in trimmed.bytes().filter(u8::is_ascii_digit) {
         if len == digits.len() {
-            return trimmed.to_owned();
+            return f(trimmed);
         }
         digits[len] = b;
         len += 1;
@@ -180,17 +182,19 @@ pub fn normalize_phone_key(raw: &str) -> String {
         None
     };
     if let Some(d) = ten {
-        let mut out = String::with_capacity(12);
-        for (i, &b) in d.iter().enumerate() {
-            if i == 3 || i == 6 {
-                out.push('-');
-            }
-            out.push(char::from(b));
-        }
-        out
+        let buf = [
+            d[0], d[1], d[2], b'-', d[3], d[4], d[5], b'-', d[6], d[7], d[8], d[9],
+        ];
+        let s = std::str::from_utf8(&buf).expect("ASCII digits and hyphens");
+        f(s)
     } else {
-        trimmed.to_owned()
+        f(trimmed)
     }
+}
+
+/// Normalize a US 10-digit phone number to `XXX-XXX-XXXX`, leaving non-10-digit strings trimmed.
+pub fn normalize_phone_key(raw: &str) -> String {
+    with_normalized_phone_key(raw, str::to_owned)
 }
 
 /// Canonicalize a natural primary key for `logical_table`.
@@ -225,7 +229,10 @@ fn sha256_ascii_lowercase(bytes: &[u8]) -> [u8; 32] {
 /// Convert a natural primary key (`m104`, `root@example.com`, `+1-555-234-5678`,
 /// `acc-001`) into a uniform `crypto::name`-safe storage key (`<prefix>-<24 hex chars>`).
 pub fn storage_key(logical_table: &str, natural_key: &str) -> Result<String> {
-    let canonical = normalize_natural_key(logical_table, natural_key)?;
+    let trimmed = natural_key.trim();
+    if trimmed.is_empty() {
+        return Err(Error::new("table primary key must not be empty"));
+    }
     let prefix = match logical_table {
         "computers" => "mc",
         "emails" => "em",
@@ -233,7 +240,11 @@ pub fn storage_key(logical_table: &str, natural_key: &str) -> Result<String> {
         "ai_accounts" => "ac",
         _ => "rk",
     };
-    let digest = sha256_ascii_lowercase(canonical.as_bytes());
+    let digest = if logical_table == "phones" {
+        with_normalized_phone_key(trimmed, |s| sha256_ascii_lowercase(s.as_bytes()))
+    } else {
+        sha256_ascii_lowercase(trimmed.as_bytes())
+    };
     let mut out = String::with_capacity(prefix.len() + 1 + 24);
     out.push_str(prefix);
     out.push('-');
@@ -462,7 +473,7 @@ pub fn normalize_row(logical_table: &str, natural_key: &str, mut value: Value) -
                 .filter(|s| !s.is_empty())
                 .unwrap_or(trimmed_key);
             let phone = normalize_phone_key(raw_phone);
-            if phone != normalize_phone_key(trimmed_key) {
+            if with_normalized_phone_key(trimmed_key, |norm| phone != norm) {
                 return Err(Error::new("phones row number must match primary key"));
             }
             obj.insert("phone".into(), Value::from(phone));
@@ -1054,6 +1065,14 @@ pub fn tables_summary(db: &Database) -> Result<Value> {
     let mut broken_account_emails = Vec::new();
     let mut broken_account_refs = Vec::new();
 
+    let has_ci = |map: &BTreeMap<String, Value>, raw: &str| {
+        let trimmed = raw.trim();
+        if trimmed.bytes().any(|b| b.is_ascii_uppercase()) {
+            map.contains_key(&trimmed.to_ascii_lowercase())
+        } else {
+            map.contains_key(trimmed)
+        }
+    };
     for (email, row) in &emails {
         let is_protected = row
             .get("protected")
@@ -1098,18 +1117,10 @@ pub fn tables_summary(db: &Database) -> Result<Value> {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            && !phones.contains_key(&normalize_phone_key(ph))
+            && !with_normalized_phone_key(ph, |norm| phones.contains_key(norm))
         {
             broken_phone_refs.push(format!("{email} -> {ph}"));
         }
-        let has_ci = |map: &BTreeMap<String, Value>, raw: &str| {
-            let trimmed = raw.trim();
-            if trimmed.bytes().any(|b| b.is_ascii_uppercase()) {
-                map.contains_key(&trimmed.to_ascii_lowercase())
-            } else {
-                map.contains_key(trimmed)
-            }
-        };
         if let Some(comps) = row.get("assigned_computers").and_then(Value::as_array) {
             for c in comps.iter().filter_map(Value::as_str) {
                 if !has_ci(&computers, c) {
@@ -1118,15 +1129,6 @@ pub fn tables_summary(db: &Database) -> Result<Value> {
             }
         }
     }
-
-    let has_ci = |map: &BTreeMap<String, Value>, raw: &str| {
-        let trimmed = raw.trim();
-        if trimmed.bytes().any(|b| b.is_ascii_uppercase()) {
-            map.contains_key(&trimmed.to_ascii_lowercase())
-        } else {
-            map.contains_key(trimmed)
-        }
-    };
     for (id, row) in &ai_accounts {
         for field_name in ["email", "receiving_mailbox"] {
             if let Some(em) = row
@@ -1317,12 +1319,13 @@ fn plan_rows(view: &View, doc: &Value, existing: Existing) -> Result<Plan> {
             let normalized = normalize_row(logical, &nat, item_val)?;
             let final_nat = natural_key_of(logical, &nat, &normalized);
             let skey = storage_key(logical, &final_nat)?;
-            if !seen_keys.insert((collection.to_owned(), skey.clone())) {
+            let key_pair = (collection.to_owned(), skey);
+            if !seen_keys.insert(key_pair.clone()) {
                 return Err(Error::new(
                     "snapshot document contains duplicate primary keys in table",
                 ));
             }
-            let cell = view.cells.get(&(collection.to_owned(), skey.clone()));
+            let cell = view.cells.get(&key_pair);
             let settled = match existing {
                 Existing::Keep => cell.is_some(),
                 // A dump of exactly this state changes nothing, a conflict it shows included.
@@ -1342,8 +1345,8 @@ fn plan_rows(view: &View, doc: &Value, existing: Existing) -> Result<Plan> {
                 ));
             }
             plan.changes.push(Change {
-                collection: collection.to_owned(),
-                key: skey,
+                collection: key_pair.0,
+                key: key_pair.1,
                 value: Some(normalized),
             });
             written += 1;
@@ -1439,7 +1442,7 @@ fn unfinished_rekeys(dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
             }
         }
     }
-    found.sort_by(|a, b| b.cmp(a));
+    found.sort_unstable_by(|a, b| b.cmp(a));
     Ok(found)
 }
 
@@ -1555,12 +1558,13 @@ fn finish_rekey(dir: &Path, kept: &Path, secret: &[u8]) -> Result<Value> {
     .and_then(|mut db| {
         let moved = import_rows(&mut db, &doc, Existing::Keep)?;
         let view = db.view();
+        let mut key_pair = (String::new(), String::new());
         let fresh = deleted
             .into_iter()
             .filter(|change| {
-                !view
-                    .cells
-                    .contains_key(&(change.collection.clone(), change.key.clone()))
+                key_pair.0.clone_from(&change.collection);
+                key_pair.1.clone_from(&change.key);
+                !view.cells.contains_key(&key_pair)
             })
             .collect();
         commit_batch(&mut db, fresh)?;
@@ -4474,7 +4478,7 @@ mod tests {
         });
         assert_eq!(
             calls, 1,
-            "a local network refusal does not retry under another executable"
+            "a failed round (no route to the host) is not retried"
         );
         assert_eq!(refused["ok"], json!(false));
         assert_eq!(refused["caught_up"], json!(false));

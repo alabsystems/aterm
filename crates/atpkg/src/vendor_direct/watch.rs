@@ -1107,7 +1107,7 @@ pub fn for_host(
 ) -> Option<(HeadWatch, Arc<ConcurrentVendorGetFn<'static>>)> {
     admitted(
         crate::manager_enabled(),
-        crate::cli::registry_seam().as_deref(),
+        crate::source::registry_seam().as_deref(),
     )
     .then(|| {
         (
@@ -1118,7 +1118,7 @@ pub fn for_host(
 }
 
 fn admitted(manager_enabled: bool, registry: Option<&OsStr>) -> bool {
-    manager_enabled && crate::cli::dir_registry(registry).is_none()
+    manager_enabled && crate::source::dir_registry(registry).is_none()
 }
 
 /// The production GET.
@@ -2046,7 +2046,7 @@ mod tests {
             "anything but dir: is the network fetcher"
         );
         assert_eq!(
-            crate::cli::dir_registry(Some(dir)),
+            crate::source::dir_registry(Some(dir)),
             Some(PathBuf::from("/mirror")),
             "the pass's own choice"
         );

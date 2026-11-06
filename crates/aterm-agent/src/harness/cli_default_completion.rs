@@ -18,7 +18,33 @@ fn identity(read: &mut impl FnMut(&Path) -> Option<String>, home: &Path) -> Opti
 pub(in crate::harness) fn complete(
     env: &Env,
     asked: Option<&accounts::Row>,
+    read: impl FnMut(&Path) -> Option<String>,
+) -> Result<Option<String>, String> {
+    complete_with(env, asked, read, &mut |store| {
+        store
+            .signin_within()
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| accounts::SIGNIN_HELD.to_owned())
+    })
+}
+
+pub(super) fn complete_manual(
+    env: &Env,
+    asked: &accounts::Row,
+    read: impl FnMut(&Path) -> Option<String>,
+    current: &dyn Fn() -> bool,
+    queued: &mut dyn FnMut(accounts::SigninPosition),
+) -> Result<Option<String>, String> {
+    complete_with(env, Some(asked), read, &mut |store| {
+        creation_signin_guard(store, current, queued)
+    })
+}
+
+fn complete_with(
+    env: &Env,
+    asked: Option<&accounts::Row>,
     mut read: impl FnMut(&Path) -> Option<String>,
+    take: &mut dyn FnMut(&accounts::Store) -> Result<accounts::SigninTurn, String>,
 ) -> Result<Option<String>, String> {
     let Some(path) = env.accounts_roster_for(Cli::Codex) else {
         return Ok(None);
@@ -82,7 +108,7 @@ pub(in crate::harness) fn complete(
     let store = env
         .accounts_store_for(Cli::Codex)
         .ok_or_else(|| no_home_for(Cli::Codex))?;
-    let _signing = creation_signin_guard(&store)?;
+    let _signing = take(&store)?;
     let _held = store
         .acquire_bounded()
         .map_err(|e| e.to_string())?

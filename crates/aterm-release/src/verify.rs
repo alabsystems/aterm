@@ -369,17 +369,17 @@ pub(crate) fn scan_release_page(
             let TagKind::Candidate(tag_order) = publish::parse_release_tag(release.tag)? else {
                 continue;
             };
-            if !seen_tags.insert(tag_order.clone()) {
-                return Err(Error::new(format!(
-                    "duplicate published update candidates have the same numeric tag order as {}",
-                    release.tag
-                )));
-            }
             if selected
                 .as_ref()
                 .is_none_or(|(_, current)| tag_order > *current)
             {
+                seen_tags.insert(tag_order.clone());
                 selected = Some((release, tag_order));
+            } else if !seen_tags.insert(tag_order) {
+                return Err(Error::new(format!(
+                    "duplicate published update candidates have the same numeric tag order as {}",
+                    release.tag
+                )));
             }
         }
         let Some((release, _)) = selected else {

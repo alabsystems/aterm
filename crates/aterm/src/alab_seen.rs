@@ -124,12 +124,12 @@ pub(crate) fn harness_seen(view: &LabView, seen: &seen::Seen) -> alab_seen::Seen
                 t: secs(s.t),
             })
             .collect();
-        signed_in.sort_by(|a, b| b.t.cmp(&a.t).then_with(|| a.on.cmp(&b.on)));
+        signed_in.sort_unstable_by(|a, b| b.t.cmp(&a.t).then_with(|| a.on.cmp(&b.on)));
         let windows = seen
             .quota(&pk)
             .into_iter()
             .map(|q| {
-                let (figure, read) = match &q.usage {
+                let (figure, read) = match q.usage {
                     None => (None, None),
                     Some(Usage::Current {
                         pct_x10,
@@ -139,21 +139,19 @@ pub(crate) fn harness_seen(view: &LabView, seen: &seen::Seen) -> alab_seen::Seen
                         src,
                     }) => (
                         Some(Figure::Used {
-                            pct_x10: *pct_x10,
+                            pct_x10,
                             reset: reset.map(secs),
                         }),
-                        Some((secs(*read), mac(view, by), src.clone())),
+                        Some((secs(read), mac(view, &by), src)),
                     ),
                     Some(Usage::ResetUnread { reset, read, by }) => (
-                        Some(Figure::ResetUnread {
-                            reset: secs(*reset),
-                        }),
-                        Some((secs(*read), mac(view, by), "reading".to_owned())),
+                        Some(Figure::ResetUnread { reset: secs(reset) }),
+                        Some((secs(read), mac(view, &by), "reading".to_owned())),
                     ),
                 };
                 WindowSeen {
                     window: q.window.word().to_owned(),
-                    sub: (q.pk != pk).then(|| q.pk.clone()),
+                    sub: (q.pk != pk).then_some(q.pk),
                     figure,
                     read,
                     wall_until: q.wall.map(|w| w.until.map(secs)),

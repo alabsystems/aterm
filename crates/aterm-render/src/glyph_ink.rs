@@ -207,11 +207,11 @@ impl GlyphRaster {
 /// how that renderer remaps coverage ([`TextBlending`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GlyphInk {
-    regular: Box<[GlyphCoverage; ASCII]>,
-    bold: Box<[GlyphCoverage; ASCII]>,
+    regular: std::sync::Arc<[GlyphCoverage; ASCII]>,
+    bold: std::sync::Arc<[GlyphCoverage; ASCII]>,
     /// Each glyph's raster as the renderer seats it ([`Self::raster`]), regular then bold, by
     /// [`Self::index`]; empty for a table built from coverage alone ([`Self::from_coverage`]).
-    rasters: Box<[Option<GlyphRaster>]>,
+    rasters: std::sync::Arc<[Option<GlyphRaster>]>,
     /// The glyph every other character is judged as: the alphanumeric whose core lies lowest.
     other: u8,
     corrected: bool,
@@ -268,9 +268,9 @@ impl GlyphInk {
             }
         }
         Self {
-            regular: Box::new(regular),
-            bold: Box::new(bold),
-            rasters: Box::new([]),
+            regular: std::sync::Arc::new(regular),
+            bold: std::sync::Arc::new(bold),
+            rasters: std::sync::Arc::from([]),
             other,
             corrected,
             fingerprint,
@@ -301,7 +301,7 @@ impl GlyphInk {
                 fingerprint = aterm_hash::fnv_mix_u64(fingerprint, v);
             }
         }
-        self.rasters = rasters.into_boxed_slice();
+        self.rasters = rasters.into();
         self.fingerprint = fingerprint;
         self
     }
@@ -313,6 +313,15 @@ impl GlyphInk {
     #[must_use]
     pub fn raster(&self, index: u8) -> Option<&GlyphRaster> {
         self.rasters.get(usize::from(index))?.as_ref()
+    }
+
+    /// The rasters [`Self::raster`] reads, by [`Self::index`]: one table a frame's own ink
+    /// ([`Renderer::glyph_ink_for`]) shares with the face's, so a reader that holds it knows a
+    /// glyph index means the same raster for as long as a later table is this one.
+    #[inline]
+    #[must_use]
+    pub const fn raster_table(&self) -> &std::sync::Arc<[Option<GlyphRaster>]> {
+        &self.rasters
     }
 
     /// Whether the renderer remaps coverage in linear light ([`TextBlending::LinearCorrected`]),

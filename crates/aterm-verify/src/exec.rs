@@ -44,8 +44,21 @@ pub struct Cmd {
     /// Whether the child's waits for admission or a lock count against its ceiling as work
     /// ([`Cmd::counting_waits`]); otherwise its tree marks them and the ceiling leaves them out.
     pub waits_count: bool,
-    /// Observe libtest failures before this binary completes; diagnostic only.
-    pub test_progress: Option<String>,
+    /// A test binary whose cases are read as they end ([`CaseWatch`]).
+    pub test_cases: Option<CaseWatch>,
+}
+
+/// How a test binary's cases are read while it runs (`exec_test_progress.rs`'s `LiveCases`):
+/// each failed case is said at once (a `test-case-failed` event), and under `stop_at_red` the
+/// first decisive one ends the binary ([`Run::stopped_at`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaseWatch {
+    /// cargo's re-run spec for the binary.
+    pub spec: String,
+    /// The binary writes libtest's JSON events; a human log's failures are decided at its end.
+    pub json: bool,
+    /// End the binary at its first decisive red case: the run halts at its first red.
+    pub stop_at_red: bool,
 }
 
 impl Cmd {
@@ -62,7 +75,7 @@ impl Cmd {
             preamble: None,
             term_grace: None,
             waits_count: false,
-            test_progress: None,
+            test_cases: None,
         }
     }
 
@@ -260,7 +273,7 @@ pub trait StageGroupEnd: Sync + std::fmt::Debug {
 }
 
 /// What a child did.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Run {
     /// True only on exit status 0.
     pub ok: bool,
@@ -273,6 +286,9 @@ pub struct Run {
     /// found a member (a host with no reading: every platform but macOS; a child that never
     /// started), never zeros.
     pub usage: Option<TreeUsage>,
+    /// Set when verify ended this test binary at its first decisive red case ([`CaseWatch`]):
+    /// its run is a FAIL by construction, read from the blocks of the cases that finished.
+    pub stopped_at: Option<crate::libtest_json::Stopped>,
 }
 
 /// WHAT A CHILD'S TREE USED (`docs/DESIGN-fast-build-release-2026-11-05.md` §4.1, A1), as its
@@ -341,7 +357,7 @@ impl Run {
 /// disk it simulated); otherwise anywhere, as a build or a tool that died says it. Passing test
 /// binaries and ceiling kills are excluded ([`crate::libtest::out_of_disk`]).
 fn out_of_disk(output: &str) -> bool {
-    crate::libtest::out_of_disk(output, ENOSPC_SENTENCE)
+    crate::libtest::out_of_disk(output)
 }
 
 /// The default ceiling on one stage child's work ([`ExecEnv::child_ceiling`]).
@@ -1405,10 +1421,9 @@ fn finish(
     #[cfg(unix)]
     drop(spawning);
 
-    let mut progress = cmd
-        .test_progress
-        .as_ref()
-        .and_then(|_| log.and_then(|path| test_progress::Progress::open(path).ok()));
+    let mut cases = cmd.test_cases.as_ref().and_then(|watch| {
+        log.and_then(|path| test_progress::LiveCases::open(path, watch.json).ok())
+    });
     let begun = Instant::now();
     let mut clock = Clock::new(marks, env.host, child.id(), crate::memory::current()).owning(&own);
     let used = |run: Run, clock: &Clock<'_>| Run {
@@ -1418,20 +1433,73 @@ fn finish(
     let mut told = false;
     let mut nap = Duration::from_millis(1);
     loop {
-        if let Some(progress) = &mut progress {
-            progress.poll(|case| {
+        if let (Some(watch), Some(cases)) = (&cmd.test_cases, &mut cases) {
+            for seen in cases.poll() {
+                use test_progress::Seen;
+                let halts = watch.stop_at_red && matches!(seen, Seen::Red { .. }) && !ending();
+                // A spared case's own block says its machine, not the tree, refused it: it reads
+                // NOT RUN, as its binary's row will; a red or an undecided case reads FAIL.
+                let outcome = if matches!(seen, Seen::Spared { .. }) {
+                    "NOT RUN"
+                } else {
+                    "FAIL"
+                };
+                let (case, says) = match &seen {
+                    Seen::Red { case, marks } | Seen::Spared { case, marks } => {
+                        (Some(case.as_str()), block_says(*marks))
+                    }
+                    Seen::Undecided { case } => (case.as_deref(), Some("unknown")),
+                };
                 eprintln!(
                     "verify-event: {}",
                     aterm_json::json!({
-                        "schema": 1, "event": "test-case-failed", "outcome": "FAIL",
-                        "test": cmd.test_progress, "case": case,
+                        "schema": 1, "event": "test-case-failed", "outcome": outcome,
+                        "test": watch.spec, "case": case,
                         "at_unix_ms": aterm_time::unix_millis(),
                         "elapsed_s": begun.elapsed().as_secs_f64(),
                         "binary_completed": false,
-                        "detail": "libtest reported a failed case; final binary result is pending",
+                        "halts": halts, "block_says": says,
+                        "detail": match seen {
+                            Seen::Red { .. } => "its block decides its binary a FAIL",
+                            Seen::Spared { .. } => "its block says its machine, not the tree",
+                            Seen::Undecided { .. } => "its block is decided at its binary's end",
+                        },
                     })
                 );
-            });
+                if let (true, Seen::Red { case, .. }) = (halts, seen) {
+                    // The red is ended here, inside the child's own run and before anything
+                    // calls the run's halt (`Halt::red`, which `testrun` calls once this returns):
+                    // the halt makes `ending` true, and a child reaped while the run is ending is
+                    // released as interrupted (`Live::release_for_reap`), which would turn this
+                    // red into a NOT RUN.
+                    let stopped = crate::libtest_json::Stopped {
+                        spec: watch.spec.clone(),
+                        case,
+                    };
+                    let killed = kill_and_reap(
+                        &mut child,
+                        #[cfg(unix)]
+                        &mut live,
+                        Some(STUCK_GRACE),
+                        #[cfg(unix)]
+                        REAP_AFTER_KILL,
+                    );
+                    return (
+                        used(
+                            Run {
+                                ok: false,
+                                output: killed,
+                                code: None,
+                                spawn_error: None,
+                                stopped_at: Some(stopped),
+                                usage: None,
+                            },
+                            &clock,
+                        ),
+                        read_log(log),
+                    );
+                }
+            }
         }
         #[cfg(unix)]
         let status = live.reap_stage_sweeping(&mut child, false, sweep, record);
@@ -1480,6 +1548,7 @@ fn finish(
             return (
                 used(
                     Run {
+                        stopped_at: None,
                         ok: false,
                         output: killed,
                         code: None,
@@ -1508,6 +1577,17 @@ fn finish(
         }
         std::thread::sleep(nap);
         nap = (nap * 2).min(Duration::from_millis(25));
+    }
+}
+
+/// What a failed case's block says of its machine, for its `test-case-failed` event: `null` for a
+/// block that says neither (a plain failure).
+fn block_says(marks: crate::libtest::Marks) -> Option<&'static str> {
+    match (marks.refused, marks.disk) {
+        (true, true) => Some("both"),
+        (true, false) => Some("refusal"),
+        (false, true) => Some("disk"),
+        (false, false) => None,
     }
 }
 
@@ -1604,6 +1684,7 @@ fn over_ceiling(cmd: &Cmd, clock: &Clock<'_>, limit: Duration, kill: &str) -> Ru
     let argv = cmd.argv().join(" ");
     let waited = waited_clause(clock.waited, clock.starved);
     Run {
+        stopped_at: None,
         ok: false,
         output: format!(
             "{} — child killed after {:.1}s of work, over the {:.1}s ceiling \
@@ -2356,6 +2437,7 @@ pub mod group {
 fn reaped(st: io::Result<std::process::ExitStatus>) -> Run {
     match st {
         Ok(st) => Run {
+            stopped_at: None,
             ok: st.success(),
             output: ended_by_signal(st),
             code: st.code(),
@@ -2387,6 +2469,7 @@ fn ended_by_signal(st: std::process::ExitStatus) -> String {
 
 fn failed_to_wait(why: &str) -> Run {
     Run {
+        stopped_at: None,
         ok: false,
         output: String::new(),
         code: None,
@@ -2397,6 +2480,7 @@ fn failed_to_wait(why: &str) -> Run {
 
 fn spawn_failure(cmd: &Cmd, why: &str) -> Run {
     Run {
+        stopped_at: None,
         ok: false,
         output: format!("aterm-verify: cannot run {}: {why}", cmd.program.display()),
         code: None,
@@ -3148,6 +3232,7 @@ mod tests {
             );
             let records = pidfile.with_extension("records");
             let record = crate::runs::Runs::open(&ctx, &records, |_, _| Run {
+                stopped_at: None,
                 ok: false,
                 output: String::new(),
                 code: None,

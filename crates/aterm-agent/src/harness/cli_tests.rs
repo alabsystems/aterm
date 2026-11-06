@@ -20,6 +20,9 @@ mod asked;
 #[path = "cli_report_read_tests.rs"]
 mod report_read;
 
+#[path = "cli_disk_output_tests.rs"]
+mod disk_output_results;
+
 #[path = "cli_lapsed_login_tests.rs"]
 mod lapsed_login;
 
@@ -2856,6 +2859,159 @@ fn disk_why_says_what_the_worker_removed_from_the_ledgers_other_rows() {
 }
 
 #[test]
+fn lease_read_failure_is_reported_by_disk_why_without_false_empty_output() {
+    let cases = [
+        Vec::new(),
+        b"not json".to_vec(),
+        vec![0xff],
+        br#"{"schema":2,"volumes":[]}"#.to_vec(),
+        br#"{"schema":1}"#.to_vec(),
+    ];
+    let mut failures = Vec::new();
+    for json in [false, true] {
+        for bytes in &cases {
+            let tmp = tmp_dir("disk-why-lease-error");
+            let env = env_at(&tmp);
+            std::fs::create_dir_all(&env.state).expect("state");
+            let path = env.state.join(disk::ask::LEASE_FILE);
+            std::fs::write(&path, bytes).expect("bad lease");
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = run_disk_why(&env, json, &mut out, &mut err);
+            let diagnostic = String::from_utf8(err).expect("diagnostic");
+            if code != ExitCode::from(1)
+                || !out.is_empty()
+                || !diagnostic.contains("disk why")
+                || !diagnostic.contains(disk::ask::LEASE_FILE)
+            {
+                failures.push(format!(
+                    "json={json} input={bytes:?}: code={code:?}, out_len={}, err={diagnostic:?}",
+                    out.len()
+                ));
+            }
+            assert_eq!(std::fs::read(path).expect("lease remains"), *bytes);
+            assert!(!env.disk_ledger().exists());
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+fn disk_why_output_fixture(populated: bool, json: bool) -> (Tmp, Env, Vec<u8>) {
+    let tmp = tmp_dir("disk-why-output");
+    let env = env_at(&tmp);
+    if populated {
+        std::fs::create_dir_all(&env.state).expect("state");
+        std::fs::write(
+            env.state.join(disk::ask::LEASE_FILE),
+            disk::ask::Lease::default().encode(),
+        )
+        .expect("lease");
+        let host = disk::ask::HostId {
+            pid: 7,
+            start: "fixture".into(),
+        };
+        let rows = ["claimed", "released:finished"]
+            .map(|step| disk::ask::step_row(env.now, "s-worker", "dev:1", step, &host));
+        disk_ask_journal(&env.state, &rows);
+    }
+    let (mut bytes, mut err) = (Vec::new(), Vec::new());
+    assert_eq!(
+        run_disk_why(&env, json, &mut bytes, &mut err),
+        ExitCode::SUCCESS
+    );
+    assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
+    if populated {
+        assert!(bytes.iter().filter(|b| **b == b'\n').count() >= 3);
+    }
+    (tmp, env, bytes)
+}
+
+fn disk_why_output_failure(flush: bool) {
+    let mut failures = Vec::new();
+    for json in [false, true] {
+        let (_tmp, env, complete) = disk_why_output_fixture(true, json);
+        let paths = [env.state.join(disk::ask::LEASE_FILE), env.disk_ledger()];
+        let before = paths.each_ref().map(|p| std::fs::read(p).expect("state"));
+        let limits = if flush {
+            vec![None]
+        } else {
+            let first_row = complete.iter().position(|b| *b == b'\n').expect("row") + 1;
+            vec![
+                Some(0),
+                Some(1),
+                Some(first_row + 1),
+                Some(complete.len() - 1),
+            ]
+        };
+        for remaining in limits {
+            let mut sink = ResultSink {
+                bytes: Vec::new(),
+                remaining,
+                fail_flush: flush,
+                flushed: false,
+            };
+            let mut err = Vec::new();
+            let code = run_disk_why(&env, json, &mut sink, &mut err);
+            let diagnostic = String::from_utf8(err).expect("diagnostic");
+            if code != ExitCode::from(1)
+                || !diagnostic.contains("disk why")
+                || !diagnostic.contains(OUTPUT_FAILURE)
+                || sink.flushed != flush
+            {
+                failures.push(format!(
+                    "json={json} remaining={remaining:?} flush={flush}: code={code:?}, \
+                     flushed={}, err={diagnostic:?}",
+                    sink.flushed
+                ));
+            }
+            assert_eq!(sink.bytes, complete[..remaining.unwrap_or(complete.len())]);
+            assert_eq!(
+                paths.each_ref().map(|p| std::fs::read(p).expect("state")),
+                before,
+                "reporting an output failure must not change the lease or ledger"
+            );
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn disk_why_output_write_failures_are_nonzero_and_read_only() {
+    disk_why_output_failure(false);
+}
+
+#[test]
+fn disk_why_output_flush_failures_are_nonzero_and_read_only() {
+    disk_why_output_failure(true);
+}
+
+#[test]
+fn disk_why_output_success_flushes_complete_bytes_without_creating_state() {
+    for populated in [false, true] {
+        for json in [false, true] {
+            let (_tmp, env, complete) = disk_why_output_fixture(populated, json);
+            let paths = [env.state.join(disk::ask::LEASE_FILE), env.disk_ledger()];
+            let before = paths.each_ref().map(|p| std::fs::read(p).ok());
+            let mut sink = ResultSink {
+                bytes: Vec::new(),
+                remaining: None,
+                fail_flush: false,
+                flushed: false,
+            };
+            let mut err = Vec::new();
+            assert_eq!(
+                run_disk_why(&env, json, &mut sink, &mut err),
+                ExitCode::SUCCESS
+            );
+            assert!(err.is_empty());
+            assert_eq!(sink.bytes, complete);
+            assert!(sink.flushed);
+            assert_eq!(paths.each_ref().map(|p| std::fs::read(p).ok()), before);
+            assert_eq!(env.state.exists(), populated);
+        }
+    }
+}
+
+#[test]
 fn the_disk_verb_holds_the_error_boxes_off() {
     let tmp = tmp_dir("disk-quiet");
     let env = env_at(&tmp);
@@ -5545,6 +5701,8 @@ struct FakeHost<'a> {
     unaskable: Option<String>,
     asked: std::cell::RefCell<Vec<String>>,
     logins: std::cell::RefCell<Vec<Option<String>>>,
+    queued: Option<&'a dyn Fn(accounts::SigninPosition)>,
+    cancelled: Option<&'a dyn Fn() -> bool>,
 }
 
 impl<'a> FakeHost<'a> {
@@ -5559,11 +5717,21 @@ impl<'a> FakeHost<'a> {
             unaskable: None,
             asked: std::cell::RefCell::new(Vec::new()),
             logins: std::cell::RefCell::new(Vec::new()),
+            queued: None,
+            cancelled: None,
         }
     }
 }
 
 impl AccountsHost for FakeHost<'_> {
+    fn signin_queued(&self, position: accounts::SigninPosition) {
+        if let Some(queued) = self.queued {
+            queued(position);
+        }
+    }
+    fn work_cancelled(&self) -> bool {
+        self.cancelled.is_some_and(|cancelled| cancelled())
+    }
     fn stdin_is_terminal(&self) -> bool {
         self.tty
     }
@@ -10258,6 +10426,100 @@ fn a_stage_a_removal_could_not_finish_is_journalled_with_what_stayed() {
     }
 }
 
+#[test]
+fn disk_watch_unreadable_history_is_unknown_and_keeps_other_observations() {
+    let tmp = tmp_dir("watch-read-failure");
+    let ledger = tmp.path().join("disk.jsonl");
+    let watch = |path: &Path| {
+        disk_watch_status(
+            path,
+            Some(tmp.path()),
+            None,
+            disk::Config::default(),
+            disk::Written::default(),
+            9,
+        )
+    };
+    let missing = watch(&ledger);
+    assert_eq!(missing.json["sweep_in_flight"].as_u64(), Some(0));
+    assert!(missing.json["ledger_error"].is_null());
+    assert!(!ledger.exists(), "a status read creates no ledger");
+    std::fs::write(&ledger, "").unwrap();
+    let empty = watch(&ledger);
+    assert_eq!(empty.json["sweep_in_flight"].as_u64(), Some(0));
+    assert!(!empty.line.contains("sweep_in_flight="));
+    assert!(empty.json["ledger_error"].is_null());
+
+    let poke = disk::poke_row(
+        1,
+        &disk::poke::Cause::Write("fixture".to_owned()),
+        Some(123),
+        disk::Level::Short,
+    );
+    let reserve = disk::reserve_row(2, "removed", Some(4096), "fixture");
+    let intent = disk::sweep_row(
+        3,
+        Path::new("/fixture/cache"),
+        disk::SweepAction::Removing,
+        4096,
+        atpkg::build_cache::Unused::Unfinished,
+    );
+    let body = format!("{poke}\n{reserve}\n{intent}\n");
+    std::fs::write(&ledger, &body).unwrap();
+    let known = watch(&ledger);
+    assert_eq!(known.json["sweep_in_flight"].as_u64(), Some(1));
+    assert!(known.line.contains("sweep_in_flight=1"));
+    assert!(known.json["ledger_error"].is_null());
+    assert_eq!(
+        known.json["last_poke"],
+        aterm_json::from_str::<Value>(&poke).unwrap()
+    );
+    assert_eq!(
+        known.json["last_reserve"],
+        aterm_json::from_str::<Value>(&reserve).unwrap()
+    );
+
+    let invalid = tmp.path().join("invalid.jsonl");
+    let bad_bytes = [b"\xff\n".as_slice(), body.as_bytes()].concat();
+    std::fs::write(&invalid, &bad_bytes).unwrap();
+    let directory = tmp.path().join("not-a-file.jsonl");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::write(directory.join("kept"), "untouched").unwrap();
+    let mut refused = vec![invalid.clone()];
+    refused.push(directory.clone());
+    #[cfg(unix)]
+    for (name, target) in [
+        ("linked.jsonl", ledger.clone()),
+        ("dangling.jsonl", tmp.path().join("absent")),
+    ] {
+        let path = tmp.path().join(name);
+        std::os::unix::fs::symlink(target, &path).unwrap();
+        refused.push(path);
+    }
+    for path in refused {
+        let unknown = watch(&path);
+        assert!(unknown.json["sweep_in_flight"].is_null(), "{path:?}");
+        assert!(
+            unknown.json["ledger_error"]
+                .as_str()
+                .is_some_and(|why| !why.is_empty())
+        );
+        assert!(unknown.line.contains("sweep_in_flight=unknown"));
+        assert!(unknown.json["last_poke"].is_null() && unknown.json["last_reserve"].is_null());
+        for (key, value) in known.json.as_object().unwrap() {
+            if !matches!(
+                key.as_str(),
+                "last_poke" | "last_reserve" | "sweep_in_flight" | "ledger_error"
+            ) {
+                assert_eq!(unknown.json.get(key), Some(value), "preserve {key}");
+            }
+        }
+    }
+    assert_eq!(std::fs::read(&ledger).unwrap(), body.as_bytes());
+    assert_eq!(std::fs::read(&invalid).unwrap(), bad_bytes);
+    assert_eq!(std::fs::read(directory.join("kept")).unwrap(), b"untouched");
+}
+
 /// AN INTENT CLOSED BY A KEPT ROW IS NOT IN FLIGHT: the sweep's intent row for a build
 /// directory, then the outcome row for it when nothing of it went (`Unused::Refused`, its rename
 /// refused after the check), journalled as `kept` with 0 bytes and the refusal's word, reads as no
@@ -10285,16 +10547,16 @@ fn an_intent_closed_by_a_kept_row_is_not_in_flight() {
     };
     let in_flight = || disk::sweep_in_flight(rows().iter().map(String::as_str));
     let watch = || {
-        disk_watch_status(
+        let status = disk_watch_status(
             &ledger,
             None,
             None,
             disk::Config::default(),
             disk::Written::default(),
             9,
-        )
-        .json["sweep_in_flight"]
-            .as_u64()
+        );
+        assert_eq!(status.json.get("ledger_error"), Some(&Value::Null));
+        status.json["sweep_in_flight"].as_u64()
     };
 
     assert!(disk_sweep_journal(&state, leaf, 7 << 30, gone, false, 1));
@@ -10716,11 +10978,20 @@ fn another_clis_rows_are_added_listed_and_pinned_in_its_own_roster_and_login_roo
     assert_eq!(code, exit(0), "{err}");
     assert!(out.starts_with("sol: the active account, pinned"), "{out}");
     assert!(env.state.join("accounts-kimi").join("state.json").is_file());
+    // A completed manual turn leaves a lock-free ticket for the next admission
+    // to prune. The normal shared admission proves retirement before the snapshot.
+    drop(
+        env.accounts_store()
+            .signin_now()
+            .expect("shared admission")
+            .expect("the completed manual turn released its signer and ticket"),
+    );
     let shared = env.accounts_store().shared_dir();
     assert!(
-        every_file(&shared)
-            .iter()
-            .all(|(path, _)| path == &shared.join(accounts::SIGNIN_LOCK_FILE)),
+        every_file(&shared).iter().all(|(path, bytes)| {
+            path == &shared.join(accounts::SIGNIN_LOCK_FILE)
+                || (path == &shared.join("signin-queue/queue.lock") && bytes.is_empty())
+        }),
         "the machine-wide sign-in lock is shared, but Claude Code's account data is untouched"
     );
     let json = run_line("accounts --cli kimi --json", &env).1;
@@ -11213,47 +11484,72 @@ fn harness_agy_login_fails_closed_without_reading_home_quota() {
 /// `harness agy login <account>` and `signin --cli grok` are a person's sign-in
 /// (`DESIGN-alab-one-mesh-2026-11-05.md` §4.15, [`person_begin`]): it starts under the machine's
 /// sign-in lock, which it holds through the flow, and records its start on the Mac's spacing
-/// clock under the account it names; while another sign-in holds the lock it waits only as
-/// `again` says, then runs and records nothing. CONTROL: with the lock free the same call
-/// begins, and a person's named sign-in is not held by another account's start a minute before.
+/// clock under the account it names. Cancellation at its actual queue observation
+/// starts nothing; after a queued turn the start uses the refreshed policy clock.
 #[test]
 fn a_persons_named_sign_in_starts_under_the_machines_lock() {
     use crate::harness::sign_in_ladder::{Started, last_started};
     let (_dir, env) = agy_env("agy-login-door");
     let store = env.accounts_store_for(Cli::Agy).unwrap();
     let held = store.signin_now().unwrap().expect("the lock is free");
-    let asked = std::cell::Cell::new(0);
-    let again = |tried: u32| {
-        asked.set(asked.get() + 1);
-        tried < 2
-    };
-    let refused = person_begin(&store, (Cli::Agy, "primary"), env.now, &again).unwrap_err();
-    assert!(refused.starts_with("held: "), "{refused}");
+    let cancelled = std::cell::Cell::new(false);
+    let clock = std::cell::Cell::new(env.now);
+    let mut positions = Vec::new();
+    let refused = person_begin(
+        &store,
+        (Cli::Agy, "primary"),
+        &|| clock.get(),
+        &|| cancelled.get(),
+        &mut |position| {
+            positions.push(position);
+            cancelled.set(true);
+        },
+    )
+    .unwrap_err();
+    assert!(refused.contains("cancelled"), "{refused}");
     assert_eq!(
-        asked.get(),
-        3,
-        "waited twice, as `again` said, then gave up"
+        positions,
+        [accounts::SigninPosition {
+            ahead: 0,
+            blocker: accounts::SigninBlocker::UnscheduledSignin
+        }]
     );
     assert_eq!(last_started(&store).unwrap(), None, "nothing recorded");
     drop(held);
-    let begun = person_begin(&store, (Cli::Agy, "primary"), env.now, &|_| false)
-        .expect("CONTROL: the lock is free");
+    let running = std::cell::RefCell::new(store.signin_now().unwrap());
+    let begun = person_begin(
+        &store,
+        (Cli::Agy, "primary"),
+        &|| clock.get(),
+        &|| false,
+        &mut |_| {
+            clock.set(env.now + 1200);
+            drop(running.borrow_mut().take());
+        },
+    )
+    .expect("CONTROL: the actual queued holder completed");
     assert!(begun.names(Cli::Agy, "primary"));
     assert_eq!(
         last_started(&store).unwrap(),
-        Some(Started::new(Cli::Agy, "primary", env.now))
+        Some(Started::new(Cli::Agy, "primary", env.now + 1200))
     );
     assert!(
-        person_begin(&store, (Cli::Agy, "second"), env.now, &|_| false).is_err(),
+        store.signin_now().unwrap().is_none(),
         "the flow holds the lock until it ends"
     );
     drop(begun);
-    let second = person_begin(&store, (Cli::Grok, "second"), env.now + 60, &|_| false)
-        .expect("a person's ask");
+    let second = person_begin(
+        &store,
+        (Cli::Grok, "second"),
+        &|| env.now + 1260,
+        &|| false,
+        &mut |_| {},
+    )
+    .expect("a person's ask");
     assert!(second.names(Cli::Grok, "second"));
     assert_eq!(
         last_started(&store).unwrap(),
-        Some(Started::new(Cli::Grok, "second", env.now + 60))
+        Some(Started::new(Cli::Grok, "second", env.now + 1260))
     );
 }
 
@@ -11742,9 +12038,10 @@ fn disk_free_result_write_and_flush_failures_are_nonzero_without_undoing_cleanup
             std::fs::create_dir_all(&home).expect("home");
             let home = std::fs::canonicalize(home).expect("resolved home");
             env.home = Some(home.clone());
-            std::fs::write(
+            aterm_uds::atomic_file::write(
                 env.config.as_ref().expect("fixture config"),
-                "[disk]\nauto_free_gib = 10\n",
+                b"[disk]\nauto_free_gib = 10\n",
+                0o600,
             )
             .expect("grant");
             let cache = home.join(".cache/tool");

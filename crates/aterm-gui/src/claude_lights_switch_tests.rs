@@ -121,12 +121,12 @@ fn not_saved(app: &App, key: &str) -> Option<String> {
 const MASTER_OFF: &str = "[harness]\nenabled = false\n";
 
 /// AUTOPILOT OFF IS NOT THE HARNESS OFF: a session whose Autopilot is Off keeps the harness's
-/// switch lit, ` ● on ` and its label, `alab` in the white the rest of its glass wears (the
-/// moonbow, bold, never the bare switch's accent), and a press on it turns the WHOLE harness off:
-/// it writes `harness.enabled = false`, arms `◐ turning off` (the refused write here lets it go),
+/// switch lit, ` ● on ` and its label, `alab` bold in the moonbow's hero (the Off card's settled
+/// hero letters, never the system accent), and a press on it turns the WHOLE harness off:
+/// it writes `harness.enabled = false`, arms `◌ turning off` (the refused write here lets it go),
 /// and writes no Autopilot word. CONTROL: the rule beside the switch is no button.
 #[test]
-fn an_autopilot_off_session_reads_on_in_white_and_its_press_turns_the_harness_off() {
+fn an_autopilot_off_session_reads_on_in_the_moonbow_and_its_press_turns_the_harness_off() {
     let (mut app, wid, session, mut reader, _host) = claude_pane(120);
     let lit = switch(&app, wid).expect("a hosted Claude Code pane draws the switch");
     assert_eq!(lit.face, HarnessSwitch::On);
@@ -159,11 +159,13 @@ fn an_autopilot_off_session_reads_on_in_white_and_its_press_turns_the_harness_of
     );
     let alab = brand(&app, &on);
     assert_eq!(alab.iter().map(|c| c.ch).collect::<String>(), "alab");
-    for c in &alab {
-        let spread = c.fg.iter().max().unwrap() - c.fg.iter().min().unwrap();
+    let ground = app.windows[&wid].input_scratch.implicit_blank.bg;
+    let ground = u32::from_be_bytes([0, ground[0], ground[1], ground[2]]);
+    for (k, c) in alab.iter().enumerate() {
+        let hero = aterm_effects::harness_card::CardPalette::Off.hero_on(k as f32 / 3.0, ground);
         assert!(
-            c.bold && spread <= 24,
-            "{:?}: white and bold, the moonbow: {:?}",
+            c.bold && c.fg == hero.to_be_bytes()[1..],
+            "{:?}: bold, the moonbow's hero {hero:06x}: {:?}",
             c.ch,
             c.fg
         );
@@ -203,7 +205,7 @@ fn an_autopilot_off_session_reads_on_in_white_and_its_press_turns_the_harness_of
     assert_eq!(
         super::SWITCHES_LET_GO.with(std::cell::Cell::get),
         1,
-        "the press armed `◐ turning off`, and the refusal let it go"
+        "the press armed `◌ turning off`, and the refusal let it go"
     );
     assert_eq!(
         autopilot(&app, session),
@@ -254,7 +256,7 @@ fn the_off_switch_writes_the_switch_and_never_cruise() {
 }
 
 /// A SWITCH TURNING OFF SAYS SO AND TAKES NO CLICK: while the master switch's off-write has not
-/// read back, the switch reads ` ◐ off ` at every width it stands at, the side it turns to is in
+/// read back, the switch reads ` ◌ off ` at every width it stands at, the side it turns to is in
 /// the repaint key, and a click on it writes nothing; the read-back lets it go.
 #[test]
 fn a_switch_turning_off_says_so_and_takes_no_click() {
@@ -284,7 +286,7 @@ fn a_switch_turning_off_says_so_and_takes_no_click() {
     let turning = switch(&app, wid).expect("the switch, turning off");
     assert_eq!(turning.face, HarnessSwitch::TurningOff);
     assert!(
-        top_rule(&app, wid).contains(" \u{25d0} off "),
+        top_rule(&app, wid).contains(" \u{25cc} off "),
         "{:?}",
         top_rule(&app, wid)
     );
@@ -299,7 +301,7 @@ fn a_switch_turning_off_says_so_and_takes_no_click() {
         if let Some(b) = switch(&app, wid) {
             assert_eq!(b.face, HarnessSwitch::TurningOff, "{width}");
             let face = painted(&app, wid, &b, b.cols.clone()).trim().to_owned();
-            assert_eq!(face, "\u{25d0} off", "{width}");
+            assert_eq!(face, "\u{25cc} off", "{width}");
             narrowest = Some(width);
         }
     }
@@ -477,7 +479,7 @@ fn under_the_master_switch_off_on_turns_the_master_switch_on() {
     assert_eq!(
         super::SWITCHES_LET_GO.with(std::cell::Cell::get),
         1,
-        "the click armed `◐ turning on`, and the refusal let it go"
+        "the click armed `◌ turning on`, and the refusal let it go"
     );
     assert_eq!(
         autopilot(&app, session),
@@ -517,7 +519,7 @@ fn under_the_agents_switch_off_on_turns_the_agents_switch_on() {
     assert_eq!(
         super::SWITCHES_LET_GO.with(std::cell::Cell::get),
         1,
-        "the click armed `◐ turning on`, and the refusal let it go"
+        "the click armed `◌ turning on`, and the refusal let it go"
     );
     assert!(
         not_saved(&app, "harness.claude.enabled").is_some(),
@@ -550,7 +552,7 @@ fn a_switch_turning_on_says_so_and_takes_no_click() {
     let turning = switch(&app, wid).expect("the switch, turning");
     assert_eq!(turning.face, HarnessSwitch::Turning);
     assert!(
-        top_rule(&app, wid).contains(" \u{25d0} on "),
+        top_rule(&app, wid).contains(" \u{25cc} on "),
         "{:?}",
         top_rule(&app, wid)
     );
@@ -619,7 +621,7 @@ fn the_switch_draws_its_mark_as_one_set_in_every_state() {
         switch(&app, wid).map(|b| b.face),
         Some(HarnessSwitch::TurningOff)
     );
-    drawn(&app, BandIcon::HalfDisc, "turning off");
+    drawn(&app, BandIcon::DottedRing, "turning off");
     policy(&mut app, "[harness]\nenabled = false\n");
     frame(&mut app, wid);
     drawn(&app, BandIcon::Ring, "off");
@@ -629,13 +631,13 @@ fn the_switch_draws_its_mark_as_one_set_in_every_state() {
         switch(&app, wid).map(|b| b.face),
         Some(HarnessSwitch::Turning)
     );
-    drawn(&app, BandIcon::HalfDisc, "turning on");
+    drawn(&app, BandIcon::DottedRing, "turning on");
     frame(&mut app, wid);
-    drawn(&app, BandIcon::HalfDisc, "turning on, painted again");
+    drawn(&app, BandIcon::DottedRing, "turning on, painted again");
     let (plan, route) = app.active_visible_frame_layout(wid).expect("a layout");
     for _ in 0..3 {
         app.splice_claude_footer(wid, &plan, route);
-        drawn(&app, BandIcon::HalfDisc, "turning on, spliced again");
+        drawn(&app, BandIcon::DottedRing, "turning on, spliced again");
     }
     let row = switch(&app, wid).expect("the switch").frame_row;
     let ws = app.windows.get_mut(&wid).expect("window");
@@ -1803,6 +1805,85 @@ fn rendered(app: &mut App, wid: WindowId) -> (usize, usize, Vec<u8>) {
     let (rgba, width, height) =
         aterm_render::decode_png_rgba8(&png.expect("PNG bytes")).expect("a PNG");
     (width, height, rgba)
+}
+
+/// LINES B, D AND E IGNORE THE SYSTEM ACCENT (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md`
+/// §4.1, S4): a Claude Code pane under the harness, unsupervised (no palette: the neutral inks)
+/// and supervised (Cruise's palette: the arc, the letters and the hero), rendered by the capture
+/// route under two system accents, is pixel-identical on its top rule (line B), its composer
+/// rule (line D) and the row under it (line E). CONTROLS: the two accents reach the band the
+/// glass once read them from; the supervised pane's lines B and D wear the palette, so their
+/// pixels differ from the unsupervised pane's; and the harness held off changes line D's pixels,
+/// so the comparison sees its inks.
+#[test]
+fn lines_b_d_and_e_ignore_the_system_accent() {
+    use crate::native_appearance::{SystemAccent, install_system_accent};
+    let shot = |accent: [u8; 3], supervised: bool, off: bool| {
+        install_system_accent(Some(SystemAccent {
+            on_dark: accent,
+            on_light: accent,
+        }));
+        let (mut app, wid, session, _reader, _host) = claude_pane(110);
+        if supervised {
+            let ctx = app.pool.get(session).expect("session").ctx.clone();
+            crate::session_timeline::claim_supervisor(
+                &ctx,
+                &crate::harness_host::holder(),
+                None,
+                None,
+                crate::metrics::now_us(),
+            )
+            .expect("the claim");
+        }
+        if off {
+            policy(&mut app, MASTER_OFF);
+        }
+        frame(&mut app, wid);
+        let band = crate::chrome_band::band_colors(app.theme).accent;
+        let rule = footer_row(&app, wid);
+        let (w, h, rgba) = rendered(&mut app, wid);
+        let ch = app.win_cell_size(wid).1;
+        let top = app.win_pad_top(wid) + app.win_head(wid);
+        let lines: Vec<Vec<u8>> = [rule - 2, rule, rule + 1]
+            .into_iter()
+            .map(|row| {
+                let (y0, y1) = (top + row * ch, (top + (row + 1) * ch).min(h));
+                assert!(y0 < y1, "row {row} is in the frame");
+                rgba[y0 * w * 4..y1 * w * 4].to_vec()
+            })
+            .collect();
+        (band, lines)
+    };
+    let (blue, pink) = ([0x00, 0x7a, 0xff], [0xf7, 0x4f, 0x9e]);
+    let mut seen = Vec::new();
+    for supervised in [false, true] {
+        let (blue_band, on_blue) = shot(blue, supervised, false);
+        let (pink_band, on_pink) = shot(pink, supervised, false);
+        assert_ne!(blue_band, pink_band, "CONTROL: the accents reach the band");
+        for (line, (a, b)) in ["B", "D", "E"]
+            .into_iter()
+            .zip(on_blue.iter().zip(&on_pink))
+        {
+            assert!(
+                a == b,
+                "line {line} (supervised: {supervised}): its pixels moved with the system accent"
+            );
+        }
+        seen.push(on_blue);
+    }
+    let (_, held) = shot(blue, false, true);
+    install_system_accent(None);
+    let (plain, cruise) = (&seen[0], &seen[1]);
+    for (k, line) in [(0, "B"), (1, "D")] {
+        assert!(
+            plain[k] != cruise[k],
+            "CONTROL: the supervised pane's line {line} wears the palette"
+        );
+    }
+    assert!(
+        plain[1] != held[1],
+        "CONTROL: the harness held off redraws line D's inks"
+    );
 }
 
 /// THE SWITCH AS A PERSON SEES IT: each face (lit, off, turning on, turning off, lit under the

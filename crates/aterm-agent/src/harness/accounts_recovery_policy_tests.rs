@@ -93,6 +93,7 @@ fn google_checkpoint_recovery_requires_its_original_binding_and_root() {
             (
                 &[Duration::ZERO],
                 &shared_renewal::CheckpointAuthority::Unavailable,
+                None,
             ),
             || {
                 if !admitted && case == 9 {

@@ -300,7 +300,7 @@ pub fn roll_shipped(main: &str, source: &str, version: &str, date: &str) -> Resu
 
     let mut out: Vec<&str> = lines[..=start].to_vec();
     out.push("");
-    out.extend(leftovers.iter().map(String::as_str));
+    out.extend_from_slice(&leftovers);
     let heading = format!("## [{version}] - {date}");
     out.push(&heading);
     out.extend(shipped.iter().copied());
@@ -315,20 +315,13 @@ pub fn roll_shipped(main: &str, source: &str, version: &str, date: &str) -> Resu
 /// The raw lines of `text`'s `[Unreleased]` body, between its header and the next
 /// `## ` heading.
 fn unreleased_body(text: &str) -> Result<Vec<&str>> {
-    let lines: Vec<&str> = text.lines().collect();
-    let start = lines
-        .iter()
-        .position(|l| is_section_header(l, "Unreleased"))
-        .ok_or_else(|| {
-            Error::new(format!(
-                "{CHANGELOG_FILE} has no \"## [Unreleased]\" section"
-            ))
-        })?;
-    let end = lines[start + 1..]
-        .iter()
-        .position(|l| l.starts_with("## "))
-        .map_or(lines.len(), |p| start + 1 + p);
-    Ok(lines[start + 1..end].to_vec())
+    let mut lines = text.lines();
+    if !lines.any(|l| is_section_header(l, "Unreleased")) {
+        return Err(Error::new(format!(
+            "{CHANGELOG_FILE} has no \"## [Unreleased]\" section"
+        )));
+    }
+    Ok(lines.take_while(|l| !l.starts_with("## ")).collect())
 }
 
 /// One unit of a changelog section body: a `###` heading, or an entry — a line
@@ -369,15 +362,16 @@ fn units<'a>(body: &[&'a str]) -> Vec<Unit<'a>> {
 /// The entries of `main_body` that `shipped` does not carry, each shipped entry
 /// consuming at most one match, rendered under their headings with a blank line
 /// after every heading and every entry.
-fn unshipped_entries(main_body: &[&str], shipped: &[&str]) -> Vec<String> {
-    let mut remaining: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+fn unshipped_entries<'a>(main_body: &[&'a str], shipped: &[&'a str]) -> Vec<&'a str> {
+    let mut remaining: std::collections::HashMap<Vec<&'a str>, usize> =
+        std::collections::HashMap::new();
     for unit in units(shipped) {
         if let Unit::Entry(lines) = unit {
-            *remaining.entry(lines.join("\n")).or_default() += 1;
+            *remaining.entry(lines).or_default() += 1;
         }
     }
     let mut out = Vec::new();
-    let mut heading: Option<&str> = None;
+    let mut heading: Option<&'a str> = None;
     let mut heading_written = false;
     for unit in units(main_body) {
         match unit {
@@ -386,8 +380,7 @@ fn unshipped_entries(main_body: &[&str], shipped: &[&str]) -> Vec<String> {
                 heading_written = false;
             }
             Unit::Entry(lines) => {
-                let key = lines.join("\n");
-                if let Some(count) = remaining.get_mut(&key)
+                if let Some(count) = remaining.get_mut(lines.as_slice())
                     && *count > 0
                 {
                     *count -= 1;
@@ -396,12 +389,12 @@ fn unshipped_entries(main_body: &[&str], shipped: &[&str]) -> Vec<String> {
                 if let Some(line) = heading
                     && !heading_written
                 {
-                    out.push(line.to_string());
-                    out.push(String::new());
+                    out.push(line);
+                    out.push("");
                     heading_written = true;
                 }
-                out.extend(lines.iter().map(|l| (*l).to_string()));
-                out.push(String::new());
+                out.extend_from_slice(&lines);
+                out.push("");
             }
         }
     }

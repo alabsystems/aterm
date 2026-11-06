@@ -334,10 +334,21 @@ impl Ledger {
     /// note the span, then count its return. Release: a reading that counts the return (an
     /// acquire load) sees the index the note took.
     fn timed(&self, kind: FlushKind, flush: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+        self.timed_on(&clock_ns, kind, flush)
+    }
+
+    /// [`Ledger::timed`] on `clock`, which a test injects so a call's span is what it says,
+    /// not however long a loaded machine took to run it.
+    fn timed_on(
+        &self,
+        clock: &impl Fn() -> u64,
+        kind: FlushKind,
+        flush: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
         let _ = self.counts[kind.index()].fetch_add(1, Ordering::Relaxed);
-        let start = clock_ns();
+        let start = clock();
         let answer = flush();
-        let _ = self.note(kind, start, clock_ns());
+        let _ = self.note(kind, start, clock());
         let _ = self.returned.fetch_add(1, Ordering::Release);
         answer
     }
@@ -475,6 +486,13 @@ mod tests {
 
     const MS: u64 = 1_000_000;
 
+    /// A clock each read of which is 100 ns past the last: a call timed on it spans 100 ns per
+    /// read between its two, however long the machine took to run it.
+    fn stepping() -> impl Fn() -> u64 {
+        let now = std::cell::Cell::new(0u64);
+        move || now.replace(now.get() + 100)
+    }
+
     /// A FLUSH IS KEPT ONLY WHEN SLOWER THAN 1 MS, and every one joins its kind's total and
     /// count, whatever it answers. Exactly 1 ms is not slow; 1 ms and 1 ns is, and takes the
     /// first index.
@@ -485,13 +503,16 @@ mod tests {
         assert_eq!(span(&ledger, FlushKind::Full, 10, MS), None);
         assert_eq!(span(&ledger, FlushKind::Barrier, 20, 300), None);
         assert_eq!(span(&ledger, FlushKind::Plain, 5 * MS, MS + 1), Some(0));
-        let failed = ledger.timed(FlushKind::Barrier, || Err(io::Error::other("refused")));
+        let failed = ledger.timed_on(&stepping(), FlushKind::Barrier, || {
+            Err(io::Error::other("refused"))
+        });
         assert!(failed.is_err(), "the flush's own answer comes back");
         let t = ledger.times();
         assert_eq!(t.clock, FLUSH_CLOCK);
         assert_eq!((t.full_ns, t.plain_ns), (MS, MS + 1));
-        assert!(
-            t.barrier_ns >= 300,
+        assert_eq!(
+            t.barrier_ns,
+            300 + 100,
             "the timed barrier adds its span: {t:?}"
         );
         assert_eq!(
@@ -898,9 +919,10 @@ mod tests {
         let _ = ledger.note(FlushKind::Full, 0, 2 * MS);
         assert_eq!(ledger.times().running, 0, "a note alone is no call");
         let mut inside = Vec::new();
-        let answer = ledger.timed(FlushKind::Barrier, || {
+        let clock = stepping();
+        let answer = ledger.timed_on(&clock, FlushKind::Barrier, || {
             inside.push(ledger.times());
-            ledger.timed(FlushKind::Plain, || {
+            ledger.timed_on(&clock, FlushKind::Plain, || {
                 inside.push(ledger.times());
                 Err(io::Error::other("refused"))
             })
@@ -921,8 +943,9 @@ mod tests {
             after.slow_count, 1,
             "the note's index, and none for fast calls"
         );
-        assert!(
-            after.barrier_ns > 0,
+        assert_eq!(
+            (after.barrier_ns, after.plain_ns),
+            (300, 100),
             "its time, once it returned: {after:?}"
         );
     }

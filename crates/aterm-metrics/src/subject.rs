@@ -624,18 +624,28 @@ impl Metric {
         }
     }
 
+    /// Whether this build names `self` in [`Metric::ALL`].
+    #[must_use]
+    pub(crate) const fn is_named(self) -> bool {
+        match self {
+            Metric::Tokens(Cli::Claude | Cli::Codex) => true,
+            Metric::Tokens(_) => false,
+            Metric::Class(..) => !self.as_str().is_empty(),
+        }
+    }
+
     /// The minute total of `cli`'s tokens, when this build names it.
     #[must_use]
     pub fn tokens(cli: Cli) -> Option<Metric> {
         let m = Metric::Tokens(cli);
-        Metric::ALL.contains(&m).then_some(m)
+        m.is_named().then_some(m)
     }
 
     /// The hourly class metric of `cli`, `family` and `class`, when this build names it.
     #[must_use]
     pub fn class(cli: Cli, family: Family, class: TokenClass) -> Option<Metric> {
         let m = Metric::Class(cli, family, class);
-        Metric::ALL.contains(&m).then_some(m)
+        m.is_named().then_some(m)
     }
 }
 

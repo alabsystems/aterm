@@ -976,8 +976,8 @@ mod tests {
 
     /// A measured instance of the handed bundle (`/Applications/aterm (dev).app`: a release
     /// build, no development seams) starts, unless its world says otherwise, the lanes that act
-    /// for the login's own account: its window's `_alab._tcp` browse and converge runner, a
-    /// local-network use macOS puts its consent prompt on the desk for, and a keeper job in the
+    /// for the login's own account: its window's `_alab._tcp` browse and converge runner, a use
+    /// of the person's real LAN, and a keeper job in the
     /// login's launchd domain. The world says otherwise in both places those lanes read: its
     /// `aterm.toml`, read back as a document, holds every lanes-off entry after a head that opens
     /// a table of its own, and its environment carries the scratch world's marker at the state

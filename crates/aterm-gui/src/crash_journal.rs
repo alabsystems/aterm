@@ -2521,6 +2521,7 @@ fn same_but_titles(a: &RestoreManifest, b: &RestoreManifest) -> bool {
             theme: a_theme,
             lost: a_lost,
             task: a_task,
+            told: a_told,
         } = a;
         let TerminalLeafRestore {
             cwd: b_cwd,
@@ -2549,9 +2550,11 @@ fn same_but_titles(a: &RestoreManifest, b: &RestoreManifest) -> bool {
             theme: b_theme,
             lost: b_lost,
             task: b_task,
+            told: b_told,
         } = b;
         a_cwd == b_cwd
             && a_task == b_task
+            && a_told == b_told
             && a_profile == b_profile
             && a_local_id == b_local_id
             && a_user_title == b_user_title
@@ -3089,6 +3092,7 @@ pub(crate) mod fixtures {
                 not_claim_worker: false,
                 claim_worker: None,
                 task: None,
+                told: None,
             },
         ))
     }

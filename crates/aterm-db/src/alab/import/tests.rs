@@ -1339,6 +1339,147 @@ fn an_address_both_sheets_list_alike_is_no_disagreement() {
     assert_eq!(disagreements, Vec::<&str>::new());
 }
 
+/// An address row is matched by its key, and the table wins: re-importing the sheet a row was
+/// born from after the owner renamed it writes no new row and reports the row's `addr`
+/// owner-kept, the cell still saying the new address; a sheet saying the new address names the
+/// same row (nothing under the new address's key, the row not reported no-longer-listed); and an
+/// address two rows were renamed onto, with no row under its key, is `address-ambiguous` and
+/// nothing of its sheet row is written.
+/// NEGATIVE CONTROL: with `Planner::address` keyed by `keys::address_pk` alone (as before), the
+/// sheet saying the new address births a second row: `` left: 1 right: 0 ``.
+#[test]
+fn a_sheet_matches_a_renamed_row_by_key_and_the_table_keeps_its_addr() {
+    let new_rows = |plan: &Plan| plan.counts.get(ADDRESS.name).map_or(0, |c| c.new_rows);
+    let first = vault(&[
+        ",ann@example.invalid,,,,,,,,,,,",
+        ",bob@example.invalid,,,,,,,,,,,",
+    ]);
+    let mut book = Book::new();
+    let one = plan(&input(std::slice::from_ref(&first), &[]), &Cells::new()).unwrap();
+    apply(&mut book, &one);
+    let ann = keys::address_pk("ann@example.invalid").unwrap();
+    let seen = book.all();
+    book.write(
+        2,
+        &seen,
+        vec![put(
+            &ADDRESS,
+            &ann,
+            "addr",
+            json!("ann.new@example.invalid"),
+        )],
+    );
+    let cells = book.cells();
+    // The sheet the row was born from, again.
+    let again = plan(&input(std::slice::from_ref(&first), &[]), &cells).unwrap();
+    assert_eq!(new_rows(&again), 0);
+    assert!(
+        again.findings.iter().any(|f| f.kind == Kind::OwnerKept
+            && f.pk.as_deref() == Some(ann.as_str())
+            && f.column.as_deref() == Some("addr")),
+        "{:?}",
+        again.findings
+    );
+    let after = apply(&mut book, &again);
+    assert_eq!(
+        cell::project(&ADDRESS, &after).rows[&ann].get("addr"),
+        Some(&json!("ann.new@example.invalid"))
+    );
+    // A sheet saying the new address.
+    let renamed = vault(&[
+        ",ann.new@example.invalid,,,,,,,,,,,",
+        ",bob@example.invalid,,,,,,,,,,,",
+    ]);
+    let next = plan(&input(&[renamed], &[]), &after).unwrap();
+    assert_eq!(new_rows(&next), 0);
+    let new = keys::address_pk("ann.new@example.invalid").unwrap();
+    assert!(next.planned.iter().all(|p| p.pk != new));
+    assert!(
+        !next
+            .findings
+            .iter()
+            .any(|f| f.kind == Kind::NoLongerListed && f.pk.as_deref() == Some(ann.as_str())),
+        "{:?}",
+        next.findings
+    );
+    // Two rows renamed onto one address no row is keyed by.
+    let (cy, dan) = (
+        keys::address_pk("cy@example.invalid").unwrap(),
+        keys::address_pk("dan@example.invalid").unwrap(),
+    );
+    let mut owned = Book::new();
+    owned.write(
+        2,
+        &[],
+        vec![
+            put(&ADDRESS, &cy, "addr", json!("same@example.invalid")),
+            put(&ADDRESS, &cy, "row", json!("live")),
+            put(&ADDRESS, &dan, "addr", json!("same@example.invalid")),
+            put(&ADDRESS, &dan, "row", json!("live")),
+        ],
+    );
+    let both = vault(&[",same@example.invalid,m3,,1,,,,,,,,"]);
+    let held = plan(&input(&[both], &[]), &owned.cells()).unwrap();
+    assert!(
+        kinds(&held).contains(&"address-ambiguous"),
+        "{:?}",
+        kinds(&held)
+    );
+    assert!(
+        held.planned
+            .iter()
+            .all(|p| p.collection != ADDRESS.name && p.collection != ACCOUNT.name),
+        "{:?}",
+        held.planned
+    );
+}
+
+/// A renamed row's account is keyed from the address the row says in the table, as the view and
+/// the harness name it: re-importing the sheet the row was born from, which still names its birth
+/// address and now gives it a Claude Code account, plans the account of the row's new address
+/// with that row as its login, and no account keyed from the address the row no longer says.
+/// NEGATIVE CONTROL: with `Planner::account` keyed from the sheet's address
+/// (`keys::account_pk(realm, address)`, as before), the new address's account is never planned:
+/// `` assertion `left == right` failed left: None right: Some(String("ad-…")) ``.
+#[test]
+fn a_renamed_row_s_account_is_keyed_from_the_address_the_table_says() {
+    let first = vault(&[",ann@example.invalid,,,,,,,,,,,"]);
+    let mut book = Book::new();
+    let one = plan(&input(std::slice::from_ref(&first), &[]), &Cells::new()).unwrap();
+    apply(&mut book, &one);
+    let ann = keys::address_pk("ann@example.invalid").unwrap();
+    let seen = book.all();
+    book.write(
+        2,
+        &seen,
+        vec![put(
+            &ADDRESS,
+            &ann,
+            "addr",
+            json!("ann.new@example.invalid"),
+        )],
+    );
+    let joined = vault(&[",ann@example.invalid,,,1,,,,,,,,"]);
+    let again = plan(&input(&[joined], &[]), &book.cells()).unwrap();
+    let new = keys::account_pk("claude", "ann.new@example.invalid").unwrap();
+    let old = keys::account_pk("claude", "ann@example.invalid").unwrap();
+    assert_eq!(planned(&again, "account", &new, "login"), Some(&json!(ann)));
+    assert!(
+        again.planned.iter().all(|p| p.pk != old),
+        "{:?}",
+        again.planned
+    );
+    let after = apply(&mut book, &again);
+    let view = crate::alab::view::LabView::read(
+        &after,
+        &crate::typed::owned::OwnedRead::default(),
+        &crate::typed::owned::OwnedRead::default(),
+        None,
+    );
+    let account = &view.accounts[&new];
+    assert_eq!(account.login.as_deref(), Some("ann.new@example.invalid"));
+}
+
 /// A stated file is named by its file name alone, and a name that names no file is refused.
 #[test]
 fn a_stated_file_is_named_by_its_file_name() {

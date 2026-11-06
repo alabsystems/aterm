@@ -25,7 +25,6 @@ pub(crate) fn start(state: PathBuf) {
                             drive: Some(aterm_agent::drive_fleet),
                             here: &|| aterm_ctl::resolve_sock_for(None).ok(),
                             own_node: &aterm_agent::fleet_node,
-                            stop: &|| false,
                         },
                     );
                 },

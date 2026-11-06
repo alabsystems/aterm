@@ -823,7 +823,7 @@ mod tests {
             panic!("a lease answers before the table is read")
         });
         assert!(matches!(busy, Busy::Leased { .. }), "{busy:?}");
-        drop(lease);
+        lease.release();
         let view = crate::seam::view_dir(&l, "trust");
         std::fs::create_dir_all(view.join("bin")).unwrap();
         let in_view = view.join("bin/targo");
@@ -839,7 +839,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(probe(&l, &live, &empty), Busy::Leased { .. }));
-        drop(lease);
+        lease.release();
         assert_eq!(probe(&l, &live, &empty), Busy::Quiet);
         let _ = std::fs::remove_dir_all(&l.prefix);
     }

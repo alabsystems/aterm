@@ -122,6 +122,48 @@ fn local_replica_retention_is_bounded_and_preserves_negative_evidence_before_dat
     );
 }
 
+/// A combined store's check reads its own claim after its primary's check, which can wait in a
+/// generation guard: a witness a writer advances during that wait is that check's to see, not the
+/// next one's.
+///
+/// NEGATIVE CONTROL (2026-11-05): with the claim read before `primary.check`, as it was, this fails
+/// at "the advance went unseen: Ok(())".
+#[test]
+fn a_witness_advanced_while_a_primary_is_checked_is_seen_by_that_check() {
+    let lab = Lab::new(&[Role::Writer]);
+    let bootstrap = lab.bootstrap(0);
+    let session = Session::open(&bootstrap).unwrap();
+    let original = lab._home.path().join("primary");
+    let scope = Store::create(&session, &original).unwrap().scope();
+    let recovery_path = bootstrap
+        .paths()
+        .dir
+        .join("commons/recovery/tables")
+        .join(aterm_codec::hex::encode_lower(&scope.digest()));
+    drop(Store::join_recovery(&session, &recovery_path, scope).unwrap());
+    let combined = Store::observe_recovery(&session, &recovery_path, scope)
+        .unwrap()
+        .with_observed_primary(
+            &session,
+            Store::observe(&session, &original, scope).unwrap(),
+        )
+        .unwrap();
+    combined.check(&session).unwrap();
+
+    let claim = combined.claim_dir.join(&combined.claim_name);
+    let mut advanced = std::fs::read(&claim).unwrap();
+    let count = Witness::decode(&advanced[WITNESS_AT..]).unwrap().count;
+    advanced[WITNESS_AT..WITNESS_AT + 8].copy_from_slice(&(count + 1).to_le_bytes());
+    let answer = with_primary_checked(
+        move || aterm_secrets::fsx::write_atomic(&claim, &advanced, 0o600).unwrap(),
+        || combined.check(&session),
+    );
+    assert!(
+        answer.as_ref().is_err_and(Error::is_busy),
+        "the advance went unseen: {answer:?}"
+    );
+}
+
 #[test]
 fn stronger_local_restrictions_and_positive_limits_do_not_block_negative_relay() {
     let lab = Lab::new(&[Role::Writer, Role::Writer, Role::Writer]);

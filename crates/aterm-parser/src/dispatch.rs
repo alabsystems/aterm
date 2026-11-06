@@ -628,7 +628,12 @@ impl Parser {
         sink.osc_dispatch_with_terminator(pty_wrap_ref(params.as_slice()), bel_terminated);
     }
 
-    /// Decode and dispatch a run of multi-byte UTF-8 characters.
+    /// Decode and dispatch a run of UTF-8 text that begins at a multi-byte lead: well-formed
+    /// multi-byte characters, and the printable ASCII between them where another lead follows
+    /// it ([`crate::utf8_simd::joinable_ascii_gap`]), as one `print` or `print_unicode_bulk`. A
+    /// line of words in another script reaches the sink as one run, not a call per word and per
+    /// space. The run ends at a control, at an ill-formed or incomplete sequence (its lead
+    /// starts the per-byte decoder, as before) and at `RUN_CAP` characters.
     #[inline(never)]
     fn decode_multibyte_run<S: ActionSink>(
         &mut self,
@@ -636,7 +641,7 @@ impl Parser {
         remaining: &[u8],
         sink: &mut S,
     ) -> usize {
-        let mut chars: ArrayVec<char, 256> = ArrayVec::new();
+        let mut chars: ArrayVec<char, { crate::utf8_simd::RUN_CAP }> = ArrayVec::new();
         let orig_len = remaining.len();
         let mut rem = remaining;
 
@@ -671,6 +676,16 @@ impl Parser {
                         }
                     }
                 }
+                Some(_) if self.joins_ascii() => {
+                    let gap = crate::utf8_simd::joinable_ascii_gap(rem, chars.remaining_capacity());
+                    if gap == 0 {
+                        break;
+                    }
+                    for &byte in rem.get(..gap).unwrap_or(&[]) {
+                        chars.push(char::from(byte));
+                    }
+                    rem = rem.get(gap..).unwrap_or(&[]);
+                }
                 _ => break,
             }
         }
@@ -682,6 +697,27 @@ impl Parser {
         }
 
         orig_len.saturating_sub(rem.len())
+    }
+
+    /// Whether a multi-byte run joins the printable ASCII between its characters: always, but
+    /// for a parser on the reference path ([`Parser::set_reference_runs`]).
+    #[inline]
+    #[cfg_attr(
+        not(any(test, debug_assertions)),
+        expect(
+            clippy::unused_self,
+            reason = "the reference path, the one reader of `self`, exists only in test and debug builds"
+        )
+    )]
+    const fn joins_ascii(&self) -> bool {
+        #[cfg(any(test, debug_assertions))]
+        {
+            !self.reference_runs
+        }
+        #[cfg(not(any(test, debug_assertions)))]
+        {
+            true
+        }
     }
 
     /// Decode one multi-byte UTF-8 character from `lead` plus the prefix of `rem`.

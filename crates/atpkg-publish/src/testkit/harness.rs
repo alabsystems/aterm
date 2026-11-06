@@ -261,6 +261,8 @@ fn main() {{
     // Counter/barrier paths live outside the checkout and are committed as
     // source. Counter writes preserve the pre-created namespace. The live
     // writer/cancellation barriers test custody rather than warm enrollment.
+    // Each barrier the probe polls for appears whole through note() (a
+    // temporary write, then a rename), so a poll never reads it half-written.
     let script = format!(
         r#"
 use std::{{io::Write as _,path::PathBuf,process::{{Command,Stdio}},time::{{Duration,Instant}}}};
@@ -308,13 +310,12 @@ fn main() {{
  }}
  if phase=="failure" {{ panic!("actual intended build failure"); }}
  if phase=="cancel" {{
-  std::fs::write(root.join("cancel.ready"),format!("pid={{}}\n",std::process::id())).unwrap();
+  note(&root,"cancel.ready",&format!("pid={{}}\n",std::process::id()));
   let end=Instant::now()+Duration::from_secs(60);
   while !root.join("cancel.release").exists() {{
    if let Ok(nonce)=std::fs::read_to_string(root.join("cancel.challenge")) {{
     if !root.join("cancel.alive").exists() {{
-     std::fs::write(root.join(".cancel.alive.pending"),format!("pid={{}}\nnonce={{nonce}}\n",std::process::id())).unwrap();
-     std::fs::rename(root.join(".cancel.alive.pending"),root.join("cancel.alive")).unwrap();
+     note(&root,"cancel.alive",&format!("pid={{}}\nnonce={{nonce}}\n",std::process::id()));
     }}
    }}
    assert!(Instant::now()<end,"native cancellation fixture was not released"); std::thread::sleep(Duration::from_millis(10));

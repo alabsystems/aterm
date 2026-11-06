@@ -266,8 +266,14 @@ impl Exception {
 
     /// Whether the agent working on a busy screen ends this exception, `at_break` a break of its
     /// own background work: every exception ends so but the refusal of the standing go-ahead
-    /// ([`Self::refuses_go_ahead`]) at such a break, where the refusal is told and nothing is
-    /// typed ([`super::turn_end::GO_AHEAD_REFUSED`]).
+    /// ([`Self::refuses_go_ahead`]) at such a break. There, where the carry can go (Cruise, the
+    /// continuation on, an unattended run, a window host), answers are on and no continuation a
+    /// `/compact` owes goes first, a park still spent records the refusal
+    /// (`recovering:go-ahead-refused`, [`super::turn_end::GO_AHEAD_REFUSED`];
+    /// `Session::break_go_ahead`) unless the window's host withholds the session's decisions,
+    /// where no refusal is recorded and nothing is typed; the carry's change of approach goes in
+    /// the go-ahead's place where its ladder, its budget and the write's guards let it
+    /// (`Session::cruise_carry`).
     #[must_use]
     pub fn ends_at_work(&self, at_break: bool) -> bool {
         !(at_break && self.why == REFUSES_GO_AHEAD)

@@ -1244,15 +1244,15 @@ impl<M: Machine> Core<M> {
             w.ready(now);
         }
         self.phase = Phase::Ready;
-        note!(
-            "ready: {}{}",
-            ready.state,
-            if ready.failed_units.is_empty() {
-                String::new()
-            } else {
-                format!(", failed: {}", ready.failed_units.join(" "))
-            }
-        );
+        if ready.failed_units.is_empty() {
+            note!("ready: {}", ready.state);
+        } else {
+            note!(
+                "ready: {}, failed: {}",
+                ready.state,
+                ready.failed_units.join(" ")
+            );
+        }
         self.failed_units = ready.failed_units;
         self.broadcast(&Reply::Ready(hello));
         Flow::Go
@@ -1734,9 +1734,10 @@ pub fn take(paths: &Paths, ident: &Ident, pids: &dyn Pids) -> Result<Held, Strin
         boot_id: None,
         agent_sha256: None,
     };
+    let record_path = paths.record();
     record
-        .write(&paths.record())
-        .map_err(|e| format!("the record {}: {e}", paths.record().display()))?;
+        .write(&record_path)
+        .map_err(|e| format!("the record {}: {e}", record_path.display()))?;
     Ok(Held {
         lock,
         listener,
@@ -1755,11 +1756,12 @@ pub fn previous_console(console_log: &Path) -> PathBuf {
 /// still `record`'s (a lab that saw its session end reads no record of this helper), and
 /// the key disk whoever's record is there, since this helper wrote it under the lock.
 pub fn release_run_files(paths: &Paths, record: &Record, socket: &Path) {
-    let ours = Record::read(&paths.record()).is_some_and(|r| {
+    let record_path = paths.record();
+    let ours = Record::read(&record_path).is_some_and(|r| {
         r.pid == record.pid && r.uniq == record.uniq && r.birth_us == record.birth_us
     });
     if ours {
-        let _ = std::fs::remove_file(paths.record());
+        let _ = std::fs::remove_file(&record_path);
         let _ = std::fs::remove_file(socket);
     }
     let _ = std::fs::remove_file(paths.key_disk());

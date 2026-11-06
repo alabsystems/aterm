@@ -1943,13 +1943,18 @@ impl<'a> Sim<'a> {
 // ---------------------------------------------------------------------------------------------
 // The builder
 
-/// Each roster row's plan as seen: the series' newest `plan` row, else the renewal's word, with
-/// the multiple it names ([`Plan::named`]); [`Plan::m`] is filled in by the builder.
-fn plans_of(inputs: &Inputs<'_>) -> BTreeMap<String, Plan> {
+/// Each row of `roster`'s plan as seen: its `series`' newest `plan` row, else its renewal's word
+/// (`renewals`, [`renewals_of`]), with the multiple it names ([`Plan::named`]); [`Plan::m`] is 1,
+/// and the outlook's builder fills it in. A row neither names has none.
+#[must_use]
+pub fn plans_seen(
+    roster: &Roster,
+    series: &BTreeMap<String, Vec<SeriesRow>>,
+    renewals: &BTreeMap<String, String>,
+) -> BTreeMap<String, Plan> {
     let mut out = BTreeMap::new();
-    for row in &inputs.roster.rows {
-        let said = inputs
-            .series
+    for row in &roster.rows {
+        let said = series
             .get(&row.label)
             .and_then(|rows| {
                 let plan = account_series::newest_plan(rows)?;
@@ -1968,7 +1973,7 @@ fn plans_of(inputs: &Inputs<'_>) -> BTreeMap<String, Plan> {
                 })
             })
             .or_else(|| {
-                let word = inputs.renewals.get(&row.label)?.to_ascii_lowercase();
+                let word = renewals.get(&row.label)?.to_ascii_lowercase();
                 Some(Plan {
                     m: 1,
                     named: multiple_of(&word, None),
@@ -2255,7 +2260,7 @@ fn build(
     let now = inputs.now;
     let state = inputs.state;
     let roster = inputs.roster;
-    let plans = plans_of(inputs);
+    let plans = plans_seen(inputs.roster, inputs.series, inputs.renewals);
     let choice = carrier_of(inputs);
     let carrier = choice.ok();
     let carrier_label = carrier.map(|r| r.label.clone());

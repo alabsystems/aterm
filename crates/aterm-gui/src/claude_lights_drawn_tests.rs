@@ -772,7 +772,15 @@ fn a_chip_the_rule_did_not_take_names_no_cells() {
     w.note_autopilot(7, None, AutopilotView::Cruise, now);
     w.clear_hits();
     let block = w
-        .lend_block(7, 0, blank, [0, 128, 255], (None, None), (40, true), None)
+        .lend_block(
+            7,
+            0,
+            blank,
+            super::super::ChipAt::cruise(blank),
+            (None, None),
+            (40, true),
+            None,
+        )
         .expect("a chip fits in 40 cells");
     w.give_back(block);
     assert_eq!(
@@ -810,8 +818,16 @@ fn a_chip_the_rule_did_not_take_names_no_cells() {
     w.note_autopilot(8, None, AutopilotView::Unhosted, now);
     w.clear_hits();
     assert!(
-        w.lend_block(8, 0, blank, [0, 128, 255], (None, None), (40, true), None)
-            .is_none(),
+        w.lend_block(
+            8,
+            0,
+            blank,
+            super::super::ChipAt::cruise(blank),
+            (None, None),
+            (40, true),
+            None
+        )
+        .is_none(),
         "control: no host, no chip"
     );
     assert_eq!(w.drawn_chip(8, 0, shown), Drawn::NoHost);

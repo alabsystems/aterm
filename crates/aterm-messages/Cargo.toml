@@ -10,7 +10,7 @@ version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm's unified message engine — the platform-neutral model, glass policy, single-row width law, tagged log ring and line codec behind the message band, the Settings ▸ Messages page and the `messages`/`notice` verbs; and the needs border, pill and tab marks' core (the published need, story, levels, pill words, tones); the host paints cells, appends the file, performs intents and senses the presence facts."
+description = "aterm's unified message engine — the platform-neutral model, glass policy, single-row width law, tagged log ring and line codec behind the message band, the Settings ▸ Messages page and the `messages`/`notice` verbs; and the tab marks' core (the published need, story and levels); the host paints cells, appends the file, performs intents and senses the presence facts."
 
 [dependencies]
 # `Instant` is std's on native and a JS clock on wasm32. Every method that

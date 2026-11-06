@@ -9,10 +9,13 @@ fn data_files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     every_file(root)
         .into_iter()
         .filter(|(path, _)| {
-            !matches!(
-                path.file_name().and_then(|name| name.to_str()),
-                Some("accounts.lock" | "signin.lock")
-            )
+            !path
+                .components()
+                .any(|component| component.as_os_str() == "signin-queue")
+                && !matches!(
+                    path.file_name().and_then(|name| name.to_str()),
+                    Some("accounts.lock" | "signin.lock")
+                )
         })
         .collect()
 }
@@ -58,6 +61,8 @@ fn accounts_add_refuses_a_directory_retained_by_another_label() {
                     label: "work".into(),
                     ..accounts::Row::default()
                 },
+                &|| true,
+                &mut |_| {},
             );
             assert!(
                 result.is_err(),
@@ -221,7 +226,16 @@ fn creation_case(case: i64, cli: Cli) -> (i64, i64, i64) {
             code: Some(0),
         })
     };
-    let host = FakeHost::new(&status);
+    let cancelled = std::cell::Cell::new(false);
+    let observations = std::cell::Cell::new(0);
+    let queued = |_: accounts::SigninPosition| {
+        observations.set(observations.get() + 1);
+        cancelled.set(true);
+    };
+    let closed = || cancelled.get();
+    let mut host = FakeHost::new(&status);
+    host.queued = Some(&queued);
+    host.cancelled = Some(&closed);
     let row = accounts::Row {
         label: "work".into(),
         email: Some("new@example.test".into()),
@@ -234,11 +248,13 @@ fn creation_case(case: i64, cli: Cli) -> (i64, i64, i64) {
     };
     let mut out = Vec::new();
     let mut err = Vec::new();
-    // A lock a case holds stays held for the whole verb, so its stores refuse at the first
-    // take: the refusal and the files it leaves are the subject, not the ladder's pauses.
+    // A held signer remains held while the manual request observes its actual
+    // queue place and is cancelled. No account writer or provider is admitted.
     let success = accounts::with_store_ladder(&[], || {
         if adding {
-            let result = accounts_add(cli, &env, &row);
+            let result = accounts_add(cli, &env, &row, &|| !cancelled.get(), &mut |position| {
+                queued(position)
+            });
             if let Err(why) = &result {
                 err.extend_from_slice(why.as_bytes());
             }
@@ -248,6 +264,7 @@ fn creation_case(case: i64, cli: Cli) -> (i64, i64, i64) {
                 == ExitCode::SUCCESS
         }
     });
+    assert_eq!(observations.get(), usize::from(matches!(case, 20 | 29)));
     let after = data_files(tmp.path());
     let before = before.into_inner();
     if !success {
@@ -322,6 +339,10 @@ fn new_labels_conform_to_retained_state_and_signin_exclusion() {
     let model = aterm_models_harness::account_create_label_model();
     assert_eq!(model.mutant_dials(), (1..=32).collect::<Vec<_>>());
     assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
+    if accounts::manual_signin_capability() == accounts::ManualSigninCapability::Unavailable {
+        creation_unavailable_writes_nothing(Cli::Claude);
+        return;
+    }
     let mut checked = 0;
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
@@ -344,8 +365,39 @@ fn new_labels_conform_to_retained_state_and_signin_exclusion() {
     assert!(!model.check_invariant("RetainedLabelsRefused", &bad));
 }
 
+fn creation_unavailable_writes_nothing(cli: Cli) {
+    let tmp = tmp_dir("manual-creation-unavailable");
+    let env = env_at(&tmp);
+    let before = every_file(tmp.path());
+    assert!(
+        accounts_add(
+            cli,
+            &env,
+            &accounts::Row {
+                label: "new".into(),
+                email: Some("new@example.test".into()),
+                ..accounts::Row::default()
+            },
+            &|| true,
+            &mut |_| panic!("unsupported admission cannot publish a queue position")
+        )
+        .is_err()
+    );
+    assert_eq!(
+        every_file(tmp.path()),
+        before,
+        "unavailable creation edits no roster, state or retained login"
+    );
+}
+
 #[test]
 fn each_provider_refuses_retained_labels_and_accepts_unrelated_records() {
+    if accounts::manual_signin_capability() == accounts::ManualSigninCapability::Unavailable {
+        for cli in Cli::ALL {
+            creation_unavailable_writes_nothing(cli);
+        }
+        return;
+    }
     for cli in Cli::ALL {
         for case in [1, 2, 4, 18, 19, 26, 27, 28] {
             let result = creation_case(case, cli);

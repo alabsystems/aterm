@@ -1710,6 +1710,7 @@ fn a_runs_record_roots_are_the_dirs_its_build_names() {
             "the run's child environment"
         );
         crate::exec::Run {
+            stopped_at: None,
             ok: true,
             output: format!(
                 "targo: a lane banner\n{{\"target_directory\":\"{}\",\
@@ -1800,6 +1801,7 @@ fn a_stage_groups_line_is_bounded_whatever_its_label() {
         PathBuf::from("/tmp/atv-s"),
     );
     let runs = Runs::open(&ctx, dir.path(), |_, _| crate::exec::Run {
+        stopped_at: None,
         ok: false,
         output: String::new(),
         code: None,
@@ -2211,6 +2213,7 @@ fn a_real_stage_that_leaves_nothing_is_recorded_closed() {
         PathBuf::from("/tmp/atv-s"),
     );
     let runs = Runs::open(&ctx, dir.path(), |_, _| crate::exec::Run {
+        stopped_at: None,
         ok: false,
         output: String::new(),
         code: None,
@@ -2291,6 +2294,7 @@ fn a_closed_line_lands_on_the_group_its_sweep_proved_empty() {
         PathBuf::from("/tmp/atv-s"),
     );
     let runs = Runs::open(&ctx, dir.path(), |_, _| crate::exec::Run {
+        stopped_at: None,
         ok: false,
         output: String::new(),
         code: None,
@@ -2878,6 +2882,7 @@ fn the_default_poster_is_inert() {
         PathBuf::from("/tmp/atv-s"),
     );
     let runs = Runs::open(&ctx, dir.path(), |_, _| crate::exec::Run {
+        stopped_at: None,
         ok: false,
         output: String::new(),
         code: None,

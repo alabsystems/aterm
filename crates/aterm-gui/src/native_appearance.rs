@@ -614,15 +614,74 @@ pub(crate) fn at_least_as_open_as(color: [u8; 3], floor: [u8; 3]) -> [u8; 3] {
     ensure_contrast(color, [0, 0, 0], contrast_ratio(floor, [0, 0, 0]))
 }
 
-/// Build the native palette.
+/// Everything [`solve_roles`] reads: one key has one palette, whenever it is asked for.
+#[derive(Clone, Copy, PartialEq)]
+struct RolesKey {
+    theme: Theme,
+    /// What [`crate::chrome_band::ChromePalette::tokens`] derives from.
+    seeds: aterm_messages::tokens::ChromeSeeds,
+    preferences: AppearancePreferences,
+    control: Option<SystemAccent>,
+}
+
+/// The palettes a thread keeps solved: a window's chrome, the default theme each text and icon
+/// measure paints by ([`crate::native_ui::words_bands`]), a page's theme and the previews'.
+const ROLES_KEPT: usize = 6;
+
+/// A thread's kept palettes, oldest overwritten first.
+struct KeptRoles {
+    solved: Vec<(RolesKey, NativeRoles)>,
+    next: usize,
+}
+
+thread_local! {
+    static KEPT_ROLES: std::cell::RefCell<KeptRoles> = const {
+        std::cell::RefCell::new(KeptRoles { solved: Vec::new(), next: 0 })
+    };
+}
+
+/// Build the native palette. Its contrast searches cost more than the paint or measure that asks
+/// for it, and a page asks once a control, so each thread keeps the last [`ROLES_KEPT`] by all
+/// they read ([`RolesKey`]).
 pub(crate) fn roles(
     p: impl Into<crate::chrome_band::ChromePalette>,
     preferences: AppearancePreferences,
 ) -> NativeRoles {
     let p = p.into();
+    let preferences = preferences.normalized();
+    let control = control_accent();
+    let key = RolesKey {
+        theme: p.theme,
+        seeds: p.seeds(),
+        preferences,
+        control,
+    };
+    KEPT_ROLES.with_borrow_mut(|kept| {
+        if let Some((_, solved)) = kept.solved.iter().find(|(at, _)| *at == key) {
+            return *solved;
+        }
+        let solved = solve_roles(p, preferences, control);
+        if kept.solved.len() < ROLES_KEPT {
+            kept.solved.push((key, solved));
+        } else {
+            let next = kept.next;
+            kept.solved[next] = (key, solved);
+            kept.next = (next + 1) % ROLES_KEPT;
+        }
+        solved
+    })
+}
+
+/// The native palette of `p` under normalized `preferences` and the OS's `control` accent.
+fn solve_roles(
+    p: crate::chrome_band::ChromePalette,
+    preferences: AppearancePreferences,
+    control: Option<SystemAccent>,
+) -> NativeRoles {
+    #[cfg(test)]
+    crate::work_counts::roles_solved();
     let theme = p.theme;
     let tokens = p.tokens();
-    let preferences = preferences.normalized();
     let bg = packed_rgb(theme.bg);
     let fg = packed_rgb(theme.fg);
     let selection = packed_rgb(theme.selection);
@@ -687,7 +746,7 @@ pub(crate) fn roles(
         white
     };
     let on_accent = ensure_contrast(on_seed, accent, 4.5);
-    let control_accent = control_accent()
+    let control_accent = control
         .or(CONTROL_ACCENT_DEFAULT)
         .map_or(accent, |os| os.for_surface(bg));
 
@@ -1106,6 +1165,147 @@ pub(crate) fn ensure_contrast_on(fg: [u8; 3], grounds: &[[u8; 3]], target: f32) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE KEPT PALETTE IS THE ONE A SOLVE GIVES: whatever a thread asked before, [`roles`]
+    /// answers what [`solve_roles`] answers now, across each thing a solve reads (each theme
+    /// colour, the ANSI hues, the authored accent and border, the preferences, the OS and control
+    /// accents). Each
+    /// asked palette differs from the first in one of them and solves apart from it, and is read
+    /// straight after it and before it, so a key blind to that reading answers for the other. Asked
+    /// again unchanged it solves nothing, and it keeps no more than [`ROLES_KEPT`].
+    /// NEGATIVE CONTROL (2026-11-05): with the key blind to the theme (a default theme in its place)
+    /// this fired "the palette kept under another reading" on the selection colour's case; blind to
+    /// the seeds, on the ANSI hues' case; blind to the authored border alone, on that border's; blind
+    /// to the preferences, on high contrast's; blind to the control accent, on that accent's. With a
+    /// kept palette never found it fired "asked again it solves nothing" (left 1, right 0), and with
+    /// every solve kept "it keeps what it may, no more" (left 11, right 6).
+    #[test]
+    fn a_kept_palette_is_the_one_a_solve_gives() {
+        use aterm_messages::ink::AnsiHues;
+        use aterm_messages::tokens::AuthoredChrome;
+
+        use crate::chrome_band::ChromePalette;
+        // Palette, preferences, the OS's accent and the control's.
+        type Asked = (
+            ChromePalette,
+            AppearancePreferences,
+            Option<SystemAccent>,
+            Option<SystemAccent>,
+        );
+        let grey = Theme {
+            cursor: 0x0080_8080,
+            ..Theme::default()
+        };
+        let plain = ChromePalette::from(grey);
+        let accent = SystemAccent {
+            on_dark: [0xFF, 0x9F, 0x0A],
+            on_light: [0x95, 0x3D, 0x96],
+        };
+        let hues = AnsiHues {
+            red: [0xF0, 0x30, 0x30],
+            green: [0x30, 0xF0, 0x30],
+            yellow: [0xF0, 0xF0, 0x30],
+            blue: [0x30, 0x70, 0xF0],
+            cyan: [0x30, 0xF0, 0xF0],
+        };
+        let base = AppearancePreferences::default();
+        let palette_of = |palette: ChromePalette| -> Asked { (palette, base, None, None) };
+        let themed = |theme: Theme| palette_of(ChromePalette { theme, ..plain });
+        let asked: Vec<Asked> = vec![
+            palette_of(plain),
+            themed(Theme {
+                fg: 0x00FF_FFFF,
+                ..grey
+            }),
+            themed(Theme {
+                bg: 0x0030_1018,
+                ..grey
+            }),
+            themed(Theme {
+                cursor: 0x00FF_3060,
+                ..grey
+            }),
+            themed(Theme {
+                selection: 0x00E0_40A0,
+                ..grey
+            }),
+            palette_of(ChromePalette {
+                ansi: Some(hues),
+                ..plain
+            }),
+            palette_of(ChromePalette {
+                authored: AuthoredChrome {
+                    accent: Some([0x10, 0xC0, 0x90]),
+                    ..AuthoredChrome::NONE
+                },
+                ..plain
+            }),
+            palette_of(ChromePalette {
+                authored: AuthoredChrome {
+                    border: Some([0xC0, 0x30, 0x90]),
+                    ..AuthoredChrome::NONE
+                },
+                ..plain
+            }),
+            (
+                plain,
+                AppearancePreferences {
+                    high_contrast: true,
+                    ..base
+                },
+                None,
+                None,
+            ),
+            (plain, base, Some(accent), None),
+            (plain, base, None, Some(accent)),
+        ];
+        assert!(
+            asked.len() > ROLES_KEPT,
+            "the asking overflows what is kept"
+        );
+        let set = |(_, _, system, control): &Asked| {
+            let _ = install_system_accent(*system);
+            let _ = install_control_accent(*control);
+        };
+        let answers: Vec<NativeRoles> = asked
+            .iter()
+            .map(|asked| {
+                set(asked);
+                solve_roles(asked.0, asked.1.normalized(), control_accent())
+            })
+            .collect();
+        for (at, answer) in answers.iter().enumerate().skip(1) {
+            assert_ne!(*answer, answers[0], "it moves the palette: {:?}", asked[at]);
+        }
+        for at in 0..asked.len() {
+            for each in [0, at, at, 0] {
+                set(&asked[each]);
+                assert_eq!(
+                    roles(asked[each].0, asked[each].1),
+                    answers[each],
+                    "the palette kept under another reading: {:?}",
+                    asked[each]
+                );
+            }
+        }
+        KEPT_ROLES.with_borrow(|kept| {
+            assert_eq!(
+                kept.solved.len(),
+                ROLES_KEPT,
+                "it keeps what it may, no more"
+            );
+        });
+        set(&asked[0]);
+        let first = roles(plain, base);
+        let _ = crate::work_counts::take_roles_solved();
+        assert_eq!(roles(plain, base), first);
+        assert_eq!(
+            crate::work_counts::take_roles_solved(),
+            0,
+            "asked again it solves nothing"
+        );
+        let _ = take_chrome_inputs_moved();
+    }
 
     #[test]
     fn the_accessibility_seam_turns_on_what_it_names_and_nothing_else() {

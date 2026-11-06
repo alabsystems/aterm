@@ -45,9 +45,14 @@ fn path(module: &[String]) -> PathBuf {
     p
 }
 fn key(it: &Item) -> String {
-    [it.module.clone(), vec![it.name.clone()]]
-        .concat()
-        .join("::")
+    let cap = it.module.iter().map(|s| s.len() + 2).sum::<usize>() + it.name.len();
+    let mut out = String::with_capacity(cap);
+    for seg in &it.module {
+        out.push_str(seg);
+        out.push_str("::");
+    }
+    out.push_str(&it.name);
+    out
 }
 fn recordable(it: &Item) -> bool {
     it.arch.is_empty() && ["struct", "union", "const"].contains(&it.kind.as_str())
@@ -110,10 +115,17 @@ pub fn crate_files(
         };
         let mut text = header(&files, &count, &"../".repeat(m.len()));
         writeln!(text, "\n//! `{}`.\n", m.join("::")).unwrap();
+        let mut child_path = Vec::with_capacity(m.len() + 1);
+        child_path.extend(m.iter().cloned());
         let kids: Vec<_> = module
             .children
             .iter()
-            .filter(|(n, _)| needed.contains(&[m.clone(), vec![n.clone()]].concat()))
+            .filter(|(n, _)| {
+                child_path.push(n.clone());
+                let keep_child = needed.contains(&child_path);
+                child_path.pop();
+                keep_child
+            })
             .collect();
         for (n, _) in &kids {
             writeln!(text, "pub mod {n};").unwrap()
@@ -122,7 +134,7 @@ pub fn crate_files(
             text.push('\n')
         }
         let mut variants: Vec<_> = mine.iter().flat_map(|k| up.variants(k, enabled)).collect();
-        variants.sort_by_key(|it| it.order);
+        variants.sort_unstable_by_key(|it| it.order);
         for it in variants {
             attrs(&mut text, &it.arch);
             attrs(&mut text, &it.other);
@@ -577,7 +589,7 @@ pub fn recorded_tests(up: &Upstream, variants: &[&Item], data: &Value) -> Result
                 number(r, "align")?
             ));
             let mut fs = recorded_offsets(it, r)?;
-            fs.sort_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)));
+            fs.sort_unstable_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)));
             for (n, o) in fs {
                 rows.push(format!("assert!(offset_of!({p}, {n}) == {o});"));
             }

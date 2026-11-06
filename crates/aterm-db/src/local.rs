@@ -674,12 +674,11 @@ impl Database {
                 ));
             }
             if let Some(changes) = command.changes() {
+                let mut key_pair = (String::new(), String::new());
                 for change in changes {
-                    if view
-                        .cells
-                        .get(&(change.collection.clone(), change.key.clone()))
-                        .is_some_and(|cell| cell.stopped)
-                    {
+                    key_pair.0.clone_from(&change.collection);
+                    key_pair.1.clone_from(&change.key);
+                    if view.cells.get(&key_pair).is_some_and(|cell| cell.stopped) {
                         return Err(Error::new(
                             "object generation stopped; use a new object key",
                         ));

@@ -2,9 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! The paths a build stamp is of, one rule for every producer that probes a work tree for a
-//! commit stamp's `-dirty`: aterm's, aterm-bench's and aterm-lab's build scripts, the lab's
-//! Windows build facts, `verify perf`'s pinned git facts and `ship dev-app`'s pinned stamp,
-//! each of which mounts this file by `#[path]`. A release cut and its handoff fixtures pin
+//! commit stamp's `-dirty`: aterm's and aterm-bench's build scripts, the lab's commit (read when
+//! it runs) and its Windows build facts, `verify perf`'s pinned git facts and `ship dev-app`'s
+//! pinned stamp, each of which mounts this file by `#[path]`. A release cut and its handoff fixtures pin
 //! `ATERM_BUILD_GIT_COMMIT` to a commit they build, never `-dirty`, so they ask no work tree.
 //!
 //! A stamp is dirty when `git status --porcelain` over [`PATHSPEC`] prints anything: a tracked

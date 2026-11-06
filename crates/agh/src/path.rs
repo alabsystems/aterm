@@ -10,6 +10,13 @@ use crate::error::{Error, Result};
 const UPPER: &[u8; 16] = b"0123456789ABCDEF";
 
 pub(crate) fn encode_into(out: &mut String, text: &str) {
+    if text
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'))
+    {
+        out.push_str(text);
+        return;
+    }
     for b in text.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
             out.push(char::from(b));

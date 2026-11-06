@@ -210,10 +210,59 @@ fn history_image_removal_releases_ring_and_cached_staged_payloads() {
         } else {
             assert!(grid.storage.ring_extras.retained_bytes() < bytes);
         }
-        // Full-screen scroll's O(1) extras offset can retain off-grid cell references
-        // until its next compaction; those are separate from the history's custody.
-        drop(grid);
-        assert_eq!(Arc::strong_count(&image), 1);
+        assert_eq!(
+            Arc::strong_count(&image),
+            1,
+            "the scroll kept no off-grid cell reference of its own"
+        );
+    }
+}
+
+/// A full-screen scroll hands an image row to history and keeps no reference of its own, so once
+/// history lets the picture go nothing holds it: whether the ring grows, recycles its oldest row
+/// into the store, recycles it with no store, or the grid keeps no history at all, one row at a
+/// time or several.
+#[test]
+fn a_picture_scrolled_off_the_screen_is_held_by_history_alone() {
+    let ring_only = |ring| Grid::with_scrollback(4, 20, ring);
+    let tiered = |ring| {
+        Grid::with_tiered_scrollback(4, 20, ring, aterm_scrollback::Scrollback::with_defaults())
+    };
+    let cases: [(&str, Grid, usize); 6] = [
+        ("no history", ring_only(0), 1),
+        ("a full two-row ring", ring_only(2), 1),
+        ("a full two-row ring, three rows at once", ring_only(2), 3),
+        ("a store behind no ring", tiered(0), 1),
+        ("a growing ring", tiered(128), 1),
+        ("a full ring over a store, three rows at once", tiered(2), 3),
+    ];
+    for (what, mut grid, rows_per_scroll) in cases {
+        let mut pictures = Vec::new();
+        for _ in 0..6 {
+            let image = placement(1, 20);
+            stamp(&mut grid, 0, &image, 0, 20);
+            grid.scroll_up(rows_per_scroll);
+            pictures.push(image);
+        }
+        for (n, image) in pictures.iter().enumerate() {
+            let in_history = grid
+                .history_images()
+                .filter(|span| Arc::ptr_eq(&span.image, image))
+                .count();
+            assert_eq!(
+                Arc::strong_count(image),
+                1 + in_history,
+                "{what}: picture {n} is held by {in_history} history row(s) and nothing else"
+            );
+        }
+        grid.retain_history_images(&mut |_| false);
+        for (n, image) in pictures.iter().enumerate() {
+            assert_eq!(
+                Arc::strong_count(image),
+                1,
+                "{what}: picture {n} outlived its history"
+            );
+        }
     }
 }
 

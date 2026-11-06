@@ -744,8 +744,7 @@ impl LineInks {
         y_bg: f32,
         at: f32,
     ) -> u32 {
-        let step =
-            ((at.clamp(0.0, 1.0) * LINE_INK_STEPS as f32).round() as usize).min(LINE_INK_STEPS);
+        let step = line_ink_step(at);
         if self.key == Some((palette, ground)) {
             self.ink[step]
         } else {
@@ -753,6 +752,18 @@ impl LineInks {
             LINE_INK_SOLVES.with(|n| n.set(n.get() + 1));
             palette.text_at_with_bg_lum(table, step as f32 * Self::INV_LINE_INK_STEPS, y_bg)
         }
+    }
+}
+
+/// The step of [`LineInks`]' table a light-ground line letter at palette position `at` is read
+/// at.
+#[inline]
+const fn line_ink_step(at: f32) -> usize {
+    let step = (at.clamp(0.0, 1.0) * LINE_INK_STEPS as f32).round() as usize;
+    if step < LINE_INK_STEPS {
+        step
+    } else {
+        LINE_INK_STEPS
     }
 }
 
@@ -866,6 +877,33 @@ impl CardPalette {
             line_floor(table, self.letter_dark_with(table, t), lg)
         } else {
             self.text_at_with_bg_lum(table, t, lg)
+        }
+    }
+
+    /// Returns the hero word's settled letter at `k` across it (`0.0..=1.0`) against `ground`
+    /// (`0x00RRGGBB`): the ink the launch card's status line gives its hero at rest
+    /// ([`HarnessCard::line_ink_into`] at the settled clock), `tri(k)` of the palette, on a dark
+    /// ground lifted to the hero's luma floor and floored along its hue to 4.5:1, on paper the
+    /// print law's ink.
+    #[must_use]
+    #[inline]
+    pub const fn hero_on(self, k: f32, ground: u32) -> u32 {
+        let ground = ground & 0x00FF_FFFF;
+        let table = crate::color_math::relative_luminance_table();
+        let lg = crate::color_math::relative_luminance_with(table, ground);
+        let place = tri(k * LINE_HERO_SPREAD + PHI_SETTLED);
+        if lg < 0.5 {
+            line_floor(
+                table,
+                lift_to_luminance_with(table, self.at(place), LINE_HERO_DARK_LUMA_FLOOR),
+                lg,
+            )
+        } else {
+            self.text_at_with_bg_lum(
+                table,
+                line_ink_step(place) as f32 * LineInks::INV_LINE_INK_STEPS,
+                lg,
+            )
         }
     }
 

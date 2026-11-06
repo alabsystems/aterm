@@ -57,7 +57,7 @@ impl Verdict {
 ///
 /// could_not_run, `Sub::Local`, for a path whose entry cannot be looked at (the real run's
 /// journal would meet it too); `Github::journal`'s errors.
-fn readable_journal(w: &Write<'_>) -> Result<Box<dyn IntentStore>> {
+pub(super) fn readable_journal(w: &Write<'_>) -> Result<Box<dyn IntentStore>> {
     let taped = w.gh.fx().mode().is_taped();
     let there = match w.gh.dirs() {
         Some(dirs) if !taped => {

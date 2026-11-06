@@ -294,7 +294,9 @@ impl Registry {
                         "the registry's history here is incomplete; seeds wait for a complete scan",
                     ));
                 }
-                for changes in pack(seeds::rows_for(&view.cells)?)? {
+                let packed = pack(seeds::rows_for(&view.cells)?)?;
+                let packed_len = packed.len();
+                for (index, changes) in packed.into_iter().enumerate() {
                     let request = typed::request_id(APPLICATION, compiled.table.role, &changes)?;
                     let command = Command::Write { request, changes };
                     if log.retry(session.actor(), &command)?.is_some() {
@@ -309,9 +311,11 @@ impl Registry {
                     }
                     application::append(session, store, &command.encode()?)?;
                     seeded.records += 1;
-                    // Re-read before admitting another append (`Log::append_records_bound`).
-                    log = Log::read_with(session, store, scope, decode)?;
-                    view = View::read(compiled.table, session, &log);
+                    if index + 1 < packed_len {
+                        // Re-read before admitting another append (`Log::append_records_bound`).
+                        log = Log::read_with(session, store, scope, decode)?;
+                        view = View::read(compiled.table, session, &log);
+                    }
                 }
                 Ok(seeded)
             },
@@ -449,7 +453,8 @@ impl Registry {
     /// `mailbox-obs` row and the birth of the address being signed in, in one record within
     /// discovery's share of this Mac's quota ([`discover::REGISTRATION_RESERVE`]), only where the
     /// row's content changed ([`discover::plan`]). It reads `[commons]` first, as a registration pass does, and never
-    /// declares the registry. The mailbox is the row its login's address key derives
+    /// declares the registry. The mailbox is the one keyed from the row whose `addr` says its
+    /// login now, or from the key the login derives where no row says it and none holds that key
     /// ([`keys::mailbox_pk`]).
     ///
     /// # Errors
@@ -473,10 +478,6 @@ impl Registry {
                 _ => discover::Outcome::NotHeld,
             }));
         }
-        // The open mailbox's key derives from its login's address key (`keys::mailbox_pk`).
-        let keyed = keys::address_pk(&listing.login)
-            .and_then(|login| keys::mailbox_pk(&login))
-            .ok();
         application::with_store(
             &self.paths,
             false,
@@ -501,7 +502,6 @@ impl Registry {
                 let input = discover::Input {
                     uuid: &uuid,
                     listing,
-                    keyed: keyed.as_deref(),
                     now_ms,
                 };
                 let discover::Plan {

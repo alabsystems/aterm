@@ -1449,7 +1449,10 @@ fn steps(
         scratch.kept = true;
         let built = engine::build(
             world,
-            &clone,
+            engine::Source {
+                clone: &clone,
+                commit: &commit,
+            },
             pin,
             env.home.as_deref(),
             &scratch.dir.join("engine"),

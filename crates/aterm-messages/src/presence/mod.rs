@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Presence's pure core: the needs border ([`Rim`]), titlebar pill ([`Pill`]),
-//! tab marks ([`ChipLevel`]), and `status` record of who drives a session.
+//! Presence's pure core: tab marks ([`ChipLevel`]) and the `status` record of
+//! who drives a session.
 //!
-//! Folds host [`Facts`] per session ([`Slot`]), composes the pill and hover
+//! Folds host [`Facts`] per session ([`Slot`]), composes the hover
 //! [`state_line`], and maintains the per-window [`View`] without re-gridding
 //! panes or reading a clock directly.
 
@@ -12,21 +12,17 @@ use core::fmt::Debug;
 
 pub mod drive;
 mod model;
-mod paint;
-mod pill;
 mod view;
 mod words;
 
 pub use model::{
     AgentPhase, AgentReading, ChipLevel, Facts, Hand, HoldFact, Level, Link, MailFacts, MailLast,
-    NeedFact, NeedSeverity, Rim, Slot, StopCause, StoryVerb, TurnFact, WallAnswer,
+    NeedFact, NeedSeverity, Slot, StopCause, StoryVerb, TurnFact, WallAnswer,
 };
-pub use paint::{PresenceTones, inks, tones};
-pub use pill::{Pill, PillAct, PillHit, PillKind, PillLayout, Span, pill_layout};
-pub use view::{RimGlow, View, chip_of_attention};
+pub use view::{View, chip_of_attention};
 pub use words::{
-    PillWords, fmt_dur, hold_reason_words, pill_age, pill_age_room, pill_due, pill_text,
-    pill_words, prompt_band_word, prompt_kind_words, sanitize_token, short_sid, state_line,
+    fmt_dur, hold_reason_words, prompt_band_word, prompt_kind_words, sanitize_token, short_sid,
+    state_line,
 };
 
 /// Host-specific vocabulary, lease ownership, percent encoding, and grid width hooks.
@@ -54,9 +50,3 @@ pub const TOLD_TEXT_MAX_BYTES: usize = 96;
 
 /// The context-left percentage at and below which the hover line warns.
 pub(crate) const CTX_WARN_PCT: u8 = 15;
-
-/// The border's inset alpha.
-pub(crate) const RIM_BORDER_ALPHA: u8 = 235;
-
-/// The `yours` outline thickness in 1/16 units of the host's size law ([`RimGlow::border_scale_q4`]).
-pub const YOURS_BORDER_SCALE_Q4: u8 = 1;

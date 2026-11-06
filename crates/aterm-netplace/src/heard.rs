@@ -362,7 +362,7 @@ pub fn format(evidence: &Evidence) -> String {
             .iter()
             .map(|i| (i.at_ms, internet_line(i))),
     );
-    lines.sort();
+    lines.sort_unstable();
     let mut out = String::with_capacity(lines.iter().map(|(_, l)| l.len() + 1).sum());
     for (_, line) in lines {
         out.push_str(&line);
@@ -374,11 +374,19 @@ pub fn format(evidence: &Evidence) -> String {
 /// The evidence in `dir`; empty where there is none or it is not private.
 #[must_use]
 pub fn read(dir: &Path) -> Evidence {
-    read_counted(dir).0
+    aterm_uds::private_file::JudgedDir::judge(dir)
+        .ok()
+        .map(|judged| read_in(dir, &judged))
+        .unwrap_or_default()
 }
 
-pub(crate) fn read_in(dir: &Path, judged: &aterm_uds::private_file::JudgedDir<'_>) -> Evidence {
-    read_counted_in(dir, judged).0
+pub(crate) fn read_in(_dir: &Path, judged: &aterm_uds::private_file::JudgedDir<'_>) -> Evidence {
+    judged
+        .read(FILE, MAX_BYTES)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .map(|text| parse(&text))
+        .unwrap_or_default()
 }
 
 /// Presentation evidence includes direct scans, stored apart from admission evidence.
@@ -596,11 +604,11 @@ pub fn write_book(
             .map(|(node, addr, answered_ms)| {
                 let member = member_key(Lane::Fleet, &node);
                 let booked = held_by_member
-                    .get(&member)
+                    .remove(&member)
                     .filter(|(held_ms, _)| *held_ms == answered_ms)
                     .map_or_else(
                         || answered_ms.and_then(|_| network.cloned()),
-                        |(_, booked_net)| booked_net.clone(),
+                        |(_, booked_net)| booked_net,
                     );
                 BookMember {
                     member,
@@ -657,7 +665,10 @@ fn flush(dir: &Path, mut notes: Evidence, keys: Vec<String>, now: u64) {
         notes.internet.extend(held.internet);
     }
     if !keys.is_empty() {
-        let dir_last = noted.last.entry(dir.to_path_buf()).or_default();
+        let dir_last = match noted.last.get_mut(dir) {
+            Some(dir_last) => dir_last,
+            None => noted.last.entry(dir.to_path_buf()).or_default(),
+        };
         for key in keys {
             dir_last.insert(key, now);
         }
@@ -666,16 +677,30 @@ fn flush(dir: &Path, mut notes: Evidence, keys: Vec<String>, now: u64) {
     if let Err(e) = add_inner(dir, &mut notes) {
         aterm_log::debug!("network place: a note waits for the next ({e})");
         let mut guard = NOTED.lock().unwrap_or_else(PoisonError::into_inner);
-        let held = guard
-            .get_or_insert_with(Noted::default)
-            .pending
-            .entry(dir.to_path_buf())
-            .or_default();
+        let pending = &mut guard.get_or_insert_with(Noted::default).pending;
+        let held = match pending.get_mut(dir) {
+            Some(held) => held,
+            None => pending.entry(dir.to_path_buf()).or_default(),
+        };
         held.answers.extend(notes.answers);
         held.rounds.extend(notes.rounds);
         held.internet.extend(notes.internet);
         *held = compact(std::mem::take(held));
     }
+}
+
+/// Formats `"<lane> <member_key>"` on a 32-byte stack buffer when it fits.
+fn noted_key_buf(lane: Lane, key_bytes: &[u8]) -> Option<([u8; 32], usize)> {
+    let word = lane.word().as_bytes();
+    let len = word.len() + 1 + key_bytes.len();
+    if len > 32 {
+        return None;
+    }
+    let mut buf = [0u8; 32];
+    buf[..word.len()].copy_from_slice(word);
+    buf[word.len()] = b' ';
+    buf[word.len() + 1..len].copy_from_slice(key_bytes);
+    Some((buf, len))
 }
 
 /// NOTES ONE AUTHENTICATED MEMBER ANSWER into the evidence in `dir` (the place's directory,
@@ -694,21 +719,25 @@ pub fn note_answer(
     (began_on, logged): (Option<&NetworkId>, bool),
     (began_ms, at_ms): (u64, u64),
 ) {
-    let key = member_key(lane, member);
-    let noted_key = format!("{} {key}", lane.word());
+    let key_bytes = crate::place::member_key_bytes(lane, member);
+    let key_str = std::str::from_utf8(&key_bytes).unwrap_or_default();
+    let (noted_buf, noted_len) = noted_key_buf(lane, &key_bytes).expect("member_key fits in 32B");
+    let noted_key_str = std::str::from_utf8(&noted_buf[..noted_len]).unwrap_or_default();
     let mut stay = None;
     {
         let mut guard = NOTED.lock().unwrap_or_else(PoisonError::into_inner);
         if !due(
             guard.get_or_insert_with(Noted::default),
             dir,
-            &noted_key,
+            noted_key_str,
             at_ms,
             &mut stay,
         ) {
             return;
         }
     }
+    let key = key_str.to_owned();
+    let noted_key = noted_key_str.to_owned();
     let via = addr.and_then(crate::facts::route_via);
     let network = began_on
         .filter(|began_on| crate::facts::network_now().as_ref() == Some(*began_on))
@@ -755,11 +784,19 @@ pub fn note_answers(dir: &Path, answers: Vec<Answer>) {
         let mut guard = NOTED.lock().unwrap_or_else(PoisonError::into_inner);
         let noted = guard.get_or_insert_with(Noted::default);
         notes.answers.retain(|answer| {
-            let key = format!("{} {}", answer.lane.word(), answer.member);
-            if !due(noted, dir, &key, answer.at_ms, &mut stay) {
-                return false;
+            if let Some((buf, len)) = noted_key_buf(answer.lane, answer.member.as_bytes()) {
+                let key_str = std::str::from_utf8(&buf[..len]).unwrap_or_default();
+                if !due(noted, dir, key_str, answer.at_ms, &mut stay) {
+                    return false;
+                }
+                keys.push(key_str.to_owned());
+            } else {
+                let key = format!("{} {}", answer.lane.word(), answer.member);
+                if !due(noted, dir, &key, answer.at_ms, &mut stay) {
+                    return false;
+                }
+                keys.push(key);
             }
-            keys.push(key);
             now = now.max(answer.at_ms);
             true
         });
@@ -1021,7 +1058,7 @@ pub fn compact_days(days: HomeDays) -> HomeDays {
                 .collect();
             if days.len() > DAYS_KEPT {
                 let newest = days.last().map(|day| day.day);
-                days.sort_by_key(|day| {
+                days.sort_unstable_by_key(|day| {
                     (
                         Reverse(Some(day.day) == newest),
                         Reverse(day.members.len()),
@@ -1029,7 +1066,7 @@ pub fn compact_days(days: HomeDays) -> HomeDays {
                     )
                 });
                 days.truncate(DAYS_KEPT);
-                days.sort_by_key(|day| day.day);
+                days.sort_unstable_by_key(|day| day.day);
             }
             NetworkDays {
                 network,
@@ -1064,7 +1101,7 @@ pub fn compact_days(days: HomeDays) -> HomeDays {
     }
     let mut networks = credited;
     networks.append(&mut earning);
-    networks.sort_by(|a, b| a.network.cmp(&b.network));
+    networks.sort_unstable_by(|a, b| a.network.cmp(&b.network));
     HomeDays {
         seeded_ms: days.seeded_ms,
         networks,
@@ -1179,7 +1216,7 @@ pub fn note_days(dir: &Path, answers: &[Answer]) {
             })
             .collect()
     };
-    wanted.sort();
+    wanted.sort_unstable();
     wanted.dedup();
     if wanted.is_empty() {
         return;
@@ -1256,7 +1293,7 @@ pub fn seed_days(dir: &Path, remembered: &[Known], credit: u32, at_ms: u64) -> i
             .map(|known| known.network.clone())
             .filter(NetworkId::is_strong)
             .collect();
-        credited.sort();
+        credited.sort_unstable();
         credited.dedup();
         days.networks
             .extend(credited.iter().map(|network| NetworkDays {

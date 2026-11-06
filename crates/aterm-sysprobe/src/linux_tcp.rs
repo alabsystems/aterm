@@ -613,8 +613,8 @@ pub fn read_namespaces(budget: Duration) -> usize {
 
 /// Every due namespace read now, whatever the self-check: a test's fixture namespaces. It is
 /// none of the self-check's runs, and it starts the self-check over, so no test's read retires
-/// the process's reads, however loaded the machine.
-#[cfg(test)]
+/// the process's reads, however loaded the machine. Its one caller is a unix test.
+#[cfg(all(test, unix))]
 pub(crate) fn read_namespaces_now() -> usize {
     held_namespaces().pace = Pace::new();
     read_due(Duration::MAX, false)

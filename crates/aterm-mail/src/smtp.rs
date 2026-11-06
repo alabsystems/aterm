@@ -38,9 +38,17 @@ fn submit(
     drop(credentials);
     authenticate(&mut wire, mechanism, &encoded)?;
     drop(encoded);
-    command(&mut wire, &format!("MAIL FROM:<{}>", draft.from), 250)?;
+    let mut cmd = String::with_capacity(64);
+    cmd.push_str("MAIL FROM:<");
+    cmd.push_str(&draft.from);
+    cmd.push('>');
+    command(&mut wire, &cmd, 250)?;
     for recipient in draft.to.iter().chain(&draft.cc).chain(&draft.bcc) {
-        command(&mut wire, &format!("RCPT TO:<{recipient}>"), 250)?;
+        cmd.clear();
+        cmd.push_str("RCPT TO:<");
+        cmd.push_str(recipient);
+        cmd.push('>');
+        command(&mut wire, &cmd, 250)?;
     }
     command(&mut wire, "DATA", 354)?;
     wire.write(bytes)
@@ -87,7 +95,16 @@ fn authenticate(wire: &mut Wire, mechanism: &str, encoded: &str) -> Result<(), S
 }
 
 fn command(wire: &mut Wire, text: &str, expected: u16) -> Result<(), String> {
-    wire.write(format!("{text}\r\n").as_bytes())?;
+    let bytes = text.as_bytes();
+    if bytes.len() + 2 <= 512 {
+        let mut buf = [0u8; 512];
+        buf[..bytes.len()].copy_from_slice(bytes);
+        buf[bytes.len()] = b'\r';
+        buf[bytes.len() + 1] = b'\n';
+        wire.write(&buf[..bytes.len() + 2])?;
+    } else {
+        wire.write(format!("{text}\r\n").as_bytes())?;
+    }
     expect(wire, expected)
 }
 

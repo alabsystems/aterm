@@ -69,13 +69,30 @@ pub const FOOTPRINT: &str = "footprint.json";
 pub const MACHINE_FOOTPRINT: &str = "verify/disk-footprint.json";
 
 /// Whether `check` builds into the run's directories: every check but those that only read the
-/// tree (fmt, census, forge) or the network (export).
+/// tree (fmt, census, forge) or the network (export), or write only the run's own temporary
+/// directory, which no footprint measures (export-scan, whose export of the change lands there).
 #[must_use]
 pub const fn builds(check: Check) -> bool {
     !matches!(
         check,
-        Check::Fmt | Check::Census | Check::Forge | Check::Export
+        Check::Fmt | Check::Census | Check::Forge | Check::Export | Check::ExportScan
     )
+}
+
+/// The words of a run's work ([`selection_of`]) each of which adds work to its directories, or
+/// none, and takes none away, so a run the machine's record keeps that did a run's work and more of
+/// them bounds what that run writes (`aterm_capacity::MachineFootprints::cover_by`): each check,
+/// spelled as when it reads the selection and as when it does not (`:tree`). A check that builds
+/// nothing is among them for the runs kept before it left the work (export-scan's, before
+/// 2026-11-06). The work's other words (the cells chosen, pulled cells, `--compile-only`,
+/// `--no-windows`, `measure`'s flags) change what its checks write, so a run that bounds it has
+/// the same of them.
+#[must_use]
+pub fn more_work() -> Vec<String> {
+    crate::checks::CHECKS
+        .iter()
+        .flat_map(|spec| [spec.name.to_owned(), format!("{}:tree", spec.name)])
+        .collect()
 }
 
 /// The directory a `build.build-dir='…'` value names for the checkout at `root`.
@@ -227,6 +244,7 @@ pub fn run_of(ctx: &Ctx) -> Option<atpkg::admit_disk::Run> {
             .map(|state| atpkg::admit_disk::Machinewide {
                 record: state.join(MACHINE_FOOTPRINT),
                 selection: selection_of(ctx),
+                more: more_work(),
             }),
     })
 }
@@ -740,6 +758,75 @@ mod tests {
             ),
             sel("cells:tree --cell linux,win", None)
         );
+        // export-scan writes its export into the run's temporary directory, which no footprint
+        // measures, so it is not in the work: a run with it and one without write the same.
+        let dev = at(p(&["a"]), &crate::checks::DEV);
+        assert_eq!(selection_of(&dev), sel("doc lint test", Some(&["a"])));
+        assert_eq!(scope_of(&dev), "doc lint test -p a");
+        assert!(
+            run_of(&at(
+                p(&["a"]),
+                &[Check::Fmt, Check::Census, Check::ExportScan]
+            ))
+            .is_none(),
+            "a run of checks that build nothing claims no disk"
+        );
+    }
+
+    /// A run the machine's record keeps that did a run's work and more checks over its crates
+    /// bounds it ([`more_work`]): a fresh worktree's bare `verify -p a` claims what a kept
+    /// `verify cells doc lint test -p a -p b` wrote, not the cold budget. NEGATIVE CONTROL: read by
+    /// the same work alone, nothing covers it; and a kept run with other cells does not.
+    #[test]
+    fn a_kept_run_of_more_checks_bounds_a_run_of_fewer() {
+        let at = |checks: &[Check]| {
+            Ctx::new(
+                PathBuf::from("/w/aterm"),
+                crate::Scope::packages(&["a".to_owned()]),
+                crate::EnvSnapshot::default(),
+                PathBuf::from("/tmp/x"),
+            )
+            .with_checks(checks)
+        };
+        let asked = selection_of(&at(&crate::checks::DEV));
+        let kept = |work: &str| atpkg::admit_disk::Selection {
+            work: work.to_owned(),
+            crates: Some(vec!["a".to_owned(), "b".to_owned()]),
+        };
+        let wrote = |gib: u64| atpkg::admit_disk::Footprint {
+            peak: gib << 30,
+            grew: gib << 30,
+            at_ms: 1,
+            dirs: Some(1),
+            scope: None,
+        };
+        let mut m = aterm_capacity::MachineFootprints::default();
+        m.push(kept("cells doc lint test --cell win"), wrote(9));
+        assert_eq!(
+            m.cover_by(&asked, 0, COLD_BYTES, &more_work()),
+            None,
+            "a cell chosen changes what the run writes"
+        );
+        m.push(kept("cells doc lint test"), wrote(3));
+        assert_eq!(m.cover(&asked, 0, COLD_BYTES), None, "the same work alone");
+        assert_eq!(
+            m.cover_by(&asked, 0, COLD_BYTES, &more_work())
+                .map(|c| c.bytes),
+            Some(3 << 30)
+        );
+        m.push(kept("doc export-scan lint test"), wrote(1));
+        assert_eq!(
+            m.cover_by(&asked, 0, COLD_BYTES, &more_work())
+                .map(|c| c.bytes),
+            Some(1 << 30),
+            "a run kept while export-scan was in the work still bounds"
+        );
+        assert!(more_work().iter().any(|w| w == "cells:tree"));
+        assert!(
+            !more_work()
+                .iter()
+                .any(|w| w.starts_with('-') || w == "pulled-cells")
+        );
     }
 
     /// A run that builds names the machine's record under this user's aterm state directory (a
@@ -799,6 +886,7 @@ mod tests {
                         work: "lint".to_owned(),
                         crates: Some(vec!["a".to_owned()]),
                     },
+                    more: more_work(),
                 }),
             };
             let held = atpkg::admit_disk::admit_on(

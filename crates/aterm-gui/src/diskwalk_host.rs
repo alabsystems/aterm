@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
 
 use aterm_types::MutexExt as _;
@@ -394,7 +394,7 @@ pub(crate) enum ToWalker {
     ReadDiskPolicy(Sender<Option<bool>>),
 }
 
-/// The walker's whole answer, sent after each change.
+/// The walker's whole answer, stored after each change.
 #[derive(Debug, Default)]
 pub(crate) struct Published {
     /// `(session key, label)` of every pane the facts named.
@@ -414,6 +414,36 @@ pub(crate) struct Published {
     /// The scopes the last discovery derived `tab_claims` and `own_claims` for, when it read the
     /// facts `tabs` was published from (else none): a scope outside it has no roots *yet*.
     pub(crate) discovered: BTreeSet<DiskScope>,
+}
+
+/// The walker's newest publication until the loop takes it (`diskwalk-mailbox`): the loop only
+/// ever wants the newest, and a receive from std's channel waits on a send part-way through its
+/// slot.
+#[derive(Default)]
+pub(crate) struct Mailbox(Mutex<Option<Arc<Published>>>);
+
+impl Mailbox {
+    /// The walker's store, which replaces a publication the loop has not taken, and then its
+    /// `wake` of the loop. It holds the lock for that one store and lets it go before it drops
+    /// the older publication and before `wake`, so the absorb a wake brings takes the store,
+    /// and a loop that found the mailbox held comes round again for it.
+    fn store(&self, published: Arc<Published>, wake: impl FnOnce()) {
+        let older = self.0.lock_or_recover().replace(published);
+        drop(older);
+        wake();
+    }
+
+    /// The loop's take of the newest publication stored since its last take. It never waits
+    /// on the walker, which runs at the lowest class (clippy.toml: a wait that wakes): while the
+    /// walker holds the lock it takes nothing, and the wake the walker sends after that store
+    /// brings the loop round again.
+    fn take(&self) -> Option<Arc<Published>> {
+        match self.0.try_lock() {
+            Ok(mut newest) => newest.take(),
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner().take(),
+            Err(TryLockError::WouldBlock) => None,
+        }
+    }
 }
 
 type Proxy = aterm_window::event_loop::EventLoopProxy<crate::Wake>;
@@ -511,9 +541,10 @@ impl Shared {
         build_report(scope, &published, self.walker_state())
     }
 
-    /// The loop's (or a test's) take of what the walker sent.
-    pub(crate) fn absorb(&self, from: &Receiver<Arc<Published>>) -> Option<Arc<Published>> {
-        let newest = from.try_iter().last()?;
+    /// The loop's (or a test's) take of what the walker stored. It never waits on the walker
+    /// (clippy.toml: a wait that wakes; [`Mailbox::take`]).
+    pub(crate) fn absorb(&self, from: &Mailbox) -> Option<Arc<Published>> {
+        let newest = from.take()?;
         *self.board.lock_or_recover() = Some(Arc::clone(&newest));
         Some(newest)
     }
@@ -541,9 +572,10 @@ fn spawn_walker(
     shared: &'static Shared,
     proxy: Option<Proxy>,
     class: WalkerClass,
-) -> std::io::Result<Receiver<Arc<Published>>> {
+) -> std::io::Result<Arc<Mailbox>> {
     let (inbox_tx, inbox) = std::sync::mpsc::channel();
-    let (out, from_walker) = std::sync::mpsc::channel();
+    let out = Arc::new(Mailbox::default());
+    let from_walker = Arc::clone(&out);
     if shared.inbox.set(inbox_tx).is_err() {
         return Err(std::io::Error::other("the disk walker already runs"));
     }
@@ -1084,7 +1116,7 @@ struct Active {
 
 struct Engine {
     inbox: Receiver<ToWalker>,
-    out: Sender<Arc<Published>>,
+    out: Arc<Mailbox>,
     proxy: Option<Proxy>,
     facts: Facts,
     facts_seq: u64,
@@ -1113,7 +1145,7 @@ struct Engine {
 
 fn walker_main(
     inbox: Receiver<ToWalker>,
-    out: Sender<Arc<Published>>,
+    out: Arc<Mailbox>,
     proxy: Option<Proxy>,
     disk: aterm_diskwalk::DiskIo,
 ) {
@@ -1125,7 +1157,7 @@ fn walker_main(
 }
 
 impl Engine {
-    fn new(inbox: Receiver<ToWalker>, out: Sender<Arc<Published>>, proxy: Option<Proxy>) -> Self {
+    fn new(inbox: Receiver<ToWalker>, out: Arc<Mailbox>, proxy: Option<Proxy>) -> Self {
         Self {
             inbox,
             out,
@@ -1831,11 +1863,12 @@ impl Engine {
                 _ => BTreeSet::new(),
             },
         });
-        if self.out.send(published).is_ok()
-            && let Some(proxy) = self.proxy.as_ref()
-        {
-            let _ = proxy.send_event(crate::Wake::DiskWalk);
-        }
+        let proxy = self.proxy.as_ref();
+        self.out.store(published, || {
+            if let Some(proxy) = proxy {
+                let _ = proxy.send_event(crate::Wake::DiskWalk);
+            }
+        });
     }
 }
 
@@ -2183,7 +2216,7 @@ fn group(n: u32) -> String {
 /// what it last sent, and the §10.8 set it last stated.
 #[derive(Default)]
 pub(crate) struct DiskwalkHost {
-    from_walker: Option<Receiver<Arc<Published>>>,
+    from_walker: Option<Arc<Mailbox>>,
     proxy_installed: bool,
     started: bool,
     facts_due: Option<Instant>,
@@ -2313,3 +2346,8 @@ mod tests;
 #[cfg(all(test, unix))]
 #[path = "diskwalk_host/freshness_tests.rs"]
 mod freshness_tests;
+
+/// Every platform: the mailbox's tests walk no disk.
+#[cfg(test)]
+#[path = "diskwalk_host/mailbox_tests.rs"]
+mod mailbox_tests;

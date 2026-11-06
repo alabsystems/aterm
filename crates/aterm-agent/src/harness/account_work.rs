@@ -3,7 +3,8 @@
 
 //! App-owned automatic work admissions and retirement across cancellation epochs.
 
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 
 #[derive(Default)]
 struct Epoch;
@@ -47,6 +48,7 @@ impl Lifetime {
         Some(Scope(Arc::new(Operation {
             shared: self.0.clone(),
             epoch: state.epoch.clone(),
+            cancelled: Arc::new(AtomicBool::new(false)),
         })))
     }
 
@@ -67,6 +69,7 @@ impl Lifetime {
 struct Operation {
     shared: Arc<Shared>,
     epoch: Arc<Epoch>,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl Drop for Operation {
@@ -84,7 +87,15 @@ impl Drop for Operation {
 pub struct Scope(Arc<Operation>);
 
 impl Scope {
-    /// Whether the operation's original admission epoch has been closed.
+    /// A cancellation handle which does not keep this operation alive.
+    pub fn cancellation(&self) -> Cancellation {
+        Cancellation {
+            operation: Arc::downgrade(&self.0),
+            cancelled: self.0.cancelled.clone(),
+        }
+    }
+
+    /// Whether this operation or its original admission epoch has been cancelled.
     pub fn cancelled(&self) -> bool {
         let state = self
             .0
@@ -92,13 +103,35 @@ impl Scope {
             .state
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        state.closed || !Arc::ptr_eq(&state.epoch, &self.0.epoch)
+        self.0.cancelled.load(Ordering::Acquire)
+            || state.closed
+            || !Arc::ptr_eq(&state.epoch, &self.0.epoch)
     }
 
     /// Retains this scope until all work captures have retired, even without a run.
     pub fn wrap<W: FnOnce() + Send + 'static>(self, work: W) -> impl FnOnce() + Send + 'static {
         let owned = Wrapped { work, scope: self };
         move || owned.run()
+    }
+}
+
+/// Cancels one operation without retaining any of its work captures.
+#[derive(Clone)]
+pub struct Cancellation {
+    operation: Weak<Operation>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Cancellation {
+    /// Requests cancellation of this exact operation and all its scope clones.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    /// Whether every scope for this exact operation has retired.
+    /// This is a work-lifetime observation, not enrollment publication authority.
+    pub fn retired(&self) -> bool {
+        self.operation.upgrade().is_none()
     }
 }
 

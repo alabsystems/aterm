@@ -781,10 +781,9 @@ impl Proton {
         let body = value["Message"]["Body"]
             .as_str()
             .ok_or("Proton returned no message body")?;
-        let decrypted = crate::crypto::pgp::decrypt(body, &self.keys)?;
-        message.text = std::str::from_utf8(&decrypted)
-            .map_err(|_| "Message body is not UTF-8")?
-            .into();
+        let mut decrypted = crate::crypto::pgp::decrypt(body, &self.keys)?;
+        message.text = String::from_utf8(std::mem::take(&mut *decrypted))
+            .map_err(|_| "Message body is not UTF-8")?;
         let mime = value["Message"]["MIMEType"]
             .as_str()
             .unwrap_or("text/plain")

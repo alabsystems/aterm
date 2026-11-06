@@ -23,6 +23,7 @@ fn land() -> Vec<Check> {
                 c,
                 Check::Fmt
                     | Check::Census
+                    | Check::ExportScan
                     | Check::Forge
                     | Check::Cells
                     | Check::WasmSmoke
@@ -236,7 +237,7 @@ fn fmt_reports_what_trustfmt_would_change_and_fix_rewrites_only_that() {
 fn the_in_process_checks_refuse_a_root_that_is_not_an_aterm_checkout() {
     let repo = FakeRepo::new();
     repo.with_stage2("exit 0");
-    let checks = [Check::Census, Check::Forge, Check::Cells];
+    let checks = [Check::Census, Check::ExportScan, Check::Forge, Check::Cells];
     let (out, code) = repo.run(&checks, Scope::workspace());
     assert_eq!(code, exit::COULD_NOT_RUN, "{out}");
     for c in checks {
@@ -330,12 +331,18 @@ fn a_scoped_run_narrows_the_driver_where_the_check_reads_the_selection() {
         "argv: --config build.build-dir='{}/target/build.noindex' ",
         repo.root.display()
     );
+    let config = aterm_toolchain::build_cache::TEST_GRAPH_CONFIG.join(" ");
+    let flag = aterm_toolchain::build_cache::TEST_GRAPH_FLAG;
     assert!(
-        ladder.contains(&format!("{lead}--unverified test -p aterm-grid")),
+        ladder.contains(&format!(
+            "{lead}--unverified {config} test {flag} -p aterm-grid"
+        )),
         "{ladder}"
     );
     assert!(
-        ladder.contains(&format!("{lead}--unverified test --doc -p aterm-grid")),
+        ladder.contains(&format!(
+            "{lead}--unverified {config} test {flag} --doc -p aterm-grid"
+        )),
         "{ladder}"
     );
     assert!(
@@ -391,8 +398,12 @@ fn the_doctests_run_rustdoc_only_where_a_doctest_lives_over_the_test_compiles_se
     common::standin_body(&trustdoc, &ran(0));
     let (ladder, code) = doc_run();
     assert_eq!(code, exit::PASS, "{ladder}");
+    let config = aterm_toolchain::build_cache::TEST_GRAPH_CONFIG.join(" ");
+    let flag = aterm_toolchain::build_cache::TEST_GRAPH_FLAG;
     assert!(
-        ladder.contains("--unverified test --doc --workspace --no-fail-fast"),
+        ladder.contains(&format!(
+            "--unverified {config} test {flag} --doc --workspace --no-fail-fast"
+        )),
         "{ladder}"
     );
     let want = format!(
@@ -489,7 +500,13 @@ const COMPILE_RED: &str = "echo 'error[E0425]: cannot find value `gone` in this 
      echo '  --> crates/aterm-gui/src/bin/rot.rs:3:13' >&2; exit 101";
 
 fn with_recording_cargo(repo: &FakeRepo, bins: &[(&str, &str, &str)], extra: &str) {
-    with_recording_cargo_from(repo, bins, bins, extra, true);
+    with_recording_cargo_from(repo, bins, bins, extra, true, false);
+}
+
+/// [`with_recording_cargo`], each artifact naming its package's manifest, which declares no
+/// `harness`: verify reads every binary as libtest's and asks the first one for its JSON format.
+fn with_recording_harness_cargo(repo: &FakeRepo, bins: &[(&str, &str, &str)]) {
+    with_recording_cargo_from(repo, bins, bins, "", true, true);
 }
 
 fn with_recording_cargo_from(
@@ -498,15 +515,25 @@ fn with_recording_cargo_from(
     bins: &[(&str, &str, &str)],
     extra: &str,
     report_artifacts: bool,
+    manifests: bool,
 ) {
     let deps = repo.root.join("target/debug/deps");
     fs::create_dir_all(&deps).expect("mkdir");
     let metadata = |bins: &[(&str, &str, &str)]| {
-        bins.iter().map(|(_, flag, name)| {
+        bins.iter().map(|(pkg, flag, name)| {
             let (kind, target) = flag.split_once(' ')
                 .map_or(("lib", *name), |(kind, target)| (kind.trim_start_matches("--"), target));
+            let manifest = if manifests {
+                let path = repo.root.join("crates").join(pkg).join("Cargo.toml");
+                fs::create_dir_all(path.parent().expect("a crate dir")).expect("mkdir");
+                fs::write(&path, format!("[package]\nname = \"{pkg}\"\nversion = \"0.1.0\"\n"))
+                    .expect("a manifest");
+                format!(",\"manifest_path\":{}", aterm_json::json!(path.to_str().unwrap()))
+            } else {
+                String::new()
+            };
             let message = format!(
-                "{{\"reason\":\"compiler-artifact\",\"target\":{{\"kind\":[{}],\"name\":{}}},\"profile\":{{\"test\":true}},\"executable\":{}}}",
+                "{{\"reason\":\"compiler-artifact\",\"target\":{{\"kind\":[{}],\"name\":{}}},\"profile\":{{\"test\":true}},\"executable\":{}{manifest}}}",
                 aterm_json::json!(kind), aterm_json::json!(target),
                 aterm_json::json!(deps.join(format!("{name}-1")).to_str().unwrap()),
             );
@@ -676,7 +703,13 @@ fn whole_and_shaped_compiles_are_followed_by_one_fresh_recording_pass() {
         assert!(!recording.contains("--no-run"));
         assert!(recording.contains(aterm_verify::testrun::RECORD_FLAG));
         assert!(recording.contains("--message-format=json-render-diagnostics"));
-        assert!(recording.contains(&stages::test_run_args(&ctx.scope).join(" ")));
+        assert!(
+            recording.contains(
+                &aterm_toolchain::build_cache::with_test_graph(&stages::test_run_args(&ctx.scope))
+                    .join(" ")
+            ),
+            "{recording}"
+        );
         assert_eq!(fs::read_to_string(ran).unwrap(), "current\n");
     }
 }
@@ -690,6 +723,7 @@ fn recording_metadata_names_the_fresh_executable_and_target() {
         &[("fixture", "--test changed", "fresh")],
         "",
         true,
+        false,
     );
     let ran = repo.scratch.join("ran");
     for (name, body) in [
@@ -785,6 +819,7 @@ fn missing_recording_artifacts_cannot_reuse_the_previous_compile() {
         &[("fixture", "--lib", "old")],
         &[("fixture", "--test current", "current")],
         "",
+        false,
         false,
     );
     let ran = repo.scratch.join("ran");
@@ -1226,6 +1261,223 @@ fn the_first_failing_test_binary_ends_a_halted_run_and_nothing_else_does() {
     );
     assert_eq!(words, None);
     assert_eq!(tags(&block), ["FAIL"], "{block}");
+}
+
+/// A JSON BINARY ENDS AT ITS FIRST DECISIVE RED CASE (ATERM-KI-1105-18): binary a, asked in
+/// libtest's JSON format (it exits 3 if its argv lacks `--format json`), says a plainly failed case
+/// and then never ends; a halted run ends it there, under a hang-detector ceiling it never reaches.
+/// Only a ran, the row is FAIL with a's NOT RUN for the rest, the itemized `a::broke` keeps its
+/// panic, and nothing was a ceiling kill. Its refusal and full-disk controls say a spared case and
+/// end by themselves: every binary runs, and the row is NOT RUN.
+#[cfg(unix)]
+#[test]
+fn a_json_binary_ends_at_its_first_decisive_red_case_and_nothing_else_does() {
+    use aterm_verify::sched::Halt;
+    const LIST: &str = r#"case " $* " in *" --list "*) echo '{ "type": "suite", "event": "discovery" }'; exit 0 ;; esac"#;
+    let run = |block: &str, forever: bool| {
+        let repo = FakeRepo::new();
+        let marks = repo.scratch.join("marks");
+        fs::create_dir_all(&marks).expect("mkdir");
+        let bins = [
+            ("fixture", "--lib", "a"),
+            ("fixture", "--test b", "b"),
+            ("fixture", "--test c", "c"),
+        ];
+        with_recording_harness_cargo(&repo, &bins);
+        let deps = repo.root.join("target/debug/deps");
+        let m = marks.display();
+        let tail = if forever {
+            "while :; do sleep 1; done".to_owned()
+        } else {
+            "echo '{ \"type\": \"test\", \"name\": \"a::hangs\", \"event\": \"ok\" }'\n\
+             echo '{ \"type\": \"suite\", \"event\": \"failed\", \"passed\": 1, \"failed\": 1, \
+             \"ignored\": 0, \"measured\": 0, \"filtered_out\": 0, \"exec_time\": 0.01 }'\nexit 101"
+                .to_owned()
+        };
+        let failed = aterm_json::json!({
+            "type": "test", "name": "a::broke", "event": "failed", "stdout": block
+        });
+        common::standin_body(
+            &deps.join("a-1"),
+            &format!(
+                "{LIST}\ntouch '{m}/a'\ncase \" $* \" in *\" --format json \"*) ;; *) echo 'no json'; \
+                 exit 3 ;; esac\ncat <<'EOF'\n{{ \"type\": \"suite\", \"event\": \"started\", \
+                 \"test_count\": 2 }}\n{{ \"type\": \"test\", \"event\": \"started\", \"name\": \
+                 \"a::broke\" }}\n{{ \"type\": \"test\", \"event\": \"started\", \"name\": \
+                 \"a::hangs\" }}\n{failed}\nEOF\n{tail}"
+            ),
+        );
+        for name in ["b", "c"] {
+            common::standin_body(
+                &deps.join(format!("{name}-1")),
+                &format!(
+                    "{LIST}\ntouch '{m}/{name}'\nprintf '\\nrunning 1 test\\ntest {name}::fine ... ok\\n\\n\
+                     test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; \
+                     finished in 0.01s\\n\\n'"
+                ),
+            );
+        }
+        let mut ctx = repo
+            .ctx(&land(), Scope::workspace())
+            .with_halt(Halt::at_first_red("the run", |_| {}));
+        ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
+        ctx.test_jobs = 1;
+        ctx.child_ceiling = Some(aterm_spec::wait::MUST_HAPPEN);
+        let spec = plan::plan(&ctx)
+            .into_iter()
+            .find(|s| s.id == StageId::Test)
+            .expect("the test stage");
+        let report = stages::run_stage(&ctx, &spec);
+        let ran: Vec<&str> = ["a", "b", "c"]
+            .into_iter()
+            .filter(|name| marks.join(name).exists())
+            .collect();
+        let found: Vec<(String, String)> = report
+            .findings()
+            .into_iter()
+            .map(|f| (f.id, f.message.join("\n")))
+            .collect();
+        (report.render(), ran, found)
+    };
+    let (block, ran, found) = run(
+        "\nthread 'a::broke' panicked at src/a.rs:3:5:\nassertion failed: broke\n",
+        true,
+    );
+    assert_eq!(ran, ["a"], "nothing started after the red:\n{block}");
+    assert_eq!(tags(&block), ["FAIL", "NOT RUN"], "{block}");
+    assert!(
+        block.contains("test cases: seen as they fail (libtest JSON)"),
+        "{block}"
+    );
+    assert!(
+        block.contains("assertion failed: broke"),
+        "the red keeps its why:\n{block}"
+    );
+    assert!(
+        found
+            .iter()
+            .any(|(id, message)| id == "-p fixture --lib -- a::broke"
+                && message.contains("assertion failed: broke")),
+        "a::broke itemized with its message: {found:?}\n{block}"
+    );
+    assert!(!block.contains("CEILING"), "no ceiling kill:\n{block}");
+    for said in [
+        "\nthread 'a::broke' panicked at src/a.rs:3:5:\naterm-gate: COULD NOT RUN: no fish\n",
+        "\nthread 'a::broke' panicked at src/a.rs:3:5:\nNo space left on device (os error 28)\n",
+    ] {
+        let (block, ran, _) = run(said, false);
+        assert_eq!(ran, ["a", "b", "c"], "a spared case is no red:\n{block}");
+        assert_eq!(tags(&block), ["NOT RUN"], "{block}");
+    }
+}
+
+/// A REFUSED PROBE RUNS EVERY BINARY AS BEFORE: the first binary's `--list` in JSON answers as
+/// libtest without `-Z unstable-options` does, so every binary runs in the human format (a binary
+/// that sees `--format` exits 3) and the ladder says why. NEGATIVE CONTROL: the JSON test above,
+/// whose probe passes, runs binary a with `--format json`.
+#[cfg(unix)]
+#[test]
+fn a_refused_probe_runs_every_binary_in_the_human_format() {
+    let repo = FakeRepo::new();
+    let marks = repo.scratch.join("marks");
+    fs::create_dir_all(&marks).expect("mkdir");
+    let bins = [("fixture", "--lib", "a"), ("fixture", "--test b", "b")];
+    with_recording_harness_cargo(&repo, &bins);
+    let deps = repo.root.join("target/debug/deps");
+    let m = marks.display();
+    for name in ["a", "b"] {
+        common::standin_body(
+            &deps.join(format!("{name}-1")),
+            &format!(
+                "case \" $* \" in *\" --list \"*) echo 'error: The \"json\" format is only accepted \
+                 on the nightly compiler with -Z unstable-options'; exit 101 ;; *--format*) exit 3 ;; esac\n\
+                 touch '{m}/{name}'\nprintf '\\nrunning 1 test\\ntest {name}::fine ... ok\\n\\n\
+                 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; \
+                 finished in 0.01s\\n\\n'"
+            ),
+        );
+    }
+    let mut ctx = repo.ctx(&land(), Scope::workspace());
+    ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
+    ctx.test_jobs = 1;
+    let spec = plan::plan(&ctx)
+        .into_iter()
+        .find(|s| s.id == StageId::Test)
+        .expect("the test stage");
+    let block = stages::run_stage(&ctx, &spec).render();
+    assert!(
+        marks.join("a").exists() && marks.join("b").exists(),
+        "{block}"
+    );
+    assert_eq!(tags(&block), ["ok"], "{block}");
+    assert!(
+        block.contains(
+            "test cases: decided at each binary's end — libtest refused JSON: error: The \"json\" \
+             format is only accepted"
+        ),
+        "{block}"
+    );
+}
+
+/// A PROBE A CRASH LEAVES UNANSWERED ASKS THE NEXT BINARY: binary a dies by a signal on its JSON
+/// `--list`, which says nothing of libtest, so b is asked, lists its cases in JSON, and every
+/// binary runs with `--format json` (each exits 3 without it). NEGATIVE CONTROL: when b dies too,
+/// the ladder says no binary answered, never that libtest refused JSON, and both run in the human
+/// format.
+#[cfg(unix)]
+#[test]
+fn a_probe_a_crash_leaves_unanswered_asks_the_next_binary() {
+    const DISCOVER: &str = r#"case " $* " in *" --list "*) echo '{ "type": "suite", "event": "discovery" }'; exit 0 ;; esac"#;
+    const CRASH: &str = r#"case " $* " in *" --list "*) kill -9 $$ ;; esac"#;
+    let run = |b_list: &str, json: bool| {
+        let repo = FakeRepo::new();
+        let bins = [("fixture", "--lib", "a"), ("fixture", "--test b", "b")];
+        with_recording_harness_cargo(&repo, &bins);
+        let deps = repo.root.join("target/debug/deps");
+        for (name, list) in [("a", CRASH), ("b", b_list)] {
+            let body = if json {
+                format!(
+                    "{list}\ncase \" $* \" in *\" --format json \"*) ;; *) exit 3 ;; esac\n\
+                     cat <<'EOF'\n\
+                     {{ \"type\": \"suite\", \"event\": \"started\", \"test_count\": 1 }}\n\
+                     {{ \"type\": \"test\", \"event\": \"started\", \"name\": \"{name}::fine\" }}\n\
+                     {{ \"type\": \"test\", \"event\": \"ok\", \"name\": \"{name}::fine\" }}\n\
+                     {{ \"type\": \"suite\", \"event\": \"ok\", \"passed\": 1, \"failed\": 0, \
+                     \"ignored\": 0, \"measured\": 0, \"filtered_out\": 0, \"exec_time\": 0.01 }}\n\
+                     EOF"
+                )
+            } else {
+                format!(
+                    "{list}\ncase \" $* \" in *--format*) exit 3 ;; esac\n\
+                     printf '\\nrunning 1 test\\ntest {name}::fine ... ok\\n\\n\
+                     test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; \
+                     finished in 0.01s\\n\\n'"
+                )
+            };
+            common::standin_body(&deps.join(format!("{name}-1")), &body);
+        }
+        let mut ctx = repo.ctx(&land(), Scope::workspace());
+        ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
+        ctx.test_jobs = 1;
+        let spec = plan::plan(&ctx)
+            .into_iter()
+            .find(|s| s.id == StageId::Test)
+            .expect("the test stage");
+        stages::run_stage(&ctx, &spec).render()
+    };
+    let block = run(DISCOVER, true);
+    assert_eq!(tags(&block), ["ok"], "{block}");
+    assert!(
+        block.contains("test cases: seen as they fail (libtest JSON)"),
+        "{block}"
+    );
+    let block = run(CRASH, false);
+    assert_eq!(tags(&block), ["ok"], "{block}");
+    assert!(
+        block.contains("no binary answered libtest's JSON probe: -p fixture --test b"),
+        "{block}"
+    );
+    assert!(!block.contains("libtest refused JSON"), "{block}");
 }
 
 /// A BINARY THE CEILING ENDED KEEPS ITS SAMPLE, AND ONE IT LEFT NO TIME TO START KEEPS NONE: one

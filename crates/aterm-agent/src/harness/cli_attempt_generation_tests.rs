@@ -26,7 +26,7 @@ struct AttemptHost<'a> {
     changed: Cell<bool>,
     after: RefCell<Option<[Option<Vec<u8>>; 4]>>,
     staging: RefCell<Option<PathBuf>>,
-    /// The sign-in a person waits for, ending ([`AccountsHost::retries_sign_in_lock`]).
+    /// The sign-in a manual FIFO wait observes before re-reading the parent binding.
     waited_for: RefCell<Option<Box<dyn FnOnce() + 'a>>>,
 }
 
@@ -238,12 +238,10 @@ impl AccountsHost for AttemptHost<'_> {
     fn stdin_is_terminal(&self) -> bool {
         true
     }
-    fn retries_sign_in_lock(&self, _: u32) -> bool {
-        self.waited_for
-            .borrow_mut()
-            .take()
-            .map(|ended| ended())
-            .is_some()
+    fn signin_queued(&self, _: accounts::SigninPosition) {
+        if let Some(ended) = self.waited_for.borrow_mut().take() {
+            ended();
+        }
     }
     fn unaskable(&self) -> Option<String> {
         None

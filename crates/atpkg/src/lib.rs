@@ -129,6 +129,8 @@ mod pending_wake;
 pub mod pin;
 pub mod platform;
 pub mod prereq;
+/// Signed, leased prerequisites for builds and publication.
+pub mod prerequisite;
 /// Readings a doctor keeps between runs under keys that name what they depend on.
 pub mod probe_cache;
 pub mod progress;
@@ -150,6 +152,7 @@ pub mod selfupdate;
 mod serde_corpus_tests;
 pub mod shim_env;
 pub mod sig;
+mod source;
 /// Canonical per-program state spellings shared by `status.toml`, pass logs, `doctor`, and `which`.
 pub mod state;
 pub mod status;

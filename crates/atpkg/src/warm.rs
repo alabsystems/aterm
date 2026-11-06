@@ -43,7 +43,7 @@ pub(crate) fn spawn_landed(layout: &Layout, programs: &BTreeSet<String>) {
     }
     let admitted = admitted(
         crate::manager_enabled(),
-        crate::cli::registry_seam().as_deref(),
+        crate::source::registry_seam().as_deref(),
         crate::packages_log::records(layout),
         running_as_root(),
     );
@@ -84,7 +84,7 @@ fn admitted(
     records: bool,
     root: bool,
 ) -> bool {
-    manager_enabled && crate::cli::dir_registry(registry).is_none() && records && !root
+    manager_enabled && crate::source::dir_registry(registry).is_none() && records && !root
 }
 
 fn running_as_root() -> bool {

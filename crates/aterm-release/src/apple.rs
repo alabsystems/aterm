@@ -687,8 +687,8 @@ const RENEWAL_WINDOW_SECS: u64 = 90 * 24 * 60 * 60;
 /// The expiry clause on a green Apple line.
 fn expiry_note(kc: &Keychains<'_>, sha1: &str) -> Option<String> {
     let leaf = installed_leaf_pem(kc, sha1)?;
-    let mut soonest = (cert_enddate_iso(&leaf)?, leaf.clone());
-    if let Some(ca) = issuer_in_keychain(kc, &leaf) {
+    let mut soonest = (cert_enddate_iso(&leaf)?, leaf);
+    if let Some(ca) = issuer_in_keychain(kc, &soonest.1) {
         match cert_enddate_iso(&ca) {
             Some(iso) if iso < soonest.0 => soonest = (iso, ca),
             _ => {}

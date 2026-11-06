@@ -24,7 +24,18 @@ fn intent(login: &str, generation: &str) -> ExecutionIntent {
     }
 }
 
+/// [`laid_out`] of `phase`, made once: the same inputs, and each caller changes its own copy.
 fn fixture(phase: ImagePhase) -> (St, Prepare) {
+    static FIXTURES: std::sync::LazyLock<[(St, Prepare); 2]> = std::sync::LazyLock::new(|| {
+        [
+            laid_out(ImagePhase::Forward),
+            laid_out(ImagePhase::Rollback),
+        ]
+    });
+    FIXTURES[usize::from(phase == ImagePhase::Rollback)].clone()
+}
+
+fn laid_out(phase: ImagePhase) -> (St, Prepare) {
     let image = Image {
         path: b"/model/claude".to_vec(),
         device: 1,
@@ -585,6 +596,20 @@ fn model_step(
     phase: ImagePhase,
     restore: bool,
 ) -> State {
+    // What only a later attempt reads reaches no record, whichever record there is: a state these
+    // are enabled in also enables `Attempt`, which plants and judges that record.
+    let modeled = match action {
+        "FailBarrier" => Some(("barrier_failed", 1)),
+        "RepairBarrier" => Some(("barrier_failed", 0)),
+        "DryRun" => Some(("dry", 1)),
+        "LiveRun" => Some(("dry", 0)),
+        _ => None,
+    };
+    if let Some((field, value)) = modeled {
+        let mut next = state.clone();
+        next.insert(field, value);
+        return next;
+    }
     let root = aterm_tempfile::tempdir().unwrap();
     let mut opts = opts(root.path());
     opts.dry_run = state["dry"] == 1;
@@ -679,16 +704,7 @@ fn model_step(
                 next.insert("weakened", 1);
             }
         }
-        other => {
-            let (field, value) = match other {
-                "FailBarrier" => ("barrier_failed", 1),
-                "RepairBarrier" => ("barrier_failed", 0),
-                "DryRun" => ("dry", 1),
-                "LiveRun" => ("dry", 0),
-                _ => unreachable!(),
-            };
-            next.insert(field, value);
-        }
+        other => unreachable!("{other}"),
     }
     next.insert("staged", i64::from(st.native_account_candidate.is_some()));
     if without_candidate(&st) != old {
@@ -717,6 +733,12 @@ fn client_slot_refines_every_model_transition_and_breaks_on_early_exposure() {
     let model = aterm_models_harness::native_account_client_slot_model();
     aterm_spec::interp::prove_and_catch(&model);
     assert!(aterm_spec::verify::sweep_faults(std::slice::from_ref(&model)).is_empty());
+    // NEGATIVE CONTROL (2026-11-05): with one phase's copy served for both this fails at
+    // "Rollback's fixture". With a retry that exposes its candidate past a failed save, the walk
+    // below fails at `Attempt` from `barrier_failed: 1`.
+    for phase in [ImagePhase::Forward, ImagePhase::Rollback] {
+        assert_eq!(fixture(phase), laid_out(phase), "{phase:?}'s fixture");
+    }
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {

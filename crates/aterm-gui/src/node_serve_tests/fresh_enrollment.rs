@@ -77,7 +77,7 @@ impl Node {
             wake_timeout: DIAL_WITHIN,
             stop: Arc::clone(&stop),
             launcher,
-            lan_may_go: || true,
+            lan_unavailable: || None,
             updates: None,
             mesh: NodeMesh::off(),
         };

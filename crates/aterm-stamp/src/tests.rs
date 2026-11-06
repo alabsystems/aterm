@@ -133,3 +133,68 @@ fn a_release_is_the_versions_core_and_nothing_else_reads_as_one() {
         assert_eq!(of(refused), None, "{refused}");
     }
 }
+
+#[test]
+fn the_unstamped_record_is_what_encode_writes_for_unstamped() {
+    assert_eq!(UNSTAMPED_RECORD, encode(&Stamp::UNSTAMPED).unwrap());
+    assert_eq!(
+        decode(leak(UNSTAMPED_RECORD), Stamp::UNSTAMPED).unwrap(),
+        Stamp::UNSTAMPED
+    );
+}
+
+#[test]
+fn the_writer_replaces_the_one_record_an_image_holds() {
+    // An image: code bytes, a lone header string (as the decoder's own literal compiles in),
+    // the compiled-in record, more bytes.
+    let mut image = b"\0asm code ".to_vec();
+    image.extend_from_slice(HEADER.as_bytes());
+    image.extend_from_slice(b"version=1.0.0\nnot a record");
+    let at = image.len();
+    image.extend_from_slice(&UNSTAMPED_RECORD);
+    image.extend_from_slice(b" tail");
+    let before = image.clone();
+    rewrite(&mut image, &stamped()).unwrap();
+    assert_eq!(image.len(), before.len());
+    assert_eq!(image[..at], before[..at], "the bytes before the record");
+    assert_eq!(image[at + LEN..], before[at + LEN..], "the bytes after it");
+    let record: [u8; LEN] = image[at..at + LEN].try_into().unwrap();
+    assert_eq!(record, encode(&stamped()).unwrap());
+    // A stamped image is stamped again the same way.
+    let again = Stamp {
+        app_version: "0.158.0",
+        ..stamped()
+    };
+    rewrite(&mut image, &again).unwrap();
+    assert_eq!(
+        decode(
+            leak(image[at..at + LEN].try_into().unwrap()),
+            Stamp::UNSTAMPED
+        )
+        .unwrap()
+        .app_version,
+        "0.158.0"
+    );
+
+    // No record, two records, a record cut short by the image's end, or a stamp that does not
+    // encode: refused, the image unchanged.
+    let mut two = before.clone();
+    two.extend_from_slice(&UNSTAMPED_RECORD);
+    let mut cut = b"head ".to_vec();
+    cut.extend_from_slice(&UNSTAMPED_RECORD[..LEN - 1]);
+    let bad = Stamp {
+        app_version: "0.1\n",
+        ..Stamp::UNSTAMPED
+    };
+    for (mut image, stamp, why) in [
+        (b"\0asm no record".to_vec(), stamped(), "no identity record"),
+        (two, stamped(), "2 identity records"),
+        (cut, stamped(), "no identity record"),
+        (before.clone(), bad, "holds a newline"),
+    ] {
+        let kept = image.clone();
+        let refused = rewrite(&mut image, &stamp).expect_err(why);
+        assert!(refused.contains(why), "{why}: {refused}");
+        assert_eq!(image, kept, "{why}");
+    }
+}

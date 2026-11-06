@@ -118,11 +118,16 @@ impl Terminal {
         self.main_grid().scrollback()
     }
 
-    /// Reclaimable history bytes (promoted store budget plus ring hyperlink bytes), or `None` without a tiered store.
+    /// Reclaimable history bytes (promoted store budget, ring hyperlink bytes and what taking
+    /// the inline images only history holds off it frees beyond the shares of them the store's
+    /// hot lines book), or `None` without a tiered store.
     pub fn history_scrollback_bytes(&mut self) -> Option<usize> {
+        let stored = self.transient.kitty_store_images();
         let grid = self.history_grid_mut();
         let store = grid.scrollback_mut()?.budgeted_memory_used();
-        Some(store + grid.history_link_bytes())
+        let links = grid.history_link_bytes();
+        let images = super::handler_osc_1337::unbooked_history_image_bytes(grid, &stored);
+        Some(store + links + images)
     }
 
     /// Evicts history down to `keep(budget)` bytes and restores `budget`, returning the before/after byte counts.
@@ -130,17 +135,22 @@ impl Terminal {
         &mut self,
         keep: impl FnOnce(usize) -> usize,
     ) -> Option<HistoryShed> {
-        let grid = self.history_grid_mut();
-        let store = grid.scrollback_mut()?;
-        let budget = store.memory_budget();
-        let before = store.budgeted_memory_used() + grid.history_link_bytes();
+        let budget = self.history_grid_mut().scrollback_mut()?.memory_budget();
+        let before = self.history_scrollback_bytes()?;
         let _ = self.set_memory_budget(keep(budget));
         let _ = self.set_memory_budget(budget);
-        let after = self.history_scrollback().map_or(
-            0,
-            crate::scrollback::ScrollbackStorage::budgeted_memory_used,
-        ) + self.main_grid().history_link_bytes();
+        let after = self.history_scrollback_bytes().unwrap_or(0);
         Some(HistoryShed { before, after })
+    }
+
+    /// Hold the primary history's inline images to its (possibly just lowered) budget now, and
+    /// restart the placement room from what is left.
+    fn enforce_history_image_budget(&mut self) {
+        let stored = self.transient.kitty_store_images();
+        let grid = self.history_grid_mut();
+        let budget = super::handler_osc_1337::history_image_budget(grid);
+        let found = super::handler_osc_1337::measure_history_images(grid, &stored, budget);
+        self.transient.history_image_room = found.room(budget);
     }
 
     /// Drains deferred scrollback rows into attached tiered storage for all grids.
@@ -166,6 +176,7 @@ impl Terminal {
                 first_err.get_or_insert(e);
             }
         }
+        self.enforce_history_image_budget();
         match first_err {
             Some(e) => Err(e),
             None => Ok(()),

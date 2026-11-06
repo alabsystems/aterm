@@ -221,19 +221,19 @@ impl Paths {
     /// `run/helper.log`.
     #[must_use]
     pub fn helper_log(&self) -> PathBuf {
-        self.run_dir().join("helper.log")
+        self.root.join("run/helper.log")
     }
 
     /// `run/console.log`.
     #[must_use]
     pub fn console_log(&self) -> PathBuf {
-        self.run_dir().join("console.log")
+        self.root.join("run/console.log")
     }
 
     /// `run/key.img`: the boot's key disk ([`crate::key`]).
     #[must_use]
     pub fn key_disk(&self) -> PathBuf {
-        self.run_dir().join("key.img")
+        self.root.join("run/key.img")
     }
 
     /// `live/aterm-linux.img`.
@@ -308,7 +308,7 @@ impl Record {
             "birth_us": self.birth_us,
             "helper_sha256": self.helper_sha256,
             "proto": self.proto,
-            "live_disk": self.live_disk.to_string_lossy().into_owned(),
+            "live_disk": self.live_disk.to_string_lossy().as_ref(),
             "started": self.started,
             "boot_id": self.boot_id,
             "agent_sha256": self.agent_sha256,
@@ -523,8 +523,9 @@ pub fn holder(paths: &Paths, pids: &dyn Pids) -> Holder {
     )
 )]
 pub fn remove_leftovers(paths: &Paths, dead: &Record) {
-    if Record::read(&paths.record()).as_ref() == Some(dead) && owned_plain_dir(&paths.run_dir()) {
-        let _ = std::fs::remove_file(paths.record());
+    let record_path = paths.record();
+    if Record::read(&record_path).as_ref() == Some(dead) && owned_plain_dir(&paths.run_dir()) {
+        let _ = std::fs::remove_file(record_path);
         let _ = std::fs::remove_file(paths.socket());
         let _ = std::fs::remove_file(paths.key_disk());
     }

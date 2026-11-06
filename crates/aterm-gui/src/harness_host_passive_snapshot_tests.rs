@@ -73,6 +73,17 @@ impl Passive {
         }
     }
 
+    /// The tab's primary line comes to stand. The shipped host reads one store for what names the
+    /// primary and for its line; this fixture keeps two, [`Acting::self_copies`], which starts a
+    /// pass's read (`PassivePrimary::current`), and the copy that read takes its line from
+    /// (`with_self_claimed_line`). So the copy goes in first: a pass another test's ring makes
+    /// between them would read no line and pace its next read 2 s out, past the drain in
+    /// [`Self::admit_primary`].
+    ///
+    /// NEGATIVE CONTROL (2026-11-05): a `ring()` and a 300 ms sleep between the two, with
+    /// `self_copies` first as it was, fired "ordinary passive observation must publish its
+    /// now-valid exact restart route" on the unnamed case, 2 of 2 runs, and on the unread case; the
+    /// same gap in this order passed, 2 of 2 and 1 of 1.
     fn admit(world: &Acting, sid: &str, copy: &self_claimed::Copy) {
         *world.session_now.lock().unwrap() = Some(Some(
             copy.resume
@@ -82,12 +93,12 @@ impl Passive {
                 .clone(),
         ));
         world.unreadable.store(false, Ordering::SeqCst);
+        crate::self_claim::set_copy_for_test(sid, Some(copy.clone()));
         world
             .self_copies
             .lock()
             .unwrap()
             .insert(sid.to_string(), copy.clone());
-        crate::self_claim::set_copy_for_test(sid, Some(copy.clone()));
     }
 
     fn admit_primary(&self) {

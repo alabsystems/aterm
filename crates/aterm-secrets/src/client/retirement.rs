@@ -674,6 +674,8 @@ pub fn admin_revoke(
     // A refused locker rewrite comes before the permanent retirement, not after it.
     custody_readable(paths, admin)?;
 
+    // Every removal path signs its table cutoffs before its `Remove` (one-mesh §4.10, B11).
+    super::remove::cut_tables_for_recipients(paths, std::slice::from_ref(&recipient));
     let (published, retirement) = admin_publish_revocation(paths, admin, &doc, &[recipient])?;
     Ok(Revocation {
         published,
@@ -738,6 +740,7 @@ pub fn admin_retire(
             "this vault has no Commons control, so it has no Commons membership to retire; aterm secrets revoke removes a machine",
         ));
     }
+    super::remove::cut_tables_for_recipients(paths, &recipients);
     retire_cached(paths, admin, &admin.published_doc, &recipients)?.ok_or_else(|| {
         Error::new("a requested recipient has no authenticated vault or Commons identity")
     })
@@ -1794,6 +1797,8 @@ pub fn admin_revoke_stolen(
     admin.admissions.retained(&doc)?.validate(&doc, sequence)?;
     custody_readable(paths, admin)?;
 
+    // Every removal path signs its table cutoffs before its `Remove` (one-mesh §4.10, B11).
+    super::remove::cut_tables_for_recipients(paths, std::slice::from_ref(&recipient));
     let (published, retirement) = admin_publish_revocation(paths, admin, &doc, &[recipient])?;
     Ok(StolenRevocation {
         revocation: Revocation {

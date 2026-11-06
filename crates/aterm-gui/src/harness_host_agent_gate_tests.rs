@@ -204,7 +204,7 @@ fn switching_off_revokes_a_cold_relaunch_read_already_inflight() {
     let mut h = hooks(&world, parking_body(&world));
     h.acts.account_cold = {
         let release = Arc::clone(&release);
-        Arc::new(move |_, _| {
+        Arc::new(move |_, _, _| {
             release_after_edit(&release, &entered_tx);
             Ok(relaunch::ColdAdmission::Immediate(None))
         })

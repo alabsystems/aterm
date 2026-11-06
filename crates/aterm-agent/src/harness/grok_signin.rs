@@ -775,7 +775,7 @@ impl Ladder {
 /// The automatic rung of the gate's ladder, ahead of the person: the row that signs the default
 /// home in, what this machine offers it, and the headless approver that takes it. A test's
 /// stand-in approves or stops as it is told; [`LiveAuto`] is the machine's.
-pub trait Auto {
+pub(super) trait Auto {
     /// Whether the vendor's sign-in page answers this rung's headless browser
     /// ([`Cli::renews_headlessly`]). Where it does not (accounts.x.ai answers it with
     /// Cloudflare's block page, design §5 (g)), no profile or mailbox gets the rung past it, so
@@ -790,7 +790,7 @@ pub trait Auto {
     /// Approves `handoff`'s page as the ladder's row, or says why not; called only where
     /// [`Ladder::ready`] and no [`Skip`] holds, with a deadline [`AUTO_WITHIN`] at most away and
     /// a `finished` that is also true once the caller was asked to stop.
-    fn approve(&mut self, handoff: &Handoff<'_>) -> Approval;
+    fn approve(&mut self, handoff: &Handoff<'_>, begun: &super::sign_in_ladder::Begun) -> Approval;
 }
 
 /// Why the automatic rung does not run for a sign-in, decided once before its ladder is read
@@ -963,33 +963,15 @@ impl Auto for LiveAuto {
         }
     }
 
-    fn approve(&mut self, handoff: &Handoff<'_>) -> Approval {
-        let (Some(store), Some(approver)) = (self.store.as_ref(), self.approver.as_mut()) else {
+    fn approve(&mut self, handoff: &Handoff<'_>, begun: &super::sign_in_ladder::Begun) -> Approval {
+        if !begun.names(super::accounts::Cli::Grok, LEDGER_ACCOUNT) {
+            return Approval::Refused("the retained sign-in belongs to another operation".into());
+        }
+        let (Some(_), Some(approver)) = (self.store.as_ref(), self.approver.as_mut()) else {
             return Approval::NeedsYou("no row was read for the automatic sign-in".to_owned());
         };
-        // One headless sign-in at a time on this machine, for every CLI (a renewal, `accounts
-        // browser`, the upkeep): the row's profile admits one browser.
-        let _lock = loop {
-            match store.signin_now() {
-                Ok(Some(lock)) => break lock,
-                Ok(None) => {}
-                Err(e) => {
-                    return Approval::NeedsYou(format!(
-                        "the machine's sign-in lock could not be taken ({e})"
-                    ));
-                }
-            }
-            if (handoff.finished)() {
-                return Approval::Approved { page: false };
-            }
-            if handoff.deadline.passed() {
-                return Approval::NeedsYou(format!(
-                    "{} for the automatic rung's time",
-                    super::accounts::SIGNIN_HELD
-                ));
-            }
-            std::thread::sleep(POLL);
-        };
+        // The gate retains this same machine turn through approval and cleanup.
+        // Reacquiring here would deadlock against its own manual FIFO ticket.
         approver.approve(handoff)
     }
 }
@@ -1004,8 +986,14 @@ pub trait Owner {
     fn say(&mut self, line: &str);
 }
 
+type Begin<'a> = dyn Fn(
+        i64,
+        &mut dyn FnMut(super::accounts::SigninPosition),
+    ) -> Result<super::sign_in_ladder::Begun, String>
+    + 'a;
+
 /// One gate's inputs, injected so a test drives it with a stand-in vendor and sandbox.
-pub struct Gate<'a> {
+pub(super) struct Gate<'a> {
     /// The harness state directory: the lock, the record, the staging homes.
     pub state: &'a Path,
     /// The owner's home.
@@ -1031,7 +1019,7 @@ pub struct Gate<'a> {
     /// caller's sign-in at the given time ([`super::sign_in_ladder::SignIn::begin`], on the
     /// machine's sign-in lock and spacing clock), called once and only where [`run`] decided to
     /// start one, before grok runs; its refusal, in words, runs nothing.
-    pub begin: &'a dyn Fn(i64) -> Result<(), String>,
+    pub begin: &'a Begin<'a>,
 }
 
 /// How one gate ended.
@@ -1254,7 +1242,7 @@ pub fn running(state: &Path) -> bool {
 /// page the rung never runs and its browser is never fetched ([`Skip::Blocked`]). A person's own
 /// launch after a sign-in the automatic rung refused ([`Record::by`]) skips that rung once and
 /// asks them, so a profile that keeps refusing never leaves the machine with no way in.
-pub fn run(
+pub(super) fn run(
     gate: &Gate<'_>,
     auto: &mut dyn Auto,
     owner: &mut dyn Owner,
@@ -1312,9 +1300,16 @@ pub fn run(
     }
     // The sign-in starts here or not at all: a refused start writes no record, so it leaves
     // no backoff behind it.
-    if let Err(why) = (gate.begin)(now) {
-        return Ended::NotRun(why);
-    }
+    let begun = match (gate.begin)(now, &mut |position| {
+        owner.say(&format!(
+            "Grok Build sign-in: {}",
+            super::cli::signin_queue_words(position)
+        ))
+    }) {
+        Ok(begun) if begun.names(super::accounts::Cli::Grok, LEDGER_ACCOUNT) => begun,
+        Ok(_) => return Ended::NotRun("the retained sign-in belongs to another operation".into()),
+        Err(why) => return Ended::NotRun(why),
+    };
     remove_stale_staging(gate.state);
     let leading = Leading::write(gate.state, now);
     // The one place the automatic rung is gated. It never runs where the vendor's sign-in page
@@ -1328,7 +1323,7 @@ pub fn run(
     } else {
         None
     };
-    let led = lead(gate, &target, auto, owner, skip);
+    let led = lead(gate, &target, auto, owner, skip, &begun);
     drop(leading);
     owner.clear();
     let (word, host) = match &led.lead {
@@ -1405,6 +1400,9 @@ fn unsigned_why(outcome: &Outcome) -> String {
         }
         Outcome::Exited(None) => "grok was ended by a signal".to_owned(),
         Outcome::SignedIn { .. } => "grok said it signed in but left no login file".to_owned(),
+        Outcome::CompletedHeld => {
+            "its completed native response was retained without publication".to_owned()
+        }
         Outcome::NotRun(why) | Outcome::PageNotOpened(why) | Outcome::Unverified(why) => {
             why.clone()
         }
@@ -1553,6 +1551,9 @@ impl Approver for NeedApprover<'_, '_> {
         if (handoff.finished)() {
             return Approval::Approved { page: false };
         }
+        if handoff.deadline.expired() {
+            return Approval::NotRun("sign-in deadline expired".into());
+        }
         if let Some(signed) = signed_in(self.gate.var, self.gate.home) {
             self.elsewhere = Some(signed);
             return Approval::Refused("signed in elsewhere".to_owned());
@@ -1564,8 +1565,11 @@ impl Approver for NeedApprover<'_, '_> {
             handoff.url,
         );
         loop {
-            if (handoff.finished)() || handoff.deadline.passed() {
+            if (handoff.finished)() {
                 return Approval::Approved { page: false };
+            }
+            if handoff.deadline.expired() {
+                return Approval::NotRun("sign-in deadline expired".into());
             }
             if (self.gate.stopped)() {
                 self.stopped = true;
@@ -1588,6 +1592,7 @@ impl Approver for NeedApprover<'_, '_> {
 /// ([`Approval::BotCheck`]) ends it too, with no need raised: nobody is asked to pass one.
 struct LadderApprover<'a, 'b> {
     auto: &'a mut dyn Auto,
+    begun: &'a super::sign_in_ladder::Begun,
     ready: bool,
     need: NeedApprover<'a, 'b>,
     /// The automatic rung's result, in the ladder's words.
@@ -1612,10 +1617,10 @@ impl Approver for LadderApprover<'_, '_> {
                 hosts: handoff.hosts,
                 email: handoff.email,
                 finished: &finished,
-                deadline: handoff.deadline.within(AUTO_WITHIN),
+                deadline: handoff.deadline.limited(AUTO_WITHIN),
             };
             self.ran = true;
-            let said = self.auto.approve(&within);
+            let said = self.auto.approve(&within, self.begun);
             if (gate.stopped)() {
                 self.need.stopped = true;
                 self.headless = Some("stopped".to_owned());
@@ -1766,6 +1771,7 @@ fn lead(
     auto: &mut dyn Auto,
     owner: &mut dyn Owner,
     skip: Option<Skip>,
+    begun: &super::sign_in_ladder::Begun,
 ) -> Led {
     let prepared = match preflight(gate) {
         Ok(prepared) => prepared,
@@ -1806,6 +1812,7 @@ fn lead(
     ));
     let mut approver = LadderApprover {
         auto,
+        begun,
         ready,
         need: NeedApprover {
             owner,

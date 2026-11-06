@@ -1050,6 +1050,12 @@ fn wakes_past_the_clear(v: &Verdict, run: &Run<MomentumSchema>, inputs: &[Moment
     }
 }
 
+/// A poll in a frame's slack: lane fidelity passes it on every training item at the frame's interval,
+/// and `NoStrandedLight` refuses it on one of them, each failure a wake past the clear.
+///
+/// NEGATIVE CONTROL (2026-11-05): `LaneFidelity::judge` failing every run fires `"… the slack is
+/// unjudged by lane fidelity"`; a poll that wakes no later than one frame fires `"… NoStrandedLight
+/// refuses a poll past a frame on a training item at … ns"`.
 #[test]
 fn a_poll_just_past_a_frame_is_refused() {
     let t0 = Instant::now();

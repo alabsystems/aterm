@@ -5,6 +5,114 @@ use super::*;
 
 const NOW: i64 = 1_790_000_000;
 
+#[test]
+fn pool_authority_witness_tracks_binding_identity_and_raw_policy_not_workflow_clocks() {
+    let mut raw = Roster::own();
+    let mut logins = Logins::default();
+    let original = pool_authority_revision(&raw, &logins).unwrap();
+    logins.workflow_clock += 1;
+    assert_eq!(pool_authority_revision(&raw, &logins).unwrap(), original);
+    logins.labels.insert(
+        "main".into(),
+        Binding {
+            dir: Some("/new/login".into()),
+            renewal_generation: 1,
+            ..Binding::default()
+        },
+    );
+    let rebound = pool_authority_revision(&raw, &logins).unwrap();
+    assert_ne!(rebound, original);
+    logins.labels.get_mut("main").unwrap().proved_email = Some("different@example.invalid".into());
+    assert_ne!(pool_authority_revision(&raw, &logins).unwrap(), rebound);
+    let before_policy = pool_authority_revision(&raw, &logins).unwrap();
+    raw.rows[0].held_by = Some("other-machine".into());
+    assert_ne!(
+        pool_authority_revision(&raw, &logins).unwrap(),
+        before_policy
+    );
+}
+
+#[test]
+fn metadata_observation_never_recovers_publication_or_reads_credentials() {
+    let root = aterm_tempfile::TempDir::new().unwrap();
+    let store = Store::at_for(root.path(), Cli::Codex, &root.path().join("home")).bounded_by(&[]);
+    let path = root.path().join("accounts-codex.toml");
+    let empty = store.peek_account_records(&path, NOW).unwrap();
+    assert!(!empty.roster_present);
+    assert!(empty.roster.rows.is_empty());
+    assert!(
+        !store.dir.exists(),
+        "observing absent metadata creates nothing"
+    );
+    store
+        .transact_logins(NOW, &mut None, |state, logins| {
+            Ok(note_renewed(
+                state,
+                logins,
+                "main",
+                None,
+                "/opaque/login",
+                None,
+                NOW,
+            ))
+        })
+        .unwrap();
+    pause(&store, || {
+        store.transact_logins(NOW, &mut None, |state, logins| {
+            Ok(note_renewed(
+                state,
+                logins,
+                "main",
+                None,
+                "/other/login",
+                None,
+                NOW,
+            ))
+        })
+    });
+    let receipt = store.dir.join("sync-commit.json");
+    let before = std::fs::read(&receipt).unwrap();
+    assert!(store.peek_account_records(&path, NOW).is_err());
+    assert_eq!(
+        std::fs::read(receipt).unwrap(),
+        before,
+        "pending publication stays pending"
+    );
+}
+
+#[test]
+fn metadata_observation_refuses_roster_or_publication_changed_during_read() {
+    let root = aterm_tempfile::TempDir::new().unwrap();
+    let store = Store::at_for(root.path(), Cli::Codex, &root.path().join("home")).bounded_by(&[]);
+    let path = root.path().join("accounts-codex.toml");
+    assert!(
+        store
+            .peek_account_records_with(&path, NOW, || {
+                std::fs::write(&path, "# now present").unwrap();
+            })
+            .is_err()
+    );
+    assert!(
+        store
+            .peek_account_records_with(&path, NOW, || {
+                store
+                    .transact_logins(NOW, &mut None, |state, logins| {
+                        Ok(note_renewed(
+                            state,
+                            logins,
+                            "main",
+                            None,
+                            "/new/login",
+                            None,
+                            NOW,
+                        ))
+                    })
+                    .unwrap();
+            })
+            .is_err()
+    );
+}
+
 fn pause(store: &Store, publish: impl FnOnce() -> Result<Vec<Event>, String>) {
     let witness = store.state_witness_file();
     let retained = witness.with_extension("retained");

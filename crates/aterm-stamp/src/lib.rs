@@ -13,6 +13,9 @@
 //! identity field in [`KEYS`] order, then NUL padding. `crates/aterm/build.rs` writes it with
 //! [`encode`]; the binary's static holding it is read once with a volatile load ([`install`]), so
 //! a writer that rewrites the section's bytes after the link is the one the binary reports.
+//! [`rewrite`] is that writer: it finds the one record a linked image compiled in and replaces it.
+//! The web module compiles in [`UNSTAMPED_RECORD`], which `ship site` rewrites with the version
+//! and commit of the source it builds the module from.
 //!
 //! A process that installed no record (a library's own test binary, a dev helper) reads
 //! [`Stamp::UNSTAMPED`]: version `0.0.0`, commit `unknown`. A test that needs a real identity
@@ -171,6 +174,25 @@ impl Stamp {
     }
 }
 
+/// [`Stamp::UNSTAMPED`]'s record, byte for byte what [`encode`] writes for it: the record an image
+/// compiles in when a writer stamps it after the link ([`rewrite`]).
+pub const UNSTAMPED_RECORD: [u8; LEN] = record_of(
+    "aterm-stamp 1\nversion=0.0.0\ncommit=unknown\nfull_commit=unknown\ndirty=false\n\
+     built_at=unknown\nbuild=0\ndev_commits=0\nindex_hint=\nrelease=false\n",
+);
+
+/// `text` then NUL padding to [`LEN`] bytes; a text longer than [`LEN`] fails the build.
+const fn record_of(text: &str) -> [u8; LEN] {
+    let text = text.as_bytes();
+    let mut out = [0u8; LEN];
+    let mut i = 0;
+    while i < text.len() {
+        out[i] = text[i];
+        i += 1;
+    }
+    out
+}
+
 /// Write `stamp`'s identity fields as a [`LEN`]-byte record.
 /// # Errors
 /// A value holding a newline or a NUL, or a record longer than [`LEN`].
@@ -203,6 +225,25 @@ pub fn encode(stamp: &Stamp) -> Result<[u8; LEN], String> {
 /// A record without [`HEADER`], one that is not UTF-8 up to its padding, or one whose lines are
 /// not exactly [`KEYS`] in order with `dirty` and `release` each `true` or `false`.
 pub fn decode(record: &'static [u8; LEN], compiled: Stamp) -> Result<Stamp, String> {
+    let mut stamp = compiled;
+    for (key, value) in KEYS.into_iter().zip(values(record)?) {
+        match key {
+            "version" => stamp.app_version = value,
+            "commit" => stamp.git_commit = value,
+            "full_commit" => stamp.git_commit_full = value,
+            "dirty" => stamp.git_dirty = value,
+            "built_at" => stamp.build_time = value,
+            "build" => stamp.build_number = value,
+            "dev_commits" => stamp.dev_commits = value,
+            "index_hint" => stamp.index_hint = value,
+            _ => stamp.release_build = value == "true",
+        }
+    }
+    Ok(stamp)
+}
+
+/// A record's values, in [`KEYS`] order, under [`decode`]'s rules.
+fn values(record: &[u8; LEN]) -> Result<[&str; KEYS.len()], String> {
     let used = record.iter().position(|&b| b == 0).unwrap_or(LEN);
     let text = std::str::from_utf8(record.get(..used).unwrap_or_default())
         .map_err(|e| format!("stamp record is not UTF-8: {e}"))?;
@@ -210,8 +251,8 @@ pub fn decode(record: &'static [u8; LEN], compiled: Stamp) -> Result<Stamp, Stri
         .strip_prefix(HEADER)
         .ok_or_else(|| format!("stamp record does not start {HEADER:?}"))?;
     let mut lines = body.split_terminator('\n');
-    let mut stamp = compiled;
-    for key in KEYS {
+    let mut values = [""; KEYS.len()];
+    for (key, slot) in KEYS.into_iter().zip(&mut values) {
         let line = lines
             .next()
             .ok_or_else(|| format!("stamp record ends before {key}"))?;
@@ -219,21 +260,49 @@ pub fn decode(record: &'static [u8; LEN], compiled: Stamp) -> Result<Stamp, Stri
             .strip_prefix(key)
             .and_then(|rest| rest.strip_prefix('='))
             .ok_or_else(|| format!("stamp record line {line:?} is not {key}=…"))?;
-        match key {
-            "version" => stamp.app_version = value,
-            "commit" => stamp.git_commit = value,
-            "full_commit" => stamp.git_commit_full = value,
-            "dirty" => stamp.git_dirty = boolean(key, value)?,
-            "built_at" => stamp.build_time = value,
-            "build" => stamp.build_number = value,
-            "dev_commits" => stamp.dev_commits = value,
-            "index_hint" => stamp.index_hint = value,
-            _ => stamp.release_build = boolean(key, value)? == "true",
-        }
+        *slot = match key {
+            "dirty" | "release" => boolean(key, value)?,
+            _ => value,
+        };
     }
     match lines.next() {
-        None => Ok(stamp),
+        None => Ok(values),
         Some(extra) => Err(format!("stamp record has an extra line {extra:?}")),
+    }
+}
+
+/// Replace the one record a linked `image` compiled in with `stamp`'s: the post-link writer. A
+/// record is [`LEN`] bytes from a [`HEADER`] that [`decode`] reads; any other bytes, a lone
+/// [`HEADER`] string among them, are left alone.
+/// # Errors
+/// `stamp` does not encode ([`encode`]), or `image` holds no record or more than one, so which
+/// to replace is not known; `image` is unchanged.
+pub fn rewrite(image: &mut [u8], stamp: &Stamp) -> Result<(), String> {
+    let record = encode(stamp)?;
+    let header = HEADER.as_bytes();
+    let mut found = Vec::new();
+    for (at, window) in image.windows(header.len()).enumerate() {
+        let is_record = window == header
+            && image
+                .get(at..at + LEN)
+                .and_then(|r| <&[u8; LEN]>::try_from(r).ok())
+                .is_some_and(|r| values(r).is_ok());
+        if is_record {
+            found.push(at);
+        }
+    }
+    match *found.as_slice() {
+        [at] => {
+            if let Some(slot) = image.get_mut(at..at + LEN) {
+                slot.copy_from_slice(&record);
+            }
+            Ok(())
+        }
+        [] => Err("the image holds no identity record".to_owned()),
+        _ => Err(format!(
+            "the image holds {} identity records, at offsets {found:?}",
+            found.len()
+        )),
     }
 }
 

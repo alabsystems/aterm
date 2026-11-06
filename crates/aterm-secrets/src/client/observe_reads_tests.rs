@@ -12,15 +12,19 @@ use crate::commons::{Observation, Unavailable};
 use log_entries_tests::{TwoMacs, two_macs};
 use std::collections::BTreeMap;
 
-fn observed_with_reads(paths: &Paths) -> (crate::Result<Observation>, BTreeMap<PathBuf, usize>) {
+fn reads_during<T>(paths: &Paths, read: impl FnOnce() -> T) -> (T, BTreeMap<PathBuf, usize>) {
     let before = fsx::reads_under(&paths.home);
-    let observed = observe_commons(paths);
+    let answer = read();
     let mut reads = fsx::reads_under(&paths.home);
     reads.retain(|path, count| {
         *count -= before.get(path).copied().unwrap_or(0);
         *count > 0
     });
-    (observed, reads)
+    (answer, reads)
+}
+
+fn observed_with_reads(paths: &Paths) -> (crate::Result<Observation>, BTreeMap<PathBuf, usize>) {
+    reads_during(paths, || observe_commons(paths))
 }
 
 /// `expected` were each read exactly once, and no other file more than once.
@@ -40,13 +44,13 @@ fn is_unavailable(paths: &Paths, reason: Unavailable) -> bool {
     matches!(observe_commons(paths), Ok(Observation::Unavailable(found)) if found == reason)
 }
 
-/// The vault files every observation of an applied vault reads.
+/// The vault files every observation of an applied vault reads. An absent records pin is seen by
+/// its `lstat` ([`crate::records_storage::selected`]), not read.
 fn vault_files(paths: &Paths) -> Vec<PathBuf> {
     vec![
         paths.source_file(),
         paths.state_file(),
         paths.identity_file(),
-        paths.dir.join("records.layout"),
         paths.dir.join("records.frontiers"),
     ]
 }
@@ -82,7 +86,8 @@ fn with_a_denied_node(lab: &TwoMacs) {
 /// NEGATIVE CONTROLS (2026-11-05): with the denial check given a second `Reads::new(paths)`, a file
 /// is `read more than once`; with `OBSERVE_COMMONS_CACHE`'s lookup moved ahead of the applied
 /// branch's denial check, the second observation reads no `device.age` (`left: None, right:
-/// Some(1)`).
+/// Some(1)`); with `selected` always going through `data_path`, the absent pin is opened (`left:
+/// Some(1), right: None`).
 #[test]
 fn an_observation_of_an_applied_vault_reads_each_file_once() {
     let _answering = ServersAnswering::set();
@@ -101,6 +106,7 @@ fn an_observation_of_an_applied_vault_reads_each_file_once() {
         let (observed, reads) = observed_with_reads(&lab.m7);
         assert!(is_visible(&observed), "{observed:?}");
         assert_read_once(&reads, &expected);
+        assert_eq!(reads.get(&lab.m7.dir.join("records.layout")), None);
     }
     lab.server.stop();
 }
@@ -114,7 +120,11 @@ fn an_observation_under_a_pinned_records_layout_opens_its_data_twice_and_the_res
     let lab = two_macs(&[]);
     drop(crate::records_storage::write_path(&lab.m7.records_file(), true).unwrap());
     let mut expected = logged_vault_files(&lab.m7);
-    expected.extend([lab.m7.cache_file(), lab.m7.records_file().join("layout")]);
+    expected.extend([
+        lab.m7.cache_file(),
+        lab.m7.dir.join("records.layout"),
+        lab.m7.records_file().join("layout"),
+    ]);
     let (observed, mut reads) = observed_with_reads(&lab.m7);
     assert!(is_visible(&observed), "{observed:?}");
     assert_eq!(
@@ -168,6 +178,83 @@ fn an_observation_of_a_vault_with_no_log_reads_each_file_once() {
         assert!(is_visible(&observed), "{observed:?}");
         assert_read_once(&reads, &expected);
     }
+}
+
+/// The read each caller of a roster makes, under the one lock it holds.
+fn roster_with_reads(
+    paths: &Paths,
+) -> (
+    crate::Result<Option<crate::swarm_roster::SwarmRoster>>,
+    BTreeMap<PathBuf, usize>,
+) {
+    let lock = StateLock::observe(paths).unwrap().unwrap();
+    reads_during(paths, || roster::swarm_roster_held(paths, &lock))
+}
+
+/// A roster read asks for this Mac's log as it finds its base roster and again to overlay it.
+///
+/// NEGATIVE CONTROL (2026-11-05): with `swarm_roster_held` handing the overlay a second
+/// `Reads::new(paths)`, a file is `read more than once`.
+#[test]
+fn a_roster_read_of_an_applied_vault_reads_each_file_once() {
+    let _answering = ServersAnswering::set();
+    let lab = two_macs(&[]);
+    with_a_denied_node(&lab);
+    let mut expected = logged_vault_files(&lab.m7);
+    expected.extend([lab.m7.cache_file(), lab.m7.records_file()]);
+    let (roster, reads) = roster_with_reads(&lab.m7);
+    assert!(roster.unwrap().unwrap().is_label_denied("m99"));
+    assert_read_once(&reads, &expected);
+    lab.server.stop();
+}
+
+/// NEGATIVE CONTROL (2026-11-05): with `swarm_roster_held` handing the overlay a second
+/// `Reads::new(paths)`, a file is `read more than once`.
+#[test]
+fn a_roster_read_of_a_log_only_vault_reads_each_file_once() {
+    let _answering = ServersAnswering::set();
+    let (_root, paths, _config, state) = log_only_tests::applied_log();
+    assert_eq!(state.digest, None);
+    let mut expected = logged_vault_files(&paths);
+    expected.push(paths.records_file());
+    let (roster, reads) = roster_with_reads(&paths);
+    assert!(roster.unwrap().is_some());
+    assert_read_once(&reads, &expected);
+}
+
+/// One read of the Commons log, as each check of a Commons access makes: the store, the lineage
+/// that judges it and the retained history that covers it.
+///
+/// NEGATIVE CONTROLS (2026-11-05): with `commons_log_under`'s `reads.config()` back to
+/// `config(reads.paths())`, `source.toml` is `read more than once`; with `require_covers` handed
+/// `&Reads::new(reads.paths())`, `records.frontiers` is.
+#[test]
+fn a_commons_log_read_reads_each_file_once() {
+    let _answering = ServersAnswering::set();
+    let lab = two_macs(&[]);
+    with_a_denied_node(&lab);
+    let store = load_acknowledged_records(&lab.m7).unwrap();
+    let crate::membership_log::Body::Genesis { root, .. } = store.log().unwrap().genesis().body()
+    else {
+        panic!("a log begins with its genesis");
+    };
+    let trust = crate::commons::journal::Trust {
+        network: root.network,
+        authority: root.authority,
+        genesis: [0; 32],
+    };
+    let (log, reads) = reads_during(&lab.m7, || log_entries::trusted_commons_log(&lab.m7, trust));
+    assert!(log.unwrap().is_some());
+    assert_read_once(
+        &reads,
+        &[
+            lab.m7.source_file(),
+            lab.m7.records_file(),
+            lab.m7.dir.join("records.frontiers"),
+            lab.m7.dir.join("frontiers.checkpoint"),
+        ],
+    );
+    lab.server.stop();
 }
 
 /// A failed read fails the observation, as it did when each check read for itself. Only the vault
@@ -916,5 +1003,39 @@ fn a_roster_denial_applied_between_two_observations_is_seen_by_the_second() {
     save_records(&lab.m7, &load_records(&lab.m22).unwrap().encode()).unwrap();
     sync_with(&lab.m7, std::fs::read(lab.m22.cache_file()).unwrap()).unwrap();
     assert!(is_unavailable(&lab.m7, Unavailable::Revoked));
+    lab.server.stop();
+}
+
+/// A take of the state lock with nothing to finish reads each file it holds once: the step that
+/// finishes a prepared transition reads the records layout before any read is shared, the shared
+/// selection answers from its `lstat`, and the recovery steps share one read of the claim, the
+/// journal, the configuration and the records.
+///
+/// NEGATIVE CONTROLS (2026-11-05): with [`retained_history::acknowledge_under`] reading for itself
+/// (`acknowledge_selected(&Reads::new(reads.paths()), ...)`), `read more than once` names
+/// `records.frontiers` and `frontiers.checkpoint`; with [`crate::records_storage::selected`] always
+/// through `data_path`, it names `records.layout`.
+#[test]
+fn a_state_lock_take_with_nothing_to_finish_reads_each_file_once() {
+    let _answering = ServersAnswering::set();
+    let lab = two_macs(&[]);
+    for paths in [&lab.m22, &lab.m7] {
+        let before = fsx::reads_under(&paths.home);
+        drop(StateLock::take(paths).unwrap());
+        let mut reads = fsx::reads_under(&paths.home);
+        reads.retain(|path, count| {
+            *count -= before.get(path).copied().unwrap_or(0);
+            *count > 0
+        });
+        assert_read_once(
+            &reads,
+            &[
+                paths.source_file(),
+                paths.dir.join("records.layout"),
+                paths.dir.join("records.frontiers"),
+                paths.dir.join("frontiers.checkpoint"),
+            ],
+        );
+    }
     lab.server.stop();
 }

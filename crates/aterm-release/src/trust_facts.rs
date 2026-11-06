@@ -4,6 +4,7 @@
 //! Trust verification lane fact recording, memory admission, ratchet judgment, and CLI verbs.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -150,15 +151,18 @@ impl Pace {
     /// when its threads were read: the lane's `.pace` mark and the facts' field.
     #[must_use]
     pub fn text(&self) -> String {
-        let mut t = format!(
-            "{} {} {} {}",
-            self.cpu_ms,
-            self.wall_ms,
-            self.load.map_or_else(|| "-".into(), |l| l.to_string()),
-            self.cores
-        );
+        let mut t = String::new();
+        let _ = write!(t, "{} {} ", self.cpu_ms, self.wall_ms);
+        match self.load {
+            Some(l) => {
+                let _ = write!(t, "{l} {}", self.cores);
+            }
+            None => {
+                let _ = write!(t, "- {}", self.cores);
+            }
+        }
         if let Some(th) = self.threads {
-            t.push_str(&format!(" {} {}", th.ran_ms, th.runnable_ms));
+            let _ = write!(t, " {} {}", th.ran_ms, th.runnable_ms);
         }
         t
     }
@@ -240,11 +244,12 @@ impl Pace {
             self.cores
         );
         if let Some(t) = self.share() {
-            said.push_str(&format!(
+            let _ = write!(
+                said,
                 ", threads ran {} of their runnable time, {} of them runnable on average",
                 ratio(t.ran_ms, t.runnable_ms),
                 ratio(t.runnable_ms, self.wall_ms)
-            ));
+            );
         }
         said
     }
@@ -585,14 +590,14 @@ pub const TRUSTD_DIRTY: &str = "crash epoch is not CLEAN";
 /// counts, is not this.
 pub const TARGO_COULD_NOT_RUN: &str = "COULD NOT RUN: ";
 
-fn find_all(hay: &str, needle: &str) -> Vec<usize> {
-    let mut out = Vec::new();
-    let mut from = 0;
-    while let Some(i) = hay.get(from..).and_then(|s| s.find(needle)) {
-        out.push(from + i);
-        from += i + needle.len().max(1);
-    }
-    out
+fn find_all<'a>(hay: &'a str, needle: &'a str) -> impl Iterator<Item = usize> + 'a {
+    debug_assert!(!needle.is_empty());
+    hay.match_indices(needle).map(|(i, _)| i)
+}
+
+fn rfind_all<'a>(hay: &'a str, needle: &'a str) -> impl Iterator<Item = usize> + 'a {
+    debug_assert!(!needle.is_empty());
+    hay.rmatch_indices(needle).map(|(i, _)| i)
 }
 
 fn digits_at(s: &str, i: usize) -> &str {
@@ -613,14 +618,14 @@ const fn digits_start_before(s: &str, end: usize) -> usize {
 /// Extracts `(proved, total)` counts from a `Summary: <n> proved ... (<n> total)` log line.
 #[must_use]
 pub fn parse_summary(line: &str) -> (Option<u64>, Option<u64>) {
-    let proved = find_all(line, "Summary: ").into_iter().rev().find_map(|i| {
+    let proved = rfind_all(line, "Summary: ").find_map(|i| {
         let d = digits_at(line, i + "Summary: ".len());
         let after = i + "Summary: ".len() + d.len();
         (!d.is_empty() && line.get(after..).is_some_and(|r| r.starts_with(" proved")))
             .then(|| d.parse().ok())
             .flatten()
     });
-    let total = find_all(line, "(").into_iter().rev().find_map(|i| {
+    let total = rfind_all(line, "(").find_map(|i| {
         let d = digits_at(line, i + 1);
         let after = i + 1 + d.len();
         (!d.is_empty() && line.get(after..).is_some_and(|r| r.starts_with(" total)")))
@@ -632,20 +637,17 @@ pub fn parse_summary(line: &str) -> (Option<u64>, Option<u64>) {
 
 fn census_skipped(line: &str) -> Option<u64> {
     let census = line.find("memory census:")? + "memory census:".len();
-    find_all(line, " bodies skipped at the memory ceiling")
-        .into_iter()
-        .rev()
-        .find_map(|j| {
-            let start = digits_start_before(line, j);
-            (start < j && start > census)
-                .then(|| line[start..j].parse().ok())
-                .flatten()
-        })
+    rfind_all(line, " bodies skipped at the memory ceiling").find_map(|j| {
+        let start = digits_start_before(line, j);
+        (start < j && start > census)
+            .then(|| line[start..j].parse().ok())
+            .flatten()
+    })
 }
 
 fn census_figure(line: &str, key: &str) -> Option<String> {
     let census = line.find("memory census:")? + "memory census:".len();
-    find_all(line, key).into_iter().rev().find_map(|k| {
+    rfind_all(line, key).find_map(|k| {
         if k < census {
             return None;
         }
@@ -671,7 +673,6 @@ fn census_figure(line: &str, key: &str) -> Option<String> {
 fn transport_rows(line: &str) -> Vec<(String, String)> {
     const OPEN: &str = "[transport:";
     find_all(line, OPEN)
-        .into_iter()
         .filter_map(|i| {
             let rest = &line[i + OPEN.len()..];
             let n = rest
@@ -870,9 +871,10 @@ impl Measured {
                     .find("[UNKNOWN]")
                     .is_some_and(|u| u + "[UNKNOWN]".len() <= last)
                 {
-                    listed.push(said.clone());
+                    listed.push(said);
+                } else if listed.is_empty() {
+                    named.push(said);
                 }
-                named.push(said);
             }
             for i in find_all(line, "timed_out=") {
                 let d = digits_at(line, i + "timed_out=".len());
@@ -1335,16 +1337,16 @@ fn fits(row: &MemRow, host: &Host, c: &str) -> bool {
         }
 }
 
-fn tab_fields(line: &str, n: usize) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
+fn tab_fields(line: &str, n: usize) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::with_capacity(n);
     let mut rest = line.trim_matches('\t');
     while out.len() + 1 < n && !rest.is_empty() {
         let (f, r) = rest.split_once('\t').unwrap_or((rest, ""));
-        out.push(f.to_string());
+        out.push(f);
         rest = r.trim_start_matches('\t');
     }
     if !rest.is_empty() {
-        out.push(rest.to_string());
+        out.push(rest);
     }
     out
 }
@@ -1358,10 +1360,10 @@ pub fn parse_memory(
     let mut out: BTreeMap<String, Vec<MemRow>> = BTreeMap::new();
     for line in text.lines() {
         let f = tab_fields(line, 7);
-        let Some(lib) = f.first().filter(|n| !n.starts_with('#')) else {
+        let Some(&lib) = f.first().filter(|n| !n.starts_with('#')) else {
             continue;
         };
-        let col = |i: usize| f.get(i).map_or("", String::as_str);
+        let col = |i: usize| f.get(i).copied().unwrap_or("");
         let (fc, ram, at, need, bound) = (col(1), col(2), col(3), col(4), col(5));
         let bad = if !gib_or_dash(fc) {
             format!("the floor ceiling '{fc}'; it must be GiB (e.g. 16.0) or '-'")
@@ -1404,7 +1406,7 @@ pub fn parse_memory(
                 when.into()
             },
         };
-        let rows = out.entry(lib.clone()).or_default();
+        let rows = out.entry(lib.to_string()).or_default();
         let clash = if let Some(first) = rows.first().filter(|r| r.f != row.f) {
             format!(
                 "two floor ceilings, '{}' and '{fc}'; every row of a library names the ceiling its one floor was set at",
@@ -1487,24 +1489,27 @@ pub fn parse_host_obs(text: &str) -> Vec<HostObs> {
     text.lines()
         .filter_map(|line| {
             let f = tab_fields(line, 8);
-            let col = |i: usize| f.get(i).cloned().unwrap_or_default();
+            let col = |i: usize| f.get(i).copied().unwrap_or_default();
             let spec = col(0);
-            (!spec.is_empty() && !spec.starts_with('#')).then_some(())?;
-            let o = HostObs {
-                spec,
-                outcome: col(1),
-                ceil: col(2),
-                peak: col(3),
-                proved: col(4),
-                floor: col(5),
-                prover: col(6),
-                when: col(7),
-            };
-            (matches!(o.outcome.as_str(), "held" | "cap-bound")
-                && gib(&o.ceil).is_some()
-                && !o.floor.is_empty()
-                && o.floor.bytes().all(|b| b.is_ascii_digit()))
-            .then_some(o)
+            let outcome = col(1);
+            let ceil = col(2);
+            let floor = col(5);
+            (!spec.is_empty()
+                && !spec.starts_with('#')
+                && matches!(outcome, "held" | "cap-bound")
+                && gib(ceil).is_some()
+                && !floor.is_empty()
+                && floor.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| HostObs {
+                spec: spec.into(),
+                outcome: outcome.into(),
+                ceil: ceil.into(),
+                peak: col(3).into(),
+                proved: col(4).into(),
+                floor: floor.into(),
+                prover: col(6).into(),
+                when: col(7).into(),
+            })
         })
         .collect()
 }
@@ -1761,9 +1766,9 @@ pub fn memory_rewritten(text: &str, rows: &[(String, MemRow)]) -> String {
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .map(|l| {
             let f = tab_fields(l, 7);
-            let name = f.first().cloned().unwrap_or_default();
-            let fields: Vec<&str> = f.iter().skip(1).map(String::as_str).collect();
-            (name, MemRow::from_fields(&fields), l.to_string())
+            let name = f.first().copied().unwrap_or_default().to_string();
+            let fields = f.get(1..).unwrap_or_default();
+            (name, MemRow::from_fields(fields), l.to_string())
         })
         .collect();
     for (n, r) in rows {
@@ -1782,7 +1787,7 @@ pub fn memory_rewritten(text: &str, rows: &[(String, MemRow)]) -> String {
         }
     }
     let ram_of = |r: &Option<MemRow>| r.as_ref().and_then(|r| gib(&r.ram)).unwrap_or(-1.0);
-    data.sort_by(|a, b| {
+    data.sort_unstable_by(|a, b| {
         a.0.cmp(&b.0)
             .then_with(|| ram_of(&a.1).total_cmp(&ram_of(&b.1)))
             .then_with(|| a.2.cmp(&b.2))
@@ -1921,10 +1926,10 @@ impl Facts {
                 ("jobs", &p.jobs),
                 ("date", &p.date),
             ] {
-                out.push_str(&format!("{k} {}\n", one_line(v)));
+                let _ = writeln!(out, "{k} {}", one_line(v));
             }
             for r in &p.remeasured {
-                out.push_str(&format!("remeasured {}\n", one_line(r)));
+                let _ = writeln!(out, "remeasured {}", one_line(r));
             }
         }
         for (k, v) in [
@@ -1935,36 +1940,40 @@ impl Facts {
             ("trustd-seen", &self.trustd_seen),
             ("only", &self.only),
         ] {
-            out.push_str(&format!("{k} {}\n", one_line(v)));
+            let _ = writeln!(out, "{k} {}", one_line(v));
         }
-        out.push_str(&format!("host-mem {}\n", self.host.mem));
-        out.push_str(&format!(
-            "host-mem-os {}\n",
+        let _ = writeln!(out, "host-mem {}", self.host.mem);
+        let _ = writeln!(
+            out,
+            "host-mem-os {}",
             if self.host.memtotal { "MemTotal" } else { "-" }
-        ));
-        out.push_str(&format!(
-            "driver-ceiling {}\n",
+        );
+        let _ = writeln!(
+            out,
+            "driver-ceiling {}",
             if self.host.uncapped { "no" } else { "yes" }
-        ));
-        out.push_str(&format!("measured-at {}\n", one_line(&self.measured_at)));
+        );
+        let _ = writeln!(out, "measured-at {}", one_line(&self.measured_at));
         for v in &self.vanished {
-            out.push_str(&format!("vanished {}\n", one_line(v)));
+            let _ = writeln!(out, "vanished {}", one_line(v));
         }
         for (n, a, b) in &self.ambiguous {
-            out.push_str(&format!(
-                "ambiguous {}\t{}\t{}\n",
+            let _ = writeln!(
+                out,
+                "ambiguous {}\t{}\t{}",
                 one_line(n),
                 one_line(a),
                 one_line(b)
-            ));
+            );
         }
         for c in &self.crates {
-            out.push_str(&format!(
+            let _ = write!(
+                out,
                 "crate {}\t{}\t{}",
                 one_line(&c.name),
                 one_line(&c.decision.word()),
                 c.memory.fields()
-            ));
+            );
             match &c.decision {
                 Decision::Gate(m) => {
                     out.push('\t');
@@ -1972,11 +1981,10 @@ impl Facts {
                 }
                 Decision::Memory(seen) => {
                     out.push('\t');
-                    out.push_str(
-                        &seen
-                            .as_ref()
-                            .map_or_else(|| ["-"; 4].join("\t"), Seen::fields),
-                    );
+                    match seen {
+                        Some(seen) => out.push_str(&seen.fields()),
+                        None => out.push_str("-\t-\t-\t-"),
+                    }
                 }
                 _ => {}
             }
@@ -1986,7 +1994,7 @@ impl Facts {
             }) = &c.decision
             {
                 for b in b {
-                    out.push_str(&format!("backstop {}\t{}\n", one_line(&c.name), b.fields()));
+                    let _ = writeln!(out, "backstop {}\t{}", one_line(&c.name), b.fields());
                 }
             }
         }
@@ -2216,11 +2224,11 @@ pub fn floor_run(backstops: Option<&str>, name: &str) -> Option<FloorRun> {
 #[must_use]
 pub fn backstops_rewritten(backstops: Option<&str>, name: &str, run: &FloorRun) -> String {
     let text = backstops.unwrap_or("");
-    let mut out: String = text
-        .lines()
-        .take_while(|l| l.starts_with('#'))
-        .map(|l| format!("{l}\n"))
-        .collect();
+    let mut out = String::new();
+    for l in text.lines().take_while(|l| l.starts_with('#')) {
+        out.push_str(l);
+        out.push('\n');
+    }
     if out.is_empty() {
         out = format!("{BACKSTOPS_HEADER}\n");
     }
@@ -2233,7 +2241,7 @@ pub fn backstops_rewritten(backstops: Option<&str>, name: &str, run: &FloorRun) 
         .chain([format!("{name}\t{RUN_ROW}{}", run.cancelled)])
         .chain(run.stops.iter().map(|b| format!("{name}\t{}", b.fields())))
         .collect();
-    rows.sort();
+    rows.sort_unstable();
     for r in rows {
         out.push_str(&r);
         out.push('\n');
@@ -2524,12 +2532,12 @@ pub fn judge(
         match &c.decision {
             Decision::Queued(_) => {
                 queued += 1;
-                queued_what.push_str(&format!(" {}", c.name));
-                skipped_what.push_str(&format!(" {} (queued fork)", c.name));
+                let _ = write!(queued_what, " {}", c.name);
+                let _ = write!(skipped_what, " {} (queued fork)", c.name);
             }
             Decision::Memory(seen) => {
-                mem_what.push_str(&format!(" {}", c.name));
-                skipped_what.push_str(&format!(" {} (memory)", c.name));
+                let _ = write!(mem_what, " {}", c.name);
+                let _ = write!(skipped_what, " {} (memory)", c.name);
                 let peak = seen.as_ref().and_then(|s| peak_refusal(&host, &c.name, s));
                 let by_peak = peak.is_some();
                 let r = peak
@@ -2605,7 +2613,7 @@ pub fn judge(
             failed.push(format!("{name} {s}"));
             rows.push([name.into(), s, dash(), dash()]);
             unfinished_n += 1;
-            skipped_what.push_str(&format!(" {name} (over its wall budget)"));
+            let _ = write!(skipped_what, " {name} (over its wall budget)");
             notes.push(format!(
                 "OVER BUDGET: {name}: still verifying when its per-crate wall budget of {} ran out, so the lane ended its check there and nothing was decided about it — a verification that does not finish is not verified; give it longer with --crate-budget <seconds>, or find what holds it (its log, up to where it was ended)",
                 secs.map_or_else(
@@ -2642,7 +2650,7 @@ pub fn judge(
             }
             rows.push([name.into(), "NOT-VERIFIED(trustd)".into(), dash(), dash()]);
             by_trustd.push(name.to_string());
-            skipped_what.push_str(&format!(" {name} (trustd did not admit it)"));
+            let _ = write!(skipped_what, " {name} (trustd did not admit it)");
             let cause = match m.launch.as_str() {
                 "dirty" => "trustd's crash epoch is DIRTY (its log carries the recovery command)",
                 "owned" => {
@@ -2669,7 +2677,7 @@ pub fn judge(
         {
             rows.push([name.into(), "NOT-VERIFIED(trustd)".into(), dash(), dash()]);
             by_lost.push(name.to_string());
-            skipped_what.push_str(&format!(" {name} (trustd went away)"));
+            let _ = write!(skipped_what, " {name} (trustd went away)");
             let how = if m.ended.is_empty() {
                 format!("it exited {} with nothing measured", m.rc)
             } else {
@@ -2692,7 +2700,7 @@ pub fn judge(
         {
             rows.push([name.into(), "NOT-VERIFIED(targo)".into(), dash(), dash()]);
             by_targo.push(name.to_string());
-            skipped_what.push_str(&format!(" {name} (targo-trust could not run it)"));
+            let _ = write!(skipped_what, " {name} (targo-trust could not run it)");
             notes.push(format!(
                 "NOT VERIFIED: {name}: targo-trust exited 3 with nothing measured, in its own words {} — no verdict either way, which says nothing of the code; re-run it ({})",
                 m.could_not_run,
@@ -2721,7 +2729,7 @@ pub fn judge(
             failed.push(format!("{name} {s}"));
             rows.push([name.into(), s, dash(), dash()]);
             unfinished_n += 1;
-            skipped_what.push_str(&format!(" {name} (did not finish)"));
+            let _ = write!(skipped_what, " {name} (did not finish)");
             notes.push(format!(
                 "NOT VERIFIED: {name}: its verification did not finish ({}) — {counted}, so nothing was decided about it; re-run it",
                 m.ended
@@ -2833,7 +2841,7 @@ pub fn judge(
                         .map_or_else(|| "no floor".to_string(), |f| format!("its floor of {f}"));
                     rows.push([name.into(), "NOT-VERIFIED(trustd)".into(), dash(), dash()]);
                     by_trustd.push(name.to_string());
-                    skipped_what.push_str(&format!(" {name} (trustd did not admit it)"));
+                    let _ = write!(skipped_what, " {name} (trustd did not admit it)");
                     notes.push(format!(
                         "NOT VERIFIED: {name}: {refused} obligation(s) refused memory admission ({why}) left {proved} proved against {against} — the shortfall is the machine's, so nothing was decided; measure it again once trustd admits its work: {}",
                         measure_again(facts, &[name])
@@ -2845,8 +2853,8 @@ pub fn judge(
         if let (true, Some(f), Some(x)) = (capbound, floor, cen.ceil.as_deref()) {
             rows.push([name.into(), format!("CAP-BOUND(<{f})"), dash(), dash()]);
             capbound_n += 1;
-            mem_what.push_str(&format!(" {name}"));
-            skipped_what.push_str(&format!(" {name} (cap-bound)"));
+            let _ = write!(mem_what, " {name}");
+            let _ = write!(skipped_what, " {name} (cap-bound)");
             let low = gib_max(cen.peak.as_deref().unwrap_or("0"), x);
             let sure = gib(&mem.f).map(ram_for);
             let may = (!gib_le(&mem.f, &low)).then(|| ram_above(gib(&low).unwrap_or(0.0)));
@@ -2903,7 +2911,7 @@ pub fn judge(
             ]);
             by_clock.push(name.to_string());
             clock_need.get_or_insert_with(|| pace.unstarved());
-            skipped_what.push_str(&format!(" {name} (starved)"));
+            let _ = write!(skipped_what, " {name} (starved)");
             let rest = if proved.saturating_add(clock) < f {
                 format!(
                     ", and the {} it leaves is within the {allowance} runs of one tree under this prover differ by",
@@ -2937,7 +2945,7 @@ pub fn judge(
                 dash(),
             ]);
             by_spread.push(name.to_string());
-            skipped_what.push_str(&format!(" {name} (within the prover's spread)"));
+            let _ = write!(skipped_what, " {name} (within the prover's spread)");
             let names = if credit.floor_run.is_some() {
                 "no backstop stop its floor's run did not have, no proof check cancelled beyond that run's count"
             } else {
@@ -3174,7 +3182,7 @@ pub fn judge(
                         }
                         None => format!("{name}\t{proved}\t{all}\t{driver_row}"),
                     });
-                    lines.sort();
+                    lines.sort_unstable();
                     let mut text = lines.join("\n");
                     text.push('\n');
                     ratchet_now = Some(text);
@@ -3237,53 +3245,66 @@ pub fn judge(
     let memory_n = mem_what.split_whitespace().count();
     let gated_n = gated.saturating_sub(capbound_n + unverified.len() + unfinished_n);
     let mut out = String::from("\n");
-    let row_line = |r: &[String; 4]| format!("{:<28} {:<26} {:>8} {:>8}\n", r[0], r[1], r[2], r[3]);
-    out.push_str(&row_line(&[
-        "CRATE".into(),
-        "STATUS".into(),
-        "PROVED".into(),
-        "TOTAL".into(),
-    ]));
+    let _ = writeln!(
+        out,
+        "{:<28} {:<26} {:>8} {:>8}",
+        "CRATE", "STATUS", "PROVED", "TOTAL"
+    );
     for r in &rows {
-        out.push_str(&row_line(r));
+        let _ = writeln!(out, "{:<28} {:<26} {:>8} {:>8}", r[0], r[1], r[2], r[3]);
     }
     out.push('\n');
-    out.push_str(&format!("TOTAL: {total_proved}/{total_all} proved\n"));
+    let _ = writeln!(out, "TOTAL: {total_proved}/{total_all} proved");
     let id = if facts.driver_id.is_empty() {
         "no --version answer"
     } else {
         facts.driver_id.as_str()
     };
-    out.push_str(&format!("DRIVER: {} ({id})\n", facts.driver));
+    let _ = writeln!(out, "DRIVER: {} ({id})", facts.driver);
     match host.ceiling() {
-        Some(c) => out.push_str(&format!(
-            "HOST: {} GiB RAM, verifier ceiling {c} GiB per library (targo trust: RAM / 8)\n",
-            host.ram_gib()
-        )),
-        None if host.mem > 0 => out.push_str(&format!(
-            "HOST: {} GiB RAM, no verifier ceiling (this prover's trustc takes none): refused up front only for a recorded peak whose claim is not below what it can ever have available\n",
-            host.ram_gib()
-        )),
+        Some(c) => {
+            let _ = writeln!(
+                out,
+                "HOST: {} GiB RAM, verifier ceiling {c} GiB per library (targo trust: RAM / 8)",
+                host.ram_gib()
+            );
+        }
+        None if host.mem > 0 => {
+            let _ = writeln!(
+                out,
+                "HOST: {} GiB RAM, no verifier ceiling (this prover's trustc takes none): refused up front only for a recorded peak whose claim is not below what it can ever have available",
+                host.ram_gib()
+            );
+        }
         None => out.push_str("HOST: memory unreadable, nothing refused up front\n"),
     }
     if gated > 0 {
         match facts.grants.as_str() {
-            "1" => out.push_str(&format!("TRUSTD: held by this run's keeper ({sock})\n")),
+            "1" => {
+                let _ = writeln!(out, "TRUSTD: held by this run's keeper ({sock})");
+            }
             "" if !facts.trustd_seen.is_empty() => {
                 let what = facts
                     .trustd_seen
                     .split_once('\t')
                     .map_or(facts.trustd_seen.as_str(), |(_, w)| w);
-                out.push_str(&format!(
-                    "TRUSTD: never held — the keeper holds only this build's trustd, and {what}\n"
-                ));
+                let _ = writeln!(
+                    out,
+                    "TRUSTD: never held — the keeper holds only this build's trustd, and {what}"
+                );
             }
-            "" => out.push_str(&format!(
-                "TRUSTD: never held — no trustd granted the keeper's request at {sock}\n"
-            )),
-            n => out.push_str(&format!(
-                "TRUSTD: held by this run's keeper, {n} grants — trustd went away under a live grant and came back ({sock})\n"
-            )),
+            "" => {
+                let _ = writeln!(
+                    out,
+                    "TRUSTD: never held — no trustd granted the keeper's request at {sock}"
+                );
+            }
+            n => {
+                let _ = writeln!(
+                    out,
+                    "TRUSTD: held by this run's keeper, {n} grants — trustd went away under a live grant and came back ({sock})"
+                );
+            }
         }
         let lost: Vec<&str> = facts
             .crates
@@ -3292,10 +3313,11 @@ pub fn judge(
             .map(|c| c.name.as_str())
             .collect();
         if !lost.is_empty() {
-            out.push_str(&format!(
-                "TRUSTD: went away under this run's keeper while these ran: {}\n",
+            let _ = writeln!(
+                out,
+                "TRUSTD: went away under this run's keeper while these ran: {}",
                 lost.join(" ")
-            ));
+            );
         }
     }
     for n in refused_notes.iter().chain(&mem_notes).chain(&notes) {
@@ -3307,14 +3329,16 @@ pub fn judge(
     } else {
         skipped_what.as_str()
     };
-    out.push_str(&format!(
-        "GATED: {gated_n} of {} selected; not verified:{skipped_shown}\n",
+    let _ = writeln!(
+        out,
+        "GATED: {gated_n} of {} selected; not verified:{skipped_shown}",
         facts.crates.len()
-    ));
+    );
     if queued > 0 {
-        out.push_str(&format!(
-            "SCOPE: {queued} vendored fork(s) QUEUED, not gated, nothing claimed:{queued_what}\n"
-        ));
+        let _ = writeln!(
+            out,
+            "SCOPE: {queued} vendored fork(s) QUEUED, not gated, nothing claimed:{queued_what}"
+        );
     }
     let roster_missing = facts.vanished.len();
     if total_all > 0 && total_proved == total_all {
@@ -3325,21 +3349,20 @@ pub fn judge(
             out.push_str("         Everything gated above is clean; the campaign claim is the\n");
             out.push_str("         WHOLE-TREE run, and this run was narrower:\n");
             if narrowed {
-                out.push_str(&format!(
-                    "     - -p restricted the run to: {}\n",
-                    facts.only
-                ));
+                let _ = writeln!(out, "     - -p restricted the run to: {}", facts.only);
             }
             if queued > 0 {
-                out.push_str(&format!(
-                    "     - {queued} vendored fork(s) QUEUED (not converted), nothing is claimed about them:{queued_what}\n"
-                ));
+                let _ = writeln!(
+                    out,
+                    "     - {queued} vendored fork(s) QUEUED (not converted), nothing is claimed about them:{queued_what}"
+                );
                 out.push_str("       Queued: aterm-release trust_lane.rs QUEUED_FORKS\n");
             }
             if roster_missing > 0 {
-                out.push_str(&format!(
-                    "     - {roster_missing} librar(ies) a floor or QUEUED_FORKS names are NOT in the resolved graph (FORK-VANISHED): a floor row goes with its library\n"
-                ));
+                let _ = writeln!(
+                    out,
+                    "     - {roster_missing} librar(ies) a floor or QUEUED_FORKS names are NOT in the resolved graph (FORK-VANISHED): a floor row goes with its library"
+                );
             }
             if fail {
                 out.push_str("     - at least one crate failed (the NO-FLOOR / TOTAL-ABOVE-ROW / GATE-BROKE / NOT-VERIFIED / OVER-BUDGET /\n");
@@ -3347,34 +3370,39 @@ pub fn judge(
                 out.push_str("       did not finish, is in NEITHER total\n");
             }
             if !by_trustd.is_empty() {
-                out.push_str(&format!(
-                    "     - trustd did not admit the work, so nothing was decided about: {} (in NEITHER total)\n",
+                let _ = writeln!(
+                    out,
+                    "     - trustd did not admit the work, so nothing was decided about: {} (in NEITHER total)",
                     by_trustd.join(" ")
-                ));
+                );
             }
             if !by_lost.is_empty() {
-                out.push_str(&format!(
-                    "     - trustd went away while they ran, so nothing was decided about: {} (in NEITHER total)\n",
+                let _ = writeln!(
+                    out,
+                    "     - trustd went away while they ran, so nothing was decided about: {} (in NEITHER total)",
                     by_lost.join(" ")
-                ));
+                );
             }
             if !by_targo.is_empty() {
-                out.push_str(&format!(
-                    "     - targo-trust could not run them to a measurement (its exit 3), so nothing was decided about: {} (in NEITHER total)\n",
+                let _ = writeln!(
+                    out,
+                    "     - targo-trust could not run them to a measurement (its exit 3), so nothing was decided about: {} (in NEITHER total)",
                     by_targo.join(" ")
-                ));
+                );
             }
             if !by_clock.is_empty() {
-                out.push_str(&format!(
-                    "     - in a starved run, what the machine can be credited with (its BUDGET LAPSED note says what) could cover the shortfall, so nothing was decided about: {} (in NEITHER total)\n",
+                let _ = writeln!(
+                    out,
+                    "     - in a starved run, what the machine can be credited with (its BUDGET LAPSED note says what) could cover the shortfall, so nothing was decided about: {} (in NEITHER total)",
                     by_clock.join(" ")
-                ));
+                );
             }
             if !by_spread.is_empty() {
-                out.push_str(&format!(
-                    "     - within the prover's run-to-run spread of their floors, with no obligation named lost (each WITHIN SPREAD note), so nothing was decided about: {} (in NEITHER total)\n",
+                let _ = writeln!(
+                    out,
+                    "     - within the prover's run-to-run spread of their floors, with no obligation named lost (each WITHIN SPREAD note), so nothing was decided about: {} (in NEITHER total)",
                     by_spread.join(" ")
-                ));
+                );
             }
             out.push_str("         Re-run the whole tree, with every exclusion lifted, before quoting a whole-tree number.\n");
         }
@@ -3499,7 +3527,7 @@ pub fn judge(
                 )
             })
             .collect();
-        tail.push_str(&format!(" — REFUSED PATH: {}", said.join("; ")));
+        let _ = write!(tail, " — REFUSED PATH: {}", said.join("; "));
     }
     let none_if_empty = |s: &str| {
         let s = s.trim();
@@ -3873,12 +3901,12 @@ impl Plan {
         let (mut lines, mut refused) = (String::new(), Vec::new());
         let none = MemRow::default();
         for c in &self.facts.crates {
-            let row = record
-                .get(&c.name)
+            let found = record.get(&c.name);
+            let row = found
                 .and_then(|rows| row_for(rows, &self.facts.host))
                 .unwrap_or(&none);
-            if record.contains_key(&c.name) {
-                lines.push_str(&format!("memory {}\t{}\n", one_line(&c.name), row.fields()));
+            if found.is_some() {
+                let _ = writeln!(lines, "memory {}\t{}", one_line(&c.name), row.fields());
             }
             if !matches!(c.decision, Decision::Gate(_)) || self.try_refused {
                 continue;
@@ -3888,11 +3916,7 @@ impl Plan {
                 .and_then(|(rss, when)| peak_seen(&self.facts.host, *rss, when))
                 && let Some(r) = peak_refusal(&self.facts.host, &c.name, &seen)
             {
-                lines.push_str(&format!(
-                    "refused {}\t{}\n",
-                    one_line(&c.name),
-                    seen.fields()
-                ));
+                let _ = writeln!(lines, "refused {}\t{}", one_line(&c.name), seen.fields());
                 refused.push((c.name.clone(), r.line));
                 continue;
             }
@@ -3917,8 +3941,10 @@ impl Plan {
             ) {
                 let seen_fields = seen
                     .as_ref()
-                    .map_or_else(|| ["-"; 4].join("\t"), Seen::fields);
-                lines.push_str(&format!("refused {}\t{seen_fields}\n", one_line(&c.name)));
+                    .map_or(std::borrow::Cow::Borrowed("-\t-\t-\t-"), |s| {
+                        std::borrow::Cow::Owned(s.fields())
+                    });
+                let _ = writeln!(lines, "refused {}\t{seen_fields}", one_line(&c.name));
                 refused.push((c.name.clone(), r.line));
             }
         }
@@ -4114,7 +4140,7 @@ fn dep_info_check(target_root: &Path, lane: &LaneEnv) -> std::result::Result<(),
             target_root.display()
         ));
     }
-    reads.sort();
+    reads.sort_unstable();
     let refused: Vec<(String, PathBuf, String)> = reads
         .into_iter()
         .filter_map(|(name, file, value)| {
@@ -4538,7 +4564,7 @@ fn write_host_obs(path: &Path, plan: &Plan, verdict: &Verdict) -> std::io::Resul
         .map(str::to_string)
         .chain(set)
         .collect();
-    rows.sort();
+    rows.sort_unstable();
     let mut text = format!("{HOST_OBS_HEADER}\n");
     for r in rows {
         text.push_str(&r);
@@ -4564,7 +4590,7 @@ pub fn file_record(store: &Path, facts: &Facts) -> std::result::Result<PathBuf, 
     let key = facts
         .provenance
         .as_ref()
-        .map(|p| p.key.clone())
+        .map(|p| p.key.as_str())
         .filter(|k| !k.is_empty())
         .ok_or("a record with no key cannot be filed")?;
     let path = store.join(format!("{FACTS_PREFIX}{key}"));
@@ -4695,7 +4721,7 @@ fn records_about(receipts: &Path, tsr: &str) -> Vec<(String, Facts)> {
             (facts.provenance.as_ref()?.tree_sans_floors == tsr).then(|| (name.to_string(), facts))
         })
         .collect();
-    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     out
 }
 
@@ -4727,14 +4753,17 @@ pub fn facts_for(
             short(&id)
         );
         for (n, f) in &others {
-            let p = f.provenance.clone().unwrap_or_default();
-            why.push_str(&format!(
-                "; `{}` holds facts for this tree from prover {} (trustc {}, at {})",
+            let (prover, trustc, prover_root) = f
+                .provenance
+                .as_ref()
+                .map_or(("", "", ""), |p| (&p.prover, &p.trustc, &p.prover_root));
+            let _ = write!(
+                why,
+                "; `{}` holds facts for this tree from prover {} (trustc {}, at {prover_root})",
                 short_name(n),
-                short(&p.prover),
-                short(&p.trustc),
-                p.prover_root
-            ));
+                short(prover),
+                short(trustc),
+            );
         }
         return Ok(Err(why));
     };
@@ -4747,7 +4776,7 @@ pub fn facts_for(
         }
         return Ok(Err(format!("`{shown}` is not a complete facts record")));
     };
-    let Some(p) = facts.provenance.clone() else {
+    let Some(p) = facts.provenance.as_ref() else {
         return Ok(Err(format!(
             "`{shown}` names no key: it is not a filed facts record"
         )));

@@ -68,6 +68,18 @@ impl Terminal {
         self.process_at(input, ClockReading::now());
     }
 
+    /// Test seam: with `on`, print text the reference way, as before multi-byte runs joined the
+    /// ASCII between their characters and narrow glyphs reached the grid as a run: the parser
+    /// ends each run at its first ASCII byte (`Parser::set_reference_runs`) and each narrow
+    /// glyph of a run is its own grid write. The differential test
+    /// (`tests/unicode_run_differential.rs`) holds the fast path to it.
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn set_reference_print_path(&mut self, on: bool) {
+        self.transient.reference_print_path = on;
+        self.parser.set_reference_runs(on);
+    }
+
     /// Play the Kitty graphics animations up to `now`.
     pub fn advance_kitty_animations(&mut self, now: aterm_time::Instant) -> KittyAnimationStep {
         if self.transient.kitty_frames.is_empty() {

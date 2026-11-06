@@ -89,6 +89,275 @@ fn a_concurrent_first_reader_wins_even_when_the_other_read_fails() {
     }
 }
 
+fn registry_name(n: u32, nick: Option<(&str, NickClass)>) -> RegistryNameRead {
+    RegistryNameRead::Bound(Ok(RegistryName {
+        num: num(n),
+        nick: nick.map(|(word, class)| (Nickname::parse(word).expect("a nickname"), class)),
+    }))
+}
+
+#[test]
+fn a_bound_registry_name_precedes_legacy_books_and_roster_without_making_a_local_claim() {
+    let root = state();
+    let me = node_identity(root.path()).expect("an older local identity");
+    write_private(root.path(), NAME_FILE, b"m7\n").expect("older legacy evidence");
+    write_private(
+        root.path(),
+        PEERS_FILE,
+        entry(&me, &record(&me, Some(9), 8, Some("Heron"))).as_bytes(),
+    )
+    .expect("older signed evidence");
+    let (name, origin) = ensure_from(
+        root.path(),
+        || registry_name(86, Some(("MissBunny", NickClass::Chosen))),
+        unread,
+        |_| panic!("a supplied registry nickname needs no draw"),
+        NOW,
+    )
+    .expect("uses the bound row");
+    assert_eq!(origin, Origin::Registry);
+    assert_eq!(name.title(), "m86 MissBunny");
+    assert_eq!(
+        (name.class, name.since, name.rev),
+        (Class::Seeded, IMPLIED_SINCE, 0)
+    );
+    assert_eq!(name.migration, None);
+    assert_eq!(name.by, None);
+    assert_eq!(name.undo, None);
+    assert!(name.was.is_empty());
+    assert_eq!(file::read(root.path()).expect("reads"), Some(name));
+}
+
+#[test]
+fn registry_nicknames_keep_their_spelling_and_automatic_or_chosen_provenance() {
+    for class in [NickClass::Auto, NickClass::Chosen] {
+        let root = state();
+        let (name, origin) = ensure_from(
+            root.path(),
+            || registry_name(86, Some(("MissBunny", class))),
+            unread,
+            never,
+            NOW,
+        )
+        .expect("a typed nickname");
+        assert_eq!(origin, Origin::Registry);
+        assert_eq!(name.nick.as_str(), "MissBunny");
+        assert_eq!(name.nick_class, class);
+        assert_eq!((name.num, name.class), (Some(num(86)), Class::Seeded));
+    }
+}
+
+#[test]
+fn a_null_registry_nickname_draws_a_local_automatic_noun_without_reading_legacy_sources() {
+    use std::cell::Cell;
+    let root = state();
+    let draws = Cell::new(0);
+    let (name, origin) = ensure_from(
+        root.path(),
+        || registry_name(86, None),
+        unread,
+        |_| {
+            draws.set(draws.get() + 1);
+            false
+        },
+        NOW,
+    )
+    .expect("draws the nickname only");
+    assert_eq!((name.num, origin), (Some(num(86)), Origin::Registry));
+    assert_eq!(name.nick_class, NickClass::Auto);
+    assert!(draws.get() > 0);
+    assert!(!name.nick.as_str().is_empty());
+    assert!(
+        read_node_identity(root.path())
+            .expect("does not mint an identity")
+            .is_none()
+    );
+}
+
+#[test]
+fn an_existing_local_name_reads_no_registry_roster_or_nickname_source() {
+    let root = state();
+    let winner = MachineName::unnumbered(Nickname::parse("Winner").expect("a nickname"), NOW);
+    file::read_or_create(root.path(), || Ok(winner.clone())).expect("an existing local name");
+    assert_eq!(
+        ensure_from(
+            root.path(),
+            || panic!("an existing name does not ask the registry"),
+            unread,
+            |_| panic!("an existing name needs no draw"),
+            NOW
+        )
+        .expect("keeps the local name"),
+        (winner, Origin::Kept)
+    );
+}
+
+#[test]
+fn pending_or_invalid_bound_registry_names_refuse_first_creation_without_fallback() {
+    for source in [
+        RegistryNameRead::Pending,
+        RegistryNameRead::Bound(Err("the label is conflicted".to_owned())),
+    ] {
+        let root = state();
+        write_private(root.path(), NAME_FILE, b"m7\n").expect("a tempting legacy fallback");
+        assert!(
+            ensure_from(
+                root.path(),
+                || source,
+                unread,
+                |_| panic!("an unavailable registry name needs no draw"),
+                NOW
+            )
+            .is_err()
+        );
+        assert!(
+            file::read(root.path())
+                .expect("reads no partial name")
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn an_unbound_registry_preserves_the_existing_fallback_order() {
+    let root = state();
+    write_private(root.path(), NAME_FILE, b"m7\n").expect("legacy evidence");
+    let (name, origin) = ensure_from(
+        root.path(),
+        || RegistryNameRead::Unbound,
+        no_roster,
+        never,
+        NOW,
+    )
+    .expect("uses legacy fallback");
+    assert_eq!((name.num, origin), (Some(num(7)), Origin::Evidence));
+    assert_eq!(name.migration, Some(Migration::Pending));
+}
+
+#[test]
+fn a_concurrent_local_winner_overrides_registry_pending_or_invalid_results() {
+    use aterm_uds::private_file::PrivateLock;
+    use std::time::Duration;
+    for source in [
+        RegistryNameRead::Pending,
+        RegistryNameRead::Bound(Err("the label is conflicted".to_owned())),
+    ] {
+        let root = state();
+        let winner = MachineName::unnumbered(Nickname::parse("Winner").expect("a nickname"), NOW);
+        let registry = || {
+            let _lock = PrivateLock::take(
+                root.path(),
+                file::LOCK,
+                Duration::ZERO,
+                "registry preparation held the name lock",
+            )
+            .expect("preparation is outside the lock");
+            write_private(
+                root.path(),
+                file::FILE,
+                winner.to_toml().expect("the winner").as_bytes(),
+            )
+            .expect("a concurrent creator won");
+            source
+        };
+        assert_eq!(
+            ensure_from(root.path(), registry, unread, never, NOW)
+                .expect("the valid winner stands"),
+            (winner.clone(), Origin::Kept)
+        );
+        assert_eq!(file::read(root.path()).expect("reads"), Some(winner));
+    }
+}
+
+#[test]
+fn registry_names_remain_the_edit_base_despite_newer_old_own_book_records() {
+    let root = state();
+    let me = node_identity(root.path()).expect("this node's identity");
+    let mut old = record(&me, Some(9), 9, Some("Heron"));
+    old.claim.anchor = Some(aterm_types::machine_name::Anchor([0x42; 8]));
+    old.claim.ephemeral = true;
+    old.claim.sgen = 4;
+    old.claim.top = 100;
+    write_private(root.path(), PEERS_FILE, entry(&me, &old).as_bytes())
+        .expect("a retired signed naming source");
+    let (mirror, _) = ensure_from(
+        root.path(),
+        || registry_name(86, Some(("MissBunny", NickClass::Chosen))),
+        unread,
+        never,
+        NOW,
+    )
+    .expect("the registry supplies the local mirror");
+    let to = NickTo::Word(Nickname::parse("Bunny").expect("a nickname"));
+    let preview = set_nick(root.path(), &to, ByKind::Person, unread, NOW + 1, true)
+        .expect("previews from the local mirror");
+    assert_eq!((preview.name.num, preview.name.rev), (Some(num(86)), 1));
+    assert_eq!(
+        file::read(root.path()).expect("reads"),
+        Some(mirror.clone())
+    );
+    let nicked = set_nick(root.path(), &to, ByKind::Person, unread, NOW + 1, false)
+        .expect("changes only the local nickname")
+        .name;
+    assert_eq!(nicked.title(), "m86 Bunny");
+    assert_eq!(
+        (nicked.class, nicked.since, nicked.act),
+        (mirror.class, mirror.since, mirror.act),
+        "a nickname edit does not strengthen its number"
+    );
+    assert_eq!(nicked.rev, 1);
+    assert!(nicked.undo.is_none());
+
+    let to = NameTo {
+        num: num(87),
+        nick: None,
+    };
+    let preview = set_name(
+        root.path(),
+        &to,
+        no_labels,
+        ByKind::Person,
+        unread,
+        NOW + 2,
+        true,
+    )
+    .expect("previews a local rename");
+    assert_eq!(
+        preview
+            .name
+            .undo
+            .as_ref()
+            .expect("the previous local claim")
+            .num,
+        Some(num(86))
+    );
+    assert_eq!(file::read(root.path()).expect("reads"), Some(nicked));
+    let renamed = set_name(
+        root.path(),
+        &to,
+        no_labels,
+        ByKind::Person,
+        unread,
+        NOW + 2,
+        false,
+    )
+    .expect("renames the local mirror")
+    .name;
+    assert_eq!(renamed.title(), "m87 Bunny");
+    assert_eq!(renamed.rev, 2);
+    let undo = renamed.undo.expect("the actual previous local claim");
+    assert_eq!(
+        (undo.num, undo.class, undo.since),
+        (Some(num(86)), Class::Seeded, IMPLIED_SINCE)
+    );
+    assert_eq!(
+        renamed.was.iter().map(|was| was.num).collect::<Vec<_>>(),
+        [num(86)]
+    );
+    assert_eq!((renamed.base, renamed.tgen, renamed.sgen), (None, 0, 0));
+    assert_eq!(renamed.cap, None);
+}
+
 fn num(n: u32) -> Number {
     Number::new(n).expect("a number")
 }
@@ -168,7 +437,7 @@ fn a_new_machine_is_m0_and_a_drawn_noun_and_every_later_reader_keeps_it() {
     let (name, origin) = ensure(root.path(), no_roster, taken, NOW).expect("ensures");
     assert_eq!(origin, Origin::Drawn);
     assert_eq!(name.num, None);
-    assert_eq!(name.rev, 0, "below every record this node can sign");
+    assert_eq!(name.rev, 0, "the first local revision");
     assert_ne!(name.nick.as_str(), "otter", "a noun in view is not drawn");
     assert!(nouns::NOUNS.contains(&name.nick.as_str()));
     assert!(name.title().starts_with("m0 "), "{}", name.title());
@@ -513,7 +782,7 @@ fn choosing_the_held_seeded_number_never_weakens_its_claim_against_a_rival() {
 fn an_upgraded_machine_keeps_its_older_name_pending_migration() {
     let root = state();
     write_private(root.path(), NAME_FILE, b"m7\n").expect("writes");
-    let (name, origin) = ensure(root.path(), unread, never, NOW).expect("ensures");
+    let (name, origin) = ensure(root.path(), no_roster, never, NOW).expect("ensures");
     assert_eq!(origin, Origin::Evidence);
     assert_eq!(
         (name.num, name.class, name.since, name.migration),
@@ -523,7 +792,7 @@ fn an_upgraded_machine_keeps_its_older_name_pending_migration() {
             IMPLIED_SINCE,
             Some(Migration::Pending)
         ),
-        "the fleet name before the roster label"
+        "the legacy fleet name when no roster label exists"
     );
     assert_eq!(name.nick_class, NickClass::Auto, "no word to keep: drawn");
 
@@ -541,17 +810,18 @@ fn an_upgraded_machine_keeps_its_older_name_pending_migration() {
 }
 
 #[test]
-fn the_roster_is_read_only_when_nothing_else_names_the_claim() {
+fn the_roster_precedes_legacy_names_and_old_own_signed_records() {
     let root = state();
     let me = node_identity(root.path()).expect("a node key");
+    write_private(root.path(), NAME_FILE, b"m7\n").expect("the old fleet name");
     write_private(
         root.path(),
         PEERS_FILE,
         entry(&me, &record(&me, Some(9), 3, None)).as_bytes(),
     )
     .expect("writes the book");
-    let (name, origin) = ensure(root.path(), unread, never, NOW).expect("ensures");
-    assert_eq!((name.num, origin), (Some(num(9)), Origin::Floor));
+    let (name, origin) = ensure(root.path(), label("m12"), never, NOW).expect("ensures");
+    assert_eq!((name.num, origin), (Some(num(12)), Origin::Evidence));
 }
 
 #[test]
@@ -642,141 +912,6 @@ fn only_a_bare_name_is_older_evidence() {
 }
 
 #[test]
-fn floor_brings_back_this_nodes_own_record_over_older_evidence() {
-    let root = state();
-    let me = node_identity(root.path()).expect("a node key");
-    let other = NodeIdentity::from_seed(&"b2".repeat(16), &[0x22; 32]).expect("an identity");
-    write_private(root.path(), NAME_FILE, b"m7\n").expect("writes");
-    let mine = record(&me, Some(9), 3, Some("Heron"));
-    write_private(
-        root.path(),
-        PEERS_FILE,
-        (entry(&other, &record(&other, Some(11), 8, Some("Puffin"))) + &entry(&me, &mine))
-            .as_bytes(),
-    )
-    .expect("writes the book");
-    let (name, origin) = ensure(root.path(), no_roster, never, NOW).expect("ensures");
-    assert_eq!(origin, Origin::Floor);
-    assert_eq!(
-        name.title(),
-        "m9 Heron",
-        "this node's record, not the other's"
-    );
-    assert_eq!(
-        (name.rev, name.class, name.migration),
-        (3, Class::Chosen, None)
-    );
-    assert_eq!(name.by, Some(mine.by));
-    assert!(name.fleets.is_empty(), "the zero digest names no fleet");
-}
-
-#[test]
-fn floor_without_this_nodes_record_leaves_the_older_evidence() {
-    let root = state();
-    node_identity(root.path()).expect("a node key");
-    let other = NodeIdentity::from_seed(&"b2".repeat(16), &[0x22; 32]).expect("an identity");
-    write_private(root.path(), NAME_FILE, b"m7\n").expect("writes");
-    write_private(
-        root.path(),
-        ISSUER_BOOK_FILE,
-        entry(&other, &record(&other, Some(11), 8, None)).as_bytes(),
-    )
-    .expect("writes the book");
-    let (name, origin) = ensure(root.path(), no_roster, never, NOW).expect("ensures");
-    assert_eq!((name.num, origin), (Some(num(7)), Origin::Evidence));
-}
-
-#[test]
-fn a_waiting_record_keeps_its_name_in_the_title() {
-    let root = state();
-    let me = node_identity(root.path()).expect("a node key");
-    let mut waiting = record(&me, None, 4, None);
-    waiting.claim.waits = true;
-    waiting.claim.prev = Some(num(8));
-    write_private(
-        root.path(),
-        ISSUER_BOOK_FILE,
-        entry(&me, &waiting).as_bytes(),
-    )
-    .expect("writes the book");
-    let (name, origin) = ensure(root.path(), no_roster, never, NOW).expect("ensures");
-    assert_eq!(origin, Origin::Floor);
-    assert_eq!(
-        (name.num, name.prev, name.migration),
-        (Some(num(8)), None, Some(Migration::Waiting))
-    );
-    assert!(
-        name.title().starts_with("m8 "),
-        "never m0: {}",
-        name.title()
-    );
-    assert_eq!(
-        name.nick_class,
-        NickClass::Auto,
-        "no nickname in the record: drawn"
-    );
-}
-
-#[test]
-fn a_displaced_record_keeps_its_last_name_in_the_title() {
-    let root = state();
-    let me = node_identity(root.path()).expect("a node key");
-    let mut moving = record(&me, None, 6, Some("Heron"));
-    moving.claim.prev = Some(num(8));
-    write_private(root.path(), PEERS_FILE, entry(&me, &moving).as_bytes())
-        .expect("writes the book");
-    let (name, origin) = ensure(root.path(), no_roster, never, NOW).expect("ensures");
-    assert_eq!(origin, Origin::Floor);
-    assert_eq!(name.title(), "m8 Heron", "never m0 on a numbered machine");
-    assert_eq!((name.prev, name.migration), (None, None));
-
-    let root = state();
-    let me = node_identity(root.path()).expect("a node key");
-    let never_numbered = record(&me, None, 2, Some("Otter"));
-    write_private(
-        root.path(),
-        PEERS_FILE,
-        entry(&me, &never_numbered).as_bytes(),
-    )
-    .expect("writes the book");
-    let (name, _) = ensure(root.path(), no_roster, never, NOW).expect("ensures");
-    assert_eq!(name.title(), "m0 Otter", "control: no NAME kept");
-}
-
-#[test]
-fn floor_under_the_held_seed_keeps_that_fleets_claim() {
-    use aterm_net::fleet_member::fleet_seed::{self, FleetSeed};
-    let root = state();
-    let me = node_identity(root.path()).expect("a node key");
-    let mark = aterm_net::fleet::FleetMark::from_hex("0101010101010101").expect("a mark");
-    let seed = FleetSeed::mint(&me, mark, NOW).expect("mints");
-    write_private(
-        root.path(),
-        fleet_seed::FILE,
-        format!("{}\n", seed.words()).as_bytes(),
-    )
-    .expect("writes the seed");
-    let mine = record(&me, Some(9), 3, Some("Heron"));
-    let mut peer = Peer::own(&me, ("m9.local", 7485, "0.160.0"), NOW);
-    peer.signed = peer
-        .signed
-        .map(|signed| signed.with_record(mine.sign(&me, seed.digest())));
-    write_private(root.path(), PEERS_FILE, (peer.line() + "\n").as_bytes())
-        .expect("writes the book");
-    let (name, origin) = ensure(root.path(), no_roster, never, NOW).expect("ensures");
-    assert_eq!(origin, Origin::Floor);
-    assert_eq!(name.title(), "m9 Heron");
-    assert_eq!(
-        name.fleets
-            .iter()
-            .map(|fleet| (fleet.digest, fleet.top, fleet.claim.num))
-            .collect::<Vec<_>>(),
-        vec![(seed.digest(), 9, Some(num(9)))],
-        "the claim kept under the seed it was signed under"
-    );
-}
-
-#[test]
 fn the_nicknames_taken_are_other_nodes_records_under_the_held_seed() {
     let root = state();
     let me = node_identity(root.path()).expect("a node");
@@ -822,8 +957,8 @@ fn a_nickname_change_is_chosen_raises_rev_and_keeps_the_claim() {
     let chosen = renicked(&held, heron(), None).expect("a drawn noun chosen is a change");
     assert_eq!(
         (chosen.nick_class, chosen.rev),
-        (NickClass::Chosen, 0),
-        "a file no record seeded stays at rev 0, so Floor still adopts this node's own claim"
+        (NickClass::Chosen, 1),
+        "every changed local nickname advances its revision"
     );
     assert_eq!(renicked(&chosen, heron(), None), None, "chosen already");
     let seeded = MachineName { rev: 4, ..chosen };
@@ -917,404 +1052,6 @@ fn a_fleet_key_is_in_and_a_home_with_no_vault_is_out() {
     write_private(root.path(), aterm_net::fleet::KEY_FILE, key.as_bytes()).expect("a fleet key");
     assert_eq!(InFleet::read(root.path(), Some(&vault)), InFleet::In);
     assert!(super::standing_vault().is_none(), "a test reads no vault");
-}
-
-/// A restored local backup behind this node's own signed claim, with an obsolete undo entry.
-fn edit_floor_fixture() -> (
-    aterm_tempfile::TempDir,
-    NodeIdentity,
-    MachineName,
-    NameRecord,
-) {
-    let root = state();
-    let me = node_identity(root.path()).expect("our identity");
-    ensure(root.path(), label("m7"), never, NOW).expect("the old name");
-    let before = file::replace(root.path(), |name| {
-        name.rev = 2;
-        name.nick = Nickname::parse("Heron").expect("a nickname");
-        name.undo = Some(file::Held {
-            num: Some(num(6)),
-            class: Class::Chosen,
-            since: NOW - 2_000,
-            base: None,
-            tgen: 0,
-            sgen: 0,
-        });
-        Ok(())
-    })
-    .expect("the local backup");
-    let mut signed = record(&me, Some(9), 9, Some("Otter"));
-    signed.claim.prev = Some(num(8));
-    signed.claim.was.push(aterm_types::machine_name::Was {
-        num: num(8),
-        retired: true,
-        lost: false,
-    });
-    signed.claim.cap = Some(aterm_types::machine_name::Cap {
-        value: 100,
-        since: NOW - 500,
-    });
-    write_private(root.path(), PEERS_FILE, entry(&me, &signed).as_bytes())
-        .expect("our newer signed claim");
-    (root, me, before, signed)
-}
-
-#[test]
-fn choosing_a_recovered_waiting_number_creates_a_claim_only_when_available() {
-    for occupied in [false, true] {
-        let (root, me, before, mut signed) = edit_floor_fixture();
-        signed.claim.num = None;
-        signed.claim.prev = Some(num(9));
-        signed.claim.waits = true;
-        let mut book = entry(&me, &signed);
-        if occupied {
-            let other =
-                NodeIdentity::from_seed(&"b2".repeat(16), &[0x22; 32]).expect("another identity");
-            book.push_str(&entry(&other, &record(&other, Some(9), 3, Some("Heron"))));
-        }
-        write_private(root.path(), PEERS_FILE, book.as_bytes()).expect("the waiting record");
-        let result = set_name(
-            root.path(),
-            &NameTo {
-                num: num(9),
-                nick: None,
-            },
-            no_labels,
-            ByKind::Agent,
-            unread,
-            NOW,
-            false,
-        );
-        if occupied {
-            assert!(result.is_err(), "another machine holds this number");
-            assert_eq!(file::read(root.path()).expect("reads"), Some(before));
-        } else {
-            let set = result.expect("chooses the available number");
-            assert_eq!(set.name.num, Some(num(9)));
-            assert_eq!(set.name.migration, None, "the request leaves Waiting");
-            assert_eq!(set.name.class, Class::Chosen);
-            assert_eq!(set.name.rev, signed.rev + 1);
-            assert_eq!(set.name.nick.as_str(), "Otter");
-            assert_eq!(set.name.by.expect("the edit's actor").kind, ByKind::Agent);
-            assert_eq!(
-                set.name.undo.expect("the recovered claim").num,
-                Some(num(9))
-            );
-        }
-    }
-}
-
-#[test]
-fn name_and_nickname_edits_restore_the_own_signed_claim_before_acting() {
-    for number in [true, false] {
-        let (root, _, _, signed) = edit_floor_fixture();
-        let nick = Nickname::parse("MissBunny").expect("a nickname");
-        let (name, origin) = if number {
-            let set = set_name(
-                root.path(),
-                &NameTo {
-                    num: num(86),
-                    nick: Some(nick),
-                },
-                no_labels,
-                ByKind::Agent,
-                unread,
-                NOW,
-                false,
-            )
-            .expect("renames from the floor");
-            assert!(set.changed);
-            (set.name, set.origin)
-        } else {
-            let set = set_nick(
-                root.path(),
-                &NickTo::Word(nick),
-                ByKind::Agent,
-                unread,
-                NOW,
-                false,
-            )
-            .expect("renicks from the floor");
-            assert!(set.changed);
-            (set.name, set.origin)
-        };
-        assert_eq!(origin, Origin::Floor);
-        assert_eq!(name.rev, signed.rev + 1);
-        assert_eq!(name.nick.as_str(), "MissBunny");
-        assert_eq!(name.cap, signed.claim.cap);
-        assert_eq!(name.by.expect("the new actor").kind, ByKind::Agent);
-        if number {
-            assert_eq!(name.num, Some(num(86)));
-            let undo = name.undo.as_ref().expect("the restored claim is undo");
-            assert_eq!(
-                (undo.num, undo.class, undo.since),
-                (signed.claim.num, signed.claim.class, signed.claim.since)
-            );
-            assert_eq!(
-                name.was.iter().map(|was| was.num).collect::<Vec<_>>(),
-                [num(9), num(8)]
-            );
-        } else {
-            assert_eq!(
-                (name.num, name.class, name.since, name.act),
-                (
-                    signed.claim.num,
-                    signed.claim.class,
-                    signed.claim.since,
-                    signed.claim.act
-                )
-            );
-            assert_eq!(name.was, signed.claim.was);
-            assert!(
-                name.undo.is_none(),
-                "the stale local undo is not the restored claim's undo"
-            );
-        }
-        assert_eq!(file::read(root.path()).expect("reads"), Some(name));
-    }
-}
-
-#[test]
-fn a_request_already_matching_the_floor_persists_its_repair_without_an_extra_revision() {
-    for number in [true, false] {
-        let (root, _, _, signed) = edit_floor_fixture();
-        let (name, changed, origin) = if number {
-            let set = set_name(
-                root.path(),
-                &NameTo {
-                    num: num(9),
-                    nick: None,
-                },
-                no_labels,
-                ByKind::Agent,
-                unread,
-                NOW,
-                false,
-            )
-            .expect("restores the held number");
-            (set.name, set.changed, set.origin)
-        } else {
-            let set = set_nick(
-                root.path(),
-                &NickTo::Word(signed.nick.clone().expect("a nickname")),
-                ByKind::Agent,
-                unread,
-                NOW,
-                false,
-            )
-            .expect("restores the held nickname");
-            (set.name, set.changed, set.origin)
-        };
-        assert!(changed, "restoring a backup changed the local file");
-        assert_eq!(origin, Origin::Floor);
-        assert_eq!(
-            (name.num, name.rev, name.by),
-            (signed.claim.num, signed.rev, Some(signed.by))
-        );
-        assert_eq!(
-            (name.class, name.since, name.act),
-            (signed.claim.class, signed.claim.since, signed.claim.act)
-        );
-        assert_eq!(name.was, signed.claim.was);
-        assert!(name.undo.is_none());
-        assert_eq!(file::read(root.path()).expect("reads"), Some(name));
-    }
-}
-
-#[test]
-fn edit_floor_previews_restore_and_edit_without_replacing_the_local_backup() {
-    for number in [true, false] {
-        let (root, _, before, signed) = edit_floor_fixture();
-        let nick = Nickname::parse("MissBunny").expect("a nickname");
-        let (name, changed, origin) = if number {
-            let set = set_name(
-                root.path(),
-                &NameTo {
-                    num: num(86),
-                    nick: Some(nick),
-                },
-                no_labels,
-                ByKind::Agent,
-                unread,
-                NOW,
-                true,
-            )
-            .expect("previews a rename");
-            (set.name, set.changed, set.origin)
-        } else {
-            let set = set_nick(
-                root.path(),
-                &NickTo::Word(nick),
-                ByKind::Agent,
-                unread,
-                NOW,
-                true,
-            )
-            .expect("previews a nickname");
-            (set.name, set.changed, set.origin)
-        };
-        assert!(changed);
-        assert_eq!(origin, Origin::Floor);
-        assert_eq!(name.rev, signed.rev + 1);
-        assert_eq!(name.nick.as_str(), "MissBunny");
-        assert_eq!(file::read(root.path()).expect("reads"), Some(before));
-    }
-}
-
-#[test]
-fn floor_edits_ignore_other_keys_digests_and_records_not_above_the_local_revision() {
-    for number in [true, false] {
-        for control in ["other-key", "other-digest", "older", "equal"] {
-            let (root, me, before, mut signed) = edit_floor_fixture();
-            match control {
-                "older" => signed.rev = before.rev - 1,
-                "equal" => signed.rev = before.rev,
-                _ => {}
-            }
-            let entry = match control {
-                "other-key" => {
-                    let impostor =
-                        NodeIdentity::from_seed(me.node(), &[0x42; 32]).expect("another key");
-                    entry(&impostor, &signed)
-                }
-                "other-digest" => entry_under(&me, &signed, [0x42; 8]),
-                _ => entry(&me, &signed),
-            };
-            write_private(root.path(), PEERS_FILE, entry.as_bytes()).expect("the control record");
-            let nick = Nickname::parse("MissBunny").expect("a nickname");
-            let (name, origin) = if number {
-                let set = set_name(
-                    root.path(),
-                    &NameTo {
-                        num: num(86),
-                        nick: Some(nick),
-                    },
-                    no_labels,
-                    ByKind::Agent,
-                    unread,
-                    NOW,
-                    false,
-                )
-                .expect("renames local state");
-                (set.name, set.origin)
-            } else {
-                let set = set_nick(
-                    root.path(),
-                    &NickTo::Word(nick),
-                    ByKind::Agent,
-                    unread,
-                    NOW,
-                    false,
-                )
-                .expect("renicks local state");
-                (set.name, set.origin)
-            };
-            assert_eq!(origin, Origin::Kept, "{control}");
-            assert_eq!(name.rev, before.rev + 1, "{control}");
-            if number {
-                assert_eq!(name.undo.expect("local undo").num, before.num, "{control}");
-            } else {
-                assert_eq!(
-                    (name.num, name.undo),
-                    (before.num, before.undo),
-                    "{control}"
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn edits_use_the_floor_record_ordered_by_entry_sequence_before_revision() {
-    let (root, me, _, mut latest) = edit_floor_fixture();
-    latest.eseq = 20;
-    let mut older = record(&me, Some(10), 50, Some("Older"));
-    older.eseq = 10;
-    write_private(root.path(), PEERS_FILE, entry(&me, &latest).as_bytes())
-        .expect("newer publication");
-    write_private(root.path(), ISSUER_BOOK_FILE, entry(&me, &older).as_bytes())
-        .expect("older publication");
-    let set = set_name(
-        root.path(),
-        &NameTo {
-            num: num(86),
-            nick: None,
-        },
-        no_labels,
-        ByKind::Person,
-        unread,
-        NOW,
-        false,
-    )
-    .expect("edits the newer publication");
-    assert_eq!(set.name.rev, latest.rev + 1);
-    assert_eq!(set.name.nick, latest.nick.expect("the newest nickname"));
-    assert_eq!(
-        set.name.undo.expect("the latest claim").num,
-        latest.claim.num
-    );
-}
-
-#[test]
-fn a_saved_seed_digest_and_a_future_own_clock_do_not_lose_the_edit_floor() {
-    let (root, me, _, mut signed) = edit_floor_fixture();
-    let digest = [0x42; 8];
-    signed.claim.since = NOW + 3 * 86_400_000;
-    signed.claim.act = signed.claim.since;
-    write_private(root.path(), fleet_seed::DIGEST_FILE, b"4242424242424242\n")
-        .expect("the digest kept after a leave");
-    write_private(
-        root.path(),
-        PEERS_FILE,
-        entry_under(&me, &signed, digest).as_bytes(),
-    )
-    .expect("our signed record under the saved digest");
-    let set = set_name(
-        root.path(),
-        &NameTo {
-            num: num(86),
-            nick: None,
-        },
-        no_labels,
-        ByKind::Person,
-        unread,
-        NOW,
-        false,
-    )
-    .expect("edits the signed floor despite a clock reset");
-    assert_eq!(set.origin, Origin::Floor);
-    assert_eq!(set.name.rev, signed.rev + 1);
-    assert!(set.name.since > signed.claim.act);
-    assert_eq!(
-        set.name.undo.expect("the restored claim").num,
-        signed.claim.num
-    );
-    assert_eq!(set.name.fleets[0].digest, digest);
-}
-
-#[test]
-fn a_conflicting_rename_does_not_partially_persist_its_floor_repair() {
-    let (root, me, before, signed) = edit_floor_fixture();
-    let other = NodeIdentity::from_seed(&"b2".repeat(16), &[0x22; 32]).expect("another identity");
-    let peers = entry(&me, &signed) + &entry(&other, &record(&other, Some(86), 3, None));
-    write_private(root.path(), PEERS_FILE, peers.as_bytes()).expect("our floor and their claim");
-    let to = NameTo {
-        num: num(86),
-        nick: Some(Nickname::parse("MissBunny").expect("a nickname")),
-    };
-    assert!(
-        set_name(
-            root.path(),
-            &to,
-            no_labels,
-            ByKind::Person,
-            unread,
-            NOW,
-            false
-        )
-        .is_err()
-    );
-    assert_eq!(file::read(root.path()).expect("reads"), Some(before));
 }
 
 /// The vault's labels on today's lab (§11.86): a number its roster, log or policy gives another
@@ -1438,10 +1175,9 @@ fn a_move_off_the_policys_server_name_is_refused() {
 }
 
 /// A request that keeps the stored number, a nickname typed with it, reads no labels, so an
-/// unreadable vault does not stop it; a number change needs them; and a request whose stored
-/// number a newer signed floor moves under the lock is refused rather than checked unread.
+/// unreadable vault does not stop it, while a number change needs its labels.
 #[test]
-fn keeping_the_stored_number_reads_no_labels_unless_a_floor_moves_it() {
+fn keeping_the_stored_number_reads_no_labels_but_a_number_change_requires_them() {
     let unreadable = || Err(io::Error::other("the vault is busy"));
     let root = state();
     ensure(root.path(), label("m7"), never, NOW).expect("a seeded name");
@@ -1475,23 +1211,6 @@ fn keeping_the_stored_number_reads_no_labels_unless_a_floor_moves_it() {
     )
     .expect_err("a number change needs its labels");
     assert!(why.to_string().contains("the vault is busy"), "{why}");
-    let (moved, _, before, _) = edit_floor_fixture();
-    let keep = NameTo {
-        num: num(7),
-        nick: None,
-    };
-    let why = set_name(
-        moved.path(),
-        &keep,
-        unreadable,
-        ByKind::Person,
-        unread,
-        NOW,
-        false,
-    )
-    .expect_err("the signed floor moved m7 to m9");
-    assert!(why.to_string().contains("rename again"), "{why}");
-    assert_eq!(file::read(moved.path()).expect("reads"), Some(before));
 }
 
 /// No vault read holds nothing; a home with no vault set up holds nothing either.
@@ -1504,4 +1223,173 @@ fn lab_labels_with_no_vault_hold_nothing() {
         lab_labels(Some(&vault)).expect("reads"),
         LabLabels::default()
     );
+}
+
+/// Rename This Mac…'s live line judges each number from one read as [`set_name`] does, in its
+/// words: a number another signed node or the vault holds is refused, a free one passes and this
+/// Mac's own is `Same`; a vault whose labels were not read refuses each number but this Mac's.
+#[test]
+fn a_preview_judges_each_number_in_the_words_the_set_refuses_it() {
+    let root = state();
+    node_identity(root.path()).expect("our identity");
+    let other = NodeIdentity::from_seed(&"b2".repeat(16), &[0x22; 32]).expect("another identity");
+    let (before, _) = ensure(root.path(), label("m7"), never, NOW).expect("a seeded name");
+    let theirs = record(&other, Some(86), 3, Some("Otter"));
+    write_private(root.path(), PEERS_FILE, entry(&other, &theirs).as_bytes())
+        .expect("writes their signed claim");
+    let lab = LabLabels {
+        held: BTreeMap::from([(num(20), LabelHold::Label)]),
+        ..LabLabels::default()
+    };
+    let preview = rename_preview(root.path(), || Ok(lab.clone()), unread, NOW).expect("a read");
+    assert_eq!(preview.name(), &before);
+    for n in [86, 20] {
+        let to = NameTo {
+            num: num(n),
+            nick: None,
+        };
+        let refused = set_name(
+            root.path(),
+            &to,
+            || Ok(lab.clone()),
+            ByKind::Person,
+            unread,
+            NOW,
+            true,
+        )
+        .expect_err("held");
+        assert_eq!(preview.judge(num(n)), Err(refused.to_string()), "m{n}");
+    }
+    assert_eq!(preview.judge(num(7)), Ok(Verdict::Same));
+    assert_eq!(preview.judge(num(87)), Ok(Verdict::Free));
+    assert!(preview.shared(&Nickname::parse("otter").expect("a nickname")));
+    assert!(!preview.shared(&Nickname::parse("Kestrel").expect("a nickname")));
+    let unlabelled = rename_preview(
+        root.path(),
+        || Err(io::Error::other("the vault's labels are unread: busy")),
+        unread,
+        NOW,
+    )
+    .expect("a read");
+    assert_eq!(
+        unlabelled.judge(num(87)),
+        Err("the vault's labels are unread: busy".to_owned())
+    );
+    assert_eq!(
+        unlabelled.unchecked(num(87)),
+        Some("the vault's labels are unread: busy")
+    );
+    assert_eq!(unlabelled.judge(num(7)), Ok(Verdict::Same));
+    assert_eq!(
+        unlabelled.unchecked(num(7)),
+        None,
+        "a kept number needs no labels"
+    );
+    assert_eq!(preview.unchecked(num(87)), None, "the labels were read");
+    assert_eq!(
+        file::read(root.path()).expect("reads"),
+        Some(before),
+        "a read changes no name"
+    );
+    // The vault's labels judge only a number that moves: kept, the policy's server name (which
+    // follows the roster label m8 while m7 is only seeded) refuses nothing, as in the set.
+    let serves = LabLabels {
+        own: BTreeSet::from([num(8)]),
+        label: Some(num(8)),
+        servers: BTreeSet::from([num(8)]),
+        ..LabLabels::default()
+    };
+    let served = rename_preview(root.path(), || Ok(serves.clone()), unread, NOW).expect("a read");
+    let keep = NameTo {
+        num: num(7),
+        nick: Some(Nickname::parse("Kestrel").expect("a nickname")),
+    };
+    set_name(
+        root.path(),
+        &keep,
+        || Ok(serves.clone()),
+        ByKind::Person,
+        unread,
+        NOW,
+        true,
+    )
+    .expect("a kept number reads no labels");
+    assert_eq!(served.judge(num(7)), Ok(Verdict::Same));
+    let refused = set_name(
+        root.path(),
+        &NameTo {
+            num: num(87),
+            nick: None,
+        },
+        || Ok(serves.clone()),
+        ByKind::Person,
+        unread,
+        NOW,
+        true,
+    )
+    .expect_err("a move off the server's name");
+    assert_eq!(served.judge(num(87)), Err(refused.to_string()));
+    // A number a migration waits on holds no claim: the read says so and judges it as a move, and
+    // the set then makes the claim.
+    assert!(!preview.waits());
+    file::replace(root.path(), |name| {
+        name.migration = Some(Migration::Waiting);
+        Ok(())
+    })
+    .expect("a waiting number");
+    let waiting = rename_preview(root.path(), no_labels, unread, NOW).expect("a read");
+    assert!(waiting.waits());
+    assert!(waiting.judge(num(7)).is_ok());
+    let unlabelled =
+        rename_preview(root.path(), || Err(io::Error::other("busy")), unread, NOW).expect("a read");
+    assert_eq!(unlabelled.judge(num(7)), Err("busy".to_owned()));
+    let claimed = set_name(
+        root.path(),
+        &NameTo {
+            num: num(7),
+            nick: None,
+        },
+        no_labels,
+        ByKind::Person,
+        unread,
+        NOW,
+        false,
+    )
+    .expect("the shown number is claimed");
+    assert_eq!(
+        (claimed.name.num, claimed.name.migration),
+        (Some(num(7)), None)
+    );
+}
+
+/// A number that moves the name the edit starts from is judged only with the vault's labels read:
+/// with none it is refused, so a stored number that moved under the set's locks after its unlocked
+/// read decided it kept the number is never renamed past the vault or the server rule; the number
+/// held, or a read set of labels, passes.
+#[test]
+fn a_move_judged_without_the_vault_s_labels_is_refused() {
+    let root = state();
+    node_identity(root.path()).expect("our identity");
+    let (held, _) = ensure(root.path(), label("m7"), never, NOW).expect("a seeded name");
+    let node = node_of(node_identity(root.path()).expect("our identity").node()).expect("a node");
+    let view = BTreeMap::from([(node, Entry::Record(current_record(&held)))]);
+    let settled = settle(&view);
+    let fleet = Fleet {
+        view: &view,
+        settled: &settled,
+        top: 7,
+        kept: &[],
+        labels: &BTreeMap::new(),
+    };
+    let refused = judge(num(87), &held, None, &fleet, node).expect_err("unread labels");
+    assert!(refused.contains("rename again"), "{refused}");
+    assert_eq!(
+        judge(num(87), &held, Some(&LabLabels::default()), &fleet, node),
+        Ok(Verdict::Free)
+    );
+    assert_eq!(judge(num(7), &held, None, &fleet, node), Ok(Verdict::Same));
+    let mut waiting = held;
+    waiting.migration = Some(Migration::Waiting);
+    let refused = judge(num(7), &waiting, None, &fleet, node).expect_err("a waiting number moves");
+    assert!(refused.contains("rename again"), "{refused}");
 }

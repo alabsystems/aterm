@@ -495,7 +495,10 @@ fn eventless_selection_and_identical_event_images_recover() {
     let root = aterm_tempfile::TempDir::new().unwrap();
     let store = Store::at(root.path()).bounded_by(&[]);
     let selected = store.request_pin("main", NOW).unwrap();
-    assert_eq!(store.load(NOW).unwrap().0.pending_pin, Some(selected));
+    assert_eq!(
+        store.load(NOW).unwrap().0.pending_pin,
+        Some(selected.into())
+    );
     assert!(!store.ledger_path().exists());
     assert!(!store.wake_path().exists());
     assert_eq!(store.load_logins(NOW).unwrap().0, Logins::default());

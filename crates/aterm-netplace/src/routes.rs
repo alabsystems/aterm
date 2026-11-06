@@ -88,7 +88,7 @@ type Via = Box<dyn Fn(IpAddr) -> Option<Ipv4Addr> + Send + Sync>;
 pub struct Routes {
     place: Place,
     /// The fleet members (by [`member_key`]) that answered in this stay.
-    heard: BTreeSet<String>,
+    heard: BTreeSet<[u8; 16]>,
     via: Via,
 }
 
@@ -115,7 +115,7 @@ impl Routes {
                 .answers
                 .iter()
                 .filter(|answer| answer.lane == Lane::Fleet && answer.began_ms >= since)
-                .map(|answer| answer.member.clone())
+                .filter_map(|answer| <[u8; 16]>::try_from(answer.member.as_bytes()).ok())
                 .collect()
         });
         Self {
@@ -187,11 +187,7 @@ impl Routes {
             return true;
         }
         if !self.heard.is_empty()
-            && node.is_some_and(|node| {
-                let key = member_key_bytes(Lane::Fleet, node);
-                self.heard
-                    .contains(std::str::from_utf8(&key).unwrap_or_default())
-            })
+            && node.is_some_and(|node| self.heard.contains(&member_key_bytes(Lane::Fleet, node)))
         {
             return true;
         }
@@ -264,16 +260,14 @@ impl Round {
         let full = routes.full_round_due(last, now_ms);
         let told = slot.is_some_and(|at| rounds[at].4);
         if full {
-            let entry = (
-                state.to_path_buf(),
-                lane,
-                routes.network().cloned(),
-                now_ms,
-                false,
-            );
+            let network = routes.network().cloned();
             match slot {
-                Some(at) => rounds[at] = entry,
-                None => rounds.push(entry),
+                Some(at) => {
+                    rounds[at].2 = network;
+                    rounds[at].3 = now_ms;
+                    rounds[at].4 = false;
+                }
+                None => rounds.push((state.to_path_buf(), lane, network, now_ms, false)),
             }
         }
         drop(rounds);
@@ -305,7 +299,7 @@ impl Round {
     }
 
     /// Whether `addr` lies on the network this round began on ([`crate::words::on_this_network`]):
-    /// a dial there that found no route was refused by this Mac's own Local Network privacy.
+    /// a dial there that found no route found the member off the link.
     #[must_use]
     pub fn on_this_network(&self, addr: IpAddr) -> bool {
         crate::words::on_this_network(&self.routes.place, addr)

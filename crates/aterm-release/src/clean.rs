@@ -127,7 +127,7 @@ pub fn raw_differences(root: &Path) -> Option<Vec<String>> {
     let mut files: Vec<(String, String)> = Vec::new();
     for rec in listing.split(|b| *b == 0).filter(|r| !r.is_empty()) {
         let tab = rec.iter().position(|b| *b == b'\t')?;
-        let meta = String::from_utf8_lossy(&rec[..tab]);
+        let meta = std::str::from_utf8(&rec[..tab]).ok()?;
         let path = String::from_utf8_lossy(&rec[tab + 1..]).into_owned();
         let mut fields = meta.split(' ');
         let (mode, blob) = (fields.next()?, fields.nth(1)?);
@@ -179,7 +179,7 @@ pub fn raw_differences(root: &Path) -> Option<Vec<String>> {
             &["hash-object", "--no-filters", "--stdin-paths"],
             input.as_bytes(),
         )?;
-        let ids = String::from_utf8_lossy(&ids);
+        let ids = std::str::from_utf8(&ids).ok()?;
         let mut got = ids.lines();
         for (path, blob) in plain {
             if got.next() != Some(blob.as_str()) {
@@ -187,7 +187,7 @@ pub fn raw_differences(root: &Path) -> Option<Vec<String>> {
             }
         }
     }
-    differ.sort();
+    differ.sort_unstable();
     differ.dedup();
     Some(differ)
 }
@@ -196,7 +196,7 @@ const GITLINK_MODE: &str = "160000";
 
 struct IndexEntry {
     tag: char,
-    mode: String,
+    mode: std::borrow::Cow<'static, str>,
     blob: String,
     path: String,
 }
@@ -245,11 +245,19 @@ fn index_entries(root: &Path) -> Option<Vec<IndexEntry>> {
         .filter(|r| !r.is_empty())
         .map(|rec| {
             let tab = rec.iter().position(|b| *b == b'\t')?;
-            let meta = String::from_utf8_lossy(&rec[..tab]);
+            let meta = std::str::from_utf8(&rec[..tab]).ok()?;
             let mut fields = meta.split(' ');
+            let tag = fields.next()?.chars().next()?;
+            let mode = match fields.next()? {
+                "100644" => std::borrow::Cow::Borrowed("100644"),
+                "100755" => std::borrow::Cow::Borrowed("100755"),
+                "120000" => std::borrow::Cow::Borrowed("120000"),
+                GITLINK_MODE => std::borrow::Cow::Borrowed(GITLINK_MODE),
+                other => std::borrow::Cow::Owned(other.to_string()),
+            };
             Some(IndexEntry {
-                tag: fields.next()?.chars().next()?,
-                mode: fields.next()?.to_string(),
+                tag,
+                mode,
                 blob: fields.next()?.to_string(),
                 path: String::from_utf8_lossy(&rec[tab + 1..]).into_owned(),
             })

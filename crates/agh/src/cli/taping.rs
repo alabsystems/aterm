@@ -73,6 +73,7 @@ fn one_shot(inv: &Invocation) -> bool {
     matches!(
         path,
         ["repo", "create"]
+            | ["repo", "push"]
             | ["release", "create"]
             | ["release", "ensure"]
             | ["ref", "create"]

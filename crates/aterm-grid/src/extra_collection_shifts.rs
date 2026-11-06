@@ -196,6 +196,7 @@ impl CellExtras {
         start_col: u16,
         max_col: u16,
     ) -> aterm_alloc::SmallVec<(u16, CellExtra), 8> {
+        self.settle_image_candidate();
         let mut extracted: aterm_alloc::SmallVec<(u16, CellExtra), 8> =
             aterm_alloc::SmallVec::new();
         let width = usize::from(max_col.saturating_sub(start_col));
@@ -433,6 +434,105 @@ mod tests {
                         None
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn pending_images_survive_rekeying_before_the_next_mutable_access() {
+        use crate::{ImageData, ImageFormat, ImageRef, ImageScaling};
+        use Shift::*;
+        use std::sync::Arc;
+
+        let image = Arc::new(ImageData {
+            bytes: vec![7; 4],
+            format: ImageFormat::Png,
+            cols: 1,
+            rows: 1,
+            z_index: 0,
+            band_lift_px: 0,
+            cell_offset_px: (0, 0),
+            scaling: ImageScaling::Fit,
+            source_rect: None,
+        });
+        let shifts = [
+            RowsUp { n: 1 },
+            RegionUp {
+                top: 0,
+                bottom: 3,
+                n: 1,
+            },
+            RegionDown {
+                top: 0,
+                bottom: 3,
+                n: 1,
+            },
+            RectUp {
+                top: 0,
+                bottom: 3,
+                left: 0,
+                right: 7,
+                n: 1,
+            },
+            RectDown {
+                top: 0,
+                bottom: 3,
+                left: 0,
+                right: 7,
+                n: 1,
+            },
+            ColsRight {
+                row: 1,
+                start: 0,
+                n: 1,
+                max: 8,
+            },
+            ColsLeft {
+                row: 1,
+                start: 0,
+                n: 1,
+                max: 8,
+            },
+        ];
+        for offset in [0, 1, 128] {
+            for shift in shifts {
+                let mut extras = CellExtras::new();
+                extras
+                    .get_or_create(crate::CellCoord::new(5, 0))
+                    .add_combining('\u{0301}');
+                extras.shift_rows_up_by(offset);
+                extras
+                    .get_or_create(crate::CellCoord::new(1, 2))
+                    .set_image(Some(ImageRef {
+                        image: image.clone(),
+                        cell_row: 0,
+                        cell_col: 0,
+                        kitty: None,
+                    }));
+                extras.modify(crate::CellCoord::new(3, 7), |extra| {
+                    extra.set_fg_rgb(Some([1, 2, 3]))
+                });
+                shift.apply(&mut extras);
+                extras.compact();
+                let actual: Vec<_> = extras
+                    .iter()
+                    .filter_map(|(coord, extra)| extra.image().map(|_| (coord.row, coord.col)))
+                    .collect();
+                let expected: Vec<_> = shift.model(1, 2).into_iter().collect();
+                assert_eq!(actual, expected, "{shift:?}, offset={offset}");
+                assert!(
+                    extras.any_image(),
+                    "rekeyed pending image: {shift:?}, offset={offset}"
+                );
+                extras
+                    .fresh(crate::CellCoord::new(3, 7))
+                    .set_fg_rgb(Some([1, 2, 3]));
+                assert!(
+                    extras.any_image(),
+                    "another mutable entry cannot hide its predecessor"
+                );
+                extras.clear();
+                assert!(!extras.any_image());
             }
         }
     }

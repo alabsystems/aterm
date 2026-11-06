@@ -15,12 +15,11 @@ use aterm_window::event::{ElementState, MouseButton};
 use super::gesture_tests::{
     BYPASS, app, cell_at, draw_claude, feed, frame, host, publish_facts, px_of, row_text,
 };
-use super::{Chip, ChipWord, Inks, WORD_FADE, WORD_HOLD, WORD_STEPS, WindowLights};
+use super::{Chip, ChipAt, ChipWord, Inks, WORD_FADE, WORD_HOLD, WORD_STEPS, WindowLights};
 use crate::autopilot::AutopilotView;
 use crate::{App, WindowId};
 
 const S: u64 = 7;
-const ACCENT: [u8; 3] = [0, 128, 255];
 
 fn blank() -> RenderCell {
     RenderCell {
@@ -95,16 +94,16 @@ fn a_clicks_mode_name_holds_then_fades_a_step_at_a_time_and_goes() {
     assert_eq!(named.step(at), None);
 
     let ground = blank().bg;
-    let amber = Inks::of(blank(), ACCENT).amber;
+    let letter = Inks::of(blank(), ChipAt::cruise(blank())).letter;
     assert_eq!(
-        ChipWord::ink(0, amber, ground),
-        amber,
+        ChipWord::ink(0, letter, ground),
+        letter,
         "whole: the chip's own tone"
     );
     for step in 1..=WORD_STEPS {
         let (was, now) = (
-            ChipWord::ink(step - 1, amber, ground),
-            ChipWord::ink(step, amber, ground),
+            ChipWord::ink(step - 1, letter, ground),
+            ChipWord::ink(step, letter, ground),
         );
         assert!(
             far(now, ground) < far(was, ground),
@@ -128,9 +127,9 @@ fn a_clicks_mode_name_holds_then_fades_a_step_at_a_time_and_goes() {
 }
 
 /// THE NAME FOLLOWS THE GLYPH, IS THE CHIP'S, AND GIVES WAY FIRST: Land at rest is `⤓` alone;
-/// with its name, `⤓ land` in Land's amber, the whole of it the chip's (a click on the name cycles
-/// too), set off from the next chip as any word is (`⤓ land ─ ⏸ plan`), [`super::Block::word`]
-/// counting what it adds; a rule with room for the rest alone lays the rest, never a narrower
+/// with its name, `⤓ land` in the chip's letter, the whole of it the chip's (a click on the name
+/// cycles too), set off from the next chip as any word is (`⤓ land ─ ⏸ plan`),
+/// [`super::Block::word`] counting what it adds; a rule with room for the rest alone lays the rest, never a narrower
 /// rung; a name for another mode, or a click in flight, lays none.
 #[test]
 fn the_name_follows_the_glyph_in_its_tone_where_the_rest_leaves_room() {
@@ -138,7 +137,7 @@ fn the_name_follows_the_glyph_in_its_tone_where_the_rest_leaves_room() {
     let mut w = WindowLights::default();
     w.note_autopilot(S, Some(Autopilot::Land), AutopilotView::Land, now);
     let rest = w
-        .fitted(S, blank(), now, ACCENT, None, None, 40)
+        .fitted(S, blank(), now, ChipAt::cruise(blank()), None, None, 40)
         .expect("fits");
     assert_eq!(
         text(&rest.lights),
@@ -149,7 +148,7 @@ fn the_name_follows_the_glyph_in_its_tone_where_the_rest_leaves_room() {
 
     w.sessions.get_mut(&S).expect("noted").word = Some(land_at(now, true));
     let named = w
-        .fitted(S, blank(), now, ACCENT, None, None, 40)
+        .fitted(S, blank(), now, ChipAt::cruise(blank()), None, None, 40)
         .expect("fits");
     assert_eq!(text(&named.lights), "\u{2913} land");
     assert_eq!(named.word, " land".len(), "the name's cells");
@@ -159,21 +158,21 @@ fn the_name_follows_the_glyph_in_its_tone_where_the_rest_leaves_room() {
         [(0..6, Chip::Autopilot)],
         "the name is the chip's"
     );
-    let amber = Inks::of(blank(), ACCENT).amber;
+    let letter = ChipAt::cruise(blank()).letter_at(0);
     assert!(
-        named.lights.iter().all(|c| c.ch == ' ' || c.fg == amber),
-        "Land's amber"
+        named.lights.iter().all(|c| c.ch == ' ' || c.fg == letter),
+        "the chip's letter"
     );
 
     w.sessions.get_mut(&S).expect("noted").shown = lights_plan();
     let word = w.sessions.get_mut(&S).expect("noted").word.take();
     let rest_plan = w
-        .fitted(S, blank(), now, ACCENT, None, None, 40)
+        .fitted(S, blank(), now, ChipAt::cruise(blank()), None, None, 40)
         .expect("fits");
     assert_eq!(text(&rest_plan.lights), "\u{2913} \u{23F8} plan");
     w.sessions.get_mut(&S).expect("noted").word = word;
     let beside = w
-        .fitted(S, blank(), now, ACCENT, None, None, 40)
+        .fitted(S, blank(), now, ChipAt::cruise(blank()), None, None, 40)
         .expect("fits");
     assert_eq!(
         text(&beside.lights),
@@ -193,7 +192,15 @@ fn the_name_follows_the_glyph_in_its_tone_where_the_rest_leaves_room() {
     assert_eq!(beside.holds, rest_plan.holds + beside.word);
 
     let tight = w
-        .fitted(S, blank(), now, ACCENT, None, None, rest_plan.holds)
+        .fitted(
+            S,
+            blank(),
+            now,
+            ChipAt::cruise(blank()),
+            None,
+            None,
+            rest_plan.holds,
+        )
         .expect("the rest fits");
     assert_eq!(
         tight.lights, rest_plan.lights,
@@ -201,17 +208,33 @@ fn the_name_follows_the_glyph_in_its_tone_where_the_rest_leaves_room() {
     );
     assert_eq!(tight.word, 0);
     let short = w
-        .fitted(S, blank(), now, ACCENT, None, None, beside.holds - 1)
+        .fitted(
+            S,
+            blank(),
+            now,
+            ChipAt::cruise(blank()),
+            None,
+            None,
+            beside.holds - 1,
+        )
         .expect("the rest fits");
     assert_eq!(short.word, 0, "a cell short of the name: none");
     let room = w
-        .fitted(S, blank(), now, ACCENT, None, None, beside.holds)
+        .fitted(
+            S,
+            blank(),
+            now,
+            ChipAt::cruise(blank()),
+            None,
+            None,
+            beside.holds,
+        )
         .expect("fits");
     assert_eq!(room.word, beside.word, "CONTROL: room for it, the name");
 
     w.note_autopilot(S, Some(Autopilot::Off), AutopilotView::Off, now);
     let other = w
-        .fitted(S, blank(), now, ACCENT, None, None, 40)
+        .fitted(S, blank(), now, ChipAt::cruise(blank()), None, None, 40)
         .expect("fits");
     assert!(
         text(&other.lights).starts_with("\u{25cb} \u{23F8}"),
@@ -223,9 +246,9 @@ fn the_name_follows_the_glyph_in_its_tone_where_the_rest_leaves_room() {
     w.sessions.get_mut(&S).expect("noted").autopilot_pending =
         Some((Autopilot::Off, now + ms(2500)));
     let flight = w
-        .fitted(S, blank(), now, ACCENT, None, None, 40)
+        .fitted(S, blank(), now, ChipAt::cruise(blank()), None, None, 40)
         .expect("fits");
-    assert_eq!(flight.word, 0, "a click in flight: `◐`, no name");
+    assert_eq!(flight.word, 0, "a click in flight: `◌`, no name");
 }
 
 /// Claude in plan mode: a light drawn beside Autopilot.
@@ -237,9 +260,9 @@ fn lights_plan() -> aterm_agent::harness::lights::Reading {
 }
 
 /// A NAME STANDS FROM ITS READ-BACK, AND A CLICK THAT NEVER READS BACK SHOWS NONE: a click whose
-/// word is still being written shows `◐` and no name, and its name waits (no frame owed, no
+/// word is still being written shows `◌` and no name, and its name waits (no frame owed, no
 /// expiry) however long the write takes; the frame that reads the word back starts the name's
-/// hold there; a write that times out lets the name go with the `◐`.
+/// hold there; a write that times out lets the name go with the `◌`.
 #[test]
 fn a_name_stands_from_its_read_back_and_goes_with_a_click_that_times_out() {
     let t0 = Instant::now();

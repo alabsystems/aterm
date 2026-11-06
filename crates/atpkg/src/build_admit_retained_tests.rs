@@ -439,6 +439,135 @@ fn cache_guard_until_native_finish(world: &Path, seat: &Seat<'_>) {
     contender.try_lock().unwrap();
 }
 
+fn sdk_cache_bundle_until_reaper_finish(world: &Path, seat: &Seat<'_>) {
+    let prefix = world.join("sdk-prefix");
+    let subject = crate::lease::Subject::build("trust", 17).unwrap();
+    let sdk_bin = subject.path(&prefix).join("bin");
+    std::fs::create_dir_all(&sdk_bin).unwrap();
+    // A private managed subject exercises real retention, not compiler or
+    // installed-SDK qualification. Neither unmanaged nor best-effort is held.
+    let sdk_lease = match crate::lease::hold_for(
+        &prefix,
+        &sdk_bin,
+        "retained native SDK/cache bundle control",
+        Duration::ZERO,
+    ) {
+        Ok(crate::lease::Hold::Held(lease)) => lease,
+        other => panic!("private managed SDK lease refused: {other:?}"),
+    };
+    assert_eq!(sdk_lease.subject(), &subject);
+    sdk_lease.check_current().unwrap();
+    let home = world.join("cargo-home");
+    std::fs::create_dir(&home).unwrap();
+    let cache_guard = crate::cargo_cache::SourceCacheGuard::try_acquire(&home).unwrap();
+    cache_guard.check_current().unwrap();
+    let contender = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(home.join(".package-cache-mutate"))
+        .unwrap();
+    let assert_held = |claims| {
+        match crate::lease::reclaim(&prefix, &subject) {
+            crate::lease::Reclaim::Keep(crate::lease::Holders::Held(who)) => {
+                assert!(!who.is_empty());
+            }
+            other => panic!("SDK reclaim did not observe the actual held lease: {other:?}"),
+        }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "independent actual cache mutator must remain blocked by the retained bundle"
+        )]
+        let blocked = contender.try_lock();
+        assert!(matches!(blocked, Err(std::fs::TryLockError::WouldBlock)));
+        let observed = aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "private cohort inventory observation",
+            || match seat.ledger.as_ref().unwrap().list() {
+                Ok(records) => Some(records.len()),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => None,
+                Err(error) => panic!("private cohort inventory: {error}"),
+            },
+        );
+        assert_eq!(observed, claims);
+    };
+    assert_held(0);
+
+    let mut jobs = Jobs::new(1).unwrap();
+    let mut target = command("/bin/cat");
+    target.stdin(Stdio::piped()).stdout(Stdio::piped());
+    let ticket = jobs
+        .submit_retained(
+            held(world, seat),
+            &mut target,
+            Duration::ZERO,
+            (sdk_lease, cache_guard),
+        )
+        .unwrap();
+    assert!(until(&mut jobs, |jobs| !jobs.jobs[&ticket.id.sequence].starting).is_empty());
+    let job = jobs.jobs.get_mut(&ticket.id.sequence).unwrap();
+    let input = aterm_uds::deadline::cat_echoes(job.owned.as_mut().unwrap().child_mut());
+    let SupervisedChild::Bound(bound) = job.owned.as_mut().unwrap() else {
+        panic!("bound actual root")
+    };
+    let mut member = command("/bin/cat");
+    member.stdin(Stdio::piped()).stdout(Stdio::piped());
+    let mut member = job
+        .held
+        .as_ref()
+        .unwrap()
+        .claim
+        .launch_cohort_member(bound, &mut member)
+        .unwrap();
+    let member_input = aterm_uds::deadline::cat_echoes(&mut member);
+    drop(input);
+    assert!(until(&mut jobs, |jobs| jobs.snapshot().unwrap()[0].root_reaped).is_empty());
+    assert!(
+        jobs.jobs[&ticket.id.sequence]
+            .usage
+            .as_ref()
+            .unwrap()
+            .status
+            .success()
+    );
+    let snapshot = jobs.snapshot().unwrap();
+    assert!(snapshot[0].retained_resources && snapshot[0].settlement_failure.is_some());
+    assert_held(1);
+
+    // The root is already positively reaped. Drop must transfer the actual
+    // member claim and both guards to the existing reaper, not unlock either.
+    drop(jobs);
+    assert_held(1);
+    drop(member_input);
+    assert!(member.wait().unwrap().success());
+    let reclaimed = aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "native SDK/cache bundle and cohort settlement",
+        || {
+            match seat.ledger.as_ref().unwrap().list() {
+                Ok(records) if records.is_empty() => {}
+                Ok(_) => return None,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return None,
+                Err(error) => panic!("private cohort settlement observation: {error}"),
+            }
+            let crate::lease::Reclaim::Clear(reclaimed) = crate::lease::reclaim(&prefix, &subject)
+            else {
+                return None;
+            };
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "actual native settlement must release the cache lock as well as the SDK lease"
+            )]
+            let released = contender.try_lock();
+            match released {
+                Ok(()) => Some(reclaimed),
+                Err(std::fs::TryLockError::WouldBlock) => None,
+                Err(error) => panic!("cache mutator after native settlement: {error}"),
+            }
+        },
+    );
+    drop(reclaimed);
+}
+
 #[test]
 fn retained_actor() {
     let Ok(case) = std::env::var(ACTOR) else {
@@ -453,6 +582,7 @@ fn retained_actor() {
             "owner" => owner_and_background(world, seat),
             "arm" => uncertain_arm(world, seat),
             "cache" => cache_guard_until_native_finish(world, seat),
+            "sdk-cache-member" => sdk_cache_bundle_until_reaper_finish(world, seat),
             "foreign" => {
                 foreign_owner_keeps_resources(world, seat);
                 return 1;
@@ -514,4 +644,9 @@ fn retained_foreign_owner_copy_cannot_drop_original_resources() {
 #[test]
 fn actual_cargo_cache_guard_stays_owned_until_native_finish() {
     actor("cache");
+}
+
+#[test]
+fn actual_managed_sdk_and_cache_bundle_survives_root_reap_and_reaper_handoff() {
+    actor("sdk-cache-member");
 }

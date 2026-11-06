@@ -14,8 +14,13 @@ use super::TerminalHandler;
 /// and U+00A0-U+02FF outside CJK mode (it holds ambiguous characters), are width 1; the
 /// uniformly wide CJK ideograph and Hangul blocks are width 2; the emoji blocks read a
 /// bitmap before the table; and everything else asks `aterm_grapheme::char_width`
-/// (`char_width_cjk` when `cjk`).
-#[inline]
+/// (`char_width_cjk` when `cjk`). Inlined into every caller: the bulk writer classifies each
+/// character of a run by it, and a call per character cost more than the lookup.
+#[allow(
+    clippy::inline_always,
+    reason = "measured: plain #[inline] left a call per character in the unicode run writer"
+)]
+#[inline(always)]
 fn char_width(c: char, cjk: bool) -> usize {
     let cp = c as u32;
     if (0x20..0x7F).contains(&cp) || (!cjk && (0xA0..0x0300).contains(&cp)) {
@@ -45,6 +50,19 @@ fn char_width(c: char, cjk: bool) -> usize {
     } else {
         aterm_grapheme::char_width(c)
     }
+}
+
+/// Whether `c` continues a narrow run in [`TerminalHandler::write_unicode_bulk`]: a width-1 BMP
+/// glyph outside the blocks its wide arm takes (U+3000-U+9FFF, Hangul syllables), and ASCII only
+/// where GL prints it as itself (`ascii_passes`).
+#[inline]
+fn is_narrow_run_glyph(c: char, cjk: bool, ascii_passes: bool) -> bool {
+    let cp = c as u32;
+    (cp >= 0x80 || ascii_passes)
+        && cp <= 0xFFFF
+        && !(0x3000..0xA000).contains(&cp)
+        && !(0xAC00..0xD7A4).contains(&cp)
+        && char_width(c, cjk) == 1
 }
 
 /// Bitmap of width-2 codepoints in U+1F300-U+1F6FF (128 bytes), from the
@@ -180,12 +198,46 @@ impl TerminalHandler<'_> {
         self.write_char_core(translated, width);
     }
 
-    /// Bulk write path for runs of 2+ consecutive multi-byte UTF-8 characters.
+    /// Bulk write path for runs of multi-byte UTF-8 characters and the printable ASCII the
+    /// parser joins between them. The bulk loop ([`Self::write_unicode_run`]) takes what it
+    /// can; from a character it does not take on, the rest goes as the parser's calls wrote it
+    /// before runs joined ASCII: the characters up to the next ASCII one glyph at a time, that
+    /// ASCII as `print_ascii_bulk` writes it (an extras pen keeps its colors in the row's ring,
+    /// not a `CellExtra` per cell), and what follows as a run again, bracketed for selection
+    /// damage on its own as its print was (`print_unicode_bulk` brackets the first).
+    pub(super) fn write_unicode_bulk(&mut self, chars: &[char]) {
+        let mut rest = chars;
+        let mut origin = None;
+        while !rest.is_empty() {
+            let taken = self.write_unicode_run(rest);
+            if let Some(origin) = origin {
+                self.grid.damage_selection_output(origin);
+            }
+            let left = rest.get(taken..).unwrap_or(&[]);
+            let (glyphs, left) =
+                left.split_at(left.iter().position(char::is_ascii).unwrap_or(left.len()));
+            for &c in glyphs {
+                self.write_char(c);
+            }
+            let (ascii, left) = left.split_at(
+                left.iter()
+                    .position(|c| !c.is_ascii())
+                    .unwrap_or(left.len()),
+            );
+            self.write_joined_ascii(ascii);
+            rest = left;
+            origin = Some(self.grid.output_damage_origin());
+        }
+    }
+
+    /// The bulk loop of [`Self::write_unicode_bulk`]: writes `chars` from the first and returns
+    /// how many it took, all of them or up to a character it does not take on (none under a
+    /// mode that writes one glyph at a time).
     #[allow(
         clippy::too_many_lines,
         reason = "hot-path character dispatch with many optimized branches"
     )]
-    pub(super) fn write_unicode_bulk(&mut self, chars: &[char]) {
+    fn write_unicode_run(&mut self, chars: &[char]) -> usize {
         // Preconditions: no insert mode, autowrap on, no style extras. VT52
         // addressing never reaches here (`print_unicode_bulk` routes it per
         // character). U+00A0-U+00FF may need GR-mapped translation when a
@@ -202,14 +254,15 @@ impl TerminalHandler<'_> {
             || self.grid.cols() < 2
             || self.grid.cursor_outside_margin_span()
         {
-            for &c in chars {
-                self.write_char(c);
-            }
-            return;
+            return 0;
         }
         self.charset.clear_single_shift();
 
         let cjk = self.modes.ambiguous_width_double;
+        // Whether the ASCII the parser joins to a run (the spaces between words) prints as
+        // itself: GL is an ASCII G0. Read after the single shift is spent on the run's first
+        // character, which is never ASCII.
+        let ascii_passes = self.charset.is_ascii_passthrough();
 
         let margins_active = self.grid.has_horizontal_margins();
 
@@ -234,8 +287,10 @@ impl TerminalHandler<'_> {
                 if (0x3000..0x4E00).contains(&cp) {
                     match char_width(c, cjk) {
                         0 => {
+                            self.bracket_mark_after_joined_ascii(chars, i);
                             self.transient.last_combining_was_zwj = false;
                             self.add_combining_to_previous_cell(c);
+                            self.bracket_joined_ascii_after_mark(chars, i);
                             i += 1;
                             continue;
                         }
@@ -276,8 +331,10 @@ impl TerminalHandler<'_> {
             } else if cp > 0xFFFF {
                 let width = char_width(c, cjk);
                 if width == 0 {
+                    self.bracket_mark_after_joined_ascii(chars, i);
                     self.transient.last_combining_was_zwj = c == '\u{200D}';
                     self.add_combining_to_previous_cell(c);
+                    self.bracket_joined_ascii_after_mark(chars, i);
                     i += 1;
                     continue;
                 }
@@ -344,12 +401,36 @@ impl TerminalHandler<'_> {
                     continue;
                 }
                 self.write_char_core(c, width);
-            } else if !cjk && (0xA0..0x300).contains(&cp) {
-                self.grid.write_narrow_autowrap_fast(c, colors, flags);
+            } else if cp < 0x80 && !ascii_passes {
+                // Printable ASCII the parser joined to the run, under a GL set that translates
+                // it: `print_ascii_bulk` writes it then.
+                if let Some(g) = last_graphic.take() {
+                    self.transient.last_graphic_char = Some(g);
+                }
+                return i;
             } else {
                 let width = char_width(c, cjk);
+                if width == 1 {
+                    // A run of narrow BMP glyphs (the ASCII between words included) outside the
+                    // wide blocks the first arm batches: one grid write per row.
+                    let run_start = i;
+                    i += 1;
+                    while let Some(&next) = chars.get(i)
+                        && is_narrow_run_glyph(next, cjk, ascii_passes)
+                    {
+                        i += 1;
+                    }
+                    self.write_narrow_run(&chars[run_start..i], colors, flags);
+                    last_graphic = Some(chars[i - 1]);
+                    self.transient.last_combining_was_zwj = false;
+                    continue;
+                }
                 if width == 0 {
+                    self.bracket_mark_after_joined_ascii(chars, i);
                     if is_c1_control(c) {
+                        // It lands nowhere, but the joined ASCII after it still begins its own
+                        // bracket, on a cell a lone mark before the control may have extended.
+                        self.bracket_joined_ascii_after_mark(chars, i);
                         i += 1;
                         continue;
                     }
@@ -361,23 +442,17 @@ impl TerminalHandler<'_> {
                     if c == '\u{FE0E}' {
                         self.narrow_previous_cell_for_vs15();
                     }
+                    self.bracket_joined_ascii_after_mark(chars, i);
                     i += 1;
                     if self.transient.last_combining_was_zwj {
                         if let Some(g) = last_graphic.take() {
                             self.transient.last_graphic_char = Some(g);
                         }
-                        for &rest in &chars[i..] {
-                            self.write_char(rest);
-                        }
-                        return;
+                        return i;
                     }
                     continue;
                 }
-                if width == 2 {
-                    self.grid.write_wide_autowrap_fast(c, colors, flags);
-                } else {
-                    self.grid.write_narrow_autowrap_fast(c, colors, flags);
-                }
+                self.grid.write_wide_autowrap_fast(c, colors, flags);
             }
             last_graphic = Some(c);
             self.transient.last_combining_was_zwj = false;
@@ -387,6 +462,62 @@ impl TerminalHandler<'_> {
         if let Some(c) = last_graphic {
             self.transient.last_graphic_char = Some(c);
         }
+        chars.len()
+    }
+
+    /// Bracket the mark at `chars[i]` as the parser's own print of it did before runs joined
+    /// the ASCII before it: where that ASCII left the cursor at the row's end, the mark's print
+    /// began on existing content and recorded the row as overwritten
+    /// (`Grid::damage_selection_output`), which the run's one bracket, begun before the ASCII,
+    /// does not.
+    #[inline]
+    fn bracket_mark_after_joined_ascii(&mut self, chars: &[char], i: usize) {
+        if i > 0 && chars.get(i - 1).is_some_and(char::is_ascii) && self.grid.pending_wrap() {
+            let origin = self.grid.output_damage_origin();
+            self.grid.damage_selection_output(origin);
+        }
+    }
+
+    /// Bracket the joined ASCII after the mark at `chars[i]` as its own `print_ascii_bulk` did
+    /// before runs joined it: where the mark landed on the cell under the cursor (a row's first
+    /// column, with no cell before it to join), that print began on the mark's cell and recorded
+    /// the row as overwritten, which the run's one bracket, begun before the mark, does not.
+    #[inline]
+    fn bracket_joined_ascii_after_mark(&mut self, chars: &[char], i: usize) {
+        if chars.get(i + 1).is_some_and(char::is_ascii) {
+            let origin = self.grid.output_damage_origin();
+            self.grid.damage_selection_output(origin);
+        }
+    }
+
+    /// Write printable ASCII the parser joined to a run through `print_ascii_bulk`'s writer.
+    fn write_joined_ascii(&mut self, ascii: &[char]) {
+        let mut bytes = [0u8; 256];
+        for part in ascii.chunks(bytes.len()) {
+            for (byte, &c) in bytes.iter_mut().zip(part) {
+                *byte = u8::try_from(c).unwrap_or(b'?');
+            }
+            self.write_ascii_print(bytes.get(..part.len()).unwrap_or(&[]));
+        }
+    }
+
+    /// Write a run of narrow glyphs [`Self::write_unicode_bulk`] batched: one grid write per row,
+    /// or one per glyph on the reference path (`Terminal::set_reference_print_path`).
+    #[inline]
+    fn write_narrow_run(
+        &mut self,
+        run: &[char],
+        colors: crate::grid::PackedColors,
+        flags: CellFlags,
+    ) {
+        #[cfg(any(test, debug_assertions))]
+        if self.transient.reference_print_path {
+            for &c in run {
+                self.grid.write_narrow_autowrap_fast(c, colors, flags);
+            }
+            return;
+        }
+        self.grid.write_narrow_run_autowrap(run, colors, flags);
     }
 
     fn write_char_core(&mut self, c: char, width: usize) {
@@ -518,26 +649,28 @@ impl TerminalHandler<'_> {
         } else {
             1
         };
+        let transient = &*self.transient;
         for i in 0..cols {
-            let extra = self.grid.cell_extra_mut_preflagged(row, col + i);
-            if let Some(ref hyperlink) = self.transient.current_hyperlink {
-                extra.set_hyperlink(Some(Arc::clone(hyperlink)));
-                if let Some(ref id) = self.transient.current_hyperlink_id {
-                    extra.set_hyperlink_id(Some(Arc::clone(id)));
-                }
-            }
-            if let Some(color) = self.transient.current_underline_color {
-                extra.set_underline_color_u32(Some(color));
-            }
-            if has_extended {
-                extra.set_extended_flags(flags.extended_flags().bits());
-            }
-            if let Some((r, g, b)) = fg_rgb {
-                extra.set_fg_rgb(Some([r, g, b]));
-            }
-            if let Some((r, g, b)) = bg_rgb {
-                extra.set_bg_rgb(Some([r, g, b]));
-            }
+            self.grid
+                .extras_mut()
+                .modify(aterm_grid::CellCoord::new(row, col + i), |extra| {
+                    *extra = aterm_grid::CellExtra::default();
+                    if let Some(ref hyperlink) = transient.current_hyperlink {
+                        extra.set_hyperlink_data(Some(Arc::clone(hyperlink)));
+                    }
+                    if let Some(color) = transient.current_underline_color {
+                        extra.set_underline_color_u32(Some(color));
+                    }
+                    if has_extended {
+                        extra.set_extended_flags(flags.extended_flags().bits());
+                    }
+                    if let Some((r, g, b)) = fg_rgb {
+                        extra.set_fg_rgb(Some([r, g, b]));
+                    }
+                    if let Some((r, g, b)) = bg_rgb {
+                        extra.set_bg_rgb(Some([r, g, b]));
+                    }
+                });
         }
 
         if has_hyperlink {

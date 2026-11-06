@@ -32,8 +32,7 @@ mod relay;
 mod repair;
 
 pub(crate) use relay::{
-    error_stage as live_error_stage, read_owner_publication,
-    read_publication as read_live_publication,
+    error_stage as live_error_stage, read_publication as read_live_publication,
 };
 
 /// A second address for the current transport owner's observation, kept only while
@@ -237,105 +236,12 @@ pub fn directory(config: &Path) -> PathBuf {
 
 /// Whether the Commons runtime's observation history for `config` exists: its
 /// `observations.astream` is a regular file (a link is not followed). Only an owner's observer
-/// creates it, as it opens (`Observer::open`). An aterm whose Commons opened no LAN gate (0.145.0)
-/// did so just before it opened its transport, so with no `local-network-use` record the file
-/// stands for that aterm's LAN use here ([`lan_used`]); an owner with a gate opens it whether or
-/// not it uses the LAN.
+/// creates it, as it opens (`Observer::open`).
+#[cfg(test)]
 #[must_use]
-pub fn history_exists(config: &Path) -> bool {
+pub(crate) fn history_exists(config: &Path) -> bool {
     std::fs::symlink_metadata(directory(config).join("observations.astream"))
         .is_ok_and(|metadata| metadata.file_type().is_file())
-}
-
-/// The Commons runtime's record, in its directory ([`directory`]), of whether an aterm with no LAN
-/// gate left its observation history with this configuration's home before any owner with a gate
-/// opened its observer here: `used` where one had, `unused` where none had ([`begin_lan_use`]).
-/// Nothing writes it after that first owner: a gated runtime's own LAN use is its host's to keep,
-/// for its own app on its own Mac (`runtime::LanGate::keeping_use`).
-const LAN_USE: &str = "local-network-use";
-const USED: &[u8] = b"used\n";
-const UNUSED: &[u8] = b"unused\n";
-
-/// Whether an aterm with no LAN gate made a LAN use with `config`'s home, as nearly as its
-/// observation history tells: the record says `used` ([`LAN_USE`]), or, with no record, the
-/// history exists ([`history_exists`]). 0.145.0 is the one release that keeps a history and opens
-/// no gate (no earlier release keeps one): it opened its observer at every start and then, while
-/// Commons was enabled, its transport on each IPv4 LAN address. So a history it left with Commons
-/// disabled, or on a Mac with no IPv4 LAN address, reads as a use it never made, and the record
-/// and the history are per home, so on a home that Macs or apps of aterm share one's use reads as
-/// another's. An owner with a gate starts the record before its observer, so its history alone
-/// says nothing. A record that cannot be read, or says anything else, is no use.
-#[must_use]
-pub fn lan_used(config: &Path) -> bool {
-    match private_file::read_private(&directory(config), LAN_USE, UNUSED.len()) {
-        Ok(record) => record == USED,
-        Err(PrivateFileError::Missing) => history_exists(config),
-        Err(_) => false,
-    }
-}
-
-/// Start [`LAN_USE`] for `config` where none is kept, before an owner whose gate let it through
-/// opens its observer: `used` where an observation history is there already (an aterm with no
-/// gate left it, [`lan_used`]), else `unused`. It cannot tell such a history from one that a dev
-/// build with a gate, from before this record (none released), left with no LAN use: that
-/// history is started as `used`, and reads as a use for good.
-///
-/// # Errors
-///
-/// The directory cannot be made private, or the record cannot be read or written.
-pub(crate) fn begin_lan_use(config: &Path) -> std::io::Result<()> {
-    let dir = directory(config);
-    match private_file::read_private(&dir, LAN_USE, UNUSED.len()) {
-        Ok(_) => Ok(()),
-        Err(PrivateFileError::Missing) => {
-            let record = if history_exists(config) { USED } else { UNUSED };
-            private_file::create_private_dir(&dir)?;
-            private_file::write_private(&dir, LAN_USE, record)
-        }
-        Err(error) => Err(std::io::Error::other(error.to_string())),
-    }
-}
-
-/// How often a held owner tries again to serve its wait when it could not ([`WaitRelay::keep`]).
-const WAIT_RELAY_RETRY: Duration = Duration::from_secs(10);
-
-/// A held owner's relay of its wait: an owner that opened no observer (no journal) serves what it
-/// publishes to other local processes on a socket apart from the journal owner's, so `aterm db
-/// network-state` hears it live, as it hears an open owner's.
-#[derive(Default)]
-pub(crate) struct WaitRelay {
-    server: Option<relay::Server>,
-    tried: Option<Instant>,
-}
-
-impl WaitRelay {
-    /// Serve `published` unless this relay serves it already. A try that fails (another held
-    /// owner serves its wait, or the directory is not private) is made again
-    /// [`WAIT_RELAY_RETRY`] later.
-    pub(crate) fn keep(&mut self, config: &Path, published: &ObservationHandle) {
-        if self.server.as_ref().is_some_and(relay::Server::is_running) {
-            return;
-        }
-        let now = Instant::now();
-        if self
-            .tried
-            .is_some_and(|at| now.saturating_duration_since(at) < WAIT_RELAY_RETRY)
-        {
-            return;
-        }
-        self.tried = Some(now);
-        drop(self.server.take());
-        let dir = directory(config);
-        self.server = private_file::create_private_dir(&dir)
-            .and_then(|()| relay::Server::start_wait(&dir, published.clone()))
-            .ok();
-    }
-
-    /// Stop serving, before this owner opens its observer or yields to a window.
-    pub(crate) fn stop(&mut self) {
-        drop(self.server.take());
-        self.tried = None;
-    }
 }
 
 fn bad() -> Error {

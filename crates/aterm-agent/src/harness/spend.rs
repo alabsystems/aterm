@@ -690,7 +690,7 @@ pub struct FoldReport {
     pub files: usize,
     /// Bytes read from disk by this fold.
     pub read: u64,
-    /// Every followed transcript was read to the end it had (a torn last line aside): the sums are not a mid-read prefix.
+    /// Every followed transcript was read to the end it had (a torn last line aside), and none was left unfollowed at [`MAX_FILES`]: the sums are not a mid-read prefix.
     pub caught_up: bool,
     /// Files or directories which could not be inspected, and transcripts past [`MAX_FILES`] or named by a path that is not UTF-8.
     pub unread: usize,
@@ -771,6 +771,17 @@ impl Spend {
         now: i64,
         limits: Limits,
     ) -> FoldReport {
+        self.fold_claude_home_each(prices, now, limits, &mut |_| {})
+    }
+
+    /// [`Self::fold_claude_home`], handing `each` every message it counts and every growth of one it holds, in read order ([`Served`]). A spend started over for another price table hands every message in the horizon again.
+    pub fn fold_claude_home_each(
+        &mut self,
+        prices: &PriceTable,
+        now: i64,
+        limits: Limits,
+        each: &mut dyn FnMut(Served<'_>),
+    ) -> FoldReport {
         let home = PathBuf::from(&self.home);
         if !self.is_for(&home, prices) {
             *self = Self::new(&home, prices);
@@ -792,6 +803,7 @@ impl Spend {
         for found in &walk.files {
             if !self.files.contains_key(&found.rel) && self.files.len() >= MAX_FILES {
                 report.unread += 1;
+                report.caught_up = false;
                 continue;
             }
             let cursor = self.files.entry(found.rel.clone()).or_default();
@@ -809,6 +821,7 @@ impl Spend {
                 buckets: &mut self.buckets,
                 seen: &mut self.seen,
                 report: &mut report,
+                each: &mut *each,
             };
             match advance(cursor, &found.path, &mut left, &limits, &mut sink) {
                 Ok(true) => quiet(cursor, &found.meta, now),
@@ -896,12 +909,27 @@ impl Spend {
     }
 }
 
+/// What a fold hands its sink (design §4.14 "Tokens"): a served message's key, the time of the row that set its counts, its model, and its counts now (each class the largest any of its rows carried). A message counted for the first time and a held message whose counts grew each hand one; a copy of a message the home already counted, a row that grew nothing, an untimed row and a row past the horizon hand nothing. A raise hands the same `key` again with the grown counts: the reader replaces what it holds for that key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Served<'a> {
+    /// FNV-1a/64 of `message.id`; `None` for a row that carried none, or one longer than [`MAX_ID_BYTES`] (handed once, never raised).
+    pub key: Option<u64>,
+    /// Unix seconds the row was served (clamped to the fold's `now`, as the buckets are).
+    pub at: i64,
+    /// Its model id as the row names it, [`UNKNOWN_MODEL`] where it names no model id (a bucket already holding [`MAX_MODELS`] others files the tally under [`OTHER_MODEL`] all the same).
+    pub model: &'a str,
+    /// Its counts now.
+    pub tokens: TokenUsage,
+}
+
 struct Sink<'a> {
     prices: &'a PriceTable,
     now: i64,
     buckets: &'a mut Buckets,
     seen: &'a mut HashMap<u64, i64>,
     report: &'a mut FoldReport,
+    /// Where each counted message and each growth of a held one goes ([`Served`]).
+    each: &'a mut dyn FnMut(Served<'_>),
 }
 
 impl Sink<'_> {
@@ -1147,6 +1175,12 @@ fn fold_row(bytes: &[u8], cursor: &mut Cursor, sink: &mut Sink<'_>) {
         };
         held.tokens = grown;
         held.add(sink.buckets, at, model, tally(0, growth, usd, newly));
+        (sink.each)(Served {
+            key: Some(held.key),
+            at,
+            model,
+            tokens: grown,
+        });
         return;
     }
     if let Some(key) = id {
@@ -1170,6 +1204,12 @@ fn fold_row(bytes: &[u8], cursor: &mut Cursor, sink: &mut Sink<'_>) {
         let usd = sink.prices.message_usd(model, &tokens);
         add(sink.buckets, at, model, tally(1, tokens, usd, approx));
     }
+    (sink.each)(Served {
+        key: id,
+        at,
+        model,
+        tokens,
+    });
     report.messages = report.messages.saturating_add(1);
 }
 

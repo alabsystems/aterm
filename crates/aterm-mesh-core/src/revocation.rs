@@ -117,7 +117,7 @@ pub(crate) fn any_n(n: usize, mut p: impl FnMut(usize) -> bool) -> bool {
 }
 
 /// The island's `allN`: `&&` folded left over `0..n`, every index asked, no early exit.
-fn all_n(n: usize, mut p: impl FnMut(usize) -> bool) -> bool {
+pub(crate) fn all_n(n: usize, mut p: impl FnMut(usize) -> bool) -> bool {
     let mut acc = true;
     for i in 0..n {
         acc &= p(i);

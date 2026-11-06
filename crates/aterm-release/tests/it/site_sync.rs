@@ -94,6 +94,23 @@ fn optimised_mark() -> Vec<u8> {
     custom_section("fixture-wasm-opt", b"-O3")
 }
 
+/// The identity record the real module compiles in (`aterm-wasm`'s `STAMP`), as a section.
+fn compiled_record() -> Vec<u8> {
+    custom_section("fixture-stamp", &aterm_stamp::UNSTAMPED_RECORD)
+}
+
+/// The record the sync stamps an engine built from the fixture's public commit `sha` with.
+fn stamped_record(sha: &str) -> Vec<u8> {
+    let record = aterm_stamp::encode(&aterm_stamp::Stamp {
+        app_version: "0.64.0",
+        git_commit: Box::leak(sha[..12].to_owned().into_boxed_str()),
+        git_commit_full: Box::leak(sha.to_owned().into_boxed_str()),
+        ..aterm_stamp::Stamp::UNSTAMPED
+    })
+    .unwrap();
+    record.to_vec()
+}
+
 fn installed_pair(term: &Path) -> (String, String, Vec<u8>) {
     let mut modules: Vec<String> = std::fs::read_dir(term)
         .unwrap()
@@ -184,6 +201,10 @@ enum EngineFault {
     LeaksHome,
     /// `wasm-opt` leaves the module as it was.
     OptimiseNothing,
+    /// A module that compiled in no identity record.
+    NoStamp,
+    /// `wasm-opt` loses the module's identity record.
+    OptimiseDropsStamp,
 }
 
 /// A deploy as Firebase Hosting's REST API would end it ([`hosting::deploy`]).
@@ -384,6 +405,9 @@ impl World for Fake {
             _ => toy_module(),
         };
         module.extend(custom_section("fixture-commit", commit.as_bytes()));
+        if self.engine != EngineFault::NoStamp {
+            module.extend(compiled_record());
+        }
         if self.engine == EngineFault::LeaksHome {
             let panic = format!("{}/crates/aterm-wasm/src/lib.rs", self.home.display());
             module.extend(custom_section("fixture-panic", panic.as_bytes()));
@@ -400,6 +424,14 @@ impl World for Fake {
         }
         if self.engine != EngineFault::OptimiseNothing {
             let mut bytes = std::fs::read(wasm).unwrap();
+            if self.engine == EngineFault::OptimiseDropsStamp {
+                let header = aterm_stamp::HEADER.as_bytes();
+                let at = bytes
+                    .windows(header.len())
+                    .position(|w| w == header)
+                    .unwrap();
+                bytes[at..at + aterm_stamp::LEN].fill(0);
+            }
             bytes.extend(optimised_mark());
             std::fs::write(wasm, bytes).unwrap();
         }
@@ -597,11 +629,16 @@ impl Lab {
         let src = self.root.join(format!("public-src-{}", self.generation));
         std::fs::create_dir_all(src.join("crates/aterm-wasm")).unwrap();
         std::fs::create_dir_all(src.join("tools")).unwrap();
+        std::fs::write(
+            src.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/aterm-wasm\"]\n\n[workspace.package]\nversion = \"0.64.0\"\n",
+        )
+        .unwrap();
         std::fs::copy(installer(), src.join(crate::site::INSTALLER_SOURCE)).unwrap();
         std::fs::write(
             src.join("crates/aterm-wasm/Cargo.toml"),
             format!(
-                "[package]\nname = \"aterm-wasm\"\nversion = \"0.64.0\"\n# {}\n",
+                "[package]\nname = \"aterm-wasm\"\nversion = \"0.0.0\"\n# {}\n",
                 self.generation
             ),
         )
@@ -912,8 +949,20 @@ fn a_release_sync_rewrites_rebuilds_commits_pushes_deploys_and_verifies() {
         "the shipped module is the optimised one"
     );
     assert!(wasm.windows(40).any(|w| w == lab.public_sha.as_bytes()));
+    let stamped = stamped_record(&lab.public_sha);
+    assert!(
+        wasm.windows(stamped.len()).any(|w| w == stamped),
+        "the shipped module names the public commit's version and commit"
+    );
+    assert!(
+        !wasm
+            .windows(aterm_stamp::LEN)
+            .any(|w| w == aterm_stamp::UNSTAMPED_RECORD),
+        "and no unstamped record"
+    );
     let mut built = toy_module();
     built.extend(custom_section("fixture-commit", lab.public_sha.as_bytes()));
+    built.extend(compiled_record());
     let generated = aterm_verify::wasm_glue::glue(&built, "aterm_wasm").unwrap();
     let (_, generated) = generated
         .into_iter()
@@ -1932,6 +1981,8 @@ fn an_engine_that_cannot_ship_fails_the_sync_and_writes_nothing() {
             EngineFault::OptimiseNothing,
             "the engine never ships pre-opt",
         ),
+        (EngineFault::NoStamp, "holds no identity record"),
+        (EngineFault::OptimiseDropsStamp, "wasm-opt did not keep"),
     ] {
         let lab = Lab::new();
         let before = lab.head();

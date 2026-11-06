@@ -192,6 +192,7 @@ impl Grid {
             let extracted =
                 Self::extract_row_extras(&self.storage.rows[phys], &self.storage.extras, row_idx);
             self.storage.push_ring_extras(extracted);
+            self.storage.release_scrolled_row_extras(phys, row_idx);
         }
 
         self.storage.rows.reserve(rows_to_add);
@@ -286,6 +287,7 @@ impl Grid {
                 Self::extract_row_extras(&self.storage.rows[phys], &self.storage.extras, 0);
             self.storage.push_ring_extras(extracted);
         }
+        self.storage.release_scrolled_row_extras(phys, 0);
 
         {
             let storage = &mut self.storage;
@@ -315,6 +317,7 @@ impl Grid {
                 &self.storage.extras,
                 row_u16(0),
             );
+            self.storage.release_scrolled_row_extras(phys, 0);
             self.reuse_one_scrolled_row(new_extras, cols, row_count, has_scrollback, fill);
             return;
         }
@@ -326,6 +329,10 @@ impl Grid {
                 Self::extract_row_extras(&self.storage.rows[phys], &self.storage.extras, row_idx)
             })
             .collect();
+        for i in 0..rows_to_reuse {
+            let phys = (self.storage.ring_head + ring_sb + i) % row_count;
+            self.storage.release_scrolled_row_extras(phys, row_u16(i));
+        }
 
         for new_extras in new_scrollback_extras {
             self.reuse_one_scrolled_row(new_extras, cols, row_count, has_scrollback, fill);

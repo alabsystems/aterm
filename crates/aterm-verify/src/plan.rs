@@ -25,8 +25,6 @@ pub enum Lane {
     AfterCompile,
     /// `tippy.noindex` under [`lanes_dir`] for lint builds.
     TippyTarget,
-    /// `checkers.noindex` under [`lanes_dir`] for `--features aterm-spec/checkers` test builds.
-    CheckersTarget,
     /// `trust.noindex` under [`lanes_dir`] for `ship check --export` release tools.
     TrustTarget,
     /// `cells.noindex` under [`lanes_dir`] for cross-target cells, wasm modules, and browser runs.
@@ -49,11 +47,11 @@ pub enum StageId {
     LibcOracle,
     /// Source guards and L0 censuses ([`aterm_census::CENSUSES`]).
     Census,
+    /// The engine's content guards over the export of the selection ([`crate::export_scan`]).
+    ExportScan,
     /// Trust checkers over registered formal models (`spec-check`).
     SpecCheck,
-    /// Compiles `aterm-spec/checkers` tests (`--no-run`) in [`Lane::CheckersTarget`].
-    CheckersCompile,
-    /// Runs `aterm-spec/checkers` tests after [`Self::Test`].
+    /// Reruns compiled tests with external checkers after [`Self::Test`].
     SpecCheckers,
     /// Prebuilds measuring test binaries (`--no-run`) before the first exclusive barrier.
     MeasurePrebuild,
@@ -160,7 +158,7 @@ pub fn lanes_dir(ctx: &Ctx) -> PathBuf {
 }
 
 /// The side lanes' names, each a `<name>.noindex` directory in [`lanes_dir`].
-pub const SIDE_LANES: [&str; 4] = ["tippy", "checkers", "trust", "cells"];
+pub const SIDE_LANES: [&str; 3] = ["tippy", "trust", "cells"];
 
 /// Target directory for `lane`'s cargo invocations, or `None` for [`Lane::Pure`].
 #[must_use]
@@ -170,7 +168,6 @@ pub fn lane_dir(ctx: &Ctx, lane: Lane) -> Option<PathBuf> {
         Lane::Pure => None,
         Lane::MainTarget | Lane::AfterCompile => Some(ctx.target_dir.clone()),
         Lane::TippyTarget => side("tippy"),
-        Lane::CheckersTarget => side("checkers"),
         Lane::TrustTarget => side("trust"),
         Lane::CellsTarget => Some(cells_dir(ctx)),
         Lane::LibcOracleTarget => Some(ctx.root.join("libc-oracle").join(LIBC_ORACLE_TARGET)),
@@ -243,7 +240,7 @@ pub fn named_skip(ctx: &Ctx, id: StageId) -> bool {
 fn wanted(ctx: &Ctx) -> Vec<StageId> {
     let mut wanted = crate::checks::stages_of(&ctx.checks);
     if ctx.compile_only {
-        wanted.retain(|id| matches!(id, StageId::TestCompile | StageId::CheckersCompile));
+        wanted.retain(|id| *id == StageId::TestCompile);
     }
     if ctx.cursor_pacing {
         wanted.retain(|id| *id == StageId::GuiSmoke);
@@ -263,8 +260,7 @@ fn wanted(ctx: &Ctx) -> Vec<StageId> {
 /// first (`verify test --all --compile-only --as-release`), so the release's `verify` finds the
 /// benches built, and a red row of it reruns as `--as-release`, which builds them again. Their
 /// units are the test compile's: `test --bench` and `bench --profile test` build a bench under the
-/// same profile in the same compile mode, the workspace's features unify alike for both, and the
-/// `aterm-spec/checkers` feature the release's compile carries reaches none of them. So no
+/// same profile in the same compile mode, the workspace's features unify alike for both. So no
 /// prebuild row is planned, and the measuring stage, alone on the quiet machine, finds its benches
 /// built or does not run ([`crate::stages`]' `measuring_tests`). Any other plan that measures
 /// leaves them to the prebuild row ([`StageId::MeasurePrebuild`]): a dev run's red test compile
@@ -396,7 +392,6 @@ fn calls_of(ctx: &Ctx, s: &StageSpec, calls: Vec<crate::shape::Call>) -> Vec<Sta
 #[must_use]
 pub fn declared(scope: &Scope) -> Vec<StageSpec> {
     let label = scope.label();
-    let checker_label = crate::stages::spec_checkers_scope(scope).label();
     vec![
         spec(
             StageId::TestCompile,
@@ -427,6 +422,11 @@ pub fn declared(scope: &Scope) -> Vec<StageSpec> {
             "source guards and L0 censuses (aterm-census)",
             Lane::Pure,
         ),
+        spec(
+            StageId::ExportScan,
+            "export scan (the publication engine's content guards, offline)",
+            Lane::Pure,
+        ),
         StageSpec {
             after_stages: vec![StageId::TestCompile],
             ..spec(
@@ -435,20 +435,12 @@ pub fn declared(scope: &Scope) -> Vec<StageSpec> {
                 Lane::AfterCompile,
             )
         },
-        spec(
-            StageId::CheckersCompile,
-            format!("checkers compile ({checker_label} with aterm-spec/checkers, --no-run)"),
-            Lane::CheckersTarget,
-        ),
         StageSpec {
-            after_stages: vec![StageId::Test],
+            after_stages: vec![StageId::TestCompile, StageId::Test],
             ..spec(
                 StageId::SpecCheckers,
-                format!(
-                    "checkers ({checker_label} with aterm-spec/checkers: per-step ty \
-                 agreement; after the test run)"
-                ),
-                Lane::CheckersTarget,
+                format!("checkers ({label}: per-step ty agreement; after the test run)"),
+                Lane::MainTarget,
             )
         },
         spec(
@@ -648,7 +640,6 @@ mod tests {
             let lane = |l| lane_dir(&c, l).expect("a directory");
             for (l, name) in [
                 (Lane::TippyTarget, "tippy.noindex"),
-                (Lane::CheckersTarget, "checkers.noindex"),
                 (Lane::TrustTarget, "trust.noindex"),
                 (Lane::CellsTarget, "cells.noindex"),
             ] {
@@ -752,7 +743,7 @@ mod tests {
     }
 
     /// A release's red `test` or `doc` row prints a command the CLI takes and that runs the check
-    /// as the release did: without `--as-release` it carries no feature and owes no golden test,
+    /// as the release did: without `--as-release` it enables no checkers and owes no golden test,
     /// so what failed there would pass. CONTROL: a plain run's and another check's name no flag.
     #[test]
     fn a_releases_red_test_row_reruns_as_the_release_ran() {
@@ -847,11 +838,11 @@ mod tests {
     }
 
     #[test]
-    fn compile_only_keeps_both_test_modes_and_neither_runtime() {
+    fn compile_only_keeps_the_shared_test_graph_and_neither_runtime() {
         let full = ctx(&[Check::Test, Check::Checkers], Scope::Workspace);
         let expected: Vec<_> = plan(&full)
             .into_iter()
-            .filter(|s| matches!(s.id, StageId::TestCompile | StageId::CheckersCompile))
+            .filter(|s| s.id == StageId::TestCompile)
             .map(|s| (s.id, s.mem, s.lane))
             .collect();
         let focused = full.with_compile_only(true);
@@ -860,7 +851,7 @@ mod tests {
             .map(|s| (s.id, s.mem, s.lane))
             .collect();
         assert_eq!(actual, expected);
-        assert_eq!(actual.len(), 2);
+        assert_eq!(actual.len(), 1);
         assert!(focused.rerun(Check::Checkers).ends_with(" --compile-only"));
         assert!(
             plan(&ctx(&[Check::Test, Check::Checkers], Scope::Workspace))
@@ -1279,35 +1270,26 @@ mod tests {
     }
 
     #[test]
-    fn the_feature_builds_compile_beside_the_test_run_and_test_after_it() {
-        use crate::sched::{awaited, ready};
-        let p = plan(&ctx(&[Check::Test, Check::Checkers], Scope::workspace()));
-        let at = |id| p.iter().position(|s| s.id == id).expect("planned");
-        let none = vec![false; p.len()];
-        assert!(
-            ready(&p, &none, &none, 0, at(StageId::CheckersCompile), u64::MAX),
-            "the checkers compile at t0"
-        );
-        let (test, checkers) = (at(StageId::Test), at(StageId::SpecCheckers));
-        assert_eq!(awaited(&p, checkers).collect::<Vec<_>>(), [test]);
-        let mut done = none.clone();
-        for id in [StageId::TestCompile, StageId::CheckersCompile] {
-            done[at(id)] = true;
+    fn checkers_reuse_the_test_compile_and_wait_for_the_plain_run() {
+        for checks in [vec![Check::Checkers], vec![Check::Test, Check::Checkers]] {
+            let p = plan(&ctx(&checks, Scope::workspace()));
+            assert_eq!(
+                p.iter().filter(|s| crate::memory::compiles(s.id)).count(),
+                1
+            );
+            let checker = p.iter().find(|s| s.id == StageId::SpecCheckers).unwrap();
+            assert_eq!(checker.lane, Lane::MainTarget);
+            assert!(checker.after_stages.contains(&StageId::TestCompile));
+            assert_eq!(
+                checker.after_stages.contains(&StageId::Test),
+                checks.contains(&Check::Test)
+            );
         }
         assert!(
-            !ready(&p, &done, &done, 0, checkers, u64::MAX),
-            "the checkers wait for the test run"
+            plan(&ctx(&RELEASE, Scope::workspace()))
+                .iter()
+                .all(|s| s.id != StageId::SpecCheckers)
         );
-        done[test] = true;
-        assert!(ready(&p, &done, &done, 0, checkers, u64::MAX));
-        let alone = plan(&ctx(&[Check::Checkers], Scope::workspace()));
-        assert!(alone.iter().all(|s| s.after_stages.is_empty()));
-        // The release runs its suite once, with the feature, in the main lane.
-        let release = plan(&ctx(&RELEASE, Scope::workspace()));
-        assert!(release.iter().all(|s| {
-            !matches!(s.id, StageId::CheckersCompile | StageId::SpecCheckers)
-                && s.lane != Lane::CheckersTarget
-        }));
     }
 }
 

@@ -312,6 +312,7 @@ impl LaneChild {
             // SAFETY: `raw` is a live local `waitpid` writes; the pid is ours.
             let got = unsafe { waitpid(self.pid, &mut raw, options) };
             if got == self.pid {
+                crate::deaths::note(self.pid, raw);
                 let status = ExitStatus::from_raw(raw);
                 self.status = Some(status);
                 return Ok(Some(status));
@@ -484,7 +485,8 @@ static CHILDREN_IN_BAND: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// From now on start every child of this process in macOS's background band, as a child of a
 /// launchd job of `ProcessType` `Background` starts (a background daemon task: every thread at
 /// priority 4 whatever class it asks for), but one started with
-/// [`Command::leave_background_band`]; an in-place exec keeps this process's own type. For a
+/// [`Command::leave_background_band`]; an in-place exec keeps this process's own type unless it
+/// explicitly requests another. For a
 /// process that left such a job's band to lift one thread, whose children stay where the job
 /// ran them (the vault subscriber's converge runner). Elsewhere nothing changes.
 pub fn start_children_in_background_band() {

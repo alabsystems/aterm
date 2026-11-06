@@ -21,6 +21,8 @@ use crate::codex_alab_model::{
 };
 use crate::codex_rig;
 
+#[path = "codex_accounts_proof.rs"]
+mod accounts_proof;
 #[path = "codex_boxes.rs"]
 mod boxes;
 #[path = "codex_alab_capacity_proof.rs"]
@@ -41,6 +43,7 @@ use crate::pyjson::J;
 use crate::screen::{composer_row, field};
 use crate::stop::{self, Stopped};
 use crate::{Fail, LAB, Res};
+pub use accounts_proof::cmd_codex_accounts_proof;
 pub use boxes::cmd_codex_boxes;
 
 const LANDED: &str = "landed@v1";

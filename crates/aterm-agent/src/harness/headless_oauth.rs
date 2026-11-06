@@ -5984,26 +5984,40 @@ enum CdpReceiveError {
 
 fn receive_cdp<T>(
     from: &Receiver<T>,
-    timeout: Duration,
+    deadline: Deadline<'_>,
     scope: Option<&super::account_work::Scope>,
 ) -> Result<T, CdpReceiveError> {
-    let started = Instant::now();
+    receive_cdp_observed(from, deadline, scope, || {})
+}
+
+fn receive_cdp_observed<T>(
+    from: &Receiver<T>,
+    deadline: Deadline<'_>,
+    scope: Option<&super::account_work::Scope>,
+    mut received: impl FnMut(),
+) -> Result<T, CdpReceiveError> {
     loop {
         if scope.is_some_and(super::account_work::Scope::cancelled) {
             return Err(CdpReceiveError::Cancelled);
         }
-        let left = timeout.saturating_sub(started.elapsed());
-        let tick = if scope.is_some() {
+        let left = deadline.remaining().map_err(|_| CdpReceiveError::Timeout)?;
+        let tick = if scope.is_some() || deadline.counts_sleep() {
             left.min(Duration::from_millis(25))
         } else {
             left
         };
         match from.recv_timeout(tick) {
-            Ok(value) => return Ok(value),
-            Err(RecvTimeoutError::Disconnected) => return Err(CdpReceiveError::Disconnected),
-            Err(RecvTimeoutError::Timeout) if started.elapsed() >= timeout => {
-                return Err(CdpReceiveError::Timeout);
+            Ok(value) => {
+                received();
+                return if scope.is_some_and(super::account_work::Scope::cancelled) {
+                    Err(CdpReceiveError::Cancelled)
+                } else if deadline.expired() {
+                    Err(CdpReceiveError::Timeout)
+                } else {
+                    Ok(value)
+                };
             }
+            Err(RecvTimeoutError::Disconnected) => return Err(CdpReceiveError::Disconnected),
             Err(RecvTimeoutError::Timeout) => {}
         }
     }
@@ -6114,19 +6128,9 @@ impl CdpClient {
         params: Value,
         timeout: Duration,
     ) -> Result<Value, &'static str> {
-        let t0 = Instant::now();
-        self.call_with(
-            session,
-            method,
-            params,
-            &|| timeout.saturating_sub(t0.elapsed()),
-            timeout,
-        )
+        self.call_by(session, method, params, Deadline::after(timeout))
     }
 
-    /// [`CdpClient::call`] within `deadline`, which counts the time the host slept: its waits
-    /// look at both clocks at least every [`super::wake_deadline::SLEEP_CHECK`], so a call the
-    /// host slept past ends within that of its waking.
     pub fn call_until(
         &mut self,
         session: Option<&str>,
@@ -6134,48 +6138,20 @@ impl CdpClient {
         params: Value,
         deadline: WakeDeadline,
     ) -> Result<Value, &'static str> {
-        let tick = if deadline.counts_sleep() {
-            super::wake_deadline::SLEEP_CHECK
-        } else {
-            Duration::MAX
-        };
-        self.call_with(session, method, params, &|| deadline.remaining(), tick)
+        self.call_by(
+            session,
+            method,
+            params,
+            Deadline::waking(deadline, &Instant::now),
+        )
     }
 
-    /// [`CdpClient::call`] within `deadline`: its expiry's words where it has passed, and where it
-    /// counts the time the host slept ([`Deadline::waking`]) its waits look again at least every
-    /// [`super::wake_deadline::SLEEP_CHECK`], as [`CdpClient::call_until`]'s do.
-    fn call_by(
+    pub(super) fn call_by(
         &mut self,
         session: Option<&str>,
         method: &str,
         params: Value,
         deadline: Deadline<'_>,
-    ) -> Result<Value, &'static str> {
-        deadline.left()?;
-        let tick = if deadline.counts_sleep() {
-            super::wake_deadline::SLEEP_CHECK
-        } else {
-            Duration::MAX
-        };
-        self.call_with(
-            session,
-            method,
-            params,
-            &|| deadline.remaining().unwrap_or(Duration::ZERO),
-            tick,
-        )
-    }
-
-    /// Sends the command and waits for its response while `left` leaves time, at most `tick` per
-    /// wait before it reads `left` again.
-    fn call_with(
-        &mut self,
-        session: Option<&str>,
-        method: &str,
-        params: Value,
-        left: &dyn Fn() -> Duration,
-        tick: Duration,
     ) -> Result<Value, &'static str> {
         if self
             .work
@@ -6187,6 +6163,7 @@ impl CdpClient {
         if self.write_failed {
             return Err("browser DevTools pipe is unavailable");
         }
+        deadline.left()?;
         self.next_id += 1;
         let id = self.next_id;
         let mut msg = json!({"id": id, "method": method, "params": params});
@@ -6200,13 +6177,7 @@ impl CdpClient {
             self.write_failed = true;
             return Err("browser DevTools pipe is unavailable");
         }
-        let wrote = loop {
-            match receive_cdp(&written, left().min(tick), self.work.as_ref()) {
-                Err(CdpReceiveError::Timeout) if !left().is_zero() => {}
-                wrote => break wrote,
-            }
-        };
-        match wrote {
+        match receive_cdp(&written, deadline, self.work.as_ref()) {
             Ok(true) => {}
             Err(CdpReceiveError::Cancelled) => {
                 return Err("browser DevTools account work is paused");
@@ -6221,11 +6192,10 @@ impl CdpClient {
             }
         }
         loop {
-            let remaining = left();
-            if remaining.is_zero() {
+            if deadline.expired() {
                 return Err("timed out waiting for browser DevTools response");
             }
-            match receive_cdp(&self.from, remaining.min(tick), self.work.as_ref()) {
+            match receive_cdp(&self.from, deadline, self.work.as_ref()) {
                 Ok(m) => {
                     if m.get("id").and_then(Value::as_u64) != Some(id) {
                         self.events.push(m);
@@ -6239,7 +6209,6 @@ impl CdpClient {
                 Err(CdpReceiveError::Cancelled) => {
                     return Err("browser DevTools account work is paused");
                 }
-                Err(CdpReceiveError::Timeout) if !left().is_zero() => {}
                 Err(CdpReceiveError::Timeout) => {
                     return Err("timed out waiting for browser DevTools response");
                 }
@@ -7835,7 +7804,7 @@ fn drive_cdp_oauth_flow_until(
                     if bot.held(now).is_none() {
                         return Err(browser_control_failed(why));
                     }
-                    if now >= deadline.end() {
+                    if deadline.expired() {
                         return Err(oauth_out_of_time(&bot, last_host.as_deref(), now));
                     }
                     bot.unread(now);
@@ -8313,11 +8282,9 @@ fn authorize_pinned_browser_until(
             let child = start_browser(cmd, OwnedFd::from(cmd_read), OwnedFd::from(out_write))?;
             let _guard = BrowserChild::new(child);
             let mut cdp = CdpClient::new(cmd_write, out_read);
-            let make_up_until = deadline
-                .limited(super::browser_window::MAKE_UP_WITHIN)
-                .end();
+            let make_up_until = deadline.limited(super::browser_window::MAKE_UP_WITHIN);
             deadline.left()?;
-            let _ = super::browser_window::make_up_tidy(&mut cdp, profile_dir, make_up_until);
+            let _ = super::browser_window::make_up_tidy_until(&mut cdp, profile_dir, make_up_until);
             let mut seen_otps = BTreeSet::new();
 
             deadline.left()?;
@@ -8357,6 +8324,7 @@ fn authorize_pinned_browser_until(
                     )
                 },
                 |cb_url| {
+                    deadline.left()?;
                     if cb_url.split('?').next()
                         == Some("https://platform.claude.com/oauth/code/callback")
                     {
@@ -9688,7 +9656,7 @@ pub fn drive_cdp_vendor(
     start: &str,
     gate: Gate<'_>,
     finished: &dyn Fn() -> bool,
-    deadline: WakeDeadline,
+    deadline: Deadline<'_>,
     mailbox: impl FnMut(&mut CdpClient, Option<&str>) -> Result<MailboxCredential, &'static str>,
 ) -> super::login_drive::Approval {
     drive_cdp_vendor_within(
@@ -9728,13 +9696,13 @@ pub(super) fn drive_cdp_vendor_within(
     cdp: &mut CdpClient,
     start: &str,
     gate: Gate<'_>,
-    (finished, deadline): (&dyn Fn() -> bool, WakeDeadline),
+    (finished, deadline): (&dyn Fn() -> bool, Deadline<'_>),
     mut stall: PageStall,
     mut mailbox: impl FnMut(&mut CdpClient, Option<&str>) -> Result<MailboxCredential, &'static str>,
 ) -> super::login_drive::Approval {
     use super::login_drive::Approval;
     let opened = (|| -> Result<(String, String), &'static str> {
-        let target = cdp.call_until(
+        let target = cdp.call_by(
             None,
             "Target.createTarget",
             json!({"url": "about:blank"}),
@@ -9745,7 +9713,7 @@ pub(super) fn drive_cdp_vendor_within(
             .and_then(Value::as_str)
             .ok_or("browser created no targetId")?
             .to_owned();
-        let attached = cdp.call_until(
+        let attached = cdp.call_by(
             None,
             "Target.attachToTarget",
             json!({"targetId": target_id, "flatten": true}),
@@ -9757,9 +9725,9 @@ pub(super) fn drive_cdp_vendor_within(
             .ok_or("browser attached no sessionId")?
             .to_owned();
         for method in ["Page.enable", "Runtime.enable"] {
-            let _ = cdp.call_until(Some(&session), method, json!({}), deadline)?;
+            let _ = cdp.call_by(Some(&session), method, json!({}), deadline)?;
         }
-        let _ = cdp.call_until(
+        let _ = cdp.call_by(
             Some(&session),
             "Page.navigate",
             json!({"url": start}),
@@ -9786,10 +9754,10 @@ pub(super) fn drive_cdp_vendor_within(
             break Approval::Approved { page: page_proved };
         }
         let now = Instant::now();
-        if deadline.passed() {
+        if deadline.expired() {
             break vendor_out_of_time(&stall, last_place.as_deref(), now);
         }
-        let eval = cdp.call_until(
+        let eval = cdp.call_by(
             Some(&session),
             "Runtime.evaluate",
             json!({"expression": VENDOR_PAGE_JS, "returnByValue": true}),
@@ -9831,7 +9799,7 @@ pub(super) fn drive_cdp_vendor_within(
         match &step {
             Step::Done => {
                 if gate.completion == crate::ai::connector::Completion::Device {
-                    while !finished() && !deadline.passed() {
+                    while !finished() && !deadline.expired() {
                         std::thread::sleep(VENDOR_TICK);
                     }
                 }
@@ -9878,7 +9846,7 @@ pub(super) fn drive_cdp_vendor_within(
                         if let Some(why) = gate.bound.and_then(|b| b.outside(&link, gate.hosts)) {
                             break Approval::Refused(format!("the sign-in mail's link: {why}"));
                         }
-                        let _ = cdp.call_until(
+                        let _ = cdp.call_by(
                             Some(&session),
                             "Page.navigate",
                             json!({"url": link}),
@@ -9892,7 +9860,7 @@ pub(super) fn drive_cdp_vendor_within(
             Step::Press(_) | Step::FillCode | Step::FillEmail | Step::FillOtp => {
                 post_otp_wait_ticks = 0;
                 let acted = cdp
-                    .call_until(
+                    .call_by(
                         Some(&session),
                         "Runtime.evaluate",
                         json!({"expression": vendor_act_js(&step, value), "returnByValue": true}),
@@ -10103,7 +10071,7 @@ impl super::login_drive::Approver for VendorApprover {
     fn resume(
         &mut self,
         request: &super::login_drive::Request<'_>,
-        deadline: WakeDeadline,
+        deadline: Deadline<'_>,
     ) -> Result<super::login_drive::Resume, String> {
         self.google_pending = None;
         self.google_recovery = None;
@@ -10159,7 +10127,7 @@ impl super::login_drive::Approver for VendorApprover {
         &mut self,
         request: &super::login_drive::Request<'_>,
         outcome: &super::login_drive::Outcome,
-        deadline: WakeDeadline,
+        deadline: Deadline<'_>,
     ) -> Result<(), String> {
         if !matches!(outcome, super::login_drive::Outcome::SignedIn { .. }) {
             self.google_pending = None;
@@ -10208,6 +10176,9 @@ impl super::login_drive::Approver for VendorApprover {
         {
             return Approval::NotRun("automatic account work is cancelled".into());
         }
+        if handoff.deadline.expired() {
+            return Approval::NotRun("native sign-in deadline expired".into());
+        }
         if let Some(result) = super::google_federation::configured(self, handoff) {
             return result;
         }
@@ -10241,7 +10212,7 @@ impl super::login_drive::Approver for VendorApprover {
             &mut super::headless_fetch::Curl,
             &|| {
                 (handoff.finished)()
-                    || handoff.deadline.passed()
+                    || handoff.deadline.expired()
                     || self
                         .work
                         .as_ref()
@@ -10304,20 +10275,18 @@ impl VendorApprover {
             {
                 return Err("automatic account work is cancelled");
             }
+            handoff.deadline.left()?;
             let child = spawn_with_two_fds(cmd, OwnedFd::from(cmd_read), OwnedFd::from(out_write))
                 .map_err(|_| "could not spawn headless browser")?;
             let _guard = BrowserChild::new(child);
             let mut cdp = CdpClient::new_scoped(cmd_write, out_read, self.work.clone())
                 .map_err(|_| "could not start scoped CDP workers")?;
-            // The make-up's own waits take an `Instant`: [`MAKE_UP_WITHIN`] bounds them, so it
-            // gets its share of the deadline as one, read now.
-            let _ = super::browser_window::make_up_tidy(
+            let _ = super::browser_window::make_up_tidy_until(
                 &mut cdp,
                 profile_dir,
                 handoff
                     .deadline
-                    .within(super::browser_window::MAKE_UP_WITHIN)
-                    .instant(),
+                    .limited(super::browser_window::MAKE_UP_WITHIN),
             );
             let mut seen_otps = BTreeSet::new();
             let gate = Gate {
@@ -10354,7 +10323,7 @@ impl VendorApprover {
                         }
                         return Err(no_mailbox);
                     };
-                    poll_mailbox_or_webmail_for_credential_by(
+                    poll_mailbox_or_webmail_until(
                         cdp_inner,
                         mb,
                         em,

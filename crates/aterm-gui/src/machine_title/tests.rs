@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use aterm_agent::machine_name::file;
-use aterm_types::machine_name::Nickname;
+use aterm_types::machine_name::{Nickname, Number};
 
 use super::*;
 
@@ -224,8 +224,10 @@ fn the_watch_hears_a_rename_by_replace_a_vault_made_later_and_a_fleet_key_writte
     let mut was = String::new();
     for file in ["state.toml", "identity", "source.toml"] {
         let at = vault_dir.join(file);
-        std::fs::write(&at, "not = [a vault file").expect("a vault file");
-        std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o600)).expect("private");
+        // Published whole at its private mode by one rename, so the reader can find it in one
+        // state only. Written at the umask's mode and made private after, it has two (refused as
+        // readable by other users, then unparsable), and a read of each posts a view of its own.
+        aterm_uds::atomic_file::write(&at, b"not = [a vault file", 0o600).expect("a vault file");
         let unread = views.recv_timeout(hang).expect("the vault's file heard");
         let InFleet::Unread(why) = &unread.fleet else {
             panic!("{file}: {:?}", unread.fleet);
@@ -373,8 +375,11 @@ fn a_failed_set_is_kept_for_the_next_press_unless_a_later_press_superseded_it() 
     let mut app = crate::App::headless_for_test();
     let unset = |generation| NameUnset {
         generation,
-        kind: EditKind::Nickname,
-        word: Some("Kestrel".to_owned()),
+        asked: Asked {
+            kind: EditKind::Nickname,
+            number: None,
+            nick: Some("Kestrel".to_owned()),
+        },
         why: "The nickname was not changed: the lock is busy.".to_owned(),
     };
     app.machine_sets = 2;
@@ -387,39 +392,44 @@ fn a_failed_set_is_kept_for_the_next_press_unless_a_later_press_superseded_it() 
     assert_eq!(app.machine_unset, Some(unset(2)));
 }
 
+/// Rename sets a nickname alone as Change Nickname… does and another number as `aterm name set`
+/// does; fields that ask for nothing set nothing.
 #[test]
-fn the_rename_field_keeps_nickname_case_and_accepts_a_number_alone() {
-    let held = view("m184", "Linnet", true);
-    let to = name_to("  m86 MissBunny  ", &held)
-        .expect("valid")
-        .expect("changed");
-    assert_eq!(to.num.get(), 86);
-    assert_eq!(to.nick.expect("a nickname").as_str(), "MissBunny");
-    let to = name_to("86", &held).expect("valid").expect("changed");
-    assert_eq!(to.num.get(), 86);
-    assert!(
-        to.nick.is_none(),
-        "a number alone preserves the held nickname"
-    );
-    let to = name_to("m86 Blue Heron", &held)
-        .expect("valid")
-        .expect("changed");
-    assert_eq!(to.nick.expect("a nickname").as_str(), "Blue Heron");
+fn rename_writes_what_its_fields_ask() {
+    use crate::machine_rename_sheet::RenameTo;
+    assert!(rename_change(RenameTo::Keep).is_none());
+    let word = Nickname::parse("Puffin").expect("a nickname");
+    assert!(matches!(
+        rename_change(RenameTo::Nick(word.clone())),
+        Some(NameChange::Nickname(NickTo::Word(set))) if set == word
+    ));
+    let to = NameTo {
+        num: Number::new(86).expect("a number"),
+        nick: Some(word),
+    };
+    assert!(matches!(
+        rename_change(RenameTo::Name(to.clone())),
+        Some(NameChange::Name(set)) if set == to
+    ));
 }
 
+/// A set that fails keeps what its press typed, field by field, for the next press of the same
+/// menu row, which takes it; a press of the other row leaves it for its own.
 #[test]
-fn the_rename_field_rejects_invalid_names_and_leaves_an_untouched_name_alone() {
-    let held = view("m184", "Linnet", true);
-    for invalid in ["", "m0 MissBunny", "m086 MissBunny", "m86 m8", "m86 --bad"] {
-        assert!(name_to(invalid, &held).is_err(), "{invalid}");
-    }
-    assert!(name_to("m184 Linnet", &held).expect("valid").is_none());
-    assert!(name_to("184", &held).expect("valid").is_none());
-    assert!(
-        name_to("m0 Linnet", &view("m0", "Linnet", false))
-            .expect("untouched")
-            .is_none()
-    );
+fn a_failed_set_refills_the_next_press_of_its_own_row() {
+    let asked = Asked {
+        kind: EditKind::Name,
+        number: Some("m86".to_owned()),
+        nick: None,
+    };
+    let failed = unset_of(3, &asked, "the vault is busy");
+    assert_eq!(failed.why, "The name was not changed: the vault is busy.");
+    assert_eq!(failed.asked, asked);
+    let mut kept = Some(failed.clone());
+    assert_eq!(unset_for(&mut kept, EditKind::Nickname), None);
+    assert_eq!(kept.as_ref(), Some(&failed), "left for Rename");
+    assert_eq!(unset_for(&mut kept, EditKind::Name), Some(failed));
+    assert_eq!(kept, None, "taken");
 }
 
 #[test]
@@ -463,6 +473,11 @@ fn the_writer_applies_number_and_nickname_requests_in_submission_order() {
         send.send(NameJob {
             to,
             generation: u64::try_from(generation).expect("a generation"),
+            asked: Asked {
+                kind: EditKind::Name,
+                number: None,
+                nick: None,
+            },
         })
         .expect("queues");
     }
@@ -490,14 +505,19 @@ fn the_writer_applies_number_and_nickname_requests_in_submission_order() {
                     .name
             }
         };
-        applied.push((job.generation, name.title()));
+        applied.push((job.generation, name.title(), name.rev));
     });
     assert_eq!(
         applied
             .iter()
-            .map(|(generation, _)| *generation)
+            .map(|(generation, _, _)| *generation)
             .collect::<Vec<_>>(),
         [0, 1, 2, 3]
+    );
+    assert_eq!(
+        applied.iter().map(|(_, _, rev)| *rev).collect::<Vec<_>>(),
+        [1, 2, 3, 4],
+        "number and nickname edits advance the same local revision"
     );
     assert_eq!(applied[1].1, "m86 MissBunny");
     assert_eq!(applied[2].1, "m87 MissBunny");

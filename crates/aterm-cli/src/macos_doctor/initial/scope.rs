@@ -27,13 +27,9 @@ pub use watch_test::ProvisionalSetupWatchTest;
 pub(super) const NO_VAULT: &str = "No vault on this network";
 
 /// The note when nothing answered at the ALab vault's address. That is not proof
-/// there is none: macOS's Local Network switch, the network itself, or the
-/// vault being down look the same from here.
+/// there is none: the network itself, a LAN broker not yet installed, or the vault
+/// being down look the same from here.
 pub(super) const NOT_REACHED: &str = "The ALab vault did not answer on this network";
-
-/// The note when the ALab vault did not answer while macOS refuses aterm the local network: no
-/// look can reach it until the person turns Local Network on, which its own row opens.
-pub(super) const LAN_OFF: &str = "Local Network is off for aterm";
 
 /// How long one probe of the ALab vault takes at most, all of it: it answers within
 /// milliseconds on its own LAN, and a Mac elsewhere must not hold its first launch longer.
@@ -65,15 +61,6 @@ impl VaultHere {
         }
     }
 
-    /// [`Self::note`], naming Local Network ([`LAN_OFF`]) for a vault nobody answered while the
-    /// last LAN look heard macOS refuse aterm (`lan`, [`access::last_answer`]).
-    pub(super) fn note_for(self, lan: Option<access::LanAnswer>) -> Option<&'static str> {
-        match (self, lan) {
-            (Self::Unreached, Some(access::LanAnswer::Refused)) => Some(LAN_OFF),
-            _ => self.note(),
-        }
-    }
-
     /// Whether it leaves the ALab vault off this network, as [`off_network`] reads a Secrets try:
     /// a server there holds none, or nobody answered. The Repositories stage then runs on this
     /// Mac's own GitHub credentials ([`vault_not_here`]).
@@ -90,8 +77,7 @@ pub(super) struct Probe {
     pub(super) on: Option<String>,
 }
 
-/// The last probe of the ALab vault in this process ([`probe_vault`], or Check again's
-/// [`look_again`]).
+/// The last explicit Check again probe of the ALab vault in this process ([`look_again`]).
 static LAST_PROBE: std::sync::Mutex<Option<Probe>> = std::sync::Mutex::new(None);
 
 /// What aterm last heard at the ALab vault's address on the network `reads` reads now, for System
@@ -209,31 +195,8 @@ pub(super) fn join_typed(root: &Path) -> bool {
     })
 }
 
-/// Ask the ALab vault's address once ([`aterm_secrets::client::probe_default`]).
-/// An answer from it is also the only proof an app has that macOS lets it use
-/// the local network, and macOS refusing it the `.local` name the only proof it
-/// does not: either is kept for later launches ([`access::lan_answered`]). Its
-/// first request can raise macOS's Local Network alert, so its one caller (the
-/// Secrets stage's join) holds a [`aterm_types::macos_setup::MacosDialog`] across
-/// the probe, one macOS dialog this process started at a time.
-///
-/// Another vault's signed answer at the ALab vault's address, kept on this network by this look
-/// or `aterm init`'s within a day ([`aterm_machines::init_secrets::kept_elsewhere`]), stands for
-/// it: no request is made, and nothing is kept of the LAN.
-pub(super) fn probe_vault() -> VaultHere {
-    let here = probe_vault_with(
-        || {
-            look_place().is_some_and(|(home, network, now)| {
-                aterm_machines::init_secrets::kept_elsewhere(&home, network.as_deref(), now)
-            })
-        },
-        probe_lan,
-    );
-    keep_probe(&LAST_PROBE, here, &secrets_retry::Live)
-}
-
-/// Check again's look at the ALab vault ([`super::probe_local_network_again`]): [`probe_lan`],
-/// which a kept answer never stands for, kept as this process's last probe as [`probe_vault`]'s
+/// Check again's look at the ALab vault ([`super::look_for_the_vault_again`]): [`probe_lan`],
+/// which a kept answer never stands for, kept as this process's last probe as the prior look
 /// is, so the vault row reads the newest look on this network ([`heard_at`]), a stopped run's
 /// too, which asks nothing again by itself.
 pub(super) fn look_again() {
@@ -263,18 +226,6 @@ fn keep_probe(
     here
 }
 
-/// [`probe_vault`] with what a kept look says (`kept_elsewhere`) and the look itself (`probe`).
-fn probe_vault_with(
-    kept_elsewhere: impl FnOnce() -> bool,
-    probe: impl FnOnce() -> VaultHere,
-) -> VaultHere {
-    if kept_elsewhere() {
-        VaultHere::Absent
-    } else {
-        probe()
-    }
-}
-
 /// Where this login keeps its looks for the ALab vault (its home), the network this Mac is on
 /// now ([`aterm_secrets::heard::network`]) and the time (unix seconds).
 fn look_place() -> Option<(std::path::PathBuf, Option<String>, u64)> {
@@ -285,23 +236,15 @@ fn look_place() -> Option<(std::path::PathBuf, Option<String>, u64)> {
     Some((home, aterm_secrets::heard::network_key(), now))
 }
 
-/// [`probe_vault`]'s look, keeping what it heard of the LAN, and a definitive answer for the next
-/// look on this network ([`aterm_machines::init_secrets::keep_look`]); its caller keeps what it
-/// heard of the vault ([`LAST_PROBE`]). It is also Check again's look ([`look_again`]), which a
-/// kept answer never stands for.
+/// The vault look, keeping a definitive answer for the next look on this network
+/// ([`aterm_machines::init_secrets::keep_look`]); its caller keeps what it heard of the vault
+/// ([`LAST_PROBE`]). It is also Check again's look ([`look_again`]), which a kept answer never
+/// stands for.
 pub(super) fn probe_lan() -> VaultHere {
-    use access::LanAnswer;
-    use aterm_machines::init_secrets::LanHeard;
     use aterm_secrets::client::ProbeOutcome;
     let probed = aterm_secrets::client::probe_default(PROBE_WAIT);
     if let Some((home, network, now)) = look_place() {
         aterm_machines::init_secrets::keep_look(&home, network, now, &probed);
-    }
-    // What the look heard of the switch, by the rule `aterm init`'s look reads too.
-    match aterm_machines::init_secrets::alab_look_heard(&probed) {
-        Some(LanHeard::Reached) => access::lan_answered(LanAnswer::Reached),
-        Some(LanHeard::Refused) => access::lan_answered(LanAnswer::Refused),
-        None => {}
     }
     match probed {
         Ok(ProbeOutcome::Found(_)) => VaultHere::Found,
@@ -1152,39 +1095,6 @@ pub(super) fn settle_put_back(root: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// One look per network: another vault's answer at the ALab vault's address, kept by any
-    /// look on this network (`aterm init`'s too), stands for System State's look for a day; on
-    /// another network, or after it, the vault is asked.
-    #[test]
-    fn a_kept_answer_of_another_vault_stands_for_the_look_on_its_network() {
-        use aterm_secrets::heard::{self, ABSENT_FOR, Heard, Verdict};
-        let home = aterm_tempfile::tempdir().unwrap();
-        let lan = "n00112233445566aa";
-        let paths = aterm_secrets::client::Paths::for_home(home.path());
-        let verdict = Verdict {
-            at: 1_000,
-            heard: Heard::Absent,
-            network: lan.into(),
-        };
-        heard::write(&paths, &verdict).unwrap();
-        let looks = std::cell::Cell::new(0);
-        let look = |network: Option<&str>, now: u64| {
-            probe_vault_with(
-                || aterm_machines::init_secrets::kept_elsewhere(home.path(), network, now),
-                || {
-                    looks.set(looks.get() + 1);
-                    VaultHere::Unreached
-                },
-            )
-        };
-        assert_eq!(look(Some(lan), 1_000 + ABSENT_FOR - 1), VaultHere::Absent);
-        assert_eq!(looks.get(), 0, "no request on its network");
-        assert_eq!(look(Some("n66778899aabbccdd"), 1_001), VaultHere::Unreached);
-        assert_eq!(look(Some(lan), 1_000 + ABSENT_FOR), VaultHere::Unreached);
-        assert_eq!(look(None, 1_001), VaultHere::Unreached);
-        assert_eq!(looks.get(), 3);
-    }
 
     #[test]
     fn an_upgrade_checkpoint_round_trips_every_progress_field() {

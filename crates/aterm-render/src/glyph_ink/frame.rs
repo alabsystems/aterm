@@ -443,6 +443,23 @@ mod tests {
         assert!(Arc::ptr_eq(&fresh, &renderer.glyph_ink_for(after)));
     }
 
+    /// Two frames' ink, drawn by one renderer, share one raster table, so a reader that keeps
+    /// what it read of a glyph by index (the letter guard's ring reads) keeps it from frame to
+    /// frame. NEGATIVE CONTROL (2026-11-05): `glyph_ink_for` giving each frame a copy of the
+    /// table (`ink.rasters = ink.rasters.to_vec().into()`) fails it.
+    #[test]
+    fn a_frame_s_ink_shares_the_face_s_raster_table() {
+        let mut renderer =
+            Renderer::from_bytes(crate::embedded_font(), 24.0, Theme::default()).unwrap();
+        let first = renderer.glyph_ink_for(&input(b"one"));
+        let next = renderer.glyph_ink_for(&input(b"two"));
+        assert!(!Arc::ptr_eq(&first, &next), "fixture: two frames' carriers");
+        assert!(
+            Arc::ptr_eq(first.raster_table(), next.raster_table()),
+            "each frame's ink read a table of its own"
+        );
+    }
+
     #[test]
     fn bidi_map_changes_reject_old_carriers_and_follow_the_actual_font_plan() {
         let mut renderer =

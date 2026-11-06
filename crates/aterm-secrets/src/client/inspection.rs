@@ -411,7 +411,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), crate::ErrorKind::VaultBusy);
         drop(held);
-        let foreign = client::log_entries_tests::two_macs(&[]);
+        let foreign = client::log_entries_tests::fresh_two_macs(&[]);
         let wire = client::load_records(&foreign.m7).unwrap().encode();
         crate::fsx::write_atomic(&macs.m7.records_file(), &wire, 0o600).unwrap();
         assert!(

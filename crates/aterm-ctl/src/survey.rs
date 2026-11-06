@@ -97,7 +97,7 @@ pub enum PeerFault {
     Other,
     /// Not dialled (unresolvable name, missing host, or non-LAN address).
     NotDialled,
-    /// No route to host (`EHOSTUNREACH`, such as macOS local-network privacy).
+    /// No route to host (`EHOSTUNREACH`: the host is off the link, asleep or off).
     NoRoute,
     /// No route to network (`ENETUNREACH`, such as offline or full-tunnel VPN).
     NoNetwork,
@@ -107,9 +107,7 @@ pub enum PeerFault {
     /// aterm), so the survey was not sent: alone in a read, exit 2.
     Unserved,
     /// A host at its address answered the dial and no survey came back: it refused the connect
-    /// (no aterm listening), or the handshake, the proof or the reply failed. The dial reached the
-    /// link, so on this Mac's network it shows Local Network privacy let this process onto it
-    /// (`aterm_netplace::words::Dial::Reached`).
+    /// (no aterm listening), or the handshake, the proof or the reply failed.
     HostAnswered,
 }
 
@@ -869,10 +867,13 @@ fn header_line(reply: &HostReply, survey: &Survey) -> String {
         (left, 0) => format!(" · {left} not sent (reply cap)"),
         (left, cut) => format!(" · {left} not sent, {cut} without excerpts (reply cap)"),
     };
+    // A node service answers for every window it reaches (`instances_read=`); a window that
+    // answered alone read itself.
+    let read = h.number("instances_read").unwrap_or(1);
     let siblings = h
         .number("instances")
-        .filter(|&n| reply.remote && n > 1)
-        .map_or_else(String::new, |n| format!(" · 1 of {n} instances read"));
+        .filter(|&n| reply.remote && n > read)
+        .map_or_else(String::new, |n| format!(" · {read} of {n} instances read"));
     let unproven = if reply.remote && reply.unproven {
         " · node unproven"
     } else {
@@ -2118,9 +2119,8 @@ pub(crate) fn read_survey(
 }
 
 /// Diagnostic note when every dialled fleet peer failed with `EHOSTUNREACH`.
-pub const NO_ROUTE_NOTE: &str = "Every peer had no route: on a Mac, Local Network privacy \
-     refuses an app's LAN connections this way until they are allowed (System Settings › \
-     Privacy & Security › Local Network: aterm, or the terminal this runs in).";
+pub const NO_ROUTE_NOTE: &str = "Every peer had no route: each is off this network, asleep or \
+     off.";
 
 /// Diagnostic note when every dialled fleet peer failed with `ENETUNREACH`.
 pub(crate) const NO_NETWORK_NOTE: &str = "This machine had no route to any peer's network: it is \
@@ -2148,17 +2148,11 @@ fn place_now() -> Option<aterm_netplace::Place> {
 /// The note a fleet read ends with, given this Mac's network place `place`:
 ///
 /// - a sandbox that refused every connect is still said as the sandbox;
-/// - a member on this Mac's network that this read found no route to, while nothing there
-///   answered (no member, and no host that refused or failed a handshake), is this Mac's own
-///   Local Network privacy, wherever this Mac is
-///   (`aterm_netplace::words::on_link`, [`aterm_netplace::words::ON_LINK_PRIVACY_NOTE`]), a
-///   member on the same phone hotspot included;
 /// - away from the ALab LAN (on another network), a read no dialled peer answered says where this
-///   Mac is (`aterm_netplace::words::survey_note`), not a privacy blame and not nothing (the
-///   timeouts of a hotspot);
-/// - a no-route the on-link rule placed off this network, or on it while another member there
-///   answered (that member's own, off the link now: its row says so), blames no privacy setting;
-///   only one with no address to judge keeps [`fleet_note`]'s, which is the rest's note.
+///   Mac is (`aterm_netplace::words::survey_note`), not nothing (the timeouts of a hotspot);
+/// - a no-route the on-link rule placed (`aterm_netplace::words::on_link`: off this network, or
+///   on it, that member's own, off the link now, which its row says) needs no note; only one with
+///   no address to judge keeps [`fleet_note`]'s, which is the rest's note.
 pub(crate) fn fleet_note_at(
     peers: &[PeerSurvey],
     place: Option<&aterm_netplace::Place>,
@@ -2170,9 +2164,6 @@ pub(crate) fn fleet_note_at(
     }
     let on_link =
         place.map(|place| aterm_netplace::words::on_link(place, peers.iter().map(dial_of)));
-    if on_link.is_some_and(|on_link| on_link.privacy > 0) {
-        return Some(aterm_netplace::words::ON_LINK_PRIVACY_NOTE.to_owned());
-    }
     let dialled = peers.iter().any(|peer| peer.fault != PeerFault::NotDialled);
     let answered = peers.iter().any(|peer| peer.answer.is_ok());
     if dialled
@@ -2187,20 +2178,17 @@ pub(crate) fn fleet_note_at(
     note.map(str::to_owned)
 }
 
-/// One peer's dial as the on-link rule reads it (`aterm_netplace::words::Dial`): an answer from
-/// its address, a no-route to the address its dial went to, a host that answered there with no
-/// survey ([`PeerFault::HostAnswered`]), or anything else.
+/// One peer's dial as the on-link rule reads it (`aterm_netplace::words::Dial`): a no-route to
+/// the address its dial went to, or anything else.
 fn dial_of(peer: &PeerSurvey) -> aterm_netplace::words::Dial {
     use aterm_netplace::words::Dial;
-    let addr = peer
-        .addr
-        .as_deref()
-        .and_then(|addr| addr.parse::<std::net::IpAddr>().ok());
     match (&peer.answer, peer.fault) {
-        (Ok(_), _) => addr.map_or(Dial::Other, Dial::Answered),
-        (Err(_), PeerFault::NoRoute) => Dial::NoRoute(addr),
-        (Err(_), PeerFault::HostAnswered) => addr.map_or(Dial::Other, Dial::Reached),
-        (Err(_), _) => Dial::Other,
+        (Err(_), PeerFault::NoRoute) => Dial::NoRoute(
+            peer.addr
+                .as_deref()
+                .and_then(|addr| addr.parse::<std::net::IpAddr>().ok()),
+        ),
+        _ => Dial::Other,
     }
 }
 

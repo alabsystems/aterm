@@ -379,7 +379,7 @@ impl World {
     }
 
     fn lease(&self) -> Lease {
-        ask::read(&self.dir.0)
+        ask::read(&self.dir.0).expect("persisted model lease")
     }
 
     /// The model's moves from where it holds free space to where the volume reads now, between

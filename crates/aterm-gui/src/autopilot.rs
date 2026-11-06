@@ -102,22 +102,24 @@ pub(crate) enum AutopilotView {
     AgentOff(aterm_phase::Program),
 }
 
-/// How a chip is tinted (§2.3): Cruise the accent, Land amber, the off chips their floored dim,
-/// another supervisor's dim.
+/// How a chip is tinted, in the glass's tokens (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md`
+/// §4.1): a chip the harness types under in the palette's letter of its column (Cruise's
+/// spectrum, Land's sunset), every other in the quiet ink.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ChipTone {
-    /// The theme's accent.
-    Accent,
-    /// Amber: the work is being wrapped up.
-    Amber,
-    /// Dim: the harness's hands are off.
-    Dim,
-    /// The off chips (`○`, `⊘ off`): the dim ink floored to read as words do.
-    Off,
+    /// The palette's letter at the chip's column (`GlassInks::letter`).
+    Letter,
+    /// The quiet ink: the harness's hands are off, or another supervisor's are on.
+    Quiet,
 }
 
-/// The chip while a click's word is being written and read back (§2.3, "changing").
-pub(crate) const PENDING_GLYPH: &str = "\u{25d0}";
+/// The glass's one in-flight mark (§4.2): a switch turning, an asked update, the top-effort key
+/// in flight, a chip whose click's word is being written and read back.
+pub(crate) const IN_FLIGHT: char = '\u{25cc}';
+
+/// The chip while a click's word is being written and read back (§2.3, "changing"): the glass's
+/// in-flight mark ([`IN_FLIGHT`]).
+pub(crate) const PENDING_GLYPH: &str = "\u{25cc}";
 
 /// Title suffix when no host runs a harness and a click opens Settings ▸ Harness.
 #[cfg(test)]
@@ -274,9 +276,8 @@ impl AutopilotView {
     #[must_use]
     pub(crate) const fn tone(self) -> ChipTone {
         match self {
-            Self::Cruise => ChipTone::Accent,
-            Self::Land => ChipTone::Amber,
-            Self::Off | Self::MasterOff | Self::Unhosted | Self::AgentOff(_) => ChipTone::Off,
+            Self::Cruise | Self::Land => ChipTone::Letter,
+            Self::Off | Self::MasterOff | Self::Unhosted | Self::AgentOff(_) => ChipTone::Quiet,
         }
     }
 
@@ -395,7 +396,7 @@ pub(crate) enum SwitchOff {
     Master,
 }
 
-/// Timeout for a switch write to read back before clearing `◐ turning on` or `◐ turning off`.
+/// Timeout for a switch write to read back before clearing `◌ turning on` or `◌ turning off`.
 pub(crate) const SWITCH_SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl HarnessSwitch {
@@ -1303,32 +1304,37 @@ mod tests {
             (
                 AutopilotView::Cruise,
                 "\u{221e}",
-                ChipTone::Accent,
+                ChipTone::Letter,
                 Some(Autopilot::Land),
             ),
             (
                 AutopilotView::Land,
                 "\u{2913}",
-                ChipTone::Amber,
+                ChipTone::Letter,
                 Some(Autopilot::Off),
             ),
             (
                 AutopilotView::Off,
                 "\u{25cb}",
-                ChipTone::Off,
+                ChipTone::Quiet,
                 Some(Autopilot::Cruise),
             ),
             (
                 AutopilotView::MasterOff,
                 "\u{2298} off",
-                ChipTone::Off,
+                ChipTone::Quiet,
                 None,
             ),
-            (AutopilotView::Unhosted, "\u{2298} off", ChipTone::Off, None),
+            (
+                AutopilotView::Unhosted,
+                "\u{2298} off",
+                ChipTone::Quiet,
+                None,
+            ),
             (
                 AutopilotView::AgentOff(aterm_phase::Program::Claude),
                 "\u{2298} off",
-                ChipTone::Off,
+                ChipTone::Quiet,
                 None,
             ),
         ];
@@ -1350,7 +1356,8 @@ mod tests {
         }
         assert_eq!(seen, Autopilot::ALL);
         assert_eq!(view, AutopilotView::Cruise);
-        assert_eq!(PENDING_GLYPH, "\u{25d0}");
+        assert_eq!(PENDING_GLYPH, "\u{25cc}");
+        assert_eq!(PENDING_GLYPH.chars().collect::<Vec<_>>(), [IN_FLIGHT]);
         assert!(AutopilotView::Cruise.carries() && AutopilotView::Land.carries());
         assert!(!AutopilotView::Off.carries() && !AutopilotView::MasterOff.carries());
         assert_eq!(AutopilotView::ALL.len(), 6);
@@ -1414,7 +1421,7 @@ mod tests {
                 assert!(!view.carries());
                 assert_eq!(view.wire(), "off");
                 assert_eq!(view.label(), "\u{2298} off");
-                assert_eq!(view.tone(), ChipTone::Off);
+                assert_eq!(view.tone(), ChipTone::Quiet);
                 assert_eq!(
                     wire_field(posture, word, Some(agent)),
                     "off",

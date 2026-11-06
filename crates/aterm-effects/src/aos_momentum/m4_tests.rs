@@ -319,17 +319,49 @@ fn the_grid_search_selects_a_plan_useful_on_held_out() {
     assert!(parts.rows.iter().all(|r| r.run.passed()));
 }
 
+/// A search's result does not read the origin it ran from: a fresh evaluator 17 s out ends a search
+/// in the same bytes as the shared one, on the grid's winner and a plan of each wake the grid holds,
+/// with the shipped split and the widest settle among them, seven of the grid's 54. An origin read
+/// that shows only on a grid plan outside the seven, or only in the grid's own proposer on a fresh
+/// evaluator, goes unseen here (`a_memoizing_evaluator_judges_each_pair_once_as_a_fresh_one_does`
+/// holds four pairs fresh, and `select_spread_equals_select` the grid's selection on the shared one).
+///
+/// NEGATIVE CONTROL (2026-11-05): `judge_lane`'s `row.ticks` raised by one when the evaluator's origin
+/// is past the present fires `assert_eq!(again.gain(), first.gain())` (left held-out ticks 5128,
+/// right 5119); a `row.chain` bent the same way, which no total reads, fires the bundle digests'
+/// `assert_eq!`.
 #[test]
 fn same_policy_same_winner_same_bundle_digest() {
     if refused_off_the_pinned_target() {
         return;
     }
-    let first = &searched().admitted;
+    let hex =
+        |p: SchedulePlan| -> String { p.encode().iter().map(|b| format!("{b:02x}")).collect() };
+    let text: String = [
+        gap0(),
+        plan(Split::Shipped, Wake::NextStep),
+        plan(Split::SettleAtStep { gap_us: 250_000 }, Wake::NextStep),
+        cold_only(),
+        plan(Split::Shipped, Wake::Poll { period_us: 16_667 }),
+        plan(Split::Shipped, Wake::Cadence),
+        plan(Split::Shipped, Wake::Never),
+    ]
+    .iter()
+    .map(|&p| format!("{}\n", hex(p)))
+    .collect();
+    let search = |ev: &Evaluator| {
+        let selection = ev
+            .select_spread(&mut FileProposer::from_text(&text), &Threads)
+            .expect("the grid's winner is among them");
+        ev.held_out(selection).expect("the search has an outcome")
+    };
+    let first = search(evaluator());
+    assert_eq!(first.plan(), gap0());
     let t0 = Instant::now()
         .checked_add(Duration::from_secs(17))
         .expect("an instant 17 s out");
     let ev = Evaluator::v1(BUILD, t0).expect("the pinned policy v1");
-    let again = grid_search(&ev);
+    let again = search(&ev);
     assert_eq!(again.plan(), first.plan());
     assert_eq!(again.useful(), first.useful());
     assert_eq!(again.gain(), first.gain());
@@ -467,6 +499,10 @@ fn cold_only_passes_no_stranded_light_and_fails_no_step_slept() {
     assert_eq!(passing, ["held-105"]);
 }
 
+/// Every poll past a frame, the grid's and the twelve in a frame's slack, is refused by the wake law
+/// on the way in. That lane fidelity alone would leave those twelve unjudged, on every training item
+/// at their interval, is `policy_tests::a_poll_just_past_a_frame_is_refused`'s, with each failure
+/// read against the clear.
 #[test]
 fn a_poll_past_a_frame_is_refused() {
     if refused_off_the_pinned_target() {
@@ -478,18 +514,18 @@ fn a_poll_past_a_frame_is_refused() {
         let f_us = u32::try_from(f / 1_000).expect("a frame is under a second");
         for q in [f_us + 1, f_us + 2_000] {
             for split in [Split::Shipped, Split::SettleAtStep { gap_us: 0 }] {
-                plans.push((Some(f), plan(split, Wake::Poll { period_us: q })));
+                plans.push(plan(split, Wake::Poll { period_us: q }));
             }
         }
     }
     for &(split, wake) in &GRID_V1 {
         if let Wake::Poll { .. } = wake {
-            plans.push((None, plan(split, wake)));
+            plans.push(plan(split, wake));
         }
     }
     assert_eq!(plans.len(), 12 + 18);
-    let refusals = crate::test_pool::par_map(&plans, |(_, p)| ev.admit_one(&p.encode()).err());
-    for ((_, p), r) in plans.iter().zip(&refusals) {
+    let refusals = crate::test_pool::par_map(&plans, |p| ev.admit_one(&p.encode()).err());
+    for (p, r) in plans.iter().zip(&refusals) {
         let r = r.as_ref().unwrap_or_else(|| panic!("{p:?} is refused"));
         assert_eq!(r.law(), WAKE_NO_LATER_THAN_CLEAR, "{p:?}: {r}");
         assert!(
@@ -498,43 +534,6 @@ fn a_poll_past_a_frame_is_refused() {
                 CandidateRefusal::OpenLoop { .. } | CandidateRefusal::StrandedLight { .. }
             ),
             "{p:?}: {r}"
-        );
-    }
-    let corpus = Corpus::generate().expect("generator v1");
-    let lanes: Vec<(usize, u64)> = corpus
-        .items()
-        .iter()
-        .enumerate()
-        .filter(|(_, i)| i.split() == CorpusSplit::Train)
-        .filter_map(|(k, i)| i.scenario().map(|s| (k, s.frame_interval_ns())))
-        .collect();
-    let jobs: Vec<(SchedulePlan, usize)> = plans
-        .iter()
-        .filter_map(|&(f, p)| f.map(|f| (f, p)))
-        .flat_map(|(f, p)| {
-            lanes
-                .iter()
-                .filter(move |&&(_, at)| at == f)
-                .map(move |&(k, _)| (p, k))
-        })
-        .collect();
-    let rows = crate::test_pool::par_map(&jobs, |&(p, k)| {
-        (p, ev.judge(Sched::Plan(p), k).expect("an item").0)
-    });
-    for (f, p) in plans.iter().filter_map(|&(f, p)| f.map(|f| (f, p))) {
-        let of: Vec<&Row> = rows
-            .iter()
-            .filter(|(q, _)| *q == p)
-            .map(|(_, r)| r)
-            .collect();
-        assert!(!of.is_empty(), "{f} ns: training items at the interval");
-        assert!(
-            of.iter().all(|r| r.lane_fidelity.passed()),
-            "{p:?}: the slack is unjudged by lane fidelity"
-        );
-        assert!(
-            of.iter().any(|r| matches!(&r.stranded_light, RowVerdict::Fail { law, .. } if law == WAKE_NO_LATER_THAN_CLEAR)),
-            "{p:?}: refused at {f} ns"
         );
     }
 }
@@ -935,6 +934,32 @@ fn a_winner_without_a_training_gain_is_no_outcome() {
     }
     let n = ev.reads().held_out.load(Ordering::Relaxed);
     assert_eq!(n, 0);
+}
+
+/// A SELECTION OF THE GRID ASKS FOR NO HELD-OUT ITEM: the split is read once per search, by the
+/// training winner (design §10.8 decision 7), and the grid's own path through `select_spread`, the
+/// one `aos-search --grid` runs, is no exception. The `aos-learn` counter's binary
+/// (`m6_held_out_counter`) selects over a file of four plans, so it does not take this path; [`Reads`]
+/// counts every ask, a judgment the shared evaluator kept included, so the 54 plans cost next to
+/// nothing here.
+///
+/// NEGATIVE CONTROL (2026-11-05): one `self.judge` of a held-out item in `select_spread`'s grid arm
+/// fired "a grid selection asks for no held-out item" (left 1, right 0).
+#[test]
+fn a_selection_of_the_grid_asks_for_no_held_out_item() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
+    let _ = searched();
+    let ev = evaluator().anew();
+    let _ = ev
+        .select_spread(&mut GridProposer::new(), &Threads)
+        .expect("the grid has a training winner");
+    assert_eq!(
+        ev.reads().held_out.load(Ordering::Relaxed),
+        0,
+        "a grid selection asks for no held-out item"
+    );
 }
 
 #[test]

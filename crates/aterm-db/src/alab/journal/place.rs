@@ -124,7 +124,7 @@ pub(crate) fn live(places: &crate::typed::owned::OwnedRead, now: u64) -> Places 
             })
         })
         .collect();
-    rows.sort_by(|a, b| (&a.account, &a.uuid).cmp(&(&b.account, &b.uuid)));
+    rows.sort_unstable_by(|a, b| (&a.account, &a.uuid).cmp(&(&b.account, &b.uuid)));
     Places { rows }
 }
 

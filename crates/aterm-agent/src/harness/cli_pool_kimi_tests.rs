@@ -100,7 +100,7 @@ impl AccountsHost for Native<'_> {
         expected: &str,
         _: i64,
         _: Instant,
-        guard: Arc<dyn aterm_http::Guard>,
+        guard: Arc<dyn shared_provider::KimiRefreshAuthority>,
     ) -> Result<Option<Box<dyn shared_provider::LoginProof>>, shared_provider::ObservationError>
     {
         self.calls.set(self.calls.get() + 1);
@@ -521,7 +521,7 @@ impl AccountsHost for Reauthenticate<'_> {
         _: &str,
         _: i64,
         _: Instant,
-        guard: Arc<dyn aterm_http::Guard>,
+        guard: Arc<dyn shared_provider::KimiRefreshAuthority>,
     ) -> Result<Option<Box<dyn shared_provider::LoginProof>>, shared_provider::ObservationError>
     {
         assert!(guard.is_authorized());

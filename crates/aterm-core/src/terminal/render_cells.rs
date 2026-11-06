@@ -648,14 +648,18 @@ impl Terminal {
             out.sort_by_key(|&(col, _)| col);
             return;
         }
-        if grid.extras().is_empty() {
+        let has_kitty = !self.transient.kitty_images.is_empty();
+        if grid.extras().is_empty()
+            || (!has_kitty
+                && self.transient.kitty_floating.is_empty()
+                && !grid.extras().any_image())
+        {
             return;
         }
         let screen_row = visible_row.saturating_sub(u16::try_from(offset).unwrap_or(u16::MAX));
         if screen_row >= grid.rows() {
             return;
         }
-        let has_kitty = !self.transient.kitty_images.is_empty();
         for col in 0..grid.cols() {
             let Some(extra) = grid.cell_extra(screen_row, col) else {
                 continue;
@@ -719,7 +723,12 @@ impl Terminal {
             };
             push_history_images(grid, visible_row, images_row);
         }
-        if grid.extras().is_empty() {
+        let has_kitty = !self.transient.kitty_images.is_empty();
+        if grid.extras().is_empty()
+            || (!has_kitty
+                && self.transient.kitty_floating.is_empty()
+                && !grid.extras().any_image())
+        {
             for row in images.iter_mut().take(rows.min(offset)) {
                 if row.len() > 1 {
                     row.sort_by_key(|&(col, _)| col);
@@ -728,7 +737,6 @@ impl Terminal {
             return;
         }
         let max_screen_row = usize::from(grid.rows());
-        let has_kitty = !self.transient.kitty_images.is_empty();
         if !self.transient.kitty_floating.is_empty() {
             let screen_rows = u16::try_from(rows.saturating_sub(offset)).unwrap_or(u16::MAX);
             for (row, col, tile) in self.kitty_floating_tiles(0..screen_rows) {
@@ -1916,9 +1924,74 @@ mod tests {
         let _ = term.images_frame(rows);
         assert_eq!(
             image_probe_meter::take(),
-            extras,
-            "the batch reader charges the extras that exist, not rows x cols"
+            0,
+            "image-free linked text does not enter the image collector"
         );
+    }
+
+    #[test]
+    fn cached_image_absence_does_not_hide_mutably_installed_images() {
+        use aterm_grid::{CellExtra, ImageData, ImageFormat, ImageRef, ImageScaling};
+        use std::sync::Arc;
+
+        let mut term = Terminal::new(4, 20);
+        term.process(b"\x1b]8;;https://example.com\x1b\\linked text\x1b]8;;\x1b\\");
+        assert!(term.images_frame(4).iter().all(Vec::is_empty));
+        assert!(term.images_row(2).is_empty());
+        let image = Arc::new(ImageData {
+            bytes: vec![7; 4],
+            format: ImageFormat::Png,
+            cols: 1,
+            rows: 1,
+            z_index: 0,
+            band_lift_px: 0,
+            cell_offset_px: (0, 0),
+            scaling: ImageScaling::Fit,
+            source_rect: None,
+        });
+        let mut extra = CellExtra::default();
+        extra.set_image(Some(ImageRef {
+            image: image.clone(),
+            cell_row: 0,
+            cell_col: 0,
+            kitty: None,
+        }));
+        *term.grid_mut().cell_extra_mut(2, 3) = extra;
+        let _ = image_probe_meter::take();
+        for frame in [term.images_frame(4), term.live_images_frame(4)] {
+            assert_eq!(frame.iter().map(Vec::len).sum::<usize>(), 1);
+            assert_eq!(frame[2][0].0, 3);
+            assert!(Arc::ptr_eq(&frame[2][0].1.image, &image));
+        }
+        assert_eq!(
+            image_probe_meter::take(),
+            2 * term.grid().extras().len(),
+            "image-bearing frames still visit each extra once"
+        );
+        let row = term.images_row(2);
+        assert_eq!(row.len(), 1);
+        assert_eq!(row[0].0, 3);
+        assert!(Arc::ptr_eq(&row[0].1.image, &image));
+        let carry = term.grid().capture_image_carry(0);
+        assert_eq!(carry.visible.len(), 1);
+        assert_eq!(carry.visible[0].0, 2);
+        assert!(Arc::ptr_eq(&carry.visible[0].1[0].image, &image));
+
+        term.process(b"\x1b[4;1H\n\n\n\x1b[2J");
+        term.grid_mut()
+            .cell_extra_mut(0, 0)
+            .set_fg_rgb(Some([1, 2, 3]));
+        assert!(
+            !term.grid().extras().any_image(),
+            "the live map is now image-free"
+        );
+        term.scroll_display(1);
+        assert!(term.live_images_frame(4).iter().all(Vec::is_empty));
+        let viewport = term.images_frame(4);
+        assert_eq!(viewport.iter().map(Vec::len).sum::<usize>(), 1);
+        assert_eq!(viewport[0][0].0, 3);
+        assert!(Arc::ptr_eq(&viewport[0][0].1.image, &image));
+        assert!(Arc::ptr_eq(&term.images_row(0)[0].1.image, &image));
     }
 
     #[test]

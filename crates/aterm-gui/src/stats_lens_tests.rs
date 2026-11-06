@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use super::*;
 use crate::stats_deck::paint_tests::{
-    AT, FRONT, GIB, MIN_MS, Scene, light_inks, scene, scene_input,
+    AT, FRONT, GIB, LONG_TAB, MIN_MS, Scene, light_inks, scene, scene_input,
 };
 use crate::stats_deck::tests::dark_inks;
 use crate::stats_plan::DeckForm;
@@ -208,6 +208,32 @@ pub(crate) fn lens_scene(sc: Scene) -> Snapshot {
     s
 }
 
+/// [`Scene::Trouble`]'s lens scene with its Memory footprints `by` bytes past the scopes around
+/// them: aterm's past used memory and the front tab's past aterm's, so a negative `by` leaves
+/// each inside. A `long` front tab bears T-G4's worst name. Without `procs` no process reports
+/// its footprint, so Biggest now is the one line of the scopes' figures, as in the owner's scene
+/// (the R3 lens fixes' review, 2026-11-06).
+fn footprints_scene(by: f64, long: bool, procs: bool) -> Snapshot {
+    let mut s = lens_scene(Scene::Trouble);
+    if long && let Some(t) = s.tabs.iter_mut().find(|t| t.key == FRONT) {
+        t.label = LONG_TAB.into();
+    }
+    if !procs {
+        for t in &mut s.top {
+            t.footprint = None;
+        }
+    }
+    let view = &mut s.resources[Resource::Memory.index()];
+    let used = view.now.expect("the trouble scene reads memory");
+    view.aterm.now = Some(used + by);
+    for (key, fig) in &mut view.tabs {
+        if *key == FRONT {
+            fig.now = Some(used + 2.0 * by);
+        }
+    }
+    s
+}
+
 fn input(snap: &Snapshot, inks: VitalsInks) -> DeckInput<'_> {
     let mut input = scene_input(snap, DeckForm::Full);
     input.inks = inks;
@@ -287,23 +313,55 @@ fn faults(laid: &LensLaid, lw: f64, lh: f64) -> Vec<String> {
     out
 }
 
-#[test]
-fn every_lens_holds_its_frame_at_every_size() {
-    let snap = lens_scene(Scene::Calm);
-    let trouble = lens_scene(Scene::Trouble);
-    let m = FaceMetrics::helvetica_neue();
+/// The widths and heights the lens laws lay every lens at, pt.
+fn lens_sizes() -> (Vec<f64>, Vec<f64>) {
     let mut widths: Vec<f64> = (160..=1024).step_by(16).map(f64::from).collect();
     widths.extend([526.0, 639.0, 640.0, 1023.0]);
     let mut heights: Vec<f64> = (90..=250).step_by(8).map(f64::from).collect();
     heights.extend([110.0, 124.0, 134.0, 136.0, 154.0, 249.0]);
+    (widths, heights)
+}
+
+/// Every lens keeps its shell, its columns, each column's order and the priority order's prefix
+/// at every size, in a calm scene and a troubled one; the Memory lens also where its footprints
+/// read larger than the scopes around them, under a short tab name and T-G4's longest, whose
+/// words its Biggest heading and line must fit or give up (A1 §4.6), with its processes'
+/// footprints read (Biggest now a list) and with none (its one line).
+#[test]
+fn every_lens_holds_its_frame_at_every_size() {
+    let snap = lens_scene(Scene::Calm);
+    let trouble = lens_scene(Scene::Trouble);
+    let over = footprints_scene(4.0 * GIB, false, true);
+    let over_long = footprints_scene(4.0 * GIB, true, true);
+    let bare = footprints_scene(4.0 * GIB, false, false);
+    let bare_long = footprints_scene(4.0 * GIB, true, false);
+    let m = FaceMetrics::helvetica_neue();
+    let (widths, heights) = lens_sizes();
     let (snap, trouble, m, widths, heights) = (&snap, &trouble, &m, &widths, &heights);
+    let (over, over_long, bare, bare_long) = (&over, &over_long, &bare, &bare_long);
+    // How many lenses drew a footprint larger than its parent, with process footprints read and
+    // without.
+    let said_larger = [
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+    ];
+    let said_larger = &said_larger;
     let failed: Vec<String> = std::thread::scope(|scope| {
         let runs: Vec<_> = ALL
             .into_iter()
             .map(|focus| {
                 scope.spawn(move || {
                     let mut failed = Vec::new();
-                    for (name, snap) in [("calm", snap), ("trouble", trouble)] {
+                    let mut scenes = vec![("calm", snap), ("trouble", trouble)];
+                    if focus == Instrument::Memory {
+                        scenes.extend([
+                            ("footprints over", over),
+                            ("footprints over, long tab", over_long),
+                            ("footprints over, none of a process", bare),
+                            ("footprints over, none of a process, long tab", bare_long),
+                        ]);
+                    }
+                    for (name, snap) in scenes {
                         let input = input(snap, dark_inks());
                         for &lw in widths {
                             for &lh in heights {
@@ -324,6 +382,11 @@ fn every_lens_holds_its_frame_at_every_size() {
                                     };
                                     let laid =
                                         lay_lens(&shell(lw, lh, 2.0), &input, &lens, m, false);
+                                    if laid.boxes.iter().any(|b| b.text.contains("larger than")) {
+                                        let bare = name.contains("none of a process");
+                                        said_larger[usize::from(bare)]
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
                                     let mut why = faults(&laid, lw, lh);
                                     if focus == Instrument::Disk
                                         && !laid.placed.iter().flatten().any(|(i, _)| *i == 0)
@@ -352,6 +415,87 @@ fn every_lens_holds_its_frame_at_every_size() {
             .collect()
     });
     assert!(failed.is_empty(), "{}", failed.join("\n"));
+    let said = said_larger
+        .each_ref()
+        .map(|n| n.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(
+        said.iter().all(|&n| n > 0),
+        "CONTROL: some Memory lens draws a footprint larger than its parent, with process \
+         footprints read and without ({said:?})"
+    );
+}
+
+/// A Memory footprint that crosses the scope around it between two readings changes the words
+/// of the Memory lens's Biggest section and nothing else (A1 §4.6): at every size each section
+/// keeps its column, place and form, and every other text its words and box, so no column's tab
+/// moves and no section above re-forms. The figures as drawn are the same either side; only the
+/// words that say a footprint is larger come and go, starting where the words they replace start.
+/// It holds with its processes' footprints read, Biggest now a list, and with none, its one line.
+/// CONTROL: the Footprints line the follow-up first drew, a section of its own after Biggest
+/// while a footprint was larger, moved Swap and Pressure down, the right column's tab from 52 to
+/// 64 pt, and Where it is from its bar to one line at 526 × 250 pt; this test fails on it.
+#[test]
+fn a_footprint_crossing_its_parent_moves_nothing_in_the_memory_lens() {
+    let m = FaceMetrics::helvetica_neue();
+    let (widths, heights) = lens_sizes();
+    let mib = GIB / 1024.0;
+    // Where a footprint past its parent was said, with process footprints read and without.
+    let mut said = [0_usize; 2];
+    let mut failed = Vec::new();
+    for (long, procs) in [(false, true), (true, true), (false, false), (true, false)] {
+        let (inside, past) = (
+            footprints_scene(-mib, long, procs),
+            footprints_scene(mib, long, procs),
+        );
+        let (a_in, b_in) = (input(&inside, dark_inks()), input(&past, dark_inks()));
+        for &lw in &widths {
+            for &lh in &heights {
+                let lay = |i: &DeckInput<'_>| {
+                    lay_lens(
+                        &shell(lw, lh, 2.0),
+                        i,
+                        &pinned(Instrument::Memory),
+                        &m,
+                        false,
+                    )
+                };
+                let (a, b) = (lay(&a_in), lay(&b_in));
+                let at = format!("long tab {long}, process footprints {procs}, {lw}×{lh}");
+                if a.placed != b.placed {
+                    failed.push(format!("{at}: placed {:?} then {:?}", a.placed, b.placed));
+                    continue;
+                }
+                if a.boxes.len() != b.boxes.len() {
+                    failed.push(format!(
+                        "{at}: {} texts then {}",
+                        a.boxes.len(),
+                        b.boxes.len()
+                    ));
+                    continue;
+                }
+                for (x, y) in a.boxes.iter().zip(&b.boxes) {
+                    if y.text.contains("larger than") {
+                        said[usize::from(!procs)] += 1;
+                        if x.r[..2] != y.r[..2] || x.text.contains("larger than") {
+                            failed.push(format!("{at}: {x:?} then {y:?}"));
+                        }
+                    } else if x != y {
+                        failed.push(format!("{at}: {x:?} then {y:?}"));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "{}",
+        failed[..failed.len().min(20)].join("\n")
+    );
+    assert!(
+        said.iter().all(|&n| n > 0),
+        "CONTROL: a footprint past its parent is said at some size, with process footprints read \
+         and without ({said:?})"
+    );
 }
 
 fn disk_forms(snap: &Snapshot, lw: f64, lh: f64) -> Vec<Vec<(String, usize, usize)>> {
@@ -514,6 +658,312 @@ fn a_chart_says_an_unread_span_once() {
     assert!(
         dst_said.ends_with(" Not read from 01:30 to 02:30."),
         "{dst_said}"
+    );
+}
+
+/// The Network lens's throughput trace draws the busier direction, column by column (the R3 lens
+/// fixes, 2026-11-06): each column's figures are the direction whose share of its own capacity is
+/// the larger, the rule the trace's heat, the deck's Network row and the lens's words ("busier
+/// direction") take, not receiving alone. Receiving reads 1.5 MB/s all hour, 1.2 % of its 125 MB/s;
+/// sending 0.1 MB/s, 0.5 % of its 20 MB/s, until its last 20 minutes at 14 MB/s, 70 %. The trace
+/// says receiving's figure an hour ago and sending's now, and draws each column in the heat of its
+/// direction's share, the deck row's column heat: 1.2 % an hour ago, 70 % now (the review's gap,
+/// 2026-11-06). NEGATIVE CONTROLS: receiving alone says 1.5 now; receiving's heat alone
+/// (`heat_cells`) draws now's column at 1.2 %.
+#[test]
+fn the_network_trace_draws_the_busier_direction() {
+    let mut snap = lens_scene(Scene::Calm);
+    let view = &mut snap.resources[Resource::Network.index()];
+    let n = aterm_vitals::ring::RING_BUCKETS;
+    let cell = |v: f64| Cell {
+        mean: Some(v),
+        max: Some(v),
+        n: 1.0,
+        over_n: 0.0,
+    };
+    view.capacity = Some(125e6);
+    view.ring = (0..n).map(|_| cell(1.5e6)).collect();
+    view.second = Some(aterm_vitals::model::Series {
+        now: Some(14e6),
+        capacity: Some(20e6),
+        ring: (0..n)
+            .map(|k| cell(if k + 120 >= n { 14e6 } else { 0.1e6 }))
+            .collect(),
+        long: Arc::from([]),
+        recent: Arc::from([]),
+        binds: true,
+    });
+    let laid = heard(&snap, pinned(Instrument::Network));
+    let chart = well(&laid, "Throughput, last hour");
+    assert!(
+        chart.starts_with("Throughput over the last hour: 1.5 MB/s 1 hour ago, 14.0 now."),
+        "{chart}"
+    );
+    let traffic = well(&laid, "Traffic now");
+    assert!(traffic.starts_with("14 MB/s busier direction"), "{traffic}");
+    let m = FaceMetrics::helvetica_neue();
+    let c = two_columns(&snap, &m);
+    let (trace, unit, _) = net_trace(c);
+    assert_eq!(unit, "MB/s");
+    let now = snap.at_unix_ms;
+    let row = c.view(Resource::Network).heat_columns(60, 60, now);
+    for (j, (h, r)) in trace.heat.iter().zip(&row).enumerate() {
+        assert_eq!(
+            (h.heat, h.over),
+            (r.heat, r.over),
+            "column {j}: the deck row's column heat"
+        );
+    }
+    let ends = |h: &HeatCell| (h.heat, h.max);
+    let (rx, tx) = (Some((1.5e6 / 125e6) as f32), Some((14e6 / 20e6) as f32));
+    assert_eq!(
+        ends(&trace.heat[0]),
+        (rx, rx),
+        "receiving's share an hour ago"
+    );
+    assert_eq!(ends(&trace.heat[59]), (tx, tx), "sending's share now");
+}
+
+/// The Network lens's throughput trace against capacities far apart (the R3 lens fixes' review,
+/// 2026-11-06): receiving against 100 MB/s, sending against 10, ten minutes at a time. Each column
+/// is one direction's minute, so its tick, that direction's largest reading, never stands below its
+/// column on the trace's one MB/s axis, and the column and the tick are drawn, at 1× and 2×, each
+/// in the heat of its own share: where receiving's 30 MB/s minutes (largest 55, 30 % and 55 %)
+/// stand beside sending's 1 (largest 7, 10 % and 70 %), the column is 30 and the tick 55, in the
+/// heat of 55 %, a heat step under the deck row's 70 % peak and a step over its column's 30 %;
+/// where sending's 6 MB/s minutes (largest 10, 60 % and 100 %) bind, the column is 6 and the tick
+/// 10. The shares stand a heat step apart so that the drawn inks tell them apart (that review's own
+/// review: at 60 % and 70 % the tick and the row's peak share a step). NEGATIVE CONTROLS: each
+/// figure from the series it is the larger share of (the R3 fix as first built) ticks receiving's
+/// minutes at sending's 7 MB/s, under their 30 MB/s columns, where no tick is drawn; the tick in
+/// the row's peak heat, the larger largest share of either direction, inks receiving's ticks a step
+/// too hot, and the drawn check alone finds it (at 60 % it passed); the column in its tick's heat
+/// fails the column's check.
+#[test]
+fn the_network_trace_ticks_each_minute_at_its_own_directions_peak() {
+    let mut snap = lens_scene(Scene::Calm);
+    let view = &mut snap.resources[Resource::Network.index()];
+    let n = aterm_vitals::ring::RING_BUCKETS;
+    let ring_k = view.ring_k;
+    let cell = |(mean, max): (f64, f64)| Cell {
+        mean: Some(mean),
+        max: Some(max),
+        n: 1.0,
+        over_n: 0.0,
+    };
+    // Whether sending binds in bucket `i` of the ring: in every other ten minutes of the clock.
+    let sends = |i: usize| (ring_k - (n - 1 - i) as i64).div_euclid(60) % 2 == 1;
+    view.capacity = Some(100e6);
+    view.ring = (0..n).map(|_| cell((30e6, 55e6))).collect();
+    view.second = Some(aterm_vitals::model::Series {
+        now: Some(1e6),
+        capacity: Some(10e6),
+        ring: (0..n)
+            .map(|i| cell(if sends(i) { (6e6, 10e6) } else { (1e6, 7e6) }))
+            .collect(),
+        long: Arc::from([]),
+        recent: Arc::from([]),
+        binds: false,
+    });
+    let m = FaceMetrics::helvetica_neue();
+    let c = two_columns(&snap, &m);
+    let (trace, unit, start) = net_trace(c);
+    assert_eq!(unit, "MB/s");
+    // The deck row's column heat, whose peak takes the larger largest share of either direction.
+    let row = c
+        .view(Resource::Network)
+        .heat_columns(60, 60, snap.at_unix_ms);
+    let inks = dark_inks();
+    let (mut kinds, mut steps_apart) = ([0_usize; 2], 0_usize);
+    for scale in [1.0_f32, 2.0] {
+        let pen = Pen {
+            p: Painter::new(&inks, scale, 14.0 * scale, false),
+            m: &m,
+            inks,
+            ic: false,
+            s: f64::from(scale),
+            ox: 0.0,
+            oy: 0.0,
+            draw: true,
+            line_tab: 0.0,
+            boxes: Vec::new(),
+        };
+        // The axis `draw_trace` lays for a plot 56 pt tall.
+        let ch = 56.0;
+        let read: Vec<f64> = trace
+            .vals
+            .iter()
+            .chain(&trace.peaks)
+            .flatten()
+            .copied()
+            .collect();
+        let (mn, mx) = read
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &v| {
+                (a.min(v), b.max(v))
+            });
+        let k = if ch >= 60.0 { 3 } else { 2 };
+        let (lo, step) = axis(mn, mx, k, trace.min_span);
+        let boxes = trace_boxes(
+            &pen,
+            &trace,
+            (12.0, 30.0, 432.0, 30.0 + ch),
+            (lo, lo + step * k as f64),
+        );
+        assert_eq!(boxes.len(), 60, "{scale}×: every minute read");
+        for (j, sky) in boxes.iter().enumerate() {
+            let at = format!("{scale}×, column {j}");
+            let (v, peak, h) = (trace.vals[j], trace.peaks[j], trace.heat[j]);
+            assert!(peak >= v, "{at}: the tick {peak:?} under its column {v:?}");
+            let sending = (start / 60_000 + j as i64).div_euclid(10) % 2 == 1;
+            let want = if sending {
+                ((6.0, 10.0), (Some((6e6 / 10e6) as f32), Some(1.0)))
+            } else {
+                (
+                    (30.0, 55.0),
+                    (Some((30e6 / 100e6) as f32), Some((55e6 / 100e6) as f32)),
+                )
+            };
+            assert_eq!(
+                (
+                    (v.unwrap_or_default(), peak.unwrap_or_default()),
+                    (h.heat, h.max)
+                ),
+                want,
+                "{at}: its own direction's minute"
+            );
+            let Some((_, tick)) = sky.tick else {
+                panic!("{at}: no tick at {peak:?} over {v:?}: {sky:?}");
+            };
+            let (column_heat, tick_heat) = (want.1.0.expect("a share"), want.1.1.expect("a share"));
+            assert_eq!(
+                sky.column.map(|c| c.1),
+                Some(inks.cell_at(column_heat, false)),
+                "{at}: the column's own heat"
+            );
+            assert_eq!(
+                tick,
+                inks.cell_at(tick_heat, false),
+                "{at}: the tick's own heat"
+            );
+            let row_peak = row[j].max.expect("the row's peak share");
+            steps_apart += usize::from(!sending && inks.cell_at(row_peak, false) != tick);
+            kinds[usize::from(sending)] += 1;
+        }
+    }
+    assert!(
+        kinds.iter().all(|&n| n >= 40) && steps_apart == kinds[0],
+        "CONTROL: minutes of each direction ({kinds:?}), and receiving's ticks a heat step from \
+         the row's peak ({steps_apart})"
+    );
+}
+
+/// The Processes lens's trace heats each minute at the limit that binds first, as its explainer
+/// and the deck's row say (the R3 lens fixes' review, 2026-11-06): 2,000 of this Mac's 4,000
+/// processes (50 %) while 1,600 of them are yours against your user's 2,666 (60 %), so yours binds,
+/// and the trace's columns and ticks are in the heat of 60 %, the deck row's (`heat_columns`),
+/// while its figures stay all processes'. Memory, one series, keeps its own share (`heat_cells`),
+/// so nothing else moves. NEGATIVE CONTROL: the first series' share alone (`heat_cells`, as the
+/// trace took it) heats Processes at 50 %.
+#[test]
+fn the_processes_trace_heats_at_the_limit_that_binds_first() {
+    let mut snap = lens_scene(Scene::Calm);
+    let n = aterm_vitals::ring::RING_BUCKETS;
+    let cell = |v: f64| Cell {
+        mean: Some(v),
+        max: Some(v),
+        n: 1.0,
+        over_n: 0.0,
+    };
+    let view = &mut snap.resources[Resource::Processes.index()];
+    view.now = Some(2_000.0);
+    view.capacity = Some(4_000.0);
+    view.ring = (0..n).map(|_| cell(2_000.0)).collect();
+    view.second = Some(aterm_vitals::model::Series {
+        now: Some(1_600.0),
+        capacity: Some(2_666.0),
+        ring: (0..n).map(|_| cell(1_600.0)).collect(),
+        long: Arc::from([]),
+        recent: Arc::from([]),
+        binds: true,
+    });
+    let m = FaceMetrics::helvetica_neue();
+    let c = two_columns(&snap, &m);
+    let now = snap.at_unix_ms;
+    let procs = c.view(Resource::Processes);
+    let (vals, peaks, heat) = hour_columns(&procs, now, 1.0);
+    assert_eq!(heat, procs.heat_columns(60, 60, now), "the deck row's heat");
+    let yours = Some((1_600.0 / 2_666.0) as f32);
+    assert!(
+        heat.iter().all(|h| (h.heat, h.max) == (yours, yours)),
+        "yours binds: {heat:?}"
+    );
+    assert!(
+        vals.iter().chain(&peaks).all(|v| *v == Some(2_000.0)),
+        "all processes' figures: {vals:?}"
+    );
+    let mem = c.view(Resource::Memory);
+    assert!(mem.second.is_none(), "PRECONDITION: Memory is one series");
+    let (_, _, mem_heat) = hour_columns(&mem, now, GIB);
+    assert_eq!(mem_heat, mem.heat_cells(mem.columns(60, 60, now)));
+    assert!(
+        mem_heat.iter().any(|h| h.heat.is_some()),
+        "CONTROL: Memory's hour is read"
+    );
+}
+
+/// The Network lens's Traffic line names the busier direction's rate where no capacity is known
+/// yet, as the throughput trace beside it does (the R3 lens fixes' review, 2026-11-06): in the
+/// first day of learning, on a link that reports no speed, sending 14 MB/s against receiving's
+/// 2.1, then a reading whose counters went back, which reads no rates, so the line takes the row's
+/// binding series. The view is the one `Vitals::absorb` builds, its binding not set by hand.
+/// NEGATIVE CONTROL: binding the first series wherever no share is known (`ResourceView::of`
+/// before the review) says "2.1 MB/s busier direction".
+#[test]
+fn the_traffic_line_names_the_busier_direction_with_no_capacity_known() {
+    use aterm_vitals::model::{LinkKind, LinkSample};
+    let mut v = aterm_vitals::Vitals::new();
+    let mut snap = Snapshot::default();
+    for t in 0..6_u64 {
+        let mut s = crate::stats_deck::tests::sample_at(10 + t, &[0; 10], &[0, 0]);
+        s.at_unix_ms = AT - (5 - t as i64) * 1000;
+        s.mono_ms = (10 + t) * 1000;
+        s.cadence_ms = 1000;
+        // The last reading's counters went back, as a reset leaves them.
+        let back = t == 5;
+        s.links = Some(vec![LinkSample {
+            name: "en0".into(),
+            kind: LinkKind::Wifi,
+            up: true,
+            counts: true,
+            rx: if back { 0 } else { 2_100_000 * t },
+            tx: if back { 0 } else { 14_000_000 * t },
+            rate_bps: None,
+            ..LinkSample::default()
+        }]);
+        snap = v.absorb(&s);
+    }
+    assert!(
+        snap.net.as_ref().is_some_and(|n| n.rates.is_none()),
+        "PRECONDITION: no rates this reading"
+    );
+    let net = &snap.resources[Resource::Network.index()];
+    let tx = net.second.as_ref().expect("sending");
+    assert_eq!(
+        (net.capacity, tx.capacity),
+        (None, None),
+        "PRECONDITION: no capacity known"
+    );
+    assert_eq!((net.now, tx.now), (Some(2.1e6), Some(14e6)));
+    let laid = heard(&snap, pinned(Instrument::Network));
+    let traffic = well(&laid, "Traffic now");
+    assert!(traffic.starts_with("14 MB/s busier direction"), "{traffic}");
+    let m = FaceMetrics::helvetica_neue();
+    let (trace, unit, _) = net_trace(two_columns(&snap, &m));
+    assert_eq!(
+        (trace.vals.iter().rev().flatten().next().copied(), unit),
+        (Some(14.0), "MB/s"),
+        "the trace beside it ends at sending's rate"
     );
 }
 

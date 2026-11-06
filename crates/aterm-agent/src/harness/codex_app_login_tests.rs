@@ -222,15 +222,16 @@ fn callback_listener_ignores_a_bare_cancel_and_keeps_its_active_flow() {
     let server_done = done.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     let server = std::thread::spawn(move || {
-        serve_callback_loop(
+        serve_callback_loop(CallbackServer {
             listener,
             port,
-            "owned-state".into(),
-            Arc::new(AtomicBool::new(false)),
-            server_done,
+            expected_state: "owned-state".into(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            done: server_done,
             tx,
-            WakeDeadline::after(aterm_spec::wait::MUST_HAPPEN),
-        );
+            deadline: WakeDeadline::after(aterm_spec::wait::MUST_HAPPEN),
+            work: None,
+        });
     });
     let base = format!("http://127.0.0.1:{port}");
     assert_eq!(raw_get_loopback(&format!("{base}/cancel")).0, 404);
@@ -260,6 +261,7 @@ fn callback_io_budget_bounds_trickling_headers() {
         let mut input = std::io::Cursor::new(wire);
         let target = {
             let mut reader = CallbackRead {
+                parent: None,
                 deadline: start + CALLBACK_IO_WAIT,
                 now: || clock.get(),
                 read: |buf: &mut [u8], remaining: Duration| {
@@ -289,6 +291,7 @@ fn callback_io_budget_bounds_reply_drain() {
         let clock = std::cell::Cell::new(start);
         let consumed = std::cell::Cell::new(0);
         let mut reader = CallbackRead {
+            parent: None,
             deadline: start + CALLBACK_DRAIN_WAIT,
             now: || clock.get(),
             read: |buf: &mut [u8], remaining: Duration| {
@@ -315,6 +318,271 @@ fn callback_io_budget_bounds_reply_drain() {
             );
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn an_accepted_callback_cannot_finish_its_head_after_the_original_host_slept_past_it() {
+    const HOUR: Duration = Duration::from_secs(3600);
+    for sleep_after_read in [false, true] {
+        let seam = super::super::wake_deadline::SleepSeam::hold();
+        let sleeper = seam.sleeper();
+        sleeper.slept(HOUR);
+        let deadline = WakeDeadline::after(HOUR);
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut peer = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (mut accepted, _) = listener.accept().unwrap();
+        let wire = format!("GET /auth/callback?code=ok HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+        peer.write_all(wire.as_bytes()).unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut advanced = false;
+        let target = {
+            let mut reader = CallbackRead {
+                parent: Some(deadline),
+                deadline: deadline.instant(),
+                now: Instant::now,
+                read: |buf: &mut [u8], remaining: Duration| {
+                    accepted
+                        .set_read_timeout(Some(remaining.min(aterm_spec::wait::MUST_HAPPEN)))?;
+                    let take = buf.len().min(1);
+                    let n = accepted.read(&mut buf[..take])?;
+                    if sleep_after_read && n != 0 && !advanced {
+                        advanced = true;
+                        sleeper.slept(2 * HOUR);
+                    }
+                    Ok(n)
+                },
+            };
+            read_request_target(&mut reader, port)
+        };
+        drop(accepted);
+        drop(peer);
+        drop(listener);
+        assert_eq!(deadline.passed(), sleep_after_read);
+        assert_eq!(
+            target.as_deref(),
+            (!sleep_after_read).then_some("/auth/callback?code=ok"),
+            "bytes returned after the original budget expired cannot complete a callback"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn callback_owner_joins_partial_socket_work_before_original_guards_retire() {
+    use crate::harness::{account_work::Lifetime, accounts::Store};
+    struct PanicOnDrop;
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            panic!("callback payload drop");
+        }
+    }
+    for panic_kind in 0..4 {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let store = Store::at(tmp.path());
+        let signin = store.signin_now().unwrap().unwrap();
+        let lifetime = Lifetime::default();
+        let scope = lifetime.enter().unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut socket, _) = listener.accept().unwrap();
+        peer.write_all(b"G").unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (settle_tx, settle_rx) = std::sync::mpsc::channel();
+        let (joining_tx, joining_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let caller = std::thread::spawn(scope.clone().wrap(move || {
+            let _signin = signin;
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let worker_cancelled = cancelled.clone();
+            let reader_scope = scope.clone();
+            let worker = std::thread::spawn(reader_scope.clone().wrap(move || {
+                let deadline = WakeDeadline::after(aterm_spec::wait::MUST_HAPPEN);
+                let mut reader = callback_reader(
+                    &mut socket,
+                    deadline,
+                    &worker_cancelled,
+                    Some(&reader_scope),
+                );
+                let mut first = [0];
+                let first_read = reader.read_exact(&mut first);
+                let _ = ready_tx.send((first_read.is_ok(), first));
+                let _ = release_rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+                let stopped = reader.read(&mut first).is_err();
+                if panic_kind >= 2 {
+                    std::panic::panic_any(PanicOnDrop);
+                }
+                assert!(stopped);
+            }));
+            let mut owner = CallbackOwner {
+                cancelled,
+                worker: Some(worker),
+            };
+            let _ = settle_rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+            let _ = joining_tx.send(());
+            if panic_kind == 1 || panic_kind == 3 {
+                panic!("approver unwind");
+            }
+            let _ = result_tx.send(owner.join());
+        }));
+        let ready = ready_rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+        let _ = settle_tx.send(());
+        let joining = joining_rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+        let held = store.signin_now().unwrap().is_none();
+        let pause = lifetime.pause().unwrap();
+        let pending = pause.try_wait();
+        // Recover the actual peer/worker on every observed failure before making assertions.
+        let _ = release_tx.send(());
+        let _ = peer.shutdown(std::net::Shutdown::Both);
+        let joined = caller.join();
+        drop(peer);
+        drop(listener);
+        assert_eq!(ready.unwrap(), (true, *b"G"));
+        joining.unwrap();
+        assert!(held);
+        match panic_kind {
+            1 | 3 => assert!(joined.is_err()),
+            2 => {
+                joined.unwrap();
+                assert!(!result_rx.recv().unwrap());
+            }
+            _ => {
+                joined.unwrap();
+                assert!(result_rx.recv().unwrap());
+            }
+        }
+        assert!(store.signin_now().unwrap().is_some());
+        assert!(
+            pending
+                .expect_err("original caller and callback were still owned")
+                .try_wait()
+                .is_ok()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn an_approver_unwind_retires_the_actual_callback_listener_and_scope() {
+    use crate::harness::{
+        account_work::{Lifetime, Scope},
+        accounts::Store,
+    };
+    struct Panics {
+        scope: Scope,
+        peer: Option<TcpStream>,
+        port: Option<u16>,
+    }
+    impl Approver for Panics {
+        fn work_scope(&self) -> Option<Scope> {
+            Some(self.scope.clone())
+        }
+        fn approve(&mut self, handoff: &Handoff<'_>) -> Approval {
+            let params = query_map(handoff.url);
+            let redirect = &params
+                .iter()
+                .find(|(key, _)| key == "redirect_uri")
+                .unwrap()
+                .1;
+            let address = redirect
+                .strip_prefix("http://")
+                .unwrap()
+                .split('/')
+                .next()
+                .unwrap();
+            let mut peer = TcpStream::connect(address).unwrap();
+            peer.write_all(b"G").unwrap();
+            self.port = Some(peer.peer_addr().unwrap().port());
+            self.peer = Some(peer);
+            panic!("actual approver unwind");
+        }
+    }
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let store = Store::at(tmp.path());
+    let lifetime = Lifetime::default();
+    let mut approver = Panics {
+        scope: lifetime.enter().unwrap(),
+        peer: None,
+        port: None,
+    };
+    let signin = store.signin_now().unwrap().unwrap();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _signin = signin;
+        login_with(
+            &tmp.path().join("login"),
+            &Endpoints {
+                issuer: DEFAULT_ISSUER.into(),
+                token_url: "http://127.0.0.1:1/oauth/token".into(),
+                callback_ports: vec![0],
+            },
+            &mut approver,
+            HOSTS,
+            None,
+            WakeDeadline::after(aterm_spec::wait::MUST_HAPPEN),
+        )
+    }));
+    let port = approver.port.unwrap();
+    drop(approver);
+    assert!(outcome.is_err());
+    assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
+    assert!(store.signin_now().unwrap().is_some());
+    assert!(lifetime.pause().unwrap().try_wait().is_ok());
+}
+
+#[test]
+fn one_operation_cancels_its_accepted_socket_without_closing_the_epoch() {
+    use crate::harness::account_work::Lifetime;
+    let lifetime = Lifetime::default();
+    let scope = lifetime.enter().unwrap();
+    let unrelated = lifetime.enter().unwrap();
+    let cancellation = scope.cancellation();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut socket, _) = listener.accept().unwrap();
+    peer.write_all(b"G").unwrap();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let worker_cancelled = cancelled.clone();
+    let worker_scope = scope.clone();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (stopped_tx, stopped_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(scope.wrap(move || {
+        let mut reader = callback_reader(
+            &mut socket,
+            WakeDeadline::after(Duration::from_secs(3600)),
+            &worker_cancelled,
+            Some(&worker_scope),
+        );
+        let mut first = [0];
+        let first_read = reader.read_exact(&mut first);
+        let _ = ready_tx.send((first_read.is_ok(), first));
+        let stopped = reader.read(&mut first).is_err();
+        let _ = stopped_tx.send((stopped, worker_scope.cancelled()));
+    }));
+    let mut owner = CallbackOwner {
+        cancelled,
+        worker: Some(worker),
+    };
+    let ready = ready_rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+    cancellation.cancel();
+    // The peer's write side remains open. A stop observed here precedes the
+    // owner's separate cancellation signal and cannot be caused by its join.
+    let stopped = stopped_rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+    let owner_had_not_stopped = !owner.cancelled.load(Ordering::SeqCst);
+    // Even a failed observation is recovered through actual cancellation/join.
+    let joined = owner.join();
+    let _ = peer.shutdown(std::net::Shutdown::Both);
+    drop(peer);
+    drop(listener);
+    assert_eq!(ready.unwrap(), (true, *b"G"));
+    assert_eq!(stopped.unwrap(), (true, true));
+    assert!(owner_had_not_stopped && joined);
+    assert!(cancellation.retired());
+    assert!(!unrelated.cancelled());
+    assert!(lifetime.enter().is_some());
+    drop(unrelated);
+    assert!(lifetime.pause().unwrap().try_wait().is_ok());
 }
 
 #[test]
@@ -357,6 +625,25 @@ fn callback_io_budget_bounds_partial_writes() {
     )
     .unwrap_err();
     assert_eq!(zero.kind(), std::io::ErrorKind::WriteZero);
+}
+
+#[test]
+fn a_final_callback_write_cannot_report_success_after_its_absolute_cap() {
+    let start = Instant::now();
+    let clock = std::cell::Cell::new(start);
+    let mut delivered = Vec::new();
+    let result = write_callback_until(
+        b"complete",
+        start + CALLBACK_IO_WAIT,
+        || clock.get(),
+        |bytes, _| {
+            delivered.extend_from_slice(bytes);
+            clock.set(start + CALLBACK_IO_WAIT);
+            Ok(bytes.len())
+        },
+    );
+    assert_eq!(delivered, b"complete");
+    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
 }
 
 /// Runs a complete in-process loopback PKCE login in `home` against a mock `127.0.0.1:0` token
@@ -790,19 +1077,22 @@ fn login_case(case: i64) -> [(&'static str, i64); 6] {
         redirect_uri: "http://127.0.0.1/callback",
         code: "code",
         code_verifier: "verifier",
-        wait,
+        deadline: WakeDeadline::after(wait),
+        work: None,
         now: 1_790_000_000,
     };
     let perform = || {
-        exchange_code_and_persist(
-            tmp.path(),
-            &endpoints,
-            "http://127.0.0.1/callback",
-            "code",
-            "verifier",
-            wait,
-            1_790_000_000,
-        )
+        CodeExchange {
+            home: tmp.path(),
+            endpoints: &endpoints,
+            redirect_uri: "http://127.0.0.1/callback",
+            code: "code",
+            code_verifier: "verifier",
+            deadline: WakeDeadline::after(wait),
+            work: None,
+            now: 1_790_000_000,
+        }
+        .exchange()
     };
     let mut result = if case == 18 {
         exchange().persist(Some(""))
@@ -3163,15 +3453,17 @@ fn sign_in_takes_the_publication_lock_before_spending_its_code() {
             callback_ports: vec![],
         };
         assert!(
-            exchange_code_and_persist(
-                &home,
-                &endpoints,
-                "http://127.0.0.1/callback",
-                "unspent-code",
-                "verifier",
-                Duration::from_millis(20),
-                now,
-            )
+            CodeExchange {
+                home: &home,
+                endpoints: &endpoints,
+                redirect_uri: "http://127.0.0.1/callback",
+                code: "unspent-code",
+                code_verifier: "verifier",
+                deadline: WakeDeadline::after(Duration::from_millis(20)),
+                work: None,
+                now
+            }
+            .exchange()
             .is_none()
         );
         assert!(provider_seen(port, server).is_empty());
@@ -3200,19 +3492,21 @@ fn first_sign_in_holds_its_lock_during_the_token_exchange() {
         )
     });
     assert_eq!(
-        exchange_code_and_persist(
-            &home,
-            &Endpoints {
+        CodeExchange {
+            home: &home,
+            endpoints: &Endpoints {
                 issuer: format!("http://127.0.0.1:{port}"),
                 token_url: format!("http://127.0.0.1:{port}/oauth/token"),
                 callback_ports: vec![],
             },
-            "http://127.0.0.1/callback",
-            "code",
-            "verifier",
-            aterm_spec::wait::MUST_HAPPEN,
-            now,
-        ),
+            redirect_uri: "http://127.0.0.1/callback",
+            code: "code",
+            code_verifier: "verifier",
+            deadline: WakeDeadline::after(aterm_spec::wait::MUST_HAPPEN),
+            work: None,
+            now
+        }
+        .exchange(),
         Some(Some("owner@example.test".into()))
     );
     assert_eq!(provider_seen(port, server), ["POST /oauth/token"]);
@@ -3221,6 +3515,206 @@ fn first_sign_in_holds_its_lock_during_the_token_exchange() {
         Some("new-refresh")
     );
     assert!(AuthLock::try_take(&home.join(AUTH_FILE)).unwrap().is_some());
+}
+
+#[cfg(unix)]
+#[test]
+fn code_exchange_rechecks_original_work_after_the_actual_publication_lock() {
+    use crate::harness::account_work::Lifetime;
+    use crate::harness::wake_deadline::SleepSeam;
+    for stopped in 0..4 {
+        let seam = SleepSeam::hold();
+        seam.sleeper().slept(Duration::from_secs(3600));
+        let deadline = WakeDeadline::after(Duration::from_secs(3600));
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let home = tmp.path().join("login");
+        let now = 1_790_000_000;
+        hour_login(&home, now, Some("original-refresh"));
+        RefreshJournal::Attempted {
+            token: refresh_token_digest("original-refresh"),
+        }
+        .write(&home)
+        .unwrap();
+        let before = std::fs::read(home.join(AUTH_FILE)).unwrap();
+        let evidence = std::fs::read(beside_auth(&home, JOURNAL_SUFFIX)).unwrap();
+        let held = AuthLock::within(&home, Instant::now() + aterm_spec::wait::MUST_HAPPEN).unwrap();
+        let (port, server) = provider(move |_, _| {
+            let access = make_chatgpt_jwt(Some("owner@example.test"), "pro", now + 3600);
+            (
+                "200 OK",
+                json!({"id_token":access,"access_token":access,"refresh_token":"new-refresh"}),
+            )
+        });
+        let lifetime = Lifetime::default();
+        let scope = lifetime.enter().unwrap();
+        let cancellation = scope.cancellation();
+        let unrelated = lifetime.enter().unwrap();
+        let worker_home = home.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(scope.clone().wrap(move || {
+            let result = CodeExchange {
+                home: &worker_home,
+                endpoints: &Endpoints {
+                    issuer: format!("http://127.0.0.1:{port}"),
+                    token_url: format!("http://127.0.0.1:{port}/oauth/token"),
+                    callback_ports: vec![],
+                },
+                redirect_uri: "http://127.0.0.1/callback",
+                code: "code",
+                code_verifier: "verifier",
+                deadline,
+                work: Some(&scope),
+                now,
+            }
+            .persist_using(Some("new-owner"), |home, lock_deadline| {
+                let busy = AuthLock::try_take(&home.join(AUTH_FILE)).unwrap().is_none();
+                let _ = ready_tx.send(busy);
+                AuthLock::within(home, lock_deadline.instant())
+            });
+            let _ = result_tx.send(result);
+        }));
+        let readiness = ready_rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+        let pause = if stopped == 2 {
+            Some(lifetime.pause().unwrap())
+        } else {
+            None
+        };
+        if stopped == 1 {
+            seam.sleeper().slept(Duration::from_secs(7200));
+        }
+        if stopped == 3 {
+            cancellation.cancel();
+        }
+        drop(held);
+        let result = worker.join();
+        let seen = provider_seen(port, server);
+        assert!(readiness.unwrap());
+        result.unwrap();
+        let result = result_rx.recv().unwrap();
+        if stopped == 0 {
+            assert_eq!(result, Some(Some("owner@example.test".into())));
+            assert_eq!(seen, ["POST /oauth/token"]);
+            assert!(!beside_auth(&home, JOURNAL_SUFFIX).exists());
+        } else {
+            assert_eq!(result, None);
+            assert!(seen.is_empty());
+            assert_eq!(std::fs::read(home.join(AUTH_FILE)).unwrap(), before);
+            assert_eq!(
+                std::fs::read(beside_auth(&home, JOURNAL_SUFFIX)).unwrap(),
+                evidence
+            );
+        }
+        if stopped == 3 {
+            assert!(cancellation.retired());
+            assert!(!unrelated.cancelled());
+            assert!(lifetime.enter().is_some());
+        }
+        drop(unrelated);
+        if let Some(pause) = pause {
+            assert!(pause.try_wait().is_ok());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_complete_valid_code_response_is_saved_but_not_approved_after_work_stops() {
+    use crate::harness::account_work::{Lifetime, Scope};
+    use crate::harness::wake_deadline::SleepSeam;
+    struct Deliver {
+        scope: Scope,
+    }
+    impl Approver for Deliver {
+        fn work_scope(&self) -> Option<Scope> {
+            Some(self.scope.clone())
+        }
+        fn approve(&mut self, handoff: &Handoff<'_>) -> Approval {
+            let params = query_map(handoff.url);
+            let get = |key: &str| {
+                params
+                    .iter()
+                    .find(|(name, _)| name == key)
+                    .unwrap()
+                    .1
+                    .clone()
+            };
+            let (status, _) = raw_get_loopback(&format!(
+                "{}?code=auth_code_ok&state={}",
+                get("redirect_uri"),
+                get("state")
+            ));
+            assert_eq!(status, 200);
+            aterm_spec::wait::until_within(
+                aterm_spec::wait::MUST_HAPPEN,
+                "accepted callback completion",
+                || (handoff.finished)().then_some(()),
+            );
+            Approval::Approved { page: false }
+        }
+    }
+    for stop in 0..3 {
+        let seam = SleepSeam::hold();
+        seam.sleeper().slept(Duration::from_secs(3600));
+        let sleeper = seam.sleeper();
+        let deadline = WakeDeadline::after(Duration::from_secs(3600));
+        let lifetime = Lifetime::default();
+        let scope = lifetime.enter().unwrap();
+        let service_lifetime = lifetime.clone();
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let home = tmp.path().join("login");
+        let now = 1_790_000_000;
+        hour_login(&home, now, Some("old-refresh"));
+        RefreshJournal::Attempted {
+            token: refresh_token_digest("old-refresh"),
+        }
+        .write(&home)
+        .unwrap();
+        let service_home = home.clone();
+        let (port, server) = provider(move |_, _| {
+            assert!(
+                AuthLock::try_take(&service_home.join(AUTH_FILE))
+                    .unwrap()
+                    .is_none()
+            );
+            if stop == 1 {
+                sleeper.slept(Duration::from_secs(7200));
+            }
+            if stop == 2 {
+                drop(service_lifetime.pause().unwrap());
+            }
+            let access = make_chatgpt_jwt(Some("owner@example.test"), "pro", now + 3600);
+            (
+                "200 OK",
+                json!({"id_token":access,"access_token":access,"refresh_token":"rotated-refresh"}),
+            )
+        });
+        let drove = login_with(
+            &home,
+            &Endpoints {
+                issuer: DEFAULT_ISSUER.into(),
+                token_url: format!("http://127.0.0.1:{port}/oauth/token"),
+                callback_ports: vec![0],
+            },
+            &mut Deliver { scope },
+            HOSTS,
+            Some("owner@example.test"),
+            deadline,
+        );
+        let seen = provider_seen(port, server);
+        assert_eq!(seen, ["POST /oauth/token"]);
+        if stop == 0 {
+            assert!(matches!(drove.outcome, Outcome::SignedIn { .. }));
+        } else {
+            assert_eq!(drove.outcome, Outcome::CompletedHeld);
+        }
+        assert_eq!(
+            load_stored_auth(&home).unwrap().refresh_token.as_deref(),
+            Some("rotated-refresh")
+        );
+        assert!(!beside_auth(&home, JOURNAL_SUFFIX).exists());
+        assert!(AuthLock::try_take(&home.join(AUTH_FILE)).unwrap().is_some());
+    }
 }
 
 #[test]
@@ -3245,19 +3739,21 @@ fn sign_in_and_stale_journal_recovery_keep_evidence_until_publication_is_durable
     });
     let fault = aterm_durable::seam::FailingDirs::with(aterm_durable::seam::EIO);
     assert!(
-        exchange_code_and_persist(
-            &home,
-            &Endpoints {
+        CodeExchange {
+            home: &home,
+            endpoints: &Endpoints {
                 issuer: format!("http://127.0.0.1:{port}"),
                 token_url: format!("http://127.0.0.1:{port}/oauth/token"),
                 callback_ports: vec![],
             },
-            "http://127.0.0.1/callback",
-            "code",
-            "verifier",
-            aterm_spec::wait::MUST_HAPPEN,
-            now,
-        )
+            redirect_uri: "http://127.0.0.1/callback",
+            code: "code",
+            code_verifier: "verifier",
+            deadline: WakeDeadline::after(aterm_spec::wait::MUST_HAPPEN),
+            work: None,
+            now
+        }
+        .exchange()
         .is_none()
     );
     assert_eq!(std::fs::read(&journal).unwrap(), evidence);
@@ -4450,15 +4946,17 @@ fn code_exchange_validates_and_clears_refresh_journal_around_publication() {
     std::fs::create_dir_all(beside_auth(&bad_journal_home, JOURNAL_SUFFIX))
         .expect("journal directory");
     assert_eq!(
-        exchange_code_and_persist(
-            &bad_journal_home,
-            &endpoints,
-            "http://127.0.0.1/callback",
-            "one-use-code",
-            "verifier",
-            aterm_spec::wait::MUST_HAPPEN,
-            1_790_000_000,
-        ),
+        CodeExchange {
+            home: &bad_journal_home,
+            endpoints: &endpoints,
+            redirect_uri: "http://127.0.0.1/callback",
+            code: "one-use-code",
+            code_verifier: "verifier",
+            deadline: WakeDeadline::after(aterm_spec::wait::MUST_HAPPEN),
+            work: None,
+            now: 1_790_000_000
+        }
+        .exchange(),
         None
     );
     assert_eq!(
@@ -4471,15 +4969,17 @@ fn code_exchange_validates_and_clears_refresh_journal_around_publication() {
     let bad_auth_home = tmp.path().join("bad-auth");
     std::fs::create_dir_all(bad_auth_home.join(AUTH_FILE)).expect("auth.json directory");
     assert_eq!(
-        exchange_code_and_persist(
-            &bad_auth_home,
-            &endpoints,
-            "http://127.0.0.1/callback",
-            "one-use-code",
-            "verifier",
-            aterm_spec::wait::MUST_HAPPEN,
-            1_790_000_000,
-        ),
+        CodeExchange {
+            home: &bad_auth_home,
+            endpoints: &endpoints,
+            redirect_uri: "http://127.0.0.1/callback",
+            code: "one-use-code",
+            code_verifier: "verifier",
+            deadline: WakeDeadline::after(aterm_spec::wait::MUST_HAPPEN),
+            work: None,
+            now: 1_790_000_000
+        }
+        .exchange(),
         None
     );
     assert_eq!(*seen.lock().expect("seen lock"), 0);
@@ -4506,15 +5006,17 @@ fn code_exchange_validates_and_clears_refresh_journal_around_publication() {
     .expect("write rejected journal");
 
     assert_eq!(
-        exchange_code_and_persist(
-            &relogin_home,
-            &endpoints,
-            "http://127.0.0.1/callback",
-            "bad-code",
-            "verifier",
-            aterm_spec::wait::MUST_HAPPEN,
-            1_790_000_000,
-        ),
+        CodeExchange {
+            home: &relogin_home,
+            endpoints: &endpoints,
+            redirect_uri: "http://127.0.0.1/callback",
+            code: "bad-code",
+            code_verifier: "verifier",
+            deadline: WakeDeadline::after(aterm_spec::wait::MUST_HAPPEN),
+            work: None,
+            now: 1_790_000_000
+        }
+        .exchange(),
         None
     );
     assert!(
@@ -4525,15 +5027,17 @@ fn code_exchange_validates_and_clears_refresh_journal_around_publication() {
     // Also overwrite with truncated journal bytes to exercise corrupt-journal cleanup on sign-in.
     std::fs::write(beside_auth(&relogin_home, JOURNAL_SUFFIX), b"{truncated")
         .expect("corrupt journal");
-    let signed_in = exchange_code_and_persist(
-        &relogin_home,
-        &endpoints,
-        "http://127.0.0.1/callback",
-        "good-code",
-        "verifier",
-        aterm_spec::wait::MUST_HAPPEN,
-        1_790_000_000,
-    );
+    let signed_in = CodeExchange {
+        home: &relogin_home,
+        endpoints: &endpoints,
+        redirect_uri: "http://127.0.0.1/callback",
+        code: "good-code",
+        code_verifier: "verifier",
+        deadline: WakeDeadline::after(aterm_spec::wait::MUST_HAPPEN),
+        work: None,
+        now: 1_790_000_000,
+    }
+    .exchange();
     assert_eq!(signed_in, Some(Some("relogin@example.test".to_owned())));
     assert!(
         !beside_auth(&relogin_home, JOURNAL_SUFFIX).exists(),

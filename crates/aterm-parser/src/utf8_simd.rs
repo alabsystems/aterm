@@ -19,6 +19,30 @@ pub(crate) fn bulk_decode_run(bytes: &[u8], out: &mut ArrayVec<char, RUN_CAP>) -
     }
 }
 
+/// The longest printable-ASCII gap a multi-byte run joins: the spaces and punctuation between
+/// words. A longer stretch ends the run and goes to `print_ascii_bulk`, whose writer takes ASCII
+/// for less per byte than the run's per-character loop does; past about this length that costs
+/// more than the run break it saves.
+pub(crate) const JOIN_GAP_MAX: usize = 32;
+
+/// The length of the printable ASCII (`0x20..=0x7E`) `bytes` begins with, when a multi-byte lead
+/// ([`crate::utf8::is_utf8_lead`]) follows it within its first `room` bytes and its first
+/// [`JOIN_GAP_MAX`] + 1: the space between two words a multi-byte run joins across. `0` when
+/// another byte ends it, when it reaches either bound or the end of `bytes` (that ASCII stays
+/// for the printable scan), and when `bytes` does not begin with printable ASCII. A nonzero gap
+/// is shorter than `room`, so the lead's character fits after it. The scan is the printable
+/// scanner's ([`crate::simd::count_printable`]) over at most that window, so a gap that does
+/// not join costs little before the printable scan reads it again.
+#[inline]
+pub(crate) fn joinable_ascii_gap(bytes: &[u8], room: usize) -> usize {
+    let window = bytes.get(..room.min(JOIN_GAP_MAX + 1)).unwrap_or(bytes);
+    let gap = crate::simd::count_printable(window);
+    match window.get(gap) {
+        Some(&lead) if crate::utf8::is_utf8_lead(lead) => gap,
+        _ => 0,
+    }
+}
+
 /// 3-byte run (BMP: CJK, Hangul, Greek, Cyrillic, ...).
 #[inline]
 fn bulk_3byte(bytes: &[u8], out: &mut ArrayVec<char, RUN_CAP>) -> usize {
@@ -161,6 +185,27 @@ mod tests {
             let (bc, bi) = bulk_run(s.as_bytes());
             assert_eq!((rc, ri), (bc, bi), "input {s:?}");
         }
+    }
+
+    #[test]
+    fn a_gap_joins_up_to_the_longest_join_and_short_of_the_room() {
+        let gap = |n: usize, room: usize| {
+            let mut bytes = vec![b'x'; n];
+            bytes.extend_from_slice("\u{e9}".as_bytes());
+            joinable_ascii_gap(&bytes, room)
+        };
+        assert_eq!(gap(1, RUN_CAP), 1);
+        assert_eq!(gap(JOIN_GAP_MAX, RUN_CAP), JOIN_GAP_MAX);
+        assert_eq!(gap(JOIN_GAP_MAX + 1, RUN_CAP), 0);
+        assert_eq!(gap(5, 6), 5, "the lead's character fits after the gap");
+        assert_eq!(gap(5, 5), 0, "no room for the lead's character");
+        assert_eq!(
+            joinable_ascii_gap(b"ab\r\xc3\xa9", RUN_CAP),
+            0,
+            "a control ends it"
+        );
+        assert_eq!(joinable_ascii_gap(b"ab", RUN_CAP), 0, "no lead follows");
+        assert_eq!(joinable_ascii_gap(b"\x80ab\xc3\xa9", RUN_CAP), 0);
     }
 
     #[test]

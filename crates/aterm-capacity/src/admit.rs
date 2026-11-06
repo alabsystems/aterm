@@ -31,6 +31,18 @@
 //! the load within it: past its reservation age it holds back claimed work that asked after it
 //! ([`Short::Reserved`]), and at its bound it starts whatever the load ([`QuietStart`]).
 //!
+//! QUIET-BURST. A quiet claim with a patience, and a measured one ([`Need::timing`]) whatever
+//! covers it, waits for a quiet GPU too ([`Short::Gpu`]) until its patience bound, as it waits
+//! for the load: another process's long command buffers starve the frames timed work renders,
+//! and neither the load nor a CPU window shows them. At its bound the GPU holds it back no longer,
+//! and how busy it read is stated ([`QuietStart::gpu`]); a CPU window and the load still decide
+//! whether a measured claim is qualified or loaded.
+//!
+//! QUIET-FIRST. A claim of a process that holds the quiet machine (a timed stage's memory, which
+//! verify claims once it holds its run's quiet claim) waits for the held claims alone, never
+//! behind a waiter ([`counted`]): every other timed run waits for that quiet claim, so a turn in
+//! the queue would hold the quiet machine for nothing while the run measured nothing.
+//!
 //! ALONE. A memory need is admitted beside the claims ahead of it only while what is available,
 //! less what they reserve, holds it. Where it does not, and no other claim holds memory or waits
 //! ahead for it, what it is short of is work no claim holds (a person's apps, another session's
@@ -43,8 +55,10 @@
 //! for every claim ahead that holds it, and is admitted, beside what is left or alone, once they
 //! end. A waiter of the same process is not ahead of its memory: the process orders its own
 //! claims (verify's run budget), so its later claim that fits never waits for an earlier one's
-//! room. Bounded so, every memory wait ends once the claims ahead of it end. A need with a margin
-//! (a VM's boot, which pins its memory) is never admitted alone: it waits for room beside it.
+//! room. Nor is any waiter ahead of a process that holds the quiet machine (QUIET-FIRST): it
+//! overtakes them by the timed stage it runs. Bounded so, every memory wait ends once the claims
+//! ahead of it end. A need with a margin (a VM's boot, which pins its memory) is never admitted
+//! alone: it waits for room beside it.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -251,6 +265,15 @@ pub enum Short {
         /// The most it allows.
         max: f64,
     },
+    /// The GPU is not quiet: busier than a quiet claim allows ([`crate::QUIET_GPU_BUSY`]), at its
+    /// most over the look's window ([`Machine::gpu_busy`]). Another process's GPU work starves
+    /// the frames timed work renders whatever the load.
+    Gpu {
+        /// How busy, percent.
+        busy: u8,
+        /// The most it allows.
+        max: u8,
+    },
     /// Another quiet claim holds the quiet machine, or waits ahead for it.
     Quiet {
         /// Its holder's pid.
@@ -306,6 +329,15 @@ impl Short {
                 | Short::Quiet { .. }
                 | Short::Reserved { .. }
                 | Short::Alone { .. }
+        )
+    }
+
+    /// Whether this is the machine too busy for a quiet claim: the load, a measured claim's CPU
+    /// window, or the GPU, what its patience waits for ([`crate::Patience`]).
+    const fn machine_busy(&self) -> bool {
+        matches!(
+            self,
+            Short::Load { .. } | Short::Timing(_) | Short::Gpu { .. }
         )
     }
 
@@ -382,6 +414,9 @@ impl fmt::Display for Short {
             }
             Short::Load { load1, max } => {
                 write!(f, "waiting for a quiet machine: load {load1:.1} > {max:.1}")
+            }
+            Short::Gpu { busy, max } => {
+                write!(f, "waiting for a quiet GPU: {busy}% busy > {max}%")
             }
             Short::Quiet { pid, what, held } => write!(
                 f,
@@ -925,6 +960,12 @@ pub fn covering_disk(
 /// its ancestors have yet to write may overrun the room by up to their reservation, into the
 /// floor, which is what the floor is kept for. Without a process sweep no ancestor is known,
 /// and every claim counts.
+///
+/// QUIET-FIRST: so is a waiter whose own process holds the quiet machine (verify's timed stage,
+/// which claims its memory once it holds the run's quiet claim): it is held to the held claims
+/// alone, its own included, and to no waiter. Every other timed run waits for its quiet claim,
+/// which is held for the run's timed work alone, so a wait behind the queue would hold the quiet
+/// machine for nothing while the run measured nothing.
 pub(crate) fn counted<'r>(
     records: Vec<&'r Record>,
     pid: u32,
@@ -935,7 +976,13 @@ pub(crate) fn counted<'r>(
         r.accounting == crate::Accounting::Holder
             && (ancestors.contains(&r.pid) || credits(r, pid, &ancestors))
     };
-    let inside = records.iter().any(|r| r.held.is_some() && kin(r));
+    let measuring = records.iter().any(|r| {
+        r.accounting == crate::Accounting::Holder
+            && r.pid == pid
+            && r.held.is_some()
+            && r.need.quiet.is_some()
+    });
+    let inside = measuring || records.iter().any(|r| r.held.is_some() && kin(r));
     records
         .into_iter()
         .filter(|r| !kin(r) && (!inside || r.held.is_some()))
@@ -1250,8 +1297,10 @@ pub struct QuietStart {
     pub load1: Option<f64>,
     /// Its bound.
     pub max: f64,
+    /// How busy the GPU was at that look, percent ([`Short::Gpu`]).
+    pub gpu: Option<u8>,
     /// Whether it started at the end of its patience ([`crate::Patience::start`]), the load
-    /// still above its bound.
+    /// or the GPU still above its bound.
     pub at_bound: bool,
     /// How long it reserved the machine before it started; zero when it never did.
     pub reserved: Duration,
@@ -1259,14 +1308,23 @@ pub struct QuietStart {
 
 impl fmt::Display for QuietStart {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let started = if self.at_bound {
+            "started at its bound"
+        } else {
+            "started"
+        };
         match self.load1 {
-            Some(l) if self.at_bound => write!(
-                f,
-                "started at its bound under load {l:.1} > {:.1}",
-                self.max
-            )?,
-            Some(l) => write!(f, "started under load {l:.1} <= {:.1}", self.max)?,
-            None => f.write_str("started with the load unread")?,
+            Some(l) => {
+                let to = if l > self.max { ">" } else { "<=" };
+                write!(f, "{started} under load {l:.1} {to} {:.1}", self.max)?;
+            }
+            None => write!(f, "{started} with the load unread")?,
+        }
+        if let Some(busy) = self.gpu {
+            write!(f, ", GPU {busy}% busy")?;
+            if busy > crate::QUIET_GPU_BUSY {
+                write!(f, " > {}%", crate::QUIET_GPU_BUSY)?;
+            }
         }
         if !self.reserved.is_zero() {
             write!(
@@ -1289,8 +1347,8 @@ pub struct Claim {
     waited: Duration,
     /// Where its measured writes lie in its file, once written ([`Self::wrote`]).
     wrote_at: Option<u64>,
-    /// How a quiet claim started; `None` for any other, one a held quiet claim covers, or one
-    /// `--admit now` admitted.
+    /// How a quiet claim started; `None` for any other, a load-only one a held quiet claim
+    /// covers, or one `--admit now` admitted.
     quiet: Option<QuietStart>,
     /// How its memory was admitted alone; `None` beside other claims.
     alone: Option<Alone>,
@@ -1675,9 +1733,9 @@ impl Claim {
         }))
     }
 
-    /// How a quiet claim started: the load, whether at its bound, how long it reserved the
-    /// machine. `None` for any other claim, one a held quiet claim covers, or one `--admit now`
-    /// admitted.
+    /// How a quiet claim started: the load and the GPU, whether at its bound, how long it
+    /// reserved the machine. `None` for any other claim, a load-only one a held quiet claim
+    /// covers, or one `--admit now` admitted.
     #[must_use]
     pub const fn quiet(&self) -> Option<QuietStart> {
         self.quiet
@@ -1987,9 +2045,10 @@ pub struct Waiter {
 /// stall from the first read of it that found its work as it is now, not from its own first look
 /// (a verify run's later stage behind the holder its earlier stage waited behind). An entry no
 /// waiter has read for [`STALL_KEPT`] goes.
-static STALLS: Mutex<
-    std::collections::BTreeMap<(PathBuf, u32), (aterm_toolchain::stall::Stall, Instant)>,
-> = Mutex::new(std::collections::BTreeMap::new());
+type StallsByPid = std::collections::BTreeMap<u32, (aterm_toolchain::stall::Stall, Instant)>;
+
+static STALLS: Mutex<std::collections::BTreeMap<PathBuf, StallsByPid>> =
+    Mutex::new(std::collections::BTreeMap::new());
 
 /// How long [`STALLS`] keeps what a waiter read of a holder that no waiter has read since.
 const STALL_KEPT: Duration = Duration::from_secs(3600);
@@ -2069,10 +2128,22 @@ impl Waiter {
         )
     )]
     pub fn poll(self, machine: &dyn Machine) -> Polled {
-        self.poll_mode(machine, false)
+        self.poll_until(machine, &|| false)
     }
 
-    fn poll_mode(mut self, machine: &dyn Machine, forced_now: bool) -> Polled {
+    /// As [`Self::poll`], a quiet claim's read of the GPU ended early once `stopped` says so
+    /// ([`Machine::gpu_busy`]), so an interrupt ends a quiet wait within a nap, as any other.
+    #[must_use]
+    pub fn poll_until(self, machine: &dyn Machine, stopped: &dyn Fn() -> bool) -> Polled {
+        self.poll_mode(machine, false, stopped)
+    }
+
+    fn poll_mode(
+        mut self,
+        machine: &dyn Machine,
+        forced_now: bool,
+        stopped: &dyn Fn() -> bool,
+    ) -> Polled {
         if std::fs::symlink_metadata(self.laid.path())
             .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
         {
@@ -2084,6 +2155,17 @@ impl Waiter {
                 ),
             ));
         }
+        // A quiet claim's GPU is read over a window, before the turn: no other waiter's look
+        // waits on it. A forced look waits for nothing, and a measured claim's first look forms
+        // no CPU window, so it admits nothing: one reading says either.
+        let warming =
+            self.record.need.quiet_policy == crate::QuietPolicy::Timing && self.cpu_point.is_none();
+        let gpu = self
+            .record
+            .need
+            .quiet
+            .filter(|_| !forced_now && !warming)
+            .and_then(|_| machine.gpu_busy(stopped));
         let turn = match self.ledger.try_turn() {
             Ok(Ok(turn)) => turn,
             Ok(Err(holder)) => {
@@ -2091,7 +2173,7 @@ impl Waiter {
             }
             Err(e) => return Polled::Waiting(self, Shortfall::only(Short::Ledger(e.to_string()))),
         };
-        let found = match self.look(machine) {
+        let found = match self.look(machine, gpu) {
             Ok(found) => found,
             Err(e) => return Polled::Waiting(self, Shortfall::only(Short::Ledger(e.to_string()))),
         };
@@ -2143,24 +2225,35 @@ impl Waiter {
         let now = Instant::now();
         let dir = self.ledger.dir();
         let mut stalls = STALLS.lock().unwrap_or_else(PoisonError::into_inner);
-        for h in short.holders.iter_mut().filter(|h| h.held) {
-            let work = procs.and_then(|p| p.work(h.pid, &h.credit));
-            let (stall, read) = stalls
-                .entry((dir.to_path_buf(), h.pid))
-                .or_insert_with(|| (aterm_toolchain::stall::Stall::default(), now));
-            *read = now;
-            h.stalled = stall.stuck(h.pid, work, now, self.stalled_after);
+        if short.holders.iter().any(|h| h.held) {
+            let dir_stalls = match stalls.get_mut(dir) {
+                Some(entry) => entry,
+                None => stalls.entry(dir.to_path_buf()).or_default(),
+            };
+            for h in short.holders.iter_mut().filter(|h| h.held) {
+                let work = procs.and_then(|p| p.work(h.pid, &h.credit));
+                let (stall, read) = dir_stalls
+                    .entry(h.pid)
+                    .or_insert_with(|| (aterm_toolchain::stall::Stall::default(), now));
+                *read = now;
+                h.stalled = stall.stuck(h.pid, work, now, self.stalled_after);
+            }
         }
-        stalls.retain(|_, (_, read)| now.saturating_duration_since(*read) < STALL_KEPT);
+        stalls.retain(|_, by_pid| {
+            by_pid.retain(|_, (_, read)| now.saturating_duration_since(*read) < STALL_KEPT);
+            !by_pid.is_empty()
+        });
         drop(stalls);
         stuck(&short.holders)
     }
 
-    /// Read the machine and the ledger, and decide.
-    fn look(&mut self, machine: &dyn Machine) -> io::Result<Found> {
+    /// Read the machine and the ledger, and decide; a quiet claim holds the GPU to
+    /// [`crate::QUIET_GPU_BUSY`] by `gpu` ([`Machine::gpu_busy`]), else by this reading's.
+    fn look(&mut self, machine: &dyn Machine, gpu: Option<u8>) -> io::Result<Found> {
         let now = now_ms();
         trace("look.read.begin");
         let reading = machine.read(self.at.as_deref());
+        let gpu = gpu.or(reading.gpu_busy);
         let measured = self.record.need.quiet_policy == crate::QuietPolicy::Timing;
         let cpu = if measured {
             match machine.cpu_point() {
@@ -2216,8 +2309,8 @@ impl Waiter {
         } else {
             need.quiet
         };
-        // Past its patience the load holds a quiet claim back no longer: only another quiet claim
-        // does, so two timed runs never overlap.
+        // Past its patience the load and the GPU hold a quiet claim back no longer: only another
+        // quiet claim does, so two timed runs never overlap.
         let past = bound.is_some()
             && self
                 .record
@@ -2240,6 +2333,7 @@ impl Waiter {
         claimants.insert(self.record.pid);
         let trees = procs
             .as_ref()
+            .filter(|_| !records.is_empty())
             .map(|p| {
                 let mut roots: Vec<u32> = Vec::with_capacity(
                     claimants.len() + records.iter().map(|r| r.credit.len()).sum::<usize>(),
@@ -2293,6 +2387,23 @@ impl Waiter {
                 }
             }
         }
+        // QUIET-BURST: a quiet claim short of its patience waits for a quiet GPU too, a measured
+        // one whatever covers it (`bound` is its own), as it waits for the load. One with no
+        // patience waits for the load alone.
+        if !past
+            && bound.is_some()
+            && self.record.need.patience.is_some()
+            && let Some(busy) = gpu.filter(|b| *b > crate::QUIET_GPU_BUSY)
+        {
+            let short = Short::Gpu {
+                busy,
+                max: crate::QUIET_GPU_BUSY,
+            };
+            match &mut decided {
+                Ok(_) => decided = Err(Shortfall::only(short)),
+                Err(s) => s.shorts.push(short),
+            }
+        }
         let me = self.record.pid;
         let kin = |pid: u32| {
             pid == me
@@ -2340,9 +2451,7 @@ impl Waiter {
             && self.record.need.patience.is_some()
             && self.record.next_ms.is_none()
             && decided.as_ref().is_err_and(|s| {
-                s.shorts
-                    .iter()
-                    .any(|x| matches!(x, Short::Load { .. } | Short::Timing(_)))
+                s.shorts.iter().any(Short::machine_busy)
                     && !s.shorts.iter().any(|x| matches!(x, Short::Quiet { .. }))
             });
         let reserved = self
@@ -2357,7 +2466,10 @@ impl Waiter {
             let quiet = bound.map(|max| QuietStart {
                 load1: reading.load1,
                 max,
-                at_bound: past && reading.load1.is_some_and(|l| l > max),
+                gpu,
+                at_bound: past
+                    && (reading.load1.is_some_and(|l| l > max)
+                        || gpu.is_some_and(|b| b > crate::QUIET_GPU_BUSY)),
                 reserved: Duration::from_millis(reserved),
             });
             (granted, quiet)
@@ -2494,7 +2606,7 @@ impl Waiter {
     /// short of anything but the ledger's lock.
     pub fn force(mut self, machine: &dyn Machine) -> io::Result<Forced> {
         if self.ledger.cohort_aware()? {
-            return match self.poll_mode(machine, true) {
+            return match self.poll_mode(machine, true, &|| false) {
                 Polled::Admitted(claim) => Ok(Forced::Admitted(claim, None)),
                 Polled::Waiting(waiter, short)
                     if matches!(short.shorts[..], [Short::Turn { .. }]) =>
@@ -2512,7 +2624,7 @@ impl Waiter {
                 return Ok(Forced::Turn(self, Shortfall::only(Short::Turn { holder })));
             }
         };
-        let found = self.look(machine)?;
+        let found = self.look(machine, None)?;
         // An override may bypass resource-only memory/disk admission, never a Release's
         // core reservation or the physical core bound.
         if self.record.need.cores > 0 && found.cores == 0 {
@@ -2553,7 +2665,8 @@ impl Waiter {
     /// and `--admit now` starts it ([`UNSERVABLE`]); for a quiet claim next for the quiet
     /// machine, when its patience reserves the machine and when its wait reaches the bound.
     /// A measured need that runs loaded starts there on a busy machine and says so, a strict one
-    /// is refused; load-only admission starts whatever the load.
+    /// is refused; load-only admission starts whatever the load, and a wait the GPU alone holds
+    /// back starts whatever the GPU.
     pub(crate) fn line(&self, short: &Shortfall) -> String {
         use std::fmt::Write as _;
         let mut line = format!(
@@ -2564,13 +2677,17 @@ impl Waiter {
         if short.shorts.iter().any(Short::unservable) {
             line.push_str(UNSERVABLE);
         }
-        let waits_load = short
-            .shorts
-            .iter()
-            .any(|s| matches!(s, Short::Load { .. } | Short::Timing(_)));
-        if let (true, Some(p), Some(next)) =
-            (waits_load, self.record.need.patience, self.record.next_ms)
-        {
+        let waits_machine = short.shorts.iter().any(Short::machine_busy);
+        if let (true, Some(p), Some(next)) = (
+            waits_machine,
+            self.record.need.patience,
+            self.record.next_ms,
+        ) {
+            let gpu = short.shorts.iter().any(|s| matches!(s, Short::Gpu { .. }));
+            let cpu = short
+                .shorts
+                .iter()
+                .any(|s| matches!(s, Short::Load { .. } | Short::Timing(_)));
             let now = now_ms();
             // Whole seconds to go, rounded up: a person reads `2m00s` for the minute and 59.9 s left.
             let at = |d: Duration| {
@@ -2584,8 +2701,15 @@ impl Waiter {
                     let _ = write!(line, "; it reserves the machine in {}, and ", span(d));
                 }
             }
-            if self.record.need.quiet_policy != crate::QuietPolicy::Timing {
-                let _ = write!(line, "starts whatever the load in {start}");
+            if !cpu {
+                let _ = write!(line, "starts whatever the GPU in {start}");
+            } else if self.record.need.quiet_policy != crate::QuietPolicy::Timing {
+                let whatever = if gpu {
+                    "the load and the GPU"
+                } else {
+                    "the load"
+                };
+                let _ = write!(line, "starts whatever {whatever} in {start}");
             } else if self.record.need.at_bound == crate::AtBound::RunLoaded {
                 let _ = write!(
                     line,
@@ -2623,11 +2747,12 @@ impl Waiter {
 /// last of them to work has made none. A claim that waits ahead looks again every few seconds, so
 /// it works, and a short that no claim holds has no holder to be stuck.
 pub(crate) fn stuck(holders: &[Holder]) -> Option<aterm_toolchain::waits::Stuck> {
-    let spans: Option<Vec<Duration>> = holders
-        .iter()
-        .map(|h| h.stalled.filter(|_| h.held))
-        .collect();
-    let span = spans?.into_iter().min()?;
+    let mut min_span: Option<Duration> = None;
+    for h in holders {
+        let span = h.stalled.filter(|_| h.held)?;
+        min_span = Some(min_span.map_or(span, |cur| cur.min(span)));
+    }
+    let span = min_span?;
     let mut pids: Vec<u32> = holders.iter().map(|h| h.pid).collect();
     pids.sort_unstable();
     pids.dedup();
@@ -3105,7 +3230,7 @@ fn admit_deciding(
         }
         // A claim file removed while it waits (the ledger's directory cleaned) is in no other
         // session's queue and can never be named a claim: the wait ends, saying so.
-        let polled = waiter.poll(machine);
+        let polled = waiter.poll_until(machine, &interrupted);
         if let Polled::Waiting(w, short) = &polled
             && entered.stuck_ends.is_some()
             && let Some(stuck) = w.stuck()

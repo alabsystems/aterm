@@ -73,7 +73,7 @@ fn report_preserves_the_authenticated_predecessor_order_and_refuses_incomplete_c
             .unwrap();
     }
     let config = lab._home.path().join("aterm.toml");
-    std::fs::write(&config, "").unwrap();
+    aterm_uds::atomic_file::write(&config, b"", 0o600).unwrap();
     let selected = crate::test_complete_writer_successor(
         lab._home.path(),
         &original,

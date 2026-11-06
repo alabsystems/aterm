@@ -6,6 +6,7 @@
 pub mod adopt;
 pub mod api;
 pub mod artifact;
+pub mod canary;
 pub mod channel;
 pub mod cli;
 pub mod ctx;

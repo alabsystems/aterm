@@ -3,7 +3,7 @@
 
 //! Bridge loop wait tally ([`SEAM`](crate::wait_tally::SEAM), [`FILE`](crate::wait_tally::FILE), [`Tally::parse`](crate::wait_tally::Tally::parse), [`Tally::since`](crate::wait_tally::Tally::since),
 //! [`Tally::at_ns`](crate::wait_tally::Tally::at_ns), [`Recorder::idle`](crate::wait_tally::Recorder::idle)) with per-[`Row`](crate::wait_tally::Row) log2 [`Hist`](crate::wait_tally::Hist) buckets
-//! ([`Row::partitions`](crate::wait_tally::Row::partitions)): broker ([`Row::Request`](crate::wait_tally::Row::Request), [`Row::Ack`](crate::wait_tally::Row::Ack), [`Row::Commit`](crate::wait_tally::Row::Commit)), verb lane
+//! ([`Row::partitions`](crate::wait_tally::Row::partitions)): broker ([`Row::Request`](crate::wait_tally::Row::Request), [`Row::BudgetRequest`](crate::wait_tally::Row::BudgetRequest), [`Row::Ack`](crate::wait_tally::Row::Ack), [`Row::Commit`](crate::wait_tally::Row::Commit)), verb lane
 //! ([`Row::LaneOutbox`](crate::wait_tally::Row::LaneOutbox), the presence reads [`Row::LaneStatus`](crate::wait_tally::Row::LaneStatus) to
 //! [`Row::LaneSessionsStatus`](crate::wait_tally::Row::LaneSessionsStatus), [`Row::LaneOther`](crate::wait_tally::Row::LaneOther), [`lane_row`](crate::wait_tally::lane_row)), [`crate::state::StateDir`]
 //! ([`Row::DirReplace`](crate::wait_tally::Row::DirReplace), [`Row::DirFlush`](crate::wait_tally::Row::DirFlush), [`Row::SetPostPin`](crate::wait_tally::Row::SetPostPin), [`Row::AppendSelfAcked`](crate::wait_tally::Row::AppendSelfAcked),
@@ -40,7 +40,7 @@ pub const FILE: &str = "wait-tally";
 
 /// What the line starts with: the format's name and version. The head's fields follow it,
 /// each fixed-width, the row count ([`ROWS`]) first.
-pub const FORMAT: &str = "wait-tally v=7";
+pub const FORMAT: &str = "wait-tally v=8";
 
 /// What `astream_sys::flush_tally`, in the head, counts of this build's flushes
 /// (`aterm_durable::ASTREAM_COUNTS`): one word for every line a build writes, so every line
@@ -50,8 +50,11 @@ pub const FLUSHES_COUNTED: &str = aterm_durable::ASTREAM_COUNTS;
 /// One thing the loop does, counted ([`Hist`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Row {
-    /// Requests that read their own reply.
+    /// Requests that read their own reply, but the subject budget's ([`Row::BudgetRequest`]).
     Request,
+    /// Of the requests that read their own reply, the node's subject budget's
+    /// (`subject_budget`), apart from [`Row::Request`] (critic item G04).
+    BudgetRequest,
     /// Pipelined acks read, waited for or not.
     Ack,
     /// Of both, the inbox group's commits (a pipelined ack each since aterm-0).
@@ -124,12 +127,13 @@ pub enum Row {
 }
 
 /// How many rows a line holds.
-pub const ROWS: usize = 30;
+pub const ROWS: usize = 31;
 
 impl Row {
     /// Every row, in the line's order.
     pub const ALL: [Row; ROWS] = [
         Row::Request,
+        Row::BudgetRequest,
         Row::Ack,
         Row::Commit,
         Row::LaneOutbox,
@@ -172,6 +176,7 @@ impl Row {
     pub const fn name(self) -> &'static str {
         match self {
             Row::Request => "request",
+            Row::BudgetRequest => "budget_request",
             Row::Ack => "ack",
             Row::Commit => "commit",
             Row::LaneOutbox => "lane_outbox",
@@ -219,6 +224,7 @@ impl Row {
         matches!(
             self,
             Row::Request
+                | Row::BudgetRequest
                 | Row::Ack
                 | Row::LaneOutbox
                 | Row::LaneSessions
@@ -662,11 +668,12 @@ impl Tally {
         &self.rows[r.index()]
     }
 
-    /// Every wait on the broker, requests and acks.
+    /// Every wait on the broker, requests (the subject budget's too) and acks.
     #[must_use]
     pub const fn blocked_ns(&self) -> u64 {
         self.row(Row::Request)
             .total
+            .saturating_add(self.row(Row::BudgetRequest).total)
             .saturating_add(self.row(Row::Ack).total)
     }
 
@@ -1190,10 +1197,11 @@ impl Recorder {
         }
     }
 
-    /// A request written at `started` has had its reply read now.
-    pub(crate) fn request(&mut self, started: Instant) {
+    /// A request written at `started` has had its reply read now, counted in `row`
+    /// ([`Row::Request`], or [`Row::BudgetRequest`] for the subject budget's).
+    pub(crate) fn request(&mut self, row: Row, started: Instant) {
         if self.on() {
-            self.note(Row::Request, Some(started));
+            self.note(row, Some(started));
         }
     }
 
@@ -1416,7 +1424,7 @@ mod tests {
         let t = sample();
         let line = t.render();
         assert!(
-            line.starts_with("wait-tally v=7 rows=030 pid=0000004242 "),
+            line.starts_with("wait-tally v=8 rows=031 pid=0000004242 "),
             "{line}"
         );
         assert!(
@@ -1432,8 +1440,8 @@ mod tests {
         );
         assert!(
             line.contains(&format!(
-                " slow_calls=00000000000000000003 calls=00{:016x}+{:016x}.01{:016x}+{:016x}.\
-                 06{:016x}+{:016x}.--0000000000000000+0000000000000000.",
+                " slow_calls=00000000000000000003 calls=00{:016x}+{:016x}.02{:016x}+{:016x}.\
+                 07{:016x}+{:016x}.--0000000000000000+0000000000000000.",
                 7_000_000_000u64,
                 31_000_000u64,
                 7_020_000_000u64,
@@ -1515,10 +1523,10 @@ mod tests {
             Ok(sample()),
             "the control: re-summed as it was, it reads"
         );
-        let fewer = body.replacen("rows=030", "rows=025", 1);
+        let fewer = body.replacen("rows=031", "rows=025", 1);
         let why = Tally::parse(&resummed(fewer)).expect_err("another row count");
         assert!(
-            why.contains("of 25 rows") && why.contains("reads 30"),
+            why.contains("of 25 rows") && why.contains("reads 31"),
             "{why}"
         );
         let other = if FLUSHES_COUNTED == "all" {
@@ -1642,7 +1650,7 @@ mod tests {
         put(
             "a row past the last",
             2,
-            place("30", 7_100_000_000, 40_000_000),
+            place(&format!("{ROWS:02}"), 7_100_000_000, 40_000_000),
         );
         put(
             "a row not in digits",
@@ -1652,19 +1660,19 @@ mod tests {
         put(
             "a call under 1.05 ms",
             2,
-            place("06", 7_100_000_000, (1 << 20) - 1),
+            place("07", 7_100_000_000, (1 << 20) - 1),
         );
         put(
             "a call that ends before the one before it",
             2,
-            place("06", 7_000_000_000, 20_000_000),
+            place("07", 7_000_000_000, 20_000_000),
         );
         put("a call after an empty place", 4, places[2].clone());
         put("an empty place with a span", 3, place("--", 0, 1));
         put(
             "a start not in hex",
             2,
-            format!("06{}+{:016x}", "00000001a2b3c4dz", 40_000_000),
+            format!("07{}+{:016x}", "00000001a2b3c4dz", 40_000_000),
         );
         put("a place with no length", 2, places[2].replace('+', ""));
         let mut short = places.clone();
@@ -1728,14 +1736,14 @@ mod tests {
         );
         for bad in [
             "",
-            "wait-tally v=7\n",
+            "wait-tally v=8\n",
             &old[..old.len() - 1],
-            &old.replace("wait-tally v=7", "wait-tally v=6"),
+            &old.replace("wait-tally v=8", "wait-tally v=7"),
             &old.replace(" sum=", " sum=0"),
         ] {
             assert!(Tally::parse(bad).is_err(), "{bad:?}");
         }
-        for body in ["wait-tally v=7 rows=030 pid=1 requests=1".to_string(), {
+        for body in ["wait-tally v=8 rows=031 pid=1 requests=1".to_string(), {
             let (body, _) = old.trim_end().rsplit_once(" sum=").expect("a sum");
             body.rsplit_once('.').expect("a band").0.to_string()
         }] {
@@ -2124,7 +2132,7 @@ mod tests {
     #[test]
     fn an_off_recorder_counts_nothing_and_an_on_one_writes_only_what_moved() {
         let mut off = Recorder::default();
-        off.request(Instant::now());
+        off.request(Row::Request, Instant::now());
         let started = off.ack_starts();
         assert_eq!(started, None);
         assert_eq!(off.starts(), None);
@@ -2140,8 +2148,9 @@ mod tests {
         assert!(on.on());
         let read = || std::fs::read_to_string(&path).expect("read the tally");
         assert_eq!(read(), "", "nothing until the first idle moment");
-        on.request(Instant::now());
-        on.request(Instant::now());
+        on.request(Row::Request, Instant::now());
+        on.request(Row::Request, Instant::now());
+        on.request(Row::BudgetRequest, Instant::now());
         let started = on.ack_starts();
         assert!(started.is_some());
         on.ack(started, false);
@@ -2161,12 +2170,14 @@ mod tests {
             (
                 written.pid,
                 counts(&written, Row::Request),
+                counts(&written, Row::BudgetRequest),
                 counts(&written, Row::Commit),
                 counts(&written, Row::Ack),
                 counts(&written, Row::LaneSent),
                 written.row(Row::DrainPosts).total,
             ),
-            (std::process::id(), 2, 1, 2, 1, 2)
+            (std::process::id(), 2, 1, 1, 2, 1, 2),
+            "a request is counted in the row it names, a budget read apart from the rest"
         );
         assert_eq!(
             (

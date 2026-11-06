@@ -6,6 +6,80 @@
 use super::*;
 use crate::harness::disk::tests::Tmp;
 
+fn sparse_reserve(path: &Path, length: u64, prefix: bool) -> u64 {
+    use std::io::Write as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .unwrap();
+    if prefix {
+        file.write_all(&[0x5a; 4096]).unwrap();
+        aterm_durable::ordered(&file).unwrap();
+    }
+    file.set_len(length).unwrap();
+    aterm_durable::ordered(&file).unwrap();
+    let meta = file.metadata().unwrap();
+    let held = meta.blocks().saturating_mul(512);
+    assert_eq!(meta.len(), length);
+    assert!(held < length, "the fixture really is sparse: {meta:?}");
+    held
+}
+
+#[test]
+fn reserve_allocation_sparse_files_are_repaired_before_readiness() {
+    use std::os::unix::fs::MetadataExt as _;
+    let tmp = Tmp::new("reserve-sparse-repair");
+    let path = path_for(tmp.path());
+    let length = 8 << 20;
+    sparse_reserve(&path, length, true);
+    assert!(matches!(state(&path), Err(ReserveError::Thin(_))));
+    assert_eq!(ensure(&path, length), Ok(true));
+    let meta = std::fs::symlink_metadata(&path).unwrap();
+    assert_eq!(meta.len(), length);
+    assert!(meta.blocks().saturating_mul(512) >= length);
+    assert_eq!(state(&path), Ok(State::Present(length)));
+    assert_eq!(ensure(&path, length), Ok(false));
+    let kept = std::fs::symlink_metadata(&path).unwrap();
+    assert_eq!((kept.dev(), kept.ino()), (meta.dev(), meta.ino()));
+    assert_eq!(release(&path), Ok(Some(length)));
+}
+
+#[test]
+fn reserve_allocation_sparse_release_counts_only_held_blocks() {
+    for prefix in [false, true] {
+        let tmp = Tmp::new("reserve-sparse-release");
+        let path = path_for(tmp.path());
+        let length = 8 << 20;
+        let held = sparse_reserve(&path, length, prefix);
+        assert_eq!(release(&path), Ok(Some(held.min(length))));
+        assert!(!path.exists());
+        assert_eq!(release(&path), Ok(None));
+    }
+}
+
+#[test]
+fn reserve_allocation_shared_inodes_are_left_alone() {
+    let tmp = Tmp::new("reserve-shared");
+    let path = path_for(tmp.path());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    write_blocks(&path, 8192).unwrap();
+    let alias = tmp.path().join("another-name");
+    std::fs::hard_link(&path, &alias).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    assert!(matches!(state(&path), Err(ReserveError::NotOurs(_))));
+    assert!(matches!(ensure(&path, 8192), Err(ReserveError::NotOurs(_))));
+    assert!(matches!(release(&path), Err(ReserveError::NotOurs(_))));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(std::fs::read(&alias).unwrap(), before);
+    std::fs::remove_file(alias).unwrap();
+    assert_eq!(state(&path), Ok(State::Present(8192)));
+    assert_eq!(release(&path), Ok(Some(8192)));
+}
+
 #[test]
 fn writing_the_reserve_ticks_for_each_block() {
     let tmp = Tmp::new("reserve-ticks");

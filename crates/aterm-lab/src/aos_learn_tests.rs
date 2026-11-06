@@ -53,7 +53,6 @@ fn each_verb_takes_its_flags_alone() {
         parse(&args(&["chain"])).ok(),
         Some(Verb::Chain { threads: 1 })
     );
-    assert_eq!(parse(&args(&["build"])).ok(), Some(Verb::Build));
     assert_eq!(
         parse(&args(&["verify", "--threads", "8", "--store", "s"])).ok(),
         Some(Verb::Verify {
@@ -96,8 +95,6 @@ fn each_verb_takes_its_flags_alone() {
         &["frobnicate"],
         &["chain", "--store", "s"],
         &["chain", "--to", &d],
-        &["build", "--threads", "2"],
-        &["build", "extra"],
         &["init", "--store", "s"],
         &["init", "--practice", "0"],
         &["init", "--store", "s", "--practice", "0", "--threads", "2"],

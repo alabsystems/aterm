@@ -50,6 +50,14 @@ impl RingExtras {
         })
     }
 
+    /// Every inline-image span the ring's history rows hold, oldest row first.
+    pub(crate) fn images(&self) -> impl Iterator<Item = &aterm_scrollback::ImageSpan> {
+        self.slots
+            .iter()
+            .filter_map(|slot| slot.as_deref())
+            .flat_map(|extras| extras.images.iter())
+    }
+
     /// Retains accepted image spans, preserving the running retained-byte count.
     pub(crate) fn retain_images(
         &mut self,

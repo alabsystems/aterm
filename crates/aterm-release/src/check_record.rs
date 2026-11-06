@@ -153,10 +153,13 @@ pub fn seal_dir(seal: &str) -> String {
 /// one path per key, so no record of one key ever replaces another key's.
 #[must_use]
 pub fn path(root: &Path, tree: &str, seal: &str, check: &str, executable: Option<&str>) -> PathBuf {
-    let dir = root.join(tree).join(seal_dir(seal));
+    path_in_seal_dir(&root.join(tree).join(seal_dir(seal)), check, executable)
+}
+
+fn path_in_seal_dir(seal_dir: &Path, check: &str, executable: Option<&str>) -> PathBuf {
     match executable {
-        Some(u) => dir.join(check).join(format!("{u}.toml")),
-        None => dir.join(format!("{check}.toml")),
+        Some(u) => seal_dir.join(check).join(format!("{u}.toml")),
+        None => seal_dir.join(format!("{check}.toml")),
     }
 }
 
@@ -212,15 +215,10 @@ fn answers(
     record.key == key(check, tree, seal, executable)
 }
 
-/// The records of bundle check `check` of `tree` under `seal`, one per executable: each U and
+/// The records of bundle check `check` in `seal_dir`, one per executable: each U and
 /// its record's path, in U order.
-fn bundle_records(
-    root: &Path,
-    tree: &str,
-    seal: &str,
-    check: &str,
-) -> Result<Vec<(String, PathBuf)>, String> {
-    let dir = root.join(tree).join(seal_dir(seal)).join(check);
+fn bundle_records(seal_dir: &Path, check: &str) -> Result<Vec<(String, PathBuf)>, String> {
+    let dir = seal_dir.join(check);
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -239,7 +237,7 @@ fn bundle_records(
             found.push((u, entry.path()));
         }
     }
-    found.sort();
+    found.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     Ok(found)
 }
 
@@ -304,7 +302,12 @@ impl VerifyRun {
     /// (`--checks a,b`).
     #[must_use]
     pub fn strict_subset(&self) -> bool {
-        self.checks != release_names()
+        self.checks.len() != RELEASE.len()
+            || self
+                .checks
+                .iter()
+                .zip(RELEASE.iter())
+                .any(|(a, b)| a != b.name())
     }
 
     /// Whether it runs a bundle check, the one kind that reads `--app`.
@@ -600,13 +603,14 @@ pub fn checks_in(
         return Ok(Checks::of(commit, tree, executable, missing, Vec::new()));
     }
     let seal = seal()?;
+    let seal_path = root.join(tree).join(seal_dir(&seal));
     let mut states: BTreeMap<&'static str, State> = BTreeMap::new();
     for check in RELEASE {
         let u = bundle(check).then_some(executable).flatten();
         if bundle(check) && u.is_none() {
             continue;
         }
-        let Read::Record(record) = read(&path(root, tree, &seal, check.name(), u))? else {
+        let Read::Record(record) = read(&path_in_seal_dir(&seal_path, check.name(), u))? else {
             continue;
         };
         if !answers(&record, check.name(), tree, &seal, u) {
@@ -638,7 +642,7 @@ pub fn checks_in(
     let mut also = Vec::new();
     // The run-level record refuses the tree when no check's own record does, and names it then.
     if !states.values().any(|s| matches!(s, State::Failed { .. }))
-        && let Read::Record(record) = read(&path(root, tree, &seal, RUN_LEVEL, None))?
+        && let Read::Record(record) = read(&path_in_seal_dir(&seal_path, RUN_LEVEL, None))?
         && answers(&record, RUN_LEVEL, tree, &seal, None)
         && [FAIL, BEGAN].contains(&record.outcome.as_str())
     {
@@ -651,7 +655,7 @@ pub fn checks_in(
     // A FAIL of a bundle check on another build of this tree under this seal refuses it too: a
     // rebuilt U (a spent reservation built again) never re-rolls it.
     for check in RELEASE.into_iter().filter(|c| bundle(*c)) {
-        for (u, at) in bundle_records(root, tree, &seal, check.name())? {
+        for (u, at) in bundle_records(&seal_path, check.name())? {
             if Some(u.as_str()) == executable {
                 continue;
             }
@@ -885,12 +889,18 @@ pub fn events(at: &Path) -> std::io::Result<RunEvents> {
                     .as_str()
                     .filter(|s| aterm_codec::hex::is_lower(s, 64))
                     .unwrap_or_default();
-                binaries.retain(|b| b.spec != spec);
-                binaries.push(Binary {
-                    spec: spec.to_owned(),
-                    sha256: sha256.to_owned(),
-                    outcome: outcome.to_owned(),
-                });
+                if let Some(pos) = binaries.iter().position(|b| b.spec == spec) {
+                    let mut b = binaries.remove(pos);
+                    sha256.clone_into(&mut b.sha256);
+                    outcome.clone_into(&mut b.outcome);
+                    binaries.push(b);
+                } else {
+                    binaries.push(Binary {
+                        spec: spec.to_owned(),
+                        sha256: sha256.to_owned(),
+                        outcome: outcome.to_owned(),
+                    });
+                }
             }
             _ => {}
         }
@@ -1023,6 +1033,7 @@ pub fn write_run(
     end: RunEnd<'_>,
 ) -> Result<Vec<String>, String> {
     let ended = (end.exit, end.log_sha256);
+    let seal_path = root.join(facts.tree).join(seal_dir(facts.seal));
     let mut records: Vec<(PathBuf, CheckRecord, String)> = Vec::new();
     if let Ok(events) = end.events {
         let mut test_finished = false;
@@ -1038,7 +1049,7 @@ pub fn write_run(
                 || ![OK, FAIL, NOT_RUN, SKIP].contains(&outcome)
             {
                 continue;
-            }
+            };
             let u = bundle(check).then_some(facts.executable);
             let mut r = record(facts, ended, name, outcome, u);
             r.seconds = event["seconds"].as_f64().unwrap_or(0.0);
@@ -1065,7 +1076,7 @@ pub fn write_run(
                 r.binaries.clone_from(&events.binaries);
             }
             records.push((
-                path(root, facts.tree, facts.seal, name, u),
+                path_in_seal_dir(&seal_path, name, u),
                 r,
                 format!("{name} {outcome}"),
             ));
@@ -1089,7 +1100,7 @@ pub fn write_run(
             );
             r.binaries.clone_from(&events.binaries);
             let said = format!("test {} (from its binaries)", r.outcome);
-            records.push((path(root, facts.tree, facts.seal, "test", None), r, said));
+            records.push((path_in_seal_dir(&seal_path, "test", None), r, said));
         }
     }
     let failed = records.iter().any(|(_, r, _)| r.outcome == FAIL);
@@ -1099,7 +1110,7 @@ pub fn write_run(
         write(at, r)?;
         lines.push(format!("{said} → {}", at.display()));
     }
-    let began = path(root, facts.tree, facts.seal, RUN_LEVEL, None);
+    let began = path_in_seal_dir(&seal_path, RUN_LEVEL, None);
     let run_level = end.exit == 1 && !failed;
     if run_level {
         let mut r = record(facts, ended, RUN_LEVEL, FAIL, None);

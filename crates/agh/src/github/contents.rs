@@ -130,7 +130,7 @@ impl<'a> Contents<'a> {
             .map(from_json::<ContentEntry>)
             .collect::<Result<Vec<_>>>()
             .map_err(|e| e.with_repo(self.slug.to_string()))?;
-        items.sort_by(|a, b| a.name.cmp(&b.name));
+        items.sort_unstable_by(|a, b| a.name.cmp(&b.name));
         let end = if items.len() >= DIRECTORY_CAP {
             if !partial {
                 return Err(Error::new(Kind::Incomplete, DIRECTORY_CAP_WHY)

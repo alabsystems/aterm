@@ -219,7 +219,7 @@ impl Model {
             .iter()
             .flat_map(|k| self.up.variants(k, &self.enabled))
             .collect();
-        out.sort_by(|a, b| (&a.module, a.order).cmp(&(&b.module, b.order)));
+        out.sort_unstable_by(|a, b| (&a.module, a.order).cmp(&(&b.module, b.order)));
         out
     }
     pub fn summary(&self) -> String {
@@ -307,14 +307,15 @@ pub fn rust_files(root: &Path) -> Result<Vec<PathBuf>> {
         for e in std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))? {
             let e = e.map_err(|e| e.to_string())?;
             let t = e.file_type().map_err(|e| e.to_string())?;
-            if t.is_dir() && e.file_name() != "target" && e.file_name() != ".git" {
+            let name = e.file_name();
+            if t.is_dir() && name != "target" && name != ".git" {
                 todo.push(e.path())
-            } else if t.is_file() && e.path().extension().is_some_and(|s| s == "rs") {
+            } else if t.is_file() && Path::new(&name).extension().is_some_and(|s| s == "rs") {
                 out.push(e.path())
             }
         }
     }
-    out.sort();
+    out.sort_unstable();
     Ok(out)
 }
 fn raw_tokens(src: &str) -> Vec<Token> {
@@ -510,7 +511,7 @@ pub fn harvest_file(
         }
         h.seed(&[], &segs, t.start)?;
     }
-    for (alias, base) in h.aliases.clone() {
+    for (alias, base) in std::mem::take(&mut h.aliases) {
         for (idx, t) in ts.iter().enumerate() {
             if t.text != alias
                 || !ts.get(idx + 1).is_some_and(|t| t.text == "::")

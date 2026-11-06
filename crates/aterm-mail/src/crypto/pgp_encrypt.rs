@@ -140,14 +140,31 @@ impl EncryptedBody {
         Ok(frame(1, &packet))
     }
     pub fn armored(&self, recipient: &Recipient) -> Result<String, String> {
-        let mut bytes = self.key_packet(recipient)?;
-        bytes.extend_from_slice(&self.data);
-        let encoded =
-            aterm_codec::base64::encode(&bytes).map_err(|_| "Could not encode encrypted mail")?;
-        let mut out = String::with_capacity(encoded.len() + encoded.len() / 64 + 64);
+        let key_packet = self.key_packet(recipient)?;
+        let total_bytes = key_packet.len() + self.data.len();
+        let b64_len = total_bytes.div_ceil(3) * 4;
+        let mut out = String::with_capacity(b64_len + b64_len / 64 + 64);
         out.push_str("-----BEGIN PGP MESSAGE-----\n\n");
-        for line in encoded.as_bytes().chunks(64) {
-            out.push_str(std::str::from_utf8(line).map_err(|_| "Invalid encoded mail")?);
+        let (head_chunks, head_rem) = key_packet.as_chunks::<48>();
+        for chunk in head_chunks {
+            aterm_codec::base64::encode_into(&mut out, chunk)
+                .map_err(|_| "Could not encode encrypted mail")?;
+            out.push('\n');
+        }
+        let mut tail = self.data.as_slice();
+        if !head_rem.is_empty() {
+            let take = (48 - head_rem.len()).min(tail.len());
+            let mut stitch = [0u8; 48];
+            stitch[..head_rem.len()].copy_from_slice(head_rem);
+            stitch[head_rem.len()..head_rem.len() + take].copy_from_slice(&tail[..take]);
+            aterm_codec::base64::encode_into(&mut out, &stitch[..head_rem.len() + take])
+                .map_err(|_| "Could not encode encrypted mail")?;
+            out.push('\n');
+            tail = &tail[take..];
+        }
+        for chunk in tail.chunks(48) {
+            aterm_codec::base64::encode_into(&mut out, chunk)
+                .map_err(|_| "Could not encode encrypted mail")?;
             out.push('\n');
         }
         out.push_str("-----END PGP MESSAGE-----\n");

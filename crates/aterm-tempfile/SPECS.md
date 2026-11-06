@@ -1,10 +1,10 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-tempfile: spec recovery from its 20 unit tests
+# aterm-tempfile: spec recovery from its 21 unit tests
 
-> Status 2026-11-05: reconciled with current `main` across all 20 live `#[test]` functions in
-> `src/lib.rs` (8 unconditional, 9 `cfg(unix)`, 2 `cfg(target_os = "macos")`, and 1 `cfg(windows)`).
+> Status 2026-11-05: reconciled with current `main` across all 21 live `#[test]` functions in
+> `src/lib.rs` (8 unconditional, 9 `cfg(unix)`, 3 `cfg(target_os = "macos")`, and 1 `cfg(windows)`).
 
 > Audit amendment: The 2026-10-16 code audit corrected unique_name's cross-process uniqueness claim (§5.1). The dated inventory below records the earlier snapshot; atomic-create collision retry remains the guarantee.
 
@@ -14,9 +14,9 @@
 > `unique-name-format-and-injective` can retire its test without the effects lane (gap 8).
 
 Source: `crates/aterm-tempfile/src/lib.rs` (read only). Every path below is repo-relative. It is the crate's only source file.
-All 20 `#[test]` fns are in its `mod tests` (8 unconditional, 9 `cfg(unix)`, 2 `cfg(target_os = "macos")`, and 1 `cfg(windows)`).
+All 21 `#[test]` fns are in its `mod tests` (8 unconditional, 9 `cfg(unix)`, 3 `cfg(target_os = "macos")`, and 1 `cfg(windows)`).
 
-Result: **4 specs**, covering **19 tests**. **1 test is not a spec sample** (§4).
+Result: **4 specs**, covering **19 tests**. **2 tests are not spec samples** (§4).
 
 ## 0. Notation used in the statements
 
@@ -123,11 +123,12 @@ crates/aterm-tempfile/src/lib.rs	a_slot_still_being_written_or_holding_another_t
 crates/aterm-tempfile/src/lib.rs	a_cache_folder_not_the_users_alone_is_refused	stand-in-read-only-shared-inode	
 crates/aterm-tempfile/src/lib.rs	a_slot_handed_out_is_marked_used_and_one_passed_over_is_not	stand-in-read-only-shared-inode	
 crates/aterm-tempfile/src/lib.rs	windows_os_random_succeeds	(none; §4)	
+crates/aterm-tempfile/src/lib.rs	a_cloned_tree_holds_what_its_source_held_and_shares_nothing_after	(none; §4)	
 ```
 
 ## 3. Coverage
 
-- 20 `#[test]` functions in `src/lib.rs` (including `unique_name_hex_digit_and_seed_codec_roundtrip`,
+- 21 `#[test]` functions in `src/lib.rs` (including `unique_name_hex_digit_and_seed_codec_roundtrip`,
   `a_suffix_stays_in_the_name_and_keeps_directory_cleanup`, `a_cache_slots_hash_is_aterm_hashs_fold`,
   the `.ubd` quiet-folder suite, and the stand-in suite, plus the non-`#[test]` child helper
   `stand_in_cache_child_if_asked`). `tempdir-creates-fresh-private-dir-under-parent` directly tests Unix `0o700`
@@ -140,6 +141,7 @@ crates/aterm-tempfile/src/lib.rs	windows_os_random_succeeds	(none; §4)
 | test | why | recommendation |
 |---|---|---|
 | crates/aterm-tempfile/src/lib.rs::windows_os_random_succeeds | It is a `cfg(windows)` smoke check of the BCryptGenRandom FFI (without the former probabilistic `assert_ne!`). It belongs in the FFI assumption channel as an axiom on `read_os_random` (gap 8). | **move-to-bench**: move it to a Windows environment check, outside the unit-test suite, and record the OS-RNG success assumption as the FFI contract of `read_os_random`. |
+| crates/aterm-tempfile/src/lib.rs::a_cloned_tree_holds_what_its_source_held_and_shares_nothing_after | It holds `clone_tree`, added 2026-11-05, which none of the 4 specs states: a `cfg(target_os = "macos")` check of `clonefile(2)` on a directory, each entry keeping its mode and sharing nothing afterwards. | **keep**: it stays a unit test until a spec of `clone_tree` is written, with the call's contract in the FFI assumption channel. |
 
 ## 5. Implied specs that look wrong, or disagree with the code
 

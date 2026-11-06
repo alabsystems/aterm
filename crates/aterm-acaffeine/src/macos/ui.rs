@@ -431,9 +431,21 @@ mod tests {
     use aterm_objc::Encode;
 
     use super::*;
+
     use crate::launchd::Startup;
     use crate::menu::{self, MenuAction};
     use crate::model::{Choice, Clocks, Mode};
+
+    /// The menu's other rows as `startup` and version 1 show them, the lid option off and no
+    /// pause.
+    fn plain(startup: Startup) -> menu::Shown<'static> {
+        menu::Shown {
+            startup,
+            lid_awake: false,
+            paused: None,
+            version: "1",
+        }
+    }
 
     fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
         CGRect {
@@ -490,9 +502,9 @@ mod tests {
             since_boot: 300_000,
             wall: 1_790_000_000,
         };
-        let off = menu::compose(Mode::Off, NOW, Startup::Off, "1");
+        let off = menu::compose(Mode::Off, NOW, plain(Startup::Off));
         assert_eq!(changed_rows(&off, &off), Some(vec![]));
-        let forever = menu::compose(Mode::Forever, NOW, Startup::Off, "1");
+        let forever = menu::compose(Mode::Forever, NOW, plain(Startup::Off));
         let forever_row = off
             .iter()
             .position(|r| {
@@ -507,8 +519,8 @@ mod tests {
             .expect("forever row");
         assert_eq!(changed_rows(&off, &forever), Some(vec![forever_row]));
         let timed = Mode::chosen(Choice::Hours1, NOW);
-        let a = menu::compose(timed, NOW, Startup::On, "1");
-        let b = menu::compose(timed, NOW + 60, Startup::On, "1");
+        let a = menu::compose(timed, NOW, plain(Startup::On));
+        let b = menu::compose(timed, NOW + 60, plain(Startup::On));
         assert_eq!(changed_rows(&a, &b).map(|c| c.len()), Some(1));
         assert_eq!(changed_rows(&off, &off[1..]), None);
         let mut kinds = off.clone();
@@ -543,7 +555,7 @@ mod tests {
                 .into_iter()
                 .flat_map(move |startup| {
                     [NOW, NOW + 30, NOW + 25 * crate::model::HOUR]
-                        .map(|at| menu::compose(mode, at, startup, "1"))
+                        .map(|at| menu::compose(mode, at, plain(startup)))
                 })
             })
             .collect();
@@ -554,8 +566,8 @@ mod tests {
         }
 
         let hour = Mode::chosen(Choice::Hours1, NOW);
-        let before = menu::compose(hour, NOW + (crate::model::HOUR - 30), Startup::Off, "1");
-        let after = menu::compose(hour, NOW + crate::model::HOUR + 1, Startup::Off, "1");
+        let before = menu::compose(hour, NOW + (crate::model::HOUR - 30), plain(Startup::Off));
+        let after = menu::compose(hour, NOW + crate::model::HOUR + 1, plain(Startup::Off));
         let row = |choice: Choice| {
             before
                 .iter()

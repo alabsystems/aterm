@@ -37,16 +37,14 @@ pub fn resolve_commit(clone: &Path, want: Build) -> Result<String> {
              from a branch this clone lacks)"
         )));
     }
-    let chain: Vec<String> = git::run(clone, &["rev-list", "--first-parent", &head])?
-        .lines()
-        .map(str::to_string)
-        .collect();
+    let first_parent = git::run(clone, &["rev-list", "--first-parent", &head])?;
+    let chain: Vec<&str> = first_parent.lines().collect();
     let (mut lo, mut hi) = (0usize, chain.len());
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        let c = git::rev_count(clone, &chain[mid])?;
+        let c = git::rev_count(clone, chain[mid])?;
         if c == want {
-            return Ok(chain[mid].clone());
+            return Ok(chain[mid].to_string());
         }
         if c > want {
             lo = mid + 1;
@@ -54,7 +52,8 @@ pub fn resolve_commit(clone: &Path, want: Build) -> Result<String> {
             hi = mid;
         }
     }
-    let (Some(newer), Some(older)) = (lo.checked_sub(1).and_then(|i| chain.get(i)), chain.get(lo))
+    let (Some(&newer), Some(&older)) =
+        (lo.checked_sub(1).and_then(|i| chain.get(i)), chain.get(lo))
     else {
         return Err(Error::refused(format!(
             "resolve: no first-parent bracket for count {want}"

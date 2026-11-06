@@ -962,7 +962,8 @@ pub fn retired_opt_outs_exported() -> Vec<(&'static str, &'static str)> {
 }
 
 /// The publisher-side act that cures an `UnknownField` verdict.
-pub const PUBLISH_RUSTC_GROUP: &str = "atpkg-publish publish-group rustc --seal <dir> --upload";
+pub const PUBLISH_RUSTC_GROUP: &str =
+    "atpkg-publish publish-group rustc --seal <dir> --stage-upload";
 
 fn workspace_with_trust_table(start: &Path) -> Option<PathBuf> {
     let mut dir = Some(start);

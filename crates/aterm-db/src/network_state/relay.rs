@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Read-only, same-user forwarding of the journal owner's current observation, and on a socket of
-//! its own ([`WAIT`]) of a held owner's wait: an owner that opened no journal yet, held before its
-//! first LAN use or by a disabled Commons, so a reader hears why. Readers prefer the journal
-//! owner's. Disk projections are never accepted by this protocol as live evidence.
+//! Read-only, same-user forwarding of the journal owner's current observation. Disk projections
+//! are never accepted by this protocol as live evidence.
 
 use super::*;
 use aterm_uds::{CtlListener, CtlStream, listener, peer};
@@ -16,9 +14,6 @@ use std::{
 };
 
 const NAME: &str = "observer.sock";
-/// The socket a held owner serves its wait on, apart from [`NAME`], so it never stands in the way
-/// of the journal owner's relay.
-const WAIT: &str = "waiting.sock";
 const REQUEST: &[u8] = b"aterm-observer/1\n";
 const ACK: &[u8] = b"\x06";
 #[cfg(not(test))]
@@ -150,11 +145,6 @@ fn stale(error: &io::Error) -> bool {
 impl Server {
     pub(super) fn start(dir: &Path, source: ObservationHandle) -> io::Result<Self> {
         Self::start_named(dir, NAME, source)
-    }
-
-    /// Serve a held owner's wait ([`WAIT`]).
-    pub(super) fn start_wait(dir: &Path, source: ObservationHandle) -> io::Result<Self> {
-        Self::start_named(dir, WAIT, source)
     }
 
     fn start_named(dir: &Path, name: &'static str, source: ObservationHandle) -> io::Result<Self> {
@@ -328,23 +318,8 @@ fn read(config: &Path) -> io::Result<NetworkObservation> {
         .map(|publication| publication.current_at(Instant::now(), aterm_time::unix_millis()))
 }
 
-/// The live observation of `config`'s Commons from another local owner: the journal owner's, else
-/// a held owner's wait. If both fail, preserve the owner's error unless its endpoint is absent
-/// or no longer accepting connections.
+/// The live observation of `config`'s Commons from the journal owner, another local process.
 pub(crate) fn read_publication(config: &Path) -> io::Result<Publication> {
-    read_named(config, NAME).or_else(|owner_error| {
-        read_named(config, WAIT).map_err(|wait_error| {
-            if stale(&owner_error) {
-                wait_error
-            } else {
-                owner_error
-            }
-        })
-    })
-}
-
-/// The journal owner's live observation only ([`read_publication`] without a held owner's wait).
-pub(crate) fn read_owner_publication(config: &Path) -> io::Result<Publication> {
     read_named(config, NAME)
 }
 
@@ -951,7 +926,7 @@ mod tests {
     }
 
     #[test]
-    fn long_paths_keep_profiles_waiters_and_directory_permissions_separate() {
+    fn long_paths_keep_profiles_and_directory_permissions_separate() {
         let root = socket_dir();
         let first = root.path().join("first-configuration-".repeat(10));
         let second = root.path().join("second-configuration-".repeat(10));
@@ -976,12 +951,6 @@ mod tests {
         assert_eq!(read(&alias).unwrap().observer, first_state.observer);
         assert_eq!(read(&second).unwrap().observer, second_state.observer);
 
-        let wait_handle = ObservationHandle::default();
-        let mut held = current();
-        held.visibility = Visibility::Waiting;
-        held.peers.clear();
-        publish(&wait_handle, held);
-        let wait = Server::start_wait(&directory(&first), wait_handle).unwrap();
         std::fs::set_permissions(directory(&first), std::fs::Permissions::from_mode(0o755))
             .unwrap();
         assert_eq!(
@@ -993,10 +962,9 @@ mod tests {
             .unwrap();
         assert_eq!(read(&first).unwrap().visibility, Visibility::Active);
         drop(first_owner);
-        assert_eq!(read(&first).unwrap().visibility, Visibility::Waiting);
-        assert_eq!(read(&alias).unwrap().visibility, Visibility::Waiting);
+        assert!(read(&first).is_err());
+        assert!(read(&alias).is_err());
         assert_eq!(read(&second).unwrap().observer, second_state.observer);
-        drop(wait);
 
         // An older owner used the short alias itself as its socket pathname.
         let legacy_handle = ObservationHandle::default();
@@ -1440,47 +1408,6 @@ mod tests {
             fake_reply(&wire, wire.len() as u32).unwrap_err(),
             "source-stale",
         );
-    }
-
-    #[test]
-    fn refused_owner_preserves_its_error_and_still_accepts_a_valid_wait() {
-        let root = socket_dir();
-        let config = root.path().join("aterm.toml");
-        let owner_handle = ObservationHandle::default();
-        let owner = Observer::open(&config, owner_handle.clone()).unwrap();
-        let state = current();
-        publish(&owner_handle, state.clone());
-        let wait_handle = ObservationHandle::default();
-        let mut held = current();
-        held.visibility = Visibility::Disabled;
-        held.peers.clear();
-        publish(&wait_handle, held);
-        let wait = Server::start_wait(&directory(&config), wait_handle).unwrap();
-        assert_eq!(read(&config).unwrap().visibility, Visibility::Active);
-        let mut refused = state;
-        refused.unverified_endpoints = crate::runtime::MAX_UNVERIFIED_ENDPOINTS + 1;
-        publish(&owner_handle, refused);
-        let fallback = read(&config).unwrap();
-        assert_eq!(fallback.visibility, Visibility::Disabled);
-        assert_eq!(fallback.via_local_process, Some(std::process::id()));
-        assert!(fallback.peers.is_empty());
-        drop(wait);
-        assert_eq!(
-            read(&config).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
-        drop(owner);
-        assert_eq!(read(&config).unwrap_err().kind(), io::ErrorKind::NotFound);
-        let wait_handle = ObservationHandle::default();
-        let mut invalid = current();
-        invalid.unverified_endpoints = crate::runtime::MAX_UNVERIFIED_ENDPOINTS + 1;
-        publish(&wait_handle, invalid);
-        let wait = Server::start_wait(&directory(&config), wait_handle).unwrap();
-        assert_eq!(
-            read(&config).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
-        drop(wait);
     }
 
     #[test]

@@ -7627,9 +7627,9 @@ impl Acting {
                             .map(|(_, ms)| ms)
                     })
                 }),
-                relaunch: Arc::new(move |sid, _, snap, left, upgrade, asked, carried, _| {
+                relaunch: Arc::new(move |sid, _, snap, left, upgrade, asked, how, _| {
                     a5.relaunch_attempts.fetch_add(1, Ordering::SeqCst);
-                    a5.carried_exits.lock().unwrap().push(carried);
+                    a5.carried_exits.lock().unwrap().push(how.carried);
                     assert_eq!(snap.tab, sid, "the snapshot of the session that left");
                     if a5.busy_sweep.load(Ordering::SeqCst) {
                         return "busy:another-sweep".to_string();
@@ -7647,7 +7647,7 @@ impl Acting {
                         || (matches!(left, ExitRecord::Unread)
                             && snap.codex().is_none()
                             && a5.record_left(snap));
-                    if !survived && asked.is_none() && !carried {
+                    if !survived && asked.is_none() && !how.carried {
                         return "ended:graceful-exit".to_string();
                     }
                     if asked.is_some() {
@@ -7768,7 +7768,7 @@ impl Acting {
                 account_restart: Arc::new(|_, _| None),
                 background: Arc::new(|_| false),
                 account_made: Arc::new(|_, _, _| {}),
-                account_cold: Arc::new(|_, _| Ok(relaunch::ColdAdmission::Immediate(None))),
+                account_cold: Arc::new(|_, _, _| Ok(relaunch::ColdAdmission::Immediate(None))),
                 codex_cold: Arc::new(|_| Ok(None)),
                 hold: Arc::new(|_, _| true),
                 route: Arc::new(|_, _, _| Route::Custom("inert".to_string())),
@@ -22871,7 +22871,12 @@ fn pty_job(end: JobEnd) -> (i32, std::process::Child, i32) {
             Ok(())
         });
     }
+    // std's spawn forks and waits for the child's exec without the spawn lock: held across it, the
+    // child copies no neighbour's descriptor between its creation and its close-on-fork mark
+    // (`aterm_uds::kept_out`).
+    let spawning = aterm_uds::spawn_lock::spawning();
     let leader = cmd.spawn().expect("spawn the session leader");
+    drop(spawning);
     drop(slave);
     let shell = libc::pid_t::try_from(leader.id()).expect("pid");
     let agent = std::cell::Cell::new(0);
@@ -28556,7 +28561,8 @@ fn unasked_term(end: EndBy, local_id: u64) -> UnaskedTerm {
     let ctx = Arc::clone(&agent.ctx);
     hooks.acts.end_asked =
         Arc::new(move |_, group, began| crate::harness_host::end_asked_of(&ctx, group, began));
-    hooks.acts.relaunch = Arc::new(move |_, _, snap, left, upgrade, asked, carried, admit| {
+    hooks.acts.relaunch = Arc::new(move |_, _, snap, left, upgrade, asked, how, admit| {
+        let carried = how.carried;
         // The stand-in leads its own pty with no shell under it: the lane is handed a live
         // `bash` as the tab's shell, as tab 1's zsh stood at its prompt.
         let snap = &Snapshot {
@@ -44444,4 +44450,85 @@ fn a_program_worker_starts_only_at_the_line_its_launcher_typed() {
         Duration::ZERO
     ));
     assert_eq!(seen(), StartupSeen::Started, "CONTROL: its typed line ran");
+}
+
+/// A seat's Claude Code store reads the default login under the seat's home, so the window's
+/// advice, picks and menus judge a lapsed default login (a tokenless `.credentials.json` where
+/// the platform keeps that login in a file) as the report does. NEGATIVE CONTROL: the store
+/// these paths built before, `Store::at` with no home, reads no lapse for it. The records the
+/// account-progress inventory reads (`AccountSeat::bounded_claude_store`) carry the same lapse.
+#[test]
+fn a_seats_store_judges_a_lapsed_default_login_where_it_is_a_file() {
+    use aterm_agent::ai::connector::test_on_login_platform;
+    use aterm_agent::harness::accounts;
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("home");
+    let claude = home.join(".claude");
+    std::fs::create_dir_all(&claude).expect("mkdir");
+    std::fs::write(
+        claude.join(".credentials.json"),
+        r#"{"claudeAiOauth":{"accessToken":"","refreshToken":""}}"#,
+    )
+    .expect("write credential");
+    let roster_path = tmp.path().join("accounts.toml");
+    let rows = [accounts::Row {
+        label: "default".into(),
+        ..accounts::Row::default()
+    }];
+    std::fs::write(
+        &roster_path,
+        accounts::append_rows_for(accounts::Cli::Claude, "", &rows).expect("the rows"),
+    )
+    .expect("write roster");
+    let roster = accounts::Roster::load(&roster_path).expect("roster");
+    let seat = AccountSeat {
+        roster: Some(roster_path),
+        state: tmp.path().join("state"),
+        home,
+        now: 1_800_000_000,
+        ladder: &[],
+    };
+    let lapsed = |store: accounts::Store| {
+        test_on_login_platform(true, || {
+            let (state, _) = store.load_judged(seat.now, &roster).expect("load");
+            state.lapsed_logins.contains("default")
+        })
+    };
+    assert!(
+        lapsed(seat.claude_store()),
+        "the seat's store reads the lapse"
+    );
+    assert!(
+        !lapsed(accounts::Store::at(&seat.state)),
+        "NEGATIVE CONTROL: a store with no home reads none"
+    );
+    let records_lapsed = |store: accounts::Store| {
+        test_on_login_platform(true, || {
+            store
+                .read_account_records(seat.roster.as_deref(), seat.now)
+                .expect("records")
+                .state
+                .lapsed_logins
+                .contains("default")
+        })
+    };
+    assert!(
+        records_lapsed(seat.bounded_claude_store()),
+        "the progress inventory's records read the lapse"
+    );
+    assert!(
+        !records_lapsed(accounts::Store::at(&seat.state).bounded_by(seat.ladder)),
+        "NEGATIVE CONTROL: the records the inventory read before carry none"
+    );
+    let keychain = test_on_login_platform(false, || {
+        let (state, _) = seat
+            .claude_store()
+            .load_judged(seat.now, &roster)
+            .expect("load");
+        state.lapsed_logins.contains("default")
+    });
+    assert!(
+        !keychain,
+        "the keychain platform reads nothing for the default login"
+    );
 }

@@ -12140,14 +12140,14 @@ fn the_per_address_seam_raises_the_allowance_and_never_lowers_it() {
     );
 }
 
-/// A heartbeat dial that got no answer is silence (a timeout, a host down, no route to an
-/// address off this network: the home LAN's addresses from a phone hotspot) or something else
-/// (a host answered and refused, or this Mac's own Local Network privacy refused a connect to an
-/// address on this network), and only silence lets the network place call a remembered home
-/// network one members were once on.
-/// NEGATIVE CONTROL: taking every no-route as silence (`HostUnreachable | ... =>
-/// on_this_network(at.ip())` made `=> false`) reads home with Local Network turned off as
-/// silent, and "this Mac's privacy refused an on-link member" fails.
+/// A heartbeat dial that got no answer is silence (a timeout, a host down, no route to any
+/// address: a member off the link, or the home LAN's addresses from a phone hotspot) or
+/// something else (a host answered and refused, or a sandbox or firewall here refused a connect
+/// to an address on this network), and only silence lets the network place call a remembered
+/// home network one members were once on.
+/// NEGATIVE CONTROL: taking a refusal here as silence (`NetworkUnreachable | PermissionDenied
+/// => on_this_network(at.ip())` made `=> false`) fails "a sandbox here refused an on-link
+/// member".
 #[test]
 fn a_dial_this_mac_or_a_host_refused_is_no_silence() {
     use std::io::{Error, ErrorKind};
@@ -12158,10 +12158,13 @@ fn a_dial_this_mac_or_a_host_refused_is_no_silence() {
     let off_link = |_: IpAddr| false;
     let connect = |kind: ErrorKind| Unreached::Connect(at(home), Error::from(kind));
     assert!(
-        dial_blocked(&connect(ErrorKind::HostUnreachable), on_link),
-        "this Mac's privacy refused an on-link member"
+        !dial_blocked(&connect(ErrorKind::HostUnreachable), on_link),
+        "no route to an on-link member is silence: it is off the link"
     );
-    assert!(dial_blocked(&connect(ErrorKind::PermissionDenied), on_link));
+    assert!(
+        dial_blocked(&connect(ErrorKind::PermissionDenied), on_link),
+        "a sandbox here refused an on-link member"
+    );
     assert!(
         !dial_blocked(
             &Unreached::Connect(at(off), Error::from(ErrorKind::HostUnreachable)),

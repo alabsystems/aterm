@@ -18,6 +18,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use super::auth_deadline::Deadline;
 use aterm_json::{Value, json};
 
 /// A Chromium that opens a window, by its executable inside an app bundle in an applications
@@ -741,13 +742,12 @@ fn call_by(
     session: Option<&str>,
     method: &str,
     params: Value,
-    deadline: Instant,
+    deadline: Deadline<'_>,
 ) -> Result<Value, String> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
+    if deadline.expired() {
         return Err(format!("{method}: browser operation deadline expired"));
     }
-    cdp.call(session, method, params, remaining)
+    cdp.call_by(session, method, params, deadline)
         .map_err(|why| format!("{method}: {why}"))
 }
 
@@ -755,7 +755,7 @@ fn call_by(
 /// ([`idp_cookie`]) in `cdp`'s store, never their values.
 fn idp_cookie_keys(
     cdp: &mut super::headless_oauth::CdpClient,
-    deadline: Instant,
+    deadline: Deadline<'_>,
 ) -> Result<Vec<Value>, String> {
     call_by(cdp, None, "Storage.getCookies", json!({}), deadline).map(|got| {
         got.get("cookies")
@@ -789,7 +789,7 @@ fn idp_cookie_keys(
 /// A blank page target in `cdp`'s browser, attached: its target id and page session.
 fn blank_target(
     cdp: &mut super::headless_oauth::CdpClient,
-    deadline: Instant,
+    deadline: Deadline<'_>,
 ) -> Result<(String, String), String> {
     let target = call_by(
         cdp,
@@ -823,7 +823,7 @@ fn blank_target(
 fn drop_idp_cookies(
     cdp: &mut super::headless_oauth::CdpClient,
     page: &str,
-    deadline: Instant,
+    deadline: Deadline<'_>,
 ) -> Result<usize, String> {
     let doomed = idp_cookie_keys(cdp, deadline)?;
     for key in &doomed {
@@ -856,6 +856,14 @@ pub fn tidy_over_cdp(
     cdp: &mut super::headless_oauth::CdpClient,
     session: Option<(&str, &str)>,
     deadline: Instant,
+) -> Result<Tidied, String> {
+    tidy_over_cdp_until(cdp, session, Deadline::until(deadline))
+}
+
+fn tidy_over_cdp_until(
+    cdp: &mut super::headless_oauth::CdpClient,
+    session: Option<(&str, &str)>,
+    deadline: Deadline<'_>,
 ) -> Result<Tidied, String> {
     let (target_id, page) = blank_target(cdp, deadline)?;
     let dropped = drop_idp_cookies(cdp, &page, deadline)?;
@@ -909,6 +917,14 @@ pub fn make_up_tidy(
     profile: &Path,
     deadline: Instant,
 ) -> Option<Result<usize, String>> {
+    make_up_tidy_until(cdp, profile, Deadline::until(deadline))
+}
+
+pub(super) fn make_up_tidy_until(
+    cdp: &mut super::headless_oauth::CdpClient,
+    profile: &Path,
+    deadline: Deadline<'_>,
+) -> Option<Result<usize, String>> {
     if std::fs::symlink_metadata(profile.join(UNTIDIED_MARK)).is_err() {
         return None;
     }
@@ -936,11 +952,10 @@ fn session_kept(
     page: &str,
     origin: &str,
     key: &str,
-    deadline: Instant,
+    deadline: Deadline<'_>,
 ) -> Result<bool, String> {
-    let left = || deadline.saturating_duration_since(Instant::now());
     let call = |cdp: &mut super::headless_oauth::CdpClient, method: &str, params: Value| {
-        cdp.call(Some(page), method, params, left())
+        cdp.call_by(Some(page), method, params, deadline)
             .map_err(|why| format!("{method}: {why}"))
     };
     call(cdp, "Network.enable", json!({}))?;
@@ -970,7 +985,7 @@ fn session_kept(
          }})()"
     );
     let mut served = false;
-    while Instant::now() < deadline {
+    while !deadline.expired() {
         for paused in cdp.take_events("Fetch.requestPaused", Some(page)) {
             let Some(id) = paused.pointer("/params/requestId").and_then(Value::as_str) else {
                 continue;

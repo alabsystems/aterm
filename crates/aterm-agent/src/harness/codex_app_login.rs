@@ -2640,6 +2640,7 @@ fn callback_io_budget(deadline: Instant, now: Instant) -> std::io::Result<Durati
 }
 
 struct CallbackRead<R, N> {
+    parent: Option<WakeDeadline>,
     deadline: Instant,
     read: R,
     now: N,
@@ -2652,17 +2653,59 @@ where
 {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let remaining = callback_io_budget(self.deadline, (self.now)())?;
-        (self.read)(buf, remaining)
+        if self.parent.is_some_and(|parent| parent.passed()) {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        let read = (self.read)(buf, remaining)?;
+        callback_io_budget(self.deadline, (self.now)())?;
+        if self.parent.is_some_and(|parent| parent.passed()) {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        Ok(read)
     }
 }
 
-fn callback_reader(stream: &mut TcpStream, deadline: Instant) -> impl Read + '_ {
+const CALLBACK_POLL: Duration = Duration::from_millis(50);
+
+fn callback_stopped(
+    deadline: WakeDeadline,
+    cancelled: &AtomicBool,
+    work: Option<&super::account_work::Scope>,
+) -> bool {
+    deadline.passed()
+        || cancelled.load(Ordering::SeqCst)
+        || work.is_some_and(super::account_work::Scope::cancelled)
+}
+
+fn callback_reader<'a>(
+    stream: &'a mut TcpStream,
+    deadline: WakeDeadline,
+    cancelled: &'a AtomicBool,
+    work: Option<&'a super::account_work::Scope>,
+) -> impl Read + 'a {
     CallbackRead {
-        deadline,
+        parent: Some(deadline),
+        deadline: deadline.instant(),
         now: Instant::now,
-        read: move |buf: &mut [u8], remaining: Duration| {
-            stream.set_read_timeout(Some(remaining))?;
-            stream.read(buf)
+        read: move |buf: &mut [u8], _remaining: Duration| loop {
+            if callback_stopped(deadline, cancelled, work) {
+                return Err(std::io::ErrorKind::TimedOut.into());
+            }
+            stream.set_read_timeout(Some(deadline.remaining().min(CALLBACK_POLL)))?;
+            let result = stream.read(buf);
+            if callback_stopped(deadline, cancelled, work) {
+                return Err(std::io::ErrorKind::TimedOut.into());
+            }
+            match result {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::Interrupted
+                    ) => {}
+                result => return result,
+            }
         },
     }
 }
@@ -2675,7 +2718,9 @@ fn write_callback_until(
 ) -> std::io::Result<()> {
     while !bytes.is_empty() {
         let remaining = callback_io_budget(deadline, now())?;
-        match write(bytes, remaining) {
+        let written = write(bytes, remaining);
+        callback_io_budget(deadline, now())?;
+        match written {
             Ok(0) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::WriteZero,
@@ -2705,6 +2750,8 @@ fn drain_callback(from: &mut impl Read) {
 fn write_http_reply(
     stream: &mut TcpStream,
     deadline: WakeDeadline,
+    cancelled: &AtomicBool,
+    work: Option<&super::account_work::Scope>,
     status: &str,
     content_type: &str,
     body: &str,
@@ -2713,22 +2760,38 @@ fn write_http_reply(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    // The reply's writes and its drain are leaves that take an `Instant`: their short caps bound
-    // them, so each gets its share of the deadline as one, read now.
+    let reply = deadline.within(CALLBACK_IO_WAIT);
     let _ = write_callback_until(
         head.as_bytes(),
-        deadline.within(CALLBACK_IO_WAIT).instant(),
+        reply.instant(),
         Instant::now,
-        |bytes, remaining| {
-            stream.set_write_timeout(Some(remaining))?;
-            stream.write(bytes)
+        |bytes, _remaining| loop {
+            if callback_stopped(reply, cancelled, work) {
+                return Err(std::io::ErrorKind::TimedOut.into());
+            }
+            stream.set_write_timeout(Some(reply.remaining().min(CALLBACK_POLL)))?;
+            let result = stream.write(bytes);
+            if callback_stopped(reply, cancelled, work) {
+                return Err(std::io::ErrorKind::TimedOut.into());
+            }
+            match result {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::Interrupted
+                    ) => {}
+                result => return result,
+            }
         },
     );
-    let _ = stream.flush();
     let _ = stream.shutdown(std::net::Shutdown::Write);
     drain_callback(&mut callback_reader(
         stream,
-        deadline.within(CALLBACK_DRAIN_WAIT).instant(),
+        deadline.within(CALLBACK_DRAIN_WAIT),
+        cancelled,
+        work,
     ));
 }
 
@@ -2837,7 +2900,39 @@ fn parse_callback_request_target(buf: &[u8], port: u16) -> Option<String> {
     saw_host.then(|| target.to_owned())
 }
 
-fn serve_callback_loop(
+/// Retires the actual callback worker before the caller can release its own resources.
+struct CallbackOwner {
+    cancelled: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CallbackOwner {
+    fn join(&mut self) -> bool {
+        self.cancelled.store(true, Ordering::SeqCst);
+        let Some(worker) = self.worker.take() else {
+            return true;
+        };
+        match worker.join() {
+            Ok(()) => true,
+            Err(payload) => {
+                if let Err(secondary) =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)))
+                {
+                    std::mem::forget(secondary);
+                }
+                false
+            }
+        }
+    }
+}
+
+impl Drop for CallbackOwner {
+    fn drop(&mut self) {
+        let _ = self.join();
+    }
+}
+
+struct CallbackServer {
     listener: TcpListener,
     port: u16,
     expected_state: String,
@@ -2845,24 +2940,50 @@ fn serve_callback_loop(
     done: Arc<AtomicBool>,
     tx: mpsc::Sender<CallbackOutcome>,
     deadline: WakeDeadline,
-) {
-    let _ = listener.set_nonblocking(true);
-    while !cancelled.load(Ordering::SeqCst) && !deadline.passed() {
+    work: Option<super::account_work::Scope>,
+}
+
+fn serve_callback_loop(server: CallbackServer) {
+    let CallbackServer {
+        listener,
+        port,
+        expected_state,
+        cancelled,
+        done,
+        tx,
+        deadline,
+        work,
+    } = server;
+    if listener.set_nonblocking(true).is_err() {
+        let _ = tx.send(CallbackOutcome::Failed);
+        done.store(true, Ordering::SeqCst);
+        return;
+    }
+    while !callback_stopped(deadline, &cancelled, work.as_ref()) {
         match listener.accept() {
             Ok((mut stream, _)) => {
-                let _ = stream.set_nonblocking(false);
-                // A leaf that takes an `Instant`, bounded by the request head's short cap.
+                if stream.set_nonblocking(false).is_err() {
+                    continue;
+                }
+                // The accepted descriptor retains the original budget through every head read.
                 let target = read_request_target(
                     &mut callback_reader(
                         &mut stream,
-                        deadline.within(CALLBACK_HEAD_WAIT).instant(),
+                        deadline.within(CALLBACK_HEAD_WAIT),
+                        &cancelled,
+                        work.as_ref(),
                     ),
                     port,
                 );
+                if callback_stopped(deadline, &cancelled, work.as_ref()) {
+                    break;
+                }
                 let Some(target) = target else {
                     write_http_reply(
                         &mut stream,
                         deadline,
+                        &cancelled,
+                        work.as_ref(),
                         "400 Bad Request",
                         "text/plain",
                         "Bad Request",
@@ -2876,6 +2997,8 @@ fn serve_callback_loop(
                     write_http_reply(
                         &mut stream,
                         deadline,
+                        &cancelled,
+                        work.as_ref(),
                         "404 Not Found",
                         "text/plain",
                         "Not Found",
@@ -2886,6 +3009,8 @@ fn serve_callback_loop(
                     write_http_reply(
                         &mut stream,
                         deadline,
+                        &cancelled,
+                        work.as_ref(),
                         "400 Bad Request",
                         "text/plain",
                         "Invalid callback query",
@@ -2902,6 +3027,8 @@ fn serve_callback_loop(
                     write_http_reply(
                         &mut stream,
                         deadline,
+                        &cancelled,
+                        work.as_ref(),
                         "400 Bad Request",
                         "text/plain",
                         "State mismatch",
@@ -2915,10 +3042,15 @@ fn serve_callback_loop(
                     write_http_reply(
                         &mut stream,
                         deadline,
+                        &cancelled,
+                        work.as_ref(),
                         "400 Bad Request",
                         "text/plain",
                         "Duplicate callback parameter",
                     );
+                    if callback_stopped(deadline, &cancelled, work.as_ref()) {
+                        break;
+                    }
                     done.store(true, Ordering::SeqCst);
                     let _ = tx.send(CallbackOutcome::Failed);
                     return;
@@ -2927,10 +3059,15 @@ fn serve_callback_loop(
                     write_http_reply(
                         &mut stream,
                         deadline,
+                        &cancelled,
+                        work.as_ref(),
                         "200 OK",
                         "text/html; charset=utf-8",
                         "<!doctype html><title>Sign-in failed</title><p>Sign-in was not completed.</p>",
                     );
+                    if callback_stopped(deadline, &cancelled, work.as_ref()) {
+                        break;
+                    }
                     done.store(true, Ordering::SeqCst);
                     let _ = tx.send(CallbackOutcome::Failed);
                     return;
@@ -2939,10 +3076,15 @@ fn serve_callback_loop(
                     write_http_reply(
                         &mut stream,
                         deadline,
+                        &cancelled,
+                        work.as_ref(),
                         "400 Bad Request",
                         "text/plain",
                         "Missing authorization code",
                     );
+                    if callback_stopped(deadline, &cancelled, work.as_ref()) {
+                        break;
+                    }
                     done.store(true, Ordering::SeqCst);
                     let _ = tx.send(CallbackOutcome::Failed);
                     return;
@@ -2950,10 +3092,15 @@ fn serve_callback_loop(
                 write_http_reply(
                     &mut stream,
                     deadline,
+                    &cancelled,
+                    work.as_ref(),
                     "200 OK",
                     "text/html; charset=utf-8",
                     "<!doctype html><title>Signed in</title><p>Sign-in complete. You may close this window.</p>",
                 );
+                if callback_stopped(deadline, &cancelled, work.as_ref()) {
+                    break;
+                }
                 done.store(true, Ordering::SeqCst);
                 let _ = tx.send(CallbackOutcome::Code(code.to_owned()));
                 return;
@@ -2971,6 +3118,9 @@ fn serve_callback_loop(
                 }
             }
             Err(_) => {
+                if callback_stopped(deadline, &cancelled, work.as_ref()) {
+                    break;
+                }
                 done.store(true, Ordering::SeqCst);
                 let _ = tx.send(CallbackOutcome::Failed);
                 return;
@@ -2985,43 +3135,27 @@ fn serve_callback_loop(
     done.store(true, Ordering::SeqCst);
 }
 
-fn exchange_code_and_persist(
-    home: &Path,
-    endpoints: &Endpoints,
-    redirect_uri: &str,
-    code: &str,
-    code_verifier: &str,
-    wait: Duration,
-    now: i64,
-) -> Option<Option<String>> {
-    let mut entropy = [0u8; 32];
-    let owner = SystemRandom::new()
-        .fill(&mut entropy)
-        .ok()
-        .and_then(|()| base64url_encode(&entropy));
-    CodeExchange {
-        home,
-        endpoints,
-        redirect_uri,
-        code,
-        code_verifier,
-        wait,
-        now,
-    }
-    .persist(owner.as_deref())
-}
-
 struct CodeExchange<'a> {
     home: &'a Path,
     endpoints: &'a Endpoints,
     redirect_uri: &'a str,
     code: &'a str,
     code_verifier: &'a str,
-    wait: Duration,
+    deadline: WakeDeadline,
+    work: Option<&'a super::account_work::Scope>,
     now: i64,
 }
 
 impl CodeExchange<'_> {
+    fn exchange(self) -> Option<Option<String>> {
+        let mut entropy = [0u8; 32];
+        let owner = SystemRandom::new()
+            .fill(&mut entropy)
+            .ok()
+            .and_then(|()| base64url_encode(&entropy));
+        self.persist(owner.as_deref())
+    }
+
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -3031,35 +3165,46 @@ impl CodeExchange<'_> {
         )
     )]
     fn persist(self, owner: Option<&str>) -> Option<Option<String>> {
+        self.persist_using(owner, |home, deadline| {
+            AuthLock::within(home, deadline.instant())
+        })
+    }
+
+    fn persist_using(
+        self,
+        owner: Option<&str>,
+        take_lock: impl FnOnce(&Path, WakeDeadline) -> Option<AuthLock>,
+    ) -> Option<Option<String>> {
         let Self {
             home,
             endpoints,
             redirect_uri,
             code,
             code_verifier,
-            wait,
+            deadline,
+            work,
             now,
         } = self;
         let owner = owner.filter(|owner| !owner.is_empty())?;
         let token_url = &endpoints.token_url;
-        if wait.is_zero() || !is_allowed_auth_endpoint(token_url) {
+        if deadline.passed()
+            || work.is_some_and(super::account_work::Scope::cancelled)
+            || !is_allowed_auth_endpoint(token_url)
+        {
             return None;
         }
         // Take the publication lock before spending the authorization code. A lock refusal
         // must not leave a successful exchange with nowhere serialized to save its tokens.
         // Preparing the destination first also lets a first sign-in take the lock.
-        let deadline = Instant::now() + wait;
         prepare_auth_dest(home).ok()?;
-        let _held = AuthLock::within(home, Instant::now() + wait.min(SIGN_IN_LOCK_WAIT))?;
+        let _held = take_lock(home, deadline.within(SIGN_IN_LOCK_WAIT))?;
         match std::fs::symlink_metadata(beside_auth(home, JOURNAL_SUFFIX)) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Ok(md) if md.is_file() && !md.file_type().is_symlink() => {}
             Ok(_) | Err(_) => return None,
         }
-        let wait = deadline
-            .saturating_duration_since(Instant::now())
-            .min(EXCHANGE_WAIT);
-        if wait.is_zero() {
+        let wait = deadline.remaining().min(EXCHANGE_WAIT);
+        if wait.is_zero() || work.is_some_and(super::account_work::Scope::cancelled) {
             return None;
         }
         let form = encode_form(&[
@@ -3069,6 +3214,9 @@ impl CodeExchange<'_> {
             ("redirect_uri", redirect_uri),
             ("code_verifier", code_verifier),
         ]);
+        if deadline.passed() || work.is_some_and(super::account_work::Scope::cancelled) {
+            return None;
+        }
         let resp = http_client(token_url, wait)
             .request(Method::Post, token_url)
             .header("Content-Type", "application/x-www-form-urlencoded")
@@ -3232,24 +3380,47 @@ pub fn login_with(
         };
     }
 
+    let work = approver.work_scope();
     let cancelled = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
-    let server_thread = {
-        let cancelled = Arc::clone(&cancelled);
+    let mut server = {
+        let worker_cancelled = Arc::clone(&cancelled);
         let done = Arc::clone(&done);
         let expected_state = state;
-        std::thread::spawn(move || {
-            serve_callback_loop(
+        let worker_work = work.clone();
+        let run = move || {
+            serve_callback_loop(CallbackServer {
                 listener,
                 port,
                 expected_state,
-                cancelled,
+                cancelled: worker_cancelled,
                 done,
                 tx,
                 deadline,
-            );
-        })
+                work: worker_work,
+            });
+        };
+        let run: Box<dyn FnOnce() + Send> = match work.clone() {
+            Some(scope) => Box::new(scope.wrap(run)),
+            None => Box::new(run),
+        };
+        let worker = match std::thread::Builder::new()
+            .name("codex-callback".to_owned())
+            .spawn(run)
+        {
+            Ok(worker) => worker,
+            Err(_) => {
+                return Drove {
+                    outcome: Outcome::Failed,
+                    host,
+                };
+            }
+        };
+        CallbackOwner {
+            cancelled: Arc::clone(&cancelled),
+            worker: Some(worker),
+        }
     };
 
     let finished = || done.load(Ordering::SeqCst);
@@ -3260,44 +3431,39 @@ pub fn login_with(
         hosts,
         email,
         finished: &finished,
-        deadline,
+        deadline: super::login_drive::Deadline::waking(deadline, &Instant::now),
     }) {
         Approval::Approved { page } => page,
         Approval::NotRun(why) => {
-            cancelled.store(true, Ordering::SeqCst);
-            let _ = server_thread.join();
+            let _ = server.join();
             return Drove {
                 outcome: Outcome::PageNotOpened(why),
                 host,
             };
         }
         Approval::NeedsYou(why) => {
-            cancelled.store(true, Ordering::SeqCst);
-            let _ = server_thread.join();
+            let _ = server.join();
             return Drove {
                 outcome: Outcome::NeedsYou(why),
                 host,
             };
         }
         Approval::NeedsSignIn(why) => {
-            cancelled.store(true, Ordering::SeqCst);
-            let _ = server_thread.join();
+            let _ = server.join();
             return Drove {
                 outcome: Outcome::NeedsSignIn(why),
                 host,
             };
         }
         Approval::Refused(why) => {
-            cancelled.store(true, Ordering::SeqCst);
-            let _ = server_thread.join();
+            let _ = server.join();
             return Drove {
                 outcome: Outcome::Refused(why),
                 host,
             };
         }
         Approval::BotCheck(why) => {
-            cancelled.store(true, Ordering::SeqCst);
-            let _ = server_thread.join();
+            let _ = server.join();
             return Drove {
                 outcome: Outcome::BotCheck(why),
                 host,
@@ -3307,8 +3473,12 @@ pub fn login_with(
 
     // One tick at a time, so a callback wait the host slept past ends within a tick of its waking.
     let callback = deadline.recv(&rx);
-    cancelled.store(true, Ordering::SeqCst);
-    let _ = server_thread.join();
+    if !server.join() {
+        return Drove {
+            outcome: Outcome::Failed,
+            host,
+        };
+    }
 
     let code = match callback {
         Ok(CallbackOutcome::Code(code)) => code,
@@ -3332,8 +3502,7 @@ pub fn login_with(
         }
     };
 
-    // The exchange is a leaf that takes what is left as a span: its lock wait and its request
-    // have their own caps ([`SIGN_IN_LOCK_WAIT`], [`EXCHANGE_WAIT`]).
+    // Retain the original work budget across publication-lock admission and exchange.
     let left = deadline.remaining();
     if left.is_zero() {
         return Drove {
@@ -3342,15 +3511,29 @@ pub fn login_with(
         };
     }
     let now = crate::supervise::limit::unix_now();
-    match exchange_code_and_persist(
+    let exchanged = CodeExchange {
         home,
         endpoints,
-        &redirect_uri,
-        &code,
-        &code_verifier,
-        left,
+        redirect_uri: &redirect_uri,
+        code: &code,
+        code_verifier: &code_verifier,
+        deadline,
+        work: work.as_ref(),
         now,
-    ) {
+    }
+    .exchange();
+    match exchanged {
+        Some(_)
+            if deadline.passed()
+                || work
+                    .as_ref()
+                    .is_some_and(super::account_work::Scope::cancelled) =>
+        {
+            Drove {
+                outcome: Outcome::CompletedHeld,
+                host,
+            }
+        }
         Some(signed_in_email) => Drove {
             outcome: Outcome::SignedIn {
                 email: signed_in_email,

@@ -16,6 +16,99 @@ use crate::autopilot_menu::{MenuAct, MenuRow, PlotInk};
 use crate::claude_lights::Fact;
 
 #[test]
+fn unavailable_manual_admission_disables_only_signin_choices_and_next() {
+    use aterm_agent::harness::accounts::{self, ManualSigninCapability};
+    let roster = accounts::Roster {
+        rows: ["ready", "signed-out", "missing"]
+            .map(|label| accounts::Row {
+                label: label.into(),
+                email: Some(format!("{label}@example.test")),
+                ..Default::default()
+            })
+            .to_vec(),
+    };
+    let mut state = accounts::State {
+        active: Some("ready".into()),
+        pinned: true,
+        ..Default::default()
+    };
+    state.lapsed_logins.insert("signed-out".into());
+    let before = state.clone();
+    let enrolled = std::collections::BTreeSet::from(["ready".into(), "signed-out".into()]);
+    let (initial, _) = account_menu_rows_from(
+        &roster,
+        &state,
+        &enrolled,
+        true,
+        None,
+        None,
+        SessionWeek::default(),
+        100,
+    );
+    assert!(initial.iter().all(|row| row.enabled));
+    let mut available = initial.clone();
+    super::apply_manual_signin_capability(
+        &mut available,
+        &roster,
+        &state,
+        &enrolled,
+        100,
+        ManualSigninCapability::Available,
+    );
+    assert_eq!(available, initial);
+    let mut unavailable = initial;
+    super::apply_manual_signin_capability(
+        &mut unavailable,
+        &roster,
+        &state,
+        &enrolled,
+        100,
+        ManualSigninCapability::Unavailable,
+    );
+    assert_eq!(
+        unavailable
+            .iter()
+            .map(|row| row.enabled)
+            .collect::<Vec<_>>(),
+        [true, false, false]
+    );
+    assert!(unavailable[0].active);
+    let facts = FactMenuFacts {
+        cli: Some(accounts::Cli::Claude),
+        accounts: unavailable,
+        manual_signin_unavailable: true,
+        ..Default::default()
+    };
+    let menu = rows(Fact::Account, &facts);
+    assert!(menu.iter().any(|row| matches!(
+        row,
+        MenuRow::Item {
+            act: MenuAct::Fact(Fact::Account, FactAct::AutoRotate),
+            enabled: false,
+            ..
+        }
+    )));
+    assert!(menu.iter().any(|row| matches!(row, MenuRow::Item { act: MenuAct::Fact(Fact::Account, FactAct::UseAccount(label)), enabled: true, .. } if label.as_str() == "ready")));
+    assert_eq!(
+        state, before,
+        "capability projection never clears the preferred pin"
+    );
+    let empty = FactMenuFacts {
+        cli: Some(accounts::Cli::Claude),
+        manual_signin_unavailable: true,
+        ..Default::default()
+    };
+    assert!(rows(Fact::Account, &empty).iter().any(|row| matches!(
+        row,
+        MenuRow::Item {
+            act: MenuAct::Fact(Fact::Account, FactAct::AutoRotate),
+            enabled: false,
+            ..
+        }
+    )));
+}
+
+#[test]
 fn typed_login_diagnostic_is_wrapped_spoken_once_and_preserved_in_copy() {
     use aterm_agent::harness::{
         account_progress::AccountProgress,
@@ -166,6 +259,8 @@ fn mask(kinds: &[FactKind]) -> FactMask {
 fn menu_facts(off: FactMask, side: bool) -> FactMenuFacts {
     FactMenuFacts {
         account_progress: None,
+        account_queue: None,
+        manual_signin_unavailable: false,
         title: "Folder \u{b7} tab 1".into(),
         name: None,
         room: 44,
@@ -1607,8 +1702,14 @@ fn a_grok_pools_menu_offers_no_automatic_sign_in() {
             ),
         )
         .unwrap();
-        let (rows, _) =
-            super::pool_menu_rows(cli, (&aterm_toml, &state, &home), (None, None), NOW).unwrap();
+        let (rows, _, _) = super::pool_menu_rows(
+            cli,
+            (&aterm_toml, &state, Some(home.as_path())),
+            (None, None),
+            SessionWeek::default(),
+            NOW,
+        )
+        .unwrap();
         assert_eq!(rows.len(), 1, "{id}: {rows:?}");
         assert_eq!(rows[0].enabled, cli != Cli::Grok, "{id}: {rows:?}");
     }
@@ -1645,9 +1746,14 @@ fn a_default_rows_menu_entry_follows_its_login_file() {
     )
     .unwrap();
     let main_row = || {
-        let (rows, _) =
-            super::pool_menu_rows(Cli::Codex, (&aterm_toml, &state, &home), (None, None), NOW)
-                .unwrap();
+        let (rows, _, _) = super::pool_menu_rows(
+            Cli::Codex,
+            (&aterm_toml, &state, Some(home.as_path())),
+            (None, None),
+            SessionWeek::default(),
+            NOW,
+        )
+        .unwrap();
         rows.into_iter()
             .find(|row| row.account.as_str() == "main")
             .expect("main's row")
@@ -1703,8 +1809,14 @@ fn a_kimi_sessions_account_menu_reads_its_own_pool() {
         "[[account]]\nlabel = \"m16\"\nemail = \"claude-one@example.com\"\n",
     )
     .unwrap();
-    let (none, _) =
-        super::pool_menu_rows(Cli::Kimi, (&aterm_toml, &state, &home), (None, None), NOW).unwrap();
+    let (none, _, _) = super::pool_menu_rows(
+        Cli::Kimi,
+        (&aterm_toml, &state, Some(home.as_path())),
+        (None, None),
+        SessionWeek::default(),
+        NOW,
+    )
+    .unwrap();
     assert!(none.is_empty(), "no Kimi roster, no rows: {none:?}");
     let login = home.join(".aterm/logins/kimi/kimi-1");
     std::fs::write(
@@ -1716,8 +1828,14 @@ fn a_kimi_sessions_account_menu_reads_its_own_pool() {
         ),
     )
     .unwrap();
-    let (listed, _) =
-        super::pool_menu_rows(Cli::Kimi, (&aterm_toml, &state, &home), (None, None), NOW).unwrap();
+    let (listed, _, _) = super::pool_menu_rows(
+        Cli::Kimi,
+        (&aterm_toml, &state, Some(home.as_path())),
+        (None, None),
+        SessionWeek::default(),
+        NOW,
+    )
+    .unwrap();
     let labels: Vec<&str> = listed.iter().map(|row| row.account.as_str()).collect();
     assert_eq!(labels, ["kimi-1"], "Kimi's roster alone: {listed:?}");
 
@@ -1731,8 +1849,14 @@ fn a_kimi_sessions_account_menu_reads_its_own_pool() {
             store.logins_file()
         };
         std::fs::write(&path, "{").unwrap();
-        let why = super::pool_menu_rows(Cli::Kimi, (&aterm_toml, &dir, &home), (None, None), NOW)
-            .unwrap_err();
+        let why = super::pool_menu_rows(
+            Cli::Kimi,
+            (&aterm_toml, &dir, Some(home.as_path())),
+            (None, None),
+            SessionWeek::default(),
+            NOW,
+        )
+        .unwrap_err();
         let refused = FactMenuFacts {
             cli: Some(Cli::Kimi),
             accounts_refused: Some(why),
@@ -1930,7 +2054,13 @@ fn select_menu_account_for_pins_enrolled_rows_and_dispatches_auto_login_per_cli_
     assert_eq!(dispatched.len(), 1);
     assert_eq!(dispatched[0].label(), "codex-2");
     assert_eq!(
-        codex_store.load(NOW + 2).unwrap().0.pending_pin.as_ref(),
+        codex_store
+            .load(NOW + 2)
+            .unwrap()
+            .0
+            .pending_pin
+            .as_ref()
+            .and_then(aterm_agent::harness::accounts::PendingSelection::account),
         Some(&dispatched[0])
     );
 

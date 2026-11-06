@@ -174,6 +174,9 @@ impl Prepared {
         record.extend_from_slice(version.as_bytes());
         write_scratch(&reservation, &record, "write version reservation")?;
         ordered.push(copied.clone());
+        let ordered = super::super::bottle::reference::qualification::snapshot(
+            manifest, &copied, &bytes, &ordered,
+        )?;
         Ok(Self {
             _scratch: scratch,
             manifest: copied,

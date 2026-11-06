@@ -1198,3 +1198,120 @@ fn release_tag_regex_step_budget_exhaustion_fails_closed_instead_of_omitting() {
     }
     w.fake.assert_clean();
 }
+
+#[test]
+fn public_asset_download_uses_no_api_even_with_writer_available() {
+    let world = World::new("cli-public-asset");
+    let release = world
+        .fake
+        .add_release(APP, ReleaseSpec::published("v1", "2026-01-01T00:00:00Z"));
+    world
+        .fake
+        .add_asset(release, AssetSpec::uploaded("SUMS", b"signed bytes"));
+    let ran = world.run(&[
+        "--anonymous",
+        "--no-anonymous-api",
+        "asset",
+        "fetch-public",
+        APP,
+        "v1",
+        "SUMS",
+        "--meta",
+    ]);
+    assert_eq!(ran.exit, 0, "{}", ran.stderr);
+    assert_eq!(ran.stdout, b"signed bytes");
+    let seen = world.fake.seen();
+    assert!(!seen.is_empty());
+    assert!(
+        seen.iter()
+            .all(|s| s.origin != agh_fake::FakeOrigin::Api && !s.had_authorization)
+    );
+    assert!(ran.stderr.contains("rest={}"), "{}", ran.stderr);
+    // The old release download resolves the release and asset through REST.
+    // This negative control proves the fake observes API calls, not just bytes.
+    let old = world.run(&[
+        "--anonymous",
+        "release",
+        "download",
+        APP,
+        "v1",
+        "--asset",
+        "SUMS",
+        "--output",
+        "-",
+        "--meta",
+    ]);
+    assert_eq!(old.exit, 0, "{}", old.stderr);
+    assert_eq!(old.stdout, b"signed bytes");
+    let old_api = world
+        .fake
+        .seen()
+        .iter()
+        .filter(|s| s.origin == agh_fake::FakeOrigin::Api)
+        .count();
+    assert!(old_api > 0);
+    println!("public asset REST calls before={old_api} after=0");
+    let view = world.run(&["--anonymous", "release", "view", APP, "v1", "--meta"]);
+    assert_eq!(view.exit, 0, "{}", view.stderr);
+    let after_view = world
+        .fake
+        .seen()
+        .iter()
+        .filter(|s| s.origin == agh_fake::FakeOrigin::Api)
+        .count();
+    let verification_before = 4 * old_api + after_view - old_api;
+    println!("source verification REST calls before={verification_before} after=0");
+
+    // Negative control: no implicit routed download is admitted.
+    assert_eq!(
+        world
+            .run(&["asset", "fetch-public", APP, "v1", "SUMS"])
+            .exit,
+        2
+    );
+    let absent = world.run(&[
+        "--anonymous",
+        "asset",
+        "fetch-public",
+        APP,
+        "v1",
+        "missing",
+        "--meta",
+    ]);
+    assert_ne!(absent.exit, 0);
+    assert!(absent.stderr.contains("agh: meter"));
+    assert!(absent.stderr.contains("rest={}"));
+}
+
+#[test]
+fn zero_anonymous_api_budget_refuses_explicit_and_fallback_reads_before_send() {
+    let world = World::new("cli-zero-anon-api");
+    world.fake.add_repo("fixture-anon/app", RepoSpec::public());
+    std::fs::remove_file(world.root.path().join("tokens/dev.token")).unwrap();
+    for flags in [
+        &["--no-anonymous-api"][..],
+        &["--no-anonymous-api", "--anonymous"][..],
+    ] {
+        let mut args = flags.to_vec();
+        args.extend(["repo", "view", "fixture-anon/app", "--meta"]);
+        let ran = world.run(&args);
+        assert_ne!(ran.exit, 0, "{}", ran.stderr);
+        assert!(
+            ran.stderr.contains("anonymous API budget is zero"),
+            "{}",
+            ran.stderr
+        );
+        assert!(
+            world.fake.seen().is_empty(),
+            "a refused anonymous request reached the wire"
+        );
+    }
+    // Negative control: without the budget, the same routed read spends a request.
+    let allowed = world.run(&["repo", "view", "fixture-anon/app"]);
+    assert_eq!(allowed.exit, 0, "{}", allowed.stderr);
+    assert!(!world.fake.seen().is_empty());
+    // The budget permits an authenticated REST read.
+    common::canonical_tokens(world.root.path(), &world.fake, true, true);
+    let authenticated = world.run(&["--no-anonymous-api", "repo", "view", APP]);
+    assert_eq!(authenticated.exit, 0, "{}", authenticated.stderr);
+}

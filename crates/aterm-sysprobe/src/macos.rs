@@ -949,46 +949,92 @@ unsafe impl Send for Accel {}
 // SAFETY: As for `Send`.
 unsafe impl Sync for Accel {}
 
-/// The power manager's root domain and its `System Capabilities` key, kept for the process.
+/// The power manager's root domain and the keys read off it (`System Capabilities`,
+/// `AppleClamshellState`), kept for the process.
 struct RootDomain {
     service: Io,
-    key: Cf,
+    capabilities: Cf,
+    clamshell: Cf,
 }
 
-// SAFETY: `service` is a Mach port name and `key` an immutable CFString the process keeps; IOKit
-// and CoreFoundation take both from any thread.
+// SAFETY: `service` is a Mach port name and the keys immutable CFStrings the process keeps; IOKit
+// and CoreFoundation take them from any thread.
 unsafe impl Send for RootDomain {}
-// SAFETY: As for `Send`: neither is written after it is made.
+// SAFETY: As for `Send`: none is written after it is made.
 unsafe impl Sync for RootDomain {}
+
+/// The kernel's `IOPMrootDomain`, found once for the process; `None` where it or a key string
+/// could not be made.
+fn root_domain() -> Option<&'static RootDomain> {
+    static ROOT: OnceLock<Option<RootDomain>> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        // SAFETY: A NUL-terminated class name; the dictionary is +1 and consumed by
+        // `IOServiceGetMatchingService`, whose service is kept for the process.
+        let service = unsafe {
+            let matching = iokit::IOServiceMatching(c"IOPMrootDomain".as_ptr());
+            if matching.is_null() {
+                return None;
+            }
+            iokit::IOServiceGetMatchingService(MAIN_PORT_DEFAULT, matching.cast_const())
+        };
+        if service == 0 {
+            return None;
+        }
+        let service = Io(service);
+        Some(RootDomain {
+            service,
+            capabilities: Cf::string(c"System Capabilities")?,
+            clamshell: Cf::string(c"AppleClamshellState")?,
+        })
+    })
+    .as_ref()
+}
 
 /// [`crate::power::wake`] on macOS: the `System Capabilities` the kernel's `IOPMrootDomain`
 /// publishes in the registry now (its `IOPMSystemCapabilities` bits: CPU 0x1, graphics 0x2),
 /// read through the public registry calls. `None` where the entry or the key is missing.
 pub(crate) fn system_capabilities() -> Option<u32> {
-    static ROOT: OnceLock<Option<RootDomain>> = OnceLock::new();
-    let root = ROOT
-        .get_or_init(|| {
-            // SAFETY: A NUL-terminated class name; the dictionary is +1 and consumed by
-            // `IOServiceGetMatchingService`, whose service is kept for the process.
-            let service = unsafe {
-                let matching = iokit::IOServiceMatching(c"IOPMrootDomain".as_ptr());
-                if matching.is_null() {
-                    return None;
-                }
-                iokit::IOServiceGetMatchingService(MAIN_PORT_DEFAULT, matching.cast_const())
-            };
-            if service == 0 {
-                return None;
-            }
-            let service = Io(service);
-            Some(RootDomain {
-                service,
-                key: Cf::string(c"System Capabilities")?,
-            })
-        })
-        .as_ref()?;
-    let value = Cf::property(root.service.0, root.key.0)?;
+    let root = root_domain()?;
+    let value = Cf::property(root.service.0, root.capabilities.0)?;
     cf_u64(value.0).and_then(|n| u32::try_from(n).ok())
+}
+
+/// [`crate::power::lid_closed`] on macOS: the `AppleClamshellState` the root domain publishes
+/// (a CFBoolean, `true` while the lid is closed). `None` where the key is missing, as on a Mac
+/// with no lid, or is not a boolean.
+pub(crate) fn clamshell_closed() -> Option<bool> {
+    let root = root_domain()?;
+    let value = Cf::property(root.service.0, root.clamshell.0)?;
+    // SAFETY: `value` is a live +1 CF object this function holds; its type is checked before
+    // `CFBooleanGetValue` reads it as a boolean.
+    unsafe {
+        (iokit::CFGetTypeID(value.0) == iokit::CFBooleanGetTypeID())
+            .then(|| iokit::CFBooleanGetValue(value.0.cast()) != 0)
+    }
+}
+
+/// [`crate::power::hold`] on macOS: a power assertion of type `kind` named `name`, created at
+/// `kIOPMAssertionLevelOn` (`IOPMAssertionCreateWithName`, public IOPMLib.h); its id, which
+/// [`release_assertion`] releases, or `None` when either string has a NUL or the power manager
+/// refused it.
+pub(crate) fn create_assertion(kind: &str, name: &str) -> Option<u32> {
+    let kind = std::ffi::CString::new(kind).ok()?;
+    let name = std::ffi::CString::new(name).ok()?;
+    let kind = Cf::string(&kind)?;
+    let name = Cf::string(&name)?;
+    let mut id = 0u32;
+    // SAFETY: Two live CFStrings, borrowed for the call, and a writable id; level 255 is
+    // `kIOPMAssertionLevelOn`.
+    let rc = unsafe {
+        iokit::IOPMAssertionCreateWithName(kind.0.cast(), 255, name.0.cast(), &raw mut id)
+    };
+    (rc == 0).then_some(id)
+}
+
+/// Release the assertion [`create_assertion`] answered `id` for.
+pub(crate) fn release_assertion(id: u32) {
+    // SAFETY: `id` is an assertion this process created and releases once.
+    unsafe { iokit::IOPMAssertionRelease(id) };
 }
 
 /// [`crate::power::assertions_of`] on macOS: the power assertions `pid` holds now, as the power

@@ -534,14 +534,7 @@ fn a_run_keys_each_stage_by_its_checkout_selection_and_variant() {
     );
     let checker = Key::of_run(StageId::SpecCheckers, &here);
     assert_eq!(checker.variant, Some(format!("jobs {}", here.test_jobs())));
-    assert_eq!(
-        checker.crates,
-        Some(vec!["aterm-gui".to_owned(), "aterm-spec".to_owned()])
-    );
-    assert_eq!(
-        Key::of_run(StageId::CheckersCompile, &here).crates,
-        checker.crates
-    );
+    assert_eq!(checker.crates, Some(vec!["aterm-gui".to_owned()]));
     let mut cells = ctx("/ck");
     cells.cells = vec!["win".to_owned(), "linux-arm".to_owned()];
     let foreign = Key::of_run(StageId::ForeignCells, &cells);

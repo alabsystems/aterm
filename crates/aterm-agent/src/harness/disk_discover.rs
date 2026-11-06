@@ -475,13 +475,17 @@ fn own_dir(exec: &Exec, cwd: Option<&Path>, home: Option<&Path>) -> OwnDir {
     }) {
         None if exec.config.is_some() || set(&exec.home) => OwnDir::Unread,
         None => OwnDir::Unset,
-        Some(dir)
-            if checkout::never_looked_at(&dir, home).is_some() && !in_aterm_state(&dir, home) =>
-        {
-            OwnDir::Unread
-        }
+        Some(dir) if !looked_at(&dir, home) => OwnDir::Unread,
         Some(dir) => OwnDir::Read(dir),
     }
+}
+
+/// Whether the census reads `dir` as a Claude home of `home`'s person: not one it never looks
+/// into ([`checkout::never_looked_at`]: under a volume root or a [`HOME_SKIP`] folder, where a
+/// read could raise a privacy prompt), unless it is under aterm's own state.
+#[must_use]
+pub fn looked_at(dir: &Path, home: Option<&Path>) -> bool {
+    checkout::never_looked_at(dir, home).is_none() || in_aterm_state(dir, home)
 }
 
 fn in_aterm_state(dir: &Path, home: Option<&Path>) -> bool {

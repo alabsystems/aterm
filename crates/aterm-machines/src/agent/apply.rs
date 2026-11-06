@@ -438,8 +438,11 @@ fn prepare_start<'s>(
         .map_err(|e| format!("the run job was not committed: {e}"))?;
     starting.active = false;
     drop(starting.child.take());
+    // Idle sleep only (`-i`): a run never keeps a MacBook running with its lid closed, which
+    // `-s` (PreventSystemSleep) would on AC power; a person who wants that opts in through
+    // acaffeine's Keep Awake with Lid Closed.
     let _ = sys.spawn_detached(
-        &Cmd::new("/usr/bin/caffeinate").args(["-i", "-s", "-w", &pid.to_string()]),
+        &Cmd::new("/usr/bin/caffeinate").args(["-i", "-w", &pid.to_string()]),
         &dir.join("caffeinate.log"),
     );
     Ok(())
@@ -813,7 +816,7 @@ mod tests {
         assert!(floor < job, "the floor rises before anything is acted on");
         assert!(calls.iter().any(|c| c == "stage committed 4242"));
         assert!(calls.contains(&format!(
-            "detach /usr/bin/caffeinate -i -s -w 4242 >> /A/state/runs/{run}/caffeinate.log"
+            "detach /usr/bin/caffeinate -i -w 4242 >> /A/state/runs/{run}/caffeinate.log"
         )));
         let got = lines(&out);
         assert!(

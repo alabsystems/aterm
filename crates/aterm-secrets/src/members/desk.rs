@@ -24,7 +24,10 @@
 //! on that one connection, with nobody's Allow (owner, 2026-11-02: "physical access to the LAN is
 //! sufficient proof"). A proof from any other network, however private its address, is not
 //! marked so, and a plain `ask`, from any network, shows as a row that waits for a person's Allow
-//! (`docs/DESIGN-automatic-lan-admission-2026-11-02.md`).
+//! (`docs/DESIGN-automatic-lan-admission-2026-11-02.md`). In a debug build a lab's own vault,
+//! served at a URL and never the live one, can name its home LAN instead
+//! (`members::lab_lan`): a proof from another host inside that network is then marked
+//! [`Proving::lan`] on its desk the same way, which a release build never compiles.
 
 use super::bundle::Reader;
 use super::wire::{self, Line};
@@ -206,14 +209,16 @@ pub struct Local {
     /// The writer keys the current Commons roster binds: a Mac an approver enrolled from an
     /// `Allowed` (F10) is bound here once let in. Empty where Commons control is not this Mac's.
     bound: std::collections::BTreeSet<[u8; 32]>,
-    /// The pinned default ALab vault served at a URL: a Mac on this member's home ALab LAN that
-    /// proves itself is let in ([`Local::automatically_admits`], [`Proving::lan`]), and the
-    /// vault's signed swarm roster closes rows (`Local::knows_recipient`).
+    /// The pinned default ALab vault served at a URL, or (a debug build's seam) a lab vault that
+    /// names its home LAN (`members::lab_lan::home`): a Mac on this member's home LAN that proves
+    /// itself is let in ([`Local::automatically_admits`], [`Proving::lan`]), and the vault's
+    /// signed swarm roster closes rows (`Local::knows_recipient`).
     automatic_lan: bool,
-    /// The recipients the vault's signed swarm roster names (on the default ALab vault only).
+    /// The recipients the vault's signed swarm roster names (where `automatic_lan` holds only).
     admitted_recipients: std::collections::BTreeSet<String>,
-    /// This member's home ALab LAN when it read its place (`crate::home_lan::home_net`): only a
-    /// host on it is let in by its proof.
+    /// This member's home LAN when it read its place: the home ALab LAN on the default ALab vault
+    /// (`crate::home_lan::home_net`), the network a lab vault names in a debug build
+    /// (`members::lab_lan::home`). Only a host on it is let in by its proof.
     home: Option<crate::home_lan::HomeNet>,
     /// Its vault is the live ALab's by its genesis ([`client::on_live_genesis`]): a lab identity's
     /// ask and run are refused here ([`LAB_REFUSED`]), and its proof is by the caller's decision.
@@ -236,7 +241,10 @@ impl Local {
     /// admitting this Mac or still busy at the read's deadline; and, where Commons control is not
     /// its own, for a Mac its log removed or does not seat, or one that never pinned an anchor
     /// ([`client::member_by_log`] tells those from a busy vault). Where Commons control is not its
-    /// own, reading creates no custody, founds no network and claims no control.
+    /// own, reading creates no custody, founds no network and claims no control. It reads its home
+    /// LAN, which lets a proving Mac in, on the default ALab vault served at a URL and, in a debug
+    /// build, on a lab vault that names one (`members::lab_lan::home`); on any other vault it has
+    /// none.
     ///
     /// # Errors
     /// Unreadable or corrupt local Commons state, a pinned anchor that names another network than
@@ -276,9 +284,17 @@ impl Local {
         let admitted = client::log_admitted_actors(paths);
         let request = device.request(trust.network, trust.authority)?;
         let config = client::config(paths)?;
-        let automatic_lan = config.as_ref().is_some_and(|config| {
+        let live_genesis = client::on_live_genesis(paths);
+        let alab_url = config.as_ref().is_some_and(|config| {
             client::alab_vault(config) && matches!(&config.source, crate::transport::Source::Url(_))
         });
+        // A debug build's lab vault names its own home LAN (`super::lab_lan`); a release build
+        // compiles no such seam, and its desk admits by the live vault's home alone.
+        #[cfg(any(test, debug_assertions))]
+        let lab_home = super::lab_lan::home(paths, config.as_ref(), live_genesis);
+        #[cfg(not(any(test, debug_assertions)))]
+        let lab_home: Option<crate::home_lan::HomeNet> = None;
+        let automatic_lan = alab_url || lab_home.is_some();
         let name = config.map(|config| config.host).unwrap_or_default();
         // A removed Mac that asks again shows as removed, not new (F16): from the log this Mac
         // holds, read without the state lock (the records file is written whole).
@@ -297,10 +313,10 @@ impl Local {
             Default::default()
         };
         // Read here, on the desk's lane or a connection thread, never a window's main thread.
-        let home = if automatic_lan {
+        let home = if alab_url {
             crate::home_lan::home_net()
         } else {
-            None
+            lab_home
         };
         Ok(Some(Self {
             device,
@@ -315,7 +331,7 @@ impl Local {
             automatic_lan,
             admitted_recipients,
             home,
-            live_genesis: client::on_live_genesis(paths),
+            live_genesis,
             paths: Some(paths.clone()),
         }))
     }
@@ -424,8 +440,10 @@ impl Local {
     }
 
     /// Whether a proof from `from` is from the home ALab LAN ([`Proving::lan`]): this member
-    /// serves the pinned default ALab vault, it was on its home ALab LAN when it last read its
-    /// place, and `from` is another host on that network ([`crate::home_lan::HomeNet::holds`]).
+    /// serves the pinned default ALab vault and was on its home ALab LAN when it last read its
+    /// place, or (a debug build's seam) its lab vault names a home LAN that held this Mac's route
+    /// then (`members::lab_lan::home`), and `from` is another host on that network
+    /// ([`crate::home_lan::HomeNet::holds`]).
     /// A private address alone is no home: a phone hotspot, a café, a VM bridge or Internet
     /// Sharing number their hosts privately too, and a proof from any other network is not
     /// marked so.

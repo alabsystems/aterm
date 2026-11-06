@@ -9,6 +9,7 @@ use super::*;
 use crate::alab::command::tests::{NOW, email_row, replica_fixture, words};
 use crate::alab::import::tests::Stand;
 use crate::table::tests::Lab;
+use crate::typed::{grid::tests::put, keys};
 use aterm_secrets::commons::roster::Role;
 use std::path::Path;
 
@@ -399,6 +400,232 @@ fn set_takes_a_password_only_from_stdin() {
         json!("piped-password-new")
     );
     assert_eq!(row("box02@proton.example")["status"], json!("disabled"));
+}
+
+/// The address rows of `paths`' registry.
+fn addresses(paths: &Paths) -> cell::Projection {
+    crate::alab::Registry::at(paths.clone())
+        .view()
+        .unwrap()
+        .project(&ADDRESS)
+}
+
+/// `emails set` names a row by the address its `addr` says now: a renamed row goes by its new
+/// address and keeps its birth key, its old address names no row (the refusal names the row born
+/// with it), and the rename writes the row's `domain` in the same record. A rename onto an address
+/// another row says, onto one whose birth key another row holds, or of a row a live account
+/// signs in with is refused with nothing written and no address in the refusal; a rename back to
+/// the row's birth address passes.
+/// NEGATIVE CONTROLS: with `row_named`'s `emails` arm keyed by `keys::address_pk` (as before),
+/// the new address names no row: `` called `Result::unwrap()` on an `Err` value: Error("no email
+/// row holds that address") ``; with `commit_planned` skipping the guard for the owner (`if false
+/// && owner && let Some(refused)`), the rename writes no `domain`: `` assertion `left == right`
+/// failed: addr and domain: {"ad":"ad-…","column":"addr","table":"emails","written":1} ``.
+#[test]
+fn set_names_a_renamed_row_by_its_current_address_and_refuses_a_held_one() {
+    let lab = imported(3);
+    let paths = &lab.paths[0];
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let journal = Journal::at(scratch.path());
+    let set = |list: &[&str]| {
+        view(
+            paths,
+            Noun::Emails,
+            list,
+            &spawned,
+            &mut no_grid,
+            b"",
+            &journal,
+        )
+    };
+    let pk = |address: &str| keys::address_pk(address).unwrap();
+    let (box01, box02, box03) = (
+        pk("box01@proton.example"),
+        pk("box02@proton.example"),
+        pk("box03@proton.example"),
+    );
+    let renamed = set(&[
+        "set",
+        "box01@proton.example",
+        "addr",
+        "renamed01@example.test",
+    ])
+    .unwrap();
+    assert_eq!(renamed["ad"], json!(box01));
+    assert_eq!(renamed["written"], json!(2), "addr and domain: {renamed}");
+    let rows = addresses(paths);
+    assert_eq!(
+        rows.rows[&box01].get("addr"),
+        Some(&json!("renamed01@example.test"))
+    );
+    assert_eq!(
+        rows.rows[&box01].get("domain"),
+        Some(&json!("example.test"))
+    );
+    assert!(!rows.rows.contains_key(&pk("renamed01@example.test")));
+    // The new address names the row; the old one names none.
+    let status = set(&["set", "renamed01@example.test", "status", "disabled"]).unwrap();
+    assert_eq!(status["ad"], json!(box01));
+    let old = set(&["set", "box01@proton.example", "status", "active"])
+        .unwrap_err()
+        .to_string();
+    assert!(old.contains(&box01) && !old.contains('@'), "{old}");
+    // Onto an address another row says, onto a renamed row's birth address, or of an account's
+    // login: refused, nothing written.
+    let before = addresses(paths);
+    let onto_held = set(&[
+        "set",
+        "box02@proton.example",
+        "addr",
+        "renamed01@example.test",
+    ]);
+    assert!(onto_held.is_err());
+    let onto_key = set(&[
+        "set",
+        "box02@proton.example",
+        "addr",
+        "box01@proton.example",
+    ]);
+    assert!(onto_key.is_err());
+    let account = keys::account_pk("claude", "box03@proton.example").unwrap();
+    crate::alab::Registry::at(paths.clone())
+        .write(vec![vec![
+            put(&ACCOUNT, &account, "realm", json!("claude")),
+            put(&ACCOUNT, &account, "login", json!(box03)),
+            put(&ACCOUNT, &account, "row", json!("live")),
+        ]])
+        .unwrap();
+    let login = set(&[
+        "set",
+        "box03@proton.example",
+        "addr",
+        "renamed03@example.test",
+    ]);
+    for refused in [&onto_held, &onto_key, &login] {
+        let text = refused.as_ref().unwrap_err().to_string();
+        assert!(!text.contains('@'), "{text}");
+    }
+    assert!(login.unwrap_err().to_string().contains(&account));
+    let after = addresses(paths);
+    for key in [&box01, &box02, &box03] {
+        assert_eq!(after.rows[key].get("addr"), before.rows[key].get("addr"));
+    }
+    // Back to its birth address.
+    let back = set(&[
+        "set",
+        "renamed01@example.test",
+        "addr",
+        "box01@proton.example",
+    ])
+    .unwrap();
+    assert_eq!(back["ad"], json!(box01));
+    let rows = addresses(paths);
+    assert_eq!(
+        rows.rows[&box01].get("domain"),
+        Some(&json!("proton.example"))
+    );
+}
+
+/// Type `to` into the `addr` cell of the grid row that says `from` in `file`; returns that row's
+/// 1-based line.
+fn type_addr(file: &Path, from: &str, to: &str) -> usize {
+    let held = std::fs::read_to_string(file).unwrap();
+    let mut lines: Vec<String> = held.lines().map(str::to_owned).collect();
+    let header: Vec<&str> = lines[0].split('\t').collect();
+    let at = header.iter().position(|h| *h == "addr").unwrap();
+    let row = lines.iter().position(|l| l.contains(from)).unwrap();
+    let mut cells: Vec<String> = lines[row].split('\t').map(str::to_owned).collect();
+    cells[at] = to.to_owned();
+    lines[row] = cells.join("\t");
+    std::fs::write(file, format!("{}\n", lines.join("\n"))).unwrap();
+    row + 1
+}
+
+/// The grid's own edit of an `addr` cell passes the same rules as `set`: a save that types
+/// another row's address into a row writes nothing and reopens the owner's file as they saved it,
+/// the caret on that row, the refusal reported by row and column and never an address (closing it
+/// unchanged ends the session, abandoned); one that types a fresh address writes it with the
+/// row's `domain` beside it, though the save never typed the domain.
+/// NEGATIVE CONTROLS: with `Handle::apply` skipping the guard (`if false && let Some(refused)`),
+/// the colliding save is written and the grid never reopens: `` assertion `left == right` failed:
+/// {"abandoned":false,"born":0,"cells":1,"problems":[],"records":1,"retired":0,"rounds":1,
+/// "table":"emails"} left: Number(Number(Unsigned(1))) right: Number(Number(Unsigned(2))) ``;
+/// with the edit session ignoring a refused save (`if false && let Some(refused) =
+/// &applied.refused`), it ends there, nothing written and nothing reported: `` assertion `left
+/// == right` failed: {"abandoned":false,"born":0,"cells":0,"problems":[],"records":0,
+/// "retired":0,"rounds":1,"table":"emails"} left: Number(Number(Unsigned(1))) right:
+/// Number(Number(Unsigned(2))) ``.
+#[test]
+fn the_grids_edit_of_an_address_passes_the_owners_rules() {
+    let lab = imported(2);
+    let paths = &lab.paths[0];
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let journal = Journal::at(scratch.path());
+    let box01 = keys::address_pk("box01@proton.example").unwrap();
+    let mut saved: Option<(usize, String)> = None;
+    let mut reopened: Option<(usize, String)> = None;
+    let mut colliding = |opening: &Opening<'_>| -> Result<()> {
+        match saved {
+            None => {
+                let line = type_addr(opening.file, "box01@proton.example", "box02@proton.example");
+                saved = Some((line, std::fs::read_to_string(opening.file).unwrap()));
+            }
+            Some(_) => {
+                reopened = Some((opening.line, std::fs::read_to_string(opening.file).unwrap()));
+            }
+        }
+        Ok(())
+    };
+    let collided = view(
+        paths,
+        Noun::Emails,
+        &["--edit"],
+        &allowed,
+        &mut colliding,
+        b"",
+        &journal,
+    )
+    .unwrap();
+    assert_eq!(collided["rounds"], json!(2), "{collided}");
+    assert_eq!(collided["abandoned"], json!(true));
+    assert_eq!(collided["cells"], json!(0));
+    assert_eq!(reopened, saved);
+    let problems = collided["problems"].as_array().unwrap();
+    assert_eq!(problems.len(), 1, "{collided}");
+    let problem = problems[0].as_str().unwrap();
+    let box02 = keys::address_pk("box02@proton.example").unwrap();
+    assert!(
+        problem.contains("column addr") && problem.contains(&box02) && !problem.contains('@'),
+        "{problem}"
+    );
+    assert_eq!(
+        addresses(paths).rows[&box01].get("addr"),
+        Some(&json!("box01@proton.example"))
+    );
+    let mut fresh = |opening: &Opening<'_>| -> Result<()> {
+        type_addr(opening.file, "box01@proton.example", "fresh01@example.test");
+        Ok(())
+    };
+    let edited = view(
+        paths,
+        Noun::Emails,
+        &["--edit"],
+        &allowed,
+        &mut fresh,
+        b"",
+        &journal,
+    )
+    .unwrap();
+    assert_eq!(edited["cells"], json!(2), "addr and domain: {edited}");
+    let rows = addresses(paths);
+    assert_eq!(
+        rows.rows[&box01].get("addr"),
+        Some(&json!("fresh01@example.test"))
+    );
+    assert_eq!(
+        rows.rows[&box01].get("domain"),
+        Some(&json!("example.test"))
+    );
 }
 
 /// `--digest` names the `[everyone]` epoch it was keyed under and the rows with a password, is

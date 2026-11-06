@@ -247,22 +247,28 @@ fn recover_locked(
         if context(&admin.config) != expected_context {
             return Err("native intake authority changed before publication".into());
         }
-        let previous = admin
+        let previous_raw = admin
             .native_entry_digest(&entry)
-            .map_err(|e| e.to_string())?
-            .map(|digest| aterm_codec::hex::encode_lower(&digest));
-        let desired = aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(input.expose()));
-        if previous.as_deref() != Some(desired.as_str()) {
+            .map_err(|e| e.to_string())?;
+        let previous = previous_raw
+            .as_ref()
+            .map(|digest| aterm_codec::hex::encode_lower(digest));
+        let desired_raw = aterm_digest::Sha256::digest(input.expose());
+        if previous_raw != Some(desired_raw) {
             if plan["previous"].as_str() != previous.as_deref() {
                 return Err("native intake entry changed before publication".into());
             }
             allowed()?;
             imported::current(paths, key, &plan["origin"], deadline)?;
-            let expected = admin
-                .native_entry_digest(&entry)
-                .map_err(|e| e.to_string())?;
-            client::admin_set_entry_until(paths, admin, &entry, expected, input.expose(), deadline)
-                .map_err(|_| "native intake publication remains pending")?;
+            client::admin_set_entry_until(
+                paths,
+                admin,
+                &entry,
+                previous_raw,
+                input.expose(),
+                deadline,
+            )
+            .map_err(|_| "native intake publication remains pending")?;
         } else {
             client::sync_reader_until(paths, deadline)
                 .map_err(|_| "native intake materialization remains pending")?;

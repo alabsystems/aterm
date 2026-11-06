@@ -2668,7 +2668,7 @@ mod tests {
         assert_eq!(
             app.tab_label_of_session(sid),
             "manager",
-            "the pill and the hovers name the tab by its role"
+            "the hovers name the tab by its role"
         );
         assert!(app.windows.get(&wid).unwrap().rename_edit.is_none());
         assert_eq!(

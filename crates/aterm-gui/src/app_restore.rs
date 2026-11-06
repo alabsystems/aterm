@@ -1192,6 +1192,7 @@ impl App {
                     not_claim_worker: false,
                     claim_worker: claim.map(|(folder, _)| folder),
                     task: None,
+                    told: None,
                 };
                 leaf.mark_claim_bystander();
                 Some(restore::RestoredView::Terminal(leaf))
@@ -1506,6 +1507,7 @@ impl App {
         let snapshot = self.config.restore_session_or_default().then(|| {
             let mut manifest = self.capture_restore_manifest();
             self.fill_desk_agents(&mut manifest);
+            self.fill_told(&mut manifest);
             manifest
         });
         self.end_session.took(snapshot.as_ref(), now);
@@ -1522,12 +1524,51 @@ impl App {
             .set_journal_durable(durable);
     }
 
-    /// Populates agent restore records and operator holds onto `manifest` during a clean quit.
+    /// Populates agent restore records and operator holds onto `manifest` during a clean quit, and
+    /// each leaf's told-once ids ([`Self::fill_told`]) either way.
     pub(crate) fn quit_agents(&mut self, manifest: &mut restore::RestoreManifest, keeps: bool) {
         if keeps {
             self.fill_desk_agents(manifest);
         } else {
             manifest.forget_agents_and_holds();
+        }
+        self.fill_told(manifest);
+    }
+
+    /// Writes each leaf's told-once ids ([`restore::TerminalLeafRestore::told`]) from its session's
+    /// herald memory, so whatever restores the manifest (a quit's, the crash journal's, an end of
+    /// session's) tells a need its owner was told of once across the restart.
+    fn fill_told(&self, manifest: &mut restore::RestoreManifest) {
+        let herald = &self.presence.herald;
+        manifest.fill_told(&|id| crate::status_item::told_ids_row(&herald.told_ids(id)));
+    }
+
+    /// A quit's leaf carried its session's told-once ids ([`restore::TerminalLeafRestore::told`]):
+    /// the session that fills it takes them as its herald's memory at its first publication
+    /// (`App::adopt_status_carry`, [`crate::status_item::Herald::adopt`]), so a need its owner was
+    /// told of before the quit is told once across the restart.
+    fn carry_restored_told(
+        &mut self,
+        leaf: &restore::TerminalLeafRestore,
+        filling: FillingShell<'_>,
+    ) {
+        let told_ids = leaf
+            .told
+            .as_deref()
+            .map(crate::status_item::parse_told_ids)
+            .unwrap_or_default();
+        if told_ids.is_empty() {
+            return;
+        }
+        let sid = match filling {
+            FillingShell::Registered(session) => self
+                .pool
+                .get(session)
+                .map(|live| live.ctx.self_id.as_str().to_string()),
+            FillingShell::Unregistered(session) => Some(session.ctx.self_id.as_str().to_string()),
+        };
+        if let Some(sid) = sid {
+            self.status_carry.entry(sid).or_default().told_ids = told_ids;
         }
     }
 
@@ -1596,6 +1637,7 @@ impl App {
         self.crash_journal.begin_capture();
         let mut manifest = self.capture_restore_manifest();
         self.fill_desk_agents(&mut manifest);
+        self.fill_told(&mut manifest);
         let programs = self.crash_journal_programs(&manifest);
         let written = self.crash_journal.offer(manifest, programs, now);
         aterm_log::debug!(
@@ -3835,6 +3877,7 @@ impl App {
             if let Some(ctx) = ctx {
                 self.carry_restored_managers(leaf.sid.as_deref(), &ctx);
             }
+            self.carry_restored_told(leaf, filling);
         }
         // A claim worker's tab: the worker brought back, or still running in a shell the PTY
         // keeper hands back, or a tab whose worker is not coming back, its leaf with no agent to

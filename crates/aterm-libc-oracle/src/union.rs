@@ -116,7 +116,7 @@ impl Union {
             .into_iter()
             .filter(|name| list.insert(name.clone()))
             .collect();
-        added.sort();
+        added.sort_unstable();
         added
     }
 

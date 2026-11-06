@@ -817,9 +817,9 @@ struct InFlight {
 /// rotation arrives, and m22 changes `shared` to v3 from a view that shows v2 waiting: no rotation
 /// is due now, so the change's records sign v3 themselves. The publish ends once the server
 /// stored its version, before it keeps its records (`CUT_AFTER_STORE`); m22's pass runs, then its
-/// sync reads the stored version back, then its pass runs again. `control` sets
-/// [`log_entries::RACE_UNDEFERRED`] for the passes.
-fn in_flight(control: bool) -> InFlight {
+/// sync reads the stored version back, then its pass runs again. `race` sets
+/// [`log_entries::RACE_UNDEFERRED`] for the passes, and `held` [`log_entries::HELD_UNDEFERRED`].
+fn in_flight(race: bool, held: bool) -> InFlight {
     let lab = convergence::six_with(true);
     let chain = held_remove(&lab);
     let m22 = &lab.all[0];
@@ -838,7 +838,8 @@ fn in_flight(control: bool) -> InFlight {
         admin_publish(m22, &admin, &doc).is_err(),
         "CONTROL: the publish ends early"
     );
-    log_entries::RACE_UNDEFERRED.with(|cell| cell.set(control));
+    log_entries::RACE_UNDEFERRED.with(|cell| cell.set(race));
+    log_entries::HELD_UNDEFERRED.with(|cell| cell.set(held));
     let before = convergence::ids(m22);
     vault_pass_at(m22, aterm_time::unix_millis().unwrap_or(0)).unwrap();
     let during = convergence::signed_since(m22, &before);
@@ -851,6 +852,7 @@ fn in_flight(control: bool) -> InFlight {
     .unwrap();
     let after = convergence::signed_since(m22, &before);
     log_entries::RACE_UNDEFERRED.with(|cell| cell.set(false));
+    log_entries::HELD_UNDEFERRED.with(|cell| cell.set(false));
     convergence::carry(&lab.all, 0);
     InFlight { lab, during, after }
 }
@@ -861,13 +863,19 @@ fn in_flight(control: bool) -> InFlight {
 /// version back keeps its records and lands its set, the waiting write is settled, and every Mac
 /// reads v3 with nothing recorded as overtaken.
 ///
-/// NEGATIVE CONTROL: [`log_entries::RACE_UNDEFERRED`] (a pass signs or drops a waiting write
-/// whose name a pending set writes, as before W3), run in the test: the pass while the change is
-/// in flight signs v2, as the CONTROL assert says; with the switch set for the first run too, the
-/// test fails "the pass while the change is in flight signs nothing".
+/// The change's hold changes `shared` too, so two deferrals keep the pass off it: its pending
+/// set's (W3) and its held draft's (P3 LaterKept). Each alone keeps it: with
+/// [`log_entries::RACE_UNDEFERRED`] alone the pass still signs nothing. That switch alone is
+/// caught by the waiting conformance's two waiting writes, whose sets are of waiting writes no
+/// hold changes; [`log_entries::HELD_UNDEFERRED`] alone by its direct drafts, which keep no set.
+///
+/// NEGATIVE CONTROL: both switches (a pass defers no name a pending set writes or a held draft
+/// changes, as before W3), run in the test: the pass while the change is in flight signs v2, as
+/// the CONTROL assert says; with both set for the first run too, the test fails "the pass while
+/// the change is in flight signs nothing".
 #[test]
 fn a_waiting_write_a_pending_set_rewrites_waits_for_that_set() {
-    let run = in_flight(false);
+    let run = in_flight(false, false);
     let m22 = &run.lab.all[0];
     assert_eq!(
         everyone_puts(&run.during),
@@ -885,7 +893,15 @@ fn a_waiting_write_a_pending_set_rewrites_waits_for_that_set() {
     }
     run.lab.macs.server.stop();
 
-    let control = in_flight(true);
+    let race = in_flight(true, false);
+    assert_eq!(
+        everyone_puts(&race.during),
+        0,
+        "the change's hold keeps the pass off shared without its set"
+    );
+    race.lab.macs.server.stop();
+
+    let control = in_flight(true, true);
     assert_eq!(
         everyone_puts(&control.during),
         1,
@@ -1032,4 +1048,845 @@ fn a_later_save_signs_the_settle_of_a_conflict_its_view_showed_waiting() {
         "CONTROL: a save that drops the settle its view showed leaves the conflict"
     );
     control.lab.macs.server.stop();
+}
+
+/// What [`stored_unkept`] saw.
+struct Unkept {
+    lab: convergence::Six,
+    s2: crate::server::Running,
+    /// The sequence and envelope digest each server holds once both publishes answered: the
+    /// first server's, then the second's.
+    served: [(u64, [u8; 32]); 2],
+    /// What the second publish said waits.
+    waiting: Vec<String>,
+    /// `shared` as m22's log reads it once the first publish kept its records, before any pass.
+    kept: Option<Vec<u8>>,
+    /// Whether the second publish's waiting write of `shared` may be signed over what m22's log
+    /// reads there then ([`log_entries::waits_over`]).
+    over: Option<bool>,
+    /// What m22's passes signed once the rotation arrived.
+    signed: Vec<Record>,
+}
+
+/// `[everyone]`'s `name` as the Mac at `paths` opens its log.
+fn entry_at(paths: &Paths, name: &str) -> Option<Entry> {
+    let identity = read_identity(paths).unwrap().unwrap();
+    log_of(paths)
+        .open_audience_entries(&identity)
+        .unwrap()?
+        .by_audience
+        .get(&Audience::Everyone)?
+        .get(name)
+        .cloned()
+}
+
+/// The version `url` serves: its sequence and envelope digest.
+fn served_at(url: &str) -> (u64, [u8; 32]) {
+    let Fetched::Body(bytes) = transport::fetch(
+        &Source::Url(url.to_owned()),
+        None,
+        aterm_spec::wait::MUST_HAPPEN,
+    )
+    .expect("a read of the server") else {
+        panic!("{url} serves no envelope");
+    };
+    let parsed = envelope::parse(&bytes).expect("an envelope");
+    (parsed.seq, parsed.digest())
+}
+
+/// What the first publish of [`stored_unkept`] does to `shared`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Earlier {
+    /// Sets it to v2.
+    Put,
+    /// Takes it out of `[everyone]`.
+    Delete,
+}
+
+/// One person, two commands at once from one opened view, which shows `shared` = v1: m22 opens the
+/// vault and publishes from it (P1) `shared` = v2, or with `shared` taken out (`earlier`); no
+/// rotation is due, so P1's records sign that at once. The server stores P1, and before P1 keeps
+/// its records (`AFTER_STORE`), m22 takes m7's `Remove` of m42 without its rotation, and a second
+/// publish from the same opened view (P2) sets `shared` = v3, which now waits for the new key.
+/// The server refuses P2 as not newer; a second server, which P1 never reached, stores it. Then
+/// P1 keeps its records and ends, the rotation arrives, m22's passes run, and every Mac takes its
+/// records. `control` sets [`log_entries::BASES_WITHOUT_HELD`] for both publishes.
+fn stored_unkept(earlier: Earlier, control: bool) -> Unkept {
+    let lab = convergence::six_with(true);
+    let (m22, m7) = (lab.all[0].clone(), lab.all[1].clone());
+    let s2 =
+        crate::client::log_entries_tests::start_loopback_server(&lab.macs.root.path().join("s2"));
+    let url2 = format!("http://{}/v1/alab", s2.addr);
+    let base = convergence::ids(&m7);
+    test_remove_unposted(&m7, &join_code(&lab.recipients[4])).expect("m7 removes m42");
+    let chain = convergence::signed_since(&m7, &base);
+    let opened = Rc::new(admin_open(&m22).expect("an admin"));
+    assert_eq!(
+        shows(&opened, "shared"),
+        Some(b"v1".to_vec()),
+        "CONTROL: the opened view shows v1"
+    );
+    let mut first = opened.doc.clone();
+    match earlier {
+        Earlier::Put => set(&mut first, "shared", b"v2"),
+        Earlier::Delete => {
+            let _ = first.unset_entry(&Audience::Everyone, "shared");
+        }
+    }
+    let mut second = opened.doc.clone();
+    set(&mut second, "shared", b"v3");
+
+    let waiting = Rc::new(RefCell::new(None));
+    let said = Rc::clone(&waiting);
+    let (on, view, remove) = (m22.clone(), Rc::clone(&opened), encode_records(&chain[..1]));
+    AFTER_STORE.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            save_records(&on, &remove).unwrap();
+            assert!(
+                log_of(&on)
+                    .rekey_dues()
+                    .iter()
+                    .any(|due| due.audience == EpochAudience::Everyone && due.rotation),
+                "CONTROL: m22 holds the Remove, not its rotation"
+            );
+            let second = admin_publish_with_candidates(&on, &view, &second, &[url2])
+                .expect("P2: the second server stores it");
+            *said.borrow_mut() = Some(second.waiting);
+        }));
+    });
+    log_entries::BASES_WITHOUT_HELD.with(|cell| cell.set(control));
+    let first = admin_publish(&m22, &opened, &first);
+    log_entries::BASES_WITHOUT_HELD.with(|cell| cell.set(false));
+    first.expect("P1");
+    let waiting = waiting
+        .borrow_mut()
+        .take()
+        .expect("CONTROL: P2 ran in P1's window");
+    let served = [
+        served_at(&lab.macs.url),
+        served_at(&format!("http://{}/v1/alab", s2.addr)),
+    ];
+    let kept = reads(&m22, true, "shared");
+    let over = log_entries::waits_over(
+        &m22,
+        &read_identity(&m22).unwrap().unwrap(),
+        "shared",
+        entry_at(&m22, "shared").as_ref(),
+    );
+
+    save_records(&m22, &encode_records(&chain)).unwrap();
+    let signed = two_passes(&m22);
+    convergence::carry(&lab.all, 0);
+    Unkept {
+        lab,
+        s2,
+        served,
+        waiting,
+        kept,
+        over,
+        signed,
+    }
+}
+
+/// Which Mac's tender covers the fresh `[everyone]` epoch that [`stored_unkept`]'s earlier
+/// publish minted for its `Delete` ([`covered`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Coverer {
+    /// m7, the remover: first among the removers, it waits no grace, so its first pass once it
+    /// holds that epoch coalesces it.
+    Remover,
+    /// m22 alone, the writer, with no pass of any other Mac: no remover, it waits the remover's
+    /// grace ([`log_entries::REMOVER_GRACE_MS`]) and then its rank's steps among the members.
+    Writer,
+}
+
+/// After [`stored_unkept`] with [`Earlier::Delete`]: the earlier publish's `Delete` minted its own
+/// fresh `[everyone]` epoch (F15), wrapped to m42, since it was drafted before m22 held the
+/// `Remove`. m7's rotation, concurrent with it, leaves it a newest epoch, so a rotation is due
+/// over it in turn, and the passes of [`stored_unkept`] sign nothing. `by`'s tender then covers
+/// both newest epochs with one, the coalesce of the ranked re-key
+/// (`coalesce_concurrent_commons_epochs`): a pass of m7 at once, which every Mac takes, then
+/// [`two_passes`] of m22; or one pass of m22 alone at its turn. Every Mac then takes m22's
+/// records. Returns what m22 holds since, the coalesce among it.
+fn covered(run: &Unkept, by: Coverer) -> Vec<Record> {
+    let (m22, m7) = (&run.lab.all[0], &run.lab.all[1]);
+    let before = convergence::ids(m22);
+    let now = aterm_time::unix_millis().unwrap_or(0);
+    match by {
+        Coverer::Remover => {
+            vault_pass_at(m7, now).unwrap();
+            convergence::carry(&run.lab.all, 1);
+            two_passes(m22);
+        }
+        Coverer::Writer => {
+            let log = log_of(m22);
+            let turn = log
+                .rekey_dues()
+                .into_iter()
+                .find(|due| due.audience == EpochAudience::Everyone)
+                .and_then(|due| due.turn(&log.membership(), &run.lab.actors[0]))
+                .expect("CONTROL: m22 takes a turn in the due");
+            assert!(
+                turn.after_grace,
+                "CONTROL: m22 is no remover, so its turn waits the remover's grace"
+            );
+            let rank = u64::try_from(turn.rank).unwrap();
+            let at = now + log_entries::REMOVER_GRACE_MS + rank * log_entries::GAP_STEP_MS;
+            vault_pass_at(m22, at).unwrap();
+        }
+    }
+    convergence::carry(&run.lab.all, 0);
+    convergence::signed_since(m22, &before)
+}
+
+/// One-mesh P3 ([`stored_unkept`]): a waiting write drafted while a server holds an earlier
+/// version of this Mac whose records are not kept yet is signed over that version's value. The
+/// later publish reads the log without the earlier one's records, but its hold
+/// (`records.drafts`), so the write's bases hold what the earlier publish leaves at the name, v2
+/// or, where it took the name out, no value: once it keeps its records, the write stands over
+/// what the log reads. With v2, once the rotation arrives, a pass signs v3, the person's later
+/// save, nothing is recorded as overtaken, and every Mac reads v3. Where the earlier publish took
+/// the name out, its `Delete`'s fresh epoch, wrapped to m42, keeps a rotation due after m7's
+/// arrives, and the write still waits after those passes, neither signed nor overtaken. The
+/// tender's coalesce covers that epoch ([`covered`]), whether m7, the remover, mints it at once
+/// or m22 alone does at its turn after the grace; a pass of m22 then signs v3, as above, and
+/// every Mac the log keeps reads v3. (What m42, the removed Mac, can open is P1's law, not this
+/// test's.)
+///
+/// NEGATIVE CONTROL: [`log_entries::BASES_WITHOUT_HELD`] (a write's bases leave out what this
+/// Mac's held drafts write, as before), run in the test: the write's one base is the log's v1, so
+/// it stands over neither v2 nor no value, and the pass drops v3 as overtaken by m22's own v2,
+/// which every Mac then reads, or, past the coalesce, by m22's own `Delete`, so no Mac reads
+/// `shared`, as the CONTROL asserts say; with the switch set for the first run too, the test
+/// fails "P2's write stands over what P1 leaves".
+#[test]
+fn a_waiting_write_drafted_before_its_own_earlier_version_kept_its_records_is_signed() {
+    for (earlier, control, coverer) in [
+        (Earlier::Put, false, None),
+        (Earlier::Put, true, None),
+        (Earlier::Delete, false, Some(Coverer::Remover)),
+        (Earlier::Delete, false, Some(Coverer::Writer)),
+        (Earlier::Delete, true, Some(Coverer::Remover)),
+        (Earlier::Delete, true, Some(Coverer::Writer)),
+    ] {
+        let run = stored_unkept(earlier, control);
+        let m22 = &run.lab.all[0];
+        let earlier_value = (earlier == Earlier::Put).then(|| b"v2".to_vec());
+        assert_eq!(
+            run.served[0].0, run.served[1].0,
+            "CONTROL: both publishes are of one sequence"
+        );
+        assert_ne!(
+            run.served[0].1, run.served[1].1,
+            "CONTROL: the first server holds P1, the second P2"
+        );
+        assert_eq!(
+            run.waiting,
+            vec!["shared".to_owned()],
+            "CONTROL: P2's write waits"
+        );
+        assert_eq!(
+            run.kept, earlier_value,
+            "CONTROL: P1's records are kept before any pass"
+        );
+        if control {
+            assert_eq!(
+                run.over,
+                Some(false),
+                "CONTROL: with the old bases P2's write stands over the log's v1 alone"
+            );
+        } else {
+            assert_eq!(
+                run.over,
+                Some(true),
+                "P2's write stands over what P1 leaves"
+            );
+        }
+        let signed = match coverer {
+            None => run.signed.clone(),
+            Some(by) => {
+                let log = log_of(m22);
+                assert_eq!(
+                    log.newest_epochs(&EpochAudience::Everyone).len(),
+                    2,
+                    "CONTROL: two newest epochs, P1's fresh one and m7's rotation"
+                );
+                let minters: BTreeSet<MemberId> = log
+                    .newest_epochs(&EpochAudience::Everyone)
+                    .iter()
+                    .filter_map(|epoch| log.get(epoch).map(|record| *record.actor()))
+                    .collect();
+                assert_eq!(
+                    minters,
+                    BTreeSet::from([run.lab.actors[0], run.lab.actors[1]]),
+                    "CONTROL: P1's fresh epoch stands beside m7's rotation"
+                );
+                assert!(
+                    log.rekey_dues()
+                        .iter()
+                        .any(|due| due.audience == EpochAudience::Everyone && due.rotation),
+                    "CONTROL: P1's fresh epoch, wrapped to m42, keeps a rotation due"
+                );
+                assert_eq!(
+                    everyone_puts(&run.signed),
+                    0,
+                    "CONTROL: the passes sign nothing while it is due"
+                );
+                assert!(
+                    log_entries::waiting_file(m22).exists(),
+                    "CONTROL: the write still waits"
+                );
+                assert!(
+                    log_entries::read_overtaken(m22).unwrap().is_empty(),
+                    "CONTROL: and is not overtaken"
+                );
+                let signed = covered(&run, by);
+                let log = log_of(m22);
+                assert_eq!(
+                    log.newest_epochs(&EpochAudience::Everyone).len(),
+                    1,
+                    "{by:?}: one epoch covers both"
+                );
+                let coalescer = match by {
+                    Coverer::Remover => run.lab.actors[1],
+                    Coverer::Writer => run.lab.actors[0],
+                };
+                assert_eq!(
+                    log.newest_epochs(&EpochAudience::Everyone)
+                        .iter()
+                        .find_map(|epoch| log.get(epoch).map(|record| *record.actor())),
+                    Some(coalescer),
+                    "{by:?}: that Mac's tender mints the coalesce"
+                );
+                assert!(
+                    !log.rekey_dues()
+                        .iter()
+                        .any(|due| due.audience == EpochAudience::Everyone),
+                    "{by:?}: nothing is due over it"
+                );
+                signed
+            }
+        };
+        let journal = log_entries::read_overtaken(m22).unwrap();
+        // Every Mac but m42, which the log removed.
+        let readers = run
+            .lab
+            .all
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 4)
+            .map(|(_, paths)| paths);
+        if control {
+            assert_eq!(
+                everyone_puts(&signed),
+                0,
+                "CONTROL: with the old bases nothing is signed"
+            );
+            assert_eq!(
+                journal
+                    .iter()
+                    .map(|record| record.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["shared"],
+                "CONTROL: the later save is dropped as overtaken"
+            );
+            let by = journal[0].by.as_ref();
+            assert_eq!(
+                by.map(|by| by.label.as_str()),
+                log_of(m22).membership().label(&run.lab.actors[0]),
+                "CONTROL: by m22's own earlier write"
+            );
+            assert_eq!(
+                by.map(|by| by.deleted),
+                Some(earlier == Earlier::Delete),
+                "CONTROL: its Put or its Delete"
+            );
+            for paths in readers {
+                assert_eq!(
+                    reads(paths, true, "shared"),
+                    earlier_value,
+                    "CONTROL: and every Mac reads what the earlier save left"
+                );
+            }
+        } else {
+            assert_eq!(
+                everyone_puts(&signed),
+                1,
+                "a pass signs the person's later save"
+            );
+            assert!(journal.is_empty(), "nothing is recorded as overtaken");
+            assert!(!log_entries::waiting_file(m22).exists(), "nothing waits");
+            for paths in readers {
+                assert_eq!(reads(paths, true, "shared"), Some(b"v3".to_vec()));
+            }
+        }
+        run.s2.stop();
+        run.lab.macs.server.stop();
+    }
+}
+
+/// What [`kept_late`] saw.
+struct KeptLate {
+    lab: convergence::Six,
+    /// How each later open stood to the log and what it showed at `shared`: P2a's, then P2b's.
+    opens: Vec<(log_entries::LogBase, Option<Vec<u8>>)>,
+    /// What P2b said waits.
+    waiting: Vec<String>,
+    /// `shared` as m22's log reads it once P1 ended, before any pass.
+    ended: Option<Vec<u8>>,
+    /// What m22's passes signed once the rotation arrived.
+    signed: Vec<Record>,
+}
+
+/// m22 opens the vault and publishes `shared` = v2 from it (P1); no rotation is due, so P1's
+/// records sign v2. The server stores P1, and before P1 keeps its records (`AFTER_STORE`), m22
+/// opens the vault again (P2a): the server serves P1, whose records m22's log lacks, so the open
+/// reads P1's text and P2a saves `other` = o1 from it, unstamped. P2a's version names P1's as its
+/// parent, and its landing settles P1's hold by descent. m22 takes m7's `Remove` of m42 without
+/// its rotation and opens P2a's version (P2b), whose text shows v2; the person sets `shared` = v3,
+/// which waits for the new key, as P2a's `other` does, imported from that text. Then P1 goes on
+/// to keep its records and ends, the rotation arrives, m22's passes run, and every Mac takes its
+/// records. `control` sets [`log_entries::KEEPS_SUPERSEDED`] for P1.
+fn kept_late(control: bool) -> KeptLate {
+    let lab = convergence::six_with(true);
+    let (m22, m7) = (lab.all[0].clone(), lab.all[1].clone());
+    let base = convergence::ids(&m7);
+    test_remove_unposted(&m7, &join_code(&lab.recipients[4])).expect("m7 removes m42");
+    let chain = convergence::signed_since(&m7, &base);
+    let opened = admin_open(&m22).expect("an admin");
+    let mut first = opened.doc.clone();
+    set(&mut first, "shared", b"v2");
+
+    let seen = Rc::new(RefCell::new((Vec::new(), Vec::new())));
+    let saw = Rc::clone(&seen);
+    let (on, remove) = (m22.clone(), encode_records(&chain[..1]));
+    AFTER_STORE.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            let p2a = admin_open(&on).expect("P2a opens");
+            saw.borrow_mut()
+                .0
+                .push((p2a.log_base, shows(&p2a, "shared")));
+            let mut doc = p2a.doc.clone();
+            set(&mut doc, "other", b"o1");
+            admin_publish(&on, &p2a, &doc).expect("P2a");
+            save_records(&on, &remove).unwrap();
+            let p2b = admin_open(&on).expect("P2b opens");
+            saw.borrow_mut()
+                .0
+                .push((p2b.log_base, shows(&p2b, "shared")));
+            let mut doc = p2b.doc.clone();
+            set(&mut doc, "shared", b"v3");
+            saw.borrow_mut().1 = admin_publish(&on, &p2b, &doc).expect("P2b").waiting;
+        }));
+    });
+    log_entries::KEEPS_SUPERSEDED.with(|cell| cell.set(control));
+    let first = admin_publish(&m22, &opened, &first);
+    log_entries::KEEPS_SUPERSEDED.with(|cell| cell.set(false));
+    first.expect("P1");
+    let ended = reads(&m22, true, "shared");
+
+    save_records(&m22, &encode_records(&chain)).unwrap();
+    let signed = two_passes(&m22);
+    convergence::carry(&lab.all, 0);
+    let (opens, waiting) = seen.take();
+    KeptLate {
+        lab,
+        opens,
+        waiting,
+        ended,
+        signed,
+    }
+}
+
+/// One-mesh P3 ([`kept_late`]): a publish that keeps its records after a later head of this Mac
+/// settled its hold by descent keeps none, so the person's later edit, drafted from that head's
+/// text while the log lacked them, stands. P1's records stay where P2a's landing left them, as a
+/// publish cut short after its PUT leaves them: m22's log keeps v1 until the rotation arrives,
+/// and a pass then signs P2b's v3 and P2a's o1, nothing is recorded as overtaken, nothing waits,
+/// and every Mac reads v3 and o1.
+///
+/// NEGATIVE CONTROL: [`log_entries::KEEPS_SUPERSEDED`] (P1 keeps its records after the descent, as
+/// before), run in the test: v2 enters the log after P2b's draft, whose one base is the log's v1,
+/// so the pass drops v3 as overtaken by m22's own v2, which every Mac then reads, as the CONTROL
+/// asserts say; with the switch set for the first run too, the test fails "P1's records stay
+/// where the descent left them".
+#[test]
+fn a_publish_whose_own_later_head_settled_its_hold_leaves_the_later_edit_standing() {
+    for control in [false, true] {
+        let run = kept_late(control);
+        let m22 = &run.lab.all[0];
+        let v2 = Some(b"v2".to_vec());
+        assert_eq!(
+            run.opens,
+            vec![
+                (log_entries::LogBase::Behind, v2.clone()),
+                (log_entries::LogBase::Unstamped, v2.clone()),
+            ],
+            "CONTROL: P2a reads P1's text with the log behind it, P2b P2a's unstamped text"
+        );
+        assert_eq!(
+            run.waiting,
+            vec!["other".to_owned(), "shared".to_owned()],
+            "CONTROL: P2b's writes wait"
+        );
+        let journal = log_entries::read_overtaken(m22).unwrap();
+        if control {
+            assert_eq!(
+                run.ended, v2,
+                "CONTROL: kept after the descent, v2 enters the log"
+            );
+            assert_eq!(
+                journal
+                    .iter()
+                    .map(|record| record.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["shared"],
+                "CONTROL: the later save is dropped as overtaken"
+            );
+            assert_eq!(
+                journal[0].by.as_ref().map(|by| by.label.as_str()),
+                log_of(m22).membership().label(&run.lab.actors[0]),
+                "CONTROL: by m22's own earlier write"
+            );
+            for paths in &run.lab.all[..4] {
+                assert_eq!(
+                    reads(paths, true, "shared"),
+                    v2,
+                    "CONTROL: and every Mac reads the earlier save"
+                );
+            }
+        } else {
+            assert_eq!(
+                run.ended,
+                Some(b"v1".to_vec()),
+                "P1's records stay where the descent left them"
+            );
+            assert_eq!(
+                everyone_puts(&run.signed),
+                2,
+                "a pass signs the later save and the imported o1"
+            );
+            assert!(journal.is_empty(), "nothing is recorded as overtaken");
+            assert!(!log_entries::waiting_file(m22).exists(), "nothing waits");
+            for paths in &run.lab.all[..4] {
+                assert_eq!(reads(paths, true, "shared"), Some(b"v3".to_vec()));
+                assert_eq!(reads(paths, true, "other"), Some(b"o1".to_vec()));
+            }
+        }
+        run.lab.macs.server.stop();
+    }
+}
+
+/// What the second publish of [`drafted_in_turn`] did first, while the first was between its
+/// draft and its hold.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Step {
+    /// It found the first's turn taken and waited for it ([`log_entries::TURN_WAITS`]).
+    Waits,
+    /// It drafted (`AFTER_DRAFT`).
+    Drafted,
+}
+
+/// What [`drafted_in_turn`] saw.
+struct InTurn {
+    lab: convergence::Six,
+    s2: crate::server::Running,
+    /// What P2 did first while P1 was between its draft and its hold.
+    first: Option<Step>,
+    /// The sequence and envelope digest each server holds once both publishes answered: the
+    /// first server's, then the second's.
+    served: [(u64, [u8; 32]); 2],
+    /// What P2 said waits.
+    waiting: Vec<String>,
+    /// `shared` as m22's log reads it once P1 ended, before any pass.
+    kept: Option<Vec<u8>>,
+    /// What m22's passes signed once the rotation arrived.
+    signed: Vec<Record>,
+}
+
+/// One person, two commands at once: m22 opens the vault and publishes `shared` = v2 from it (P1);
+/// no rotation is due, so P1's records sign v2. Once P1 drafted, before it holds its records
+/// (`AFTER_DRAFT`), m22 takes m7's `Remove` of m42 without its rotation, and a second command on
+/// another thread opens the vault, which still serves v1, and publishes `shared` = v3 to a second
+/// server (P2), which waits for the new key: it takes its turn, which P1 holds, and drafts once P1
+/// held its records and wrote its pending set, or, where `control` sets
+/// [`log_entries::DRAFTS_AT_ONCE`] for it, drafts at once. P2 stores its version only once the
+/// first server stored P1's (`AFTER_STORE`). Then P1 keeps its records and ends, the rotation
+/// arrives, m22's passes run, and every Mac takes its records.
+fn drafted_in_turn(control: bool) -> InTurn {
+    let lab = convergence::six_with(true);
+    let (m22, m7) = (lab.all[0].clone(), lab.all[1].clone());
+    let s2 =
+        crate::client::log_entries_tests::start_loopback_server(&lab.macs.root.path().join("s2"));
+    let url2 = format!("http://{}/v1/alab", s2.addr);
+    let base = convergence::ids(&m7);
+    test_remove_unposted(&m7, &join_code(&lab.recipients[4])).expect("m7 removes m42");
+    let chain = convergence::signed_since(&m7, &base);
+    let opened = admin_open(&m22).expect("an admin");
+    let mut first = opened.doc.clone();
+    set(&mut first, "shared", b"v2");
+
+    let (step_tx, step_rx) = std::sync::mpsc::channel::<Step>();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let p2: Rc<RefCell<Option<std::thread::JoinHandle<Vec<String>>>>> = Rc::new(RefCell::new(None));
+    let started = Rc::clone(&p2);
+    let first_step = Rc::new(Cell::new(None));
+    let saw = Rc::clone(&first_step);
+    let (on, remove) = (m22.clone(), encode_records(&chain[..1]));
+    AFTER_DRAFT.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            save_records(&on, &remove).unwrap();
+            let handle = std::thread::spawn(move || {
+                let view = admin_open(&on).expect("P2 opens");
+                assert_eq!(
+                    (view.log_base, shows(&view, "shared")),
+                    (log_entries::LogBase::Covers, Some(b"v1".to_vec())),
+                    "CONTROL: P2 opens the version P1 was drafted from"
+                );
+                let mut second = view.doc.clone();
+                set(&mut second, "shared", b"v3");
+                let waits = step_tx.clone();
+                log_entries::TURN_WAITS.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        let _ = waits.send(Step::Waits);
+                    }));
+                });
+                AFTER_DRAFT.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        let _ = step_tx.send(Step::Drafted);
+                        go_rx
+                            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                            .expect("P1 stored its version");
+                    }));
+                });
+                log_entries::DRAFTS_AT_ONCE.with(|cell| cell.set(control));
+                admin_publish_with_candidates(&on, &view, &second, &[url2])
+                    .expect("P2: the second server stores it")
+                    .waiting
+            });
+            saw.set(Some(
+                step_rx
+                    .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                    .expect("P2 tried to draft"),
+            ));
+            *started.borrow_mut() = Some(handle);
+        }));
+    });
+    let joined = Rc::clone(&p2);
+    let waiting = Rc::new(RefCell::new(None));
+    let said = Rc::clone(&waiting);
+    AFTER_STORE.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            go_tx.send(()).unwrap();
+            let handle = joined.borrow_mut().take().expect("P2 started");
+            *said.borrow_mut() = Some(handle.join().expect("P2's thread"));
+        }));
+    });
+    admin_publish(&m22, &opened, &first).expect("P1");
+    let waiting = waiting
+        .borrow_mut()
+        .take()
+        .expect("CONTROL: P2 ended in P1's window");
+    let served = [
+        served_at(&lab.macs.url),
+        served_at(&format!("http://{}/v1/alab", s2.addr)),
+    ];
+    let kept = reads(&m22, true, "shared");
+
+    save_records(&m22, &encode_records(&chain)).unwrap();
+    let signed = two_passes(&m22);
+    convergence::carry(&lab.all, 0);
+    InTurn {
+        lab,
+        s2,
+        first: first_step.get(),
+        served,
+        waiting,
+        kept,
+        signed,
+    }
+}
+
+/// One-mesh P3 ([`drafted_in_turn`]): a publish drafts in its turn, so a waiting write drafted
+/// while another publish of this Mac is between its draft and its hold, whose records are then in
+/// neither the log nor a hold, is not drafted until that hold is written. P2 tries to draft while
+/// P1 holds its turn, waits for it, then reads P1's hold, so its write's bases hold v2; once P1
+/// keeps its records and the rotation arrives, a pass signs v3, the person's later save, nothing
+/// is recorded as overtaken, and every Mac reads v3.
+///
+/// NEGATIVE CONTROL: [`log_entries::DRAFTS_AT_ONCE`] (a publish takes no turn, as before), run in
+/// the test: P2 drafts before P1's hold is written, its write's one base is the log's v1, and the
+/// pass drops v3 as overtaken by m22's own v2, which every Mac then reads, as the CONTROL asserts
+/// say; with the switch set for the first run too, the test fails "P2 waits for P1's turn".
+#[test]
+fn a_waiting_write_drafted_while_its_own_earlier_publish_drafts_is_signed() {
+    for control in [false, true] {
+        let run = drafted_in_turn(control);
+        let m22 = &run.lab.all[0];
+        assert_eq!(
+            run.served[0].0, run.served[1].0,
+            "CONTROL: both publishes are of one sequence"
+        );
+        assert_ne!(
+            run.served[0].1, run.served[1].1,
+            "CONTROL: the first server holds P1, the second P2"
+        );
+        assert_eq!(
+            run.waiting,
+            vec!["shared".to_owned()],
+            "CONTROL: P2's write waits"
+        );
+        assert_eq!(
+            run.kept,
+            Some(b"v2".to_vec()),
+            "CONTROL: P1's records are kept before any pass"
+        );
+        let journal = log_entries::read_overtaken(m22).unwrap();
+        if control {
+            assert_eq!(
+                run.first,
+                Some(Step::Drafted),
+                "CONTROL: P2 drafts before P1 holds its records"
+            );
+            assert_eq!(
+                everyone_puts(&run.signed),
+                0,
+                "CONTROL: drafted at once, nothing is signed"
+            );
+            assert_eq!(
+                journal
+                    .iter()
+                    .map(|record| record.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["shared"],
+                "CONTROL: the later save is dropped as overtaken"
+            );
+            assert_eq!(
+                journal[0].by.as_ref().map(|by| by.label.as_str()),
+                log_of(m22).membership().label(&run.lab.actors[0]),
+                "CONTROL: by m22's own earlier write"
+            );
+            for paths in &run.lab.all[..4] {
+                assert_eq!(
+                    reads(paths, true, "shared"),
+                    Some(b"v2".to_vec()),
+                    "CONTROL: and every Mac reads the earlier save"
+                );
+            }
+        } else {
+            assert_eq!(run.first, Some(Step::Waits), "P2 waits for P1's turn");
+            assert_eq!(
+                everyone_puts(&run.signed),
+                1,
+                "a pass signs the person's later save"
+            );
+            assert!(journal.is_empty(), "nothing is recorded as overtaken");
+            assert!(!log_entries::waiting_file(m22).exists(), "nothing waits");
+            for paths in &run.lab.all[..4] {
+                assert_eq!(reads(paths, true, "shared"), Some(b"v3".to_vec()));
+            }
+        }
+        run.s2.stop();
+        run.lab.macs.server.stop();
+    }
+}
+
+/// One-mesh P3's keep in [`log_entries::SINGLE_SLOT_HOLD`]'s mode, the negative control of
+/// per-version holds: its one hold goes at any other publish's hold or answer, so a publish whose
+/// hold another replaced keeps its records once a server took its version, as before
+/// per-version holds, not as a hold settled by descent. m22 publishes `shared` = v2 (P1); the
+/// server stores it, and before P1 keeps its records (`AFTER_STORE`) a second publish from the
+/// same opened view sets `other` = o1: its hold replaces P1's, and the server refuses it as not
+/// newer. P1 then keeps its records: m22's log reads v2.
+#[test]
+fn the_single_slot_control_keeps_a_version_whose_hold_another_publish_replaced() {
+    let lab = convergence::six_with(true);
+    let m22 = lab.all[0].clone();
+    let opened = Rc::new(admin_open(&m22).expect("an admin"));
+    let mut first = opened.doc.clone();
+    set(&mut first, "shared", b"v2");
+    let mut second = opened.doc.clone();
+    set(&mut second, "other", b"o1");
+    let holds = |paths: &Paths| {
+        std::fs::read_dir(paths.dir.join("records.drafts"))
+            .map(|dir| dir.count())
+            .unwrap_or(0)
+    };
+
+    let left = Rc::new(Cell::new(None));
+    let saw = Rc::clone(&left);
+    let (on, view) = (m22.clone(), Rc::clone(&opened));
+    AFTER_STORE.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            assert_eq!(holds(&on), 1, "CONTROL: P1's hold is there");
+            let refused = admin_publish(&on, &view, &second).expect_err("P2 is not newer than P1");
+            assert_eq!(refused.kind(), crate::ErrorKind::NotStored, "{refused}");
+            saw.set(Some(holds(&on)));
+        }));
+    });
+    log_entries::SINGLE_SLOT_HOLD.with(|cell| cell.set(true));
+    let first = admin_publish(&m22, &opened, &first);
+    log_entries::SINGLE_SLOT_HOLD.with(|cell| cell.set(false));
+    first.expect("P1");
+    assert_eq!(
+        left.get(),
+        Some(0),
+        "CONTROL: P2's hold replaced P1's and its refusal forgot it"
+    );
+    assert_eq!(
+        reads(&m22, true, "shared"),
+        Some(b"v2".to_vec()),
+        "P1 keeps its records with its one hold gone"
+    );
+    lab.macs.server.stop();
+}
+
+/// One-mesh P3 under W3's rule: what this Mac cannot read is never read as none. A held draft
+/// that does not read leaves values nobody can tell (`held_values`), so a save
+/// whose `[everyone]` writes wait refuses over it, as over unread waiting writes, rather than
+/// sign them over the log's value alone.
+///
+/// NEGATIVE CONTROL: [`log_entries::UNREAD_AS_NONE`] (the hold reads as leaving nothing), run in
+/// the test: the save goes on and its write waits, as the CONTROL assert says.
+#[test]
+fn a_waiting_write_is_never_drafted_over_a_hold_that_does_not_read() {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let lab = convergence::six_with(true);
+    let m22 = lab.all[0].clone();
+    let _chain = held_remove(&lab);
+    let dir = m22.dir.join("records.drafts");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(dir.join(format!("{:020}-{}", 1, "ab".repeat(32))))
+        .unwrap()
+        .write_all(b"no held draft")
+        .unwrap();
+    let admin = admin_open(&m22).expect("an admin");
+    let mut doc = admin.doc.clone();
+    set(&mut doc, "shared", b"v3");
+
+    let refused = admin_publish(&m22, &admin, &doc).expect_err("the save refuses");
+    assert!(
+        refused
+            .to_string()
+            .contains("no [everyone] write waits over this Mac's held drafts until they read"),
+        "{refused}"
+    );
+    assert!(!log_entries::waiting_file(&m22).exists(), "nothing waits");
+
+    log_entries::UNREAD_AS_NONE.with(|cell| cell.set(true));
+    let control = admin_publish(&m22, &admin, &doc);
+    log_entries::UNREAD_AS_NONE.with(|cell| cell.set(false));
+    assert_eq!(
+        control
+            .expect("CONTROL: read as none, the save goes on")
+            .waiting,
+        vec!["shared".to_owned()],
+        "CONTROL: and its write waits"
+    );
+    lab.macs.server.stop();
 }

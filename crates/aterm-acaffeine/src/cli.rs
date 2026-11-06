@@ -13,13 +13,16 @@ use crate::model::{Clocks, Mode};
 pub const USAGE: &str = "\
 aterm acaffeine — a menu-bar mug that keeps this Mac awake: a click fills it (no
 idle sleep of the system or the display) until the next click; a right click or
-Control-click picks 1, 8 or 24 hours or forever, Enable at Startup, or Quit.
+Control-click picks 1, 8 or 24 hours or forever, Keep Awake with Lid Closed,
+Enable at Startup, or Quit. With the lid closed it holds nothing (the mode stays
+on and holds again when the lid opens) unless you turn lid on.
 
 USAGE:
     aterm acaffeine [start]
     aterm acaffeine on [1h|8h|24h|forever|<n>h|<n>m]
     aterm acaffeine off
     aterm acaffeine status
+    aterm acaffeine lid [on|off]
     aterm acaffeine startup [on|off]
     aterm acaffeine quit [own]
     aterm acaffeine serve
@@ -38,7 +41,15 @@ USAGE:
                menu=stopped, then the running mug's job (else this build's):
                startup=on|off|blocked|disabled and label=<launchd label>. It
                reads what was saved; `aterm doctor`'s awake: row reads whether
-               macOS holds the mug's assertion.
+               macOS holds the mug's assertion. lid=on|off is Keep Awake with
+               Lid Closed.
+    lid        Say whether the mug keeps this Mac running with its lid closed
+               (lid=on|off; off by default); `on` or `off` sets it, for the
+               running mug and every later one. Off: closing the lid pauses the
+               mug, which lets go of its assertions until the lid opens. On: it
+               also holds PreventSystemSleep, which macOS honours on AC power
+               only, so on battery a closed lid still sleeps the Mac. Either
+               way the system's own sleep or a dark wake pauses it.
     startup    Say whether this build's mug starts at every login; `on` or `off`
                sets it (a plist in ~/Library/LaunchAgents; `off` also removes
                any whose build is gone) and leaves the running mug as it is.
@@ -95,6 +106,8 @@ pub enum Command {
     Off,
     /// `status`: the mode, the mug, Enable at Startup and the label.
     Status,
+    /// `lid [on|off]`: say (`None`) or set Keep Awake with Lid Closed.
+    Lid(Option<bool>),
     /// `startup [on|off]`: say (`None`) or set Enable at Startup.
     Startup(Option<bool>),
     /// `quit [own]`: turn off and end the mug, or with `own` only this build's.
@@ -110,7 +123,7 @@ pub enum Command {
 
 /// Parse the words after `acaffeine`.
 /// # Errors
-/// What is wrong, as the part of the error line after `aterm acaffeine: `: an unknown command, any option (a word starting with `-`, help's aside), a span [`crate::model::parse_span`] refuses, a `startup` word other than `on` or `off`, or an extra operand.
+/// What is wrong, as the part of the error line after `aterm acaffeine: `: an unknown command, any option (a word starting with `-`, help's aside), a span [`crate::model::parse_span`] refuses, a `lid` or `startup` word other than `on` or `off`, or an extra operand.
 pub fn parse(args: &[OsString]) -> Result<Command, String> {
     let words: Vec<String> = args
         .iter()
@@ -136,6 +149,12 @@ pub fn parse(args: &[OsString]) -> Result<Command, String> {
         },
         Some("off") => Command::Off,
         Some("status") => Command::Status,
+        Some("lid") => Command::Lid(match it.next() {
+            None => None,
+            Some("on") => Some(true),
+            Some("off") => Some(false),
+            Some(word) => return Err(format!("lid takes on or off, not {word:?}")),
+        }),
         Some("startup") => Command::Startup(match it.next() {
             None => None,
             Some("on") => Some(true),
@@ -187,7 +206,7 @@ pub fn on_line(mode: Mode, now: Clocks) -> String {
     format!("acaffeine=requested until={}\n", until_word(mode, now))
 }
 
-/// `status`'s answer, one `key=value` per line: `acaffeine=on|off`, `until=` ([`until_word`]), `menu=running` and `pid=<n>` or `menu=stopped`, `startup=on|off|blocked|disabled` ([`Startup::word`]), `label=<label>`.
+/// `status`'s answer, one `key=value` per line: `acaffeine=on|off`, `until=` ([`until_word`]), `menu=running` and `pid=<n>` or `menu=stopped`, `startup=on|off|blocked|disabled` ([`Startup::word`]), `label=<label>`, `lid=on|off` ([`lid_line`]).
 #[must_use]
 pub fn status_text(
     mode: Mode,
@@ -195,6 +214,7 @@ pub fn status_text(
     menu_pid: Option<u32>,
     startup: Startup,
     label: &str,
+    lid_awake: bool,
 ) -> String {
     let on_off = |on: bool| if on { "on" } else { "off" };
     let menu = menu_pid.map_or_else(
@@ -203,11 +223,18 @@ pub fn status_text(
     );
     let mode = if menu_pid.is_some() { mode } else { Mode::Off };
     format!(
-        "acaffeine={}\nuntil={}\n{menu}startup={}\nlabel={label}\n",
+        "acaffeine={}\nuntil={}\n{menu}startup={}\nlabel={label}\n{}",
         on_off(mode.is_on(now)),
         until_word(mode, now),
         startup.word(),
+        lid_line(lid_awake),
     )
+}
+
+/// `lid`'s answer: `lid=on|off`, Keep Awake with Lid Closed.
+#[must_use]
+pub fn lid_line(lid_awake: bool) -> String {
+    format!("lid={}\n", if lid_awake { "on" } else { "off" })
 }
 
 /// `startup`'s answer: `startup=on|off|blocked|disabled` ([`Startup::word`]).
@@ -264,6 +291,7 @@ fn run(command: Command, version: &str) -> ExitCode {
         Command::On { span } => mac::on(span),
         Command::Off => mac::off(),
         Command::Status => mac::status(),
+        Command::Lid(set) => mac::lid(set),
         Command::Startup(set) => mac::startup(set),
         Command::Quit { own } => mac::quit(own),
         Command::Serve => mac::serve(version),
@@ -1081,8 +1109,27 @@ mod mac {
             holder.as_ref().map(|holder| holder.pid),
             launchd::startup(&here.paths, label, &crate::macos::STARTUP_DOORS),
             label,
+            state::load_lid(&here.paths.lid_file()),
         );
         answer(&text)
+    }
+
+    /// Keep Awake with Lid Closed: said, or saved and told to a running mug, which reads it on
+    /// the notification ([`crate::notify::post_changed`]); a mug started later reads it at its
+    /// start.
+    pub(super) fn lid(set: Option<bool>) -> ExitCode {
+        let paths = match login_paths() {
+            Ok(paths) => paths,
+            Err(why) => return fail(why),
+        };
+        let file = paths.lid_file();
+        if let Some(on) = set {
+            if let Err(e) = state::save_lid(&file, on) {
+                return fail(format!("{}: {e}", file.display()));
+            }
+            crate::notify::post_changed();
+        }
+        answer(&super::lid_line(state::load_lid(&file)))
     }
 
     /// Enable at Startup for this build's job: the plist it writes runs this executable.
@@ -2170,6 +2217,11 @@ mod tests {
         assert_eq!(parsed("on"), Ok(Command::On { span: None }));
         assert_eq!(parsed("off"), Ok(Command::Off));
         assert_eq!(parsed("status"), Ok(Command::Status));
+        assert_eq!(parsed("lid"), Ok(Command::Lid(None)));
+        assert_eq!(parsed("lid on"), Ok(Command::Lid(Some(true))));
+        assert_eq!(parsed("lid off"), Ok(Command::Lid(Some(false))));
+        assert!(parsed("lid yes").is_err());
+        assert!(parsed("lid on now").is_err());
         assert_eq!(parsed("startup"), Ok(Command::Startup(None)));
         assert_eq!(parsed("startup on"), Ok(Command::Startup(Some(true))));
         assert_eq!(parsed("startup off"), Ok(Command::Startup(Some(false))));
@@ -2298,29 +2350,35 @@ mod tests {
     #[test]
     fn status_says_the_mode_the_mug_startup_and_label() {
         assert_eq!(
-            status_text(Mode::Off, NOW, None, Startup::Off, "l.x"),
-            "acaffeine=off\nuntil=-\nmenu=stopped\nstartup=off\nlabel=l.x\n"
+            status_text(Mode::Off, NOW, None, Startup::Off, "l.x", false),
+            "acaffeine=off\nuntil=-\nmenu=stopped\nstartup=off\nlabel=l.x\nlid=off\n"
         );
         assert_eq!(
-            status_text(Mode::Forever, NOW, None, Startup::On, "l.x"),
-            "acaffeine=off\nuntil=-\nmenu=stopped\nstartup=on\nlabel=l.x\n"
+            status_text(Mode::Forever, NOW, None, Startup::On, "l.x", false),
+            "acaffeine=off\nuntil=-\nmenu=stopped\nstartup=on\nlabel=l.x\nlid=off\n"
         );
         assert_eq!(
-            status_text(Mode::Forever, NOW, Some(42), Startup::Blocked, "l.x"),
-            "acaffeine=on\nuntil=forever\nmenu=running\npid=42\nstartup=blocked\nlabel=l.x\n"
+            status_text(Mode::Forever, NOW, Some(42), Startup::Blocked, "l.x", false),
+            "acaffeine=on\nuntil=forever\nmenu=running\npid=42\nstartup=blocked\nlabel=l.x\nlid=off\n"
         );
         let timed = Mode::activate(Some(HOUR), NOW);
         assert_eq!(
-            status_text(timed, NOW, Some(7), Startup::Off, "l.x"),
+            status_text(timed, NOW, Some(7), Startup::Off, "l.x", false),
             format!(
-                "acaffeine=on\nuntil={}\nmenu=running\npid=7\nstartup=off\nlabel=l.x\n",
+                "acaffeine=on\nuntil={}\nmenu=running\npid=7\nstartup=off\nlabel=l.x\nlid=off\n",
                 NOW.wall + HOUR
             )
         );
         assert_eq!(
-            status_text(timed, NOW + HOUR, Some(7), Startup::Off, "l.x"),
-            "acaffeine=off\nuntil=-\nmenu=running\npid=7\nstartup=off\nlabel=l.x\n"
+            status_text(timed, NOW + HOUR, Some(7), Startup::Off, "l.x", false),
+            "acaffeine=off\nuntil=-\nmenu=running\npid=7\nstartup=off\nlabel=l.x\nlid=off\n"
         );
+        assert_eq!(
+            status_text(Mode::Forever, NOW, Some(42), Startup::On, "l.x", true),
+            "acaffeine=on\nuntil=forever\nmenu=running\npid=42\nstartup=on\nlabel=l.x\nlid=on\n"
+        );
+        assert_eq!(lid_line(true), "lid=on\n");
+        assert_eq!(lid_line(false), "lid=off\n");
     }
 
     /// Ten minutes into `on 1h`, the wall clock set back or forward a day: `status` says the
@@ -2334,9 +2392,9 @@ mod tests {
                 wall,
             };
             assert_eq!(
-                status_text(timed, later, Some(7), Startup::Off, "l.x"),
+                status_text(timed, later, Some(7), Startup::Off, "l.x", false),
                 format!(
-                    "acaffeine=on\nuntil={}\nmenu=running\npid=7\nstartup=off\nlabel=l.x\n",
+                    "acaffeine=on\nuntil={}\nmenu=running\npid=7\nstartup=off\nlabel=l.x\nlid=off\n",
                     wall + HOUR - 600
                 )
             );

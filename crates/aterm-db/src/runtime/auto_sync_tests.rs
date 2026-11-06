@@ -82,14 +82,15 @@ impl Watch {
 #[derive(Clone)]
 pub(super) struct Attachment {
     pub(super) port: u16,
-    pub(super) lan_allowed: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the isolated attachment delivers its links' sends ([`super::transport::Transport::isolated`]).
+    pub(super) delivering: Arc<std::sync::atomic::AtomicBool>,
     progress: Arc<(Mutex<Progress>, Condvar)>,
 }
 impl Attachment {
     pub(super) fn new(port: u16) -> Self {
         Self {
             port,
-            lan_allowed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            delivering: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             progress: Arc::new((Mutex::new(Progress::default()), Condvar::new())),
         }
     }
@@ -958,8 +959,6 @@ fn an_application_created_after_both_runtimes_start_is_discovered_and_writable_o
 
 #[test]
 fn windowless_background_runtime_replicates_yields_to_window_and_resumes_with_negative_control() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
     let lab = crate::table::tests::Lab::new(&[Role::Writer; 2]);
     let observers = aterm_tempfile::Builder::new()
         .prefix("commons-bg-")
@@ -1013,49 +1012,18 @@ fn windowless_background_runtime_replicates_yields_to_window_and_resumes_with_ne
         state.via_local_process.is_none() && state.visibility == Visibility::Active
     });
 
-    // A new window waiting for its LAN step leaves the working background owner in place.
+    // A window claims priority and takes the transport and observation.
     let win_progress = Attachment::new(port);
-    let window_ready = Arc::new(AtomicBool::new(false));
-    let ready = window_ready.clone();
-    let (win_tx, win_rx) = std::sync::mpsc::channel();
     let win_runtime = Runtime::start_on(
         lab.paths[1].clone(),
         config_1.clone(),
-        move |status| {
-            let _ = win_tx.send(status);
-        },
+        |_| {},
         Network {
-            lan: LanGate::asking(move || {
-                if ready.load(Ordering::Acquire) {
-                    LanTurn::Open("the window is ready")
-                } else {
-                    LanTurn::Held("the window waits for its LAN step")
-                }
-            }),
             isolated: Some(win_progress.clone()),
             ..Network::default()
         },
     )
     .unwrap();
-    assert_eq!(
-        win_rx.recv_timeout(Duration::from_secs(60)).unwrap(),
-        Status::LanHeld
-    );
-    assert!(
-        !owner::window_claimed(&crate::network_state::directory(&config_1)),
-        "a held window must not make the working background owner yield"
-    );
-    source
-        .write([34; 16], vec![proposal("while-window-waits")])
-        .unwrap();
-    bg_progress.wait_for(
-        table.digest(),
-        2,
-        "background repairs while the window waits",
-    );
-
-    // Once ready, the window claims priority and takes the transport and observation.
-    window_ready.store(true, Ordering::Release);
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let status = bg_rx
@@ -1074,7 +1042,7 @@ fn windowless_background_runtime_replicates_yields_to_window_and_resumes_with_ne
         .unwrap();
     win_progress.wait_for(
         table.digest(),
-        3,
+        2,
         "window runtime replicated write while holding lease",
     );
 
@@ -1086,8 +1054,8 @@ fn windowless_background_runtime_replicates_yields_to_window_and_resumes_with_ne
         .unwrap();
     bg_progress.wait_for(
         table.digest(),
-        4,
-        "background runtime resumed after window exit and replicated fourth write",
+        3,
+        "background runtime resumed after window exit and replicated third write",
     );
 
     bg_runtime.stop();
@@ -1095,7 +1063,7 @@ fn windowless_background_runtime_replicates_yields_to_window_and_resumes_with_ne
 
     let expected = source.snapshot().unwrap();
     let actual = Proposals::at(lab.paths[1].clone()).snapshot().unwrap();
-    assert_eq!(expected.operations.len(), 4);
+    assert_eq!(expected.operations.len(), 3);
     assert_eq!(actual.cells, expected.cells);
 }
 

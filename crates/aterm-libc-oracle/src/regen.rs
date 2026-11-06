@@ -283,7 +283,9 @@ impl Reference {
 /// The dump `--docs` holds for `cell`, if any.
 fn supplied_doc(docs: Option<&Path>, cell: &Cell) -> Option<PathBuf> {
     let path = docs?.join(format!("libc-{REFERENCE_VERSION}-{}.json", cell.triple));
-    path.is_file().then_some(path)
+    std::fs::symlink_metadata(&path)
+        .is_ok_and(|m| m.is_file())
+        .then_some(path)
 }
 
 /// The toolchains a run needs: Trust always (the host cell, the formatter),

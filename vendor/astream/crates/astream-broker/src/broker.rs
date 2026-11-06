@@ -3975,6 +3975,15 @@ impl Broker {
         opts: OpenOptions,
         open: impl FnOnce(OpenOptions) -> io::Result<BrokerLog>,
     ) -> io::Result<Broker> {
+        // The writer acks each batch at its publish: a log recorded as acked only at a full
+        // flush would hide the loss of those acks after an unclean stop.
+        if opts.acks != crate::store::Acks::Publish {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a broker acks at its writer's publish: Acks::FullFlush is for a BrokerLog \
+                 used directly",
+            ));
+        }
         #[cfg(feature = "cap")]
         let guard = opts.guard.clone();
         #[cfg(not(feature = "cap"))]

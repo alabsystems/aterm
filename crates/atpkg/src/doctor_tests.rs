@@ -345,6 +345,12 @@ fn a_foreign_rustup_trust_entry_is_named_with_its_repoint_and_never_repointed() 
 
 #[test]
 fn a_held_toolchain_update_and_a_lease_are_said_and_healthy() {
+    #[cfg(unix)]
+    if !crate::testdir::isolated_lifecycle(
+        "doctor::tests::a_held_toolchain_update_and_a_lease_are_said_and_healthy",
+    ) {
+        return;
+    }
     let l = layout("held-flip");
     install(&l, "ay", 18);
     install(&l, "trust", 9192);

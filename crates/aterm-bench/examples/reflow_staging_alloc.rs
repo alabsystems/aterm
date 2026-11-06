@@ -67,6 +67,8 @@ fn instructions() -> Option<u64> {
 }
 
 fn main() {
+    linked_writes();
+    image_free_frames();
     floating_frames();
     restore_rows();
     for (rows, cols, next_cols) in [
@@ -110,6 +112,94 @@ fn main() {
             "reflow_staging rows={rows} cols={cols} next_cols={next_cols} allocation_calls={calls} allocated_bytes={bytes} ns={ns} instructions={retired:?} glyphs={expected} history_lines={}",
             term.grid().scrollback_lines()
         );
+    }
+}
+
+fn linked_writes() {
+    for (label, linked, input) in [
+        ("cursor", false, &b"\x1b[H"[..]),
+        ("plain_ascii", false, &b"\x1b[Hx"[..]),
+        ("linked_ascii", true, &b"\x1b[Hx"[..]),
+        ("linked_unicode", true, "\x1b[H日".as_bytes()),
+    ] {
+        let mut term = Terminal::new(2, 80);
+        if linked {
+            term.process(b"\x1b]8;id=write-probe;https://example.com\x1b\\");
+        }
+        term.process(input);
+        let before_instructions = instructions();
+        let before_calls = CALLS.load(Ordering::Relaxed);
+        let before_bytes = BYTES.load(Ordering::Relaxed);
+        let began = Instant::now();
+        for _ in 0..256 {
+            black_box(&mut term).process(black_box(input));
+        }
+        let ns = began.elapsed().as_nanos();
+        let calls = CALLS.load(Ordering::Relaxed) - before_calls;
+        let bytes = BYTES.load(Ordering::Relaxed) - before_bytes;
+        let retired = instructions()
+            .zip(before_instructions)
+            .map(|(end, start)| end - start);
+        if linked {
+            let extra = term.grid().cell_extra(0, 0).unwrap();
+            assert_eq!(
+                extra.hyperlink().map(AsRef::as_ref),
+                Some("https://example.com")
+            );
+            assert_eq!(extra.hyperlink_id().map(AsRef::as_ref), Some("write-probe"));
+        }
+        println!(
+            "linked_write phase={label} iterations=256 allocation_calls={calls} allocated_bytes={bytes} ns={ns} instructions={retired:?}"
+        );
+    }
+}
+
+fn image_free_frames() {
+    for (rows, cols) in [(24_u16, 80_u16), (40, 120)] {
+        let mut term = Terminal::new(rows, cols);
+        term.process(b"\x1b]8;;https://example.com\x1b\\");
+        let text = "x".repeat(usize::from(cols) - 1);
+        for row in 0..rows {
+            term.process(format!("\x1b[{};1H{text}", row + 1).as_bytes());
+        }
+        assert_eq!(term.grid().extras().len(), usize::from(rows) * text.len());
+        let mut frame = aterm_core::render::RenderInput::empty();
+        term.cell_frame_into(&mut frame, usize::from(rows), usize::from(cols));
+        for phase in ["images", "frame", "write_frame"] {
+            let before_instructions = instructions();
+            let before_calls = CALLS.load(Ordering::Relaxed);
+            let before_bytes = BYTES.load(Ordering::Relaxed);
+            let began = Instant::now();
+            for _ in 0..256 {
+                if phase == "images" {
+                    assert!(
+                        black_box(&term)
+                            .images_frame(usize::from(rows))
+                            .iter()
+                            .all(Vec::is_empty)
+                    );
+                } else {
+                    if phase == "write_frame" {
+                        term.process(b"\x1b[Hx");
+                    }
+                    black_box(&mut term).cell_frame_into(
+                        &mut frame,
+                        usize::from(rows),
+                        usize::from(cols),
+                    );
+                }
+            }
+            let ns = began.elapsed().as_nanos();
+            let calls = CALLS.load(Ordering::Relaxed) - before_calls;
+            let bytes = BYTES.load(Ordering::Relaxed) - before_bytes;
+            let retired = instructions()
+                .zip(before_instructions)
+                .map(|(end, start)| end - start);
+            assert!(frame.images.iter().all(Vec::is_empty));
+            println!(
+                "image_free rows={rows} cols={cols} phase={phase} iterations=256 allocation_calls={calls} allocated_bytes={bytes} ns={ns} instructions={retired:?}"
+            );
+        }
     }
 }
 

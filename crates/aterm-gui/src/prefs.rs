@@ -2910,9 +2910,6 @@ pub(crate) fn section_of(key: &str) -> Section {
     {
         return Section::Appearance;
     }
-    if key.starts_with("presence.") {
-        return Section::Window;
-    }
     if matches!(key, EDIT_CURSOR_TRAIL_STYLE | EDIT_CURSOR_NYAN_SPRITE)
         || CURSOR_STYLE_TUNING_KEYS.contains(&key)
     {
@@ -3039,9 +3036,6 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
     }
     if key.starts_with("matrix_rain.") || key.starts_with("output_streak.") {
         return ("Effects", 5);
-    }
-    if key.starts_with("presence.") {
-        return ("Presence", 2);
     }
     match key {
         EDIT_THEME | EDIT_WINDOW_THEME | EDIT_WINDOW_COLORSPACE | EDIT_PALETTE_GENERATE => {

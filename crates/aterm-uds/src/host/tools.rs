@@ -170,34 +170,20 @@ const fn hardware(name: &'static str, what: &'static str, why: &'static str) -> 
 
 /// Every outside program aterm runs, and why.
 pub const TOOLS: &[Tool] = &[
-    workspace(
+    toolset(
+        "openssl-signing",
         super::upstream::OPENSSL_SIGNING.name,
-        When::Release,
-        Some(Pin {
-            package: super::upstream::OPENSSL_SIGNING.name,
-            version: super::upstream::OPENSSL_SIGNING.version,
-            exe: "bin/openssl",
-            built: true,
-            hosts: super::upstream::OPENSSL_SIGNING.hosts,
-        }),
-        &[],
-        "OpenSSL 3 for Ed25519 source attestations on a release host; separate from Apple's certificate tools",
+        "signed, leased OpenSSL for Ed25519 source attestations; separate from Apple's certificate tools",
     ),
-    workspace(
+    toolset(
+        "python3.14",
         super::upstream::CPYTHON.name,
-        When::Release,
-        Some(Pin {
-            package: super::upstream::CPYTHON.name,
-            version: super::upstream::CPYTHON.version,
-            exe: super::upstream::CPYTHON.executable,
-            built: false,
-            hosts: super::upstream::CPYTHON.hosts,
-        }),
-        &[],
-        "the publication engine's interpreter on a release host: `bin/pub-python` runs the newest \
-         `python3.14` … `python3.11` on PATH that imports tomllib, and macOS ships only 3.9, so \
-         `ship release` puts this pinned standalone CPython's `bin` first on the engine's PATH \
-         (3.14, the version the engine's ported guards were measured on)",
+        "the publication engine's signed, leased CPython interpreter; its operation-local python3 alias never changes global command routing",
+    ),
+    toolset(
+        "lake",
+        super::upstream::LEAN4.name,
+        "the publication engine's signed, leased Lean project builder; the global lean command still routes to Clean",
     ),
     os(
         "sh",
@@ -672,7 +658,8 @@ pub const TOOLS: &[Tool] = &[
     os(
         "dns-sd",
         &["/usr/bin/dns-sd"],
-        "the fleet's and the machines controller's Bonjour discovery",
+        "a lab guest's Bonjour member advert (aterm-lab's guest member); aterm itself browses and \
+         registers through the LAN broker",
     ),
     os(
         "open",
@@ -1008,19 +995,10 @@ pub const TOOLS: &[Tool] = &[
          producer test that decodes a pack with it; the publication engine decodes compressed \
          files before scanning their plaintext (row 18)",
     ),
-    workspace(
+    toolset(
+        "gitleaks",
         super::upstream::GITLEAKS.name,
-        When::Always,
-        Some(Pin {
-            package: super::upstream::GITLEAKS.name,
-            version: super::upstream::GITLEAKS.version,
-            exe: super::upstream::GITLEAKS.executable,
-            built: false,
-            hosts: super::upstream::GITLEAKS.hosts,
-        }),
-        &[],
-        "the publication engine's required secret scanner in `pub stage` and `ship check --export` \
-         (row 19); developer init provisions the pinned binary",
+        "the signed, leased secret scanner used by verify export-scan and publication guards",
     ),
     release_host(
         "pub",

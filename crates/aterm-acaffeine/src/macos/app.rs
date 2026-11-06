@@ -24,8 +24,8 @@ use super::ui::{self, StatusUi};
 use super::watch::Watch;
 use crate::instance::Instance;
 use crate::launchd::{self, Startup, StartupDoors};
-use crate::menu::{self, Click, MenuAction, Row};
-use crate::model::{Clocks, Mode};
+use crate::menu::{self, Click, Face, MenuAction, Row, Shown};
+use crate::model::{Clocks, Hold, Machine, Mode};
 use crate::notify::ChangedObserver;
 use crate::paths::Paths;
 use crate::state;
@@ -55,6 +55,10 @@ const KEY_QUIT_REASON: u32 = u32::from_be_bytes(*b"why?");
 const SYSTEM_REASONS: [[u8; 4]; 6] = [*b"logo", *b"rlgo", *b"rrst", *b"rest", *b"rsdn", *b"shut"];
 /// `NSWorkspaceDidWakeNotification`, spelled as its value (AppKit's symbol holds it).
 const DID_WAKE: &str = "NSWorkspaceDidWakeNotification";
+/// `NSApplicationDidChangeScreenParametersNotification`, spelled as its value: a display came or
+/// went, as the built-in one goes when the lid closes with an external display attached (macOS
+/// then runs on, in clamshell mode, rather than sleep).
+const SCREENS_CHANGED: &str = "NSApplicationDidChangeScreenParametersNotification";
 /// `NSRunLoopCommonModes`, spelled as its value (Foundation's symbol holds it).
 const COMMON_MODES: &str = "kCFRunLoopCommonModes";
 
@@ -151,10 +155,24 @@ struct Mug {
     version: String,
     /// The mode as last set or read.
     mode: Mode,
-    /// The keep-awake activity, held while the mode is on.
+    /// The keep-awake activity, held while the mode is on and not paused ([`Hold::activity`]).
     awake: Option<Awake>,
     /// The one activity-acquisition door.
     awake_begin: fn(&str) -> Option<Awake>,
+    /// Keep Awake with Lid Closed, as last set or read ([`state::load_lid`]).
+    lid_awake: bool,
+    /// The `PreventSystemSleep` assertion, held while Keep Awake with Lid Closed keeps the mode
+    /// on ([`Hold::system`]).
+    lid_hold: Option<aterm_sysprobe::power::Hold>,
+    /// The one door to that assertion ([`hold_lid`]).
+    lid_begin: fn(&str) -> Option<aterm_sysprobe::power::Hold>,
+    /// The machine as it reads now: the lid and a dark wake ([`crate::held::machine_now`]); a
+    /// test's arm reads an open lid in a full wake.
+    machine: fn() -> Machine,
+    /// The system announced it will sleep, and no wake has come since ([`Mug::power`]).
+    going_to_sleep: bool,
+    /// What [`Mug::apply`] last decided to hold ([`crate::model::hold`]).
+    hold: Hold,
     /// Restore saved state, including any corrective save-back.
     take_saved: fn(&Path, Clocks) -> std::io::Result<Mode>,
     /// Whether a replaced origin still has the `acaffeine` verb ([`crate::code::serves_acaffeine`]).
@@ -209,12 +227,31 @@ impl Mug {
         saved(&file, state::save_at(&file, self.mode, now))
     }
 
-    /// Hold the activity while on and show its actual state. An activity macOS refused leaves
-    /// the mode as it is, which is the person's: the mug shows itself empty, records why
-    /// ([`crate::trouble`]) and asks again at the next tick. Once it holds, or the mode is off,
-    /// the trouble is cleared and a restart's bridge lets go.
+    /// Hold what the mode, Keep Awake with Lid Closed and the machine call for
+    /// ([`crate::model::hold`]) and show its actual state: the activity while on, with the
+    /// `PreventSystemSleep` assertion besides when the person opted in, and nothing while
+    /// paused (the lid closed without the opt-in, or a going-to-sleep or a dark wake either
+    /// way), the mode staying as it is. What macOS refused leaves the mode as it is, which is
+    /// the person's: the mug shows itself so, records why ([`crate::trouble`]) and asks again at
+    /// the next tick. Once nothing it asked for is refused, the trouble is cleared and a
+    /// restart's bridge lets go.
     fn apply(&mut self, now: Clocks) {
-        if !self.mode.is_on(now) {
+        let machine = Machine {
+            going_to_sleep: self.going_to_sleep,
+            ..(self.machine)()
+        };
+        let hold = crate::model::hold(self.mode.is_on(now), self.lid_awake, machine);
+        if hold != self.hold
+            && (matches!(hold, Hold::Paused(_)) || matches!(self.hold, Hold::Paused(_)))
+        {
+            aterm_log::info!(
+                "acaffeine: {:?}, which held {:?}, now holds {hold:?}",
+                machine,
+                self.hold
+            );
+        }
+        self.hold = hold;
+        if !hold.activity() {
             self.awake = None;
         } else if self.awake.is_none() {
             self.awake = (self.awake_begin)(AWAKE_REASON);
@@ -225,12 +262,33 @@ impl Mug {
                 crate::trouble::note(&self.paths, "macOS refused the keep-awake activity");
             }
         }
-        let lit = self.awake.is_some();
-        if lit || !self.mode.is_on(now) {
+        if !hold.system() {
+            self.lid_hold = None;
+        } else if self.lid_hold.is_none() {
+            self.lid_hold = (self.lid_begin)(AWAKE_REASON);
+            if self.lid_hold.is_none() {
+                aterm_log::warn!(
+                    "acaffeine: the lid-closed assertion was refused; asking again in a minute"
+                );
+                crate::trouble::note(
+                    &self.paths,
+                    "macOS refused the assertion that keeps this Mac running with its lid closed",
+                );
+            }
+        }
+        let refused =
+            (hold.activity() && self.awake.is_none()) || (hold.system() && self.lid_hold.is_none());
+        if !refused {
             crate::trouble::clear(&self.paths);
             bridge::release(&self.paths);
         }
-        let face = (lit, menu::tooltip(self.mode, now, lit));
+        let lit = self.awake.is_some();
+        let face = match hold {
+            Hold::Paused(pause) => Face::Paused(pause),
+            _ if refused => Face::Refused,
+            held => Face::Held { lid: held.system() },
+        };
+        let face = (lit, menu::tooltip(self.mode, now, face));
         if let Some(ui) = self.ui.as_mut() {
             ui.show(face.0, &face.1);
         }
@@ -256,6 +314,7 @@ impl Mug {
     fn choose(&mut self, action: MenuAction, now: Clocks) -> Next {
         match action {
             MenuAction::Activate(choice) => self.set(Mode::chosen(choice, now), now),
+            MenuAction::ToggleLid => self.set_lid(!self.lid_awake, now),
             MenuAction::ToggleStartup => {
                 let shown = self.startup() == Startup::On;
                 self.set_startup(!shown)
@@ -263,6 +322,39 @@ impl Mug {
             MenuAction::Quit => {
                 self.quit_off = matches!(self.set(Mode::Off, now), Next::Tick(_));
                 Next::Stop(Exit::Quit)
+            }
+        }
+    }
+
+    /// Turn Keep Awake with Lid Closed on or off, as the person chose: saved
+    /// ([`state::save_lid`]) and applied, leaving the tick armed as it is ([`Next::Keep`]). A
+    /// save that fails is logged and changes nothing, so the menu goes on showing what the file
+    /// holds.
+    fn set_lid(&mut self, on: bool, now: Clocks) -> Next {
+        let file = self.paths.lid_file();
+        match state::save_lid(&file, on) {
+            Ok(()) => self.lid_awake = on,
+            Err(err) => aterm_log::warn!("acaffeine: could not save {}: {err}", file.display()),
+        }
+        self.apply(now);
+        Next::Keep
+    }
+
+    /// What the system announced ([`aterm_uds::power::listen`]): a will-sleep lets go of
+    /// everything the mug holds before the system is told it may sleep (the listener acknowledges
+    /// once this returns), and a wake looks again as a tick does, holding again unless the lid is
+    /// still closed without Keep Awake with Lid Closed, or this is a dark wake (which pauses it
+    /// with the option on too).
+    fn power(&mut self, power: aterm_uds::power::Power, now: Clocks, menu_open: bool) -> Next {
+        match power {
+            aterm_uds::power::Power::WillSleep => {
+                self.going_to_sleep = true;
+                self.apply(now);
+                Next::Keep
+            }
+            aterm_uds::power::Power::Woke => {
+                self.going_to_sleep = false;
+                self.tick(now, menu_open)
             }
         }
     }
@@ -341,7 +433,8 @@ impl Mug {
         }
     }
 
-    /// Take the saved mode at `now`, saving it back when the file is one to ([`state::take`]), so
+    /// Read Keep Awake with Lid Closed ([`state::load_lid`]), and take the saved mode at `now`,
+    /// saving it back when the file is one to ([`state::take`]), so
     /// no later read of it (`status`, a bridge, the next mug) is off the mug's mode by more than
     /// [`state::DRIFT_SECS`]; a writer's change that lands first is taken instead
     /// ([`state::take_saving`]). Whether the mug runs on what it took: the save, if one was due,
@@ -349,6 +442,7 @@ impl Mug {
     /// yet notified, say), which `status`, a bridge and the next mug read as forever too, so the
     /// mug holds forever. Otherwise the mug keeps its own mode, settled at `now`.
     fn take(&mut self, now: Clocks) -> bool {
+        self.lid_awake = state::load_lid(&self.paths.lid_file());
         let file = self.paths.state_file();
         match (self.take_saved)(&file, now) {
             Ok(mode) => {
@@ -391,12 +485,22 @@ impl Mug {
             aterm_log::warn!("acaffeine: no bridge keeps the Mac awake while the mug restarts");
         }
         self.awake = None;
+        self.lid_hold = None;
         self.exit
     }
 
     /// The menu's rows at `now`.
     fn rows(&self, now: Clocks) -> Vec<Row> {
-        menu::compose(self.mode, now, self.startup(), &self.version)
+        let shown = Shown {
+            startup: self.startup(),
+            lid_awake: self.lid_awake,
+            paused: match self.hold {
+                Hold::Paused(pause) => Some(pause),
+                _ => None,
+            },
+            version: &self.version,
+        };
+        menu::compose(self.mode, now, shown)
     }
 
     /// Show the mode at `now` in the open menu ([`StatusUi::retitle_menu`]), unless how the app
@@ -512,6 +616,17 @@ aterm_objc::declare_class! {
         /// `NSWorkspaceDidWakeNotification`.
         @sel(workspaceDidWake:)
         fn workspace_did_wake(&self, _note: Id) {
+            if MainThread::new().is_some() {
+                let now = now();
+                let menu_open = self.ivars().tracking.get();
+                self.handle(|mug| mug.tick(now, menu_open));
+            }
+        }
+
+        /// `NSApplicationDidChangeScreenParametersNotification`: the lid may have closed or opened
+        /// on a Mac that runs on with an external display.
+        @sel(screensChanged:)
+        fn screens_changed(&self, _note: Id) {
             if MainThread::new().is_some() {
                 let now = now();
                 let menu_open = self.ivars().tracking.get();
@@ -640,14 +755,15 @@ fn stop_from_outside(mug: &RefCell<Mug>) -> (Option<Next>, bool) {
 }
 
 thread_local! {
-    /// The target a person's SIGTERM stops ([`quit_by_sigterm`]).
-    static SIGTERMED: RefCell<Option<Retained<CaffeineTarget>>> = const { RefCell::new(None) };
+    /// The running target, on the main thread: the one a person's SIGTERM stops
+    /// ([`quit_by_sigterm`]) and the system's sleep and wake reach ([`heard_power`]).
+    static TARGET: RefCell<Option<Retained<CaffeineTarget>>> = const { RefCell::new(None) };
 }
 
 /// A person's SIGTERM ([`term::watch`]).
 fn quit_by_sigterm(sender: libc::pid_t) {
     aterm_objc::run_on_main(move |_| {
-        let target = SIGTERMED.with_borrow(|target| target.as_ref().map(Retained::clone_retained));
+        let target = TARGET.with_borrow(|target| target.as_ref().map(Retained::clone_retained));
         let Some(target) = target else {
             return;
         };
@@ -658,6 +774,24 @@ fn quit_by_sigterm(sender: libc::pid_t) {
             term::end_by_sigterm();
         }
     });
+}
+
+/// What the system announced, heard on the power listener's thread ([`aterm_uds::power::listen`]):
+/// handed to the mug on the main thread, which it waits for ([`aterm_objc::run_on_main`]), so a
+/// will-sleep is acknowledged only once the mug has let go.
+fn heard_power(power: aterm_uds::power::Power) {
+    aterm_objc::run_on_main(move |_| {
+        let target = TARGET.with_borrow(|target| target.as_ref().map(Retained::clone_retained));
+        if let Some(target) = target {
+            let menu_open = target.ivars().tracking.get();
+            target.handle(|mug| mug.power(power, now(), menu_open));
+        }
+    });
+}
+
+/// The `PreventSystemSleep` assertion Keep Awake with Lid Closed holds, named `reason`.
+fn hold_lid(reason: &str) -> Option<aterm_sysprobe::power::Hold> {
+    aterm_sysprobe::power::hold(crate::held::LID_ASSERTION, reason)
 }
 
 /// The running application, which [`run`] made before any of this can be sent.
@@ -855,11 +989,16 @@ fn workspace_center() -> Id {
     }
 }
 
-/// Send `target` `workspaceDidWake:` when the Mac wakes; whether it was registered. The center
-/// holds `target` unretained: [`stop_observing_wake`] removes it before it goes.
-fn observe_wake(target: Id) -> bool {
-    let center = workspace_center();
-    let Some(name) = aterm_objc::ns_string(DID_WAKE) else {
+/// The app's default notification center (+0), where AppKit posts its screen changes.
+fn default_center() -> Id {
+    // SAFETY: `+defaultCenter` is `@16@0:8`, main thread; the center lives for the process.
+    unsafe { send_id(class(c"NSNotificationCenter").as_id(), sel!(defaultCenter)) }
+}
+
+/// Send `target` `selector` whenever `center` posts `name`; whether it was registered. The center
+/// holds `target` unretained: [`stop_observing`] removes it before it goes.
+fn observe(center: Id, name: &str, target: Id, selector: Sel) -> bool {
+    let Some(name) = aterm_objc::ns_string(name) else {
         return false;
     };
     if center.is_null() {
@@ -872,7 +1011,7 @@ fn observe_wake(target: Id) -> bool {
             center,
             sel!(addObserver:selector:name:object:),
             target,
-            sel!(workspaceDidWake:),
+            selector,
             name.id(),
             Id::NIL,
         );
@@ -880,9 +1019,8 @@ fn observe_wake(target: Id) -> bool {
     true
 }
 
-/// Undo [`observe_wake`].
-fn stop_observing_wake(target: Id) {
-    let center = workspace_center();
+/// Undo [`observe`] on `center`.
+fn stop_observing(center: Id, target: Id) {
     if !center.is_null() {
         // SAFETY: `-removeObserver:` is `v24@0:8@16`.
         unsafe { send_v_id(center, sel!(removeObserver:), target) };
@@ -983,6 +1121,12 @@ pub(super) fn run(ctx: ServeContext) -> ExitCode {
         version,
         awake: None,
         awake_begin: Awake::begin,
+        lid_awake: false,
+        lid_hold: None,
+        lid_begin: hold_lid,
+        machine: crate::held::machine_now,
+        going_to_sleep: false,
+        hold: Hold::Off,
         take_saved: state::take_saving,
         origin_serves: crate::code::serves_acaffeine,
         bridge_start: bridge::start,
@@ -1207,12 +1351,35 @@ fn run_app(main: MainThread, mug: Mug) -> Result<Ended, Unstarted> {
         mug.apply(now);
         next_tick_secs(mug.mode, now)
     };
-    let woke = observe_wake(target.as_id());
+    let woke = observe(
+        workspace_center(),
+        DID_WAKE,
+        target.as_id(),
+        sel!(workspaceDidWake:),
+    );
+    let screens = observe(
+        default_center(),
+        SCREENS_CHANGED,
+        target.as_id(),
+        sel!(screensChanged:),
+    );
+    if !screens {
+        aterm_log::warn!(
+            "acaffeine: display changes not watched; a lid closed on an external display is \
+             seen at the next tick"
+        );
+    }
     arm_tick(target.as_id(), first_tick);
     // SAFETY: `-setDelegate:` is `v24@0:8@16`; the app holds its delegate unretained, and the
     // target outlives `-run`, after which it is taken back.
     unsafe { send_v_id(app, sel!(setDelegate:), target.as_id()) };
-    SIGTERMED.set(Some(target.clone_retained()));
+    TARGET.set(Some(target.clone_retained()));
+    let power = aterm_uds::power::listen(Box::new(heard_power));
+    if power.is_none() {
+        aterm_log::warn!(
+            "acaffeine: the system's sleep is not heard; the mug looks at the lid each tick"
+        );
+    }
     let sigterm = term::watch(quit_by_sigterm);
     if sigterm.is_none() {
         aterm_log::warn!(
@@ -1223,12 +1390,16 @@ fn run_app(main: MainThread, mug: Mug) -> Result<Ended, Unstarted> {
     // SAFETY: `-run` is `v16@0:8` on the live app, on the main thread.
     unsafe { send_v(app, sel!(run)) };
     drop(sigterm);
-    SIGTERMED.set(None);
+    drop(power);
+    TARGET.set(None);
     cancel_performs(target.as_id());
     // SAFETY: as the `-setDelegate:` above, with nil.
     unsafe { send_v_id(app, sel!(setDelegate:), Id::NIL) };
     if woke {
-        stop_observing_wake(target.as_id());
+        stop_observing(workspace_center(), target.as_id());
+    }
+    if screens {
+        stop_observing(default_center(), target.as_id());
     }
     drop(changed);
     let (exit, quit_off) = match target.ivars().mug.try_borrow_mut() {
@@ -1680,6 +1851,12 @@ mod tests {
             mode: Mode::Off,
             awake: None,
             awake_begin: Awake::begin,
+            lid_awake: false,
+            lid_hold: None,
+            lid_begin: |_| panic!("only Keep Awake with Lid Closed asks for its assertion"),
+            machine: Machine::default,
+            going_to_sleep: false,
+            hold: Hold::Off,
             take_saved: state::take_saving,
             origin_serves: |_| Some(true),
             bridge_start: || panic!("only a restart that holds the activity starts a bridge"),
@@ -1713,6 +1890,122 @@ mod tests {
         assert_eq!(mug.mode, Mode::Off);
         assert!(mug.awake.is_none());
         assert_eq!(saved(&mug), Some(Mode::Off));
+    }
+
+    thread_local! {
+        /// The lid a test's machine door reads ([`lid_door`]).
+        static LID: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// A machine door that reads [`LID`], in a full wake.
+    fn lid_door() -> Machine {
+        Machine {
+            lid_closed: LID.get(),
+            ..Machine::default()
+        }
+    }
+
+    /// By default a lid's close pauses the mug: it lets go of its activity, the mode and the
+    /// saved file stay on, the tooltip and the menu say it is paused, and the lid's open holds
+    /// again; the lid's own assertion is never asked for.
+    #[test]
+    fn a_closed_lid_pauses_the_hold_and_keeps_the_mode() {
+        let dir = crate::test_scratch_dir("app");
+        let mut mug = scratch_mug(dir.path());
+        mug.machine = lid_door;
+        LID.set(false);
+        assert_eq!(mug.set(Mode::Forever, NOW), Next::Tick(TICK_SECS));
+        assert!(mug.awake.is_some());
+        LID.set(true);
+        assert_eq!(mug.tick(NOW + 60, false), Next::Tick(TICK_SECS));
+        assert!(mug.awake.is_none(), "the closed lid lets go");
+        assert!(mug.lid_hold.is_none());
+        assert_eq!(mug.mode, Mode::Forever, "the mode stays on");
+        assert_eq!(saved(&mug), Some(Mode::Forever));
+        assert_eq!(mug.hold, Hold::Paused(crate::model::Pause::LidClosed));
+        let (lit, tip) = mug.shown.clone().expect("shown");
+        assert!(!lit);
+        assert!(tip.contains("lid is closed"), "{tip}");
+        assert!(
+            mug.rows(NOW + 60).contains(&Row::Info(
+                menu::pause_line(crate::model::Pause::LidClosed).into()
+            )),
+            "the menu says it"
+        );
+        assert!(
+            crate::trouble::read(&mug.paths).is_none(),
+            "a pause is no trouble"
+        );
+        LID.set(false);
+        assert_eq!(mug.tick(NOW + 120, false), Next::Tick(TICK_SECS));
+        assert!(mug.awake.is_some(), "the open lid holds again");
+        assert_eq!(mug.hold, Hold::Idle);
+    }
+
+    /// Keep Awake with Lid Closed, chosen in the menu, is saved and holds `PreventSystemSleep`
+    /// besides the activity, the lid closed too; a will-sleep lets go of both, the mode staying
+    /// on, and the wake holds both again. Turned off with the lid closed, the mug pauses.
+    #[test]
+    fn the_lid_option_holds_the_system_assertion_until_macos_sleeps() {
+        const REASON: &str = "aterm acaffeine lid option test";
+        let dir = crate::test_scratch_dir("app");
+        let mut mug = scratch_mug(dir.path());
+        mug.machine = lid_door;
+        mug.awake_begin = |_| Awake::begin(REASON);
+        mug.lid_begin = |_| aterm_sysprobe::power::hold(crate::held::LID_ASSERTION, REASON);
+        let listed = || {
+            let mut kinds = super::super::awake::tests::assertions_named(REASON);
+            kinds.sort();
+            kinds
+        };
+        LID.set(false);
+        let _ = mug.set(Mode::Forever, NOW);
+        assert_eq!(mug.choose(MenuAction::ToggleLid, NOW), Next::Keep);
+        assert!(mug.lid_awake);
+        assert!(state::load_lid(&mug.paths.lid_file()), "saved");
+        assert!(mug.rows(NOW).contains(&Row::Action {
+            label: menu::LID_LABEL.into(),
+            action: MenuAction::ToggleLid,
+            checked: true,
+        }));
+        LID.set(true);
+        let _ = mug.tick(NOW + 60, false);
+        assert_eq!(mug.hold, Hold::LidClosedToo);
+        assert_eq!(
+            listed(),
+            [
+                crate::held::LID_ASSERTION,
+                "PreventUserIdleDisplaySleep",
+                crate::held::SYSTEM_ASSERTION
+            ]
+        );
+        assert_eq!(
+            mug.power(aterm_uds::power::Power::WillSleep, NOW + 61, false),
+            Next::Keep
+        );
+        assert!(mug.awake.is_none() && mug.lid_hold.is_none());
+        assert_eq!(listed(), Vec::<String>::new(), "let go before the sleep");
+        assert_eq!(mug.mode, Mode::Forever);
+        let _ = mug.power(aterm_uds::power::Power::Woke, NOW + 600, false);
+        assert_eq!(mug.hold, Hold::LidClosedToo, "the wake holds again");
+        assert!(mug.awake.is_some() && mug.lid_hold.is_some());
+        let _ = mug.choose(MenuAction::ToggleLid, NOW + 601);
+        assert!(!state::load_lid(&mug.paths.lid_file()));
+        assert_eq!(mug.hold, Hold::Paused(crate::model::Pause::LidClosed));
+        assert_eq!(listed(), Vec::<String>::new());
+    }
+
+    /// The lid option a writer saved is what the mug reads when it takes the file again.
+    #[test]
+    fn a_writers_lid_choice_is_read_with_the_mode() {
+        let dir = crate::test_scratch_dir("app");
+        let mut mug = scratch_mug(dir.path());
+        state::save_lid(&mug.paths.lid_file(), true).expect("lid on");
+        assert!(mug.take(NOW));
+        assert!(mug.lid_awake);
+        state::save_lid(&mug.paths.lid_file(), false).expect("lid off");
+        assert!(mug.take(NOW));
+        assert!(!mug.lid_awake);
     }
 
     #[test]
@@ -1756,7 +2049,7 @@ mod tests {
             );
             let read = state::load(&mug.paths.state_file(), NOW);
             assert!(
-                crate::cli::status_text(read, NOW, Some(42), Startup::Off, "l.x")
+                crate::cli::status_text(read, NOW, Some(42), Startup::Off, "l.x", false)
                     .starts_with("acaffeine=on\n"),
                 "`status` reads the file"
             );
@@ -1765,7 +2058,7 @@ mod tests {
                 "the refusal is recorded"
             );
             assert_eq!(
-                menu::tooltip(mug.mode, NOW, mug.awake.is_some()),
+                menu::tooltip(mug.mode, NOW, Face::Refused),
                 menu::NOT_HELD_TIP
             );
             mug.awake_begin = |_| GRANT.get().then(|| Awake::begin(REASON)).flatten();
@@ -1820,7 +2113,7 @@ mod tests {
         assert_eq!(mug.mode, Mode::Off);
         assert_eq!(saved(&mug), Some(Mode::Off));
         assert!(mug.awake.is_none());
-        assert!(menu::tooltip(mug.mode, NOW + HOUR + 1, false).contains("is off"));
+        assert!(menu::tooltip(mug.mode, NOW + HOUR + 1, Face::Refused).contains("is off"));
         let _ = mug.choose(MenuAction::Activate(Choice::Forever), NOW);
         assert!(mug.awake.is_some());
         assert_eq!(mug.choose(MenuAction::Quit, NOW), Next::Stop(Exit::Quit));

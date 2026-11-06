@@ -391,6 +391,8 @@ fn spec_xref_closure() {
         "AccountSharedProgress",
         "AccountSharedAdoptionProgress",
         "AccountSharedAdoptionRecovery",
+        "FabricRouting",
+        "FabricHalts",
     ] {
         assert!(
             report

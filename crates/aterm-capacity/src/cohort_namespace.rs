@@ -372,8 +372,13 @@ impl Namespace {
                 && namespace.home.starts_with(&root)
                 && namespace.home != root
                 && namespace.root.parent() == Some(namespace.home.as_path())
-                && namespace.root.file_name()?.to_str()?
-                    == format!(".capacity-cohort-{}.noindex", namespace.nonce))
+                && namespace
+                    .root
+                    .file_name()?
+                    .to_str()?
+                    .strip_prefix(".capacity-cohort-")
+                    .and_then(|s| s.strip_suffix(".noindex"))
+                    == Some(namespace.nonce.as_str()))
             .then_some((namespace, root))
         };
         build().ok_or_else(|| refused("invalid cohort namespace header"))

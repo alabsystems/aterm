@@ -27,69 +27,68 @@ mod landings;
 #[path = "harness_counts_tests.rs"]
 mod counts;
 
+/// A service resolve's answer is dialled only where it names a host to dial on a real port.
 #[cfg(target_os = "macos")]
 #[test]
 fn lan_discovery_uses_only_the_resolved_service_endpoint() {
     assert_eq!(
-        bonjour_ssh_target(
-            "Office Server._ssh._tcp.local. can be reached at actual-peer.local.:2222 (interface 8)"
-        ),
+        bonjour_ssh_target("actual-peer.local.", 2222),
         Some(("actual-peer.local".to_string(), 2222))
     );
-    for unresolved in [
-        "",
-        "Office Server._ssh._tcp.local.",
-        "Office Server can be reached at actual-peer.local.:invalid (interface 8)",
-        "Office Server can be reached at :22 (interface 8)",
-        "Office Server can be reached at /foreign/path:22 (interface 8)",
+    for (host, port) in [
+        ("", 22),
+        ("actual-peer.local.", 0),
+        (".local.", 22),
+        ("-peer.local.", 22),
+        ("/foreign/path", 22),
     ] {
-        assert_eq!(bonjour_ssh_target(unresolved), None, "{unresolved}");
+        assert_eq!(bonjour_ssh_target(host, port), None, "{host:?}:{port}");
     }
 }
 
-/// A Bonjour browse lists each instance of the service asked for once, however its case, and
-/// drops one the browse saw leave.
+/// A Bonjour browse lists each instance once, however its case, and drops one the browse heard
+/// leave.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_browse_lists_each_instance_once_until_it_leaves() {
     let browse = |rmv: bool| {
-        let mut lines = vec![
-            "Browsing for _ssh._tcp.local.",
-            "DATE: ---Wed 29 Oct 2026---",
-            "Timestamp     A/R    Flags  if Domain               Service Type         Instance Name",
-            "10:00:00.100  Add        3  14 local.               _ssh._tcp.           m14 MacBook Air",
-            "10:00:00.101  Add        3  14 local.               _ssh._tcp.           M14 macbook air",
-            "10:00:00.102  Add        3  14 local.               _sftp-ssh._tcp.      other",
-            "10:00:00.103  Add        2  14 local.               _ssh._tcp.           guest",
-        ];
-        if rmv {
-            lines.push(
-                "10:00:00.104  Rmv        0  14 local.               _ssh._tcp.           m14 MacBook Air",
-            );
+        let mut out = Vec::new();
+        for name in ["m14 MacBook Air", "M14 macbook air", "guest"] {
+            note_instance(&mut out, name.to_owned(), true);
         }
-        parse_bonjour_service_instances(&lines.join("\n"), "_ssh._tcp.")
+        if rmv {
+            note_instance(&mut out, "m14 MacBook Air".to_owned(), false);
+        }
+        out
     };
     assert_eq!(browse(false), ["m14 MacBook Air", "guest"]);
     assert_eq!(browse(true), ["guest"], "m14 left");
 }
 
-/// A device-info reply's hex bytes decode to its model, comma kept, and its Darwin version,
-/// each length byte a separator.
+/// A device-info TXT record's strings, each led by its length byte, name its model, comma kept,
+/// and its Darwin version; a length that runs past the data reads what is there.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_device_info_reply_names_its_model_and_darwin_version() {
+    let txt = |strings: &[&str]| -> Vec<u8> {
+        strings
+            .iter()
+            .flat_map(|s| std::iter::once(u8::try_from(s.len()).unwrap()).chain(s.bytes()))
+            .collect()
+    };
     assert_eq!(
-        parse_bonjour_device_txt(
-            "10:00:00.123  Add  2  14  m14._device-info._tcp.local.  TXT  IN  25 bytes: 0D 6D 6F \
-             64 65 6C 3D 4D 61 63 31 34 2C 32 0A 6F 73 78 76 65 72 73 3D 32 35"
-        ),
+        parse_bonjour_device_txt(&txt(&["model=Mac14,2", "osxvers=25"])),
         (Some("Mac14,2".into()), Some(25))
     );
     assert_eq!(
-        parse_bonjour_device_txt("model=MacBookPro18,3\\osxvers=21"),
-        (Some("MacBookPro18,3".into()), Some(21))
+        parse_bonjour_device_txt(&txt(&["ecolor=1", "model=MacBookPro18,3 "])),
+        (Some("MacBookPro18,3".into()), None)
     );
-    assert_eq!(parse_bonjour_device_txt(""), (None, None));
+    assert_eq!(
+        parse_bonjour_device_txt(b"\x20osxvers=21"),
+        (None, Some(21))
+    );
+    assert_eq!(parse_bonjour_device_txt(&[]), (None, None));
 }
 
 /// LAN instances sort numbered Macs first by their number, `m` or `M`, then the rest by name
@@ -4593,34 +4592,37 @@ fn an_aterm_that_is_not_its_accounts_own_reads_no_fleet() {
     );
 }
 
-/// Tab Control's Bonjour sweep (its `dns-sd` browses, `.local` lookups and SSH probes) puts
-/// macOS's Local Network question on screen where macOS never asked aterm, so it waits while
-/// System State's Local Network step, which asks that question first, is still to come, and the
-/// page says why it shows no computer on the network; once the step asked, or never will, it
-/// sweeps and the page says nothing of it. While `[swarm] enabled = false` turns sharing off it
-/// sweeps nothing and says that instead.
+/// Tab Control's Bonjour sweep (its browses, `.local` lookups and SSH probes) goes through the
+/// root LAN broker, so while the broker does not answer it sweeps nothing and the page says why
+/// in the broker's own words; once it answers, it sweeps and the page says nothing of it. While
+/// `[swarm] enabled = false` turns sharing off it sweeps nothing and says that instead.
 #[cfg(target_os = "macos")]
 #[test]
-fn tab_control_sweeps_the_local_network_only_after_the_local_network_step() {
+fn tab_control_sweeps_the_local_network_only_while_the_lan_broker_answers() {
+    const NO_BROKER: &str = "no root LAN broker answers";
     let mut swept = 0;
     assert_eq!(
-        sweep_lan_after_the_step(true, || false, || swept += 1),
-        Some(LAN_WAITS)
+        sweep_lan_through_the_broker(true, || Some(NO_BROKER.to_owned()), || swept += 1).as_deref(),
+        Some(NO_BROKER)
     );
-    assert_eq!(swept, 0, "no sweep while the step is still to come");
+    assert_eq!(swept, 0, "no sweep while the broker does not answer");
     assert_eq!(
-        sweep_lan_after_the_step(
+        sweep_lan_through_the_broker(
             false,
-            || panic!("sharing off: the door is not asked"),
+            || panic!("sharing off: the broker is not asked"),
             || {
                 swept += 1;
             }
-        ),
+        )
+        .as_deref(),
         Some(LAN_SHARING_OFF)
     );
     assert_eq!(swept, 0, "no sweep while sharing is off");
-    assert_eq!(sweep_lan_after_the_step(true, || true, || swept += 1), None);
-    assert_eq!(swept, 1, "the step asked, or never will: it sweeps");
+    assert_eq!(
+        sweep_lan_through_the_broker(true, || None, || swept += 1),
+        None
+    );
+    assert_eq!(swept, 1, "the broker answers: it sweeps");
 
     let mut app = App::headless_for_test();
     let mut report = HarnessStatsReport::new(
@@ -4630,7 +4632,7 @@ fn tab_control_sweeps_the_local_network_only_after_the_local_network_step() {
         Some(0),
         &|_| Some(0),
     );
-    report.lan_waits = Some(LAN_WAITS);
+    report.lan_waits = Some(NO_BROKER.to_owned());
     app.harness_screen.stats.report = Some(std::sync::Arc::new(report));
     let state = app.tab_control_state(crate::autopilot::HarnessPosture::default());
     let said = |state: &TabControlState| {
@@ -4643,7 +4645,7 @@ fn tab_control_sweeps_the_local_network_only_after_the_local_network_step() {
     };
     assert_eq!(
         said(&state).as_deref(),
-        Some(LAN_WAITS),
+        Some(NO_BROKER),
         "the page says why it looked for no computer on the network"
     );
     assert_eq!(

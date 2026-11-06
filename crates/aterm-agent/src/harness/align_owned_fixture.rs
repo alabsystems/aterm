@@ -75,6 +75,20 @@ impl Provider {
         Self::with_tail(tag, "while :; do '{sleep}' 0.1; done\n")
     }
 
+    /// Leaves stdin unread until the test cooperatively releases its input gate.
+    pub(in crate::harness) fn unread_input(tag: &str) -> Self {
+        Self::with_tail(
+            tag,
+            "while [ ! -e \"$d/release-input\" ]; do '{sleep}' 0.1; done\nIFS= read -r answer\nexit 0\n",
+        )
+    }
+
+    /// Releases this stand-in's input gate, including recovery from a failed bounded-write test.
+    pub(in crate::harness) fn release_input(&self) {
+        std::fs::write(self.dir.path().join("release-input"), b"read\n")
+            .expect("release owned input");
+    }
+
     /// The stand-in that signs in and exits by itself, its member still holding its stdout,
     /// laid out for the test `tag`.
     pub(in crate::harness) fn signing_in(tag: &str) -> Self {

@@ -14,12 +14,10 @@ use std::sync::mpsc;
 #[cfg(all(test, unix))]
 use std::sync::{Arc, atomic::AtomicBool, atomic::Ordering};
 use std::time::Duration;
-#[cfg(unix)]
 use std::time::Instant;
 
 #[cfg(unix)]
 use super::wake_deadline::SLEEP_CHECK;
-use super::wake_deadline::WakeDeadline;
 
 /// On non-Unix hosts the reader still uses a blocking pipe.
 #[cfg(not(unix))]
@@ -32,6 +30,9 @@ type ChildReady = Box<dyn FnOnce(&mut Child) + Send>;
 
 #[cfg(all(test, unix))]
 type OwningWait = Box<dyn FnMut(&mut Child) -> std::io::Result<std::process::ExitStatus> + Send>;
+
+#[cfg(all(test, unix))]
+type GroupSignal = Box<dyn FnOnce(i32) -> std::io::Result<()> + Send>;
 
 #[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
@@ -145,18 +146,6 @@ impl CaptureOwner {
             .map(|lineage| aterm_uds::tether::Watched::of(&lineage));
     }
 
-    fn exited_for_signal(&mut self) -> bool {
-        match self.child.exited() {
-            Ok(exited) => exited,
-            Err(error) => {
-                self.custody.observe_error(&error);
-                self.note_uncertainty("signal-check", &error);
-                discard_capture_value(error);
-                false
-            }
-        }
-    }
-
     fn cancel_output(&mut self) {
         self.cancel.take();
     }
@@ -228,16 +217,24 @@ impl CaptureOwner {
                 #[cfg(not(test))]
                 let result = aterm_uds::process::kill_group_until_empty(pgid);
                 #[cfg(test)]
-                let result = aterm_uds::process::kill_group_until_empty_within(
-                    pgid,
-                    aterm_spec::wait::MUST_HAPPEN,
-                );
-                // A proved owned end can leave only zombies or no signalable members.
+                let result = match self
+                    .observer
+                    .as_ref()
+                    .and_then(|observer| observer.group_signal.lock().unwrap().take())
+                {
+                    Some(signal) => signal(pgid),
+                    None => aterm_uds::process::kill_group_until_empty_within(
+                        pgid,
+                        aterm_spec::wait::MUST_HAPPEN,
+                    ),
+                };
+                // Darwin can make a dying group unsignalable before waitid publishes
+                // its terminal exit. Accept these errors only after the owning wait below
+                // positively settles that exit; a one-shot WNOHANG probe here races it.
                 match result {
                     Ok(()) => Ok(()),
                     Err(error)
-                        if matches!(error.raw_os_error(), Some(libc::EPERM | libc::ESRCH))
-                            && self.exited_for_signal() =>
+                        if matches!(error.raw_os_error(), Some(libc::EPERM | libc::ESRCH)) =>
                     {
                         Ok(())
                     }
@@ -373,6 +370,7 @@ struct CaptureLifecycleObservation {
     reader_joined: AtomicBool,
     /// How many times the capture signalled its child's group.
     group_kills: std::sync::atomic::AtomicUsize,
+    group_signal: std::sync::Mutex<Option<GroupSignal>>,
     /// Run after spawn, and the deadline taken again after it, so what a
     /// test's child must have done by then (an escape test's holder leaving
     /// for its own session) happens before the deadline under any load.
@@ -392,6 +390,8 @@ struct CaptureLifecycleObservation {
     /// Run once, as the capture's wait first starts waiting, after it has taken what is left of
     /// the deadline: what happens while it waits.
     in_wait: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Run at an actual full stdin pipe, before its bounded writable wait.
+    in_input_wait: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 #[cfg(all(test, unix))]
@@ -463,35 +463,7 @@ fn mark_capture_child_reaped(observer: &CaptureObserver) {
     let _ = observer;
 }
 
-/// A capture's deadline ([`WakeDeadline`]), read against `observer`'s clock that counts through
-/// sleep ([`through_sleep_ns`]), which a test sets.
-#[derive(Clone, Copy)]
-struct Deadline(WakeDeadline);
-
-impl Deadline {
-    /// `budget` from now.
-    fn after(budget: Duration, observer: &CaptureObserver) -> Self {
-        Self(WakeDeadline::after_from(budget, through_sleep_ns(observer)))
-    }
-
-    /// What is left of it now: the less of what each clock leaves.
-    fn remaining(self, observer: &CaptureObserver) -> Duration {
-        self.0.remaining_from(through_sleep_ns(observer))
-    }
-
-    /// It on the clock that stops in sleep, from what is left of it now: the output reader's
-    /// bound, which the capture's wait cancels where sleep ends the deadline first.
-    #[cfg(unix)]
-    fn awake_end(self, observer: &CaptureObserver) -> Instant {
-        Instant::now() + self.remaining(observer)
-    }
-
-    /// Whether it counts the time the host slept ([`WakeDeadline::counts_sleep`]).
-    #[cfg(unix)]
-    fn counts_sleep(self) -> bool {
-        self.0.counts_sleep()
-    }
-}
+use super::auth_deadline::Deadline;
 
 /// The clock that counts through sleep, now ([`Deadline`]), and in a test what the test says the
 /// host slept besides.
@@ -622,6 +594,8 @@ pub fn capture_bounded_owned(
 /// other stop ends it, the output reader is cancelled and joined, and the answer is
 /// [`Ended::Stopped`]; an exit the capture observes first is answered as that exit. A panic in
 /// `stopped` becomes an error after the same end; its payload is not returned.
+/// The callback receives only bounded input under the original deadline, not the child's
+/// wait or signal authority.
 ///
 /// # Errors
 ///
@@ -632,7 +606,7 @@ pub(super) fn capture_bounded_owned_watching(
     mut cmd: Command,
     budget: Duration,
     max_stdout: usize,
-    mut stopped: impl FnMut(&mut aterm_uds::spawnfd::Child) -> bool,
+    mut stopped: impl FnMut(&mut CaptureInput<'_>) -> bool,
 ) -> Result<Ended, String> {
     tie(&mut cmd)?;
     capture_with(
@@ -827,7 +801,7 @@ fn capture_with(
     stop: Option<&'static [u8]>,
     observer: CaptureObserver,
     owned: bool,
-    mut watch: Option<&mut dyn FnMut(&mut aterm_uds::spawnfd::Child) -> bool>,
+    mut watch: Option<&mut dyn FnMut(&mut CaptureInput<'_>) -> bool>,
 ) -> Result<Ended, String> {
     let mut keep: Vec<(std::ffi::OsString, std::ffi::OsString)> = Vec::new();
     for (name, value) in cmd.get_envs() {
@@ -873,7 +847,8 @@ fn capture_with(
     }
     #[cfg(unix)]
     cmd.process_group(0);
-    let deadline = Deadline::after(budget, &observer);
+    let continuous = || through_sleep_ns(&observer);
+    let deadline = Deadline::with_clocks(budget, &Instant::now, &continuous);
     #[cfg(all(test, unix))]
     observed_step(&observer, |o| &o.before_spawn);
     let child = cmd.spawn().map_err(|e| format!("it will not run: {e}"))?;
@@ -897,7 +872,7 @@ fn capture_with(
     drop(cmd);
     #[cfg(all(test, unix))]
     let deadline = if observed_step(&observer, |o| &o.after_spawn) {
-        Deadline::after(budget, &observer)
+        Deadline::with_clocks(budget, &Instant::now, &continuous)
     } else {
         deadline
     };
@@ -922,7 +897,7 @@ fn capture_with(
     #[cfg(all(test, unix))]
     let reader_observer = observer.clone();
     #[cfg(unix)]
-    let reader_until = deadline.awake_end(&observer);
+    let reader_end = deadline.end();
     let reader = std::thread::Builder::new()
         .name("aterm-capture-output".to_owned())
         .spawn(move || {
@@ -932,7 +907,7 @@ fn capture_with(
             let read = read_capture_pipe_until(
                 stdout,
                 max_stdout,
-                reader_until,
+                reader_end,
                 stop,
                 cancel_reader.as_ref().map(AsRawFd::as_raw_fd),
             );
@@ -960,7 +935,7 @@ fn capture_with(
     observed_step(&observer, |o| &o.after_reader);
     #[cfg(unix)]
     let waited = loop {
-        let remaining = deadline.remaining(&observer);
+        let remaining = deadline.remaining().unwrap_or_default();
         let watching = stderr_watch.is_some() || watch.is_some();
         let tick = match (watching, owned) {
             (true, true) => STDERR_WATCH.min(REAP_CHECK),
@@ -1011,7 +986,8 @@ fn capture_with(
                         };
                     }
                 }
-                let checked = check_capture_watch(&mut watch, &mut child.child);
+                let checked =
+                    check_capture_watch(&mut watch, &mut child.child, deadline, &observer);
                 if !matches!(checked, Ok(false)) {
                     let cleanup = kill_capture_child_checked(&mut child, &observer);
                     let joined = join_capture_reader(&mut child, &mut reader);
@@ -1025,7 +1001,7 @@ fn capture_with(
         }
     };
     #[cfg(not(unix))]
-    let waited = rx.recv_timeout(deadline.remaining(&observer));
+    let waited = rx.recv_timeout(deadline.remaining().unwrap_or_default());
     let bytes = match waited {
         Ok(Ok((_, true))) => {
             let _ = join_capture_reader(&mut child, &mut reader);
@@ -1085,13 +1061,13 @@ fn capture_with(
         }
         // Natural exit observed after output completion retains its actual exit status.
         // Until then the original unreaped child still pins its private process group.
-        let checked = check_capture_watch(&mut watch, &mut child.child);
+        let checked = check_capture_watch(&mut watch, &mut child.child, deadline, &observer);
         if !matches!(checked, Ok(false)) {
             kill_capture_child_checked(&mut child, &observer)?;
             checked?;
             return Ok(Ended::Stopped);
         }
-        let remaining = deadline.remaining(&observer);
+        let remaining = deadline.remaining().unwrap_or_default();
         if remaining.is_zero() {
             kill_capture_child(&mut child, &observer);
             return Err(String::from(
@@ -1146,14 +1122,124 @@ fn discard_capture_value<T>(value: T) {
     }
 }
 
+/// Borrowed input to the actual capture child. It conveys no wait, signal or reap right.
+pub(super) struct CaptureInput<'a> {
+    #[cfg(unix)]
+    stdin: Option<&'a mut std::process::ChildStdin>,
+    deadline: Deadline<'a>,
+    #[cfg(all(test, unix))]
+    observer: &'a CaptureObserver,
+}
+
+#[cfg(unix)]
+impl CaptureInput<'_> {
+    /// Writes this slice through the same pipe, retaining progress under the original budget.
+    /// # Errors
+    /// The pipe is absent, closed or unavailable; work is cancelled; or the original budget
+    /// expires. An error can follow partial delivery and never proves no provider effect.
+    pub(super) fn write_all(
+        &mut self,
+        mut bytes: &[u8],
+        cancelled: impl Fn() -> bool,
+    ) -> std::io::Result<()> {
+        use std::io::Write as _;
+        if cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "capture input cancelled",
+            ));
+        }
+        self.deadline
+            .remaining()
+            .map_err(|_| capture_pipe_deadline())?;
+        let fd = self
+            .stdin
+            .as_ref()
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?
+            .as_raw_fd();
+        capture_pipe_nonblocking(fd)?;
+        loop {
+            if cancelled() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "capture input cancelled",
+                ));
+            }
+            let remaining = self
+                .deadline
+                .remaining()
+                .map_err(|_| capture_pipe_deadline())?;
+            if bytes.is_empty() {
+                return Ok(());
+            }
+            match self
+                .stdin
+                .as_mut()
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?
+                .write(bytes)
+            {
+                Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                Ok(n) => {
+                    bytes = &bytes[n..];
+                    continue;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e),
+            }
+            #[cfg(all(test, unix))]
+            observed_step(self.observer, |o| &o.in_input_wait);
+            // A readiness wake is not permission for another write: the loop rechecks work
+            // and the same deadline, including host sleep, before continuing this offset.
+            let mut ready = libc::pollfd {
+                fd,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let millis = remaining
+                .min(REAP_CHECK)
+                .as_millis()
+                .max(1)
+                .min(i32::MAX as u128) as i32;
+            // SAFETY: the capture retains its actual child and this borrowed pipe for the
+            // entire call; ready is one initialized pollfd, and no handle is reconstructed.
+            let polled = unsafe { libc::poll(&mut ready, 1, millis) };
+            if polled < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            } else if ready.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+        }
+    }
+}
+
 fn check_capture_watch(
-    watch: &mut Option<&mut dyn FnMut(&mut aterm_uds::spawnfd::Child) -> bool>,
+    watch: &mut Option<&mut dyn FnMut(&mut CaptureInput<'_>) -> bool>,
     child: &mut aterm_uds::spawnfd::Child,
+    deadline: Deadline<'_>,
+    observer: &CaptureObserver,
 ) -> Result<bool, String> {
     let Some(watch) = watch else {
         return Ok(false);
     };
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| watch(child))) {
+    let mut input = CaptureInput {
+        #[cfg(unix)]
+        stdin: child.stdin.as_mut(),
+        deadline,
+        #[cfg(all(test, unix))]
+        observer,
+    };
+    #[cfg(not(unix))]
+    let _ = child;
+    #[cfg(not(all(test, unix)))]
+    let _ = observer;
+    if input.deadline.expired() {
+        return Ok(false);
+    }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| watch(&mut input))) {
         Ok(stopped) => Ok(stopped),
         Err(payload) => {
             // A callback's arbitrary panic payload may itself panic on drop.
@@ -1166,7 +1252,7 @@ fn check_capture_watch(
 
 #[cfg(unix)]
 fn capture_pipe_nonblocking(fd: std::os::fd::RawFd) -> std::io::Result<()> {
-    // SAFETY: the worker exclusively owns this pipe end until it drops it;
+    // SAFETY: the caller exclusively owns or borrows this pipe end for this call;
     // `fcntl` changes only this end's open-file-description flags.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 {

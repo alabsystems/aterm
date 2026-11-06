@@ -12,6 +12,11 @@
 //! ([`take_saving`]). Missing or unparseable state restores to [`Mode::Forever`]; any other mode
 //! is the one saved, in any boot: an off (a person's: a click, Quit, `aterm acaffeine off` or
 //! `quit`, or the end of a span they picked) lasts until it is turned on again.
+//!
+//! Keep Awake with Lid Closed is a file of its own beside it (`<state dir>/acaffeine.lid`,
+//! `lid=on|off`, [`load_lid`]): the person's standing choice, of no boot and no deadline, which
+//! no save of the mode reads or writes, so neither can undo the other's change. A missing file
+//! (every install from before the choice existed) or any other text reads off.
 
 use std::io;
 use std::path::Path;
@@ -381,8 +386,62 @@ fn write_unless(
     written
 }
 
-/// Remove the temporaries that no write will rename beside the mode and the update bridge's pid
-/// file, under this name and the old one ([`crate::legacy`]), and beside the mug's trouble record
+/// The text of Keep Awake with Lid Closed `on`.
+#[must_use]
+pub fn encode_lid(on: bool) -> String {
+    format!("lid={}\n", if on { "on" } else { "off" })
+}
+
+/// Keep Awake with Lid Closed as `text` says it: on only when the last `lid=` line says `on`;
+/// any other text, a file of an older build's format among them, is off.
+#[must_use]
+pub fn decode_lid(text: &str) -> bool {
+    text.lines()
+        .filter_map(|line| line.trim().strip_prefix("lid="))
+        .next_back()
+        .is_some_and(|value| value == "on")
+}
+
+/// Keep Awake with Lid Closed as saved in `path` (read as [`read`] reads the mode file): off for
+/// a file that is missing or cannot be read.
+#[must_use]
+pub fn load_lid(path: &Path) -> bool {
+    read_text(path).is_some_and(|text| decode_lid(&text))
+}
+
+/// Save Keep Awake with Lid Closed `on` to `path`, whole, through a sibling temporary.
+///
+/// # Errors
+///
+/// The parent directory cannot be made or has gone, or the write or the rename fails.
+pub fn save_lid(path: &Path, on: bool) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("the lid file has no directory"))?;
+    if !parent.as_os_str().is_empty() {
+        crate::paths::ensure_real_dir(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        aterm_uds::atomic_file::write_checked(path, encode_lid(on).as_bytes(), 0o600, || {
+            if parent.as_os_str().is_empty() || crate::paths::existing_real_dir(parent)? {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("{} does not exist", parent.display()),
+                ))
+            }
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, encode_lid(on))
+    }
+}
+
+/// Remove the temporaries that no write will rename beside the mode, Keep Awake with Lid Closed
+/// and the update bridge's pid file, under this name and the old one ([`crate::legacy`]), and beside the mug's trouble record
 /// ([`crate::trouble`]), with
 /// [`aterm_uds::atomic_file::sweep_temps_beside`] past
 /// [`aterm_uds::atomic_file::ABANDONED_AFTER`]; the job plists' are
@@ -396,6 +455,7 @@ fn write_unless(
 pub fn sweep_temps(paths: &crate::paths::Paths) -> Vec<(std::path::PathBuf, io::Result<usize>)> {
     let files = [
         paths.state_file(),
+        paths.lid_file(),
         paths.bridge_file(),
         paths.trouble_file(),
         crate::legacy::state_file(paths),
@@ -619,6 +679,50 @@ mod tests {
             !at(span(NOW.since_boot), Some(BOOT)),
             "a span that has ended"
         );
+    }
+
+    /// Keep Awake with Lid Closed round-trips through its file; a missing file, an older
+    /// build's state (which named no lid), a mode file and any other word read off.
+    /// NEGATIVE CONTROL: the `on` line itself reads on, so the off answers are no constant.
+    #[test]
+    fn the_lid_choice_round_trips_and_anything_else_is_off() {
+        for on in [false, true] {
+            assert_eq!(decode_lid(&encode_lid(on)), on, "{on}");
+        }
+        assert_eq!(encode_lid(true), "lid=on\n");
+        assert_eq!(encode_lid(false), "lid=off\n");
+        let old = encode(
+            &Saved {
+                mode: Mode::Forever,
+                boot: Some(BOOT),
+            },
+            NOW,
+        );
+        for text in [
+            "",
+            old.as_str(),
+            "lid=yes\n",
+            "lid=On\n",
+            "lid=on \nlid=off\n",
+            "lid\n",
+            "#lid=on\n",
+        ] {
+            assert!(!decode_lid(text), "{text:?}");
+        }
+        assert!(decode_lid("lid=off\nlid=on\n"), "the last line says it");
+        assert!(decode_lid("  lid=on  \n"), "CONTROL");
+        let dir = crate::test_scratch_dir("lid");
+        let file = dir.path().join("state").join("acaffeine.lid");
+        assert!(
+            !load_lid(&file),
+            "no file: an install from before the choice"
+        );
+        save_lid(&file, true).expect("save on");
+        assert!(load_lid(&file));
+        save_lid(&file, false).expect("save off");
+        assert!(!load_lid(&file));
+        std::fs::write(&file, old).expect("an old file");
+        assert!(!load_lid(&file));
     }
 
     #[test]
@@ -1326,6 +1430,7 @@ mod tests {
         };
         let written = [
             "acaffeine.state",
+            "acaffeine.lid",
             "acaffeine.bridge",
             "acaffeine.trouble",
             "caffeine.state",

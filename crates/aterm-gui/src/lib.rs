@@ -231,6 +231,8 @@ pub use fleet_listen::node_serve::dial_units;
 #[cfg(unix)]
 pub use fleet_listen::node_serve::{WindowLauncher, run_node_serve_owning};
 #[cfg(unix)]
+pub use fleet_listen::node_serve::{WindowNeeds, install_window_needs};
+#[cfg(unix)]
 pub use fleet_listen::vault_here;
 #[cfg(all(unix, any(test, debug_assertions)))]
 pub use fleet_listen::vault_reading;
@@ -283,9 +285,7 @@ pub fn install_session_log() {
 /// (design §6.4): a keyboard, mouse or trackpad used within the last minute
 /// ([`system_state_host::PERSON_PRESENT_WITHIN`]), and this login's screen neither locked nor
 /// switched away for another login. `aterm init` reads it as the Messages and FaceTime
-/// sign-outs start, on every run, a terminal's too, and the door a window's first LAN uses go
-/// through past their wait for the Local Network step reads it from any thread
-/// (`aterm_types::macos_setup::lan_first_use::install_door`). In a window it is the window's own
+/// sign-outs start, on every run, a terminal's too. In a window it is the window's own
 /// reader ([`App::person_present_within`], as the window last published it on its events and
 /// ticks): where macOS gives no idle time, aterm's own last key, click or scroll instead. A
 /// process with no window has none of those, so there an unreadable idle time reads nobody there.
@@ -301,93 +301,12 @@ pub fn person_at_this_screen() -> bool {
     ) && !platform::screen_away_source(false)()
 }
 
-/// What a window's keys look like from any thread of the process ([`keys_at_rest`]): whether an
-/// aterm window has keyboard focus, and when a key last went to aterm or an aterm window took
-/// keyboard focus back after none had it ([`App::note_keyboard_focus`]).
-#[derive(Clone, Copy)]
-struct KeyRest {
-    focused: bool,
-    since: Option<Instant>,
-}
-
-static KEY_REST: std::sync::Mutex<KeyRest> = std::sync::Mutex::new(KeyRest {
-    focused: false,
-    since: None,
-});
-
-/// Note what the window's keys did for [`keys_at_rest`]: `focused`, whether an aterm window has
-/// keyboard focus now, and `key`, a key that went to aterm, or focus taken back, at `now`.
-fn note_key_rest(focused: Option<bool>, key: bool, now: Instant) {
-    let mut rest = KEY_REST
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(focused) = focused {
-        rest.focused = focused;
-    }
-    if key {
-        rest.since = Some(now);
-    }
-}
-
-/// Whether this window's keys are at rest now, read from any thread: an aterm window has keyboard
-/// focus, and no key went to aterm, nor did an aterm window take focus back, within the steps'
-/// key rest ([`devtools_helper::QUIET_FOR`]), as System State's steps read their quiet moment
-/// ([`App::step_moment_is_quiet`]): no key on its way lands in a macOS question that comes up
-/// now. The door a window's first LAN uses go through past their wait for the Local Network step
-/// reads it (`aterm_types::macos_setup::lan_first_use::install_door`).
-#[must_use]
-pub fn keys_at_rest() -> bool {
-    let rest = *KEY_REST
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    keys_rest_at(rest.focused, rest.since, Instant::now())
-}
-
-/// Whether this Mac's keyboard and pointer have been at rest for the steps' key rest
-/// ([`devtools_helper::QUIET_FOR`]), by macOS's idle time, read from any thread: the quiet moment
-/// of a process with no window (a terminal session lane), so no key on its way lands in a macOS
-/// question that comes up now. `false` where macOS gives no idle time.
-#[must_use]
-pub fn input_at_rest() -> bool {
-    platform::user_input_readable_source(false)()
-        && !platform::user_input_source(false)(devtools_helper::QUIET_FOR)
-}
-
-/// The window's watch of macOS's Local Network question a first LAN use raises through
-/// `lan_first_use`'s door, or the Commons gate's first use raises by itself past the wait for
-/// the step (`aterm_types::macos_setup::lan_first_use::install_question_watch`): it reads the
-/// window list's windows of the alert's owner from a lane worker of this process, starting
-/// before the use asks, and ends the door's hold of the question once it sees the
-/// question answered, as System State's step's own watch ends that step's hold
-/// ([`system_state_access::door_question_watch`]). Only a window installs it: a process with no
-/// window never reads the window list for it.
-#[cfg(target_os = "macos")]
-#[must_use]
-pub fn door_question_watch() -> aterm_types::macos_setup::lan_first_use::QuestionWatch {
-    system_state_access::door_question_watch()
-}
-
-/// [`keys_at_rest`] of what it read (pure).
-fn keys_rest_at(focused: bool, since: Option<Instant>, now: Instant) -> bool {
-    focused
-        && since.is_none_or(|at| now.saturating_duration_since(at) >= devtools_helper::QUIET_FOR)
-}
-
 /// Persisted source and apply policy for CLI checks and interactive sessions.
 #[must_use]
 pub fn configured_update_settings() -> Option<aterm_update::CheckSettings> {
     app_config::update_check_settings_setting()
 }
 
-/// Why System State's Local Network step will not run in a window here, as `aterm.toml` says:
-/// a `[privacy]` switch off or `[swarm] enabled = false`; `None` while it may (an unreadable
-/// file included). Every network gives the step something to ask macOS with (a subnet to name,
-/// else a Bonjour browse of its own), so no network reads as a reason. The Commons runtime reads
-/// it before its first LAN use, and a window's other first LAN uses through it.
-#[must_use]
-pub fn local_network_step_off() -> Option<&'static str> {
-    app_config::local_network_step_off_setting()
-}
 mod budget;
 mod cast;
 mod cast_scrub;
@@ -957,6 +876,9 @@ mod harness_policy_verb;
 mod harness_recovery_verb;
 mod kitty_animation;
 mod login_notice_verb;
+/// Rename This Mac…'s two fields and live line (`docs/DESIGN-machine-names-2026-11-04.md` §5.3).
+#[cfg(target_os = "macos")]
+mod machine_rename_sheet;
 /// The menu bar's machine title, `m8 Heron` (`docs/DESIGN-machine-names-2026-11-04.md` §5.1).
 #[cfg(target_os = "macos")]
 mod machine_title;
@@ -3233,7 +3155,6 @@ struct RepaintKey {
     deck_fp: u64,
     level_up_fp: Option<level_up::LevelUpRepaintKey>,
     band_fp: u64,
-    presence_fp: u64,
     question: (u64, u64),
     system_dark: bool,
     link_caption: Option<link_target::LinkHover>,
@@ -3518,15 +3439,6 @@ enum Wake {
     LeaseChanged {
         session: aterm_session::SessionId,
     },
-    #[cfg_attr(
-        not(target_os = "macos"),
-        expect(dead_code, reason = "only the macOS NeedsPill view posts it")
-    )]
-    PillAct {
-        window: WindowId,
-        session: u64,
-        hit: presence::PillHit,
-    },
     FabricChanged {
         session: aterm_session::SessionId,
     },
@@ -3612,15 +3524,6 @@ enum Wake {
     ConsentCensusReady,
     DebuggerProbeReady,
     DevToolsProbeReady,
-    #[cfg(target_os = "macos")]
-    LocalNetworkProbeReady,
-    /// System State's Local Network alert watch moved: its first read came back, so the step's
-    /// trigger that waits for it goes in this turn's consent lanes
-    /// (`App::tick_local_network_step`), or it saw a new window of the alert's owner come and
-    /// then, with the person at the Mac, no window of that owner left
-    /// (`App::on_local_network_alert_answered`).
-    #[cfg(target_os = "macos")]
-    LocalNetworkAlertWatch,
     DebuggerAccessResult,
     DevToolsHandOver,
     /// No macOS dialog of this process is up any more, after a gesture of the window's found one
@@ -7505,7 +7408,6 @@ type StripCacheKey = (
     bool,
     tab_bar::CaptionSlot,
     Option<tab_bar::CaptionButton>,
-    Option<(u64, Option<Instant>)>,
 );
 
 #[cfg(any(windows, target_os = "linux"))]
@@ -7760,7 +7662,6 @@ struct WindowState {
     leaf_render_cache: std::collections::BTreeMap<tab_model::ViewId, LeafRenderCache>,
     tab_segments: Vec<tab_bar::TabSegment>,
     last_strip_fp: Option<StripCacheKey>,
-    strip_pill_session: Option<u64>,
     strip_hover: Option<usize>,
     strip_hover_new_tab: bool,
     strip_hover_version: bool,
@@ -8890,7 +8791,6 @@ impl WindowState {
             leaf_render_cache: std::collections::BTreeMap::new(),
             tab_segments: Vec::new(),
             last_strip_fp: None,
-            strip_pill_session: None,
             strip_hover: None,
             strip_hover_new_tab: false,
             strip_hover_version: false,
@@ -11527,25 +11427,15 @@ impl App {
         // A `[privacy]` switch on again makes the launch's decisions it held first.
         self.resume_held_launch_steps(now);
         self.tick_macos_access_card(now);
-        // An answer the Local Network alert watch left is drained before the walk looks for its
-        // start, so a watch that saw no window of the alert's owner left lets the walk start in
-        // this turn (`App::on_local_network_alert_answered`).
-        self.on_local_network_alert_answered(now);
-        // The permission walk starts before any step after Local Network takes the moment (a cold
-        // first launch), once that step has run and its alert's hold is over
-        // (`App::local_network_step_to_come`), or once that step alone has held it ready for
-        // `permission_walk::LOCAL_NETWORK_WAIT` of unbroken looks, its own moment not come
-        // (`App::waited_out_local_network`): the walk then goes first.
+        // The permission walk starts before any step takes the moment (a cold first launch).
         self.tick_permission_walk(now);
-        // The Local Network step goes first in an approved revision's order, at its own moment,
-        // which waits for no walk still to come; a walk that went first after that wait holds it,
-        // as every gesture of the window's does, until the walk is over.
-        self.tick_local_network_step(now);
+        // A pane aterm opened counts as up for its bounded time only.
+        self.end_lapsed_access_pane(now);
         self.tick_devtools_hand_over(now);
         // A walk page that closed this turn turns the panel to the next at once.
         self.drive_permission_walk(now);
-        // A control client's act on the Local Network or Accessibility row, at the
-        // same step moment, after the pages.
+        // A control client's act on the Accessibility row, at the same step moment, after the
+        // pages.
         self.tick_queued_pane(now);
         #[expect(
             clippy::disallowed_methods,
@@ -11805,55 +11695,6 @@ impl App {
         devtools_helper::HandOver::Queued
     }
 
-    /// Which parts of System State's steps' quiet moment ([`Self::step_moment_is_quiet`]) fail
-    /// now, in aterm.log's words, in its order: empty when it is quiet.
-    pub(crate) fn step_quiet_gaps(&self, now: Instant) -> Vec<String> {
-        self.quiet_gaps(now, true)
-    }
-
-    /// The quiet moment's failing parts, in aterm.log's words and in its order, empty when it is
-    /// quiet: the input part read as the steps read it (`keys`: only aterm's own keys at rest,
-    /// [`Self::step_moment_is_quiet`]) or as the control verb's moment does (the keyboard and
-    /// pointer, [`Self::devtools_moment_is_quiet`]).
-    fn quiet_gaps(&self, now: Instant, keys: bool) -> Vec<String> {
-        let mut gaps = Vec::new();
-        if !keys && !self.any_os_window_focused() {
-            gaps.push("no aterm window has keyboard focus".to_owned());
-        }
-        if self.consent_warmup.is_live() {
-            gaps.push("the launch folder pass is walking".to_owned());
-        }
-        if self.permission_walk.active() {
-            gaps.push("a permission walk is under way".to_owned());
-        }
-        let quiet_for = devtools_helper::QUIET_FOR.as_secs();
-        if keys {
-            if self.keys_typed_within(devtools_helper::QUIET_FOR, now) {
-                gaps.push(format!(
-                    "a key was typed into aterm in the last {quiet_for} s"
-                ));
-            }
-        } else if (self.user_input_recent)(devtools_helper::QUIET_FOR) {
-            gaps.push(format!(
-                "the keyboard or pointer was used in the last {quiet_for} s (or macOS's idle \
-                 time could not be read)"
-            ));
-        }
-        let present_for = devtools_helper::PRESENT_WITHIN.as_secs() / 60;
-        if !keys && !(self.user_input_recent)(devtools_helper::PRESENT_WITHIN) {
-            gaps.push(format!(
-                "nobody used the keyboard or pointer in the last {present_for} min"
-            ));
-        }
-        if !self.devtools_helper.settled(now) {
-            gaps.push("aterm is still settling after its launch".to_owned());
-        }
-        if self.incoming_handoff_pending || self.update_handoff_in_flight() {
-            gaps.push("an update hand-off is pending or in flight".to_owned());
-        }
-        gaps
-    }
-
     /// Whether a key was typed into an aterm window within `within` of `now`.
     fn keys_typed_within(&self, within: Duration, now: Instant) -> bool {
         self.last_keystroke_at
@@ -11868,7 +11709,6 @@ impl App {
     /// from that return too ([`Self::step_moment_is_quiet`]).
     pub(crate) fn note_keyboard_focus(&mut self, had: bool, now: Instant) {
         let has = self.any_os_window_focused();
-        let mut back = false;
         if had && !has {
             self.keyboard_focus_lost_at = Some(now);
         } else if !had
@@ -11878,9 +11718,7 @@ impl App {
                 .is_none_or(|lost| now.saturating_duration_since(lost) >= FOCUS_AWAY_FOR)
         {
             self.keyboard_focus_back_at = Some(now);
-            back = true;
         }
-        note_key_rest(Some(has), back, now);
     }
 
     /// Whether a person is known to have been at this Mac within `within` of `now`, as System
@@ -16389,7 +16227,6 @@ impl App {
         self.rebuild_teams();
         self.publish_workers_all();
         self.refresh_presence_session(session);
-        self.reproject_pill_of(session);
         self.mark_status_dirty();
         self.redraw_claude_footer(session);
         self.note_harness_arm(session);
@@ -17991,7 +17828,6 @@ impl App {
                 w.request_redraw();
             }
         }
-        self.reproject_pill_of(session);
         if self
             .teams
             .get(&session)
@@ -18183,7 +18019,7 @@ impl ApplicationHandler<Wake> for App {
             }
             let level_up_animating = self.level_up.is_some();
             let band_folded = self.settle_messages(now);
-            let presence_dirty = self.presence_tick(now);
+            self.presence_tick(now);
             for (id, ws) in self.windows.iter_mut() {
                 let mut dirty = ws.bell_flash.expire(now);
                 dirty |= ws.flip_due_blink(now);
@@ -18260,7 +18096,6 @@ impl ApplicationHandler<Wake> for App {
                 to_redraw.extend(self.windows.keys().copied());
             }
             to_redraw.extend(self.band_motion_due(now));
-            to_redraw.extend(presence_dirty);
             let native_preview_phase_ms =
                 u64::try_from(self.lat_epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
             for wid in native_motion_due {
@@ -19638,11 +19473,6 @@ impl App {
             Wake::FabricChanged { session } => self.on_fabric_changed(&session),
             Wake::Typed { session } => self.on_typed(&session),
             Wake::Driven { session, host, act } => self.on_driven(&session, &host, &act),
-            Wake::PillAct {
-                window,
-                session,
-                hit,
-            } => self.on_pill_wake(window, session, hit),
             Wake::Ready { session, window } => {
                 let _ = window;
                 self.store
@@ -19861,7 +19691,6 @@ impl App {
                 #[cfg(all(a11y_tree, any(test, debug_assertions)))]
                 lines.extend(self.harness_a11y_lines());
                 lines.extend(self.status_item_chrome_lines());
-                lines.push(self.presence_chrome_line());
                 let _ = reply.send(lines);
             }
             Wake::ReadPanes { session, reply } => {
@@ -19920,12 +19749,6 @@ impl App {
             }
             Wake::DebuggerProbeReady => self.on_debugger_probe_ready(),
             Wake::DevToolsProbeReady => self.on_devtools_probe_ready(),
-            #[cfg(target_os = "macos")]
-            Wake::LocalNetworkProbeReady => self.on_local_network_probe_ready(Instant::now()),
-            #[cfg(target_os = "macos")]
-            Wake::LocalNetworkAlertWatch => {
-                self.on_local_network_alert_answered(Instant::now());
-            }
             Wake::DebuggerAccessResult => self.tick_debugger_access(),
             Wake::DevToolsHandOver => self.tick_devtools_hand_over(Instant::now()),
             Wake::NoMacosDialog => self.tick_developer_tools_install(),
@@ -20866,7 +20689,7 @@ impl App {
                 let _ = reply.send(self.session_status_record(session));
             }
             Wake::ReadSetupStatus { reply } => {
-                let _ = reply.send(crate::system_state_access::setup_field(
+                let _ = reply.send(crate::system_state_access::background_setup_fields(
                     self.system_state_host.latest_status(),
                 ));
             }

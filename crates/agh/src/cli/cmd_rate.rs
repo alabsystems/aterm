@@ -45,7 +45,7 @@ pub(crate) fn rate(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
             .map(|p| p.name.clone())
             .filter(|name| gh.presence(name) == Presence::Present)
             .collect();
-        names.sort();
+        names.sort_unstable();
         names.into_iter().map(Some).chain([None]).collect()
     };
     let mut rows = Vec::new();

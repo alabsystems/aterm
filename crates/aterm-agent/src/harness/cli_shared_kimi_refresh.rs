@@ -13,6 +13,17 @@ use std::time::Instant;
 
 const CLIENT_ID: &str = "17e5f671-d194-4dfb-9706-5516cb48c098";
 
+/// The longest one token refresh request may take. Its wait is what the refresh's budget leaves
+/// when it starts, up to a sign-in's whole budget (a Google federation recovery a sign-in resumes,
+/// `google_federation_recovery`'s `renew_recorded`), and the HTTP client measures it on the clock
+/// that stops in sleep, so a request in flight while the host sleeps ends this long at most after
+/// the host wakes (KI-1105-14), as Codex's code exchange and Google's token requests do.
+const REFRESH_REQUEST: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[path = "cli_shared_kimi_completion.rs"]
+mod completion;
+pub use completion::RecoveryContext;
+
 const REVOKED: &[u8] = br#"{"access_token":"","refresh_token":"","token_type":"Bearer","expires_at":0,"expires_in":0,"scope":""}"#;
 
 #[derive(Clone, Copy)]
@@ -49,18 +60,119 @@ pub(super) mod native_lock;
 mod tests;
 
 #[derive(Debug)]
-pub(super) struct AdmissionGuard(pub(super) login_drive::RecoveryAdmission);
-impl aterm_http::Guard for AdmissionGuard {
-    fn is_authorized(&self) -> bool {
-        self.0.current(None).is_ok()
+pub(super) struct AdmissionGuard {
+    pub(super) admission: login_drive::RecoveryAuthority,
+    pub(super) recovery: RecoveryContext,
+    pub(super) work: Option<crate::harness::account_work::Scope>,
+}
+
+/// Permission for new HTTP work is distinct from recording its exact completed response.
+pub trait Authority: aterm_http::Guard {
+    #[cfg(test)]
+    fn native_lease_clock(&self) -> Option<Arc<std::sync::atomic::AtomicU64>> {
+        None
+    }
+    /// The exact attempt, provider binding, role and file/lease authority remain current.
+    /// Work cancellation or expiry alone does not withdraw custody of a completed response.
+    fn receipt_current(&self) -> bool;
+    /// Current original account/role authority, without permission to mutate a native lease.
+    fn binding_current(&self) -> bool {
+        self.receipt_current()
+    }
+    /// The actual admitted root/account custody; unavailable custody prevents dispatch.
+    /// # Errors
+    /// This authority has no admitted protected completion location.
+    fn recovery_context(&self) -> Result<RecoveryContext, String> {
+        Err("Protected Kimi completion is unavailable".into())
+    }
+    /// Durably arm the one admitted exchange before it can reach the provider.
+    /// # Errors
+    /// Protected completion cannot be recorded under the current parent authority.
+    fn checkpoint_started(&self, _config: [u8; 32], _predecessor: [u8; 32]) -> Result<(), String> {
+        Err("Protected Kimi completion is unavailable".into())
+    }
+    /// Retire only this invocation's armed marker when exchange was never invoked.
+    /// # Errors
+    /// Exact newly armed custody or its durable retirement cannot be established.
+    fn checkpoint_unstarted(&self) -> Result<(), String> {
+        Err("Protected Kimi completion is unavailable".into())
+    }
+    /// Consume this call's no-dispatch cleanup right before invoking its exchange.
+    /// # Errors
+    /// The freshly armed private marker is no longer current.
+    fn checkpoint_dispatching(&self) -> Result<(), String> {
+        Ok(())
+    }
+    /// Retain an exact completed response, without granting native credential publication.
+    /// # Errors
+    /// Protected completion cannot be recorded under the current parent authority.
+    fn checkpoint_completed(
+        &self,
+        _status: u16,
+        _received: i64,
+        _body: &[u8],
+    ) -> Result<(), String> {
+        Err("Protected Kimi completion is unavailable".into())
+    }
+    /// Retire only a receipt whose canonical candidate is already durable and unchanged.
+    /// # Errors
+    /// Its canonical candidate or protected receipt cannot be established.
+    fn checkpoint_applied(&self) -> Result<(), String> {
+        Err("Protected Kimi completion is unavailable".into())
     }
 }
 
-fn authorized(guard: &dyn aterm_http::Guard, deadline: Instant) -> Result<(), NativeError> {
-    if Instant::now() >= deadline || !guard.is_authorized() {
+#[cfg(test)]
+impl Authority for aterm_http::AlwaysAuthorized {
+    fn receipt_current(&self) -> bool {
+        true
+    }
+    fn checkpoint_started(&self, _: [u8; 32], _: [u8; 32]) -> Result<(), String> {
+        Ok(())
+    }
+    fn checkpoint_completed(&self, _: u16, _: i64, _: &[u8]) -> Result<(), String> {
+        Ok(())
+    }
+    fn checkpoint_applied(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+impl aterm_http::Guard for AdmissionGuard {
+    fn is_authorized(&self) -> bool {
+        !self
+            .work
+            .as_ref()
+            .is_some_and(crate::harness::account_work::Scope::cancelled)
+            && self.admission.current(None).is_ok()
+    }
+}
+
+impl Authority for AdmissionGuard {
+    fn receipt_current(&self) -> bool {
+        self.admission.current(None).is_ok()
+    }
+    fn recovery_context(&self) -> Result<RecoveryContext, String> {
+        Ok(self.recovery.clone())
+    }
+}
+
+fn authorized(
+    guard: &dyn Authority,
+    deadline: login_drive::Deadline<'_>,
+) -> Result<(), NativeError> {
+    if deadline.expired() || !guard.is_authorized() {
         return Err(NativeError::Temporary);
     }
     Ok(())
+}
+
+fn receipt_authorized(guard: &dyn Authority) -> Result<(), NativeError> {
+    if guard.receipt_current() {
+        Ok(())
+    } else {
+        Err(NativeError::Temporary)
+    }
 }
 
 pub(in crate::harness) fn verify_or_refresh(
@@ -68,8 +180,8 @@ pub(in crate::harness) fn verify_or_refresh(
     region: Region,
     expected: &str,
     now: i64,
-    deadline: Instant,
-    guard: Arc<dyn aterm_http::Guard>,
+    deadline: login_drive::Deadline<'_>,
+    guard: Arc<dyn Authority>,
 ) -> Result<Option<KimiProof>, NativeError> {
     verify_target(
         staging,
@@ -81,6 +193,7 @@ pub(in crate::harness) fn verify_or_refresh(
         now,
         deadline,
         guard,
+        Arc::new(aterm_http::TcpConnector),
     )
 }
 
@@ -89,8 +202,8 @@ pub(in crate::harness) fn verify_or_refresh_with_rejection(
     region: Region,
     expected: &str,
     now: i64,
-    deadline: Instant,
-    guard: Arc<dyn aterm_http::Guard>,
+    deadline: login_drive::Deadline<'_>,
+    guard: Arc<dyn Authority>,
     on_rejected: &dyn Fn() -> Result<(), String>,
 ) -> Result<Option<KimiProof>, NativeError> {
     verify_target(
@@ -103,6 +216,7 @@ pub(in crate::harness) fn verify_or_refresh_with_rejection(
         now,
         deadline,
         guard,
+        Arc::new(aterm_http::TcpConnector),
     )
 }
 
@@ -110,8 +224,9 @@ fn verify_target(
     staging: &Path,
     target: Target<'_>,
     now: i64,
-    deadline: Instant,
-    guard: Arc<dyn aterm_http::Guard>,
+    deadline: login_drive::Deadline<'_>,
+    guard: Arc<dyn Authority>,
+    connector: Arc<dyn aterm_http::Connect>,
 ) -> Result<Option<KimiProof>, NativeError> {
     let Target {
         region, expected, ..
@@ -125,10 +240,11 @@ fn verify_target(
         |now, guard| verify_native_guarded(staging, region, expected, now, deadline, Some(guard)),
         |url, form, guard| {
             let wait = deadline
-                .checked_duration_since(Instant::now())
-                .filter(|wait| !wait.is_zero())
-                .ok_or(NativeError::Temporary)?;
-            let client = Client::new(Trust::PlatformVerifier, ProxyMode::Direct, wait);
+                .remaining()
+                .map_err(|_| NativeError::Temporary)?
+                .min(REFRESH_REQUEST);
+            let client = Client::new(Trust::PlatformVerifier, ProxyMode::Direct, wait)
+                .with_connector(connector);
             let reply = client
                 .post(url)
                 .header("Content-Type", "application/x-www-form-urlencoded")
@@ -154,16 +270,36 @@ fn coordinated_using(
     staging: &Path,
     target: Target<'_>,
     now: i64,
-    deadline: Instant,
-    guard: Arc<dyn aterm_http::Guard>,
-    mut read: impl FnMut(i64, Arc<dyn aterm_http::Guard>) -> Result<Option<KimiProof>, NativeError>,
+    deadline: login_drive::Deadline<'_>,
+    guard: Arc<dyn Authority>,
+    mut read: impl FnMut(i64, Arc<dyn Authority>) -> Result<Option<KimiProof>, NativeError>,
     exchange: impl FnOnce(
         &str,
         &[u8],
-        Arc<dyn aterm_http::Guard>,
+        Arc<dyn Authority>,
     ) -> Result<(u16, aterm_secrets::SecretBytes), NativeError>,
 ) -> Result<Option<KimiProof>, NativeError> {
     authorized(guard.as_ref(), deadline)?;
+    let context = guard
+        .recovery_context()
+        .map_err(|_| NativeError::Temporary)?;
+    if let Some(record) = completion::Record::existing(staging, target, context.clone())? {
+        let prepared = Arc::new(completion::Prepared::new(record, guard.clone(), target));
+        let lease = prepared
+            .restore(target, deadline)?
+            .ok_or(NativeError::Temporary)?;
+        let guarded = lease.guard();
+        let result = read(now, guarded.clone());
+        authorized(guarded.as_ref(), deadline)?;
+        // Consuming an exact prior response never dispatches another refresh in this call.
+        return match result {
+            Ok(Some(mut proof)) => {
+                proof.native_lock = Some(lease);
+                Ok(Some(proof))
+            }
+            _ => Err(NativeError::Temporary),
+        };
+    }
     let started = Instant::now();
     let initial = read(now, guard.clone());
     authorized(guard.as_ref(), deadline)?;
@@ -181,8 +317,29 @@ fn coordinated_using(
         Err(NativeError::Expired | NativeError::Rejected) => {}
         result => return result,
     }
-    let native_lock = native_lock::NativeLock::acquire(staging, target.region, deadline)?;
-    let guard = native_lock.guard(guard);
+    // Read-only native observations do not create a machine key or sealed store.
+    // Preparation reclaims and rechecks custody before the first irreversible exchange.
+    let record = completion::Record::open(staging, target, context)?;
+    let prepared = Arc::new(completion::Prepared::new(record, guard, target));
+    let restored = prepared.restore(target, deadline)?;
+    let guard: Arc<dyn Authority> = prepared;
+    if let Some(lease) = restored {
+        let guarded = lease.guard();
+        let result = read(now, guarded.clone());
+        authorized(guarded.as_ref(), deadline)?;
+        return match result {
+            Ok(Some(mut proof)) => {
+                proof.native_lock = Some(lease);
+                Ok(Some(proof))
+            }
+            _ => Err(NativeError::Temporary),
+        };
+    }
+    let native_lock =
+        native_lock::NativeLock::acquire(staging, target.region, deadline, guard.clone())?;
+    #[cfg(test)]
+    native_lock.observe_clock(guard.native_lease_clock());
+    let guard = native_lock.guard();
     let now = now
         .checked_add(
             i64::try_from(started.elapsed().as_secs()).map_err(|_| NativeError::Temporary)?,
@@ -209,8 +366,8 @@ fn run_using(
     staging: &Path,
     target: Target<'_>,
     now: i64,
-    deadline: Instant,
-    guard: &dyn aterm_http::Guard,
+    deadline: login_drive::Deadline<'_>,
+    guard: &dyn Authority,
     mut read: impl FnMut(i64) -> Result<Option<KimiProof>, NativeError>,
     exchange: impl FnOnce(&str, &[u8]) -> Result<(u16, aterm_secrets::SecretBytes), NativeError>,
 ) -> Result<Option<KimiProof>, NativeError> {
@@ -282,8 +439,8 @@ fn renew_using(
     staging: &Path,
     target: Target<'_>,
     now: i64,
-    deadline: Instant,
-    guard: &dyn aterm_http::Guard,
+    deadline: login_drive::Deadline<'_>,
+    guard: &dyn Authority,
     exchange: impl FnOnce(&str, &[u8]) -> Result<(u16, aterm_secrets::SecretBytes), NativeError>,
 ) -> Result<(), NativeError> {
     authorized(guard, deadline)?;
@@ -315,15 +472,33 @@ fn renew_using(
     config.check_current()?;
     credential.check_current()?;
     authorized(guard, deadline)?;
+    if guard
+        .checkpoint_started(
+            aterm_digest::Sha256::digest(config.bytes.expose()),
+            aterm_digest::Sha256::digest(credential.bytes.expose()),
+        )
+        .is_err()
+    {
+        // Arm may have completed before its final authority check failed. The
+        // exchange is still uncalled; only exact newly armed custody can retire.
+        guard
+            .checkpoint_unstarted()
+            .map_err(|_| NativeError::Temporary)?;
+        return Err(NativeError::Temporary);
+    }
+    if let Err(error) = authorized(guard, deadline) {
+        guard
+            .checkpoint_unstarted()
+            .map_err(|_| NativeError::Temporary)?;
+        return Err(error);
+    }
+    guard
+        .checkpoint_dispatching()
+        .map_err(|_| NativeError::Temporary)?;
     let (status, body) = exchange(
         &format!("{}/api/oauth/token", issuer(region)),
         request.expose(),
     )?;
-    // The returned grant may already have rotated. Persist before any subsequent
-    // identity request, but never replace a concurrently changed or withdrawn grant.
-    authorized(guard, deadline)?;
-    config.check_current()?;
-    credential.check_current()?;
     if body.len() > REPLY_MAX {
         return Err(NativeError::Temporary);
     }
@@ -332,7 +507,53 @@ fn renew_using(
             i64::try_from(started.elapsed().as_secs()).map_err(|_| NativeError::Temporary)?,
         )
         .ok_or(NativeError::Temporary)?;
-    let mut value: Value = aterm_json::from_slice(body.as_slice()).unwrap_or(Value::Null);
+    if !guard.binding_current() {
+        return Err(NativeError::Temporary);
+    }
+    // Preserve the exact response before touching native state. A stale lease permits only
+    // this private checkpoint, never canonical overwrite or a new provider effect.
+    guard
+        .checkpoint_completed(status, received, body.as_slice())
+        .map_err(|_| NativeError::Temporary)?;
+    receipt_authorized(guard)?;
+    config.check_current()?;
+    credential.check_current()?;
+    let (replacement, rejected) = response_candidate(status, body.as_slice(), received)?;
+    receipt_authorized(guard)?;
+    config.check_current()?;
+    credential.check_current()?;
+    if rejected {
+        rejection::save(staging, target, &config, &credential)?;
+        receipt_authorized(guard)?;
+        config.check_current()?;
+        credential.check_current()?;
+        record_rejected(target)?;
+        receipt_authorized(guard)?;
+        config.check_current()?;
+        credential.check_current()?;
+    }
+    aterm_secrets::fsx::write_atomic(&path, replacement.as_slice(), 0o600)
+        .map_err(|_| NativeError::Temporary)?;
+    receipt_authorized(guard)?;
+    guard
+        .checkpoint_applied()
+        .map_err(|_| NativeError::Temporary)?;
+    if rejected {
+        Err(NativeError::RefreshRejected)
+    } else {
+        Ok(())
+    }
+}
+
+fn response_candidate(
+    status: u16,
+    body: &[u8],
+    received: i64,
+) -> Result<(aterm_secrets::SecretBytes, bool), NativeError> {
+    if body.len() > REPLY_MAX {
+        return Err(NativeError::Temporary);
+    }
+    let mut value: Value = aterm_json::from_slice(body).unwrap_or(Value::Null);
     // A gateway's unstructured 401/403 is not proof of a revoked grant.
     let rejected =
         matches!(status, 400 | 401 | 403) && value["error"].as_str() == Some("invalid_grant");
@@ -347,28 +568,7 @@ fn renew_using(
     };
     super::super::wipe_json(value);
     let replacement = replacement?;
-    authorized(guard, deadline)?;
-    config.check_current()?;
-    credential.check_current()?;
-    if rejected {
-        // Journal the confirmed response first. A crash before native tombstone
-        // publication must not turn the old rejected seed into an unknown grant.
-        rejection::save(staging, target, &config, &credential)?;
-        authorized(guard, deadline)?;
-        config.check_current()?;
-        credential.check_current()?;
-        record_rejected(target)?;
-        authorized(guard, deadline)?;
-        config.check_current()?;
-        credential.check_current()?;
-    }
-    aterm_secrets::fsx::write_atomic(&path, replacement.as_slice(), 0o600)
-        .map_err(|_| NativeError::Temporary)?;
-    if rejected {
-        Err(NativeError::RefreshRejected)
-    } else {
-        Ok(())
-    }
+    Ok((replacement, rejected))
 }
 
 fn replacement(value: &mut Value, now: i64) -> Result<aterm_secrets::SecretBytes, NativeError> {
@@ -439,7 +639,7 @@ pub(in crate::harness) fn rejection_fixture(home: &Path, region: Region, expecte
             on_rejected: None,
         },
         1000,
-        Instant::now() + std::time::Duration::from_secs(60),
+        login_drive::Deadline::after(std::time::Duration::from_secs(60)),
         &aterm_http::AlwaysAuthorized,
         |_, _| {
             Ok((

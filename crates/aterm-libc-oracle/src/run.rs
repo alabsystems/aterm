@@ -136,7 +136,9 @@ impl Run<'_> {
         let root = &options.root;
         let oracle = root.join("libc-oracle");
         let shim_src = root.join("crates/aterm-libc/src");
-        if !oracle.join("Cargo.toml").is_file() || !shim_src.join("lib.rs").is_file() {
+        if !std::fs::symlink_metadata(oracle.join("Cargo.toml")).is_ok_and(|m| m.is_file())
+            || !std::fs::symlink_metadata(shim_src.join("lib.rs")).is_ok_and(|m| m.is_file())
+        {
             return Err(CouldNotRun::new(
                 format!(
                     "{} holds no libc-oracle/ and crates/aterm-libc/",

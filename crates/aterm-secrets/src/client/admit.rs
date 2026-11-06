@@ -1042,15 +1042,18 @@ pub fn log_admitted_actors(paths: &Paths) -> BTreeSet<crate::membership_log::Mem
 /// membership log with its `Admit` ([`admit_by_phrase`]) where the new Mac reads it and the log
 /// path applies, else F10's `[everyone]` files ([`handover_bundle`]). Where this Mac holds a log
 /// that removed the new Mac or left it out on purpose, neither: the run ends with the reason. A
-/// log path that fails here (a records file this Mac cannot read, a store at its bound or a
-/// receiver with incompatible capacity) refuses the handover. Both payloads are built
+/// vault no new Mac can reach (none configured, none pinned, or one this Mac reads from a path)
+/// refuses before the log path signs anything ([`HandedVault::of`]). A log path that fails here
+/// (a records file this Mac cannot read, a store at its bound or a receiver with incompatible
+/// capacity) refuses the handover. Both payloads are built
 /// under [`Handing::held`] where the desk holds this Mac's state for the run (it took it before
 /// the run touched its phrase), which neither takes again.
 ///
 /// # Errors
 /// The log keeps the new Mac out ([`ByLog::KeptOut`]), a vault pass holds this Mac's state past
-/// [`super::HANDOVER_LOCK_WAIT`] where the desk holds none for the run ([`ByLog::Busy`]), or
-/// the receiver cannot hold the whole log, or neither path can hand a bundle from this Mac's state.
+/// [`super::HANDOVER_LOCK_WAIT`] where the desk holds none for the run ([`ByLog::Busy`]), no new
+/// Mac can reach this Mac's vault, the receiver cannot hold the whole log, or neither path can
+/// hand a bundle from this Mac's state.
 pub fn hand_over(paths: &Paths, handing: &Handing<'_>) -> crate::Result<Handout> {
     hand_over_with(paths, handing, Book::default())
 }
@@ -1064,6 +1067,9 @@ pub fn hand_over(paths: &Paths, handing: &Handing<'_>) -> crate::Result<Handout>
 /// # Errors
 /// As [`hand_over`].
 pub fn hand_over_with(paths: &Paths, handing: &Handing<'_>, book: Book) -> crate::Result<Handout> {
+    // Before the log path signs an `Admit`: a vault no new Mac can reach (one read from a path,
+    // or none pinned) hands neither bundle, F10's files included, so it signs nothing either.
+    let vault = HandedVault::of(config(paths)?).map_err(Error::new)?;
     match log_path(
         paths,
         handing.request,
@@ -1082,7 +1088,7 @@ pub fn hand_over_with(paths: &Paths, handing: &Handing<'_>, book: Book) -> crate
                 || handover::policy_servers(paths),
                 |held| held.policy.clone(),
             );
-            let bundle = log_bundle(paths, handing.allowed, admission, policy, handing.reader)?;
+            let bundle = log_bundle(vault, handing.allowed, admission, policy, handing.reader)?;
             return Ok(Handout {
                 bundle: bundle.encode()?,
                 logged: true,
@@ -1104,8 +1110,48 @@ pub fn hand_over_with(paths: &Paths, handing: &Handing<'_>, book: Book) -> crate
     })
 }
 
+/// The vault a member's log bundle names for the new Mac ([`log_bundle`]): its name, its pinned
+/// signer, the handoffs that reached it and the URL this Mac reads it at. A member reads it before
+/// it signs an admission, so a vault no new Mac can reach refuses with nothing signed
+/// ([`HandedVault::of`]).
+pub(super) struct HandedVault {
+    name: String,
+    signer: [u8; 32],
+    followed: Vec<[u8; 32]>,
+    url: String,
+}
+
+impl HandedVault {
+    /// The vault `config` (this Mac's configured one) names.
+    ///
+    /// # Errors
+    /// Why a new Mac cannot be handed it: no vault is configured, it pins no signer, or this Mac
+    /// reads it from a path, which a new Mac cannot reach.
+    pub(super) fn of(config: Option<Config>) -> Result<Self, &'static str> {
+        let config = config.ok_or("no vault configured")?;
+        let signer = config
+            .signer
+            .ok_or("this Mac's vault has no pinned signer")?;
+        let Source::Url(url) = config.source else {
+            return Err("this Mac reads its vault from a path, which a new Mac cannot reach");
+        };
+        Ok(Self {
+            name: config.name,
+            signer,
+            followed: config.followed,
+            url,
+        })
+    }
+}
+
+/// The log bundle that hands `vault` to the new Mac `allowed` names, with `admission`'s records,
+/// where `reader` takes the records' source; the new Mac reads the vault from its URL first, then
+/// from the policy's servers `policy`.
+///
+/// # Errors
+/// The new Mac's reader cannot take the source's records.
 pub(super) fn log_bundle(
-    paths: &Paths,
+    vault: HandedVault,
     allowed: &Allowed,
     admission: LogAdmission,
     policy: Vec<String>,
@@ -1114,20 +1160,11 @@ pub(super) fn log_bundle(
     if !reader.can_take(admission.source) {
         return Err(Error::new(reader.refusal(admission.source)));
     }
-    let config = config(paths)?.ok_or_else(|| Error::new("no vault configured"))?;
-    let signer = config
-        .signer
-        .ok_or_else(|| Error::new("this Mac's vault has no pinned signer"))?;
-    let Source::Url(url) = &config.source else {
-        return Err(Error::new(
-            "this Mac reads its vault from a path, which a new Mac cannot reach",
-        ));
-    };
     Ok(Bundle {
-        vault: config.name.clone(),
-        signer,
-        followed: config.followed.clone(),
-        servers: handover::bundle_servers(url, policy),
+        vault: vault.name,
+        signer: vault.signer,
+        followed: vault.followed,
+        servers: handover::bundle_servers(&vault.url, policy),
         allowed: allowed.clone(),
         handed: Handed::Log {
             source: matches!(reader, Reader::BoundedLog(_)).then_some(admission.source),

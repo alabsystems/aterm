@@ -44,8 +44,8 @@ pub(crate) struct Selected {
     witnesses: Option<Witnesses>,
 }
 
-/// The stamps of a selection's pin, entry and intent.
-type Witnesses = [Option<fsx::FileStamp>; 3];
+/// What stood at a selection's pin, entry and intent: each one's kind and stamp, from one `lstat`.
+type Witnesses = [Option<(fsx::Kind, fsx::FileStamp)>; 3];
 
 impl Selected {
     pub(crate) fn path(&self) -> &Path {
@@ -64,19 +64,24 @@ impl Selected {
 
 fn selection_witnesses(entry: &Path) -> Result<Witnesses> {
     Ok([
-        fsx::stamp_if_present(&pin_path(entry)?)?,
-        fsx::stamp_if_present(entry)?,
-        fsx::stamp_if_present(&intent_path(entry)?)?,
+        fsx::kind_and_stamp_if_present(&pin_path(entry)?)?,
+        fsx::kind_and_stamp_if_present(entry)?,
+        fsx::kind_and_stamp_if_present(&intent_path(entry)?)?,
     ])
 }
 
 /// [`data_path`], for a reader that holds the selection across its read
-/// ([`Selected::confirm`]).
+/// ([`Selected::confirm`]). With no pin, no intent and a regular file or nothing at the entry, the
+/// witnesses already hold what `data_path` looks at, and the entry is what it answers.
 pub(crate) fn selected(entry: &Path) -> Result<Selected> {
     let witnesses = selection_witnesses(entry).ok();
+    let path = match witnesses {
+        Some([None, None | Some((fsx::Kind::File, _)), None]) => entry.to_path_buf(),
+        _ => data_path(entry)?,
+    };
     Ok(Selected {
         entry: entry.to_path_buf(),
-        path: data_path(entry)?,
+        path,
         witnesses,
     })
 }
@@ -1137,8 +1142,8 @@ mod tests {
         assert!(!pin_path(&entry).unwrap().exists());
     }
 
-    /// NEGATIVE CONTROLS (2026-11-05): with `fsx::stamp_if_present(entry)` replaced by `None` in
-    /// `selection_witnesses`, the entry's arm confirms the replaced entry
+    /// NEGATIVE CONTROLS (2026-11-05): with `fsx::kind_and_stamp_if_present(entry)` replaced by
+    /// `None` in `selection_witnesses`, the entry's arm confirms the replaced entry
     /// (`the selection still stood`); with the intent's stamp replaced the same way, the intent's
     /// arm does.
     #[test]
@@ -1175,6 +1180,81 @@ mod tests {
         assert!(
             refused.contains("the intended original records file is missing"),
             "{refused}"
+        );
+    }
+
+    /// NEGATIVE CONTROLS (2026-11-05), `selected`'s witness arm loosened each way: with any kind
+    /// at the entry, the symlink selects the entry (`a symlink`, `left: Ok(entry), right: Err(..)`);
+    /// with `Dir` or `Other` admitted alone, the directory or the FIFO does; with the intent's slot
+    /// `_`, the missing original does; with the pin's slot `_`, the pin beside a file does.
+    #[test]
+    fn a_selection_from_its_witnesses_answers_as_data_path_does() {
+        let answer = |path: Result<PathBuf>| path.map_err(|error| error.to_string());
+        let shaped = |shape: &str, make: &dyn Fn(&Path, &Path), refused: bool| {
+            let (root, entry) = fixture();
+            make(root.path(), &entry);
+            let resolved = answer(data_path(&entry));
+            assert_eq!(resolved.is_err(), refused, "{shape}: {resolved:?}");
+            assert_eq!(
+                answer(selected(&entry).map(|held| held.path().to_path_buf())),
+                resolved,
+                "{shape}"
+            );
+        };
+        shaped("a regular file", &|_, _| {}, false);
+        shaped(
+            "nothing",
+            &|_, entry| std::fs::remove_file(entry).unwrap(),
+            false,
+        );
+        shaped(
+            "a symlink",
+            &|root, entry| {
+                let kept = root.join("kept");
+                std::fs::rename(entry, &kept).unwrap();
+                symlink(&kept, entry).unwrap();
+            },
+            true,
+        );
+        shaped(
+            "a directory",
+            &|_, entry| {
+                std::fs::remove_file(entry).unwrap();
+                fsx::ensure_private_dir(entry).unwrap();
+            },
+            true,
+        );
+        shaped(
+            "a FIFO",
+            &|_, entry| {
+                std::fs::remove_file(entry).unwrap();
+                let made = aterm_uds::spawnfd::command("/usr/bin/mkfifo")
+                    .arg(entry)
+                    .status()
+                    .expect("mkfifo");
+                assert!(made.success());
+            },
+            true,
+        );
+        shaped(
+            "an intent whose original is gone",
+            &|root, entry| {
+                assert!(stop_at(&Context::new(entry).unwrap(), Step::Intent).is_err());
+                std::fs::rename(entry, root.join("saved-original")).unwrap();
+            },
+            true,
+        );
+        shaped(
+            "a pinned layout",
+            &|_, entry| drop(write_path(entry, true).unwrap()),
+            false,
+        );
+        shaped(
+            "a pin beside a regular file",
+            &|_, entry| {
+                fsx::write_atomic(&pin_path(entry).unwrap(), b"no pin", 0o600).unwrap();
+            },
+            true,
         );
     }
 

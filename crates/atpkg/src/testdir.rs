@@ -10,6 +10,9 @@ use aterm_tempfile::TempDir;
 
 use crate::store::Layout;
 
+#[cfg(unix)]
+pub(crate) use aterm_uds::test_binary::isolated_lifecycle;
+
 /// Complete static ELF metadata for byte-only fixtures; no machine code is executed.
 pub(crate) fn elf_fixture() -> Vec<u8> {
     let mut bytes = vec![0; 64];

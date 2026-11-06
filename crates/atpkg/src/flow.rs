@@ -442,11 +442,20 @@ fn lay_commands_off_path(
     repo: &str,
     program: &str,
     build: u64,
+    prepared: Option<&crate::manifest::PkgManifest>,
 ) -> Result<Vec<String>, FlowError> {
     let build_dir = layout.build_dir(program, build);
     let tools = match crate::store::recorded_exposes(&build_dir) {
         Some(tools) => tools,
-        None => match signed_exposes(fetcher, index, repo, program, build) {
+        None => match prepared.map_or_else(
+            || signed_exposes(fetcher, index, repo, program, build),
+            |pkg| {
+                Ok((
+                    crate::store::split_exposed(&pkg.exposes).0,
+                    pkg.version.clone(),
+                ))
+            },
+        ) {
             Ok((tools, version)) => {
                 let _ = crate::store::write_exposes(&build_dir, &tools);
                 if crate::store::recorded_version(&build_dir).is_none() {
@@ -505,9 +514,19 @@ fn signed_exposes(
     program: &str,
     build: u64,
 ) -> Result<(Vec<ToolName>, String), FlowError> {
-    let (raw, sig) = fetcher
+    let pair = fetcher
         .pkg_manifest(repo, program, build)
         .map_err(FlowError::PkgFetch)?;
+    let pkg = verified_package(index, pair, program, build)?;
+    Ok((crate::store::split_exposed(&pkg.exposes).0, pkg.version))
+}
+
+fn verified_package(
+    index: &TrustedIndex,
+    (raw, sig): PackageBytes,
+    program: &str,
+    build: u64,
+) -> Result<crate::manifest::PkgManifest, FlowError> {
     let verified = index
         .verify_pkg(raw, &sig)
         .map_err(|_| FlowError::PkgVerify)?;
@@ -515,7 +534,7 @@ fn signed_exposes(
     if !pkg.is_for(program) || pkg.build_number != build {
         return Err(FlowError::Mismatch);
     }
-    Ok((crate::store::split_exposed(&pkg.exposes).0, pkg.version))
+    Ok(pkg)
 }
 
 /// The [`FlowError`] a signed manifest that verified but did not parse is refused with.
@@ -589,6 +608,47 @@ pub(crate) fn install_collecting_assets_with_index(
     pre_resolved: Option<TrustedIndex>,
     resolved_assets: &mut BTreeMap<String, String>,
 ) -> Result<InstallReport, FlowError> {
+    install_collecting_assets_with_snapshot(
+        fetcher,
+        layout,
+        anchor,
+        req,
+        floor,
+        now_unix,
+        pre_resolved.map(|index| InstallSnapshot {
+            index,
+            package: None,
+        }),
+        resolved_assets,
+    )
+}
+
+/// Detached signed bytes frozen by an operation; the install flow still checks
+/// their signature, parser, program and build under its authenticated index.
+pub(crate) type PackageBytes = (Vec<u8>, Vec<u8>);
+
+/// An operation's index and optional exact signed package document. The index
+/// pins a build, not a document digest, so callers that prevalidate metadata must
+/// keep that same document through installation rather than fetching it again.
+pub(crate) struct InstallSnapshot {
+    pub index: TrustedIndex,
+    pub package: Option<PackageBytes>,
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the same install inputs with one operation-local signed snapshot"
+)]
+pub(crate) fn install_collecting_assets_with_snapshot(
+    fetcher: &dyn Fetcher,
+    layout: &Layout,
+    anchor: &Anchor,
+    req: &InstallRequest,
+    floor: BuildFloor,
+    now_unix: i64,
+    pre_resolved: Option<InstallSnapshot>,
+    resolved_assets: &mut BTreeMap<String, String>,
+) -> Result<InstallReport, FlowError> {
     let mut seen = BTreeMap::new();
     install_inner(
         fetcher,
@@ -618,7 +678,7 @@ fn install_inner(
     req: &InstallRequest,
     floor: BuildFloor,
     now_unix: i64,
-    pre_resolved: Option<TrustedIndex>,
+    pre_resolved: Option<InstallSnapshot>,
     seen: &mut BTreeMap<String, Option<DepResult>>,
     resolved_assets: &mut BTreeMap<String, String>,
 ) -> Result<InstallReport, FlowError> {
@@ -627,7 +687,10 @@ fn install_inner(
     if crate::linkmode::is_linked(layout, program) {
         return Err(FlowError::Linked(program.to_string()));
     }
-    let mut resolved_index = pre_resolved;
+    let (mut resolved_index, prepared) = match pre_resolved {
+        Some(snapshot) => (Some(snapshot.index), snapshot.package),
+        None => (None, None),
+    };
     if resolved_index.is_none()
         && let Some(spec) = crate::vendor_direct::spec(program)
         && !crate::alab::agent(program).is_some_and(|agent| {
@@ -675,6 +738,9 @@ fn install_inner(
         .pin
         .get(program)
         .ok_or_else(|| FlowError::NotPinned(program.to_string()))?;
+    let prepared = prepared
+        .map(|bytes| verified_package(&index, bytes, program, pinned))
+        .transpose()?;
 
     match decide(
         ch,
@@ -683,7 +749,15 @@ fn install_inner(
     ) {
         ApplyDecision::UpToDate => {
             reassert_witness(layout, program, pinned)?;
-            let shimmed = lay_commands_off_path(fetcher, layout, &index, repo, program, pinned)?;
+            let shimmed = lay_commands_off_path(
+                fetcher,
+                layout,
+                &index,
+                repo,
+                program,
+                pinned,
+                prepared.as_ref(),
+            )?;
             return Ok(InstallReport {
                 program: program.to_string(),
                 build: pinned,
@@ -705,17 +779,16 @@ fn install_inner(
         ApplyDecision::Install => {}
     }
 
-    let (raw, sig) = fetcher.pkg_manifest(repo, program, pinned).map_err(|e| {
-        note_fetch_fault();
-        FlowError::PkgFetch(e)
-    })?;
-    let verified = index
-        .verify_pkg(raw, &sig)
-        .map_err(|_| FlowError::PkgVerify)?;
-    let pkg = parse_pkg(&verified).map_err(pkg_parse_error)?;
-    if !pkg.is_for(program) || pkg.build_number != pinned {
-        return Err(FlowError::Mismatch);
-    }
+    let pkg = match prepared {
+        Some(package) => package,
+        None => {
+            let pair = fetcher.pkg_manifest(repo, program, pinned).map_err(|e| {
+                note_fetch_fault();
+                FlowError::PkgFetch(e)
+            })?;
+            verified_package(&index, pair, program, pinned)?
+        }
+    };
 
     let requires = &pkg.requires;
     let mut dependencies: Vec<DepOutcome> = Vec::new();
@@ -1581,7 +1654,9 @@ pub(crate) fn install_tombstone_shims(layout: &Layout, program: &str, installed:
 }
 
 fn abort_activated_install(layout: &Layout, program: &str, staged: &Staged) {
-    rollback_member(layout, program, staged);
+    if let Err(e) = rollback_member(layout, program, staged) {
+        eprintln!("atpkg: {program}: its rollback could not put everything back: {e}");
+    }
     crate::activate::undo_activation(layout, &staged.build_dir);
     if staged.was_live {
         // Re-point the witness at the kept tree, or the keep is one-shot. Exists, not
@@ -2135,6 +2210,7 @@ fn apply_group_txn_inner(
                 failed: member.clone(),
                 during_flip: false,
                 why: FlowError::RequiresRetired(member.clone()).to_string(),
+                rolled_back: Vec::new(),
             },
             BTreeMap::new(),
         );
@@ -2183,6 +2259,7 @@ fn apply_group_txn_inner(
                      {build}) is not published for {triple}, so its commands are disabled \
                      until it is"
                 ),
+                rolled_back: Vec::new(),
             },
             BTreeMap::new(),
         );
@@ -2215,6 +2292,7 @@ fn apply_group_txn_inner(
                 failed: install_members[0].clone(),
                 during_flip: false,
                 why: short.to_string(),
+                rolled_back: Vec::new(),
             },
             BTreeMap::new(),
         );
@@ -2263,6 +2341,7 @@ fn apply_group_txn_inner(
                                 failed: (*m).clone(),
                                 during_flip: false,
                                 why,
+                                rolled_back: Vec::new(),
                             },
                             BTreeMap::new(),
                         );
@@ -2286,6 +2365,7 @@ fn apply_group_txn_inner(
                                 failed: (*m).clone(),
                                 during_flip: false,
                                 why: format!("staging {} failed: {err}", fetched.artifact.asset),
+                                rolled_back: Vec::new(),
                             },
                             BTreeMap::new(),
                         );
@@ -2378,15 +2458,14 @@ fn apply_group_txn_inner(
         &mut |m| {
             crate::progress::note_phase(m, crate::progress::Phase::Link);
             let check = ahead.borrow_mut().remove(m);
-            staged
-                .borrow()
-                .get(m)
-                .is_some_and(|s| flip_member(layout, m, s, check))
+            let all = staged.borrow();
+            let s = all.get(m).ok_or_else(|| format!("{m} was not staged"))?;
+            flip_member(layout, m, s, check).map_err(|e| e.to_string())
         },
         &mut |m| {
-            if let Some(s) = staged.borrow().get(m) {
-                rollback_member(layout, m, s);
-            }
+            let all = staged.borrow();
+            let s = all.get(m).ok_or_else(|| format!("{m} was not staged"))?;
+            rollback_member(layout, m, s)
         },
     );
     *resolved_assets = assets.into_inner();
@@ -3244,7 +3323,9 @@ pub fn rollback_returning_index(
         tree_root: String::new(),
         aliases: Aliases::for_program(program, index.program(program)),
     };
-    rollback_member(layout, program, &staged);
+    if let Err(e) = rollback_member(layout, program, &staged) {
+        eprintln!("atpkg: {program}: its rollback could not put everything back: {e}");
+    }
     let active = crate::ops::active_builds(layout);
     let members = pin_gate_members(layout, &index, ch, program, &active, excluded);
     let revoked_member = members.iter().find_map(|m| {
@@ -3809,25 +3890,30 @@ fn stage_fetched(
     })
 }
 
-fn flip_member(layout: &Layout, program: &str, s: &Staged, ahead: Option<ResolveAhead>) -> bool {
+fn flip_member(
+    layout: &Layout,
+    program: &str,
+    s: &Staged,
+    ahead: Option<ResolveAhead>,
+) -> Result<(), FlowError> {
     flip_member_with(layout, program, s, ahead, activate_build)
 }
 
+/// Flip one staged member live; an `Err` names the step that failed and its own error, after
+/// that step's undo ran, and names what the undo could not put back if it failed too.
 fn flip_member_with(
     layout: &Layout,
     program: &str,
     s: &Staged,
     ahead: Option<ResolveAhead>,
     activate: impl FnOnce(&Layout, &Path) -> std::io::Result<()>,
-) -> bool {
+) -> Result<(), FlowError> {
     // A sysroot-bundle member gets its pre-activation wiring before the flip; a
     // failure here aborts the group (the payload is staged but never activated).
-    if let Some(reloc) = &s.reloc
-        && apply_sysroot_bundle(reloc).is_err()
-    {
-        return false;
+    if let Some(reloc) = &s.reloc {
+        apply_sysroot_bundle(reloc)?;
     }
-    if activate(layout, &s.build_dir).is_err() {
+    if let Err(e) = activate(layout, &s.build_dir) {
         match s.prior_build {
             Some(prior) => {
                 let _ = crate::activate::atomic_symlink(
@@ -3837,25 +3923,37 @@ fn flip_member_with(
             }
             None => crate::platform::remove_link(&layout.program_current(program)),
         }
-        return false;
+        return Err(FlowError::Activate(format!(
+            "pointing {} at {}: {e}",
+            layout.program_current(program).display(),
+            s.build_dir.display()
+        )));
     }
     let env = crate::shim_env::read_sidecar(&s.build_dir);
-    if install_tools_env(layout, &s.build_dir, &s.exposes, s.aliases, &env).is_err() {
-        rollback_member(layout, program, s);
-        return false;
+    if let Err(e) = install_tools_env(layout, &s.build_dir, &s.exposes, s.aliases, &env) {
+        let laying = FlowError::Activate(format!(
+            "laying its shims in {}: {e}",
+            layout.bin_dir().display()
+        ));
+        return Err(and_its_undo(laying, rollback_member(layout, program, s)));
     }
     if s.reloc.is_some()
-        && ahead
-            .map_or_else(
-                || bundle_resolve_check(&s.build_dir, &s.exposes),
-                ResolveAhead::verdict,
-            )
-            .is_err()
+        && let Err(e) = ahead.map_or_else(
+            || bundle_resolve_check(&s.build_dir, &s.exposes),
+            ResolveAhead::verdict,
+        )
     {
-        rollback_member(layout, program, s);
-        return false;
+        return Err(and_its_undo(e, rollback_member(layout, program, s)));
     }
-    true
+    Ok(())
+}
+
+/// A flip step's error `e`, also naming what its undo could not put back when that undo failed.
+fn and_its_undo(e: FlowError, undo: Result<(), String>) -> FlowError {
+    match undo {
+        Ok(()) => e,
+        Err(stuck) => FlowError::Rollback(format!("{e}; undoing it failed: {stuck}")),
+    }
 }
 
 struct ResolveAhead(Option<std::thread::JoinHandle<Result<(), FlowError>>>);
@@ -3967,7 +4065,19 @@ fn build_can_be_rolled_onto(layout: &Layout, program: &str, build: u64) -> bool 
     }
 }
 
-fn rollback_member(layout: &Layout, program: &str, s: &Staged) {
+/// Put `program` back on its prior build (a fresh install: take its shims and `current` away).
+/// Every step runs even when one fails; an `Err` names each step that could not put its part
+/// back, with its own error, so no caller reports a member rolled back that is not.
+fn rollback_member(layout: &Layout, program: &str, s: &Staged) -> Result<(), String> {
+    fn unlay(shim: &Path, stuck: &mut Vec<String>) {
+        match crate::lay::remove_in_process(shim) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                stuck.push(format!("removing {}: {e}", shim.display()));
+            }
+            _ => {}
+        }
+    }
+    let mut stuck: Vec<String> = Vec::new();
     match s.prior_build {
         Some(prior) if prior != s.build => {
             let prior_dir = layout.build_dir(program, prior);
@@ -3995,11 +4105,12 @@ fn rollback_member(layout: &Layout, program: &str, s: &Staged) {
                     }
                 }
             }
+            // The shims are re-laid even when `current` cannot be re-pointed.
             if let Err(e) = activate_build(layout, &prior_dir) {
-                eprintln!(
-                    "atpkg: {program}: the rollback to build {prior} could not re-point \
-                     `current` ({e}) — its shims are re-laid all the same"
-                );
+                stuck.push(format!(
+                    "re-pointing {} at build {prior}: {e}",
+                    layout.program_current(program).display()
+                ));
             }
             let env = crate::shim_env::read_sidecar(&prior_dir);
             if let Some(n) = crate::compat::trust_build_of(layout, &prior_dir) {
@@ -4020,25 +4131,20 @@ fn rollback_member(layout: &Layout, program: &str, s: &Staged) {
                         !listing_only.contains(tool)
                             || shim_free_or_owned_by(layout, program, &layout.shim(alias))
                     });
-                if target.exists() {
-                    let _ = crate::platform::install_shim_env(
-                        &prior_dir.join("bin"),
-                        tool,
-                        &layout.shim(tool),
-                        &env,
-                    );
-                    if let Some(alias) = &alias {
-                        let _ = crate::platform::install_shim_env(
+                let shims =
+                    std::iter::once(layout.shim(tool)).chain(alias.map(|a| layout.shim(&a)));
+                for shim in shims {
+                    if target.exists() {
+                        if let Err(e) = crate::platform::install_shim_env(
                             &prior_dir.join("bin"),
                             tool,
-                            &layout.shim(alias),
+                            &shim,
                             &env,
-                        );
-                    }
-                } else {
-                    let _ = crate::lay::remove_in_process(&layout.shim(tool));
-                    if let Some(alias) = &alias {
-                        let _ = crate::lay::remove_in_process(&layout.shim(alias));
+                        ) {
+                            stuck.push(format!("re-laying {}: {e}", shim.display()));
+                        }
+                    } else {
+                        unlay(&shim, &mut stuck);
                     }
                 }
             }
@@ -4046,17 +4152,26 @@ fn rollback_member(layout: &Layout, program: &str, s: &Staged) {
         Some(_) => { /* prior == new build: nothing meaningful to undo */ }
         None => {
             for tool in &s.exposes {
-                let _ = crate::lay::remove_in_process(&layout.shim(tool));
+                unlay(&layout.shim(tool), &mut stuck);
                 if s.aliases == Aliases::Alab
                     && let Some(alias) = tool.alias()
                 {
-                    let _ = crate::lay::remove_in_process(&layout.shim(&alias));
+                    unlay(&layout.shim(&alias), &mut stuck);
                 }
             }
-            crate::platform::remove_link(&layout.program_current(program));
+            let current = layout.program_current(program);
+            crate::platform::remove_link(&current);
+            if std::fs::symlink_metadata(&current).is_ok() {
+                stuck.push(format!("removing {}: it is still there", current.display()));
+            }
         }
     }
     crate::activate::reconcile_agents(layout);
+    if stuck.is_empty() {
+        Ok(())
+    } else {
+        Err(stuck.join("; "))
+    }
 }
 
 fn rollback_may_claim(layout: &Layout, program: &str, tool: &ToolName) -> bool {

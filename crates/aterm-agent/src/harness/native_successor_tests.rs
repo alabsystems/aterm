@@ -79,11 +79,25 @@ fn project(
     next
 }
 
-pub(crate) fn transition(
-    state: &aterm_spec::interp::State,
-    action: &str,
-) -> aterm_spec::interp::State {
-    let (_home, paths, root, binding) = fixture();
+/// The actions that add a record. Any other leaves storage as it was, which [`act`]'s projection
+/// proves against the model after each: one that moved it fails there, and fails again on whatever
+/// the next action finds.
+const MOVE_STORAGE: [&str; 6] = ["May", "NoExec", "Seal", "ClaimA", "ClaimB", "ClaimLostAck"];
+/// The claims storage must refuse, in the order a state's shared laying takes them.
+const REFUSED: [&str; 4] = ["Rival", "Conflict", "RetryClosed", "FailedClaim"];
+
+/// Storage as one model state has it, by the real entries, with the chain that reached it.
+struct Laid {
+    _home: aterm_tempfile::TempDir,
+    paths: Paths,
+    root: Prepare,
+    root_pair: (Prepare, Binding),
+    chain: Vec<(Prepare, Binding)>,
+    cap: Limits,
+}
+
+fn lay(state: &aterm_spec::interp::State) -> Laid {
+    let (home, paths, root, binding) = fixture();
     let cap = Limits {
         bytes: state["byte_limit"] as usize,
         ..limits(state["slots"] as usize)
@@ -116,6 +130,28 @@ pub(crate) fn transition(
         *state,
         "reconstructed storage"
     );
+    Laid {
+        _home: home,
+        paths,
+        root,
+        root_pair,
+        chain,
+        cap,
+    }
+}
+
+/// `action` on `laid`, and the model state its storage now projects to.
+fn act(laid: &Laid, state: &aterm_spec::interp::State, action: &str) -> aterm_spec::interp::State {
+    let Laid {
+        paths,
+        root,
+        root_pair,
+        chain,
+        cap,
+        ..
+    } = laid;
+    let cap = *cap;
+    let current = chain.last().unwrap();
     let mut next = state.clone();
     match action {
         "Room7" => {
@@ -129,13 +165,13 @@ pub(crate) fn transition(
         "TightBytes" => {
             next.insert("byte_limit", 2420);
         }
-        "May" => event(&paths, current, Event::MayExecute, cap),
-        "NoExec" => event(&paths, current, Event::NoExec, cap),
-        "Seal" => event(&paths, current, Event::Seal, cap),
+        "May" => event(paths, current, Event::MayExecute, cap),
+        "NoExec" => event(paths, current, Event::NoExec, cap),
+        "Seal" => event(paths, current, Event::Seal, cap),
         "ClaimA" | "ClaimB" | "ClaimLostAck" => {
             let choice = if action == "ClaimB" { 2 } else { 1 };
-            let child = candidate(&root, state["depth"] as usize, choice);
-            claim(&paths, current, &child, cap).unwrap();
+            let child = candidate(root, state["depth"] as usize, choice);
+            claim(paths, current, &child, cap).unwrap();
             if action != "ClaimLostAck" {
                 next.insert("ack", state["depth"] + 1);
             }
@@ -145,14 +181,11 @@ pub(crate) fn transition(
             let mut child = current.clone();
             if action == "Rival" {
                 let choice = state[["one", "two", "three"][chain.len() - 2]];
-                child = candidate(&root, chain.len() - 2, 3 - choice);
+                child = candidate(root, chain.len() - 2, 3 - choice);
             } else if action == "Conflict" {
                 child.0.deadline_us += 1;
             }
-            assert_eq!(
-                claim(&paths, parent, &child, cap).is_ok(),
-                action == "Retry"
-            );
+            assert_eq!(claim(paths, parent, &child, cap).is_ok(), action == "Retry");
             if action == "Retry" {
                 next.insert("ack", state["depth"]);
             }
@@ -161,15 +194,22 @@ pub(crate) fn transition(
             // A caller with the wrong predecessor capability gets no partial claim.
             let mut parent = current.clone();
             parent.1.capability = "dd".repeat(32);
-            let child = candidate(&root, state["depth"] as usize, 1);
-            assert!(claim(&paths, &parent, &child, cap).is_err());
+            let child = candidate(root, state["depth"] as usize, 1);
+            assert!(claim(paths, &parent, &child, cap).is_err());
         }
         "Reopen" => {
-            read(&paths).unwrap().unwrap();
+            read(paths).unwrap().unwrap();
         }
         _ => panic!("unknown successor action {action}"),
     }
-    project(&paths, &root_pair, &next)
+    project(paths, root_pair, &next)
+}
+
+pub(crate) fn transition(
+    state: &aterm_spec::interp::State,
+    action: &str,
+) -> aterm_spec::interp::State {
+    act(&lay(state), state, action)
 }
 
 #[test]
@@ -181,15 +221,49 @@ fn atomic_successors_refine_three_link_races_retries_and_capacity() {
     let states = aterm_spec::interp::reachable_states(&model);
     assert!(states.iter().any(|state| state["depth"] == 3));
     for state in states {
-        for action in &model.actions {
-            if model.action_enabled(action.name, &state) {
-                let next = transition(&state, action.name);
-                assert!(
-                    model.successors(action.name, &state).contains(&next),
-                    "{}: {state:?} -> {next:?}",
-                    action.name
-                );
-            }
+        let (mut stay, moving): (Vec<_>, Vec<_>) = model
+            .actions
+            .iter()
+            .filter(|action| model.action_enabled(action.name, &state))
+            .partition(|action| !MOVE_STORAGE.contains(&action.name));
+        let holds = |action: &str, next: aterm_spec::interp::State| {
+            assert!(
+                model.successors(action, &state).contains(&next),
+                "{action}: {state:?} -> {next:?}",
+            );
+        };
+        // One laying per state: an action's side effects reach the actions after it, which a laying
+        // per action would not show. What it gives up is judging each later action from an unused
+        // laying: a refusal that holds only once an earlier action has run would pass. So the claims
+        // that must be refused go first, before the exact retry and the reopen that succeed, and
+        // `claims_require_exact_live_epoch_noexec_and_preserve_all_links` and
+        // `concurrent_successor_claims_choose_one_and_lost_reply_retries_without_appending` refuse a
+        // rival from a fresh store.
+        //
+        // NEGATIVE CONTROLS (2026-11-05): with a refused rival claim made to append its record
+        // before it refuses, the projection after that action fails on storage that reads back
+        // "native no-exec receipt or custody is invalid", in the shared laying as in a fresh one.
+        // With `record_successor_at` answering a rival unless a claim of an existing candidate has
+        // left a sidecar file, which the projection does not read, the rival is answered from the
+        // unused laying (`left: true`, `right: false` at `act`'s `is_ok`); with the sort gone that
+        // plant passes this walk and fails those two tests alone.
+        stay.sort_by_key(|action| {
+            REFUSED
+                .iter()
+                .position(|refused| *refused == action.name)
+                .unwrap_or(REFUSED.len())
+        });
+        let shared = lay(&state);
+        for action in stay {
+            holds(action.name, act(&shared, &state, action.name));
+        }
+        // The first action that adds a record takes the laying they left as they found it.
+        let mut moving = moving.into_iter();
+        if let Some(action) = moving.next() {
+            holds(action.name, act(&shared, &state, action.name));
+        }
+        for action in moving {
+            holds(action.name, transition(&state, action.name));
         }
     }
     // Negative implementation: publish success after separately preparing the

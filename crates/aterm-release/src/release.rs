@@ -76,7 +76,7 @@ pub fn child_notes(dir: &Path) -> Vec<PathBuf> {
         .filter(|entry| entry.file_name().to_str().is_some_and(is_child_note))
         .map(|entry| entry.path())
         .collect();
-    notes.sort();
+    notes.sort_unstable();
     notes
 }
 
@@ -321,13 +321,12 @@ impl ReleaseOptions {
             }
             let flag = arg
                 .to_str()
-                .filter(|a| PATH_FLAGS.contains(a))
-                .map(str::to_string);
+                .and_then(|a| PATH_FLAGS.iter().copied().find(|&f| f == a));
             out.push(arg);
             if let Some(flag) = flag
                 && let Some(given) = args.next()
             {
-                out.push(value(&flag).map_or(given, |p| p.clone().into_os_string()));
+                out.push(value(flag).map_or(given, |p| p.clone().into_os_string()));
             }
         }
         out
@@ -509,6 +508,9 @@ pub struct RunClaim {
     /// This run took the claim over from the run of this release that started it as R's own
     /// cutter ([`RunClaim::hand`]).
     pub adopted: bool,
+    /// The logs of the run that handed this one the claim, as its claim named them: what that run
+    /// did before it handed the release on is in them.
+    pub handed_logs: Option<PathBuf>,
     /// The line exists before qualify takes any resource claims. Its rank ends Background
     /// samples on this host even during steps which need no CPU or memory reservation.
     priority: Option<aterm_capacity::Claim>,
@@ -553,16 +555,16 @@ pub(crate) fn read_holder(path: &Path) -> Option<Holder> {
     let field = |key: &str| {
         text.lines()
             .find_map(|l| l.strip_prefix(key))
-            .map(|v| v.trim().to_string())
+            .map(str::trim)
     };
     Some(Holder {
         pid: field("pid ")
             .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))?
             .parse()
             .ok()?,
-        started: field("started ").unwrap_or_default(),
-        logs: field("logs ").unwrap_or_default(),
-        step: field("step "),
+        started: field("started ").unwrap_or_default().to_string(),
+        logs: field("logs ").unwrap_or_default().to_string(),
+        step: field("step ").map(str::to_string),
         handed: text.lines().any(|l| l.trim() == HANDED),
     })
 }
@@ -623,10 +625,11 @@ impl RunClaim {
         lock: &dyn Fn(&Path) -> std::io::Result<aterm_update_core::FileLock>,
     ) -> Result<Self, std::result::Result<Holder, String>> {
         let body = format!("pid {}\nstarted {}\nlogs {}\n", me.0, me.1, logs.display());
-        let claim = |adopted| Self {
+        let claim = |handed_logs: Option<PathBuf>, adopted| Self {
             path: path.to_path_buf(),
             me: (me.0, me.1.to_string()),
             adopted,
+            handed_logs,
             priority: None,
         };
         let dir = path.parent().unwrap_or(Path::new("."));
@@ -641,7 +644,8 @@ impl RunClaim {
                         let _ = std::fs::remove_file(&next);
                     })
                     .map_err(|e| Err(format!("take over {}: {e}", path.display())))?;
-                return Ok(claim(true));
+                let handed_logs = (!holder.logs.is_empty()).then(|| PathBuf::from(&holder.logs));
+                return Ok(claim(handed_logs, true));
             }
             return Err(Ok(holder));
         }
@@ -656,7 +660,7 @@ impl RunClaim {
         let created = crate::durable::open_create_new(path)
             .and_then(|mut f| std::io::Write::write_all(&mut f, body.as_bytes()));
         match created {
-            Ok(()) => Ok(claim(false)),
+            Ok(()) => Ok(claim(None, false)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 Err(read_holder(path).ok_or_else(|| format!("{} appeared", path.display())))
             }
@@ -728,8 +732,9 @@ pub fn estimates(tsv: &str) -> BTreeMap<String, u64> {
         }
     }
     runs.into_iter()
-        .map(|(step, all)| {
-            let mut last: Vec<u64> = all[all.len().saturating_sub(5)..].to_vec();
+        .map(|(step, mut all)| {
+            let start = all.len().saturating_sub(5);
+            let last = &mut all[start..];
             last.sort_unstable();
             let upper_median = last[last.len() / 2];
             (step.to_string(), upper_median)
@@ -1002,8 +1007,8 @@ pub trait Backend {
     /// for room: held until [`Backend::let_disk_go`], and naming itself to every child the
     /// release starts, which then claims and walks nothing ([`aterm_capacity::DISK_COVER_ENV`]).
     fn claim_disk(&mut self, bytes: u64, why: &str) -> Result<(), Refusal>;
-    /// End the release's disk claim, if it holds one; where `passed`, this run's verify passed,
-    /// and what the run wrote is kept for the next claim's size.
+    /// End the disk claim the release holds, if any (step 4's, or a stage's); where `passed`,
+    /// this run's verify passed, and what the run wrote is kept for the next release's claim.
     fn let_disk_go(&mut self, passed: bool);
     fn commit_gates(&mut self, c: &Candidate, dry: bool) -> Vec<Refusal>;
     /// The cut's read-only pre-claim gates of this machine, its credentials and the channel.
@@ -1146,6 +1151,9 @@ struct Run<'b> {
     later_secs: u64,
     /// Set when the stage runs again: the engine moved since it staged R (found by [`Run::reask_prepared`], or right before any publish by [`Run::engine_still_staged`], where a moved staging tier also stages again).
     restage: Option<(Option<String>, String)>,
+    /// Whether this run holds a disk claim ([`Run::claim_disk`]), step 4's or a stage's, or in a
+    /// dry run has said it would.
+    disk_held: bool,
     /// Owner asks the checks delivered before this run had a journal (a first run): journaled with the candidate at step 3, so they are not raised again.
     early_asks: Vec<String>,
     /// Seconds the current step waited for the owner (not its own time).
@@ -1190,6 +1198,7 @@ pub fn run_with(b: &mut dyn Backend, opts: &ReleaseOptions, home: &Path) -> Outc
         later: Vec::new(),
         later_secs: 0,
         restage: None,
+        disk_held: false,
         early_asks: Vec::new(),
         waited: 0,
         dry_audit: None,
@@ -1295,14 +1304,17 @@ impl Run<'_> {
             if let Some(prep) = self.pending_reask() {
                 self.reask_prepared(&prep)?;
             }
-            self.disk_still_needed()?;
+            self.disk_still_needed("the stage, the build and `verify release`")?;
             self.stage()?;
         }
 
+        // A stage's refresh can find R's reservation spent (another release claimed past it
+        // while it staged), so its build and checks run again: they claim where nothing does.
         self.begin(Step::Build)?;
         if let Some(why) = self.skip_build() {
             self.skip(&why);
         } else {
+            self.disk_still_needed("the build and `verify release`")?;
             self.build()?;
         }
 
@@ -1311,10 +1323,13 @@ impl Run<'_> {
             self.skip(&why);
             Ok(false)
         } else {
-            self.verify().map(|()| true)
+            self.disk_still_needed("`verify release`")
+                .and_then(|()| self.verify())
+                .map(|()| true)
         };
-        // The build and `verify release` are all the release writes under its disk claim.
-        self.b.let_disk_go(matches!(verified, Ok(true)));
+        // The stage, the build and `verify release` are all the release writes under its claim; a
+        // stage after it claims for itself ([`Run::stage_claimed`]).
+        self.let_disk_go(matches!(verified, Ok(true)));
         verified?;
 
         self.begin(Step::Ready)?;
@@ -1792,7 +1807,7 @@ impl Run<'_> {
         if !self.planned.contains(&Step::Stage) {
             let secs = self.est_secs(Step::Stage);
             self.planned.push(Step::Stage);
-            self.planned.sort();
+            self.planned.sort_unstable();
             self.plan_secs += secs;
         }
         self.restage = Some((old, why));
@@ -2163,6 +2178,14 @@ impl Run<'_> {
         match taken {
             Ok(mut claim) => {
                 claim.priority = self.b.line_priority();
+                // The run that handed this one the release took its first steps' records, its
+                // seal call among them, into its own logs ([`crate::release_timeline::Timeline`]).
+                if let Some(from) = claim.handed_logs.clone() {
+                    let event = aterm_json::json!({
+                        "schema": 1, "event": "handed", "from": from.display().to_string(),
+                    });
+                    self.say(&format!("release-event: {event}"));
+                }
                 self.claim = Some(claim);
             }
             Err(Ok(h)) => self.claim_refused = Some(running_refusal(&h)),
@@ -3282,12 +3305,15 @@ impl Run<'_> {
         ));
     }
 
-    /// The release's one disk claim for its build and `verify release`, taken before either
-    /// writes: as much as the most any of this machine's recorded releases wrote, and never less
-    /// than [`crate::release_disk::WARM`] where the clone's build is warm, or
+    /// The release's disk claim, for what `covers` names, where this run holds none and the
+    /// candidate's checks are not all recorded: step 4 takes it before its gates, its stage, its
+    /// build and its `verify release`, and a build or verify that a stage's refresh brought on
+    /// takes it before it runs. It ends as verify does ([`Run::let_disk_go`]). It is as much as
+    /// the most any of this machine's recorded releases wrote, and never less than
+    /// [`crate::release_disk::WARM`] where the clone's build is warm, or
     /// [`crate::release_disk::COLD`]. Nothing is walked to size it.
-    fn disk_still_needed(&mut self) -> Flow {
-        if self.facts.checks.complete() {
+    fn disk_still_needed(&mut self, covers: &str) -> Flow {
+        if self.disk_held || self.facts.checks.complete() {
             return Ok(());
         }
         let (_, warm) = self.b.disk();
@@ -3298,7 +3324,6 @@ impl Run<'_> {
         } else {
             crate::release_disk::COLD
         };
-        let gib = bytes.div_ceil(1 << 30);
         let basis = if bytes > floor {
             "the most a recorded release on this Mac wrote"
         } else if warm {
@@ -3306,20 +3331,60 @@ impl Run<'_> {
         } else {
             "the floor where the clone's build is cold"
         };
+        self.claim_disk(bytes, basis, covers, "through verify")
+    }
+
+    /// A stage of R, `stage`, under the release's disk claim where this run holds it (step 4's),
+    /// else under a claim of its own for [`crate::release_disk::STAGE`], ended as the stage ends:
+    /// a stage compiles in the clone's build, and the claim covers each `verify` it runs, which
+    /// then walks nothing. That is a stage again before the publish where the engine moved, and
+    /// one of a candidate verified earlier; neither holds a claim through what comes after it,
+    /// an owner's wait included. A dry run's `stage` does nothing, and says the claim it would
+    /// take.
+    fn stage_claimed<T>(&mut self, stage: impl FnOnce(&mut Self) -> T) -> Result<T, Halt> {
+        if self.disk_held {
+            return Ok(stage(self));
+        }
+        self.claim_disk(
+            crate::release_disk::STAGE,
+            "the room a release that verified is held to",
+            "this stage",
+            "a stage",
+        )?;
+        let staged = stage(self);
+        self.let_disk_go(false);
+        Ok(staged)
+    }
+
+    /// Claim `bytes` of the clone's volume, as much as `basis` says, for what `covers` names,
+    /// held as the release's `span` until [`Run::let_disk_go`]; a dry run says it would.
+    fn claim_disk(&mut self, bytes: u64, basis: &str, covers: &str, span: &str) -> Flow {
+        let gib = bytes.div_ceil(1 << 30);
         if self.dry {
+            self.disk_held = true;
             self.say(&format!(
-                "        disk: would claim {gib} GiB ({basis}) for the build and `verify \
-                 release`, walking nothing"
+                "        disk: would claim {gib} GiB ({basis}) for {covers}, walking nothing"
             ));
             return Ok(());
         }
-        let why = format!("release v{} (build and verify)", self.version());
+        let why = format!("release v{} ({span})", self.version());
         match self.b.claim_disk(bytes, &why) {
             Ok(()) => {
-                self.say(&format!("        disk: claimed {gib} GiB ({basis})"));
+                self.disk_held = true;
+                self.say(&format!(
+                    "        disk: claimed {gib} GiB ({basis}) for {covers}"
+                ));
                 Ok(())
             }
             Err(refusal) => self.refuse(refusal),
+        }
+    }
+
+    /// End the disk claim this run holds, if any; `passed` keeps what the run wrote to size the
+    /// next release's claim ([`Backend::let_disk_go`]).
+    fn let_disk_go(&mut self, passed: bool) {
+        if std::mem::take(&mut self.disk_held) && !self.dry {
+            self.b.let_disk_go(passed);
         }
     }
 
@@ -3335,11 +3400,12 @@ impl Run<'_> {
         if self.opts.qualify {
             words.extend(self.line_holds(&c)?);
             if self.dry {
+                self.stage_claimed(|_| ())?;
                 words.push("would check the compat slice and full export with pub stage --dry-run, without a staging push".into());
             } else {
                 let log = self.b.log_path(Step::Stage);
                 self.say(&format!("        log: {}", log.display()));
-                let ran = match self.b.stage(&c, &p, StageTarget::Local) {
+                let ran = match self.stage_claimed(|run| run.b.stage(&c, &p, StageTarget::Local))? {
                     Ok(ran) => ran,
                     Err(refusal) => return self.refuse(refusal),
                 };
@@ -3362,6 +3428,7 @@ impl Run<'_> {
             Some(why) => words.push(why),
             None if self.dry => {
                 words.extend(self.line_holds(&c)?);
+                self.stage_claimed(|_| ())?;
                 words.push(format!(
                     "would check its x86_64 compat slice with stable (cargo check), then run pub \
                      stage aterm --commit {} --repo-path <this clone>",
@@ -3378,7 +3445,7 @@ impl Run<'_> {
                 words.extend(self.line_holds(&c)?);
                 let log = self.b.log_path(Step::Stage);
                 self.say(&format!("        log: {}", log.display()));
-                let ran = self.b.stage(&c, &p, StageTarget::Remote);
+                let ran = self.stage_claimed(|run| run.b.stage(&c, &p, StageTarget::Remote))?;
                 self.refresh();
                 match self.stage_verdict(&c, ran) {
                     Ok(note) => words.push(note),
@@ -3658,7 +3725,7 @@ impl Run<'_> {
             "        {why}: {r} is staged again by the engine as it is now, before the publish"
         ));
         self.restage = Some((old, why));
-        let ran = self.b.stage(c, p, StageTarget::Remote);
+        let ran = self.stage_claimed(|run| run.b.stage(c, p, StageTarget::Remote))?;
         self.refresh();
         let note = match self.stage_verdict(c, ran) {
             Ok(note) => note,
@@ -4230,8 +4297,9 @@ impl Run<'_> {
             let line = self.provision(true)?;
             self.finish(&format!(
                 "{line}; would ask again what the cut would refuse and that the engine is the \
-                 one that staged R (else stage again), then run: pub publish aterm --repo-path \
-                 <this clone>"
+                 one that staged R (else stage again, under a stage's disk claim of {} GiB), \
+                 then run: pub publish aterm --repo-path <this clone>",
+                crate::release_disk::STAGE >> 30
             ));
             return Ok(());
         }
@@ -4613,9 +4681,11 @@ pub fn public_version(v: &str) -> Option<(u64, u64)> {
         return None;
     }
     let number = |s: &str| -> Option<u64> {
-        (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
-            .then(|| s.parse::<u64>().ok().filter(|n| n.to_string() == s))
-            .flatten()
+        (!s.is_empty()
+            && (s == "0" || !s.starts_with('0'))
+            && s.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| s.parse::<u64>().ok())
+        .flatten()
     };
     Some((number(major)?, number(minor)?))
 }
@@ -4696,9 +4766,16 @@ mod tests {
         assert!(!path.exists(), "a claim nobody took is removed");
 
         let claim = RunClaim::take(&path, me, logs, &mut started_of, &[]).unwrap();
+        assert!(claim.handed_logs.is_none());
         claim.hand().unwrap();
-        let took = RunClaim::take(&path, rerun, logs, &mut started_of, &[me.0, 1]).unwrap();
+        let rerun_logs = Path::new("/l2");
+        let took = RunClaim::take(&path, rerun, rerun_logs, &mut started_of, &[me.0, 1]).unwrap();
         assert!(took.adopted && !claim.names_this_run());
+        assert_eq!(
+            took.handed_logs.as_deref(),
+            Some(logs),
+            "the handing run's logs"
+        );
         drop(claim);
         assert!(
             path.exists(),

@@ -1132,6 +1132,10 @@ struct Deck<'a> {
     /// The header line: handed in already planned ([`DeckStill`]) or planned by [`Self::paint`],
     /// and as planned after it (T-G14).
     head: Option<HeaderPlan>,
+    /// The over caps the strip boxes drew since the last axis rail, device px, as each shows
+    /// (a moving fine band's clipped to its span), each with its box's band: the rail breaks
+    /// over a cap it would touch ([`Self::rail_pieces`]).
+    caps: Vec<(Rect, u8)>,
 }
 
 impl<'a> Deck<'a> {
@@ -1166,6 +1170,7 @@ impl<'a> Deck<'a> {
             hits_last: Vec::new(),
             boxes: Boxes::default(),
             head: None,
+            caps: Vec::new(),
         }
     }
 
@@ -1425,10 +1430,12 @@ impl<'a> Deck<'a> {
         let (y, h) = (self.px(top), self.px(cell_h));
         let radius = if self.s < 2.0 { 0.0 } else { 1.0 };
         let live_slot = rects.iter().copied().find(|r| r.3);
+        let spec_slots = strip.spec.slots();
+        let band_of = |idx: usize| spec_slots.get(idx).map_or(0, |slot| slot.band);
         // A moving fine band draws inside the span it stands in at rest: its newest box passes
         // under the live box and the entering one comes out from its old end, so neither the
         // live box nor a coarser box ever takes a moving box's ink.
-        let band = fine_band_slots(&strip.spec.slots()).unwrap_or(0..0);
+        let band = fine_band_slots(&spec_slots).unwrap_or(0..0);
         let clip = (lag != 0.0).then(|| self.fine_band_span(strip)).flatten();
         let mut clipped = false;
         for &(idx, x, cw, is_live_now) in &rects {
@@ -1464,6 +1471,7 @@ impl<'a> Deck<'a> {
             };
             let sky = skyline::skyline_box((x, y, cw, h), value, self.s, &self.inks, self.ic);
             self.skyline(&sky, radius);
+            self.note_cap(sky.cap, if clipped { clip } else { None }, band_of(idx));
         }
         if clipped {
             self.p.prims.push(DrawPrim::ClipPop);
@@ -1485,6 +1493,65 @@ impl<'a> Deck<'a> {
                 }
             }
             self.skyline(&sky, radius);
+            self.note_cap(sky.cap, None, band_of(idx));
+        }
+    }
+
+    /// Keeps a box's over `cap` for the axis rail to break over, as much of it as shows inside
+    /// `clip` (a moving fine band's span, `x0..x1`), with the box's `band`.
+    fn note_cap(&mut self, cap: Option<Rect>, clip: Option<(f32, f32)>, band: u8) {
+        let Some((x, y, w, h)) = cap else {
+            return;
+        };
+        let (a, b) = clip.map_or((x, x + w), |(c0, c1)| (x.max(c0), (x + w).min(c1)));
+        if b > a {
+            self.caps.push(((a, y, b - a, h), band));
+        }
+    }
+
+    /// The pieces `(a, b)` of a 1 device px rail along `y` from `x0` to `x1`, broken over each
+    /// over cap of `caps` that would touch it, with a device px of ground kept either side
+    /// (`docs/DESIGN-stats-deck-units-2026-11-04.md` §3; the R3 lens fixes, 2026-11-06). At 1×
+    /// row 0's caps stand in the device row under the rail, where an unbroken rail reads as the
+    /// caps' own edge; at 2× they keep a px of ground under it, and the rail is whole. A piece
+    /// under 3 px left between two caps of one band goes too, so no speck of rail stands between
+    /// them. A piece across a gate stays: it belongs to two bands, and where one of them is the
+    /// fine band its px outside that band's span would otherwise turn on a moving cap, outside
+    /// the rect the live edge re-rasters for it; each break reaches only a px past its cap, which
+    /// keeps a moving box's breaks inside that rect.
+    fn rail_pieces((x0, x1): (f32, f32), y: f32, caps: &[(Rect, u8)]) -> Vec<(f32, f32)> {
+        let mut breaks: Vec<(f32, f32, u8)> = caps
+            .iter()
+            .filter(|&&((_, cy, _, ch), _)| cy <= y + 1.0 && cy + ch >= y)
+            .map(|&((cx, _, cw, _), band)| (cx - 1.0, cx + cw + 1.0, band))
+            .collect();
+        breaks.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut pieces = Vec::with_capacity(breaks.len() + 1);
+        // The rail from `x`, and the band of the break it starts after.
+        let (mut x, mut after) = (x0, None);
+        for (a, b, band) in breaks {
+            let a = a.min(x1);
+            if a > x && (a - x >= 3.0 || after != Some(band)) {
+                pieces.push((x, a));
+            }
+            if b > x {
+                (x, after) = (b, Some(band));
+            }
+        }
+        if x1 > x {
+            pieces.push((x, x1));
+        }
+        pieces
+    }
+
+    /// The rail's `pieces` ([`Self::rail_pieces`]) along `y` in `ink`, as much of each as stands
+    /// inside `x0..x1`.
+    fn rail(&mut self, pieces: &[(f32, f32)], (x0, x1): (f32, f32), y: f32, ink: Rgb) {
+        for &(a, b) in pieces {
+            let (a, b) = (a.max(x0), b.min(x1));
+            if b > a {
+                self.rect((a, y, b - a, 1.0), 0.0, ink);
+            }
         }
     }
 
@@ -1559,7 +1626,11 @@ impl<'a> Deck<'a> {
         spans
     }
 
-    /// Draws the strip's X-axis baseline rail, discontinuity break notches over [`TimeGap`]s, and
+    /// Draws the strip's X-axis baseline rail (broken over a row-0 over cap it would touch,
+    /// [`Self::rail_pieces`]), discontinuity break notches over [`TimeGap`]s, whose span of the
+    /// rail takes the gap's ink px for px (the grid rail's own pieces, clipped to the gap, so it
+    /// breaks and drops exactly where they do: the R3 lens fixes' review, 2026-11-06) and whose
+    /// notches stand on that span of the rail, their foot its px (that review's own review), and
     /// vertical event marker lines + cap pips for [`StripEvent`]s (`Crash`, `Restart`,
     /// `SleepWake`, `PressureSpike`).
     fn strip_axis_and_events(
@@ -1571,6 +1642,7 @@ impl<'a> Deck<'a> {
         holes: &[(f64, f64)],
         words: &DeckWords,
     ) {
+        let caps = std::mem::take(&mut self.caps);
         if !self.draw {
             return;
         }
@@ -1582,7 +1654,8 @@ impl<'a> Deck<'a> {
         let y_tick0 = self.px(base + 1.0);
         let y_tick1 = self.px(base + 2.5).max(y_tick0 + TICK_MIN_PX);
         let y_axis = (y_tick1 - 1.0).max(y_tick0);
-        self.rect((x0, y_axis, x1 - x0, 1.0), 0.0, self.inks.grid);
+        let pieces = Self::rail_pieces((x0, x1), y_axis, &caps);
+        self.rail(&pieces, (x0, x1), y_axis, self.inks.grid);
         let Some(now_ms) = self.at_ms else {
             return;
         };
@@ -1605,11 +1678,14 @@ impl<'a> Deck<'a> {
             let (gx0, gx1) = (gx_new.min(gx_old), gx_new.max(gx_old));
             if gx1 > gx0 {
                 let gink = self.gap_ink(gap.kind);
-                self.rect((gx0, y_axis, gx1 - gx0, 1.0), 0.0, gink);
+                self.rail(&pieces, (gx0, gx1), y_axis, gink);
+                // Each end's notch stands up from the rail's row; its foot on that row is the gap's
+                // own rail, just drawn, so where the rail breaks over a cap the notch does too and
+                // keeps a device px of ground over the cap.
                 let nh = (2.0 * self.s as f32).round().max(2.0);
-                self.rect((gx0, y_axis + 1.0 - nh, 1.0, nh), 0.0, gink);
+                self.rect((gx0, y_axis + 1.0 - nh, 1.0, nh - 1.0), 0.0, gink);
                 if gx1 - gx0 >= 2.0 {
-                    self.rect((gx1 - 1.0, y_axis + 1.0 - nh, 1.0, nh), 0.0, gink);
+                    self.rect((gx1 - 1.0, y_axis + 1.0 - nh, 1.0, nh - 1.0), 0.0, gink);
                 }
             }
         }
@@ -1629,6 +1705,8 @@ impl<'a> Deck<'a> {
                 .then_with(|| b.at_unix_ms.cmp(&a.at_unix_ms))
         });
         let mut drawn_xs: Vec<i32> = Vec::with_capacity(6);
+        let lw = (0.85 * self.s).round().max(1.0) as f32;
+        let mut lines: Vec<(f32, StripEventKind)> = Vec::with_capacity(6);
         for ev in events {
             if drawn_xs.len() >= 6 {
                 break;
@@ -1643,26 +1721,36 @@ impl<'a> Deck<'a> {
             }
             drawn_xs.push(bucket_px);
             let ev_ink = self.event_ink(ev.kind);
-            let lw = (0.85 * self.s).round().max(1.0) as f32;
             let lx = (ex - lw / 2.0).round().clamp(x0, (x1 - lw).max(x0));
             let pip = (2.2 * self.s).round().max(2.0) as f32;
             let px_pip = (ex - pip / 2.0).round().clamp(x0, (x1 - pip).max(x0));
             let py_pip = (y_axis + 0.5 - pip / 2.0).round().max(0.0);
             self.rect((px_pip, py_pip, pip, pip), (0.5 * self.s) as f32, ev_ink);
-            let ground = rgba(self.inks.ground, 0xFF);
-            for &(a, b) in &spans {
-                let (ya, yb) = (self.px(a), self.px(b));
-                if yb <= ya {
-                    continue;
-                }
-                // A device px of ground each side keeps the line off the boxes' columns and
-                // ticks (`docs/DESIGN-stats-deck-units-2026-11-04.md` §3, "States").
+            lines.push((lx, ev.kind));
+        }
+        let rows: Vec<(f32, f32)> = spans
+            .iter()
+            .map(|&(a, b)| (self.px(a), self.px(b)))
+            .filter(|(ya, yb)| yb > ya)
+            .collect();
+        // A device px of ground each side keeps a line off the boxes' columns and ticks
+        // (`docs/DESIGN-stats-deck-units-2026-11-04.md` §3, "States"). Every keyline goes down
+        // before any line: two events' lines can touch, and a keyline drawn after its neighbour's
+        // line would cut it.
+        let ground = rgba(self.inks.ground, 0xFF);
+        for &(lx, _) in &lines {
+            for &(ya, yb) in &rows {
                 for kx in [lx - 1.0, lx + lw] {
                     self.p.prims.push(panel(kx, ya, 1.0, yb - ya, 0.0, ground));
                 }
-                match ev.kind {
+            }
+        }
+        for (lx, kind) in lines {
+            let ev_ink = self.event_ink(kind);
+            for &(ya, yb) in &rows {
+                match kind {
                     StripEventKind::Crash | StripEventKind::Restart => {
-                        let alpha = if ev.kind == StripEventKind::Crash {
+                        let alpha = if kind == StripEventKind::Crash {
                             0xFF
                         } else {
                             0xE0
@@ -2496,7 +2584,8 @@ impl<'a> Deck<'a> {
     /// [`TICK_MIN_PX`] tall, so at 1× it reads as a tick and not a stray dot. It ends on the axis
     /// rail's foot, short of the strip's top in both forms. At 2× a device px of ground stands
     /// between the two and row 0's over caps; at 1× a cap stands flush under them, never in them
-    /// (`the_over_cap_sits_outside_the_plate_and_clear_of_the_row_above`).
+    /// (`the_over_cap_sits_outside_the_plate_and_clear_of_the_row_above`), and the rail breaks
+    /// over it (`the_rail_breaks_over_a_cap_it_would_touch`).
     fn tick_mark(&mut self, x: f64, base: f64) {
         let (x, w) = tick_px(x, self.s);
         let y0 = self.px(base + 1.0);
@@ -5538,7 +5627,10 @@ pub(crate) mod tests {
     /// bar under a % nests them by length alone, so there (`apart`) a fill ends a px short of
     /// the one around it, and the fills inside give way where it has no px to spare.
     /// CONTROL: the old rule, which widened a fill to the one inside it, draws the machine's
-    /// fill past its share wherever a scope inside reads more, and the check sees it.
+    /// fill past its share wherever a scope inside reads more, and the check sees it. A Memory
+    /// footprint larger than the figure of the scope around it, which the bar therefore cannot
+    /// show, is said in speech and drawn after its figure in the Memory lens's Biggest now
+    /// exactly then.
     #[test]
     fn the_this_mac_fill_is_the_percent_and_nested_fills_never_widen_it() {
         let fill = |global, aterm, tab| BarFill {
@@ -5730,6 +5822,141 @@ pub(crate) mod tests {
             widened > 100,
             "CONTROL: the widening rule breaks the law {widened} times"
         );
+
+        // In words (§4.6): Memory's aterm and Tab fills are footprints, which count pages
+        // differently from the machine's used memory, so one can read larger than the scope
+        // around it, whose fill stops it. Speech and the Memory lens say each such footprint,
+        // and only then: aterm's against used memory and this tab's against aterm's, each below,
+        // equal to and above it; and with aterm unread, this tab's against this Mac's. The lens
+        // says it whether its processes report footprints, Biggest now listing them, or report
+        // none, Biggest now one line of the scopes' figures (the owner's scene, and an idle tab
+        // under Bar::Tab: the R3 lens fixes' review, 2026-11-06).
+        use crate::stats_lens::{Lens, LensGeom, Opened, lay_lens};
+        const ATERM: &str = "aterm's footprint is larger than this Mac's used memory";
+        const TAB: &str = "Tab 1's footprint is larger than aterm's";
+        const TAB_MAC: &str = "Tab 1's footprint is larger than this Mac's used memory";
+        let m = FaceMetrics::helvetica_neue();
+        let used = snapshot().resources[Resource::Memory.index()]
+            .now
+            .expect("CONTROL: memory read");
+        // aterm's and this tab's footprints as shares of used memory (aterm's `None`: unread),
+        // and what is said.
+        let cases: [(Option<f64>, f64, &[&str]); 9] = [
+            (Some(0.8), 0.3, &[]),
+            (Some(1.0), 1.0, &[]),
+            (Some(1.25), 0.3, &[ATERM]),
+            (Some(0.5), 0.5, &[]),
+            (Some(0.5), 0.6, &[TAB]),
+            (Some(1.25), 1.3, &[ATERM, TAB]),
+            (None, 0.9, &[]),
+            (None, 1.0, &[]),
+            (None, 1.1, &[TAB_MAC]),
+        ];
+        let fig = |v: f64| ScopeFig {
+            now: Some(v),
+            ..ScopeFig::default()
+        };
+        for ((ka, kt, want), procs) in cases
+            .into_iter()
+            .flat_map(|case| [(case, true), (case, false)])
+        {
+            let at = format!(
+                "aterm {ka:?} and Tab 1 {kt} of used memory, {}",
+                if procs {
+                    "its processes' footprints read"
+                } else {
+                    "no process's footprint read"
+                }
+            );
+            let mut snap = snapshot();
+            if !procs {
+                for t in &mut snap.top {
+                    t.footprint = None;
+                }
+            }
+            if ka.is_none() {
+                snap.aterm = None;
+            }
+            let view = &mut snap.resources[Resource::Memory.index()];
+            view.aterm = ka.map_or_else(ScopeFig::default, |k| fig(used * k));
+            view.tabs = vec![(7, fig(used * kt))];
+            let i = input(&snap);
+            let spoken = words::row_sentence(Resource::Memory, &snap, &i.tab_panes, &i.locale);
+            let lens = lay_lens(
+                &LensGeom {
+                    dx: 0,
+                    dy: 0,
+                    w: 1024.0 * 2.0 + 24.0,
+                    h: 250.0 * 2.0 + 24.0,
+                    margin: 12.0,
+                    scale: 2.0,
+                    font_px: 26.0,
+                },
+                &i,
+                &Lens {
+                    focus: Instrument::Memory,
+                    bar: Bar::Global,
+                    how: Opened::Pinned,
+                },
+                &m,
+                true,
+            );
+            let wells = lens
+                .wells
+                .iter()
+                .map(|(name, line)| format!("{name}: {line}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let biggest = lens
+                .wells
+                .iter()
+                .find(|(name, _)| name == "Biggest now")
+                .map(|(_, line)| line.as_str())
+                .unwrap_or_else(|| panic!("{at}: Biggest now in {wells}"));
+            assert_eq!(
+                biggest.contains("claude"),
+                procs,
+                "PRECONDITION {at}: Biggest now lists the processes exactly when they report \
+                 footprints: {biggest}"
+            );
+            for clause in want {
+                assert!(
+                    biggest.contains(clause),
+                    "{at}: Biggest now's words say {clause:?}: {biggest}"
+                );
+            }
+            for (surface, text) in [("speech", &spoken), ("the lens", &wells)] {
+                assert_eq!(
+                    text.matches("footprint is larger").count(),
+                    want.len(),
+                    "{at}, {surface}: {text}"
+                );
+                for clause in want {
+                    assert!(
+                        text.contains(clause),
+                        "{at}, {surface}: {clause:?} in {text}"
+                    );
+                }
+            }
+            let drawn: Vec<&str> = lens.boxes.iter().map(|b| b.text.as_str()).collect();
+            let larger: Vec<&str> = drawn
+                .iter()
+                .copied()
+                .filter(|t| t.contains("larger than"))
+                .collect();
+            assert_eq!(
+                larger.len(),
+                usize::from(!want.is_empty()),
+                "{at}: the lens draws it beside the footprints' figures: {drawn:?}"
+            );
+            for clause in want {
+                let than = &clause[clause.find("larger than").expect("a clause")..];
+                assert!(
+                    larger.iter().any(|t| t.contains(than)),
+                    "{at}: {than:?} drawn in {larger:?}"
+                );
+            }
+        }
     }
 
     /// The bar's widths as they were drawn before the clamp (A1 §4.6): each scope never

@@ -1,7 +1,7 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-cli: spec recovery (71 specs, 111 mapped unit tests)
+# aterm-cli: spec recovery (70 specs, 109 mapped unit tests)
 
 > Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 36 tests it
 > deleted are gone, and the spec rows no longer cite those tests.
@@ -50,7 +50,7 @@ Source: `crates/aterm-cli` (read only). The initial pass read `src/lib.rs`, `src
 specs added later). This file replaces an earlier untracked pass and corrects three of its claims
 (§5, items 2 and 3).
 
-Result: **71 specs**, covering **111 tests** in §2 (**12 non-spec tests** retired in §4, **5**
+Result: **70 specs**, covering **109 tests** in §2 (**12 non-spec tests** retired in §4, **5**
 code-doc guards in `src/manual/fabric_page_tests.rs`, and **680 newer `#[test]`s** across
 `macos_doctor*`, `lib.rs`, `theme*`, `doctor.rs`, `clt_shim.rs`, `spotlight.rs`, `manual.rs`, and
 `cli_text.rs` awaiting spec recovery, §3).
@@ -168,15 +168,14 @@ bounded-probe	other	manual::bounded_output, manual::bounded_first_line	A timing 
 rust-page-measured-rows	refinement	manual::rust_page, manual::checks_toolchain, manual::checks_pinned_channel, manual::compare_toolchains	The 'PATH vs checks' row of rust_page() is the words of compare_toolchains(checks side, PATH side). The checks side is atpkg Toolchain::discover_with_store under ATERM_RUST_TOOLCHAIN's pin (and TRUST_STAGE2_BIN when it is set), whatever the cwd pins. The PATH side is resolve_on_path(targo). The DIVERGENCE label and the '`aterm pkg doctor` flags' pointer appear iff the result is OtherBuild or OtherDir. A rustup trust entry older than the store is shown as 'demoted ... NOT used by the checks', with the fix 'aterm pkg repair' for a link and REMEDY_DIRECTORY for a real directory. A newer one keeps its rank.	-	env, fs, process probes, cross-crate atpkg toolchain discovery; factor the rendering over a measured-facts struct first	0,1,8,12
 rust-page-pending-stub	other	manual::rust_page, atpkg::stub::is_pending_stub	Effect absence. If resolve_on_path(targo) finds a file f with atpkg::stub::is_pending_stub(f), rust_page() never executes f, and the targo, targo fmt and targo tippy rows each name it as atpkg's pending stub. The row-text half is a pure case split on the pending flag.	crates/aterm-cli/src/manual.rs::page_never_runs_a_pending_targo	needs an effect trace of process spawns; the row text is a pure case split	0,8,12
 permission-steps	contract	macos_doctor::initial::{permission_steps,permission_steps_at,initial_setup_permission_steps,snapshot_from_observation}	For setup records R, with P their progress when it belongs to the saved plan and Q the plan every reader presents: Allowed iff the snapshot's permissions_allowed as it was (no Cancel, no Stop of the run, and either a saved plan's admitted run under decision Pending, Applied(true) or Stopped(Restored) whose Q selects Permissions, or no progress, no modern plan and Applied(true)); else Off iff a Cancel, a Stop of the run (on record or requested), a Restore's record a Cancel holds, or a saved plan's admitted run whose Q leaves Permissions out; else NotYet. The snapshot's access_steps is that value and permissions_allowed = (access_steps == Allowed); permission_steps_at (no vault, no ledger) gives the same value at the same root. With no saved plan the fallback plan never decides it.	crates/aterm-cli/src/macos_doctor/initial.rs::permission_steps_split_what_waits_from_what_a_person_holds	struct and enum matches, Option combinators, setup records read from files	0,1,8
-local-network-first-use	contract	macos_doctor::initial::{first_use,local_network_first_use}, aterm_types::macos_setup::access_record::latest_of_any_revision	first_use(last, recorded, steps, step_off), the first matching case: last in {Reached, Refused} or recorded = Granted => Answered; last = Asked or recorded = Triggered => Asked; step_off = Some(w) => NoStep(w); steps = Ok(Off) => NoStep(the plan or a person's Cancel or Stop holds it); steps = Err(e) with setup_is_newer(e) (a newer aterm saved this Mac's setup, NEWER_SETUP) => NoStep(NEWER_SETUP_NO_STEP): this build reads no access revision from those records, so its window takes no step; else StepToCome (NotYet, Allowed, or any other read error). local_network_first_use reads last from access::last_answer for this loaded-code identity (or its current process's own observation when identity is unknown), recorded as the access record's last matching-subject Local Network line in any revision (revision 0 included), and steps from initial_setup_permission_steps. Unbound and other-identity cached answers and access events establish no current permission.	crates/aterm-cli/src/macos_doctor/initial.rs::the_first_lan_use_waits_for_the_step_unless_macos_asked_or_no_step_runs, crates/aterm-cli/src/macos_doctor/initial.rs::a_newer_aterms_setup_leaves_no_step_to_wait_for	enum matches over cross-crate enums, Result equality, &'static str	0,1,12
-secrets-join-waits-for-local-network	contract	macos_doctor::initial::{execute_pass,InitialHost::secrets_wait_for_local_network}, secrets_retry::record	In a pass whose Secrets stage would run its join (SecretsTry::RunItem: the vault look on this network and the join's look), while host.secrets_wait_for_local_network() (live: not aterm_types::macos_setup::lan_first_use::may_use()) the stage calls no host.secrets, gives exactly one row (Stage::Secrets.name(), WAITING, SECRETS_WAIT_LOCAL_NETWORK), leaves SetupNext::Park (the Local Network step's access record wakes the parked run) and keeps no try (secrets_retry::record is not called, so no retry pause holds the join once the step asked); a vault left in place (SecretsTry::LeaveInPlace) never waits. Once it no longer waits, the next pass calls host.secrets.	crates/aterm-cli/src/macos_doctor/initial.rs::the_secrets_join_waits_for_local_network_step_and_keeps_no_try	trait default method, a match guard, a record file's absence	0,1,8
+local-network-first-use	contract	macos_doctor::initial::{first_use,local_network_first_use}, aterm_types::macos_setup::access_record::latest_of_any_revision	first_use(last, recorded, step_off), the first matching case: last in {Reached, Refused} or recorded = Granted => Answered; last = Asked or recorded = Triggered => Asked; else NoStep(step_off, or NO_LOCAL_NETWORK_STEP where it is None): System State takes no Local Network step, so StepToCome is never read. local_network_first_use reads last from access::last_answer for this loaded-code identity (or its current process's own observation when identity is unknown), and recorded as the access record's last matching-subject Local Network line in any revision (revision 0 included). Unbound and other-identity cached answers and access events establish no current permission.	crates/aterm-cli/src/macos_doctor/initial.rs::the_first_lan_use_waits_for_no_step	enum matches over cross-crate enums, &'static str	0,1,12
 ```
 
-### Distribution by kind (71)
+### Distribution by kind (70)
 
 | kind | count | ids |
 |---|---|---|
-| contract | 46 | windowing-behavior-parse, parse-window-request-grammar, window-args, plain-launch-gate, push-utf16-unit, decide-leading-words, decide-diag-grammar, decide-run-options, tool-candidate, front-door-verb, help-text-layout, exceptions-reader, doctor-report-layout, doctor-shell-row, shell-check-fs, privacy-row, debugger-row, exceptions-row, instances-row, recovery-row, window-answer, local-day-words, prepend-path, session-path-env, reroute-dir-from-values, managed-agents-dir, font-reports, show-config-shape, explain-config-path, version-text, kitty-report-rows, run-exit-status, first-output-hook-once, config-shell-from-text, window-shell-source, manual-render-routing, trust-version-row, rust-toolchain-row, build-rustc-in, rustc-movers, rust-row-tables, build-of, is-toolchain-bin, permission-steps, local-network-first-use, secrets-join-waits-for-local-network |
+| contract | 45 | windowing-behavior-parse, parse-window-request-grammar, window-args, plain-launch-gate, push-utf16-unit, decide-leading-words, decide-diag-grammar, decide-run-options, tool-candidate, front-door-verb, help-text-layout, exceptions-reader, doctor-report-layout, doctor-shell-row, shell-check-fs, privacy-row, debugger-row, exceptions-row, instances-row, recovery-row, window-answer, local-day-words, prepend-path, session-path-env, reroute-dir-from-values, managed-agents-dir, font-reports, show-config-shape, explain-config-path, version-text, kitty-report-rows, run-exit-status, first-output-hook-once, config-shell-from-text, window-shell-source, manual-render-routing, trust-version-row, rust-toolchain-row, build-rustc-in, rustc-movers, rust-row-tables, build-of, is-toolchain-bin, permission-steps, local-network-first-use |
 | table-property | 11 | route-launch-table, verb-roster, diag-registry-dispatch, mark-table, agents-dir-mode, session-limits-table, poll-must-read, manual-generated-pages, manual-text-roster-consistency, manual-page-width, compare-toolchains |
 | other | 6 | doctor-probe-fence, poll-hangup-platform-axiom, run-ends-with-shell, run-resize-delivery, bounded-probe, rust-page-pending-stub |
 | refinement | 4 | devtools-hand-over-table, session-limits-actuation, shim-hop-agrees-with-sh, rust-page-measured-rows |
@@ -189,14 +188,14 @@ Each row gives the number of specs that list the gap. The gap names come from th
 
 | gap | name | specs blocked |
 |---|---|---|
-| 0 | Installed seal (2026-09-17) publishes no Lean-discharged row | 71 |
-| 1 | Non-scalar carriers and content models | 57 |
+| 0 | Installed seal (2026-09-17) publishes no Lean-discharged row | 70 |
+| 1 | Non-scalar carriers and content models | 56 |
 | 2 | Certified `&self`/`&mut self` views and two-state `x'` | 2 |
 | 3 | E6 body widening | 41 |
 | 4 | Callee-ensures → caller-assert composition | 3 |
 | 5 | Quantified clauses | 13 |
 | 7 | Loops | 34 |
-| 8 | Effects | 28 |
+| 8 | Effects | 27 |
 | 11 | Generics | 4 |
 | 12 | Cross-crate theorem citation | 38 |
 | 13 | Threads, async, closures | 11 |
@@ -335,14 +334,12 @@ crates/aterm-cli/src/manual.rs	a_toolchain_bin_needs_trustc_and_a_sysroot	is-too
 crates/aterm-cli/src/manual.rs	bounded_first_line_kills_a_wedged_probe	bounded-probe	
 crates/aterm-cli/src/manual.rs	page_never_runs_a_pending_targo	rust-page-pending-stub	
 crates/aterm-cli/src/macos_doctor/initial.rs	permission_steps_split_what_waits_from_what_a_person_holds	permission-steps	
-crates/aterm-cli/src/macos_doctor/initial.rs	the_first_lan_use_waits_for_the_step_unless_macos_asked_or_no_step_runs	local-network-first-use	
-crates/aterm-cli/src/macos_doctor/initial.rs	a_newer_aterms_setup_leaves_no_step_to_wait_for	local-network-first-use	
-crates/aterm-cli/src/macos_doctor/initial.rs	the_secrets_join_waits_for_the_local_network_step_and_keeps_no_try	secrets-join-waits-for-local-network	
+crates/aterm-cli/src/macos_doctor/initial.rs	the_first_lan_use_waits_for_no_step	local-network-first-use	
 ```
 
 ## 3. Coverage
 
-- 111 live tests map to the 71 specs in §1 (3 specs — `manual-text-roster-consistency`, `manual-page-width` and `rust-page-measured-rows` — currently subsume `-` after the 2026-10-16/17/27 test deletions in §4).
+- 109 live tests map to the 70 specs in §1 (3 specs — `manual-text-roster-consistency`, `manual-page-width` and `rust-page-measured-rows` — currently subsume `-` after the 2026-10-16/17/27 test deletions in §4).
 - The crate currently has 796 `#[test]`s: 111 mapped in §2, 5 code-to-doc guards in `src/manual/fabric_page_tests.rs` (G7), and 680 newer `#[test]`s across `src/macos_doctor*` (586), `src/lib.rs` (26), `src/theme_author.rs` (15), `src/doctor.rs` (10), `src/theme_cmd.rs` (10), `src/clt_shim.rs` (9), `src/spotlight.rs` (9), `src/theme_pack_cmd.rs` (6), `src/manual.rs` (5), and `src/cli_text.rs` (4) that still need spec recovery.
 - The largest collapses, by primary tests: `manual-render-routing` (8), `decide-diag-grammar` (5), `parse-window-request-grammar` (4), `devtools-hand-over-table` (4), `managed-agents-dir` (4), `decide-run-options` (3), `verb-roster` (3), `doctor-report-layout` (3), `font-reports` (3), `window-shell-source` (3).
 - 13 tests sample more than one spec. A test is deleted only when all of its specs are proved.

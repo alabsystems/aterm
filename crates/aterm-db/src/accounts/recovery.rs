@@ -137,9 +137,10 @@ impl Recovery {
                 "recovery publication waits for the retained day floor",
             ));
         }
+        let actor_key = Sha256::digest(session.actor());
         for period in state.current(&RECOVERIES, now)..=*state.window(&RECOVERIES, now).end() {
             require_time(deadline)?;
-            let command = command(session.actor(), account, decision, attempt, period);
+            let command = command_key(actor_key, account, decision, attempt, period);
             let scope = RECOVERIES.scope(directory.trust(), period)?;
             let mut room = max_records > 0 && max_writer_records > 0;
             if let Some(store) = Store::observe_if_exists(&session, &directory.path(scope)?, scope)?
@@ -231,7 +232,7 @@ impl Recovery {
         let directory = Directory::new(&paths, bootstrap.trust());
         let state = directory.ring_view(&session, &RECOVERIES);
         let mut latest: BTreeMap<DecisionKey, ((u64, u64), Request)> = BTreeMap::new();
-        let mut writers: BTreeMap<Actor, Option<Binding>> = BTreeMap::new();
+        let mut writers: BTreeMap<Actor, (Digest, Option<Binding>)> = BTreeMap::new();
         for period in state.window(&RECOVERIES, now) {
             require_time(deadline)?;
             let scope = RECOVERIES.scope(directory.trust(), period)?;
@@ -246,27 +247,32 @@ impl Recovery {
                 let Ok((key, account, decision, attempt, record_period)) = body(command) else {
                     continue;
                 };
-                if key != Sha256::digest(actor) || record_period != period {
+                if record_period != period {
                     continue;
                 }
                 let rank = (period, operation.header.sequence);
-                let key = DecisionKey {
+                let decision_key = DecisionKey {
                     writer: actor,
                     account,
                     decision,
                 };
-                if latest.get(&key).is_some_and(|(old, _)| *old >= rank) {
+                if latest
+                    .get(&decision_key)
+                    .is_some_and(|(old, _)| *old >= rank)
+                {
                     continue;
                 }
-                let Some(requester) = writers
+                let (actor_key, requester) = writers
                     .entry(actor)
-                    .or_insert_with(|| session.peer_writer(actor).ok())
-                    .clone()
-                else {
+                    .or_insert_with(|| (Sha256::digest(actor), session.peer_writer(actor).ok()));
+                if key != *actor_key {
+                    continue;
+                }
+                let Some(requester) = requester.clone() else {
                     continue;
                 };
                 latest.insert(
-                    key,
+                    decision_key,
                     (
                         rank,
                         Request {
@@ -305,6 +311,7 @@ fn require_time(deadline: Instant) -> Result<()> {
     }
 }
 
+#[cfg(test)]
 fn command(
     actor: Actor,
     account: Digest,
@@ -568,7 +575,7 @@ impl Queue {
                 candidates.push((*due, key, request));
             }
         }
-        candidates.sort_by_key(|(due, key, _)| (*due, *key));
+        candidates.sort_unstable_by_key(|(due, key, _)| (*due, *key));
         candidates
             .into_iter()
             .take(limit)

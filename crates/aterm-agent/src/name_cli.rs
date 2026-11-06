@@ -20,7 +20,10 @@ aterm name — this machine's name: its NAME (`m8`, or `m0` until it is numbered
   joining, out, or unread where the vault's state cannot be read), or with `--json` one
   object of its fields; the first run to find no `machine-name.toml` makes it. `set` chooses
   this machine's number, optionally its nickname in the same change; a number another signed
-  node currently holds is refused. `nick` sets the
+  node currently holds is refused. A successful set also records the explicit naming policy
+  and publishes the checked fleet name. On macOS, one password approval changes all three
+  system names. A failed later step reports publication pending.
+  `nick` sets the
   nickname to <word> (one argument: quote `Blue Heron`) or to a noun drawn again, as a chosen
   nickname, and prints the name as it then stands; `--dry-run` changes no nickname (a first
   run still makes the name, as any read does). `aterm help name` has the page. Unix only for
@@ -168,6 +171,10 @@ fn parse_nick(words: &[&str]) -> Result<Mode, String> {
 /// `aterm name …`: `argv[1..]` in, exit code out (2 for a usage error or a platform that keeps no
 /// machine name, 1 for a name that cannot be read, made or changed).
 pub fn main_entry(argv: Vec<OsString>) -> ExitCode {
+    #[cfg(target_os = "macos")]
+    if argv.first().is_some_and(|arg| arg == "apply-system") {
+        return apply_system(&argv[1..]);
+    }
     match parse(&argv) {
         Ok(Mode::Help) => aterm_uds::stdout::answer_exit("aterm name", USAGE, 0),
         Ok(Mode::Show { json }) => show(json),
@@ -180,11 +187,26 @@ pub fn main_entry(argv: Vec<OsString>) -> ExitCode {
     }
 }
 
+/// `aterm name set`: aterm.toml's naming policy is read first (a dry run's too), so a naming
+/// hold or an aterm.toml that cannot be edited changes no name; then the set; then, for a real
+/// change, its publication ([`crate::machine_name::publish::publish`]), whose first unfinished
+/// step is reported as publication pending.
 #[cfg(unix)]
 fn set(to: &Name, dry_run: bool, json: bool) -> ExitCode {
+    use crate::machine_name::publish;
     let Some(state) = aterm_types::dirs::state_dir() else {
         eprintln!("aterm name: no state directory: $HOME is not set");
         return ExitCode::from(1);
+    };
+    let policy = aterm_types::dirs::aterm_config_path()
+        .ok_or_else(|| "no aterm configuration path".to_owned())
+        .and_then(|config| publish::Policy::read(&config, to.num).map(|policy| (policy, config)));
+    let (policy, config) = match policy {
+        Ok(read) => read,
+        Err(why) => {
+            eprintln!("aterm name: {why}; no name changed");
+            return ExitCode::from(1);
+        }
     };
     let to = crate::machine_name::NameTo {
         num: to.num,
@@ -205,6 +227,18 @@ fn set(to: &Name, dry_run: bool, json: bool) -> ExitCode {
         aterm_netplace::unix_ms_now(),
     ) {
         Ok((text, notes)) => {
+            #[cfg(target_os = "macos")]
+            let system: Option<&dyn publish::SystemNames> = Some(&CtlSudo);
+            #[cfg(not(target_os = "macos"))]
+            let system: Option<&dyn publish::SystemNames> = None;
+            if !dry_run && let Err(pending) = publish::publish(&state, &config, &policy, system) {
+                eprintln!(
+                    "aterm name: {} was requested; publication pending: {}; inspect the current name before retrying",
+                    to.num,
+                    pending.why()
+                );
+                return ExitCode::from(1);
+            }
             for note in notes {
                 eprintln!("aterm name: {}", note.text(&state));
             }
@@ -215,6 +249,67 @@ fn set(to: &Name, dry_run: bool, json: bool) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// `aterm name set`'s way to macOS's names: read with scutil, and set by the root half
+/// (`aterm name apply-system mN`, [`apply_system`]) run through `aterm ctl sudo`, whose one
+/// password sheet covers all three, within
+/// [`crate::machine_name::publish::SYSTEM_RENAME_WAIT`].
+#[cfg(target_os = "macos")]
+struct CtlSudo;
+
+#[cfg(target_os = "macos")]
+impl crate::machine_name::publish::SystemNames for CtlSudo {
+    fn read(&self) -> [Option<String>; 3] {
+        crate::machine_name::publish::read_system_names()
+    }
+
+    /// # Errors
+    /// This program's own path cannot be found ([`crate::own_exe`]) or is not UTF-8, or
+    /// `aterm ctl sudo` could not be run in time (`system rename: …`) or did not succeed
+    /// (`system rename: ` and what it said on stderr).
+    fn apply(&self, number: aterm_types::machine_name::Number) -> Result<(), String> {
+        use crate::machine_name::publish;
+        let exe = crate::own_exe()?;
+        let mut command = aterm_uds::spawnfd::command(&exe);
+        command
+            .args(["ctl", "sudo", "--"])
+            .args(publish::apply_system_words(&exe, number)?);
+        let out = aterm_uds::deadline::output_within(&mut command, publish::SYSTEM_RENAME_WAIT)
+            .map_err(|e| format!("system rename: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "system rename: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The fixed privileged half: no configuration, registry or user path is read as root
+/// ([`crate::machine_name::publish::set_as_root`]).
+#[cfg(target_os = "macos")]
+fn apply_system(args: &[OsString]) -> ExitCode {
+    let number = match args {
+        [number] => number
+            .to_str()
+            .and_then(|number| aterm_types::machine_name::Number::parse(number).ok()),
+        _ => None,
+    };
+    let Some(number) = number else {
+        return ExitCode::from(2);
+    };
+    // SAFETY: geteuid is a side-effect-free getter with no pointer arguments.
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("aterm name: apply-system requires system authorization");
+        return ExitCode::from(1);
+    }
+    let failed = crate::machine_name::publish::set_as_root(number);
+    for field in &failed {
+        eprintln!("aterm name: macOS could not set {field}");
+    }
+    ExitCode::from(u8::from(!failed.is_empty()))
 }
 
 #[cfg(not(unix))]
@@ -355,8 +450,8 @@ mod unix {
     use crate::machine_name::{InFleet, Origin, ensure_in_view};
 
     /// The report of this machine's name in `state`, made first where no file is there
-    /// ([`ensure_in_view`], which reads `roster` only then, and only when neither `fleet-name`
-    /// nor Floor names the claim, so a read of a name already made opens no vault), with the
+    /// ([`ensure_in_view`], whose first-name sources are the registry, roster and legacy name;
+    /// a read of a name already made opens no naming source), with the
     /// mode `state` was narrowed from when it was open to others. Whether it is in a fleet is
     /// [`InFleet::read`] over `state` and the vault at `vault`, where one is read.
     /// An unreadable identity is journaled and leaves the node unknown beside a valid name.
@@ -570,7 +665,7 @@ mod unix {
                 "made".to_owned(),
                 text(match self.origin {
                     Origin::Kept => "kept",
-                    Origin::Floor => "floor",
+                    Origin::Registry => "registry",
                     Origin::Evidence => "evidence",
                     Origin::Drawn => "drawn",
                 }),

@@ -729,6 +729,14 @@ impl LazyBuffer {
         self.image_rows != 0 && self.lines.iter().any(|line| line.any_image(selected))
     }
 
+    /// Every inline-image span the staged rows hold, oldest row first.
+    pub(crate) fn images(&self) -> impl Iterator<Item = &ImageSpan> {
+        self.lines
+            .iter()
+            .filter_map(DeferredLine::image_spans)
+            .flatten()
+    }
+
     /// Retain accepted image spans without materializing or draining staged text.
     pub(crate) fn retain_images(&mut self, keep: &mut dyn FnMut(&ImageSpan) -> bool) -> bool {
         let mut changed = false;

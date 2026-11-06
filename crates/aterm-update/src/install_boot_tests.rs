@@ -1458,6 +1458,52 @@ fn arm_window_trial(s: &Staging, installed: &Path, build: u64, digest: &str) -> 
     rollback
 }
 
+#[test]
+fn only_an_owned_trial_not_waiting_for_a_window_needs_headless_service_health() {
+    let s = scratch("headless-service-trial");
+    let installed = s.root.join("Applications/aterm.app");
+    assert!(!headless_boot_trial_pending_at(
+        &s,
+        11,
+        &installed,
+        unix_now_secs()
+    ));
+    arm_window_trial(&s, &installed, 11, &"ab".repeat(32));
+    assert!(headless_boot_trial_pending_at(
+        &s,
+        11,
+        &installed,
+        unix_now_secs()
+    ));
+    assert!(!headless_boot_trial_pending_at(
+        &s,
+        12,
+        &installed,
+        unix_now_secs()
+    ));
+    let other = s.root.join("Another.app");
+    make_app(&other, "OTHER");
+    assert!(!headless_boot_trial_pending_at(
+        &s,
+        11,
+        &other,
+        unix_now_secs()
+    ));
+    record_window_launch(&s, 11);
+    assert!(!headless_boot_trial_pending_at(
+        &s,
+        11,
+        &installed,
+        unix_now_secs()
+    ));
+    assert!(headless_boot_trial_pending_at(
+        &s,
+        11,
+        &installed,
+        unix_now_secs() + WINDOW_TRIAL_HEADLESS_WAIT.as_secs() + 1,
+    ));
+}
+
 fn backdate(s: &Staging) {
     std::fs::File::options()
         .write(true)
@@ -1474,6 +1520,74 @@ fn bundle_at(installed: &Path) -> impl FnOnce() -> Option<bundle::Bundle> + use<
             exe: installed.join("Contents/MacOS/aterm"),
             app_root: installed,
         })
+    }
+}
+
+#[test]
+fn recovery_only_counts_and_reverts_its_trial_without_applying_a_stage() {
+    use crate::TrialWitness::Headless;
+    for previous_attempts in [0, MAX_BOOT_ATTEMPTS - 1] {
+        let s = scratch("boot-recovery-only");
+        let installed = s.root.join("Applications").join("aterm.app");
+        let rollback = arm_window_trial(&s, &installed, 11, &"ab".repeat(32));
+        make_app(&s.staged_app, "STAGED-NEWER");
+        std::fs::write(&s.ready, "a newer stage is ready").unwrap();
+        let sentinel = boot_sentinel(&s);
+        for _ in 0..previous_attempts {
+            sentinel.observe_launch(11).unwrap();
+        }
+        backdate(&s);
+        let outcome = recover_boot_trial_at(&s, 11, Headless, bundle_at(&installed), |_| {
+            Ok(TrialRevert::To(VerifiedRollback {
+                path: rollback.clone(),
+                build: 10,
+            }))
+        });
+        if previous_attempts == 0 {
+            assert!(matches!(outcome, ApplyOutcome::NotApplicable));
+            assert_eq!(sentinel.read_state(), Some((11, 1)));
+            assert_eq!(read_id(&installed), "NEW");
+            assert_eq!(read_id(&rollback), "OLD");
+        } else {
+            assert!(
+                matches!(outcome, ApplyOutcome::ReExecFailed(_)),
+                "the verified predecessor is restored; this fixture has no executable: {outcome:?}"
+            );
+            assert_eq!(read_id(&installed), "OLD");
+            assert_eq!(sentinel.read_state(), None);
+            assert!(FailedMark::read(&s.failed()).is_some());
+            assert!(
+                !s.staged_app.exists() && !s.ready.exists(),
+                "the ordinary crash-loop revert retires the pending stage"
+            );
+            continue;
+        }
+        assert_eq!(read_id(&s.staged_app), "STAGED-NEWER");
+        assert_eq!(
+            std::fs::read_to_string(&s.ready).unwrap(),
+            "a newer stage is ready"
+        );
+    }
+
+    for trial_owner in [None, Some("another-install")] {
+        let s = scratch("boot-recovery-only-unowned");
+        let installed = s.root.join("Applications").join("aterm.app");
+        make_app(&installed, "CURRENT");
+        make_app(&s.staged_app, "STAGED-NEWER");
+        std::fs::write(&s.ready, "a newer stage is ready").unwrap();
+        if let Some(owner) = trial_owner {
+            let owner = s.root.join(owner);
+            arm_window_trial(&s, &owner, 11, &"ab".repeat(32));
+        }
+        let before = boot_sentinel(&s).read_state();
+        let outcome = recover_boot_trial_at(&s, 11, Headless, bundle_at(&installed), |_| {
+            panic!("an absent or foreign trial is never proved")
+        });
+        assert!(matches!(outcome, ApplyOutcome::NotApplicable));
+        assert_eq!(boot_sentinel(&s).read_state(), before);
+        assert_eq!(read_id(&installed), "CURRENT");
+        assert_eq!(read_id(&s.staged_app), "STAGED-NEWER");
+        assert!(s.ready.exists());
     }
 }
 

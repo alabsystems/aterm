@@ -212,10 +212,15 @@ impl GrantCeiling {
         Self::parse(&lines)
     }
 
-    /// Construct the canonical 6-grant `aterm-link` node ring ceiling for `(fleet, node)`
+    /// Construct the canonical 8-grant `aterm-link` node ring ceiling for `(fleet, node)`
     /// (`DESIGN-aterm-fabric.md` §8.2). aterm mints a node's ring from its [`Self::rules`]
     /// and checks a ring it holds against it (§14 Open Question 5). No grant reaches
     /// `/f/<fleet>/term/`: the drive face those grants served is cut.
+    ///
+    /// The last two are the fleet-wide halts (aterm's one-mesh design, §4.11): the node reads
+    /// every node's halt subject (`/f/<fleet>/halt/<node>`, each record signed by its origin
+    /// and relayed to every member) and publishes on its own alone. It writes no other node's,
+    /// and no person's halt row (`/f/<fleet>/fleet/>` stays read-only).
     pub fn aterm_node_ring(fleet: &str, node: &str) -> Result<Self, String> {
         validate_fleet_segment(fleet)?;
         if !node.starts_with("n-") || !valid_principal(node) {
@@ -230,6 +235,8 @@ impl GrantCeiling {
             format!("rw,p={node}:/f/{fleet}/in/*/*/{node}/*"),
             format!("ro:/f/{fleet}/in/{node}/>"),
             format!("rw,p={node}:/f/{fleet}/cur/{node}/>"),
+            format!("ro:/f/{fleet}/halt/>"),
+            format!("rw,p={node}:/f/{fleet}/halt/{node}"),
         ];
         Self::parse(&rules)
     }
@@ -420,7 +427,7 @@ mod tests {
     fn aterm_node_ring_accepts_exact_and_attenuated_ring_and_rejects_god_cap() {
         let node = "n-0123456789abcdef";
         let ceiling = GrantCeiling::aterm_node_ring("f1", node).unwrap();
-        assert_eq!(ceiling.len(), 6);
+        assert_eq!(ceiling.len(), 8);
 
         let exact_grants = [
             format!("rw,p={node}:/f/f1/pub/{node}/>"),
@@ -429,6 +436,8 @@ mod tests {
             format!("rw,p={node}:/f/f1/in/*/*/{node}/*"),
             format!("ro:/f/f1/in/{node}/>"),
             format!("rw,p={node}:/f/f1/cur/{node}/>"),
+            "ro:/f/f1/halt/>".to_string(),
+            format!("rw,p={node}:/f/f1/halt/{node}"),
         ];
         assert_eq!(ceiling.rules(), exact_grants, "the rules, in mint order");
         let mut ring: Vec<Capability> = ceiling
@@ -472,7 +481,7 @@ mod tests {
         let mut with_god = ring.clone();
         with_god.push(mint(SECRET, "rw:/f/f1/>").unwrap());
         let err = ceiling.check_ring(&with_god).unwrap_err();
-        assert_eq!(err.index, 6);
+        assert_eq!(err.index, 8);
         assert!(matches!(
             err.kind,
             CeilingViolationKind::UnboundGodCap { .. }
@@ -505,6 +514,27 @@ mod tests {
         assert!(matches!(
             err.kind,
             CeilingViolationKind::ExceedsCeiling { .. }
+        ));
+
+        // A node publishes its own halt subject alone: another node's, or every node's under
+        // its own principal, is refused, and an unbound halt write is the god cap's kind.
+        for forged in [
+            format!("rw,p={node}:/f/f1/halt/n-fedcba9876543210"),
+            format!("rw,p={node}:/f/f1/halt/>"),
+        ] {
+            let err = ceiling
+                .check_ring(&[mint(SECRET, &forged).unwrap()])
+                .unwrap_err();
+            assert!(
+                matches!(err.kind, CeilingViolationKind::ExceedsCeiling { .. }),
+                "{forged}: {err}"
+            );
+        }
+        let unbound_halt = vec![mint(SECRET, &format!("rw:/f/f1/halt/{node}")).unwrap()];
+        let err = ceiling.check_ring(&unbound_halt).unwrap_err();
+        assert!(matches!(
+            err.kind,
+            CeilingViolationKind::UnboundGodCap { .. }
         ));
     }
 

@@ -1971,6 +1971,74 @@ impl ResourceView {
         self.heat_of_columns(cells, self.capacity)
     }
 
+    /// A two-series row's columns as its lens trace draws them, the busier direction's
+    /// (`docs/DESIGN-stats-deck-units-2026-11-04.md` §7; the R3 lens fixes and their review,
+    /// 2026-11-06), each with its heat. Each column is one series' minute: the series whose mean
+    /// is the larger share of its own capacity now (where neither share is known, the larger
+    /// finite raw mean, with no heat), its mean the column and its largest reading the tick, each
+    /// with its own share as its heat. The trace draws both on one raw axis, so a tick taken from
+    /// the other series could stand below its column, where no tick is drawn; one series' largest
+    /// reading never does. The column's heat is [`Self::heat_columns`]' (the deck row's), but the
+    /// tick's can be cooler than the row's peak heat, which takes the larger share of either
+    /// series. A column's count and over count are its series', or the other's where that one's
+    /// over share is the larger, as the heat's over share is. A one-series row's are
+    /// [`Self::columns`] and [`Self::heat_cells`].
+    #[must_use]
+    pub fn busier_columns(
+        &self,
+        per_s: u32,
+        ncols: usize,
+        now_unix_ms: i64,
+    ) -> (Vec<Cell>, Vec<HeatCell>) {
+        let first = self.columns(per_s, ncols, now_unix_ms);
+        let Some(second) = self.second.as_ref() else {
+            let heat = self.heat_cells(first.clone());
+            return (first, heat);
+        };
+        let other = columns_of(&second.ring, self.ring_k, per_s, ncols, now_unix_ms);
+        let ceiling = self.basis.heat_ceiling();
+        let share = |v: Option<f64>, cap: Option<f64>| heat_of(v, cap).map(|h| h.min(ceiling));
+        first
+            .into_iter()
+            .zip(other)
+            .map(|(a, b)| {
+                let from_b = match (
+                    heat_of(a.mean, self.capacity),
+                    heat_of(b.mean, second.capacity),
+                ) {
+                    (Some(x), Some(y)) => y > x,
+                    (Some(_), None) => false,
+                    (None, Some(_)) => true,
+                    (None, None) => {
+                        b.mean.filter(|v| v.is_finite()) > a.mean.filter(|v| v.is_finite())
+                    }
+                };
+                let (own, rival, cap) = if from_b {
+                    (b, a, second.capacity)
+                } else {
+                    (a, b, self.capacity)
+                };
+                let counts = if rival.over_share() > own.over_share() {
+                    rival
+                } else {
+                    own
+                };
+                let cell = Cell {
+                    mean: own.mean,
+                    max: own.max,
+                    ..counts
+                };
+                let heat = HeatCell {
+                    heat: share(own.mean, cap),
+                    max: share(own.max, cap),
+                    over: counts.over_share() as f32,
+                    gap: None,
+                };
+                (cell, heat)
+            })
+            .unzip()
+    }
+
     /// The live box's peak tick and over cap (`docs/DESIGN-stats-deck-units-2026-11-04.md` §3,
     /// "Live box"): the largest reading of the trailing [`NOW_WINDOW_MS`] as a share of capacity
     /// now, the larger series' on a two-series row as [`Self::heat_now`] takes, and the share of
@@ -2027,13 +2095,22 @@ impl ResourceView {
         }
     }
 
+    /// A row of `first` and its `second` series, if it has one. The second binds where its share
+    /// of its capacity now is the larger; where neither share is known, where its finite raw
+    /// "now" is the larger, the rule [`Self::busier_columns`] takes each column by, so the
+    /// amount, the deck's no-heat fill and the lens's words name the series its trace draws (the
+    /// R3 lens fixes' review, 2026-11-06).
     fn of(first: Series, second: Option<Series>, ring_k: i64, over: bool, basis: CapBasis) -> Self {
         let a = heat_of(first.now, first.capacity);
         let b = second.as_ref().and_then(|s| heat_of(s.now, s.capacity));
         let second_binds = match (a, b) {
             (Some(a), Some(b)) => b > a,
             (None, Some(_)) => true,
-            _ => false,
+            (Some(_), None) => false,
+            (None, None) => {
+                let raw = |s: Option<&Series>| s.and_then(|s| s.now).filter(|v| v.is_finite());
+                raw(second.as_ref()) > raw(Some(&first))
+            }
         };
         Self {
             now: first.now,
@@ -6210,6 +6287,233 @@ mod tests {
         assert!(
             tok.now.is_some(),
             "the rate is read while the peak is learned"
+        );
+    }
+
+    /// A1 §7 (the R3 lens fixes and their review, 2026-11-06): each column of a two-series row's
+    /// lens trace is one series' minute, the series whose mean is the larger share of its own
+    /// capacity: its mean the column and its largest reading the tick, each with its own share as
+    /// its heat, held at the basis's ceiling. The column's heat and over share are therefore the
+    /// deck row's ([`ResourceView::heat_columns`]) and the tick's heat at most the row's peak heat,
+    /// cooler where the other series' largest reading is the larger share. With no capacity, the
+    /// series whose raw mean is the larger, with no heat; a one-series row's are its columns. With
+    /// capacities far apart (receiving 100, sending 10) a column's tick never stands below it.
+    /// NEGATIVE CONTROLS: the larger raw figure takes sending's minute in column 0; each figure
+    /// from the series it is the larger share of (the R3 fix as first built) takes sending's
+    /// largest reading in column 0 and, against the far-apart capacities, ticks 7 under a column
+    /// of 50 and 9 under one of 30.
+    #[test]
+    fn busier_columns_take_each_column_from_its_busier_series() {
+        let k = 1_000_000_i64;
+        let cell = |v: Option<(f64, f64)>, over_n: f64| Cell {
+            mean: v.map(|v| v.0),
+            max: v.map(|v| v.1),
+            n: if v.is_some() { 4.0 } else { 0.0 },
+            over_n,
+        };
+        // Receiving against 10, sending against 20.
+        let rx: Arc<[Cell]> = vec![
+            cell(Some((5.0, 6.0)), 1.0),
+            cell(Some((2.0, 9.0)), 0.0),
+            cell(Some((1.0, 1.0)), 0.0),
+            cell(None, 0.0),
+            cell(Some((9.0, 9.5)), 0.0),
+        ]
+        .into();
+        let tx: Arc<[Cell]> = vec![
+            cell(Some((8.0, 16.0)), 2.0),
+            cell(Some((6.0, 10.0)), 0.0),
+            cell(None, 0.0),
+            cell(Some((3.0, 4.0)), 0.0),
+            cell(Some((19.0, 30.0)), 0.0),
+        ]
+        .into();
+        let view =
+            |rx: &Arc<[Cell]>, tx: &Arc<[Cell]>, rx_cap: Option<f64>, tx_cap: Option<f64>| {
+                ResourceView {
+                    capacity: rx_cap,
+                    basis: CapBasis::Peak,
+                    ring: Arc::clone(rx),
+                    ring_k: k,
+                    second: Some(Series {
+                        capacity: tx_cap,
+                        ring: Arc::clone(tx),
+                        ..Series::default()
+                    }),
+                    ..ResourceView::default()
+                }
+            };
+        let now = k * BUCKET_MS + 5_000;
+        let shared = view(&rx, &tx, Some(10.0), Some(20.0));
+        let (cells, heat) = shared.busier_columns(10, 5, now);
+        let figures: Vec<(Option<f64>, Option<f64>, f64)> = cells
+            .iter()
+            .map(|c| (c.mean, c.max, c.over_share()))
+            .collect();
+        assert_eq!(
+            figures,
+            [
+                (Some(5.0), Some(6.0), 0.5),
+                (Some(6.0), Some(10.0), 0.0),
+                (Some(1.0), Some(1.0), 0.0),
+                (Some(3.0), Some(4.0), 0.0),
+                (Some(19.0), Some(30.0), 0.0),
+            ],
+            "each column the minute of the series whose mean is the larger share"
+        );
+        let shares: Vec<(Option<f32>, Option<f32>)> =
+            heat.iter().map(|h| (h.heat, h.max)).collect();
+        assert_eq!(
+            shares,
+            [
+                (Some(0.5), Some(0.6)),
+                (Some(0.3), Some(0.5)),
+                (Some(0.1), Some(0.1)),
+                (Some(0.15), Some(0.2)),
+                (Some(0.95), Some(1.0)),
+            ],
+            "each with its own share, held at the peak basis's ceiling"
+        );
+        let row = shared.heat_columns(10, 5, now);
+        for (j, (h, r)) in heat.iter().zip(&row).enumerate() {
+            assert_eq!(
+                (h.heat, h.over),
+                (r.heat, r.over),
+                "column {j}: the deck row's column heat and over share"
+            );
+            assert!(h.max <= r.max, "column {j}: {h:?} against the row's {r:?}");
+        }
+        assert_eq!(
+            (heat[0].max, row[0].max),
+            (Some(0.6), Some(0.8)),
+            "CONTROL: column 0's tick is receiving's, cooler than sending's peak the row takes"
+        );
+        let (cells, heat) = view(&rx, &tx, None, None).busier_columns(10, 5, now);
+        assert_eq!(
+            cells.iter().map(|c| (c.mean, c.max)).collect::<Vec<_>>(),
+            [
+                (Some(8.0), Some(16.0)),
+                (Some(6.0), Some(10.0)),
+                (Some(1.0), Some(1.0)),
+                (Some(3.0), Some(4.0)),
+                (Some(19.0), Some(30.0)),
+            ],
+            "the minute of the larger raw mean with no capacity"
+        );
+        assert!(heat.iter().all(|h| h.heat.is_none() && h.max.is_none()));
+        let one = ResourceView {
+            second: None,
+            ..view(&rx, &tx, Some(10.0), None)
+        };
+        let (cells, heat) = one.busier_columns(10, 5, now);
+        assert_eq!(cells, one.columns(10, 5, now));
+        assert_eq!(heat, one.heat_cells(one.columns(10, 5, now)));
+
+        // Receiving against 100, sending against 10: the review's column (50/60 against 1/7), one
+        // whose sending mean binds and one whose receiving mean binds over a hotter sending tick.
+        let rx: Arc<[Cell]> = vec![
+            cell(Some((50.0, 60.0)), 0.0),
+            cell(Some((40.0, 95.0)), 0.0),
+            cell(Some((30.0, 80.0)), 0.0),
+        ]
+        .into();
+        let tx: Arc<[Cell]> = vec![
+            cell(Some((1.0, 7.0)), 0.0),
+            cell(Some((6.0, 9.0)), 0.0),
+            cell(Some((2.0, 9.0)), 0.0),
+        ]
+        .into();
+        let apart = view(&rx, &tx, Some(100.0), Some(10.0));
+        let (cells, heat) = apart.busier_columns(10, 3, now);
+        assert_eq!(
+            cells.iter().map(|c| (c.mean, c.max)).collect::<Vec<_>>(),
+            [
+                (Some(50.0), Some(60.0)),
+                (Some(6.0), Some(9.0)),
+                (Some(30.0), Some(80.0)),
+            ],
+            "far-apart capacities"
+        );
+        for (j, c) in cells.iter().enumerate() {
+            assert!(
+                c.max >= c.mean,
+                "column {j}: the tick {:?} under its column {:?}",
+                c.max,
+                c.mean
+            );
+        }
+        assert_eq!(
+            heat.iter().map(|h| (h.heat, h.max)).collect::<Vec<_>>(),
+            [
+                (Some(0.5), Some(0.6)),
+                (Some(0.6), Some(0.9)),
+                (Some(0.3), Some(0.8)),
+            ]
+        );
+    }
+
+    /// The R3 lens fixes' review (2026-11-06): where neither series' share is known, the second
+    /// binds where its finite raw "now" is the larger, the rule `busier_columns` takes each column
+    /// by, so the amount, the deck's no-heat fill and the Network lens's Traffic line name the
+    /// series its trace draws. Read through [`Vitals::absorb`] in the first day of learning, on a
+    /// link that reports no speed: sending 14 MB/s against receiving's 2.1 binds; Processes with
+    /// no limits read keeps all, whose count yours never passes; equal figures keep the first.
+    /// NEGATIVE CONTROL: the old arm, which bound the first series whenever no share was known,
+    /// binds receiving.
+    #[test]
+    fn with_no_share_known_the_larger_raw_figure_binds() {
+        let mut v = Vitals::new();
+        let mut s = Snapshot::default();
+        for t in 0..6_u64 {
+            let mut sample = at(t * 1000, 1000);
+            sample.room.procs_max = None;
+            sample.room.user_procs_max = None;
+            if let Some(l) = sample.links.as_mut().and_then(|l| l.first_mut()) {
+                l.rate_bps = None;
+                l.rx = 2_100 * t * 1000;
+                l.tx = 14_000 * t * 1000;
+            }
+            s = v.absorb(&sample);
+        }
+        let net = &s.resources[Network.index()];
+        let tx = net.second.as_ref().expect("send");
+        assert_eq!(
+            (net.basis, net.capacity, tx.capacity),
+            (CapBasis::Learning, None, None),
+            "PRECONDITION: no share is known"
+        );
+        assert!(close(net.now, 2.1e6) && close(tx.now, 14e6), "{net:?}");
+        assert!(tx.binds && !net.first().binds, "{net:?}");
+        assert_eq!(net.binding().now, tx.now);
+        let (cells, _) = net.busier_columns(10, 1, s.at_unix_ms);
+        assert!(close(cells[0].mean, 14e6), "the trace's column: {cells:?}");
+        let procs = &s.resources[Processes.index()];
+        let yours = procs.second.as_ref().expect("yours");
+        assert_eq!((procs.capacity, yours.capacity), (None, None));
+        assert!(
+            close(procs.now, 900.0) && close(yours.now, 500.0),
+            "{procs:?}"
+        );
+        assert!(!yours.binds);
+        let even = |b: f64| Series {
+            now: Some(b),
+            ..Series::default()
+        };
+        let tie = ResourceView::of(even(3.0), Some(even(3.0)), 0, false, CapBasis::Learning);
+        assert!(
+            !tie.second.as_ref().expect("second").binds,
+            "a tie keeps the first"
+        );
+        let unread = ResourceView::of(
+            Series::default(),
+            Some(even(f64::NAN)),
+            0,
+            false,
+            CapBasis::Learning,
+        );
+        assert!(
+            !unread.second.as_ref().expect("second").binds,
+            "a figure that is not finite is unread"
         );
     }
 

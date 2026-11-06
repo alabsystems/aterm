@@ -224,14 +224,19 @@ pub fn load_or_seed(path: &Path, now: i64) -> Result<Priority, String> {
 
 /// Write `text` to `path` through a sibling temp file and a rename.
 /// # Errors
-/// The directory could not be made or the write/rename failed.
+/// The directory could not be made or the write/rename failed. Among those, with
+/// [`std::io::ErrorKind::InvalidFilename`], a name the folder takes but its temporary does not:
+/// the temporary's name is that name, 15 bytes and the writer's pid in decimal, so a name past 233
+/// bytes on a filesystem of 255-byte names under a 7-digit pid (235 under a 5-digit one). Nothing
+/// is left behind, and what was at `path` stays.
 pub fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
     write_atomic_mode(path, text, None)
 }
 
 /// [`write_atomic`], with the replacement's permission bits (unix) where `mode` names them, for a file its owner keeps as they made it.
 /// # Errors
-/// The directory could not be made or the write, the mode or the rename failed.
+/// The directory could not be made, the name has no room for its temporary ([`write_atomic`]), or
+/// the write, the mode or the rename failed.
 pub fn write_atomic_mode(path: &Path, text: &str, mode: Option<u32>) -> std::io::Result<()> {
     use std::io::Write as _;
     write_atomic_using(
@@ -298,24 +303,23 @@ fn write_atomic_using(
     write: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
     before_publish: impl FnOnce() -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    let dir = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    std::fs::create_dir_all(dir)?;
-    let stage = aterm_tempfile::Builder::new()
-        .prefix(".aterm-write-")
-        .tempdir_in(dir)?;
-    let staged = stage.path().join("data");
-    let mut open = std::fs::OpenOptions::new();
-    open.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        open.mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    }
-    let mut file = open.open(&staged)?;
+    let (staged, mut file) = match aterm_uds::atomic_file::create_temp_beside(path, 0o600) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let dir = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            std::fs::create_dir_all(dir)?;
+            aterm_uds::atomic_file::create_temp_beside(path, 0o600)?
+        }
+        made => made?,
+    };
+    let mut stage = OwnedStage {
+        path: staged,
+        unpublished: true,
+    };
+    // The bytes are written under 0600: `mode` reaches only a complete replacement.
+    write(&mut file, text.as_bytes())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -323,11 +327,28 @@ fn write_atomic_using(
     }
     #[cfg(not(unix))]
     let _ = mode;
-    write(&mut file, text.as_bytes())?;
     crate::durable::finish(&file, flush)?;
     drop(file);
     before_publish()?;
-    std::fs::rename(&staged, path)
+    std::fs::rename(&stage.path, path)?;
+    // Its name is free after the rename, and may be a later writer's by then.
+    stage.unpublished = false;
+    Ok(())
+}
+
+/// The temporary this write alone created ([`aterm_uds::atomic_file::create_temp_beside`]), removed
+/// on any way out that did not publish it.
+struct OwnedStage {
+    path: PathBuf,
+    unpublished: bool,
+}
+
+impl Drop for OwnedStage {
+    fn drop(&mut self) {
+        if self.unpublished {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 /// One row of the served catalog (`~/.claude/cache/model-catalog/*-cc.json`).
@@ -2617,6 +2638,62 @@ mod atomic_write_tests {
             std::fs::read_to_string(&unrelated).expect("unrelated"),
             "irreplaceable fixture"
         );
+    }
+
+    /// A destination's name leaves its temporary room: [`write_atomic`] writes the longest one
+    /// and refuses the next, with what was there kept and nothing else left in the folder.
+    ///
+    /// NEGATIVE CONTROLS (2026-11-05): with two bytes more in the temporary's name, the longest
+    /// name fails (`the longest name: ... "File name too long"`); with no `.tmp.<pid>` in it, the
+    /// name past the room is written (`past the room: ()`).
+    #[cfg(unix)]
+    #[test]
+    fn a_destination_name_is_limited_by_the_room_its_temporary_leaves() {
+        let dir = aterm_tempfile::tempdir().expect("private directory");
+        // A name's `.`, `.tmp.`, the `.` before its salt and the salt's 8 digits, and the pid.
+        let room = 255 - 15 - std::process::id().to_string().len();
+        let longest = dir.path().join("n".repeat(room));
+        write_atomic(&longest, "fits").expect("the longest name");
+        let past = dir.path().join("p".repeat(room + 1));
+        std::fs::write(&past, "as it was").expect("the folder takes the name");
+        let refused = write_atomic(&past, "no room").expect_err("past the room");
+        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidFilename);
+        assert_eq!(std::fs::read_to_string(&past).expect("kept"), "as it was");
+        let left = std::fs::read_dir(dir.path()).expect("folder").count();
+        assert_eq!(left, 2, "a temporary stayed behind");
+    }
+
+    /// A destination's final mode reaches only a complete replacement: its bytes are written
+    /// under 0600, in a temporary whose name any reader of the folder can see.
+    ///
+    /// NEGATIVE CONTROL (2026-11-05): with the mode set before the bytes are written, this fails at
+    /// "the bytes went into a wider file", `Some(420)` against `Some(384)`.
+    #[cfg(unix)]
+    #[test]
+    fn a_wider_mode_reaches_only_a_complete_replacement() {
+        use std::{io::Write as _, os::unix::fs::PermissionsExt as _};
+        let dir = aterm_tempfile::tempdir().expect("private directory");
+        let dest = dir.path().join("record");
+        let mut written_under = None;
+        write_atomic_using(
+            &dest,
+            "public signature",
+            Some(0o644),
+            aterm_durable::Flush::Durable,
+            |file, bytes| {
+                written_under = Some(file.metadata()?.permissions().mode() & 0o777);
+                file.write_all(bytes)
+            },
+            || Ok(()),
+        )
+        .expect("public replacement");
+        assert_eq!(
+            written_under,
+            Some(0o600),
+            "the bytes went into a wider file"
+        );
+        let meta = std::fs::metadata(&dest).expect("metadata");
+        assert_eq!(meta.permissions().mode() & 0o777, 0o644);
     }
 
     #[test]

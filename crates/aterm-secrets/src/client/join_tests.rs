@@ -89,6 +89,168 @@ fn options<'a>(
     }
 }
 
+#[test]
+fn admitted_http_joins_recheck_after_fetch_before_creating_identity_source_or_requests() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let _answering = ServersAnswering::set();
+    let root = aterm_tempfile::tempdir().unwrap();
+    let server = serve_holding(&root.path().join("store"), Duration::from_millis(200));
+    let (_admin, source, _) = team(root.path(), &server);
+    let url = format!("http://{}/v1/team", server.addr);
+    for constrained in [false, true] {
+        let queued = transport::list_joins(&url).unwrap().len();
+        let paths = Paths::for_home(&root.path().join(format!("reader-{constrained}")));
+        let active = AtomicBool::new(true);
+        let current = || {
+            if active.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(Error::new("the accepted setup was replaced during fetch"))
+            }
+        };
+        let expected = if constrained {
+            ExpectedConfig::AdmittedRead(None, &current)
+        } else {
+            ExpectedConfig::AdmittedAny(&current)
+        };
+        let options = options(&source, JoinPassword::Given(None), None, Duration::ZERO);
+        let refused = join_with(&paths, &options, expected, |source| {
+            let fetched = transport::fetch(source, None, HANG_DETECTOR)?;
+            assert!(matches!(fetched, Fetched::Body(_)));
+            active.store(false, Ordering::SeqCst);
+            Ok(fetched)
+        });
+        assert!(refused.is_err());
+        for file in [
+            paths.identity_file(),
+            paths.source_file(),
+            paths.state_file(),
+            paths.cache_file(),
+        ] {
+            assert!(!file.exists(), "{file:?}");
+        }
+        assert!(!paths.home.join(".secrets").exists());
+        assert_eq!(transport::list_joins(&url).unwrap().len(), queued);
+
+        active.store(true, Ordering::SeqCst);
+        let joined = if constrained {
+            join_if_unchanged_admitted(&paths, &options, None, &current)
+        } else {
+            join_admitted(&paths, &options, &current)
+        };
+        assert!(
+            matches!(joined, Ok(JoinOutcome::Pending { .. })),
+            "{joined:?}"
+        );
+        assert!(paths.identity_file().is_file());
+        assert!(paths.source_file().is_file());
+        assert_eq!(status(&paths).unwrap().membership, Membership::Pending);
+        assert_eq!(transport::list_joins(&url).unwrap().len(), queued + 1);
+    }
+    server.stop();
+}
+
+#[test]
+fn admitted_http_join_rechecks_under_the_apply_lock_after_its_own_source_publication() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let _answering = ServersAnswering::set();
+    let root = aterm_tempfile::tempdir().unwrap();
+    let server = serve_holding(&root.path().join("store"), Duration::from_millis(200));
+    let (admin_paths, source, _) = team(root.path(), &server);
+    let url = format!("http://{}/v1/team", server.addr);
+    let paths = Paths::for_home(&root.path().join("reader"));
+    let announced = AtomicBool::new(false);
+    let post_config_checks = AtomicUsize::new(0);
+    let current = || {
+        if announced.load(Ordering::SeqCst) && post_config_checks.fetch_add(1, Ordering::SeqCst) > 0
+        {
+            Err(Error::new(
+                "setup stopped between configuration and materialization",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    let say = |event: &JoinEvent<'_>| {
+        if matches!(event, JoinEvent::Machine { .. }) {
+            announced.store(true, Ordering::SeqCst);
+        }
+    };
+    let options = JoinOptions {
+        say: &say,
+        ..options(&source, JoinPassword::Given(None), None, Duration::ZERO)
+    };
+    assert!(join_if_unchanged_admitted(&paths, &options, None, &current).is_err());
+    assert!(post_config_checks.load(Ordering::SeqCst) >= 2);
+    assert!(paths.identity_file().is_file());
+    let committed = config(&paths).unwrap().unwrap();
+    assert!(!paths.cache_file().exists());
+    assert!(!paths.home.join(".secrets").exists());
+    assert!(transport::list_joins(&url).unwrap().is_empty());
+    // This fresh admission names the committed source; the original None is no longer required.
+    let resumed = join_if_unchanged_admitted(&paths, &options, Some(&committed), &|| Ok(()));
+    assert!(
+        matches!(resumed, Ok(JoinOutcome::Pending { .. })),
+        "{resumed:?}"
+    );
+    assert_eq!(transport::list_joins(&url).unwrap().len(), 1);
+    let recipient = read_machine_identity(&paths)
+        .unwrap()
+        .unwrap()
+        .recipient()
+        .to_bech32();
+    let admin = admin_open(&admin_paths).unwrap();
+    let mut document = admin.doc.clone();
+    document.add_machine("mb", &recipient).unwrap();
+    document
+        .set_entry(&Audience::Everyone, "fixture-token", b"fixture-value")
+        .unwrap();
+    admin_publish_approved(&admin_paths, &admin, &document, &[recipient]).unwrap();
+    let joined = sync_within_admitted(&paths, HANG_DETECTOR, &|| Ok(()));
+    assert!(
+        matches!(joined, Ok(SyncOutcome::Applied { .. })),
+        "{joined:?}"
+    );
+    assert_eq!(
+        std::fs::read(paths.home.join(".secrets/fixture-token")).unwrap(),
+        b"fixture-value"
+    );
+    server.stop();
+}
+
+#[test]
+fn admitted_http_join_withdrawn_at_the_password_boundary_posts_and_records_nothing_further() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let _answering = ServersAnswering::set();
+    let root = aterm_tempfile::tempdir().unwrap();
+    let server = serve_holding(&root.path().join("store"), Duration::from_millis(200));
+    let (_admin, source, _) = team(root.path(), &server);
+    let url = format!("http://{}/v1/team", server.addr);
+    let paths = Paths::for_home(&root.path().join("reader"));
+    let active = AtomicBool::new(true);
+    let before = RefCell::new(None);
+    let ask = || {
+        *before.borrow_mut() = Some(std::fs::read(paths.state_file()).unwrap());
+        active.store(false, Ordering::SeqCst);
+        None
+    };
+    let current = || {
+        if active.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err(Error::new("setup stopped before requesting enrollment"))
+        }
+    };
+    let options = options(&source, JoinPassword::Ask(&ask), None, Duration::ZERO);
+    assert!(join_admitted(&paths, &options, &current).is_err());
+    assert_eq!(
+        std::fs::read(paths.state_file()).unwrap(),
+        before.into_inner().unwrap()
+    );
+    assert!(transport::list_joins(&url).unwrap().is_empty());
+    server.stop();
+}
+
 /// Remove the admin Mac's approver record, as on a Mac whose approver never kept one.
 fn forget_record(admin: &Paths) {
     std::fs::remove_file(admin.answered_file()).expect("CONTROL: the approver kept a record");
@@ -2961,6 +3123,36 @@ fn deaf() -> Hearing<'static> {
     }
 }
 
+/// A route hint that moved no address cannot discard the later verified broker
+/// arrival. That cause ends the actual error nap and starts its retry afresh.
+#[test]
+fn broker_readiness_ends_a_failed_round_after_an_unrelated_route_hint() {
+    let bell = crate::wake::Bell::new();
+    let hearing = Hearing {
+        bell: &bell,
+        ..deaf()
+    };
+    bell.ring(crate::wake::Wake::Route);
+    bell.ring(crate::wake::Wake::Broker);
+    let said = std::sync::Mutex::new(Vec::new());
+    assert!(nap_after_failing_with(
+        &hearing,
+        HANG_DETECTOR,
+        || false,
+        &|line| {
+            said.lock().unwrap().push(line.to_owned());
+        }
+    ));
+    assert_eq!(
+        said.lock().unwrap().as_slice(),
+        ["asking again now: woken by the LAN broker becoming ready"]
+    );
+    assert_eq!(
+        retry_after(AWAY_ERROR_RETRY, true, true),
+        Duration::from_secs(5)
+    );
+}
+
 /// A test loop's round `[swarm]` holds: it has no standing browse to drop.
 fn hold_nothing() {}
 
@@ -3095,6 +3287,7 @@ fn a_route_asks_pending_members_without_waiting_for_the_vault_long_poll() {
                 &hearing.members,
                 &ask,
                 &|_| {},
+                &|_| {},
                 move |most| {
                     crate::envelope::TEST_RETIRED
                         .with(|cell| *cell.borrow_mut() = Some(alab.clone()));
@@ -3139,6 +3332,148 @@ fn a_route_asks_pending_members_without_waiting_for_the_vault_long_poll() {
     });
 }
 
+/// A newly installed broker ends the member backoff while the route is unchanged
+/// and the subscriber's real vault long-poll remains held.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_broker_arrival_asks_pending_members_without_a_route_change() {
+    use aterm_uds::lan::wire::{self, Frame, Reader};
+    use std::os::unix::net::UnixListener;
+
+    struct EndServer(Option<crate::server::Running>);
+    impl Drop for EndServer {
+        fn drop(&mut self) {
+            if let Some(server) = self.0.take() {
+                server.stop();
+            }
+        }
+    }
+
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let server = serve_holding(&root.path().join("store"), Duration::from_secs(600));
+    let (_admin, mb, alab) = waiting_for_alab(root.path(), &server);
+    let socket = root.path().join("broker.sock");
+    let asks = std::sync::atomic::AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    let broker_stop = AtomicBool::new(false);
+    let (tick, ticks) = mpsc::channel();
+    let (handled, handling) = mpsc::channel();
+    let observed = std::thread::scope(|scope| {
+        let mut server = EndServer(Some(server));
+        let _ends = StopsOnDrop(&stop);
+        let _ends_broker = StopsOnDrop(&broker_stop);
+        let me = &mb;
+        let asks = &asks;
+        let stop = &stop;
+        let subscriber_socket = socket.clone();
+        let subscriber = scope.spawn(move || {
+            crate::envelope::TEST_RETIRED.with(|cell| *cell.borrow_mut() = Some(alab.clone()));
+            let ask = |_: &Paths| Ok(asks.fetch_add(1, Ordering::SeqCst));
+            let hearing = Hearing {
+                members: std::sync::Mutex::new(MembersAsked {
+                    at: Some(Instant::now()),
+                    asks: 6,
+                    ..MembersAsked::default()
+                }),
+                ask: &ask,
+                ..deaf()
+            };
+            aterm_uds::lan::seam_here(
+                aterm_uds::lan::Seam {
+                    socket: Some(subscriber_socket),
+                    ..aterm_uds::lan::Seam::default()
+                },
+                || {
+                    let mut consumed = false;
+                    member_routes::while_hearing(
+                        me,
+                        &hearing.members,
+                        &ask,
+                        &|_| {},
+                        &|_| {},
+                        move |most| {
+                            crate::envelope::TEST_RETIRED
+                                .with(|cell| *cell.borrow_mut() = Some(alab.clone()));
+                            if std::mem::take(&mut consumed) {
+                                handled.send(()).expect("turn handled");
+                            }
+                            consumed = ticks.recv_timeout(most).is_ok();
+                            false // A broker's arrival changes no route.
+                        },
+                        || {
+                            subscriber_loop_until(
+                                me,
+                                &|_| {},
+                                &|| stop.load(Ordering::SeqCst),
+                                &Converging {
+                                    start: &|_| None,
+                                    routes: &crate::server::route_sources,
+                                },
+                                &hearing,
+                            )
+                        },
+                    )
+                },
+            )
+        });
+        until("the subscriber's long-poll is held", || {
+            server.0.as_ref().unwrap().waiting() == 1
+        });
+        assert_eq!(asks.load(Ordering::SeqCst), 0, "the member backoff holds");
+        let listener = UnixListener::bind(&socket).expect("private broker binds");
+        listener.set_nonblocking(true).expect("bounded accept");
+        let ending = &broker_stop;
+        let broker = scope.spawn(move || {
+            while !ending.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(false).expect("blocking receipt");
+                        let deadline = Some(Instant::now() + HANG_DETECTOR);
+                        let hello = Reader::new(0).frame(&stream, deadline).expect("hello");
+                        assert!(matches!(hello, Some(Frame::Hello { .. })));
+                        wire::send(
+                            &stream,
+                            &Frame::Hello {
+                                protocol: aterm_uds::lan::PROTOCOL,
+                                build: "owned-broker".into(),
+                            },
+                        )
+                        .expect("broker answers");
+                        return true;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("private broker accept: {error}"),
+                }
+            }
+            false
+        });
+        tick.send(()).expect("observe the broker's arrival");
+        handling
+            .recv_timeout(HANG_DETECTOR)
+            .expect("turn completed");
+        let observed = (
+            asks.load(Ordering::SeqCst),
+            server.0.as_ref().unwrap().waiting(),
+        );
+        stop.store(true, Ordering::SeqCst);
+        broker_stop.store(true, Ordering::SeqCst);
+        server.0.take().unwrap().stop();
+        subscriber
+            .join()
+            .expect("subscriber ended")
+            .expect("cleanly");
+        (observed, broker.join().expect("broker ended"))
+    });
+    assert_eq!(
+        observed.0.0, 1,
+        "broker availability must end the old member backoff"
+    );
+    assert_eq!(observed.0.1, 1, "the vault long-poll stays held");
+    assert!(observed.1, "the arriving broker answered a real hello");
+}
+
 #[test]
 fn member_route_wakes_preserve_sharing_holds_and_revocation() {
     for off in [true, false] {
@@ -3166,6 +3501,7 @@ fn member_route_wakes_preserve_sharing_holds_and_revocation() {
             &members,
             &|_: &Paths| Ok(asks.fetch_add(1, Ordering::SeqCst)),
             &|_| {},
+            &|_| {},
             move |most| {
                 crate::envelope::TEST_RETIRED.with(|cell| *cell.borrow_mut() = Some(alab.clone()));
                 if std::mem::take(&mut consumed) {
@@ -3178,6 +3514,237 @@ fn member_route_wakes_preserve_sharing_holds_and_revocation() {
         );
         assert_eq!(asks.load(Ordering::SeqCst), 0, "off={off}");
         server.stop();
+    }
+}
+
+/// Local admission owes the ordinary fleet/node pass even when the previous runner is still
+/// running and the vault's actual HTTP long-poll never completes. A reply alone owes nothing.
+#[cfg(unix)]
+#[test]
+fn member_admission_projects_after_the_previous_runner_without_releasing_the_long_poll() {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicI32, AtomicUsize};
+    for admit in [true, false] {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let server = serve_holding(&root.path().join("store"), Duration::from_secs(600));
+        let (_admin, mb, alab) = waiting_for_alab(root.path(), &server);
+        let (input, mut release) = std::io::pipe().unwrap();
+        let input = std::sync::Mutex::new(Some(input));
+        let starts = AtomicUsize::new(0);
+        let pid = AtomicI32::new(0);
+        let start = |_: &Path| {
+            starts.fetch_add(1, Ordering::SeqCst);
+            input.lock().unwrap().take().map(|input| {
+                let sh = aterm_uds::deadline::stand_in(Path::new("/bin/sh"));
+                let child = aterm_uds::spawnfd::command(&sh)
+                    .args(["-c", "read line"])
+                    .stdin(input)
+                    .spawn()
+                    .unwrap();
+                pid.store(child.id().try_into().unwrap(), Ordering::SeqCst);
+                child
+            })
+        };
+        let ports = Converging {
+            start: &start,
+            routes: &|| [None; 3],
+        };
+        let projection = projection::Projection::new(&ports);
+        let stop = AtomicBool::new(false);
+        let (route, routes) = std::sync::mpsc::channel();
+        let (handled, handling) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let _stops = StopsOnDrop(&stop);
+            let subscriber = scope.spawn(|| {
+                crate::envelope::TEST_RETIRED.with(|cell| *cell.borrow_mut() = Some(alab.clone()));
+                let ask = |paths: &Paths| {
+                    if admit {
+                        // The authenticated transport's already-tested local publication is
+                        // the callback boundary; this fixture holds the HTTP source unchanged.
+                        let mut state = load_state(paths)?;
+                        state.membership = Stored::In;
+                        save_state(paths, &state)?;
+                    }
+                    Ok(1)
+                };
+                let hearing = Hearing {
+                    members: std::sync::Mutex::new(MembersAsked {
+                        at: Some(Instant::now()),
+                        asks: 6,
+                        ..MembersAsked::default()
+                    }),
+                    ask: &ask,
+                    ..deaf()
+                };
+                let mut consumed = false;
+                member_routes::while_hearing(
+                    &mb,
+                    &hearing.members,
+                    &ask,
+                    &|_| {},
+                    &|admitted| {
+                        if matches!(admitted, member_routes::ProjectionEvent::Admitted) {
+                            projection.admitted();
+                        } else {
+                            projection.poll();
+                        }
+                    },
+                    move |most| {
+                        crate::envelope::TEST_RETIRED
+                            .with(|cell| *cell.borrow_mut() = Some(alab.clone()));
+                        if std::mem::take(&mut consumed) {
+                            handled.send(()).unwrap();
+                        }
+                        consumed = routes.recv_timeout(most).is_ok();
+                        consumed
+                    },
+                    || {
+                        subscriber_loop_projecting(
+                            &mb,
+                            &|_| {},
+                            &|| stop.load(Ordering::SeqCst),
+                            &hearing,
+                            &projection,
+                        )
+                    },
+                )
+            });
+            until("the real vault long-poll is held", || server.waiting() == 1);
+            assert_eq!(starts.load(Ordering::SeqCst), 1);
+            route.send(()).unwrap();
+            handling.recv_timeout(HANG_DETECTOR).unwrap();
+            assert_eq!(starts.load(Ordering::SeqCst), 1, "one runner at a time");
+            release.write_all(b"finished\n").unwrap();
+            until("the route lane reaps the finished runner", || {
+                aterm_uds::process::process_presence(pid.load(Ordering::SeqCst))
+                    == aterm_uds::process::ProcessPresence::Absent
+            });
+            if admit {
+                until("native admission's owed fleet/node pass starts", || {
+                    starts.load(Ordering::SeqCst) >= 2
+                });
+            } else {
+                assert_eq!(
+                    starts.load(Ordering::SeqCst),
+                    1,
+                    "a plain member reply grants no projection wake"
+                );
+            }
+            assert_eq!(
+                server.waiting(),
+                1,
+                "projection did not await the HTTP source"
+            );
+            stop.store(true, Ordering::SeqCst);
+            server.stop();
+            subscriber.join().unwrap().unwrap();
+        });
+    }
+}
+
+/// A background install/repair is a new input, so neither a settled job's recheck nor an
+/// unfinished job's retry should hide it behind the still-held HTTP source.
+#[cfg(unix)]
+#[test]
+fn local_inputs_restart_subscriber_projection_while_http_and_retry_time_stand_still() {
+    use std::sync::atomic::{AtomicI32, AtomicUsize};
+    for exit in [0, 76] {
+        for changed in [true, false] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let server = serve_holding(&root.path().join("store"), Duration::from_secs(600));
+            let (_admin, mb, _alab) = waiting_for_alab(root.path(), &server);
+            let ready = root.path().join("input-ready");
+            let observed = ready.clone();
+            let (polled, polling) = std::sync::mpsc::channel();
+            let mut previous = false;
+            let inputs = Box::new(move || {
+                let now = observed.is_file();
+                let moved = now != previous;
+                previous = now;
+                polled.send(()).unwrap();
+                moved
+            });
+            let starts = AtomicUsize::new(0);
+            let pid = AtomicI32::new(0);
+            let start = |_: &Path| {
+                if starts.fetch_add(1, Ordering::SeqCst) != 0 {
+                    return None;
+                }
+                let sh = aterm_uds::deadline::stand_in(Path::new("/bin/sh"));
+                let child = aterm_uds::spawnfd::command(&sh)
+                    .args(["-c", &format!("exit {exit}")])
+                    .spawn()
+                    .unwrap();
+                pid.store(child.id().try_into().unwrap(), Ordering::SeqCst);
+                Some(child)
+            };
+            let ports = Converging {
+                start: &start,
+                routes: &|| [None; 3],
+            };
+            let projection = projection::Projection::observing(&ports, inputs).at_clock(|| 0);
+            let stop = AtomicBool::new(false);
+            std::thread::scope(|scope| {
+                let _stops = StopsOnDrop(&stop);
+                let subscriber = scope.spawn(|| {
+                    let hearing = deaf();
+                    member_routes::while_hearing(
+                        &mb,
+                        &hearing.members,
+                        &|_| Ok(0),
+                        &|_| {},
+                        &|admitted| {
+                            if matches!(admitted, member_routes::ProjectionEvent::Admitted) {
+                                projection.admitted()
+                            } else {
+                                projection.poll()
+                            }
+                        },
+                        |most| {
+                            std::thread::sleep(most);
+                            false
+                        },
+                        || {
+                            subscriber_loop_projecting(
+                                &mb,
+                                &|_| {},
+                                &|| stop.load(Ordering::SeqCst),
+                                &hearing,
+                                &projection,
+                            )
+                        },
+                    )
+                });
+                until("the real vault long-poll is held", || server.waiting() == 1);
+                until("the first runner is reaped", || {
+                    let pid = pid.load(Ordering::SeqCst);
+                    pid != 0
+                        && aterm_uds::process::process_presence(pid)
+                            == aterm_uds::process::ProcessPresence::Absent
+                });
+                assert_eq!(starts.load(Ordering::SeqCst), 1);
+                while polling.try_recv().is_ok() {}
+                if changed {
+                    std::fs::write(&ready, "installed").unwrap();
+                }
+                polling.recv_timeout(HANG_DETECTOR).unwrap();
+                if changed {
+                    until("the changed local input starts its job", || {
+                        starts.load(Ordering::SeqCst) == 2
+                    });
+                } else {
+                    assert_eq!(
+                        starts.load(Ordering::SeqCst),
+                        1,
+                        "unchanged input spends no retry"
+                    );
+                }
+                assert_eq!(server.waiting(), 1, "no HTTP response or timer advanced");
+                stop.store(true, Ordering::SeqCst);
+                server.stop();
+                subscriber.join().unwrap().unwrap();
+            });
+        }
     }
 }
 
@@ -3390,7 +3957,7 @@ fn swarm_off_asks_no_alab_member_from_a_waiting_subscriber() {
 
 /// The subscriber's standing `_alab-vault._tcp` browse ends once `[swarm]` holds the rounds and
 /// a fresh one starts with the first pass of the ALab vault after sharing comes back on: no
-/// `dns-sd -B` runs while sharing is off. (A test build's `Watch::start` runs no browse.)
+/// browse runs while sharing is off. (A test build's `Watch::start_look` runs no browse.)
 /// NEGATIVE CONTROL: make `StandingBrowse::stop` keep the watch: it still runs while held.
 #[test]
 fn the_standing_browse_ends_while_sharing_is_off_and_starts_afresh() {
@@ -3399,7 +3966,7 @@ fn the_standing_browse_ends_while_sharing_is_off_and_starts_afresh() {
     let starts = std::sync::atomic::AtomicUsize::new(0);
     let start = || {
         starts.fetch_add(1, Ordering::SeqCst);
-        crate::discover::Watch::start(&bell, &[])
+        crate::discover::Watch::start_look(&bell, &[])
     };
     let first = standing.watch_or_start(start);
     drop(standing.watch_or_start(|| panic!("one browse runs: no second start")));
@@ -3437,11 +4004,6 @@ fn member_in(root: &Path, admin: &Paths, source: &str) -> Paths {
     approve_request(admin, &key).expect("approves");
     assert!(matches!(sync(&mb, None), Ok(SyncOutcome::Applied { .. })));
     mb
-}
-
-/// A `dns-sd -B _alab-vault._tcp local.` row adding `name` on interface 4.
-fn browse_add(name: &str) -> String {
-    format!("8:30:01.200  Add        3   4 local.               _alab-vault._tcp.    {name}")
 }
 
 /// Sets its flag as it drops, a failed check's unwinding included: the subscriber loop that
@@ -3552,7 +4114,7 @@ fn the_subscriber_starts_the_converge_pass_as_it_starts_per_applied_version_and_
 
 /// A subscriber whose vault cannot be reached naps between tries, and a vault server its
 /// standing browse hears ends the nap at once: its log says the browse woke it. The browse is a
-/// watch fed one `dns-sd -B` row, ringing the bell the loop naps on.
+/// watch that hears one add, ringing the bell the loop naps on.
 /// NEGATIVE CONTROL: a nap that waits on no bell runs to its timer and the next, and the hang
 /// detector fires.
 #[test]
@@ -3606,7 +4168,7 @@ fn a_failing_subscriber_ends_its_nap_on_a_browse_add() {
         until("a pass fails, and its nap begins", || {
             said("retrying with backoff")
         });
-        watch.feed(&browse_add("m3"));
+        watch.hear(true, 4, "m3");
         until("the nap ends on the browse's Add", || said(woken));
         stop.store(true, Ordering::SeqCst);
         subscriber
@@ -3688,7 +4250,7 @@ fn a_pass_healthy_after_errors_starts_a_runner() {
         save_config(&mb, &reached).expect("put back");
         // A vault server the browse heard ends the failed pass's nap, so the healthy pass comes
         // at once.
-        watch.feed(&browse_add("m3"));
+        watch.hear(true, 4, "m3");
         until("one more for the healthy pass after errors", || {
             starts.load(Ordering::SeqCst) == 2
         });
@@ -3743,7 +4305,7 @@ fn a_server_that_vanishes_and_returns_at_a_new_address_is_applied() {
     let logged = std::sync::Mutex::new(Vec::<String>::new());
     let log = |line: &str| {
         if line.contains("retrying with backoff") {
-            watch.feed(&browse_add("ma"));
+            watch.hear(true, 4, "ma");
         }
         logged.lock().expect("log").push(line.to_owned());
     };

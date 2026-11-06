@@ -27,6 +27,10 @@ clean {
         trust_import_aterm_mesh_core__relay_live__runs a b = spec_runs a b := by
       cases a <;> cases b <;> rfl
 
+    theorem asks_again_is_exact (a b : Bool) :
+        trust_import_aterm_mesh_core__relay_live__asks_again a b = spec_asks_again a b := by
+      cases a <;> cases b <;> rfl
+
     namespace AtermMeshRelayLive
 
     open AtermMeshTemporal
@@ -36,23 +40,24 @@ clean {
         trust_import_aterm_mesh_core__relay_live__start_repair
         trust_import_aterm_mesh_core__relay_live__requests
         trust_import_aterm_mesh_core__relay_live__runs
+        trust_import_aterm_mesh_core__relay_live__asks_again
 
     theorem compiled_exact : Exact compiled :=
-      ⟨cursor_is_exact, start_repair_is_exact, requests_is_exact, runs_is_exact⟩
+      ⟨cursor_is_exact, start_repair_is_exact, requests_is_exact, runs_is_exact, asks_again_is_exact⟩
 
     -- The quiet rule of the compiled kernels, in every state of every run.
     theorem compiled_quiet_safe (noGap : Bool) (durable : Nat → Bool) (nb : Nat → Nat → Bool)
         (o : Nat) : Satisfies (SpecM (Model.mk compiled noGap durable nb) o) (Always (Lift QInv)) :=
       quiet_safe (Model.mk compiled noGap durable nb) o
 
-    -- What the compiled relay's edge owes reaches the neighbour's stores, under its fair hop.
+    -- What the compiled relay's edge owes reaches the neighbour's stores, under its fair hop (the
+    -- start's second ask answered once s ingests).
     theorem compiled_edge_is_repaired (durable : Nat → Bool) (nb : Nat → Nat → Bool) (o : Nat)
         (b : Nat → W) (ev : Nat → Ev) (hr : RunsE (Model.mk compiled false durable nb) o b ev)
         (s d n : Nat) (hd : durable s = true) (hf : FairHop b s d)
-        (hra : RepairAfterIngest (Model.mk compiled false durable nb) b ev s d)
         (h : ((b n).owes s d && (b n).log s) = true) : ∃ k, (b k).store d = true :=
       the_edge_is_repaired (Model.mk compiled false durable nb) o b ev hr compiled_exact rfl s d n hd
-        hf hra h
+        hf h
 
     -- Every seat the origin reaches, under the compiled kernels and the digest trigger.
     theorem compiled_every_seat_gets_the_record (noGap : Bool) (durable : Nat → Bool)

@@ -1246,3 +1246,105 @@ fn could_not_finish_reads_a_head_with_a_reason_and_nothing_else() {
         assert_eq!(could_not_finish(tail), why, "{tail:?}");
     }
 }
+
+/// A BARE HEAD BEFORE A FINITE AUXILIARY IS PROSE (live 2026-11-04: an agent's bullet `- **NEEDS
+/// YOU can be lost.** A NEEDS YOU line in a turn that ended on a usage wall …` showed in `aterm
+/// ctl survey` as `claude needs you: can be lost.`). NEEDS YOU there is the subject of its clause
+/// ([`subject_of`]): the row names no need and its prose stays every other reader's. The row
+/// still opens a line of its own ([`apart`]), and the scan for a head past a row's start
+/// ([`mid_head`], from the row's first byte) reads none on it. A question after a bare head (an
+/// auxiliary before a subject, a question mark in its line, on a row wrapped under it too), an
+/// imperative, a noun, and a head past a separator or a qualifier still name their need.
+/// Negative control: on the reader before [`subject_of`] every prose row below named a need
+/// (`can be lost.** A NEEDS YOU line …`), and every need below named the same need.
+#[test]
+fn a_bare_head_before_a_finite_auxiliary_is_prose_not_a_need() {
+    let incident =
+        "- **NEEDS YOU can be lost.** A NEEDS YOU line in a turn that ended on a usage wall …";
+    for tail in [
+        incident.to_string(),
+        format!("Merged and pushed main.\n{incident}\nNothing left: all on origin/main."),
+        "NEEDS YOU is now read only past a colon.".to_string(),
+        "## NEEDS YOU was raised twice by tab 3".to_string(),
+        "**NEEDS YOU** should stay on screen until answered.".to_string(),
+        "NEEDS YOU won't block Land any more.".to_string(),
+        "NEEDS YOU won’t block Land any more.".to_string(),
+        "  - **NEEDS YOU is loud and never blocks.** An agent puts what only a person can give on \
+         a line"
+            .to_string(),
+        "`NEEDS YOU` is the head the harness reads.".to_string(),
+        "NEEDS YOU is loud and never blocks\nwhen a wall ends the turn.".to_string(),
+        "Put what only a person can give on a line starting\nNEEDS YOU can the release go out\n\
+         today? and carry on."
+            .to_string(),
+    ] {
+        assert!(
+            needs_you(&tail).is_empty(),
+            "{tail:?}: {:?}",
+            needs_you(&tail)
+        );
+        assert!(!says_no_needs(&tail), "{tail:?}");
+        assert_eq!(without_needs(&tail), tail, "{tail:?}");
+    }
+    assert_eq!(mid_head(incident, "", &[], 0), None);
+    let above = "Merged the parser, and a turn that ended on a usage wall and the";
+    for row in [
+        "NEEDS YOU can be lost.",
+        "NEEDS YOU can the release go out",
+        "NEEDS YOU: sign in to GitHub",
+    ] {
+        assert!(apart(above, row), "{row:?}");
+    }
+    assert!(!apart(above, "needs you can be lost."));
+    for (tail, want) in [
+        (
+            "NEEDS YOU can you sign in to GitHub?",
+            "can you sign in to GitHub?",
+        ),
+        (
+            "NEEDS YOU should I force-push main?",
+            "should I force-push main?",
+        ),
+        (
+            "NEEDS YOU could you approve the deploy",
+            "could you approve the deploy",
+        ),
+        (
+            "NEEDS YOU is the release key still valid? If not, rotate it.",
+            "is the release key still valid? If not, rotate it.",
+        ),
+        (
+            "NEEDS YOU can the release go out\ntoday?",
+            "can the release go out today?",
+        ),
+        (
+            "NEEDS YOU can\nyou sign in to GitHub",
+            "can you sign in to GitHub",
+        ),
+        (
+            "- **NEEDS YOU:** can you sign in to GitHub",
+            "can you sign in to GitHub",
+        ),
+        (
+            "NEEDS YOU — must rotate the deploy key before Friday",
+            "must rotate the deploy key before Friday",
+        ),
+        (
+            "NEEDS YOU (owner) is blocked on the notary key",
+            "is blocked on the notary key",
+        ),
+        ("NEEDS YOU the release credential", "the release credential"),
+        ("NEEDS-YOU approve the deploy", "approve the deploy"),
+        (
+            "NEEDS YOU have the notary password ready",
+            "have the notary password ready",
+        ),
+        (
+            "NEEDS YOU is loud. NEEDS YOU: rotate the key",
+            "rotate the key",
+        ),
+    ] {
+        assert_eq!(needs_you(tail), [want], "{tail:?}");
+        assert!(!says_no_needs(tail), "{tail:?}");
+    }
+}

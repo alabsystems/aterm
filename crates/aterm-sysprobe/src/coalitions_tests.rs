@@ -285,11 +285,43 @@ mod live {
         );
     }
 
-    /// The live tasks of every coalition, `Σ (started − exited)`, are the process table's count
+    /// The process table, read between two coalition reads: every pid the kernel lists, and how
+    /// many of those were unsettled when each was read again: a zombie (its task has ended), one
+    /// being created or exiting (its task may or may not be a coalition's yet, or still), or one
+    /// gone since the list.
+    fn table() -> (u64, u64) {
+        use crate::jobs::RunState;
+        // SAFETY: a null buffer asks for the count only.
+        let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+        let room = usize::try_from(count).expect("the table's count") + 64;
+        let mut pids: Vec<libc::c_int> = vec![0; room];
+        let bytes = libc::c_int::try_from(std::mem::size_of_val(pids.as_slice())).expect("room");
+        // SAFETY: `pids` is writable for `bytes` bytes, the size passed; the call returns how
+        // many pids it wrote.
+        let listed = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+        pids.truncate(usize::try_from(listed).expect("the list"));
+        let settled = |pid: libc::c_int| {
+            crate::jobs::macos_kinfo(pid).is_some_and(|k| {
+                matches!(
+                    RunState::from_bsd(k.stat),
+                    RunState::Running | RunState::Sleeping | RunState::Stopped
+                )
+            }) && u32::try_from(pid).ok().and_then(crate::jobs::exiting) != Some(true)
+        };
+        let unsettled = pids.iter().filter(|&&pid| !settled(pid)).count();
+        (pids.len() as u64, unsettled as u64)
+    }
+
+    /// The live tasks of every coalition, `Σ (started − exited)`, are the process table's
     /// (record §8.2 measured 738 against `ps -A`'s 738): the coalitions cover every process of
     /// every user, read unprivileged. The table is read between two coalition reads, so it may
     /// differ from the first by what started or ended over them (counted by the starts formula,
-    /// `aterm_vitals::starts`), plus a zombie or two the table still lists after its task ended.
+    /// `aterm_vitals::starts`). Its zombies, and the processes being created or exiting, may or
+    /// may not be live tasks, and how many there are depends on the machine's load (15 more
+    /// listed than live in a loaded broad verify on 2026-11-06), so each settled process is a live
+    /// task and each live task a listed process, within that churn. NEGATIVE CONTROL (by hand:
+    /// every listed pid read as settled): beside a parent holding 20 unreaped children it fails,
+    /// 20 settled processes no live task.
     #[test]
     fn live_tasks_by_coalition_match_the_process_table_within_the_reads_churn() {
         let live = |r: &CoalitionRead| {
@@ -310,17 +342,18 @@ mod live {
             )
         };
         let then = coalitions().expect("the list reads");
-        let table = crate::macos::pid_counts(0).0.expect("the process table");
+        let (listed, unsettled) = table();
         let now = coalitions().expect("the list reads");
         assert!(!then.truncated && !now.truncated, "whole lists");
         let (starts, exits) = aterm_vitals::starts::coalition_moves(&tasks(&then), &tasks(&now))
             .expect("two based reads");
-        let slack = starts + exits + 4;
         let counted = live(&then);
+        let settled = listed - unsettled;
         assert!(
-            counted.abs_diff(table) <= slack,
-            "{counted} live tasks in {} coalitions against {table} processes in the table \
-             ({starts} started and {exits} ended over the reads)",
+            settled <= counted + starts && counted <= listed + exits,
+            "{counted} live tasks in {} coalitions against {listed} processes in the table, \
+             {unsettled} of them zombies, exiting, being created or gone ({starts} started and \
+             {exits} ended over the reads)",
             then.rows.len()
         );
     }

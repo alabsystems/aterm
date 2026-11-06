@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! Formal model of the herald's told-once memory: a need its owner was told of is not told again
-//! until the agent takes it down or the owner takes a turn (design §14.18).
+//! until the agent takes it down or the owner takes a turn, a window restart between them
+//! included (design §14.18).
 
 use aterm_spec::derive::Model;
 
@@ -14,10 +15,15 @@ use aterm_spec::derive::Model;
 /// need not told yet, one new to the view first, then marks every shown need told; one whose
 /// every need was told posts nothing. `named_*` counts the notices naming each need since the
 /// last forget, `new_*` whether the last action brought it into view, and `fresh` whether the
-/// last action was the owner's turn (1) or the agent's take-down (2). Mutants: 1 keeps no memory
-/// (one notice per new key naming the first need, the herald before told once); 2 keys the
-/// memory by the set's first need alone; 3 lets the owner's turn keep the memory; 4 lets the
-/// take-down keep it; 5 judges news only on a new key.
+/// last action was the owner's turn (1) or the agent's take-down (2). `Restart` is a quit's cold
+/// restore while what stands is raised again in the new process: the told memory carries across
+/// it and the slot's view does not, so what stands is judged afresh against that memory, a need
+/// told before posting nothing and one left untold by the owner's turn posting one notice, the
+/// first such need named. Mutants: 1
+/// keeps no memory (one notice per new key naming the first need, the herald before told once);
+/// 2 keys the memory by the set's first need alone; 3 lets the owner's turn keep the memory; 4
+/// lets the take-down keep it; 5 judges news only on a new key; 6 lets a restart forget it, so
+/// what stands is told again in the new process.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn herald_told_once_model() -> Model {
@@ -165,6 +171,30 @@ pub fn herald_told_once_model() -> Model {
                 new_a = 0;
                 new_b = 0;
                 fresh = 2;
+            }
+
+            action Restart {
+                named_a = if (shown == 1 || shown == 3)
+                    && (told_a == 0 || Buggy == 6) && named_a <= 1 {
+                    named_a + 1
+                } else { named_a };
+                named_b = if ((shown == 2 && (told_b == 0 || Buggy == 6))
+                    || (shown == 3 && told_a == 1 && told_b == 0
+                        && (Buggy <= 5 || Buggy > 6)))
+                    && named_b <= 1 {
+                    named_b + 1
+                } else { named_b };
+                told_a = if shown == 1 || shown == 3
+                    || (told_a == 1 && (Buggy <= 5 || Buggy > 6)) {
+                    1
+                } else { 0 };
+                told_b = if shown == 2 || shown == 3
+                    || (told_b == 1 && (Buggy <= 5 || Buggy > 6)) {
+                    1
+                } else { 0 };
+                new_a = 0;
+                new_b = 0;
+                fresh = 0;
             }
 
             action OwnerTurn {

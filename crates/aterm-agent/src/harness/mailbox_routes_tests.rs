@@ -233,8 +233,8 @@ webmail_url = "https://mail.example.test/inbox"
 /// `mailbox ab…@… has no password yet`, never as a failed sign-in; a top-level IMAP mailbox
 /// with no password sends no LOGIN either. NEGATIVE CONTROL: dropping the password from
 /// [`MailboxRoute::ready`] (a login alone) hands the entry's IMAP URL to its addresses, and
-/// dropping `password.is_empty() ||` from `fetch_imap_credential` lets the top-level poll
-/// connect; each fails this.
+/// dropping the `password.is_empty()` return from `fetch_imap_credential` lets the top-level
+/// poll connect; each fails this.
 #[test]
 fn a_mailbox_with_no_password_is_never_tried() {
     let (url, connections, logins) = refusing_imap();
@@ -262,13 +262,12 @@ fn a_mailbox_with_no_password_is_never_tried() {
         user: Some("legacy@example.test".to_owned()),
         ..MailboxConfig::default()
     };
+    // One pass with no deadline, which reaches the step that would connect whatever the
+    // machine's load: a budget spent before it would leave the counts below nothing to judge.
+    // A connection is counted before the fake's greeting, which a poll that connects reads.
     assert!(
-        poll_mailbox_config_for_credential(
-            &legacy,
-            Some("legacy@example.test"),
-            Duration::from_millis(300)
-        )
-        .is_err()
+        poll_mailbox_config_for_credential(&legacy, Some("legacy@example.test"), Duration::ZERO)
+            .is_err()
     );
     assert_eq!(
         connections.load(Ordering::SeqCst),
@@ -1180,6 +1179,7 @@ fn a_routed_address_reads_its_own_http_mailbox_with_its_own_login() {
     let port = listener.local_addr().expect("addr").port();
     let headers = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let seen = Arc::clone(&headers);
+    let (read, request_read) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { break };
@@ -1192,6 +1192,7 @@ fn a_routed_address_reads_its_own_http_mailbox_with_its_own_login() {
                 }
                 line.clear();
             }
+            let _ = read.send(());
             let _ = writer.write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n[]",
             );
@@ -1218,17 +1219,18 @@ fn a_routed_address_reads_its_own_http_mailbox_with_its_own_login() {
     assert_eq!(top.bearer_token.as_deref(), Some("top-token"));
     assert_eq!(top.password.as_deref(), Some("top-pw"));
 
-    let _ = poll_mailbox_config_for_credential(
-        &cfg,
-        Some("ai@pm.example.test"),
-        Duration::from_millis(300),
-    );
+    // One pass with no deadline, which sends its request whatever the machine's load; the fake's
+    // word that it read the request's headers is what the assertions below wait for.
+    let _ = poll_mailbox_config_for_credential(&cfg, Some("ai@pm.example.test"), Duration::ZERO);
+    request_read
+        .recv_timeout(HANG)
+        .expect("the own mailbox was read");
     let sent = headers.lock().expect("lock").clone();
     let basic = format!(
         "Basic {}",
         super::super::open_url::encode_base64(b"own@example.test:own-pw")
     );
-    assert!(!sent.is_empty(), "the own mailbox was read");
+    assert!(!sent.is_empty(), "the own mailbox was read with a login");
     assert!(
         sent.iter()
             .all(|h| h.ends_with(&basic) && !h.contains("Bearer")),

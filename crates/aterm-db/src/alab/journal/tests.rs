@@ -1367,17 +1367,17 @@ fn a_journal_turned_off_publishes_only_its_sum_and_nothing_from_then() {
     let scratch = aterm_tempfile::tempdir().unwrap();
     let config = scratch.path().join("aterm.toml");
     assert!(publishing(Some(&config)), "no file: on");
-    std::fs::write(&config, "[alab]\njournal = true\n").unwrap();
+    aterm_uds::atomic_file::write(&config, b"[alab]\njournal = true\n", 0o600).unwrap();
     assert!(publishing(Some(&config)));
-    std::fs::write(&config, "[alab]\njournal = false\n").unwrap();
+    aterm_uds::atomic_file::write(&config, b"[alab]\njournal = false\n", 0o600).unwrap();
     assert!(!publishing(Some(&config)));
     assert!(publishing(None));
     // The hook's gate follows the file as it changes.
     let gate = Publishing::new(Some(config.clone()));
     assert!(!gate.now());
-    std::fs::write(&config, "[alab]\njournal = true\n").unwrap();
+    aterm_uds::atomic_file::write(&config, b"[alab]\njournal = true\n", 0o600).unwrap();
     assert!(gate.now(), "the gate sees the file change");
-    std::fs::write(&config, "[alab]\njournal = false\n").unwrap();
+    aterm_uds::atomic_file::write(&config, b"[alab]\njournal = false\n", 0o600).unwrap();
     assert!(!gate.now());
 
     let lab = Lab::new(&[Role::Writer]);
@@ -1440,7 +1440,7 @@ fn a_journal_turned_off_publishes_only_its_sum_and_nothing_from_then() {
         published.is_empty(),
         "nothing noted while off is published: {published:?}"
     );
-    std::fs::write(&config, "[alab\njournal = false\n").unwrap();
+    aterm_uds::atomic_file::write(&config, b"[alab\njournal = false\n", 0o600).unwrap();
     assert!(!publishing(Some(&config)), "a typo keeps it off");
     assert_eq!(status(spool, Some(&config)), "off: aterm.toml unreadable");
 }
@@ -1694,4 +1694,42 @@ fn the_flusher_writes_holdings_as_place_rows_the_reader_finds() {
     pass(&|| Some(Vec::new()), end);
     let places = place::read(&lab.paths[0], end + 1).unwrap().unwrap();
     assert!(places.rows.is_empty(), "ended: {places:?}");
+}
+
+/// The book's public read (one-mesh §4.14, the metrics publisher's quota row): what a pass
+/// folded and saved reads back per account as its sign-in word, last start and end and its
+/// sessions in the 7 days before the read, and an account the book never saw is absent. A
+/// missing book reads as an empty one.
+/// NEGATIVE CONTROL: a read 8 days after the starts counts none of them, so the count is the
+/// window's, not the book's whole list.
+#[test]
+fn book_facts_read_back_what_the_book_saved() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let spool = Spool::at(scratch.path().join("alab"));
+    assert_eq!(book_facts(&spool, 1), BookFacts::default(), "no book yet");
+    let ann = pk("ann@example.test");
+    let bob = pk("bob@example.test");
+    let now = W * WEEK + 3600;
+    let mut book = Book::default();
+    book.fold(&[
+        ev(now - 7200, Kind::SessionStart, ann),
+        ev(now - 3600, Kind::SessionStart, ann),
+        ev(now - 1800, Kind::SessionEnd, ann),
+        ev(now - 900, Kind::SignedIn, ann),
+    ]);
+    book.save(&spool).unwrap();
+    let read = book_facts(&spool, now);
+    assert_eq!(
+        read.accounts.get(&ann),
+        Some(&AccountFacts {
+            signin: Some(("in", now - 900)),
+            last_start: Some(now - 3600),
+            last_end: Some(now - 1800),
+            sessions_7d: 2,
+            plan: None,
+        })
+    );
+    assert!(!read.accounts.contains_key(&bob), "never seen");
+    let later = book_facts(&spool, now + 8 * 86_400);
+    assert_eq!(later.accounts.get(&ann).map(|f| f.sessions_7d), Some(0));
 }

@@ -1201,6 +1201,9 @@ fn a_corroborated_candidate_whose_leader_already_exited_still_has_its_group_swep
 }
 
 fn forked_child_contains_itself(become_session_leader: bool) -> bool {
+    // Held across the fork alone, so the child copies no neighbour's descriptor between its
+    // creation and its close-on-fork mark (`aterm_uds::kept_out`).
+    let spawning = aterm_uds::spawn_lock::spawning();
     // SAFETY: fork from a multi-threaded harness; child runs async-signal-safe calls only.
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0, "fork failed");
@@ -1216,6 +1219,7 @@ fn forked_child_contains_itself(become_session_leader: bool) -> bool {
         // SAFETY: async-signal-safe process exit without unwinding or atexit handlers.
         unsafe { libc::_exit(i32::from(!as_expected)) }
     }
+    drop(spawning);
     let mut status = 0i32;
     loop {
         // SAFETY: blocking wait for one exact child pid into a local status slot.

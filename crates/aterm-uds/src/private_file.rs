@@ -241,6 +241,16 @@ impl<'a> JudgedDir<'a> {
         })
     }
 
+    /// [`Self::judge`] of a directory that must be private: [`check_private_dir`], whose verdict
+    /// this holds for the files that follow.
+    /// # Errors
+    /// As [`check_private_dir`].
+    pub fn private(dir: &'a Path) -> io::Result<Self> {
+        let judged = dir_is(dir)?;
+        check_dir_verdict(dir, judged)?;
+        Ok(Self { dir, judged })
+    }
+
     /// Whether `dir` was an existing owner-private `0700` directory with no ACL grants when
     /// [`Self::judge`] took its verdict.
     #[must_use]
@@ -797,6 +807,25 @@ pub fn write_private(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
     one_component_io(name)?;
     check_private_dir(dir)?;
     crate::atomic_file::write(&dir.join(name), bytes, 0o600)
+}
+
+/// [`write_private`] for a writer whose promise rests on `name`'s new entry: `flush` finishes the
+/// file and, after the rename, `dir`, and a directory whose entries cannot be flushed here is
+/// refused like any failed flush ([`crate::atomic_file::write_entry_flushed`]), where
+/// [`write_private`] goes on without that flush.
+/// # Errors
+/// Returns an error if `name` spans multiple components, `dir` is not private, or the write
+/// fails; or `dir`'s flush after the rename failed or is unavailable here, when `name` holds
+/// `bytes` but its entry may not survive a power loss.
+pub fn write_private_flushed(
+    dir: &Path,
+    name: &str,
+    bytes: &[u8],
+    flush: aterm_durable::Flush,
+) -> io::Result<()> {
+    one_component_io(name)?;
+    check_private_dir(dir)?;
+    crate::atomic_file::write_entry_flushed(&dir.join(name), bytes, 0o600, flush)
 }
 
 /// Writes `bytes` to a NEW `name` in private directory `dir` with mode `0600`, and never over one
@@ -1444,6 +1473,35 @@ mod tests {
         // A read, then refusals for a loose file, an open directory, a link, a missing file,
         // a name of two components and a directory that is a file.
         assert_eq!(verdicts.len(), 7, "{verdicts:?}");
+    }
+
+    /// A private judgement refuses every directory [`super::check_private_dir`] refuses, as it does.
+    ///
+    /// NEGATIVE CONTROL (2026-11-05): with `check_dir_verdict` gone from `JudgedDir::private`, the
+    /// first directory that is not private is taken (`left: Ok(()), right: Err(..)`).
+    #[test]
+    fn a_private_judgement_refuses_as_check_private_dir_does() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let state = dir_in(root.path(), "state", 0o700);
+        let linked = root.path().join("linked");
+        std::os::unix::fs::symlink(&state, &linked).unwrap();
+        file_in(root.path(), "plain", b"x", 0o600);
+        let said = |answer: io::Result<()>| answer.map_err(|error| error.to_string());
+        assert!(super::JudgedDir::private(&state).is_ok());
+        for dir in [
+            dir_in(root.path(), "open", 0o755),
+            linked,
+            root.path().join("plain"),
+            root.path().join("gone"),
+        ] {
+            let want = said(super::check_private_dir(&dir));
+            assert!(want.is_err(), "{dir:?}");
+            assert_eq!(
+                said(super::JudgedDir::private(&dir).map(drop)),
+                want,
+                "{dir:?}"
+            );
+        }
     }
 
     /// A verdict is the directory's when it was judged: opens under it do not judge the

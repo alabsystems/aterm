@@ -4556,6 +4556,9 @@ mod claim_presentation_conformance {
             assert_eq!(unsafe { libc::pipe(report.as_mut_ptr()) }, 0, "report pipe");
             let table = aterm_uds::spawnfd::descriptor_bound();
 
+            // Held across the fork alone, so the child copies no neighbour's descriptor between
+            // its creation and its close-on-fork mark (`aterm_uds::kept_out`).
+            let spawning = aterm_uds::spawn_lock::spawning();
             // SAFETY: child only invokes async-signal-safe syscalls before `_exit`.
             let pid = unsafe { libc::fork() };
             assert!(pid >= 0, "fork failed");
@@ -4617,6 +4620,7 @@ mod claim_presentation_conformance {
                     libc::_exit(code);
                 }
             }
+            drop(spawning);
             // SAFETY: `report` holds freshly created pipe descriptors owned exclusively here.
             let (read_end, write_end) = unsafe {
                 (

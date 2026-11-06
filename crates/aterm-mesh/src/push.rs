@@ -37,11 +37,12 @@ static ANSWERING: AtomicUsize = AtomicUsize::new(0);
 
 /// The datagram that asks the node to push `table` within `within`.
 fn ask(table: &Digest, within: Duration) -> String {
-    format!(
-        "atm-push 1 {} {}\n",
-        aterm_codec::hex::encode_lower(table),
-        within.as_millis()
-    )
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(96);
+    out.push_str("atm-push 1 ");
+    aterm_codec::hex::push_lower(&mut out, table);
+    let _ = writeln!(out, " {}", within.as_millis());
+    out
 }
 
 /// The push `datagram` asks, `None` for anything else: its table and how long its asker waits,
@@ -94,16 +95,16 @@ pub(crate) fn answer(
     within: Duration,
     from: &SocketAddr,
 ) {
-    let Some(to) = from.as_pathname().map(Path::to_path_buf) else {
+    let Some(pathname) = from.as_pathname() else {
         return;
     };
     if ANSWERING.fetch_add(1, Ordering::AcqRel) >= ANSWERING_MAX {
         ANSWERING.fetch_sub(1, Ordering::AcqRel);
-        let _ = socket.send_to(answer_of(None), &to);
+        let _ = socket.send_to(answer_of(None), pathname);
         return;
     }
     let deadline = Instant::now() + within;
-    let (reply, reply_to, mesh) = (Arc::clone(socket), to.clone(), mesh.clone());
+    let (reply, reply_to, mesh) = (Arc::clone(socket), pathname.to_path_buf(), mesh.clone());
     let spawned = std::thread::Builder::new()
         .name("aterm-mesh-push".to_owned())
         .spawn(move || {
@@ -116,7 +117,7 @@ pub(crate) fn answer(
         });
     if spawned.is_err() {
         ANSWERING.fetch_sub(1, Ordering::AcqRel);
-        let _ = socket.send_to(answer_of(None), &to);
+        let _ = socket.send_to(answer_of(None), pathname);
     }
 }
 

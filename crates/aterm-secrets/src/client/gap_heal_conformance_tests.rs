@@ -14,7 +14,7 @@
 use super::*;
 use crate::age::Recipient;
 use crate::client::log_entries::{GAP_STEP_MS, REMOVER_GRACE_MS, SETTLE_GRACE_MS};
-use crate::client::log_entries_tests::newcomer;
+use crate::client::log_entries_tests::{fresh_two_macs, newcomer};
 use crate::client::readmit::{Book, Proven, Readmit};
 use crate::membership_log::admission::OLD_GAP_RULE;
 use crate::membership_log::rekey::UNSETTLED_OK;
@@ -344,7 +344,7 @@ impl GapShapes {
     fn omits_b() -> (Lab, Vec<Record>) {
         let names = ["m22", "m7", "m40"];
         for _ in 0..SEARCH {
-            let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
+            let macs = fresh_two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
             let root = macs.root.path().to_path_buf();
             copy_private_tree(&root.join("m22"), &root.join("m22-before"));
             let (m40, _, _) = let_in_by(&macs, &macs.m7, "m40", "m40");

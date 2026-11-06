@@ -513,55 +513,6 @@ pub fn accept(
     })
 }
 
-/// This node's own newest name record in its books (`fleet-peers` and `fleet-issuer-book`):
-/// every copy of its entry under its key whose record verifies under one of `digests` (the seed
-/// digest it holds, the one kept from its last leave, the zero digest), the highest (`eseq`,
-/// `rev`) of them, with the digest it verified under. It is what Floor adopts when
-/// `machine-name.toml` is missing or behind (`docs/DESIGN-machine-names-2026-11-04.md` §3.2).
-/// The node's own signature is all it trusts, so a `since` past this clock still stands. A book
-/// that cannot be read counts as holding none.
-#[must_use]
-pub fn own_newest(
-    dir: &std::path::Path,
-    me: &NodeIdentity,
-    digests: &[[u8; 8]],
-) -> Option<(NameRecord, [u8; 8])> {
-    let key = me.key();
-    let mut newest: Option<(NameRecord, [u8; 8])> = None;
-    for (node, entry_key, carried) in carried_in_books(dir) {
-        if node != me.node() || entry_key != key {
-            continue;
-        }
-        // Under the digest it was signed under, exactly: `accept` falls back to the zero
-        // digest, which names no fleet the record was signed in. At this clock nothing is
-        // ahead.
-        let found = digests.iter().find_map(|digest| {
-            match accept(
-                &carried,
-                (me.node(), &key),
-                *digest,
-                Source::Entry,
-                None,
-                u64::MAX,
-            ) {
-                Ok(Accepted::Record {
-                    record,
-                    digest: under,
-                }) if under == *digest => Some((record, under)),
-                Ok(_) | Err(_) => None,
-            }
-        });
-        if let Some((record, digest)) = found
-            && newest
-                .as_ref()
-                .is_none_or(|(held, _)| (record.eseq, record.rev) > (held.eseq, held.rev))
-        {
-            newest = Some((record, digest));
-        }
-    }
-    newest
-}
-
 /// The nicknames other nodes' records in this node's books carry (§2.4's "in view", without the
 /// `computers` table until stage 5): each record that verifies under its entry's key and the
 /// seed digest held here (`digest`), else the zero digest, of every entry whose node is not

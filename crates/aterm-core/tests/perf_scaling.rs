@@ -76,6 +76,35 @@ fn count_allocations(f: impl FnOnce()) -> u64 {
     ALLOC_CALLS.load(Ordering::Relaxed)
 }
 
+fn linked_writes_reuse_payload_and_overwrite_storage() {
+    use aterm_core::terminal::Terminal;
+    use std::hint::black_box;
+
+    for text in ["x".to_owned(), "日".to_owned(), "x".repeat(80)] {
+        let mut term = Terminal::new(2, 80);
+        term.process(b"\x1b]8;id=steady-link;https://example.com\x1b\\");
+        let input = format!("\x1b[H{text}");
+        term.process(input.as_bytes());
+        ALLOC_BYTES.store(0, Ordering::Relaxed);
+        let calls = count_allocations(|| {
+            for _ in 0..256 {
+                black_box(&mut term).process(black_box(input.as_bytes()));
+            }
+        });
+        let bytes = ALLOC_BYTES.load(Ordering::Relaxed);
+        assert_eq!((calls, bytes), (0, 0), "warm linked overwrite {text:?}");
+        let width = if text == "日" { 2 } else { text.len() };
+        for col in 0..width {
+            let extra = term.grid().cell_extra(0, col as u16).unwrap();
+            assert_eq!(
+                extra.hyperlink().map(AsRef::as_ref),
+                Some("https://example.com")
+            );
+            assert_eq!(extra.hyperlink_id().map(AsRef::as_ref), Some("steady-link"));
+        }
+    }
+}
+
 fn floating_frame_reuses_warm_storage() {
     use aterm_core::render::RenderInput;
     use aterm_core::terminal::Terminal;
@@ -278,6 +307,7 @@ fn hot_scrollback_walks_allocate_only_owned_line_payloads() {
 
 #[test]
 fn engine_steady_state_processing_is_allocation_free() {
+    linked_writes_reuse_payload_and_overwrite_storage();
     floating_frame_reuses_warm_storage();
     selective_truecolor_erase_reuses_warm_storage();
     hot_scrollback_walks_allocate_only_owned_line_payloads();

@@ -235,15 +235,11 @@ fn member(paths: &Paths, deadline: Instant) -> Result<String, String> {
         if roster.is_member_denied(row) {
             return Err("native execution member is denied".into());
         }
-        if roster
-            .members
-            .iter()
-            .filter(|other| other.label == row.label && !roster.is_member_denied(other))
-            .map(|other| other.recipient.as_str())
-            .collect::<std::collections::BTreeSet<_>>()
-            .len()
-            != 1
-        {
+        if roster.members.iter().any(|other| {
+            other.label == row.label
+                && !roster.is_member_denied(other)
+                && other.recipient != row.recipient
+        }) {
             return Err("native execution member label is ambiguous".into());
         }
         Ok(row.label.clone())
@@ -1083,13 +1079,15 @@ fn set_policy_mode(
     }
     assignment.validate()?;
     for label in &assignment.warm {
-        let recipients: std::collections::BTreeSet<_> = roster
+        let mut recipients = roster
             .members
             .iter()
             .filter(|member| member.label == *label && !roster.is_member_denied(member))
-            .map(|member| member.recipient.as_str())
-            .collect();
-        if recipients.len() != 1 {
+            .map(|member| member.recipient.as_str());
+        let Some(first) = recipients.next() else {
+            return Err("native warm slot is not a unique current member".into());
+        };
+        if recipients.any(|recipient| recipient != first) {
             return Err("native warm slot is not a unique current member".into());
         }
     }

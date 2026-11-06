@@ -72,6 +72,12 @@ pub(crate) enum Outcome {
     /// The first [`QUICK_BUSY_RETRIES`] failed rounds keep the ordinary interval;
     /// further failures back off until a control exchange completes.
     Busy,
+    /// The peer authenticated and the control exchange completed, but the application round
+    /// deferred its table (`crate::replica::Report::table_deferred`) and moved nothing: not a
+    /// repair. The endpoint stays established and its backoff ends; the next dial comes soon after
+    /// a first such round, so the table's retry is not left to the quiet interval, and at that
+    /// interval after consecutive ones, so a table that stays unavailable holds no worker.
+    Deferred,
     /// The round never reached the peer's answer: no connection, no TLS within the handshake's
     /// limit (a peer asleep, cut off, hung or saturated), a hello this side refused (its proof,
     /// witness or membership), or a round that panicked. Such a failure repeats until its cause
@@ -84,9 +90,19 @@ impl Outcome {
     /// the completed control exchange's durable acknowledgement report.
     pub(crate) fn of(success: bool, repair: &Repair, control: Option<Report>) -> Self {
         if success {
-            Self::Repaired {
-                transferred: control.is_some_and(|r| r.sent != 0 || r.received != 0)
-                    || repair_transferred(repair),
+            let transferred = control.is_some_and(|r| r.sent != 0 || r.received != 0)
+                || repair_transferred(repair);
+            #[cfg(test)]
+            let deferral_succeeds = DEFERRAL_SUCCEEDS.with(std::cell::Cell::get);
+            #[cfg(not(test))]
+            let deferral_succeeds = false;
+            if !transferred
+                && !deferral_succeeds
+                && repair.application().is_some_and(|r| r.table_deferred)
+            {
+                Self::Deferred
+            } else {
+                Self::Repaired { transferred }
             }
         } else if repair.authenticated_actor().is_some() || repair.unanswered() {
             Self::Busy
@@ -110,6 +126,21 @@ fn repair_transferred(repair: &Repair) -> bool {
         })
 }
 
+/// Why an unverified endpoint is dialled ahead of ordinary discovery (CR1). Neither reason is
+/// trust: a lead orders dials, and only an authenticated round verifies an endpoint. It lasts
+/// until a dial of the endpoint fails without authenticating anyone ([`Hints::finish`]), so one
+/// that is not the peer it looked like gets one early dial and then waits its turn.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+enum Lead {
+    #[default]
+    None,
+    /// An endpoint this Mac verified before it restarted ([`Hints::remember`]), not heard since.
+    Remembered,
+    /// An endpoint at an address a peer authenticated from ([`Hints::kin`]): it beaconed from
+    /// there, or it is a remembered endpoint that beaconed again.
+    Kin,
+}
+
 #[derive(Debug)]
 struct Peer {
     seen: Instant,
@@ -117,6 +148,8 @@ struct Peer {
     verified: bool,
     busy: bool,
     failed: bool,
+    /// Its dial goes ahead of ordinary discovery ([`Lead`]) while it is unverified.
+    lead: Lead,
     /// A push hurried this peer while its round ran ([`Hints::hurry`]): dial it again as the round
     /// ends.
     hurried: bool,
@@ -125,6 +158,12 @@ struct Peer {
     quiet_push: bool,
     /// Consecutive incomplete or refused dials. Changing failure kind is not recovery.
     failures: u32,
+    /// Its last round ended [`Outcome::Deferred`].
+    deferring: bool,
+    /// A round its seat dialled in has pulled its next dial in since its own last completed
+    /// round ([`Hints::vouch`]): once per failure streak, so a dead endpoint of a live seat
+    /// still backs off.
+    pulled: bool,
     repair: Repair,
 }
 
@@ -132,6 +171,142 @@ impl Peer {
     fn established(&self) -> bool {
         self.verified && !self.failed
     }
+    /// A candidate no beacon or round has told anything of yet.
+    fn candidate(now: Instant, lead: Lead) -> Self {
+        Self {
+            seen: now,
+            next: now,
+            verified: false,
+            busy: false,
+            failed: false,
+            lead,
+            hurried: false,
+            quiet_push: false,
+            failures: 0,
+            deferring: false,
+            pulled: false,
+            repair: Repair::default(),
+        }
+    }
+    /// The lead its next dial takes: none once it is verified, when it is served as an
+    /// established peer or rediscovered by its own turn.
+    fn lead(&self) -> Lead {
+        if self.verified { Lead::None } else { self.lead }
+    }
+}
+
+/// A seat's endpoint this Mac verified, kept across restarts ([`Hints::remember`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Remembered {
+    pub(super) actor: astream_wire::sync::Actor,
+    pub(super) address: SocketAddr,
+    /// Unix ms when a round with it last completed.
+    pub(super) at_ms: u64,
+}
+
+/// The most remembered endpoints: the most recently verified seats' ([`Hints::remember`]).
+pub(super) const MAX_REMEMBERED: usize = 32;
+/// A remembered endpoint older than this is forgotten: a week away is a new Mac's start.
+const REMEMBER_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+/// How stale the kept times of remembered endpoints may grow while none changes.
+const REMEMBER_REFRESH: Duration = Duration::from_secs(3600);
+/// The file the remembered endpoints are kept in, in the endpoint's Commons custody directory.
+pub(super) const REMEMBERED_NAME: &str = "commons-peers.state";
+const REMEMBERED_MAGIC: &[u8; 5] = b"ATPE1";
+/// What a kept file names before its entries, and must name to be read: the trust it was kept
+/// under (network, authority, genesis) and this Mac's seat.
+pub(super) type MemoryScope = [u8; 16 + 32 + 32 + 48];
+const REMEMBERED_ENTRY: usize = 48 + 4 + 2 + 8;
+pub(super) const REMEMBERED_MAX: usize = REMEMBERED_MAGIC.len()
+    + std::mem::size_of::<MemoryScope>()
+    + 1
+    + MAX_REMEMBERED * REMEMBERED_ENTRY;
+
+impl Remembered {
+    /// `entries`, kept for `scope`, in their one spelling: sorted by seat, at most
+    /// [`MAX_REMEMBERED`].
+    pub(super) fn encode(scope: &MemoryScope, entries: &[Self]) -> Vec<u8> {
+        let mut sorted = entries.to_vec();
+        sorted.sort_by_key(|entry| entry.actor);
+        sorted.dedup_by_key(|entry| entry.actor);
+        sorted.truncate(MAX_REMEMBERED);
+        let mut bytes = Vec::with_capacity(REMEMBERED_MAX);
+        bytes.extend_from_slice(REMEMBERED_MAGIC);
+        bytes.extend_from_slice(scope);
+        bytes.push(u8::try_from(sorted.len()).expect("bounded by MAX_REMEMBERED"));
+        for entry in &sorted {
+            let IpAddr::V4(ip) = entry.address.ip() else {
+                unreachable!("only IPv4 endpoints are remembered")
+            };
+            bytes.extend_from_slice(&entry.actor);
+            bytes.extend_from_slice(&ip.octets());
+            bytes.extend_from_slice(&entry.address.port().to_be_bytes());
+            bytes.extend_from_slice(&entry.at_ms.to_le_bytes());
+        }
+        bytes
+    }
+    /// The entries `bytes` spell for `scope` in their one spelling; another scope, or any other
+    /// spelling, reads as none.
+    pub(super) fn decode(scope: &MemoryScope, bytes: &[u8]) -> Option<Vec<Self>> {
+        let rest = bytes
+            .strip_prefix(REMEMBERED_MAGIC)?
+            .strip_prefix(scope.as_slice())?;
+        let (&[count], rest) = rest.split_first_chunk::<1>()?;
+        let count = usize::from(count);
+        if count > MAX_REMEMBERED || rest.len() != count * REMEMBERED_ENTRY {
+            return None;
+        }
+        let mut entries: Vec<Self> = Vec::with_capacity(count);
+        for entry in rest.as_chunks::<REMEMBERED_ENTRY>().0 {
+            let actor: astream_wire::sync::Actor = entry[..48].try_into().expect("48 bytes");
+            if entries.last().is_some_and(|last| last.actor >= actor) {
+                return None;
+            }
+            let ip = std::net::Ipv4Addr::from(<[u8; 4]>::try_from(&entry[48..52]).expect("four"));
+            let port = u16::from_be_bytes(entry[52..54].try_into().expect("two"));
+            if port == 0 || !beaconable(ip) {
+                return None;
+            }
+            entries.push(Self {
+                actor,
+                address: SocketAddr::from((ip, port)),
+                at_ms: u64::from_le_bytes(entry[54..].try_into().expect("eight")),
+            });
+        }
+        Some(entries)
+    }
+}
+
+/// Whether a beacon or a remembered endpoint may name `ip`: no unspecified, multicast,
+/// reserved or broadcast source.
+fn beaconable(ip: std::net::Ipv4Addr) -> bool {
+    !(ip.octets()[0] == 0 || ip.octets()[0] >= 224 || ip.is_broadcast())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// MUTANT of CR1's dial order, on for one test thread: no candidate leads ([`Lead`]), so
+    /// discovery dials in its address order alone, as it did before CR1.
+    pub(super) static UNLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// MUTANT of CR1's outcome, on for one test thread: a deferred round that moved nothing is
+    /// [`Outcome::Repaired`], as it was before CR1.
+    pub(super) static DEFERRAL_SUCCEEDS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// MUTANT of CR1's first cut, on for one test thread: every round a seat dials in pulls its
+    /// endpoints' next dials in, failing or not ([`Peer::pulled`]).
+    pub(super) static REPULLS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// MUTANT of CR1's first cut, on for one test thread: each round completed with a seat
+    /// remembers its endpoint, so a seat on two attachments changes it every round.
+    pub(super) static FLAPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// MUTANT of CR1's first cut, on for one test thread: a led dial that authenticated nobody
+    /// spends nothing ([`Hints::kin_spent`]).
+    pub(super) static UNSPENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the mutant `cell` is on (tests); never in a build.
+#[cfg(test)]
+fn mutant(cell: &'static std::thread::LocalKey<std::cell::Cell<bool>>) -> bool {
+    cell.with(std::cell::Cell::get)
 }
 
 #[derive(Debug)]
@@ -153,6 +328,24 @@ pub(super) struct Hints {
     addresses: BTreeMap<IpAddr, astream_wire::sync::Actor>,
     /// Seats that speak `Bus` ([`Self::bus_speakers`]): never dialled or hurried, still known.
     bus: BTreeSet<astream_wire::sync::Actor>,
+    /// Addresses a peer authenticated from, each when it last did: a round this side dialled
+    /// there, a round dialled from there ([`Self::vouch`]), or a remembered endpoint
+    /// ([`Self::remember`]). A beacon from one leads ([`Lead::Kin`]). At most [`MAX_PEERS`],
+    /// each kept [`VERIFIED_EXPIRES`].
+    vouched: BTreeMap<IpAddr, Instant>,
+    /// Addresses where a dial led as kin ([`Lead::Kin`]) authenticated nobody, each when: a new
+    /// port beaconed from one leads again only once a peer authenticates from there again, so
+    /// beacons forged from a peer's address lead at most one dial per round the peer makes. At
+    /// most [`MAX_PEERS`], each kept [`VERIFIED_EXPIRES`].
+    kin_spent: BTreeMap<IpAddr, Instant>,
+    /// Each seat's endpoint that a round this side dialled last completed with, and when: what
+    /// this Mac remembers across a restart ([`Self::remember`], [`Self::remembered`]). At most
+    /// [`MAX_REMEMBERED`], the most recent.
+    remembered: BTreeMap<astream_wire::sync::Actor, (SocketAddr, Instant)>,
+    /// A seat's remembered endpoint changed since [`Self::remembered`] last read them.
+    remembered_changed: bool,
+    /// When [`Self::remembered`] last read them.
+    remembered_read: Option<Instant>,
 }
 
 /// Whether the peer at `address` is a seat in `bus`, by its signed fleet advertisement's address
@@ -188,6 +381,186 @@ impl Hints {
             versions: BTreeMap::new(),
             addresses: BTreeMap::new(),
             bus: BTreeSet::new(),
+            vouched: BTreeMap::new(),
+            kin_spent: BTreeMap::new(),
+            remembered: BTreeMap::new(),
+            remembered_changed: false,
+            remembered_read: None,
+        }
+    }
+    /// Seed what this Mac remembers from before it restarted, read at `now_ms` (unix ms): each
+    /// endpoint verified within [`REMEMBER_MS`] becomes a candidate that leads
+    /// ([`Lead::Remembered`]), and its address vouches for beacons from there ([`Lead::Kin`]).
+    /// Nothing here is trust: each is verified only by a round that authenticates its seat. The
+    /// most recent go first where the bounds hold fewer.
+    pub(super) fn remember(&mut self, entries: Vec<Remembered>, now: Instant, now_ms: u64) {
+        let mut entries: Vec<_> = entries
+            .into_iter()
+            .filter(|entry| now_ms.saturating_sub(entry.at_ms) < REMEMBER_MS)
+            .collect();
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.at_ms));
+        entries.truncate(MAX_REMEMBERED);
+        for entry in entries {
+            let age = Duration::from_millis(now_ms.saturating_sub(entry.at_ms));
+            let at = now.checked_sub(age).unwrap_or(now);
+            self.remembered
+                .entry(entry.actor)
+                .or_insert((entry.address, at));
+            self.vouch_address(entry.address.ip(), now);
+            self.admit(entry.address, Lead::Remembered, now);
+        }
+    }
+    /// What this Mac remembers now, with when each was last verified as `now` reads it, if it
+    /// changed since the last call or that call was [`REMEMBER_REFRESH`] ago, so the times kept
+    /// stay within it; a caller keeps them across a restart ([`Self::remember`]).
+    pub(super) fn remembered(&mut self, now: Instant, now_ms: u64) -> Option<Vec<Remembered>> {
+        let stale = self
+            .remembered_read
+            .is_none_or(|read| now.saturating_duration_since(read) >= REMEMBER_REFRESH);
+        if !std::mem::take(&mut self.remembered_changed) && !(stale && !self.remembered.is_empty())
+        {
+            return None;
+        }
+        self.remembered_read = Some(now);
+        Some(
+            self.remembered
+                .iter()
+                .map(|(actor, (address, at))| Remembered {
+                    actor: *actor,
+                    address: *address,
+                    at_ms: now_ms.saturating_sub(
+                        u64::try_from(now.saturating_duration_since(*at).as_millis())
+                            .unwrap_or(u64::MAX),
+                    ),
+                })
+                .collect(),
+        )
+    }
+    /// Remember `address` as `actor`'s endpoint, verified at `now`: the most recent
+    /// [`MAX_REMEMBERED`] seats are kept. A changed endpoint or a new seat is a change to keep
+    /// ([`Self::remembered`]); a later round with the same endpoint only refreshes its time, which
+    /// the next change carries. While the endpoint remembered still answers, a round with another
+    /// of the seat's (a Mac on Wi-Fi and Ethernet beacons from both) refreshes the one kept, so
+    /// the file is written when an endpoint stops answering, not at every round.
+    fn keep(&mut self, actor: astream_wire::sync::Actor, address: SocketAddr, now: Instant) {
+        let IpAddr::V4(_) = address.ip() else {
+            return;
+        };
+        #[cfg(test)]
+        let flaps = mutant(&FLAPS);
+        #[cfg(not(test))]
+        let flaps = false;
+        if let Some((old, _)) = self.remembered.get(&actor).copied()
+            && old != address
+            && !flaps
+            && self.peers.get(&old).is_some_and(Peer::established)
+        {
+            self.remembered.insert(actor, (old, now));
+            return;
+        }
+        let previous = self.remembered.insert(actor, (address, now));
+        if previous.is_none_or(|(old, _)| old != address) {
+            self.remembered_changed = true;
+        }
+        while self.remembered.len() > MAX_REMEMBERED {
+            let oldest = self
+                .remembered
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(actor, _)| *actor)
+                .expect("over the bound");
+            self.remembered.remove(&oldest);
+        }
+    }
+    /// Note that a peer authenticated from `ip` at `now`, within the bounds of [`Self::vouched`].
+    fn vouch_address(&mut self, ip: IpAddr, now: Instant) {
+        self.kin_spent.remove(&ip);
+        self.vouched
+            .retain(|_, at| now.saturating_duration_since(*at) < VERIFIED_EXPIRES);
+        if !self.vouched.contains_key(&ip)
+            && self.vouched.len() >= MAX_PEERS
+            && let Some(oldest) = self
+                .vouched
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(ip, _)| *ip)
+        {
+            self.vouched.remove(&oldest);
+        }
+        self.vouched.insert(ip, now);
+    }
+    /// A dial led as kin to `ip` authenticated nobody at `now` ([`Self::kin_spent`]).
+    fn spend_kin(&mut self, ip: IpAddr, now: Instant) {
+        self.kin_spent
+            .retain(|_, at| now.saturating_duration_since(*at) < VERIFIED_EXPIRES);
+        if !self.kin_spent.contains_key(&ip)
+            && self.kin_spent.len() >= MAX_PEERS
+            && let Some(oldest) = self
+                .kin_spent
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(ip, _)| *ip)
+        {
+            self.kin_spent.remove(&oldest);
+        }
+        self.kin_spent.insert(ip, now);
+    }
+    /// Whether a beacon from `ip` leads ([`Lead::Kin`]): a peer authenticated from there
+    /// within [`VERIFIED_EXPIRES`], or an endpoint there is verified, and no dial led there since
+    /// has authenticated nobody ([`Self::kin_spent`]).
+    fn kin(&self, ip: IpAddr, now: Instant) -> bool {
+        if self
+            .kin_spent
+            .get(&ip)
+            .is_some_and(|at| now.saturating_duration_since(*at) < VERIFIED_EXPIRES)
+        {
+            return false;
+        }
+        self.vouched
+            .get(&ip)
+            .is_some_and(|at| now.saturating_duration_since(*at) < VERIFIED_EXPIRES)
+            || self
+                .peers
+                .iter()
+                .any(|(address, peer)| address.ip() == ip && peer.verified)
+    }
+    /// A round dialled from `ip` authenticated `actor` and completed at `now`: the inbound
+    /// side of what [`Self::finish`] does for a round this side dialled. The address vouches for
+    /// its beacons ([`Lead::Kin`]), and each endpoint whose last authenticated round was with
+    /// `actor` drops its backoff, its next dial due within the ordinary interval, as a completed
+    /// round of its own would have it: once per failure streak ([`Peer::pulled`]), so the seat's
+    /// endpoint that died (an old port, an address it left) backs off whatever the seat does. An
+    /// endpoint bound to another seat is left alone, so an address one seat takes over from
+    /// another moves nothing of the other's. Nothing is verified here: an endpoint is, only by a
+    /// round dialled to it.
+    pub(super) fn vouch(&mut self, ip: IpAddr, actor: astream_wire::sync::Actor, now: Instant) {
+        self.vouch_address(ip, now);
+        self.attempt = self.attempt.wrapping_add(1);
+        let quiet = now + retry_delay(&self.own, self.attempt);
+        #[cfg(test)]
+        let repulls = mutant(&REPULLS);
+        #[cfg(not(test))]
+        let repulls = false;
+        for (address, peer) in &mut self.peers {
+            if peer.repair.actor() == Some(actor) {
+                if peer.pulled && !repulls {
+                    continue;
+                }
+                peer.pulled = true;
+                peer.failures = 0;
+                if !peer.busy {
+                    peer.next = peer.next.min(quiet);
+                }
+            } else if address.ip() == ip
+                && peer.repair.actor().is_none()
+                && !peer.verified
+                && peer.failures == 0
+                && !peer.failed
+            {
+                // Only an endpoint no dial has yet failed: one that failed unauthenticated is not
+                // this peer, and each later round from the address must not lead it again.
+                peer.lead = peer.lead.max(Lead::Kin);
+            }
         }
     }
     /// The seats that speak `Bus` now, replacing the last set: the mesh carries their tables, so
@@ -266,7 +639,7 @@ impl Hints {
         let IpAddr::V4(ip) = source.ip() else {
             return;
         };
-        if ip.octets()[0] == 0 || ip.octets()[0] >= 224 || ip.is_broadcast() {
+        if !beaconable(ip) {
             return;
         }
         if let Some((address, seen)) = self.presence.get_mut(&token) {
@@ -334,7 +707,7 @@ impl Hints {
         let std::net::IpAddr::V4(ip) = source.ip() else {
             return;
         };
-        if ip.octets()[0] == 0 || ip.octets()[0] >= 224 || ip.is_broadcast() {
+        if !beaconable(ip) {
             return;
         }
         let port = u16::from_be_bytes(wire[36..].try_into().unwrap());
@@ -342,10 +715,26 @@ impl Hints {
             return;
         }
         let address = SocketAddr::from((ip, port));
+        // A peer that restarted beacons a new port from the address it authenticated from: that
+        // endpoint is dialled ahead of the crowd ([`Lead::Kin`]), and is still only a hint.
+        let lead = if self.kin(address.ip(), now) {
+            Lead::Kin
+        } else {
+            Lead::None
+        };
+        self.admit(address, lead, now);
+    }
+    /// Take `address` as a candidate leading by `lead`, within the per-IP and total bounds: a
+    /// new one replaces only a failed endpoint ([`Self::replacement`]).
+    fn admit(&mut self, address: SocketAddr, lead: Lead, now: Instant) {
         self.expire(now);
         // Repeated untrusted claims cannot pin either an untried or failed
         // endpoint forever. Only a successful authenticated round renews it.
-        if self.peers.contains_key(&address) {
+        if let Some(peer) = self.peers.get_mut(&address) {
+            // A remembered endpoint heard again from its vouched address is up: it leads as kin.
+            if peer.lead == Lead::Remembered && lead == Lead::Kin {
+                peer.lead = Lead::Kin;
+            }
             return;
         }
         if self.peers.keys().filter(|p| p.ip() == address.ip()).count() >= PER_IP {
@@ -360,20 +749,7 @@ impl Hints {
             };
             self.peers.remove(&oldest);
         }
-        self.peers.insert(
-            address,
-            Peer {
-                seen: now,
-                next: now,
-                verified: false,
-                busy: false,
-                failed: false,
-                hurried: false,
-                quiet_push: false,
-                failures: 0,
-                repair: Repair::default(),
-            },
-        );
+        self.peers.insert(address, Peer::candidate(now, lead));
     }
     pub(super) fn count(&self) -> usize {
         self.peers.len()
@@ -393,6 +769,16 @@ impl Hints {
     /// attempt fails. An announcement alone never reserves worker capacity.
     pub(super) fn established(&self, address: SocketAddr) -> bool {
         self.peers.get(&address).is_some_and(Peer::established)
+    }
+    /// When `address` is next due (tests).
+    #[cfg(test)]
+    pub(super) fn next_at(&self, address: SocketAddr) -> Instant {
+        self.peers[&address].next
+    }
+    /// Whether `address` waits in the follow-up queue (tests).
+    #[cfg(test)]
+    pub(super) fn follow_up_contains(&self, address: SocketAddr) -> bool {
+        self.follow_up.contains(&address)
     }
     /// Whether a peer this side may dial is established; a `Bus` speaker reserves no capacity.
     pub(super) fn has_established(&self) -> bool {
@@ -456,7 +842,22 @@ impl Hints {
         } else {
             self.established_cursor
         };
-        let address = follow_up.or_else(|| {
+        // A candidate that leads ([`Lead`]) goes before the ordinary scan, kin before remembered,
+        // and leaves the scan's place where it was.
+        #[cfg(test)]
+        let unled = UNLED.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let unled = false;
+        let led = if follow_up.is_none() && !unled {
+            self.peers
+                .iter()
+                .filter(|(a, p)| p.lead() > Lead::None && eligible(a, p))
+                .max_by_key(|(a, p)| (p.lead(), std::cmp::Reverse(**a)))
+                .map(|(a, _)| *a)
+        } else {
+            None
+        };
+        let address = follow_up.or(led).or_else(|| {
             use std::ops::Bound::{Excluded, Unbounded};
             let tail = match cursor {
                 Some(cursor) => self.peers.range((Excluded(cursor), Unbounded)),
@@ -478,7 +879,7 @@ impl Hints {
         peer.next = now + retry_delay(&self.own, self.attempt);
         if follow_up.is_some() {
             self.follow_up_left -= 1;
-        } else {
+        } else if led.is_none() {
             // A preferred transfer must not rewind the ordinary scan and keep
             // selecting the same neighbor after every burst.
             if allow_discovery {
@@ -556,12 +957,14 @@ impl Hints {
         // refusing) waits longer each time, so it cannot hold an outgoing worker
         // every few seconds.
         peer.failures = match outcome {
-            Outcome::Repaired { .. } => 0,
+            Outcome::Repaired { .. } | Outcome::Deferred => 0,
             Outcome::Refused | Outcome::Busy => peer.failures.saturating_add(1),
         };
         let delay = match outcome {
             Outcome::Repaired { transferred: true } => follow_up_delay(&self.own, self.attempt),
             Outcome::Repaired { transferred: false } => retry_delay(&self.own, self.attempt),
+            Outcome::Deferred if !peer.deferring => follow_up_delay(&self.own, self.attempt),
+            Outcome::Deferred => retry_delay(&self.own, self.attempt),
             Outcome::Busy if peer.failures <= QUICK_BUSY_RETRIES => {
                 retry_delay(&self.own, self.attempt)
             }
@@ -584,13 +987,37 @@ impl Hints {
         } else {
             now + delay
         };
-        if success && repair.actor().is_some() {
+        // A deferred round authenticated its peer and completed its control exchange: the
+        // endpoint is established, though the round repaired nothing.
+        let completed = success || outcome == Outcome::Deferred;
+        peer.deferring = outcome == Outcome::Deferred;
+        if completed {
+            peer.pulled = false;
+        }
+        let verified = repair.actor().filter(|_| completed);
+        if verified.is_some() {
             peer.verified = true;
             peer.seen = now;
         }
+        let mut spent = false;
+        if !completed && repair.authenticated_actor().is_none() {
+            // Whatever answers there authenticated no seat: it was not the peer it looked like,
+            // and takes its turn with the crowd. Contention with a peer that did keeps its lead.
+            spent = peer.lead() == Lead::Kin;
+            peer.lead = Lead::None;
+        }
         peer.busy = false;
-        peer.failed = !success;
+        peer.failed = !completed;
         peer.repair = repair;
+        #[cfg(test)]
+        let spent = spent && !mutant(&UNSPENT);
+        if spent {
+            self.spend_kin(address.ip(), now);
+        }
+        if let Some(actor) = verified {
+            self.vouch_address(address.ip(), now);
+            self.keep(actor, address, now);
+        }
         self.follow_up
             .retain(|queued| self.peers.contains_key(queued));
         if matches!(outcome, Outcome::Repaired { transferred: true }) {
@@ -776,6 +1203,273 @@ mod tests {
     }
     fn hints() -> Hints {
         Hints::new([4; 32])
+    }
+
+    /// A crowd of unverified LAN beacons, as every aterm on the ALab LAN sends them, each sorting
+    /// ahead of `10.1.9.0/24` ("B held 70 to 74", E1b).
+    fn crowd(hints: &mut Hints, now: Instant) -> SocketAddr {
+        for n in 1..=70 {
+            hints.observe(&wire(1234), SocketAddr::from(([10, 1, 1, n], 1)), now);
+        }
+        SocketAddr::from(([10, 1, 1, 1], 1234))
+    }
+
+    /// CR1: a peer that restarted beacons a new port from the address it was verified at, and the
+    /// peer that stayed up dials that port before a crowd of unverified hints that sort ahead of
+    /// it, at once. A stranger's new port gets no such lead, nor does an endpoint whose dial failed
+    /// without authenticating anyone, and the ordinary scan keeps its place.
+    ///
+    /// NEGATIVE CONTROL (run here): with no candidate leading ([`UNLED`]), the old address order
+    /// dials the crowd first.
+    #[test]
+    fn a_verified_peers_new_port_is_dialled_before_the_crowd() {
+        for unled in [false, true] {
+            UNLED.with(|cell| cell.set(unled));
+            let mut hints = hints();
+            let now = Instant::now();
+            let old: SocketAddr = "10.1.9.9:1000".parse().unwrap();
+            hints.observe(&wire(old.port()), old, now);
+            // It was verified; its listener went with the restart, and the dials since failed.
+            let peer = hints.peers.get_mut(&old).unwrap();
+            peer.verified = true;
+            peer.failed = true;
+            peer.failures = 4;
+            peer.next = now + BACKOFF_MAX;
+            let first_of_crowd = crowd(&mut hints, now);
+            let stranger: SocketAddr = "10.1.9.7:2000".parse().unwrap();
+            hints.observe(&wire(stranger.port()), stranger, now);
+            let new: SocketAddr = "10.1.9.9:2000".parse().unwrap();
+            hints.observe(&wire(new.port()), new, now);
+            let (first, repair) = hints.next(now).unwrap();
+            if unled {
+                assert_eq!(first, first_of_crowd, "the old order dials the crowd first");
+                continue;
+            }
+            assert_eq!(first, new, "the verified peer's new port goes first");
+            assert_eq!(hints.peers[&stranger].lead(), Lead::None);
+            // The ordinary scan did not move: the crowd's first is next.
+            let (second, _) = hints.next(now).unwrap();
+            assert_eq!(second, first_of_crowd);
+            // Something else answering there that authenticates no seat loses the lead.
+            hints.finish(first, repair, Outcome::Refused, now);
+            assert_eq!(hints.peers[&new].lead(), Lead::None);
+            let again = hints.peers[&new].next;
+            assert_ne!(
+                hints.next(again).map(|(address, _)| address),
+                Some(new),
+                "a failed lead waits its turn behind the crowd"
+            );
+        }
+        UNLED.with(|cell| cell.set(false));
+    }
+
+    /// CR1: what a Mac verified before it restarted is dialled first after: a remembered endpoint
+    /// that beacons again leads as kin, then one not yet heard, both before the crowd; one older
+    /// than [`REMEMBER_MS`] is forgotten, and only the most recent [`MAX_REMEMBERED`] seats are
+    /// kept. Their file round-trips in one spelling, and any other spelling reads as none.
+    ///
+    /// NEGATIVE CONTROL (run here): with no candidate leading ([`UNLED`]), the old address order
+    /// dials the crowd first after a restart.
+    #[test]
+    fn a_remembered_endpoint_is_dialled_first_after_a_restart() {
+        let (heard, unheard, stale): (SocketAddr, SocketAddr, SocketAddr) = (
+            "10.1.9.9:1000".parse().unwrap(),
+            "10.1.9.8:1000".parse().unwrap(),
+            "10.1.9.6:1000".parse().unwrap(),
+        );
+        let day_ms = 24 * 60 * 60 * 1000;
+        let wall_ms = 30 * day_ms;
+        let mut before = hints();
+        let t0 = Instant::now() + Duration::from_millis(REMEMBER_MS + 2 * day_ms);
+        before.keep([7; 48], heard, t0);
+        before.keep([8; 48], unheard, t0 - Duration::from_secs(60));
+        before.keep(
+            [9; 48],
+            stale,
+            t0 - Duration::from_millis(REMEMBER_MS + day_ms),
+        );
+        let kept = before
+            .remembered(t0, wall_ms)
+            .expect("new seats are a change");
+        assert!(
+            before.remembered(t0, wall_ms).is_none(),
+            "nothing changed since the last read"
+        );
+        before.keep([7; 48], heard, t0 + Duration::from_secs(5));
+        assert!(
+            before
+                .remembered(t0 + Duration::from_secs(5), wall_ms)
+                .is_none(),
+            "a later round with the same endpoint is no change"
+        );
+        assert!(
+            before.remembered(t0 + REMEMBER_REFRESH, wall_ms).is_some(),
+            "kept times are refreshed once an hour"
+        );
+        let scope: MemoryScope = [3; std::mem::size_of::<MemoryScope>()];
+        let bytes = Remembered::encode(&scope, &kept);
+        assert!(bytes.len() <= REMEMBERED_MAX);
+        assert_eq!(
+            Remembered::decode(&scope, &bytes).as_deref(),
+            Some(&kept[..])
+        );
+        let mut another = scope;
+        another[0] = 4;
+        assert_eq!(
+            Remembered::decode(&another, &bytes),
+            None,
+            "another trust or seat reads none"
+        );
+        for damaged in [
+            &bytes[..bytes.len() - 1],
+            &[bytes.as_slice(), &[0]].concat()[..],
+            &[b"ATPE0".as_slice(), &bytes[5..]].concat()[..],
+        ] {
+            assert_eq!(Remembered::decode(&scope, damaged), None);
+        }
+        let mut unsorted = bytes.clone();
+        let entries = REMEMBERED_MAGIC.len() + scope.len() + 1;
+        let (first, rest) = unsorted[entries..].split_at_mut(REMEMBERED_ENTRY);
+        first.swap_with_slice(&mut rest[..REMEMBERED_ENTRY]);
+        assert_eq!(
+            Remembered::decode(&scope, &unsorted),
+            None,
+            "one spelling: sorted seats"
+        );
+
+        for unled in [false, true] {
+            UNLED.with(|cell| cell.set(unled));
+            let mut after = Hints::new([9; 32]);
+            let now = Instant::now();
+            let first_of_crowd = crowd(&mut after, now);
+            after.remember(
+                Remembered::decode(&scope, &bytes).unwrap(),
+                now,
+                wall_ms + 60_000,
+            );
+            assert!(
+                !after.peers.contains_key(&stale),
+                "a week-old endpoint is forgotten"
+            );
+            // One remembered peer is up again and beacons the port it was verified on.
+            after.observe(&wire(heard.port()), heard, now);
+            let (first, _) = after.next(now).unwrap();
+            if unled {
+                assert_eq!(first, first_of_crowd, "the old order dials the crowd first");
+                continue;
+            }
+            let (second, repair) = after.next(now).unwrap();
+            assert_eq!((first, second), (heard, unheard));
+            assert_eq!(after.next(now).unwrap().0, first_of_crowd);
+            after.finish(unheard, repair, Outcome::Refused, now);
+            assert_eq!(after.peers[&unheard].lead(), Lead::None);
+            // What it remembers stays to be kept again, though nothing was verified since.
+            let again = after.remembered(now, wall_ms + 60_000).unwrap();
+            assert_eq!(again.len(), 2);
+        }
+        UNLED.with(|cell| cell.set(false));
+
+        let mut many = hints();
+        let now = Instant::now() + Duration::from_secs(3600);
+        for n in 0..=MAX_REMEMBERED as u8 {
+            let address = SocketAddr::from(([10, 1, 3, n + 1], 1000));
+            many.keep([n; 48], address, now - Duration::from_secs(u64::from(n)));
+        }
+        let kept = many.remembered(now, wall_ms).unwrap();
+        assert_eq!(kept.len(), MAX_REMEMBERED);
+        assert!(
+            kept.iter()
+                .all(|entry| entry.actor != [MAX_REMEMBERED as u8; 48]),
+            "the oldest seat is the one forgotten"
+        );
+    }
+    /// CR1: beacons forged from a peer's address, a new port every few hundred ms, lead one
+    /// dial per round the peer makes from there: a led dial that authenticates nobody spends the
+    /// address's lead until a peer authenticates from it again, and the crowd keeps its turns.
+    ///
+    /// NEGATIVE CONTROL (run here, [`UNSPENT`]): every forged port leads, ahead of the crowd.
+    #[test]
+    fn forged_ports_from_a_peers_address_lead_one_dial_per_round_the_peer_makes() {
+        for unspent in [false, true] {
+            let mut hints = hints();
+            let now = Instant::now();
+            let peer: SocketAddr = "10.1.9.9:1000".parse().unwrap();
+            hints.observe(&wire(peer.port()), peer, now);
+            let established = hints.peers.get_mut(&peer).unwrap();
+            established.verified = true;
+            established.next = now + BACKOFF_MAX;
+            let first_of_crowd = crowd(&mut hints, now);
+            let forged = |port: u16| SocketAddr::from(([10, 1, 9, 9], port));
+            hints.observe(&wire(2000), forged(2000), now);
+            let (first, repair) = hints.next(now).unwrap();
+            assert_eq!(
+                first,
+                forged(2000),
+                "a new port from a peer's address leads"
+            );
+            UNSPENT.with(|cell| cell.set(unspent));
+            hints.finish(first, repair, Outcome::Refused, now);
+            UNSPENT.with(|cell| cell.set(false));
+            hints.observe(&wire(2001), forged(2001), now);
+            let (next, _) = hints.next(now).unwrap();
+            if unspent {
+                assert_eq!(next, forged(2001), "MUTANT: every forged port leads");
+                continue;
+            }
+            assert_eq!(
+                next, first_of_crowd,
+                "a spent address's new port waits its turn"
+            );
+            // The peer dials in from its address: one new port there leads again.
+            hints.vouch(peer.ip(), [7; 48], now);
+            assert_eq!(hints.peers[&forged(2001)].lead(), Lead::Kin);
+        }
+    }
+
+    /// CR1: a seat on two attachments (Wi-Fi and Ethernet) completes rounds on both endpoints in
+    /// turn; the one remembered stays while it answers, so the file is not rewritten each round,
+    /// and the other takes its place once it stops answering.
+    ///
+    /// NEGATIVE CONTROL (run here, [`FLAPS`]): each round's endpoint replaces the last.
+    #[test]
+    fn a_seat_on_two_attachments_keeps_one_remembered_endpoint_while_it_answers() {
+        for flaps in [false, true] {
+            FLAPS.with(|cell| cell.set(flaps));
+            let mut hints = hints();
+            let now = Instant::now();
+            let wifi: SocketAddr = "10.1.9.9:1000".parse().unwrap();
+            let wired: SocketAddr = "10.1.8.9:1000".parse().unwrap();
+            for address in [wifi, wired] {
+                hints.observe(&wire(address.port()), address, now);
+                let peer = hints.peers.get_mut(&address).unwrap();
+                peer.verified = true;
+            }
+            hints.keep([7; 48], wifi, now);
+            assert!(hints.remembered(now, 0).is_some(), "a new seat is a change");
+            let mut writes = 0;
+            for round in 1..=4 {
+                let address = if round % 2 == 0 { wifi } else { wired };
+                hints.keep([7; 48], address, now + Duration::from_secs(round));
+                writes += usize::from(
+                    hints
+                        .remembered(now + Duration::from_secs(round), 0)
+                        .is_some(),
+                );
+            }
+            FLAPS.with(|cell| cell.set(false));
+            if flaps {
+                assert_eq!(writes, 4, "MUTANT: every round rewrites the file");
+                continue;
+            }
+            assert_eq!(writes, 0, "rounds on either attachment change nothing kept");
+            hints.peers.get_mut(&wifi).unwrap().failed = true;
+            hints.keep([7; 48], wired, now + Duration::from_secs(5));
+            let kept = hints.remembered(now + Duration::from_secs(5), 0).unwrap();
+            assert_eq!(
+                kept[0].address, wired,
+                "the endpoint that answers replaces one that stopped"
+            );
+        }
     }
     fn wire(port: u16) -> Vec<u8> {
         Hints::new([5; 32]).wire(port).to_vec()
@@ -995,6 +1689,61 @@ mod tests {
             ended,
         );
         assert!(hints.next(ended).is_none());
+    }
+
+    /// A real round whose table was deferred and moved nothing is [`Outcome::Deferred`], not a
+    /// repair: its endpoint stays established with no backoff, is dialled again after the short
+    /// follow-up delay, then at the quiet interval while it keeps deferring, and never joins the
+    /// follow-up queue that productive rounds share. MUTANT (`DEFERRAL_SUCCEEDS`, as before
+    /// CR1): the same round reads as a quiet repair.
+    #[test]
+    fn a_deferred_round_is_no_success_and_is_retried_soon_once() {
+        let repair = crate::replica::tests::witness::deferred_repair();
+        assert_eq!(Outcome::of(true, &repair, None), Outcome::Deferred);
+        DEFERRAL_SUCCEEDS.with(|flag| flag.set(true));
+        let mutant = Outcome::of(true, &repair, None);
+        DEFERRAL_SUCCEEDS.with(|flag| flag.set(false));
+        assert_eq!(mutant, Outcome::Repaired { transferred: false });
+
+        let mut hints = hints();
+        let now = Instant::now();
+        hints.observe(&wire(1234), "10.1.1.2:1".parse().unwrap(), now);
+        let (address, _) = hints.next(now).unwrap();
+        hints.finish(address, repair.clone(), Outcome::Deferred, now);
+        let peer = &hints.peers[&address];
+        assert!(
+            peer.established(),
+            "the peer authenticated and completed control"
+        );
+        assert_eq!(peer.failures, 0);
+        assert!(
+            peer.next <= now + Duration::from_millis(500),
+            "soon after a first deferral"
+        );
+        assert!(!hints.follow_up.contains(&address));
+        let again = hints.peers[&address].next;
+        let (next, _) = hints.next(again).unwrap();
+        assert_eq!(next, address);
+        hints.finish(address, repair.clone(), Outcome::Deferred, again);
+        assert!(
+            hints.peers[&address].next >= again + Duration::from_secs(3),
+            "a table that stays deferred waits the quiet interval"
+        );
+        let later = hints.peers[&address].next;
+        let _ = hints.next(later).unwrap();
+        hints.finish(
+            address,
+            repair.clone(),
+            Outcome::Repaired { transferred: false },
+            later,
+        );
+        hints.peers.get_mut(&address).unwrap().next = later;
+        let _ = hints.next(later).unwrap();
+        hints.finish(address, repair, Outcome::Deferred, later);
+        assert!(
+            hints.peers[&address].next <= later + Duration::from_millis(500),
+            "a repair in between makes the next deferral a first one"
+        );
     }
 
     #[test]

@@ -2664,9 +2664,15 @@ fn the_owners_pin_clears_the_walls_and_holds_the_compare_and_set() {
     let first = PinRequest::new("work-2", "a".repeat(32)).unwrap();
     let second = PinRequest::new("work-2", "b".repeat(32)).unwrap();
     let mut pending = on_main();
-    pending.pending_pin = Some(first.clone());
+    pending.pending_pin = Some(first.clone().into());
     let mut pending = State::from_json(&pending.to_json(), NOW).unwrap();
-    assert_eq!(pending.pending_pin.as_ref(), Some(&first));
+    assert_eq!(
+        pending
+            .pending_pin
+            .as_ref()
+            .and_then(PendingSelection::account),
+        Some(&first)
+    );
     pin(&mut pending, &r, &enrolled, "pool-a", NOW).unwrap();
     let chosen = pending.clone();
     assert_eq!(
@@ -2679,7 +2685,7 @@ fn the_owners_pin_clears_the_walls_and_holds_the_compare_and_set() {
     );
 
     let mut pending = on_main();
-    pending.pending_pin = Some(first.clone());
+    pending.pending_pin = Some(first.clone().into());
     assert_eq!(unpin(&mut pending, "use --auto", NOW), None);
     let automatic = pending.clone();
     assert_eq!(
@@ -2691,7 +2697,7 @@ fn the_owners_pin_clears_the_walls_and_holds_the_compare_and_set() {
         "auto cancels a login even with no existing pin"
     );
 
-    pending.pending_pin = Some(second.clone());
+    pending.pending_pin = Some(second.clone().into());
     let newer = pending.clone();
     assert_eq!(
         complete_requested_pin(&mut pending, &r, &enrolled, &first, NOW),
@@ -2732,12 +2738,7 @@ fn the_owners_pin_clears_the_walls_and_holds_the_compare_and_set() {
             .as_object_mut()
             .unwrap()
             .insert("nonce".into(), Value::from(nonce));
-        assert!(
-            State::from_json(&aterm_json::to_string(&bad).unwrap(), NOW)
-                .unwrap()
-                .pending_pin
-                .is_none()
-        );
+        assert!(State::from_json(&aterm_json::to_string(&bad).unwrap(), NOW).is_err());
     }
 
     let mut refused = newer;
@@ -2748,7 +2749,10 @@ fn the_owners_pin_clears_the_walls_and_holds_the_compare_and_set() {
     );
     assert_eq!(refused.active, before);
     assert_eq!(
-        refused.pending_pin.as_ref(),
+        refused
+            .pending_pin
+            .as_ref()
+            .and_then(PendingSelection::account),
         Some(&second),
         "a refused pin keeps the request for a later eligible completion"
     );
@@ -5275,13 +5279,16 @@ fn the_store_keeps_the_state_private_and_reads_back_what_it_wrote() {
         .expect("records a selection");
     assert_eq!(
         Store::at(dir.path()).load(NOW).unwrap().0.pending_pin,
-        Some(first.clone())
+        Some(first.clone().into())
     );
     let second = store
         .request_pin("pool-a", NOW)
         .expect("records a newer selection");
     store.cancel_pin_request(&first, NOW).unwrap();
-    assert_eq!(store.load(NOW).unwrap().0.pending_pin, Some(second.clone()));
+    assert_eq!(
+        store.load(NOW).unwrap().0.pending_pin,
+        Some(second.clone().into())
+    );
     store.cancel_pin_request(&second, NOW).unwrap();
     assert!(store.load(NOW).unwrap().0.pending_pin.is_none());
     store
@@ -5648,7 +5655,13 @@ fn account_selection_uses_current_bindings_and_never_turns_store_errors_into_sig
         panic!("a signed-out account needs sign-in");
     };
     let requested = store.load(NOW).unwrap().0;
-    assert_eq!(requested.pending_pin.as_ref(), Some(&request));
+    assert_eq!(
+        requested
+            .pending_pin
+            .as_ref()
+            .and_then(PendingSelection::account),
+        Some(&request)
+    );
     assert!(store.select_account(&roster, &path, "gone", NOW).is_err());
     assert_eq!(store.load(NOW).unwrap().0, requested);
 
@@ -5676,7 +5689,10 @@ fn account_selection_uses_current_bindings_and_never_turns_store_errors_into_sig
         panic!("an empty current login needs sign-in");
     };
     assert_ne!(unenrolled, request);
-    assert_eq!(store.load(NOW).unwrap().0.pending_pin, Some(unenrolled));
+    assert_eq!(
+        store.load(NOW).unwrap().0.pending_pin,
+        Some(unenrolled.into())
+    );
 }
 
 #[test]
@@ -9009,10 +9025,12 @@ fn claudes_roster_admits_no_vendor_key_and_its_store_is_where_it_was() {
         Store::at(state).logins_dir(),
         state.join("accounts").join("logins")
     );
+    let claude = Store::at_for(state, Cli::Claude, Path::new("/home/o"));
     assert_eq!(
-        Store::at_for(state, Cli::Claude, Path::new("/home/o")),
-        Store::at(state)
+        (claude.dir.clone(), claude.logins_dir()),
+        (Store::at(state).dir, Store::at(state).logins_dir())
     );
+    assert_eq!(Store::at(state).default_login_home(), None);
     let codex = Store::at_for(state, Cli::Codex, Path::new("/home/o"));
     assert_eq!(codex.dir, state.join("accounts-codex"));
     assert_eq!(codex.logins_dir(), Path::new("/home/o/.aterm/logins/codex"));

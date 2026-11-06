@@ -85,6 +85,48 @@ fn a_write_with_no_flush_asks_none_and_a_durable_one_two_full_flushes() {
     );
 }
 
+/// A directory whose entries cannot be flushed here (`ENOTSUP`) is refused by
+/// [`write_entry_flushed`], with either flush, and accepted by [`write_flushed`]; a failed flush
+/// (`EIO`) is refused by both. Each asks one flush of the temporary and one of the directory,
+/// and the rename has landed either way. NEGATIVE CONTROL: with `write_entry_flushed` taking
+/// `best_effort(Flush::dir)`, the `ENOTSUP` arm returns `Ok` and its assertion fails.
+#[test]
+fn an_entry_flushed_write_refuses_a_directory_it_cannot_flush() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let path = dir.path().join("checkpoint");
+    let recording = aterm_durable::seam::Recording::start();
+    for flush in [Flush::Ordered, Flush::Durable] {
+        for (errno, best_effort_fails) in [
+            (aterm_durable::seam::ENOTSUP, false),
+            (aterm_durable::seam::EIO, true),
+        ] {
+            let bytes = format!("{flush:?} {errno}\n");
+            let failing = aterm_durable::seam::FailingDirs::with(errno);
+            let entry = write_entry_flushed(&path, bytes.as_bytes(), 0o600, flush);
+            let best = write_flushed(&path, bytes.as_bytes(), 0o600, Some(flush));
+            drop(failing);
+            assert_eq!(
+                entry.map_err(|e| e.raw_os_error()),
+                Err(Some(errno)),
+                "{flush:?} {errno}: an entry flush needs its directory's"
+            );
+            assert_eq!(
+                best.map_err(|e| e.raw_os_error()),
+                if best_effort_fails {
+                    Err(Some(errno))
+                } else {
+                    Ok(())
+                },
+                "{flush:?} {errno}"
+            );
+            assert_eq!(recording.take(), vec![flush; 4], "{flush:?} {errno}");
+            assert_eq!(std::fs::read(&path).unwrap(), bytes.as_bytes());
+        }
+        write_entry_flushed(&path, b"flushed\n", 0o600, flush).unwrap();
+        assert_eq!(recording.take(), vec![flush; 2], "{flush:?}");
+    }
+}
+
 #[test]
 fn producer_error_and_panic_leave_the_old_file_and_no_temporary() {
     let dir = aterm_tempfile::tempdir().unwrap();

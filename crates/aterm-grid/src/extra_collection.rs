@@ -12,6 +12,21 @@ use aterm_hash::FxHashMap;
 use crate::cell::Cell;
 use crate::extra::{CellCoord, CellExtra};
 
+#[cfg(test)]
+pub(crate) mod image_hint_meter {
+    thread_local! {
+        static VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn charge() {
+        VISITS.with(|visits| visits.set(visits.get() + 1));
+    }
+
+    pub(crate) fn take() -> usize {
+        VISITS.with(|visits| visits.replace(0))
+    }
+}
+
 /// Dense ring-buffer storage for non-BMP complex chars in the visible grid: flat indexing instead of a HashMap probe for cells (emoji and the like) whose only extra is `complex_char`.
 #[derive(Debug, Clone)]
 pub(crate) struct ComplexCharRing {
@@ -777,6 +792,18 @@ impl MaxRowCache {
     }
 }
 
+/// Conservative image knowledge. A raw mutable borrow can change only its one
+/// entry; record that key until a reader or key-changing operation checks it.
+/// Keep the state in one word-aligned, inline tag and coordinate payload.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(u32)]
+enum ImageHint {
+    #[default]
+    Absent,
+    Possible,
+    Pending(CellCoord),
+}
+
 /// Storage for cell extras across the grid.
 #[derive(Debug, Clone, Default)]
 pub struct CellExtras {
@@ -800,9 +827,10 @@ pub struct CellExtras {
     /// colours, flags and images, so guarding on it would walk the whole map on
     /// every linked write once anything else filled it.
     hyperlink_upper_bound: usize,
-    /// Sticky: an inline image has been placed here at some point; reset only by
-    /// [`Self::clear`].
-    any_image: bool,
+    /// When not `Possible`, every image must be at the single pending key.
+    /// Resolve it before exposing another entry or changing keys. Deletions
+    /// and nonimage writes cannot introduce an image elsewhere.
+    image_hint: ImageHint,
 }
 
 /// Reset or insert the empty entry at internal key `key` for a writer's new cell:
@@ -837,7 +865,7 @@ impl CellExtras {
             rgb_ring: None,
             hyperlink_scratch: Vec::new(),
             hyperlink_upper_bound: 0,
-            any_image: false,
+            image_hint: ImageHint::Absent,
         }
     }
 
@@ -1165,8 +1193,14 @@ impl CellExtras {
     pub fn get_or_create(&mut self, coord: CellCoord) -> &mut CellExtra {
         let internal_row = self.internal_row_for_write(coord.row);
         let key = CellCoord::new(internal_row, coord.col);
+        self.track_image_candidate(key);
+        self.get_or_create_at_key(key)
+    }
+
+    #[inline]
+    fn get_or_create_at_key(&mut self, key: CellCoord) -> &mut CellExtra {
         let was_empty = self.data.is_empty();
-        self.max_row_cache.on_insert(internal_row, was_empty);
+        self.max_row_cache.on_insert(key.row, was_empty);
         let bound = &mut self.hyperlink_upper_bound;
         let extra = self.data.entry(key).or_default();
         if extra.hyperlink().is_none() {
@@ -1175,11 +1209,28 @@ impl CellExtras {
         extra
     }
 
+    /// Modify one entry without letting its mutable borrow escape. Image state
+    /// is checked in place, avoiding a later lookup; a panic keeps the hint armed.
+    #[inline]
+    pub fn modify(&mut self, coord: CellCoord, f: impl FnOnce(&mut CellExtra)) {
+        let internal_row = self.internal_row_for_write(coord.row);
+        let key = CellCoord::new(internal_row, coord.col);
+        let previous = self.image_hint;
+        self.image_hint = ImageHint::Possible;
+        let entry = self.get_or_create_at_key(key);
+        f(entry);
+        let has_image = entry.image().is_some();
+        if !has_image {
+            self.image_hint = previous;
+        }
+    }
+
     /// Return a fresh entry for `coord`, replacing any existing entry.
     #[inline]
     pub fn fresh(&mut self, coord: CellCoord) -> &mut CellExtra {
         let internal_row = self.internal_row_for_write(coord.row);
         let key = CellCoord::new(internal_row, coord.col);
+        self.track_image_candidate(key);
         let was_empty = self.data.is_empty();
         self.max_row_cache.on_insert(internal_row, was_empty);
         let bound = &mut self.hyperlink_upper_bound;
@@ -1191,25 +1242,62 @@ impl CellExtras {
         extra
     }
 
-    /// Whether an inline image has ever been placed here.
+    /// Whether this storage may hold an inline image; false rules images out.
     #[must_use]
     #[inline]
-    pub const fn any_image(&self) -> bool {
-        self.any_image
+    pub fn any_image(&self) -> bool {
+        match self.image_hint {
+            ImageHint::Absent => false,
+            ImageHint::Possible => true,
+            ImageHint::Pending(key) => self.entry_has_image(key),
+        }
+    }
+
+    #[inline]
+    fn entry_has_image(&self, key: CellCoord) -> bool {
+        #[cfg(test)]
+        image_hint_meter::charge();
+        self.data
+            .get(&key)
+            .is_some_and(|extra| extra.image().is_some())
+    }
+
+    /// Settle the only potentially image-bearing mutable entry before its key
+    /// changes. This keeps queries bounded by one lookup, without a map scan.
+    #[inline]
+    pub(crate) fn settle_image_candidate(&mut self) {
+        if let ImageHint::Pending(key) = self.image_hint {
+            self.image_hint = if self.entry_has_image(key) {
+                ImageHint::Possible
+            } else {
+                ImageHint::Absent
+            };
+        }
+    }
+
+    #[inline]
+    fn track_image_candidate(&mut self, key: CellCoord) {
+        if self.image_hint == ImageHint::Pending(key) {
+            return;
+        }
+        self.settle_image_candidate();
+        if self.image_hint == ImageHint::Absent {
+            self.image_hint = ImageHint::Pending(key);
+        }
     }
 
     /// Attach an inline-image reference to a cell.
     #[inline]
     pub fn set_image(&mut self, coord: CellCoord, image: crate::extra::ImageRef) {
-        self.any_image = true;
         self.get_or_create(coord).set_image(Some(image));
+        self.image_hint = ImageHint::Possible;
     }
 
     /// Add `image` to the cell's image layers.
     #[inline]
     pub fn stack_image(&mut self, coord: CellCoord, image: crate::extra::ImageRef) {
-        self.any_image = true;
         self.get_or_create(coord).stack_image(image);
+        self.image_hint = ImageHint::Possible;
     }
 
     /// Set extras for a cell, removing the entry when `extra` has no data.
@@ -1225,7 +1313,7 @@ impl CellExtras {
                 self.hyperlink_upper_bound += 1;
             }
             if extra.image().is_some() {
-                self.any_image = true;
+                self.image_hint = ImageHint::Possible;
             }
             self.data.insert(internal, extra);
             self.max_row_cache.on_insert(internal_row, was_empty);
@@ -1251,6 +1339,25 @@ impl CellExtras {
         }
         self.max_row_cache.on_remove(key.row, self.data.is_empty());
         true
+    }
+
+    /// Drop the entries row `row`'s `cells` flag HAS_EXTRAS, as a full-screen scroll that has
+    /// copied what history keeps moves the row off the screen. [`Self::shift_rows_up_by`] would
+    /// leave them stale, unreachable but alive until the next compaction up to
+    /// [`COMPACT_THRESHOLD`] rows later, so the inline images they hold would outlive every image
+    /// budget. Only a map that may hold an image ([`Self::any_image`]) is walked: the cost is the
+    /// row's flag scan, which history's image extraction already pays, plus one removal per entry.
+    pub(crate) fn release_scrolled_row(&mut self, row: u16, cells: &[crate::Cell]) {
+        if self.data.is_empty() || !self.any_image() {
+            return;
+        }
+        for (col, cell) in cells.iter().enumerate() {
+            if cell.has_extras()
+                && let Ok(col) = u16::try_from(col)
+            {
+                self.remove(CellCoord::new(row, col));
+            }
+        }
     }
 
     /// Strip what a cell without HAS_EXTRAS cannot own from its entry ([`CellExtra::retain_overflow_colors`]): everything but truecolor fg/bg bytes, which a BCE blank owns through its RGB marker.
@@ -1332,6 +1439,17 @@ impl CellExtras {
         if let Some(ring) = &mut self.complex_ring {
             ring.clear_range(row, start_col, end_col);
         }
+        self.clear_map_range_retaining_capacity(row, start_col, end_col);
+        self.maybe_shrink();
+    }
+
+    /// Remove map entries in an overwritten span, keeping rings and map capacity.
+    pub(crate) fn clear_map_range_retaining_capacity(
+        &mut self,
+        row: u16,
+        start_col: u16,
+        end_col: u16,
+    ) {
         if self.data.is_empty() {
             return;
         }
@@ -1365,7 +1483,6 @@ impl CellExtras {
             });
             self.max_row_cache.set_exact_opt(max_row);
         }
-        self.maybe_shrink();
     }
 
     /// Clear extras for a range of rows in a single pass, including both rings.
@@ -1485,13 +1602,6 @@ impl CellExtras {
 
         self.clear_rgb_ring_cell(row, col_start, col_end - col_start);
 
-        let hyperlink = vals.hyperlink.map(|url| {
-            Arc::new(crate::extra::HyperlinkData {
-                url: Arc::clone(url),
-                id: vals.hyperlink_id.cloned(),
-            })
-        });
-
         let internal_row = self.internal_row_for_write(row);
         let was_empty = self.data.is_empty();
         let mut replaced_links = 0usize;
@@ -1511,7 +1621,7 @@ impl CellExtras {
             if vals.extended_flags != 0 {
                 extra.set_extended_flags(vals.extended_flags);
             }
-            if let Some(data) = &hyperlink {
+            if let Some(data) = vals.hyperlink {
                 extra.set_hyperlink_data(Some(Arc::clone(data)));
             }
         }
@@ -1531,7 +1641,7 @@ impl CellExtras {
         self.row_offset = 0;
         self.max_row_cache.set_empty();
         self.hyperlink_upper_bound = 0;
-        self.any_image = false;
+        self.image_hint = ImageHint::Absent;
         if let Some(ring) = &mut self.complex_ring {
             ring.clear();
         }
@@ -1639,7 +1749,8 @@ impl CellExtras {
 
     /// Take the accumulated row offset, resetting it to 0, so a region shift can compact and shift keys in one drain pass.
     #[inline]
-    pub(crate) const fn take_row_offset(&mut self) -> u16 {
+    pub(crate) fn take_row_offset(&mut self) -> u16 {
+        self.settle_image_candidate();
         let offset = self.row_offset;
         self.row_offset = 0;
         offset
@@ -1670,11 +1781,13 @@ impl CellExtras {
             Some(t) => t,
             None => {
                 self.data.clear();
+                self.image_hint = ImageHint::Absent;
                 self.row_offset = 0;
                 self.max_row_cache.set_empty();
                 return;
             }
         };
+        self.settle_image_candidate();
         #[cfg(any(test, debug_assertions))]
         crate::test_counters::count_extras_shift_ops(self.data.len());
         let mut new_data =
@@ -2287,8 +2400,10 @@ mod tests {
                 bg_rgb: None,
                 underline_color: None,
                 extended_flags: 0,
-                hyperlink: Some(&url),
-                hyperlink_id: Some(&id),
+                hyperlink: Some(&Arc::new(crate::extra::HyperlinkData {
+                    url: url.clone(),
+                    id: Some(id.clone()),
+                })),
             },
             24,
             80,

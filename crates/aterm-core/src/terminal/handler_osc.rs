@@ -252,11 +252,13 @@ impl TerminalHandler<'_> {
                         .find_map(|kv| kv.strip_prefix("id="))
                         .filter(|v| !v.is_empty() && v.len() <= 256)
                 });
-            self.transient.current_hyperlink = Some(std::sync::Arc::from(uri));
-            self.transient.current_hyperlink_id = id.map(std::sync::Arc::from);
+            self.transient.current_hyperlink =
+                Some(std::sync::Arc::new(aterm_grid::HyperlinkData {
+                    url: std::sync::Arc::from(uri),
+                    id: id.map(std::sync::Arc::from),
+                }));
         } else {
             self.transient.current_hyperlink = None;
-            self.transient.current_hyperlink_id = None;
         }
         self.transient.update_has_transient_extras();
     }
@@ -745,11 +747,60 @@ mod tests {
         let mut term = Terminal::new(24, 80);
         term.process(b"\x1b]8;id=first:id=second;https://a.example/\x07");
         assert_eq!(
-            term.transient.current_hyperlink_id.as_deref(),
+            term.transient
+                .current_hyperlink
+                .as_ref()
+                .and_then(|link| link.id.as_deref()),
             Some("second")
         );
         term.process(b"\x1b]8;id=first:id=;https://a.example/\x07");
-        assert_eq!(term.transient.current_hyperlink_id, None);
+        assert!(
+            term.transient
+                .current_hyperlink
+                .as_ref()
+                .unwrap()
+                .id
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn shared_link_payload_keeps_cells_and_later_writes_independent() {
+        let mut term = Terminal::new(2, 20);
+        term.process(b"\x1b]8;id=original;https://example.com\x1b\\A");
+        term.process("日".as_bytes());
+        term.process(b"B");
+        let first = term.grid_mut().cell_extra_mut(0, 0);
+        first.set_hyperlink(Some(std::sync::Arc::from("https://edited.example")));
+        first.set_hyperlink_id(Some(std::sync::Arc::from("edited")));
+        term.process(b"C\x1b]8;;\x1b\\x\x1b]8;id=new;https://example.com\x1b\\D");
+        for (col, url, id) in [
+            (0, Some("https://edited.example"), Some("edited")),
+            (1, Some("https://example.com"), Some("original")),
+            (2, Some("https://example.com"), Some("original")),
+            (3, Some("https://example.com"), Some("original")),
+            (4, Some("https://example.com"), Some("original")),
+            (5, None, None),
+            (6, Some("https://example.com"), Some("new")),
+        ] {
+            let extra = term.grid().cell_extra(0, col);
+            assert_eq!(
+                extra.and_then(|extra| extra.hyperlink()).map(AsRef::as_ref),
+                url,
+                "column {col}"
+            );
+            assert_eq!(
+                extra
+                    .and_then(|extra| extra.hyperlink_id())
+                    .map(AsRef::as_ref),
+                id,
+                "column {col}"
+            );
+        }
+        assert_eq!(
+            term.current_hyperlink().map(AsRef::as_ref),
+            Some("https://example.com")
+        );
     }
 
     #[test]

@@ -33,6 +33,27 @@ fn vault(root: &std::path::Path) -> aterm_secrets::client::Paths {
     aterm_secrets::client::Paths::locate_for_home(&root.join("home"))
 }
 
+#[test]
+fn a_registry_origin_is_named_in_the_json_report() {
+    use crate::machine_name::{InFleet, Origin};
+    let mut name = file::MachineName::unnumbered(
+        aterm_types::machine_name::Nickname::parse("MissBunny").expect("a nickname"),
+        NOW,
+    );
+    name.num = aterm_types::machine_name::Number::new(86);
+    name.class = aterm_types::machine_name::Class::Seeded;
+    name.since = IMPLIED_SINCE;
+    let shown = super::unix::Shown {
+        name: &name,
+        origin: Origin::Registry,
+        fleet: InFleet::Out,
+        node: None,
+    };
+    let json: aterm_json::Value = aterm_json::from_str(&shown.json()).expect("JSON");
+    assert_eq!(json["made"].as_str(), Some("registry"));
+    assert_eq!(json["title"].as_str(), Some("m86 MissBunny"));
+}
+
 fn no_roster() -> io::Result<Option<String>> {
     Ok(None)
 }
@@ -292,41 +313,6 @@ fn the_report_names_the_fleet_the_node_and_a_migration_not_finished() {
 }
 
 #[test]
-fn a_first_read_brings_back_this_nodes_own_record() {
-    let root = state(0o700);
-    let me = node_identity(root.path()).expect("a node");
-    write_private(
-        root.path(),
-        PEERS_FILE,
-        entry(&me, &record(&me, Some(9), 3, Some("Heron"))).as_bytes(),
-    )
-    .expect("writes the book");
-    let unread = || -> io::Result<Option<String>> { unreachable!("Floor names the claim") };
-    let (json, _) =
-        report(root.path(), Some(&vault(root.path())), true, unread, NOW).expect("reports");
-    for field in [
-        "\"made\":\"floor\"",
-        "\"title\":\"m9 Heron\"",
-        "\"class\":\"chosen\"",
-        "\"rev\":3",
-    ] {
-        assert!(json.contains(field), "{field} in {json}");
-    }
-    let (line, _) = report(
-        root.path(),
-        Some(&vault(root.path())),
-        false,
-        no_roster,
-        NOW,
-    )
-    .expect("reports");
-    assert_eq!(
-        line,
-        format!("m9 Heron  class=chosen fleet=out node={}\n", me.node())
-    );
-}
-
-#[test]
 fn a_report_keeps_a_known_name_when_identity_is_damaged_but_refuses_uncertain_names() {
     use super::unix::{NickAsk, renick};
     use crate::machine_name::NickTo;
@@ -510,8 +496,8 @@ fn nick_sets_a_chosen_nickname_raising_rev_and_keeping_the_claim() {
     let set = file::read(root.path()).expect("reads").expect("a name");
     assert_eq!(
         (set.nick.as_str(), set.nick_class, set.rev),
-        ("Blue Heron", NickClass::Chosen, 0),
-        "a file no record seeded stays below every record"
+        ("Blue Heron", NickClass::Chosen, 1),
+        "the first nickname edit advances the local revision"
     );
     let by = set.by.expect("who set it");
     let me = aterm_net::fleet_member::read_node_identity(root.path())
@@ -561,7 +547,7 @@ fn nick_sets_a_chosen_nickname_raising_rev_and_keeping_the_claim() {
     assert!(nouns::NOUNS.contains(&drawn.nick.as_str()), "{drawn:?}");
     assert_eq!(
         (drawn.nick_class, drawn.rev, drawn.by.map(|by| by.kind)),
-        (NickClass::Chosen, 0, Some(ByKind::Agent))
+        (NickClass::Chosen, 2, Some(ByKind::Agent))
     );
     assert_eq!(
         (drawn.num, drawn.class, drawn.since, drawn.act),

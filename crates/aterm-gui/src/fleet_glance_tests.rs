@@ -106,7 +106,7 @@ fn a_fleet_read_parses_to_its_peers() {
         hosts.push(unanswered(&format!("mac-t{n}"), "no connection in 3 s"));
     }
     let json = format!("[{}]", hosts.join(","));
-    let snap = parse(&json, false, Some("own-node"), 1_000).expect("a survey");
+    let snap = parse(&json, Some("own-node"), 1_000).expect("a survey");
     assert_eq!(snap.macs.len() + snap.unanswered.len(), 31);
     assert_eq!(snap.unanswered.len(), 3);
     assert!(
@@ -147,9 +147,35 @@ fn a_fleet_read_parses_to_its_peers() {
     let cut = snap.macs.iter().find(|m| m.dial == "mac-cut").expect("cut");
     assert_eq!(cut.left_out, 3);
     assert_eq!(snap.agents(), 4);
-    let with_self = parse(&json, false, None, 1_000).expect("a survey");
+    let with_self = parse(&json, None, 1_000).expect("a survey");
     assert_eq!(with_self.macs.len(), snap.macs.len() + 1);
-    assert!(parse("not json", false, None, 0).is_err());
+    assert!(parse("not json", None, 0).is_err());
+}
+
+/// A PEER'S INSTANCES READ ARE ITS NODE'S WORD: a node service that read every window says so
+/// (`instances_read=`), and only instances past those go unread; a window that answered alone read
+/// itself.
+#[test]
+fn a_peers_instances_read_are_its_nodes_word() {
+    let with = |dial: &str, extra: &[(&'static str, &str)]| {
+        let mut header = header(&format!("n-{dial}"));
+        header.extend(extra.iter().map(|(k, v)| (*k, (*v).to_string())));
+        peer(dial, &pairs(&header), &[QUIET])
+    };
+    let json = format!(
+        "[{},{},{}]",
+        with("mac-all", &[("instances", "2"), ("instances_read", "2")]),
+        with("mac-some", &[("instances", "3"), ("instances_read", "2")]),
+        with("mac-one", &[("instances", "2")]),
+    );
+    let snap = parse(&json, None, 1_000).expect("a survey");
+    let read = |dial: &str| {
+        let mac = snap.macs.iter().find(|m| m.dial == dial).expect(dial);
+        (mac.instances_read, mac.instances_unread)
+    };
+    assert_eq!(read("mac-all"), (2, 0));
+    assert_eq!(read("mac-some"), (2, 1));
+    assert_eq!(read("mac-one"), (1, 1));
 }
 
 fn unproven(entry: &str) -> String {
@@ -181,13 +207,8 @@ fn an_unproven_peer_is_listed_on_its_word_alone() {
     for (marked, listed, node, host, drive, counts) in table {
         let entries = [me.clone(), studio.clone()];
         let entries = entries.map(|e| if marked { unproven(&e) } else { e });
-        let snap = parse(
-            &format!("[{}]", entries.join(",")),
-            false,
-            Some("own-node"),
-            0,
-        )
-        .expect("a survey");
+        let snap =
+            parse(&format!("[{}]", entries.join(",")), Some("own-node"), 0).expect("a survey");
         assert_eq!(snap.macs.len(), listed, "unproven={marked}: {snap:?}");
         let m = snap
             .macs
@@ -227,7 +248,7 @@ fn a_fleet_need_names_its_tab_as_a_local_one_does() {
         let mut head = header("n1");
         head[3].1 = level.to_string();
         let json = format!("[{}]", peer("mac-1", &pairs(&head), &[row.as_slice()]));
-        let snap = parse(&json, false, None, 1_000).expect("a survey");
+        let snap = parse(&json, None, 1_000).expect("a survey");
         let need = snap.macs[0].needs[0].clone();
         (need.who, need.age_ms)
     };
@@ -271,7 +292,7 @@ fn a_peers_harness_report_carries_on_and_a_direct_ask_does_not() {
         let mut head = header("n1");
         head[3].1 = level.to_string();
         let json = format!("[{}]", peer("mac-1", &pairs(&head), &[fields.as_slice()]));
-        parse(&json, false, None, 1_000).expect("a survey").macs[0].needs[0].carries_on
+        parse(&json, None, 1_000).expect("a survey").macs[0].needs[0].carries_on
     };
     for level in ["facts", "content"] {
         assert!(carries_on(level, "harness"), "{level}");
@@ -297,7 +318,7 @@ fn a_content_peer_says_what_its_need_is_and_a_freeze_dates_only_an_agent() {
         let mut head = header("n1");
         head[3].1 = level.to_string();
         let json = format!("[{}]", peer("mac-1", &pairs(&head), &[fields.as_slice()]));
-        parse(&json, false, None, 1_000).expect("a survey").macs[0].needs[0].clone()
+        parse(&json, None, 1_000).expect("a survey").macs[0].needs[0].clone()
     };
     let agent = [("program_kind", "agent")];
     let ask = [
@@ -502,7 +523,7 @@ fn a_peer_known_by_name_is_dialled_by_it() {
             unanswered("mac-22.local", "no connection in 3 s"),
         )
     };
-    let snap = parse(&at("192.168.1.17"), false, None, 0).expect("a survey");
+    let snap = parse(&at("192.168.1.17"), None, 0).expect("a survey");
     let m17 = &snap.macs[0];
     assert_eq!(
         (m17.dial.as_str(), m17.name.as_str()),
@@ -531,7 +552,7 @@ fn a_peer_known_by_name_is_dialled_by_it() {
         ),
         ("mac-22.local", "mac-22")
     );
-    let moved = parse(&at("192.168.1.40"), false, None, 0).expect("a survey");
+    let moved = parse(&at("192.168.1.40"), None, 0).expect("a survey");
     assert_eq!(
         herald_key(moved.macs[0].ident(), "s-w"),
         herald_key(m17.ident(), "s-w")
@@ -559,55 +580,6 @@ fn the_fleet_word_tells_no_fleet_from_not_read_yet() {
         ..FleetSnapshot::default()
     }));
     assert_eq!(slot.word(), "as_of:42");
-}
-
-#[test]
-fn all_no_route_is_one_line_and_one_entry() {
-    let hosts: Vec<String> = (0..4)
-        .map(|n| unanswered(&format!("mac-{n}"), "no route to 10.0.0.1:7100"))
-        .collect();
-    let snap = parse(&format!("[{}]", hosts.join(",")), true, None, 0).expect("a survey");
-    assert!(snap.no_route && snap.macs.is_empty());
-    assert_eq!(snap.unanswered.len(), 4);
-    let entry = no_route_entry();
-    entry.message().expect("an entry the digest shows");
-    assert_eq!(
-        entry.family(),
-        aterm_messages::exceptions::Family::FleetUnreadable
-    );
-    assert!(
-        entry
-            .key()
-            .starts_with(&aterm_messages::exceptions::Family::FleetUnreadable.prefix())
-    );
-}
-
-/// A read's notes blame this Mac's Local Network privacy when the survey judged a member on this
-/// network refused with none there answering (the on-link note), or, with no address to judge,
-/// every peer refused at once; a read that said where this Mac is instead blames nothing.
-/// NEGATIVE CONTROL: `privacy_refused` reading `NO_ROUTE_NOTE` alone fails "the on-link verdict
-/// blames privacy".
-#[test]
-fn a_reads_privacy_verdict_is_its_on_link_note_or_every_peer_refused() {
-    assert!(
-        privacy_refused(&format!(
-            "{}\n",
-            aterm_netplace::words::ON_LINK_PRIVACY_NOTE
-        )),
-        "the on-link verdict blames privacy"
-    );
-    assert!(privacy_refused(aterm_ctl::NO_ROUTE_NOTE));
-    let words = aterm_netplace::words::Words {
-        now_ms: 1_800_000_060_000,
-        zone: &|_| Some(0),
-    };
-    let away = aterm_netplace::words::survey_note(
-        &aterm_netplace::sample::hotspot(1_800_000_000_000, 1_800_000_000_000),
-        &words,
-    )
-    .expect("away words");
-    assert!(!privacy_refused(&away), "where this Mac is blames nothing");
-    assert!(!privacy_refused(""));
 }
 
 #[test]
@@ -803,18 +775,17 @@ fn away_a_glance_that_reached_nobody_waits_the_longest_at_once() {
         .expect("the move back reads at once");
 }
 
-/// THE GLANCE WAITS FOR THE STEP: a read dials the fleet's Macs, so while System State's Local
-/// Network step, which asks macOS first, is still to come, the glance reads nothing by itself
-/// (its tick, a menu opening); once the step asked, it reads. A person's Read the Fleet Now reads
-/// all the same.
+/// THE GLANCE WAITS FOR THE LAN BROKER: a read dials the fleet's Macs through the broker, so
+/// while the broker does not answer, the glance reads nothing by itself (its tick, a menu
+/// opening); once it answers, it reads. A person's Read the Fleet Now reads all the same.
 #[test]
-fn the_glance_reads_nothing_by_itself_while_the_local_network_step_is_to_come() {
+fn the_glance_reads_nothing_by_itself_while_the_lan_broker_does_not_answer() {
     let hang = aterm_spec::wait::MUST_HAPPEN;
-    let step_asked = Arc::new(AtomicBool::new(false));
+    let broker_answers = Arc::new(AtomicBool::new(false));
     let (runs_tx, runs) = std::sync::mpsc::channel();
     let (looks_tx, looks) = std::sync::mpsc::channel();
     let (posts_tx, _posts) = std::sync::mpsc::channel();
-    let asked = Arc::clone(&step_asked);
+    let asked = Arc::clone(&broker_answers);
     let glance = spawn(
         Box::new(Nobody { runs: runs_tx }),
         ReaderSeams {
@@ -832,23 +803,23 @@ fn the_glance_reads_nothing_by_itself_while_the_local_network_step_is_to_come() 
         for _ in 0..3 {
             looks
                 .recv_timeout(hang)
-                .expect("the reader looks at the step");
+                .expect("the reader looks for the broker");
         }
     };
     looks_three_times();
     assert!(
         runs.try_recv().is_err(),
-        "it read by itself before the step asked"
+        "it read by itself before the broker answered"
     );
     glance.kick(Kick::MenuOpening);
     looks_three_times();
     assert!(
         runs.try_recv().is_err(),
-        "a menu opening read before the step asked"
+        "a menu opening read before the broker answered"
     );
-    step_asked.store(true, Ordering::SeqCst);
+    broker_answers.store(true, Ordering::SeqCst);
     runs.recv_timeout(hang)
-        .expect("it reads once the step asked");
+        .expect("it reads once the broker answers");
 
     let (runs_tx, runs) = std::sync::mpsc::channel();
     let (posts_tx, _posts) = std::sync::mpsc::channel();
@@ -862,7 +833,7 @@ fn the_glance_reads_nothing_by_itself_while_the_local_network_step_is_to_come() 
     .expect("the thread starts");
     held.kick(Kick::Now);
     runs.recv_timeout(hang)
-        .expect("a person's Read the Fleet Now reads while the step is to come");
+        .expect("a person's Read the Fleet Now reads while the broker does not answer");
 }
 
 struct Gated {
@@ -1239,6 +1210,7 @@ fn read_slot(read_at_ms: u64, dark: bool) -> FleetSlot {
         what: None,
         claim: None,
         carries_on: false,
+        ids: Vec::new(),
     };
     FleetSlot {
         generation: 1,
@@ -1255,7 +1227,6 @@ fn read_slot(read_at_ms: u64, dark: bool) -> FleetSlot {
                 .into_iter()
                 .collect(),
             unanswered: Vec::new(),
-            no_route: dark,
         })),
         book: BookFacts {
             in_fleet: true,
@@ -1267,19 +1238,12 @@ fn read_slot(read_at_ms: u64, dark: bool) -> FleetSlot {
     }
 }
 
+/// A fleet read heralds each need of a Mac that counts once per transition, and a read that
+/// reached no Mac, or one stale or from the future, heralds nothing.
 #[test]
-fn a_fleet_read_states_its_digest_entry_and_heralds_its_needs() {
+fn a_fleet_read_heralds_its_needs() {
     let take_posts =
         || crate::app_tabs::HERALD_POSTS.with(|p| std::mem::take(&mut *p.borrow_mut()));
-    let unreadable = |app: &crate::App| {
-        let prefix = aterm_messages::exceptions::Family::FleetUnreadable.prefix();
-        app.messages
-            .digest()
-            .entries
-            .iter()
-            .filter(|e| e.key.starts_with(&prefix))
-            .count()
-    };
     let settle = |app: &mut crate::App| {
         if let Some(due) = app.messages_deadline() {
             let _ = app.settle_messages(due + Duration::from_secs(1));
@@ -1294,15 +1258,14 @@ fn a_fleet_read_states_its_digest_entry_and_heralds_its_needs() {
 
     app.fleet_glance = Some(glance_over(read_slot(now, true)));
     app.on_fleet_read();
-    assert_eq!(unreadable(&app), 1, "one entry for the whole fleet");
-    app.on_fleet_read();
-    assert_eq!(unreadable(&app), 1, "stated again, still one");
-    assert!(take_posts().is_empty(), "no route is no need");
+    assert!(
+        take_posts().is_empty(),
+        "a read that reached no Mac is no need"
+    );
 
     app.fleet_glance = Some(glance_over(read_slot(now, false)));
     app.on_fleet_read();
     settle(&mut app);
-    assert_eq!(unreadable(&app), 0, "a peer reached sweeps it");
     let posts = take_posts();
     assert_eq!(posts.len(), 1, "one notice for the fleet need");
     assert!(is_herald_key(posts[0].session));
@@ -1424,8 +1387,7 @@ fn host_words_and_herald_keys() {
 
 /// A FLEET ACT GOES THROUGH THE PLATFORM SEAMS, whose test arms open and
 /// copy nothing of the system's: Screen Sharing names `vnc://<host>`, Copy
-/// "ssh" puts the line on the (test) pasteboard, the degrade line opens the
-/// Local Network pane.
+/// "ssh" puts the line on the (test) pasteboard.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_fleet_act_goes_through_the_seams_and_no_host_gets_nothing() {
@@ -1458,11 +1420,6 @@ fn a_fleet_act_goes_through_the_seams_and_no_host_gets_nothing() {
         crate::control::pbpaste().as_deref(),
         Some("ssh mac-17.local")
     );
-    app.dispatch_status_action(StatusAction::OpenLocalNetwork);
-    assert_eq!(
-        crate::platform::take_opened_urls(),
-        vec![LOCAL_NETWORK_PANE]
-    );
     app.fleet_act(
         StatusAction::MacScreen(p),
         "x",
@@ -1493,6 +1450,7 @@ fn mac17(read_at_ms: u64, need: bool) -> FleetMac {
                 what: None,
                 claim: None,
                 carries_on: false,
+                ids: Vec::new(),
             })
             .into_iter()
             .collect(),
@@ -1516,7 +1474,6 @@ fn slot_of(read_at_ms: u64, macs: Vec<FleetMac>, unanswered: Vec<Unanswered>) ->
             read_at_ms,
             macs,
             unanswered,
-            no_route: false,
         })),
         book: BookFacts {
             in_fleet: true,
@@ -1541,7 +1498,6 @@ fn a_read_carries_a_silent_mac_while_its_rows_count() {
             ..busy.clone()
         }],
         unanswered: vec![silent("mac-17.local")],
-        no_route: false,
     };
     let first = FleetSnapshot {
         read_at_ms: t0,
@@ -1756,7 +1712,7 @@ fn a_hold_this_mac_placed_is_read_back_whatever_its_need() {
             &[&held("s-a", mine), &held("s-b", theirs), QUIET]
         )
     );
-    let snap = parse(&text, false, Some(mine), 0).expect("a survey");
+    let snap = parse(&text, Some(mine), 0).expect("a survey");
     assert_eq!(
         snap.macs[0].held_here,
         [FleetHeld {
@@ -1765,7 +1721,7 @@ fn a_hold_this_mac_placed_is_read_back_whatever_its_need() {
         }]
     );
     assert!(snap.macs[0].needs.is_empty(), "a hold is no need");
-    let blind = parse(&text, false, None, 0).expect("a survey");
+    let blind = parse(&text, None, 0).expect("a survey");
     assert!(blind.macs[0].held_here.is_empty(), "{:?}", blind.macs[0]);
 }
 
@@ -1778,7 +1734,7 @@ fn a_peer_that_says_drive_is_held_and_handed_back_over_the_fleet() {
         peer("lab-mini.local", &pairs(&head), &[QUIET]),
         peer("mac-17.local", &pairs(&header("n5")), &[QUIET])
     );
-    let snap = parse(&text, false, None, 0).expect("a survey");
+    let snap = parse(&text, None, 0).expect("a survey");
     assert_eq!(
         snap.macs.iter().map(|m| m.drive).collect::<Vec<_>>(),
         [true, false]
@@ -1806,10 +1762,9 @@ fn a_peer_that_says_drive_is_held_and_handed_back_over_the_fleet() {
     }
 }
 
-/// The glance's `lan` seam is `lan_first_use::may_use`, which, past the Local Network step's
-/// wait, goes through the door: it takes this process's dialog slot for 30 s and notes that a use
-/// asked, after which every other use follows with no door. So the glance asks it only for a read
-/// it then makes; a tick that reads nothing (its quiet pause) does not.
+/// The glance's `lan` seam is `network_moved::lan_answers`, which on macOS asks the root LAN
+/// broker for its hello, a round trip on its socket. So the glance asks it only for a read it
+/// then makes; a tick that reads nothing (its quiet pause) does not.
 /// NEGATIVE CONTROL: ask `(seams.lan)()` before `should_poll` in `reader_loop`: every tick asks.
 #[test]
 fn the_glance_asks_the_lan_door_only_for_a_read_it_makes() {

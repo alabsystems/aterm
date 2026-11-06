@@ -209,29 +209,6 @@ impl ReplyWindow {
     }
 }
 
-/// The full member set for a person's phrase: its owner may answer after another
-/// member. Automatic admission uses [`probe`] and continues only if proof fails.
-pub(crate) fn members(within: Duration) -> aterm_secrets::Result<Vec<String>> {
-    let began = Instant::now();
-    let mut direct: Vec<_> = probe(within.min(Duration::from_millis(500)))
-        .unwrap_or_default()
-        .into_iter()
-        .map(|hint| hint.address.to_string())
-        .collect();
-    match aterm_secrets::discover::browse_members(within.saturating_sub(began.elapsed())) {
-        Ok(more) => {
-            for address in more {
-                if !direct.contains(&address) {
-                    direct.push(address);
-                }
-            }
-            Ok(direct)
-        }
-        Err(_) if !direct.is_empty() => Ok(direct),
-        Err(error) => Err(error),
-    }
-}
-
 /// Owned by the fleet listener's advertiser. Drop interrupts readiness and joins
 /// the worker before the listener's ownership can be released.
 pub(crate) struct Responder {

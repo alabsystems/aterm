@@ -447,42 +447,42 @@ pub fn apply(dir: &Path, path: &Path, request: [u8; 16]) -> Result<Value> {
             account_count += 1;
         }
     }
-    let changes: Vec<_> = changes.into_values().collect();
+    let total_changes = changes.len();
+    let email_identities = changes
+        .values()
+        .filter(|c| c.collection == "email-addresses")
+        .count();
     // Plan every bounded chunk before the first mutation. A wide private note
     // becomes only a source coordinate, but many coordinates can still be large.
+    // `Command::Write` encodes as `{"changes":[...],"kind":"write","request":"<32 hex>","v":1}`,
+    // which adds 80 framing bytes around the comma-separated `Change` items.
+    const WRITE_FRAME_BYTES: usize = 80;
     let mut chunks = Vec::new();
     let mut chunk = Vec::new();
-    for change in &changes {
-        chunk.push(change.clone());
-        let candidate = Command::Write {
-            request: chunk_request(request, chunks.len() as u64),
-            changes: chunk.clone(),
-        };
-        if chunk.len() > crate::database::MAX_WRITES || candidate.encode()?.len() > crypto::MAX_BODY
-        {
-            let last = chunk
-                .pop()
-                .ok_or_else(|| Error::new("empty import chunk"))?;
-            if chunk.is_empty() {
-                return Err(Error::new(
-                    "one imported proposal exceeds transaction capacity",
-                ));
-            }
-            chunks.push(std::mem::take(&mut chunk));
-            chunk.push(last);
-            if (Command::Write {
-                request: chunk_request(request, chunks.len() as u64),
-                changes: chunk.clone(),
-            })
-            .encode()?
-            .len()
-                > crypto::MAX_BODY
-            {
-                return Err(Error::new(
-                    "one imported proposal exceeds transaction capacity",
-                ));
-            }
+    let mut chunk_bytes = WRITE_FRAME_BYTES;
+    for change in changes.into_values() {
+        let change_bytes = aterm_json::to_vec(&change)
+            .map_err(|_| Error::new("database payload could not be encoded"))?
+            .len();
+        if WRITE_FRAME_BYTES.saturating_add(change_bytes) > crypto::MAX_BODY {
+            return Err(Error::new(
+                "one imported proposal exceeds transaction capacity",
+            ));
         }
+        let added = if chunk.is_empty() {
+            change_bytes
+        } else {
+            1 + change_bytes
+        };
+        if chunk.len() >= crate::database::MAX_WRITES
+            || chunk_bytes.saturating_add(added) > crypto::MAX_BODY
+        {
+            chunks.push(std::mem::take(&mut chunk));
+            chunk_bytes = WRITE_FRAME_BYTES + change_bytes;
+        } else {
+            chunk_bytes += added;
+        }
+        chunk.push(change);
     }
     if !chunk.is_empty() {
         chunks.push(chunk);
@@ -496,7 +496,7 @@ pub fn apply(dir: &Path, path: &Path, request: [u8; 16]) -> Result<Value> {
             collection: "imports".into(),
             key: import_key.clone(),
             value: Some(
-                json!({"source_sha256":digest,"state":"importing","changes":changes.len()}),
+                json!({"source_sha256":digest,"state":"importing","changes":total_changes}),
             ),
         }],
     };
@@ -507,9 +507,9 @@ pub fn apply(dir: &Path, path: &Path, request: [u8; 16]) -> Result<Value> {
             changes: chunk,
         })?;
     }
-    db.commit(Command::Write{request:chunk_request(request,u64::MAX-1),changes:vec![Change{collection:"imports".into(),key:import_key,value:Some(json!({"source_sha256":digest,"state":"complete","changes":changes.len(),"proposals":account_count,"unclassified_cells":unresolved_cells}))}]})?;
+    db.commit(Command::Write{request:chunk_request(request,u64::MAX-1),changes:vec![Change{collection:"imports".into(),key:import_key,value:Some(json!({"source_sha256":digest,"state":"complete","changes":total_changes,"proposals":account_count,"unclassified_cells":unresolved_cells}))}]})?;
     Ok(
-        json!({"source_sha256":digest,"provider_proposals":account_count,"email_identities":changes.iter().filter(|c|c.collection=="email-addresses").count(),"unclassified_source_cells":unresolved_cells,"records_without_an_unambiguous_email":rejected,"raw_source_modified":false,"raw_unclassified_values_replicated":false,"mailbox_aliases_inferred":false,"request":hex::encode_lower(&request)}),
+        json!({"source_sha256":digest,"provider_proposals":account_count,"email_identities":email_identities,"unclassified_source_cells":unresolved_cells,"records_without_an_unambiguous_email":rejected,"raw_source_modified":false,"raw_unclassified_values_replicated":false,"mailbox_aliases_inferred":false,"request":hex::encode_lower(&request)}),
     )
 }
 fn chunk_request(request: [u8; 16], index: u64) -> [u8; 16] {

@@ -226,12 +226,12 @@ pub fn prune_staging_dirs(
     };
     let mut dirs: Vec<PathBuf> = entries
         .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         .filter(|entry| entry.file_name().to_str().is_some_and(is_staging_dir_name))
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         .map(|entry| entry.path())
         .filter(|path| path != keep)
         .collect();
-    dirs.sort();
+    dirs.sort_unstable();
     let Some(processes) = processes else {
         return dirs
             .iter()
@@ -386,7 +386,8 @@ pub fn assemble_at(spec: &BundleSpec, app: &Path) -> Result<(), String> {
     }
 
     let icns = mac_dir.join("aterm.icns");
-    let icon = icns.is_file().then_some("aterm");
+    let has_icns = std::fs::symlink_metadata(&icns).is_ok_and(|m| m.is_file());
+    let icon = has_icns.then_some("aterm");
     let template_path = mac_dir.join("Info.plist");
     let template = crate::durable::read_text(&template_path)
         .map_err(|e| format!("read {}: {e}", template_path.display()))?;
@@ -405,7 +406,7 @@ pub fn assemble_at(spec: &BundleSpec, app: &Path) -> Result<(), String> {
         spec.short_version, spec.build_number, spec.git_commit, spec.bundle_id
     );
 
-    if icns.is_file() {
+    if has_icns {
         crate::durable::copy_regular_fresh(&icns, resources.join("aterm.icns"))
             .map_err(|e| format!("copy aterm.icns: {e}"))?;
     }
@@ -415,7 +416,7 @@ pub fn assemble_at(spec: &BundleSpec, app: &Path) -> Result<(), String> {
         .map_err(|e| format!("copy {}: {e}", credits.display()))?;
 
     let help = mac_dir.join("Help.html");
-    if help.is_file() {
+    if std::fs::symlink_metadata(&help).is_ok_and(|m| m.is_file()) {
         crate::durable::copy_regular_fresh(&help, resources.join("Help.html"))
             .map_err(|e| format!("copy Help.html: {e}"))?;
         println!("    bundled Help.html");

@@ -108,7 +108,7 @@ impl AtomicRefBatch {
                 return Err(Error::usage("an atomic ref update cannot delete a ref"));
             }
         }
-        updates.sort_by(|a, b| a.reference.cmp(&b.reference));
+        updates.sort_unstable_by(|a, b| a.reference.cmp(&b.reference));
         Ok(Self { updates })
     }
 

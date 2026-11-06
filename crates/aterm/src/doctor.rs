@@ -513,13 +513,13 @@ fn converge<'a>(
         None => Vec::new(),
     };
     laps.lap("packages");
-    let ran_ids: Vec<&str> = fact_rows
+    let ran_ids: std::collections::HashSet<&str> = fact_rows
         .iter()
         .chain(&repair_rows)
         .map(|row| row.id.as_str())
         .collect();
     packages.retain(|row| {
-        !ran_ids.contains(&row.id.as_str())
+        !ran_ids.contains(row.id.as_str())
             && (tokens.is_empty() || tokens.iter().any(|token| named_by(token, row)))
     });
     if matches!(how, How::LeftToPass(_)) {
@@ -599,13 +599,12 @@ fn converge<'a>(
     );
     if args.json {
         let rows: Vec<ItemReport> = fact_rows
-            .iter()
-            .chain(&repair_rows)
-            .chain(&docs_rows)
-            .chain(&develop_rows)
-            .chain(&packages)
-            .chain(&refused)
-            .cloned()
+            .into_iter()
+            .chain(repair_rows)
+            .chain(docs_rows)
+            .chain(develop_rows)
+            .chain(packages)
+            .chain(refused)
             .collect();
         let mode = if mode == Mode::Plan {
             ReportMode::Check
@@ -616,12 +615,15 @@ fn converge<'a>(
         report.readiness = Some(readiness);
         report.phases = laps.phases();
         return match aterm_json::to_string(&report) {
-            Ok(text) => Ran {
-                text: format!("{text}\n"),
-                code,
-                stdout: true,
-                hand_over: None,
-            },
+            Ok(mut text) => {
+                text.push('\n');
+                Ran {
+                    text,
+                    code,
+                    stdout: true,
+                    hand_over: None,
+                }
+            }
             Err(why) => Ran {
                 text: format!("aterm doctor: cannot encode the report: {why}\n"),
                 code: 70,
@@ -739,6 +741,8 @@ fn brief_rows<'r>(
         How::StoodAside(line) | How::HeldBack(line) => Some(line.as_str()),
         How::LeftToPass(_) | How::Applied | How::Planned => None,
     };
+    let unresolved: std::collections::HashSet<&str> =
+        readiness.unresolved.iter().map(String::as_str).collect();
     let mut shown = Vec::new();
     let mut changes = Vec::new();
     for (label, rows) in sections {
@@ -750,7 +754,7 @@ fn brief_rows<'r>(
                 }
                 continue;
             }
-            if !readiness.unresolved.contains(&row.id) {
+            if !unresolved.contains(row.id.as_str()) {
                 continue;
             }
             let why = row.why.as_deref().unwrap_or("not done");
@@ -1227,7 +1231,7 @@ impl Item for AgentPrimerItem {
                 why: "$HOME is unknown, so no coding agent's folder can be found".to_owned(),
             };
         };
-        let pending = (self.pending)(home);
+        let mut pending = (self.pending)(home);
         if pending.detected.is_empty() {
             return Probe::NotApplicable {
                 why: format!(
@@ -1246,16 +1250,13 @@ impl Item for AgentPrimerItem {
             (true, false) => Probe::Blocked {
                 why: pending.errors.join("; "),
             },
-            (false, _) => Probe::Change {
-                from: pending
-                    .due
-                    .iter()
-                    .chain(&pending.errors)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                to: format!("this aterm's primer and skills for {agents}"),
-            },
+            (false, _) => {
+                pending.due.extend(pending.errors);
+                Probe::Change {
+                    from: pending.due.join(", "),
+                    to: format!("this aterm's primer and skills for {agents}"),
+                }
+            }
         }
     }
 
@@ -1476,18 +1477,19 @@ fn ai_accounts_claude_probe(env: &aterm_agent::harness::cli::Env) -> aterm_conve
         Err(why) => return Probe::Unusable { why },
     }
     let store = env.accounts_store();
-    let fleet_path = roster_path
-        .parent()
-        .map(|p| p.join(FLEET_ROSTER_FILE))
-        .unwrap_or_default();
-    let config_path = roster_path
-        .parent()
-        .map(|p| p.join("aterm.toml"))
-        .unwrap_or_else(|| std::path::PathBuf::from("aterm.toml"));
     if let Ok(raw) = accounts::Roster::load(&roster_path)
         && !raw.rows.is_empty()
-        && fleet_path.is_file()
-        && configured_source(Some(&config_path), Some(&roster_path)).is_some()
+        && roster_path.parent().is_some_and(|parent| {
+            std::fs::symlink_metadata(parent.join(FLEET_ROSTER_FILE))
+                .is_ok_and(|meta| meta.is_file())
+        })
+        && {
+            let config_path = roster_path
+                .parent()
+                .map(|p| p.join("aterm.toml"))
+                .unwrap_or_else(|| std::path::PathBuf::from("aterm.toml"));
+            configured_source(Some(&config_path), Some(&roster_path)).is_some()
+        }
         && !needs_init_accounts_sync(home, &env.state, &roster_path, env.now)
     {
         let (bound, state) = match store
@@ -1538,7 +1540,7 @@ fn ai_accounts_claude_probe(env: &aterm_agent::harness::cli::Env) -> aterm_conve
 /// runs ([`crate::converge::mac_name_label`]), so the one password also aligns the Mac's
 /// own names. On a Mac that has the tools it still asks for that password where the
 /// elevation's other root steps are owed ([`aterm_machines::root_steps::owed_here`]: developer
-/// mode, the rule that names the Mac after admission).
+/// mode, the rule that names the Mac after admission, the LAN broker).
 /// `None` when this executable cannot name itself.
 #[cfg(target_os = "macos")]
 fn command_line_tools() -> Option<aterm_machines::init_clt::CommandLineTools> {

@@ -24,12 +24,7 @@ clean {
          "presence::drive::refresh_session", "presence::drive::refresh_window",
          "presence::drive::refresh_all", "presence::drive::human_acted_on",
          "presence::drive::deadline", "presence::drive::tick",
-         "presence::drive::chrome_line", "presence::drive::status_tail",
-         "presence::drive::tell",
-         -- `Desk`'s provided `next_need_after`, which the pill's `+N` runs
-         -- at `&App` (`App::on_pill_act`): it reads the table through
-         -- `Desk`'s getters and is handed no `&mut`.
-         "presence::drive::Desk::next_need_after",
+         "presence::drive::status_tail", "presence::drive::tell",
          -- An `unsafe impl` of another crate's trait, other than an auto
          -- trait (`Send`, `Sync`), is the crate's word to that crate's
          -- `unsafe` code, whatever it is for, so each seal answers for it. This one is `aterm_objc`'s: the window's Objective-C

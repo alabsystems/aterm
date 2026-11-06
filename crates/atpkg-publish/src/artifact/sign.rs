@@ -171,12 +171,29 @@ pub fn sig_path(doc: &Path) -> PathBuf {
 /// Sign `bytes` with `key` and verify the pair under `authority` with the client's rule.
 ///
 /// # Errors
-/// The client's refusal (this machine is not on the roster, or is revoked).
+/// The client's refusal (this machine is not on the roster, or is revoked), or a
+/// source-derived reference without the native admission performed by [`sign_all`].
 pub fn sign_checked(
     key: &MachineKey,
     bytes: &[u8],
     authority: &Authority,
 ) -> Result<(Vec<u8>, atpkg::PkgManifest)> {
+    sign_with_reference(key, bytes, authority, None)
+}
+
+fn sign_with_reference(
+    key: &MachineKey,
+    bytes: &[u8],
+    authority: &Authority,
+    reference: Option<&super::bottle::reference::qualification::Permit>,
+) -> Result<(Vec<u8>, atpkg::PkgManifest)> {
+    if super::bottle::reference::qualification::is_reference(bytes)?
+        && !reference.is_some_and(|permit| permit.matches(bytes))
+    {
+        return Err(Error::refused(
+            "source-derived reference signing requires native qualification of these exact manifest bytes; use sign with the archive and native receipts beside the manifest",
+        ));
+    }
     let sig = key.sign(bytes)?;
     let parsed = authority.verify_pkg(bytes, &sig)?;
     Ok((sig, parsed))
@@ -260,17 +277,24 @@ pub fn check_signable(parsed: &atpkg::PkgManifest) -> Result<()> {
 /// Sign every manifest named — the ceremony ([`authority`]).
 ///
 /// # Errors
-/// The first manifest refused; the ones before it stay signed, and the refused one's
-/// directory is left as it was.
+/// Input/native preflight failures write no signatures. A later signing or lineage
+/// failure leaves the signatures already written for preceding manifests.
 pub fn sign_all(ctx: &Ctx, pkgs: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    // Retain the exact preflighted bytes through signing. Source-derived references
+    // must finish native admission before the key is opened, without a second read.
+    let mut prepared = Vec::new();
+    for pkg in pkgs {
+        let bytes = crate::identity::read_regular_bytes(pkg, crate::identity::MAX_META_BYTES)
+            .map_err(|e| Error::io(format!("read {}", ctx.shown(pkg)), &e))?;
+        let reference = super::bottle::reference::qualification::require(pkg, &bytes)?;
+        prepared.push((pkg, bytes, reference));
+    }
     let key = MachineKey::load(ctx, &ctx.identity.key)?;
     let authority = authority(ctx)?;
     let mut sigs = Vec::new();
-    for pkg in pkgs {
+    for (pkg, bytes, reference) in prepared {
         let shown = ctx.shown(pkg);
-        let bytes = crate::identity::read_regular_bytes(pkg, crate::identity::MAX_META_BYTES)
-            .map_err(|e| Error::io(format!("read {shown}"), &e))?;
-        let (sig, parsed) = sign_checked(&key, &bytes, &authority)
+        let (sig, parsed) = sign_with_reference(&key, &bytes, &authority, reference.as_ref())
             .map_err(|e| Error::refused(format!("{shown}: {e}")))?;
         check_signable(&parsed).map_err(|e| Error::refused(format!("{shown}: {e}")))?;
         if has_unproven_row(&parsed) {

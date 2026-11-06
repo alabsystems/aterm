@@ -191,7 +191,7 @@ pub fn sha256_and_size(path: &Path) -> Result<(String, u64), String> {
     let (mut f, meta) = crate::durable::open_regular_file_with_meta(path)
         .map_err(|e| format!("open {}: {e}", path.display()))?;
     let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 1 << 20];
+    let mut buf = [0u8; 64 * 1024];
     loop {
         let n = f
             .read(&mut buf)

@@ -50,8 +50,9 @@ pub use damage::{
 #[cfg(any(test, debug_assertions))]
 pub use extra::is_combining_mark;
 pub use extra::{
-    CellCoord, CellExtra, CellExtras, ImageData, ImageFormat, ImageRef, ImageScaling,
-    KittyPlacementTag, MAX_IMAGE_LAYERS, SourceRect, UniformExtras, underline_color_sgr,
+    CellCoord, CellExtra, CellExtras, HyperlinkData, ImageData, ImageFormat, ImageRef,
+    ImageScaling, KittyPlacementTag, MAX_IMAGE_LAYERS, SourceRect, UniformExtras,
+    underline_color_sgr,
 };
 pub use page::PageStore;
 pub use row::{LineSize, Row, RowFlags};

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Pure state and deadline model for acaffeine wake assertions.
+//! Pure state and deadline model for acaffeine wake assertions, and what the mug holds for a
+//! mode that is on given the lid and the system's sleep ([`hold`]).
 //!
 //! A timed mode's deadline is on the boot clock ([`Clocks::since_boot`]), which counts time
 //! asleep and which no change of the date or time moves, so a span lasts what it was set for
@@ -213,6 +214,87 @@ impl Mode {
             Self::Forever => Some(Choice::Forever),
             Self::Until { span, .. } => Choice::from_span(Some(span)),
         }
+    }
+}
+
+/// What the machine is doing, as the mug reads it before it decides what to hold ([`hold`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Machine {
+    /// The lid is closed (the power manager's `AppleClamshellState`); a Mac with no lid reads
+    /// open.
+    pub lid_closed: bool,
+    /// The Mac is in a dark wake: awake without graphics, as macOS wakes one with its lid closed
+    /// for moments at a time.
+    pub dark_wake: bool,
+    /// The system announced it will sleep, and no wake has come since.
+    pub going_to_sleep: bool,
+}
+
+/// Why a mode that is on holds nothing ([`Hold::Paused`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pause {
+    /// The lid is closed, and the person did not ask to keep the Mac awake with it closed.
+    LidClosed,
+    /// The Mac is going to sleep, or is in a dark wake: macOS chose to sleep it (the lid's
+    /// close on battery, Apple menu > Sleep, a thermal emergency), which no hold argues with,
+    /// Keep Awake with Lid Closed included.
+    Asleep,
+}
+
+/// What the mug holds ([`hold`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hold {
+    /// Nothing: the mode is off.
+    Off,
+    /// Nothing, the mode staying on: it holds again once the pause ends (the lid opens, the Mac
+    /// wakes fully), unless its span ended meanwhile.
+    Paused(Pause),
+    /// The activity: no idle sleep of the system or the display (`PreventUserIdleSystemSleep`,
+    /// `PreventUserIdleDisplaySleep`).
+    Idle,
+    /// The activity and a `PreventSystemSleep` assertion, which keeps the Mac running with its
+    /// lid closed while it is on AC power (macOS does not honour it on battery).
+    LidClosedToo,
+}
+
+impl Hold {
+    /// Whether the keep-awake activity is held.
+    #[inline]
+    #[must_use]
+    pub const fn activity(self) -> bool {
+        matches!(self, Self::Idle | Self::LidClosedToo)
+    }
+
+    /// Whether the `PreventSystemSleep` assertion is held.
+    #[inline]
+    #[must_use]
+    pub const fn system(self) -> bool {
+        matches!(self, Self::LidClosedToo)
+    }
+}
+
+/// What the mug holds for a mode that is `on`, with Keep Awake with Lid Closed `lid_awake`, on
+/// `machine`. A going-to-sleep or a dark wake holds nothing whatever was chosen, so macOS's own
+/// sleep (the lid's close on battery, where `PreventSystemSleep` is not honoured, or a thermal
+/// emergency) is never argued with: a Mac the opt-in keeps running lid-closed on AC power never
+/// slept, so it is in a full wake, and a dark wake means macOS already slept it, which a hold
+/// taken again would only stretch into a DarkWake loop. Otherwise the person's opt-in holds both
+/// assertions, lid open or closed: the system assertion must already be held when the lid
+/// closes, since macOS sleeps at the close. Without it, a closed lid pauses the hold, and an
+/// open lid in a full wake holds the activity alone.
+#[inline]
+#[must_use]
+pub const fn hold(on: bool, lid_awake: bool, machine: Machine) -> Hold {
+    if !on {
+        Hold::Off
+    } else if machine.going_to_sleep || machine.dark_wake {
+        Hold::Paused(Pause::Asleep)
+    } else if lid_awake {
+        Hold::LidClosedToo
+    } else if machine.lid_closed {
+        Hold::Paused(Pause::LidClosed)
+    } else {
+        Hold::Idle
     }
 }
 
@@ -458,6 +540,92 @@ mod tests {
         assert_eq!(describe_left(HOUR), "1 h");
         assert_eq!(describe_left(7 * HOUR + 12 * 60 + 59), "7 h 12 min");
         assert_eq!(describe_left(24 * HOUR), "24 h");
+    }
+
+    /// Every reading of the machine, with and without the lid option, and the hold each one
+    /// gets for a mode that is on; an off mode holds nothing on any.
+    fn every_machine() -> impl Iterator<Item = Machine> {
+        (0..8u8).map(|bits| Machine {
+            lid_closed: bits & 1 != 0,
+            dark_wake: bits & 2 != 0,
+            going_to_sleep: bits & 4 != 0,
+        })
+    }
+
+    /// By default a closed lid holds nothing, the mode staying on, and an open lid in a full
+    /// wake holds the activity alone: no reading holds the system assertion.
+    #[test]
+    fn by_default_a_closed_lid_holds_nothing() {
+        for machine in every_machine() {
+            let held = hold(true, false, machine);
+            assert!(!held.system(), "{machine:?}");
+            let want = if machine.going_to_sleep || machine.dark_wake {
+                Hold::Paused(Pause::Asleep)
+            } else if machine.lid_closed {
+                Hold::Paused(Pause::LidClosed)
+            } else {
+                Hold::Idle
+            };
+            assert_eq!(held, want, "{machine:?}");
+            assert_eq!(held.activity(), want == Hold::Idle, "{machine:?}");
+        }
+    }
+
+    /// The opt-in holds both assertions, lid open or closed, and lets go of both once the
+    /// system announces its sleep or the Mac is in a dark wake: a lid-closed Mac on battery,
+    /// which macOS slept despite `PreventSystemSleep`, is not held through its dark wakes.
+    /// NEGATIVE CONTROL: `hold` with its `machine.dark_wake` term removed answers
+    /// `LidClosedToo` for a dark wake, which the first assertion refuses.
+    #[test]
+    fn the_opt_in_holds_both_until_macos_sleeps_anyway() {
+        for machine in every_machine() {
+            let held = hold(true, true, machine);
+            if machine.going_to_sleep || machine.dark_wake {
+                assert_eq!(held, Hold::Paused(Pause::Asleep), "{machine:?}");
+                assert!(!held.activity() && !held.system());
+            } else {
+                assert_eq!(held, Hold::LidClosedToo, "{machine:?}");
+                assert!(held.activity() && held.system());
+            }
+        }
+    }
+
+    /// An off mode holds nothing, whatever the lid and the option.
+    #[test]
+    fn an_off_mode_holds_nothing_anywhere() {
+        for machine in every_machine() {
+            for lid_awake in [false, true] {
+                assert_eq!(hold(false, lid_awake, machine), Hold::Off, "{machine:?}");
+            }
+        }
+    }
+
+    /// The lid's close pauses the hold and its open resumes it while the mode is still on: the
+    /// pause is no change of the mode, and a span that ended during it holds nothing after.
+    /// NEGATIVE CONTROL: `hold` with its `machine.lid_closed` arm removed answers `Idle` for
+    /// the closed lid, which the first assertion refuses.
+    #[test]
+    fn a_closed_lid_pauses_the_mode_and_an_open_one_resumes_it() {
+        let closed = Machine {
+            lid_closed: true,
+            ..Machine::default()
+        };
+        let open = Machine::default();
+        let mode = Mode::chosen(Choice::Hours8, NOW);
+        let during = NOW + HOUR;
+        assert_eq!(
+            hold(mode.is_on(during), false, closed),
+            Hold::Paused(Pause::LidClosed)
+        );
+        assert_eq!(
+            mode.settled(during),
+            mode,
+            "the pause leaves the mode as it was"
+        );
+        assert_eq!(hold(mode.is_on(during + 60), false, open), Hold::Idle);
+        let after = NOW + 9 * HOUR;
+        assert_eq!(hold(mode.is_on(after), false, open), Hold::Off);
+        assert_eq!(hold(Mode::Forever.is_on(after), false, open), Hold::Idle);
     }
 
     #[test]

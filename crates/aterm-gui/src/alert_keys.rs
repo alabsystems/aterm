@@ -333,7 +333,7 @@ mod macos {
         parent: Option<&Obj>,
         accept: &Obj,
         cancel: &Obj,
-        field: Option<&Obj>,
+        fields: &[Obj],
         mtm: MainThread,
     ) -> Id {
         let attached = confirmation_owns_event(event, panel.id(), parent.map(Obj::id), mtm);
@@ -359,9 +359,8 @@ mod macos {
         let posted = reaches && unsafe { posted_key(event) };
         if attached
             && !posted
-            && let Some(field) = field
             && let Some(edit) = field_edit(modifier_flags, chars.as_deref())
-            && edit_field(field, edit)
+            && fields.iter().any(|field| edit_field(field, edit))
         {
             return Id::NIL;
         }
@@ -393,19 +392,20 @@ mod macos {
         accept: Obj,
         cancel: Obj,
     ) -> Option<ConfirmKeyWatch> {
-        watch(panel, parent, accept, cancel, None)
+        watch(panel, parent, accept, cancel, Vec::new())
     }
 
-    /// [`watch_alert_keys`] for an app-modal alert whose accessory is the text field `field`: the
-    /// person's ⌘X, ⌘C, ⌘V and ⌘A edit the field ([`field_edit`]) rather than reaching aterm's
-    /// Edit menu, and a key a control client posted still types nothing.
+    /// [`watch_alert_keys`] for an app-modal alert whose accessory holds the text fields
+    /// `fields`: the person's ⌘X, ⌘C, ⌘V and ⌘A edit the one being edited ([`field_edit`])
+    /// rather than reaching aterm's Edit menu, and a key a control client posted still types
+    /// nothing.
     pub(crate) fn watch_field_alert_keys(
         panel: Obj,
-        field: Obj,
+        fields: Vec<Obj>,
         accept: Obj,
         cancel: Obj,
     ) -> Option<ConfirmKeyWatch> {
-        watch(panel, None, accept, cancel, Some(field))
+        watch(panel, None, accept, cancel, fields)
     }
 
     fn watch(
@@ -413,7 +413,7 @@ mod macos {
         parent: Option<Obj>,
         accept: Obj,
         cancel: Obj,
-        field: Option<Obj>,
+        fields: Vec<Obj>,
     ) -> Option<ConfirmKeyWatch> {
         let handler = move |event: Id| -> Id {
             let pass_through = event;
@@ -430,7 +430,7 @@ mod macos {
                     parent.as_ref(),
                     &accept,
                     &cancel,
-                    field.as_ref(),
+                    &fields,
                     mtm,
                 )
             }) {

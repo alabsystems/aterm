@@ -1206,6 +1206,131 @@ fn deck_owner_compare_gallery() {
     assert_eq!(steam, 8);
 }
 
+/// The busy scene with Memory's footprints larger than the scopes around them, aterm's 4 GiB
+/// past this Mac's used memory and this tab's 1 GiB past aterm's, for a person to read beside
+/// `docs/DESIGN-stats-deck-units-2026-11-04.md` §4.6: the deck, whose fills stop at the one
+/// around them, Folded at the owner's 1039 pt and at 1440 pt in both themes, under Increase
+/// Contrast and Differentiate Without Color, and Full; and the Memory lens, which says the
+/// footprints in words after their figures, at 1024 and 526 pt, in Biggest now's one line and,
+/// where processes' footprints are read, its list's heading.
+#[test]
+fn deck_footprints_gallery() {
+    use crate::stats_lens::{Lens, LensGeom, Opened, lens_paint};
+    let (dir, _gallery) = crate::scripted_redraw_fixture::gallery_directory("ATERM_DECK_GALLERY");
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    let mut snap = owner_scene(Owner::Busy);
+    let mem = &mut snap.resources[Resource::Memory.index()];
+    let used = mem.now.expect("the busy scene reads memory");
+    mem.aterm.now = Some(used + 4.0 * GIB);
+    mem.tabs = vec![(
+        FRONT,
+        ScopeFig {
+            now: Some(used + 5.0 * GIB),
+            ..ScopeFig::default()
+        },
+    )];
+    let png = |prims: &[DrawPrim], w: f32, h: f32, ground: [u8; 4]| {
+        let (rgba, pw, ph) =
+            crate::tray_raster::rasterize_tray(prims, w as u32, h as u32, 1.0, ground);
+        crate::app_introspect::encode_rgba8_png(&rgba, pw, ph).expect("the frame encodes")
+    };
+    let looks = |variant: &str| {
+        let mut input = owner_input(&snap);
+        match variant {
+            "light" => input.inks = light_inks(),
+            "contrast" => input.contrast = true,
+            "dwc" => input.dwc = true,
+            _ => {}
+        }
+        input
+    };
+    let mut written = 0;
+    for (form, w, variant) in [
+        (DeckForm::Folded, OWNER_W, "dark"),
+        (DeckForm::Folded, OWNER_W, "light"),
+        (DeckForm::Folded, 1440.0, "dark"),
+        (DeckForm::Folded, 1440.0, "light"),
+        (DeckForm::Folded, OWNER_W, "contrast"),
+        (DeckForm::Folded, OWNER_W, "dwc"),
+        (DeckForm::Full, OWNER_W, "dark"),
+    ] {
+        let input = DeckInput {
+            form,
+            ..looks(variant)
+        };
+        let g = owner_geom_at(form, w, 2.0);
+        let (prims, _) = deck_paint(&g, &input);
+        let name = if form == DeckForm::Full {
+            "full"
+        } else {
+            "folded"
+        };
+        let file = dir.join(format!("footprints_{name}_{w}pt_2x_{variant}.png"));
+        std::fs::write(&file, png(&prims, g.w, g.h, [0; 4])).expect("the PNG writes");
+        written += 1;
+    }
+    for (lw, variant) in [
+        (1024.0_f32, "dark"),
+        (1024.0, "light"),
+        (1024.0, "contrast"),
+        (1024.0, "dwc"),
+        (526.0, "dark"),
+    ] {
+        let s = 2.0_f32;
+        let margin = (6.0 * s).round();
+        let lg = LensGeom {
+            dx: 0,
+            dy: 0,
+            w: lw * s + 2.0 * margin,
+            h: 250.0 * s + 2.0 * margin,
+            margin,
+            scale: s,
+            font_px: 13.0 * s,
+        };
+        let lens = Lens {
+            focus: Instrument::Memory,
+            bar: Bar::Global,
+            how: Opened::Pinned,
+        };
+        let ground = if variant == "light" {
+            [0xF5, 0xF5, 0xF5, 0xFF]
+        } else {
+            [0x1E, 0x1E, 0x1E, 0xFF]
+        };
+        let prims = lens_paint(&lg, &looks(variant), &lens);
+        let file = dir.join(format!("footprints_lens_memory_{lw}x250_2x_{variant}.png"));
+        std::fs::write(&file, png(&prims, lg.w, lg.h, ground)).expect("the PNG writes");
+        written += 1;
+        // Where processes' footprints are read, as on a live Mac, Biggest now lists them and its
+        // heading carries the scopes' figures and the words.
+        if variant == "dark" {
+            use aterm_vitals::model::{ProcScope, TopProc};
+            let mut listed = snap.clone();
+            listed.top = [
+                ("rustc", 21.0, ProcScope::Tab(FRONT)),
+                ("cargo", 0.4, ProcScope::Tab(FRONT)),
+                ("aterm", 1.2, ProcScope::Aterm),
+                ("WindowServer", 0.6, ProcScope::Other),
+            ]
+            .into_iter()
+            .map(|(name, gib, scope)| TopProc {
+                name: name.into(),
+                cores: 1.0,
+                footprint: Some((gib * GIB) as u64),
+                scope,
+            })
+            .collect();
+            let prims = lens_paint(&lg, &owner_input(&listed), &lens);
+            let file = dir.join(format!(
+                "footprints_lens_memory_listed_{lw}x250_2x_dark.png"
+            ));
+            std::fs::write(&file, png(&prims, lg.w, lg.h, ground)).expect("the PNG writes");
+            written += 1;
+        }
+    }
+    assert_eq!(written, 14);
+}
+
 /// The steam clock the gallery draws its frames at, ms.
 const GALLERY_STEAM_MS: i64 = 12_000;
 

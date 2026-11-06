@@ -499,21 +499,13 @@ pub(super) fn files(paths: &Paths) -> [PathBuf; 4] {
 }
 
 /// The enrollment claim as it stands: `None` with none, or whether it is ready.
-fn claim_ready(paths: &Paths) -> Result<Option<bool>> {
+pub(super) fn claim_ready(paths: &Paths) -> Result<Option<bool>> {
     match fsx::read_private(&claim(paths), PENDING.len())? {
         Some(bytes) if bytes.as_slice() == PENDING => Ok(Some(false)),
         Some(bytes) if bytes.as_slice() == READY || bytes.as_slice() == ANCHOR => Ok(Some(true)),
         Some(_) => Err(Error::new("invalid retained membership enrollment")),
         None => Ok(None),
     }
-}
-
-fn established(paths: &Paths) -> Result<bool> {
-    Ok(claim_ready(paths)?.is_some())
-}
-
-fn ready(paths: &Paths) -> Result<bool> {
-    Ok(claim_ready(paths)? == Some(true))
 }
 
 /// What one read of the enrollment claim, and of the journal it establishes, found.
@@ -538,8 +530,9 @@ impl Enrollment {
     }
 }
 
-pub(super) fn read_enrollment(paths: &Paths) -> Result<Enrollment> {
-    let Some(ready) = claim_ready(paths)? else {
+pub(super) fn read_enrollment(reads: &Reads<'_>) -> Result<Enrollment> {
+    let paths = reads.paths();
+    let Some(ready) = reads.claim()? else {
         if fsx::kind(&journal_file(paths, "anchor"))? != fsx::Kind::Missing {
             return Err(Error::new(
                 "retained membership enrollment needs exclusive recovery",
@@ -569,7 +562,9 @@ fn read(paths: &Paths) -> Result<Arc<History>> {
 }
 
 fn read_history(paths: &Paths, allow_pending: bool) -> Result<Arc<History>> {
-    read_enrollment(paths)?.history(allow_pending).cloned()
+    read_enrollment(&Reads::new(paths))?
+        .history(allow_pending)
+        .cloned()
 }
 
 /// Exact-root custody also constrains raw recovery, so a competing genesis cannot displace
@@ -654,14 +649,17 @@ pub(super) fn version(paths: &Paths) -> Result<[u8; 32]> {
 
 /// Complete a first enrollment interrupted after its journal anchor was made durable but
 /// before the independent claim. No receipt can precede the claim in the writer protocol.
-pub(super) fn recover_enrollment(paths: &Paths) -> Result<()> {
-    let enrolled = established(paths)?;
-    if ready(paths)? {
-        let _ = read_history(paths, true)?;
-        return Ok(());
+/// Whether it wrote, which ends `reads`.
+pub(super) fn recover_enrollment(reads: &Reads<'_>) -> Result<bool> {
+    let paths = reads.paths();
+    let claim = reads.claim()?;
+    if claim == Some(true) {
+        reads.enrollment()?;
+        return Ok(false);
     }
+    let enrolled = claim.is_some();
     if !enrolled && fsx::kind(&journal_file(paths, "anchor"))? == fsx::Kind::Missing {
-        return Ok(());
+        return Ok(false);
     }
     let mut journal = aterm_journal::Log::open(&paths.dir, NAME, ANCHOR, true, limits())?;
     let history = replay(&journal)?;
@@ -673,7 +671,7 @@ pub(super) fn recover_enrollment(paths: &Paths) -> Result<()> {
     journal.finish_open()?;
     let marker = if history.0.is_empty() { PENDING } else { READY };
     aterm_journal::write_private_durable(&paths.dir, "records.frontiers", marker)?;
-    Ok(())
+    Ok(true)
 }
 
 fn replay(journal: &aterm_journal::Log) -> Result<Arc<History>> {
@@ -707,24 +705,31 @@ fn replay_uncached(journal: &aterm_journal::Log) -> Result<History> {
     )
 )]
 pub(super) fn acknowledge(paths: &Paths, store: &Store) -> Result<()> {
-    let Some(config) = super::config(paths)? else {
+    let reads = Reads::new(paths);
+    let Some(config) = reads.config()? else {
         return Ok(());
     };
-    acknowledge_selected(paths, store, &config, false)
+    acknowledge_selected(&reads, store, config, false)
+}
+
+/// [`acknowledge`] of `store` under `reads`, which holds what it needs of a state lock's recovery
+/// and is left behind if a receipt is due.
+pub(super) fn acknowledge_under(reads: &Reads<'_>, store: &Store, config: &Config) -> Result<()> {
+    acknowledge_selected(reads, store, config, false)
 }
 
 /// An exclusive caller may supply a configuration authenticated by an explicit replacement
 /// envelope before publishing that configuration or materializing its values.
 pub(super) fn acknowledge_replacement(paths: &Paths, store: &Store, config: &Config) -> Result<()> {
-    acknowledge_selected(paths, store, config, true)
+    acknowledge_selected(&Reads::new(paths), store, config, true)
 }
 
 pub(super) fn acknowledge_for(paths: &Paths, store: &Store, config: &Config) -> Result<()> {
-    acknowledge_selected(paths, store, config, false)
+    acknowledge_selected(&Reads::new(paths), store, config, false)
 }
 
 fn acknowledge_selected(
-    paths: &Paths,
+    reads: &Reads<'_>,
     store: &Store,
     config: &Config,
     replacement: bool,
@@ -735,16 +740,14 @@ fn acknowledge_selected(
     if !eligible(config) {
         return Ok(());
     }
-    let enrolled = established(paths)?;
+    let paths = reads.paths();
+    let enrolled = reads.claim()?.is_some();
     let before = if enrolled {
-        read_history(paths, true)?
+        reads.enrollment()?.history(true)?.clone()
     } else {
         Arc::new(History::default())
     };
-    if before
-        .plan(&Reads::new(paths), config, log, replacement)?
-        .is_none()
-    {
+    if before.plan(reads, config, log, replacement)?.is_none() {
         return Ok(());
     }
     // Opening completes a previous uncertain append, so its plan reads the files afterwards.
@@ -761,7 +764,7 @@ fn acknowledge_selected(
         aterm_journal::write_private_durable(&paths.dir, "records.frontiers", PENDING)?;
     }
     journal.append(SUBJECT, bytes)?;
-    if !history.0.is_empty() && !ready(paths)? {
+    if !history.0.is_empty() && claim_ready(paths)? != Some(true) {
         aterm_journal::write_private_durable(&paths.dir, "records.frontiers", READY)?;
     }
     Ok(())
@@ -1080,7 +1083,7 @@ mod tests {
                 );
             } else {
                 drop(repaired.unwrap());
-                assert!(ready(&paths).unwrap());
+                assert_eq!(claim_ready(&paths).unwrap(), Some(true));
                 assert!(project_store(&Reads::new(&paths), &config, source.clone()).is_ok());
                 // A crash after the first delta but before its ready marker can finish locally.
                 fsx::write_atomic(&claim(&paths), PENDING, 0o600).unwrap();
@@ -1092,11 +1095,44 @@ mod tests {
         fixture.server.stop();
     }
 
+    /// A take that finishes an enrollment a crash left before its claim goes on from the claim it
+    /// wrote, not from what it read before writing it.
+    ///
+    /// NEGATIVE CONTROL (2026-11-05): with `StateLock::recovered` going on under the [`Reads`] it
+    /// began with, the take fails (`retained membership enrollment needs exclusive recovery`).
+    #[test]
+    fn a_take_goes_on_from_the_enrollment_claim_it_wrote() {
+        let _answering = crate::client::ServersAnswering::set();
+        let fixture = crate::client::log_entries_tests::two_macs(&[]);
+        let source = crate::client::load_records(&fixture.m7).unwrap();
+        let config = crate::client::configured(&fixture.m7).unwrap();
+        fixture.server.stop();
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::for_home(scratch.path());
+        fsx::ensure_private_dir(&paths.dir).unwrap();
+        crate::client::save_config(&paths, &config).unwrap();
+        fsx::write_atomic(&paths.records_file(), &source.encode(), 0o600).unwrap();
+        let mut journal =
+            aterm_journal::Log::open(&paths.dir, NAME, ANCHOR, false, limits()).unwrap();
+        journal.finish_open().unwrap();
+        drop(journal);
+        assert_eq!(
+            claim_ready(&paths).unwrap(),
+            None,
+            "the crash left no claim"
+        );
+
+        drop(crate::client::StateLock::take(&paths).unwrap());
+
+        assert_eq!(claim_ready(&paths).unwrap(), Some(true));
+        assert!(project_store(&Reads::new(&paths), &config, source).is_ok());
+    }
+
     #[test]
     fn switching_vaults_retains_each_genesis_without_reusing_its_frontier() {
         let _answering = crate::client::ServersAnswering::set();
         let a = crate::client::log_entries_tests::two_macs(&[]);
-        let b = crate::client::log_entries_tests::two_macs(&[]);
+        let b = crate::client::log_entries_tests::fresh_two_macs(&[]);
         let ca = crate::client::configured(&a.m7).unwrap();
         let cb = crate::client::configured(&b.m7).unwrap();
         let sa = crate::client::load_records(&a.m7).unwrap();
@@ -1165,7 +1201,7 @@ mod tests {
     fn cached_endorsement_pins_a_new_signers_genesis_before_config_repinning() {
         let _answering = crate::client::ServersAnswering::set();
         let lab = crate::client::log_entries_tests::two_macs(&[]);
-        let other = crate::client::log_entries_tests::two_macs(&[]);
+        let other = crate::client::log_entries_tests::fresh_two_macs(&[]);
         let admin = crate::client::admin_open(&lab.m22).unwrap();
         let source = crate::client::load_records(&lab.m7).unwrap();
         let foreign = crate::client::load_records(&other.m7).unwrap();
@@ -1194,7 +1230,7 @@ mod tests {
         .unwrap();
         fsx::write_atomic(&paths.cache_file(), &envelope, 0o600).unwrap();
         crate::client::write_records(&paths, &source).unwrap();
-        assert!(ready(&paths).unwrap());
+        assert_eq!(claim_ready(&paths).unwrap(), Some(true));
         assert_eq!(
             pinned_network(&Reads::new(&paths), &config).unwrap(),
             Some(*source.log().unwrap().network())

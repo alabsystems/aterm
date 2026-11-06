@@ -464,7 +464,7 @@ mod tests {
     }
 
     /// A LAB BUS LAYS THE NODE RING AND AN OBSERVER RING: the keys (program link, 32-byte secret,
-    /// `node.cap` with the node's six grants in order, `observer.cap` with an `a-` service ring)
+    /// `node.cap` with the node's grants in ceiling order, `observer.cap` with an `a-` service ring)
     /// in one dir and the bridge's state in another, dirs 0700 and secrets 0600; the table's
     /// command is plain words naming the live socket, the node cap, the live state and the node;
     /// the rendezvous file renders and parses back with that command. A failed mint makes no cap
@@ -577,12 +577,17 @@ mod tests {
         );
         assert!(!root.join("run2/fabric/node.cap").exists());
         assert!(!root.join("run2/fabric/observer.cap").exists());
+        // The observer's first grant is the mint after the node ring's last.
+        let node_grants = astream_cap::GrantCeiling::aterm_node_ring(FLEET, "n-0")
+            .unwrap()
+            .rules()
+            .len();
         let failed_observer = lay(
             aterm,
             &root.join("run3/fabric"),
             &root.join("sock3/fabric"),
             Some("a-lab-observer"),
-            &mut fake_mint(Some(7)),
+            &mut fake_mint(Some(node_grants + 1)),
         )
         .expect_err("the observer's first grant is refused");
         assert!(

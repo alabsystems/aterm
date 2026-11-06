@@ -618,7 +618,7 @@ impl History {
                 }
             }
         }
-        assignments.sort_by_key(|(sequence, id, _)| (*sequence, *id));
+        assignments.sort_unstable_by_key(|(sequence, id, _)| (*sequence, *id));
         assignments.into_iter().map(|(_, _, row)| row).collect()
     }
     /// Reconstruct the causal past of an exact operation. Concurrent changes are
@@ -809,20 +809,32 @@ impl History {
                 .iter()
                 .any(|actor| actor[..32] == self.root)
                 || self.refused.values().any(|(opened, _)| opened.control));
-        let mut requests = BTreeMap::<(Actor, [u8; 16]), Vec<Digest>>::new();
+        enum SeenRequest {
+            One(Digest),
+            Many(Vec<Digest>),
+        }
+        let mut requests = BTreeMap::<(Actor, [u8; 16]), SeenRequest>::new();
         for (id, (opened, command)) in &self.records {
-            requests
-                .entry((opened.header.actor, command.request()))
-                .or_default()
-                .push(*id);
+            match requests.entry((opened.header.actor, command.request())) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(SeenRequest::One(*id));
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => match entry.get_mut() {
+                    SeenRequest::One(first) => {
+                        let first = *first;
+                        entry.insert(SeenRequest::Many(vec![first, *id]));
+                    }
+                    SeenRequest::Many(ids) => ids.push(*id),
+                },
+            }
         }
         let mut duplicate_effects = BTreeSet::new();
         let mut request_conflicts = BTreeSet::new();
-        for ids in requests.values_mut() {
-            if ids.len() <= 1 {
+        for entry in requests.values_mut() {
+            let SeenRequest::Many(ids) = entry else {
                 continue;
-            }
-            ids.sort_by_key(|id| self.index.get(id).map(|h| (h.sequence, h.id)));
+            };
+            ids.sort_unstable_by_key(|id| self.index.get(id).map(|h| (h.sequence, h.id)));
             if let Some(first) = ids.first() {
                 let first_cmd = self.command(first).map(|(_, c)| c);
                 if ids[1..]
@@ -953,11 +965,11 @@ impl History {
                                     changes: target, ..
                                 } => {
                                     target.iter().all(|c| c.value.is_some())
-                                        && change_keys(target) == change_keys(changes)
+                                        && same_change_keys(target, changes)
                                 }
                                 Command::Revert {
                                     changes: target, ..
-                                } => change_keys(target) == change_keys(changes),
+                                } => same_change_keys(target, changes),
                                 _ => false,
                             }))
                     {
@@ -1022,6 +1034,21 @@ impl History {
         }
         view
     }
+}
+pub(crate) fn same_change_keys(a: &[Change], b: &[Change]) -> bool {
+    if a.len() == 1 && b.len() == 1 {
+        return a[0].collection == b[0].collection && a[0].key == b[0].key;
+    }
+    if a.len() <= 8 && b.len() <= 8 {
+        return a.iter().all(|x| {
+            b.iter()
+                .any(|y| x.collection == y.collection && x.key == y.key)
+        }) && b.iter().all(|y| {
+            a.iter()
+                .any(|x| x.collection == y.collection && x.key == y.key)
+        });
+    }
+    change_keys(a) == change_keys(b)
 }
 pub(crate) fn change_keys(items: &[Change]) -> BTreeSet<(&str, &str)> {
     items

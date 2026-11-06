@@ -1618,6 +1618,111 @@ mod tests {
         term
     }
 
+    /// A TYPED TURN'S REST REACHES ITS PROGRAM AS TYPING IT WOULD HAVE (the hostile review of the
+    /// turn-deadline work, 2026-11-06): wherever the cap or the pace stops a `turn typed=1`'s
+    /// keys, the keys typed and the writes of the rest ([`crate::control::rest_writes`], each
+    /// paste built as the turn builds it) put on the wire the bytes that typing the whole text
+    /// puts there, where the program has no bracketed paste; where it has, only the brackets
+    /// differ, and no Tab or line break is inside them, so a shell still completes on the Tab and
+    /// a composer still takes the line break as the key. A trailing literal `\n` stays the two
+    /// characters it is. Typed and written, the text's keys are counted once each.
+    /// NEGATIVE CONTROLS: with the rest pasted in one piece, a Tab is text inside the brackets;
+    /// with the turn's paste built as the `paste` verb's (`paste_text`), the rest of
+    /// `echo done\n` ends in a CR, an Enter ahead of the turn's own.
+    #[test]
+    fn a_typed_turn_s_rest_reaches_its_program_as_typing_it_would() {
+        use aterm_grapheme::GraphemeClusters;
+
+        use crate::control::{RestWrite, rest_writes, turn_paste_event, typed_key_events};
+
+        fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+            hay.windows(needle.len()).position(|w| w == needle)
+        }
+        // The bytes with each bracketed paste's markers taken out, and what was inside them.
+        fn unbracket(mut bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
+            let (open, close) = (b"\x1b[200~", b"\x1b[201~");
+            let (mut out, mut inside) = (Vec::new(), Vec::new());
+            while let Some(at) = find(bytes, open) {
+                out.extend_from_slice(&bytes[..at]);
+                let body = &bytes[at + open.len()..];
+                let end = find(body, close).expect("every bracketed paste closes");
+                out.extend_from_slice(&body[..end]);
+                inside.extend_from_slice(&body[..end]);
+                bytes = &body[end + close.len()..];
+            }
+            out.extend_from_slice(bytes);
+            (out, inside)
+        }
+        let typed = |term: &Mutex<Terminal>, text: &str| -> (Vec<u8>, usize) {
+            let keys = typed_key_events(text);
+            let bytes = keys
+                .iter()
+                .flat_map(|(_, ev)| egress_bytes(term, ev))
+                .collect();
+            (bytes, keys.len())
+        };
+        let rest = |term: &Mutex<Terminal>, text: &str| -> (Vec<u8>, usize) {
+            let (mut bytes, mut keys) = (Vec::new(), 0);
+            for write in rest_writes(text) {
+                match write {
+                    RestWrite::Paste { text, graphemes } => {
+                        bytes.extend(egress_bytes(term, &turn_paste_event(&text)));
+                        keys += graphemes;
+                    }
+                    RestWrite::Key(ev) => {
+                        bytes.extend(egress_bytes(term, &ev));
+                        keys += 1;
+                    }
+                }
+            }
+            (bytes, keys)
+        };
+        let plain = term_with(&[]);
+        let bracketed = term_with(&[b"\x1b[?2004h"]);
+        for text in [
+            "echo done\\n",
+            "col1\tcol2",
+            "\t\tlead",
+            "trail\t",
+            "a\r\nb",
+            "x\ry\n",
+            "Hi, a-1!",
+            "ctl\u{1}\u{1b}x\u{7f}y",
+            "e\u{301}\u{1f44d}\u{1f3fd} \u{65e5}\u{672c}",
+        ] {
+            let (whole, keys) = typed(&plain, text);
+            let cuts = text
+                .grapheme_indices()
+                .map(|(at, _)| at)
+                .chain([text.len()]);
+            for cut in cuts {
+                let (head, tail) = text.split_at(cut);
+                let ((mut split, typed_keys), (rest_bytes, rest_keys)) =
+                    (typed(&plain, head), rest(&plain, tail));
+                split.extend(rest_bytes);
+                assert_eq!(
+                    String::from_utf8_lossy(&split),
+                    String::from_utf8_lossy(&whole),
+                    "{text:?} cut at {cut}, no bracketed paste"
+                );
+                assert_eq!(typed_keys + rest_keys, keys, "{text:?} cut at {cut}");
+                let (mut framed, _) = typed(&bracketed, head);
+                framed.extend(rest(&bracketed, tail).0);
+                let (unframed, inside) = unbracket(&framed);
+                assert_eq!(
+                    String::from_utf8_lossy(&unframed),
+                    String::from_utf8_lossy(&whole),
+                    "{text:?} cut at {cut}, under DEC 2004"
+                );
+                assert!(
+                    !inside.iter().any(|b| matches!(b, b'\t' | b'\r' | b'\n')),
+                    "{text:?} cut at {cut}: a Tab or line break pasted as text: {:?}",
+                    String::from_utf8_lossy(&inside)
+                );
+            }
+        }
+    }
+
     #[test]
     fn key_and_text_egress_complete_while_the_terminal_mutex_is_held() {
         use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};

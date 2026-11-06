@@ -253,7 +253,7 @@ fn plain_destination(t: &Target) -> Result<(), String> {
     Ok(())
 }
 
-/// A host key, as `ssh-keyscan` read it.
+/// A host key, as the scan read it ([`scan_host_key`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostKey {
     pub kind: String,
@@ -269,7 +269,8 @@ impl HostKey {
     }
 }
 
-/// The first `<host> ssh-ed25519 <base64>` row of `ssh-keyscan` output, as `(kind, blob)`.
+/// The first `<host> ssh-ed25519 <base64>` row of what the scan recorded (known_hosts lines, as
+/// `ssh-keyscan` prints them too), as `(kind, blob)`.
 #[must_use]
 pub fn parse_keyscan(out: &str) -> Option<(String, String)> {
     out.lines().filter(|l| !l.starts_with('#')).find_map(|l| {
@@ -305,30 +306,41 @@ pub fn fingerprint_of(sys: &dyn System, line: &str, scratch: &Path) -> Result<St
     parse_fingerprint(&ran.out()).ok_or_else(|| "ssh-keygen -lf printed no fingerprint".into())
 }
 
-/// Reason `ssh-keyscan` returned no ed25519 host key.
+/// Reason the host key scan ([`scan_host_key`]) recorded no ed25519 host key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NoHostKey {
     NoRoute,
     Down,
     Closed,
     Silent,
+    /// The LAN broker could not make the connection: its line ([`ssh::Failure::Broker`]).
+    Broker(String),
     Answered(String),
 }
 
-const KEYSCAN_CLOSED: [&str; 2] = [": Broken pipe", ssh::CONNECTION_REFUSED];
+/// What `ssh` says where nothing takes the connection, or the Mac closes it at once.
+const SCAN_CLOSED: [&str; 2] = [ssh::CONNECTION_REFUSED, "Connection closed by remote host"];
 
 impl NoHostKey {
-    /// What `ran`, an `ssh-keyscan` that printed no ed25519 key, means.
+    /// What `ran`, a scan that recorded no ed25519 key, means.
     #[must_use]
     pub fn of(ran: &Ran) -> Self {
         let err = ran.err();
-        if err.contains(ssh::NO_ROUTE) {
+        if let Some(line) = err
+            .lines()
+            .find(|line| line.contains(super::lan_proxy::BROKER_SAID))
+        {
+            Self::Broker(line.trim().to_owned())
+        } else if err.contains(ssh::NO_ROUTE) {
             Self::NoRoute
         } else if err.contains(ssh::HOST_DOWN) {
             Self::Down
-        } else if KEYSCAN_CLOSED.iter().any(|said| err.contains(said)) {
+        } else if SCAN_CLOSED.iter().any(|said| err.contains(said)) {
             Self::Closed
-        } else if err.trim().is_empty() {
+        } else if err.trim().is_empty()
+            || err.contains(ssh::CONNECT_TIMED_OUT)
+            || err.contains(ssh::BANNER_TIMED_OUT)
+        {
             Self::Silent
         } else {
             Self::Answered(ran.describe())
@@ -341,13 +353,15 @@ impl NoHostKey {
         const TURN_ON: &str = "turn it on at that Mac (System Settings ▸ General ▸ Sharing ▸ \
                                Remote Login), then run the same enroll command again";
         match self {
-            Self::NoRoute => ssh::Failure::NoRoute.why_alone(address),
+            Self::NoRoute => ssh::Failure::NoRoute.why(),
             Self::Down => ssh::Failure::TimedOut.why(),
             Self::Closed => format!("Remote Login is off: {TURN_ON}"),
             Self::Silent => format!(
-                "no answer in 10 s: Remote Login is off, or the Mac is asleep, off or not on \
-                 this network; if Remote Login is off, {TURN_ON}"
+                "no answer in {} s: Remote Login is off, or the Mac is asleep, off or not on \
+                 this network; if Remote Login is off, {TURN_ON}",
+                super::lan_proxy::SCAN_WITHIN.as_secs()
             ),
+            Self::Broker(line) => line.clone(),
             Self::Answered(said) => {
                 let said = if address.is_empty() {
                     said.clone()
@@ -365,16 +379,17 @@ impl NoHostKey {
     }
 }
 
-/// Scan `address` for its `ssh-ed25519` host key via `ssh-keyscan`.
-pub fn scan_host_key(sys: &dyn System, address: &str, scratch: &Path) -> Result<HostKey, String> {
-    let ran = sys
-        .run(
-            &Cmd::new("/usr/bin/ssh-keyscan")
-                .args(["-T", "10", "-t", "ed25519", "--", address])
-                .budget(Duration::from_secs(30)),
-        )
-        .map_err(|e| format!("ssh-keyscan: {e}"))?;
-    let (kind, blob) = parse_keyscan(&ran.out()).ok_or_else(|| NoHostKey::of(&ran).why(address))?;
+/// Scan `address` for its `ssh-ed25519` host key on port 22 ([`super::lan_proxy::scan`], its
+/// record kept in `dir` only while it is read), fingerprinted in `scratch`.
+pub fn scan_host_key(
+    sys: &dyn System,
+    dir: &Path,
+    address: &str,
+    scratch: &Path,
+) -> Result<HostKey, String> {
+    let (recorded, ran) =
+        super::lan_proxy::scan(sys, dir, address, 22, super::lan_proxy::SCAN_WITHIN)?;
+    let (kind, blob) = parse_keyscan(&recorded).ok_or_else(|| NoHostKey::of(&ran).why(address))?;
     let fingerprint = fingerprint_of(sys, &format!("{kind} {blob}"), scratch)?;
     Ok(HostKey {
         kind,
@@ -538,13 +553,9 @@ pub fn master_cmd(
         .arg(format!("HostKeyAlias={alias}"))
         .args(["-o", "PubkeyAuthentication=no", "-o"])
         .arg(format!("PreferredAuthentications={method}"))
-        .args([
-            "-o",
-            "NumberOfPasswordPrompts=1",
-            "-o",
-            "ConnectTimeout=15",
-            "--",
-        ])
+        .args(["-o", "NumberOfPasswordPrompts=1", "-o", "ConnectTimeout=15"])
+        .args(super::lan_proxy::options(Duration::from_secs(15)))
+        .arg("--")
         .arg(&master.destination)
         .arg("true")
         .budget(LOGIN_BUDGET)
@@ -574,6 +585,9 @@ fn through(master: &Master) -> Vec<OsString> {
         ]
         .map(OsString::from),
     );
+    // A rider opens no connection while the master lives; one that finds it gone connects
+    // through the proxy too.
+    args.extend(super::lan_proxy::options(Duration::from_secs(15)));
     args
 }
 
@@ -792,8 +806,11 @@ pub fn copy_cmd(master: &Master, files: &[&Path], remote_dir: &str) -> Cmd {
             "PubkeyAuthentication=no",
             "-o",
             "BatchMode=yes",
-            "--",
-        ]);
+        ])
+        // `scp` opens no connection while the master lives; one that finds it gone connects
+        // through the proxy too.
+        .args(super::lan_proxy::options(Duration::from_secs(15)))
+        .arg("--");
     for f in files {
         cmd = cmd.arg(f.as_os_str());
     }
@@ -1747,7 +1764,6 @@ pub fn log_in(
     alias: &str,
     askpass: &Path,
     password: &Secret,
-    address: &str,
 ) -> Login {
     let mut method = PASSWORD_METHOD;
     loop {
@@ -1763,7 +1779,7 @@ pub fn log_in(
         let Some(offered) = denied_methods(&err) else {
             return Login::Failed(ssh::classify(&ran).map_or_else(
                 || format!("ssh did not log in ({})", ran.describe()),
-                |f| f.why_alone(address),
+                |f| f.why(),
             ));
         };
         let offers = |m: &str| offered.split(',').any(|o| o.trim() == m);
@@ -1804,7 +1820,8 @@ pub fn scan_one<'s>(
 ) -> Result<Scanned<'s>, Unscanned> {
     let scratch = Scratch::new(sys, "enroll")
         .map_err(|e| Unscanned::Stopped(format!("enroll scratch: {e}")))?;
-    let key = scan_host_key(sys, &req.address, scratch.path()).map_err(Unscanned::NoKey)?;
+    let dir = super::lan_proxy::scan_dir(sys, paths).map_err(Unscanned::Stopped)?;
+    let key = scan_host_key(sys, &dir, &req.address, scratch.path()).map_err(Unscanned::NoKey)?;
     if let Some(name) = check_host_key(&key, &req.trust)
         .and_then(|()| check_enrolled_address(sys, paths, &req.address, &key))
         .map_err(Unscanned::Stopped)?
@@ -1886,7 +1903,7 @@ fn enroll_one(
     };
     close_master(sys, &master);
     let _ = writeln!(out, "logging in as {}", req.user);
-    match log_in(sys, &master, known, alias, askpass, password, &req.address) {
+    match log_in(sys, &master, known, alias, askpass, password) {
         Login::In => {}
         Login::Refused => {
             return Done::Refused(format!(
@@ -2128,7 +2145,7 @@ pub fn found_macs(
                 row.port
             ));
         }
-        let offered = discover::offered_keys(sys, row)?;
+        let offered = discover::offered_keys(sys, paths, row)?;
         if own_key.as_ref().is_some_and(|own| offered.contains(own)) {
             return Err("this Mac, the controller".to_owned());
         }
@@ -2179,9 +2196,7 @@ fn first_hello(sys: &dyn System, paths: &Paths, host: &Host) -> Result<Hello, St
     )
     .map_err(|e| e.to_string())?;
     if !ran.success() {
-        return Err(
-            ssh::classify(&ran).map_or_else(|| ran.describe(), |f| f.why_alone(&host.address))
-        );
+        return Err(ssh::classify(&ran).map_or_else(|| ran.describe(), |f| f.why()));
     }
     let hello: Hello = aterm_json::from_str(ran.out().trim()).map_err(|e| format!("hello: {e}"))?;
     if !hello.uuid.eq_ignore_ascii_case(&host.uuid) {
@@ -2420,78 +2435,143 @@ mod tests {
         assert!(err.contains("Nothing was sent"), "{err}");
     }
 
+    /// How `ssh` ends a scan whose key exchange recorded the key: no method authenticates.
+    fn denied() -> Ran {
+        Ran::exit(
+            255,
+            "hostkey@host: Permission denied (publickey,password).\n",
+        )
+    }
+
+    /// `sys` answers enrollment's scan of `address` (under the controller's folder): `key`
+    /// recorded, or nothing, and `ssh` ending as `ran`.
+    fn scanned(sys: &Fake, address: &str, key: Option<&str>, ran: Ran) {
+        super::super::lan_proxy::scanned(
+            sys,
+            &PathBuf::from(ROOT).join("scan"),
+            address,
+            22,
+            super::super::lan_proxy::SCAN_WITHIN,
+            key,
+            ran,
+        );
+    }
+
+    /// `sys` answers `found_macs`' scan of `address` (under the controller's folder).
+    fn found_scanned(sys: &Fake, address: &str, key: &str) {
+        super::super::lan_proxy::scanned(
+            sys,
+            &PathBuf::from(ROOT).join("scan"),
+            address,
+            22,
+            discover::OFFERED_WITHIN,
+            Some(key),
+            denied(),
+        );
+    }
+
+    /// The scan reads the key `ssh` recorded, not what it printed, and leaves no record behind.
     #[test]
     fn scanning_reads_the_key_and_fingerprints_it_from_a_file() {
         let fake = Fake::root();
-        fake.on(
-            "/usr/bin/ssh-keyscan -T 10 -t ed25519 -- 192.168.64.2",
-            Ran::ok(&format!("192.168.64.2 ssh-ed25519 {VM_KEY}\n")),
+        super::super::lan_proxy::scanned(
+            &fake,
+            Path::new("/s"),
+            "192.168.64.2",
+            22,
+            super::super::lan_proxy::SCAN_WITHIN,
+            Some(VM_KEY),
+            denied(),
         );
         fake.on(
             "/usr/bin/ssh-keygen -lf -",
             Ran::ok(&format!("256 {VM_FP} 192.168.64.2 (ED25519)\n")),
         );
-        let key = scan_host_key(&fake, "192.168.64.2", Path::new("/s")).unwrap();
+        let key = scan_host_key(&fake, Path::new("/s"), "192.168.64.2", Path::new("/s")).unwrap();
         assert_eq!(key.fingerprint, VM_FP);
         assert!(fake.written("/s/hostkey.pub").is_none());
+        let record = super::super::lan_proxy::scan_file(Path::new("/s"), "192.168.64.2", 22);
+        assert!(fake.read_file(&record).is_err(), "the record is removed");
     }
 
     #[test]
-    fn what_ssh_keyscan_printed_tells_no_route_nothing_there_and_no_remote_login_apart() {
-        let said = |err: &str| NoHostKey::of(&Ran::exit(1, err));
+    fn what_the_scan_said_tells_no_route_nothing_there_and_no_remote_login_apart() {
+        let said = |err: &str| NoHostKey::of(&Ran::exit(255, err));
         assert_eq!(
-            said("connect (`0.0.0.1'): No route to host\n"),
+            said("ssh: connect to host 0.0.0.1 port 22: No route to host\n"),
             NoHostKey::NoRoute
         );
         assert_eq!(
-            said("connect (`192.168.64.252'): Host is down\n"),
+            said("ssh: connect to host 192.168.64.252 port 22: Host is down\n"),
             NoHostKey::Down
         );
         assert_eq!(said(""), NoHostKey::Silent);
         assert_eq!(
-            said("write (192.168.64.17): Broken pipe\n"),
+            said("ssh: connect to host 192.168.64.17 port 22: Operation timed out\n"),
+            NoHostKey::Silent
+        );
+        assert_eq!(
+            said("kex_exchange_identification: Connection closed by remote host\n"),
             NoHostKey::Closed
         );
         assert_eq!(
-            said("connect (`192.168.64.17'): Connection refused\n"),
+            said("ssh: connect to host 192.168.64.17 port 22: Connection refused\n"),
             NoHostKey::Closed
         );
         assert!(matches!(
-            said("read (192.168.64.17): Connection reset by peer\n"),
+            said("kex_exchange_identification: read: Connection reset by peer\n"),
             NoHostKey::Answered(_)
         ));
-        assert!(
-            NoHostKey::NoRoute
-                .why("192.168.64.2")
-                .contains(ssh::LOCAL_NETWORK_ROW)
+        let broker = format!(
+            "{}{}",
+            super::super::lan_proxy::BROKER_SAID,
+            aterm_uds::lan::Unavailable::NotInstalled
+        );
+        assert_eq!(
+            said(&format!(
+                "{broker}\nConnection closed by UNKNOWN port 65535\n"
+            )),
+            NoHostKey::Broker(broker.clone())
+        );
+        assert_eq!(
+            NoHostKey::Broker(broker.clone()).why("192.168.64.2"),
+            broker
         );
         for (class, remote_login) in [
             (NoHostKey::Down, false),
             (NoHostKey::Closed, true),
             (NoHostKey::Silent, true),
-            (NoHostKey::Answered("exit 1".into()), true),
+            (NoHostKey::Answered("exit 255".into()), true),
         ] {
             let why = class.why("192.168.64.3");
-            assert!(!why.contains("Local Network"), "{why}");
             assert_eq!(why.contains("Remote Login"), remote_login, "{why}");
         }
         for err in [
-            "connect (`192.168.64.3'): No route to host\n",
-            "connect (`192.168.64.3'): Host is down\n",
-            "write (192.168.64.3): Broken pipe\n",
+            "ssh: connect to host 192.168.64.3 port 22: No route to host\n",
+            "ssh: connect to host 192.168.64.3 port 22: Host is down\n",
+            "kex_exchange_identification: Connection closed by remote host\n",
             "",
-            "read (192.168.64.3): Connection reset by peer\n",
-            "connect (`192.168.64.3'): Operation timed out\n",
+            "kex_exchange_identification: read: Connection reset by peer\n",
+            "ssh: connect to host 192.168.64.3 port 22: Operation timed out\n",
         ] {
             let why = said(err).why("192.168.64.3");
             assert!(!why.contains("192.168.64.3"), "{err:?}: {why}");
         }
         let fake = Fake::root();
-        fake.on(
-            "/usr/bin/ssh-keyscan -T 10 -t ed25519 -- 192.168.64.4",
-            Ran::exit(1, "connect (`192.168.64.4'): Host is down\n"),
+        super::super::lan_proxy::scanned(
+            &fake,
+            Path::new("/s"),
+            "192.168.64.4",
+            22,
+            super::super::lan_proxy::SCAN_WITHIN,
+            None,
+            Ran::exit(
+                255,
+                "ssh: connect to host 192.168.64.4 port 22: Host is down\n",
+            ),
         );
-        let err = scan_host_key(&fake, "192.168.64.4", Path::new("/s")).unwrap_err();
+        let err =
+            scan_host_key(&fake, Path::new("/s"), "192.168.64.4", Path::new("/s")).unwrap_err();
         assert_eq!(err, NoHostKey::Down.why("192.168.64.4"));
     }
 
@@ -3270,10 +3350,7 @@ mod tests {
     }
 
     fn a_mac(sys: &Fake, address: &str, uuid: &str, local: &str, install: Ran) {
-        sys.on(
-            &format!("/usr/bin/ssh-keyscan -T 10 -t ed25519 -- {address}"),
-            Ran::ok(&format!("{address} ssh-ed25519 {VM_KEY}\n")),
-        );
+        scanned(sys, address, Some(VM_KEY), denied());
         sys.on(
             "/usr/bin/ssh-keygen -lf -",
             Ran::ok(&format!("256 {VM_FP} {address} (ED25519)\n")),
@@ -3389,10 +3466,7 @@ mod tests {
             ]
         );
         let asked = calls.iter().position(|c| c.starts_with("ask")).unwrap();
-        let last_scan = calls
-            .iter()
-            .rposition(|c| c.contains("ssh-keyscan"))
-            .unwrap();
+        let last_scan = calls.iter().rposition(|c| c.contains(" hostkey@")).unwrap();
         let first_fed = calls.iter().position(|c| c.starts_with("fed ")).unwrap();
         assert!(last_scan < asked && asked < first_fed, "{calls:?}");
         let fed = sys.fed();
@@ -3646,9 +3720,14 @@ mod tests {
     fn of_several_macs_one_with_remote_login_off_says_so_before_the_password_is_asked() {
         let sys = set_up();
         sys.answer(Some(RIGHT));
-        sys.on(
-            "/usr/bin/ssh-keyscan -T 10 -t ed25519 -- 192.168.64.9",
-            Ran::exit(1, "write (192.168.64.9): Broken pipe\n"),
+        scanned(
+            &sys,
+            "192.168.64.9",
+            None,
+            Ran::exit(
+                255,
+                "kex_exchange_identification: Connection closed by remote host\n",
+            ),
         );
         a_mac(&sys, "lab-02.local", UUID_A, "lab-02", Ran::ok(""));
         sys.on(&login_key("lab-02.local", 1, PASSWORD_METHOD), Ran::ok(""));
@@ -3821,10 +3900,7 @@ mod tests {
         assert!(done.unwrap_err().contains("no password typed"));
         assert!(sys.fed().is_empty(), "{:?}", sys.calls());
         let sys = set_up();
-        sys.on(
-            "/usr/bin/ssh-keyscan -T 10 -t ed25519 -- lab-02.local",
-            Ran::exit(1, ""),
-        );
+        scanned(&sys, "lab-02.local", None, Ran::exit(255, ""));
         let (done, _) = run_batch(&sys, &batch(&["lab-02.local"], true));
         let summary = done.unwrap();
         assert!(
@@ -3839,13 +3915,13 @@ mod tests {
     fn a_mac_with_remote_login_off_is_skipped_with_one_line_and_nothing_asked() {
         for (said, class) in [
             ("", NoHostKey::Silent),
-            ("write (192.168.64.9): Broken pipe\n", NoHostKey::Closed),
+            (
+                "kex_exchange_identification: Connection closed by remote host\n",
+                NoHostKey::Closed,
+            ),
         ] {
             let sys = set_up();
-            sys.on(
-                "/usr/bin/ssh-keyscan -T 10 -t ed25519 -- 192.168.64.9",
-                Ran::exit(1, said),
-            );
+            scanned(&sys, "192.168.64.9", None, Ran::exit(255, said));
             let inventory = format!("{ROOT}/machines.toml");
             let before = sys.written(&inventory);
             let (done, out) = run_batch(&sys, &batch(&["192.168.64.9"], true));
@@ -4054,10 +4130,7 @@ mod tests {
             "/usr/sbin/scutil --get LocalHostName",
             Ran::ok("m14-Air-M5-32GB-4TB-prime\n"),
         );
-        sys.on(
-            "/usr/bin/ssh-keyscan -T 3 -t ed25519 -p 22 -- lab-02.local",
-            Ran::ok(&format!("lab-02.local ssh-ed25519 {VM_KEY}\n")),
-        );
+        found_scanned(&sys, "lab-02.local", VM_KEY);
         let inv = Inventory::default();
         let (take, notes) = found_macs(&sys, &ctl(), &inv, &browse);
         assert_eq!(take, ["lab-02.local"]);
@@ -4073,11 +4146,7 @@ mod tests {
                 .any(|n| n == "m14-Air-M5-32GB-4TB-prime.local: left: this Mac, the controller"),
             "{notes:?}"
         );
-        assert!(
-            !sys.calls()
-                .iter()
-                .any(|c| c.contains("keyscan") && c.contains("spark-1"))
-        );
+        assert!(!sys.calls().iter().any(|c| c.contains("hostkey@spark-1")));
         sys.file(
             &format!("{ROOT}/known_hosts"),
             format!("{VM_UUID} ssh-ed25519 {VM_KEY}\n").as_bytes(),
@@ -4094,14 +4163,10 @@ mod tests {
 
     #[test]
     fn found_says_so_when_the_sftp_browse_failed() {
-        let sys =
-            discover::tests::lab_session_with(Ran::exit(255, "DNSService call failed -65570"));
+        let sys = discover::tests::lab_session_with(Err("Bonjour error -65537".to_owned()));
         let browse = discover::browse(&sys, Duration::from_secs(3)).unwrap();
         sys.on("/usr/sbin/scutil --get LocalHostName", Ran::exit(1, ""));
-        sys.on(
-            "/usr/bin/ssh-keyscan -T 3 -t ed25519 -p 22 -- lab-02.local",
-            Ran::ok(&format!("lab-02.local ssh-ed25519 {VM_KEY}\n")),
-        );
+        found_scanned(&sys, "lab-02.local", VM_KEY);
         let (take, notes) = found_macs(&sys, &ctl(), &Inventory::default(), &browse);
         assert_eq!(take, ["lab-02.local"]);
         assert!(
@@ -4121,16 +4186,8 @@ mod tests {
             format!("ssh-ed25519 {OWN_KEY} root@m14\n").as_bytes(),
         );
         sys.on("/usr/sbin/scutil --get LocalHostName", Ran::exit(1, ""));
-        sys.on(
-            "/usr/bin/ssh-keyscan -T 3 -t ed25519 -p 22 -- lab-02.local",
-            Ran::ok(&format!("lab-02.local ssh-ed25519 {VM_KEY}\n")),
-        );
-        sys.on(
-            "/usr/bin/ssh-keyscan -T 3 -t ed25519 -p 22 -- m14-Air-M5-32GB-4TB-prime.local",
-            Ran::ok(&format!(
-                "m14-Air-M5-32GB-4TB-prime.local ssh-ed25519 {OWN_KEY}\n"
-            )),
-        );
+        found_scanned(&sys, "lab-02.local", VM_KEY);
+        found_scanned(&sys, "m14-Air-M5-32GB-4TB-prime.local", OWN_KEY);
         let (take, _) = found_macs(&sys, &ctl(), &Inventory::default(), &browse);
         assert_eq!(take, ["lab-02.local"]);
     }

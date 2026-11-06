@@ -1091,11 +1091,13 @@ struct Live<'a> {
 
 impl<'a> Live<'a> {
     fn new(mesh: &'a Mesh, peer: &'a str, key: [u8; 32]) -> Self {
-        mesh.heard
-            .lock_or_recover()
-            .entry(peer.to_owned())
-            .or_insert((key, 0))
-            .1 += 1;
+        let mut heard = mesh.heard.lock_or_recover();
+        if let Some(entry) = heard.get_mut(peer) {
+            entry.1 += 1;
+        } else {
+            heard.insert(peer.to_owned(), (key, 1));
+        }
+        drop(heard);
         Self { mesh, peer }
     }
 }
@@ -1214,6 +1216,20 @@ fn relay_once(mesh: &Arc<Mesh>, slot: &Slot) -> io::Result<()> {
         lineage.as_ref(),
         wall_ms(&mesh.wall),
     );
+    // A start that asks an exchange (`relay_live::start_repair`) lists this Mac's stores, which may
+    // not yet hold what its log holds: it can run first and move nothing (PF5b's finding H2). The
+    // last table record its log holds at or past the ingest floor, read before the start records
+    // its cursor or asks, so a failed read leaves the next start asking again, and a record the
+    // ingest settles after the read is one the second ask waits for (`relay_live::asks_again`).
+    let unsettled = match (slot.log, mesh.ingest()) {
+        (MeshLog::Tables, Some(ingest))
+            if mesh.inventory().is_some()
+                && relay_live::start_repair(cursor as u8) != relay_live::ASK_NONE =>
+        {
+            last_record_from(mesh, slot.log, ingest.floor(mesh))?
+        }
+        _ => None,
+    };
     match cursor {
         Cursor::Kept => {}
         Cursor::Moved => send_newest(mesh, slot, &dial, &grants)?,
@@ -1271,12 +1287,25 @@ fn relay_once(mesh: &Arc<Mesh>, slot: &Slot) -> io::Result<()> {
         // What the relay cannot carry (`relay_live::start_repair`): the last records a later
         // generation of the neighbour's log may have lost, or those before the head it starts at
         // (no cursor; any code outside the kernel's asks this widest exchange too).
-        match relay_live::start_repair(cursor as u8) {
-            relay_live::ASK_NONE => {}
-            relay_live::ASK_LINEAGE => {
-                inventory.request(&slot.peer, &slot.link, Reason::Lineage);
-            }
-            _ => inventory.request(&slot.peer, &slot.link, Reason::NewLink),
+        let reason = match relay_live::start_repair(cursor as u8) {
+            relay_live::ASK_NONE => None,
+            relay_live::ASK_LINEAGE => Some(Reason::Lineage),
+            _ => Some(Reason::NewLink),
+        };
+        if let Some(reason) = reason {
+            inventory.request(&slot.peer, &slot.link, reason);
+        }
+        // Asked once more when the ingest passes `unsettled`; and a second ask that fell due while
+        // this neighbour had no live link is asked over this one.
+        if relay_live::asks_again(reason.is_some(), unsettled.is_none())
+            && let (Some(reason), Some(last)) = (reason, unsettled)
+        {
+            inventory.ask_once_ingested(&slot.peer, reason, last);
+        }
+        if inventory.awaits_ingest()
+            && let Some(ingest) = mesh.ingest()
+        {
+            inventory.ingested(ingest.floor(mesh));
         }
     }
     let mut held = 0;
@@ -1316,6 +1345,29 @@ fn relay_once(mesh: &Arc<Mesh>, slot: &Slot) -> io::Result<()> {
         })
         .map_err(io_of)
 }
+
+/// The offset of the last record of `log`'s filter at or past `from` that this Mac's broker holds
+/// now: for the ingest's floor, the last one its stores may not hold yet.
+fn last_record_from(mesh: &Mesh, log: MeshLog, from: u64) -> io::Result<Option<u64>> {
+    let hosted = mesh.hosted(log);
+    let mut local = client_over(hosted.adopt(mesh.me.key)?, &hosted.source_grants(&mesh.me)?)?;
+    let (_, (_, head)) = local.fetch(0, log.filter(), 0)?;
+    let (mut at, mut last) = (from, None);
+    while at < head {
+        let (page, (next, _)) = local.fetch(at, log.filter(), LAST_PAGE)?;
+        if let Some((offset, _, _)) = page.last() {
+            last = Some(*offset);
+        }
+        if next <= at {
+            break;
+        }
+        at = next;
+    }
+    Ok(last)
+}
+
+/// The records one read of [`last_record_from`] takes.
+const LAST_PAGE: u32 = 1024;
 
 /// Send `slot`'s log's newest rows, each with its origin's key ([`newest_rows`]), where it has
 /// any.

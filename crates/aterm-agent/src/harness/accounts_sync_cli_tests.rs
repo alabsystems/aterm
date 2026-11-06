@@ -675,6 +675,27 @@ fn automatic_sync_refuses_a_new_label_with_retained_login_state() {
     }
 }
 
+/// The empty persistent scheduling lock is not retained account or recovery state.
+fn empty_queue_gate(root: &Path, path: &Path, bytes: &[u8]) -> bool {
+    path == root.join("state/accounts/signin-queue/queue.lock")
+        && bytes.is_empty()
+        && fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
+}
+
+#[test]
+fn only_the_exact_empty_queue_gate_is_outside_account_snapshots() {
+    let bed = Bed::new("queue-gate-snapshot");
+    let gate = bed.state.join("accounts/signin-queue/queue.lock");
+    fs::create_dir_all(gate.parent().unwrap()).unwrap();
+    fs::write(&gate, []).unwrap();
+    assert!(empty_queue_gate(bed._dir.path(), &gate, b""));
+    fs::write(&gate, b"unknown").unwrap();
+    assert!(!empty_queue_gate(bed._dir.path(), &gate, b"unknown"));
+    let ticket = gate.with_file_name("ticket-unknown");
+    fs::write(&ticket, []).unwrap();
+    assert!(!empty_queue_gate(bed._dir.path(), &ticket, b""));
+}
+
 /// A scratch home, state and config directory, `[fleet] machine = "m16"`.
 struct Bed {
     _dir: aterm_tempfile::TempDir,
@@ -923,6 +944,7 @@ fn background_signins_refuse_unknown_records_before_dispatch_or_locks() {
                 &|_| panic!("unknown records cannot dispatch a sign-in"),
                 None,
                 None,
+                &mut None,
             );
             assert_eq!(dispatch, RenewalDispatch::Fenced, "{cli:?}/{bad}");
             assert!(guard.lock().unwrap().last_attempt.is_empty());
@@ -1559,8 +1581,9 @@ fn with_logged_effects<R>(
 ) -> R {
     let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
     let cooldown = Mutex::new(None);
+    let lifetime = crate::harness::account_work::Lifetime::default();
     let fx = UpkeepEffects {
-        scope: None,
+        scope: lifetime.enter(),
         fetch,
         spawn_renewal: spawn,
         sync_cooldown: &cooldown,
@@ -2539,29 +2562,73 @@ fn a_grok_rows_background_renewal_hands_off_nothing_and_a_kimi_rows_still_starts
     assert_eq!(*handed.lock().unwrap(), 2);
 
     // A saved selection of each, as a menu click leaves it, served by the window's upkeep.
-    let bed = Bed::new("grok-selection");
-    fake_headless_browser(&bed.home);
-    fs::write(bed.roster(Cli::Grok), GROK_ROSTER).unwrap();
-    fs::write(bed.roster(Cli::Kimi), &kimi_roster).unwrap();
-    let pending = |cli: Cli| {
-        let store = accounts::Store::at_for(&bed.state, cli, &bed.home);
-        store.load(NOW).unwrap().0.pending_pin
-    };
-    for (cli, label) in [(Cli::Grok, "grok-1"), (Cli::Kimi, "kimi-1")] {
-        accounts::Store::at_for(&bed.state, cli, &bed.home)
-            .request_pin(label, NOW)
-            .unwrap();
+    #[cfg(unix)]
+    {
+        let bed = Bed::new("grok-selection");
+        fake_headless_browser(&bed.home);
+        fs::write(bed.roster(Cli::Grok), GROK_ROSTER).unwrap();
+        fs::write(bed.roster(Cli::Kimi), &kimi_roster).unwrap();
+        let pending = |cli: Cli| {
+            let store = accounts::Store::at_for(&bed.state, cli, &bed.home);
+            store.load(NOW).unwrap().0.pending_pin
+        };
+        for (cli, label) in [(Cli::Grok, "grok-1"), (Cli::Kimi, "kimi-1")] {
+            accounts::Store::at_for(&bed.state, cli, &bed.home)
+                .request_pin(label, NOW)
+                .unwrap();
+        }
+        let manual_workers = std::sync::atomic::AtomicUsize::new(0);
+        let run_grok = |work: Box<dyn FnOnce() + Send>| {
+            manual_workers.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            work(); // Grok refuses before any provider handoff.
+            Ok(())
+        };
+        let fetch = |_: &Env, _: &str| -> Result<String, String> { panic!("no source read") };
+        with_effects(&run_grok, &fetch, |fx| {
+            assert_eq!(
+                resume_pending_pin_for(
+                    Cli::Grok,
+                    &bed.home,
+                    &bed.state,
+                    &bed.roster(Cli::Grok),
+                    NOW,
+                    fx
+                ),
+                Some(RenewalDispatch::Started),
+                "the detached manual owner, not a provider, was started"
+            );
+            assert!(!fx.renew_guard.lock().unwrap().in_flight);
+        });
+        assert_eq!(manual_workers.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(pending(Cli::Grok), None, "the Grok selection is cancelled");
+        let retain_kimi = |_: Box<dyn FnOnce() + Send>| {
+            manual_workers.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(()) // Drop this separate manual owner unstarted; no real sign-in.
+        };
+        with_effects(&retain_kimi, &fetch, |fx| {
+            assert_eq!(
+                resume_pending_pin_for(
+                    Cli::Kimi,
+                    &bed.home,
+                    &bed.state,
+                    &bed.roster(Cli::Kimi),
+                    NOW,
+                    fx
+                ),
+                Some(RenewalDispatch::Started)
+            );
+            assert!(!fx.renew_guard.lock().unwrap().in_flight);
+        });
+        assert_eq!(
+            manual_workers.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "two owners are distinct from the provider handoffs above"
+        );
+        assert!(
+            pending(Cli::Kimi).is_some(),
+            "CONTROL: the Kimi selection waits on its renewal"
+        );
     }
-    assert_eq!(
-        upkeep_over(&bed, UpkeepStep::Renew),
-        1,
-        "the Kimi selection's renewal alone is handed off"
-    );
-    assert_eq!(pending(Cli::Grok), None, "the Grok selection is cancelled");
-    assert!(
-        pending(Cli::Kimi).is_some(),
-        "CONTROL: the Kimi selection waits on its renewal"
-    );
 }
 
 #[test]
@@ -3279,6 +3346,7 @@ region = \"global\"
                 &guard,
                 &spawn,
                 None,
+                None,
             ),
             RenewalDispatch::Started,
             "CONTROL: a person's own selection starts at once (bound here: {bound})"
@@ -3892,6 +3960,7 @@ fn a_pin_request_on_a_default_codex_row_with_no_login_file_is_not_pinned() {
             &guard,
             &noop_spawn,
             None,
+            None,
         )
     };
     let missing = renew(store.request_pin("main", now).unwrap());
@@ -3913,6 +3982,7 @@ fn a_pin_request_on_a_default_codex_row_with_no_login_file_is_not_pinned() {
 }
 
 #[test]
+#[cfg(unix)]
 fn explicit_vendor_account_selection_holds_wakes_and_resumes_to_completion() {
     let bed = Bed::new("vendor-pending-pin");
     fake_headless_browser(&bed.home);
@@ -4000,12 +4070,19 @@ fn explicit_vendor_account_selection_holds_wakes_and_resumes_to_completion() {
             &guard,
             &noop_spawn,
             None,
+            None,
         ),
         RenewalDispatch::Held,
         "in-flight Claude renewal must hold Codex's request without cancelling it"
     );
     assert_eq!(
-        codex_store.load(now).unwrap().0.pending_pin.as_ref(),
+        codex_store
+            .load(now)
+            .unwrap()
+            .0
+            .pending_pin
+            .as_ref()
+            .and_then(accounts::PendingSelection::account),
         Some(&request)
     );
 
@@ -4025,6 +4102,7 @@ fn explicit_vendor_account_selection_holds_wakes_and_resumes_to_completion() {
             now,
             &guard,
             &noop_spawn,
+            None,
             None,
         ),
         RenewalDispatch::Superseded
@@ -4048,10 +4126,15 @@ fn explicit_vendor_account_selection_holds_wakes_and_resumes_to_completion() {
     .unwrap();
     let cooldown = Mutex::new(None);
     let fetch = |_: &Env, s: &str| -> Result<String, String> { Err(s.to_owned()) };
+    let finish = |work: Box<dyn FnOnce() + Send>| {
+        work();
+        Ok(())
+    };
+    let lifetime = crate::harness::account_work::Lifetime::default();
     let fx = UpkeepEffects {
-        scope: None,
+        scope: lifetime.enter(),
         fetch: &fetch,
-        spawn_renewal: &noop_spawn,
+        spawn_renewal: &finish,
         sync_cooldown: &cooldown,
         rediscovery: &Mutex::new(Rediscovery::default()),
         renew_guard: &guard,

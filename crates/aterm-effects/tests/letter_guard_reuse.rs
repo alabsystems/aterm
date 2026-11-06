@@ -187,6 +187,8 @@ const DARK: (u32, u32, u32) = (0x00D0_D0D0, 0x0011_1318, 0x0050_FA7B);
 const LIGHT: (u32, u32, u32) = (0x001F_2328, 0x00FF_FFFF, 0x0009_69DA);
 /// Solarized Dark: dim text, whose letters the lights cut most.
 const DIM: (u32, u32, u32) = (0x0083_9496, 0x0000_2B36, 0x0093_A1A1);
+/// Solarized Light: dim text on paper.
+const DIM_PAPER: (u32, u32, u32) = (0x0065_7B83, 0x00FD_F6E3, 0x0058_6E75);
 
 /// A frame whose lights, text and grid are the frame before's takes the
 /// guard's last streams back and judges no cell, while publishing what a
@@ -232,6 +234,54 @@ fn a_frame_whose_lights_did_not_move_judges_no_cell() {
     }
 }
 
+/// `text` typed after a prompt, as the randomized scene below types it.
+fn typed_on_a_prompt(text: &str, every: u64) -> Vec<(u64, Ev)> {
+    let mut ev = vec![(200, Ev::Out(b"\x1b[2J\x1b[4H$ ".to_vec()))];
+    ev.extend(typed(text, 600, every));
+    ev
+}
+
+/// A SHARE LOWERED ON ITS FRAME IS THAT FRAME'S ALONE. A cell read again on the frame its cuts make
+/// (`CursorGlow::verify_cuts`) can fall under its bar for what its verdict's key does not hold: a
+/// neighbour's feather, the flames' and night grounds. So what the next frame takes back is the
+/// weighing and not the lowered share, and a guard that keeps verdicts publishes what one judging
+/// afresh does however the frames before it went. A sweep of 300 seeded scenes found 6 that moved
+/// when the lowered share was kept, too few for a seed to find; these are three of them.
+///
+/// NEGATIVE CONTROL (2026-11-05): `verify_cuts` writing its lowered share back over the kept
+/// verdict, as it did from 39ba2aa319, fired "the kept guard's streams, of 67 frames" (left 5,
+/// right 0) on the first scene; in the sweep the second moved 9 of 112 frames and the third 3 of
+/// 238. What the fix adds was measured over 600 seeded scenes' 99,164 frames, the kept replays
+/// alone, two runs a side: 77,657 -> 77,758 verification passes, 5,435 -> 5,555 cells lowered,
+/// 247.30 G and 247.19 G -> 247.42 G and 247.38 G instructions in the test build.
+#[test]
+fn a_share_lowered_on_its_frame_is_that_frame_s_alone() {
+    let scenes = [
+        ("phaser", DIM, "cmqλuж", 33, 312),
+        ("comet", DIM_PAPER, "wncf   d mxo", 35, 817),
+        (
+            "aurora",
+            DIM_PAPER,
+            "fжzhwoßékfßi cném жzn  sqsyo",
+            67,
+            1_397,
+        ),
+    ];
+    for (style, look, text, every, tail) in scenes {
+        let ev = typed_on_a_prompt(text, every);
+        let (frames, _) = run(&mut Replay::new(style, look, true), &ev, tail);
+        let (afresh, _) = run(&mut Replay::new(style, look, false), &ev, tail);
+        let moved = frames.iter().zip(&afresh).filter(|(a, b)| a != b).count();
+        assert_eq!(
+            moved,
+            0,
+            "{style} on {:06x}, {text:?} every {every} ms: the kept guard's streams, of {} frames",
+            look.1,
+            frames.len()
+        );
+    }
+}
+
 /// Over randomized typing (style, theme, text, cadence), the guard that
 /// keeps frames and verdicts publishes every frame's streams exactly as
 /// the guard that judges every cell of every frame afresh. The negative
@@ -273,8 +323,7 @@ fn kept_frames_and_verdicts_publish_what_judging_afresh_does() {
             })
             .collect();
         let every = 30 + next() % 90;
-        let mut ev = vec![(200, Ev::Out(b"\x1b[2J\x1b[4H$ ".to_vec()))];
-        ev.extend(typed(&text, 600, every));
+        let ev = typed_on_a_prompt(&text, every);
         let tail = 200 + next() % 1_200;
         let (frames, _) = run(&mut Replay::new(style, look, true), &ev, tail);
         let (afresh, _) = run(&mut Replay::new(style, look, false), &ev, tail);

@@ -26,6 +26,7 @@ use crate::triple::{
 mod git_text;
 mod macos;
 mod pinned;
+pub(crate) mod reference;
 mod source;
 pub mod upstream;
 
@@ -906,6 +907,9 @@ pub fn pack_bottle_with(
             "--unsigned and --upload together make no sense — nothing unsigned may publish",
         ));
     }
+    if matches!(bottle_def.origin, programs::BottleOrigin::Reference(_)) {
+        reference::check_request(request)?;
+    }
     let (input, directory) = match &request.input {
         BottleInput::Archive(path) => (path, false),
         BottleInput::InstallTree(path) => (path, true),
@@ -937,7 +941,10 @@ pub fn pack_bottle_with(
         ctx.identity.key.clone_from(key);
     }
     let ctx = &ctx;
+    let deferred_reference_signing = request.signing == Signing::MachineKey
+        && matches!(bottle_def.origin, programs::BottleOrigin::Reference(_));
     let signer = match request.signing {
+        Signing::MachineKey if deferred_reference_signing => None,
         Signing::MachineKey => Some(pack::Signer::load(ctx)?),
         Signing::Unsigned => None,
     };
@@ -999,6 +1006,9 @@ pub fn pack_bottle_with(
     }
 
     materialize_symlinks(&stage)?;
+    if let programs::BottleOrigin::Reference(recipe) = bottle_def.origin {
+        reference::prepare(recipe, request, &stage)?;
+    }
     preserve_donor_licenses(&stage, &all_donors)?;
     if program == "git" && system_loader(request.triple).is_some() {
         preserve_gnu_git_trust(&stage, &all_donors)?;
@@ -1067,7 +1077,7 @@ pub fn pack_bottle_with(
         None => pkgdoc::fresh_bottle(&header, &row)?,
     };
     let manifest = out_dir.join(pkgdoc::manifest_name(program, request.build));
-    let signature =
+    let mut signature =
         pack::write_bottle_manifest(ctx, &doc, &header, &row, &manifest, signer.as_ref())?;
 
     // Publication self-check: authenticate and inspect a scratch tree without marking it live.
@@ -1109,6 +1119,23 @@ pub fn pack_bottle_with(
             request.build, request.triple
         ))
     })?;
+
+    if let programs::BottleOrigin::Reference(recipe) = bottle_def.origin {
+        let native_controls = reference::qualify(recipe, request, &check_dir)?;
+        reference::qualification::write(
+            recipe,
+            request,
+            &manifest,
+            &manifest_bytes,
+            artifact,
+            native_controls,
+        )?;
+        if deferred_reference_signing {
+            signature = super::sign::sign_all(ctx, std::slice::from_ref(&manifest))?
+                .into_iter()
+                .next();
+        }
+    }
 
     let mut uploaded = false;
     if request.upload {

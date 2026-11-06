@@ -76,6 +76,8 @@ fn lab() -> Lab {
         accounts: vec![ann, bob, cy, dee],
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),
+        #[cfg(unix)]
+        machine_name: None,
         places: Placements { by_account },
     }
 }

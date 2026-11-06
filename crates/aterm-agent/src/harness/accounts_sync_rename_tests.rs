@@ -615,7 +615,12 @@ fn default_account_rename_retains_damaged_or_missing_snapshots() {
 fn renamed_accounts_refuse_stale_completions_for_the_reused_label() {
     let bed = Bed::new();
     let state = bed.store.load(NOW).unwrap().0;
-    let request = state.pending_pin.clone().unwrap();
+    let request = state
+        .pending_pin
+        .as_ref()
+        .and_then(accounts::PendingSelection::account)
+        .unwrap()
+        .clone();
     let reset = state.reset.clone().unwrap();
     let old_row = accounts::bound(
         &Roster::load(&bed.path).unwrap(),
@@ -673,7 +678,12 @@ fn renamed_accounts_refuse_stale_completions_for_the_reused_label() {
     );
     assert!(!called);
     assert_eq!(bed.records(), records);
-    let current_request = current.pending_pin.clone().unwrap();
+    let current_request = current
+        .pending_pin
+        .as_ref()
+        .and_then(accounts::PendingSelection::account)
+        .unwrap()
+        .clone();
     assert_eq!(current_request.label(), "m1-2");
     assert!(
         accounts::complete_requested_pin(

@@ -15,8 +15,8 @@
 //! - **A remembered network that falls silent is not home.** After [`SILENT_ROUNDS`] fleet rounds
 //!   in the stay that dialled members and met only silence, it reads remote ("a network members
 //!   were once on"): a hotel or travel router where three Macs once sat together does not stay
-//!   "home". A round this Mac's own Local Network privacy refused, or a host refused, is not
-//!   silence ([`Round::blocked`]).
+//!   "home". A round a sandbox or firewall here refused, or a host refused, is not silence
+//!   ([`Round::blocked`]).
 //! - **No fleet to learn from, no ALab axis.** With nothing remembered and a fleet book of fewer
 //!   than [`LEARN_AT`] members (or none: a Mac in no fleet), nothing can ever be learned, so the
 //!   place says the network from the facts alone ([`Where::Network`], the ALab axis
@@ -518,8 +518,8 @@ pub struct Round {
     pub answered: usize,
     /// Dials that met something other than silence: a host at the address answered (a refusal,
     /// a handshake or proof that failed, a heartbeat it declined), or this Mac's own way onto this
-    /// network refused the connect (no route, or not permitted, to an address on this network:
-    /// macOS's Local Network privacy). Such a round says nothing of whether members are here.
+    /// network refused the connect (no network, or not permitted, to an address on this network:
+    /// a sandbox, a firewall). Such a round says nothing of whether members are here.
     pub blocked: usize,
     /// When it began (unix ms).
     pub began_ms: u64,
@@ -938,10 +938,10 @@ fn members_and_reachable_in(
 }
 
 /// Fleet rounds in `stay` that heard no member and met only silence ([`Round::blocked`] none):
-/// timeouts, a host down, no route to an address off this network. A round whose dials this
-/// Mac's own privacy setting refused, or that a host answered and refused, is no evidence that
-/// the members are elsewhere: at home with Local Network turned off, or with members refusing
-/// this Mac's key, the remembered network stays the ALab LAN, and the privacy advice stays.
+/// timeouts, a host down, no route to a member. A round whose dials a sandbox or firewall here
+/// refused, or that a host answered and refused, is no evidence that the members are elsewhere:
+/// at home behind such a refusal, or with members refusing this Mac's key, the remembered network
+/// stays the ALab LAN.
 fn silent_rounds(evidence: &Evidence, stay: &Stay, now: u64) -> usize {
     evidence
         .rounds

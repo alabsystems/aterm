@@ -61,6 +61,9 @@ pub fn reap_if_done(pid: u32) -> bool {
         if rc < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
             continue;
         }
+        if rc == pid {
+            aterm_uds::deaths::note(pid, status);
+        }
         return rc != 0;
     }
 }

@@ -183,7 +183,7 @@ impl World {
     }
 
     fn lease(&self) -> Lease {
-        ask::read(&self.dir.0)
+        ask::read(&self.dir.0).expect("persisted model lease")
     }
 
     fn wait(&mut self, ms: i64) {

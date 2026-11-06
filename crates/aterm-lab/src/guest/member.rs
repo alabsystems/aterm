@@ -53,6 +53,10 @@ use aterm_types::MutexExt as _;
 
 use super::Out;
 
+/// macOS's `dns-sd`, the lab's own tool for the member's advert: the guest helper's traffic,
+/// never aterm's (aterm registers through its LAN broker).
+const DNS_SD: &str = aterm_uds::os_path!("dns-sd");
+
 /// How long the member waits for its Commons state to read back as one that may allow (its
 /// enrolment, or a founder's `secrets create`, wrote it): a hang detector, ended at once when it
 /// reads.
@@ -138,27 +142,27 @@ impl Ask {
     }
 }
 
-/// The `dns-sd` arguments that register the member's ask port `port` under the lab members
-/// service `service` as `instance`: the node job's `_alab._tcp` registration
-/// (`aterm_agent::node_service::alab_tcp_dns_sd_args`, its instance, port and TXT as a window's
-/// member advertises them) with `service` in `_alab._tcp`'s place.
+/// The `dns-sd -R` arguments that register the member's ask port `port` under the lab members
+/// service `service` as `instance` on `local`: the node job's `_alab._tcp` advert (its instance,
+/// port and TXT, `aterm_agent::node_service::AlabTcpTxt::txt_pairs`, as a window's member
+/// advertises them, which the node holds through its LAN broker) with `service` in `_alab._tcp`'s
+/// place.
 pub(crate) fn advert_args(service: &str, instance: &str, port: u16) -> Vec<String> {
-    use aterm_agent::node_service::{ALAB_TCP_SERVICE, AlabTcpTxt, NodeRole};
+    use aterm_agent::node_service::{AlabTcpTxt, NodeRole};
     let txt = AlabTcpTxt {
         role: NodeRole::Member,
         fleet_port: port,
         window: true,
     };
-    aterm_agent::node_service::alab_tcp_dns_sd_args(instance, txt)
-        .into_iter()
-        .map(|word| {
-            if word == ALAB_TCP_SERVICE {
-                service.to_owned()
-            } else {
-                word
-            }
-        })
-        .collect()
+    let mut args = vec![
+        "-R".to_owned(),
+        instance.to_owned(),
+        service.to_owned(),
+        "local".to_owned(),
+        port.to_string(),
+    ];
+    args.extend(txt.txt_pairs());
+    args
 }
 
 /// Register the ask port `port` under `service` ([`advert_args`], a fresh `alab-<8 hex>`
@@ -188,7 +192,7 @@ fn register(
     let err = file
         .try_clone()
         .map_err(|e| format!("{}: {e}", log.display()))?;
-    let child = aterm_uds::spawnfd::command(aterm_agent::node_service::DNS_SD)
+    let child = aterm_uds::spawnfd::command(DNS_SD)
         .args(advert_args(service, &instance, port))
         .stdin(aterm_uds::spawnfd::Stdio::null())
         .stdout(aterm_uds::spawnfd::Stdio::from(file))
@@ -507,14 +511,6 @@ mod tests {
         }
         assert!(Ask::parse(&args(&["/s", "192.168.64.5:7486", "/o", "--advertise"])).is_err());
 
-        let shipped = aterm_agent::node_service::alab_tcp_dns_sd_args(
-            "alab-1a2b3c4d",
-            aterm_agent::node_service::AlabTcpTxt {
-                role: aterm_agent::node_service::NodeRole::Member,
-                fleet_port: 7486,
-                window: true,
-            },
-        );
         let ours = advert_args(lab, "alab-1a2b3c4d", 7486);
         assert_eq!(
             ours,
@@ -530,12 +526,23 @@ mod tests {
                 "window=1"
             ]
         );
-        let differs: Vec<(&String, &String)> =
-            shipped.iter().zip(&ours).filter(|(a, b)| a != b).collect();
+        let shipped = aterm_agent::node_service::alab_tcp_advert(
+            "alab-1a2b3c4d",
+            aterm_agent::node_service::AlabTcpTxt {
+                role: aterm_agent::node_service::NodeRole::Member,
+                fleet_port: 7486,
+                window: true,
+            },
+        );
+        let txt: Vec<String> = shipped
+            .txt
+            .iter()
+            .map(|t| String::from_utf8_lossy(t).into_owned())
+            .collect();
         assert_eq!(
-            differs,
-            [(&"_alab._tcp".to_owned(), &lab.to_owned())],
-            "only the service differs from the node job's registration"
+            (shipped.name.as_str(), shipped.port, txt.as_slice()),
+            ("alab-1a2b3c4d", 7486, &ours[5..]),
+            "only the service differs from the node job's advert"
         );
     }
 }

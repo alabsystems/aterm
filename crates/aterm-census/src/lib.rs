@@ -7,6 +7,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 pub mod export;
+pub mod export_scan;
 mod guards;
 mod held_guard;
 mod lazy_init;
@@ -756,12 +757,15 @@ fn strip_line_comment(line: &str) -> &str {
 }
 
 fn ident_after_fn(after_fn: &str) -> Option<String> {
-    let id: String = after_fn
-        .trim_start()
-        .chars()
-        .take_while(|c| c.is_alphanumeric() || *c == '_')
-        .collect();
-    if id.is_empty() { None } else { Some(id) }
+    let rest = after_fn.trim_start();
+    let len = rest
+        .find(|c: char| !c.is_alphanumeric() && c != '_')
+        .unwrap_or(rest.len());
+    if len == 0 {
+        None
+    } else {
+        Some(rest[..len].to_string())
+    }
 }
 
 fn parse_fn_def(line: &str) -> Option<(usize, String)> {
@@ -809,6 +813,11 @@ fn parse_fn_def(line: &str) -> Option<(usize, String)> {
     }
 }
 
+pub(crate) fn is_closing_brace_at_indent(line: &str, indent: usize) -> bool {
+    let bytes = line.as_bytes();
+    bytes.len() == indent + 1 && bytes[indent] == b'}' && bytes[..indent].iter().all(|&b| b == b' ')
+}
+
 fn parse_source_fns(text: &str, rel: &str, out: &mut Vec<GuiFn>) {
     let lines: Vec<&str> = text.lines().collect();
     let mut i = 0;
@@ -824,12 +833,11 @@ fn parse_source_fns(text: &str, rel: &str, out: &mut Vec<GuiFn>) {
         let def_line = strip_line_comment(lines[i]);
         let opens = def_line.matches('{').count();
         let single_line = opens > 0 && opens == def_line.matches('}').count();
-        let close = format!("{}}}", " ".repeat(indent));
         let mut end = i;
         if !single_line {
             let mut j = i + 1;
             while j < lines.len() {
-                if lines[j] == close {
+                if is_closing_brace_at_indent(lines[j], indent) {
                     end = j;
                     break;
                 }
@@ -899,16 +907,12 @@ fn guard_vars(body: &[String]) -> std::collections::BTreeSet<String> {
             continue;
         };
         let lhs = line[..eq].trim_end();
-        let name: String = lhs
-            .chars()
-            .rev()
-            .take_while(|c| c.is_alphanumeric() || *c == '_')
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect();
+        let start = lhs
+            .rfind(|c: char| !c.is_alphanumeric() && c != '_')
+            .map_or(0, |i| i + lhs[i..].chars().next().map_or(0, char::len_utf8));
+        let name = &lhs[start..];
         if !name.is_empty() {
-            guards.insert(name);
+            guards.insert(name.to_string());
         }
     }
     guards
@@ -943,13 +947,13 @@ fn term_hop_calls(body: &[String]) -> (Vec<TermHopHazard>, usize) {
             let mut search = line.as_str();
             while let Some(rel) = search.find(").") {
                 let after = &search[rel + 2..];
-                let method: String = after
-                    .chars()
-                    .take_while(|c| c.is_alphanumeric() || *c == '_')
-                    .collect();
+                let len = after
+                    .find(|c: char| !c.is_alphanumeric() && c != '_')
+                    .unwrap_or(after.len());
+                let method = &after[..len];
                 let is_call = after[method.len()..].starts_with('(');
                 if is_call && !method.is_empty() {
-                    classify(&method, line, &mut hazards, &mut offloads);
+                    classify(method, line, &mut hazards, &mut offloads);
                 }
                 search = &search[rel + 2..];
             }
@@ -964,13 +968,13 @@ fn term_hop_calls(body: &[String]) -> (Vec<TermHopHazard>, usize) {
                     !(prev.is_ascii_alphanumeric() || prev == b'_')
                 };
                 let after = &line[at + needle.len()..];
-                let method: String = after
-                    .chars()
-                    .take_while(|c| c.is_alphanumeric() || *c == '_')
-                    .collect();
+                let len = after
+                    .find(|c: char| !c.is_alphanumeric() && c != '_')
+                    .unwrap_or(after.len());
+                let method = &after[..len];
                 let is_call = after[method.len()..].starts_with('(');
                 if boundary && is_call && !method.is_empty() {
-                    classify(&method, line, &mut hazards, &mut offloads);
+                    classify(method, line, &mut hazards, &mut offloads);
                 }
                 from = at + needle.len();
             }

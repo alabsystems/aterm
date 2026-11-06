@@ -252,7 +252,7 @@ pub(crate) fn release_assets(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome>
     let gh = ctx.github()?;
     let (slug, _how, release) = named_release(&gh, inv)?;
     let mut assets = release.assets;
-    assets.sort_by(|a, b| a.name.cmp(&b.name));
+    assets.sort_unstable_by(|a, b| a.name.cmp(&b.name));
     let completeness = Completeness::of(crate::page::cut(
         crate::page::End::Complete,
         &mut assets,

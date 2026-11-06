@@ -13,7 +13,7 @@ fn main() -> ExitCode {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::from(2),
         Err(error) => {
-            probe::failure("-", "preflight", false, &error);
+            probe::failure("-", "preflight", &error);
             ExitCode::from(2)
         }
     }
@@ -37,10 +37,10 @@ mod probe {
     const MAX_SOURCES: usize = 32;
     const USAGE: &str = "usage: lan_sockets [--loopback] <239.255.x.x> <port>";
 
-    pub(super) fn failure(source: impl Display, stage: &str, reached: bool, error: &io::Error) {
+    pub(super) fn failure(source: impl Display, stage: &str, error: &io::Error) {
         let detail: String = error.to_string().chars().take(160).collect();
         println!(
-            "source={source} stage={stage} result=failed reached={reached} kind={:?} errno={:?} detail={detail:?}",
+            "source={source} stage={stage} result=failed kind={:?} errno={:?} detail={detail:?}",
             error.kind(),
             error.raw_os_error(),
         );
@@ -85,7 +85,7 @@ mod probe {
             let std::net::IpAddr::V4(source) = address.ip() else {
                 continue;
             };
-            let listener = match Listener::try_bind(*address, scope) {
+            let listener = match Listener::bind(*address, scope) {
                 Ok(listener) => {
                     println!(
                         "source={source} stage=tcp-bind result=bound local={:?}",
@@ -93,12 +93,12 @@ mod probe {
                     );
                     Some(listener)
                 }
-                Err(failure) => {
-                    self::failure(source, "tcp-bind", failure.reached, &failure.error);
+                Err(error) => {
+                    failure(source, "tcp-bind", &error);
                     None
                 }
             };
-            match Multicast::try_bind(source, group, port, scope) {
+            match Multicast::bind(source, group, port, scope) {
                 Ok(socket) => {
                     println!(
                         "source={source} stage=multicast-bind result=bound port={}",
@@ -109,10 +109,10 @@ mod probe {
                             println!("source={source} stage=multicast-send result=sent");
                             ready += usize::from(listener.is_some());
                         }
-                        Err(error) => failure(source, "multicast-send", true, &error),
+                        Err(error) => failure(source, "multicast-send", &error),
                     }
                 }
-                Err(failed) => failure(source, "multicast-bind", failed.reached, &failed.error),
+                Err(error) => failure(source, "multicast-bind", &error),
             }
         }
         println!(

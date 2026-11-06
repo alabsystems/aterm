@@ -19,7 +19,7 @@ mod measuring {
         Capture, Companion, Expect, PaintRow, Reach, Scene, Split, Style,
     };
     use aterm_conformance::measure::paint_probe::measure;
-    use aterm_conformance::measure::starvation::Disposition;
+    use aterm_conformance::measure::starvation::{Disposition, Starvation};
 
     /// The mature run: 29 keys, no spaces (a space ends the mark). The
     /// traverse is per mark, so a ~10-key mark spans 2-3 of 12 hue buckets by
@@ -324,12 +324,27 @@ mod measuring {
                 row.expect,
                 row.meaning()
             )),
-            Disposition::Unproved => Outcome::Undecided(format!(
-                "PAINT UNPROVED [{scene}]: the take is not evidence about paint ({}); \
-                 take it on an unloaded machine, from an interactive shell or a LaunchAgent \
-                 with ProcessType=Interactive.\n  {report}",
-                report.starvation
-            )),
+            Disposition::Unproved => {
+                // The driver kept time and the subject's frames did not: where that was measured
+                // it was the GPU they render on, held by another process's long command buffers
+                // with the load under its bound (QUIET-BURST).
+                let advice = match report.starvation {
+                    Starvation::CadenceBlown { .. } => {
+                        "the driver kept time, so the subject's frames were held back: take it \
+                         with the GPU quiet (the subject's slowest frame on the GPU is \
+                         subject_gpu_max_us)"
+                    }
+                    _ => {
+                        "take it on an unloaded machine, from an interactive shell or a \
+                         LaunchAgent with ProcessType=Interactive"
+                    }
+                };
+                Outcome::Undecided(format!(
+                    "PAINT UNPROVED [{scene}]: the take is not evidence about paint ({}); \
+                     {advice}.\n  {report}",
+                    report.starvation
+                ))
+            }
         }
     }
 

@@ -104,7 +104,6 @@ pub(super) fn frame_key(
         deck_fp: 0,
         level_up_fp: None,
         band_fp: 0,
-        presence_fp: 0,
         question: (0, 0),
         system_dark: false,
         link_caption: None,

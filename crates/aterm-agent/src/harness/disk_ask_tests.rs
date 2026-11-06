@@ -605,7 +605,7 @@ fn a_round_whose_sessions_are_all_held_waits_and_elects_the_first_past() {
         why_lines(&lease, &[], &[], at)
     );
     assert_eq!(
-        Lease::decode(&lease.encode()),
+        Lease::decode(&lease.encode()).expect("valid lease"),
         Lease {
             schema: 1,
             ..lease.clone()
@@ -1351,7 +1351,8 @@ fn a_lease_written_before_floors_were_recorded_holds_its_episode_to_the_looking_
         .and_then(Value::as_object_mut)
         .expect("an entry");
     assert!(entry.remove("floor").is_some(), "the lease records it now");
-    let mut old = Lease::decode(&aterm_json::to_string(&text).expect("json"));
+    let mut old =
+        Lease::decode(&aterm_json::to_string(&text).expect("json")).expect("valid older lease");
     assert_eq!(old.entry(KEY).map(|e| e.floor.clone()), Some(None));
     assert!(
         matches!(
@@ -2851,7 +2852,7 @@ fn a_line_typed_after_the_lease_moved_on_counts_for_the_cooldown_alone() {
 }
 
 #[test]
-fn the_lease_round_trips_its_file_and_a_foreign_schema_reads_as_empty() {
+fn the_lease_round_trips_its_file_and_refuses_foreign_or_malformed_data() {
     let (h1, h2) = (host(1), host(2));
     let mut lease = Lease::default();
     elected(
@@ -2860,14 +2861,132 @@ fn the_lease_round_trips_its_file_and_a_foreign_schema_reads_as_empty() {
         &At::short(&h2, vec![seat("s-c", 3, true)]),
     );
     let text = lease.encode();
-    let back = Lease::decode(&text);
+    let back = Lease::decode(&text).expect("valid lease");
     assert_eq!(back.volumes, lease.volumes);
     assert_eq!(back.schema, 1);
-    assert_eq!(
-        Lease::decode("{\"schema\":2,\"volumes\":[]}"),
-        Lease::default()
+    for bad in [
+        "{\"schema\":2,\"volumes\":[]}",
+        "not json",
+        "{\"schema\":1}",
+    ] {
+        assert_eq!(
+            Lease::decode(bad).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+}
+
+#[test]
+fn lease_read_failure_preserves_bad_bytes_and_skips_the_edit() {
+    let overfull = Lease {
+        schema: 1,
+        volumes: (0..=MAX_VOLUMES)
+            .map(|n| Entry {
+                key: format!("dev:{n}"),
+                ..Entry::default()
+            })
+            .collect(),
+    }
+    .encode();
+    let mut oversized = Lease::default().encode().into_bytes();
+    oversized.resize(usize::try_from(LEASE_MAX_BYTES).unwrap() + 1, b' ');
+    let cases = [
+        ("empty", Vec::new()),
+        ("json", b"not json".to_vec()),
+        ("utf8", vec![0xff]),
+        ("schema", br#"{"schema":2,"volumes":[]}"#.to_vec()),
+        ("missing-volumes", br#"{"schema":1}"#.to_vec()),
+        ("volumes", overfull.into_bytes()),
+        ("size", oversized),
+        (
+            "worker",
+            br#"{"schema":1,"volumes":[{"key":"dev:1","worker":{"future":true}}]}"#.to_vec(),
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (case, bytes) in cases {
+        let root = aterm_tempfile::TempDir::new().expect("lease directory");
+        let path = root.path().join(LEASE_FILE);
+        std::fs::write(&path, &bytes).expect("bad lease fixture");
+        let edited = std::cell::Cell::new(false);
+        let result = transact(root.path(), &LOCK_LADDER, |lease| {
+            edited.set(true);
+            lease.volumes = vec![Entry {
+                key: "replacement".into(),
+                ..Entry::default()
+            }];
+        });
+        let preserved = std::fs::read(&path).expect("lease remains") == bytes;
+        if result.is_ok() || edited.get() || !preserved {
+            failures.push(format!(
+                "{case}: result={result:?}, edited={}, preserved={preserved}",
+                edited.get()
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn lease_read_failure_of_a_directory_prevents_the_edit() {
+    let root = aterm_tempfile::TempDir::new().expect("lease directory");
+    let path = root.path().join(LEASE_FILE);
+    std::fs::create_dir(&path).expect("non-file lease");
+    let edited = std::cell::Cell::new(false);
+    let result = transact(root.path(), &LOCK_LADDER, |_| edited.set(true));
+    assert!(
+        result.is_err() && !edited.get() && path.is_dir(),
+        "result={result:?}, edited={}, directory={}",
+        edited.get(),
+        path.is_dir()
     );
-    assert_eq!(Lease::decode("not json"), Lease::default());
+}
+
+#[test]
+fn lease_write_bounds_preserve_missing_or_valid_state() {
+    for existing in [false, true] {
+        for bytes in [false, true] {
+            let root = aterm_tempfile::TempDir::new().expect("lease directory");
+            let path = root.path().join(LEASE_FILE);
+            let before = existing.then(|| Lease::default().encode().into_bytes());
+            if let Some(before) = &before {
+                std::fs::write(&path, before).expect("valid lease");
+            }
+            let result = transact(root.path(), &LOCK_LADDER, |lease| {
+                lease.volumes = if bytes {
+                    vec![Entry {
+                        key: "x".repeat(usize::try_from(LEASE_MAX_BYTES).unwrap()),
+                        ..Entry::default()
+                    }]
+                } else {
+                    vec![Entry::default(); MAX_VOLUMES + 1]
+                };
+            });
+            assert_eq!(
+                result.unwrap_err().kind(),
+                if bytes {
+                    io::ErrorKind::FileTooLarge
+                } else {
+                    io::ErrorKind::InvalidData
+                }
+            );
+            assert_eq!(std::fs::read(&path).ok(), before);
+            assert!(read(root.path()).is_ok());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn lease_read_failure_of_a_dangling_link_is_not_absence() {
+    let root = aterm_tempfile::TempDir::new().expect("lease directory");
+    let path = root.path().join(LEASE_FILE);
+    std::os::unix::fs::symlink(root.path().join("missing"), &path).expect("dangling lease");
+    assert!(read(root.path()).is_err());
+    let edited = std::cell::Cell::new(false);
+    assert!(transact(root.path(), &LOCK_LADDER, |_| edited.set(true)).is_err());
+    assert!(!edited.get());
+    assert!(std::fs::symlink_metadata(path).unwrap().is_symlink());
 }
 
 #[test]
@@ -2892,7 +3011,7 @@ fn transact_writes_a_changed_lease_and_skips_while_another_holds_the_lock() {
     let said = transact(&dir, &LOCK_LADDER, |l| at.step(l, T0)).expect("transact");
     assert!(matches!(said, Some(Said::Opened { .. })), "{said:?}");
     assert!(matches!(
-        read(&dir).entry(KEY).map(|e| &e.phase),
+        read(&dir).expect("lease").entry(KEY).map(|e| &e.phase),
         Some(Phase::Nominating { .. })
     ));
     let held = lock_within(&dir, &[]).expect("lock").expect("free");
@@ -2907,7 +3026,7 @@ fn transact_writes_a_changed_lease_and_skips_while_another_holds_the_lock() {
         Some(Said::Elected { .. })
     ));
     assert!(matches!(
-        read(&dir).entry(KEY).map(|e| &e.phase),
+        read(&dir).expect("lease").entry(KEY).map(|e| &e.phase),
         Some(Phase::Owed { .. })
     ));
 }
@@ -3653,7 +3772,7 @@ fn a_round_that_waits_on_a_loops_lasting_withhold_says_what_holds_it_and_what_en
             lease.encode()
         );
         assert_eq!(
-            Lease::decode(&lease.encode()),
+            Lease::decode(&lease.encode()).expect("valid lease"),
             Lease {
                 schema: 1,
                 ..lease.clone()
@@ -3727,7 +3846,7 @@ fn a_round_that_waits_on_a_hold_or_a_draft_says_what_holds_it_and_what_ends_the_
         let v: Value = aterm_json::from_str(&r).expect("json");
         assert_eq!(v.get("why").and_then(Value::as_str), Some(hold.word()));
         assert_eq!(
-            Lease::decode(&lease.encode()),
+            Lease::decode(&lease.encode()).expect("valid lease"),
             Lease {
                 schema: 1,
                 ..lease.clone()
@@ -3790,7 +3909,7 @@ fn a_round_that_waits_on_a_hold_or_a_draft_says_what_holds_it_and_what_ends_the_
         .replace("\"sid\":\"s-a\"", "\"sid\":\"s-a\",\"why\":\"telepathy\"");
     assert!(unknown.contains("telepathy"), "{unknown}");
     assert_eq!(
-        Lease::decode(&unknown),
+        Lease::decode(&unknown).expect("valid held record"),
         lease,
         "a hold this build does not know reads as none, not as an empty lease"
     );

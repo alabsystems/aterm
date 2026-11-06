@@ -592,7 +592,14 @@ fn actual_host_then_worker_sigkill_keeps_closed_guard_compiler_reserved() {
     until_within(MUST_HAPPEN, "actual worker SIGKILL and reaping", || {
         (process::read_identity(worker.pid) != Some(worker)).then_some(())
     });
-    assert!(!guards_held(&path), "compiler retained an admission guard");
+    // The identity stops reading as the worker's exit begins, before that exit closes its
+    // descriptors, so its copy of the guard can still hold the lock here. Once it has closed,
+    // nothing may: a compiler that kept a guard hangs this wait and fails it.
+    until_within(
+        MUST_HAPPEN,
+        "every guard let go: none kept by the compiler",
+        || (!guards_held(&path)).then_some(()),
+    );
     trace.step("GroupLeaderDies");
     trace.step("DropAllGuards");
     observe(&trace, &namespace, &ledger, &path, &reference, Some(worker));

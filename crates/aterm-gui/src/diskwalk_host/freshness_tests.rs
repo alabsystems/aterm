@@ -20,8 +20,7 @@ fn fixture() -> (aterm_tempfile::TempDir, Engine, PathBuf, PathBuf, PathBuf) {
         aterm_sysprobe::volumes::table(),
     );
     let (_send, inbox) = std::sync::mpsc::channel();
-    let (out, _receive) = std::sync::mpsc::channel();
-    let mut engine = Engine::new(inbox, out, None);
+    let mut engine = Engine::new(inbox, Arc::default(), None);
     engine.policy = Some(policy.clone());
     let now = Instant::now();
     for path in [&root, &other] {

@@ -1035,6 +1035,14 @@ pub enum RuleState {
 impl RuleState {
     /// Its rev's state, the owner's confirmed revs being `confirmed`.
     #[must_use]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "OwnerTell",
+            action = "Tell",
+            project = "conformance_sources::project_tell"
+        )
+    )]
     pub fn of(rev: &Rev, confirmed: &[Rev], mode: RuleMode) -> Self {
         use super::fault::{Fault, armed};
         let yes = if armed(Fault::ConfirmByName) {
@@ -1086,6 +1094,14 @@ impl Snapshot {
 
     /// Whether the rule it names still reads, in `tables` (the table in force), at its rev.
     #[must_use]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "OwnerTell",
+            action = "ConfirmWrite",
+            project = "conformance_sources::project_tell"
+        )
+    )]
     pub fn still_current(&self, tables: &OwnerTables, resolved: &Resolved) -> bool {
         use super::fault::{Fault, armed};
         let Some(rule) = tables.rule(&self.name) else {

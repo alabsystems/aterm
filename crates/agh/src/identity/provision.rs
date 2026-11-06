@@ -891,7 +891,8 @@ fn is_staged(dirs: &Dirs, path: &Path) -> bool {
     let staged_in_tokens = |p: &Path| {
         p.file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|n| n.ends_with(&format!(".token{STAGED_SUFFIX}")))
+            .and_then(|n| n.strip_suffix(STAGED_SUFFIX))
+            .is_some_and(|rest| rest.ends_with(".token"))
             && p.parent()
                 .and_then(|d| std::fs::canonicalize(d).ok())
                 .is_some_and(|d| d == tokens)

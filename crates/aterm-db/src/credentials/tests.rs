@@ -4,7 +4,7 @@
 use super::*;
 use crate::table::tests::{Lab, repair_commons};
 use aterm_secrets::{
-    commons::roster::Role,
+    commons::{bootstrap::writer_here, journal::Journal, roster::Role},
     need::{Purpose, Reason, State, Want},
     text::Audience,
 };
@@ -968,6 +968,58 @@ fn unprivate_or_symlinked_holder_files_do_not_offer_and_blank_totp_is_ignored() 
     assert_eq!(values.0.len(), 1);
     assert_eq!(values.0[0].0, "m29_password");
     assert_eq!(super::value::validate(&want, &values).unwrap(), None);
+}
+
+/// A pass beside a window whose runtime keeps the control journal's writer past the 2 s an open
+/// that names no deadline waits in product (one repair exchange's sessions back to back) waits it
+/// out and reaches the table, rather than telling the person the table was not reached. It waits
+/// holding no Commons custody, so meanwhile this Mac still reads as a Writer (the window's
+/// `sync.requests` read, a need's facts), which takes custody for at most a second.
+#[test]
+fn a_pass_waits_out_a_window_that_holds_the_journal_holding_no_custody() {
+    /// What an open that names no deadline waits in product ([`crate::admission`]); this test
+    /// binary's opens wait the hang detector.
+    const PRODUCT_ADMISSION: std::time::Duration = std::time::Duration::from_secs(2);
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    for paths in &lab.paths {
+        need::test_alab_policy(paths);
+    }
+    need::raise(&lab.paths[1], Want::Notary, Purpose::ByHand).unwrap();
+    let bootstrap = lab.bootstrap(1);
+    let held = Journal::open_existing(bootstrap.journal_dir(), bootstrap.trust()).unwrap();
+    let (waited, waiting) = std::sync::mpsc::channel();
+    let paths = lab.paths[1].clone();
+    let passing = std::thread::spawn(move || {
+        let mut since = None;
+        aterm_uds::file_lock::with_lock_wait_observer(
+            move |_| {
+                // Hold on past the product's admission, counted from the pass's first wait.
+                let since = *since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() > PRODUCT_ADMISSION + std::time::Duration::from_secs(1) {
+                    let _ = waited.send(());
+                }
+            },
+            || pass(&paths),
+        )
+    });
+    match waiting.recv_timeout(aterm_spec::wait::MUST_HAPPEN) {
+        Ok(()) => {}
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!(
+            "the pass gave up before the window let go: {:?}",
+            passing.join().unwrap().map(|passed| passed.posted)
+        ),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("the pass never waited on the held journal")
+        }
+    }
+    assert!(
+        writer_here(&lab.paths[1]),
+        "a pass waiting on the journal kept custody"
+    );
+    drop(held);
+    let passed = passing.join().unwrap().unwrap();
+    assert!(passed.writer);
+    assert_eq!(passed.posted, 1);
 }
 
 /// A withdrawal by hand reaches the lab's table as the requester's `not-needed`, resting on the

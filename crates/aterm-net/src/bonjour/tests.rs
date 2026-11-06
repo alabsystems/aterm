@@ -1,227 +1,164 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+//! The browse against a stand-in broker served on this thread's seam socket: what the broker
+//! streams reaches the callback, a callback or `going` ends it, and a missing broker or one that
+//! fails the browse is an error.
+
 use super::*;
-use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use aterm_uds::lan::wire::{self, Frame, Reader, Request};
+use aterm_uds::lan::{Seam, seam_here};
+use std::time::Instant;
 
-type ReplyData = (u32, u32, i32, Option<&'static CStr>);
+/// A hang detector, never a latency budget.
+const MUST_HAPPEN: Duration = Duration::from_secs(60);
 
-struct Fake {
-    start_error: i32,
-    private_error: bool,
-    replies: RefCell<VecDeque<ReplyData>>,
-    callback: Cell<Option<(Reply, *mut c_void)>>,
-    closed: Cell<usize>,
-}
-
-impl Fake {
-    fn new(replies: impl IntoIterator<Item = ReplyData>) -> Self {
-        Self {
-            start_error: 0,
-            private_error: false,
-            replies: RefCell::new(replies.into_iter().collect()),
-            callback: Cell::new(None),
-            closed: Cell::new(0),
-        }
+#[cfg(target_os = "macos")]
+fn instance(name: &str, interface: u32) -> Instance {
+    Instance {
+        name: name.to_owned(),
+        service: "_alab._tcp".to_owned(),
+        domain: "local.".to_owned(),
+        interface,
     }
 }
 
-impl Api for Fake {
-    unsafe fn start(
-        &self,
-        _service: &CStr,
-        _domain: &CStr,
-        reply: Reply,
-        context: *mut c_void,
-    ) -> Result<Reference, i32> {
-        if self.start_error != 0 {
-            return Err(self.start_error);
-        }
-        self.callback.set(Some((reply, context)));
-        Ok(std::ptr::NonNull::<u8>::dangling().as_ptr().cast())
-    }
-
-    unsafe fn keep_private(&self, _reference: Reference) -> io::Result<()> {
-        if self.private_error {
-            Err(io::Error::from(io::ErrorKind::PermissionDenied))
-        } else {
-            Ok(())
-        }
-    }
-
-    unsafe fn ready(&self, _reference: Reference, _within: Duration) -> io::Result<bool> {
-        Ok(!self.replies.borrow().is_empty())
-    }
-
-    unsafe fn process(&self, reference: Reference) -> i32 {
-        let Some((flags, interface, error, name)) = self.replies.borrow_mut().pop_front() else {
-            return -65537;
+/// A stand-in broker at a fresh socket that answers one browse with `frames`, then waits for the
+/// client to close; the seam pointing this thread's client at it, and the request it read
+/// (macOS: elsewhere the client browses nothing).
+#[cfg(target_os = "macos")]
+fn stand_in(
+    frames: Vec<Frame>,
+) -> (
+    Seam,
+    aterm_tempfile::TempDir,
+    std::thread::JoinHandle<Option<Request>>,
+) {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let path = root.path().join("broker.sock");
+    let listener = aterm_uds::CtlListener::bind(&path).unwrap();
+    let served = std::thread::spawn(move || {
+        let (stream, _) = aterm_uds::accept(&listener).unwrap();
+        wire::send(
+            &stream,
+            &Frame::Hello {
+                protocol: aterm_uds::lan::PROTOCOL,
+                build: "stand-in".into(),
+            },
+        )
+        .unwrap();
+        let mut reader = Reader::new(0);
+        let deadline = Some(Instant::now() + MUST_HAPPEN);
+        assert!(matches!(
+            reader.frame(&stream, deadline).unwrap(),
+            Some(Frame::Hello { .. })
+        ));
+        let request = match reader.frame(&stream, deadline) {
+            Ok(Some(Frame::Request(request))) => Some(request),
+            _ => None,
         };
-        let (reply, context) = self.callback.get().unwrap();
-        // SAFETY: browse_with keeps this context live until close. Each success
-        // supplies a static C string; errors may leave every other field NULL.
-        unsafe {
-            reply(
-                reference,
-                flags,
-                interface,
-                error,
-                name.map_or(std::ptr::null(), CStr::as_ptr),
-                std::ptr::null(),
-                std::ptr::null(),
-                context,
-            );
+        for frame in &frames {
+            wire::send(&stream, frame).unwrap();
         }
-        0
-    }
-
-    unsafe fn close(&self, _reference: Reference) {
-        self.closed.set(self.closed.get() + 1);
-        self.callback.set(None);
-    }
+        // The client's close ends the browse, as it ends the broker's.
+        let _ = reader.frame(&stream, deadline);
+        request
+    });
+    let seam = Seam {
+        socket: Some(path),
+        ..Seam::default()
+    };
+    (seam, root, served)
 }
 
+#[cfg(target_os = "macos")]
 #[test]
-fn native_entry_is_inert_in_a_unit_test() {
-    let error = browse(c"_alab._tcp", c"local.", |_| panic!("no native callback")).unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-}
-
-#[test]
-fn the_loopback_guard_refuses_the_native_browser_before_it_can_start() {
-    let error = crate::loopback::forced(true, || {
-        browse(c"_alab._tcp", c"local.", |_| panic!("no native callback"))
-    })
-    .unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-}
-
-#[test]
-fn added_flag_is_a_bit_and_names_remain_unescaped_until_the_callback_ends() {
-    let api = Fake::new([(ADD | 1, 4, 0, Some(c"Desk A")), (0, 9, 0, Some(c"Desk A"))]);
+fn each_instance_reaches_the_callback_until_it_breaks() {
+    let (seam, _root, served) = stand_in(vec![
+        Frame::Event(Heard::Added(instance("one", 4))),
+        Frame::Event(Heard::Removed(instance("one", 4))),
+        Frame::Event(Heard::Added(instance("two", 7))),
+        Frame::Event(Heard::Added(instance("unread", 7))),
+    ]);
     let mut heard = Vec::new();
-    browse_with(&api, c"_alab._tcp", c"local.", |event| {
-        heard.push((event.added, event.interface, event.name.to_owned()));
-        if heard.len() == 2 {
-            ControlFlow::Break(())
-        } else {
-            ControlFlow::Continue(())
-        }
+    seam_here(seam, || {
+        browse(c"_alab._tcp", c"local.", |event| {
+            heard.push((event.added, event.interface, event.name.to_owned()));
+            if event.name == c"two" {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
     })
     .unwrap();
     assert_eq!(
         heard,
         [
-            (true, 4, c"Desk A".to_owned()),
-            (false, 9, c"Desk A".to_owned())
+            (true, 4, c"one".to_owned()),
+            (false, 4, c"one".to_owned()),
+            (true, 7, c"two".to_owned()),
         ]
     );
-    assert_eq!(api.closed.get(), 1);
-    assert!(api.callback.get().is_none());
-}
-
-#[test]
-fn startup_and_descriptor_failures_release_only_a_successfully_started_reference() {
-    let mut api = Fake::new([]);
-    api.start_error = -65537;
-    assert!(
-        browse_with(
-            &api,
-            c"_alab._tcp",
-            c"local.",
-            |_| ControlFlow::Continue(())
-        )
-        .is_err()
-    );
-    assert_eq!(api.closed.get(), 0);
-    api.start_error = 0;
-    api.private_error = true;
     assert_eq!(
-        browse_with(
-            &api,
+        served.join().unwrap(),
+        Some(Request::Browse {
+            service: "_alab._tcp".into(),
+            domain: "local.".into(),
+        })
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_silent_browse_ends_once_going_says_no() {
+    let (seam, _root, served) = stand_in(Vec::new());
+    let mut looks = 0;
+    seam_here(seam, || {
+        browse_while(
             c"_alab._tcp",
             c"local.",
-            |_| ControlFlow::Continue(())
+            Duration::from_millis(1),
+            || {
+                looks += 1;
+                looks < 3
+            },
+            |_| panic!("the stand-in streams nothing"),
         )
-        .unwrap_err()
-        .kind(),
-        io::ErrorKind::PermissionDenied
-    );
-    assert_eq!(api.closed.get(), 1);
+    })
+    .unwrap();
+    assert_eq!(looks, 3);
+    assert!(served.join().unwrap().is_some());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_browse_the_broker_fails_is_an_error() {
+    let (seam, _root, served) = stand_in(vec![Frame::Error {
+        code: -65563,
+        words: "the daemon is not running".into(),
+    }]);
+    seam_here(seam, || {
+        browse(c"_alab._tcp", c"local.", |_| ControlFlow::Continue(()))
+    })
+    .unwrap_err();
+    served.join().unwrap();
 }
 
 #[test]
-fn asynchronous_errors_never_read_undefined_callback_fields() {
-    let api = Fake::new([(0, 0, -65537, None)]);
-    assert!(
-        browse_with(&api, c"_alab._tcp", c"local.", |_| panic!(
-            "error is not an event"
-        ))
-        .is_err()
-    );
-    assert_eq!(api.closed.get(), 1);
-}
-
-#[test]
-fn transport_failure_and_callback_panic_both_close_the_reference() {
-    let api = Fake::new([]);
-    assert!(
-        browse_with(
-            &api,
-            c"_alab._tcp",
-            c"local.",
-            |_| ControlFlow::Continue(())
-        )
-        .is_err()
-    );
-    assert_eq!(api.closed.get(), 1);
-    let api = Fake::new([(ADD, 4, 0, Some(c"desk"))]);
-    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = browse_with(&api, c"_alab._tcp", c"local.", |_| panic!("callback"));
-    }));
-    assert!(panic.is_err());
-    assert_eq!(api.closed.get(), 1);
-    assert!(api.callback.get().is_none());
-}
-
-/// A browse kept while sharing is on reads each reply as it comes, asks before each read and
-/// after each quiet `look` whether to go on, and ends, its connection closed, once the answer is
-/// no, though nothing more arrives: a person's off switch ends it within a look.
-#[test]
-fn a_browse_while_going_ends_once_going_says_no_with_nothing_heard() {
-    let api = Fake::new([(ADD, 4, 0, Some(c"Desk A")), (ADD, 4, 0, Some(c"Desk B"))]);
-    let asks = Cell::new(0);
-    let mut heard = Vec::new();
-    browse_while_with(
-        &api,
-        c"_alab._tcp",
-        c"local.",
-        (Duration::from_millis(1), || {
-            asks.set(asks.get() + 1);
-            asks.get() < 6
-        }),
-        |event| {
-            heard.push(event.name.to_owned());
-            ControlFlow::Continue(())
-        },
-    )
-    .expect("ended by its going");
-    assert_eq!(heard, [c"Desk A".to_owned(), c"Desk B".to_owned()]);
-    assert_eq!(
-        asks.get(),
-        6,
-        "asked before each read, then each quiet look"
-    );
-    assert_eq!(api.closed.get(), 1, "its connection closed");
-    let api = Fake::new([(ADD, 4, 0, Some(c"Desk A"))]);
-    browse_while_with(
-        &api,
-        c"_alab._tcp",
-        c"local.",
-        (Duration::from_millis(1), || false),
-        |_| panic!("an off switch reads nothing"),
-    )
-    .expect("off from the start");
-    assert_eq!(api.closed.get(), 1);
+fn no_broker_is_not_connected() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let seam = Seam {
+        socket: Some(root.path().join("absent.sock")),
+        ..Seam::default()
+    };
+    let error = seam_here(seam, || {
+        browse(c"_alab._tcp", c"local.", |_| ControlFlow::Continue(()))
+    })
+    .unwrap_err();
+    if cfg!(target_os = "macos") {
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected, "{error}");
+    } else {
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported, "{error}");
+    }
 }

@@ -126,15 +126,33 @@ pub fn store(repo: &Path) -> Result<PathBuf, String> {
 /// The key a bundle of `identity`, built with `compilers`, is kept under: SHA-256 over [`SCHEMA`] and each input, NUL-separated, lowercase hex.
 #[must_use]
 pub fn key(identity: &Identity, compilers: &Compilers) -> String {
+    key_parts(
+        &identity.version,
+        identity.build,
+        &identity.commit,
+        &compilers.trustc,
+        &compilers.rustc,
+        &compilers.inputs,
+    )
+}
+
+fn key_parts(
+    version: &str,
+    build: u64,
+    commit: &str,
+    trustc: &str,
+    rustc: &str,
+    inputs: &str,
+) -> String {
     let mut h = aterm_digest::Sha256::new();
     for part in [
         SCHEMA,
-        identity.version.as_str(),
-        &identity.build.to_string(),
-        identity.commit.as_str(),
-        compilers.trustc.as_str(),
-        compilers.rustc.as_str(),
-        compilers.inputs.as_str(),
+        version,
+        &build.to_string(),
+        commit,
+        trustc,
+        rustc,
+        inputs,
         "universal",
     ] {
         h.update(part.as_bytes());
@@ -149,7 +167,7 @@ pub fn key(identity: &Identity, compilers: &Compilers) -> String {
 pub fn bundle_digest(app: &Path) -> Result<String, String> {
     let mut entries: Vec<(String, String)> = Vec::new();
     walk(app, app, &mut entries)?;
-    entries.sort();
+    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let mut h = aterm_digest::Sha256::new();
     h.update(SCHEMA.as_bytes());
     h.update([0u8]);
@@ -236,17 +254,13 @@ pub fn read(store: &Path, key: &str) -> Result<Option<Complete>, String> {
             complete.schema
         ));
     }
-    let calculated = self::key(
-        &Identity {
-            version: complete.version.clone(),
-            build: complete.build,
-            commit: complete.commit.clone(),
-        },
-        &Compilers {
-            trustc: complete.trustc.clone(),
-            rustc: complete.rustc.clone(),
-            inputs: complete.inputs.clone(),
-        },
+    let calculated = key_parts(
+        &complete.version,
+        complete.build,
+        &complete.commit,
+        &complete.trustc,
+        &complete.rustc,
+        &complete.inputs,
     );
     if calculated != key {
         return Err("the COMPLETE record's build inputs do not match its cache key".into());
@@ -416,15 +430,16 @@ pub fn build(repo: &Path, identity: &Identity) -> Result<Complete, String> {
 /// Either compiler cannot be asked for its commit.
 pub fn compilers() -> Result<Compilers, String> {
     let stage2 = crate::gates::trust_stage2_bin().map_err(|e| e.to_string())?;
-    let out = aterm_uds::spawnfd::command(stage2.join("trustc"))
+    let trustc_bin = stage2.join("trustc");
+    let out = aterm_uds::spawnfd::command(&trustc_bin)
         .arg("-vV")
         .output()
-        .map_err(|e| format!("ask {} -vV: {e}", stage2.join("trustc").display()))?;
+        .map_err(|e| format!("ask {} -vV: {e}", trustc_bin.display()))?;
     let trustc = crate::buildplan::commit_hash_of(&String::from_utf8_lossy(&out.stdout))
         .ok_or_else(|| {
             format!(
                 "{} -vV names no commit-hash — a build no other build can be told from",
-                stage2.join("trustc").display()
+                trustc_bin.display()
             )
         })?;
     Ok(Compilers {
@@ -475,8 +490,10 @@ pub fn place_records(dir: &Path, dist: &Path, version: &str) -> Result<(), Strin
         }
         .map_err(|e| format!("replace {}: {e}", to.display()))?;
         let from = dir.join(&name);
-        if from.exists() {
-            copy_tree(&from, &to)?;
+        match std::fs::symlink_metadata(&from) {
+            Ok(meta) => copy_tree_kind(&from, &to, meta.file_type(), Some(&meta))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("inspect {}: {e}", from.display())),
         }
     }
     Ok(())
@@ -568,7 +585,7 @@ fn copy_tree_kind(
             .flatten()
             .filter_map(|e| Some((e.file_name(), e.file_type().ok()?)))
             .collect();
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         for (name, ft) in entries {
             copy_tree_kind(&from.join(&name), &to.join(&name), ft, None)?;
         }

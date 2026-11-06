@@ -583,3 +583,57 @@ fn the_output_dedup_guard_does_not_leak_into_the_next_batch() {
          row must record its own damage"
     );
 }
+
+#[test]
+fn a_print_that_wraps_in_place_clears_a_selection_on_its_row() {
+    // The bottom row below the scroll region wraps in place: the print's tail lands on the
+    // row's own first cells, replacing what the print itself began past.
+    let selected_bottom_row = |text: &[u8]| {
+        let mut term = Terminal::new(5, 10);
+        term.process(b"\x1b[1;3r\x1b[5;1H");
+        let sel = term.text_selection_mut();
+        sel.start_selection(4, 0, SelectionSide::Left, SelectionType::Simple);
+        sel.update_selection(4, 4, SelectionSide::Right);
+        sel.complete_selection();
+        term.process(text);
+        (term.text_selection().has_selection(), term.row_text(4))
+    };
+    assert_eq!(
+        selected_bottom_row(b"0123456789"),
+        (true, Some("0123456789".to_owned())),
+        "precondition: output that only fills the row spares the selection"
+    );
+    assert_eq!(
+        selected_bottom_row(b"0123456789abc"),
+        (false, Some("abc3456789".to_owned())),
+        "the wrap replaced selected cells in the same print"
+    );
+}
+
+#[test]
+fn ascii_after_a_lone_mark_clears_a_selection_on_its_row() {
+    // A mark with no cell before it (a row's first column) lands on the cell under the cursor
+    // without moving it, so the ASCII after it overwrites the mark's cell: alike whether that
+    // ASCII is a print of its own or joined into the mark's run (a multi-byte character after
+    // it), and after a C1 control decoded from UTF-8, which lands nowhere.
+    for text in [
+        &b"\xcc\x81ab"[..],
+        b"\xcc\x81ab\xc3\xa9",
+        b"\xcc\x81ab \xd0\xb0\xd0\xb1",
+        b"\xcc\x81\xc2\x9bab\xc3\xa9",
+        b"\xe3\x82\x99ab\xe3\x81\x82",
+        b"\xf3\xa0\x84\x80ab\xc3\xa9",
+    ] {
+        let mut term = Terminal::new(5, 10);
+        let sel = term.text_selection_mut();
+        sel.start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
+        sel.update_selection(0, 4, SelectionSide::Right);
+        sel.complete_selection();
+        term.process(text);
+        assert!(
+            !term.text_selection().has_selection(),
+            "{} overwrote the mark's selected cell without recording it",
+            String::from_utf8_lossy(text).escape_debug()
+        );
+    }
+}

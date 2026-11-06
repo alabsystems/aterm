@@ -48,6 +48,14 @@ impl PartialEq for WakeDeadline {
 impl Eq for WakeDeadline {}
 
 impl WakeDeadline {
+    /// Clamps the awake endpoint without changing the continuous clock's domain or test seam.
+    pub(super) fn limited_by_awake(self, awake: Instant) -> Self {
+        Self {
+            awake: self.awake.min(awake),
+            ..self
+        }
+    }
+
     /// `budget` from now, on both clocks.
     #[must_use]
     pub fn after(budget: Duration) -> Self {

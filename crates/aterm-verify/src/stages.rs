@@ -35,8 +35,12 @@ pub fn run_stage(ctx: &Ctx, spec: &StageSpec) -> Report {
         StageId::Export => export(ctx, &mut r),
         StageId::LibcOracle => libc_oracle(ctx, &mut r),
         StageId::Census => census(ctx, &mut r),
+        StageId::ExportScan => {
+            if in_checkout(ctx, &mut r, "export-scan") {
+                crate::export_scan::run(ctx, &mut r);
+            }
+        }
         StageId::SpecCheck => spec_check(ctx, &mut r),
-        StageId::CheckersCompile => checkers_compile(ctx, &mut r),
         StageId::SpecCheckers => spec_checkers(ctx, &mut r),
         StageId::MeasurePrebuild => measure_prebuild(ctx, &mut r),
         #[cfg(unix)]
@@ -454,7 +458,7 @@ pub fn ship_args(verb: impl IntoIterator<Item = impl Into<String>>) -> Vec<Strin
 /// The redraw harness's target name — the `[[bin]]`, the built file and the argv below all have to agree, so they read it from here.
 pub const REDRAW_CONFORMANCE_BIN: &str = "aterm-redraw-conformance";
 
-/// The profile of every binary the run builds in the main target to drive (`spec-check`, the redraw harness, the objc drivers, the Linux lane's lab). Both this profile and the helper's feature unification must match the test compile to reuse its dependencies.
+/// The profile of every binary the run builds in the main target to drive (`spec-check`, the redraw harness, the objc drivers, the Linux lane's lab). This profile and the workspace's feature unification ([`main_targo`]) must both match the test compile's to reuse its dependencies.
 pub const MAIN_PROFILE: [&str; 2] = ["--profile", "test"];
 
 /// `targo --unverified build --profile test -q -p aterm-gui --bin aterm-redraw-conformance`, in the main target with no feature: the harness's conformance seam is compiled in wherever debug assertions are on.
@@ -556,7 +560,7 @@ pub const OBJC_DRIVES: [ObjcDrive; 7] = [
         example: "objc_confirm_drive",
         code3: Code3::Hung,
         no_status: Severity::CouldNotRun,
-        pass: "the Stop Worker sheet came up on a real NSAlert with its title, body and buttons; a click on Stop answered yes, and a click on Cancel, Return and Escape each no",
+        pass: "the Stop Worker sheet came up on a real NSAlert with its title, body and buttons; a click on Stop answered yes, and a click on Cancel, Return and Escape each no; and Rename This Mac's real alert showed its two fields, its buttons and the live line for what was typed into them through their field editor, disabled Rename for a number the read it was handed through the main queue gave another Mac (Return then did nothing and Escape cancelled), redrew the line when a read landed after typing, moved each untouched field to a read newer than the window's view while a field typed into before it kept its words and the caret stayed in the field being edited, emptied the Number field of a number a migration still waits on until it was typed to claim it, and answered Rename with only what was typed",
     },
 ];
 
@@ -702,12 +706,9 @@ pub fn libc_oracle_not_run_reason(run: &exec::Run) -> Option<String> {
 
 fn run_tests_labeled(ctx: &Ctx, r: &mut Report, label: &str, cmd: &Cmd) -> bool {
     let env = crate::findings::rerun_env(cmd, ctx.test_thread_override());
-    let features = crate::testrun::feature_args(cmd);
     let cmd = &cmd.clone().counting_waits();
     run_child(ctx, r, label, cmd, |r, run, label| {
-        let mut run = run.clone();
-        crate::testrun::serial_feature_reruns(&mut run, &features);
-        r.decide_test_child(&run, label, &env);
+        r.decide_test_child(run, label, &env);
     })
 }
 
@@ -811,12 +812,17 @@ fn targo(ctx: &Ctx, args: Vec<String>) -> Cmd {
     Cmd::new(&ctx.tools.targo).args(args)
 }
 
-/// A `targo` invocation in the main target: [`targo`], led by the build-cache `--config` plain `targo` gets from atpkg's shim when the run found one ([`Ctx::main_build_dir`]), so the run and a manual build share one cache.
+/// A `targo` invocation in the main target, sharing plain targo's build cache
+/// ([`Ctx::main_build_dir`]) and workspace feature unification
+/// ([`aterm_toolchain::build_cache::with_test_graph`]). Generated configs go before the verb.
+/// If a caller supplies command-local config, all configs move after the verb together:
+/// Trust 16387 reads command-local configs in place of global ones.
 #[must_use]
 pub fn main_targo(ctx: &Ctx, args: Vec<String>) -> Cmd {
+    let mut args = aterm_toolchain::build_cache::with_test_graph(&args);
     let mut cmd = Cmd::new(&ctx.tools.targo);
     if let Some(value) = &ctx.main_build_dir {
-        cmd = cmd.arg("--config").arg(value);
+        args.splice(0..0, ["--config".to_owned(), value.clone()]);
         if aterm_toolchain::build_cache::loses_config(
             &args,
             aterm_toolchain::build_cache::Tool::Targo,
@@ -825,7 +831,9 @@ pub fn main_targo(ctx: &Ctx, args: Vec<String>) -> Cmd {
             cmd = cmd.env(aterm_toolchain::build_cache::BUILD_DIR_ENV, directory);
         }
     }
-    cmd.args(args)
+    cmd.args(aterm_toolchain::build_cache::configs_after_subcommand(
+        &args,
+    ))
 }
 
 /// `CARGO_BUILD_JOBS` for a side lane, `None` where cargo's default stays.
@@ -833,7 +841,6 @@ pub fn main_targo(ctx: &Ctx, args: Vec<String>) -> Cmd {
 pub const fn lane_build_jobs(lane: Lane) -> Option<u32> {
     match lane {
         Lane::TrustTarget | Lane::CellsTarget => Some(4),
-        Lane::CheckersTarget => Some(8),
         _ => None,
     }
 }
@@ -864,46 +871,7 @@ pub fn in_lane(ctx: &Ctx, lane: Lane, cmd: Cmd) -> Cmd {
 /// A build of a binary the run drives, in the main target.
 #[must_use]
 pub fn main_build_cmd(ctx: &Ctx, args: Vec<String>) -> Cmd {
-    main_targo(ctx, helper_scope_args(&ctx.scope, args)).demoted()
-}
-
-/// Keep named helper targets on the workspace test graph when the run checks the
-/// workspace. Selecting their packages alone changes Cargo feature unification
-/// and rebuilds otherwise identical dependencies. Narrow runs keep their scope;
-/// arguments after `--` belong to the helper and are never rewritten. A `run`
-/// keeps its package: it runs one package's binary and refuses `--workspace`
-/// ("unexpected argument '--workspace' found", which stopped `spec-check`).
-fn helper_scope_args(scope: &Scope, args: Vec<String>) -> Vec<String> {
-    let subcommand = args.iter().find(|a| !a.starts_with('-'));
-    if !scope.is_workspace() || subcommand.is_some_and(|c| c == "run") {
-        return args;
-    }
-    let mut selected = args
-        .iter()
-        .take_while(|a| a.as_str() != "--")
-        .any(|a| a == "--workspace");
-    let mut out = Vec::with_capacity(args.len());
-    let mut args = args.into_iter();
-    while let Some(arg) = args.next() {
-        if arg == "--" {
-            out.push(arg);
-            out.extend(args);
-            break;
-        }
-        if matches!(arg.as_str(), "-p" | "--package") {
-            let Some(_) = args.next() else {
-                out.push(arg);
-                break;
-            };
-            if !selected {
-                out.push("--workspace".into());
-                selected = true;
-            }
-        } else {
-            out.push(arg);
-        }
-    }
-    out
+    main_targo(ctx, args).demoted()
 }
 
 /// A binary the main target holds: `<target>/debug/<name>`.
@@ -1196,8 +1164,8 @@ fn test_cmds(ctx: &Ctx, bind: bool) -> [Cmd; 2] {
         compile.extend(measuring_bench_args());
     }
     [
-        cmd(with_checkers(ctx, compile)).demoted(),
-        cmd(with_checkers(ctx, test_run_args(&ctx.scope)))
+        cmd(compile).demoted(),
+        with_checkers(cmd(test_run_args(&ctx.scope)), ctx.checkers_in_tests)
             .env(k, v)
             .counting_waits(),
     ]
@@ -1287,10 +1255,8 @@ const MEASURE_WINDOW_ROWS_SKIP: &str = "spin's window rows (--no-windows: each o
                                         the desktop — fix: run without --no-windows when the \
                                         desktop is free)";
 
-/// The main lane's targo over `args`, widened as every helper is ([`helper_scope_args`]), and its
-/// label.
+/// The main lane's targo over `args` ([`main_targo`]), and its label.
 fn measuring_targo(ctx: &Ctx, args: Vec<String>) -> (String, Cmd) {
-    let args = helper_scope_args(&ctx.scope, args);
     let label = format!("targo {}", args[1..].join(" "));
     (label, main_targo(ctx, args))
 }
@@ -1630,7 +1596,10 @@ fn doctests(ctx: &Ctx, r: &mut Report) {
 }
 
 fn doctest_cmd(ctx: &Ctx, driver: &DocDriver, skip: &[String]) -> Cmd {
-    let cmd = main_targo(ctx, with_checkers(ctx, doctest_args(&ctx.scope)));
+    let cmd = with_checkers(
+        main_targo(ctx, doctest_args(&ctx.scope)),
+        ctx.checkers_in_tests,
+    );
     let stand_in = ctx
         .test_recorder()
         .filter(|_| !skip.is_empty())
@@ -1716,6 +1685,22 @@ fn names_rustdoc(line: &str) -> bool {
     })
 }
 
+/// A lint pass's `args` led by the workspace's feature unification
+/// ([`aterm_toolchain::build_cache::TEST_GRAPH_FLAG`] and
+/// [`aterm_toolchain::build_cache::TEST_GRAPH_CONFIG`]; `targo-tippy` hands them to the `check`
+/// it runs, after that verb, with no `--config` of its own before it, so neither replaces the
+/// other), so `lint -p X` after `lint --all` checks no unit again, as every main-lane build
+/// resolves ([`main_targo`]). Not the shipped build's pass ([`tippy_release_args`]): `ship`
+/// builds that package alone, with its own features.
+#[must_use]
+pub fn lint_unified(args: Vec<String>) -> Vec<String> {
+    std::iter::once(aterm_toolchain::build_cache::TEST_GRAPH_FLAG)
+        .chain(aterm_toolchain::build_cache::TEST_GRAPH_CONFIG)
+        .map(String::from)
+        .chain(args)
+        .collect()
+}
+
 fn tippy_cmd(ctx: &Ctx, bin: &std::path::Path, args: Vec<String>) -> Cmd {
     let dir = bin.parent().unwrap_or(&ctx.tools.stage2_dir).to_path_buf();
     let mut path = std::ffi::OsString::from(dir.as_os_str());
@@ -1749,7 +1734,7 @@ fn tippy(ctx: &Ctx, r: &mut Report) {
             ctx,
             r,
             &format!("tippy {} -D warnings{borrowed}", pass.label),
-            &tippy_cmd(ctx, &bin, pass.args),
+            &tippy_cmd(ctx, &bin, lint_unified(pass.args)),
         );
         crate::red_now(ctx, crate::checks::Check::Lint, r);
     }
@@ -1760,7 +1745,7 @@ fn tippy(ctx: &Ctx, r: &mut Report) {
             ctx,
             r,
             &format!("tippy required-features targets -D warnings{borrowed}"),
-            &tippy_cmd(ctx, &bin, args),
+            &tippy_cmd(ctx, &bin, lint_unified(args)),
         );
         crate::red_now(ctx, crate::checks::Check::Lint, r);
     }
@@ -1942,7 +1927,7 @@ pub fn spec_check_cmd(ctx: &Ctx) -> Cmd {
     if ctx.release {
         args.extend(["--".to_string(), "--full".to_string()]);
     }
-    main_targo(ctx, helper_scope_args(&ctx.scope, args))
+    main_targo(ctx, args)
 }
 
 /// Why a `spec-check` that decided nothing did not run: the machine's failure, else its own `could not run` line (a missing `ty` or `ay` names its install).
@@ -1977,84 +1962,16 @@ fn spec_check(ctx: &Ctx, r: &mut Report) {
     }
 }
 
-/// Selected test roots and the shared checker runtime that supplies their feature.
-/// Selecting the runtime makes feature activation independent of the requested roots'
-/// own dependency declarations, without selecting unrelated workspace packages.
-pub fn spec_checkers_scope(scope: &Scope) -> Scope {
-    if scope.is_workspace() || scope.selects_nothing() || scope.includes_crate("aterm-spec") {
-        return scope.clone();
-    }
-    match scope {
-        Scope::Packages(packages) => {
-            let mut packages = packages.clone();
-            packages.push("aterm-spec".into());
-            Scope::packages(&packages)
-        }
-        Scope::Changed(changed) => {
-            let mut changed = changed.clone();
-            changed.crates.push("aterm-spec".into());
-            changed.crates.sort();
-            changed.any_lib = true;
-            Scope::Changed(changed)
-        }
-        Scope::Workspace => scope.clone(),
-    }
-}
+/// Runtime selection shared by serial Cargo runs and recorded test executables.
+pub const CHECKERS_ENV: &str = "ATERM_SPEC_CHECKERS";
 
-/// The feature that turns on per-step checker agreement. A release's test children carry it
-/// ([`crate::Ctx::checkers_in_tests`]), so its one run of the suite is the tiered tests' under `ty`.
-/// ACCEPTED: nothing in a release then runs the tests with the feature off. The feature is read
-/// only through `cfg!` in `aterm_spec::verify::checkers_required`, which only test code reaches
-/// (aterm-spec's helpers and tests in aterm-spec, aterm-agent, aterm-db and aterm-gui; `spec-check`
-/// turns the checkers on before it asks), so a test that fails only with it off is a test defect
-/// and not a product one, and it waits for a bare `verify` over its cone. ALSO ACCEPTED: the
-/// spec-check helper and the appkit drivers' Objective-C examples (through aterm-gui's
-/// dev-dependencies) stay without the feature, so a release compiles aterm-spec and the
-/// `aterm-models*` crates a second time in the main lane. The redraw harness and measure's prebuild
-/// have neither in their graphs.
-pub const CHECKERS_FEATURE: [&str; 2] = ["--features", "aterm-spec/checkers"];
-
-/// `args` with [`CHECKERS_FEATURE`] when this run's test children carry it.
-fn with_checkers(ctx: &Ctx, mut args: Vec<String>) -> Vec<String> {
-    if ctx.checkers_in_tests {
-        args.extend(CHECKERS_FEATURE.map(String::from));
-    }
-    args
-}
-
-/// The selected tests and shared runtime with per-step checker agreement enabled.
-#[must_use]
-pub fn spec_checkers_args(scope: &Scope) -> Vec<String> {
-    let mut a = test_base_args(&spec_checkers_scope(scope));
-    a.extend(CHECKERS_FEATURE.map(String::from));
-    a.extend(TEST_TARGETS.map(String::from));
-    a
-}
-
-fn checkers_compile(ctx: &Ctx, r: &mut Report) {
-    if ctx.scope.selects_nothing() {
-        r.skip(format!("checker-enabled compilation {EMPTY_CONE}"));
-        return;
-    }
-    if !ctx.tools.have_targo() {
-        r.skip("checkers compile (no targo)");
-        return;
-    }
-    let args = spec_checkers_args(&ctx.scope);
-    let label = format!("targo {} --no-run", args[1..].join(" "));
-    let cmd = spec_checkers_cmd(ctx).arg("--no-run").demoted();
-    if !compile_labeled(ctx, r, &label, &cmd) {
-        ctx.checkers_compile_failed
-            .store(true, std::sync::atomic::Ordering::Release);
-    }
+/// Assert the checker policy explicitly; inherited values never choose a verifier's verdict.
+pub(crate) fn with_checkers(cmd: Cmd, required: bool) -> Cmd {
+    cmd.env(CHECKERS_ENV, if required { "1" } else { "0" })
 }
 
 fn spec_checkers_cmd(ctx: &Ctx) -> Cmd {
-    in_lane(
-        ctx,
-        Lane::CheckersTarget,
-        targo(ctx, spec_checkers_args(&ctx.scope)),
-    )
+    with_checkers(main_targo(ctx, test_run_args(&ctx.scope)), true)
 }
 
 fn spec_checkers(ctx: &Ctx, r: &mut Report) {
@@ -2067,17 +1984,17 @@ fn spec_checkers(ctx: &Ctx, r: &mut Report) {
         return;
     }
     let label = format!(
-        "targo test {} --features aterm-spec/checkers --tests",
-        spec_checkers_scope(&ctx.scope).label()
+        "ATERM_SPEC_CHECKERS=1 targo test {} --tests",
+        ctx.scope.label()
     );
     if ctx
-        .checkers_compile_failed
+        .test_compile_failed
         .load(std::sync::atomic::Ordering::Acquire)
     {
         not_run_behind(
             r,
             &label,
-            "checker-enabled compilation failed; its runtime stage does not retry compilation",
+            "test compilation failed; its runtime stage does not retry compilation",
         );
         return;
     }
@@ -3229,6 +3146,7 @@ mod tests {
     #[test]
     fn libc_oracle_reads_the_gates_verdict_before_the_machine() {
         let run = |code: Option<i32>, output: &str| exec::Run {
+            stopped_at: None,
             ok: code == Some(0),
             output: output.to_string(),
             code,
@@ -3384,9 +3302,16 @@ mod tests {
             c.tools.trustdoc = PathBuf::from("/stage2/trustdoc");
             for skip in [&[][..], &["plain".to_string()][..]] {
                 let cmd = doctest_cmd(&c, &DocDriver::Stage2, skip);
+                let unified = aterm_toolchain::build_cache::with_test_graph(&doc);
                 assert!(
+                    cmd.args.ends_with(
+                        &unified
+                            .iter()
+                            .map(std::ffi::OsString::from)
+                            .collect::<Vec<_>>()
+                    ),
+                    "{:?}",
                     cmd.args
-                        .ends_with(&doc.iter().map(std::ffi::OsString::from).collect::<Vec<_>>())
                 );
             }
         }
@@ -3454,6 +3379,67 @@ mod tests {
             .rev()
             .find(|(n, _)| n == k)
             .map(|(_, v)| v.clone())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checker_policy_is_explicit_and_every_other_child_scrubs_it() {
+        const PROBE: &str = "ATERM_SPEC_POLICY_PROBE";
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let mut c = ctx(Scope::workspace());
+        c.root = temp.path().to_owned();
+        c.scratch = temp.path().join("scratch");
+        std::fs::create_dir_all(&c.scratch).unwrap();
+        if std::env::var_os(PROBE).is_some() {
+            let out = exec::run(
+                &Cmd::new("/usr/bin/printenv").arg(CHECKERS_ENV),
+                c.exec_env(),
+            );
+            assert_eq!(
+                out.code,
+                Some(1),
+                "an inherited checker policy leaked: {}",
+                out.output
+            );
+            for required in [false, true] {
+                let out = exec::run(
+                    &with_checkers(Cmd::new("/usr/bin/printenv").arg(CHECKERS_ENV), required),
+                    c.exec_env(),
+                );
+                assert!(out.ok, "{}", out.output);
+                assert_eq!(out.output.trim(), if required { "1" } else { "0" });
+            }
+            return;
+        }
+        let child = Cmd::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "stages::tests::checker_policy_is_explicit_and_every_other_child_scrubs_it",
+            ])
+            .env(PROBE, "1")
+            .env(CHECKERS_ENV, "1");
+        let out = exec::run(&child, c.exec_env());
+        assert!(out.ok && out.output.contains("1 passed"), "{}", out.output);
+
+        let release = ctx(Scope::workspace()).with_release(true);
+        let as_release = ctx(Scope::workspace()).with_checkers_in_tests(true);
+        for context in [&c, &release, &as_release] {
+            let [compile, run] = test_cmds(context, false);
+            assert_eq!(env_of(&compile, CHECKERS_ENV), None);
+            let want = Some(if context.checkers_in_tests { "1" } else { "0" }.into());
+            assert_eq!(env_of(&run, CHECKERS_ENV), want);
+            assert_eq!(
+                env_of(
+                    &doctest_cmd(context, &DocDriver::BarePath, &[]),
+                    CHECKERS_ENV
+                ),
+                want
+            );
+            assert_eq!(run.args, test_cmds(&c, false)[1].args);
+        }
+        let checker = spec_checkers_cmd(&c);
+        assert_eq!(env_of(&checker, CHECKERS_ENV), Some("1".into()));
+        assert_eq!(checker.args, test_cmds(&c, false)[1].args);
     }
 
     #[test]
@@ -3622,120 +3608,76 @@ mod tests {
         }
     }
 
+    /// A narrow test build on the main lane resolves the workspace's features, so it builds only
+    /// units the workspace build did, by the real `targo`'s unit graphs over a scratch workspace
+    /// where one member alone turns a shared path dependency's feature on; and the words leave
+    /// the workspace graph as it was. NEGATIVE CONTROL: the same narrow call without them holds
+    /// a unit the workspace build never makes (the dependency without its feature).
     #[test]
-    fn a_scoped_checker_graph_enables_its_runtime_without_selecting_other_members() {
+    fn a_narrow_main_lane_test_build_builds_only_what_the_workspace_build_did() {
         let directory = aterm_tempfile::tempdir().unwrap();
         let root = directory.path();
         std::fs::write(
             root.join("Cargo.toml"),
-            "[workspace]\nresolver='2'\nmembers=['aterm-spec','selected','outside']\n",
+            "[workspace]\nresolver='2'\nmembers=['wide','narrow','shared']\n",
         )
         .unwrap();
-        for name in ["aterm-spec", "selected", "outside"] {
+        for (name, extra) in [
+            ("shared", "[features]\nextra=[]\n"),
+            (
+                "wide",
+                "[dependencies]\nshared={path='../shared',features=['extra']}\n",
+            ),
+            ("narrow", "[dependencies]\nshared={path='../shared'}\n"),
+        ] {
             let package = root.join(name);
             std::fs::create_dir_all(package.join("src")).unwrap();
-            let features = if name == "aterm-spec" {
-                "[features]\ncheckers=[]\n"
-            } else {
-                ""
-            };
             std::fs::write(
                 package.join("Cargo.toml"),
-                format!("[package]\nname='{name}'\nversion='1.0.0'\nedition='2021'\n{features}"),
+                format!("[package]\nname='{name}'\nversion='1.0.0'\nedition='2021'\n{extra}"),
             )
             .unwrap();
             std::fs::write(package.join("src/lib.rs"), "").unwrap();
         }
-        // Only the selected package has the target a rerun names, as in a real rerun: cargo takes
-        // `-p selected --test t -p aterm-spec` though aterm-spec has no target `t`.
-        std::fs::create_dir_all(root.join("selected/tests")).unwrap();
-        std::fs::write(root.join("selected/tests/t.rs"), "").unwrap();
-        let mut c = ctx(Scope::crate_only("selected"));
+        let mut c = ctx(Scope::crate_only("narrow"));
         c.root = root.to_owned();
         c.scratch = root.join("scratch");
         std::fs::create_dir_all(&c.scratch).unwrap();
         c.tools.targo = PathBuf::from(env!("CARGO"));
+        c.main_build_dir = None;
         c.child_ceiling = Some(std::time::Duration::from_secs(60));
-        let query = |args: Vec<String>| {
-            let cmd = targo(&c, args)
-                .args(["--unit-graph", "-Z", "unstable-options", "--offline"])
+        let mut interner = crate::unitgraph::Interner::default();
+        let mut graph = |cmd: Cmd| {
+            let cmd = cmd
+                .args(UNIT_GRAPH)
+                .arg("--offline")
                 .env("CARGO_HOME", root.join("cargo-home"));
-            exec::run(&cmd, c.exec_env())
+            let out = exec::run(&cmd, c.exec_env());
+            assert!(out.ok, "{:?}: {}", cmd.argv(), out.output);
+            let text = out
+                .output
+                .lines()
+                .find(|l| l.starts_with("{\"version\":1"))
+                .unwrap_or_else(|| panic!("no unit graph: {}", out.output));
+            crate::unitgraph::Graph::read(text, &mut interner).unwrap()
         };
-        let mut missing_runtime = test_base_args(&c.scope);
-        missing_runtime.extend(CHECKERS_FEATURE.map(String::from));
-        missing_runtime.extend(TEST_TARGETS.map(String::from));
-        assert!(
-            !query(missing_runtime).ok,
-            "the fixture must require a feature provider"
-        );
-        let provider_alone = ["--unverified", "test", "-p", "aterm-spec", "--test", "t"];
-        assert!(
-            !query(provider_alone.map(String::from).to_vec()).ok,
-            "the feature's provider has no target `t`"
-        );
-        // A failing test's rerun, as the run's findings print it, is a command cargo takes.
-        let features = crate::testrun::feature_args(&spec_checkers_cmd(&c));
-        for spec in ["-p selected --lib", "-p selected --test t"] {
-            let mut failed = exec::Run {
-                ok: false,
-                output: format!(
-                    "running 1 test\ntest t::broke ... FAILED\n\nfailures:\n\n---- t::broke stdout \
-                     ----\nboom\n\nfailures:\n    t::broke\n\ntest result: FAILED. 0 passed; 1 \
-                     failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\nerror: test \
-                     failed, to rerun pass `{spec}`\n"
-                ),
-                code: Some(101),
-                spawn_error: None,
-                usage: None,
-            };
-            crate::testrun::serial_feature_reruns(&mut failed, &features);
-            let findings = crate::findings::test_findings("test", &failed.output, &[]);
-            let rerun = findings[0].rerun.as_deref().expect("a rerun");
-            let (command, filter) = rerun.split_once(" -- ").expect("a test filter");
-            assert_eq!(filter, "t::broke --exact");
-            let args = command
-                .strip_prefix("targo ")
-                .expect("the driver")
-                .split(' ')
-                .map(String::from)
-                .collect();
-            let answer = query(args);
-            assert!(answer.ok, "{rerun}: {}", answer.output);
-        }
-        let output = query(spec_checkers_args(&c.scope));
-        assert!(output.ok, "{}", output.output);
-        let graph = output
-            .output
-            .lines()
-            .filter_map(|line| aterm_json::from_str::<aterm_json::Value>(line).ok())
-            .find(|value| value["units"].is_array())
-            .expect("Cargo's unit graph");
-        let units = graph["units"].as_array().unwrap();
-        let roots = graph["roots"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|index| {
-                let unit = &units[usize::try_from(index.as_u64().unwrap()).unwrap()];
-                crate::unitgraph::package_name(unit["pkg_id"].as_str().unwrap()).to_owned()
-            })
-            .collect::<std::collections::BTreeSet<_>>();
+        let call = |selection: &[&str]| {
+            ["--unverified", "test"]
+                .iter()
+                .chain(selection)
+                .map(|w| (*w).to_owned())
+                .collect::<Vec<_>>()
+        };
+        let wide = graph(main_targo(&c, call(&["--workspace"])));
+        let narrow = graph(main_targo(&c, call(&["-p", "narrow"])));
+        assert!(narrow.within(&wide), "{:?}", narrow.names());
         assert_eq!(
-            roots,
-            std::collections::BTreeSet::from(["selected".into(), "aterm-spec".into()])
+            graph(targo(&c, call(&["--workspace"]))).ids(),
+            wide.ids(),
+            "the words change nothing of the workspace build"
         );
-        for unit in units.iter().filter(|unit| {
-            crate::unitgraph::package_name(unit["pkg_id"].as_str().unwrap()) == "aterm-spec"
-        }) {
-            assert!(
-                unit["features"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|feature| feature.as_str() == Some("checkers"))
-            );
-        }
+        let plain = graph(targo(&c, call(&["-p", "narrow"])));
+        assert!(!plain.within(&wide), "the control: {:?}", plain.names());
     }
 
     #[test]
@@ -3750,7 +3692,6 @@ mod tests {
                 test_compile_args(&scope),
                 test_run_args(&scope),
                 doctest_args(&scope),
-                spec_checkers_args(&scope),
             ] {
                 assert!(has(&argv, "--no-fail-fast"), "{argv:?}");
                 for c in scope.crates() {
@@ -3772,11 +3713,7 @@ mod tests {
                 assert!(lint[..sep].contains(c), "{c}: {lint:?}");
             }
         }
-        for argv in [
-            measuring_args(),
-            measure_prebuild_args(),
-            spec_checkers_args(&Scope::workspace()),
-        ] {
+        for argv in [measuring_args(), measure_prebuild_args()] {
             assert!(has(&argv, "--no-fail-fast"), "{argv:?}");
         }
         let g = tippy_gated_args(&Scope::workspace(), &fixture_gated()).expect("gated");
@@ -3799,6 +3736,7 @@ mod tests {
                 output.push_str(&format!("test {t} ... ok\n"));
             }
             exec::Run {
+                stopped_at: None,
                 ok,
                 output,
                 code: Some(i32::from(!ok)),
@@ -3851,83 +3789,6 @@ mod tests {
         );
     }
 
-    /// A release's test children, compile, run and doctests, carry the feature in the main lane,
-    /// and so do `--as-release`'s, which compile and rerun them. CONTROL: a plain run's carry nothing.
-    #[test]
-    fn a_release_runs_its_tests_with_the_checkers_in_the_main_lane() {
-        let carries = |args: &[std::ffi::OsString]| {
-            args.windows(2)
-                .any(|w| w[0] == "--features" && w[1] == "aterm-spec/checkers")
-        };
-        let plain = ctx(Scope::workspace());
-        let release = ctx(Scope::workspace()).with_release(true);
-        let as_release = ctx(Scope::workspace()).with_checkers_in_tests(true);
-        assert!(release.checkers_in_tests && !plain.checkers_in_tests);
-        for bind in [false, true] {
-            for cmd in test_cmds(&plain, bind) {
-                assert!(!carries(&cmd.args), "{:?}", cmd.args);
-            }
-            for c in [&release, &as_release] {
-                for cmd in test_cmds(c, bind) {
-                    assert!(carries(&cmd.args), "{:?}", cmd.args);
-                    assert!(
-                        cmd.argv().iter().any(|a| a == "--workspace"),
-                        "{:?}",
-                        cmd.args
-                    );
-                }
-            }
-        }
-        let doc = |c: &Ctx| doctest_cmd(c, &DocDriver::BarePath, &[]);
-        assert!(carries(&doc(&release).args) && !carries(&doc(&plain).args));
-        assert!(carries(&doc(&as_release).args));
-    }
-
-    /// A failing doctest's own rerun names the feature its run carried, and the package that holds
-    /// it. CONTROL: a run with no feature keeps cargo's spelling.
-    #[cfg(unix)]
-    #[test]
-    fn a_failing_doctests_rerun_carries_what_its_run_carried() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let tmp = aterm_tempfile::tempdir().expect("scratch");
-        let targo = tmp.path().join("targo");
-        std::fs::write(
-            &targo,
-            "#!/bin/sh\n\
-             printf 'running 1 test\\ntest src/lib.rs - x (line 1) ... FAILED\\n\\nfailures:\\n\\n'\n\
-             printf -- '---- src/lib.rs - x (line 1) stdout ----\\nboom\\n\\nfailures:\\n'\n\
-             printf '    src/lib.rs - x (line 1)\\n\\ntest result: FAILED. 0 passed; 1 failed; 0 \
-             ignored; 0 measured; 0 filtered out; finished in 0.00s\\n\\n'\n\
-             printf 'error: doctest failed, to rerun pass `-p x --doc`\\n'\n\
-             exit 101\n",
-        )
-        .expect("the stand-in");
-        std::fs::set_permissions(&targo, std::fs::Permissions::from_mode(0o755))
-            .expect("executable");
-        let rerun = |cmd: Cmd| {
-            let mut c = ctx(Scope::workspace());
-            tmp.path().clone_into(&mut c.root);
-            tmp.path().clone_into(&mut c.scratch);
-            let mut report = Report::new("doc");
-            assert!(!run_tests_labeled(&c, &mut report, "doc", &cmd));
-            let found = report.entries.iter().find_map(|entry| match entry {
-                crate::ladder::Entry::Ladder { findings, .. } => findings.first().cloned(),
-                _ => None,
-            });
-            found
-                .unwrap_or_else(|| panic!("no finding: {:?}", report.entries))
-                .rerun
-                .expect("a rerun")
-        };
-        let feature = rerun(Cmd::new(&targo).args(CHECKERS_FEATURE));
-        assert!(
-            feature.contains("-p x --doc -p aterm-spec --features aterm-spec/checkers"),
-            "{feature}"
-        );
-        let plain = rerun(Cmd::new(&targo));
-        assert!(plain.contains("test -p x --doc -- "), "{plain}");
-    }
-
     #[test]
     fn an_empty_change_selection_compiles_nothing_in_any_of_those_stages() {
         let c = ctx(Scope::changed("main", vec![], true));
@@ -3936,7 +3797,6 @@ mod tests {
             StageId::Test,
             StageId::Doctests,
             StageId::Tippy,
-            StageId::CheckersCompile,
             StageId::SpecCheckers,
         ] {
             let mut cc = ctx(c.scope.clone());
@@ -4278,19 +4138,24 @@ mod tests {
             c.main_build_dir.as_deref().expect("a build dir")
         );
         let tail = "--no-fail-fast --tests --no-run --message-format=json-render-diagnostics";
+        let test = format!(
+            "--unverified {} test {}",
+            aterm_toolchain::build_cache::TEST_GRAPH_CONFIG.join(" "),
+            aterm_toolchain::build_cache::TEST_GRAPH_FLAG
+        );
         assert_eq!(
             starts,
             [
                 format!(
-                    "{lead} --unverified test -p aterm-gui --no-fail-fast --lib --no-run --message-format=json-render-diagnostics"
+                    "{lead} {test} -p aterm-gui --no-fail-fast --lib --no-run --message-format=json-render-diagnostics"
                 ),
-                format!("{lead} --unverified test -p aterm-gui {tail}"),
+                format!("{lead} {test} -p aterm-gui {tail}"),
                 test_cmds(&c, false)[0].argv()[1..].join(" "),
             ]
         );
         assert_eq!(
             starts[2],
-            format!("{lead} --unverified test -p aterm-effects -p aterm-gui {tail}")
+            format!("{lead} {test} -p aterm-effects -p aterm-gui {tail}")
         );
 
         let (rows, starts, _) = run("101");
@@ -4742,7 +4607,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn failed_checker_compilation_is_not_retried_by_the_runtime() {
+    fn checkers_do_not_retry_a_failed_main_test_compile() {
         let temp = aterm_tempfile::tempdir().unwrap();
         let mut c = Ctx::new(
             temp.path().into(),
@@ -4753,13 +4618,9 @@ mod tests {
         c.tools.targo = "/usr/bin/false".into();
         c.tools.refused = None;
         let mut compile = Report::new("checkers compile");
-        checkers_compile(&c, &mut compile);
+        test_compile(&c, &crate::plan::declared(&c.scope).remove(0), &mut compile);
         assert!(
-            c.checkers_compile_failed
-                .load(std::sync::atomic::Ordering::Acquire)
-        );
-        assert!(
-            !c.test_compile_failed
+            c.test_compile_failed
                 .load(std::sync::atomic::Ordering::Acquire)
         );
         c.scratch = temp.path().join("runtime-must-not-start");
@@ -4801,6 +4662,7 @@ mod tests {
         let release = spec_check_cmd(&ctx(Scope::workspace()).with_release(true));
         assert_eq!(tail(&release), ["spec-check", "--", "--full"]);
         let run = |code: Option<i32>, output: &str| exec::Run {
+            stopped_at: None,
             ok: code == Some(0),
             output: output.to_string(),
             code,
@@ -4879,67 +4741,6 @@ mod tests {
         assert!(
             !build.envs.iter().any(|(k, _)| k == "CARGO_TARGET_DIR"),
             "the main target, inherited"
-        );
-    }
-
-    #[test]
-    fn workspace_helpers_unify_features_without_changing_targets_or_child_arguments() {
-        let args: Vec<String> = [
-            "build",
-            "-p",
-            "aterm",
-            "--package",
-            "aterm-lab",
-            "--bin",
-            "aterm",
-            "--bin",
-            "aterm-lab",
-            "--",
-            "-p",
-            "child-value",
-        ]
-        .map(String::from)
-        .into();
-        assert_eq!(
-            helper_scope_args(&Scope::workspace(), args.clone()),
-            [
-                "build",
-                "--workspace",
-                "--bin",
-                "aterm",
-                "--bin",
-                "aterm-lab",
-                "--",
-                "-p",
-                "child-value"
-            ]
-        );
-        assert_eq!(
-            helper_scope_args(&Scope::Packages(vec!["aterm".into()]), args.clone()),
-            args
-        );
-        let already: Vec<String> = ["build", "--workspace", "-p", "aterm", "--bin", "aterm"]
-            .map(String::from)
-            .into();
-        assert_eq!(
-            helper_scope_args(&Scope::workspace(), already),
-            ["build", "--workspace", "--bin", "aterm"]
-        );
-        let run: Vec<String> = [
-            "--unverified",
-            "run",
-            "-q",
-            "-p",
-            "aterm-models",
-            "--bin",
-            "x",
-        ]
-        .map(String::from)
-        .into();
-        assert_eq!(
-            helper_scope_args(&Scope::workspace(), run.clone()),
-            run,
-            "a run keeps its package"
         );
     }
 
@@ -5089,6 +4890,7 @@ mod tests {
     /// Every ladder row `decide_measuring_child` records for `output`.
     fn decide_measured(ok: bool, output: String, subject: &Subject) -> Vec<(Outcome, String)> {
         let run = exec::Run {
+            stopped_at: None,
             ok,
             output,
             code: Some(if ok { 0 } else { 101 }),
@@ -5363,7 +5165,7 @@ mod tests {
 
     #[test]
     fn a_callers_cargo_build_jobs_is_a_ceiling_for_the_side_lanes() {
-        for lane in [Lane::TrustTarget, Lane::CellsTarget, Lane::CheckersTarget] {
+        for lane in [Lane::TrustTarget, Lane::CellsTarget] {
             let own = lane_build_jobs(lane);
             assert_eq!(lane_jobs(lane, None), own, "{lane:?}");
             assert_eq!(
@@ -5398,6 +5200,85 @@ mod tests {
         assert!(envs(&export_cmd(&c)).contains(&("CARGO_BUILD_JOBS".to_string(), "3".to_string())));
     }
 
+    /// The words of `argv` (its program first) before its subcommand and those after it up to
+    /// `--`, as cargo reads the line: a flag's value (`--config`, `-Z`, …) is no subcommand.
+    fn around_verb(argv: &[String]) -> (Vec<&str>, &str, Vec<&str>) {
+        let mut words = argv[1..].iter().map(String::as_str);
+        let mut before = Vec::new();
+        while let Some(word) = words.next() {
+            if matches!(
+                word,
+                "--config" | "-Z" | "--manifest-path" | "--target-dir" | "--color" | "-C"
+            ) {
+                before.push(word);
+                before.extend(words.next());
+            } else if word.starts_with('-') {
+                before.push(word);
+            } else {
+                return (before, word, words.take_while(|w| *w != "--").collect());
+            }
+        }
+        panic!("no subcommand: {argv:?}")
+    }
+
+    /// Every `--config` of a main-lane child, and of the test run's recording pass, goes before
+    /// its subcommand, the test graph's beside the build cache's and the recording runner's, and
+    /// the test graph's flag right after it: Trust's `targo` reads a `--config` after the verb in
+    /// place of those before it, which dropped the cache and the runner (every test binary then
+    /// ran in cargo's serial pass, unrecorded). NEGATIVE CONTROL: B16's line, its `--config`
+    /// after the verb, holds one there.
+    #[test]
+    fn a_main_lane_child_names_every_config_before_its_verb() {
+        let mut c = ctx(Scope::crate_only("x"));
+        c.main_build_dir = Some("build.build-dir='/cache'".to_string());
+        let [compile, run] = test_cmds(&c, false);
+        let recording = crate::testrun::recording_cmd(&run, "target.'cfg(all())'.runner=[\"r\"]");
+        let flag = aterm_toolchain::build_cache::TEST_GRAPH_FLAG;
+        for cmd in [compile, run, recording, spec_check_cmd(&c)] {
+            let argv = cmd.argv();
+            let (before, _, after) = around_verb(&argv);
+            assert!(!after.contains(&"--config"), "{argv:?}");
+            assert_eq!(after.first(), Some(&flag), "{argv:?}");
+            let configs = before.iter().filter(|w| **w == "--config").count();
+            assert!(configs >= 2, "the cache's and the test graph's: {argv:?}");
+        }
+        let b16 = [
+            "targo",
+            "--config",
+            "build.build-dir='/cache'",
+            "--unverified",
+            "test",
+            flag,
+            "--config",
+            "resolver.feature-unification=\"workspace\"",
+        ]
+        .map(String::from);
+        assert!(around_verb(&b16).2.contains(&"--config"));
+    }
+
+    #[test]
+    fn a_callers_local_config_keeps_the_main_lanes_cache_and_test_graph() {
+        let mut c = ctx(Scope::crate_only("x"));
+        c.main_build_dir = Some("build.build-dir='/cache'".to_string());
+        let argv = main_targo(
+            &c,
+            ["--unverified", "test", "--config", "build.jobs=1"]
+                .map(String::from)
+                .to_vec(),
+        )
+        .argv();
+        let (before, verb, after) = around_verb(&argv);
+        assert_eq!(verb, "test");
+        assert!(!before.contains(&"--config"), "{argv:?}");
+        for value in [
+            "build.build-dir='/cache'",
+            aterm_toolchain::build_cache::TEST_GRAPH_CONFIG[1],
+            "build.jobs=1",
+        ] {
+            assert!(after.contains(&value), "{argv:?}");
+        }
+    }
+
     #[test]
     fn the_main_lanes_children_lead_with_the_shims_build_dir() {
         let mut c = ctx(Scope::workspace());
@@ -5416,9 +5297,26 @@ mod tests {
                 .iter()
                 .any(|(k, v)| k == "CARGO_TARGET_DIR" && v == c.target_dir.as_os_str())
         );
+        let [config, workspace] = aterm_toolchain::build_cache::TEST_GRAPH_CONFIG;
+        let unify = aterm_toolchain::build_cache::TEST_GRAPH_FLAG;
+        let narrow = || {
+            ["--unverified", "test", "-p", "x"]
+                .map(String::from)
+                .to_vec()
+        };
         assert_eq!(
-            main_targo(&c, vec!["x".into()]).argv()[1..],
-            ["--config", fallback.as_str(), "x"]
+            main_targo(&c, narrow()).argv()[1..],
+            [
+                "--config",
+                fallback.as_str(),
+                "--unverified",
+                config,
+                workspace,
+                "test",
+                unify,
+                "-p",
+                "x"
+            ]
         );
         let value = "build.build-dir='/h/Library/Caches/aterm/cargo-build.noindex{workspace-root}/.cargo-build'";
         c.main_build_dir = Some(value.to_string());
@@ -5430,6 +5328,15 @@ mod tests {
             &linux_lab_build_cmd(&c),
         ] {
             assert_eq!(cmd.argv()[1..3], ["--config", value], "{:?}", cmd.argv());
+            assert_eq!(
+                (&cmd.argv()[4..6], &cmd.argv()[7]),
+                (
+                    &[config, workspace].map(String::from)[..],
+                    &unify.to_owned()
+                ),
+                "the workspace's features, around the verb: {:?}",
+                cmd.argv()
+            );
             assert!(
                 !cmd.envs
                     .iter()
@@ -5450,6 +5357,11 @@ mod tests {
             "the same placement must reach an external subcommand"
         );
         c.main_build_dir = None;
+        assert_eq!(
+            main_targo(&c, narrow()).argv()[1..],
+            ["--unverified", config, workspace, "test", unify, "-p", "x"],
+            "unplaced (off macOS, no shim), the main lane still resolves the workspace's features"
+        );
         assert!(
             !main_targo(&c, vec!["tippy".into()])
                 .envs
@@ -5490,15 +5402,23 @@ mod tests {
             c.main_build_dir.clone().expect("a build dir"),
         ];
         assert_eq!(build.argv()[1..3], lead);
+        let [config, workspace] = aterm_toolchain::build_cache::TEST_GRAPH_CONFIG;
+        let unify = aterm_toolchain::build_cache::TEST_GRAPH_FLAG;
         assert_eq!(
             build.argv()[3..],
             [
                 "--unverified",
+                config,
+                workspace,
                 "build",
+                unify,
                 "--profile",
                 "test",
                 "-q",
-                "--workspace",
+                "-p",
+                "aterm",
+                "-p",
+                "aterm-lab",
                 "--bin",
                 "aterm",
                 "--bin",
@@ -5537,15 +5457,21 @@ mod tests {
             c.main_build_dir.clone().expect("a build dir"),
         ];
         assert_eq!(build.argv()[1..3], lead);
+        let [config, workspace] = aterm_toolchain::build_cache::TEST_GRAPH_CONFIG;
+        let unify = aterm_toolchain::build_cache::TEST_GRAPH_FLAG;
         assert_eq!(
             build.argv()[3..],
             [
                 "--unverified",
+                config,
+                workspace,
                 "build",
+                unify,
                 "--profile",
                 "test",
                 "-q",
-                "--workspace",
+                "-p",
+                "aterm-lab",
                 "--bin",
                 "aterm-lab"
             ]

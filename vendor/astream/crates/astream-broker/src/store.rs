@@ -539,11 +539,63 @@ fn apply_retire_target(
 
 /// Durable latest `/a/will` entry per producer, tracking whether a visible record of
 /// that producer has landed ABOVE `offset` that fences or dedups `will`.
+///
+/// The map of them (`BrokerLog::durable_latest_wills`) holds every will the log still
+/// holds, one per producer: the latest one carried in `<log>.state` or in a retained
+/// `/a/will` record. An open seeds it from the state and folds the kept records into it,
+/// each append folds its record, and a cut drops what it dropped
+/// ([`BrokerLog::cut_latest_wills`]), so [`BrokerLog::stats`] and the will queries read it
+/// and never a record (aterm F19).
 #[derive(Clone, Debug)]
 struct DurableWillEntry {
     offset: Offset,
     will: WillRecord,
     settled_above: bool,
+}
+
+/// Make `will`, at offset `off`, producer `pid`'s latest will: the one it replaces leaves its
+/// target's set of producers, and the new one is settled already when its target is hidden,
+/// else joins its target's set. What a retained `/a/will` record folds in, what an open seeds
+/// from a will `<log>.state` carried, and what a live cut leaves of one it dropped.
+fn put_latest_will(
+    durable_latest_wills: &mut HashMap<u64, DurableWillEntry>,
+    durable_wills_by_subject: &mut HashMap<String, HashSet<u64>>,
+    pid: u64,
+    off: Offset,
+    will: WillRecord,
+) {
+    if let Some(old) = durable_latest_wills.remove(&pid) {
+        unindex_will_target(durable_wills_by_subject, &old.will.subject, pid);
+    }
+    let hidden_target = is_hidden_subject(&will.subject);
+    if !hidden_target {
+        durable_wills_by_subject
+            .entry(will.subject.clone())
+            .or_default()
+            .insert(pid);
+    }
+    durable_latest_wills.insert(
+        pid,
+        DurableWillEntry {
+            offset: off,
+            will,
+            settled_above: hidden_target,
+        },
+    );
+}
+
+/// Take producer `pid` out of the set of producers whose latest will targets `subject`.
+fn unindex_will_target(
+    durable_wills_by_subject: &mut HashMap<String, HashSet<u64>>,
+    subject: &str,
+    pid: u64,
+) {
+    if let Some(pids) = durable_wills_by_subject.get_mut(subject) {
+        pids.remove(&pid);
+        if pids.is_empty() {
+            durable_wills_by_subject.remove(subject);
+        }
+    }
 }
 
 fn update_durable_wills_on_record(
@@ -553,28 +605,12 @@ fn update_durable_wills_on_record(
 ) {
     if rec.subject == WILL_SUBJECT {
         if let Some(will) = WillRecord::from_record(rec) {
-            if let Some(old) = durable_latest_wills.remove(&rec.producer_id) {
-                if let Some(pids) = durable_wills_by_subject.get_mut(&old.will.subject) {
-                    pids.remove(&rec.producer_id);
-                    if pids.is_empty() {
-                        durable_wills_by_subject.remove(&old.will.subject);
-                    }
-                }
-            }
-            let hidden_target = is_hidden_subject(&will.subject);
-            if !hidden_target {
-                durable_wills_by_subject
-                    .entry(will.subject.clone())
-                    .or_default()
-                    .insert(rec.producer_id);
-            }
-            durable_latest_wills.insert(
+            put_latest_will(
+                durable_latest_wills,
+                durable_wills_by_subject,
                 rec.producer_id,
-                DurableWillEntry {
-                    offset: rec.seq,
-                    will,
-                    settled_above: hidden_target,
-                },
+                rec.seq,
+                will,
             );
         }
     } else if !is_hidden_record(rec) {
@@ -738,20 +774,12 @@ impl IndexFold {
             max_bt: 0,
         };
         for (&pid, (off, will)) in &fold.carried_wills {
-            let hidden_target = is_hidden_subject(&will.subject);
-            if !hidden_target {
-                fold.durable_wills_by_subject
-                    .entry(will.subject.clone())
-                    .or_default()
-                    .insert(pid);
-            }
-            fold.durable_latest_wills.insert(
+            put_latest_will(
+                &mut fold.durable_latest_wills,
+                &mut fold.durable_wills_by_subject,
                 pid,
-                DurableWillEntry {
-                    offset: *off,
-                    will: will.clone(),
-                    settled_above: hidden_target,
-                },
+                *off,
+                will.clone(),
             );
         }
         for (subj, rec) in &fold.carried_last {
@@ -900,6 +928,13 @@ thread_local! {
     /// How many times an open on this thread folded the log again up to its recovery's cut
     /// (a test's count, `open_scan_tests.rs`).
     pub(crate) static REFOLDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(test, feature = "retention"))]
+thread_local! {
+    /// Negative control (`will_map_tests.rs`): a cut on this thread leaves the latest-will
+    /// map as it was, its wills below the cut kept and nothing it carried put in their place.
+    pub(crate) static WILLS_UNCUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Every record of a log's intact prefix decoded, with its broker time and the byte its frame
@@ -1147,8 +1182,9 @@ pub struct BrokerLog {
     /// How many distinct subjects each producer has created in `last` (the bound
     /// [`MAX_SUBJECTS_PER_PRODUCER`] is checked against this).
     subjects_per_producer: HashMap<u64, usize>,
-    /// Each producer's latest durable `/a/will` record and whether a visible record of
-    /// that producer has landed ABOVE it that fences or dedups it.
+    /// Each producer's latest will the log still holds, carried in `<log>.state` or in a
+    /// retained `/a/will` record, and whether a visible record of that producer has landed
+    /// ABOVE it that fences or dedups it ([`DurableWillEntry`]).
     durable_latest_wills: HashMap<u64, DurableWillEntry>,
     /// Reverse index from target subject to the set of producers whose latest durable
     /// `/a/will` targets that subject, so `Retire` checks durable wills in `O(1)` without
@@ -1356,6 +1392,12 @@ pub struct BrokerLog {
     /// so a test sees what an embedder that woke at the poison would leave a reopen.
     #[cfg(test)]
     pub(crate) id_at_poison: Option<Option<Vec<u8>>>,
+    /// F24's NEGATIVE CONTROL: every append, un-batched or a batch's, written at the file
+    /// cursor as before appends were positional (`storage::write_all_at` says why they
+    /// are), so `append_tests.rs` can show its interleaving of cold reads and appends
+    /// catches that write.
+    #[cfg(test)]
+    pub(crate) cursor_appends: bool,
     /// Positional cold reads (`file.read_at`) performed by [`record_arc`](Self::record_arc)
     /// during this open: what a residency budget costs its readers
     /// ([`cold_reads`](Self::cold_reads)).
@@ -1533,6 +1575,11 @@ mod open_scan;
 #[cfg(test)]
 #[path = "open_scan_tests.rs"]
 mod open_scan_tests;
+
+/// The latest-will map held to the read-back it replaced (`will_map_tests.rs`, aterm F19).
+#[cfg(test)]
+#[path = "will_map_tests.rs"]
+mod will_map_tests;
 pub use check_open::{InterruptedStep, OpenCheck};
 
 /// The path of a log's per-log cryptographic at-rest binding sidecar, `<log>.seal`. Beside a
@@ -3578,6 +3625,25 @@ pub enum Prepared {
     Unclean(String),
 }
 
+/// When an embedder that uses a [`BrokerLog`] directly tells whoever wrote a record that it
+/// holds it ([`OpenOptions::acks`]): what the next open, in another boot, may assume a run that
+/// stopped without a clean close lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Acks {
+    /// At the publish: an ack promises what the tier promises then ([`Durability`]), so an
+    /// Ordered or Relaxed run that stopped uncleanly may have lost its newest acks, and the
+    /// next open in another boot moves the generation.
+    #[default]
+    Publish,
+    /// Only once a full flush covers the record ([`BrokerLog::sync_full`], an escalated
+    /// record, a Strict batch, [`BrokerLog::close_clean`]). A power loss then takes only
+    /// records nobody was told of, so an Ordered run is recorded in `<log>.id` as a Strict one
+    /// is, and its unclean stop moves no generation and is not announced. A Relaxed run is
+    /// still recorded Relaxed: its recovery reads from that tier that a power loss can leave
+    /// holes. A broker acks at its writer's publish, and refuses this.
+    FullFlush,
+}
+
 /// Hard upper bound (`10^12`) on per-bucket rate and burst parameters in [`RateLimit`],
 /// guaranteeing `val * 1_000` millitokens never overflows `u64`.
 pub const MAX_RATE_BUDGET: u64 = 1_000_000_000_000;
@@ -3832,6 +3898,12 @@ pub struct OpenOptions {
     /// indexes remain in memory and can grow with retained history; this is not a bound
     /// on total broker memory. `None` (the default) keeps every retained record decoded.
     pub resident_budget: Option<usize>,
+    /// When a [`BrokerLog`] used directly acknowledges a record ([`Acks::Publish`] by
+    /// default): an embedder that acks only what a full flush covered says
+    /// [`Acks::FullFlush`], and its Ordered run's unclean stop then moves no generation.
+    /// Refused by [`Broker::open_opts`](crate::Broker::open_opts), whose writer acks at the
+    /// publish.
+    pub acks: Acks,
     /// The crash simulation's recovery mutation (a negative control).
     #[cfg(test)]
     pub(crate) mutation: Mutation,
@@ -4283,10 +4355,13 @@ const _: fn(&Storage<'_>) = |s| match s {
     Storage::Os(_) => {}
 };
 
-/// The served-tier code `<log>.id` carries for `tier`: what the NEXT open reads to decide
-/// whether this run could have lost an acked record to a power loss.
-const fn served_code(tier: crate::proto::Tier) -> u8 {
+/// The served-tier code `<log>.id` carries for a run that serves `tier` and acks by `acks`:
+/// what the NEXT open reads to decide whether this run could have lost an acked record to a
+/// power loss. An Ordered run that acked only what a full flush covered ([`Acks::FullFlush`])
+/// is recorded as a Strict one: its acks were on stable media.
+const fn served_code(tier: crate::proto::Tier, acks: Acks) -> u8 {
     match tier {
+        crate::proto::Tier::Ordered if matches!(acks, Acks::FullFlush) => logid::SERVED_STRICT,
         crate::proto::Tier::Strict => logid::SERVED_STRICT,
         crate::proto::Tier::Ordered => logid::SERVED_ORDERED,
         // Relaxed, and (unreachable: a log serves only its own three) a code this build
@@ -4512,25 +4587,29 @@ pub(crate) enum TailStep {
 pub(crate) struct BatchWrite {
     out: crate::storage::BatchOut,
     bytes: Vec<u8>,
+    /// Where the batch is written: the log's durable length when it began, its end.
+    at: u64,
     flush: Flush,
     faults: InjectedFaults,
     refuse_barrier: bool,
     issued: Issued,
+    /// F24's negative control, as the log's own ([`BrokerLog::cursor_appends`]).
+    #[cfg(test)]
+    cursor_appends: bool,
 }
 
 impl BatchWrite {
-    /// Write the batch in ONE call, then issue the flush its tier owes ([`issue_flush`]):
-    /// the only part of a commit that waits on the device, and the part that runs
-    /// without the log's lock. The injected fsync fault ([`InjectedFaults::sync`]) fails
-    /// a full flush HERE, as a real one would, so a failed flush reaches the rollback
-    /// through the same halves a real one does; the injected write fault
-    /// ([`InjectedFaults::write`]) fails the write here the same way.
+    /// Write the batch in ONE positional write at its start ([`append`](Self::append)),
+    /// then issue the flush its tier owes ([`issue_flush`]): the only part of a commit that
+    /// waits on the device, and the part that runs without the log's lock. The injected
+    /// fsync fault ([`InjectedFaults::sync`]) fails a full flush HERE, as a real one would,
+    /// so a failed flush reaches the rollback through the same halves a real one does; the
+    /// injected write fault ([`InjectedFaults::write`]) fails the write here the same way.
     pub(crate) fn run(&mut self) -> io::Result<()> {
         if self.faults.write {
-            let out = &self.out;
-            return Err(faulted_write(|b| out.write_all(b), &self.bytes));
+            return Err(faulted_write(|b| self.append(b), &self.bytes));
         }
-        self.out.write_all(&self.bytes)?;
+        self.append(&self.bytes)?;
         let _ = issue_flush(
             &self.out,
             self.flush,
@@ -4539,6 +4618,16 @@ impl BatchWrite {
             &mut self.issued,
         )?;
         Ok(())
+    }
+
+    /// Write `bytes` at the batch's start, by position (`storage::write_all_at` says why),
+    /// or, in F24's negative control, at the file cursor.
+    fn append(&self, bytes: &[u8]) -> io::Result<()> {
+        #[cfg(test)]
+        if self.cursor_appends {
+            return self.out.write_at_cursor(bytes);
+        }
+        self.out.write_at(bytes, self.at)
     }
 }
 
@@ -5527,6 +5616,7 @@ impl BrokerLog {
             repair_cut,
             mutation,
             durability,
+            opts.acks,
             boot,
             boot_volume,
         )?;
@@ -5628,6 +5718,8 @@ impl BrokerLog {
             refuse_barrier: false,
             #[cfg(test)]
             id_at_poison: None,
+            #[cfg(test)]
+            cursor_appends: false,
             cold_reads: std::sync::atomic::AtomicU64::new(0),
             closed: false,
             released: false,
@@ -5669,6 +5761,7 @@ impl BrokerLog {
         repair_cut: bool,
         mutation: Mutation,
         durability: Durability,
+        acks: Acks,
         boot: Option<[u8; 16]>,
         boot_volume: bool,
     ) -> io::Result<(logid::Sidecar, Served)> {
@@ -5724,7 +5817,7 @@ impl BrokerLog {
                 Some((_, newest)) => newest,
                 None => &[],
             },
-            served: served_code(durability.tier()),
+            served: served_code(durability.tier(), acks),
             boot,
             boot_volume,
         };
@@ -5745,7 +5838,7 @@ impl BrokerLog {
             // a barrier on the log's own descriptor), and recorded in phase 2: the next open
             // reads from it whether this run's acks could be lost to a power loss.
             let served = decide_served(durability, boot_volume, file);
-            record.served = served_code(served.tier);
+            record.served = served_code(served.tier, acks);
             // PHASE 2: the floor rises to the head only now that the head is durable.
             Self::finish_serving_open(dir, prior, &record, mutation, served)
         })
@@ -5781,8 +5874,7 @@ impl BrokerLog {
         } else {
             res
         };
-        let res = res.and_then(|()| file.sync_all());
-        res.and_then(|()| file.seek_end())
+        res.and_then(|()| file.sync_all())
     }
 
     fn write_serving_if_changed(
@@ -5933,7 +6025,8 @@ impl BrokerLog {
     /// [`Broker::arm_unclean_stop`](crate::Broker::arm_unclean_stop), which leaves the
     /// log as a killed process would (the broker's stop latches the log shut all the
     /// same, when it lets the lock go: `unlock`); a direct `BrokerLog` user calls it as
-    /// the log's last act, and one that drops the log without it has stopped uncleanly.
+    /// the log's last act, and one that drops the log without it has stopped uncleanly
+    /// (which loses no ack of one that acks only at full flushes, [`Acks::FullFlush`]).
     /// Afterwards every mutation is refused until the log is reopened: the sidecar now
     /// promises nothing was appended. A poisoned log, or one
     /// with a batch staged, is not closed (`Err`), and a flush or sidecar error leaves
@@ -5965,7 +6058,7 @@ impl BrokerLog {
                         "close_clean: the newest frame is too long",
                     ));
                 };
-                self.file.read_range(at, len)?
+                self.file.read_at(at, len)?
             }
             None => Vec::new(),
         };
@@ -6054,7 +6147,8 @@ impl BrokerLog {
     /// FLUSH IN FULL NOW, unless a full flush already covers the head (counted as
     /// skipped): the durable head after it. For a [`BrokerLog`] used directly, which has
     /// no writer thread and so no horizon — on an Ordered or Relaxed log nothing but this,
-    /// an escalated record and [`close_clean`](Self::close_clean) makes an ack durable.
+    /// an escalated record and [`close_clean`](Self::close_clean) makes an ack durable; an
+    /// embedder that acks only after one of them says so at the open ([`Acks::FullFlush`]).
     /// (The broker's [`flush_durable`](crate::Broker::flush_durable) is the same flush,
     /// issued by its writer outside the log's lock.) A failure is the escalation's
     /// (`full_flush_failed`, private): the run is recorded `Lossy` and
@@ -6634,10 +6728,7 @@ impl BrokerLog {
             ));
         };
         let mut existing = Vec::new();
-        let read_res = self.file.read_to_end(&mut existing);
-        let seek_res = self.file.seek_end();
-        read_res?;
-        seek_res?;
+        self.file.read_to_end(&mut existing)?;
 
         let mut keep = 0usize;
         let mut idx = 0usize;
@@ -6711,8 +6802,8 @@ impl BrokerLog {
         let cutting = record.cutting(&prior, false);
         logid::write(&self.dir, &cutting)?;
 
-        // Phase 2: truncate `<log>`, flush in full, seek to end, write `Open` `<log>.id`,
-        // and update active sidecars. Any I/O error from here on poisons the log so stale
+        // Phase 2: truncate `<log>`, flush in full, write `Open` `<log>.id`, and update
+        // active sidecars. Any I/O error from here on poisons the log so stale
         // in-memory indices can never serve.
         let new_log_id = log_identity(kept_slice);
         let new_newest_at = logid::last_frame_start(kept_slice).map(|at| at as u64);
@@ -6725,7 +6816,6 @@ impl BrokerLog {
         let disk_step: io::Result<()> = (|| {
             self.file.resize_file(keep as u64)?;
             self.file.sync_all()?;
-            self.file.seek_end()?;
             logid::write(&self.dir, &serving)?;
             #[cfg(feature = "anti-rollback")]
             if let (Some(hw), Some(key)) = (&self.head_watermark, at_rest_ref) {
@@ -7005,18 +7095,14 @@ impl BrokerLog {
     }
 
     /// Operational snapshot of this log's retained offsets, byte size, and index
-    /// cardinalities (`REQUIREMENTS` R5).
+    /// cardinalities (`REQUIREMENTS` R5). It reads no record: its pending wills are counted
+    /// from the log's latest-will map, each producer's latest will held in memory, so under a
+    /// residency budget it reads nothing back from the file
+    /// ([`cold_reads`](Self::cold_reads)), however many wills the log retains.
     pub fn stats(&self) -> LogStats {
         let mut pending_wills = 0usize;
-        for (_, w) in self.latest_wills() {
-            if is_hidden_subject(&w.subject) {
-                continue;
-            }
-            let fenced = match self.high_water.get(&w.producer_id) {
-                Some(&hw) => crate::proto::will_is_fenced(hw, w.producer_seq),
-                None => false,
-            };
-            if !self.dedup.contains(w.producer_id, w.producer_seq) && !fenced {
+        for e in self.durable_latest_wills.values() {
+            if self.will_unsettled(&e.will) {
                 pending_wills = pending_wills.saturating_add(1);
             }
         }
@@ -8121,10 +8207,23 @@ impl BrokerLog {
     }
 
     /// [`pending_wills`](Self::pending_wills), each with the offset of its `/a/will`
-    /// record (including wills carried across compaction via `<log>.state`).
+    /// record (including wills carried across compaction via `<log>.state`): read from the
+    /// latest-will map ([`DurableWillEntry`]), so no record is read back, cold or hot.
     fn latest_wills(&self) -> Vec<(Offset, WillRecord)> {
+        let mut out = Vec::with_capacity(self.durable_latest_wills.len());
+        for e in self.durable_latest_wills.values() {
+            out.push((e.offset, e.will.clone()));
+        }
+        out.sort_unstable_by_key(|(off, _)| *off);
+        out
+    }
+
+    /// What [`latest_wills`](Self::latest_wills) answered before the map (aterm F19): the
+    /// carried wills, then every retained `/a/will` record read back in offset order, the
+    /// later of a producer's replacing the earlier. The tests hold the map to it.
+    #[cfg(test)]
+    pub(crate) fn latest_wills_read_back(&self) -> Vec<(Offset, WillRecord)> {
         let mut latest: HashMap<u64, (Offset, WillRecord)> = self.carried_wills.clone();
-        // Only the pages that name the will subject are read.
         for i in self.tier.naming(WILL_SUBJECT, 0, self.tier.len()) {
             let Some(rec) = self.record_arc(i) else {
                 continue;
@@ -8133,15 +8232,54 @@ impl BrokerLog {
                 latest.insert(rec.producer_id, (rec.seq, will));
             }
         }
-        let mut ordered: BTreeMap<Offset, WillRecord> = BTreeMap::new();
-        for (_, (off, will)) in latest {
-            ordered.insert(off, will);
-        }
-        let mut out = Vec::new();
-        for (off, will) in ordered {
-            out.push((off, will));
-        }
+        let mut out: Vec<(Offset, WillRecord)> = latest.into_values().collect();
+        out.sort_unstable_by_key(|(off, _)| *off);
         out
+    }
+
+    /// Whether `w`, a latest will the log holds, can still append when fired: its target is
+    /// visible, its key is not on the log, and no later record of its producer fences it.
+    fn will_unsettled(&self, w: &WillRecord) -> bool {
+        if is_hidden_subject(&w.subject) {
+            return false;
+        }
+        let fenced = match self.high_water.get(&w.producer_id) {
+            Some(&hw) => crate::proto::will_is_fenced(hw, w.producer_seq),
+            None => false,
+        };
+        !fenced && !self.dedup.contains(w.producer_id, w.producer_seq)
+    }
+
+    /// What a cut to `min` leaves of the latest wills: an entry at or above `min` stays as
+    /// it is; one below it goes, and what the cut carried for its producer
+    /// (`carried_wills`) takes its place. So the map holds after a cut what an open of the
+    /// cut log seeds from `<log>.state` and folds from the kept records.
+    #[cfg(feature = "retention")]
+    fn cut_latest_wills(&mut self, min: u64) {
+        #[cfg(test)]
+        if WILLS_UNCUT.with(std::cell::Cell::get) {
+            return;
+        }
+        let mut below = Vec::new();
+        for (&pid, e) in &self.durable_latest_wills {
+            if e.offset.0 < min {
+                below.push(pid);
+            }
+        }
+        for pid in below {
+            if let Some(old) = self.durable_latest_wills.remove(&pid) {
+                unindex_will_target(&mut self.durable_wills_by_subject, &old.will.subject, pid);
+            }
+            if let Some((off, will)) = self.carried_wills.get(&pid) {
+                put_latest_will(
+                    &mut self.durable_latest_wills,
+                    &mut self.durable_wills_by_subject,
+                    pid,
+                    *off,
+                    will.clone(),
+                );
+            }
+        }
     }
 
     /// Pending wills below `min` that have neither fired nor been fenced by a later
@@ -8149,18 +8287,9 @@ impl BrokerLog {
     #[cfg(feature = "retention")]
     fn pending_wills_below(&self, min: u64) -> Vec<(Offset, WillRecord)> {
         let mut out = Vec::new();
-        for (off, w) in self.latest_wills() {
-            if is_hidden_subject(&w.subject) {
-                continue;
-            }
-            if off.0 < min && !self.dedup.contains(w.producer_id, w.producer_seq) {
-                let fenced = match self.high_water.get(&w.producer_id) {
-                    Some(&hw) => crate::proto::will_is_fenced(hw, w.producer_seq),
-                    None => false,
-                };
-                if !fenced {
-                    out.push((off, w));
-                }
+        for e in self.durable_latest_wills.values() {
+            if e.offset.0 < min && self.will_unsettled(&e.will) {
+                out.push((e.offset, e.will.clone()));
             }
         }
         out
@@ -8603,10 +8732,13 @@ impl BrokerLog {
         Ok(Begun::Write(BatchWrite {
             out: self.file.batch_out(),
             bytes: std::mem::take(&mut self.staged_bytes),
+            at: self.durable_len,
             flush: self.flush_owed(),
             faults: self.faults,
             refuse_barrier: self.refuses_barrier(),
             issued: Issued::default(),
+            #[cfg(test)]
+            cursor_appends: self.cursor_appends,
         }))
     }
 
@@ -9156,9 +9288,9 @@ impl BrokerLog {
 
     /// Discard the staged (unsynced) batch, truncating the file back to `durable_len`
     /// so disk stays a clean durable prefix. Used when staging hit an
-    /// I/O error, or the batch's write or fsync failed. If the truncate (or the
-    /// seek back to the end) fails, the on-disk suffix is unknown: the log is POISONED
-    /// and refuses every further mutation until reopened.
+    /// I/O error, or the batch's write or fsync failed. If the truncate fails, the on-disk
+    /// suffix is unknown: the log is POISONED and refuses every further mutation until
+    /// reopened.
     pub(crate) fn abort_batch(&mut self) {
         if let Some(why) = self.discard_batch() {
             self.publish_poison(why, None);
@@ -9186,17 +9318,13 @@ impl BrokerLog {
         rolled
     }
 
-    /// Truncate the file back to `len` durable bytes and reposition at its end. `Some`
-    /// names why that could not be done: the log must then be POISONED, which the
-    /// caller does ([`publish_poison`](Self::publish_poison)) once the rest of its
+    /// Truncate the file back to `len` durable bytes, the end the next append is written
+    /// at. `Some` names why that could not be done: the log must then be POISONED, which
+    /// the caller does ([`publish_poison`](Self::publish_poison)) once the rest of its
     /// failure's disk work is done.
     #[must_use]
-    fn rollback_to(&mut self, len: u64) -> Option<String> {
-        let res = match self.truncate_to(len) {
-            Ok(()) => self.file.seek_end(),
-            Err(e) => Err(e),
-        };
-        match res {
+    fn rollback_to(&self, len: u64) -> Option<String> {
+        match self.truncate_to(len) {
             Ok(()) => None,
             Err(e) => Some(format!(
                 "could not roll the staged suffix back to {len} bytes: {e}"
@@ -9999,8 +10127,9 @@ impl BrokerLog {
     }
 
     /// What this log's residency tier did since the open ([`TierTally`](crate::TierTally)):
-    /// its pushes, one-record reads by index, walks and the rows they read, subject walks and
-    /// the pages they read, and wide values read. A test or debug build only.
+    /// its pushes, one-record reads by index, walks and the rows they read, the pages a
+    /// filtered read passed whole and the times it asked its filter of a subject, and wide
+    /// values read. A test or debug build only.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
     pub fn tier_tally(&self) -> crate::TierTally {
@@ -10687,6 +10816,8 @@ impl BrokerLog {
                 self.carried_last_bt.remove(&k);
             }
         }
+        // The latest wills below the cut give way to what it carried for their producers.
+        self.cut_latest_wills(c.min);
         self.durable_len = self.durable_len.saturating_sub(cut);
         self.newest_at = match self.newest_at {
             Some(at) => at.checked_sub(cut),
@@ -10800,7 +10931,6 @@ impl BrokerLog {
         use crate::compact::{remove_intent, staged_state_path, Step};
         sync_parent_dir(&self.path)?;
         self.compact_crash(Step::Rename)?;
-        self.file.seek_end()?;
         if carry {
             let state = state_path(&self.path);
             rename_path(&staged_state_path(&self.path), &state)?;
@@ -11062,10 +11192,9 @@ impl BrokerLog {
             self.flush_owed()
         };
         let wrote = if self.faults.write {
-            let file = &mut self.file;
-            Err(faulted_write(|b| file.write_all(b), frame_bytes))
+            Err(faulted_write(|b| self.append_at(b, committed), frame_bytes))
         } else {
-            self.file.write_all(frame_bytes)
+            self.append_at(frame_bytes, committed)
         };
         if let Err(e) = wrote {
             if let Some(why) = self.rollback_to(committed) {
@@ -11093,6 +11222,17 @@ impl BrokerLog {
         self.newest_at = Some(self.durable_len);
         self.durable_len = self.durable_len.saturating_add(frame_bytes.len() as u64);
         Ok(durable)
+    }
+
+    /// Write `bytes` at byte `at`, the log's durable length, by position
+    /// (`storage::write_all_at` says why), or, in F24's negative control
+    /// ([`cursor_appends`](Self::cursor_appends)), at the file cursor.
+    fn append_at(&self, bytes: &[u8], at: u64) -> io::Result<()> {
+        #[cfg(test)]
+        if self.cursor_appends {
+            return self.file.write_at_cursor(bytes);
+        }
+        self.file.write_at(bytes, at)
     }
 }
 
@@ -14620,6 +14760,52 @@ mod unclean_tests {
         drop(log);
         let log = open(&path, Durability::Relaxed, BOOT_B);
         assert_eq!(log.identity().generation, id.generation + 1);
+    }
+
+    /// An Ordered run whose embedder acks only at its full flushes ([`Acks::FullFlush`])
+    /// keeps its identity across a reboot after an unclean stop, as a Strict one does: it
+    /// acked nothing a power loss could take. On the crash simulation's device, which serves
+    /// Ordered on every platform. NEGATIVE CONTROL: the same run acking at its publishes
+    /// moves the generation once. And a broker, whose writer acks at the publish, refuses it.
+    #[test]
+    fn an_ordered_run_acked_at_its_full_flushes_keeps_its_identity_across_a_reboot() {
+        for (acks, moves) in [(Acks::FullFlush, 0), (Acks::Publish, 1)] {
+            let sim = crate::sim_device::Sim::fresh();
+            let open = |boot| {
+                let mut o = opts(Durability::Ordered { horizon: None }, boot);
+                o.acks = acks;
+                BrokerLog::open_core(
+                    Storage::Sim(sim.clone()),
+                    &o,
+                    false,
+                    None,
+                    AntiRollbackMode::Off,
+                    || Ok(Prepared::Nothing),
+                )
+                .map(|(log, _)| log)
+                .expect("a simulated log opens")
+            };
+            let mut log = open(BOOT_A);
+            assert_eq!(log.served().served, crate::proto::Tier::Ordered);
+            publish(&mut log, 2);
+            log.sync_full().unwrap();
+            let before = log.identity();
+            drop(log); // no clean close: an unclean stop
+            let log = open(BOOT_B);
+            assert_eq!(
+                log.identity().generation,
+                before.generation + moves,
+                "{acks:?}"
+            );
+        }
+        let root = Scratch::new("acks-broker");
+        let mut o = opts(Durability::Ordered { horizon: None }, BOOT_A);
+        o.acks = Acks::FullFlush;
+        let refused =
+            crate::Broker::open_opts(root.path().join("log"), o, || Ok(Prepared::Nothing))
+                .err()
+                .expect("a broker refuses acks at full flushes");
+        assert_eq!(refused.kind(), io::ErrorKind::InvalidInput);
     }
 
     /// Strict never moves the generation for stopping uncleanly (its acks were on stable

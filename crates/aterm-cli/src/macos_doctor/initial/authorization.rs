@@ -61,8 +61,8 @@ enum Admission {
     /// aterm's own first-launch plan (System State design §3.5): provisional.
     Automatic,
     /// A provisional plan widened on a later launch that found the ALab signal.
-    /// It may follow a finished provisional run; the stages both plans select
-    /// keep their completion.
+    /// Completed preferences carry forward while newly selected preferences still run;
+    /// another stage keeps completion only when its full selection and source are unchanged.
     Upgrade,
 }
 
@@ -193,7 +193,7 @@ impl AuthorizationCommit {
             || (!same_plan
                 && matches!(
                     admission,
-                    Admission::Person | Admission::Join | Admission::Offered
+                    Admission::Person | Admission::Join | Admission::Offered | Admission::Upgrade
                 ))
         {
             // A person's answer, or any answer after a Restore (no startup answer is Set up now
@@ -201,13 +201,13 @@ impl AuthorizationCommit {
             // a group choice made while the offer waited, a Join, or the plan presented in a
             // vault joined since), it is measured as System State measures one, from the run
             // the records keep ([`Progress::staged`]), or the one pass an older aterm made of its
-            // plan ([`older_run`]), so it sets only what the person turned on and keeps every
-            // stage it left as it was: no Dock reset and no sign-out again for another group, and
-            // a Join runs only the vault steps again.
+            // plan ([`older_run`]). Automatic widening carries the same completed preferences
+            // and owes the newly selected ones: no Dock reset for another group, no completion
+            // inherited by a new sign-out, and a Join runs only the vault steps again.
             let restart = Restart {
                 chosen: true,
                 joins: admission == Admission::Join,
-                automatic: false,
+                automatic: admission == Admission::Upgrade,
             };
             (next.done, next.only, still_restored) = admitted_keeps(
                 restart,
@@ -219,16 +219,6 @@ impl AuthorizationCommit {
                 waiting,
                 plan,
             );
-        } else if admission == Admission::Upgrade
-            && let (Some(previous), Some(prior)) = (previous, prior)
-            && prior.belongs_to(previous)
-        {
-            // Widening keeps what the provisional run finished: the Permissions
-            // steps of a finished revision are not handed to macOS again.
-            next.done = Stage::ALL
-                .into_iter()
-                .filter(|stage| stage.selected(previous) && stage.selected(plan))
-                .fold(0, |done, stage| done | (prior.done & stage.bit()));
         }
         if admission == Admission::Join {
             next.done &= !(Stage::Secrets.bit() | Stage::Repositories.bit());
@@ -1169,10 +1159,7 @@ mod tests {
             "System State says the vault was not joined"
         );
         let admitted = progress(root.path()).unwrap().unwrap();
-        assert!(
-            admitted.admitted,
-            "Full Disk Access, the debugger and Local Network run"
-        );
+        assert!(admitted.admitted, "Full Disk Access and the debugger run");
         assert_eq!(admitted.admitted_vault, AdmittedVault::None);
         assert_eq!(saved_plan(root.path()).unwrap(), Some(joined.clone()));
         assert!(

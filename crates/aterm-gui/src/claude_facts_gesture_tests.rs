@@ -178,13 +178,15 @@ fn a_click_on_the_branch_greys_it_off_and_a_click_on_off_brings_it_back() {
     app.on_cursor_moved(wid, x, y);
     frame(&mut app, wid);
     let rest = o(&app);
-    assert_eq!(rest.fg, rule_cell.fg, "the stub is in Claude's rule gray");
+    let quiet = quiet_ink(&app, wid);
+    assert_ne!(quiet, value.fg, "CONTROL: the quiet ink is not the value's");
+    assert_eq!(rest.fg, quiet, "the stub is in the glass's quiet ink");
     assert!(!rest.bold, "and thin, as main draws a dark ground's stub");
     assert_eq!(rest.underline, UnderlineStyle::None);
     let name = of(&app, 'm');
     assert_eq!(
         (name.fg, name.bold),
-        (rule_cell.fg, false),
+        (quiet, false),
         "its name greyed with it"
     );
 
@@ -282,8 +284,8 @@ fn a_click_on_the_context_greys_it_off_and_a_click_on_its_stub_brings_it_back() 
         let cell = ink(&app, &stub, ch);
         assert_eq!(
             (cell.fg, cell.bold),
-            (rule_cell.fg, false),
-            "{ch:?}: greyed in Claude's rule gray, thin on the dark ground"
+            (quiet_ink(&app, wid), false),
+            "{ch:?}: greyed in the glass's quiet ink, thin on the dark ground"
         );
     }
 

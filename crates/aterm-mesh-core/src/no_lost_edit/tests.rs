@@ -173,6 +173,71 @@ fn land_sheet(land: LandRule) -> Vec<u64> {
     words(1024, 6, 86, |k| land_case(k, land))
 }
 
+/// A reading of a server's compare-and-set: the decision's, or a mutant's.
+type TakeoverRule = fn(TakeoverFacts) -> Takeover;
+
+/// The island's `takeoverCase k`, under `rule`: k's bits are the facts in `TakeoverFacts`' order.
+fn takeover_case(k: usize, rule: TakeoverRule) -> u64 {
+    let bit = |b: usize| (k >> b) & 1 == 1;
+    let facts = TakeoverFacts {
+        pin_ok: bit(0),
+        replaced: bit(1),
+        not_newer: bit(2),
+        same_version: bit(3),
+        chain_ok: bit(4),
+        names_parents: bit(5),
+        held_parented: bit(6),
+        among_parents: bit(7),
+    };
+    match rule(facts) {
+        Takeover::Takes => 0,
+        Takeover::Holds => 1,
+        Takeover::PinRefused => 2,
+        Takeover::NotNewer => 3,
+        Takeover::BreaksChain => 4,
+        Takeover::OffParents => 5,
+    }
+}
+
+fn takeover_sheet(rule: TakeoverRule) -> Vec<u64> {
+    words(8, 16, 16, |k| takeover_case(k, rule))
+}
+
+/// The unversioned hold's two decisions over all four arguments each: the adoption's, then the
+/// removal's, one bit per case (the island's kernels `spec_hold_adopts`, `spec_unversioned_goes`).
+fn legacy_sheet(adopts: fn(bool, bool) -> bool, goes: fn(bool, bool) -> bool) -> Vec<u64> {
+    let bit = |k: usize, b: usize| (k >> b) & 1 == 1;
+    vec![pack(
+        2,
+        (0..8).map(|k| {
+            let rule = if k < 4 { adopts } else { goes };
+            u64::from(rule(bit(k, 0), bit(k, 1)))
+        }),
+    )]
+}
+
+/// The direct draft's three decisions over all their arguments, one bit each: the keep gate's
+/// (its hold is there), the spine's settle (it drafted records, they were kept), then the
+/// draft's refusal (it writes, a pending set does not open, a held draft does not read); the
+/// island's `draftCase`.
+fn draft_sheet(
+    keeps: fn(bool) -> bool,
+    settles: fn(bool, bool) -> bool,
+    refuses: fn(bool, bool, bool) -> bool,
+) -> Vec<u64> {
+    let bit = |k: usize, b: usize| (k >> b) & 1 == 1;
+    vec![pack(
+        2,
+        (0..14).map(|k| {
+            u64::from(match k {
+                0..=1 => keeps(k == 1),
+                2..=5 => settles(bit(k - 2, 0), bit(k - 2, 1)),
+                _ => refuses(bit(k - 6, 0), bit(k - 6, 1), bit(k - 6, 2)),
+            })
+        }),
+    )]
+}
+
 #[test]
 fn every_sheet_matches_the_island() {
     let mismatches: Vec<String> = [
@@ -181,6 +246,12 @@ fn every_sheet_matches_the_island() {
         mismatch("forgetsSheet", &forgets_sheet(publish_forgets)),
         mismatch("verdictSheet", &verdict_sheet(&PASS)),
         mismatch("landSheet", &land_sheet(land)),
+        mismatch("takeoverSheet", &takeover_sheet(Takeover::of)),
+        mismatch("legacySheet", &legacy_sheet(hold_adopts, unversioned_goes)),
+        mismatch(
+            "draftSheet",
+            &draft_sheet(drafted_keeps, spine_settles, draft_refuses),
+        ),
     ]
     .into_iter()
     .flatten()
@@ -304,6 +375,113 @@ fn the_grids_see_every_replaced_rule() {
             "the land grid cannot tell the {name} rule apart"
         );
     }
+    for (name, rule) in [
+        (
+            "a newer version taken whatever its parents",
+            (|facts| {
+                Takeover::of(TakeoverFacts {
+                    among_parents: true,
+                    ..facts
+                })
+            }) as TakeoverRule,
+        ),
+        ("a replaced pin judged by sequence", |facts| {
+            Takeover::of(TakeoverFacts {
+                replaced: false,
+                ..facts
+            })
+        }),
+        (
+            "a version of the held sequence read as the version held",
+            |facts| {
+                Takeover::of(TakeoverFacts {
+                    same_version: facts.not_newer,
+                    ..facts
+                })
+            },
+        ),
+        ("a newer version taken without the held chain", |facts| {
+            Takeover::of(TakeoverFacts {
+                chain_ok: true,
+                ..facts
+            })
+        }),
+    ] {
+        assert_ne!(
+            takeover_sheet(rule),
+            island("takeoverSheet"),
+            "the takeover grid cannot tell the {name} rule apart"
+        );
+    }
+    assert_ne!(
+        legacy_sheet(hold_adopts, |reads, _| reads),
+        island("legacySheet"),
+        "the legacy grid cannot tell an unversioned hold removed before the store holds it apart"
+    );
+    for (name, sheet) in [
+        (
+            "a keep after its hold went (KEEPS_SUPERSEDED)",
+            draft_sheet(|_| true, spine_settles, draft_refuses),
+        ),
+        (
+            "a spine settled by a version whose records were not kept",
+            draft_sheet(drafted_keeps, |_, _| true, draft_refuses),
+        ),
+        (
+            "a held draft that does not read, read as none",
+            draft_sheet(drafted_keeps, spine_settles, |writes, waiting, _| {
+                writes && waiting
+            }),
+        ),
+    ] {
+        assert_ne!(
+            sheet,
+            island("draftSheet"),
+            "the draft grid cannot tell {name} apart"
+        );
+    }
+}
+
+/// The six answers partition the facts (the island's `takeover_partitions`), so every refusal is
+/// the one the code always gave first: the pin's, then the sequence's, the chain's and the
+/// parents'.
+#[test]
+fn takeover_refuses_in_the_codes_order() {
+    let facts = |pin_ok, not_newer, chain_ok, among_parents| TakeoverFacts {
+        pin_ok,
+        replaced: false,
+        not_newer,
+        same_version: false,
+        chain_ok,
+        names_parents: true,
+        held_parented: true,
+        among_parents,
+    };
+    assert_eq!(
+        Takeover::of(facts(false, true, false, false)),
+        Takeover::PinRefused
+    );
+    assert_eq!(
+        Takeover::of(facts(true, true, false, false)),
+        Takeover::NotNewer
+    );
+    assert_eq!(
+        Takeover::of(facts(true, false, false, false)),
+        Takeover::BreaksChain
+    );
+    assert_eq!(
+        Takeover::of(facts(true, false, true, false)),
+        Takeover::OffParents
+    );
+    assert_eq!(
+        Takeover::of(facts(true, false, true, true)),
+        Takeover::Takes
+    );
+    let replaced = TakeoverFacts {
+        replaced: true,
+        ..facts(true, true, false, false)
+    };
+    assert_eq!(Takeover::of(replaced), Takeover::Takes);
 }
 
 #[test]

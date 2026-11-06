@@ -68,6 +68,10 @@ pub struct OutputOrigin {
     pub abs_row: u64,
     /// The cursor sat on existing content, so the print replaces cells.
     pub overwrites: bool,
+    /// The grid's autowrap count before the print: a print that wraps back onto the row it
+    /// began on (the bottom row below the scroll region, which wraps in place) replaces the
+    /// cells it lands on there though it began past the row's content.
+    pub wrap_serial: u64,
 }
 
 /// A bounded, ascending set of pairwise-disjoint, non-adjacent absolute-row bands.

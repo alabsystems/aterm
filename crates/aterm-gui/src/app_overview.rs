@@ -15,9 +15,11 @@ use crate::overview::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OverviewAt {
     /// The card's first line (the status item's Overview…).
+    #[cfg_attr(
+        not(target_os = "macos"),
+        expect(dead_code, reason = "only the macOS status item opens it here")
+    )]
     Top,
-    /// A session's chip, by local id (the pill's `+N`: the next need).
-    Session(u64),
     /// A manager's manages line, by its local id, else its chip (its Team chip).
     Manager(u64),
 }
@@ -368,14 +370,9 @@ impl App {
         at: OverviewAt,
     ) -> Result<(), String> {
         self.open_overview_on(wid)?;
-        let (session, as_manager) = match at {
-            OverviewAt::Top => (None, false),
-            OverviewAt::Session(session) => (Some(session), false),
-            OverviewAt::Manager(session) => (Some(session), true),
-        };
-        if let Some(session) = session
+        if let OverviewAt::Manager(session) = at
             && let Some(card) = self.windows.get_mut(&wid).and_then(|ws| ws.overview_mut())
-            && card.select_session(session, as_manager)
+            && card.select_session(session)
         {
             self.repaint_overview_pointer(wid, true);
         }

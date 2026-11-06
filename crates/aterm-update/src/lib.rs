@@ -363,6 +363,29 @@ pub fn apply_staged_if_ready_preserving_fds_exact(
     )
 }
 
+/// Counts a start of an already-armed update trial and restores its verified predecessor if
+/// the crash-loop budget is exhausted. This never admits or installs a staged update, so it
+/// also runs when automatic installation is off. Call before starting services, while this
+/// process's image is replaceable and no handoff descriptors need preserving; a successful
+/// recovery re-execs the restored build.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn recover_boot_trial_exact(
+    current_build: u64,
+    current_commit: &str,
+    witness: TrialWitness,
+) -> ApplyOutcome {
+    install::recover_boot_trial(current_build, Some(current_commit), witness)
+}
+
+/// Whether this installed image owns an unconfirmed trial which a headless service must
+/// still prove. A live window's trial remains that window's responsibility while its wait lasts.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn headless_boot_trial_pending(current_build: u64) -> bool {
+    install::headless_boot_trial_pending(current_build)
+}
+
 /// The build newer than `current_build` that a fresh start of this installed copy would run: one
 /// staged and ready for a boot apply ([`apply_staged_if_ready_preserving_fds_exact`]), or one
 /// another process already installed in this image's place. `None` where neither stands, and

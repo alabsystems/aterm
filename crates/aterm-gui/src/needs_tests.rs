@@ -970,11 +970,6 @@ fn every_reader_says_the_published_verdict() {
                 Severity::Stuck => crate::presence::NeedSeverity::Stuck,
                 Severity::Decide => crate::presence::NeedSeverity::Decide,
             });
-        let rim = app
-            .presence_view(crate::WindowId(0))
-            .map(|view| view.rim)
-            .expect("window 0");
-        assert_eq!(rim, crate::presence::Rim::None, "case {case}: {facts:?}");
         let chip = app.presence.slot(0).map(|slot| slot.chip());
         let agrees = matches!(
             (severity, chip),
@@ -1300,11 +1295,11 @@ fn a_reset_slept_through_is_due_at_the_first_turn_after_the_wake() {
         .presence_deadline(instant)
         .expect("the recheck is armed");
     assert!(deadline >= instant + std::time::Duration::from_secs(3599));
-    let _ = app.presence_tick(instant);
+    app.presence_tick(instant);
     assert_eq!(needs_of(&app, 0).as_deref(), Some("-"), "not due yet");
     set_need_unix_clock_for_test(Some(at + 60));
     assert_eq!(app.presence_deadline(instant), Some(instant), "due now");
-    let _ = app.presence_tick(instant);
+    app.presence_tick(instant);
     assert_eq!(needs_of(&app, 0).as_deref(), Some("wall"));
     assert!(app.need_rechecks.is_empty());
 }
@@ -1371,7 +1366,7 @@ fn a_frozen_program_with_no_act_keeps_a_persons_remedy() {
     assert_eq!(
         frozen(true, false, Some(line)),
         facts_alone,
-        "the pill's act"
+        "a restart on offer needs no remedy"
     );
     assert_eq!(
         frozen(false, false, Some(line)),
@@ -1683,7 +1678,7 @@ fn a_reported_need_yields_to_other_outstanding_asks() {
         let v = of(&f);
         let need = v.need.unwrap();
         assert_eq!(need.what, "check the deploy");
-        assert!(crate::presence::need_fact(&need).show_pill);
+        assert!(need.harness.is_none());
         assert_eq!(v.waiting.unwrap().word, WaitWord::Entry);
 
         f.attention.retain(|entry| entry.owner != "ops");
@@ -1691,7 +1686,7 @@ fn a_reported_need_yields_to_other_outstanding_asks() {
         f.attention.retain(|entry| entry.owner != "ci");
         let restored = of(&f).need.unwrap();
         assert_eq!(restored.key, ask_key(&report));
-        assert!(!crate::presence::need_fact(&restored).show_pill);
+        assert!(restored.harness.is_some());
     }
 }
 
@@ -1712,12 +1707,11 @@ fn a_reported_need_yields_to_an_unanswered_box_and_returns_afterward() {
             };
             let need = of(&f).need.expect("the unanswered box");
             assert_eq!(need.word, word);
-            assert!(crate::presence::need_fact(&need).show_pill);
+            assert!(need.harness.is_none());
             f.agent = None;
             let restored = of(&f).need.expect("the report still stands");
             assert_eq!(restored.key, ask_key(&report));
             assert!(restored.harness.is_some());
-            assert!(!crate::presence::need_fact(&restored).show_pill);
 
             f.agent = agent.clone();
             f.attention = vec![entry("-", "please look", Some(AttentionKind::Ask))];
@@ -1781,7 +1775,7 @@ fn a_harness_need_reads_in_its_own_words() {
 }
 
 #[test]
-fn a_report_carried_from_an_older_host_stays_out_of_the_pill() {
+fn a_report_carried_from_an_older_host_stays_a_harness_report() {
     let report = harness_entry("claude", "sign the release", 1);
     for report in [report.as_str(), "agy needs you: sign it (+1 mo"] {
         let legacy = format!("kind=ask {report}");
@@ -1798,10 +1792,6 @@ fn a_report_carried_from_an_older_host_stays_out_of_the_pill() {
             .need
             .expect("the carried ask");
             assert_eq!(need.key, ask_key(&legacy));
-            assert_eq!(
-                crate::presence::need_fact(&need).show_pill,
-                owner != crate::harness_host::NEEDS_ATTENTION_OWNER
-            );
             if owner == crate::harness_host::NEEDS_ATTENTION_OWNER {
                 let ask = need.harness.expect("the report without its legacy kind");
                 assert!(!ask.first.starts_with("kind="));
@@ -1813,7 +1803,7 @@ fn a_report_carried_from_an_older_host_stays_out_of_the_pill() {
 }
 
 #[test]
-fn an_old_truncated_report_stays_out_of_the_pill() {
+fn an_old_truncated_report_stays_a_harness_report() {
     let long = format!("claude needs you: {}", "\u{915}".repeat(60));
     assert_eq!(long.len(), 198);
     for text in [long.as_str(), "agy needs you: sign it (+1 mo"] {
@@ -1829,13 +1819,12 @@ fn an_old_truncated_report_stays_out_of_the_pill() {
             .expect("the report's known owner and program");
         assert_eq!(ask.first, text.split_once(NEEDS_YOU).unwrap().1);
         assert_eq!(ask.more, 0);
-        assert!(!crate::presence::need_fact(&need).show_pill);
 
         let direct = of(&NeedFacts {
             attention: vec![entry("ops", text, Some(AttentionKind::Ask))],
             ..facts()
         });
-        assert!(crate::presence::need_fact(&direct.need.unwrap()).show_pill);
+        assert!(direct.need.unwrap().harness.is_none());
     }
     for text in ["nobody needs you: sign it", "claude needs you: "] {
         let v = of(&NeedFacts {

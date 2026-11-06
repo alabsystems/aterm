@@ -382,6 +382,8 @@ impl Walk {
             accounts,
             aliases: BTreeMap::new(),
             mailboxes: BTreeMap::new(),
+            #[cfg(unix)]
+            machine_name: None,
             places: Default::default(),
         };
         let fetch =

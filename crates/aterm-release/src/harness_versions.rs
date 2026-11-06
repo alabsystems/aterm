@@ -146,7 +146,7 @@ pub fn owed(
         if moved.is_empty() {
             continue;
         }
-        moved.sort();
+        moved.sort_unstable();
         let now_text = after(harness)?;
         let now = declared(&now_text).ok_or_else(|| {
             Error::new(format!(
@@ -437,17 +437,14 @@ pub fn previous_release(
     version: &str,
     tags: &str,
 ) -> Result<Option<(String, String)>> {
-    let tags = crate::gates::tag_commits(tags);
+    let mut tags = crate::gates::tag_commits(tags);
     let shipped = |v: &str| tags.contains_key(&format!("v{v}"));
     let Some(release) = crate::gates::predecessor_release(ledger_text, version, &shipped)
         .map_err(|e| Error::new(format!("harness versions: {e}")))?
     else {
         return Ok(None);
     };
-    let commit = tags
-        .get(&format!("v{release}"))
-        .cloned()
-        .unwrap_or_default();
+    let commit = tags.remove(&format!("v{release}")).unwrap_or_default();
     Ok(Some((release, commit)))
 }
 

@@ -705,7 +705,7 @@ fn stall_need(facts: &NeedFacts) -> Option<Need> {
     })
 }
 
-/// A frozen program the pill offers no restart for keeps a person's remedy.
+/// A frozen program with no restart on offer keeps a person's remedy.
 pub(crate) fn stall_remedy(words: &str, hand_back: bool, resume: Option<&str>) -> String {
     let words = fold_clip(words, REMEDY_TEXT_MAX);
     if hand_back {

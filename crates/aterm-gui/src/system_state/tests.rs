@@ -356,13 +356,13 @@ fn rows_show_now_and_wanted_and_at_most_one_chip() {
     let status = with_readings(
         Selection::all(),
         vec![reading(
-            Subject::Access(Access::LocalNetwork),
+            Subject::Access(Access::Accessibility),
             Standing::InPlace,
             None,
         )],
     );
     let row = row_view(
-        Subject::Access(Access::LocalNetwork),
+        Subject::Access(Access::Accessibility),
         &status,
         Selection::all(),
     );
@@ -371,7 +371,7 @@ fn rows_show_now_and_wanted_and_at_most_one_chip() {
         (
             RowValue::One("—".into()),
             Some(Chip::InPlace),
-            "Local Network: in place"
+            "Accessibility: in place"
         )
     );
 
@@ -379,7 +379,7 @@ fn rows_show_now_and_wanted_and_at_most_one_chip() {
     // not report reads `—` on its way to On.
     let row = row_view(Subject::Setting(Setting::Dock), &status, Selection::all());
     assert_eq!((row.value, row.chip), (RowValue::One("—".into()), None));
-    let network = Subject::Access(Access::LocalNetwork);
+    let network = Subject::Access(Access::Accessibility);
     let status = with_readings(
         Selection::all(),
         vec![reading(network, Standing::Differs, None)],
@@ -679,13 +679,11 @@ fn a_row_that_will_change_shows_no_engine_line_under_it() {
 
     // On the page: the fresh Mac's scenario carries an engine line on every
     // row that will change, and no node a person sees or hears says any. The
-    // notes are the repositories', in the words of what they wait for, and
-    // Local Network's calm one: macOS tells apps nothing of it.
+    // note is the repositories', in the words of what they wait for.
     let mut app = SystemStateApp::new(Plan::default());
     app.publish(status_of("fresh"));
     let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 900.0);
     let repositories = Subject::Setting(Setting::Repositories);
-    let lan = Subject::Access(Access::LocalNetwork);
     for subject in Subject::all() {
         let key = format!("system-state/row/{}/note", row_slug(subject));
         let node = compiled.semantic(&UiKey::new(key.clone()));
@@ -693,12 +691,6 @@ fn a_row_that_will_change_shows_no_engine_line_under_it() {
             assert_eq!(
                 node.map(|node| node.label.as_str()),
                 Some("Waits for the vault to finish syncing this Mac"),
-                "{key}"
-            );
-        } else if subject == lan {
-            assert_eq!(
-                node.map(|node| node.label.as_str()),
-                Some(aterm_types::macos_setup::LOCAL_NETWORK_UNTOLD),
                 "{key}"
             );
         } else {
@@ -1455,7 +1447,7 @@ fn headlines_say_the_state_in_the_designs_words() {
     assert_eq!(line(&status_of("checking")).text, "Checking this Mac…");
     assert_eq!(
         line(&status_of("running")).text,
-        "Setting up this Mac… 11 of 16"
+        "Setting up this Mac… 10 of 15"
     );
     let needs = line(&status_of("needs-you"));
     assert_eq!(needs.text, "Needs you: Full Disk Access");
@@ -4245,8 +4237,8 @@ fn the_headline_and_the_progress_reach_a_screen_reader_in_words() {
         let progress = node("system-state/progress");
         assert_eq!(progress.role(), Role::ProgressIndicator, "{width}");
         assert_eq!(progress.label(), Some("Setup progress"), "{width}");
-        assert_eq!(progress.numeric_value(), Some(11.0), "{width}");
-        assert_eq!(progress.max_numeric_value(), Some(16.0), "{width}");
+        assert_eq!(progress.numeric_value(), Some(10.0), "{width}");
+        assert_eq!(progress.max_numeric_value(), Some(15.0), "{width}");
     }
 }
 
@@ -4670,53 +4662,6 @@ fn a_choice_names_the_groups_changed_since_the_plan_in_force() {
         changed,
         Some(Selection::none()),
         "Set up now changes no group"
-    );
-}
-
-/// macOS never tells an app whether it may use the local network. A row nothing in this launch
-/// can read (`Untold`) shows `—` with its one calm note and lets the page settle; a row still
-/// to be read holds the headline at a check.
-#[test]
-fn local_network_that_macos_never_tells_lets_the_page_settle() {
-    let mut permissions = Selection::none();
-    permissions.set(Setting::Permissions, true);
-    let lan = Subject::Access(Access::LocalNetwork);
-    let with_lan = |reading_of_lan: Observation| {
-        let observed = Subject::all()
-            .into_iter()
-            .map(|subject| {
-                if subject == lan {
-                    reading_of_lan.clone()
-                } else {
-                    reading(subject, Standing::InPlace, Some(subject.wanted()))
-                }
-            })
-            .collect();
-        with_readings(permissions, observed)
-    };
-    let untold = with_lan(Observation {
-        note: Some(aterm_types::macos_setup::LOCAL_NETWORK_UNTOLD.to_owned()),
-        ..reading(lan, Standing::Untold, None)
-    });
-    let shown = rows(&untold, permissions);
-    assert_eq!(
-        headline(&untold, &shown, untold.plan.as_ref()).text,
-        "Permissions are set up"
-    );
-    let row = shown.iter().find(|row| row.subject == lan).unwrap();
-    assert_eq!(
-        (&row.value, row.chip, row.note.as_deref()),
-        (
-            &RowValue::One("—".to_owned()),
-            None,
-            Some(aterm_types::macos_setup::LOCAL_NETWORK_UNTOLD)
-        )
-    );
-    let unread = with_lan(reading(lan, Standing::Unknown, None));
-    assert_eq!(
-        headline(&unread, &rows(&unread, permissions), unread.plan.as_ref()).text,
-        "Checking this Mac…",
-        "a row still to be read is a check under way"
     );
 }
 
@@ -5368,44 +5313,6 @@ fn the_debugger_row_waits_on_the_elevation_without_a_button() {
     assert!(app.reviewed_row(debugger).attention());
     let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 900.0);
     assert!(compiled.semantic(&UiKey::new(open)).is_none());
-}
-
-/// Where no look at the local network answered aterm, Local Network reads as macOS leaves it
-/// (design §3.2): `—` beside the calm note that macOS does not tell apps whether it is on, which
-/// a screen reader hears right after `Local Network: unknown`, in every scenario that reads so.
-#[test]
-fn local_network_reads_unknown_with_its_note_where_no_look_answered() {
-    let lan = Subject::Access(Access::LocalNetwork);
-    for scenario in ["running", "vault-unreached", "fresh", "set-up"] {
-        let mut app = SystemStateApp::new(Plan::default());
-        app.publish(status_of(scenario));
-        let row = app.reviewed_row(lan);
-        assert_eq!(
-            (row.value.clone(), row.label.as_str(), row.note.as_deref()),
-            (
-                RowValue::One("—".into()),
-                "Local Network: unknown",
-                Some(aterm_types::macos_setup::LOCAL_NETWORK_UNTOLD)
-            ),
-            "{scenario}"
-        );
-        let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 4000.0);
-        let heard: Vec<&str> = compiled
-            .semantics
-            .iter()
-            .map(|node| node.label.as_str())
-            .filter(|label| !label.is_empty())
-            .collect();
-        let at = heard
-            .iter()
-            .position(|label| *label == "Local Network: unknown")
-            .unwrap_or_else(|| panic!("{scenario}: {heard:?}"));
-        assert_eq!(
-            heard.get(at + 1).copied(),
-            Some(aterm_types::macos_setup::LOCAL_NETWORK_UNTOLD),
-            "{scenario}"
-        );
-    }
 }
 
 /// The headline claims no more than was confirmed (design §3.2): a row a Check, or a run,
@@ -6512,15 +6419,6 @@ fn a_newer_aterms_page_keeps_row_notes_and_reads_the_vault_as_it_stands() {
         .map(|node| node.label.as_str())
         .filter(|label| !label.is_empty())
         .collect();
-    let lan = heard
-        .iter()
-        .position(|label| *label == "Local Network: unknown")
-        .unwrap_or_else(|| panic!("{heard:?}"));
-    assert_eq!(
-        heard.get(lan + 1).copied(),
-        Some(aterm_types::macos_setup::LOCAL_NETWORK_UNTOLD),
-        "{heard:?}"
-    );
     let address = compiled
         .semantic(&UiKey::new("system-state/vault/address"))
         .unwrap_or_else(|| panic!("the address is shown in words: {heard:?}"));
@@ -6944,7 +6842,7 @@ fn automatic_admission_never_renders_a_phrase_prompt() {
 
 /// Each thing a phrase can come to has its own words under the field. One that reached no Mac in
 /// ALab was asked nothing, so its words stay for another Join under the not-reached line (the
-/// Local Network one while macOS's switch for aterm is off); one refused is spent, the field
+/// broker's failure stays in that line); one refused is spent, the field
 /// empties and the refused line shows; one that let this Mac in empties the field too. One a Mac
 /// a rotation dropped typed (one-mesh E2, f299) is spent as well, and its line says how that Mac
 /// comes back, never to press Allow again.
@@ -6960,13 +6858,12 @@ fn each_phrase_outcome_has_its_own_words_and_only_a_spent_phrase_empties_the_fie
             PHRASE_REFUSED,
             PHRASE_NOT_REACHED,
             PHRASE_STOPPED,
-            PHRASE_LOCAL_NETWORK_OFF,
             PHRASE_DROPPED,
         ]
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>()
         .len(),
-        6,
+        5,
         "each outcome has its own words"
     );
     let asking = status_of("vault-asking");
@@ -7015,21 +6912,6 @@ fn each_phrase_outcome_has_its_own_words_and_only_a_spent_phrase_empties_the_fie
     // line says plainly that the try stopped, and the words stay for Join to try again.
     try_with(&mut app, &mut view, PhraseOutcome::Stopped);
     assert_eq!(app.phrase_help(), PHRASE_STOPPED);
-    assert_eq!(typed(&app), "river stone lamp", "the words stay");
-
-    // A try that reached no Mac while this Mac reads macOS's Local Network switch for aterm off
-    // names that switch and where it is, not the other Mac.
-    let mut off = status_of("vault-asking");
-    let lan = off
-        .observed
-        .iter_mut()
-        .find(|row| row.subject == Subject::Access(Access::LocalNetwork))
-        .expect("the fixture reads Local Network");
-    lan.standing = Standing::NeedsYou;
-    lan.now = Some("Off".into());
-    app.publish(off);
-    try_with(&mut app, &mut view, PhraseOutcome::NotReached);
-    assert_eq!(app.phrase_help(), PHRASE_LOCAL_NETWORK_OFF);
     assert_eq!(typed(&app), "river stone lamp", "the words stay");
 }
 

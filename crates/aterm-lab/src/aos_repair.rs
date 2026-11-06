@@ -17,7 +17,7 @@ use aterm_uds::CtlStream;
 
 use crate::aos_phase::{self, ms};
 use crate::instance::{self, Instance, Launch, World, take_flag, take_value};
-use crate::lab_build::LAB_BUILD;
+use crate::lab_build::lab_build;
 use crate::paths::{from_caller, paths};
 use crate::pyjson::J;
 use crate::stop::{self, Stopped};
@@ -1697,7 +1697,7 @@ fn publish_story(
         Ok(bytes) => {
             d.keep_bytes("bundle", &bytes);
             let started = Instant::now();
-            let v = verify_in_lab(&bytes, d.build.as_deref().unwrap_or("none"), LAB_BUILD);
+            let v = verify_in_lab(&bytes, d.build.as_deref().unwrap_or("none"), lab_build());
             d.note(format!(
                 "# the lab's verification of the bundle: {} in {} ms",
                 v.word(),

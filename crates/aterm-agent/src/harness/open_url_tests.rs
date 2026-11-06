@@ -1354,6 +1354,25 @@ fn a_plaintext_mailbox_with_credentials_is_refused_off_loopback() {
     }
 }
 
+/// What `server`, a test's fake mailbox server, returns once it ends, waiting for that within
+/// [`aterm_spec::wait::MUST_HAPPEN`]. Each fake ends once it has served the connections it was
+/// written for, so one still running then waits on a connection or a request a poll should have
+/// sent, and the test fails naming `what` instead of hanging. A panic in the fake (one of its own
+/// assertions) is the test's panic.
+///
+/// Each poll of such a fake is one pass with no deadline (`Duration::ZERO`): it always reaches
+/// its connect, where a budget a loaded machine spent before then would end the poll without
+/// one, failing a poll that must read the mail and leaving the fake waiting.
+#[track_caller]
+fn served<T>(server: std::thread::JoinHandle<T>, what: &str) -> T {
+    aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, what, || {
+        server.is_finished().then_some(())
+    });
+    server
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
 #[test]
 fn imap_bridge_and_http_json_mailbox_fetch_credentials_and_track_seen_digests() {
     use super::super::headless_oauth::{
@@ -1386,7 +1405,9 @@ password_file = '{}'
 
     let imap_listener = TcpListener::bind("127.0.0.1:0").expect("bind imap");
     let imap_port = imap_listener.local_addr().expect("addr").port();
+    // Serves one session per poll and returns how many sessions fetched the code's message.
     let imap_thread = std::thread::spawn(move || {
+        let mut code_fetches = 0;
         for _ in 0..2 {
             let Ok((stream, _)) = imap_listener.accept() else {
                 break;
@@ -1421,6 +1442,7 @@ password_file = '{}'
                         "ééééé\r\n* 12345é\r\n* SeArCh 1 2\r\n{tag} OK SEARCH completed\r"
                     );
                 } else if trimmed.contains("FETCH 2 ") {
+                    code_fetches += 1;
                     let msg = concat!(
                         "From: Anthropic <no-reply@claude.com>\r\n",
                         "To: <m27@example.test>\r\n",
@@ -1454,6 +1476,7 @@ password_file = '{}'
                 let _ = writer.flush();
             }
         }
+        code_fetches
     });
 
     let seen_file = tmp.path().join("mailbox.seen");
@@ -1464,24 +1487,22 @@ password_file = '{}'
         seen_file: Some(seen_file.clone()),
         ..MailboxConfig::default()
     };
-    let cred = poll_mailbox_config_for_credential(
-        &imap_cfg,
-        Some("m27@example.test"),
-        Duration::from_secs(5),
-    )
-    .expect("fetched OTP from IMAP");
+    let cred =
+        poll_mailbox_config_for_credential(&imap_cfg, Some("m27@example.test"), Duration::ZERO)
+            .expect("fetched OTP from IMAP");
     assert_eq!(cred, MailboxCredential::Otp("739182".to_owned()));
 
-    let second = poll_mailbox_config_for_credential(
-        &imap_cfg,
-        Some("m27@example.test"),
-        Duration::from_millis(80),
-    );
+    let second =
+        poll_mailbox_config_for_credential(&imap_cfg, Some("m27@example.test"), Duration::ZERO);
     assert!(
         second.is_err(),
         "already-consumed IMAP message must not be reused"
     );
-    imap_thread.join().expect("imap thread");
+    assert_eq!(
+        served(imap_thread, "the IMAP fake's session for each poll"),
+        2,
+        "the second poll fetched the consumed message again and passed it over"
+    );
 
     let http_listener = TcpListener::bind("127.0.0.1:0").expect("bind http");
     let http_port = http_listener.local_addr().expect("addr").port();
@@ -1514,19 +1535,16 @@ password_file = '{}'
         seen_file: Some(tmp.path().join("http_mailbox.seen")),
         ..MailboxConfig::default()
     };
-    let http_cred = poll_mailbox_config_for_credential(
-        &http_cfg,
-        Some("m27@example.test"),
-        Duration::from_secs(5),
-    )
-    .expect("fetched magic link from HTTP mailbox");
+    let http_cred =
+        poll_mailbox_config_for_credential(&http_cfg, Some("m27@example.test"), Duration::ZERO)
+            .expect("fetched magic link from HTTP mailbox");
     assert_eq!(
         http_cred,
         MailboxCredential::MagicLink(
             "https://claude.com/cai/oauth/magic?token=http_magic_ok&state=s1".to_owned()
         )
     );
-    http_thread.join().expect("http thread");
+    served(http_thread, "the HTTP fake's one request");
 }
 
 #[test]
@@ -2535,7 +2553,7 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
                 &mut cdp,
                 &thread_cfg,
                 Some("sol-m27@proton.me"),
-                Duration::from_secs(5),
+                aterm_spec::wait::MUST_HAPPEN,
                 Duration::ZERO,
                 &mut thread_seen_otps,
             ),
@@ -2550,7 +2568,7 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
                 &mut cdp,
                 &thread_cfg,
                 Some("sol-m27@proton.me"),
-                Duration::from_secs(5),
+                aterm_spec::wait::MUST_HAPPEN,
                 Duration::ZERO,
                 &mut thread_seen_otps,
             ),
@@ -2578,7 +2596,7 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
                 &mut cdp,
                 &link_thread_cfg,
                 Some("sol-m27@proton.me"),
-                Duration::from_secs(5),
+                aterm_spec::wait::MUST_HAPPEN,
                 Duration::ZERO,
                 &mut link_thread_seen,
             ),
@@ -2595,7 +2613,7 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
                 &mut cdp,
                 &link_thread_cfg,
                 Some("sol-m27@proton.me"),
-                Duration::from_secs(5),
+                aterm_spec::wait::MUST_HAPPEN,
                 Duration::ZERO,
                 &mut link_thread_seen,
             ),
@@ -2974,14 +2992,14 @@ m27_2_pass = "flat-m27-2-pw"
             super::super::headless_oauth::poll_mailbox_config_for_credential(
                 &mpit_cfg,
                 Some("sol-m27@proton.me"),
-                Duration::from_secs(5),
+                Duration::ZERO,
             ),
             Ok(MailboxCredential::MagicLink(
                 "https://claude.ai/magic-link?token=mpit_detail_ok&state=s9".to_owned()
             )),
             "Mailpit summary list fetches /api/v1/message/<ID> detail when summary omits HTML body"
         );
-        mpit_thread.join().expect("mailpit mock thread");
+        served(mpit_thread, "the Mailpit fake's list and detail requests");
 
         let rfc2047_q_eml = concat!(
             "From: Anthropic <no-reply@claude.ai>\r\n",
@@ -3050,12 +3068,12 @@ m27_2_pass = "flat-m27-2-pw"
             super::super::headless_oauth::poll_mailbox_config_for_credential(
                 &basic_cfg,
                 Some("sol-m27@proton.me"),
-                Duration::from_secs(5),
+                Duration::ZERO,
             ),
             Ok(MailboxCredential::Otp("604821".to_owned())),
             "loopback HTTP client sends Basic auth for embedded user:pass@127.0.0.1 URLs"
         );
-        basic_thread.join().expect("basic auth mock thread");
+        served(basic_thread, "the Basic auth fake's one request");
 
         let provider_cfg = MailboxConfig {
             password: Some("pw".to_owned()),
@@ -3364,11 +3382,10 @@ Verification code: 390174\r\n";
         )),
         ..MailboxConfig::default()
     };
-    let cred =
-        poll_mailbox_config_for_credential(&cfg, Some("sol-m27@proton.me"), Duration::from_secs(5))
-            .expect("poll gmail stub list and detail");
+    let cred = poll_mailbox_config_for_credential(&cfg, Some("sol-m27@proton.me"), Duration::ZERO)
+        .expect("poll gmail stub list and detail");
     assert_eq!(cred, MailboxCredential::Otp("741852".to_owned()));
-    server.join().unwrap();
+    served(server, "the Gmail API fake's list and detail requests");
 }
 
 #[test]
@@ -3537,7 +3554,7 @@ fn approval_form_selection_root_loopback_callback_and_csv_slot_inference() {
     let eml_cred = poll_mailbox_config_for_credential(
         &eml_cfg,
         Some("sol-m27@proton.me"),
-        Duration::from_secs(5),
+        aterm_spec::wait::MUST_HAPPEN,
     )
     .expect("poll single eml file");
     assert_eq!(
@@ -5221,14 +5238,14 @@ fn imap_large_literal_spoofed_tags_and_ipv6_loopback_http_fetch_credentials() {
     let cred = poll_mailbox_config_for_credential(
         &imap_cfg,
         Some("owner+m27.2@example.test"),
-        Duration::from_secs(2),
+        Duration::ZERO,
     )
     .expect("large multi-literal IMAP FETCH should succeed");
     assert_eq!(
         cred,
         MailboxCredential::MagicLink("https://claude.ai/magic-link?token=large-lit-ok".to_owned())
     );
-    imap_thread.join().expect("join imap");
+    served(imap_thread, "the IMAP fake's session for each poll");
 
     if let Ok(v6_listener) = TcpListener::bind("[::1]:0") {
         let v6_port = v6_listener.local_addr().expect("v6 addr").port();
@@ -5263,11 +5280,11 @@ fn imap_large_literal_spoofed_tags_and_ipv6_loopback_http_fetch_credentials() {
         let v6_cred = poll_mailbox_config_for_credential(
             &v6_http_cfg,
             Some("owner+m27.2@example.test"),
-            Duration::from_secs(2),
+            Duration::ZERO,
         )
         .expect("IPv6 loopback HTTP should succeed");
         assert_eq!(v6_cred, MailboxCredential::Otp("814206".to_owned()));
-        v6_thread.join().expect("join v6 http");
+        served(v6_thread, "the IPv6 HTTP fake's one request");
     }
 }
 

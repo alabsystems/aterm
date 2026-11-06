@@ -312,7 +312,7 @@ pub(crate) fn whoami(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     }
     let adoption = ctx.adoption.clone();
     let mut profiles = gh.router().profiles();
-    profiles.sort_by(|a, b| a.name.cmp(&b.name));
+    profiles.sort_unstable_by(|a, b| a.name.cmp(&b.name));
     let mut rows = Vec::with_capacity(profiles.len());
     for profile in profiles {
         let from = if adoption.as_ref().is_some_and(|a| a.adopted(&profile.name)) {
@@ -346,7 +346,7 @@ pub(crate) fn whoami(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
                         .is_some_and(|name| !routed.iter().any(|r| r == name))
                 }),
         );
-        rows.sort_by(|a, b| {
+        rows.sort_unstable_by(|a, b| {
             a.get("profile")
                 .and_then(Value::as_str)
                 .cmp(&b.get("profile").and_then(Value::as_str))

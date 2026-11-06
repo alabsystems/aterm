@@ -12,7 +12,7 @@ use super::instance::{
 };
 use super::paint::{
     BUDGET_SECS, Capture, Companion, Expect, Ledger, PLANE_COL, PLANE_ROW, PaintReport, PaintRow,
-    Scene, Split, Style, judge,
+    Scene, Split, Style, SubjectGpu, judge,
 };
 use super::scan::{Cell, RecordingIndex, StatusRow, TakeContext, TypedRow, scan_dir};
 use super::starvation::{DEFAULT_LATE_THRESHOLD_US, Sampler, SchedInputs, classify, paint_verdict};
@@ -127,6 +127,7 @@ pub fn measure(rig: &Rig, row: &PaintRow) -> Result<PaintReport, CouldNotRun> {
         band: take.band,
         bench_band,
         checks: take.checks,
+        subject_gpu: take.subject_gpu,
     })
 }
 
@@ -165,6 +166,7 @@ struct Take {
     driven_ms: Option<(i64, i64)>,
     band: super::instance::Band,
     checks: String,
+    subject_gpu: SubjectGpu,
 }
 
 fn config_head(row: &PaintRow) -> String {
@@ -254,6 +256,7 @@ fn run_take(
         driven_ms: capture.driven_ms,
         band: inst.band.clone(),
         checks: super::instance::replay_checks(ctl),
+        subject_gpu: SubjectGpu::of_metrics(&metrics),
     })
 }
 

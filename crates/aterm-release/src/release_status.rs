@@ -249,7 +249,11 @@ fn read_events(reader: impl Read) -> std::io::Result<Events> {
                                 | "build-child-finished"
                                 | "step-child-finished"
                                 | "compile-finished"
+                                | "compile-unit-dispatched"
+                                | "compile-unit-finished"
+                                | "compile-unit-message-unavailable"
                                 | "inputs"
+                                | "handed"
                                 | "disk"
                                 | "publish-line"
                         )
@@ -809,6 +813,79 @@ mod tests {
         assert_eq!((events.rejected_lines, events.count), (0, 3));
         let unknown = "release-event: {\"schema\":1,\"event\":\"inputs-guessed\"}\n";
         assert_eq!(read_events(unknown.as_bytes()).unwrap().rejected_lines, 1);
+    }
+
+    /// The record a re-run as R's own cutter writes, naming the logs of the run that handed it
+    /// the release (`handed`, which [`crate::release_timeline::Timeline`] follows), is an event of
+    /// the run and no failure. NEGATIVE CONTROL: without it among the known events it is a
+    /// rejected line and the re-run's observations are incomplete.
+    #[test]
+    fn a_reruns_handed_record_is_an_event_of_the_run() {
+        let text = format!(
+            "release-event: {}\n",
+            aterm_json::json!({"schema": 1, "event": "handed", "from": "/state/logs/outer"})
+        );
+        let events = read_events(text.as_bytes()).unwrap();
+        assert_eq!((events.rejected_lines, events.count), (0, 1), "{text}");
+        assert!(events.first_failure.is_none());
+    }
+
+    /// aterm-verify's per-unit compile evidence, a line for each unit of each compile
+    /// ([`aterm_verify::report::compile_unit_events`]: dispatched, finished, or a message whose
+    /// unit cannot be told), is an event of the run and no failure, so a verify that compiled
+    /// still reads as complete. NEGATIVE CONTROL: without the three among the known events each
+    /// is a rejected line and the run's observations are incomplete.
+    #[test]
+    fn a_compiles_unit_lines_are_events_of_the_run() {
+        let unit = |reason: &str, identity: &str| {
+            aterm_json::json!({
+                "reason": reason, "schema": "targo.compilation-unit-dispatched.v1",
+                "trust_unit_identity_sha256": identity, "trust_compile_mode": "test",
+                "trust_compile_kind": "host", "fresh": false, "dirty_reason": "changed-file",
+            })
+            .to_string()
+        };
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        let two_units = unit("compilation-unit-dispatched", &a).replacen(
+            &format!("\"trust_unit_identity_sha256\":\"{a}\""),
+            &format!(
+                "\"trust_unit_identity_sha256\":\"{a}\",\"trust_unit_identity_sha256\":\"{b}\""
+            ),
+            1,
+        );
+        let output = [
+            unit("compilation-unit-dispatched", &a),
+            unit("compiler-artifact", &a),
+            two_units,
+        ]
+        .join("\n");
+        let lines = aterm_verify::report::compile_unit_events("test", &output);
+        let names: std::collections::BTreeSet<String> = lines
+            .iter()
+            .map(|line| {
+                let json = line.strip_prefix("verify-event: ").unwrap();
+                let event: aterm_json::Value = aterm_json::from_str(json).unwrap();
+                event["event"].as_str().unwrap().to_owned()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "compile-unit-dispatched",
+                "compile-unit-finished",
+                "compile-unit-message-unavailable"
+            ]
+            .map(str::to_owned)
+            .into(),
+            "{lines:#?}"
+        );
+        let text = lines
+            .iter()
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
+        let events = read_events(text.as_bytes()).unwrap();
+        assert_eq!((events.rejected_lines, events.count), (0, 3), "{lines:#?}");
+        assert!(events.first_failure.is_none());
     }
 
     /// A check's `check-finished` line (A19's record source) is an event of the run, and a

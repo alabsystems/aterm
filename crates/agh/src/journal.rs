@@ -1173,7 +1173,10 @@ fn too_long(n: usize, at: u64) -> Error {
 
 /// Whether `Redactor::shapes` would change `text`.
 fn shaped(text: &str) -> bool {
-    Redactor::shapes(text) != text
+    matches!(
+        Redactor::shapes_cow(text),
+        std::borrow::Cow::Owned(s) if s != text
+    )
 }
 
 /// Usage for an Intent record whose match fields or slug have a credential's shape: the
@@ -1268,7 +1271,8 @@ const URL_MAX: usize = 2048;
 /// Redactor would no longer see.
 fn bounded(outcome: &Settled) -> Settled {
     if let Settled::Created { id, url } = outcome {
-        let text = aterm_json::to_string(&Value::from(Redactor::shapes(url)));
+        let redacted = Redactor::shapes_cow(url);
+        let text = aterm_json::to_string(&Value::from(redacted.as_ref()));
         if !text.is_ok_and(|t| t.len() <= URL_MAX) {
             return Settled::Created {
                 id: *id,
@@ -1301,6 +1305,7 @@ fn stale_key(id: &IntentId) -> String {
 /// The id of an intent at `step`: `{step}-{first 12 hex of sha256(slug ‖ 0 ‖ op ‖ 0 ‖ key)}`,
 /// the slug lowercased (plan §8, body 1).
 fn mint(step: u64, slug: &Slug, op: WriteOp, key: &str) -> IntentId {
+    use std::fmt::Write as _;
     let mut hasher = aterm_digest::Sha256::new();
     hasher.update(slug.key().as_bytes());
     hasher.update([0u8]);
@@ -1308,8 +1313,10 @@ fn mint(step: u64, slug: &Slug, op: WriteOp, key: &str) -> IntentId {
     hasher.update([0u8]);
     hasher.update(key.as_bytes());
     let digest = hasher.finalize();
-    let short = aterm_codec::hex::encode_lower(&digest[..6]);
-    IntentId(format!("{step}-{short}"))
+    let mut id = String::with_capacity(32);
+    let _ = write!(id, "{step}-");
+    aterm_codec::hex::push_lower(&mut id, &digest[..6]);
+    IntentId(id)
 }
 
 /// What closed `view`, or `None` while it is open: `retracted`, `found` or `settled`.
@@ -1498,10 +1505,13 @@ pub(crate) fn peek_latest(
             decode(at, step, &bytes[range]).map(|record| (step, record))
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(views(&records)
-        .into_iter()
-        .rev()
-        .find(|view| view.intent.op == op && view.intent.key == key))
+    let Some(id) = records.iter().rev().find_map(|(_, r)| match r {
+        JournalRecord::Intent(i) if i.op == op && i.key == key => Some(&i.id),
+        _ => None,
+    }) else {
+        return Ok(None);
+    };
+    Ok(view_of(&records, id))
 }
 
 /// Every journal under `dirs.journal()`, by slug: the `*.steps` files two levels down, in
@@ -1549,7 +1559,7 @@ pub fn journals(dirs: &Dirs) -> Result<Vec<(Slug, PathBuf)>> {
             }
         }
     }
-    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     Ok(found)
 }
 

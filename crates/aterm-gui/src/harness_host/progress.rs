@@ -620,7 +620,7 @@ impl WorkerIdle {
         };
         let me = who.me(&roster);
         bound.value.account = me.label().map(str::to_owned);
-        let store = accounts::Store::at(&seat.state).bounded_by(seat.ladder);
+        let store = seat.bounded_claude_store();
         let records = match store.read_account_records(seat.roster.as_deref(), seat.now) {
             Ok(records) if records.roster == roster && records.notes.is_empty() => records,
             Ok(_) | Err(_) => {

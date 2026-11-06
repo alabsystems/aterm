@@ -131,6 +131,7 @@ pub(super) fn prepare(retirement: u8, execution_until: Option<Instant>) -> Prepa
 
 pub(super) fn entry(row: &accounts::Row, active: bool) -> LoginActivity {
     LoginActivity {
+        queued: None,
         label: row.label.clone(),
         route: Some("mailbox".into()),
         active,

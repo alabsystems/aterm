@@ -72,7 +72,13 @@ pub(crate) struct Log {
     records: BTreeMap<Digest, (Operation, Option<Command>)>,
     conflicts: BTreeSet<Digest>,
     opaque_authors: BTreeSet<Actor>,
+    ordered: Vec<Digest>,
+    eligible: BTreeSet<Digest>,
+    revert_refusals: BTreeSet<Digest>,
 }
+
+const REVERT_REFUSAL: &str =
+    "revert does not name a structurally valid observed edit with the same keys";
 
 fn decode_with_merge(payload: &[u8], application: fn(&[u8]) -> Result<Command>) -> Result<Command> {
     application(payload)
@@ -112,6 +118,9 @@ impl Log {
             records: BTreeMap::new(),
             conflicts: BTreeSet::new(),
             opaque_authors: BTreeSet::new(),
+            ordered: Vec::new(),
+            eligible: BTreeSet::new(),
+            revert_refusals: BTreeSet::new(),
         };
         for evidence in metadata {
             let header = evidence.header;
@@ -121,6 +130,9 @@ impl Log {
                 .map_err(|_| Error::new("invalid proposal causal history"))?;
             let available = evidence.record.is_some();
             let (command, refusal) = match &evidence.record {
+                // A removal cutoff is table membership, not a document command: a causal
+                // parent here that projects nothing and refuses nothing.
+                Some(_) if evidence.cutoff => (None, None),
                 Some(record) => match decode_with_merge(record.payload(), decode) {
                     Ok(command) => (Some(command), None),
                     Err(error) => (None, Some(error.0)),
@@ -178,28 +190,17 @@ impl Log {
             }
         }
         log.retained = log.records.len();
-        Ok(log)
-    }
-    fn project(
-        &self,
-        before: Option<Digest>,
-        skip: &BTreeSet<Digest>,
-        build_cells: bool,
-    ) -> (Cells, BTreeMap<Digest, String>, BTreeSet<Digest>) {
-        let mut cells = Cells::new();
-        let mut refusals = BTreeMap::new();
-        let mut eligible = BTreeSet::new();
-        let mut structural = BTreeSet::new();
-        let withheld = self
+        let withheld = log
             .records
             .iter()
             .filter_map(|(id, (op, _))| (!op.catalog_eligible).then_some(*id))
             .collect();
+        let mut structural = BTreeSet::new();
         // Request conflicts are inert application data, not a signed-chain fork.
         // Keep their headers as dependencies so one author cannot suppress the
         // well-formed later edits of every peer that observed the bad request.
-        for id in self.index.project_excluding(&withheld).ordered {
-            let (operation, Some(command)) = &self.records[&id] else {
+        for id in log.index.project_excluding(&withheld).ordered {
+            let (operation, Some(command)) = &log.records[&id] else {
                 continue;
             };
             if let Command::Revert {
@@ -207,38 +208,44 @@ impl Log {
                 changes,
                 ..
             } = command
-                && (!self.index.observes(&id, target)
+                && (!log.index.observes(&id, target)
                     || !structural.contains(target)
-                    || !self
+                    || !log
                         .records
                         .get(target)
                         .and_then(|(_, command)| command.as_ref())
                         .and_then(Command::changes)
-                        .is_some_and(|target| {
-                            crate::database::change_keys(target)
-                                == crate::database::change_keys(changes)
-                        }))
+                        .is_some_and(|target| crate::database::same_change_keys(target, changes)))
             {
-                refusals.insert(
-                    id,
-                    "revert does not name a structurally valid observed edit with the same keys"
-                        .into(),
-                );
+                log.revert_refusals.insert(id);
                 continue;
             }
             // Structural validity depends only on the authenticated causal past,
             // not on a later request collision by the target's author. Such a
             // collision cannot convert an honest reverter into a faulty writer.
             structural.insert(id);
-            if self.conflicts.contains(&id)
+            if log.conflicts.contains(&id)
                 || operation.duplicate_of.is_some()
-                || self.opaque_authors.contains(&operation.header.actor)
-                || before.is_some_and(|target| target == id || !self.index.observes(&target, &id))
+                || log.opaque_authors.contains(&operation.header.actor)
+            {
+                continue;
+            }
+            log.ordered.push(id);
+            log.eligible.insert(id);
+        }
+        Ok(log)
+    }
+    fn project_cells(&self, before: Option<Digest>, skip: &BTreeSet<Digest>) -> Cells {
+        let mut cells = Cells::new();
+        for &id in &self.ordered {
+            if before.is_some_and(|target| target == id || !self.index.observes(&target, &id))
                 || skip.contains(&id)
             {
                 continue;
             }
-            if build_cells && !matches!(command, Command::Merge { .. }) {
+            if let Some(command) = &self.records[&id].1
+                && !matches!(command, Command::Merge { .. })
+            {
                 crate::documents::apply(
                     &self.index,
                     &mut cells,
@@ -247,16 +254,15 @@ impl Log {
                     true,
                 );
             }
-            eligible.insert(id);
         }
-        (cells, refusals, eligible)
+        cells
     }
     /// The cells without the operations in `skip`, as if they had never been applied: an
     /// ATT/1 reader passes the automatic records past their writer's quota
     /// (`typed::owned::quota`), which stay in history and dependencies but never project.
     #[cfg(test)]
     pub(crate) fn cells_without(&self, skip: &BTreeSet<Digest>) -> Cells {
-        self.project(None, skip, true).0
+        self.project_cells(None, skip)
     }
     /// The cells without the operations in `skip`, as if they had never been applied (an ATT/1
     /// reader passes the automatic records past their writer's quota, `typed::owned::quota`,
@@ -268,7 +274,7 @@ impl Log {
         skip: &BTreeSet<Digest>,
         awaited: &BTreeSet<Digest>,
     ) -> (Cells, Vec<Digest>) {
-        let (cells, refusals, _) = self.project(None, skip, true);
+        let cells = self.project_cells(None, skip);
         let refused = self
             .records
             .iter()
@@ -276,7 +282,7 @@ impl Log {
                 (!op.available
                     || !op.catalog_eligible
                     || op.refusal.is_some()
-                    || refusals.contains_key(id)
+                    || self.revert_refusals.contains(id)
                     || self.opaque_authors.contains(&op.header.actor))
                     && !awaited.contains(id)
             })
@@ -298,13 +304,12 @@ impl Log {
     /// joins `application::append` writes before a record on a wide frontier, which a typed
     /// reader charges to that record's writer (`typed::owned::quota`).
     pub(crate) fn eligible_and_merges(&self) -> (Vec<(&Operation, &Command)>, Merges) {
-        let (_, _, eligible) = self.project(None, &BTreeSet::new(), false);
         let mut records = Vec::new();
         let mut merges = Vec::new();
         for (operation, command) in self
             .records
             .iter()
-            .filter(|(id, _)| eligible.contains(*id))
+            .filter(|(id, _)| self.eligible.contains(*id))
             .map(|(_, record)| record)
         {
             match command {
@@ -318,15 +323,15 @@ impl Log {
         (records, merges)
     }
     pub(crate) fn snapshot(&self) -> Snapshot {
-        let (cells, mut refusals, eligible) = self.project(None, &BTreeSet::new(), true);
+        let cells = self.project_cells(None, &BTreeSet::new());
         let operations = self
             .records
             .iter()
             .map(|(id, (operation, _))| {
                 let mut operation = operation.clone();
-                operation.eligible = eligible.contains(id);
-                if let Some(refusal) = refusals.remove(id) {
-                    operation.refusal = Some(refusal);
+                operation.eligible = self.eligible.contains(id);
+                if self.revert_refusals.contains(id) {
+                    operation.refusal = Some(REVERT_REFUSAL.into());
                 }
                 if self.opaque_authors.contains(&operation.header.actor) {
                     operation.refusal.get_or_insert_with(|| {
@@ -394,24 +399,15 @@ impl Log {
                 op.header.actor == actor
                     && (!op.available || !op.catalog_eligible || op.refusal.is_some())
             })
+            || self.revert_refusals.iter().any(|id| {
+                self.records
+                    .get(id)
+                    .is_some_and(|(op, _)| op.header.actor == actor)
+            })
         {
             return Err(Error::new(
                 "local proposal writer has withheld, unavailable or refused history; recovery required",
             ));
-        }
-        if self.records.values().any(|(op, cmd)| {
-            op.header.actor == actor && matches!(cmd, Some(Command::Revert { .. }))
-        }) {
-            let (_, refusals, _) = self.project(None, &BTreeSet::new(), false);
-            if refusals.keys().any(|id| {
-                self.records
-                    .get(id)
-                    .is_some_and(|(op, _)| op.header.actor == actor)
-            }) {
-                return Err(Error::new(
-                    "local proposal writer has withheld, unavailable or refused history; recovery required",
-                ));
-            }
         }
         Ok(())
     }
@@ -450,7 +446,7 @@ impl Log {
             }
         }
         if let Some((_, id)) = first {
-            if !self.project(None, &BTreeSet::new(), false).2.contains(&id) {
+            if !self.eligible.contains(&id) {
                 return Err(Error::new(
                     "the prior proposal receipt is not currently eligible",
                 ));
@@ -496,10 +492,10 @@ impl Log {
             .changes()
             .filter(|changes| !changes.is_empty())
             .ok_or_else(|| Error::new("target proposal has no value changes to revert"))?;
-        let (current, _, eligible) = self.project(None, excluded, true);
-        if !eligible.contains(&target) {
+        if !self.eligible.contains(&target) || excluded.contains(&target) {
             return Err(Error::new("target proposal is not eligible"));
         }
+        let current = self.project_cells(None, excluded);
         let mut keys = Vec::with_capacity(changes.len());
         for change in changes {
             let key = (change.collection.clone(), change.key.clone());
@@ -514,7 +510,7 @@ impl Log {
             }
             keys.push(key);
         }
-        let (mut past, _, _) = self.project(Some(target), excluded, true);
+        let mut past = self.project_cells(Some(target), excluded);
         let mut restored = Vec::with_capacity(keys.len());
         for key in keys {
             let old = past.remove(&key);

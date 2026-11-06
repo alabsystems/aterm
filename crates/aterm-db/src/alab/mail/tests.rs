@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::{
-    alab::registry::ADDRESS,
+    alab::registry::{ADDRESS, AddressIndex},
     database::Change,
     typed::{
         cell,
@@ -62,7 +62,8 @@ fn an_alias_reads_the_mailbox_of_what_it_is_linked_with() {
         put(&ADDRESS, &loop_a, "mailbox_hint", json!("mb-loop")),
         put(&ADDRESS, &loop_b, "alias_of", json!(loop_a)),
     ]);
-    let read = |address: &str| effective(&addresses, &Observed::new(), &none, address);
+    let index = AddressIndex::of(&addresses);
+    let read = |address: &str| effective(&addresses, &index, &Observed::new(), &none, address);
     assert_eq!(
         read(&ann),
         Some(Effective {
@@ -98,6 +99,7 @@ fn observation_then_route_then_guess() {
         put(&ADDRESS, &ann, "mailbox_hint", json!("mb-guess")),
         put(&ADDRESS, &bob, "mailbox_hint", json!("mb-guess")),
     ]);
+    let index = AddressIndex::of(&addresses);
     let route = |_: &str| Some("mb-route".to_owned());
     let older = json!({"mailbox": "mb-new", "complete": true, "at": 1, "addresses": [bob]});
     let newer = json!({"mailbox": "mb-new", "complete": true, "at": 2, "addresses": [ann, ""]});
@@ -118,7 +120,7 @@ fn observation_then_route_then_guess() {
     assert!(!seen.contains_key(""));
     assert!(!seen.contains_key(&bob));
     let read = |seen: &Observed, routes: &dyn Fn(&str) -> Option<String>, pk: &str| {
-        effective(&addresses, seen, routes, pk).map(|e| (e.mailbox, e.how))
+        effective(&addresses, &index, seen, routes, pk).map(|e| (e.mailbox, e.how))
     };
     assert_eq!(
         read(&seen, &route, &ann),
@@ -173,19 +175,20 @@ fn a_tag_reads_its_listed_base() {
         addr(&top, "top"),
         put(&ADDRESS, &top, "mailbox", json!("mb-top")),
     ]);
+    let index = AddressIndex::of(&addresses);
     let seen = Observed::from([
         (base.clone(), BTreeSet::from(["mb-seen".to_owned()])),
         (gone.clone(), BTreeSet::from(["mb-seen".to_owned()])),
     ]);
     let read = |seen: &Observed, pk: &str| {
-        effective(&addresses, seen, &none, pk).map(|e| (e.mailbox, e.how, e.via))
+        effective(&addresses, &index, seen, &none, pk).map(|e| (e.mailbox, e.how, e.via))
     };
     assert_eq!(
         read(&seen, &tag),
         Some(("mb-seen".to_owned(), How::Observed, vec![base.clone()]))
     );
     assert_eq!(
-        listed_base(&addresses, &seen, &tag),
+        listed_base(&addresses, &index, &seen, &tag),
         Some((base.clone(), "mb-seen".to_owned()))
     );
     // Nothing lists the base: the tag keeps its own guess.
@@ -197,7 +200,7 @@ fn a_tag_reads_its_listed_base() {
     assert_eq!(read(&seen, &gone_tag).unwrap().0, "mb-guess");
     // The owner's link comes first.
     assert_eq!(read(&seen, &owned_tag).unwrap().0, "mb-top");
-    assert_eq!(listed_base(&addresses, &seen, &base), None);
+    assert_eq!(listed_base(&addresses, &index, &seen, &base), None);
     // A base two mailboxes list decides nothing: the tag keeps its own exact route, and never takes
     // up the base's route or guess.
     let two = Observed::from([(
@@ -206,9 +209,9 @@ fn a_tag_reads_its_listed_base() {
     )]);
     let route_tag = tag.clone();
     let routes = move |pk: &str| (pk == route_tag).then(|| "mb-route".to_owned());
-    assert_eq!(listed_base(&addresses, &two, &tag), None);
+    assert_eq!(listed_base(&addresses, &index, &two, &tag), None);
     assert_eq!(
-        effective(&addresses, &two, &routes, &tag).map(|e| (e.mailbox, e.how, e.via)),
+        effective(&addresses, &index, &two, &routes, &tag).map(|e| (e.mailbox, e.how, e.via)),
         Some(("mb-route".to_owned(), How::Routed, Vec::new()))
     );
 }
@@ -226,12 +229,48 @@ fn a_tag_never_takes_up_its_base_s_guess() {
         put(&ADDRESS, &base, "mailbox_hint", json!("mb-base-guess")),
         put(&ADDRESS, &tag, "addr", json!("base+ai@example.test")),
     ]);
+    let index = AddressIndex::of(&addresses);
     let seen = Observed::from([(base, BTreeSet::from(["mb-a".to_owned(), "mb-c".to_owned()]))]);
     let route_tag = tag.clone();
     let routes = move |pk: &str| (pk == route_tag).then(|| "mb-route".to_owned());
     assert_eq!(
-        effective(&addresses, &seen, &routes, &tag).map(|e| (e.mailbox, e.how, e.via)),
+        effective(&addresses, &index, &seen, &routes, &tag).map(|e| (e.mailbox, e.how, e.via)),
         Some(("mb-route".to_owned(), How::Routed, Vec::new()))
+    );
+}
+
+/// A `+tag`'s base is the row whose `addr` says the base address now, not the row its key derives:
+/// a row renamed onto the base address links the tag, and the row born with that address and
+/// renamed away links nothing.
+/// NEGATIVE CONTROL: with `listed_base` keying the base by `keys::address_pk` again, the tag
+/// follows the row renamed away: `` left: Some(("ad-…", "mb-old")) right: Some(("ad-…",
+/// "mb-seen")) ``.
+#[test]
+fn a_tag_reads_the_base_its_row_says_now() {
+    let (moved, born_base, tag) = (pk("moved"), pk("base"), pk("base+ai"));
+    let addresses = rows(vec![
+        put(&ADDRESS, &moved, "addr", json!("base@example.test")),
+        put(
+            &ADDRESS,
+            &born_base,
+            "addr",
+            json!("elsewhere@example.test"),
+        ),
+        put(&ADDRESS, &tag, "addr", json!("base+ai@example.test")),
+        put(&ADDRESS, &tag, "mailbox_hint", json!("mb-guess")),
+    ]);
+    let index = AddressIndex::of(&addresses);
+    let seen = Observed::from([
+        (moved.clone(), BTreeSet::from(["mb-seen".to_owned()])),
+        (born_base, BTreeSet::from(["mb-old".to_owned()])),
+    ]);
+    assert_eq!(
+        listed_base(&addresses, &index, &seen, &tag),
+        Some((moved.clone(), "mb-seen".to_owned()))
+    );
+    assert_eq!(
+        effective(&addresses, &index, &seen, &none, &tag).map(|e| (e.mailbox, e.how, e.via)),
+        Some(("mb-seen".to_owned(), How::Observed, vec![moved]))
     );
 }
 
@@ -247,12 +286,16 @@ fn a_protected_address_never_resolves_a_mailbox() {
         put(&ADDRESS, &alias, "alias_of", json!(priv_addr)),
         put(&ADDRESS, &tag, "addr", json!("private+ai@example.test")),
     ]);
+    let index = AddressIndex::of(&addresses);
     let seen = Observed::from([(priv_addr.clone(), BTreeSet::from(["mb-obs".to_owned()]))]);
     let route_priv = priv_addr.clone();
     let routes = move |pk: &str| (pk == route_priv).then(|| "mb-route".to_owned());
-    assert_eq!(effective(&addresses, &seen, &routes, &priv_addr), None);
-    assert_eq!(effective(&addresses, &seen, &none, &alias), None);
-    assert_eq!(effective(&addresses, &seen, &none, &tag), None);
+    assert_eq!(
+        effective(&addresses, &index, &seen, &routes, &priv_addr),
+        None
+    );
+    assert_eq!(effective(&addresses, &index, &seen, &none, &alias), None);
+    assert_eq!(effective(&addresses, &index, &seen, &none, &tag), None);
 }
 
 /// A sign-in's mailbox from registry rows alone (step A9): the MAILBOX row names its login by
@@ -553,4 +596,41 @@ mod sign_in {
             Err(Withheld::Unopened)
         );
     }
+}
+
+/// A login names the mailbox of the row that says it now: a row renamed onto the login keeps its
+/// birth key, so the mailbox key derives from that key; a login no row says names the key it
+/// derives; one two rows say, or one whose derived key a row renamed away holds, names none.
+/// What discovery keys a mailbox by, and what names `ai-mailbox.toml`'s version-1 logins.
+/// NEGATIVE CONTROL: with `login_mailbox`'s `Row` arm deriving from the login's own key, the
+/// renamed row's login names the mailbox its birth row's key derives:
+/// `` left: Some("mb-26170bc9caa8be53") right: Some("mb-f6a9e6e07e36b369") ``.
+#[test]
+fn a_login_names_the_mailbox_of_the_row_that_says_it_now() {
+    let (moved, born, twin_a, twin_b) = (pk("moved"), pk("login"), pk("twin-a"), pk("twin-b"));
+    let addresses = rows(vec![
+        put(&ADDRESS, &moved, "addr", json!("login@example.test")),
+        put(&ADDRESS, &born, "addr", json!("elsewhere@example.test")),
+        put(&ADDRESS, &twin_a, "addr", json!("twin@example.test")),
+        put(&ADDRESS, &twin_b, "addr", json!("twin@example.test")),
+    ]);
+    let index = AddressIndex::of(&addresses);
+    assert_eq!(
+        login_mailbox(&index, "Login@Example.test"),
+        Some(keys::mailbox_pk(&moved).unwrap())
+    );
+    assert_eq!(
+        login_mailbox(&index, "new@example.test"),
+        Some(keys::mailbox_pk(&pk("new")).unwrap())
+    );
+    assert_eq!(login_mailbox(&index, "twin@example.test"), None);
+    let gone = pk("gone");
+    let renamed_away = AddressIndex::of(&rows(vec![put(
+        &ADDRESS,
+        &gone,
+        "addr",
+        json!("kept@example.test"),
+    )]));
+    assert_eq!(login_mailbox(&renamed_away, "gone@example.test"), None);
+    assert_eq!(login_mailbox(&index, "not an address"), None);
 }

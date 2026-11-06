@@ -33,7 +33,7 @@ const RESOURCE_MAX_LEN: usize = 64;
 const MAX_RESOURCES: usize = 64;
 
 /// Normalizes a rate-limit resource name to lowercase `[a-z0-9_-]{1,64}`.
-fn normalize_resource(raw: &str) -> Option<String> {
+fn normalize_resource_cow(raw: &str) -> Option<std::borrow::Cow<'_, str>> {
     let raw = raw.trim();
     if raw.is_empty()
         || raw.len() > RESOURCE_MAX_LEN
@@ -43,7 +43,15 @@ fn normalize_resource(raw: &str) -> Option<String> {
     {
         return None;
     }
-    Some(raw.to_ascii_lowercase())
+    if raw.bytes().any(|b| b.is_ascii_uppercase()) {
+        Some(std::borrow::Cow::Owned(raw.to_ascii_lowercase()))
+    } else {
+        Some(std::borrow::Cow::Borrowed(raw))
+    }
+}
+
+fn normalize_resource(raw: &str) -> Option<String> {
+    normalize_resource_cow(raw).map(std::borrow::Cow::into_owned)
 }
 
 impl RateSnapshot {
@@ -173,11 +181,11 @@ impl RateBook {
     /// Returns a `PreRefused` rate-limit error when `resource` is exhausted until after `now_unix`.
     #[must_use]
     pub fn refuse_before_send(&self, key: &str, resource: &str, now_unix: u64) -> Option<Error> {
-        let normalized = normalize_resource(resource)?;
+        let normalized = normalize_resource_cow(resource)?;
         let spent = self
             .read(key)
             .into_iter()
-            .find(|s| s.resource == normalized && s.remaining == 0 && s.reset > now_unix)?;
+            .find(|s| s.resource == *normalized && s.remaining == 0 && s.reset > now_unix)?;
         Some(
             Error::new(
                 Kind::RateLimited,
@@ -278,13 +286,13 @@ impl RateBook {
         let mut held: Vec<RateSnapshot> = resources
             .iter()
             .filter_map(|(name, entry)| {
-                let expected = normalize_resource(name)?;
+                let expected = normalize_resource_cow(name)?;
                 let snap = RateSnapshot::from_json(entry)?;
-                (snap.resource == expected && name == &expected).then_some(snap)
+                (snap.resource == *expected && name == &*expected).then_some(snap)
             })
             .take(MAX_RESOURCES)
             .collect();
-        held.sort_by(|a, b| a.resource.cmp(&b.resource));
+        held.sort_unstable_by(|a, b| a.resource.cmp(&b.resource));
         Some(held)
     }
 }

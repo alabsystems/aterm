@@ -56,6 +56,9 @@ fn reaped_or_gone(pid: i32) -> bool {
     // SAFETY: `status` is a live local `waitpid` writes; the pid names a child whose handle gave it
     // up to the reaper, so nothing else waits for it.
     let got = unsafe { waitpid(pid, &mut status, WNOHANG) };
+    if got == pid {
+        crate::deaths::note(pid, status);
+    }
     got == pid
         || (got == -1 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted)
 }

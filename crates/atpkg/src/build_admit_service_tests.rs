@@ -431,11 +431,16 @@ fn monitor_builds(world: &Path, d: &mut Driver) {
             || {
                 d.tick();
                 assert!(d.done.is_empty());
+                // The reader writes its reply before it exits, so an exit seen
+                // first means the look after it finds the reply. Here only an
+                // exit with no reply fails; a reader that replied and then
+                // failed is judged by its exit status below.
+                let exited = reader.0.try_wait().unwrap();
                 if world.join("monitor.reply").exists() {
                     return Some(());
                 }
                 assert!(
-                    reader.0.try_wait().unwrap().is_none(),
+                    exited.is_none(),
                     "reader failed: {}",
                     std::fs::read_to_string(world.join("monitor-reader.log")).unwrap_or_default()
                 );

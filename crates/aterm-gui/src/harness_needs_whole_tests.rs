@@ -350,7 +350,10 @@ fn the_stamped_hover_follows_a_set_under_one_entry() {
             && now.contains(&format!("Needs you: {NEED_C}")),
         "the stamped hover: {now}"
     );
-    assert_eq!(stamps, 1, "one stamp where the pill moved too: {now}");
+    assert_eq!(
+        stamps, 1,
+        "one stamp where the need's words moved too: {now}"
+    );
 }
 
 #[test]
@@ -373,6 +376,50 @@ fn the_stamped_hover_follows_a_first_tell_beside_a_standing_entry() {
         "stamps={stamps}; the stamped hover: {now}"
     );
     assert_eq!(stamps, 1, "one stamp for the first tell: {now}");
+}
+
+/// A TAIL THAT ALONE MOVED RESTAMPS THE HOVER: a rewrite from `carrying on` to `waits on you` keeps
+/// the need's words, and a write that lands between a refresh's publication and its read of the
+/// facts (`drive::refresh_session`: `herald`, then `sense`) has that refresh absorb the new entry
+/// under the old verdict, so the write's own wake publishes a need that differs from the slot's by
+/// its key alone. That wake stamps the strip before it publishes, with the old tail, so only the
+/// refresh's own restamp can carry the new one. CONTROL: once published, a refresh moves nothing.
+#[test]
+fn the_stamped_hover_follows_a_tail_that_alone_moved() {
+    use aterm_messages::presence::drive::Desk;
+    const CARRYING: &str = "claude needs you: sign the release \u{2014} carrying on";
+    const WAITING: &str = "claude needs you: sign the release \u{2014} waits on you";
+    let (mut app, _, ctx) = live_desk();
+    land(&mut app, &ctx, Some(CARRYING));
+    assert!(
+        stamped_hover().contains("carries on meanwhile"),
+        "PRECONDITION the first tail: {}",
+        stamped_hover()
+    );
+    ctx.meta
+        .lock()
+        .unwrap()
+        .set_attention_kind(
+            NEEDS_ATTENTION_OWNER,
+            Some(WAITING.to_string()),
+            Some(AttentionKind::Ask),
+        )
+        .expect("a slot");
+    let sensed = Desk::sense(&app, 0).expect("session 0 is pooled");
+    Desk::table_mut(&mut app).absorb(0, sensed, std::time::Instant::now());
+    let _ = crate::work_counts::take_tooltip_pushes();
+    app.on_meta_changed(0);
+    let stamps = crate::work_counts::take_tooltip_pushes();
+    let now = stamped_hover();
+    assert!(
+        now.contains("waits on you") && !now.contains("carries on meanwhile"),
+        "stamps={stamps}; the stamped hover: {now}"
+    );
+    let sensed = Desk::sense(&app, 0).expect("session 0 is pooled");
+    assert!(
+        !Desk::table_mut(&mut app).absorb(0, sensed, std::time::Instant::now()),
+        "CONTROL: nothing is left to move"
+    );
 }
 
 #[test]
@@ -703,7 +750,7 @@ fn a_codex_alabs_set_cut_at_32_counts_every_need_its_entry_counts() {
 
 /// A CODEX-ALAB'S SET THAT MOVES UNDER ONE ENTRY RESTAMPS THE HOVER ONCE (§14.3.4, §12.2.12's
 /// stamp): its `meta set harness_needs` wakes the window with the needs fact aterm's own loop's
-/// tell sends, so `[b, c, d]` to `[b, a, d]` beside the same entry, which leaves the pill's words
+/// tell sends, so `[b, c, d]` to `[b, a, d]` beside the same entry, which leaves the need's words
 /// as they were, still moves the stamped hover, in one stamp. NEGATIVE CONTROL: the same set told
 /// again stamps nothing.
 #[test]
