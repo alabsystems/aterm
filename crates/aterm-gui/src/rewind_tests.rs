@@ -1959,6 +1959,66 @@ fn closing_a_rewound_pane_or_tab_resumes_the_effects_and_answers_its_replies() {
     }
 }
 
+/// The slider speaks for the focused pane's past, so another pane's has its label to say so.
+#[cfg(a11y_tree)]
+#[test]
+fn a_rewound_pane_out_of_focus_says_so_in_its_label() {
+    use aterm_a11y::model::Role;
+    let mut app = scripted_app();
+    start_recording(&app);
+    let _ = slice(&app, b"the past screen");
+    let sibling = app.split_active_stub_tab(WID);
+    assert_eq!(app.focused_session_id(WID), Some(sibling), "CONTROL");
+    let labels = |app: &App| -> Vec<String> {
+        let tree = app.grid_a11y_tree(WID, None).expect("a tree");
+        tree.nodes
+            .iter()
+            .filter(|(_, node)| node.role() == Role::Terminal)
+            .filter_map(|(_, node)| node.label().map(str::to_owned))
+            .collect()
+    };
+    assert!(
+        labels(&app).iter().all(|l| !l.contains("REWIND")),
+        "CONTROL"
+    );
+
+    app.rewind_open(0, Target::Latest, None).expect("open");
+
+    let rewound = labels(&app);
+    assert_eq!(rewound.len(), 2, "{rewound:?}");
+    assert_eq!(
+        rewound.iter().filter(|l| l.contains("REWIND")).count(),
+        1,
+        "{rewound:?}"
+    );
+
+    assert!(app.focus_pane_in(WID, crate::pane::FocusDir::Left));
+    let focused = labels(&app);
+    assert!(focused.iter().all(|l| !l.contains("REWIND")), "{focused:?}");
+}
+
+/// A client reads what a rewound pane shows, not the live screen behind it.
+#[cfg(a11y_tree)]
+#[test]
+fn a_rewound_pane_reads_its_past_screen_to_a_client() {
+    let mut app = scripted_app();
+    app.redraw_window(WID);
+    start_recording(&app);
+    let past = slice(&app, b"\x1b[2J\x1b[Hthe past screen");
+    let _ = slice(&app, b"\x1b[2J\x1b[Hthe live screen now");
+    let (rows, cols) = grid(&app);
+    let read = |app: &App| {
+        let document = app.terminal_document(WID, 0, rows, cols, false);
+        document.expect("a document").snap.value().to_string()
+    };
+    assert!(read(&app).starts_with("the live screen now"), "CONTROL");
+
+    app.rewind_open(0, Target::At(past), None).expect("open");
+
+    let rewound = read(&app);
+    assert!(rewound.starts_with("the past screen"), "{rewound}");
+}
+
 #[cfg(a11y_tree)]
 #[test]
 fn a_rewound_pane_is_an_accessibility_slider_over_its_states() {

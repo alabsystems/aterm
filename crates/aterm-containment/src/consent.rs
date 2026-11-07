@@ -370,6 +370,22 @@ pub fn host_uuid() -> Option<String> {
         .clone()
 }
 
+/// The directory UUID (`GeneratedUID`) of the account this process runs as, from
+/// `mbr_uid_to_uuid(3)`: the key of what macOS records per account, such as each account's own
+/// Local Network answers. Uppercase and hyphenated, as macOS writes it; `None` off macOS or when
+/// the directory names none.
+#[must_use]
+pub fn user_uuid() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        imp::user_uuid()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 /// [`host_uuid`] only if something has read it.
 #[must_use]
 pub fn host_uuid_if_warm() -> Option<&'static str> {
@@ -4666,6 +4682,18 @@ mod imp {
             seconds: info.pbi_start_tvsec,
             microseconds: info.pbi_start_tvusec,
         })
+    }
+
+    /// The running user's directory UUID, formatted as macOS writes it.
+    pub(super) fn user_uuid() -> Option<String> {
+        let mut user: Uuid = [0; 16];
+        // SAFETY: `getuid` has no preconditions.
+        let uid = unsafe { libc::getuid() };
+        // SAFETY: `user` is a live 16-byte buffer, the whole of a `uuid_t`.
+        if unsafe { mbr_uid_to_uuid(uid, user.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        Some(super::format_uuid(&user))
     }
 
     /// Whether the running user is a member of the directory group `name`.

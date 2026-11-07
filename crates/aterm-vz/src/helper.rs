@@ -1019,8 +1019,9 @@ impl<M: Machine> Core<M> {
             (None, Some(s)) => s.why().to_string(),
             (None, None) => POWERED_OFF.into(),
         };
+        let exit = format!("the VM stopped: {why}");
         match error {
-            Some(_) => self.fail(why.clone()),
+            Some(_) => self.fail(why),
             None => {
                 self.phase = Phase::Stopped;
                 if !self.lost_sent {
@@ -1031,7 +1032,7 @@ impl<M: Machine> Core<M> {
         self.held.clear();
         self.dials.clear();
         self.watch_conn = None;
-        Flow::Exit(format!("the VM stopped: {why}"))
+        Flow::Exit(exit)
     }
 
     /// Something in the guest dialed port 1025. Any guest process may (§6), so no frame of a

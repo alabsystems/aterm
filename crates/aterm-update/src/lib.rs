@@ -2429,6 +2429,7 @@ fn spawn_background_check_in(
     );
     let _ = CHECKER_ARGS.set(std::sync::Arc::clone(&args));
     if let Err(error) = spawn_checker_thread(generation, args) {
+        checker_watch::WATCH.unstarted(generation);
         warn(&format!("could not start the update checker: {error}"));
     }
 }
@@ -2536,17 +2537,25 @@ impl UncheckedSweep {
 /// `sweep` takes what it left; a CLI's sweep dies with it, and a running app's or the next
 /// launch's takes the rest.
 #[cfg(target_os = "macos")]
-fn asked_check(automatic: bool, sweep: &UncheckedSweep, check: impl FnOnce()) {
-    check();
+fn asked_check<T>(automatic: bool, sweep: &UncheckedSweep, check: impl FnOnce() -> T) -> T {
+    let result = check();
     if !automatic {
         sweep.start();
     }
+    result
 }
 
 /// Tell the background check that the system just woke.
 #[cfg(target_os = "macos")]
 pub fn note_system_woke() {
     cadence::SYSTEM_WOKE.post();
+}
+
+/// Observe the host's settled network changes during the existing checker
+/// wait. The consuming probe must do no network or filesystem work.
+#[cfg(target_os = "macos")]
+pub fn set_network_change_probe(probe: Box<dyn Fn() -> bool + Send + Sync>) {
+    cadence::SYSTEM_WOKE.set_network_probe(probe);
 }
 
 /// How long the check loop pauses after the host did not answer its settings query.
@@ -2663,7 +2672,7 @@ pub fn respawn_stalled_checker(stalled_generation: u64) -> Option<u64> {
             Some(next)
         }
         Err(error) => {
-            checker_watch::WATCH.unstarted();
+            checker_watch::WATCH.unstarted(next);
             warn(&format!(
                 "the update check stopped answering; aterm could not start a fresh one: {error}"
             ));
@@ -3475,7 +3484,7 @@ fn settle_after_wake(
     settle: std::time::Duration,
 ) {
     log(&format!(
-        "woke from sleep; checking for updates in {}s",
+        "wake signal or network change; checking for updates in {}s",
         settle.as_secs()
     ));
     schedule.woke();
@@ -4395,11 +4404,11 @@ pub fn rfc3339_older_than(stamp: &str, secs: u64) -> bool {
 }
 
 /// Run one update check + stage synchronously and return the resulting [`UpdateStatus`].
+/// An already-running check is reported without queuing another request behind it.
 #[cfg(target_os = "macos")]
 pub fn check_now(current_build: u64, source: &Source) -> UpdateStatus {
-    // Not queued behind a stuck check: a checker generation the watchdog retired
-    // inside its check still holds the lane, and `run_or_join` would wait on it
-    // without bound. Say so at once instead.
+    // Retain the more specific diagnosis when the watchdog already retired
+    // the check that still holds the lane.
     if enabled()
         && let Some(why) = manual_check_blocked(&checker_watch::WATCH)
     {
@@ -4412,15 +4421,25 @@ pub fn check_now(current_build: u64, source: &Source) -> UpdateStatus {
             .unwrap_or_else(|| UpdateStatus::empty(true, current_build, why));
     }
     if enabled() {
-        asked_check(automatic(), &UNCHECKED_SWEEP, || {
+        let completed = asked_check(automatic(), &UNCHECKED_SWEEP, || {
             check_lane().run_or_join(current_build, source, || {
                 if let Err(error) =
                     github::check_and_stage_for(current_build, source, github::Asked::Person)
                 {
                     warn(&format!("manual update check failed: {error}"));
                 }
-            });
+            })
         });
+        if !completed {
+            let why = "an update check is already running; showing its current status".to_string();
+            return status(current_build).map_or_else(
+                || UpdateStatus::empty(true, current_build, why.clone()),
+                |mut status| {
+                    status.outcome = why.clone();
+                    status
+                },
+            );
+        }
     }
     status(current_build).unwrap_or_else(|| {
         UpdateStatus::empty(
@@ -4436,7 +4455,8 @@ pub fn check_now(current_build: u64, source: &Source) -> UpdateStatus {
 }
 
 /// Why a manual check cannot run right now, or `None` when it can: a retired checker generation
-/// still holds this process's check lane, and a check would only queue behind it.
+/// still holds this process's check lane. This supplies a more specific diagnosis
+/// than the general busy result.
 #[cfg(target_os = "macos")]
 fn manual_check_blocked(watch: &checker_watch::CheckerWatch) -> Option<String> {
     let holder = watch.snapshot()?.blocked_by()?;

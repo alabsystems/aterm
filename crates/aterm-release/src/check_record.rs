@@ -618,22 +618,20 @@ pub fn checks_in(
         }
         let state = match record.outcome.as_str() {
             OK => State::Passed,
-            ACCEPTED if bundle(check) => match &record.acceptance {
+            ACCEPTED if bundle(check) => match record.acceptance {
                 Some(a) => State::Accepted {
-                    reason: a.reason.clone(),
-                    log: record.log.clone(),
+                    reason: a.reason,
+                    log: record.log,
                 },
                 None => continue,
             },
-            FAIL => State::Failed {
-                log: record.log.clone(),
-            },
+            FAIL => State::Failed { log: record.log },
             _ => State::Missing {
                 resume: record
                     .binaries
-                    .iter()
-                    .filter(|b| b.carried())
-                    .map(|b| (b.spec.clone(), b.sha256.clone()))
+                    .into_iter()
+                    .filter(Binary::carried)
+                    .map(|b| (b.spec, b.sha256))
                     .collect(),
             },
         };
@@ -646,10 +644,11 @@ pub fn checks_in(
         && answers(&record, RUN_LEVEL, tree, &seal, None)
         && [FAIL, BEGAN].contains(&record.outcome.as_str())
     {
+        let unrecorded = record.outcome == BEGAN;
         also.push(Failed {
             check: RUN_LEVEL.to_owned(),
-            log: record.log.clone(),
-            unrecorded: record.outcome == BEGAN,
+            log: record.log,
+            unrecorded,
         });
     }
     // A FAIL of a bundle check on another build of this tree under this seal refuses it too: a
@@ -665,7 +664,7 @@ pub fn checks_in(
             {
                 also.push(Failed {
                     check: check.name().to_owned(),
-                    log: record.log.clone(),
+                    log: record.log,
                     unrecorded: false,
                 });
             }

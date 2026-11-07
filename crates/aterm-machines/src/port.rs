@@ -30,6 +30,7 @@ mod read_owned_file;
 mod relay;
 mod remove_empty_dir;
 mod rename_noreplace;
+mod scoped_metadata;
 mod scratch;
 mod screen_lock;
 mod scroll_direction;
@@ -470,6 +471,50 @@ pub struct Stat {
     pub len: u64,
 }
 
+/// One no-follow descriptor's metadata: kind/owner admission and change identity refer to
+/// the same opened object. It supplies no file content or executable authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScopedPathMetadata {
+    /// Owner, mode, kind and size from the opened descriptor.
+    pub stat: Stat,
+    /// The same descriptor's filesystem identity and modification/change metadata.
+    pub version: [u8; 32],
+}
+
+/// Same-descriptor owned-file admission and change facts. Cache eligibility
+/// never grants authority to use the file or skip a later effect's admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnedFileMetadata {
+    pub stat: Stat,
+    pub version: [u8; 32],
+    pub changed_ns: i128,
+}
+
+impl OwnedFileMetadata {
+    /// Whether the latest recorded change predates the existing metadata-cache
+    /// settlement bound. This never delays an ordinary file read or effect.
+    #[must_use]
+    pub fn settled_at(self, now: u64) -> bool {
+        (i128::from(now) * 1_000_000_000)
+            .checked_sub(self.changed_ns)
+            .is_some_and(|age| age >= aterm_toolchain::stat_digest::SETTLE_NS)
+    }
+}
+
+/// Bounded bytes whose descriptor metadata agreed before and after their read.
+pub struct OwnedFileRead {
+    pub bytes: Vec<u8>,
+    pub metadata: OwnedFileMetadata,
+}
+
+impl std::fmt::Debug for OwnedFileRead {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OwnedFileRead")
+            .finish_non_exhaustive()
+    }
+}
+
 /// One live process ([`System::processes`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Process {
@@ -796,6 +841,23 @@ pub trait System: Sync {
         Err(io::ErrorKind::Unsupported.into())
     }
 
+    /// Read owner, kind and change metadata from one no-follow file/directory descriptor.
+    /// A link at any component is refused by the actual open, including after admission.
+    fn scoped_path_metadata(&self, _path: &Path) -> io::Result<ScopedPathMetadata> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
+    /// Which supplied single-component names are owned ordinary child directories, relative
+    /// to a strictly opened owned directory. At most 256 known names; no recursive scan.
+    fn scoped_child_directories(
+        &self,
+        _path: &Path,
+        _uid: u32,
+        _names: &[String],
+    ) -> io::Result<Vec<String>> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
     /// Read this tree's native GNU ELF/libc requirements without starting a child. Other
     /// operating systems have no GNU libc gate. Unknown capability refuses a managed build.
     fn admit_runtime(&self, _root: &Path) -> Result<(), String> {
@@ -824,6 +886,42 @@ pub trait System: Sync {
         private: bool,
     ) -> io::Result<Vec<u8>> {
         let _ = (path, uid, max, private);
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
+    /// Owned regular-file metadata from the same final-no-follow opener as
+    /// read_owned_file, without reading contents. Parent policy is unchanged.
+    fn owned_file_metadata(
+        &self,
+        _path: &Path,
+        _uid: u32,
+        _max: usize,
+        _private: bool,
+    ) -> io::Result<OwnedFileMetadata> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
+    /// The bounded owned read and its matching descriptor metadata. A mutation
+    /// during the read refuses observation; ordinary read policy is unchanged.
+    fn read_owned_file_observed(
+        &self,
+        _path: &Path,
+        _uid: u32,
+        _max: usize,
+        _private: bool,
+    ) -> io::Result<OwnedFileRead> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
+    /// Bounded owned-file admission that also refuses every symlinked ancestor at open.
+    /// Uses a kernel no-follow-any open or descriptor-relative no-follow component walk.
+    fn read_owned_file_scoped(
+        &self,
+        _path: &Path,
+        _uid: u32,
+        _max: usize,
+        _private: bool,
+    ) -> io::Result<Vec<u8>> {
         Err(io::ErrorKind::Unsupported.into())
     }
 
@@ -1895,6 +1993,19 @@ impl System for Live {
         Ok(digest.finish().0)
     }
 
+    fn scoped_path_metadata(&self, path: &Path) -> io::Result<ScopedPathMetadata> {
+        scoped_metadata::observe(path)
+    }
+
+    fn scoped_child_directories(
+        &self,
+        path: &Path,
+        uid: u32,
+        names: &[String],
+    ) -> io::Result<Vec<String>> {
+        scoped_metadata::directories(path, uid, names)
+    }
+
     /// Opened by [`aterm_uds::nofollow::open_reader_with_identity`] (`O_NOFOLLOW_ANY | O_NONBLOCK`,
     /// then `fstat`), so a link on `path` answers `ELOOP` and a FIFO is refused without waiting;
     /// `Unsupported` off macOS.
@@ -1918,6 +2029,36 @@ impl System for Live {
         private: bool,
     ) -> io::Result<Vec<u8>> {
         read_owned_file::read(path, uid, max, private)
+    }
+
+    fn owned_file_metadata(
+        &self,
+        path: &Path,
+        uid: u32,
+        max: usize,
+        private: bool,
+    ) -> io::Result<OwnedFileMetadata> {
+        read_owned_file::metadata(path, uid, max, private)
+    }
+
+    fn read_owned_file_observed(
+        &self,
+        path: &Path,
+        uid: u32,
+        max: usize,
+        private: bool,
+    ) -> io::Result<OwnedFileRead> {
+        read_owned_file::observed(path, uid, max, private)
+    }
+
+    fn read_owned_file_scoped(
+        &self,
+        path: &Path,
+        uid: u32,
+        max: usize,
+        private: bool,
+    ) -> io::Result<Vec<u8>> {
+        read_owned_file::read_scoped(path, uid, max, private)
     }
 
     fn write_file(&self, path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
@@ -3948,6 +4089,64 @@ mod fake {
             Ok(digest.finalize())
         }
 
+        fn scoped_path_metadata(&self, path: &Path) -> io::Result<super::ScopedPathMetadata> {
+            if path
+                .ancestors()
+                .any(|p| self.stat(p).is_ok_and(|s| s.symlink))
+            {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            let stat = self.stat(path)?;
+            let version = if stat.dir {
+                let mut digest = aterm_digest::Sha256::new();
+                for name in self.list_dir(path)? {
+                    digest.update((name.len() as u64).to_le_bytes());
+                    digest.update(name.as_bytes());
+                }
+                digest.update(stat.uid.to_le_bytes());
+                digest.update(stat.gid.to_le_bytes());
+                digest.update(stat.mode.to_le_bytes());
+                digest.update(stat.len.to_le_bytes());
+                digest.finalize()
+            } else {
+                self.file_version(path)?
+            };
+            Ok(super::ScopedPathMetadata { stat, version })
+        }
+
+        fn scoped_child_directories(
+            &self,
+            path: &Path,
+            uid: u32,
+            names: &[String],
+        ) -> io::Result<Vec<String>> {
+            if names.len() > 256 {
+                return Err(io::ErrorKind::InvalidInput.into());
+            }
+            let parent = self.scoped_path_metadata(path)?.stat;
+            if !parent.dir || parent.uid != uid || parent.mode & 0o022 != 0 {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            let mut present = Vec::new();
+            for name in names {
+                let mut parts = Path::new(name).components();
+                if !matches!(parts.next(), Some(std::path::Component::Normal(_)))
+                    || parts.next().is_some()
+                    || name.as_bytes().contains(&0)
+                    || name.as_bytes().contains(&b'/')
+                {
+                    return Err(io::ErrorKind::InvalidInput.into());
+                }
+                if self
+                    .scoped_path_metadata(&path.join(name))
+                    .is_ok_and(|m| m.stat.dir && m.stat.uid == uid && m.stat.mode & 0o022 == 0)
+                {
+                    present.push(name.clone());
+                }
+            }
+            Ok(present)
+        }
+
         fn read_owned_file(
             &self,
             path: &Path,
@@ -3982,6 +4181,67 @@ mod fake {
                 hook(self, path);
             }
             Ok(bytes)
+        }
+
+        fn owned_file_metadata(
+            &self,
+            path: &Path,
+            uid: u32,
+            max: usize,
+            private: bool,
+        ) -> io::Result<super::OwnedFileMetadata> {
+            let stat = self.stat(path)?;
+            super::read_owned_file::admit(
+                stat.uid,
+                uid,
+                stat.mode,
+                !stat.dir && !stat.symlink,
+                private,
+            )?;
+            max.checked_add(1).ok_or(io::ErrorKind::InvalidInput)?;
+            if stat.len > max as u64 {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+            Ok(super::OwnedFileMetadata {
+                stat,
+                version: self.file_version(path)?,
+                changed_ns: 0,
+            })
+        }
+
+        fn read_owned_file_observed(
+            &self,
+            path: &Path,
+            uid: u32,
+            max: usize,
+            private: bool,
+        ) -> io::Result<super::OwnedFileRead> {
+            let metadata = self.owned_file_metadata(path, uid, max, private)?;
+            let bytes = self.read_owned_file(path, uid, max, private)?;
+            if metadata != self.owned_file_metadata(path, uid, max, private)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "owned file changed during read",
+                ));
+            }
+            Ok(super::OwnedFileRead { bytes, metadata })
+        }
+
+        fn read_owned_file_scoped(
+            &self,
+            path: &Path,
+            uid: u32,
+            max: usize,
+            private: bool,
+        ) -> io::Result<Vec<u8>> {
+            if path
+                .ancestors()
+                .skip(1)
+                .any(|parent| self.stat(parent).is_ok_and(|s| s.symlink))
+            {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            self.read_owned_file(path, uid, max, private)
         }
 
         fn write_file(&self, path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {

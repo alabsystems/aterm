@@ -14,7 +14,7 @@ use crate::error::{Error, Kind, Result, Sub};
 use crate::git::GitRun;
 use crate::github::{How, repo_root};
 use crate::journal::IntentStore;
-use crate::model::{RefObject, from_json};
+use crate::model::{RefObject, from_json_owned};
 use crate::path;
 use crate::policy::{Permit, RouteRequest, RouteTarget};
 use crate::retry::Idempotency;
@@ -327,7 +327,7 @@ impl<'a> Refs<'a> {
     fn ref_of(&self, answered: &Answered) -> Result<RefObject> {
         answered
             .json()
-            .and_then(|value| from_json(&value))
+            .and_then(from_json_owned)
             .map_err(|e| e.with_repo(self.slug.to_string()))
     }
 

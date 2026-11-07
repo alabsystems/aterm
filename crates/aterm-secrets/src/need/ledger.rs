@@ -331,11 +331,8 @@ fn raise_with(
             }
             Some(old) if old.state.ended() => {
                 let again = act(&old, facts, &Act::NeedAgain).unwrap_or(old);
-                match act(&again, facts, &Act::Reraise) {
+                match reraise(&again, facts)? {
                     Some(mut raised) => {
-                        if raised.id == [0; 16] {
-                            raised.id = new_id()?;
-                        }
                         raised.refused = refused.or(raised.refused);
                         settle(&raised, facts)
                     }
@@ -350,6 +347,18 @@ fn raise_with(
         }
         Ok(next)
     })
+}
+
+/// `need` raised again under a new request id, when it ended for a reason whose condition has
+/// changed while it is still needed ([`Act::Reraise`]); `None` otherwise.
+fn reraise(need: &Need, facts: &Facts) -> crate::Result<Option<Need>> {
+    let Some(mut raised) = act(need, facts, &Act::Reraise) else {
+        return Ok(None);
+    };
+    if raised.id == [0; 16] {
+        raised.id = new_id()?;
+    }
+    Ok(Some(raised))
 }
 
 /// `purpose`'s own check found `want` (§4: the consumer's check is what fulfils a need): a
@@ -419,11 +428,17 @@ pub fn retire(
 
 /// Take in what reached the lab's table, or was read off it, for this Mac's needs: a flush
 /// the table now holds, and each decision whose writer and evidence checked. A move that does
-/// not apply where the need stands changes nothing.
+/// not apply where the need stands changes nothing. A lab retirement whose reason has already
+/// changed (a lapse: this Mac is taking it in, so it is back) raises the need again at once, as
+/// the line it ends with says, since a need raised by hand has no consumer to raise it (§6.2).
+/// Each need moved comes back with the request id its move named.
 ///
 /// # Errors
-/// The ledger or the vault state cannot be read or written.
-pub fn absorb(paths: &Paths, moves: &[([u8; 16], super::Absorb)]) -> crate::Result<Vec<Need>> {
+/// The ledger or the vault state cannot be read or written, or no request id can be drawn.
+pub fn absorb(
+    paths: &Paths,
+    moves: &[([u8; 16], super::Absorb)],
+) -> crate::Result<Vec<([u8; 16], Need)>> {
     use super::Absorb;
     with_ledger(paths, |rows, facts| {
         let mut moved = Vec::new();
@@ -452,13 +467,14 @@ pub fn absorb(paths: &Paths, moves: &[([u8; 16], super::Absorb)]) -> crate::Resu
                     })
                 }
                 Absorb::Reissued { .. } => None,
-                Absorb::Decided(decision) => {
-                    super::decided(need, facts, decision).map(|next| settle(&next, facts))
-                }
+                Absorb::Decided(decision) => match super::decided(need, facts, decision) {
+                    Some(next) => Some(settle(&reraise(&next, facts)?.unwrap_or(next), facts)),
+                    None => None,
+                },
             };
             if let Some(next) = next {
                 *need = next.clone();
-                moved.push(next);
+                moved.push((*id, next));
             }
         }
         Ok(moved)

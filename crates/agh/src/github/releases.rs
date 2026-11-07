@@ -13,7 +13,7 @@ use crate::download::{self, Downloaded, Expect, Sink};
 use crate::error::{Error, Forbid, Kind, Result, Sub};
 use crate::github::{How, limit_after_sort, repo_root};
 use crate::journal::{Intent, IntentId, IntentStore, IntentView, Settled};
-use crate::model::{AssetObject, ReleaseObject, Sha256Digest, from_json};
+use crate::model::{AssetObject, ReleaseObject, Sha256Digest, from_json_owned};
 use crate::notify::Notice;
 use crate::page::{End, LinkScope, ListOpts, Listing};
 use crate::path;
@@ -137,7 +137,7 @@ impl<'a> Releases<'a> {
         })?;
         answered
             .json()
-            .and_then(|value| from_json(&value))
+            .and_then(from_json_owned)
             .map_err(|e| e.with_repo(self.slug.to_string()))
     }
 
@@ -168,7 +168,7 @@ impl<'a> Releases<'a> {
             &LinkScope::Repo(self.slug.clone()),
         )?;
         let mut listing = walked
-            .map(|value| from_json::<ReleaseObject>(&value))
+            .map(from_json_owned::<ReleaseObject>)
             .map_err(|e| e.with_repo(self.slug.to_string()))?;
         if !self.writer() {
             listing.items.retain(|release| !release.draft);
@@ -373,7 +373,7 @@ pub(crate) fn asset_object_counted(
     let answered = gh.call(&call)?;
     let asset = answered
         .json()
-        .and_then(|value| from_json(&value))
+        .and_then(from_json_owned)
         .map_err(|e| e.with_repo(slug.to_string()))?;
     Ok((asset, answered.requests))
 }
@@ -866,7 +866,7 @@ impl<'a> Releases<'a> {
                         let answered = result?;
                         let release = answered
                             .json()
-                            .and_then(|value| from_json::<ReleaseObject>(&value))
+                            .and_then(from_json_owned::<ReleaseObject>)
                             .map_err(|e| {
                                 e.with_side_effect(crate::SideEffect::Applied)
                                     .with_repo(self.slug.to_string())
@@ -1701,7 +1701,7 @@ impl<'a> Releases<'a> {
     fn release_of(&self, answered: &Answered) -> Result<ReleaseObject> {
         answered
             .json()
-            .and_then(|value| from_json(&value))
+            .and_then(from_json_owned)
             .map_err(|e| e.with_repo(self.slug.to_string()))
     }
 
@@ -1746,8 +1746,8 @@ impl<'a> Releases<'a> {
         })?;
         walked
             .items
-            .iter()
-            .map(from_json::<AssetObject>)
+            .into_iter()
+            .map(from_json_owned::<AssetObject>)
             .collect::<Result<Vec<_>>>()
             .map_err(|e| e.with_repo(self.slug.to_string()))
     }
@@ -1958,10 +1958,8 @@ impl<'a> Releases<'a> {
         let (asset, effect) = match settled {
             Ok(Settles::Found(asset, _)) => (asset, Effect::Converged),
             Ok(Settles::Answered(answered)) => {
-                let asset: AssetObject = answered
-                    .json()
-                    .and_then(|value| from_json(&value))
-                    .map_err(|e| {
+                let asset: AssetObject =
+                    answered.json().and_then(from_json_owned).map_err(|e| {
                         e.with_side_effect(crate::SideEffect::Applied)
                             .with_repo(self.slug.to_string())
                     })?;
@@ -2160,13 +2158,12 @@ impl<'a> Releases<'a> {
         };
         let asset = match self.converge(WriteOp::AssetRename, &call, permit, &mut look)? {
             Settles::Found(asset, _) => asset,
-            Settles::Answered(answered) => answered
-                .json()
-                .and_then(|value| from_json(&value))
-                .map_err(|e| {
+            Settles::Answered(answered) => {
+                answered.json().and_then(from_json_owned).map_err(|e| {
                     e.with_side_effect(crate::SideEffect::Applied)
                         .with_repo(self.slug.to_string())
-                })?,
+                })?
+            }
         };
         Ok((asset, others.saturating_add(1)))
     }

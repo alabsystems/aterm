@@ -501,6 +501,14 @@ pub fn provision_plan(web2: Option<String>) -> Vec<Step> {
     provision_plan_for(web2, true)
 }
 
+/// Keeps the kernel's vDSO clear of the arena Rosetta maps at `0xf00000000000` with `MAP_FIXED`: at
+/// Ubuntu's 33 bits the vDSO can land there, and a translated program then dies at its first clock
+/// read, 1 exec in about 66,000 (`docs/measured/rosetta-vdso-2026-11-06.md`). 32 still reaches it.
+const ROSETTA_ADDRESS_SPACE: &str = "set -eu
+printf 'vm.mmap_rnd_bits = 31\\n' > /etc/sysctl.d/60-rosetta-vdso.conf
+sysctl -q -w vm.mmap_rnd_bits=31
+";
+
 /// [`provision_plan`], with its x86_64 half only when `x86_64`.
 #[must_use]
 pub fn provision_plan_for(web2: Option<String>, x86_64: bool) -> Vec<Step> {
@@ -548,6 +556,11 @@ pub fn provision_plan_for(web2: Option<String>, x86_64: bool) -> Vec<Step> {
                 "amd64 architecture",
                 &["sudo", "dpkg", "--add-architecture", "amd64"],
                 None,
+            ),
+            step(
+                "rosetta address space",
+                &["sudo", "sh", "-s"],
+                Some(ROSETTA_ADDRESS_SPACE),
             ),
         ]);
     }
@@ -1608,7 +1621,7 @@ mod tests {
                 .iter()
                 .any(|a| a == Arch::X86_64.triple())
         );
-        assert_eq!(provision_plan(None).len(), native.len() + 2);
+        assert_eq!(provision_plan(None).len(), native.len() + 3);
         assert_eq!(provision_plan(None), provision_plan_for(None, true));
     }
 

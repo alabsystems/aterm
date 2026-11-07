@@ -1683,6 +1683,7 @@ pub(super) fn review_reading(
     let id = review::new_id();
     let now = || crate::supervise::limit::unix_now();
     let host = review::Host {
+        source_home: env.home.as_deref(),
         config: env.config.as_deref(),
         runner,
         var: &var,

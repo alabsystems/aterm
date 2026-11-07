@@ -566,15 +566,7 @@ fn notice_wall(entry: &Entry) -> Option<WallKind> {
     if error.as_deref().and_then(error_class) == Some(Class::Auth) {
         return Some(WallKind::Auth);
     }
-    if status.is_some_and(|c| (400..500).contains(&c) && !matches!(c, 401 | 408 | 409 | 429 | 451))
-    {
-        return Some(refused);
-    }
-    Some(WallKind::ApiError {
-        code: *status,
-        retryable: status.is_none_or(|c| matches!(c, 408 | 409 | 429) || c >= 500),
-        cause: ApiCause::Server,
-    })
+    Some(aterm_phase::wall::api_wall(*status, ApiCause::Server))
 }
 
 const SHOWN_WORDS: usize = 6;

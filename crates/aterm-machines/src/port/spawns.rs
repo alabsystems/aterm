@@ -40,6 +40,17 @@ impl<'a> Spawns<'a> {
 }
 
 impl System for Spawns<'_> {
+    fn scoped_path_metadata(&self, path: &Path) -> io::Result<super::ScopedPathMetadata> {
+        self.live.scoped_path_metadata(path)
+    }
+    fn scoped_child_directories(
+        &self,
+        path: &Path,
+        uid: u32,
+        names: &[String],
+    ) -> io::Result<Vec<String>> {
+        self.live.scoped_child_directories(path, uid, names)
+    }
     fn keyboard_service_ids(&self) -> Result<Vec<u64>, String> {
         self.live.keyboard_service_ids()
     }
@@ -76,6 +87,16 @@ impl System for Spawns<'_> {
         private: bool,
     ) -> io::Result<Vec<u8>> {
         self.live.read_owned_file(path, uid, max, private)
+    }
+
+    fn read_owned_file_scoped(
+        &self,
+        path: &Path,
+        uid: u32,
+        max: usize,
+        private: bool,
+    ) -> io::Result<Vec<u8>> {
+        self.live.read_owned_file_scoped(path, uid, max, private)
     }
     fn write_file(&self, path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
         self.live.write_file(path, bytes, mode)

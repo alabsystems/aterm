@@ -1,14 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Rename This Mac… (§5.3 of `docs/DESIGN-machine-names-2026-11-04.md`): an alert with a Number
-//! field and a Nickname field over one live line, which says as the person types what
-//! `aterm name set` would answer that number, judged from one read of this Mac's books and its
-//! vault's labels ([`aterm_agent::machine_name::rename_preview`]). The read runs on the name
-//! writer's thread, after every change queued before it, and reaches the open alert through the
-//! main queue, which AppKit's modal loop serves ([`deliver`]); until it lands, an untouched form's
-//! line says it is reading and a typed number's that it is checking. Once it lands the fields are
-//! judged against the name it read ([`Held`]).
+//! One Number/Nickname panel with actual aterm, fleet and macOS naming status. Its explicit
+//! open reads the books and system names on the name writer, after earlier requests, then
+//! delivers them through AppKit's modal loop. An unchanged saved number with pending
+//! publication offers Retry Sync; only a changed number selects another canonical name.
 //!
 //! Each field is the person's only once what it holds differs from what aterm would put there,
 //! the read's text once that lands ([`Field`]): a field they have not touched follows the read on
@@ -16,7 +12,7 @@
 //! a change pressed before has outdated neither shows a stale number or nickname nor turns into
 //! one; while the read is out, or after it failed, the fields stay at the view, still asking for
 //! nothing, and the line says so. A Number left alone or emptied keeps this Mac's number, so a
-//! nickname alone is set as Change Nickname… sets it, an unnumbered Mac's included
+//! nickname alone keeps the number, an unnumbered Mac's included
 //! ([`RenameTo`]). A number a migration still waits on holds no claim:
 //! the Number field opens empty, and typing that number claims it. Rename is unavailable while
 //! the line refuses what is typed. The set reads again under its locks, so a number the
@@ -28,6 +24,7 @@ use aterm_agent::machine_name::{NameTo, RenamePreview};
 use aterm_types::machine_name::{Nickname, Number, Refusal, Verdict};
 
 use crate::machine_title::MachineView;
+use crate::machine_title::naming::NamingStatus;
 
 /// The name the fields are judged against: the window's view until the press's read lands, then
 /// the read's, which follows every change pressed before it.
@@ -151,8 +148,14 @@ impl Field {
 /// The alert's title, which its menu row names with an ellipsis.
 pub(crate) const TITLE: &str = "Rename This Mac";
 
-/// The alert's buttons: Rename (Return) and Cancel (Escape).
-pub(crate) const BUTTONS: [&str; 2] = ["Rename", "Cancel"];
+/// Save (Return), or Retry Sync for pending publication, and Cancel (Escape).
+pub(crate) const BUTTONS: [&str; 2] = ["Save", "Cancel"];
+
+#[derive(Debug)]
+pub(crate) struct PanelRead {
+    preview: RenamePreview,
+    naming: Option<NamingStatus>,
+}
 
 /// What the live line judges a number from.
 #[derive(Debug)]
@@ -160,9 +163,42 @@ pub(crate) enum Snapshot {
     /// The press's read has not come back.
     Reading,
     /// This Mac's books and vault labels as the read found them.
-    Read(Box<RenamePreview>),
+    Read(Box<PanelRead>),
     /// The read failed, with why.
     Unread(String),
+}
+
+impl Snapshot {
+    pub(crate) fn named(preview: RenamePreview, naming: NamingStatus) -> Self {
+        Self::Read(Box::new(PanelRead {
+            preview,
+            naming: Some(naming),
+        }))
+    }
+
+    pub(crate) fn read(preview: RenamePreview) -> Self {
+        Self::Read(Box::new(PanelRead {
+            preview,
+            naming: None,
+        }))
+    }
+
+    fn unchanged_request(&self, held: &Held) -> Option<RenameTo> {
+        let Self::Read(read) = self else {
+            return None;
+        };
+        if !held.read || held.waits || read.preview.name().name() != held.name {
+            return None;
+        }
+        let num = read.preview.name().num?;
+        if read.preview.name().class != aterm_types::machine_name::Class::Chosen {
+            Some(RenameTo::Name(NameTo { num, nick: None }))
+        } else if read.naming.as_ref().is_some_and(NamingStatus::retry) {
+            Some(RenameTo::Synchronize(num))
+        } else {
+            None
+        }
+    }
 }
 
 /// The live line under the fields, and whether Rename applies what they hold.
@@ -178,12 +214,15 @@ pub(crate) enum RenameTo {
     /// Nothing the fields changed: neither was typed into, a typed nickname is empty, or what
     /// was typed is what the read holds.
     Keep,
-    /// A nickname alone, the number kept, as Change Nickname… sets it
+    /// A nickname alone, the number kept
     /// ([`aterm_agent::machine_name::set_nick`]), an unnumbered Mac's included.
     Nick(Nickname),
-    /// Another number, with a typed nickname or keeping the held one
+    /// A number explicitly selected by the person, including a displayed seeded number,
+    /// with a typed nickname or keeping the held one
     /// ([`aterm_agent::machine_name::set_name`]).
     Name(NameTo),
+    /// Publish the already-saved number, without choosing it again.
+    Synchronize(Number),
 }
 
 /// What the Number and Nickname fields ask for, `held` being the name they are judged against
@@ -234,7 +273,7 @@ pub(crate) fn rename_to(number: &Field, nick: &Field, held: &Held) -> Result<Ren
 /// available, since the set checks the number itself, and the line names nothing of the window's
 /// view, which the read may outdate.
 pub(crate) fn line(snapshot: &Snapshot, held: &Held, number: &Field, nick: &Field) -> Line {
-    let to = match rename_to(number, nick, held) {
+    let to = match request(snapshot, held, number, nick) {
         Ok(to) => to,
         Err(why) => {
             return Line {
@@ -244,7 +283,7 @@ pub(crate) fn line(snapshot: &Snapshot, held: &Held, number: &Field, nick: &Fiel
         }
     };
     let preview = match snapshot {
-        Snapshot::Read(preview) => Some(preview.as_ref()),
+        Snapshot::Read(read) => Some(&read.preview),
         Snapshot::Reading | Snapshot::Unread(_) => None,
     };
     let also = |nick: &Nickname| {
@@ -260,7 +299,7 @@ pub(crate) fn line(snapshot: &Snapshot, held: &Held, number: &Field, nick: &Fiel
                 Snapshot::Reading => "Reading this Mac's name\u{2026}".to_owned(),
                 Snapshot::Unread(why) => format!(
                     "This Mac's name could not be read here ({why}). Type a number or nickname; \
-                     Rename checks it."
+                     Save checks it."
                 ),
                 Snapshot::Read(_) if held.waits => format!(
                     "This Mac shows {}, which it has not claimed in this fleet yet. Type {} \
@@ -270,23 +309,20 @@ pub(crate) fn line(snapshot: &Snapshot, held: &Held, number: &Field, nick: &Fiel
                 Snapshot::Read(_) if held.unnumbered() => {
                     "This Mac has no number yet. Type one, such as m8.".to_owned()
                 }
-                Snapshot::Read(_) => format!(
-                    "This Mac is {} {}. Type another number or nickname.",
-                    held.name, held.nick
-                ),
+                Snapshot::Read(_) => "Edit the number or nickname.".to_owned(),
             },
             true,
         ),
         RenameTo::Nick(nick) => (
             if held.read && held.unnumbered() {
                 format!(
-                    "This Mac has no number yet; Rename makes its nickname {}.{}",
+                    "This Mac has no number yet; Save makes its nickname {}.{}",
                     nick.as_str(),
                     also(&nick)
                 )
             } else {
                 format!(
-                    "Rename keeps this Mac's number and makes its nickname {}.{}",
+                    "Save keeps this Mac's number and makes its nickname {}.{}",
                     nick.as_str(),
                     also(&nick)
                 )
@@ -298,7 +334,7 @@ pub(crate) fn line(snapshot: &Snapshot, held: &Held, number: &Field, nick: &Fiel
             let (text, renames) = match preview {
                 None => match snapshot {
                     Snapshot::Unread(why) => (
-                        format!("{num} could not be checked here ({why}); Rename checks it."),
+                        format!("{num} could not be checked here ({why}); Save checks it."),
                         true,
                     ),
                     Snapshot::Reading | Snapshot::Read(_) => {
@@ -306,14 +342,22 @@ pub(crate) fn line(snapshot: &Snapshot, held: &Held, number: &Field, nick: &Fiel
                     }
                 },
                 Some(preview) if let Some(why) = preview.unchecked(num) => (
-                    format!("{num} could not be checked here ({why}); Rename checks it."),
+                    format!("{num} could not be checked here ({why}); Save checks it."),
                     true,
                 ),
                 Some(preview) => match preview.judge(num) {
+                    Ok(_)
+                        if preview.name().num == Some(num)
+                            && preview.name().class != aterm_types::machine_name::Class::Chosen
+                            && !held.waits =>
+                    {
+                        (
+                            format!("Save uses {num} across aterm, the fleet and macOS."),
+                            true,
+                        )
+                    }
                     Ok(_) if held.claims(num) => (
-                        format!(
-                            "Rename claims {num}, which this Mac shows but has not claimed yet."
-                        ),
+                        format!("Save claims {num}, which this Mac shows but has not claimed yet."),
                         true,
                     ),
                     Ok(Verdict::EarlierName { of }) => (
@@ -329,8 +373,30 @@ pub(crate) fn line(snapshot: &Snapshot, held: &Held, number: &Field, nick: &Fiel
                 _ => (text, renames),
             }
         }
+        RenameTo::Synchronize(number) => {
+            (format!("Retry name synchronization for {number}."), true)
+        }
+    };
+    let text = match snapshot {
+        Snapshot::Read(read) if let Some(status) = &read.naming => {
+            format!("{}\n\n{text}", status.text(&held.name))
+        }
+        _ => text,
     };
     Line { text, renames }
+}
+
+pub(crate) fn request(
+    snapshot: &Snapshot,
+    held: &Held,
+    number: &Field,
+    nick: &Field,
+) -> Result<RenameTo, String> {
+    let to = rename_to(number, nick, held)?;
+    Ok(match to {
+        RenameTo::Keep => snapshot.unchanged_request(held).unwrap_or(RenameTo::Keep),
+        to => to,
+    })
 }
 
 /// `why` as a sentence: a capital first letter unless it opens with a machine number (`m20 is…`),
@@ -382,22 +448,21 @@ mod macos {
     use crate::machine_title::MachineView;
 
     /// The accessory's width; each field row's height, and the line's.
-    const WIDTH: f64 = 320.0;
+    const WIDTH: f64 = 380.0;
     const LABEL_WIDTH: f64 = 72.0;
     const ROW: f64 = 24.0;
     const GAP: f64 = 8.0;
-    const LINE: f64 = 48.0;
+    const LINE: f64 = 112.0;
 
     /// What the person answered Rename This Mac.
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub(crate) enum Answer {
-        /// Rename (or Return), with what the person typed into the Number and Nickname fields
-        /// (`None` for a field they left alone, [`Field::typed`]) and the name the fields were
-        /// judged against when it was pressed.
+        /// Save (or Return), with the request resolved from that press's displayed snapshot
+        /// and the person's raw typed fields, retained only for refusal recovery.
         Rename {
             number: Option<String>,
             nick: Option<String>,
-            held: Held,
+            requested: Result<super::RenameTo, String>,
         },
         /// Cancel, Escape, or any other end of the alert.
         Cancel,
@@ -454,7 +519,7 @@ mod macos {
     /// later press superseded is dropped.
     pub(crate) fn deliver(press: u64, snapshot: Snapshot) {
         let fresh = match &snapshot {
-            Snapshot::Read(preview) => Some(Held::of_read(preview)),
+            Snapshot::Read(read) => Some(Held::of_read(&read.preview)),
             Snapshot::Reading | Snapshot::Unread(_) => None,
         };
         let kept = SNAPSHOT.with_borrow_mut(|slot| keep_read(slot, press, snapshot));
@@ -489,7 +554,7 @@ mod macos {
     /// the window's `view`.
     fn held_for(press: u64, view: &MachineView) -> Held {
         SNAPSHOT.with_borrow(|held| match held {
-            Some((at, Snapshot::Read(preview))) if *at == press => Held::of_read(preview),
+            Some((at, Snapshot::Read(read))) if *at == press => Held::of_read(&read.preview),
             _ => Held::of_view(view),
         })
     }
@@ -540,12 +605,24 @@ mod macos {
             let Some(words) = appkit::nsstring(&words) else {
                 return;
             };
+            let retry = SNAPSHOT.with_borrow(|held| match held {
+                Some((at, snapshot)) if *at == open.press => matches!(
+                    super::request(snapshot, &open.held, &number, &nick),
+                    Ok(super::RenameTo::Synchronize(_))
+                ),
+                _ => false,
+            });
+            let Some(button) = appkit::nsstring(if retry { "Retry Sync" } else { BUTTONS[0] })
+            else {
+                return;
+            };
             // SAFETY: `-setStringValue:` is `-(void)(NSString *)` and copies its argument;
-            // `-setEnabled:` is `-(void)(BOOL)`; both on live views the alert holds, on the main
+            // `-setTitle:` copies its NSString and `-setEnabled:` is `-(void)(BOOL)`; all on live views the alert holds, on the main
             // thread.
             unsafe {
                 appkit::send_v_id(open.line.id(), sel!(setStringValue:), words.id());
                 appkit::send_v_bool(open.rename.id(), sel!(setEnabled:), renames);
+                appkit::send_v_id(open.rename.id(), sel!(setTitle:), button.id());
             }
         });
     }
@@ -619,12 +696,12 @@ mod macos {
     }
 
     /// Ask for this Mac's number and nickname: an alert titled `title` over `body`, over the live
-    /// line for press `press` ([`begin`]), with Rename (Return) and Cancel (Escape). The Number
+    /// line for press `press` ([`begin`]), with Save/Retry Sync (Return) and Cancel (Escape). The Number
     /// field holds `number` and the Nickname field `nick`, words the person typed at an earlier
     /// press, which stay theirs; a field given `None` opens at the name held, `view`'s until the
     /// press's read lands, and follows that read ([`deliver`]). The person's ⌘X, ⌘C, ⌘V and ⌘A
     /// edit the field being edited, Tab moves between the two, and Return does nothing while
-    /// Rename is unavailable, as AppKit answers a click on a disabled button
+    /// the primary action is unavailable, as AppKit answers a click on a disabled button
     /// ([`crate::alert_keys::watch_field_alert_keys`]); a key a control client posted does
     /// nothing. `None` when no alert could be shown, and when a key queued before it opened
     /// would not drain, since that key would land in a field or press Rename.
@@ -788,7 +865,17 @@ mod macos {
                             Answer::Rename {
                                 number: number.typed().map(str::to_owned),
                                 nick: nick.typed().map(str::to_owned),
-                                held: open.held.clone(),
+                                requested: SNAPSHOT.with_borrow(|snapshot| match snapshot {
+                                    Some((at, snapshot)) if *at == open.press => {
+                                        super::request(snapshot, &open.held, &number, &nick)
+                                    }
+                                    _ => super::request(
+                                        &Snapshot::Reading,
+                                        &open.held,
+                                        &number,
+                                        &nick,
+                                    ),
+                                }),
                             }
                         })
                     })

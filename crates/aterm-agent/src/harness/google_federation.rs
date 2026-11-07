@@ -1283,6 +1283,8 @@ mod tests {
             .route(None)
             .unwrap();
         let request = login_drive::Request {
+            publication: None,
+            enrollment: None,
             recovery: None,
             admission: None,
             cli: Cli::Kimi,
@@ -1338,6 +1340,8 @@ mod tests {
                 .route(Some(crate::ai::connector::Flow::Device))
                 .unwrap();
             let request = login_drive::Request {
+                publication: None,
+                enrollment: None,
                 recovery: Some(login_drive::RecoveryKey([1; 32])),
                 admission: None,
                 cli: Cli::Kimi,
@@ -1622,6 +1626,8 @@ mod tests {
             .route(None)
             .unwrap();
         approver.native_attempt = Some(NativeAttempt::capture(&login_drive::Request {
+            publication: None,
+            enrollment: None,
             recovery: None,
             admission: None,
             cli: Cli::Kimi,

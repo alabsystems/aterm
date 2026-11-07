@@ -612,6 +612,9 @@ fn provisional(rule: OnConflict, candidates: &[Candidate]) -> Option<Value> {
 /// as an import's because an import wrote the same value too (an import writes only over its
 /// own, [`import_step`]); different ones stay a conflict.
 fn field(rule: OnConflict, mut candidates: Vec<Candidate>) -> Option<Field> {
+    if candidates.len() <= 1 {
+        return candidates.pop().map(Field::Value);
+    }
     candidates.sort_unstable_by_key(|c| (c.value.s.is_some(), c.value.a, c.operation));
     let mut distinct: Vec<Candidate> = Vec::new();
     for candidate in candidates {
@@ -635,14 +638,7 @@ fn field(rule: OnConflict, mut candidates: Vec<Candidate>) -> Option<Field> {
 /// The most candidates one carried register holds.
 pub const MAX_CARRIED: usize = 16;
 
-/// The candidates a table roll carried into one register (design §3.8): a roll restates a
-/// register of the generation before as one value, `{"k": [{"o": <hex operation>, "v": <its
-/// value>}, …]}`, each item a candidate the register held there, in operation order, with the
-/// operation that wrote it. One writer's records are causally ordered, so a roll cannot write
-/// concurrent candidates; the list is how an open conflict stays open across generations, and
-/// `o` is how the next roll tells a candidate it carried from one it has not seen. `None` for
-/// any value that is not exactly that shape.
-pub fn carried(value: &Value) -> Option<Vec<(Digest, Value)>> {
+pub(crate) fn carried_refs(value: &Value) -> Option<Vec<(Digest, &Value)>> {
     let object = value.as_object()?;
     if object.len() != 1 {
         return None;
@@ -651,7 +647,7 @@ pub fn carried(value: &Value) -> Option<Vec<(Digest, Value)>> {
     if items.is_empty() || items.len() > MAX_CARRIED {
         return None;
     }
-    let mut out: Vec<(Digest, Value)> = Vec::with_capacity(items.len());
+    let mut out: Vec<(Digest, &Value)> = Vec::with_capacity(items.len());
     for item in items {
         let item = item.as_object()?;
         if item.len() != 2 {
@@ -665,12 +661,23 @@ pub fn carried(value: &Value) -> Option<Vec<(Digest, Value)>> {
             return None;
         }
         let inner = item.get("v")?;
-        if carried(inner).is_some() || out.last().is_some_and(|(last, _)| *last >= operation) {
+        if carried_refs(inner).is_some() || out.last().is_some_and(|(last, _)| *last >= operation) {
             return None;
         }
-        out.push((operation, inner.clone()));
+        out.push((operation, inner));
     }
     Some(out)
+}
+
+/// The candidates a table roll carried into one register (design §3.8): a roll restates a
+/// register of the generation before as one value, `{"k": [{"o": <hex operation>, "v": <its
+/// value>}, …]}`, each item a candidate the register held there, in operation order, with the
+/// operation that wrote it. One writer's records are causally ordered, so a roll cannot write
+/// concurrent candidates; the list is how an open conflict stays open across generations, and
+/// `o` is how the next roll tells a candidate it carried from one it has not seen. `None` for
+/// any value that is not exactly that shape.
+pub fn carried(value: &Value) -> Option<Vec<(Digest, Value)>> {
+    carried_refs(value).map(|items| items.into_iter().map(|(op, v)| (op, v.clone())).collect())
 }
 
 /// The carried value of `candidates` ([`carried`]), sorted by operation with each operation
@@ -696,18 +703,25 @@ pub fn carry(candidates: &BTreeMap<Digest, Value>) -> Option<Value> {
     Some(Value::Object(object))
 }
 
+pub(crate) fn origins_refs(cell: &Cell) -> Vec<(Digest, &Value)> {
+    let mut out = Vec::with_capacity(cell.candidates.len());
+    for candidate in &cell.candidates {
+        match carried_refs(&candidate.value) {
+            Some(items) => out.extend(items),
+            None => out.push((candidate.operation, &candidate.value)),
+        }
+    }
+    out
+}
+
 /// A register's candidates with the operation each came from: a carried value ([`carried`])
 /// stands for the candidates it lists, each at its own operation; any other value is its own
 /// record's.
 pub fn origins(cell: &Cell) -> Vec<(Digest, Value)> {
-    let mut out = Vec::new();
-    for candidate in &cell.candidates {
-        match carried(&candidate.value) {
-            Some(items) => out.extend(items),
-            None => out.push((candidate.operation, candidate.value.clone())),
-        }
-    }
-    out
+    origins_refs(cell)
+        .into_iter()
+        .map(|(op, v)| (op, v.clone()))
+        .collect()
 }
 
 /// Read one cells collection out of a table's projected cells.
@@ -796,10 +810,10 @@ pub fn project(collection: &Collection, cells: &Cells) -> Projection {
             candidates.push(Candidate { operation, value });
         };
         for candidate in &cell.candidates {
-            match carried(&candidate.value) {
+            match carried_refs(&candidate.value) {
                 Some(items) => {
                     for (operation, value) in items {
-                        decode_candidate(operation, &value);
+                        decode_candidate(operation, value);
                     }
                 }
                 None => decode_candidate(candidate.operation, &candidate.value),

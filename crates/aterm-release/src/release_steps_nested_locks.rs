@@ -164,15 +164,20 @@ mod unix {
 
     fn parent(root: &File, path: &str) -> Result<(File, OsString), String> {
         let mut parts = Path::new(path).components().peekable();
-        let mut directory = root.try_clone().map_err(|e| e.to_string())?;
+        let mut directory: Option<File> = None;
         while let Some(part) = parts.next() {
             let Component::Normal(name) = part else {
                 return Err("nested lock has a non-normal component".into());
             };
             if parts.peek().is_none() {
-                return Ok((directory, name.to_owned()));
+                let dir = match directory {
+                    Some(dir) => dir,
+                    None => root.try_clone().map_err(|e| e.to_string())?,
+                };
+                return Ok((dir, name.to_owned()));
             }
-            directory = self::directory(&directory, name)?;
+            let base = directory.as_ref().unwrap_or(root);
+            directory = Some(self::directory(base, name)?);
         }
         Err("nested lock has no filename".into())
     }
@@ -421,15 +426,15 @@ mod unix {
                 .check(&root)
                 .map_err(|why| format!("recheck {:?}: {why}", stage.path))?;
         }
-        let mut followed = Vec::new();
-        for stage in &stages {
+        let mut followed = Vec::with_capacity(stages.len());
+        for mut stage in stages {
             stage
                 .check(&root)
                 .map_err(|why| format!("recheck {:?}: {why}", stage.path))?;
             stage
                 .publish()
                 .map_err(|why| format!("replace {:?}: {why}", stage.path))?;
-            followed.push(stage.path.clone());
+            followed.push(std::mem::take(&mut stage.path));
         }
         Ok(followed)
     }

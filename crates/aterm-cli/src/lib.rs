@@ -2011,8 +2011,9 @@ fn lan_read() -> Option<LanRead> {
 
 /// Doctor's `lan:` row: whether the broker is installed as this build installs it and whether
 /// its socket answers. A broker that is not installed is a note (setup's one elevation installs
-/// it, and nothing is wrong meanwhile but that aterm's own LAN traffic waits); an installed one
-/// whose socket does not answer is a warning.
+/// it, and nothing is wrong meanwhile but that aterm's own LAN traffic waits, or, where macOS
+/// already allowed this aterm, goes by the allowed direct path, `aterm_uds::lan::direct`); an
+/// installed one whose socket does not answer is a warning.
 fn lan_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
     let Some(lan) = &facts.lan else {
         return Vec::new();

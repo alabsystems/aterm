@@ -12,6 +12,7 @@ mod buildplan;
 mod bundle;
 mod changelog;
 mod check_record;
+mod checkout_bin;
 
 mod channel;
 

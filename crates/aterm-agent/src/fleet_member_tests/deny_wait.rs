@@ -425,18 +425,18 @@ fn labelled_member(pair: &FleetPair) -> Paths {
     paths
 }
 
-/// A drive by a Mac's roster label while a vault writer (a subscriber pass) holds the state lock
-/// waits the writer out within its own deadline and reaches the Mac the label names, as it does
-/// with no writer. NEGATIVE CONTROL: the roster read without that wait, under the same writer,
-/// names no Mac by its label, which refused the drive as "no Mac this machine's book records".
+/// A key-bound drive waits out a vault writer before using its denial view. The legacy roster
+/// still supplies denial metadata, while the node id makes this test independent of registry
+/// label enrollment. The unwaited read is the negative control for losing that metadata.
 #[test]
-fn a_drive_by_a_roster_label_waits_out_a_vault_writer() {
+fn a_drive_by_a_key_bound_node_waits_out_a_vault_writer() {
     let pair = fleet_pair("label-busy-vault");
     let paths = labelled_member(&pair);
-    let reached = drive_fleet_in(&pair.issuer.places, "m77", HANG)
+    let node = own_identity(&pair.member.places).unwrap();
+    let reached = drive_fleet_in(&pair.issuer.places, node.node(), HANG)
         .err()
         .expect("the fixture serves no Drive");
-    assert!(reached.ungranted, "the label names the member: {reached:?}");
+    assert!(reached.ungranted, "the key names the member: {reached:?}");
 
     let writer = Rc::new(RefCell::new(Some(
         client::test_hold_state_lock(&paths).unwrap(),
@@ -456,7 +456,7 @@ fn a_drive_by_a_roster_label_waits_out_a_vault_writer() {
             drop(release.borrow_mut().take());
         },
         || {
-            drive_fleet_in(&pair.issuer.places, "m77", HANG)
+            drive_fleet_in(&pair.issuer.places, node.node(), HANG)
                 .err()
                 .expect("the fixture serves no Drive")
         },
@@ -465,7 +465,7 @@ fn a_drive_by_a_roster_label_waits_out_a_vault_writer() {
     assert_eq!(observed.get(), 1, "the drive met the writer and waited");
     assert!(
         refused.ungranted,
-        "the label named the member while the writer held the vault: {refused:?}"
+        "the key named the member while the writer held the vault: {refused:?}"
     );
 }
 

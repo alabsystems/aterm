@@ -31,7 +31,8 @@ pub(super) fn wake_lane_waiters() {
 
 /// Why aterm's own LAN traffic cannot go out now, in the root LAN broker's own words (its
 /// hello's error, [`aterm_uds::lan::LanError::Unavailable`] where none serves): on macOS every
-/// LAN use of aterm's goes through the broker. `None` once it answers, and always off macOS.
+/// LAN use of aterm's goes through the broker, or while none is installed the allowed direct
+/// path (`aterm_uds::lan::direct`). `None` once a hello is answered, and always off macOS.
 pub(super) fn lan_unavailable() -> Option<String> {
     #[cfg(target_os = "macos")]
     {

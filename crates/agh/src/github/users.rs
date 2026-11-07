@@ -10,7 +10,7 @@ use aterm_json::Value;
 use crate::client::{Answered, Call, CallBody, Ended, Github};
 use crate::error::{Error, IdentityRef, Kind, Result, SideEffect, Sub};
 use crate::github::How;
-use crate::model::{KeyObject, UserObject, from_json};
+use crate::model::{KeyObject, UserObject, from_json_owned};
 use crate::page::{Consistency, LinkScope, ListOpts};
 use crate::path::{refuse_dot_segment, segment};
 use crate::policy::{Permit, RouteRequest, RouteTarget};
@@ -81,7 +81,7 @@ impl<'a> Users<'a> {
     pub fn me(&self, profile: &str) -> Result<UserObject> {
         let route = RouteRequest::read(RouteTarget::Identity).with_as(Some(profile.to_string()));
         let answered = self.gh.call(&Call::get("/user", route))?;
-        from_json(&answered.json()?)
+        from_json_owned(answered.json()?)
     }
 
     /// `me`, sent once under `learn_deadlines()`: no retry, no secondary-limit wait. Vault
@@ -96,7 +96,7 @@ impl<'a> Users<'a> {
             .retry(Some(crate::retry::RetryPolicy::NONE))
             .deadlines(learn_deadlines());
         let answered = self.gh.call(&call)?;
-        from_json(&answered.json()?)
+        from_json_owned(answered.json()?)
     }
 
     /// `GET /users/{login}` (an Owner route, Read).
@@ -112,7 +112,7 @@ impl<'a> Users<'a> {
         let route = RouteRequest::read(RouteTarget::Owner(login.to_string()));
         let path = format!("/users/{}", segment(login));
         let answered = self.gh.call(&Call::get(path, route))?;
-        from_json(&answered.json()?)
+        from_json_owned(answered.json()?)
     }
 
     /// `GET /rate_limit`.
@@ -258,7 +258,7 @@ impl Keys<'_> {
                 // GitHub created the key: an answer agh cannot read does not unwrite it.
                 let object = answered
                     .json()
-                    .and_then(|value| from_json(&value))
+                    .and_then(from_json_owned)
                     .map_err(|error| error.with_side_effect(SideEffect::Applied))?;
                 return Ok(Ensured {
                     object,
@@ -505,7 +505,7 @@ impl Keys<'_> {
         let first = how.get(KEYS_PATH, RouteTarget::Identity);
         let opts = ListOpts::STANDARD.with_consistency(Consistency::AsRead);
         let walked = crate::page::walk(self.gh, first, &opts, &LinkScope::Exact)?;
-        let listing = walked.map(|value| from_json::<KeyObject>(&value))?;
+        let listing = walked.map(from_json_owned::<KeyObject>)?;
         let mut seen = std::collections::BTreeSet::new();
         Ok(listing
             .items

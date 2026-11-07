@@ -387,3 +387,22 @@ fn a_lock_free_reader_finds_no_witness_ahead_of_its_commit() {
         assert_eq!(held_lengths(paths).unwrap(), [(table, false, length + 1)]);
     }
 }
+
+/// A claim directory that cannot be listed fails `held_length` as it fails `held_lengths`, so
+/// `Mesh::push_table` takes its fallback instead of reading the store as empty; one that is
+/// absent holds no store.
+#[test]
+fn held_length_fails_where_the_claim_directory_cannot_be_listed() {
+    let lab = Lab::new(&[Role::Writer]);
+    let paths = &lab.paths[0];
+    let table = [7; 32];
+    let (claims, _) = held::dirs_of(paths, false);
+    if claims.is_dir() {
+        std::fs::remove_dir_all(&claims).unwrap();
+    }
+    assert_eq!(held_length(paths, table, false).unwrap(), None);
+    std::fs::create_dir_all(claims.parent().unwrap()).unwrap();
+    std::fs::write(&claims, b"not a directory").unwrap();
+    assert!(held_lengths(paths).is_err());
+    assert!(held_length(paths, table, false).is_err());
+}

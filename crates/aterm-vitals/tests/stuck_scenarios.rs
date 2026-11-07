@@ -9547,3 +9547,116 @@ fn a_codex_pipe_call_blocked_on_a_stopped_holders_lock_reads_no_progress_after_i
         row.wire()
     );
 }
+
+/// The start the world gives `pid` ([`Proc::new`]).
+const fn start_of(pid: u32) -> Option<u64> {
+    Some(pid as u64 * 1000 + 7)
+}
+
+/// The one agent call that ended since the last take, from `w`.
+fn ended_call(w: &mut World) -> aterm_vitals::jobs::Ended {
+    let mut calls: Vec<_> = w
+        .jobs
+        .take_ended()
+        .into_iter()
+        .filter(|e| e.kind == JobKind::AgentCall)
+        .collect();
+    assert_eq!(calls.len(), 1, "one call ended: {calls:?}");
+    calls.remove(0)
+}
+
+#[test]
+fn a_watched_call_ends_with_its_leaders_status_and_names_the_program_it_ran() {
+    use aterm_vitals::jobs::{ExitOf, LeaderExit};
+    for end in [ExitOf::Code(0), ExitOf::Code(3), ExitOf::Signal(15)] {
+        for early in [false, true] {
+            let mut w = World::new();
+            w.call(1, 300, 400, sleeper(401, "sleep"), None);
+            let _ = run_to(&mut w, 4_000, |_, _| {});
+            w.exit(401, false);
+            let exit = LeaderExit {
+                pid: 400,
+                start: start_of(400),
+                end,
+            };
+            if early {
+                // The kernel's event reached the host while the sweep still listed the wrapper:
+                // the engine keeps it for the pass that finds the call gone.
+                w.exits.push(exit);
+                let _ = w.tick(TICK_MS);
+            } else {
+                let _ = w.tick(TICK_MS);
+                w.exits.push(exit);
+            }
+            w.exit(400, false);
+            let _ = w.tick(TICK_MS);
+            let call = ended_call(&mut w);
+            assert_eq!(call.ended_by, Some(end), "early={early}: {call:?}");
+            assert_eq!(
+                call.ran.as_deref(),
+                Some("sleep"),
+                "not the wrapper: {call:?}"
+            );
+            assert_eq!(call.name, "zsh", "the row's own name is unchanged");
+        }
+    }
+}
+
+#[test]
+fn an_end_of_another_process_given_the_leaders_pid_is_not_the_calls() {
+    use aterm_vitals::jobs::{ExitOf, LeaderExit};
+    let mut w = World::new();
+    w.call(1, 300, 400, sleeper(401, "sleep"), None);
+    let _ = run_to(&mut w, 4_000, |_, _| {});
+    w.exit(401, false);
+    w.exit(400, false);
+    w.exits.push(LeaderExit {
+        pid: 400,
+        start: Some(1),
+        end: ExitOf::Code(0),
+    });
+    let _ = w.tick(TICK_MS);
+    let call = ended_call(&mut w);
+    assert_eq!(call.ended_by, None, "a pid taken anew: {call:?}");
+}
+
+#[test]
+fn a_call_of_builtins_names_no_program_and_one_that_execed_names_its_own() {
+    // `zsh -c 'kill -TERM $$'`: the wrapper alone, a builtin.
+    let mut w = World::new();
+    w.call(1, 300, 400, sleeper(401, "sleep"), None);
+    w.exit(401, false);
+    let _ = run_to(&mut w, 4_000, |_, _| {});
+    w.exit(400, false);
+    let _ = w.tick(TICK_MS);
+    assert_eq!(ended_call(&mut w).ran, None, "only the wrapper ran");
+
+    // `zsh -c 'sleep 4'`: zsh execs its last command, so the leader is the program.
+    let mut w = World::new();
+    w.call(1, 300, 400, sleeper(401, "sleep"), None);
+    w.exit(401, false);
+    w.p(400).name = "sleep".to_owned();
+    let _ = run_to(&mut w, 4_000, |_, _| {});
+    w.exit(400, false);
+    let _ = w.tick(TICK_MS);
+    assert_eq!(ended_call(&mut w).ran.as_deref(), Some("sleep"));
+}
+
+#[test]
+fn a_wrappers_subshell_is_passed_over_for_what_it_runs() {
+    // `echo $(git rev-parse HEAD)`: the wrapper's fork (named as it is) runs `git`.
+    let mut w = World::new();
+    let mut sub = sleeper(401, "zsh");
+    sub.exe = Some("zsh".to_owned());
+    w.call(1, 300, 400, sub, None);
+    let mut git = Proc::new(402, 401, "git");
+    git.pgid = 400;
+    git.sid = 400;
+    w.add(git);
+    let _ = run_to(&mut w, 4_000, |_, _| {});
+    w.exit(402, false);
+    w.exit(401, false);
+    w.exit(400, false);
+    let _ = w.tick(TICK_MS);
+    assert_eq!(ended_call(&mut w).ran.as_deref(), Some("git"));
+}

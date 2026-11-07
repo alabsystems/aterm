@@ -11,7 +11,7 @@ pub use create::{CREATE_KEY, RepoCreatePermit, RepoVisibility};
 use crate::client::Github;
 use crate::error::{Error, Forbid, Kind, Result, Sub};
 use crate::github::{How, limit_after_sort, repo_root};
-use crate::model::{Permissions, RepoObject, UserObject, from_json};
+use crate::model::{Permissions, RepoObject, UserObject, from_json_owned};
 use crate::page::{LinkScope, ListOpts, Listing};
 use crate::policy::{Access, Decision, RouteTarget};
 use crate::slug::Slug;
@@ -110,7 +110,7 @@ impl<'a> Repos<'a> {
         let answered = self.gh.call(&call)?;
         let repo: RepoObject = answered
             .json()
-            .and_then(|value| from_json(&value))
+            .and_then(from_json_owned)
             .map_err(|e| e.with_repo(slug.to_string()))?;
         self.gh.remember_repo_id(slug, repo.id);
         Ok(repo)
@@ -169,7 +169,7 @@ impl<'a> Repos<'a> {
                 .as_read()
                 .get(format!("/users/{owner}"), target.clone()),
         )?;
-        let user: UserObject = from_json(&who.json()?)?;
+        let user: UserObject = from_json_owned(who.json()?)?;
         let walk_opts = opts.with_limit(None);
         let listing = if user.kind == "Organization" {
             let first = self
@@ -205,7 +205,7 @@ impl<'a> Repos<'a> {
                 &LinkScope::Owner { id: user.id },
             )?
         };
-        let mut listing = listing.map(|value| from_json::<RepoObject>(&value))?;
+        let mut listing = listing.map(from_json_owned::<RepoObject>)?;
         listing.items.retain(|repo| kind.keeps(repo));
         listing.items.sort_by(|a, b| {
             a.full_name

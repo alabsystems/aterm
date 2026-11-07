@@ -1310,7 +1310,11 @@ fn thread_ids(pid: i32) -> Option<Vec<u64>> {
     // SAFETY: `ids` is a writable buffer of exactly `size` bytes for the call.
     let got =
         unsafe { libc::proc_pidinfo(pid, PROC_PIDLISTTHREADIDS, 0, ids.as_mut_ptr().cast(), size) };
-    let n = usize::try_from(got).ok()? / std::mem::size_of::<u64>();
+    let bytes = usize::try_from(got).ok()?;
+    if bytes == 0 || !bytes.is_multiple_of(std::mem::size_of::<u64>()) {
+        return None;
+    }
+    let n = bytes / std::mem::size_of::<u64>();
     Some(ids.get(..n)?.to_vec())
 }
 
@@ -1333,40 +1337,84 @@ pub struct ThreadCpu {
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn thread_cpu_ns(pid: i32) -> Option<Vec<ThreadCpu>> {
-    let mut ids = thread_ids(pid)?;
+    thread_cpu_observation(pid).map(|reading| reading.threads)
+}
+
+/// A bounded thread table and the reads it could not complete.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug)]
+pub struct ThreadCpuObservation {
+    /// Every thread whose counter was read, sorted by TID.
+    pub threads: Vec<ThreadCpu>,
+    /// Listed TIDs whose counter read failed, including a thread that exited meanwhile.
+    pub missing_tids: Vec<u64>,
+    /// False when the bounded table may have been truncated.
+    pub list_complete: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl ThreadCpuObservation {
+    /// Every listed counter was read and the table was not at its bound.
+    #[must_use]
+    pub fn complete(&self) -> bool {
+        self.list_complete && self.missing_tids.is_empty()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn thread_cpu_from_ids(
+    mut ids: Vec<u64>,
+    mut read: impl FnMut(u64) -> Option<ThreadCpu>,
+) -> ThreadCpuObservation {
+    let list_complete = !ids.is_empty() && ids.len() < 512;
     ids.sort_unstable();
-    Some(
-        ids.into_iter()
-            .filter_map(|tid| {
-                // SAFETY: an all-zero `proc_threadinfo` is valid (integers and a byte array).
-                let mut info: libc::proc_threadinfo = unsafe { std::mem::zeroed() };
-                let size = libc::c_int::try_from(std::mem::size_of_val(&info)).ok()?;
-                // SAFETY: `info` is a writable buffer of exactly `size` bytes for the call.
-                let got = unsafe {
-                    libc::proc_pidinfo(
-                        pid,
-                        PROC_PIDTHREADID64INFO,
-                        tid,
-                        (&raw mut info).cast(),
-                        size,
-                    )
-                };
-                (got == size).then(|| {
-                    let name: Vec<u8> = info
-                        .pth_name
-                        .iter()
-                        .take_while(|&&c| c != 0)
-                        .map(|&c| c as u8)
-                        .collect();
-                    ThreadCpu {
-                        tid,
-                        name: String::from_utf8_lossy(&name).into_owned(),
-                        ns: info.pth_user_time + info.pth_system_time,
-                    }
-                })
-            })
-            .collect(),
-    )
+    let mut reading = ThreadCpuObservation {
+        threads: Vec::new(),
+        missing_tids: Vec::new(),
+        list_complete,
+    };
+    for tid in ids {
+        match read(tid) {
+            Some(thread) => reading.threads.push(thread),
+            None => reading.missing_tids.push(tid),
+        }
+    }
+    reading
+}
+
+/// The same native counters as [`thread_cpu_ns`], retaining incomplete-read evidence.
+/// `None` means the thread table itself could not be read.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn thread_cpu_observation(pid: i32) -> Option<ThreadCpuObservation> {
+    Some(thread_cpu_from_ids(thread_ids(pid)?, |tid| {
+        // SAFETY: an all-zero `proc_threadinfo` is valid (integers and a byte array).
+        let mut info: libc::proc_threadinfo = unsafe { std::mem::zeroed() };
+        let size = libc::c_int::try_from(std::mem::size_of_val(&info)).ok()?;
+        // SAFETY: `info` is a writable buffer of exactly `size` bytes for the call.
+        let got = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                PROC_PIDTHREADID64INFO,
+                tid,
+                (&raw mut info).cast(),
+                size,
+            )
+        };
+        (got == size).then(|| {
+            let name: Vec<u8> = info
+                .pth_name
+                .iter()
+                .take_while(|&&c| c != 0)
+                .map(|&c| c as u8)
+                .collect();
+            ThreadCpu {
+                tid,
+                name: String::from_utf8_lossy(&name).into_owned(),
+                ns: info.pth_user_time + info.pth_system_time,
+            }
+        })
+    }))
 }
 
 /// `PROC_PIDTHREADCOUNTS` (`<sys/proc_info.h>`, macOS 13): one thread's counters, a row per CPU
@@ -3515,5 +3563,60 @@ mod tests {
             "await_exit returned while the child was still stopped"
         );
         assert_eq!(status.code(), Some(7), "{status}");
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod thread_cpu_coverage_tests {
+    use super::*;
+
+    #[test]
+    fn idle_cpu_native_snapshot_preserves_failed_tids_and_readable_counters() {
+        let reading = thread_cpu_from_ids(vec![3, 1, 2], |tid| {
+            (tid != 2).then(|| ThreadCpu {
+                tid,
+                name: "fixture".into(),
+                ns: tid * 10,
+            })
+        });
+        assert!(!reading.complete());
+        assert!(reading.list_complete);
+        assert_eq!(reading.missing_tids, [2]);
+        assert_eq!(
+            reading
+                .threads
+                .iter()
+                .map(|t| (t.tid, t.ns))
+                .collect::<Vec<_>>(),
+            [(1, 10), (3, 30)]
+        );
+    }
+
+    #[test]
+    fn idle_cpu_native_empty_or_full_table_is_not_complete() {
+        for ids in [Vec::new(), (1..=512).collect()] {
+            let reading = thread_cpu_from_ids(ids, |tid| {
+                Some(ThreadCpu {
+                    tid,
+                    name: String::new(),
+                    ns: 0,
+                })
+            });
+            assert!(
+                !reading.complete(),
+                "a zero or potentially truncated table is not a complete observation"
+            );
+        }
+        let reading = thread_cpu_from_ids(vec![1], |tid| {
+            Some(ThreadCpu {
+                tid,
+                name: "main".into(),
+                ns: 0,
+            })
+        });
+        assert!(
+            reading.complete(),
+            "a genuine complete zero counter is known zero"
+        );
     }
 }

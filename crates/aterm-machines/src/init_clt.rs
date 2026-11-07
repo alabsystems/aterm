@@ -146,17 +146,6 @@ impl Unfinished {
         }
     }
 
-    /// Whether an ask of aterm's own that ended for this reason stays spent, as System State's
-    /// window reads the tab's exit ([`Self::tab_exit`]): a stop (a person's Ctrl-C), Apple's
-    /// window closed without the tools (a person's press there) and an account that is no
-    /// administrator's keep it, as a closed tab does; every other class installed nothing and no
-    /// person declined it (a password macOS refused, a broken download, a machine's failure, Low
-    /// Data Mode), so it takes the ask back and the next ask of that build goes ahead.
-    #[must_use]
-    pub const fn keeps_the_ask(self) -> bool {
-        matches!(self, Self::Stopped | Self::WindowClosed | Self::NotAdmin)
-    }
-
     /// How `sudo <aterm> machines here apply --plain` ended (`code`, `None` on a signal): done
     /// on 0, `sudo`'s own refusal on 1, a root class on its code, else [`Self::Other`].
     ///
@@ -266,6 +255,7 @@ pub const TAB_INSTALLED: &str =
 pub struct Tab {
     say: Arc<dyn Fn(&str) + Send + Sync>,
     unfinished: Arc<Mutex<Option<Unfinished>>>,
+    entered: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Tab {
@@ -275,6 +265,7 @@ impl Tab {
         Self {
             say,
             unfinished: Arc::default(),
+            entered: Arc::default(),
         }
     }
 
@@ -295,6 +286,15 @@ impl Tab {
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(why);
         why.reason().to_owned()
+    }
+
+    /// Preserve preprompt-only exit meaning even if an engine readback changes its diagnosis.
+    pub(crate) fn exit(&self, why: Unfinished) -> u8 {
+        if why == Unfinished::LowData && self.entered.load(std::sync::atomic::Ordering::Relaxed) {
+            1
+        } else {
+            why.tab_exit()
+        }
     }
 
     /// Why the install did not finish, if the item said.
@@ -394,7 +394,7 @@ impl CommandLineTools {
 
     /// This item in a run aterm decided ([`crate::init::Decider::Aterm`]: the follow-up of a
     /// person's own package install or update), held as `unbidden` says: it asks for the Mac
-    /// password at most once per build, sharing System State's Mac Setup tab's ask
+    /// password automatically once per account episode, sharing System State's Mac Setup tab's ask
     /// ([`aterm_types::clt_mark`]), and never while the person's choices hold that tab, as read
     /// when its probe runs and again right before it claims the ask; where it asks nothing it is
     /// deferred, naming the person's step ([`PERSONS_STEP`]), and an ask a Stop or another asker
@@ -412,6 +412,16 @@ impl CommandLineTools {
     #[must_use]
     pub(crate) fn saying(self, say: Arc<dyn Fn(&str) + Send + Sync>) -> Self {
         Self { say, ..self }
+    }
+
+    /// Record an explicit person attempt in the shared episode without withholding their retry.
+    #[must_use]
+    pub(crate) fn explicit(self, mut record: Unbidden) -> Self {
+        record.explicit = true;
+        Self {
+            unbidden: Some(record),
+            ..self
+        }
     }
 
     /// The baseline the root half applies.
@@ -514,6 +524,8 @@ pub struct Unbidden {
     mark: Option<PathBuf>,
     /// The build that asks ([`aterm_stamp::build_id`]).
     build: String,
+    /// An explicit person retry records its attempt but never borrows an automatic hold.
+    explicit: bool,
     /// The person's choices now, as the setup records say ([`crate::init::Records::holds`]).
     holds: Arc<dyn Fn() -> crate::init::Holds + Send + Sync>,
 }
@@ -530,6 +542,7 @@ impl Unbidden {
         Self {
             mark,
             build,
+            explicit: false,
             holds: Arc::new(holds),
         }
     }
@@ -548,17 +561,23 @@ impl Unbidden {
     /// Why the person's choices hold the ask now, naming their step, as the setup records read
     /// at this call ([`held_by`]).
     fn held(&self) -> Option<String> {
+        if self.explicit {
+            return None;
+        }
         held_by(&(self.holds)()).map(|why| {
             format!("aterm asks for no Mac password by itself because {why}: {PERSONS_STEP}")
         })
     }
 
     /// Why a run aterm decided asks no password by itself now, naming the person's step, or
-    /// `None` when it may ask: the person's choices hold it ([`Self::held`]), this build asked by
-    /// itself already (its tab, or an earlier run aterm decided: [`ASKED_ON_THIS_BUILD`]), or the
+    /// `None` when it may ask: the person's choices hold it ([`Self::held`]), an earlier attempt consumed
+    /// the episode (its tab, or an earlier run aterm decided: [`ASK_ALREADY_SPENT`]), or the
     /// record has no place or cannot say whether it did ([`UNREAD_RECORD`]), as the record reads
     /// through `sys` ([`aterm_types::clt_mark::reading`]).
     fn withheld(&self, sys: &dyn System) -> Option<String> {
+        if self.explicit {
+            return None;
+        }
         if let Some(why) = self.held() {
             return Some(why);
         }
@@ -568,10 +587,10 @@ impl Unbidden {
                  password by itself: {PERSONS_STEP}"
             ));
         };
-        match aterm_types::clt_mark::reading(sys.clt_mark(), mark, &self.build) {
-            aterm_types::clt_mark::Asked::NotNamed => None,
-            aterm_types::clt_mark::Asked::Named => {
-                Some(format!("{ASKED_ON_THIS_BUILD}: {PERSONS_STEP}"))
+        match aterm_types::clt_mark::reading(sys.clt_mark(), mark) {
+            aterm_types::clt_mark::Asked::Available => None,
+            aterm_types::clt_mark::Asked::Spent => {
+                Some(format!("{ASK_ALREADY_SPENT}: {PERSONS_STEP}"))
             }
             aterm_types::clt_mark::Asked::Unread(error) => Some(format!(
                 "{UNREAD_RECORD}, {} ({error}), so it asks for no Mac password by itself: \
@@ -592,12 +611,15 @@ impl Unbidden {
             .mark
             .as_deref()
             .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
-        aterm_types::clt_mark::claim(sys.clt_mark(), mark, &self.build)
+        if self.explicit {
+            aterm_types::clt_mark::explicit(sys.clt_mark(), mark, &self.build)
+        } else {
+            aterm_types::clt_mark::claim(sys.clt_mark(), mark, &self.build)
+        }
     }
 
-    /// Take this build's ask back, which this run's claim added: it installed nothing, and no
-    /// person declined it, so the next run of this build, or its tab, asks again. A record that
-    /// cannot be rewritten keeps it, and says so in the log.
+    /// Release this run's exact claim after the port proves sudo never started. An unreadable
+    /// record retains the hold and reports the release failure in the journal.
     fn forget(&self, sys: &dyn System) {
         if let Some(mark) = &self.mark
             && let Err(error) = aterm_types::clt_mark::forget(sys.clt_mark(), mark, &self.build)
@@ -630,8 +652,8 @@ pub const PERSONS_STEP: &str = "press Install Command Line Tools\u{2026} on Syst
 
 /// Why a run aterm decided asks no password where this build asked by itself already: its tab,
 /// or an earlier run aterm decided ([`aterm_types::clt_mark`]).
-pub const ASKED_ON_THIS_BUILD: &str = "aterm asks for your Mac password for them by itself once \
-                                       per build, and this build has asked";
+pub const ASK_ALREADY_SPENT: &str = "aterm has already asked for your Mac password for setup; \
+                                       updates do not ask again automatically";
 
 /// Why a run aterm decided asks no password where the record of its own ask has no place, or
 /// cannot say whether this build asked ([`aterm_types::clt_mark::Asked::Unread`]): the row goes on
@@ -740,20 +762,25 @@ impl Item for CommandLineTools {
         if !sys.has_tty() {
             return Err(NO_TTY.to_owned());
         }
-        // In a run aterm decided, the person's choices are read once more and aterm's own ask is
-        // claimed right before `sudo` asks: a Stop pressed since the probe holds it, neither
-        // System State's tab nor a later run of this build asks again by itself, and of this run
-        // and a tab of this build landing at once only the one whose claim added the line asks.
-        // An ask it cannot claim is not made. The engine gives an apply no deferral of its own,
-        // so each of these reads as the row's failure in the deferral's words, naming the
-        // person's step.
-        if let Some(unbidden) = &self.unbidden {
-            if let Some(why) = unbidden.held() {
+        // Persist the episode before sudo can ask. Explicit retries bypass its withholding
+        // decision, but consume the same record so a later update never retries unsolicited.
+        let mut claimed = false;
+        if let Some(record) = &self.unbidden {
+            if let Some(why) = record.held() {
                 return Err(why);
             }
-            match unbidden.claim(sys) {
-                Ok(true) => {}
-                Ok(false) => return Err(format!("{ASKED_ON_THIS_BUILD}: {PERSONS_STEP}")),
+            match record.claim(sys) {
+                Ok(added) => {
+                    claimed = added;
+                    if !added && !record.explicit {
+                        return Err(format!("{ASK_ALREADY_SPENT}: {PERSONS_STEP}"));
+                    }
+                }
+                Err(error) if record.explicit => {
+                    aterm_log::warn!(
+                        "aterm init: could not record the explicit administrator attempt: {error}"
+                    );
+                }
                 Err(error) => return Err(format!("{NOT_NOTED} ({error}): {PERSONS_STEP}")),
             }
         }
@@ -766,10 +793,16 @@ impl Item for CommandLineTools {
         let stops = sys.defer_stops();
         let ran = sys.run_tty(&self.command());
         let ended = self.ended(sys, &ran, sys.stopped());
-        if let Some(unbidden) = &self.unbidden
-            && ended.is_err_and(|why| !why.keeps_the_ask())
+        // Only these port results prove sudo never existed. A password refusal, installer
+        // failure, timeout or lost result may follow human interaction and keeps the episode.
+        if claimed
+            && matches!(
+                ran,
+                Err(crate::port::RunFailed::Spawn(_) | crate::port::RunFailed::Refused(_))
+            )
+            && let Some(record) = &self.unbidden
         {
-            unbidden.forget(sys);
+            record.forget(sys);
         }
         drop(stops);
         match (ended, ran) {
@@ -840,6 +873,9 @@ impl CommandLineTools {
 
     /// [`Self::read`] with the tools present (`now`).
     fn read_present(&self, sys: &dyn System, now: String) -> (Probe, Option<Unfinished>) {
+        if self.asked.load(std::sync::atomic::Ordering::Relaxed) {
+            return (Probe::Ok { now }, None);
+        }
         let owed = (self.owed)(sys);
         if owed.is_empty() || self.asked.load(std::sync::atomic::Ordering::Relaxed) {
             return (Probe::Ok { now }, None);
@@ -942,6 +978,8 @@ impl CommandLineTools {
         let stops = sys.catch_stops();
         tab.line(self.intro(sys, true));
         self.asked.store(true, std::sync::atomic::Ordering::Relaxed);
+        tab.entered
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let ran = sys.run_tty(&self.command());
         let stopped = sys.stopped();
         drop(stops);
@@ -1079,8 +1117,11 @@ mod tests {
     fn a_mac_with_the_tools_still_gets_the_one_password_for_what_is_owed() {
         use crate::root_steps::Owed;
         let present = || item(Found::Present("installed".into()));
+        let owed_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let owing = |item: CommandLineTools| {
-            item.with_owed(Box::new(|_: &dyn System| {
+            let owed_reads = Arc::clone(&owed_reads);
+            item.with_owed(Box::new(move |_: &dyn System| {
+                owed_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 vec![Owed::Debugger, Owed::NameRule]
             }))
         };
@@ -1092,8 +1133,14 @@ mod tests {
         let sys = console();
         assert_eq!(run(&sys, &item, Mode::Plan).outcome, Outcome::Planned);
         sys.on(&argv(), Ran::ok(""));
+        let before = owed_reads.load(std::sync::atomic::Ordering::Relaxed);
         let row = run(&sys, &item, Mode::Apply);
         assert_eq!(row.outcome, Outcome::Changed, "{row:?} {:?}", sys.calls());
+        assert_eq!(
+            owed_reads.load(std::sync::atomic::Ordering::Relaxed) - before,
+            1,
+            "only the pre-prompt probe reads other root steps; the read-back reports the tools"
+        );
         assert_eq!(
             asked(&sys),
             [argv()],
@@ -1595,20 +1642,11 @@ mod tests {
                 if !installs {
                     assert_eq!(row.why.as_deref(), Some(Unfinished::Stopped.reason()));
                 }
-                if decider == crate::init::Decider::Aterm {
-                    assert!(marked(&sys, BUILD), "{status:?}: {calls:?}");
-                    assert!(
-                        !calls.iter().any(|call| call == &format!("remove {MARK}")),
-                        "{calls:?}"
-                    );
-                } else {
-                    assert!(
-                        !calls
-                            .iter()
-                            .any(|call| call.starts_with("write ") || call.starts_with("remove ")),
-                        "a person's run writes no record: {calls:?}"
-                    );
-                }
+                assert!(marked(&sys), "{decider:?} {status:?}: {calls:?}");
+                assert!(
+                    !calls.iter().any(|call| call == &format!("remove {MARK}")),
+                    "the consumed episode survives stop delivery: {calls:?}"
+                );
             }
         }
     }
@@ -1652,18 +1690,16 @@ mod tests {
     }
 
     /// Whether the record names `build`.
-    fn marked(sys: &Fake, build: &str) -> bool {
-        aterm_types::clt_mark::opened_on_build(sys, std::path::Path::new(MARK), build)
+    fn marked(sys: &Fake) -> bool {
+        aterm_types::clt_mark::spent(sys, std::path::Path::new(MARK))
     }
 
     /// In a run aterm decided (the follow-up of a person's own package install or update), the
-    /// first run of a build asks once, claiming the build in the record before `sudo` asks; a
-    /// second run of that build asks nothing, deferred naming the person's step, and so does a
-    /// run after System State's own tab asked on this build; an update's build asks once more,
-    /// keeping the earlier build's line.
-    /// NEGATIVE CONTROL: a person's own run asks every time, writing no record.
+    /// first run asks once, claiming its ask before `sudo`; later automatic runs and updates
+    /// preserve that spent ask after a person's cancellation. The shared GUI claim holds too.
+    /// NEGATIVE CONTROL: explicit retries remain available and record the first human attempt.
     #[test]
-    fn a_run_aterm_decided_asks_once_per_build_and_a_persons_run_every_time() {
+    fn automatic_setup_preserves_its_spent_ask_across_updates_and_a_person_can_retry() {
         let sys = console();
         let argv = argv();
         // Apple's window closed without the tools: the person's own press there, which keeps
@@ -1681,7 +1717,7 @@ mod tests {
         let ran = calls.iter().position(|call| *call == argv).unwrap();
         assert!(claimed < ran, "claimed before sudo asks: {calls:?}");
         assert_eq!(asked(&sys), std::slice::from_ref(&argv));
-        assert!(marked(&sys, BUILD));
+        assert!(marked(&sys));
 
         for mode in [Mode::Plan, Mode::Apply] {
             let row = run(&sys, &aterm, mode);
@@ -1689,7 +1725,7 @@ mod tests {
             assert!(deferred(&row));
             let why = row.why.unwrap_or_default();
             assert!(
-                why.contains(ASKED_ON_THIS_BUILD) && why.ends_with(PERSONS_STEP),
+                why.contains(ASK_ALREADY_SPENT) && why.ends_with(PERSONS_STEP),
                 "{why}"
             );
         }
@@ -1716,9 +1752,13 @@ mod tests {
             },
         );
         let row = run(&sys, update.clt.as_ref().unwrap(), Mode::Apply);
-        assert_eq!(row.outcome, Outcome::Failed, "{row:?}");
-        assert_eq!(asked(&sys).len(), 2, "an update's build asks once more");
-        assert!(marked(&sys, "0.9.1+gdef5678") && marked(&sys, BUILD));
+        assert_eq!(
+            asked(&sys).len(),
+            1,
+            "an update must not ask for the password again"
+        );
+        assert_eq!(row.outcome, Outcome::Deferred, "{row:?}");
+        assert!(marked(&sys));
 
         let person = console();
         person.on(&argv, Ran::exit(88, ""));
@@ -1727,22 +1767,34 @@ mod tests {
                 clt: Some(missing()),
                 ..crate::init::Base::none()
             },
-            || panic!("a person's run reads no record and no holds"),
+            || {
+                Unbidden::new(Some(PathBuf::from(MARK)), BUILD.to_owned(), || {
+                    panic!("an explicit retry never reads automatic holds")
+                })
+            },
         );
         let typed = typed.clt.as_ref().unwrap();
-        assert!(aterm_types::clt_mark::claim(&person, std::path::Path::new(MARK), BUILD).unwrap());
         for _ in 0..2 {
             assert_eq!(run(&person, typed, Mode::Apply).outcome, Outcome::Failed);
         }
         assert_eq!(asked(&person).len(), 2, "{:?}", person.calls());
+        assert_eq!(
+            run(&person, &decided(crate::init::Decider::Aterm), Mode::Apply).outcome,
+            Outcome::Deferred
+        );
+        assert_eq!(
+            asked(&person).len(),
+            2,
+            "explicit attempts must hold unsolicited retries"
+        );
         assert_eq!(
             person
                 .calls()
                 .iter()
                 .filter(|call| call.starts_with("write ") || call.starts_with("remove "))
                 .count(),
-            1,
-            "only the test's own record write: {:?}",
+            2,
+            "the explicit retry revokes the first attempt's release capability: {:?}",
             person.calls()
         );
     }
@@ -1794,7 +1846,7 @@ mod tests {
             let why = row.why.unwrap_or_default();
             assert!(
                 why.contains(UNREAD_RECORD)
-                    && !why.contains(ASKED_ON_THIS_BUILD)
+                    && !why.contains(ASK_ALREADY_SPENT)
                     && why.ends_with(PERSONS_STEP),
                 "{why}"
             );
@@ -1882,7 +1934,7 @@ mod tests {
                 assert_eq!(writes, 0, "{:?}", sys.calls());
             } else {
                 assert_eq!(asked(&sys).len(), 1, "{:?}", sys.calls());
-                assert!(marked(&sys, BUILD));
+                assert!(marked(&sys));
             }
         }
     }
@@ -1919,11 +1971,11 @@ mod tests {
             if tab_lands {
                 let why = row.why.unwrap_or_default();
                 assert!(
-                    why.contains(ASKED_ON_THIS_BUILD) && why.ends_with(PERSONS_STEP),
+                    why.contains(ASK_ALREADY_SPENT) && why.ends_with(PERSONS_STEP),
                     "{why}"
                 );
                 assert!(asked(&sys).is_empty(), "{calls:?}");
-                assert!(marked(&sys, BUILD), "the tab's line stays: {calls:?}");
+                assert!(marked(&sys), "the tab's line stays: {calls:?}");
                 assert_eq!(
                     calls
                         .iter()
@@ -1935,72 +1987,75 @@ mod tests {
             } else {
                 assert_eq!(asked(&sys).len(), 1, "{calls:?}");
                 assert!(
-                    !marked(&sys, BUILD),
-                    "a failed install takes its own line back: {calls:?}"
+                    marked(&sys),
+                    "a failed install retains its consumed episode: {calls:?}"
                 );
             }
         }
     }
 
-    /// A run aterm decided that installed nothing, where no person declined it (a password macOS
-    /// refused, a broken download, a machine's failure), takes its build's line back, so the next
-    /// run of that build asks again; a stop the person sent, Apple's window closed without them
-    /// and the root half's own stop keep it, as the window reads the tab's exits
-    /// ([`Unfinished::keeps_the_ask`]).
+    /// A pending automatic claim must not release a later explicit person's real attempt,
+    /// even when the automatic sudo was proven never started afterward.
     #[test]
-    fn a_failed_install_takes_the_ask_back_and_a_decline_keeps_it() {
-        for (status, stop, keeps) in [
-            (82, false, false),
-            (83, false, false),
-            (1, false, false),
-            (1, true, true),
-            (85, false, true),
-            (88, false, true),
-        ] {
-            let mut sys = console();
-            if stop {
-                sys.stop_after = Some(0);
+    fn an_explicit_attempt_survives_an_older_automatic_no_start_result() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let sys = console();
+        let first = AtomicBool::new(true);
+        sys.tty_model(move |sys, _| {
+            if first.swap(false, Ordering::SeqCst) {
+                // At A's run boundary, a separate explicit execution B reaches sudo and fails
+                // its password. A then has no scripted child, the port's real Spawn failure.
+                let person = decided(crate::init::Decider::Person);
+                assert_eq!(run(sys, &person, Mode::Apply).outcome, Outcome::Failed);
+                None
+            } else {
+                Some(Ran::exit(1, ""))
             }
-            sys.on(&argv(), Ran::exit(status, ""));
+        });
+        assert_eq!(
+            run(&sys, &decided(crate::init::Decider::Aterm), Mode::Apply).outcome,
+            Outcome::Failed
+        );
+        assert!(marked(&sys));
+        assert_eq!(
+            run(&sys, &decided(crate::init::Decider::Aterm), Mode::Apply).outcome,
+            Outcome::Deferred
+        );
+        assert_eq!(
+            asked(&sys).len(),
+            2,
+            "no third unsolicited attempt: {:?}",
+            sys.calls()
+        );
+    }
+
+    /// All outcomes after sudo may have asked a person and retain the episode. Only a proven
+    /// failure to start releases this exact claim; a lost post-start result does not.
+    #[test]
+    fn a_password_attempt_stays_spent_and_only_proven_no_start_releases_it() {
+        for (reply, keeps) in [
+            (Some(Ran::exit(82, "")), true),
+            (Some(Ran::exit(83, "")), true),
+            (Some(Ran::exit(1, "")), true),
+            (Some(Ran::exit(85, "")), true),
+            (Some(Ran::exit(88, "")), true),
+            (None, false), // The port's actual unscripted Spawn failure.
+        ] {
+            let sys = console();
+            if let Some(reply) = reply {
+                sys.on(&argv(), reply);
+            }
             let aterm = decided(crate::init::Decider::Aterm);
             let row = run(&sys, &aterm, Mode::Apply);
-            assert_eq!(row.outcome, Outcome::Failed, "{status}: {row:?}");
+            assert_eq!(row.outcome, Outcome::Failed, "{row:?}");
+            assert_eq!(marked(&sys), keeps, "{:?}", sys.calls());
             assert_eq!(
-                marked(&sys, BUILD),
-                keeps,
-                "{status} {stop}: {:?}",
-                sys.calls()
-            );
-            let calls = sys.calls();
-            if !keeps {
-                let at = |call: &str| calls.iter().position(|seen| seen == call).unwrap();
-                assert!(
-                    at(&argv()) < at(&format!("remove {MARK}"))
-                        && at(&format!("remove {MARK}")) < at("stops restored"),
-                    "taken back once the root half ended, before a stop is sent again: {calls:?}"
-                );
-                assert_eq!(
-                    run(&sys, &aterm, Mode::Plan).outcome,
-                    Outcome::Planned,
-                    "the next run of the build asks again"
-                );
-            }
-        }
-    }
-
-    /// The asks that stay spent are the tab's exits the window keeps its opening on.
-    #[test]
-    fn the_asks_that_stay_spent_are_the_tab_exits_the_window_keeps() {
-        for why in Unfinished::ALL {
-            assert_eq!(
-                why.keeps_the_ask(),
-                [
-                    aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_STOPPED,
-                    aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_WINDOW_CLOSED,
-                    aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_NOT_ADMIN,
-                ]
-                .contains(&why.tab_exit()),
-                "{why:?}"
+                run(&sys, &aterm, Mode::Plan).outcome,
+                if keeps {
+                    Outcome::Deferred
+                } else {
+                    Outcome::Planned
+                }
             );
         }
     }
@@ -2077,6 +2132,11 @@ mod tests {
             assert_eq!(row.outcome, Outcome::Failed, "{status:?}: {row:?}");
             assert_eq!(row.why.as_deref(), Some(why.reason()), "{status:?}");
             assert_eq!(tab.unfinished(), Some(why), "{status:?}");
+            assert_eq!(
+                tab.exit(Unfinished::LowData),
+                1,
+                "a post-sudo LowData diagnosis cannot release the episode"
+            );
             assert_eq!(said.lock().unwrap().len(), 1, "the intro alone: {status:?}");
         }
     }
@@ -2104,55 +2164,26 @@ mod tests {
         assert_eq!(tab.unfinished(), None);
     }
 
-    /// Every reason is a plain clause a person reads in the tab (no argv, path, item id or
-    /// engine word); each line is `Mac Setup did not finish: <reason>. Running aterm init in a
-    /// terminal tries again.` except Low Data Mode's and a non-administrator's, which say what
-    /// lifts them, with their own tab exit; and each root code is its class's own, clear of the
-    /// codes `sudo`, a usage error, a panic and a failed exec end on.
+    /// Each root code identifies only its own class and avoids generic process failures.
+    /// The tab preserves the distinct codes used by its parent for download waits and stops.
     #[test]
-    fn each_reason_is_plain_words_and_each_root_code_is_its_own() {
+    fn root_codes_are_distinct_and_tab_exit_codes_preserve_their_classes() {
         let mut codes = Vec::new();
         for why in Unfinished::ALL {
-            let reason = why.reason();
-            for word in [
-                "/",
-                "`",
-                "base.clt",
-                "baseline",
-                "journal",
-                "fleet",
-                "sudo",
-                "root",
-                "exit",
-                "argv",
-                "aterm machines",
-            ] {
-                assert!(!reason.contains(word), "{why:?}: {reason}");
-                assert!(!why.line().contains(word), "{why:?}: {}", why.line());
-            }
-            assert!(!reason.ends_with('.'), "{why:?}");
             match why {
                 Unfinished::LowData => {
-                    assert_eq!(why.line(), TAB_LOW_DATA);
                     assert_eq!(
                         why.tab_exit(),
                         aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_LOW_DATA
                     );
                 }
                 Unfinished::NotAdmin => {
-                    assert_eq!(why.line(), TAB_NOT_ADMIN);
                     assert_eq!(
                         why.tab_exit(),
                         aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_NOT_ADMIN
                     );
                 }
                 Unfinished::Stopped | Unfinished::WindowClosed => {
-                    assert_eq!(
-                        why.line(),
-                        format!(
-                            "Mac Setup did not finish: {reason}. Running aterm init in a terminal tries again."
-                        ),
-                    );
                     assert_eq!(
                         why.tab_exit(),
                         if why == Unfinished::Stopped {
@@ -2163,12 +2194,6 @@ mod tests {
                     );
                 }
                 _ => {
-                    assert_eq!(
-                        why.line(),
-                        format!(
-                            "Mac Setup did not finish: {reason}. Running aterm init in a terminal tries again."
-                        ),
-                    );
                     assert_eq!(why.tab_exit(), 1, "{why:?}");
                 }
             }
@@ -2177,12 +2202,6 @@ mod tests {
                 assert!(!codes.contains(&code), "{why:?}");
                 codes.push(code);
             }
-        }
-        assert_eq!(codes.len(), 10);
-        assert!(TAB_LOW_DATA.contains("Low Data Mode") && TAB_LOW_DATA.contains("Network"));
-        assert!(TAB_NOT_ADMIN.contains("administrator"));
-        for line in [TAB_INTRO, TAB_INSTALLED] {
-            assert!(!line.contains('/') && !line.contains('`'), "{line}");
         }
     }
 

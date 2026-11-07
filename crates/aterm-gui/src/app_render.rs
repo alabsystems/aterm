@@ -2767,7 +2767,8 @@ pub(crate) struct OverlayGlow {
     pub(crate) wash_a: u8,
     /// Inset-border alpha (0..255).
     pub(crate) border_a: u8,
-    /// Border thickness as a multiple of the size-derived law ([`aterm_gpu::drop_border_px`]), in 1/16 units.
+    /// Border thickness as a multiple of the size-derived law
+    /// ([`aterm_render::drop_overlay_border_px`]), in 1/16 units.
     pub(crate) border_scale_q4: u8,
 }
 
@@ -2797,15 +2798,7 @@ pub(crate) fn apply_overlay_at(
     if fw == 0 || fh == 0 || sw == 0 || sh == 0 {
         return;
     }
-    let fw_u32 = u32::try_from(fw).unwrap_or(u32::MAX);
-    let fh_u32 = u32::try_from(fh).unwrap_or(u32::MAX);
-    let border = (aterm_gpu::scaled_border_px(
-        aterm_gpu::drop_border_px(fw_u32, fh_u32),
-        glow.border_scale_q4,
-    ) as usize)
-        .min(fw / 2)
-        .min(fh / 2)
-        .max(1);
+    let border = aterm_render::drop_overlay_border_px(fw, fh, glow.border_scale_q4);
     let accent = glow.accent & 0x00ff_ffff;
     let (wash_a, border_a) = (u32::from(glow.wash_a), u32::from(glow.border_a));
     let y0 = ox_clamp(oy, sh);
@@ -10128,7 +10121,6 @@ impl App {
         }
         #[cfg(not(a11y_tree))]
         let _ = motion_only;
-        self.note_cells_composed(id, plan);
         true
     }
 
@@ -11036,7 +11028,6 @@ impl App {
         }
         self.paint_pane_headers(id);
         self.splice_tab_strip_with(id, tab_strip);
-        self.note_cells_composed(id, plan);
         Some(title)
     }
 
@@ -11064,7 +11055,7 @@ impl App {
         metrics::note_present_drop(reason, parked);
         #[cfg(a11y_tree)]
         if parked {
-            self.publish_in_a_parked_window(id);
+            self.publish_in_a_parked_window(id, now);
         }
     }
 
@@ -11086,7 +11077,7 @@ impl App {
                 gpu_surface.discard_pending_acquire();
             }
             #[cfg(a11y_tree)]
-            self.publish_in_a_parked_window(window);
+            self.publish_in_a_parked_window(window, Instant::now());
         }
         accepted
     }
@@ -11932,7 +11923,7 @@ impl App {
                 metrics::note_redraw_retry_gated();
                 #[cfg(a11y_tree)]
                 if ws.present_retry.parked {
-                    self.publish_in_a_parked_window(id);
+                    self.publish_in_a_parked_window(id, Instant::now());
                 }
                 return;
             }
@@ -13287,7 +13278,6 @@ impl App {
         let Some(composed) = self.compose_route_chrome(id, route, plan) else {
             return;
         };
-        self.note_cells_composed(id, plan);
         if !multi_pane && let Some(ws) = self.windows.get_mut(&id) {
             ws.capture_leaf_snapshot_seqs.clear();
             ws.capture_leaf_snapshot_seqs
@@ -14648,10 +14638,7 @@ impl App {
             after_extract,
             Some(&mut held_retry_at),
         ) {
-            Some(prepared) => {
-                self.note_cells_composed(wid, &prepared.1);
-                CapturePreparation::Ready(prepared)
-            }
+            Some(prepared) => CapturePreparation::Ready(prepared),
             None => held_retry_at.map_or(CapturePreparation::Unavailable, |retry_at| {
                 CapturePreparation::Held { retry_at }
             }),
@@ -18670,6 +18657,7 @@ impl App {
             // Distinct branch.
             return None; // too narrow to name a site; the row stays the person's
         };
+        let words: String = built.iter().map(|cell| cell.ch).collect();
         let cell_h = self.win_cell_size(wid).1;
         self.splice_band_rows_at(wid, frame_row, vec![built], cols, cell_h);
         self.windows
@@ -18679,6 +18667,7 @@ impl App {
                 session: hover.session,
                 cell: hover.cell,
                 names,
+                words: words.trim().to_owned(),
             })
     }
 

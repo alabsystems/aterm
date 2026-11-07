@@ -57,18 +57,7 @@ pub fn emit(ctx: &mut Ctx, outcome: Outcome, opts: &OutputOpts) -> u8 {
     } = outcome;
     // A write's reports, kept whole: a projection that fails once the write was sent (a
     // `--jq` program's run-time error) must never lose what the write did.
-    let reports = match &answer {
-        Answer::Object {
-            noun: Noun::Write,
-            value,
-        } => Some(value.clone()),
-        Answer::Items {
-            noun: Noun::Write,
-            items,
-            ..
-        } => Some(Value::Array(items.clone())),
-        _ => None,
-    };
+    let mut reports = None;
     let rendered = match answer {
         Answer::FailedWith { value, error } => {
             let bytes = format!("{value}\n");
@@ -84,14 +73,24 @@ pub fn emit(ctx: &mut Ctx, outcome: Outcome, opts: &OutputOpts) -> u8 {
         }
         Answer::Nothing => Ok(None),
         Answer::Bytes(bytes) => refuse_projection_flags(&receipt.verb, opts).map(|()| Some(bytes)),
-        Answer::Object { noun, value } => {
-            Plan::of(opts).and_then(|plan| render_object(noun, &value, &plan, opts).map(Some))
-        }
+        Answer::Object { noun, value } => Plan::of(opts)
+            .and_then(|plan| render_object(noun, &value, &plan, opts).map(Some))
+            .inspect_err(|_| {
+                if noun == Noun::Write {
+                    reports = Some(value);
+                }
+            }),
         Answer::Items {
             noun,
             items,
             completeness,
-        } => render_list(noun, &items, completeness, &mut receipt, opts).map(Some),
+        } => render_list(noun, &items, completeness, &mut receipt, opts)
+            .map(Some)
+            .inspect_err(|_| {
+                if noun == Noun::Write {
+                    reports = Some(Value::Array(items));
+                }
+            }),
         Answer::Files(rows) => render_files(&rows, &mut receipt, opts).map(Some),
     };
     let bytes = match rendered {
@@ -345,19 +344,19 @@ fn render_object(noun: Noun, value: &Value, plan: &Plan, opts: &OutputOpts) -> R
     {
         return render_items(noun, elements, plan, opts);
     }
-    let source = project::with_derived(noun, value);
+    let source = project::with_derived_cow(noun, value);
     let defaults = project::defaults(noun);
     validate(noun, plan, Some(&source))?;
-    let projected = projection(noun, &source, plan, &defaults);
     if let Some(program) = &plan.program {
         let input = if plan.fields.is_some() {
-            projected
+            std::borrow::Cow::Owned(projection(noun, &source, plan, &defaults))
         } else {
-            project::jq_input(noun, value)
+            project::jq_input_cow(noun, value)
         };
         let results = program.run(&input)?;
         return Ok(jq::render_results(&results).into_bytes());
     }
+    let projected = projection(noun, &source, plan, &defaults);
     if opts.raw {
         return Ok(raw_line(&projected, plan).into_bytes());
     }
@@ -370,8 +369,8 @@ fn render_items(noun: Noun, items: &[Value], plan: &Plan, opts: &OutputOpts) -> 
     let defaults = project::defaults(noun);
     let mut sample = items
         .first()
-        .map(|first| project::with_derived(noun, first));
-    validate(noun, plan, sample.as_ref())?;
+        .map(|first| project::with_derived_cow(noun, first));
+    validate(noun, plan, sample.as_deref())?;
     if let Some(program) = &plan.program
         && plan.fields.is_none()
     {
@@ -388,7 +387,7 @@ fn render_items(noun: Noun, items: &[Value], plan: &Plan, opts: &OutputOpts) -> 
     for item in items {
         let source = sample
             .take()
-            .unwrap_or_else(|| project::with_derived(noun, item));
+            .unwrap_or_else(|| project::with_derived_cow(noun, item));
         projected.push(projection(noun, &source, plan, &defaults));
     }
     if let Some(program) = &plan.program {
@@ -451,6 +450,9 @@ pub fn write_stdout(ctx: &mut Ctx, bytes: &[u8], code: u8) -> u8 {
 
 /// Writes one redacted status or receipt line to stderr.
 pub fn note(ctx: &mut Ctx, line: &str) {
+    // The line joins fields, and a context rule read across them matches falsely (a value ending
+    // in `bearer` takes the next field as its token); a value that needs those rules takes them
+    // where it is made (`receipt_line`), so the whole line takes only the context-free ones.
     let text = format!("{}\n", ctx.redactor.learned_and_tokens(line));
     write_stderr(ctx, &text);
 }

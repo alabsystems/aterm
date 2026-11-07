@@ -4729,6 +4729,116 @@ fn an_api_refusal_of_agys_request_is_escalated_never_typed_at() {
     }
 }
 
+/// A REFUSED STATUS ON MUSE CODE'S SCREEN IS A REFUSED REQUEST, NEVER AN OUTAGE: its tries climb
+/// [`TurnEndTiming::refused_backoff`], the same reply holds it after [`FUTILE_AFTER_TRIES`], and
+/// the owner is told it was refused. CONTROL: Muse Code's 500, its rate limit and a refused
+/// connection are still waited out as outages.
+#[test]
+fn a_refused_status_of_muse_codes_takes_the_refused_ladder_never_the_outage_wait() {
+    use super::super::exception::exception_for;
+    use super::super::outlook::ExceptionKind;
+    use aterm_phase::muse::fixtures as u;
+    let t = t0();
+    let point = |fixture: &str, wall: Option<&str>| {
+        let mut rows = screen(fixture);
+        if let Some(msg) = wall {
+            let at = rows
+                .iter()
+                .rposition(|r| r.starts_with("◆ model failed"))
+                .expect("the wall's row");
+            rows[at] = msg.to_string();
+        }
+        let reading = aterm_phase::read(Some("muse"), &rows, None);
+        let r = TurnEndReading::of(&reading, &rows, false, Some(3 * MIN), None, None);
+        assert_eq!(r.program, Program::Muse);
+        r
+    };
+    let outage = |a: &TurnEndAction| {
+        matches!(
+            a,
+            TurnEndAction::WaitUntil {
+                wait: WaitKind::Outage { .. },
+                ..
+            }
+        )
+    };
+    let refused = point(
+        u::SERVER_ERROR_FINAL,
+        Some("◆ model failed: API error 400: bad request (invalid_request_error)"),
+    );
+    let back = TurnEndReading {
+        worked: Some(Duration::from_secs(2)),
+        ..refused.clone()
+    };
+    let same = again(&refused);
+    let mut st = TurnEndState::default();
+    let a = at(&mut st, &refused, t);
+    assert!(
+        !outage(&a) && waits_until(&a, t + MIN),
+        "one cheap try: {a:?}"
+    );
+    let mut now = t + MIN;
+    assert_eq!(
+        act(&mut st, &same, now),
+        retried(RULE_API_RETRY, ApiCause::Request, &same)
+    );
+    for wait in [30, 120] {
+        now += 3 * MIN;
+        let a = at(&mut st, &back, now);
+        assert!(
+            !outage(&a) && waits_until(&a, now + wait * MIN),
+            "{wait} min: {a:?}"
+        );
+        assert_eq!(exception_for(&st, &back, &cfg(), now), None, "{wait} min");
+        now += wait * MIN;
+        assert_eq!(
+            act(&mut st, &same, now),
+            retried(RULE_API_RETRY, ApiCause::Request, &same),
+            "{wait} min"
+        );
+    }
+    now += 3 * MIN;
+    assert_eq!(at(&mut st, &back, now), TurnEndAction::Nothing, "held");
+    let e = exception_for(&st, &back, &cfg(), now).expect("told");
+    assert_eq!(e.kind, ExceptionKind::Refused);
+    assert!(
+        e.why.contains("Muse Code") && !e.why.contains("Claude") && !e.action.contains("Claude"),
+        "the owner reads Muse Code's words: {e:?}"
+    );
+    let first = t + TurnEndTiming::default().outage_first;
+    // The rate limit's first try is at the retry-after its words name (`Please try again in
+    // 5s.`, [`retry_after_of`]), not the ladder's first rung.
+    for (what, r, wall, until) in [
+        (
+            "500",
+            point(u::SERVER_ERROR_FINAL, None),
+            Outage::ApiError,
+            first,
+        ),
+        (
+            "429",
+            point(u::RATE_LIMIT_FINAL, None),
+            Outage::ApiError,
+            t + Duration::from_secs(5),
+        ),
+        (
+            "no status",
+            point(
+                u::SERVER_ERROR_FINAL,
+                Some("◆ model failed: connection refused"),
+            ),
+            Outage::Connection,
+            first,
+        ),
+    ] {
+        let a = at(&mut TurnEndState::default(), &r, t);
+        assert!(
+            outage_waits(&a, until, wall, true),
+            "the control, {what}: {a:?}"
+        );
+    }
+}
+
 fn refused_point(program: &str, fixture: &str) -> TurnEndReading {
     let rows = aterm_phase::prompt::fixtures::screen(fixture);
     let reading = aterm_phase::read(Some(program), &rows, None);
@@ -11860,6 +11970,61 @@ fn advice_to_wait_cuts_the_walls_wait_short_and_never_lengthens_it() {
 }
 
 #[test]
+fn the_hosts_ask_again_at_a_weekly_wall_says_it_is_asked_again() {
+    let t = t0();
+    let weekly = TurnEndReading {
+        wall: Some(WallKind::UsageWeekly),
+        ..session_wall(t)
+    };
+    let due = t + 60 * MIN + GRACE;
+    let today = at(&mut TurnEndState::default(), &weekly, t);
+    assert!(waits_until(&today, due), "{today:?}");
+    let again = |until, why| TurnEndReading {
+        account: Some(AccountAdvice::Again { until, why }),
+        ..weekly.clone()
+    };
+    for (why, said) in [
+        (
+            AskAgain::Unwritten,
+            "the limit's record is not written yet: asked again",
+        ),
+        (AskAgain::Reset, "a limit reset is in flight: asked again"),
+    ] {
+        assert_eq!(
+            at(
+                &mut TurnEndState::default(),
+                &again(t + Duration::from_secs(30), why),
+                t
+            ),
+            TurnEndAction::WaitUntil {
+                until: t + MIN,
+                why: said.to_string(),
+                wait: WaitKind::Other,
+            },
+            "{why:?}"
+        );
+        for until in [due + MIN, due, t, t - MIN] {
+            assert_eq!(
+                at(&mut TurnEndState::default(), &again(until, why), t),
+                today,
+                "control: {why:?} never lengthens the wall's wait, {:?}",
+                until.saturating_duration_since(t)
+            );
+        }
+    }
+    let cut = at(
+        &mut TurnEndState::default(),
+        &advised_wait(&weekly, t + 20 * MIN),
+        t,
+    );
+    assert!(
+        matches!(&cut, TurnEndAction::WaitUntil { why, .. }
+            if why == "another account can be used then"),
+        "control: the roster's own wait keeps its words: {cut:?}"
+    );
+}
+
+#[test]
 fn advice_to_wait_for_the_walls_own_reset_keeps_the_walls_words() {
     let t = t0();
     let wall = session_wall(t);
@@ -12246,6 +12411,40 @@ fn a_lost_login_after_a_move_waits_for_an_account_and_types_nothing() {
     assert!(
         restarts(&a, &to_account("main", AccountAt::Wall), RULE_ACCOUNT),
         "{a:?}"
+    );
+}
+
+#[test]
+fn a_lost_login_while_its_limit_reset_is_in_flight_says_it_is_asked_again() {
+    let t = t0();
+    let gone = walled(
+        WallKind::Auth,
+        "Not logged in · Please run /login",
+        Some(Duration::from_secs(2)),
+    );
+    let reset = |r: &TurnEndReading| TurnEndReading {
+        account: Some(AccountAdvice::Again {
+            until: t + Duration::from_secs(90),
+            why: AskAgain::Reset,
+        }),
+        ..r.clone()
+    };
+    let asked = TurnEndAction::WaitUntil {
+        until: t + 2 * MIN,
+        why: "the login is gone: a limit reset is in flight: asked again".to_string(),
+        wait: WaitKind::Other,
+    };
+    let mut st = moved_and_asked(t);
+    assert_eq!(act(&mut st, &reset(&gone), t + MIN), asked);
+    assert_eq!(st.login_track(), Some(0), "no attempt counted");
+    let superseded = TurnEndReading {
+        login_superseded: true,
+        ..renewable(&gone, "m7-a")
+    };
+    assert_eq!(
+        at(&mut TurnEndState::default(), &reset(&superseded), t + MIN),
+        asked,
+        "a renewed login is not what the ask waits for"
     );
 }
 
@@ -14456,6 +14655,31 @@ fn the_probes_gate_is_true_at_a_plain_idle_point_and_false_with_any_condition_fl
     latched.seed_account_unmade(Unmade::Again, None);
     assert!(!gate(&latched, &again, &cfg()), "a refused move's latch");
     assert_eq!(word(&latched, &again, &cfg()), Some("not-turn-end"));
+    // THE LAND CHECK GOES FIRST: at the defense Land answers with its check, no probe runs, so
+    // no panel comes between the defense and the check whose answer ends the task.
+    let mut landing = TurnEndState::default();
+    assert_eq!(
+        act(
+            &mut landing,
+            &land(idle("Stage 1 landed.", Some(3 * MIN))),
+            t
+        ),
+        land_instruction()
+    );
+    let defended = advised_probe(&land(idle(DEFENSE, Some(3 * MIN))), None);
+    landing.observe(&defended, t + 3 * MIN);
+    let check = decide_turn_end(&landing, &defended, &cfg(), t + 3 * MIN);
+    assert_eq!(check.rule_id(), Some(RULE_LAND_CHECK), "{check:?}");
+    assert!(landing.land_check_owed());
+    assert!(!gate(&landing, &defended, &cfg()), "the land check owed");
+    assert_eq!(word(&landing, &defended, &cfg()), Some("land-check"));
+    // Control: the same defense with no check owed (Cruise, which has none) is a probe's point.
+    let cruising = advised_probe(&idle(DEFENSE, Some(3 * MIN)), None);
+    let mut cruise = TurnEndState::default();
+    act(&mut cruise, &idle("Stage 1 landed.", Some(3 * MIN)), t);
+    cruise.observe(&cruising, t + 3 * MIN);
+    assert!(!cruise.land_check_owed());
+    assert!(gate(&cruise, &cruising, &cfg()), "no land check is owed");
 
     let before = st.clone();
     assert!(gate(&st, &base, &cfg()));
@@ -14466,8 +14690,8 @@ fn the_probes_gate_is_true_at_a_plain_idle_point_and_false_with_any_condition_fl
     );
 
     let policys: std::collections::BTreeSet<&str> =
-        ProbeGate::ALL[..12].iter().map(|g| g.word()).collect();
-    assert_eq!(policys.len(), 12);
+        ProbeGate::ALL[..13].iter().map(|g| g.word()).collect();
+    assert_eq!(policys.len(), 13);
     assert_eq!(*said.borrow(), policys);
     let all: std::collections::BTreeSet<&str> = ProbeGate::ALL.iter().map(|g| g.word()).collect();
     assert_eq!(all.len(), ProbeGate::ALL.len(), "one word a gate");

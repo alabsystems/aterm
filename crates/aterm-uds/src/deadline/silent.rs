@@ -194,6 +194,23 @@ pub fn prints(child: &mut crate::spawnfd::Child, line: &str, hang: Duration) {
     });
 }
 
+/// The longest `test <name> ... ` [`is_proof`] reads before a proof line, bytes.
+const LIBTEST_PREFIX_MAX: u64 = 1024;
+
+/// Whether `got`, one line of a child's output without its newline, is the proof line `wanted`:
+/// the line itself, or the line after libtest's `test <name> ... `. A test binary run again at one
+/// test thread (`--test-threads=1`, or a `RUST_TEST_THREADS=1` it inherits) writes that prefix,
+/// unended, before the test it runs prints anything, so the test's first line follows it on the
+/// same line.
+fn is_proof(got: &[u8], wanted: &[u8]) -> bool {
+    got == wanted
+        || got.strip_suffix(wanted).is_some_and(|before| {
+            before.starts_with(b"test ")
+                && before.ends_with(b" ... ")
+                && before.len() > b"test  ... ".len()
+        })
+}
+
 /// [`prints`], with `held` asked whether the child is held at macOS's program check when `hang` runs out.
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(unix)]
@@ -216,7 +233,7 @@ fn prints_judged(
         let mut from = std::io::BufReader::new(from);
         let limit = u64::try_from(wanted.len())
             .unwrap_or(u64::MAX)
-            .saturating_add(2);
+            .saturating_add(2 + LIBTEST_PREFIX_MAX);
         let mut got = Vec::with_capacity(wanted.len().saturating_add(2));
         loop {
             got.clear();
@@ -236,7 +253,10 @@ fn prints_judged(
                     }
                 },
                 Ok(_) => {
-                    if got.strip_suffix(b"\n") == Some(wanted.as_slice()) {
+                    if got
+                        .strip_suffix(b"\n")
+                        .is_some_and(|got| is_proof(got, &wanted))
+                    {
                         let _ = tx.send(());
                         drop(tx);
                         drop(got);
@@ -883,6 +903,34 @@ mod tests {
             )
         };
         rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
+    }
+
+    /// THE PROOF LINE AT ONE TEST THREAD: a test binary run again at `--test-threads=1` writes
+    /// `test <name> ... ` unended before its test's first line, so the proof follows it on that
+    /// line; the line alone is proof too. NEGATIVE CONTROLS: a line that only ends with the proof,
+    /// one where the proof is followed by more, and the bare prefix with no name are not.
+    #[test]
+    fn a_proof_line_counts_alone_and_after_libtests_one_thread_prefix() {
+        let proof = b"appended";
+        assert!(super::is_proof(b"appended", proof));
+        assert!(super::is_proof(
+            b"test tests::tables::child_append ... appended",
+            proof
+        ));
+        for not in [
+            &b"not appended"[..],
+            b"xappended",
+            b"test tests::tables::child_append ... appended ok",
+            b"test  ... appended",
+            b"test a ...appended",
+            b"",
+        ] {
+            assert!(
+                !super::is_proof(not, proof),
+                "{}",
+                String::from_utf8_lossy(not)
+            );
+        }
     }
 
     /// The pid a run wrote to `mark` (`echo $$ > mark`), once it has written all of it, within

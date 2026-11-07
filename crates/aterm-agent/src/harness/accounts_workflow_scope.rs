@@ -787,7 +787,7 @@ pub(super) fn from_json(doc: &Value) -> Result<(u64, BTreeMap<String, WorkflowCu
 }
 
 impl WorkflowToken {
-    pub(super) const fn value(self) -> u64 {
+    pub(in crate::harness) const fn value(self) -> u64 {
         self.0
     }
     pub(super) const fn from_value(value: u64) -> Self {

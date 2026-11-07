@@ -21,6 +21,36 @@ struct Inputs {
     pending: Option<(u64, InputServiceSet)>,
 }
 
+#[derive(Clone, Copy)]
+enum PendingOwner {
+    Window(fn()),
+    Background,
+}
+
+impl PendingOwner {
+    fn coordinate(
+        self,
+        coordinator: &mut super::input_coordinator::Coordinator,
+        scope: &Result<InputSetupScope, String>,
+        at_console: bool,
+        now: u64,
+        start: impl FnMut(u64) -> Result<Option<std::thread::JoinHandle<()>>, String>,
+        wake: impl Fn(),
+    ) -> Result<(), String> {
+        match self {
+            Self::Background => coordinator.round_with(scope, at_console, now, start, wake),
+            Self::Window(_) => Ok(()),
+        }
+    }
+
+    fn changed(self) -> fn() {
+        match self {
+            Self::Window(wake) => wake,
+            Self::Background => super::wake_setup_facts,
+        }
+    }
+}
+
 impl Inputs {
     fn round(
         &mut self,
@@ -29,7 +59,7 @@ impl Inputs {
         scope: impl FnOnce() -> Result<InputSetupScope, String>,
         services: impl FnOnce() -> Result<Vec<u64>, String>,
         activate: impl FnOnce(u64, &[u64]) -> Result<Option<bool>, String>,
-        pending_changed: Option<&dyn Fn()>,
+        pending_changed: &dyn Fn(),
     ) -> Result<bool, String> {
         if !at_console {
             *self = Self::default();
@@ -47,17 +77,13 @@ impl Inputs {
             }
             InputSetupScope::Pending(revision) => {
                 self.keeper = Keeper::default();
-                let Some(changed) = pending_changed else {
-                    self.pending = None;
-                    return Ok(false);
-                };
                 let current = (revision, InputServiceSet::new(services()?)?);
                 if self.pending.as_ref() != Some(&current) {
                     self.pending = Some(current);
                     // The first sample also nudges: a device can arrive after the parked pass
                     // read its mark but before this observer saw its pending scope. Only the
                     // worker's before/current facts may turn this nudge into another pass.
-                    changed();
+                    pending_changed();
                 }
                 Ok(false)
             }
@@ -155,7 +181,6 @@ impl Keeper {
         }
         if self.attempted.as_ref() != Some(&current) {
             self.retry = RunnerRetry::default();
-            self.attempted = Some(current.clone());
         } else if self
             .retry
             .remaining(now_ms)
@@ -176,8 +201,14 @@ impl Keeper {
             now_ms,
         );
         if matches!(result, Ok(Some(true))) {
+            if self.attempted.as_ref() != Some(&current) {
+                self.attempted = Some(current.clone());
+            }
             self.settled = Some(current);
             return Ok(true);
+        }
+        if self.attempted.as_ref() != Some(&current) {
+            self.attempted = Some(current);
         }
         result.map(|_| false)
     }
@@ -217,9 +248,14 @@ fn node_serve_with<'a, R>(
 }
 
 fn spawn_background() {
-    start_background_with(&aterm_machines::port::Live::new(), || {
-        spawn_with(|| {}, None, None)
-    });
+    spawn_background_with(&aterm_machines::port::Live::new(), spawn_with);
+}
+
+fn spawn_background_with(
+    sys: &dyn aterm_machines::port::System,
+    start: impl FnOnce(fn(), Option<fn() -> Result<(), String>>, PendingOwner),
+) {
+    start_background_with(sys, || start(|| {}, None, PendingOwner::Background));
 }
 
 fn start_background_with(sys: &dyn aterm_machines::port::System, start: impl FnOnce()) {
@@ -242,26 +278,26 @@ pub(super) fn spawn() {
             );
         },
         Some(super::wake_setup_for_console),
-        Some(super::wake_setup_facts),
+        PendingOwner::Window(super::wake_setup_facts),
     );
 }
 
 fn spawn_with(
     changed: fn(),
     console_return: Option<fn() -> Result<(), String>>,
-    pending_changed: Option<fn()>,
+    pending: PendingOwner,
 ) {
     if aterm_types::dirs::runs_under_private_state_root() || std::env::var_os("CI").is_some() {
         return;
     }
     static STARTED: std::sync::Once = std::sync::Once::new();
-    STARTED.call_once(|| spawn_worker(changed, console_return, pending_changed));
+    STARTED.call_once(|| spawn_worker(changed, console_return, pending));
 }
 
 fn spawn_worker(
     changed: fn(),
     console_return: Option<fn() -> Result<(), String>>,
-    pending_changed: Option<fn()>,
+    pending: PendingOwner,
 ) {
     let worker = move || {
         use aterm_machines::port::System as _;
@@ -270,6 +306,7 @@ fn spawn_worker(
         let sys = aterm_machines::port::Live::new();
         let mut inputs = Inputs::default();
         let mut console = ConsoleReturn::default();
+        let mut coordinator = super::input_coordinator::Coordinator::default();
         let mut said = None;
         loop {
             // One current console sample and one canonical input-scope read select accepted
@@ -278,28 +315,32 @@ fn spawn_worker(
             if let Some(wake) = console_return {
                 let _ = console.recover(at_console, wake);
             }
-            let result = inputs.round(
+            let now = u64::try_from(clock.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let scope = aterm_cli::macos_doctor::input_setup_scope();
+            let owned = pending.coordinate(
+                &mut coordinator,
+                &scope,
                 at_console,
-                u64::try_from(clock.elapsed().as_millis()).unwrap_or(u64::MAX),
-                || {
-                    if pending_changed.is_some() {
-                        aterm_cli::macos_doctor::input_setup_scope()
-                    } else {
-                        aterm_cli::macos_doctor::input_activation_revision().map(|revision| {
-                            revision.map_or(InputSetupScope::Inactive, InputSetupScope::Applied)
-                        })
-                    }
-                },
-                || sys.keyboard_service_ids(),
-                |revision, ids| {
-                    aterm_cli::macos_doctor::activate_input_attachments(
-                        revision,
-                        ids,
-                        super::setup_stop_requested,
-                    )
-                },
-                pending_changed.as_ref().map(|wake| wake as &dyn Fn()),
+                now,
+                super::input_coordinator::start,
+                super::wake_setup_facts,
             );
+            let result = owned.and_then(|()| {
+                inputs.round(
+                    at_console,
+                    now,
+                    || scope,
+                    || sys.keyboard_service_ids(),
+                    |revision, ids| {
+                        aterm_cli::macos_doctor::activate_input_attachments(
+                            revision,
+                            ids,
+                            super::setup_stop_requested,
+                        )
+                    },
+                    &pending.changed(),
+                )
+            });
             match result {
                 Ok(true) => {
                     changed();
@@ -328,6 +369,267 @@ fn spawn_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn native_pending_caps(
+        root: &std::path::Path,
+    ) -> (
+        aterm_cli::macos_doctor::InitialSetupAdmissionStopTest<'_>,
+        u64,
+    ) {
+        use aterm_cli::macos_doctor::{
+            InitialSetupAdmissionFault, InitialSetupAdmissionStopTest, SetupNext,
+            input_setup_scope_at,
+        };
+        use aterm_types::macos_setup::{Plan, Selection, Setting};
+
+        let mut selected = Selection::none();
+        selected.set(Setting::CapsLock, true);
+        let mut setup = InitialSetupAdmissionStopTest::startup(root)
+            .unwrap()
+            .with_plan(Plan::from(selected));
+        let revision = setup
+            .persist(InitialSetupAdmissionFault::None)
+            .unwrap()
+            .unwrap();
+        let (report, next) = setup
+            .native_workstation_pass(revision, || {
+                Box::new(InitialSetupAdmissionStopTest::keyboard_system(false))
+            })
+            .unwrap()
+            .unwrap();
+        assert!(report.needs_attention(), "{}", report.to_text());
+        assert_eq!(next, SetupNext::Retry);
+        assert_eq!(
+            input_setup_scope_at(root).unwrap(),
+            InputSetupScope::Pending(revision)
+        );
+        assert_eq!(setup.input_activation_revision().unwrap(), None);
+        (setup, revision)
+    }
+
+    #[test]
+    fn headless_watch_hands_the_original_pending_caps_pass_back_to_a_coordinator_on_attach() {
+        use super::super::input_coordinator::{Coordinator, fixture};
+        use aterm_cli::macos_doctor::{
+            InitialSetupAdmissionStopTest, SetupNext, input_setup_scope_at,
+        };
+        use aterm_machines::port::System as _;
+        use std::sync::atomic::Ordering;
+
+        let positive = aterm_tempfile::tempdir().unwrap();
+        let (ready, revision) = native_pending_caps(positive.path());
+        let (report, next) = ready
+            .native_workstation_pass(revision, || {
+                Box::new(InitialSetupAdmissionStopTest::keyboard_system(true))
+            })
+            .unwrap()
+            .unwrap();
+        assert!(!report.needs_attention(), "{}", report.to_text());
+        assert_eq!(next, SetupNext::Done);
+        assert_eq!(ready.input_activation_revision().unwrap(), Some(revision));
+
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let (setup, revision) = native_pending_caps(dir.path());
+        let mut actor = InitialSetupAdmissionStopTest::keyboard_system(false);
+        actor.terminal = false;
+        let (native, events) = fixture::Native::new(dir.path().to_path_buf());
+        let mut coordinator = Coordinator::default();
+        let mut inputs = Inputs::default();
+        secrets_entry_with(
+            vec![OsString::from("watch")],
+            || {
+                spawn_background_with(&actor, |_, _, owner| {
+                    for attached in [false, true] {
+                        native.attached.store(attached, Ordering::Release);
+                        let scope = input_setup_scope_at(dir.path());
+                        owner
+                            .coordinate(
+                                &mut coordinator,
+                                &scope,
+                                true,
+                                0,
+                                |revision| native.start(revision),
+                                || native.wake(),
+                            )
+                            .unwrap();
+                        let hand_off = || native.wake();
+                        assert!(
+                            !inputs
+                                .round(
+                                    true,
+                                    0,
+                                    || scope,
+                                    || {
+                                        InitialSetupAdmissionStopTest::keyboard_system(attached)
+                                            .keyboard_service_ids()
+                                    },
+                                    |_, _| panic!(
+                                        "a pending pass has no attachment-setter authority"
+                                    ),
+                                    &hand_off,
+                                )
+                                .unwrap()
+                        );
+                        if !attached {
+                            fixture::waiting(&events);
+                        }
+                    }
+                });
+            },
+            |_| {},
+        );
+        fixture::finished(&events, &mut coordinator);
+        assert_eq!(
+            input_setup_scope_at(dir.path()).unwrap(),
+            InputSetupScope::Applied(revision),
+            "the actual owned retry coordinator checkpoints verified Caps in the original run"
+        );
+        assert_eq!(setup.input_activation_revision().unwrap(), Some(revision));
+    }
+
+    #[test]
+    fn headless_watch_never_resumes_a_stopped_native_pending_caps_pass() {
+        use aterm_cli::macos_doctor::{InitialSetupAdmissionStopTest, input_setup_scope_at};
+        use std::cell::Cell;
+
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let (setup, revision) = native_pending_caps(dir.path());
+        setup.stop_revision(revision).unwrap();
+        assert_eq!(
+            input_setup_scope_at(dir.path()).unwrap(),
+            InputSetupScope::Inactive
+        );
+        let actor = InitialSetupAdmissionStopTest::keyboard_system(true);
+        let started = Cell::new(false);
+        let mut inputs = Inputs::default();
+        secrets_entry_with(
+            vec![OsString::from("watch")],
+            || {
+                spawn_background_with(&actor, |_, _, owner| {
+                    started.set(true);
+                    owner
+                        .coordinate(
+                            &mut super::super::input_coordinator::Coordinator::default(),
+                            &input_setup_scope_at(dir.path()),
+                            true,
+                            0,
+                            |_| panic!("Stop withholds coordinator startup"),
+                            || {},
+                        )
+                        .unwrap();
+                    let stopped_handoff = || -> () {
+                        panic!("Stop withholds the coordinator handoff");
+                    };
+                    inputs
+                        .round(
+                            true,
+                            0,
+                            || input_setup_scope_at(dir.path()),
+                            || panic!("Stop withholds the pending hardware read"),
+                            |_, _| panic!("Stop withholds activation"),
+                            &stopped_handoff,
+                        )
+                        .unwrap();
+                })
+            },
+            |_| {},
+        );
+        assert!(started.get(), "the valid local Aqua startup branch ran");
+    }
+
+    #[test]
+    fn the_headless_owner_retains_unchanged_work_until_the_actual_claim_is_released() {
+        use super::super::input_coordinator::{Coordinator, fixture};
+        use aterm_cli::macos_doctor::{claim_initial_setup_rerun_at, input_setup_scope_at};
+        use std::sync::atomic::Ordering;
+
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let (setup, revision) = native_pending_caps(dir.path());
+        let claim = claim_initial_setup_rerun_at(dir.path()).unwrap().unwrap();
+        let (native, events) = fixture::Native::new(dir.path().to_path_buf());
+        native.attached.store(true, Ordering::Release);
+        let actor = aterm_cli::macos_doctor::InitialSetupAdmissionStopTest::keyboard_system(true);
+        let mut coordinator = Coordinator::default();
+        spawn_background_with(&actor, |_, _, owner| {
+            let scope = input_setup_scope_at(dir.path());
+            owner
+                .coordinate(
+                    &mut coordinator,
+                    &scope,
+                    true,
+                    0,
+                    |revision| native.start(revision),
+                    || native.wake(),
+                )
+                .unwrap();
+            drop(claim);
+            // No second attachment or scope change: the existing keeper round retains duty.
+            owner
+                .coordinate(
+                    &mut coordinator,
+                    &scope,
+                    true,
+                    5000,
+                    |revision| native.start(revision),
+                    || native.wake(),
+                )
+                .unwrap();
+        });
+        fixture::finished(&events, &mut coordinator);
+        assert_eq!(setup.input_activation_revision().unwrap(), Some(revision));
+    }
+
+    #[test]
+    fn a_waiting_headless_owner_retires_on_stop_or_completion_without_new_hardware() {
+        use super::super::input_coordinator::{Coordinator, fixture};
+        use aterm_cli::macos_doctor::{InitialSetupAdmissionStopTest, input_setup_scope_at};
+
+        for stopped in [false, true] {
+            let dir = aterm_tempfile::tempdir().unwrap();
+            let (setup, revision) = native_pending_caps(dir.path());
+            let (native, events) = fixture::Native::new(dir.path().to_path_buf());
+            let actor = InitialSetupAdmissionStopTest::keyboard_system(false);
+            let mut coordinator = Coordinator::default();
+            spawn_background_with(&actor, |_, _, owner| {
+                owner
+                    .coordinate(
+                        &mut coordinator,
+                        &input_setup_scope_at(dir.path()),
+                        true,
+                        0,
+                        |revision| native.start(revision),
+                        || native.wake(),
+                    )
+                    .unwrap();
+                fixture::waiting(&events);
+                if stopped {
+                    setup.stop_revision(revision).unwrap();
+                } else {
+                    setup
+                        .native_workstation_pass(revision, || {
+                            Box::new(InitialSetupAdmissionStopTest::keyboard_system(true))
+                        })
+                        .unwrap()
+                        .unwrap();
+                }
+                owner
+                    .coordinate(
+                        &mut coordinator,
+                        &input_setup_scope_at(dir.path()),
+                        true,
+                        0,
+                        |_| panic!("retired work must never start again"),
+                        || native.wake(),
+                    )
+                    .unwrap();
+            });
+            fixture::finished(&events, &mut coordinator);
+            assert_eq!(
+                setup.input_activation_revision().unwrap(),
+                (!stopped).then_some(revision)
+            );
+        }
+    }
 
     #[test]
     fn pending_first_caps_nudges_only_facts_for_its_actual_admitted_scope() {
@@ -358,7 +660,7 @@ mod tests {
                 scope,
                 || Ok(ids),
                 |_, _| panic!("pending observation has no setter authority"),
-                Some(&changed),
+                &changed,
             )
         };
         let before = wakes.marks();
@@ -393,19 +695,6 @@ mod tests {
         assert!(!first_after_attach.refreshed_since(before));
         assert!(!first_after_attach.checked_since(before));
 
-        let mut headless = Inputs::default();
-        assert!(
-            !headless
-                .round(
-                    true,
-                    0,
-                    scope,
-                    || panic!("headless accepted-setting keeper polls no pending hardware"),
-                    |_, _| panic!("pending headless setup does not activate"),
-                    None
-                )
-                .unwrap()
-        );
         assert!(
             !inputs
                 .round(
@@ -414,7 +703,7 @@ mod tests {
                     || panic!("another console reads no setup scope"),
                     || panic!("another console reads no hardware"),
                     |_, _| panic!("another console activates nothing"),
-                    Some(&changed)
+                    &changed
                 )
                 .unwrap()
         );
@@ -428,7 +717,7 @@ mod tests {
                     scope,
                     || panic!("Stop withdraws even pending hardware observation"),
                     |_, _| panic!("Stop withdraws activation"),
-                    Some(&changed)
+                    &changed
                 )
                 .unwrap()
         );

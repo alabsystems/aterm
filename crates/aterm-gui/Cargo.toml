@@ -499,6 +499,8 @@ aterm-grid = { workspace = true }
 aterm-keeper = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
+# Compare automatic setup admission with its actual CLI item, using the inert System port.
+aterm-machines = { workspace = true }
 # Run the Linux notification queue's Unix wire/client seam against a private
 # Rust socket-pair endpoint; this adds no D-Bus edge to shipped macOS builds.
 aterm-dbus = { workspace = true }
@@ -528,6 +530,7 @@ aterm-win32 = { workspace = true }
 # Windows since LW.3 (`present/win32.rs`, GDI over aterm-win32 above).
 
 [target.'cfg(unix)'.dependencies]
+aterm-toolchain = { path = "../aterm-toolchain" }
 # The mesh logs and their relay (docs/DESIGN-alab-one-mesh-2026-11-05.md §11 B7a): the node job
 # hosts tables.log and metrics.log, serves their `Bus` streams and relays them to its neighbours.
 aterm-mesh = { workspace = true }

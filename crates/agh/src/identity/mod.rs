@@ -566,7 +566,7 @@ pub(crate) fn symlink_remedy(dir: &Path, name: &str, home: &Path, held: Held<'_>
         }
         (Held::Config(_), Some(real)) => format!(
             "pass --config {}",
-            shell_word(&tilde(&real.join(name), home))
+            shell_word(tilde(&real.join(name), home))
         ),
         (Held::Config(_), None) => format!(
             "keep {name} in a directory of yours that only you can open, and pass --config \
@@ -610,17 +610,17 @@ pub(crate) fn tilde(path: &Path, home: &Path) -> String {
 /// one of `[A-Za-z0-9_./+-]` (after a leading `~/`) unchanged, else single-quoted with each
 /// `'` written `'\''`.
 #[cfg(unix)]
-fn shell_word(text: &str) -> String {
+fn shell_word(text: String) -> String {
     if text == "~" {
-        return text.to_string();
+        return text;
     }
     let (head, rest) = match text.strip_prefix("~/") {
         Some(rest) => ("~/", rest),
-        None => ("", text),
+        None => ("", text.as_str()),
     };
     let plain = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'/' | b'+' | b'-');
     if !rest.is_empty() && rest.bytes().all(plain) {
-        return text.to_string();
+        return text;
     }
     format!("{head}'{}'", rest.replace('\'', "'\\''"))
 }
@@ -633,7 +633,7 @@ fn loose_remedy(profile: &Profile, home: &Path) -> Option<String> {
         return None;
     };
     let dir = file.parent()?;
-    let file_text = shell_word(&tilde(file, home));
+    let file_text = shell_word(tilde(file, home));
     let provision = format!(
         "agh auth add {} --tier {} --stdin < {file_text}",
         profile.name,
@@ -671,7 +671,7 @@ pub(crate) fn chmod_remedy(dir: &Path, file: &Path, home: &Path) -> Option<Strin
         PrivateFix::Fix(fix) => Some(fix),
         PrivateFix::NotAFile => Some(format!(
             "{} must be a regular file",
-            shell_word(&tilde(file, home))
+            shell_word(tilde(file, home))
         )),
         PrivateFix::NoChmod | PrivateFix::Unseen => None,
     }
@@ -699,10 +699,7 @@ pub(crate) fn private_fix(dir: &Path, file: &Path, home: &Path, held: Held<'_>) 
     if dir_mode.is_some() && never_narrowed(dir, home, held) {
         return PrivateFix::NoChmod;
     }
-    let (dir_text, file_text) = (
-        shell_word(&tilde(dir, home)),
-        shell_word(&tilde(file, home)),
-    );
+    let (dir_text, file_text) = (shell_word(tilde(dir, home)), shell_word(tilde(file, home)));
     let mut fix = Vec::new();
     let mut inverse = Vec::new();
     if let Some(mode) = dir_mode {
@@ -712,7 +709,7 @@ pub(crate) fn private_fix(dir: &Path, file: &Path, home: &Path, held: Held<'_>) 
     let mut then = None;
     match &file_meta {
         Some(meta) if meta.file_type().is_file() && (meta.uid() != ours || meta.nlink() > 1) => {
-            let copy = shell_word(&format!("{}.new", tilde(file, home)));
+            let copy = shell_word(format!("{}.new", tilde(file, home)));
             then = Some(format!(
                 "replace {file_text} with a private copy of your own: cp {file_text} {copy} \
                  && chmod 600 {copy} && mv {copy} {file_text}"

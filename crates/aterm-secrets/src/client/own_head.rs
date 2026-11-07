@@ -37,7 +37,7 @@
 use super::ledger_publish::{MergedHeads, ObservedHead};
 use super::*;
 use crate::membership_log::{Body, EpochAudience, Log};
-use crate::swarm_roster::{Newcomer, SheetHints, SwarmPolicy, SwarmRoster, assign_newcomer};
+use crate::swarm_roster::SwarmRoster;
 
 /// The most the attempt mark ([`Paths::carry_tried_file`]) holds.
 const MAX_TRIED: usize = 4096;
@@ -363,12 +363,12 @@ pub(super) fn carry_rows(
     Ok(true)
 }
 
-/// Put `recipient`'s row from `own_roster` into `roster` under the name `name`: its label where no
-/// row holds that label or alias and no deny list names it or its node, else a fresh label as an
-/// approval assigns one.
+/// Put `recipient`'s historical row from `own_roster` into `roster` under the name `name` where
+/// no deny list names it or its node. No new label is assigned:
+/// only the immutable historical evidence is carried until the denial migration.
 fn carry_roster_row(
     roster: &mut SwarmRoster,
-    doc: &Document,
+    _doc: &Document,
     own_roster: Option<&SwarmRoster>,
     recipient: &str,
     name: &str,
@@ -378,41 +378,22 @@ fn carry_roster_row(
     }
     let row = own_roster.and_then(|own| own.member_by_recipient(recipient).cloned());
     if let Some(mut row) = row {
-        let label_free = roster.member_by_label_or_alias(&row.label).is_none()
-            && !roster.is_label_denied(&row.label)
-            && row.aliases.iter().all(|alias| {
-                roster.member_by_label_or_alias(alias).is_none() && !roster.is_label_denied(alias)
-            })
+        let not_denied = !roster.is_label_denied(&row.label)
+            && row
+                .aliases
+                .iter()
+                .all(|alias| !roster.is_label_denied(alias))
             && !row
                 .node_id
                 .iter()
                 .chain(row.node_key.iter())
                 .any(|node| roster.is_node_denied(node));
-        if label_free {
+        if not_denied {
             row.vault_name = name.to_owned();
             roster.members.push(row);
             roster.canonicalize();
-            return;
         }
     }
-    let policy = SwarmPolicy::from_document(doc)
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    let sheet = SheetHints::from_document(doc);
-    assign_newcomer(
-        roster,
-        doc,
-        &policy,
-        &sheet,
-        &[],
-        Newcomer {
-            recipient,
-            requested_host: name,
-            vault_name: name,
-            now_ms: aterm_time::unix_millis().unwrap_or(0),
-        },
-    );
 }
 
 /// Keep `sealed`, a version this Mac sealed that a server took, as its own last version, unless

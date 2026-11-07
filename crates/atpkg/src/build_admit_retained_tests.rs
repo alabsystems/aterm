@@ -6,7 +6,10 @@
 use super::*;
 use crate::build_admit::{self, Admission, Seat, service::Owner};
 use crate::build_cache::Tool;
-use aterm_capacity::{Admit, Fixed, Ledger, Pace, Reading, cohort_namespace::Namespace};
+use aterm_capacity::{
+    Admit, CohortClaimState, CohortClosureRef, Fixed, Ledger, Pace, Reading,
+    cohort_namespace::Namespace,
+};
 use aterm_uds::spawnfd::{Stdio, command};
 use std::{
     path::Path,
@@ -63,6 +66,26 @@ fn held(world: &Path, seat: &Seat<'_>) -> Held {
     match build_admit::admit_cohort_job(&build, world, seat, &mut |_| {}) {
         Admission::Claimed(held) => *held,
         other => panic!("private retained admission: {other:?}"),
+    }
+}
+
+/// `Some` once the claim `reference` was retired by its owner's drop or the reaper it was
+/// handed to, never by this look: whether it is still active is read without its record's
+/// mutation lock, which a drop that meets it leaves held, and leaves the claim to a reaping
+/// scan. A non-reaping read then confirms the closure from the archive, once the retiring
+/// drop has let go of its archive slot.
+fn retired(seat: &Seat<'_>, reference: &CohortClosureRef) -> Option<()> {
+    let ledger = seat.ledger.as_ref().unwrap();
+    if ledger.cohort_claim_listed(reference).unwrap() {
+        return None;
+    }
+    match ledger.cohort_claim_state(reference) {
+        Ok(state) => {
+            assert_eq!(state, CohortClaimState::Closed);
+            Some(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => None,
+        Err(error) => panic!("retired cohort claim's archive: {error}"),
     }
 }
 
@@ -293,8 +316,10 @@ fn owner_and_background(world: &Path, seat: &Seat<'_>) {
     let (retained, drops) = guard();
     let mut target = command("/bin/cat");
     target.stdin(Stdio::null());
+    let held = held(world, seat);
+    let reference = held.claim.cohort_closure_ref().unwrap();
     let accepted = owner
-        .submit_retained(held(world, seat), &mut target, Duration::ZERO, retained)
+        .submit_retained(held, &mut target, Duration::ZERO, retained)
         .unwrap();
     accepted.publication.unwrap();
     drop(owner.controller());
@@ -306,7 +331,11 @@ fn owner_and_background(world: &Path, seat: &Seat<'_>) {
     aterm_spec::wait::until_within(
         aterm_spec::wait::MUST_HAPPEN,
         "retained background settlement",
-        || (drops.load(Ordering::SeqCst) == 1).then_some(()),
+        || {
+            (drops.load(Ordering::SeqCst) == 1)
+                .then(|| retired(seat, &reference))
+                .flatten()
+        },
     );
 }
 
@@ -533,6 +562,13 @@ fn sdk_cache_bundle_until_reaper_finish(world: &Path, seat: &Seat<'_>) {
     assert!(snapshot[0].retained_resources && snapshot[0].settlement_failure.is_some());
     assert_held(1);
 
+    let reference = jobs.jobs[&ticket.id.sequence]
+        .held
+        .as_ref()
+        .unwrap()
+        .claim
+        .cohort_closure_ref()
+        .unwrap();
     // The root is already positively reaped. Drop must transfer the actual
     // member claim and both guards to the existing reaper, not unlock either.
     drop(jobs);
@@ -543,12 +579,7 @@ fn sdk_cache_bundle_until_reaper_finish(world: &Path, seat: &Seat<'_>) {
         aterm_spec::wait::MUST_HAPPEN,
         "native SDK/cache bundle and cohort settlement",
         || {
-            match seat.ledger.as_ref().unwrap().list() {
-                Ok(records) if records.is_empty() => {}
-                Ok(_) => return None,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return None,
-                Err(error) => panic!("private cohort settlement observation: {error}"),
-            }
+            retired(seat, &reference)?;
             let crate::lease::Reclaim::Clear(reclaimed) = crate::lease::reclaim(&prefix, &subject)
             else {
                 return None;

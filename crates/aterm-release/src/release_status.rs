@@ -124,19 +124,21 @@ impl Events {
             .open_stages
             .iter()
             .map(|(index, stage)| {
-                let mut value = aterm_json::json!({"stage_index":index,"stage":stage.title});
+                let mut fields = aterm_json::Map::from([
+                    ("stage_index".to_string(), (*index).into()),
+                    ("stage".to_string(), stage.title.clone().into()),
+                ]);
                 if let Some(started) = stage.started_at_unix_ms {
-                    let fields = value.as_object_mut().expect("stage is an object");
                     fields.insert("started_at_unix_ms".into(), started.into());
                     fields.insert(
                         "elapsed_wall_ms".into(),
                         now.and_then(|now| now.checked_sub(started)).into(),
                     );
                 }
-                value
+                aterm_json::Value::Object(fields)
             })
             .collect();
-        aterm_json::json!(stages)
+        aterm_json::Value::Array(stages)
     }
 }
 
@@ -457,31 +459,90 @@ pub fn run(repo: &Path, json: bool) -> Result<(), Error> {
         .transpose()
         .map_err(Error::new)?
         .flatten();
-    let value = aterm_json::json!({
-        "schema": 1,
-        "state": state,
-        "journal_finished": journal.as_ref().is_some_and(crate::release::Journal::finished),
-        "measurement_exception": measurement_exception,
-        "journal": journal,
-        "journal_binding": journals.binding,
-        "previous_journal": journals.previous,
-        "pid": holder.as_ref().map(|holder| holder.pid),
-        "step": step,
-        "release_log": transcript,
-        "release_events": release_events.count,
-        "latest_release_event": release_events.latest,
-        "observations_complete": events.rejected_lines == 0 && release_events.rejected_lines == 0
-            && !events.incomplete_tail && !release_events.incomplete_tail,
-        "logs": logs,
-        "operational_status": operational_status(logs.as_deref()),
-        "verification_log": log,
-        "verification_events": events.count,
-        "unfinished_verification_stages": events.unfinished_stages(),
-        "first_reported_failure": events.first_failure.or(release_events.first_failure),
-        "latest_verification_event": events.latest,
-        "rejected_log_lines": events.rejected_lines.saturating_add(release_events.rejected_lines),
-        "timeline": timeline,
-    });
+    let unfinished_verification_stages = events.unfinished_stages();
+    let observations_complete = events.rejected_lines == 0
+        && release_events.rejected_lines == 0
+        && !events.incomplete_tail
+        && !release_events.incomplete_tail;
+    let rejected_log_lines = events
+        .rejected_lines
+        .saturating_add(release_events.rejected_lines);
+    let first_reported_failure = events
+        .first_failure
+        .or(release_events.first_failure)
+        .unwrap_or(aterm_json::Value::Null);
+    let latest_release_event = release_events.latest.unwrap_or(aterm_json::Value::Null);
+    let latest_verification_event = events.latest.unwrap_or(aterm_json::Value::Null);
+    let op_status = operational_status(logs.as_deref());
+    let value = aterm_json::Value::Object(aterm_json::Map::from([
+        ("schema".to_string(), aterm_json::Value::Number(1u64.into())),
+        (
+            "state".to_string(),
+            aterm_json::Value::String(state.to_string()),
+        ),
+        (
+            "journal_finished".to_string(),
+            aterm_json::Value::Bool(
+                journal
+                    .as_ref()
+                    .is_some_and(crate::release::Journal::finished),
+            ),
+        ),
+        (
+            "measurement_exception".to_string(),
+            aterm_json::json!(measurement_exception),
+        ),
+        ("journal".to_string(), aterm_json::json!(journal)),
+        (
+            "journal_binding".to_string(),
+            aterm_json::Value::String(journals.binding.to_string()),
+        ),
+        (
+            "previous_journal".to_string(),
+            aterm_json::json!(journals.previous),
+        ),
+        (
+            "pid".to_string(),
+            holder.as_ref().map_or(aterm_json::Value::Null, |holder| {
+                aterm_json::Value::Number((holder.pid as u64).into())
+            }),
+        ),
+        (
+            "step".to_string(),
+            step.map_or(aterm_json::Value::Null, aterm_json::Value::String),
+        ),
+        ("release_log".to_string(), aterm_json::json!(transcript)),
+        (
+            "release_events".to_string(),
+            aterm_json::Value::Number((release_events.count as u64).into()),
+        ),
+        ("latest_release_event".to_string(), latest_release_event),
+        (
+            "observations_complete".to_string(),
+            aterm_json::Value::Bool(observations_complete),
+        ),
+        ("logs".to_string(), aterm_json::json!(logs)),
+        ("operational_status".to_string(), op_status),
+        ("verification_log".to_string(), aterm_json::json!(log)),
+        (
+            "verification_events".to_string(),
+            aterm_json::Value::Number((events.count as u64).into()),
+        ),
+        (
+            "unfinished_verification_stages".to_string(),
+            unfinished_verification_stages,
+        ),
+        ("first_reported_failure".to_string(), first_reported_failure),
+        (
+            "latest_verification_event".to_string(),
+            latest_verification_event,
+        ),
+        (
+            "rejected_log_lines".to_string(),
+            aterm_json::Value::Number((rejected_log_lines as u64).into()),
+        ),
+        ("timeline".to_string(), timeline),
+    ]));
     if json {
         println!("{value}");
     } else {
@@ -593,7 +654,15 @@ fn operational_status(logs: Option<&Path>) -> aterm_json::Value {
         }
         Ok(record)
     })();
-    result.unwrap_or_else(|reason| aterm_json::json!({"state":"unknown","reason":reason}))
+    result.unwrap_or_else(|reason| {
+        aterm_json::Value::Object(aterm_json::Map::from([
+            (
+                "state".to_string(),
+                aterm_json::Value::String("unknown".to_string()),
+            ),
+            ("reason".to_string(), aterm_json::Value::String(reason)),
+        ]))
+    })
 }
 
 #[cfg(test)]

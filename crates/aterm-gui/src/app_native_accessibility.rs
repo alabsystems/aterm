@@ -11,6 +11,14 @@ use crate::native_accessibility::{
 use crate::native_app::{ActionInvocation, AppEvent};
 use crate::tab_model::{View, ViewId};
 use crate::{App, WindowId};
+#[cfg(a11y_tree)]
+use std::time::Instant;
+
+/// How often a window that cannot present tells a client. No frame paces it, and a program's output
+/// would otherwise rebuild the tree on each wake, a few milliseconds apart. A person hears nothing
+/// faster than this.
+#[cfg(a11y_tree)]
+const PARKED_TELL_PACE: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// A view's compile, and where it sits on its window.
 type NativeAccessibilitySource<'a> = (
@@ -98,33 +106,111 @@ impl App {
         }
     }
 
-    /// Send a client what a window that cannot present owes it.
+    /// Send a client what a window that cannot present owes it, at most once per
+    /// [`PARKED_TELL_PACE`]; a question that comes sooner falls due at the pace instead, so a
+    /// stream's last bytes are told.
     ///
     /// No frame will publish here. A tree the failed frame staged would wait for a present that is
     /// not coming, and a page that moved by itself, under a file reloaded beneath it say, would
     /// leave the client's tree behind it: its next selection would land at old offsets in the new
     /// text. With neither there is nothing to send, since a raster that holds the model says what
-    /// the client already read, shown or not. An overlay's tree does not follow the page.
+    /// the client already read, shown or not. A window that reads differently from what its client
+    /// holds tells it the same way. An overlay's tree does not follow the page.
     #[cfg(a11y_tree)]
-    pub(crate) fn publish_in_a_parked_window(&mut self, wid: WindowId) {
-        let Some(window) = self.windows.get(&wid) else {
+    pub(crate) fn publish_in_a_parked_window(&mut self, wid: WindowId, now: Instant) {
+        let Some(window) = self.windows.get_mut(&wid) else {
             return;
         };
-        if window.overlay.is_some() {
+        if window.overlay.is_some() || !window.a11y_active {
             return;
         }
+        if let Some(next) = window.a11y_parked_next.filter(|next| now < *next) {
+            window.a11y_parked_due = Some(next);
+            return;
+        }
+        let next = now + PARKED_TELL_PACE;
+        window.a11y_parked_next = Some(next);
+        window.a11y_parked_due = None;
         let staged = window.native_a11y_staged.is_some();
         let Some(plan) = self.active_visible_leaf_plan(wid) else {
             return;
         };
+        if self.waits_out_an_update(wid, &plan, next) {
+            return;
+        }
         let moved = plan.leaves.iter().any(|leaf| {
             matches!(self.view_store.get(leaf.view), Some(View::Native(_)))
                 && self
                     .retained_native_leaf_artifact_from_plan(wid, leaf.view, false, &plan)
                     .is_none()
         });
-        if staged || moved {
+        if staged || moved || self.reads_differ(wid, &plan) {
             self.push_a11y_tree(wid);
+        }
+    }
+
+    /// Whether window `wid` holds its tell for a synchronized update, as a frame waits one out:
+    /// until `next`, and as the screen stands after that.
+    #[cfg(a11y_tree)]
+    fn waits_out_an_update(
+        &mut self,
+        wid: WindowId,
+        plan: &crate::tab_model::VisibleLeafPlan,
+        next: Instant,
+    ) -> bool {
+        let open_update = plan.leaves.iter().any(|leaf| {
+            self.view_store
+                .get(leaf.view)
+                .copied()
+                .and_then(View::terminal_session)
+                .and_then(|session| self.pool.shown(session))
+                .is_some_and(|(term, owner)| {
+                    let site = crate::metrics::TermWaitSite::Redraw;
+                    crate::term_lock_ui(&term, &owner.ctx.ui_waiting, site)
+                        .modes()
+                        .synchronized_output()
+                })
+        });
+        let Some(window) = self.windows.get_mut(&wid) else {
+            return true;
+        };
+        let waits = open_update && !window.a11y_parked_held;
+        window.a11y_parked_held = waits;
+        if waits {
+            window.a11y_parked_due = Some(next);
+        }
+        waits
+    }
+
+    /// Whether window `wid` reads differently from what its client holds.
+    #[cfg(a11y_tree)]
+    fn reads_differ(&self, wid: WindowId, plan: &crate::tab_model::VisibleLeafPlan) -> bool {
+        let reads = self.client_reads(wid, Some(plan));
+        self.windows
+            .get(&wid)
+            .is_some_and(|window| window.a11y_reads != reads)
+    }
+
+    /// Runs each parked window's read that its pace held back and that has fallen due.
+    #[cfg(a11y_tree)]
+    pub(crate) fn serve_parked_tells(&mut self, now: Instant) {
+        let due: Vec<WindowId> = self
+            .windows
+            .iter_mut()
+            .filter(|(_, window)| window.a11y_parked_due.is_some_and(|at| at <= now))
+            .map(|(wid, window)| {
+                window.a11y_parked_due = None;
+                *wid
+            })
+            .collect();
+        for wid in due {
+            if self
+                .windows
+                .get(&wid)
+                .is_some_and(|window| window.present_retry.parked)
+            {
+                self.publish_in_a_parked_window(wid, now);
+            }
         }
     }
 
@@ -1864,6 +1950,432 @@ mod tests {
         }
     }
 
+    /// A window with a tab strip, a client and words on the terminal's top row, a frame presented.
+    fn presented_terminal_under_a_strip() -> (App, WindowId) {
+        let mut app = crate::scripted_redraw_fixture::scripted_app();
+        let wid = WindowId(0);
+        app.tab_strip_rows = 1;
+        app.windows.get_mut(&wid).unwrap().a11y_active = true;
+        crate::scripted_redraw_fixture::feed(&app, b"top row words");
+        app.redraw_window(wid);
+        (app, wid)
+    }
+
+    /// The document a client holds in window `wid`, whole: every row, the top one first.
+    fn assert_the_whole_terminal(app: &App, wid: WindowId, why: &str) {
+        let sent = app.windows[&wid].a11y_sent.last().expect("a tree");
+        let text = terminal_text(sent);
+        assert_eq!(text.len(), 1, "{why}: {text:?}");
+        assert!(text[0].starts_with("top row words"), "{why}: {text:?}");
+        assert_eq!(
+            text[0].lines().count(),
+            usize::from(app.windows[&wid].rows),
+            "{why}: {text:?}"
+        );
+    }
+
+    /// A redraw that proves nothing changed leaves the cells without their strip, and a read after
+    /// it must still start at the terminal's top row.
+    #[test]
+    fn a_read_after_a_redraw_that_changed_nothing_keeps_the_top_row() {
+        let (mut app, wid) = presented_terminal_under_a_strip();
+        let proved = app.windows[&wid].redraws_proved_unchanged;
+
+        app.redraw_window(wid);
+
+        assert!(
+            app.windows[&wid].redraws_proved_unchanged > proved,
+            "CONTROL"
+        );
+        app.push_a11y_tree(wid);
+        assert_the_whole_terminal(&app, wid, "after an unchanged redraw");
+    }
+
+    /// A frame held for a synchronized update stops before it composes, as above.
+    #[test]
+    fn a_read_during_a_synchronized_update_keeps_the_top_row() {
+        let (mut app, wid) = presented_terminal_under_a_strip();
+        crate::scripted_redraw_fixture::feed(&app, b"\x1b[?2026h");
+
+        app.redraw_window(wid);
+        app.push_a11y_tree(wid);
+
+        assert_the_whole_terminal(&app, wid, "during a held frame");
+    }
+
+    /// A terminal's document reads the rows on screen, its caret where it is drawn.
+    #[test]
+    fn a_document_reads_the_view_and_a_hidden_caret_is_none() {
+        let app = crate::scripted_redraw_fixture::scripted_app();
+        let wid = WindowId(0);
+        let session = app.front_terminal(wid).unwrap().session;
+        let (rows, cols) = (usize::from(app.windows[&wid].rows), 40);
+        for row in 0..rows + 3 {
+            crate::scripted_redraw_fixture::feed(&app, format!("row {row}\r\n").as_bytes());
+        }
+        let read = |app: &App, focused| {
+            app.terminal_document(wid, session, rows, cols, focused)
+                .expect("the document")
+                .snap
+        };
+        let live = read(&app, true);
+        assert!(live.value().starts_with("row 4\n"), "{}", live.value());
+        assert!(
+            live.cursor.is_some(),
+            "CONTROL: the live view has its caret"
+        );
+        assert_eq!(read(&app, false).cursor, None, "an unfocused pane has none");
+        crate::scripted_redraw_fixture::feed(&app, b"abcde");
+        assert!(
+            read(&app, true).cursor.is_some(),
+            "CONTROL: it fits this view"
+        );
+        let narrow = app.terminal_document(wid, session, rows, 3, true).unwrap();
+        assert_eq!(
+            narrow.snap.cursor, None,
+            "a caret past the view's columns is not drawn"
+        );
+
+        let term = app.front_terminal(wid).unwrap().term.clone();
+        crate::term_lock(&term).scroll_display(2);
+        let back = read(&app, true);
+        assert!(back.value().starts_with("row 2\n"), "{}", back.value());
+        assert_eq!(back.cursor, None, "the caret is below the rows in view");
+        crate::term_lock(&term).scroll_display(-2);
+
+        crate::scripted_redraw_fixture::feed(&app, b"\x1b[?25l");
+        assert_eq!(read(&app, true).cursor, None, "a hidden caret");
+    }
+
+    /// A tab that comes to the front in a window that cannot present reaches its client whole, with
+    /// no empty document on the way, and the window has nothing more to send.
+    #[test]
+    fn a_tab_switch_in_a_window_that_cannot_present_reads_its_terminal() {
+        let mut app = crate::scripted_redraw_fixture::scripted_app();
+        let wid = WindowId(0);
+        crate::scripted_redraw_fixture::feed(&app, b"text of the first tab");
+        let second = app.next_session_id;
+        app.push_stub_tab(wid, crate::stub_session(second));
+        crate::term_lock(&app.pool.get(second).unwrap().term).process(b"text of the second tab");
+        app.switch_tab_in(wid, 0);
+        app.redraw_window(wid);
+        let window = app.windows.get_mut(&wid).unwrap();
+        window.a11y_active = true;
+        window.bootstrap_present_retry_available = false;
+        app.rearm_dropped_present(wid, crate::metrics::PresentDropReason::GpuOccluded);
+        assert!(app.windows[&wid].present_retry.parked, "CONTROL");
+        app.windows.get_mut(&wid).unwrap().a11y_sent.clear();
+
+        app.switch_tab_in(wid, 1);
+        app.push_a11y_tree(wid);
+        app.rearm_dropped_present(wid, crate::metrics::PresentDropReason::GpuOccluded);
+        app.redraw_window(wid);
+
+        let sent = &app.windows[&wid].a11y_sent;
+        assert_eq!(sent.len(), 1, "the press's publish and no other");
+        let text = terminal_text(&sent[0]);
+        assert_eq!(text.len(), 1, "{text:?}");
+        assert!(text[0].contains("text of the second tab"), "{text:?}");
+    }
+
+    /// A window with a client and a terminal that holds `earlier words`, parked with nothing owed.
+    fn parked_terminal() -> (App, WindowId) {
+        let mut app = crate::scripted_redraw_fixture::scripted_app();
+        let wid = WindowId(0);
+        crate::scripted_redraw_fixture::feed(&app, b"earlier words");
+        park(&mut app, wid);
+        (app, wid)
+    }
+
+    fn park(app: &mut App, wid: WindowId) {
+        app.redraw_window(wid);
+        let window = app.windows.get_mut(&wid).unwrap();
+        window.a11y_active = true;
+        window.bootstrap_present_retry_available = false;
+        app.push_a11y_tree(wid);
+        app.rearm_dropped_present(wid, crate::metrics::PresentDropReason::GpuOccluded);
+        assert!(app.windows[&wid].present_retry.parked, "CONTROL");
+        app.windows.get_mut(&wid).unwrap().a11y_sent.clear();
+    }
+
+    /// Asks the parked window once its pace allows, and returns what its client was sent.
+    fn asked_at_the_pace(app: &mut App, wid: WindowId) -> Vec<aterm_a11y::model::TreeUpdate> {
+        let at = app.windows[&wid]
+            .a11y_parked_next
+            .expect("parking read the window");
+        app.publish_in_a_parked_window(wid, at);
+        std::mem::take(&mut app.windows.get_mut(&wid).unwrap().a11y_sent)
+    }
+
+    /// A terminal that prints in a window that cannot present tells its client once.
+    #[test]
+    fn a_terminal_that_prints_in_a_parked_window_tells_its_client_once() {
+        let (mut app, wid) = parked_terminal();
+        assert!(
+            asked_at_the_pace(&mut app, wid).is_empty(),
+            "nothing printed"
+        );
+
+        crate::scripted_redraw_fixture::feed(&app, b" and later words");
+
+        let sent = asked_at_the_pace(&mut app, wid);
+        assert_eq!(sent.len(), 1, "told");
+        let text = terminal_text(&sent[0]);
+        assert!(
+            text[0].contains("earlier words and later words"),
+            "{text:?}"
+        );
+        assert!(asked_at_the_pace(&mut app, wid).is_empty(), "and only once");
+    }
+
+    /// No frame paces a parked window, so a stream is told at the pace, and what its last wake
+    /// could not tell falls due with nothing further to wake it.
+    #[test]
+    fn a_stream_in_a_parked_window_is_told_at_the_pace_to_its_last_bytes() {
+        let (mut app, wid) = parked_terminal();
+        crate::scripted_redraw_fixture::feed(&app, b" first");
+        assert_eq!(asked_at_the_pace(&mut app, wid).len(), 1, "CONTROL");
+        let next = app.windows[&wid].a11y_parked_next.unwrap();
+        let soon = next - PARKED_TELL_PACE / 2;
+
+        for bytes in [&b" second"[..], b" third", b" fourth"] {
+            crate::scripted_redraw_fixture::feed(&app, bytes);
+            app.publish_in_a_parked_window(wid, soon);
+        }
+
+        assert!(app.windows[&wid].a11y_sent.is_empty(), "held to the pace");
+        assert_eq!(app.windows[&wid].a11y_parked_due, Some(next));
+        app.serve_parked_tells(soon);
+        assert!(
+            app.windows[&wid].a11y_sent.is_empty(),
+            "not before it is due"
+        );
+
+        app.serve_parked_tells(next);
+
+        let sent = &app.windows[&wid].a11y_sent;
+        assert_eq!(sent.len(), 1, "one tell");
+        assert!(terminal_text(&sent[0])[0].contains("first second third fourth"));
+        assert_eq!(app.windows[&wid].a11y_parked_due, None);
+    }
+
+    /// A frame ends a pace owed: what it publishes is the newest there is.
+    #[test]
+    fn a_window_that_presents_again_owes_no_parked_tell() {
+        let (mut app, wid) = parked_terminal();
+        crate::scripted_redraw_fixture::feed(&app, b" first");
+        let at = app.windows[&wid].a11y_parked_next.unwrap();
+        app.publish_in_a_parked_window(wid, at - PARKED_TELL_PACE / 2);
+        let window = app.windows.get_mut(&wid).unwrap();
+        assert!(window.a11y_parked_due.is_some(), "CONTROL");
+        window.present_retry.parked = false;
+
+        app.serve_parked_tells(at);
+
+        assert!(app.windows[&wid].a11y_sent.is_empty());
+        assert_eq!(app.windows[&wid].a11y_parked_due, None);
+    }
+
+    /// A screen part-way through a synchronized update is one no frame would show.
+    #[test]
+    fn a_parked_read_waits_out_a_synchronized_update() {
+        let (mut app, wid) = parked_terminal();
+        crate::scripted_redraw_fixture::feed(&app, b"\x1b[?2026h\x1b[2J");
+        assert!(
+            asked_at_the_pace(&mut app, wid).is_empty(),
+            "the blank screen"
+        );
+        assert!(
+            app.windows[&wid].a11y_parked_due.is_some(),
+            "and it comes back"
+        );
+
+        crate::scripted_redraw_fixture::feed(&app, b"\x1b[Hrepainted\x1b[?2026l");
+
+        let sent = asked_at_the_pace(&mut app, wid);
+        assert_eq!(sent.len(), 1);
+        assert!(terminal_text(&sent[0])[0].starts_with("repainted"));
+    }
+
+    /// As a frame does, a read stops waiting for an update that does not end.
+    #[test]
+    fn a_parked_read_tells_an_update_that_never_ends() {
+        let (mut app, wid) = parked_terminal();
+        crate::scripted_redraw_fixture::feed(&app, b"\x1b[?2026hstuck");
+        assert!(asked_at_the_pace(&mut app, wid).is_empty(), "CONTROL");
+
+        let sent = asked_at_the_pace(&mut app, wid);
+
+        assert_eq!(sent.len(), 1);
+        assert!(terminal_text(&sent[0])[0].contains("earlier wordsstuck"));
+    }
+
+    /// A page that owes a tell owes it the same screen a terminal would: a half-drawn pane beside
+    /// it is no reason to hurry.
+    #[test]
+    fn a_page_s_tell_waits_out_the_update_of_the_terminal_beside_it() {
+        let mut app = crate::scripted_redraw_fixture::scripted_app();
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(SettingsRoute::Home));
+        let (session, _) =
+            app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+        park(&mut app, wid);
+        assert_eq!(
+            asked_at_the_pace(&mut app, wid).len(),
+            1,
+            "CONTROL: it owes"
+        );
+
+        crate::term_lock(&app.pool.get(session).unwrap().term).process(b"\x1b[?2026h\x1b[2J");
+
+        assert!(asked_at_the_pace(&mut app, wid).is_empty());
+    }
+
+    /// A press that closes a menu changes nothing a terminal holds, and a client left with the row
+    /// it pressed would press it again to no effect.
+    #[test]
+    fn a_menu_that_closes_in_a_parked_window_leaves_its_client() {
+        let mut app = crate::scripted_redraw_fixture::scripted_app();
+        let wid = WindowId(0);
+        app.tab_strip_rows = 1;
+        assert!(app.open_tab_context_menu(wid, 0, 3, true));
+        park(&mut app, wid);
+        assert!(asked_at_the_pace(&mut app, wid).is_empty(), "CONTROL");
+
+        assert!(app.close_tab_menu(wid));
+
+        let sent = asked_at_the_pace(&mut app, wid);
+        assert_eq!(sent.len(), 1);
+        let menu = aterm_a11y::model::Role::Menu;
+        assert!(sent[0].nodes.iter().all(|(_, node)| node.role() != menu));
+    }
+
+    /// The field holds the keys from the moment it opens, frame or no frame, and each key it takes
+    /// is one its client has to hear.
+    #[test]
+    fn a_session_field_in_a_parked_window_reaches_its_client_as_it_changes() {
+        let mut app = crate::scripted_redraw_fixture::scripted_app();
+        let wid = WindowId(0);
+        app.tab_strip_rows = 1;
+        park(&mut app, wid);
+        let tab = app.windows[&wid].tab_set.active().unwrap().id;
+
+        assert!(app.begin_session_rename(wid, tab));
+        let sent = asked_at_the_pace(&mut app, wid);
+        assert_eq!(sent.len(), 1, "it opened");
+
+        let edit = app.windows.get_mut(&wid).unwrap().rename_edit.as_mut();
+        edit.unwrap().text = "build".to_owned();
+        let sent = asked_at_the_pace(&mut app, wid);
+        assert_eq!(sent.len(), 1, "it changed");
+        let field = aterm_a11y::model::Role::TextInput;
+        let words = sent[0].nodes.iter().find(|(_, node)| node.role() == field);
+        assert_eq!(words.expect("the field").1.value(), Some("build"));
+    }
+
+    #[test]
+    fn a_find_field_in_a_parked_window_reaches_its_client() {
+        let (mut app, wid) = parked_terminal();
+        let mut search = crate::app_search::SearchState::default();
+        search.query = "ab".to_owned();
+        app.windows.get_mut(&wid).unwrap().search = Some(search);
+
+        assert_eq!(asked_at_the_pace(&mut app, wid).len(), 1);
+    }
+
+    /// A question stops the work until it is answered, and nothing on the terminal changes for it.
+    #[test]
+    fn a_question_in_a_parked_window_reaches_its_client() {
+        let (mut app, wid) = parked_terminal();
+        app.paste_banner = Some(crate::paste_banner::PendingPaste::new(
+            wid,
+            Some(0),
+            "one\ntwo\n".to_owned(),
+            crate::input::Source::Human,
+            crate::input::PasteFraming::AtDrain,
+        ));
+
+        let sent = asked_at_the_pace(&mut app, wid);
+
+        assert_eq!(sent.len(), 1);
+        let asked = sent[0]
+            .nodes
+            .iter()
+            .any(|(_, node)| node.role() == aterm_a11y::model::Role::AlertDialog);
+        assert!(asked, "the question");
+    }
+
+    /// Two blank tabs read alike, and the client still has to hear that it moved.
+    #[test]
+    fn a_tab_that_reads_like_the_last_one_still_reaches_its_client() {
+        let mut app = crate::scripted_redraw_fixture::scripted_app();
+        let wid = WindowId(0);
+        let second = app.next_session_id;
+        app.push_stub_tab(wid, crate::stub_session(second));
+        app.switch_tab_in(wid, 0);
+        park(&mut app, wid);
+
+        app.switch_tab_in(wid, 1);
+        app.rearm_dropped_present(wid, crate::metrics::PresentDropReason::GpuOccluded);
+
+        assert_eq!(asked_at_the_pace(&mut app, wid).len(), 1);
+    }
+
+    /// A wait that ended with a frame says nothing of the next time the window parks.
+    #[test]
+    fn a_frame_ends_a_parked_read_s_wait() {
+        let (mut app, wid) = parked_terminal();
+        crate::scripted_redraw_fixture::feed(&app, b"\x1b[?2026h\x1b[2J");
+        assert!(asked_at_the_pace(&mut app, wid).is_empty(), "CONTROL");
+        assert!(app.windows[&wid].a11y_parked_held, "CONTROL");
+
+        app.push_a11y_tree(wid);
+
+        assert!(!app.windows[&wid].a11y_parked_held);
+    }
+
+    /// A client holds a caret and a view as well as words: each reaches it with no cell printed.
+    #[test]
+    fn a_parked_client_is_told_what_moves_without_printing() {
+        type Change = (&'static str, fn(&mut App, WindowId));
+        let changes: [Change; 3] = [
+            ("a caret that moves", |app, _| {
+                crate::scripted_redraw_fixture::feed(app, b"\x1b[A");
+            }),
+            ("a view scrolled back", |app, wid| {
+                let term = app.front_terminal(wid).unwrap().term.clone();
+                crate::term_lock(&term).scroll_display(1);
+            }),
+            ("a selection", |app, wid| app.select_all_in(wid)),
+        ];
+        for (change, make) in changes {
+            let mut app = crate::scripted_redraw_fixture::scripted_app();
+            let wid = WindowId(0);
+            let rows = usize::from(app.windows[&wid].rows);
+            for row in 0..rows + 2 {
+                crate::scripted_redraw_fixture::feed(&app, format!("row {row}\r\n").as_bytes());
+            }
+            park(&mut app, wid);
+
+            make(&mut app, wid);
+
+            assert_eq!(asked_at_the_pace(&mut app, wid).len(), 1, "{change}");
+        }
+    }
+
+    /// The keyboard moving to another pane moves the client's caret with it.
+    #[test]
+    fn a_focus_move_in_a_parked_window_reaches_its_client() {
+        let mut app = crate::scripted_redraw_fixture::scripted_app();
+        let wid = WindowId(0);
+        let _ = app.split_active_stub_tab(wid);
+        park(&mut app, wid);
+
+        assert!(app.focus_pane_in(wid, crate::pane::FocusDir::Left));
+
+        assert_eq!(asked_at_the_pace(&mut app, wid).len(), 1);
+    }
+
     /// A window whose terminal tab composed last, with a Settings and terminal tab behind it:
     /// the app, the window and that tab's index.
     fn mixed_tab_behind_a_terminal_tab() -> (App, WindowId, usize) {
@@ -1897,10 +2409,10 @@ mod tests {
         (app, wid, mixed)
     }
 
-    /// Cells cut by another tab's rects are that tab's text under this pane's name, so a tab that
-    /// comes back gives its page at once and its terminal only with the frame that composes it.
+    /// The cells still hold the front tab's text. A tab that comes back reads its own terminal at
+    /// once, with no frame, beside its page.
     #[test]
-    fn a_tab_brought_back_reads_no_other_tab_s_text_as_its_pane() {
+    fn a_tab_brought_back_reads_its_own_terminal_at_once() {
         let (mut app, wid, mixed) = mixed_tab_behind_a_terminal_tab();
 
         app.switch_tab_in(wid, mixed);
@@ -1909,21 +2421,15 @@ mod tests {
             .expect("a native tree")
             .expect("the page reads from the model");
 
-        assert_eq!(terminal_text(&live), Vec::<String>::new());
-
-        assert!(app.prepare_heterogeneous_input_scratch(wid).is_some());
-        let (framed, _) = app
-            .take_native_accessibility_update(wid)
-            .expect("a native tree")
-            .expect("the frame's tree");
-        let text = terminal_text(&framed);
-        assert_eq!(text.len(), 1, "the frame brings the pane: {text:?}");
+        let text = terminal_text(&live);
+        assert_eq!(text.len(), 1, "{text:?}");
         assert!(text[0].contains("text of the mixed tab"), "{text:?}");
+        assert!(!text[0].contains("text of the front tab"), "{text:?}");
     }
 
     /// The same read serves a tab of terminals, which has no page to give at once.
     #[test]
-    fn a_terminal_tab_brought_back_reads_no_other_tab_s_text() {
+    fn a_terminal_tab_brought_back_reads_its_own_terminal_at_once() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         let first = app.front_terminal(wid).unwrap().term.clone();
@@ -1937,19 +2443,15 @@ mod tests {
         crate::term_lock(&app.pool.get(second).unwrap().term).process(b"text of the second tab");
 
         let moved = app.grid_a11y_tree(wid, None).unwrap();
-        assert!(
-            !terminal_text(&moved)
-                .iter()
-                .any(|text| text.contains("text of the first tab")),
-            "{:?}",
-            terminal_text(&moved)
-        );
+        let text = terminal_text(&moved);
+        assert_eq!(text.len(), 1, "{text:?}");
+        assert!(text[0].contains("text of the second tab"), "{text:?}");
+        assert!(!text[0].contains("text of the first tab"), "{text:?}");
     }
 
-    /// Cells of the old layout cut by the new rects read columns that were another pane's, and a
-    /// new chrome row puts each row one off.
+    /// A layout no frame has composed still reads its terminal, at the leaf's own size.
     #[test]
-    fn a_moved_layout_holds_a_terminal_pane_back_until_its_frame() {
+    fn a_moved_layout_reads_its_terminal_at_once() {
         for change in ["narrower", "a chrome row"] {
             let (mut app, wid, mixed) = mixed_tab_behind_a_terminal_tab();
             app.switch_tab_in(wid, mixed);
@@ -1964,13 +2466,18 @@ mod tests {
                 .expect("a native tree")
                 .expect("the page reads from the model");
 
-            assert_eq!(terminal_text(&live), Vec::<String>::new(), "{change}");
+            let text = terminal_text(&live);
+            assert_eq!(text.len(), 1, "{change}: {text:?}");
+            assert!(
+                text[0].contains("text of the mixed tab"),
+                "{change}: {text:?}"
+            );
         }
     }
 
-    /// A lone page's frame leaves blank cells, which are no truer of a pane than another tab's.
+    /// A lone page's frame leaves blank cells, which say nothing of the terminal beside it.
     #[test]
-    fn a_tab_brought_back_from_a_lone_page_reads_no_blank_pane() {
+    fn a_tab_brought_back_from_a_lone_page_reads_its_terminal() {
         let (mut app, wid, mixed) = mixed_tab_behind_a_terminal_tab();
         app.switch_tab_in(wid, mixed);
         assert!(app.prepare_heterogeneous_input_scratch(wid).is_some());
@@ -1991,12 +2498,14 @@ mod tests {
             .expect("a native tree")
             .expect("the page reads from the model");
 
-        assert_eq!(terminal_text(&live), Vec::<String>::new());
+        let text = terminal_text(&live);
+        assert_eq!(text.len(), 1, "{text:?}");
+        assert!(text[0].contains("text of the mixed tab"), "{text:?}");
     }
 
-    /// Focus moves no cell, so a client's press in the page keeps the terminal beside it.
+    /// A client's press in the page keeps the terminal beside it.
     #[test]
-    fn a_focus_move_keeps_the_composed_pane() {
+    fn a_focus_move_keeps_the_pane() {
         let (mut app, wid, mixed) = mixed_tab_behind_a_terminal_tab();
         app.switch_tab_in(wid, mixed);
         assert!(app.prepare_heterogeneous_input_scratch(wid).is_some());

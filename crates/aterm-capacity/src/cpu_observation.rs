@@ -136,7 +136,7 @@ impl CpuObservation {
     pub fn read(dir: Option<&Path>) -> Self {
         #[cfg(unix)]
         {
-            use crate::build_cpu::{LegacyRetirement, Pool};
+            use crate::build_cpu::{LegacyRetirement, NativeDomain, Pool};
             let Some(dir) = dir else {
                 return Self::Unreadable("account capacity directory unavailable".into());
             };
@@ -145,6 +145,20 @@ impl CpuObservation {
                 Ok(None) => CpuDomain::Legacy,
                 Err(error) => return Self::Unreadable(error.to_string()),
             };
+            if matches!(domain, CpuDomain::Mixed) {
+                if crate::ledger::user_dir().as_deref() != Some(dir) {
+                    return Self::Unreadable(
+                        "mixed CPU observation requires the canonical account namespace".into(),
+                    );
+                }
+                return match NativeDomain::open_canonical() {
+                    Ok(native) => Self::read_pool(native.pool(), domain, Some(native.legacy())),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        Self::Initializing
+                    }
+                    Err(error) => Self::Unreadable(error.to_string()),
+                };
+            }
             let pool = match Pool::open_existing(dir) {
                 Ok(Some(pool)) => pool,
                 Ok(None) if matches!(domain, CpuDomain::Legacy) => return Self::Absent,

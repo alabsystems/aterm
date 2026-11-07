@@ -420,7 +420,8 @@ pub fn tippy_gated_args(scope: &Scope, gated: &[(String, String)]) -> Option<Vec
 /// The package of the one shipped executable, which `ship` builds `--release`.
 pub const SHIPPED: &str = "aterm";
 
-/// `<tippy> -p aterm --release --keep-going -- -D warnings`: the lint's pass over the shipped build as `ship` builds it.
+/// `<tippy> -p aterm --release --keep-going -- -D warnings`: every selection reaching the
+/// shipped executable also lints the build as `ship` builds it, with debug assertions off.
 #[must_use]
 pub fn tippy_release_args(scope: &Scope) -> Option<Vec<String>> {
     let spec = scope.spec_of(SHIPPED)?;
@@ -705,6 +706,12 @@ pub fn libc_oracle_not_run_reason(run: &exec::Run) -> Option<String> {
 }
 
 fn run_tests_labeled(ctx: &Ctx, r: &mut Report, label: &str, cmd: &Cmd) -> bool {
+    if let Err(why) = crate::release_test_env::prepare(ctx) {
+        r.cannot_run(format!(
+            "cannot prepare release test environment: {why}; no test was run"
+        ));
+        return false;
+    }
     let env = crate::findings::rerun_env(cmd, ctx.test_thread_override());
     let cmd = &cmd.clone().counting_waits();
     run_child(ctx, r, label, cmd, |r, run, label| {
@@ -1165,9 +1172,12 @@ fn test_cmds(ctx: &Ctx, bind: bool) -> [Cmd; 2] {
     }
     [
         cmd(compile).demoted(),
-        with_checkers(cmd(test_run_args(&ctx.scope)), ctx.checkers_in_tests)
-            .env(k, v)
-            .counting_waits(),
+        crate::release_test_env::command(
+            ctx,
+            with_checkers(cmd(test_run_args(&ctx.scope)), ctx.checkers_in_tests),
+        )
+        .env(k, v)
+        .counting_waits(),
     ]
 }
 
@@ -1475,6 +1485,64 @@ fn rows_marked(output: &str, status: &str) -> Vec<String> {
     rows
 }
 
+/// The runner's own exit on a matrix with an unanswered row (`benches/support/mod.rs`
+/// `Counts::exit_code`), as cargo names a bench that exited with it.
+const RUNNER_UNANSWERED_EXIT: &str = "(exit status: 3)";
+
+/// Each bench a `--no-fail-fast` `targo bench` child names as failed, with how its process ended:
+/// cargo's `` error: bench failed, to rerun pass `… --bench <target>` `` and, for any exit but
+/// libtest's 101, the `process didn't exit successfully: … (<how>)` under its `Caused by:`.
+fn failed_benches(output: &str) -> Vec<(String, Option<String>)> {
+    let mut failed: Vec<(String, Option<String>)> = Vec::new();
+    for line in output.lines() {
+        if let Some(target) = line
+            .strip_prefix("error: bench failed, to rerun pass `")
+            .and_then(|spec| spec.split('`').next())
+            .and_then(|spec| spec.rsplit_once("--bench "))
+        {
+            failed.push((target.1.trim().to_string(), None));
+        } else if let Some(how) = line
+            .trim_start()
+            .strip_prefix("process didn't exit successfully: ")
+            .and_then(|rest| rest.rfind(" (").map(|at| &rest[at + 1..]))
+            && let Some((_, end @ None)) = failed.last_mut()
+        {
+            *end = Some(how.trim_end().to_string());
+        }
+    }
+    failed
+}
+
+/// Whether a failed child's only failures are the runner's own exit on the matrices with an
+/// unanswered row (`answered_short`): cargo exited 101 for its benches, and it names exactly those
+/// as failed, each with [`RUNNER_UNANSWERED_EXIT`]. A bench that died of a signal, panicked, was
+/// killed, or exited any other way after its summary is not that, and neither is a run whose
+/// output does not account for each such matrix.
+fn only_unanswered_exits(run: &exec::Run, answered_short: &[&str]) -> bool {
+    let mut failed = failed_benches(&strip_ansi_if_any(&run.output));
+    failed.sort();
+    let mut named: Vec<&str> = failed.iter().map(|(t, _)| t.as_str()).collect();
+    named.dedup();
+    let mut short = answered_short.to_vec();
+    short.sort_unstable();
+    run.code == Some(101)
+        && run.spawn_error.is_none()
+        && !failed.is_empty()
+        && named.len() == failed.len()
+        && named == short
+        && failed
+            .iter()
+            .all(|(_, how)| how.as_deref() == Some(RUNNER_UNANSWERED_EXIT))
+}
+
+fn strip_ansi_if_any(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.contains('\x1b') {
+        crate::libtest::strip_ansi(s).into()
+    } else {
+        s.into()
+    }
+}
+
 fn decide_measuring_child(r: &mut Report, run: &exec::Run, label: &str, subject: &Subject) {
     let unanswered = unanswered_rows(&run.output);
     if subject.own && !unanswered.is_empty() {
@@ -1483,6 +1551,7 @@ fn decide_measuring_child(r: &mut Report, run: &exec::Run, label: &str, subject:
     }
     let mut incomplete = Vec::new();
     let mut refused = Vec::new();
+    let mut answered_short = Vec::new();
     let mut any_failed = false;
     let mut any_undecided = false;
     let mut all_reported = true;
@@ -1500,6 +1569,9 @@ fn decide_measuring_child(r: &mut Report, run: &exec::Run, label: &str, subject:
                 }
                 if counts.refused != 0 {
                     refused.push(target);
+                }
+                if counts.unanswered != 0 {
+                    answered_short.push(target);
                 }
             }
             None => {
@@ -1530,7 +1602,10 @@ fn decide_measuring_child(r: &mut Report, run: &exec::Run, label: &str, subject:
             "{label} — {}: the instrument could not run every row",
             refused.join(", ")
         ));
-    } else if incomplete.is_empty() && !unanswered.is_empty() {
+    } else if incomplete.is_empty()
+        && !unanswered.is_empty()
+        && (run.ok || only_unanswered_exits(run, &answered_short))
+    {
         r.pass(format!(
             "{label} — every row the subject answered{}",
             stated_note(&run.output)
@@ -1596,9 +1671,12 @@ fn doctests(ctx: &Ctx, r: &mut Report) {
 }
 
 fn doctest_cmd(ctx: &Ctx, driver: &DocDriver, skip: &[String]) -> Cmd {
-    let cmd = with_checkers(
-        main_targo(ctx, doctest_args(&ctx.scope)),
-        ctx.checkers_in_tests,
+    let cmd = crate::release_test_env::command(
+        ctx,
+        with_checkers(
+            main_targo(ctx, doctest_args(&ctx.scope)),
+            ctx.checkers_in_tests,
+        ),
     );
     let stand_in = ctx
         .test_recorder()
@@ -1749,9 +1827,7 @@ fn tippy(ctx: &Ctx, r: &mut Report) {
         );
         crate::red_now(ctx, crate::checks::Check::Lint, r);
     }
-    if ctx.release
-        && let Some(args) = tippy_release_args(&ctx.scope)
-    {
+    if let Some(args) = tippy_release_args(&ctx.scope) {
         compile_scoped(
             ctx,
             r,
@@ -1898,10 +1974,7 @@ fn libc_oracle(ctx: &Ctx, r: &mut Report) {
     } else {
         None
     };
-    match why {
-        Some(why) => r.cannot_run(format!("{label} — {why}")),
-        None => r.record_child(&out, outcome, label),
-    }
+    r.record_oracle(&out, outcome, label, why);
 }
 
 fn census(ctx: &Ctx, r: &mut Report) {
@@ -3391,6 +3464,14 @@ mod tests {
         c.scratch = temp.path().join("scratch");
         std::fs::create_dir_all(&c.scratch).unwrap();
         if std::env::var_os(PROBE).is_some() {
+            for key in [
+                aterm_capacity::RELEASE_RUN_ENV,
+                "ATERM_RELEASE_INPUTS_SEAL",
+                "ATERM_RELEASE_CUTTER",
+            ] {
+                let out = exec::run(&Cmd::new("/usr/bin/printenv").arg(key), c.exec_env());
+                assert_eq!(out.code, Some(1), "inherited {key}: {}", out.output);
+            }
             let out = exec::run(
                 &Cmd::new("/usr/bin/printenv").arg(CHECKERS_ENV),
                 c.exec_env(),
@@ -3417,6 +3498,9 @@ mod tests {
                 "stages::tests::checker_policy_is_explicit_and_every_other_child_scrubs_it",
             ])
             .env(PROBE, "1")
+            .env(aterm_capacity::RELEASE_RUN_ENV, "1")
+            .env("ATERM_RELEASE_INPUTS_SEAL", "/owner/seal")
+            .env("ATERM_RELEASE_CUTTER", "/owner/cutter")
             .env(CHECKERS_ENV, "1");
         let out = exec::run(&child, c.exec_env());
         assert!(out.ok && out.output.contains("1 passed"), "{}", out.output);
@@ -3428,6 +3512,16 @@ mod tests {
             assert_eq!(env_of(&compile, CHECKERS_ENV), None);
             let want = Some(if context.checkers_in_tests { "1" } else { "0" }.into());
             assert_eq!(env_of(&run, CHECKERS_ENV), want);
+            let marker = context.checkers_in_tests.then(|| "1".into());
+            assert_eq!(env_of(&compile, aterm_capacity::RELEASE_RUN_ENV), None);
+            assert_eq!(env_of(&run, aterm_capacity::RELEASE_RUN_ENV), marker);
+            assert_eq!(
+                env_of(
+                    &doctest_cmd(context, &DocDriver::BarePath, &[]),
+                    aterm_capacity::RELEASE_RUN_ENV
+                ),
+                marker
+            );
             assert_eq!(
                 env_of(
                     &doctest_cmd(context, &DocDriver::BarePath, &[]),
@@ -3678,6 +3772,88 @@ mod tests {
         );
         let plain = graph(targo(&c, call(&["-p", "narrow"])));
         assert!(!plain.within(&wide), "the control: {:?}", plain.names());
+    }
+
+    /// The real checkout's dev dependency graph must be contained in its verified test graph.
+    /// Negative controls drop workspace feature unification and change the test profile's
+    /// debuginfo: both must introduce different units. A newly feature-flipped dev dependency
+    /// fails the unmutated comparison too, even when the narrow/wide fixture still passes.
+    #[test]
+    fn dev_build_reuses_the_verified_workspace_dependencies() {
+        use aterm_toolchain::build_cache::{
+            Machine, Tool, read_config, with_build_dir, with_test_graph,
+        };
+
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let root = aterm_tempfile::manifest_dir()
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let mut c = ctx(Scope::crate_only("aterm"));
+        c.root = root.clone();
+        c.scratch = scratch.path().to_owned();
+        c.tools.targo = PathBuf::from(env!("CARGO"));
+        c.main_build_dir = None;
+        c.child_ceiling = Some(std::time::Duration::from_secs(60));
+        let machine = Machine {
+            root: None,
+            home: root.parent(),
+            cwd: Some(&root),
+            env: &|_| None,
+            read: &read_config,
+            writable: &|_| Some(true),
+        };
+        let mut interner = crate::unitgraph::Interner::default();
+        let mut graph = |args: Vec<String>| {
+            let out = exec::run(
+                &targo(&c, args).args(UNIT_GRAPH).arg("--offline"),
+                c.exec_env(),
+            );
+            assert!(out.ok, "{}", out.output);
+            let text = out
+                .output
+                .lines()
+                .find(|l| l.starts_with("{\"version\":1"))
+                .unwrap();
+            let mut value: aterm_json::Value = aterm_json::from_str(text).unwrap();
+            // The label is not a compiler input; every effective setting stays in the key.
+            for unit in value
+                .as_object_mut()
+                .unwrap()
+                .get_mut("units")
+                .unwrap()
+                .as_array_mut()
+                .unwrap()
+            {
+                unit.as_object_mut()
+                    .unwrap()
+                    .get_mut("profile")
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("name");
+            }
+            crate::unitgraph::Graph::read(&value.to_string(), &mut interner).unwrap()
+        };
+        let build = ["--unverified", "build", "-p", "aterm"]
+            .map(str::to_owned)
+            .to_vec();
+        let test = ["--unverified", "test", "-p", "aterm"]
+            .map(str::to_owned)
+            .to_vec();
+        let verified = graph(with_test_graph(&test));
+        let dev = graph(with_build_dir(&build, Tool::Targo, &machine).unwrap());
+        let shared = verified.ids();
+        let missing: Vec<_> = dev
+            .units
+            .iter()
+            .filter(|u| !shared.contains(&u.id) && !u.target_kinds.iter().any(|k| k == "bin"))
+            .collect();
+        assert!(missing.is_empty(), "dev/test dependency drift: {missing:?}");
+        assert!(!graph(build).within(&verified), "feature negative control");
+        let mut changed = with_test_graph(&test);
+        changed.splice(0..0, ["--config".into(), "profile.test.debug=true".into()]);
+        assert!(!dev.within(&graph(changed)), "profile negative control");
     }
 
     #[test]
@@ -4037,8 +4213,8 @@ mod tests {
             assert_eq!(tippy_release_args(&scope).expect("holds aterm"), want);
         }
         assert_eq!(tippy_release_args(&Scope::crate_only("aterm-font")), None);
-        let row = |release: bool| {
-            let mut c = ctx(Scope::crate_only("aterm")).with_release(release);
+        let row = |release: bool, scope: Scope| {
+            let mut c = ctx(scope).with_release(release);
             c.tools.tippy = Some(PathBuf::from("/repo/bin").join(crate::toolchain::TIPPY));
             let mut r = Report::new("lint");
             tippy(&c, &mut r);
@@ -4046,8 +4222,12 @@ mod tests {
                 .filter(|(_, l)| l.contains("--release"))
                 .count()
         };
-        assert_eq!(row(true), 1);
-        assert_eq!(row(false), 0);
+        for release in [false, true] {
+            assert_eq!(row(release, Scope::crate_only("aterm")), 1);
+            assert_eq!(row(release, Scope::workspace()), 1);
+            assert_eq!(row(release, Scope::crate_only("aterm-font")), 0);
+            assert_eq!(row(release, Scope::changed("main", Vec::new(), false)), 0);
+        }
     }
 
     /// EACH CALL OF A SHAPED TEST COMPILE RUNS ITS OWN COMMAND, THE CLOSING ONE TODAY'S: a
@@ -5124,7 +5304,12 @@ mod tests {
         let aos = "measure row: aos::a_repair UNANSWERED\naos repair named no main_us=\n\
                    measure result: aos planned=1 passed=0 failed=0 refused=0 unanswered=1 undecided=0\n";
         let rewind = measured_result("rewind", 2, 2, 0, 0);
-        let output = paint.clone() + spin + aos + &rewind;
+        let output = paint.clone()
+            + spin
+            + &bench_exit("spin", "exit status: 3")
+            + aos
+            + &bench_exit("aos", "exit status: 3")
+            + &rewind;
         let named = "spin::an_idle_open_rewind_view_arms_no_timer (ctl rewind open: the subject \
                      does not know `rewind` (ERR unknown verb)); aos::a_repair (aos repair named \
                      no main_us=)";
@@ -5161,6 +5346,108 @@ mod tests {
         let rows = decide_measured(false, refused, &measured_subject(false));
         assert_eq!(rows[0].0, Outcome::Fail(Severity::CouldNotRun), "{rows:?}");
         assert_eq!(rows[1].0, Outcome::Skip, "{rows:?}");
+    }
+
+    /// cargo's lines for a `--no-fail-fast` bench whose process ended `how`.
+    fn bench_exit(target: &str, how: &str) -> String {
+        format!(
+            "error: bench failed, to rerun pass `-p aterm-conformance --bench {target}`\n\n\
+             Caused by:\n  process didn't exit successfully: \
+             `/t/build.noindex/test/deps/{target}-0123abcd --bench` ({how})\n"
+        )
+    }
+
+    /// On a subject HEAD did not build, an unanswered row passes the rows it answered only when
+    /// the runner's own exit 3 on those matrices is every failure cargo names: a crash, a panic or
+    /// a kill after the summaries were printed is the child's failure, in any bench.
+    #[test]
+    fn an_unanswered_row_never_hides_a_crash_after_the_summaries() {
+        let rewind = "measure row: rewind::a_rewind_step_is_shown_within_8ms UNANSWERED\n\
+                      ctl metrics percentiles does not report n_rewind_shown\n\
+                      measure result: rewind planned=2 passed=1 failed=0 refused=0 unanswered=1 undecided=0\n";
+        let paint = measured_result("paint", 23, 23, 0, 0);
+        let rest = measured_result("spin", 2, 2, 0, 0) + &measured_result("aos", 1, 1, 0, 0);
+        let other = measured_subject(false);
+        let first = |output: String| decide_measured(false, output, &other)[0].clone();
+        let decided = |output: String| first(output).0;
+
+        let alone = paint.clone() + &rest + rewind + &bench_exit("rewind", "exit status: 3");
+        assert_eq!(
+            decided(alone.clone()),
+            Outcome::Ok,
+            "the runner's own exit 3"
+        );
+        let rows = decide_measured(false, alone.clone(), &other);
+        assert_eq!(rows[1].0, Outcome::Skip, "{rows:?}");
+        assert!(rows[1].1.contains("n_rewind_shown"), "{rows:?}");
+        let colored = alone.replace("error:", "\x1b[1m\x1b[91merror\x1b[0m:");
+        assert_eq!(
+            decided(colored),
+            Outcome::Ok,
+            "a colored cargo reads the same"
+        );
+
+        let segv = "signal: 11, SIGSEGV: invalid memory reference";
+        for (output, why) in [
+            (
+                paint.clone()
+                    + &bench_exit("paint", segv)
+                    + &rest
+                    + rewind
+                    + &bench_exit("rewind", "exit status: 3"),
+                "paint died of a signal after its summary",
+            ),
+            (
+                paint.clone() + &rest + rewind + &bench_exit("rewind", segv),
+                "the bench with the unanswered row died of a signal after its summary",
+            ),
+            (
+                paint.clone()
+                    + "error: bench failed, to rerun pass `-p aterm-conformance --bench paint`\n"
+                    + &rest
+                    + rewind
+                    + &bench_exit("rewind", "exit status: 3"),
+                "paint panicked after its summary (libtest's 101 has no `Caused by`)",
+            ),
+            (
+                paint.clone() + &rest + rewind,
+                "cargo named no failed bench, so its 101 is not the runner's",
+            ),
+            (
+                paint.clone() + &rest + rewind + &bench_exit("rewind", "exit status: 1"),
+                "another exit status",
+            ),
+            (
+                paint.clone()
+                    + &bench_exit("paint", "exit status: 3")
+                    + &rest
+                    + rewind
+                    + &bench_exit("rewind", "exit status: 3"),
+                "an exit 3 from a matrix that answered every row",
+            ),
+        ] {
+            assert_eq!(
+                decided(output.clone()),
+                Outcome::Fail(Severity::GateFailed),
+                "{why}: {output}"
+            );
+        }
+
+        let killed = exec::Run {
+            stopped_at: None,
+            ok: false,
+            output: alone,
+            code: None,
+            spawn_error: None,
+            usage: None,
+        };
+        let mut r = Report::new("measuring");
+        decide_measuring_child(&mut r, &killed, "measuring matrices", &other);
+        assert_ne!(
+            r.outcomes().next().map(|(o, _)| o),
+            Some(Outcome::Ok),
+            "a cargo that did not exit itself was killed"
+        );
     }
 
     #[test]

@@ -10,6 +10,7 @@ use aterm_types::macos_setup::{Plan, Subject};
 
 mod check;
 mod input_activation;
+mod input_pass;
 mod pending_inputs;
 pub use check::{check_initial_setup, check_initial_setup_observed};
 #[cfg(any(test, debug_assertions))]
@@ -18,7 +19,13 @@ pub use input_activation::{
     InputServiceSet, InputSetupScope, activate_input_attachments, input_activation_revision,
     input_setup_scope,
 };
-pub use pending_inputs::initial_setup_pending_workstation_revision;
+pub use input_pass::{
+    InitialInputPass, PendingInputAdmission, initial_setup_input_park_mark,
+    initial_setup_pending_inputs, run_initial_input_pass,
+};
+pub use pending_inputs::{
+    initial_setup_pending_repositories, initial_setup_pending_workstation_revision,
+};
 mod background_observation;
 pub use background_observation::check_background_workstation;
 mod background_vault_authorization;
@@ -6854,6 +6861,53 @@ fn execute_pass(
     password: &mut Option<SecretBytes>,
     hooks: SetupHooks,
 ) -> Result<Option<(Report, SetupNext)>, String> {
+    execute_pass_target(host, root, password, hooks, PassTarget::All)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PassTarget {
+    All,
+    Inputs(Selection),
+}
+
+impl PassTarget {
+    fn includes(self, stage: Stage) -> bool {
+        self == Self::All || stage == Stage::Workstation
+    }
+
+    fn selected(self, setting: Setting) -> bool {
+        match self {
+            Self::All => true,
+            Self::Inputs(selected) => selected.contains(setting),
+        }
+    }
+
+    fn workstation_only(self, only: Option<Selection>) -> Option<Selection> {
+        match self {
+            Self::All => only,
+            Self::Inputs(selected) => Some(filtered(selected, |setting| {
+                only.is_none_or(|only| only.contains(setting))
+            })),
+        }
+    }
+
+    fn covers(self, plan: &Plan) -> bool {
+        Setting::ALL
+            .into_iter()
+            .all(|setting| !plan.selection.contains(setting) || self.selected(setting))
+    }
+}
+
+fn execute_pass_target(
+    host: &mut dyn InitialHost,
+    root: &Path,
+    password: &mut Option<SecretBytes>,
+    hooks: SetupHooks,
+    target: PassTarget,
+) -> Result<Option<(Report, SetupNext)>, String> {
+    if target != PassTarget::All && progress(root)?.is_none() {
+        return Ok(None);
+    }
     fold_stop_request(root)?;
     if finished_at(root)? {
         return Ok(None);
@@ -6862,6 +6916,9 @@ fn execute_pass(
         return Ok(None);
     };
     let Some(mut progress) = progress(root)? else {
+        if target != PassTarget::All {
+            return Ok(None);
+        }
         return Ok(host.legacy(root)?.map(|report| {
             let next = if !report.complete() {
                 SetupNext::of(&report.rows)
@@ -6876,13 +6933,22 @@ fn execute_pass(
     }
     // Holding profile.lock, so whatever is recorded running was cut off when aterm stopped: the
     // ledger resumes it once or parks it (design §6.5), and nothing runs until a stage begins.
-    ledger::update(root, progress.revision, |ledger| {
-        ledger.recover(progress.done, progress.running)
+    ledger::update(root, progress.revision, |ledger| match target {
+        PassTarget::All => ledger.recover(progress.done, progress.running),
+        PassTarget::Inputs(_) => {
+            ledger.recover_scoped(progress.done, progress.running, Stage::Workstation.bit())
+        }
     })?;
-    if progress.running.take().is_some() {
+    let other_running = (target != PassTarget::All)
+        .then_some(progress.running)
+        .flatten()
+        .filter(|stage| *stage != Stage::Workstation);
+    if other_running.is_none() && progress.running.take().is_some() {
         save_progress(root, progress)?;
     }
-    revalidate_completed_network_stages(host, root, &plan, &mut progress)?;
+    if target == PassTarget::All {
+        revalidate_completed_network_stages(host, root, &plan, &mut progress)?;
+    }
     let boot = host.boot_session();
     let mut report = Report {
         action: Action::Apply,
@@ -6902,7 +6968,8 @@ fn execute_pass(
     let mut pages: Vec<(std::ops::Range<usize>, PassPage)> = Vec::new();
     // Each stage's rows its producer did not time carry the stage's time.
     let mut clock = RowClock::start();
-    let secrets_lane = (Stage::Secrets.selected(&plan)
+    let secrets_lane = (target == PassTarget::All
+        && Stage::Secrets.selected(&plan)
         && progress.done & Stage::Secrets.bit() == 0
         && Stage::Workstation.selected(&plan)
         && progress.done & Stage::Workstation.bit() == 0)
@@ -6949,7 +7016,8 @@ fn execute_pass(
         });
         for stage in Stage::ALL {
             clock.lap(&mut report.rows);
-            if !stage.selected(&plan) || progress.done & stage.bit() != 0 {
+            if !target.includes(stage) || !stage.selected(&plan) || progress.done & stage.bit() != 0
+            {
                 continue;
             }
             if stage == Stage::Secrets {
@@ -7066,6 +7134,7 @@ fn execute_pass(
                 .copied()
                 .filter(|setting| {
                     plan.selection.contains(*setting)
+                        && target.selected(*setting)
                         && (stage != Stage::Workstation
                             || progress.only.is_none_or(|only| only.contains(*setting)))
                 })
@@ -7118,29 +7187,33 @@ fn execute_pass(
                 }
             }
             let begun = ledger::Begun::new(root, progress.revision, stage);
-            progress.running = Some(stage);
+            if other_running.is_none() {
+                progress.running = Some(stage);
+            }
             save_progress(root, progress)?;
             let fence = StageFence::open(hooks, &settings, &subjects);
             // The page's words for the stage's rows, where its report has them.
             let mut page = None;
             let result = match stage {
-                Stage::Workstation => match host.workstation(root, progress.only) {
-                    Ok(Some(result)) => {
-                        page = result.page;
-                        Ok(result.rows)
+                Stage::Workstation => {
+                    match host.workstation(root, target.workstation_only(progress.only)) {
+                        Ok(Some(result)) => {
+                            page = result.page;
+                            Ok(result.rows)
+                        }
+                        Ok(None) if first_run_complete(root)? => Ok(vec![readiness_row(
+                            stage.name(),
+                            true,
+                            "selected Mac settings already verified".into(),
+                        )]),
+                        Ok(None) => Ok(vec![readiness_row(
+                            stage.name(),
+                            false,
+                            "waiting for the next automatic Mac settings retry".into(),
+                        )]),
+                        Err(error) => Err(error),
                     }
-                    Ok(None) if first_run_complete(root)? => Ok(vec![readiness_row(
-                        stage.name(),
-                        true,
-                        "selected Mac settings already verified".into(),
-                    )]),
-                    Ok(None) => Ok(vec![readiness_row(
-                        stage.name(),
-                        false,
-                        "waiting for the next automatic Mac settings retry".into(),
-                    )]),
-                    Err(error) => Err(error),
-                },
+                }
                 Stage::Spotlight => host.spotlight(),
                 Stage::Permissions => host.permissions(&plan, progress.access_revision()),
                 Stage::Secrets => match suppressed_secrets {
@@ -7223,7 +7296,7 @@ fn execute_pass(
                 }
             }
             let left = SetupNext::of(&rows);
-            if ready {
+            if ready && target == PassTarget::All {
                 progress.done |= stage.bit();
             }
             if matches!(stage, Stage::Workstation | Stage::Accounts) {
@@ -7243,7 +7316,7 @@ fn execute_pass(
                 not_here = vault_not_here(&rows);
             }
             next = next.and(left);
-            progress.running = None;
+            progress.running = other_running;
             save_progress(root, progress)?;
             begun.ended()?;
             if let Some(before) = paced.as_ref()
@@ -7292,11 +7365,19 @@ fn execute_pass(
         return Ok(Some((paged(report, pages), SetupNext::Done)));
     }
     // The follow-up changes its rows as a stage does: fenced from readings the same way.
-    let owed = host.withheld_owed(root);
+    let owed = if target == PassTarget::All {
+        host.withheld_owed(root)
+    } else {
+        Vec::new()
+    };
     let owed_subjects: Vec<Subject> = owed.iter().copied().map(Subject::Setting).collect();
     let followed = {
         let _fence = (!owed.is_empty()).then(|| StageFence::open(hooks, &owed, &owed_subjects));
-        host.withheld(root)
+        if target == PassTarget::All {
+            host.withheld(root)
+        } else {
+            Ok(None)
+        }
     };
     match followed {
         Ok(Some(follow_up)) => {
@@ -7331,7 +7412,7 @@ fn execute_pass(
             report.rows.push(row);
         }
     }
-    if stages_finished {
+    if stages_finished && target.covers(&plan) {
         // A final person step can outlast the vault, repository inventory or credential
         // route observed at this pass's start. Use the same admitted plan's readback before
         // publishing completion; completed sign-outs stay recorded while only stale network
@@ -7351,9 +7432,10 @@ fn execute_pass(
             report.rows.extend(rows);
         }
     }
-    if Stage::ALL
-        .iter()
-        .all(|stage| !stage.selected(&plan) || progress.done & stage.bit() != 0)
+    if target.covers(&plan)
+        && Stage::ALL
+            .iter()
+            .all(|stage| !stage.selected(&plan) || progress.done & stage.bit() != 0)
     {
         progress.completed = true;
         save_progress(root, progress)?;
@@ -7509,6 +7591,24 @@ fn execute_initial_for_revision(
     password: &mut Option<SecretBytes>,
     hooks: SetupHooks,
 ) -> Result<Option<(Report, SetupNext)>, String> {
+    execute_initial_for_revision_target(
+        host,
+        root,
+        expected_revision,
+        password,
+        hooks,
+        PassTarget::All,
+    )
+}
+
+fn execute_initial_for_revision_target(
+    host: &mut dyn InitialHost,
+    root: &Path,
+    expected_revision: u64,
+    password: &mut Option<SecretBytes>,
+    hooks: SetupHooks,
+    target: PassTarget,
+) -> Result<Option<(Report, SetupNext)>, String> {
     if revision_at(root)? != expected_revision {
         return Ok(None);
     }
@@ -7516,9 +7616,16 @@ fn execute_initial_for_revision(
     // password the person typed for a try ([`scope::join_typed`]): this one notes whether it holds
     // one as the pass begins, and as it ends, once the Secrets stage or its lane handed it back or
     // a try spent it.
-    scope::holding_join_password(root, expected_revision, password.is_some());
-    let pass = execute_pass(host, root, password, hooks);
-    scope::holding_join_password(root, expected_revision, password.is_some());
+    if target == PassTarget::All {
+        scope::holding_join_password(root, expected_revision, password.is_some());
+    }
+    let pass = match target {
+        PassTarget::All => execute_pass(host, root, password, hooks),
+        PassTarget::Inputs(_) => execute_pass_target(host, root, password, hooks, target),
+    };
+    if target == PassTarget::All {
+        scope::holding_join_password(root, expected_revision, password.is_some());
+    }
     pass
 }
 
@@ -7530,6 +7637,7 @@ mod tests {
     mod embedded_restore_tests;
     mod ledger_conformance;
     mod pending_local_inputs_tests;
+    mod pending_repository_inputs_tests;
     pub(super) mod run_ledger_tests;
     mod upgrade_completion_tests;
 

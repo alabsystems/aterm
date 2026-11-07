@@ -1224,6 +1224,27 @@ pub(super) struct Begun {
 }
 
 impl Begun {
+    /// A checked publication-only recovery retains the fresh actual signer but starts no provider.
+    pub(super) fn recovery(
+        signin: super::accounts::SigninTurn,
+        store: &super::accounts::Store,
+        label: &str,
+    ) -> Result<Self, String> {
+        signin
+            .check_store(store)
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            signin,
+            cli: store.cli(),
+            label: label.to_owned(),
+            selection_owner: None,
+        })
+    }
+    pub(super) fn check_store(&self, store: &super::accounts::Store) -> Result<(), String> {
+        self.signin
+            .check_store(store)
+            .map_err(|error| error.to_string())
+    }
     pub(super) fn selection(&self) -> Option<&super::accounts::PendingSelection> {
         self.selection_owner
             .as_ref()

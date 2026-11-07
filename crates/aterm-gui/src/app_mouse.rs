@@ -343,6 +343,8 @@ pub(crate) struct ShownCaption {
     pub(crate) session: u64,
     pub(crate) cell: (u16, u16),
     pub(crate) names: CaptionNames,
+    /// The row as painted, for a client.
+    pub(crate) words: String,
 }
 
 /// Publish only the caption carried by an accepted application present.
@@ -4900,12 +4902,16 @@ impl App {
         }
         if self.windows.get(&wid).is_some_and(|ws| !ws.overlay_open()) {
             if pressed {
-                let taken = if button == WinitMouseButton::Left {
+                let left = button == WinitMouseButton::Left;
+                let taken = if left {
                     self.stats_press(wid)
                 } else {
                     self.stats_owns_pointer(wid)
                 };
                 if taken {
+                    if left {
+                        self.settle_rename_edit(wid);
+                    }
                     return None;
                 }
             } else if self

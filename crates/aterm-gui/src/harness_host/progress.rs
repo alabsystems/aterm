@@ -304,7 +304,9 @@ fn progress_phase(advice: Option<&AccountAdvice>, point: AccountPoint) -> Progre
     match advice {
         Some(AccountAdvice::Probe { .. }) => ProgressPhase::Watching,
         Some(AccountAdvice::Move { .. } | AccountAdvice::Resume { .. }) => ProgressPhase::Ready,
-        Some(AccountAdvice::Wait { .. } | AccountAdvice::Hold { .. }) => ProgressPhase::Waiting,
+        Some(
+            AccountAdvice::Wait { .. } | AccountAdvice::Again { .. } | AccountAdvice::Hold { .. },
+        ) => ProgressPhase::Waiting,
         Some(_) => ProgressPhase::Unknown,
         None if matches!(point, AccountPoint::Wall { kind } if kind.reads_limited()) => {
             ProgressPhase::Limited
@@ -554,7 +556,12 @@ impl WorkerIdle {
         if self.switches.accounts() == accounts::Mode::Off {
             value.phase = ProgressPhase::Disabled;
         }
-        if let Some(AccountAdvice::Wait { until } | AccountAdvice::Hold { until }) = advice {
+        if let Some(
+            AccountAdvice::Wait { until }
+            | AccountAdvice::Again { until, .. }
+            | AccountAdvice::Hold { until },
+        ) = advice
+        {
             value.next_at = wait_deadline(now, until.saturating_duration_since(Instant::now()));
         }
         if let Some(AccountAdvice::Move { to, .. }) = advice {
@@ -1309,6 +1316,17 @@ mod tests {
                 AccountPoint::TurnEnd
             ),
             ProgressPhase::Watching
+        );
+        assert_eq!(
+            progress_phase(
+                Some(&AccountAdvice::Again {
+                    until: Instant::now(),
+                    why: AskAgain::Unwritten,
+                }),
+                AccountPoint::TurnEnd
+            ),
+            ProgressPhase::Waiting,
+            "the host's own ask again is a wait"
         );
         assert_eq!(
             progress_phase(None, AccountPoint::LoginEnded),

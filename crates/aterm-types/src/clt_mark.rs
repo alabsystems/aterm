@@ -2,37 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The record of aterm's own ask for Apple's Command Line Tools: a small file in this account's
-//! aterm state ([`path`], [`FILE`]), so each account on the Mac keeps its own, with one
-//! `opened <build>` line per build of aterm ([`crate::version::build_id`]) that asked by itself for
-//! the Mac password to install them, the newest [`BUILDS`] kept. Its place reads no variable a
-//! shell may export and an app opened from the Dock lacks (`XDG_CONFIG_HOME`), so the window and a
-//! terminal's `aterm init` always find one file.
+//! The account's durable record of an administrator-password attempt. A valid record holds
+//! every automatic asker, across launches and software updates. Explicit person retries remain
+//! available. `opened <build>` retains the exact claim owner for a proven preprompt release;
+//! historical multi-line and bare `opened` records also retain the hold.
 //!
-//! Two askers share it, reading and writing it through this one code: System State's automatic
-//! Mac Setup tab, which claims its build's ask as the tab lands, and `aterm init` in a run
-//! aterm decided (the follow-up of a person's own `aterm pkg install` or `update`), which claims it
-//! right before `sudo` asks. A claim ([`claim`]) adds the build's line only where the record does
-//! not name it yet, under a lock beside the record ([`Files::lock`]) that every change of it
-//! takes, and says whether this caller added it: of two askers that claim one build at once, one
-//! adds the line and asks, and the other learns it lost and asks nothing. A build it names asks by
-//! itself no more, by either asker: a person who declined (closed the tab, pressed Ctrl-C, closed
-//! Apple's installer window without them) is not asked again by that build, nor by another build
-//! that shares this account's state and asked already (a release beside a dev build). A build it
-//! does not name, an update's, asks once more, so updating aterm retries unfinished setup once. A
-//! bare `opened`, the record an aterm that kept no builds wrote, names none. An ask that installed
-//! nothing and that no person declined (a failed install, Low Data Mode holding the download back,
-//! a tab whose program never started) takes its build's line back ([`forget`]), so the next launch
-//! or run asks again; only the caller whose claim added the line takes it back. So does a tab gone
-//! with no window to read how it ended (its window went before aterm's PTY keeper held it), which
-//! the next launch of its build reads from the tab's receipt: nothing can tell whether a person
-//! pressed anything in it. A person's press of
-//! Install Command Line Tools… and an `aterm init` they type ask every time, whatever it says.
-//!
-//! A record that cannot be read, one too long or malformed to be one, and a build no line could
-//! name each count as an ask on every build ([`Asked::Unread`]), and such a record is never
-//! rewritten: aterm asks no one twice for want of a reading. The file's I/O is a [`Files`]: this
-//! Mac's ([`Live`]) or a test double's.
+//! Window and terminal callers share one record and one lock. A claim succeeds only when the
+//! record is absent, so concurrent askers from different builds cannot each open a prompt.
+//! Cancellation, refused passwords, failed installs and unknown child outcomes keep the record.
+//! Only the exact owner whose child provably never reached the prompt may release its line.
+//! Unreadable or malformed records hold automatic asks and are never rewritten.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -40,15 +19,14 @@ use std::path::{Path, PathBuf};
 /// The record's file name, in this account's aterm state ([`crate::dirs::account_state_dir`]).
 pub const FILE: &str = "command-line-tools-tab";
 
-/// The builds the record names: past them the oldest build's line goes, so an account that runs
-/// more builds than this (a dev build per commit) may see an old one ask once more.
-pub const BUILDS: usize = 8;
+/// The maximum historical record length; new claims write one owner line.
+pub const LINES: usize = 8;
 
 /// The longest build id a line names; aterm's are far shorter (a version, `+g` and a commit).
 pub const BUILD_BYTES: usize = 96;
 
-/// The longest record read or written: [`BUILDS`] `opened <build>` lines.
-pub const BYTES: usize = BUILDS * ("opened ".len() + BUILD_BYTES + 1);
+/// The longest record read or written: [`LINES`] `opened <build>` lines.
+pub const BYTES: usize = LINES * ("opened ".len() + BUILD_BYTES + 1);
 
 /// How long a change of the record waits for another asker's change to end ([`Live`]'s lock): a
 /// change is a short read and one durable write, so a holder past this is stuck, and the change
@@ -121,65 +99,60 @@ pub trait Files {
     fn lock(&self, path: &Path) -> io::Result<Held>;
 }
 
-/// What the record says of one build ([`reading`]).
+/// What the account's record says about automatic password requests.
 #[derive(Debug)]
 pub enum Asked {
-    /// It names the build: that build asked by itself already.
-    Named,
-    /// It does not: no record, a bare `opened`, or one naming only other builds.
-    NotNamed,
-    /// It cannot say: the record cannot be read, is too long or malformed to be one, or no line
-    /// could name the build, as the error says. Each holds the ask, as a record naming the build
-    /// does.
+    /// A previous attempt consumed the automatic ask, including on another build.
+    Spent,
+    /// No record exists.
+    Available,
+    /// The record cannot be read safely; automatic requests remain held.
     Unread(io::Error),
 }
 
-/// What the record at `path` says of `build`, as `files` read it: [`Asked::NotNamed`] for no
-/// record, a bare `opened` and one naming only other builds, so a newer build asks once while
-/// repeated launches and runs of one build do not ask again.
+/// Read the durable episode, independently of the running build.
 #[must_use]
-pub fn reading(files: &dyn Files, path: &Path, build: &str) -> Asked {
-    if !nameable(build) {
-        return Asked::Unread(unnameable());
-    }
+pub fn reading(files: &dyn Files, path: &Path) -> Asked {
     match files.read(path, BYTES) {
-        Ok(None) => Asked::NotNamed,
+        Ok(None) => Asked::Available,
         Ok(Some(text)) => match builds(&text) {
-            Some(builds) if builds.contains(&build) => Asked::Named,
-            Some(_) => Asked::NotNamed,
+            Some(_) => Asked::Spent,
             None => Asked::Unread(malformed()),
         },
         Err(error) => Asked::Unread(error),
     }
 }
 
-/// Whether the record at `path` holds `build`'s ask, as `files` read it ([`reading`]): it names
-/// the build, or it cannot say.
+/// Whether a previous attempt, or an unreadable record, holds automatic requests.
 #[must_use]
-pub fn opened_on_build(files: &dyn Files, path: &Path, build: &str) -> bool {
-    !matches!(reading(files, path, build), Asked::NotNamed)
+pub fn spent(files: &dyn Files, path: &Path) -> bool {
+    !matches!(reading(files, path), Asked::Available)
 }
 
-/// Claim `build`'s ask in the record at `path`: its line is added as the newest, the newest
-/// [`BUILDS`] kept, only where the record does not name it yet, all under the record's lock
-/// ([`Files::lock`]), so of two askers that claim one build at once exactly one adds it. `true`
-/// when this call added the line (and so may ask, and may [`forget`] it later), `false` when the
-/// record named the build already, which this call leaves as it was. The write is durable, its
-/// directory entry included, and replaces the file whole ([`Files::write`]).
+/// Claim the absent automatic-ask episode under the shared lock. The durable owner is `build`.
+/// Returns false without rewriting any existing valid record, regardless of its owner.
 ///
 /// # Errors
-/// A record that cannot be read or is malformed, which is left as found, a `build` no line could
-/// name, the lock's own error, and the write's.
+/// An unsafe or malformed record, an invalid owner, or a lock/write error.
 pub fn claim(files: &dyn Files, path: &Path, build: &str) -> io::Result<bool> {
     change(files, path, build, Change::Claim)
 }
 
-/// Take `build`'s line out of the record at `path`, under its lock, keeping the other builds it
-/// names; a record left naming none goes, and one that does not name `build` is left as it is.
-/// Only an asker whose [`claim`] added the line takes it back.
+/// Record an explicit retry before it can ask. An absent episode receives an exact owner and
+/// returns true. An existing episode becomes an anonymous sticky hold and returns false: no
+/// older in-flight asker's preprompt release may erase this person's attempt.
 ///
 /// # Errors
-/// As [`claim`], and the removal's own error.
+/// As [`claim`]. Explicit callers keep their person-granted authority on recording failure.
+pub fn explicit(files: &dyn Files, path: &Path, build: &str) -> io::Result<bool> {
+    change(files, path, build, Change::Explicit)
+}
+
+/// Release exactly `build`'s line after proving its attempt never reached a password prompt.
+/// Other historical owners and anonymous holds are retained.
+///
+/// # Errors
+/// An unsafe or malformed record, an invalid owner, or a lock/write/removal error.
 pub fn forget(files: &dyn Files, path: &Path, build: &str) -> io::Result<()> {
     change(files, path, build, Change::Forget).map(|_| ())
 }
@@ -189,6 +162,8 @@ pub fn forget(files: &dyn Files, path: &Path, build: &str) -> io::Result<()> {
 enum Change {
     /// Add the build's line where there is none ([`claim`]).
     Claim,
+    /// Revoke older release capabilities before an explicit retry.
+    Explicit,
     /// Take the build's line out ([`forget`]).
     Forget,
 }
@@ -206,21 +181,34 @@ fn change(files: &dyn Files, path: &Path, build: &str, how: Change) -> io::Resul
         None => Vec::new(),
         Some(text) => builds(text).ok_or_else(malformed)?,
     };
-    let named = builds.contains(&build);
+    let named = builds.contains(&Some(build));
     match how {
-        Change::Claim if named => return Ok(false),
-        Change::Claim => builds.push(build),
+        Change::Claim if !builds.is_empty() => return Ok(false),
+        Change::Claim => builds.push(Some(build)),
+        Change::Explicit if !builds.is_empty() => {
+            if !builds.contains(&None) {
+                // A sticky hold supersedes historical owner lines without growing the bounded
+                // record or granting another release capability.
+                files.write(path, "opened\n")?;
+            }
+            return Ok(false);
+        }
+        Change::Explicit => builds.push(Some(build)),
         Change::Forget if !named => return Ok(false),
-        Change::Forget => builds.retain(|&kept| kept != build),
+        Change::Forget => builds.retain(|&kept| kept != Some(build)),
     }
     if builds.is_empty() {
         files.remove(path)?;
         return Ok(true);
     }
-    let keep = builds.len().saturating_sub(BUILDS);
     let mut lines = String::new();
-    for named in &builds[keep..] {
-        let _ = writeln!(lines, "opened {named}");
+    for named in builds {
+        match named {
+            Some(named) => {
+                let _ = writeln!(lines, "opened {named}");
+            }
+            None => lines.push_str("opened\n"),
+        }
     }
     files.write(path, &lines)?;
     Ok(true)
@@ -245,18 +233,18 @@ fn malformed() -> io::Error {
 /// The builds a record's `text` names, oldest first: one `opened <build>` line each, and a bare
 /// `opened` naming none. `None` for any other text, an empty one included, and for more lines
 /// than a record keeps.
-fn builds(text: &str) -> Option<Vec<&str>> {
+fn builds(text: &str) -> Option<Vec<Option<&str>>> {
     let mut lines = 0;
     let mut builds = Vec::new();
     for line in text.lines() {
         lines += 1;
         match line.split_once(' ') {
-            None if line == "opened" => {}
-            Some(("opened", build)) if nameable(build) => builds.push(build),
+            None if line == "opened" => builds.push(None),
+            Some(("opened", build)) if nameable(build) => builds.push(Some(build)),
             _ => return None,
         }
     }
-    (1..=BUILDS).contains(&lines).then_some(builds)
+    (1..=LINES).contains(&lines).then_some(builds)
 }
 
 /// Whether a line can name `build`: one word, no longer than [`BUILD_BYTES`].
@@ -371,56 +359,44 @@ impl Files for Live {
 mod tests {
     use super::*;
 
-    /// The record names each build that claimed its ask, the newest [`BUILDS`]: a later launch or
-    /// run of a build it names asks no more, nor do two builds sharing the account run in turn,
-    /// while a build it does not name (an update) asks once more. A bare `opened` (an older
-    /// aterm's record) names no build. A record that cannot be read or is malformed, one behind a
-    /// link included, and a build no line could name, hold, and such a record is left as found.
+    /// A consumed episode survives updates and historical anonymous/multi-owner records.
+    /// Only its exact owner's proven preprompt release can remove a line; unreadable records
+    /// remain held and unchanged.
     #[test]
-    fn each_build_asks_by_itself_at_most_once() {
+    fn a_password_episode_survives_updates_and_only_its_owner_can_release_it() {
         let dir = aterm_tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE);
-        let opened = |build: &str| opened_on_build(&Live, &path, build);
         let text = || std::fs::read_to_string(&path).unwrap();
-        assert!(!opened("release"), "no record");
+        assert!(!spent(&Live, &path));
         assert!(claim(&Live, &path, "release").unwrap());
-        assert!(opened("release"), "a later launch of that build");
-        assert!(!opened("dev"), "another build asks once more");
-        assert!(claim(&Live, &path, "dev").unwrap());
-        assert!(
-            opened("release") && opened("dev"),
-            "builds launched in turn"
-        );
-        assert_eq!(text(), "opened release\nopened dev\n");
-
-        for build in 1..BUILDS {
-            assert!(claim(&Live, &path, &format!("update-{build}")).unwrap());
+        for build in ["release", "dev", "update"] {
+            assert!(spent(&Live, &path));
+            assert!(!claim(&Live, &path, build).unwrap());
         }
-        assert!(!opened("release"), "the oldest gives way");
-        assert!(opened("dev") && opened(&format!("update-{}", BUILDS - 1)));
-        assert_eq!(text().lines().count(), BUILDS);
-
-        // An ask that installed nothing takes one build's line back and keeps the others'; the
-        // file goes with the last one.
-        let before = text();
-        forget(&Live, &path, "release").unwrap();
-        assert_eq!(text(), before, "a build it does not name changes nothing");
-        forget(&Live, &path, "dev").unwrap();
-        assert!(!opened("dev") && opened("update-1"));
-        let only = dir.path().join("only");
-        assert!(claim(&Live, &only, "release").unwrap());
-        forget(&Live, &only, "release").unwrap();
-        assert!(!only.exists());
-
-        std::fs::write(&path, "opened\n").unwrap();
-        assert!(
-            !opened("release"),
-            "an older aterm's bare record names no build"
-        );
-        assert!(claim(&Live, &path, "release").unwrap());
+        forget(&Live, &path, "update").unwrap();
         assert_eq!(text(), "opened release\n");
+        forget(&Live, &path, "release").unwrap();
+        assert!(!spent(&Live, &path));
+        assert!(!path.exists());
 
-        let too_many = "opened again\n".repeat(BUILDS + 1);
+        for historical in [
+            "opened\n",
+            "opened release\nopened dev\n",
+            "opened\nopened release\n",
+        ] {
+            std::fs::write(&path, historical).unwrap();
+            assert!(spent(&Live, &path));
+            assert!(!claim(&Live, &path, "update").unwrap());
+            assert_eq!(text(), historical);
+        }
+        forget(&Live, &path, "release").unwrap();
+        assert_eq!(
+            text(),
+            "opened\n",
+            "anonymous historical hold survives exact release"
+        );
+
+        let too_many = "opened again\n".repeat(LINES + 1);
         for malformed in [
             "",
             "\n",
@@ -429,38 +405,33 @@ mod tests {
             too_many.as_str(),
         ] {
             std::fs::write(&path, malformed).unwrap();
-            assert!(opened("release"), "{malformed:?} holds");
-            assert!(claim(&Live, &path, "release").is_err(), "{malformed:?}");
-            assert!(forget(&Live, &path, "release").is_err(), "{malformed:?}");
-            assert_eq!(text(), malformed, "left as found");
+            assert!(spent(&Live, &path), "{malformed:?} holds");
+            assert!(claim(&Live, &path, "release").is_err());
+            assert!(forget(&Live, &path, "release").is_err());
+            assert_eq!(text(), malformed);
         }
-        assert!(
-            opened_on_build(&Live, dir.path(), "release"),
-            "unreadable holds"
-        );
-
-        // A record behind a link is never read through it, nor written through it.
+        assert!(spent(&Live, dir.path()));
         let target = dir.path().join("elsewhere");
         std::fs::write(&target, "opened dev\n").unwrap();
         let linked = dir.path().join("linked");
         std::os::unix::fs::symlink(&target, &linked).unwrap();
-        assert!(opened_on_build(&Live, &linked, "release"), "a link holds");
+        assert!(spent(&Live, &linked));
         assert!(claim(&Live, &linked, "release").is_err());
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "opened dev\n");
         assert!(
             std::fs::symlink_metadata(&linked)
                 .unwrap()
                 .file_type()
-                .is_symlink(),
-            "left as found"
+                .is_symlink()
         );
-
-        let unnameable = "x".repeat(BUILD_BYTES + 1);
         assert!(
-            opened_on_build(&Live, &dir.path().join("none"), &unnameable),
-            "a build no line could name holds"
+            claim(
+                &Live,
+                &dir.path().join("none"),
+                &"x".repeat(BUILD_BYTES + 1)
+            )
+            .is_err()
         );
-        assert!(claim(&Live, &dir.path().join("none"), &unnameable).is_err());
     }
 
     /// A staged copy an earlier process of this pid left as it died mid-write (killed during the
@@ -481,7 +452,7 @@ mod tests {
         assert_eq!(text(), "opened release\n");
         assert!(!staged.exists(), "the staged copy went with the rename");
 
-        assert!(claim(&Live, &path, "dev").unwrap());
+        std::fs::write(&path, "opened release\nopened dev\n").unwrap();
         std::fs::write(&staged, "opened hal").unwrap();
         forget(&Live, &path, "release").unwrap();
         assert_eq!(text(), "opened dev\n", "the forget took its line back");
@@ -489,45 +460,32 @@ mod tests {
         let target = dir.path().join("elsewhere");
         std::fs::write(&target, "kept\n").unwrap();
         std::os::unix::fs::symlink(&target, &staged).unwrap();
+        forget(&Live, &path, "dev").unwrap();
         assert!(claim(&Live, &path, "release").unwrap());
-        assert_eq!(text(), "opened dev\nopened release\n");
+        assert_eq!(text(), "opened release\n");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "kept\n");
         assert!(std::fs::symlink_metadata(&staged).is_err());
     }
 
-    /// The reading tells a record that names the build from one that cannot say: no record, a
-    /// bare `opened` and other builds' lines name it not; its own line names it; and an
-    /// unreadable record (a folder, a link), a malformed one, and a build no line could name each
-    /// cannot say, with why.
+    /// Valid historical records and unreadable records both hold, with distinct diagnostics.
     #[test]
-    fn the_reading_tells_a_named_build_from_a_record_that_cannot_say() {
+    fn the_reading_distinguishes_spent_available_and_unread() {
         let dir = aterm_tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE);
-        let read = |path: &Path, build: &str| reading(&Live, path, build);
-        assert!(matches!(read(&path, "release"), Asked::NotNamed));
-        std::fs::write(&path, "opened\n").unwrap();
-        assert!(matches!(read(&path, "release"), Asked::NotNamed));
-        std::fs::write(&path, "opened dev\n").unwrap();
-        assert!(matches!(read(&path, "release"), Asked::NotNamed));
-        assert!(matches!(read(&path, "dev"), Asked::Named));
+        assert!(matches!(reading(&Live, &path), Asked::Available));
+        for record in ["opened\n", "opened dev\n"] {
+            std::fs::write(&path, record).unwrap();
+            assert!(matches!(reading(&Live, &path), Asked::Spent));
+        }
         std::fs::write(&path, "closed\n").unwrap();
-        assert!(matches!(
-            read(&path, "dev"),
-            Asked::Unread(error) if error.kind() == io::ErrorKind::InvalidData
-        ));
+        assert!(
+            matches!(reading(&Live, &path), Asked::Unread(error) if error.kind() == io::ErrorKind::InvalidData)
+        );
         let linked = dir.path().join("linked");
         std::os::unix::fs::symlink(dir.path().join("elsewhere"), &linked).unwrap();
         for unread in [linked.as_path(), dir.path()] {
-            assert!(
-                matches!(read(unread, "dev"), Asked::Unread(_)),
-                "{}",
-                unread.display()
-            );
+            assert!(matches!(reading(&Live, unread), Asked::Unread(_)));
         }
-        assert!(matches!(
-            read(&path, &"x".repeat(BUILD_BYTES + 1)),
-            Asked::Unread(error) if error.kind() == io::ErrorKind::InvalidInput
-        ));
     }
 
     /// A claim reads the record under its lock: a claim made while another asker holds the lock
@@ -536,7 +494,7 @@ mod tests {
     /// so its order stays.
     /// NEGATIVE CONTROL: with no other asker, the same claim adds the line (`true`).
     #[test]
-    fn of_two_askers_claiming_one_build_one_adds_it() {
+    fn of_two_builds_claiming_one_episode_only_one_asks() {
         let dir = aterm_tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE);
         let other = std::rc::Rc::new(std::cell::RefCell::new(Some(Live.lock(&path).unwrap())));
@@ -553,7 +511,7 @@ mod tests {
                     }
                 }
             },
-            || claim(&Live, &path, "release").unwrap(),
+            || claim(&Live, &path, "update").unwrap(),
         );
         assert!(waited.get(), "the claim waited for the other asker's lock");
         assert!(!claimed, "the other asker added it first");
@@ -580,7 +538,7 @@ mod tests {
         let dir = aterm_tempfile::tempdir().unwrap();
         let path = dir.path().join("state").join("aterm").join(FILE);
         assert!(claim(&Live, &path, "release").unwrap());
-        assert!(opened_on_build(&Live, &path, "release"));
+        assert!(spent(&Live, &path));
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600

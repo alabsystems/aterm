@@ -1048,10 +1048,11 @@ mod tests {
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        assert!(
-            args.ends_with(&["--unverified".to_owned(), "build".to_owned()]),
-            "{args:?}"
-        );
+        let verb = args
+            .iter()
+            .position(|a| a == "build")
+            .expect("build command");
+        assert!(args[..verb].iter().any(|a| a == "--unverified"), "{args:?}");
     }
 
     #[test]

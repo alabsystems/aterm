@@ -13,7 +13,6 @@ use super::*;
 use crate::commons::bootstrap::{Availability, Bootstrap};
 use crate::membership_log::genesis::{self, Machine};
 use crate::membership_log::{Record, Root};
-use crate::swarm_roster::{SheetHints, SwarmPolicy, next_free_number};
 
 /// What [`admin_sign_genesis`] wrote.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,12 +156,8 @@ pub(super) fn sign_genesis(
             })
         })
         .collect::<crate::Result<Vec<_>>>()?;
-    let roster = super::roster::load_or_seed_swarm_roster_with_log(
-        &admin,
-        doc,
-        &super::roster::log_labels(paths)?,
-    )?;
-    let labels = roster
+    let roster = super::roster::historical_roster(doc)?;
+    let mut labels: BTreeMap<Recipient, String> = roster
         .members
         .iter()
         .filter_map(|row| {
@@ -171,16 +166,15 @@ pub(super) fn sign_genesis(
             (!roster.is_member_denied(row)).then(|| (recipient, row.label.clone()))
         })
         .collect();
-    let policy = SwarmPolicy::from_document(doc)?.unwrap_or_default();
-    let reserved = policy.effective_reserved(doc, Some(&roster));
-    let next_free = next_free_number(
-        &roster,
-        doc,
-        &reserved,
-        &SheetHints::from_document(doc),
-        &[],
-    );
-    let founders = genesis::alab_founders(&machines, &bindings, &labels, next_free)?;
+    // Genesis still carries protocol display hints. With no historical table, keep a
+    // machine's leading local-name hint instead of renaming every seat from m1 upward.
+    // No roster entry is created and these names grant no registry identity.
+    for machine in &machines {
+        if let Some((_, label)) = crate::swarm_roster::leading_m_label(&machine.name) {
+            labels.entry(machine.recipient).or_insert(label);
+        }
+    }
+    let founders = genesis::alab_founders(&machines, &bindings, &labels, 1)?;
     let members = founders.len();
     let root = Root {
         network: trust.network,

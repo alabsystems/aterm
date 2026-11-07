@@ -18,10 +18,12 @@ const FIND: NodeId = NodeId(3);
 const FIND_RUN: NodeId = NodeId(4);
 /// The focused rewound pane's slider ([`GridRewind`]).
 pub(crate) const REWIND: NodeId = NodeId(5);
+const RENAME: NodeId = NodeId(6);
+const RENAME_RUN: NodeId = NodeId(7);
 const MESSAGE_BASE: u64 = 1 << 20;
 const MENU_BASE: u64 = 1 << 29;
-const MENU_ROWS: u64 = 64;
-const MENU_EPOCH_BITS: u32 = 22;
+const MENU_ROWS: u64 = 256;
+const MENU_EPOCH_BITS: u32 = 20;
 const CHIP_BASE: u64 = 1 << 30;
 const STATS_BASE: u64 = 1 << 28;
 const STATS_CORES: usize = 1 << 20;
@@ -54,38 +56,67 @@ fn row_chunks(line: &str) -> Vec<String> {
     chunks
 }
 
-/// The layout a window's composed cells were cut under.
-///
-/// The cells hold what a frame composed, so a rect of any other layout reads another moment's text,
-/// or another tab's, as if it were that pane's. A view lives in one tab, so the leaves name the tab
-/// and their rects the window's size. Focus is left out: it moves no cell.
-#[derive(Debug, Default)]
-pub(crate) struct ComposedLayout {
-    chrome_rows: u16,
-    leaves: Vec<(crate::tab_model::ViewId, crate::tab_model::LogicalRect)>,
+/// A terminal's document as a client reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TerminalDocument {
+    /// Its rows and caret.
+    pub(crate) snap: crate::accessibility::AccessibleSnapshot,
+    /// The span of those rows that is selected.
+    pub(crate) selection: Option<GridSpan>,
 }
 
-impl ComposedLayout {
-    /// Whether cells cut under this layout can be read by `plan`'s rects below `chrome_rows`.
-    pub(crate) fn holds(&self, plan: &crate::tab_model::VisibleLeafPlan, chrome_rows: u16) -> bool {
-        self.chrome_rows == chrome_rows
-            && self
-                .leaves
-                .iter()
-                .copied()
-                .eq(plan.leaves.iter().map(|leaf| (leaf.view, leaf.rect)))
-    }
+/// What a client must hear of a window with no frame to tell it. Compared whole, so a caret, a
+/// scrolled view, a selection, a pane's focus, a step of Rewind, a menu that closed or a character
+/// typed in a field counts as a printed row does.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct ClientReads {
+    /// The leaves on screen, so a tab that reads the same as the last one still counts.
+    pub(crate) views: Vec<crate::tab_model::ViewId>,
+    /// A split's or mixed tab's terminals, one document each.
+    pub(crate) panes: Vec<GridPane>,
+    /// The one document of a tab with no panes.
+    pub(crate) front: Option<TerminalDocument>,
+    /// The focused pane's Rewind view.
+    pub(crate) rewind: Option<GridRewind>,
+    /// The paste or close question waiting on an answer.
+    pub(crate) questions: Vec<GridMessage>,
+    /// The open menu, whose rows a client presses.
+    pub(crate) menu: Option<GridMenu>,
+    /// The session field, which holds the keys while it is open.
+    pub(crate) rename: Option<GridRename>,
+    /// The find field.
+    pub(crate) find: Option<GridFind>,
+}
 
-    /// Record the layout a frame just composed under; a settled layout allocates nothing.
-    pub(crate) fn record(&mut self, plan: &crate::tab_model::VisibleLeafPlan, chrome_rows: u16) {
-        if self.holds(plan, chrome_rows) {
-            return;
-        }
-        self.chrome_rows = chrome_rows;
-        self.leaves.clear();
-        self.leaves
-            .extend(plan.leaves.iter().map(|leaf| (leaf.view, leaf.rect)));
+/// The span of `snap`, read from `cells`, that is selected, kept to the text of each row.
+pub(crate) fn selected_span(
+    cells: &aterm_core::render::RenderInput,
+    snap: &crate::accessibility::AccessibleSnapshot,
+) -> Option<GridSpan> {
+    let mut keys: Vec<aterm_core::render::SelectionRowKey> = Vec::new();
+    let mut anchor: Option<(usize, usize)> = None;
+    let mut focus: Option<(usize, usize)> = None;
+    for (row, line) in snap.value().split_inclusive('\n').enumerate() {
+        cells.selection_row_key(row, &mut keys);
+        let Some((lo, hi)) = keys
+            .iter()
+            .filter_map(|key| {
+                let (lo, hi) = (usize::from(key.lo), usize::from(key.hi));
+                let hi = hi.min(snap.cols.saturating_sub(1));
+                (lo <= hi).then_some((lo, hi))
+            })
+            .reduce(|(a_lo, a_hi), (b_lo, b_hi)| (a_lo.min(b_lo), a_hi.max(b_hi)))
+        else {
+            continue;
+        };
+        let trimmed = line.strip_suffix('\n').unwrap_or(line).chars().count();
+        let start = lo.min(trimmed);
+        let end = (hi + 1).min(trimmed);
+        anchor.get_or_insert((row, start));
+        focus = Some((row, end));
     }
+    let (anchor, focus) = (anchor?, focus?);
+    (anchor != focus).then_some(GridSpan { anchor, focus })
 }
 
 /// Minimal valid tree containing only an empty window root.
@@ -156,7 +187,7 @@ pub(crate) struct GridPane {
     pub(crate) slot: usize,
     /// What a screen reader announces on entering the pane.
     pub(crate) label: String,
-    /// This pane's rectangle of the composed frame, as text.
+    /// What this pane's terminal shows, as text.
     pub(crate) snap: crate::accessibility::AccessibleSnapshot,
     /// The pane's origin in the visible grid, for `bounds` (both `0` for a single pane).
     pub(crate) row_off: usize,
@@ -166,6 +197,17 @@ pub(crate) struct GridPane {
     pub(crate) focused: bool,
     /// This pane's painted selection, in the pane's own coordinates.
     pub(crate) selection: Option<GridSpan>,
+}
+
+/// The session field open over the tab strip, which holds the keyboard until it is answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GridRename {
+    /// What the field sets.
+    pub(crate) label: &'static str,
+    /// Its text, as the field paints it.
+    pub(crate) text: String,
+    /// The edit position as a character index into `text`.
+    pub(crate) caret: usize,
 }
 
 /// Active find panel query, caret offset, and match status.
@@ -179,7 +221,8 @@ pub(crate) struct GridFind {
     pub(crate) status: String,
 }
 
-/// Transient chrome message or status band row published as a live region.
+/// Transient chrome message or status band row, published as a live region but for the link
+/// caption, which is published silent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChromeMessage {
     /// Multi-line paste confirmation band ([`crate::paste_banner`]).
@@ -194,6 +237,8 @@ pub(crate) enum ChromeMessage {
     BandRow2,
     /// Message band overflow link (`N more messages`).
     BandOverflow,
+    /// The caption naming a hovered link's destination ([`crate::link_target`]).
+    LinkCaption,
     /// Action capsule button within a message band row.
     BandCapsule {
         /// The band row, 0 = topmost.
@@ -228,13 +273,14 @@ pub(crate) const fn capsule_action(index: u8) -> aterm_messages::ActionIndex {
 
 impl ChromeMessage {
     /// Row-level messages in top-down publish order.
-    pub(crate) const ORDER: [Self; 6] = [
+    pub(crate) const ORDER: [Self; 7] = [
         Self::BandRow0,
         Self::BandRow1,
         Self::BandRow2,
         Self::BandOverflow,
         Self::PasteConfirm,
         Self::CloseConfirm,
+        Self::LinkCaption,
     ];
 
     /// Band row variant for `row` (`0..3`).
@@ -265,6 +311,7 @@ impl ChromeMessage {
             Self::BandRow2 => 6,
             Self::BandOverflow => 7,
             Self::CloseConfirm => 8,
+            Self::LinkCaption => 9,
             Self::BandCapsule { row, index } => {
                 CAPSULE_BASE + (row as u64) * CAPSULES_PER_ROW + index as u64
             }
@@ -299,6 +346,8 @@ impl ChromeMessage {
             | Self::BandRow2
             | Self::BandOverflow
             | Self::BandCapsule { .. } => Live::Polite,
+            // A pointer resting where links scroll past would speak every one of them.
+            Self::LinkCaption => Live::Off,
         }
     }
 
@@ -315,6 +364,7 @@ impl ChromeMessage {
                 }
             }
             Self::BandOverflow => Role::Link,
+            Self::LinkCaption => Role::Label,
             Self::BandCapsule { .. } => Role::Button,
         }
     }
@@ -535,7 +585,7 @@ pub(crate) struct GridMenuItem {
     pub(crate) row: usize,
 }
 
-/// Open Autopilot popup menu (`Role::Menu`) over the pane.
+/// Open popup menu (`Role::Menu`) over the pane: Autopilot's or a tab's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GridMenu {
     /// Menu header label.
@@ -584,7 +634,7 @@ fn menu_item_node_id(epoch: u32, item: usize) -> Option<NodeId> {
     Some(NodeId(MENU_BASE + 1 + epoch * MENU_ROWS + item))
 }
 
-/// Decode `node` to `(epoch, item_index)` for an open Autopilot menu item.
+/// Decode `node` to `(epoch, item_index)` for an open menu's item.
 pub(crate) fn menu_item_for(node: NodeId) -> Option<(u32, usize)> {
     let at = node
         .0
@@ -878,6 +928,7 @@ pub(crate) struct GridFrame<'a> {
     pub(crate) selection: Option<GridSpan>,
     /// The find panel, live only while find mode is up.
     pub(crate) find: Option<&'a GridFind>,
+    pub(crate) rename: Option<&'a GridRename>,
     /// The chrome messages on screen right now, empty on an ordinary frame.
     pub(crate) messages: &'a [GridMessage],
     /// Claude Code composer rule chips in painted order.
@@ -1107,35 +1158,57 @@ pub(crate) fn splice_terminal_panes(
     Ok(())
 }
 
-fn push_find_field(nodes: &mut Vec<(NodeId, Node)>, find: &GridFind) {
+/// `field` with `text` in it as a run at `run`, and its caret at `caret`.
+fn push_text_field(
+    nodes: &mut Vec<(NodeId, Node)>,
+    (id, run_id): (NodeId, NodeId),
+    mut field: Node,
+    text: &str,
+    caret: usize,
+) {
     let mut run = Node::new(Role::TextRun);
-    run.set_value(find.query.clone());
+    run.set_value(text.to_owned());
     run.set_character_lengths(
-        find.query
-            .chars()
+        text.chars()
             .map(|c| u8::try_from(c.len_utf8()).unwrap_or(4))
             .collect::<Vec<u8>>(),
     );
-    run.set_word_starts(word_starts_of(&find.query));
-    nodes.push((FIND_RUN, run));
+    run.set_word_starts(word_starts_of(text));
+    nodes.push((run_id, run));
 
-    let mut field = Node::new(Role::SearchInput);
-    field.set_label("Find");
-    field.set_value(find.query.clone());
-    if !find.status.is_empty() {
-        field.set_description(find.status.clone());
-    }
-    field.set_children(vec![FIND_RUN]);
+    field.set_value(text.to_owned());
+    field.set_children(vec![run_id]);
     let caret = TextPosition {
-        node: FIND_RUN,
-        character_index: find.caret.min(find.query.chars().count()),
+        node: run_id,
+        character_index: caret.min(text.chars().count()),
     };
     field.set_text_selection(TextSelection {
         anchor: caret,
         focus: caret,
     });
     field.add_action(Action::Focus);
-    nodes.push((FIND, field));
+    nodes.push((id, field));
+}
+
+fn push_find_field(nodes: &mut Vec<(NodeId, Node)>, find: &GridFind) {
+    let mut field = Node::new(Role::SearchInput);
+    field.set_label("Find");
+    if !find.status.is_empty() {
+        field.set_description(find.status.clone());
+    }
+    push_text_field(nodes, (FIND, FIND_RUN), field, &find.query, find.caret);
+}
+
+fn push_rename_field(nodes: &mut Vec<(NodeId, Node)>, rename: &GridRename) {
+    let mut field = Node::new(Role::TextInput);
+    field.set_label(rename.label);
+    push_text_field(
+        nodes,
+        (RENAME, RENAME_RUN),
+        field,
+        &rename.text,
+        rename.caret,
+    );
 }
 
 fn push_message(
@@ -1216,14 +1289,17 @@ fn push_message(
 struct ChromeFocus {
     menu: Option<(NodeId, Option<NodeId>)>,
     find: bool,
+    rename: bool,
     lens: Option<NodeId>,
 }
 
 impl ChromeFocus {
-    /// The open menu's row (or the menu), else the find field, else the keyboard-driven lens.
+    /// The open menu's row (or the menu), else the session field, else the find field, else the
+    /// keyboard-driven lens.
     fn focus(&self) -> Option<NodeId> {
         match self.menu {
             Some((id, row)) => Some(row.unwrap_or(id)),
+            None if self.rename => Some(RENAME),
             None if self.find => Some(FIND),
             None => self.lens,
         }
@@ -1304,6 +1380,11 @@ fn push_chrome(
         root_children.push(FIND);
     }
 
+    if let Some(rename) = frame.rename {
+        push_rename_field(nodes, rename);
+        root_children.push(RENAME);
+    }
+
     if let Some(rewind) = frame.rewind {
         push_rewind(nodes, rewind);
         root_children.push(REWIND);
@@ -1318,6 +1399,7 @@ fn push_chrome(
     ChromeFocus {
         menu,
         find: frame.find.is_some(),
+        rename: frame.rename.is_some(),
         lens: lens_focus,
     }
 }
@@ -1325,8 +1407,8 @@ fn push_chrome(
 /// Splice the window chrome of `frame` into a native tab's window tree.
 ///
 /// The chrome goes ahead of the tab's leaves, as in the terminal grid's tree, and an open menu,
-/// find field or keyboard-driven lens takes the focus. `frame`'s panes, selection and title are
-/// not read. Returns the colliding id, leaving `update` unchanged, when a chrome node's id is
+/// session field, find field or keyboard-driven lens takes the focus. `frame`'s panes, selection
+/// and title are not read. Returns the colliding id, leaving `update` unchanged, when a chrome node's id is
 /// already one of the tree's nodes.
 pub(crate) fn splice_chrome(
     update: &mut TreeUpdate,
@@ -2425,7 +2507,7 @@ mod tests {
         let snap = live_grid(2, 20, b"hi", Some((0, 2)));
         let asked = crate::paste_banner::question("one\ntwo\nthree\nfour\nfive\nsix\nseven");
         let messages = vec![GridMessage {
-            detail: Some(crate::paste_banner::announcement_detail()),
+            detail: Some(crate::paste_banner::announcement_detail("one\ntwo")),
             ..message(ChromeMessage::PasteConfirm, &asked)
         }];
         let update = grid_tree(
@@ -2445,7 +2527,7 @@ mod tests {
         assert_eq!(ask.label(), Some(asked.as_str()));
         assert_eq!(
             ask.description(),
-            Some(crate::paste_banner::announcement_detail().as_str())
+            Some(crate::paste_banner::announcement_detail("one\ntwo").as_str())
         );
         assert!(
             !ask.supports_action(Action::Click),
@@ -2861,6 +2943,39 @@ mod tests {
         }
     }
 
+    /// A menu runs as long as what it lists: none of its rows may fall off what a client reads.
+    #[test]
+    fn a_long_menu_keeps_every_row() {
+        let snap = live_grid(12, 40, b"hi", Some((0, 2)));
+        let items = (0..200)
+            .map(|row| GridMenuItem {
+                label: format!("row {row}"),
+                checked: None,
+                disabled: false,
+                row,
+            })
+            .collect();
+        let menu = GridMenu {
+            label: "Tab menu".to_string(),
+            epoch: 1,
+            items,
+            selected: None,
+            row: 1,
+            col: 4,
+            width: 30,
+            height: 8,
+        };
+        let update = grid_tree(
+            &snap,
+            Some(GEOM),
+            &GridFrame {
+                menu: Some(&menu),
+                ..GridFrame::default()
+            },
+        );
+        assert_eq!(node(&update, NodeId(MENU_BASE)).children().len(), 200);
+    }
+
     #[test]
     fn the_open_autopilot_menu_is_a_menu_of_items_in_words() {
         let snap = live_grid(12, 40, b"hi", Some((0, 2)));
@@ -2872,7 +2987,7 @@ mod tests {
         };
         let menu = GridMenu {
             label: "Autopilot, tab 3, fix the footer".to_string(),
-            epoch: 0x2a_5a5a,
+            epoch: 0xa_5a5a,
             items: vec![
                 item("Cruise", Some(true), false, 2),
                 item("Land now", Some(false), false, 3),

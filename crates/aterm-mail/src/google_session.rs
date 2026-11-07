@@ -27,7 +27,7 @@ pub struct Session {
     grant: Grant,
     access: Option<Secret>,
     expires: u64,
-    pending: Option<(Tokens, u64)>,
+    pending: Option<(Secret, u64)>,
     dirty: bool,
     generation: u64,
     rejected: Option<Error>,
@@ -198,7 +198,7 @@ pub fn register(
     refresh: Secret,
 ) -> Result<(), String> {
     let account = email(account)?;
-    let _lease = crate::session::acquire(home, &format!("google:{account}"))?;
+    let _lease = crate::session::acquire_prefixed(home, "google:", &account)?;
     save(
         home,
         &Grant {
@@ -420,7 +420,7 @@ impl Session {
             return Ok(changed);
         }
         let grant_path = grant_path.unwrap_or_else(|| location(&self.home, &self.grant.email));
-        let lease = crate::session::acquire(&self.home, &format!("google:{}", self.grant.email))
+        let lease = crate::session::acquire_prefixed(&self.home, "google:", &self.grant.email)
             .map_err(|_| Error {
                 kind: ErrorKind::Storage,
             })?;
@@ -453,11 +453,11 @@ impl Session {
         // An unavailable response clock cannot discard the rotated refresh token.
         let base = now_unix().map_or(now, |observed| observed.min(now));
         let expires = base.saturating_add(within);
-        if let Some(refresh) = &tokens.refresh_token {
-            self.grant.refresh = refresh.clone();
+        if let Some(refresh) = tokens.refresh_token {
+            self.grant.refresh = refresh;
             self.dirty = true;
         }
-        self.pending = Some((tokens, expires));
+        self.pending = Some((tokens.access_token, expires));
         changed |= self.commit_pending()?;
         Ok(changed)
     }
@@ -469,8 +469,8 @@ impl Session {
             })?;
             self.dirty = false;
         }
-        if let Some((tokens, expires)) = self.pending.take() {
-            self.access = Some(tokens.access_token);
+        if let Some((access_token, expires)) = self.pending.take() {
+            self.access = Some(access_token);
             self.expires = expires;
             self.generation = self.generation.wrapping_add(1);
             self._lease = None;

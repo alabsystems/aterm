@@ -592,7 +592,7 @@ fn a_re_import_never_overwrites_the_owner_and_writes_nothing_when_unchanged() {
 fn labels_resolve_through_live_rows_and_known_macs_before_a_placeholder() {
     // Born under its fleet node, so its key is not the placeholder its old label would mint.
     let relabelled = keys::machine_pk("n-fedcba9876543210fedcba9876543210");
-    let adopted = keys::machine_pk("n-0123456789abcdef0123456789abcdef");
+    let adopted = keys::machine_pk("n-0123456789abcdef");
     let mut book = Book::new();
     book.write(
         2,
@@ -610,12 +610,7 @@ fn labels_resolve_through_live_rows_and_known_macs_before_a_placeholder() {
         &seen,
         vec![
             put(&MACHINE, &adopted, "label", json!("m99")),
-            put(
-                &MACHINE,
-                &adopted,
-                "fleet_node",
-                json!("0123456789abcdef0123456789abcdef"),
-            ),
+            put(&MACHINE, &adopted, "node", json!("0123456789abcdef")),
             put(&MACHINE, &adopted, "status", json!("planned")),
             put(&MACHINE, &adopted, "row", json!("live")),
         ],
@@ -624,7 +619,7 @@ fn labels_resolve_through_live_rows_and_known_macs_before_a_placeholder() {
     let macs = [KnownMac {
         label: Some(Label::plain(100)),
         aliases: vec![Label::plain(32)],
-        node: Some("0123456789abcdef0123456789abcdef".to_owned()),
+        node: Some("0123456789abcdef".to_owned()),
         hosts: Vec::new(),
     }];
     let sheet = vault(&[
@@ -738,7 +733,7 @@ fn a_retired_machines_label_births_a_row_of_its_own() {
 /// the label lands on the retired row: `left: None right: Some(String("m77"))`.
 #[test]
 fn a_retired_node_born_row_leaves_the_mac_a_row_of_its_own() {
-    let node = "0123456789abcdef0123456789abcdef";
+    let node = "0123456789abcdef";
     let retired = keys::machine_pk(&format!("n-{node}"));
     let mut book = Book::new();
     book.write(
@@ -746,7 +741,7 @@ fn a_retired_node_born_row_leaves_the_mac_a_row_of_its_own() {
         &[],
         vec![
             put(&MACHINE, &retired, "label", json!("m77")),
-            put(&MACHINE, &retired, "fleet_node", json!(node)),
+            put(&MACHINE, &retired, "node", json!(node)),
             put(&MACHINE, &retired, "status", json!("active")),
             put(&MACHINE, &retired, "row", json!("retired")),
         ],
@@ -764,10 +759,7 @@ fn a_retired_node_born_row_leaves_the_mac_a_row_of_its_own() {
         planned(&first, "machine", &fresh, "label"),
         Some(&json!("m77"))
     );
-    assert_eq!(
-        planned(&first, "machine", &fresh, "fleet_node"),
-        Some(&json!(node))
-    );
+    assert_eq!(planned(&first, "machine", &fresh, "node"), None);
     assert!(
         first.planned.iter().all(|p| p.pk != retired),
         "nothing is written onto the retired row"
@@ -1195,7 +1187,7 @@ fn a_harness_file_adds_below_the_sheets() {
 /// plan.planned.iter().all(|p| p.pk != first && p.pk != second) ``.
 #[test]
 fn two_rows_naming_one_fleet_node_adopt_neither() {
-    let node = "00112233445566778899aabbccddeeff";
+    let node = "0011223344556677";
     let (first, second) = (keys::machine_pk("m12"), keys::machine_pk("m40"));
     let mut book = Book::new();
     for (pk, label) in [(&first, "m12"), (&second, "m40")] {
@@ -1204,7 +1196,7 @@ fn two_rows_naming_one_fleet_node_adopt_neither() {
             &[],
             vec![
                 put(&MACHINE, pk, "label", json!(label)),
-                put(&MACHINE, pk, "fleet_node", json!(node)),
+                put(&MACHINE, pk, "node", json!(node)),
                 put(&MACHINE, pk, "row", json!("live")),
             ],
         );
@@ -1235,7 +1227,7 @@ fn two_rows_naming_one_fleet_node_adopt_neither() {
             .iter()
             .any(
                 |f| matches!(f, crate::typed::check::Finding::Unique { columns, .. }
-                if columns == &["fleet_node"])
+                if columns == &["node"])
             )
     );
 }
@@ -1252,7 +1244,7 @@ fn two_rows_naming_one_fleet_node_adopt_neither() {
 #[test]
 fn adopt_binds_known_macs_by_node_and_births_none() {
     let row = keys::machine_pk("m12");
-    let node = "00112233445566778899aabbccddeeff";
+    let node = "0011223344556677";
     let mut book = Book::new();
     book.write(
         2,
@@ -1274,7 +1266,7 @@ fn adopt_binds_known_macs_by_node_and_births_none() {
         KnownMac {
             label: Some(Label::plain(13)),
             aliases: Vec::new(),
-            node: Some("ffeeddccbbaa99887766554433221100".to_owned()),
+            node: Some("ffeeddccbbaa9988".to_owned()),
             hosts: Vec::new(),
         },
     ];
@@ -1288,10 +1280,7 @@ fn adopt_binds_known_macs_by_node_and_births_none() {
         unread: &[],
     };
     let plan = plan(&adopt, &cells).unwrap();
-    assert_eq!(
-        planned(&plan, "machine", &row, "fleet_node"),
-        Some(&json!(node))
-    );
+    assert_eq!(planned(&plan, "machine", &row, "node"), None);
     assert_eq!(
         planned(&plan, "machine", &row, "status"),
         Some(&json!("active"))
@@ -1300,18 +1289,22 @@ fn adopt_binds_known_macs_by_node_and_births_none() {
         planned(&plan, "machine", &row, "aliases.m70"),
         Some(&json!(true))
     );
-    let stranger = keys::machine_pk("n-ffeeddccbbaa99887766554433221100");
+    let stranger = keys::machine_pk("n-ffeeddccbbaa9988");
     assert!(plan.planned.iter().all(|p| p.pk != stranger));
     assert!(kinds(&plan).contains(&"unadopted"));
     let src = planned(&plan, "machine", &row, "src").unwrap();
     assert_eq!((&src["row"], &src["col"]), (&json!(1), &json!(0)));
-    // Applied, the next adopt finds the row by its node and writes nothing.
+    // The import leaves node publication to the adopting Mac.
     let mut book2 = book;
     let after = apply(&mut book2, &plan);
     let sources = cell::project(&SOURCE, &after);
     let roster = &sources.rows[src["source"].as_str().unwrap()];
     assert_eq!(roster.get("kind"), Some(&json!("swarm-roster")));
     assert_eq!(roster.get("rows"), Some(&json!(2)));
+    let seen = book2.all();
+    book2.write(2, &seen, vec![put(&MACHINE, &row, "node", json!(node))]);
+    let after = book2.cells();
+    // Once the Mac publishes its own node, the next adopt finds it by that node.
     let again = super::plan(&adopt, &after).unwrap();
     assert!(again.rows.is_empty());
     assert!(again.findings.iter().any(|f| f.kind == Kind::AdoptedByNode));
@@ -1613,7 +1606,7 @@ fn per_cell_provenance_preserves_cross_sheet_cells_and_empty_sheet_preference_en
         KnownMac {
             label: Some(Label::plain(77)),
             aliases: Vec::new(),
-            node: Some("0123456789ABCDEF0123456789ABCDEF".to_owned()),
+            node: Some("0123456789ABCDEF".to_owned()),
             hosts: vec![
                 "m77.local".to_owned(),
                 "m77.local".to_owned(),
@@ -1623,11 +1616,8 @@ fn per_cell_provenance_preserves_cross_sheet_cells_and_empty_sheet_preference_en
         },
     ];
     let roster_plan = plan(&input(&[], &noisy_macs), &Cells::new()).unwrap();
-    let m77 = keys::machine_pk("n-0123456789abcdef0123456789abcdef");
-    assert_eq!(
-        planned(&roster_plan, "machine", &m77, "fleet_node"),
-        Some(&json!("0123456789abcdef0123456789abcdef"))
-    );
+    let m77 = keys::machine_pk("n-0123456789abcdef");
+    assert_eq!(planned(&roster_plan, "machine", &m77, "node"), None);
     assert_eq!(
         planned(&roster_plan, "machine", &m77, "hosts"),
         Some(&json!(["m77.local"]))

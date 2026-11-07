@@ -220,13 +220,13 @@ crate::att_collection!(
     /// identity, minted once. No serial number and no IOPlatformUUID are stored.
     pub MACHINE = Collection {
         name: "machine",
-        version: 1,
+        version: 2,
         kind: Kind::Cells,
         writers: Writers::Owner,
         prefix: "mc",
         derive: Derive::BirthSha256,
         columns: &[
-            Column::new("label", Ty::Label).writer(Writer::Birth),
+            Column::new("label", Ty::Label),
             Column::new("aliases", Ty::Set(&Ty::Label)),
             Column::new("status", Ty::Enum(MACHINE_STATUS))
                 .on_conflict(OnConflict::Prefer(&["lost", "parked", "active", "planned"]))
@@ -248,6 +248,7 @@ crate::att_collection!(
             Column::new("clis", Ty::Set(&Ty::Ref("cli"))),
             Column::new("location", Ty::Text(64)).null(),
             Column::new("fleet_node", Ty::Hex(32)).null().writer(Writer::Birth),
+            Column::new("node", Ty::Hex(16)).null().since(2),
             Column::new("hosts", Ty::List(&Ty::Text(64), 4)).null().writer(Writer::Birth),
             // Display-only unless the merged Mac's own facts row names the same target (§6).
             Column::new("merged_into", Ty::Ref("machine")).null(),
@@ -258,7 +259,7 @@ crate::att_collection!(
         ],
         // A fleet node names one Mac: two live rows naming it are a finding, and adoption by
         // node binds neither (`import::Kind::NodeAmbiguous`).
-        unique: &[&["label"], &["fleet_node"]],
+        unique: &[&["label"], &["node"]],
         max_row: 0,
     }
 );
@@ -603,22 +604,21 @@ pub fn guard(rows: &mut [Vec<Change>], cells: &Cells) -> Result<Option<Refused>>
             .rows
             .get(pk)
             .and_then(|row| row.fields.get("addr"))
-            .map(cell::Field::candidates_x)
-            .unwrap_or_default();
+            .map_or(&[][..], cell::Field::candidates);
         let renames = !said.is_empty()
             && !said
                 .iter()
-                .filter_map(|x| x.as_str())
-                .any(|text| keys::address(text).ok().as_deref() == Some(address));
+                .filter_map(|c| c.value.x.as_str())
+                .any(|text| keys::address_cow(text).ok().as_deref() == Some(address));
         if renames
             && let Some((account, _)) = accounts.rows.iter().find(|(_, row)| {
                 row.live()
                     && ["login", "identity"].into_iter().any(|column| {
                         row.fields.get(column).is_some_and(|field| {
                             field
-                                .candidates_x()
+                                .candidates()
                                 .iter()
-                                .any(|x| x.as_str() == Some(pk.as_str()))
+                                .any(|c| c.value.x.as_str() == Some(pk.as_str()))
                         })
                     })
             })
@@ -648,7 +648,9 @@ pub fn guard(rows: &mut [Vec<Change>], cells: &Cells) -> Result<Option<Refused>>
                     .rows
                     .get(pk)
                     .and_then(|row| row.fields.get("domain"))
-                    .is_some_and(|field| field.candidates_x() == [&domain]);
+                    .is_some_and(
+                        |field| matches!(field.candidates(), [only] if only.value.x == domain),
+                    );
                 if !held {
                     changes.push(cell::change(
                         &ADDRESS,
@@ -672,7 +674,7 @@ pub fn guard(rows: &mut [Vec<Change>], cells: &Cells) -> Result<Option<Refused>>
             .get(&pk)
             .and_then(|row| row.get("addr"))
             .and_then(Value::as_str)
-            .and_then(|text| keys::address(text).ok());
+            .and_then(|text| keys::address_cow(text).ok());
         if let Some(address) = says
             && x.as_str() != address.split_once('@').map(|(_, d)| d)
         {
@@ -759,22 +761,21 @@ fn landed(rows: &[Vec<Change>], cells: &Cells) -> Cells {
 /// row's `addr`, else its login row's, each one unconflicted value of `addresses`; `None` where
 /// either is missing, conflicted or no address, or the realm is no known one.
 fn signs_in(row: &cell::Row, addresses: &cell::Projection) -> Option<(&'static str, String)> {
-    let one = |row: &cell::Row, column: &str| {
+    fn one<'a>(row: &'a cell::Row, column: &str) -> Option<&'a str> {
         row.fields
             .get(column)
             .filter(|field| !field.conflicted())
             .and_then(cell::Field::value)
             .and_then(Value::as_str)
-            .map(str::to_owned)
-    };
+    }
     let address = |pk: &str| one(addresses.rows.get(pk)?, "addr");
-    let realm = keys::canonical_realm(&one(row, "realm")?)?;
-    let login = address(&one(row, "login")?)?;
+    let realm = keys::canonical_realm(one(row, "realm")?)?;
+    let login = address(one(row, "login")?)?;
     let identity = match one(row, "identity") {
-        Some(pk) => Some(address(&pk)?),
+        Some(pk) => Some(address(pk)?),
         None => None,
     };
-    let email = keys::claims_email(identity.as_deref(), Some(&login)).ok()?;
+    let email = keys::claims_email(identity, Some(login)).ok()?;
     Some((realm, email))
 }
 
@@ -1154,6 +1155,7 @@ pub const DIFFER_COLUMNS: &[&str] = &[
     "model",
     "nickname",
     "nickname_aliases",
+    "node",
     "note",
     "number",
     "origin",

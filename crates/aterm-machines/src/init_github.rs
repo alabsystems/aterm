@@ -17,6 +17,7 @@ use serde::Deserialize;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
+mod checkout_inputs;
 mod credentials;
 mod dependencies;
 mod inventory;
@@ -24,9 +25,14 @@ mod keychain;
 mod native;
 mod repos;
 mod source;
+pub use checkout_inputs::RepositoryCheckoutMetadata;
 pub use credentials::{sync_vault_git_credentials, vault_git_credentials};
 pub use native::InitialRepositoryInputs;
-pub use source::{RepositoryInputMark, repository_input_mark, repository_input_watch_paths};
+pub use source::{
+    RepositoryControlPaths, RepositoryInputMark, RepositoryInputPathCache,
+    repository_checkout_watch_paths, repository_input_control_watch_paths, repository_input_mark,
+    repository_input_watch_paths,
+};
 
 /// The private vault entries that determine default repository acquisition. Other vault
 /// entries must not invalidate a clone whose source and credential remain unchanged.

@@ -840,6 +840,36 @@ fn seam_encode_as(
     (egress, accepted.encoded)
 }
 
+/// The bytes the seam writes for a key chord or committed text under `keyboard`, the program's
+/// keyboard mode: a key as the key encoder writes it, committed text as the IME commit path
+/// writes it; `None` for any other event. A typed turn's rest writes the same bytes for a run of
+/// its keys in one write (`control_session::rest_run_event`), so typing a text and the
+/// runs of its rest are one encoding.
+pub(crate) fn typed_bytes(
+    ev: &InputEvent,
+    keyboard: aterm_types::keyboard::KeyboardMode,
+) -> Option<Vec<u8>> {
+    match ev {
+        InputEvent::Key {
+            key,
+            mods,
+            base_layout,
+            layout_text,
+            event_type,
+        } => Some(aterm_types::keyboard::encode_key_with_text(
+            key,
+            *mods,
+            keyboard,
+            *event_type,
+            *base_layout,
+            *layout_text,
+        )),
+        InputEvent::Text(text) if text.is_empty() => Some(Vec::new()),
+        InputEvent::Text(text) => Some(crate::keymap::encode_committed_text(text, keyboard)),
+        _ => None,
+    }
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "the seam's six handles, the paste's meter, the injected wheel rule and the UI \
@@ -864,36 +894,13 @@ fn seam_egress_inner(
         );
     }
     match ev {
-        InputEvent::Key {
-            key,
-            mods,
-            base_layout,
-            layout_text,
-            event_type,
-        } => {
-            let bytes = aterm_types::keyboard::encode_key_with_text(
-                key,
-                *mods,
-                modes.keyboard_mode(),
-                *event_type,
-                *base_layout,
-                *layout_text,
-            );
+        InputEvent::Key { .. } | InputEvent::Text(_) => {
+            let bytes = typed_bytes(ev, modes.keyboard_mode()).unwrap_or_default();
             let d = if bytes.is_empty() {
                 Delivery::Full
             } else {
                 emit(sink, mode, &bytes, accepted_order)
             };
-            Egress::Reported(d)
-        }
-        InputEvent::Text(text) => {
-            let mut d = Delivery::Full;
-            if !text.is_empty() {
-                let out = crate::keymap::encode_committed_text(text, modes.keyboard_mode());
-                if !out.is_empty() {
-                    d = emit(sink, mode, &out, accepted_order);
-                }
-            }
             Egress::Reported(d)
         }
         InputEvent::KeySequence(bytes) => {
@@ -1618,41 +1625,28 @@ mod tests {
         term
     }
 
-    /// A TYPED TURN'S REST REACHES ITS PROGRAM AS TYPING IT WOULD HAVE (the hostile review of the
+    /// A TYPED TURN'S REST REACHES ITS PROGRAM AS TYPING IT WOULD HAVE (the hostile reviews of the
     /// turn-deadline work, 2026-11-06): wherever the cap or the pace stops a `turn typed=1`'s
-    /// keys, the keys typed and the writes of the rest ([`crate::control::rest_writes`], each
-    /// paste built as the turn builds it) put on the wire the bytes that typing the whole text
-    /// puts there, where the program has no bracketed paste; where it has, only the brackets
-    /// differ, and no Tab or line break is inside them, so a shell still completes on the Tab and
-    /// a composer still takes the line break as the key. A trailing literal `\n` stays the two
-    /// characters it is. Typed and written, the text's keys are counted once each.
-    /// NEGATIVE CONTROLS: with the rest pasted in one piece, a Tab is text inside the brackets;
-    /// with the turn's paste built as the `paste` verb's (`paste_text`), the rest of
-    /// `echo done\n` ends in a CR, an Enter ahead of the turn's own.
+    /// keys, the keys typed and the writes of the rest ([`crate::control::rest_writes`], each run
+    /// built as the turn builds it, [`crate::control::rest_run_event`] under the mirror's keyboard
+    /// mode) put on the wire the bytes that typing the whole text puts there, byte for byte,
+    /// whatever keyboard mode the program set: none, DEC 2004 (no bracket is written, so no
+    /// program's paste handler runs: fish's escaped the quotes of a pasted rest), a kitty flag set
+    /// and modifyOtherKeys. A trailing literal `\n` stays the two characters it is, and a control
+    /// character typing drops still parts the graphemes either side of it (`e`, then a combining
+    /// acute: two keys, never one committed text). Typed and written, the text's keys are counted
+    /// once each.
+    /// NEGATIVE CONTROLS: with each run pasted as the turn once pasted it
+    /// (`control_session::turn_paste_event`),
+    /// the bytes differ under DEC 2004 (the brackets), under the kitty flags and under
+    /// modifyOtherKeys (text where the keys are escape codes); with a run's text segmented again
+    /// for its keys, they differ under kitty's report-all modes for `e\x01\u{301}x`.
     #[test]
     fn a_typed_turn_s_rest_reaches_its_program_as_typing_it_would() {
         use aterm_grapheme::GraphemeClusters;
 
-        use crate::control::{RestWrite, rest_writes, turn_paste_event, typed_key_events};
+        use crate::control::{RestWrite, rest_run_event, rest_writes, typed_key_events};
 
-        fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-            hay.windows(needle.len()).position(|w| w == needle)
-        }
-        // The bytes with each bracketed paste's markers taken out, and what was inside them.
-        fn unbracket(mut bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
-            let (open, close) = (b"\x1b[200~", b"\x1b[201~");
-            let (mut out, mut inside) = (Vec::new(), Vec::new());
-            while let Some(at) = find(bytes, open) {
-                out.extend_from_slice(&bytes[..at]);
-                let body = &bytes[at + open.len()..];
-                let end = find(body, close).expect("every bracketed paste closes");
-                out.extend_from_slice(&body[..end]);
-                inside.extend_from_slice(&body[..end]);
-                bytes = &body[end + close.len()..];
-            }
-            out.extend_from_slice(bytes);
-            (out, inside)
-        }
         let typed = |term: &Mutex<Terminal>, text: &str| -> (Vec<u8>, usize) {
             let keys = typed_key_events(text);
             let bytes = keys
@@ -1662,12 +1656,13 @@ mod tests {
             (bytes, keys.len())
         };
         let rest = |term: &Mutex<Terminal>, text: &str| -> (Vec<u8>, usize) {
+            let keyboard = crate::mode_mirror_of(term).keyboard_mode();
             let (mut bytes, mut keys) = (Vec::new(), 0);
             for write in rest_writes(text) {
                 match write {
-                    RestWrite::Paste { text, graphemes } => {
-                        bytes.extend(egress_bytes(term, &turn_paste_event(&text)));
-                        keys += graphemes;
+                    RestWrite::Run { keys: run, .. } => {
+                        bytes.extend(egress_bytes(term, &rest_run_event(&run, keyboard)));
+                        keys += run.len();
                     }
                     RestWrite::Key(ev) => {
                         bytes.extend(egress_bytes(term, &ev));
@@ -1677,48 +1672,48 @@ mod tests {
             }
             (bytes, keys)
         };
-        let plain = term_with(&[]);
-        let bracketed = term_with(&[b"\x1b[?2004h"]);
-        for text in [
-            "echo done\\n",
-            "col1\tcol2",
-            "\t\tlead",
-            "trail\t",
-            "a\r\nb",
-            "x\ry\n",
-            "Hi, a-1!",
-            "ctl\u{1}\u{1b}x\u{7f}y",
-            "e\u{301}\u{1f44d}\u{1f3fd} \u{65e5}\u{672c}",
-        ] {
-            let (whole, keys) = typed(&plain, text);
-            let cuts = text
-                .grapheme_indices()
-                .map(|(at, _)| at)
-                .chain([text.len()]);
-            for cut in cuts {
-                let (head, tail) = text.split_at(cut);
-                let ((mut split, typed_keys), (rest_bytes, rest_keys)) =
-                    (typed(&plain, head), rest(&plain, tail));
-                split.extend(rest_bytes);
-                assert_eq!(
-                    String::from_utf8_lossy(&split),
-                    String::from_utf8_lossy(&whole),
-                    "{text:?} cut at {cut}, no bracketed paste"
-                );
-                assert_eq!(typed_keys + rest_keys, keys, "{text:?} cut at {cut}");
-                let (mut framed, _) = typed(&bracketed, head);
-                framed.extend(rest(&bracketed, tail).0);
-                let (unframed, inside) = unbracket(&framed);
-                assert_eq!(
-                    String::from_utf8_lossy(&unframed),
-                    String::from_utf8_lossy(&whole),
-                    "{text:?} cut at {cut}, under DEC 2004"
-                );
-                assert!(
-                    !inside.iter().any(|b| matches!(b, b'\t' | b'\r' | b'\n')),
-                    "{text:?} cut at {cut}: a Tab or line break pasted as text: {:?}",
-                    String::from_utf8_lossy(&inside)
-                );
+        let modes: [(&str, &[&[u8]]); 6] = [
+            ("no mode", &[]),
+            ("DEC 2004", &[b"\x1b[?2004h"]),
+            ("kitty 1|4 and DEC 2004", &[b"\x1b[?2004h", b"\x1b[>5u"]),
+            ("kitty report-all", &[b"\x1b[>8u"]),
+            ("kitty report-all with text", &[b"\x1b[>24u"]),
+            ("modifyOtherKeys 2", &[b"\x1b[>4;2m"]),
+        ];
+        for (mode, seqs) in modes {
+            let term = term_with(seqs);
+            for text in [
+                "printf '<%s>\\n' 'fix it'",
+                "echo done\\n",
+                "col1\tcol2",
+                "\t\tlead",
+                "trail\t",
+                "a\r\nb",
+                "x\ry\n",
+                "Hi, a-1!",
+                "ctl\u{1}\u{1b}x\u{7f}y",
+                "e\u{301}\u{1f44d}\u{1f3fd} \u{65e5}\u{672c}",
+                "e\u{1}\u{301}x",
+                "\u{1f1fa}\u{7f}\u{1f1f8}",
+                "a\u{1b}\u{200d}b",
+            ] {
+                let (whole, keys) = typed(&term, text);
+                let cuts = text
+                    .grapheme_indices()
+                    .map(|(at, _)| at)
+                    .chain([text.len()]);
+                for cut in cuts {
+                    let (head, tail) = text.split_at(cut);
+                    let ((mut split, typed_keys), (rest_bytes, rest_keys)) =
+                        (typed(&term, head), rest(&term, tail));
+                    split.extend(rest_bytes);
+                    assert_eq!(
+                        String::from_utf8_lossy(&split),
+                        String::from_utf8_lossy(&whole),
+                        "{text:?} cut at {cut}, under {mode}"
+                    );
+                    assert_eq!(typed_keys + rest_keys, keys, "{text:?} cut at {cut}");
+                }
             }
         }
     }

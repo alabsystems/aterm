@@ -23,15 +23,11 @@ come from reading the code, not from running it.
 > against `aterm_models_render::gpu_encode_model` and its negative control on the interpreter,
 > which the theorem does not cover, so it stays.
 >
-> **Blocked: `scaled-border-px`** (2026-10-19, seal `150efe4a`). The contract
-> `requires base <= 16843009` with a theorem over `trust_import_aterm_gpu__renderer__scaled_border_px`
-> is refused twice: E6 mints no import for the body (`Clean island declaration rejected:
-> AutoBoundHeadOverApplied { name: "trust_import_aterm_gpu__renderer__scaled_border_px", func_type:
-> "Sort ?u_2", remaining_args: 2 }`; the body has an early `return`, the calls `u32::from` and `.max(1)`
-> and a checked `*`, gap 3), and the clause language cannot state the spec (`unsupported contract
-> predicate expression` for the `as u32` widening of `scale_q4`, gap 1/3). The code is unchanged and
-> `scaled_border_px_is_sixteenths_never_thinner_than_a_pixel` stays. A rejected island taints every
-> later citation in the crate, so the contract cannot be left in place for the other specs.
+> **Retired: `scaled-border-px`** (2026-10-30, HR-ORACLE). `renderer::scaled_border_px` and its test
+> are gone: the present takes its drop border from aterm-render's `drop_overlay_border_px`
+> (`drop-overlay-border-px` there; §5 item 16). Its contract was refused on seal `150efe4a` (2026-10-19):
+> E6 minted no import for a body with an early `return` (`AutoBoundHeadOverApplied`, gap 3), and the
+> clause language could not state the `as u32` widening of the scale (gap 1/3).
 
 > Status 2026-10-23 (card engine lane B6): two specs added, `unorm-fetch-route` (the Metal
 > framebuffer-fetch route, its probe, its fail-closed gate and the warm's share of it), with the
@@ -116,7 +112,6 @@ frame-instrumentation	contract	aterm-gpu	gpu_time::{FrameRing,FrameToken,span_ns
 should-slice-nonempty	contract	aterm-gpu	renderer::should_slice	should_slice(n) = (n != 0) for every n: usize. With n = 12 * instances this is GpuEncode's NeverSliceEmpty.	tests/conformance_gpuencode.rs::real_gpu_encode_slice_decision_conforms_to_the_gpuencode_model	9
 surface-attach-fallback	contract	aterm-gpu	lib::surface_attach_fallback	For all v, o: surface_attach_fallback(v, o) = DeclineWindow if o; RebuildOpaque if !o && v; CpuRenderer if !o && !v.	src/lib.rs::rebuild_iff_visual_and_alone	1
 swapchain-config-validate	contract	aterm-gpu	metal::swapchain::SwapchainConfig::validate	validate(c) = Ok iff c.format is Bgra8Unorm or Rgba16Float, 2 <= c.maximum_drawables <= 3, c.width > 0 and c.height > 0. An Err reports the first failing clause in that order: the format name, '[2, 3]', then the extent.	src/metal/swapchain.rs::the_config_rejects_what_the_layer_would_throw_on	1
-scaled-border-px	contract	aterm-gpu	renderer::{drop_border_px,scaled_border_px}	∀ w, h: u32: drop_border_px(w, h) = clamp(min(w, h) / 200, 2, 6). ∀ base: u32, q: u8: scaled_border_px(base, 0) = base, and scaled_border_px(base, q) = min(u32::MAX, max(1, floor(base*q/16))) for q >= 1 (§5.4). Shared directly by aterm-gui's CPU overlay path.	src/renderer.rs::scaled_border_px_is_sixteenths_never_thinner_than_a_pixel	3
 startup-probe-slot-encoding	contract	aterm-gpu	startup_probe::{slot_ns,record}	For every d: Duration, slot_ns(d) = max(1, min(d.as_nanos(), u64::MAX)): a recorded leg never reads as the unset 0, and an unrepresentable duration saturates. record(leg, d) stores slot_ns(d) iff the leg's slot was 0 (first write wins).	-	1,3
 dense-enum-tables	table-property	aterm-gpu	startup_probe::{Leg,LEG_COUNT}; renderer::{EFFECT_PIPELINES,EFFECT_PIPELINE_COUNT}; pipeline_table::{PIPELINES,ALL_PIPELINES,PIPELINE_COUNT,Pipeline::{spec,name}}; present_glass::PresentTag::{ALL,index,from_u8,as_str}	LEG_COUNT = Leg::PipeTotal as usize + 1. EFFECT_PIPELINE_COUNT = SpriteOver as usize + 1 and EFFECT_PIPELINES[i] as usize = i for all i. PIPELINES.len() = ALL_PIPELINES.len() = PIPELINE_COUNT; for all i, ALL_PIPELINES[i] as usize = i and ALL_PIPELINES[i].spec() is &PIPELINES[i]; Pipeline::name is injective. For i < 4: PresentTag::ALL[i].index() = i and from_u8(ALL[i] as u8) = ALL[i]; from_u8(x) = Spaced for x not in {1,2,3}; as_str is injective. Decidable by evaluation.	-	1,3
 loss-classify-table	table-property	aterm-gpu	metal::loss::classify	classify is total. classify(STATUS_COMPLETED, c) = Completed for every c; Unfinished{status} for every status in NOT_ENQUEUED..=SCHEDULED; classify(STATUS_ERROR, Some(TIMEOUT or OUT_OF_MEMORY)) = Retryable{code, its header name}; classify(STATUS_ERROR, Some(c)) = Lost{Some(c), name(c)} for every other c, where the 8 header codes and ERROR_NONE are named and any other code is 'unrecognized'; classify(STATUS_ERROR, None) = Lost{None, ..}; every other status gives Lost{None, ..}.	src/metal/loss.rs::every_error_code_classifies_as_declared	1,3
@@ -209,11 +204,11 @@ compute-job-completion-observed	contract	aterm-gpu	compute::{Job::<Prepared>::su
 int-bag-mlp-equals-cpu-reference	equivalence	aterm-gpu	compute::{prelude,source,KERNEL,identity,Shape,Library::{compile,compile_salted},Pipeline::{new,new_salted,build,qualify,identity},Job::<Completed>::out}; compute::pipeline::qualification_set; shaders/int_bag_mlp.metal k_int_bag_mlp; aterm_effects::int_bag_mlp::{forward,LAYOUT,check,Batch::pack,interior_params_for,interior_rows}	For every params blob check accepts, every batch Batch::pack accepts against it and every pipeline of its Shape (E, H, C, MIN_IDS) that qualification accepted, with or without a library or run salt, the job's out words equal aterm_effects::int_bag_mlp::forward's word for word (each row's L as i32 bits, then its class; an abstaining row C zeros and class C), as aterm-effects' int-bag-mlp-forward-bounds states and bounds them. The kernel reads every header word by the name the prelude generates from LAYOUT, one constant per field at its index. A pipeline's identity is Digest::of(PIPELINE_DOMAIN, [the canonical source, E, H, C, MIN_IDS]), and no salt enters it; a run salt below 2^21 is refused, since a row index could reach it. Qualification runs two blobs at the pipeline's shape and compares every word with forward: the extreme blob with B = 65,536 over its extreme rows, three rows at MIN_IDS's edge and an all-abstain batch (batches 0 and 1), which drive every unit to a clamp, and the interior blob with B = 256 (weights of magnitude 1 or 2, MULT 181, G 8, T 127 and the identity LUT) over 64 rows (batch 2), where most units reach steps 4 to 6 unclamped, so a kernel that floors instead of truncating in step 5, divides by n - 1, shifts the LUT index or shifts by G - 1 differs on some word at every tested shape; one differing word refuses the pipeline for good, and submit refuses a pipeline not qualified. Needs a GPU execution model and MSL semantics (gap 8) and the cross-crate citation of forward (gap 12).	src/compute/tests.rs::every_word_equals_the_cpu_reference, src/compute/tests.rs::the_kernel_reads_every_header_word_by_its_generated_name, src/compute/tests.rs::the_prelude_and_the_pipeline_identity_are_pinned, src/compute/tests.rs::an_unqualified_or_mismatched_pipeline_refuses_the_job, src/compute/tests.rs::the_qualification_set_catches_faults_in_steps_4_to_6, src/compute/tests.rs::a_kernel_that_floors_in_step_5_is_refused	8,12
 ```
 
-### Distribution by kind (95)
+### Distribution by kind (94)
 
 | kind | count | ids |
 |---|---|---|
-| contract | 61 | frame-instrumentation, should-slice-nonempty, surface-attach-fallback, swapchain-config-validate, scaled-border-px, startup-probe-slot-encoding, band-shift-ops, present-copy-rect-union, present-crop-normalize, blit-uniform-layout, frame-latency-policy, capture-encoding-validity, swapchain-usage-and-alpha, hdr-gate-policy, hdr-probe-throttle, gpu-power-and-memblock-parse, glass-sample-classify, visible-source-scissor, fb-dim-clamp, frame-pass-coalescing, unorm-fetch-route, opaque-under-store, pack-image-plane, frame-plan-draw-order, atlas-shelf-packer, capture-store-ordered-budget, video-fps-gate, pixel-conversion-laws, present-tag-pacing, metal-device-selection, metal-upload-length-guards, readback-padding-contract, metal-pipeline-state-mapping, repaint-path-selection, dirty-gate, instance-stream-confined, command-buffer-outcome-observed, backend-crossing-refuses-by-name, metal-encoder-validators, acquire-bounded-and-failure-mapping, present-sample-publication, sdr-glow-envelope, metal-library-and-pipeline-build, appkit-surface-target-handle, minted-texture-storage-managed, swapchain-configure-postconditions, surface-reconfigure-retag-closure, atlas-follows-cpu-rasters, gpu-resource-residency, renderer-rebuild-preserves-config, metal-arm-disarm-sweep, metal-rescue-no-inline-wait, tray-composites-last, hdr-crown-emission, effect-layer-laws, supernova-emitter-envelope, cpu-image-layering, image-placement-decode, selection-paint, compute-job-release-after-terminal, compute-job-completion-observed |
+| contract | 60 | frame-instrumentation, should-slice-nonempty, surface-attach-fallback, swapchain-config-validate, startup-probe-slot-encoding, band-shift-ops, present-copy-rect-union, present-crop-normalize, blit-uniform-layout, frame-latency-policy, capture-encoding-validity, swapchain-usage-and-alpha, hdr-gate-policy, hdr-probe-throttle, gpu-power-and-memblock-parse, glass-sample-classify, visible-source-scissor, fb-dim-clamp, frame-pass-coalescing, unorm-fetch-route, opaque-under-store, pack-image-plane, frame-plan-draw-order, atlas-shelf-packer, capture-store-ordered-budget, video-fps-gate, pixel-conversion-laws, present-tag-pacing, metal-device-selection, metal-upload-length-guards, readback-padding-contract, metal-pipeline-state-mapping, repaint-path-selection, dirty-gate, instance-stream-confined, command-buffer-outcome-observed, backend-crossing-refuses-by-name, metal-encoder-validators, acquire-bounded-and-failure-mapping, present-sample-publication, sdr-glow-envelope, metal-library-and-pipeline-build, appkit-surface-target-handle, minted-texture-storage-managed, swapchain-configure-postconditions, surface-reconfigure-retag-closure, atlas-follows-cpu-rasters, gpu-resource-residency, renderer-rebuild-preserves-config, metal-arm-disarm-sweep, metal-rescue-no-inline-wait, tray-composites-last, hdr-crown-emission, effect-layer-laws, supernova-emitter-envelope, cpu-image-layering, image-placement-decode, selection-paint, compute-job-release-after-terminal, compute-job-completion-observed |
 | table-property | 6 | dense-enum-tables, loss-classify-table, offscreen-format-plan, pipeline-table-binding-consistency, metal-enum-abi-constants, shader-interface-matches-table |
 | equivalence | 12 | acquire-worker-guards-refine-model, target-format-resolution, video-convert-worker-equals-inline, raw-capture-rows-equal-conversion, atlas-mirrors-cpu-glyph-cache, render-history-independence, metal-arm-byte-equals-wgpu-arm, present-arms-agree, shader-kernels-equal-cpu-functions, input-hot-invariance-and-bloom-adds-light, ink-equals-fg-recolor, int-bag-mlp-equals-cpu-reference |
 | refinement | 9 | capture-lifecycle-refinement, hdr-reconfigure-retag-refinement, acquire-worker-protocol-refinement, window-atlas-ownership-refinement, frame-cycle-presents-rendered-bytes, metal-encoder-implements-pass-semantics, present-blit-denotation, cached-render-equals-fresh, gpu-frame-refines-cpu |
@@ -229,7 +224,7 @@ Specs blocked by each audit §7 gap (a spec counts once per gap it lists):
 |---|---|---|
 | 1 | 68 | non-scalar carriers |
 | 2 | 33 | certified &self/&mut self views |
-| 3 | 36 | E6 body widening |
+| 3 | 35 | E6 body widening |
 | 4 | 8 | callee-ensures composition |
 | 5 | 9 | quantified clauses |
 | 7 | 26 | loops |
@@ -241,7 +236,7 @@ Specs blocked by each audit §7 gap (a spec counts once per gap it lists):
 | 13 | 19 | threads, async, closures |
 | 14 | 1 | Clean elaborator coverage |
 
-44 specs do not need gap 8; 51 do.
+43 specs do not need gap 8; 51 do.
 
 ### Proof dependency order
 
@@ -399,7 +394,6 @@ src/renderer.rs	hdr_upgrade_publishes_linear_capture_metadata_with_safe_defaults
 src/renderer.rs	polled_snapshots_inside_the_hold_reconfigure_the_swapchain_once	swapchain-usage-and-alpha	
 src/renderer.rs	present_crop_normalizes_only_after_logical_validation	present-crop-normalize	
 src/renderer.rs	present_prev_is_per_window_no_cross_window_leak	cached-render-equals-fresh	
-src/renderer.rs	scaled_border_px_is_sixteenths_never_thinner_than_a_pixel	scaled-border-px	
 src/renderer.rs	sdr_glow_attack_is_owned_per_window	sdr-glow-envelope	
 src/renderer.rs	set_face_preserves_text_shaping	renderer-rebuild-preserves-config	
 src/renderer.rs	the_first_frame_warm_builds_what_a_default_windows_first_frames_build	first-frame-warm-latch	
@@ -586,8 +580,9 @@ tests/tray_present_scissor.rs	tray_present_scissors_and_stays_byte_identical_to_
    (`a_report_names_the_next_registration_as_its_successor`). Its deck targets (`arm_deck_target`) carry the low 8
    bits of the serial that wrote each slot, so an overwritten slot reads as no deck frame
    (`a_deck_frame_reports_its_lateness_against_its_vsync`).
-4. **Resolved: `scaled_border_px` widens through `u64` and saturates to `u32::MAX`.** `(u64::from(base) *
-   u64::from(scale_q4)) / 16` avoids intermediate `u32` overflow for `base > u32::MAX / 255`.
+4. **Resolved, then retired: `scaled_border_px` widened through `u64` and saturated to `u32::MAX`.**
+   `(u64::from(base) * u64::from(scale_q4)) / 16` avoided intermediate `u32` overflow for
+   `base > u32::MAX / 255`. The function is gone (item 16): the shared law scales a base of at most 6 px.
 5. **Resolved: `VideoTap::should_capture` is total over all `(fps_cap, now_us)` inputs.** `fps.max(1)` prevents
    division by zero on `fps_cap = Some(0)` and `now_us.saturating_add(interval_us)` prevents `u64` overflow.
 6. **Resolved: Tautologies and unobserved claims.**
@@ -639,9 +634,19 @@ tests/tray_present_scissor.rs	tray_present_scissors_and_stays_byte_identical_to_
     `w_a == max`, `w_b == max`, and `w_a < req_a < req_b`.)*
     `scissor_repaint::bloom_scissor_dirty_band_stays_proportional` asserts a ratio (`scissored*4 < full`) that
     stands in for the per-dirty-row bound of instance-stream-confined.
-16. **Resolved: single shared border-width implementation.** `aterm_gpu::{drop_border_px, scaled_border_px}` are
-    now exported `const fn`s called by both the GPU blit uniform and `aterm-gui`'s `apply_overlay_at`, removing
-    the duplicate CPU copies and duplicate test module.
+16. ~~**A duplicated implementation.**~~ Fixed (HR-ORACLE, 2026-10-30): the drop overlay's border law is
+    one function, `aterm_render::drop_overlay_border_px` (aterm-render's `drop-overlay-border-px`), which
+    aterm-gui's overlay, the arm's `present_blit_uniform` and the frame oracle's `twin_uniform` each call,
+    caps included; aterm-gpu's copies (`scaled_border_px` and `drop_border_px`, which fd12d05e37 had exported
+    for aterm-gui, leaving the half-frame caps in both callers) are gone. `render_suite`'s
+    `drop_overlay_border_is_the_short_side_over_200_scaled_and_capped` holds the law (a `/ 50` planted in it
+    fails there), and `frame_record_tests` holds the arm's use of it: the twins' uniform comes from the
+    CPU's laws, never from `present_blit_uniform`, so a border, alpha or accent the builder drifts to moves
+    `*/present/2`, `blit/cropped-overlay*` or `rim/present/cropped` off its twin. The replay fixtures' frames
+    sit at the law's 2 px floor; `rim/present/cropped` presents 700 visible rows of an 880 x 840 frame under
+    the level-up rim's 40/16 (7 px over the visible rows, 10 over the source), and the builder handing the
+    law the source's height, or scale 0, fails it (6,468 and 8,680 texels on this Mac, at most 632). The
+    `WideBorder` controls hold the border's width to showing past the twin law's bar.
 17. ~~**A hand-written TLA model.**~~ Fixed: GpuEncode is `aterm_models_render::gpu_encode_model`
     (`ty_model!`), and `tests/conformance_gpuencode.rs` runs in the default suite on the interpreter, with a
     negative control the model's mutant admits.
@@ -664,8 +669,8 @@ tests/tray_present_scissor.rs	tray_present_scissors_and_stays_byte_identical_to_
    to the GpuEncode model; prove it the day a Clean-publishing seal lands, and it retires the GpuEncode
    conformance test.
 2. **Gap-1/3 deciders**, each straight-line or a small `match`, decidable by evaluation or `omega`:
-   `surface-attach-fallback`, `swapchain-config-validate`, `scaled-border-px` (with its precondition, §5.4),
-   `band-shift-ops`, `present-copy-rect-union`, `present-crop-normalize`, `startup-probe-slot-encoding`,
+   `surface-attach-fallback`, `swapchain-config-validate`, `band-shift-ops`, `present-copy-rect-union`,
+   `present-crop-normalize`, `startup-probe-slot-encoding`,
    `frame-latency-policy`, `blit-uniform-layout`, `capture-encoding-validity`, `dense-enum-tables`,
    `loss-classify-table`. Together they retire about 20 tests and force the enum/struct carriers (gap 1)
    that everything after them needs.

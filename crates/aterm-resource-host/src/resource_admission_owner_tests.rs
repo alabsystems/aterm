@@ -77,7 +77,7 @@ struct World {
     // Drop actual authorities before removing any of their original storage.
     owner: Owner,
     namespace: Namespace,
-    retirement: LegacyRetirement,
+    retirement: aterm_capacity::build_cpu::LegacyRetirement,
     scratch: Scratch,
 }
 
@@ -99,13 +99,14 @@ impl World {
         let ledger = Ledger::at(namespace.fence());
         let pool =
             Pool::open_in(&scratch.path.join("capacity"), NonZeroU32::new(2).unwrap()).unwrap();
-        let retirement = LegacyRetirement::retire(&scratch.legacy, 1)
+        let retirement = aterm_capacity::build_cpu::LegacyRetirement::retire(&scratch.legacy, 1)
             .expect("private scoped retirement requires a non-root test process");
         let debt = ExternalDebt::activate(&pool, &retirement).unwrap();
         journal::Journal::prepare(&namespace, &debt).unwrap();
         let journal = journal::Journal::open(&namespace, &debt).unwrap();
         let fence = Fence::acquire(&namespace, Instant::now() + HANG).unwrap();
         let owner = Owner {
+            _domain: None,
             fence,
             ledger,
             pool,
@@ -194,6 +195,7 @@ impl World {
             events,
             recipe: Some(recipe::Recipe {
                 kind: recipe::Kind::Ay,
+                compiler: None,
                 program: "/bin/sleep".into(),
                 arguments: vec![OsString::from("60")],
                 environment: Vec::new(),
@@ -436,3 +438,82 @@ fn impossible_memory_head_refuses_before_arm_and_next_job_runs() {
 
 #[path = "resource_admission_owner_tests/context_rpc.rs"]
 mod context_rpc;
+
+#[test]
+fn known_member_attempt_never_receives_a_new_no_child_refusal() {
+    use aterm_ctl::resource_subgroup_client::{
+        AuthorizedSubgroup, Delegations, RemoteChild, Rights,
+    };
+    use aterm_types::resource_subgroup::{Capability, CpuDelegation, GnuTransport, Request};
+    let mut world = World::new();
+    let binding = Binding {
+        session: "s-acde".into(),
+        attempt: [92; 16],
+    };
+    world.owner.journal.create(&binding).unwrap();
+    let (host, client) = CtlStream::pair().unwrap();
+    let mut observer = RemoteChild::from_private_events(binding.clone(), client.into()).unwrap();
+    let pid = std::process::id();
+    let peer = Peer {
+        pid,
+        birth: process::read_birth(pid as i32).unwrap().0,
+    };
+    let null = || -> OwnedFd {
+        File::options()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .unwrap()
+            .into()
+    };
+    world.owner.submit_member(AuthorizedSubgroup {
+        request: Request {
+            job: Binding {
+                session: binding.session.clone(),
+                attempt: [91; 16],
+            },
+            capability: Capability::from_bytes([1; 32]),
+            member: Submission {
+                binding,
+                peer_pid: peer.pid,
+                peer_birth: peer.birth,
+                argv: vec![b"/usr/bin/true".to_vec()],
+                cwd: b"/".to_vec(),
+                env: vec![],
+                cpu_units: 1,
+                memory_bytes: MEMORY,
+                label: "known attempt".into(),
+                timeout_ms: None,
+            },
+            cpu: CpuDelegation::FixedBorrow { units: 1 },
+            gnu: GnuTransport::None,
+            fence_targets: vec![],
+        },
+        peer,
+        rights: Rights {
+            stdin: null(),
+            stdout: null(),
+            stderr: null(),
+            events: host.into(),
+            delegated: Delegations {
+                cpu: None,
+                gnu: vec![],
+                fences: vec![],
+            },
+        },
+    });
+    assert_eq!(
+        observer.try_wait().unwrap_err().kind(),
+        io::ErrorKind::UnexpectedEof
+    );
+    assert!(world.owner.idle());
+    assert_eq!(world.owner.debt.reserved().unwrap(), 0);
+}
+
+#[cfg(target_os = "macos")]
+#[path = "resource_admission_owner_tests/member_native.rs"]
+mod member_native;
+#[cfg(target_os = "macos")]
+pub(super) fn member_fixture(args: &[OsString]) -> std::process::ExitCode {
+    member_native::run(args)
+}

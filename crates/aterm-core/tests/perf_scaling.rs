@@ -105,6 +105,87 @@ fn linked_writes_reuse_payload_and_overwrite_storage() {
     }
 }
 
+fn glyph_history_restore_reuses_storage() {
+    use aterm_core::terminal::Terminal;
+    use aterm_grid::Grid;
+    use std::hint::black_box;
+
+    for (unit, width) in [
+        ("日", 2),
+        ("😀", 2),
+        ("𐐀", 1),
+        ("👩‍💻", 2),
+        ("e\u{301}\u{302}\u{303}\u{304}\u{305}", 1),
+    ] {
+        for (rows, cols) in [(1_u16, 4_u16), (1, 16), (1, 80), (24, 80), (1, 256)] {
+            for style in ["plain", "rgb", "underline", "rgb_sparse"] {
+                let mut source = Terminal::new(rows, cols);
+                if style != "plain" {
+                    source.process(b"\x1b[4;58;5;7m");
+                }
+                if style == "rgb" || style == "rgb_sparse" {
+                    source.process(b"\x1b]8;id=wide;https://wide.example\x1b\\\x1b[38;2;12;34;56m\x1b[48;2;65;43;21m");
+                }
+                let text = if style == "rgb_sparse" {
+                    format!("{unit}{}", "x".repeat(usize::from(cols - width)))
+                } else {
+                    unit.repeat(usize::from(cols / width))
+                };
+                for row in 0..rows {
+                    source.process(format!("\x1b[{};1H{text}", row + 1).as_bytes());
+                }
+                let lines = source.grid().checkpoint_visible_lines();
+                drop(source);
+                let mut grid = Grid::new(rows, cols);
+                grid.restore_visible_from_lines(&lines);
+                ALLOC_BYTES.store(0, Ordering::Relaxed);
+                let calls = count_allocations(|| {
+                    for _ in 0..64 {
+                        black_box(&mut grid).restore_visible_from_lines(black_box(&lines));
+                    }
+                });
+                let bytes = ALLOC_BYTES.load(Ordering::Relaxed);
+                assert_eq!(
+                    (calls, bytes),
+                    (0, 0),
+                    "glyph restore {unit} {rows}x{cols} {style}"
+                );
+                for row in 0..rows {
+                    assert_eq!(grid.row_text(row).as_deref(), Some(text.as_str()));
+                    for col in 0..cols {
+                        assert_eq!(
+                            grid.row(row).unwrap().get(col).unwrap().is_wide(),
+                            width == 2
+                                && if style == "rgb_sparse" {
+                                    col == 0
+                                } else {
+                                    col % 2 == 0
+                                }
+                        );
+                        if style != "plain" {
+                            assert_eq!(
+                                grid.cell_extra(row, col).unwrap().underline_color_u32(),
+                                Some(0x02000007)
+                            );
+                        }
+                        if style == "rgb" || style == "rgb_sparse" {
+                            assert_eq!(grid.fg_rgb_at(row, col), Some([12, 34, 56]));
+                            assert_eq!(grid.bg_rgb_at(row, col), Some([65, 43, 21]));
+                            assert_eq!(
+                                grid.cell_extra(row, col)
+                                    .unwrap()
+                                    .hyperlink_id()
+                                    .map(AsRef::as_ref),
+                                Some("wide")
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn image_history_restore_reuses_layer_storage() {
     use aterm_grid::{Grid, ImageData, ImageFormat, ImageRef, ImageScaling};
     use std::{hint::black_box, sync::Arc};
@@ -487,6 +568,7 @@ fn hot_scrollback_walks_allocate_only_owned_line_payloads() {
 
 #[test]
 fn engine_steady_state_processing_is_allocation_free() {
+    glyph_history_restore_reuses_storage();
     image_history_restore_reuses_layer_storage();
     linked_history_restore_reuses_payload_storage();
     linked_writes_reuse_payload_and_overwrite_storage();

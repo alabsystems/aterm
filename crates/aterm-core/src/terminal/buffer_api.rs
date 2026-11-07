@@ -61,6 +61,17 @@ fn paste_char_can_move(c: char) -> bool {
 }
 
 impl Terminal {
+    /// The text a paste of `text` sends before its framing: the prefix the formatter takes, with
+    /// every control character but Tab, LF and CR dropped ([`Self::format_paste_framed`] sends
+    /// it, each line break as a CR).
+    #[must_use]
+    pub fn paste_kept_text(text: &str) -> String {
+        bounded_paste_text(text)
+            .chars()
+            .filter(|&c| paste_char_allowed(c))
+            .collect()
+    }
+
     /// Whether a paste contains a cursor-advancing character within the bounded probe prefix.
     #[must_use]
     pub fn paste_has_payload(text: &str) -> bool {
@@ -412,22 +423,17 @@ impl Terminal {
     /// ```
     #[must_use]
     pub fn format_paste_framed(&self, text: &str, bracketed: bool) -> Vec<u8> {
-        let text = bounded_paste_text(text);
-
+        let kept = Self::paste_kept_text(text)
+            .replace("\r\n", "\r")
+            .replace('\n', "\r");
         if bracketed {
-            let sanitized: String = text.chars().filter(|&c| paste_char_allowed(c)).collect();
-            let sanitized = sanitized.replace("\r\n", "\r").replace('\n', "\r");
-            let mut result = Vec::with_capacity(sanitized.len() + 12);
+            let mut result = Vec::with_capacity(kept.len() + 12);
             result.extend_from_slice(b"\x1b[200~");
-            result.extend_from_slice(sanitized.as_bytes());
+            result.extend_from_slice(kept.as_bytes());
             result.extend_from_slice(b"\x1b[201~");
             result
         } else {
-            let cleaned: String = text.chars().filter(|&c| paste_char_allowed(c)).collect();
-            cleaned
-                .replace("\r\n", "\r")
-                .replace('\n', "\r")
-                .into_bytes()
+            kept.into_bytes()
         }
     }
 }
@@ -578,6 +584,31 @@ mod tests {
             !Terminal::paste_has_payload(&hidden),
             "content beyond the constant-cost prefix is conservatively unlicensed"
         );
+    }
+
+    /// What a paste keeps is what its formatter sends, line breaks as CRs: a control-only text
+    /// keeps nothing, so a turn that pasted one says nothing stands.
+    #[test]
+    fn a_paste_keeps_what_its_formatter_sends() {
+        let term = Terminal::new(24, 80);
+        for text in [
+            "",
+            "\x01\x1b\u{9b}\x7f",
+            "a\x01b\tc\r\nd\ne",
+            "e\u{301}\x1b[2Jx",
+            "中文🙂",
+        ] {
+            let kept = Terminal::paste_kept_text(text);
+            assert_eq!(
+                term.format_paste_framed(text, false),
+                kept.replace("\r\n", "\r").replace('\n', "\r").into_bytes(),
+                "{text:?}"
+            );
+        }
+        assert_eq!(Terminal::paste_kept_text("\x01\x1b\u{9b}\x7f"), "");
+        assert_eq!(Terminal::paste_kept_text("a\x01b\tc\r\n"), "ab\tc\r\n");
+        let over = "x".repeat(MAX_PASTE_BYTES + 1);
+        assert_eq!(Terminal::paste_kept_text(&over).len(), MAX_PASTE_BYTES);
     }
 
     #[test]

@@ -655,20 +655,23 @@ pub fn gate_list(
             argv,
         });
     }
-    let mut versions: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut versions: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     for lib in &out {
         let (_, version) = lib.spec.rsplit_once('@').unwrap_or((&lib.spec, ""));
         versions
-            .entry(package_identity(&lib.name).to_string())
+            .entry(package_identity(&lib.name))
             .or_default()
-            .insert(version.to_string());
+            .insert(version);
     }
-    for lib in &mut out {
-        if versions
-            .get(package_identity(&lib.name))
-            .is_some_and(|v| v.len() > 1)
-        {
-            lib.name.clone_from(&lib.spec);
+    let multi: BTreeSet<String> = versions
+        .into_iter()
+        .filter_map(|(k, v)| (v.len() > 1).then(|| k.to_string()))
+        .collect();
+    if !multi.is_empty() {
+        for lib in &mut out {
+            if multi.contains(package_identity(&lib.name)) {
+                lib.name.clone_from(&lib.spec);
+            }
         }
     }
     out.sort_unstable_by(|a, b| {
@@ -4927,6 +4930,15 @@ pub mod proc_tree {
         reached: &BTreeSet<(i32, u64)>,
     ) -> Vec<Proc> {
         let spared = spared(procs);
+        marked_with_spared(procs, session, reached, &spared)
+    }
+
+    fn marked_with_spared(
+        procs: &[Proc],
+        session: Option<i32>,
+        reached: &BTreeSet<(i32, u64)>,
+        spared: &BTreeSet<i32>,
+    ) -> Vec<Proc> {
         let mut out: Vec<Proc> = procs
             .iter()
             .filter(|p| {
@@ -4937,6 +4949,7 @@ pub mod proc_tree {
             })
             .cloned()
             .collect();
+        let mut seen: BTreeSet<i32> = out.iter().map(|p| p.pid).collect();
         let mut i = 0;
         while i < out.len() {
             let parent = out[i].pid;
@@ -4945,10 +4958,7 @@ pub mod proc_tree {
                     .chain(out[i].tie.iter().copied())
                     .collect();
             for p in procs {
-                if p.ppid == parent
-                    && !spared.contains(&p.pid)
-                    && !out.iter().any(|o| o.pid == p.pid)
-                {
+                if p.ppid == parent && !spared.contains(&p.pid) && seen.insert(p.pid) {
                     out.push(Proc {
                         tie: tie.clone(),
                         ..p.clone()
@@ -4972,7 +4982,7 @@ pub mod proc_tree {
     pub fn unread(procs: &[Proc], slot: &Path) -> bool {
         let canonical = std::fs::canonicalize(slot).ok();
         let spared = spared(procs);
-        let started: BTreeSet<i32> = marked(procs, None, &BTreeSet::new())
+        let started: BTreeSet<i32> = marked_with_spared(procs, None, &BTreeSet::new(), &spared)
             .iter()
             .map(|p| p.pid)
             .collect();
@@ -5067,15 +5077,19 @@ pub mod proc_tree {
     /// The check's processes `mine` in the order a signal goes to them, children before their
     /// parents, so a child's listed parent still holds when it is signalled ([`may_signal`]).
     fn targets(mine: &[Proc]) -> Vec<Proc> {
+        let mut ppids = std::collections::BTreeMap::new();
+        for q in mine {
+            ppids.entry(q.pid).or_insert(q.ppid);
+        }
         let depth = |p: &Proc| {
             let mut depth = 0;
             let mut at = p.ppid;
-            while let Some(parent) = mine.iter().find(|q| q.pid == at) {
+            while let Some(&parent_ppid) = ppids.get(&at) {
                 depth += 1;
                 if depth > mine.len() {
                     break;
                 }
-                at = parent.ppid;
+                at = parent_ppid;
             }
             depth
         };
@@ -5275,8 +5289,8 @@ pub mod trustd {
     /// SHA-256 hex digest of `exe` used by `trustd` for `IDENTITY`.
     #[must_use]
     pub fn build_digest(exe: &Path) -> String {
-        crate::durable::read_file(exe)
-            .map(|b| crate::trust_facts::hex(&aterm_digest::Sha256::digest(&b)))
+        crate::durable::sha256_file_with_meta(exe)
+            .map(|(h, _)| h)
             .unwrap_or_default()
     }
 
@@ -5354,7 +5368,6 @@ pub mod trustd {
                 .and_then(|v| v.get(k))
                 .and_then(aterm_json::Value::as_str)
                 .unwrap_or("")
-                .to_string()
         };
         let sha = field("executable_sha256");
         let build = format!("trustd {} {}", field("release"), field("commit"));

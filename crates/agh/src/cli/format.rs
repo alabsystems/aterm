@@ -168,5 +168,8 @@ fn for_person(text: &str) -> String {
             flat.push(c);
         }
     }
-    aterm_codec::tty::safe(flat.as_bytes()).into_owned()
+    match aterm_codec::tty::safe(flat.as_bytes()) {
+        std::borrow::Cow::Borrowed(_) => flat,
+        std::borrow::Cow::Owned(safe) => safe,
+    }
 }

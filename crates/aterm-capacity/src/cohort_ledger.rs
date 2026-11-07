@@ -415,25 +415,11 @@ pub(super) fn scan(
         if count > 4096 || !checkpoint::metadata_name(name) {
             return Err(refused("unknown or unbounded active cohort entry"));
         }
-        let anchor = Anchor::open_name(&active, name, namespace.nonce())?;
-        let directory = anchor.directory.try_clone()?;
-        let mut transaction = if reap {
-            anchor.lock_recover(&directory)?
-        } else {
-            anchor.lock(&directory)?
+        let Some((working, record)) = scan_listed(namespace, &active, name, reap)? else {
+            continue;
         };
-        if reap {
-            transaction.recover_pending(&directory, namespace.nonce())?
-        }
-        let working = transaction.scan_name()?.to_owned();
-        if let Some(record) = probe_under(
-            namespace,
-            &directory,
-            &working,
-            working.ends_with(CLAIM),
-            reap,
-            &mut transaction,
-        )? && named(&working)
+        if let Some(record) = record
+            && named(&working)
         {
             records.push(record)
         }
@@ -441,6 +427,70 @@ pub(super) fn scan(
     namespace.validate()?;
     records.sort_by_key(Record::order);
     Ok(records)
+}
+
+/// [`scan_entry`] of the claim directory `name` a scan listed in `active`; `None` once it was
+/// retired, by its owner's drop or another reaping scan, after that listing: no longer active,
+/// it reserves nothing a scan reports.
+///
+/// # Errors
+/// As [`scan_entry`], for a claim directory still in `active`.
+fn scan_listed(
+    namespace: &Namespace,
+    active: &File,
+    name: &str,
+    reap: bool,
+) -> io::Result<Option<(String, Option<Record>)>> {
+    match scan_entry(namespace, active, name, reap) {
+        Ok(entry) => Ok(Some(entry)),
+        Err(_) if left_active(active, name)? => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// The active claim directory `name`'s working claim name and, unless drained (and retired
+/// when `reap`), its record.
+fn scan_entry(
+    namespace: &Namespace,
+    active: &File,
+    name: &str,
+    reap: bool,
+) -> io::Result<(String, Option<Record>)> {
+    let anchor = Anchor::open_name(active, name, namespace.nonce())?;
+    let directory = anchor.directory.try_clone()?;
+    let mut transaction = if reap {
+        anchor.lock_recover(&directory)?
+    } else {
+        anchor.lock(&directory)?
+    };
+    if reap {
+        transaction.recover_pending(&directory, namespace.nonce())?
+    }
+    let working = transaction.scan_name()?.to_owned();
+    let record = probe_under(
+        namespace,
+        &directory,
+        &working,
+        working.ends_with(CLAIM),
+        reap,
+        &mut transaction,
+    )?;
+    Ok((working, record))
+}
+
+/// Whether the claim directory `name` has left `active`. Retirement moves the whole directory
+/// to `retired` in one rename, so a reader that listed it before then meets a missing name,
+/// a moved parent or a replaced directory on its open, lock or load: such a failure is the
+/// retirement, not a defect of the ledger.
+///
+/// # Errors
+/// `active` cannot be read for `name`.
+fn left_active(active: &File, name: &str) -> io::Result<bool> {
+    match fd::fstatat(active, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(_) => Ok(false),
+        Err(error) if error.is_noent() => Ok(true),
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[cfg(test)]
@@ -569,14 +619,56 @@ pub(super) fn claim_state(
         return Ok(CohortClaimState::Unknown);
     }
     let active = namespace.open_active()?;
-    match fd::fstatat(&active, reference.key(), AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(_) => {}
-        Err(error) if error.is_noent() => {
-            return checkpoint::archived_state(namespace, reference, reap);
-        }
-        Err(error) => return Err(error.into()),
+    if left_active(&active, &reference.key())? {
+        return checkpoint::archived_state(namespace, reference, reap);
     }
-    let anchor = Anchor::open_name(&active, &reference.key(), namespace.nonce())?;
+    listed_claim_state(namespace, &active, reference, reap)
+}
+
+/// Whether the claim `reference` names is still in this namespace's active directory, read
+/// without its record's mutation lock: a look that never makes its owner's drop meet a busy
+/// record and leave retirement to a reaping scan.
+///
+/// # Errors
+/// The active directory cannot be opened or read for the claim.
+#[cfg(any(test, debug_assertions))]
+pub(super) fn claim_listed(
+    namespace: &Namespace,
+    reference: &crate::CohortClosureRef,
+) -> io::Result<bool> {
+    if reference.namespace() != namespace.nonce() {
+        return Ok(false);
+    }
+    Ok(!left_active(&namespace.open_active()?, &reference.key())?)
+}
+
+/// [`claim_state`] of a reference whose claim directory a look found in `active`: from the
+/// archive once it was retired, by its owner's drop or a reaping scan, after that look.
+///
+/// # Errors
+/// As [`active_claim_state`], for a claim directory still in `active`.
+fn listed_claim_state(
+    namespace: &Namespace,
+    active: &File,
+    reference: &crate::CohortClosureRef,
+    reap: bool,
+) -> io::Result<CohortClaimState> {
+    match active_claim_state(namespace, active, reference, reap) {
+        Err(_) if left_active(active, &reference.key())? => {
+            checkpoint::archived_state(namespace, reference, reap)
+        }
+        state => state,
+    }
+}
+
+/// [`claim_state`] of a reference whose claim directory was listed in `active`.
+fn active_claim_state(
+    namespace: &Namespace,
+    active: &File,
+    reference: &crate::CohortClosureRef,
+    reap: bool,
+) -> io::Result<CohortClaimState> {
+    let anchor = Anchor::open_name(active, &reference.key(), namespace.nonce())?;
     let directory = anchor.directory.try_clone()?;
     if !anchor.matches_guard(reference.guard()) {
         return Ok(CohortClaimState::Unknown);
@@ -604,12 +696,8 @@ pub(super) fn claim_state(
             &mut transaction,
         )?;
         // A successful reap may have transferred the whole original directory atomically.
-        match fd::fstatat(&active, reference.key(), AtFlags::SYMLINK_NOFOLLOW) {
-            Err(error) if error.is_noent() => {
-                return checkpoint::archived_state(namespace, reference, reap);
-            }
-            Err(error) => return Err(error.into()),
-            Ok(_) => {}
+        if left_active(active, &reference.key())? {
+            return checkpoint::archived_state(namespace, reference, reap);
         }
     }
     let state = transaction.claim_state(
@@ -1419,6 +1507,49 @@ pub(super) mod tests {
     use crate::{Claim, Fixed, Polled, Reading, Waiter};
     use aterm_uds::spawnfd::{self, Child, Stdio};
     use std::os::unix::fs::DirBuilderExt as _;
+
+    /// A reader that listed a claim before its owner's drop retired it meets the retirement,
+    /// not a defect: a scan skips the name and a claim-state read answers from the archive.
+    #[test]
+    fn a_claim_retired_after_its_listing_is_skipped_not_an_error() {
+        let f = Fixture::new();
+        let claim = f.claim();
+        let reference = claim.cohort_closure_ref().unwrap();
+        let active = f.namespace.open_active().unwrap();
+        let name = reference.key();
+        assert!(claim_listed(&f.namespace, &reference).unwrap());
+        for reap in [false, true] {
+            let (_, record) = scan_listed(&f.namespace, &active, &name, reap)
+                .unwrap()
+                .expect("a listed live claim");
+            assert!(record.is_some(), "a live admitted claim keeps its record");
+        }
+        drop(claim);
+        assert!(left_active(&active, &name).unwrap());
+        assert!(!claim_listed(&f.namespace, &reference).unwrap());
+        for reap in [false, true] {
+            assert!(
+                scan_entry(&f.namespace, &active, &name, reap).is_err(),
+                "the stale listing itself cannot be read"
+            );
+            assert!(
+                scan_listed(&f.namespace, &active, &name, reap)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(active_claim_state(&f.namespace, &active, &reference, reap).is_err());
+            assert_eq!(
+                listed_claim_state(&f.namespace, &active, &reference, reap).unwrap(),
+                CohortClaimState::Closed,
+                "a claim-state read that listed the claim before its retirement"
+            );
+            assert_eq!(
+                claim_state(&f.namespace, &reference, reap).unwrap(),
+                CohortClaimState::Closed
+            );
+        }
+        assert!(f.ledger.list().unwrap().is_empty());
+    }
 
     pub(crate) struct Fixture {
         _scratch: checkpoint::TestWorld,

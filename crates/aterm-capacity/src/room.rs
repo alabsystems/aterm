@@ -167,7 +167,7 @@ impl Rooms {
             if self.meters.len() >= MAX_ROOMS {
                 return None;
             }
-            self.meters.insert(key.to_owned(), RoomMeter::default());
+            return Some(self.meters.entry(key.to_owned()).or_default());
         }
         self.meters.get_mut(key)
     }

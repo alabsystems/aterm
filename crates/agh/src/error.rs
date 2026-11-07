@@ -514,15 +514,19 @@ pub enum Sub {
 }
 
 impl Sub {
-    /// Returns the sub-kind slug, or `None` for `Sub::None`.
-    #[must_use]
-    pub fn slug(&self) -> Option<String> {
+    pub(crate) fn slug_cow(&self) -> Option<std::borrow::Cow<'static, str>> {
         let fixed = match self {
             Sub::None => return None,
-            Sub::Forbid(forbid) => return Some(forbid.slug().to_string()),
-            Sub::Wire(kind) => return Some(format!("wire.{}", kind.slug())),
-            Sub::Policy(code) => return Some(format!("policy.{}", code.slug())),
-            Sub::Replay(what) => return Some(format!("replay.{}", what.slug())),
+            Sub::Forbid(forbid) => forbid.slug(),
+            Sub::Wire(kind) => {
+                return Some(std::borrow::Cow::Owned(format!("wire.{}", kind.slug())));
+            }
+            Sub::Policy(code) => {
+                return Some(std::borrow::Cow::Owned(format!("policy.{}", code.slug())));
+            }
+            Sub::Replay(what) => {
+                return Some(std::borrow::Cow::Owned(format!("replay.{}", what.slug())));
+            }
             Sub::Primary => "primary",
             Sub::Secondary => "secondary",
             Sub::PreRefused => "pre_refused",
@@ -551,7 +555,13 @@ impl Sub {
             Sub::Git { .. } => "git",
             Sub::GitConfig { .. } => "git_config",
         };
-        Some(fixed.to_string())
+        Some(std::borrow::Cow::Borrowed(fixed))
+    }
+
+    /// Returns the sub-kind slug, or `None` for `Sub::None`.
+    #[must_use]
+    pub fn slug(&self) -> Option<String> {
+        self.slug_cow().map(std::borrow::Cow::into_owned)
     }
 }
 
@@ -589,7 +599,10 @@ const MESSAGE_CAP: usize = 500;
 const HEADER_CAP: usize = 200;
 
 fn cap_chars(text: &str, cap: usize) -> String {
-    text.chars().take(cap).collect()
+    match text.char_indices().nth(cap) {
+        Some((end, _)) => text[..end].to_string(),
+        None => text.to_string(),
+    }
 }
 
 fn cap_whole_runs(text: &str, cap: usize) -> String {
@@ -604,44 +617,45 @@ fn cap_whole_runs(text: &str, cap: usize) -> String {
     kept[..back].to_string()
 }
 
-fn string_at(value: &Value, key: &str) -> Option<String> {
-    value.get(key).and_then(Value::as_str).map(str::to_string)
+fn take_string_at(map: &mut Map, key: &str) -> Option<String> {
+    match map.remove(key) {
+        Some(Value::String(s)) => Some(s),
+        _ => None,
+    }
 }
 
 impl GithubBody {
     /// Parses a GitHub JSON error body, returning the default on non-JSON input.
     #[must_use]
     pub fn parse(body: &[u8]) -> GithubBody {
-        let Ok(value) = aterm_json::from_slice::<Value>(body) else {
+        let Ok(mut value) = aterm_json::from_slice::<Value>(body) else {
             return GithubBody::default();
         };
-        if !value.is_object() {
+        let Some(object) = value.as_object_mut() else {
             return GithubBody::default();
-        }
-        let errors = value
-            .get("errors")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .map(|item| match item {
-                        Value::String(text) => FieldError {
-                            message: Some(text.clone()),
-                            ..FieldError::default()
-                        },
-                        other => FieldError {
-                            resource: string_at(other, "resource"),
-                            field: string_at(other, "field"),
-                            code: string_at(other, "code"),
-                            message: string_at(other, "message"),
-                        },
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        };
+        let errors = match object.remove("errors") {
+            Some(Value::Array(items)) => items
+                .into_iter()
+                .map(|item| match item {
+                    Value::String(text) => FieldError {
+                        message: Some(text),
+                        ..FieldError::default()
+                    },
+                    Value::Object(mut other) => FieldError {
+                        resource: take_string_at(&mut other, "resource"),
+                        field: take_string_at(&mut other, "field"),
+                        code: take_string_at(&mut other, "code"),
+                        message: take_string_at(&mut other, "message"),
+                    },
+                    _ => FieldError::default(),
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
         GithubBody {
-            message: string_at(&value, "message").map(|m| cap_whole_runs(&m, MESSAGE_CAP)),
-            documentation_url: string_at(&value, "documentation_url"),
+            message: take_string_at(object, "message").map(|m| cap_whole_runs(&m, MESSAGE_CAP)),
+            documentation_url: take_string_at(object, "documentation_url"),
             errors,
             ..GithubBody::default()
         }
@@ -975,61 +989,75 @@ impl Error {
     /// Formats the redacted first stderr diagnostic line.
     #[must_use]
     pub fn line(&self, verb: &str, redactor: &Redactor) -> String {
-        let clean = |text: &str| redactor.apply(text);
-        let quoted = |text: &str| quote(&redactor.apply(text));
-        let verb = if verb.is_empty() {
-            "-".to_string()
-        } else {
-            clean(verb)
+        use std::fmt::Write as _;
+        let push_quoted = |out: &mut String, text: &str| {
+            let redacted = redactor.apply_cow(text);
+            out.push('"');
+            push_escaped(out, &redacted);
+            out.push('"');
         };
-        let mut parts = vec![
-            format!("agh: {}", self.kind.slug()),
-            format!("exit={}", self.exit()),
-            format!("verb={verb}"),
-        ];
+        let mut out = String::with_capacity(128 + self.why.len() + self.next.len());
+        let verb = if verb.is_empty() {
+            std::borrow::Cow::Borrowed("-")
+        } else {
+            redactor.apply_cow(verb)
+        };
+        let _ = write!(
+            out,
+            "agh: {} exit={} verb={verb}",
+            self.kind.slug(),
+            self.exit()
+        );
         if let Some(repo) = &self.repo {
-            parts.push(format!("repo={}", clean(repo)));
+            let _ = write!(out, " repo={}", redactor.apply_cow(repo));
         }
         if let Some(identity) = &self.identity {
-            parts.push(format!("as={}", clean(identity.label())));
+            let _ = write!(out, " as={}", redactor.apply_cow(identity.label()));
         }
         if let Some(http) = &self.http {
-            parts.push(format!(
-                "http={}",
-                quoted(&format!("{} {} {}", http.status, http.method, http.path))
-            ));
+            out.push_str(" http=");
+            push_quoted(
+                &mut out,
+                &format!("{} {} {}", http.status, http.method, http.path),
+            );
             if let Some(id) = &http.request_id {
-                let id: String = clean(id)
-                    .chars()
-                    .filter(|c| c.is_ascii_alphanumeric() || *c == ':')
-                    .collect();
-                parts.push(format!("req={id}"));
+                out.push_str(" req=");
+                for c in redactor.apply_cow(id).chars() {
+                    if c.is_ascii_alphanumeric() || c == ':' {
+                        out.push(c);
+                    }
+                }
             }
         }
-        if let Some(sub) = self.sub.slug() {
-            parts.push(format!("sub={}", clean(&sub)));
+        if let Some(sub) = self.sub.slug_cow() {
+            let _ = write!(out, " sub={}", redactor.apply_cow(&sub));
         }
         if let Some(reset) = self.reset {
-            parts.push(format!("reset={reset}"));
+            let _ = write!(out, " reset={reset}");
         }
         if let Some(secs) = self.retry_after {
-            parts.push(format!("retry_after={secs}"));
+            let _ = write!(out, " retry_after={secs}");
         }
-        parts.push(format!("side_effect={}", self.side_effect.slug()));
+        let _ = write!(out, " side_effect={}", self.side_effect.slug());
         if let Some(github) = &self.github {
             if let Some(accepted) = &github.accepted_permissions {
-                parts.push(format!("accepted={}", quoted(accepted)));
+                out.push_str(" accepted=");
+                push_quoted(&mut out, accepted);
             }
             if let Some(scopes) = &github.oauth_scopes {
-                parts.push(format!("scopes={}", quoted(scopes)));
+                out.push_str(" scopes=");
+                push_quoted(&mut out, scopes);
             }
             if let Some(scopes) = &github.accepted_oauth_scopes {
-                parts.push(format!("accepted_scopes={}", quoted(scopes)));
+                out.push_str(" accepted_scopes=");
+                push_quoted(&mut out, scopes);
             }
         }
-        parts.push(format!("why={}", quoted(&self.why)));
-        parts.push(format!("next={}", quoted(&self.next)));
-        parts.join(" ")
+        out.push_str(" why=");
+        push_quoted(&mut out, &self.why);
+        out.push_str(" next=");
+        push_quoted(&mut out, &self.next);
+        out
     }
 
     /// Formats the redacted JSON diagnostic line.
@@ -1122,7 +1150,7 @@ impl Error {
         );
         object.insert(
             "sub".into(),
-            self.sub.slug().map_or(Value::Null, |s| text(&s)),
+            self.sub.slug_cow().map_or(Value::Null, |s| text(&s)),
         );
         object.insert("tried".into(), Value::Array(tried));
         object.insert("v".into(), Value::from(1u8));

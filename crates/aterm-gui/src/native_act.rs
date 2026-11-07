@@ -53,6 +53,52 @@ pub(crate) use renewal::serve_rotation as serve_codex_rotation;
 mod accounts_control;
 pub(crate) use accounts_control::serve as serve_codex_accounts;
 #[cfg(unix)]
+#[path = "codex_auth_control.rs"]
+mod auth_control;
+#[cfg(unix)]
+#[path = "codex_source_control.rs"]
+mod source_control;
+
+/// Credential requests use this app's active configuration, just as owned
+/// constructors do. Process defaults cannot select a different account roster.
+#[cfg(unix)]
+pub(crate) fn codex_account_env() -> Result<aterm_agent::harness::cli::Env, String> {
+    let mut env = aterm_agent::harness::cli::Env::from_process()?;
+    env.config = crate::app_config::config_path();
+    Ok(env)
+}
+
+/// Transport cleanup is independent of session-store enumeration.
+pub(crate) fn source_connection_closed(connection: u64) {
+    #[cfg(unix)]
+    source_control::connection_closed(connection);
+    #[cfg(not(unix))]
+    let _ = connection;
+}
+
+pub(crate) fn serve_codex_auth(
+    ctx: &Arc<crate::SessionCtx>,
+    master: i32,
+    line: &str,
+    lifetime: &aterm_agent::harness::account_work::Lifetime,
+    registry: &Arc<aterm_agent::harness::codex_source_registry::Registry>,
+    connection: Option<u64>,
+) -> String {
+    #[cfg(unix)]
+    {
+        if source_control::handles(line) {
+            source_control::serve(ctx, master, line, lifetime, registry, connection)
+        } else {
+            auth_control::serve(ctx, master, line, lifetime)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (ctx, master, line, lifetime, registry, connection);
+        "ERR codex-auth unsupported\n".into()
+    }
+}
+#[cfg(unix)]
 #[path = "codex_enrollment_control.rs"]
 mod enrollment_control;
 

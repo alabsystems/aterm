@@ -88,6 +88,16 @@ impl Args {
                     && c.spec().reach == crate::checks::Reach::TreeOrPackages)
         })
     }
+
+    /// Does this run hand its `-p` specs to this host's cargo: a check that builds its selection
+    /// here ([`Check::builds_selection`]: lint, test, doc, checkers), with `-p` and no `--all`?
+    /// Only such a run can reach cargo's resolver with a spec the host's graph lacks
+    /// ([`crate::changed::foreign_specs`]); `cells` resolves each `-p` per cell, and
+    /// `export-scan` reads files.
+    #[must_use]
+    pub fn builds_packages_here(&self) -> bool {
+        !self.all && !self.packages.is_empty() && self.checks.iter().any(|c| c.builds_selection())
+    }
 }
 
 /// A usage error, in one line, with where to look next.
@@ -462,7 +472,8 @@ Options:
       --cell <name>       the forge cell `cells` checks (repeatable; any cell)
       --compile-only      with test/checkers/measure: compile tests or measuring benches without executing them
       --as-release        with test or doc and --all: as release runs them, with
-                          ATERM_SPEC_CHECKERS=1, and test owes the golden frame
+                          ATERM_SPEC_CHECKERS=1, ATERM_RELEASE_RUN=1, a disposable HOME
+                          holding release history, and test owes the golden frame
                           test (--compile-only: what release's test stage compiles)
       --cursor-pacing     with measure --app: run only the GUI pacing burst
       --no-windows        skip each stage that opens a window (a named skip)
@@ -487,10 +498,12 @@ Options:
                           they claim fits together in what can ever be
                           available here (one that alone does not runs
                           with no other that claims memory)
-      --test-threads <n>  RUST_TEST_THREADS ceiling for every test binary
-      --test-jobs <n>     test binary ceiling (default 8); direct binaries times
-                          threads stay within held CARGO_BUILD_JOBS, or host
-                          cores when no build-slot share is held
+      --test-threads <n>  the widest RUST_TEST_THREADS a test binary is planned
+                          at (each binary's width comes from its last runs)
+      --test-jobs <n>     how many test binaries run at once (default: the
+                          share); the running binaries' charges stay within
+                          held CARGO_BUILD_JOBS, or host cores when no
+                          build-slot share is held
       --timeout <s|off>   hang ceiling on each child's work (default 3h); its
                           waits for a lock or for room are left out
       --log <path>        where the full log goes (default: a new file in
@@ -550,6 +563,31 @@ mod tests {
         assert_eq!(a.checks.len(), DEV.len() + 1);
         assert!(a.checks.contains(&Check::Forge));
         assert!(!ok(&["fmt", "census"]).narrows());
+    }
+
+    /// Only a run whose lint, test, doc or checkers builds its `-p` with this host's cargo asks
+    /// whether the host's graph holds each spec. CONTROL: `export-scan` and `cells` read `-p`
+    /// too ([`Args::narrows`]), and are not asked.
+    #[test]
+    fn only_a_check_that_builds_its_selection_here_hands_cargo_its_specs() {
+        let p = "windows-sys@0.61.2";
+        for (args, here) in [
+            (vec!["-p", p], true),
+            (vec!["lint", "-p", p], true),
+            (vec!["test", "-p", p], true),
+            (vec!["doc", "-p", p], true),
+            (vec!["checkers", "-p", p], true),
+            (vec!["export-scan", "-p", p], false),
+            (vec!["cells", "-p", p], false),
+            (vec!["fmt", "census", "-p", p], false),
+            (vec!["lint"], false),
+            (vec!["lint", "--all"], false),
+        ] {
+            let a = ok(&args);
+            assert_eq!(a.builds_packages_here(), here, "{args:?}");
+        }
+        assert!(ok(&["export-scan", "-p", p]).narrows());
+        assert!(ok(&["cells", "-p", p]).narrows());
     }
 
     #[test]

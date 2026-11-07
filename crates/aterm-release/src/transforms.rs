@@ -458,14 +458,14 @@ fn withheld_packages(inputs: &Inputs) -> Result<std::collections::BTreeSet<Strin
     Ok(withheld)
 }
 
-/// One `[[package]]` of a Cargo.lock: its fields, and its text (from its header to the
+/// One `[[package]]` of a Cargo.lock: its fields, and its chunk (after its header to the
 /// next one).
-struct LockPackage {
+struct LockPackage<'a> {
     name: String,
     version: String,
     source: Option<String>,
     dependencies: Vec<String>,
-    text: String,
+    chunk: &'a str,
 }
 
 /// Prunes path packages in `withheld` and packages reachable only through them from `lock`.
@@ -505,12 +505,17 @@ pub fn prune_lock(
                         .collect()
                 })
                 .unwrap_or_default(),
-            text: format!("{HEADER}{chunk}"),
+            chunk,
         });
     }
-    let is_withheld = |p: &LockPackage| p.source.is_none() && withheld.contains(&p.name);
+    let is_withheld = |p: &LockPackage<'_>| p.source.is_none() && withheld.contains(&p.name);
     if !packages.iter().any(is_withheld) {
         return Ok(None);
+    }
+    let mut by_name: std::collections::BTreeMap<&str, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (idx, pkg) in packages.iter().enumerate() {
+        by_name.entry(pkg.name.as_str()).or_default().push(idx);
     }
     let resolve = |spec: &str| -> Option<usize> {
         let mut words = spec.splitn(3, ' ');
@@ -519,9 +524,9 @@ pub fn prune_lock(
         let source = words
             .next()
             .map(|s| s.trim_start_matches('(').trim_end_matches(')'));
-        packages.iter().position(|p| {
-            p.name == name
-                && version.is_none_or(|v| p.version == v)
+        by_name.get(name)?.iter().copied().find(|&i| {
+            let p = &packages[i];
+            version.is_none_or(|v| p.version == v)
                 && source.is_none_or(|s| p.source.as_deref() == Some(s))
         })
     };
@@ -550,33 +555,44 @@ pub fn prune_lock(
             todo.push(j);
         }
     }
-    let spelled = |j: usize| {
+    let spelled = |j: usize| -> std::borrow::Cow<'_, str> {
         let p = &packages[j];
-        let same_name = (0..packages.len()).filter(|&k| kept[k] && packages[k].name == p.name);
+        let candidates = by_name.get(p.name.as_str()).map_or(&[][..], Vec::as_slice);
+        let same_name = candidates.iter().copied().filter(|&k| kept[k]);
         let same_version = same_name
             .clone()
             .filter(|&k| packages[k].version == p.version);
         match (same_name.count(), same_version.count(), &p.source) {
-            (1, _, _) => p.name.clone(),
-            (_, 1, _) | (_, _, None) => format!("{} {}", p.name, p.version),
-            (_, _, Some(source)) => format!("{} {} ({source})", p.name, p.version),
+            (1, _, _) => std::borrow::Cow::Borrowed(p.name.as_str()),
+            (_, 1, _) | (_, _, None) => {
+                std::borrow::Cow::Owned(format!("{} {}", p.name, p.version))
+            }
+            (_, _, Some(source)) => {
+                std::borrow::Cow::Owned(format!("{} {} ({source})", p.name, p.version))
+            }
         }
     };
-    let mut out = preamble.to_string();
+    let mut out = String::with_capacity(lock.len());
+    out.push_str(preamble);
     let mut gone = Vec::new();
     for (i, p) in packages.iter().enumerate() {
         if !kept[i] {
             gone.push(format!("{} {}", p.name, p.version));
             continue;
         }
-        let mut text = p.text.clone();
+        out.push_str(HEADER);
+        let mut chunk: std::borrow::Cow<'_, str> = std::borrow::Cow::Borrowed(p.chunk);
         for spec in &p.dependencies {
-            let now = resolve(spec).map(spelled).unwrap_or_else(|| spec.clone());
+            let now = resolve(spec)
+                .map(spelled)
+                .unwrap_or(std::borrow::Cow::Borrowed(spec.as_str()));
             if now != *spec {
-                text = text.replace(&format!(" \"{spec}\",\n"), &format!(" \"{now}\",\n"));
+                chunk = std::borrow::Cow::Owned(
+                    chunk.replace(&format!(" \"{spec}\",\n"), &format!(" \"{now}\",\n")),
+                );
             }
         }
-        out.push_str(&text);
+        out.push_str(&chunk);
     }
     while out.ends_with("\n\n") {
         out.pop();

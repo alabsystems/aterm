@@ -42,6 +42,20 @@ pub(super) struct LaunchUse(());
 /// A reader of one login's usage ([`ReadUsage`]): [`LiveUsage`] is the product's; a test
 /// passes a closure answering `Option<Usage>`, whose `None` is [`Reading::Unread`].
 pub trait UsageReader: Sync {
+    /// A concrete provider may retire its own committed credential receipt using this trusted seat.
+    /// Cached and custom readers keep their existing observational behavior.
+    fn read_observed_on(
+        &self,
+        seat: &Seat<'_>,
+        cli: Cli,
+        home: &Path,
+        expected_email: Option<&str>,
+        now: i64,
+        use_token: provider_read::Use,
+    ) -> UsageObservation {
+        let _ = seat;
+        self.read_observed(cli, home, expected_email, now, use_token)
+    }
     /// What `cli`'s login in the home `home` reads at `now`, for a row whose provider email is
     /// `expected_email`. The reader must reject a known identity mismatch in the credential
     /// snapshot it actually uses.
@@ -126,6 +140,25 @@ where
 pub struct LiveUsage;
 
 impl UsageReader for LiveUsage {
+    fn read_observed_on(
+        &self,
+        seat: &Seat<'_>,
+        cli: Cli,
+        home: &Path,
+        expected_email: Option<&str>,
+        now: i64,
+        use_token: provider_read::Use,
+    ) -> UsageObservation {
+        if cli == Cli::Codex {
+            super::cli::cleanup_codex_enrollments(
+                &seat.store(cli),
+                &seat.config_dir.join(cli.accounts().roster_file),
+                now,
+                home,
+            );
+        }
+        self.read_observed(cli, home, expected_email, now, use_token)
+    }
     fn read(
         &self,
         cli: Cli,
@@ -1395,7 +1428,8 @@ fn poll_usage(
     }
     let mut readings = vec![(
         row.label.clone(),
-        read.read_observed(
+        read.read_observed_on(
+            seat,
             cli,
             &home,
             row.expected_identity_email(),

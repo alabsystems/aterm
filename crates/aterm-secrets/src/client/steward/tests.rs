@@ -767,7 +767,7 @@ fn steward_revoke_detects_and_finishes_a_half_done_vault_only_removal() {
 }
 
 #[test]
-fn revoke_before_explicit_roster_seed_seeds_remaining_members_first() {
+fn revoke_without_a_historical_roster_never_allocates_labels() {
     let lab = lab("steward-revoke-unseeded-roster");
     let _m2 = lab.machine("m2", false);
     let _m4 = lab.machine("mac-mini-m4", false);
@@ -785,15 +785,14 @@ fn revoke_before_explicit_roster_seed_seeds_remaining_members_first() {
         let roster = crate::swarm_roster::SwarmRoster::from_document(&after)
             .unwrap()
             .expect("revoke on ALab vault creates swarm roster");
-        let labels: Vec<&str> = roster.members.iter().map(|m| m.label.as_str()).collect();
         assert!(
-            labels.contains(&"m1") && labels.contains(&"m2"),
-            "remaining vault members must be seeded into roster: {labels:?}"
+            roster.members.is_empty(),
+            "revocation must not allocate labels"
         );
+        assert!(!after.machines().iter().any(|m| m.name == "mac-mini-m4"));
         assert!(
-            !roster.deny_labels.is_empty(),
-            "revoked member's seeded label must be added to deny_labels: {:?}",
-            roster.deny_labels
+            !after.code_only().is_empty(),
+            "the revoked recipient stays denied"
         );
     });
 }

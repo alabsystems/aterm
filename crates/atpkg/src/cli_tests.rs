@@ -620,6 +620,19 @@ fn the_lease_verb_parses_a_directory_a_name_and_a_whole_command() {
 fn named_prerequisite_leases_preserve_the_command_and_refuse_ambiguous_or_unmanaged_names() {
     use crate::prerequisite::Prerequisite;
     let args = |parts: &[&str]| parts.iter().map(ToString::to_string).collect::<Vec<_>>();
+    let named = parse_lease_args(&args(&["--tool", "lake=2", "--", "run"])).unwrap();
+    assert_eq!(
+        named.subject,
+        LeaseSubject::NamedPrerequisite(Prerequisite::Lake, 2)
+    );
+    for bad in [
+        &["--tool", "lake=0", "--", "run"][..],
+        &["--tool", "lake=oops", "--", "run"],
+        &["--tool", "lake=2", "--tool", "lake=3", "--", "run"],
+        &["--tool", "lake=2", "--tool", "python3.14", "--", "run"],
+    ] {
+        assert!(parse_lease_args(&args(bad)).is_err(), "{bad:?}");
+    }
     let parsed = parse_lease_args(&args(&[
         "--tool",
         "python3.14",
@@ -1073,11 +1086,28 @@ fn install_takes_one_operand() {
 
 /// `install <program> --build <N> [--retry]` names one build, its refusal memo forgotten first
 /// with `--retry`; any other shape around the flags, a build that is no number, and a program
-/// other than Trust are usage errors that touch no store.
+/// outside Trust and exact Lean import worlds are usage errors that touch no store.
 #[test]
-fn install_takes_a_build_by_number_for_trust_only() {
+fn install_takes_a_build_by_number_for_trust_and_lean_worlds() {
     let argv = |words: &[&str]| words.iter().map(|w| (*w).to_string()).collect::<Vec<_>>();
     let trust = "trust".to_string();
+    let lean = "lean4".to_string();
+    assert_eq!(
+        parse_install_argv(&argv(&["lean4", "--build", "3"])),
+        Ok(InstallArgs {
+            program: Some(&lean),
+            build: Some(3),
+            retry: false
+        })
+    );
+    assert_eq!(
+        parse_install_argv(&argv(&["lean4", "--build", "2", "--retry"])),
+        Ok(InstallArgs {
+            program: Some(&lean),
+            build: Some(2),
+            retry: true
+        })
+    );
     assert_eq!(
         parse_install_argv(&argv(&["trust", "--build", "16387"])),
         Ok(InstallArgs {
@@ -1114,6 +1144,8 @@ fn install_takes_a_build_by_number_for_trust_only() {
         &["trust", "--retry"],
         &["ay", "--build", "18"],
         &["ay", "--build", "18", "--retry"],
+        &["lean4", "--build", "invalid"],
+        &["lean4", "--build", "3", "unexpected"],
         &["-x", "--build", "18"],
     ] {
         assert_eq!(parse_install_argv(&argv(refused)), Err(two), "{refused:?}");
@@ -1126,11 +1158,12 @@ fn install_takes_a_build_by_number_for_trust_only() {
 }
 
 #[test]
-fn named_trust_staging_never_starts_a_changed_machine_plan() {
+fn named_staging_never_starts_a_changed_machine_plan() {
     use std::cell::Cell;
 
     for (words, private_state, expected) in [
         (&["install", "trust", "--build", "15698"][..], false, 0),
+        (&["install", "lean4", "--build", "3"][..], false, 0),
         (
             &["install", "trust", "--build", "15698", "--retry"],
             false,
@@ -14343,6 +14376,9 @@ fn the_seed_reads_the_command_line_tools_without_running_anything() {
         shim_dir: Some(shim.clone()),
         xcode_select_link: root.join("no-link"),
         default_developer_dir: developer.clone(),
+        xcode_developer_dir: None,
+        developer_dir_override: None,
+        sdkroot_override: None,
         bound: std::time::Duration::from_secs(60),
         tmp_root: root.to_path_buf(),
     };
@@ -14415,6 +14451,9 @@ fn clt_install_aliases_are_recognized_by_atpkg_install() {
             shim_dir: Some(shim.clone()),
             xcode_select_link: root.join("no-link"),
             default_developer_dir: developer.clone(),
+            xcode_developer_dir: None,
+            developer_dir_override: None,
+            sdkroot_override: None,
             bound: std::time::Duration::from_secs(60),
             tmp_root: root.to_path_buf(),
         };

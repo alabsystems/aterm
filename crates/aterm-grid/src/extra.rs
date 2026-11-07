@@ -37,6 +37,8 @@ mod extra_flags {
     pub(crate) const COLOR_MASK: u32 = HAS_UNDERLINE_COLOR | HAS_FG_RGB | HAS_BG_RGB;
     /// Bits 3-18 store the full 16-bit extended flags word without truncating bits 13-15.
     pub(crate) const EXTENDED_SHIFT: u32 = 3;
+    /// The owned complex string is spare storage, hidden until the refill uses it.
+    pub(crate) const COMPLEX_PENDING: u32 = 1 << 19;
 }
 
 pub use aterm_types::HyperlinkData;
@@ -71,7 +73,7 @@ pub const MAX_IMAGE_LAYERS: usize = 16;
 /// Rare cell attributes stored outside the packed 8-byte `Cell`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CellExtra {
-    /// Bitflags: bits 0-2 track color presence, bits 3-18 store 16-bit extended flags.
+    /// Bits 0-2 track colours, 3-18 store extended flags, and 19 hides a spare complex string during refill.
     flags: u32,
     /// Packed RGB.
     colors: [u8; 9],
@@ -93,9 +95,9 @@ impl CellExtra {
     #[inline]
     pub const fn has_data(&self) -> bool {
         self.hyperlink.is_some()
-            || self.complex_char.is_some()
+            || (self.complex_char.is_some() && self.flags & extra_flags::COMPLEX_PENDING == 0)
             || !self.combining.is_empty()
-            || self.flags != 0
+            || self.flags & !extra_flags::COMPLEX_PENDING != 0
             || self.image.is_some()
             || self.underline_color_idx.is_some()
     }
@@ -111,7 +113,7 @@ impl CellExtra {
     /// Set extended flags (bits 3-18 of flags field, preserving all 16 bits of `ext_flags`).
     #[inline]
     pub const fn set_extended_flags(&mut self, ext_flags: u16) {
-        self.flags = (self.flags & extra_flags::COLOR_MASK)
+        self.flags = (self.flags & (extra_flags::COLOR_MASK | extra_flags::COMPLEX_PENDING))
             | ((ext_flags as u32) << extra_flags::EXTENDED_SHIFT);
     }
 
@@ -293,13 +295,34 @@ impl CellExtra {
     #[must_use]
     #[inline]
     pub fn complex_char(&self) -> Option<&Arc<str>> {
-        self.complex_char.as_deref()
+        if self.flags & extra_flags::COMPLEX_PENDING != 0 {
+            None
+        } else {
+            self.complex_char.as_deref()
+        }
     }
 
     /// Set complex character string.
     #[inline]
     pub fn set_complex_char(&mut self, s: Option<Arc<str>>) {
-        self.complex_char = s.map(Box::new);
+        self.flags &= !extra_flags::COMPLEX_PENDING;
+        match (&mut self.complex_char, s) {
+            (Some(slot), Some(s)) => **slot = s,
+            (_, s) => self.complex_char = s.map(Box::new),
+        }
+    }
+
+    /// Reuse an identical immutable payload, or replace it inside its existing slot.
+    #[inline]
+    pub(crate) fn refill_complex_char(&mut self, text: &str) {
+        if self
+            .complex_char
+            .as_ref()
+            .is_none_or(|old| old.as_ref().as_ref() != text)
+        {
+            self.set_complex_char(Some(Arc::from(text)));
+        }
+        self.flags &= !extra_flags::COMPLEX_PENDING;
     }
 
     /// Get the combining characters.
@@ -325,6 +348,7 @@ impl CellExtra {
     pub fn clear_char_marks(&mut self) {
         self.combining.clear();
         self.complex_char = None;
+        self.flags &= !extra_flags::COMPLEX_PENDING;
     }
 
     /// Whether this entry holds anything besides truecolor fg/bg bytes.
@@ -332,11 +356,15 @@ impl CellExtra {
     #[inline]
     pub(crate) const fn has_claimable_data(&self) -> bool {
         self.hyperlink.is_some()
-            || self.complex_char.is_some()
+            || (self.complex_char.is_some() && self.flags & extra_flags::COMPLEX_PENDING == 0)
             || !self.combining.is_empty()
             || self.image.is_some()
             || self.underline_color_idx.is_some()
-            || self.flags & !(extra_flags::HAS_FG_RGB | extra_flags::HAS_BG_RGB) != 0
+            || self.flags
+                & !(extra_flags::HAS_FG_RGB
+                    | extra_flags::HAS_BG_RGB
+                    | extra_flags::COMPLEX_PENDING)
+                != 0
     }
 
     /// Drop everything [`Self::has_claimable_data`] counts.
@@ -352,19 +380,50 @@ impl CellExtra {
         self.has_data()
     }
 
-    /// Reset a cell for refill while retaining its owned image-layer allocation.
-    pub(crate) fn prepare_image_refill(&mut self) -> bool {
-        let Some(mut layers) = self.image.take() else {
-            return false;
+    /// Reset visible data while retaining reusable image, complex and combining storage.
+    #[inline]
+    pub(crate) fn prepare_refill(&mut self) -> bool {
+        if self.complex_char.is_none() && !self.combining.spilled() {
+            let Some(layers) = self.image.as_mut() else {
+                return false;
+            };
+            layers.clear();
+            let layers = self.image.take();
+            *self = Self::default();
+            self.image = layers;
+            return true;
+        }
+        if let Some(layers) = self.image.as_mut() {
+            layers.clear();
+        }
+        let layers = self.image.take();
+        let complex = self.complex_char.take();
+        let mut combining = if self.combining.spilled() {
+            std::mem::take(&mut self.combining)
+        } else {
+            SmallVec::new()
         };
-        layers.clear();
+        combining.clear();
         *self = Self::default();
-        self.image = Some(layers);
+        self.image = layers;
+        self.complex_char = complex;
+        self.combining = combining;
+        if self.complex_char.is_some() {
+            self.flags |= extra_flags::COMPLEX_PENDING;
+        }
         true
     }
 
-    /// Release unused image storage after refill and report remaining data.
-    pub(crate) fn finish_image_refill(&mut self) -> bool {
+    /// Release unused spare storage after refill and report remaining visible data.
+    #[inline]
+    pub(crate) fn finish_refill(&mut self) -> bool {
+        if self.flags & extra_flags::COMPLEX_PENDING != 0 {
+            self.complex_char = None;
+            self.flags &= !extra_flags::COMPLEX_PENDING;
+        }
+        if self.combining.spilled() && self.combining.len() <= 2 {
+            self.combining = SmallVec::from_slice(&self.combining);
+        }
         if self.image.as_ref().is_some_and(|layers| layers.is_empty()) {
             self.image = None;
         }
@@ -442,7 +501,11 @@ impl CellExtra {
     /// Calculate memory used by this extra.
     #[must_use]
     pub fn memory_used(&self) -> usize {
-        let base = std::mem::size_of::<Self>();
+        std::mem::size_of::<Self>().saturating_add(self.heap_memory_used())
+    }
+
+    /// Payload heap attributed to this entry, excluding its inline table slot.
+    pub(crate) fn heap_memory_used(&self) -> usize {
         let hyperlink_mem = self.hyperlink.as_ref().map_or(0, |data| {
             std::mem::size_of::<HyperlinkData>()
                 .saturating_add(data.url.len())
@@ -469,7 +532,7 @@ impl CellExtra {
                 0
             })
         });
-        base.saturating_add(hyperlink_mem)
+        hyperlink_mem
             .saturating_add(complex_char_mem)
             .saturating_add(combining_mem)
             .saturating_add(image_mem)

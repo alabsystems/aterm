@@ -1966,42 +1966,52 @@ fn test_per_user_cache_dir_takes_each_platforms_sources_in_order() {
 #[cfg(unix)]
 #[test]
 fn test_cache_dir_is_the_per_user_cache_outside_the_containment_write_roots() {
-    let xdg = posix_absolute(std::env::var_os("XDG_CACHE_HOME"));
-    let (base, tail) = match (xdg.clone(), posix_absolute(std::env::var_os("HOME"))) {
-        (Some(cache), _) => (PathBuf::from(cache), "aterm/shell-integration"),
-        (None, Some(home)) => (PathBuf::from(home), ".cache/aterm/shell-integration"),
-        (None, None) => (std::env::temp_dir(), "aterm-shell-integration"),
-    };
-    assert_eq!(
-        per_user_cache_dir(),
-        base.join(tail),
-        "the per-user cache, whatever the mode"
-    );
-    if xdg.is_none() {
+    const PROBE: &str = "ATERM_SHELL_CACHE_PROBE";
+    if let Some(home) = std::env::var_os(PROBE) {
+        let home = PathBuf::from(home);
+        assert_eq!(
+            per_user_cache_dir(),
+            home.join(".cache/aterm/shell-integration")
+        );
         let root = aterm_uds::test_binary::scratch_root().expect("this test binary's root");
         assert_eq!(cache_dir(), root.join("cache/aterm/shell-integration"));
+        return;
     }
-    let Ok(base) = std::fs::canonicalize(&base) else {
-        aterm_spec::host::could_not_run(format!(
-            "the cache base {} does not resolve here",
-            base.display()
-        ));
-    };
-    let dir = std::fs::canonicalize(base.join(tail)).unwrap_or_else(|_| base.join(tail));
     let roots = aterm_containment::sbpl::WRITABLE_ROOTS;
-    if roots.iter().any(|root| base.starts_with(root)) {
-        aterm_spec::host::could_not_run(format!(
-            "this run's cache base is itself under a temp root: {}",
-            base.display()
-        ));
-    }
-    for root in roots {
-        assert!(
-            !dir.starts_with(root),
-            "{} lies under the Containment write root {root}",
-            dir.display()
-        );
-    }
+    let home = Path::new("/fixture/operator-home");
+    let cache = per_user_cache_dir_from(
+        false,
+        |key| (key == "HOME").then(|| home.into()),
+        || PathBuf::from("/private/tmp/fixture"),
+    );
+    assert_eq!(cache, home.join(".cache/aterm/shell-integration"));
+    assert!(roots.iter().all(|root| !cache.starts_with(root)));
+    // NEGATIVE CONTROL: the fallback really is inside the containment write roots.
+    let fallback =
+        per_user_cache_dir_from(false, |_| None, || PathBuf::from("/private/tmp/fixture"));
+    assert!(roots.iter().any(|root| fallback.starts_with(root)));
+
+    // A disposable HOME under /tmp is valid too. Exercise the actual runtime adapters in
+    // an injected child: removing test-binary isolation must fail its cache_dir assertion.
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let mut child = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+    child
+        .args([
+            "--exact",
+            "tests::test_cache_dir_is_the_per_user_cache_outside_the_containment_write_roots",
+        ])
+        .env(PROBE, dir.path())
+        .env("HOME", dir.path())
+        .env_remove("XDG_CACHE_HOME");
+    let output =
+        aterm_uds::deadline::output_within(&mut child, aterm_spec::wait::MUST_HAPPEN).unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
 }
 
 #[cfg(unix)]

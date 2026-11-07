@@ -428,9 +428,8 @@ impl DeferredLine {
             return (line, body);
         }
 
-        let default_extras = ScrolledRowExtras::default();
-        let extras = self.extras.as_deref().unwrap_or(&default_extras);
-        let line = cells_to_line(&body[..self.len as usize], extras, self.wrapped);
+        let extras = self.extras.take().map(|extras| *extras).unwrap_or_default();
+        let line = cells_to_line_owned(&body[..self.len as usize], extras, self.wrapped);
         (line, body)
     }
 
@@ -442,18 +441,41 @@ impl DeferredLine {
 }
 
 fn cells_to_line(cells: &[Cell], extras: &ScrolledRowExtras, wrapped: bool) -> Line {
+    cells_to_line_with_spans(
+        cells,
+        extras,
+        wrapped,
+        extras.hyperlinks.clone(),
+        extras.images.clone(),
+    )
+}
+
+fn cells_to_line_owned(cells: &[Cell], mut extras: ScrolledRowExtras, wrapped: bool) -> Line {
+    let hyperlinks = std::mem::take(&mut extras.hyperlinks);
+    let images = std::mem::take(&mut extras.images);
+    cells_to_line_with_spans(cells, &extras, wrapped, hyperlinks, images)
+}
+
+fn cells_to_line_with_spans(
+    cells: &[Cell],
+    extras: &ScrolledRowExtras,
+    wrapped: bool,
+    hyperlinks: Vec<HyperlinkSpan>,
+    images: Vec<ImageSpan>,
+) -> Line {
     #[cfg(any(test, debug_assertions))]
     super::count_row_to_line_op();
 
     let mut line = if cells.is_empty() {
-        let mut line = Line::new();
-        attach_image_spans(&mut line, extras);
-        line
-    } else if extras.is_empty() {
+        Line::new()
+    } else if extras.is_empty() && hyperlinks.is_empty() {
         plain_cells_to_line(cells)
     } else {
-        styled_cells_to_line(cells, extras)
+        styled_cells_to_line(cells, extras, hyperlinks)
     };
+    if !images.is_empty() {
+        line.set_images(images);
+    }
     if wrapped {
         line.set_wrapped(true);
     }
@@ -487,7 +509,11 @@ fn plain_cells_to_line_with<const CHECK_UTF8: bool>(cells: &[Cell]) -> Line {
     Line::with_hyperlinks_owned(text, attrs_rle.finish(), Vec::new())
 }
 
-fn styled_cells_to_line(cells: &[Cell], extras: &ScrolledRowExtras) -> Line {
+fn styled_cells_to_line(
+    cells: &[Cell],
+    extras: &ScrolledRowExtras,
+    hyperlinks: Vec<HyperlinkSpan>,
+) -> Line {
     let mut text = String::with_capacity(cells.len());
     let mut attrs_rle = AttrRunBuilder::empty();
     let mut cursors = RowToLineCursorState::default();
@@ -537,11 +563,10 @@ fn styled_cells_to_line(cells: &[Cell], extras: &ScrolledRowExtras) -> Line {
         );
     }
 
-    let mut line = Line::with_hyperlinks_owned(text, attrs_rle.finish(), extras.hyperlinks.clone());
+    let mut line = Line::with_hyperlinks_owned(text, attrs_rle.finish(), hyperlinks);
     if !extras.underline_colors.is_empty() {
         line.set_underline_colors(coalesce_underline_spans(&extras.underline_colors));
     }
-    attach_image_spans(&mut line, extras);
     line
 }
 
@@ -1202,12 +1227,6 @@ impl Default for LazyBuffer {
     }
 }
 
-fn attach_image_spans(line: &mut Line, extras: &ScrolledRowExtras) {
-    if !extras.images.is_empty() {
-        line.set_images(extras.images.clone());
-    }
-}
-
 /// Extend a compatible run at or after `minimum_index`, or begin a new run.
 /// Passing zero for a column's first layer needs no ordering comparison.
 #[inline(always)]
@@ -1369,6 +1388,16 @@ impl Grid {
     ) -> Line {
         let len = usize::from(len.min(row.cols()));
         cells_to_line(&row.as_slice()[..len], extras, row.is_wrapped())
+    }
+
+    /// Convert a row while transferring its already-owned link and image spans.
+    pub(crate) fn row_to_line_with_owned_extras_at_len(
+        row: &Row,
+        extras: ScrolledRowExtras,
+        len: u16,
+    ) -> Line {
+        let len = usize::from(len.min(row.cols()));
+        cells_to_line_owned(&row.as_slice()[..len], extras, row.is_wrapped())
     }
 
     /// Extract a row's extras (hyperlinks, complex chars, combining marks and RGB colours) before `shift_rows_up_by` discards them.
@@ -2632,6 +2661,65 @@ mod scrolled_row_extras_tests {
     use aterm_types::{ImageData, ImageFormat, ImageScaling};
 
     use super::ScrolledRowExtras;
+
+    #[test]
+    fn consumed_spans_match_borrowed_and_cached_materialization() {
+        let image = Arc::new(ImageData {
+            bytes: vec![7; 16],
+            format: ImageFormat::Png,
+            cols: 4,
+            rows: 1,
+            z_index: 0,
+            band_lift_px: 0,
+            cell_offset_px: (0, 0),
+            scaling: ImageScaling::Fit,
+            source_rect: None,
+        });
+        for len in [0_u16, 4] {
+            for links in [false, true] {
+                for images in [false, true] {
+                    let mut grid = super::Grid::new(1, 4);
+                    let row = grid.row_mut(0).unwrap();
+                    for col in 0..len {
+                        row.set(col, super::Cell::new('x'));
+                    }
+                    row.update_len(len);
+                    row.set_wrapped(true);
+                    let mut extras = ScrolledRowExtras::default();
+                    if links {
+                        extras.hyperlinks.push(HyperlinkSpan::new(
+                            0,
+                            4,
+                            Arc::from("https://example.com"),
+                        ));
+                    }
+                    if images {
+                        extras
+                            .images
+                            .push(ImageSpan::new(0, 4, 0, 0, Arc::clone(&image)));
+                    }
+                    let expected =
+                        super::cells_to_line(&row.as_slice()[..usize::from(len)], &extras, true);
+                    for cached in [false, true] {
+                        let deferred = super::DeferredLine::new(row, extras.clone(), Vec::new());
+                        if cached {
+                            deferred.to_line();
+                        }
+                        let actual = deferred.into_line();
+                        assert_eq!(
+                            aterm_scrollback::serialize_lines(std::slice::from_ref(&actual)),
+                            aterm_scrollback::serialize_lines(std::slice::from_ref(&expected))
+                        );
+                        assert_eq!(actual.images().is_some(), images);
+                        if let Some(spans) = actual.images() {
+                            assert!(Arc::ptr_eq(&spans[0].image, &image));
+                        }
+                        assert_eq!(actual.hyperlinks().is_some(), links && len != 0);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn is_empty_iff_every_field_is_empty() {

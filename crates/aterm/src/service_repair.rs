@@ -142,6 +142,30 @@ fn backend(paths: Paths, signed: Option<Value>) -> Live {
     Live::new(paths, signed, aterm_gui::running_build_number())
 }
 
+fn observed_value(which: Job, observed: transaction::Observed) -> Value {
+    let unit = observed.unit.map_or(Value::Null, |u| {
+        Value::Object(aterm_json::Map::from([
+            ("program".to_string(), u.program.into()),
+            (
+                "args".to_string(),
+                Value::Array(u.args.into_iter().map(Into::into).collect()),
+            ),
+            ("definition".to_string(), u.definition.into()),
+            ("image".to_string(), u.image.into()),
+            ("executable_sha256".to_string(), u.executable_sha256.into()),
+        ]))
+    });
+    Value::Object(aterm_json::Map::from([
+        ("job".to_string(), which.label().into()),
+        ("unit".to_string(), unit),
+        ("off".to_string(), observed.off.into()),
+        (
+            "pin".to_string(),
+            observed.pin.map_or(Value::Null, Into::into),
+        ),
+    ]))
+}
+
 fn prepare_request(
     paths: &Paths,
     job: Job,
@@ -217,9 +241,7 @@ pub(super) fn rpc(
                 let which = job(word("job")?)?;
                 let mut live = backend(paths, None);
                 let observed = live.observe(which)?;
-                Ok(
-                    json!({"job":which.label(),"unit":observed.unit.map(|u|json!({"program":u.program,"args":u.args,"definition":u.definition,"image":u.image,"executable_sha256":u.executable_sha256})),"off":observed.off,"pin":observed.pin}),
-                )
+                Ok(observed_value(which, observed))
             }
             "prepare" => Ok(transaction::request_value(&prepare_request(
                 &paths,
@@ -264,9 +286,12 @@ pub(super) fn rpc(
         "aterm-service-rpc-result/1",
         &aterm_json::to_vec(&payload).map_err(|e| e.to_string())?,
     );
-    Ok(
-        json!({"payload":payload,"node":identity.node(),"key":identity.key().hex(),"signature":hex(&signature)}),
-    )
+    Ok(Value::Object(aterm_json::Map::from([
+        ("payload".to_string(), payload),
+        ("node".to_string(), identity.node().into()),
+        ("key".to_string(), identity.key().hex().into()),
+        ("signature".to_string(), hex(&signature).into()),
+    ])))
 }
 
 fn non_empty_option<'a, S: AsRef<str>>(operands: &'a [S], name: &str) -> Result<&'a str> {
@@ -338,9 +363,14 @@ fn execute_with_live(
             non_empty_option(operands, "--target-node")?,
             non_empty_option(operands, "--target-key")?,
         )?;
-        return Ok(json!({"verified":true,"fresh_activation_proven":false,
-            "node":outcome.request.node,"key":option(operands,"--target-key")?,
-            "outcome":transaction::outcome_value(&outcome)}));
+        let outcome_val = transaction::outcome_value(&outcome);
+        return Ok(Value::Object(aterm_json::Map::from([
+            ("verified".to_string(), true.into()),
+            ("fresh_activation_proven".to_string(), false.into()),
+            ("node".to_string(), outcome.request.node.into()),
+            ("key".to_string(), option(operands, "--target-key")?.into()),
+            ("outcome".to_string(), outcome_val),
+        ])));
     }
     match command {
         "stage" => {
@@ -421,9 +451,7 @@ fn execute_with_live(
             let mut live = backend(paths, None);
             let which = job(option(operands, "--job")?)?;
             let observed = live.observe(which)?;
-            Ok(
-                json!({"job":which.label(),"unit":observed.unit.map(|u|json!({"program":u.program,"args":u.args,"definition":u.definition,"image":u.image,"executable_sha256":u.executable_sha256})),"off":observed.off,"pin":observed.pin}),
-            )
+            Ok(observed_value(which, observed))
         }
         "prepare" => {
             let job = job(option(operands, "--job")?)?;
@@ -438,7 +466,11 @@ fn execute_with_live(
             )?;
             let body = transaction::request_value(&request);
             let sig = identity.sign_record(DOMAIN, &aterm_json::to_vec(&body).map_err(fail)?);
-            let signed = json!({"request":body,"key":identity.key().hex(),"signature":hex(&sig)});
+            let signed = Value::Object(aterm_json::Map::from([
+                ("request".to_string(), body),
+                ("key".to_string(), identity.key().hex().into()),
+                ("signature".to_string(), hex(&sig).into()),
+            ]));
             aterm_secrets::fsx::write_atomic(
                 Path::new(non_empty_option(operands, "--out")?),
                 &aterm_json::to_vec(&signed).map_err(fail)?,
@@ -453,7 +485,11 @@ fn execute_with_live(
             request.requester = identity.node().into();
             let body = transaction::request_value(&request);
             let sig = identity.sign_record(DOMAIN, &aterm_json::to_vec(&body).map_err(fail)?);
-            let signed = json!({"request":body,"key":identity.key().hex(),"signature":hex(&sig)});
+            let signed = Value::Object(aterm_json::Map::from([
+                ("request".to_string(), body),
+                ("key".to_string(), identity.key().hex().into()),
+                ("signature".to_string(), hex(&sig).into()),
+            ]));
             aterm_secrets::fsx::write_atomic(
                 Path::new(non_empty_option(operands, "--out")?),
                 &aterm_json::to_vec(&signed).map_err(fail)?,

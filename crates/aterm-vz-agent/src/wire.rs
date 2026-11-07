@@ -375,6 +375,30 @@ impl Exec {
     }
 }
 
+impl Hello {
+    /// Encode this `Hello` frame, header first, without cloning its fields into a [`Frame`].
+    ///
+    /// # Errors
+    /// Its payload is over [`MAX_FRAME`] bytes.
+    pub fn encode(&self) -> Result<Vec<u8>, WireError> {
+        let cap = HEADER + 84 + self.boot_id.len() + self.kernel.len();
+        let mut p = Put(Vec::with_capacity(cap));
+        p.0.extend_from_slice(&[HELLO, 0, 0, 0, 0]);
+        p.u32(self.proto);
+        p.0.extend_from_slice(&self.key);
+        p.0.extend_from_slice(&self.agent_sha256);
+        p.bytes(self.boot_id.as_bytes())?;
+        p.bytes(self.kernel.as_bytes())?;
+        p.u64(self.uptime_ms);
+        let payload_len = p.0.len() - HEADER;
+        if payload_len > MAX_FRAME {
+            return Err(WireError::TooLarge(payload_len as u64));
+        }
+        p.0[1..HEADER].copy_from_slice(&(payload_len as u32).to_le_bytes());
+        Ok(p.0)
+    }
+}
+
 impl Frame {
     /// The kind byte this frame goes out under.
     #[must_use]
@@ -402,8 +426,10 @@ impl Frame {
     /// # Errors
     /// Its payload is over [`MAX_FRAME`] bytes.
     pub fn encode(&self) -> Result<Vec<u8>, WireError> {
-        if let Self::Exec(e) = self {
-            return e.encode();
+        match self {
+            Self::Exec(e) => return e.encode(),
+            Self::Hello(h) => return h.encode(),
+            _ => {}
         }
         let cap = match self {
             Self::Stdin(b) | Self::Out(b) | Self::Err(b) => {
@@ -417,14 +443,13 @@ impl Frame {
             Self::Exit(Exit::Exited(_) | Exit::Signaled(_)) => HEADER + 5,
             Self::Exit(Exit::NotStarted(why)) => HEADER + 5 + why.len(),
             Self::Beat { .. } | Self::Clock { .. } => HEADER + 8,
-            Self::Hello(h) => HEADER + 84 + h.boot_id.len() + h.kernel.len(),
             Self::Ready(r) => {
                 HEADER
                     + 8
                     + r.state.len()
                     + r.failed_units.iter().map(|u| 4 + u.len()).sum::<usize>()
             }
-            Self::Exec(_) => unreachable!(),
+            Self::Exec(_) | Self::Hello(_) => unreachable!(),
             Self::Mount(shares) => {
                 HEADER
                     + 4
@@ -445,7 +470,7 @@ impl Frame {
         let mut p = Put(Vec::with_capacity(cap));
         p.0.extend_from_slice(&[self.kind(), 0, 0, 0, 0]);
         match self {
-            Self::Exec(_) => unreachable!(),
+            Self::Exec(_) | Self::Hello(_) => unreachable!(),
             Self::Mount(shares) => p.list(shares, |p, s| {
                 p.bytes(s.name.as_bytes())?;
                 p.bytes(&s.path)
@@ -467,14 +492,6 @@ impl Frame {
                     p.bytes(why.as_bytes())?;
                 }
             },
-            Self::Hello(h) => {
-                p.u32(h.proto);
-                p.0.extend_from_slice(&h.key);
-                p.0.extend_from_slice(&h.agent_sha256);
-                p.bytes(h.boot_id.as_bytes())?;
-                p.bytes(h.kernel.as_bytes())?;
-                p.u64(h.uptime_ms);
-            }
             Self::Booting(jobs) => p.list(jobs, |p, j| {
                 p.u32(j.id);
                 p.bytes(j.unit.as_bytes())?;
@@ -642,6 +659,17 @@ pub fn write_frame(w: &mut impl Write, frame: &Frame) -> Result<(), WireError> {
 /// The frame is over [`MAX_FRAME`], or the transport failed.
 pub fn write_exec(w: &mut impl Write, exec: &Exec) -> Result<(), WireError> {
     let bytes = exec.encode()?;
+    w.write_all(&bytes)?;
+    w.flush()?;
+    Ok(())
+}
+
+/// Write `hello` as a [`Frame::Hello`] without cloning its `boot_id` or `kernel`.
+///
+/// # Errors
+/// The frame is over [`MAX_FRAME`], or the transport failed.
+pub fn write_hello(w: &mut impl Write, hello: &Hello) -> Result<(), WireError> {
+    let bytes = hello.encode()?;
     w.write_all(&bytes)?;
     w.flush()?;
     Ok(())

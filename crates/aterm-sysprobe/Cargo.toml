@@ -88,3 +88,8 @@ aterm-durable = { workspace = true }
 
 [lints]
 workspace = true
+
+# Foundation scalar properties only; no direct GUI API or GUI framework link is
+# declared here. Transitive system images are a separate runtime observation.
+[target.'cfg(target_os = "macos")'.dependencies]
+aterm-objc = { workspace = true }

@@ -33,8 +33,9 @@ const STILL_WASH: f32 = 16.0;
 /// The "electric" tint the accent is pulled toward: a light cyan-white, so a
 /// dark accent brightens and a light one cools.
 const ELECTRIC: u32 = 0x00b8_f0ff;
-/// Rim thickness as a multiple of the drop-target law (`drop_border_px`), in
-/// 1/16 units: the rim thickens up to this at a pulse's crest.
+/// Rim thickness as a multiple of the drop-target law
+/// (`aterm_render::drop_overlay_border_px`), in 1/16 units: the rim thickens
+/// up to this at a pulse's crest.
 const CHARGE_THICK_Q4: f32 = 40.0; // 2.5×
 /// …and rests at this in a pulse's trough.
 const CHARGE_THIN_Q4: f32 = 24.0; // 1.5×

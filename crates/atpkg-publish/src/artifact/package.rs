@@ -871,6 +871,7 @@ pub fn pack_package_with_signed_root(
         version: pkg.version.clone(),
         build: request.build,
         exposes: exposes.clone(),
+        shim_env: Vec::new(),
     };
     let row_doc = Row {
         triple,

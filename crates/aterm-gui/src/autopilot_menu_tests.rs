@@ -2990,6 +2990,60 @@ fn mode_word(rows: &[MenuRow], i: usize) -> Option<&'static str> {
     }
 }
 
+/// A chip's menu takes the keys, so the session field it opens over gives them up: a client told of
+/// a row would otherwise press Enter on it and commit the name.
+#[cfg(a11y_tree)]
+#[test]
+fn a_chip_s_menu_settles_the_session_field_it_opens_over() {
+    let (mut app, wid, session, host) = claude_app();
+    let _host = MenuTestHost(host);
+    app.tab_strip_rows = 1;
+    frame(&mut app, wid);
+    let tab = app.windows[&wid].tab_set.active().unwrap().id;
+
+    assert!(app.begin_session_rename(wid, tab));
+    assert!(app.windows[&wid].rename_edit.is_some(), "CONTROL");
+    app.open_front_autopilot_menu().unwrap();
+    assert!(app.windows[&wid].rename_edit.is_none(), "Autopilot's");
+    app.close_autopilot_menu();
+
+    assert!(app.begin_session_rename(wid, tab));
+    assert!(app.windows[&wid].rename_edit.is_some(), "CONTROL");
+    let fact = crate::claude_lights::Fact::TopEffort;
+    app.open_fact_menu_keeping_note(wid, session, fact, (3, 3), false);
+    assert!(app.windows[&wid].rename_edit.is_none(), "a fact's");
+}
+
+/// Both cards up, the tab's is on top and takes the keys, so it is the one a client reads and
+/// presses: the tree may not announce one menu while Enter acts on another.
+#[cfg(a11y_tree)]
+#[test]
+fn a_tab_menu_over_autopilot_s_is_the_menu_a_client_reads() {
+    let (mut app, wid, _, host) = claude_app();
+    let _host = MenuTestHost(host);
+    app.tab_strip_rows = 1;
+    frame(&mut app, wid);
+    app.open_front_autopilot_menu().unwrap();
+    frame(&mut app, wid);
+
+    assert!(app.open_tab_context_menu(wid, 0, 3, true));
+    frame(&mut app, wid);
+    app.splice_tab_menu(wid);
+    assert!(app.autopilot_grid_menu(wid).is_some(), "CONTROL: both open");
+
+    let heard = published_items(&app, wid);
+    let rename = heard
+        .iter()
+        .find(|(_, words)| words.starts_with("Rename Session"))
+        .unwrap_or_else(|| panic!("the tab's rows: {heard:?}"))
+        .0;
+    reader(&mut app, wid, aterm_a11y::model::Action::Click, rename);
+    assert!(
+        app.windows[&wid].tab_menu.is_none(),
+        "the press lands on the menu it read"
+    );
+}
+
 fn open_where_a_zoom_moves_a_choice(
     app: &mut App,
     wid: WindowId,

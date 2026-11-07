@@ -17,9 +17,6 @@ use crate::ladder::{Outcome, Report, Severity};
 /// The flag cargo's runner config hands this binary.
 pub const RECORD_FLAG: &str = "--record-test-binary";
 
-/// How many test binaries run at once unless `--test-jobs` says otherwise.
-pub const DEFAULT_JOBS: u32 = 8;
-
 /// Environment variable naming the shared subprocess slot directory created by [`run_tests`].
 pub const SUBPROCESS_SLOTS_ENV: &str = "ATERM_TEST_SUBPROCESS_SLOTS";
 
@@ -633,27 +630,34 @@ pub fn plan(records: Vec<Record>, log: &str, exes: &[TestExe]) -> Result<Vec<Bin
         .collect()
 }
 
-/// Run every binary through [`pool`], `jobs` at a time: each one's run and
-/// its own wall time. Call `completed` as each finishes, before waiting for
-/// other binaries; its durations separate queue time from execution time.
+/// Run every binary through [`crate::test_plan::dispatch`] in `plan`'s order, each at its
+/// planned width, at most `workers` at once and their charges within its share: each one's run
+/// and its own wall time, in declared order whatever order they ran in. Call `completed` with
+/// its width as each finishes, before waiting for other binaries; its durations separate queue
+/// time from execution time.
 pub fn run_all<F, E>(
     bins: &[Binary],
-    jobs: usize,
-    threads: u32,
+    plan: &crate::test_plan::Plan,
+    workers: usize,
     run_one: F,
     completed: E,
 ) -> Vec<(Run, Duration)>
 where
     F: Fn(&Binary, u32) -> Run + Sync,
-    E: Fn(&Binary, &Run, Duration, Duration) + Sync,
+    E: Fn(&Binary, &Run, Duration, Duration, u32) + Sync,
 {
-    let all: Vec<usize> = (0..bins.len()).collect();
     let queued = Instant::now();
-    pool(bins.len(), &all, jobs, |i| {
+    crate::test_plan::dispatch(plan, workers, |i, width| {
         let started = Instant::now();
-        let run = run_one(&bins[i], threads);
+        let run = run_one(&bins[i], width);
         let elapsed = started.elapsed();
-        completed(&bins[i], &run, started.duration_since(queued), elapsed);
+        completed(
+            &bins[i],
+            &run,
+            started.duration_since(queued),
+            elapsed,
+            width,
+        );
         (run, elapsed)
     })
     .into_iter()
@@ -1001,7 +1005,11 @@ pub fn binary_cmd(b: &Binary, threads: u32, checkers: bool, watch: Watch) -> Cmd
         .record
         .env
         .iter()
-        .filter(|(k, _)| k != "RUST_TEST_THREADS" && k != crate::stages::CHECKERS_ENV)
+        .filter(|(k, _)| {
+            k != "RUST_TEST_THREADS"
+                && k != crate::stages::CHECKERS_ENV
+                && !k.as_encoded_bytes().starts_with(b"ATERM_RELEASE_")
+        })
         .cloned()
         .collect();
     env.push(("RUST_TEST_THREADS".into(), threads.to_string().into()));
@@ -1084,13 +1092,24 @@ pub fn combined(bins: &[Binary], runs: &[Run]) -> Run {
     }
 }
 
-/// The ladder's one line about how the binaries ran.
+/// The ladder's one line about how the binaries ran: the share their charges were drawn from,
+/// the most at once, and how many the history placed.
 #[must_use]
-pub fn summary(bins: &[Binary], jobs: usize, threads: u32) -> String {
-    let n = bins.len();
+pub fn summary(plan: &crate::test_plan::Plan, workers: usize) -> String {
+    use crate::test_plan::Class;
+    let n = plan.width.len();
+    let count = |c: Class| plan.class.iter().filter(|&&k| k == c).count();
+    let target = plan.target_s.map_or_else(String::new, |t| {
+        format!(", target {}", crate::report::duration(t))
+    });
     format!(
-        "  test binaries: {n} — RUST_TEST_THREADS={threads} each, {} at a time",
-        jobs.min(n.max(1))
+        "  test binaries: {n} — widths planned within a share of {} cores, at most {} at once; \
+         {} new, {} that failed last time, {} by history{target}",
+        plan.share,
+        workers.min(n.max(1)),
+        count(Class::New),
+        count(Class::FailedLast),
+        count(Class::Known),
     )
 }
 
@@ -1206,6 +1225,12 @@ pub fn run_tests(
     serial: &Cmd,
     check: crate::checks::Check,
 ) {
+    if let Err(why) = crate::release_test_env::prepare(ctx) {
+        r.cannot_run(format!(
+            "cannot prepare release test environment: {why}; no test was run"
+        ));
+        return;
+    }
     let mut cores = None;
     let mut host_cores = || *cores.get_or_insert_with(|| ctx.cores());
     let managed_share = match crate::test_workers::admitted_share(&ctx.env) {
@@ -1247,7 +1272,7 @@ pub fn run_tests(
         Some(cores) => cores.min(asked_cores),
         None => asked_cores,
     };
-    let (jobs, threads) = ctx.test_workers_for(granted_cores, host_cores);
+    let (jobs, threads) = ctx.test_workers_for(granted_cores);
     let thread_override = (ctx.env.build_slot_held.is_some()
         || ctx.test_threads.is_some()
         || granted_cores < asked_cores)
@@ -1267,7 +1292,8 @@ pub fn run_tests(
         |threads| serial.clone().env("RUST_TEST_THREADS", threads.to_string()),
     );
     let checkers = check == crate::checks::Check::Checkers || ctx.checkers_in_tests;
-    serial = crate::stages::with_checkers(serial, checkers).env(SUBPROCESS_SLOTS_ENV, slots.path());
+    serial = crate::release_test_env::command(ctx, crate::stages::with_checkers(serial, checkers))
+        .env(SUBPROCESS_SLOTS_ENV, slots.path());
     let serial = &serial;
     #[cfg(unix)]
     match aterm_uds::host::open_file_room(4096) {
@@ -1595,10 +1621,18 @@ pub(crate) fn run_planned(
     let samples = Mutex::new(Vec::with_capacity(bins.len()));
     // The binaries the ceiling left no time to start, by spec: their samples are not kept.
     let unstarted = Mutex::new(std::collections::BTreeSet::new());
+    let history = ctx
+        .test_history
+        .as_deref()
+        .map(crate::test_history::load)
+        .unwrap_or_default();
+    let specs: Vec<&str> = bins.iter().map(|b| b.spec.as_str()).collect();
+    let share = u32::try_from(cores).unwrap_or(u32::MAX);
+    let plan = crate::test_plan::plan(&specs, &crate::test_plan::seen(&history), share, threads);
     let timed = run_all(
         &bins,
+        &plan,
         jobs,
-        threads,
         |b, t| {
             if let Some(words) = ctx.halted() {
                 return Run {
@@ -1630,7 +1664,7 @@ pub(crate) fn run_planned(
                 }
                 env.child_ceiling = Some(left);
             }
-            let cmd = binary_cmd(b, t, checkers, watch);
+            let cmd = crate::release_test_env::command(ctx, binary_cmd(b, t, checkers, watch));
             let mut run = exec::run(&cmd, env);
             if cmd.test_cases.as_ref().is_some_and(|w| w.json) {
                 // The raw events were the child's log; every reader takes libtest's report.
@@ -1638,7 +1672,7 @@ pub(crate) fn run_planned(
             }
             run
         },
-        |binary, run, waiting, execution| {
+        |binary, run, waiting, execution, width| {
             let never_started = unstarted
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1654,7 +1688,7 @@ pub(crate) fn run_planned(
                 !never_started,
                 waiting,
                 execution,
-                threads,
+                width,
                 sha.as_deref(),
             );
             emit(ctx, &event);
@@ -1711,7 +1745,7 @@ pub(crate) fn run_planned(
             .iter()
             .zip(&runs)
             .partition(|(_, run)| run.spawn_error.as_deref() == Some(words));
-        r.raw(summary(&bins, jobs, threads));
+        r.raw(summary(&plan, jobs));
         accounted(r);
         r.raw(poles(&bins, &walls, total));
         if let Some(Err(why)) = &kept {
@@ -1738,7 +1772,7 @@ pub(crate) fn run_planned(
         return;
     }
     r.raw(preface);
-    r.raw(summary(&bins, jobs, threads));
+    r.raw(summary(&plan, jobs));
     accounted(r);
     r.raw(combined(&bins, &runs).output);
     r.raw(poles(&bins, &walls, total));
@@ -1921,10 +1955,17 @@ mod tests {
             .collect();
         let released = (Mutex::new(false), std::sync::Condvar::new());
         let reported = Mutex::new(Vec::new());
-        let runs = run_all(
-            &bins,
+        let mut plan = crate::test_plan::plan(
+            &["slow", "failed"],
+            &std::collections::BTreeMap::new(),
             2,
             1,
+        );
+        plan.order = vec![0, 1];
+        let runs = run_all(
+            &bins,
+            &plan,
+            2,
             |binary, _| {
                 if binary.spec == "slow" {
                     let (guard, timeout) = released
@@ -1949,7 +1990,7 @@ mod tests {
                     usage: None,
                 }
             },
-            |binary, _, _, _| {
+            |binary, _, _, _, _| {
                 reported.lock().unwrap().push(binary.spec.clone());
                 if binary.spec == "failed" {
                     *released.0.lock().unwrap() = true;
@@ -2450,11 +2491,11 @@ mod tests {
         );
     }
 
-    /// THE POOL: never more than `jobs` at once, every binary once and with the
-    /// whole thread count, as cargo's own run gives it, and the answers in
-    /// declared order whatever order they finished in.
+    /// THE DISPATCH: never more than `workers` at once, every binary once at the width its plan
+    /// gives it (reported to `completed` too), and the answers in declared order whatever order
+    /// they ran and finished in.
     #[test]
-    fn binaries_share_the_pool_and_answer_in_declared_order() {
+    fn binaries_run_at_their_planned_widths_and_answer_in_declared_order() {
         let bins: Vec<Binary> = (0..9)
             .map(|i| Binary {
                 harness: false,
@@ -2463,33 +2504,33 @@ mod tests {
                 record: rec(&format!("/r/t{i}"), "x"),
             })
             .collect();
+        let specs: Vec<&str> = bins.iter().map(|b| b.spec.as_str()).collect();
+        let mut plan = crate::test_plan::plan(&specs, &std::collections::BTreeMap::new(), 12, 12);
+        plan.order = (0..9).rev().collect();
+        plan.width = (1..=9).collect();
+        plan.charge = vec![1; 9];
         let running = AtomicUsize::new(0);
         let peak = AtomicUsize::new(0);
-        let runs =
-            run_all(
-                &bins,
-                3,
-                12,
-                |b, threads| {
-                    let now = running.fetch_add(1, Ordering::SeqCst) + 1;
-                    peak.fetch_max(now, Ordering::SeqCst);
-                    assert_eq!(threads, 12, "every binary gets the whole count");
-                    std::thread::sleep(std::time::Duration::from_millis(
-                        if b.spec.ends_with('0') { 60 } else { 5 },
-                    ));
-                    running.fetch_sub(1, Ordering::SeqCst);
-                    Run {
-                        stopped_at: None,
-                        ok: true,
-                        output: format!("{}\nran {}\n", b.header, b.spec),
-                        code: Some(0),
-                        spawn_error: None,
-                        usage: None,
-                    }
-                },
-                |_, _, _, _| {},
-            );
-        assert!(peak.load(Ordering::SeqCst) <= 3, "never past the jobs");
+        let index = |b: &Binary| -> u32 { b.spec.rsplit('t').next().unwrap().parse().unwrap() };
+        let runs = run_all(
+            &bins,
+            &plan,
+            3,
+            |b, width| {
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                assert_eq!(width, index(b) + 1, "each binary gets its planned width");
+                running.fetch_sub(1, Ordering::SeqCst);
+                Run {
+                    ok: true,
+                    output: format!("{}\nran {}\n", b.header, b.spec),
+                    code: Some(0),
+                    ..Run::default()
+                }
+            },
+            |b, _, _, _, width| assert_eq!(width, index(b) + 1, "and its event the same"),
+        );
+        assert!(peak.load(Ordering::SeqCst) <= 3, "never past the workers");
         let said: Vec<String> = runs
             .iter()
             .map(|(r, _)| r.output.lines().nth(1).unwrap().to_string())
@@ -2918,7 +2959,18 @@ mod tests {
         b.record
             .env
             .push((crate::stages::CHECKERS_ENV.into(), "1".into()));
+        b.record
+            .env
+            .push((aterm_capacity::RELEASE_RUN_ENV.into(), "stale".into()));
+        b.record
+            .env
+            .push(("ATERM_RELEASE_INPUTS_SEAL".into(), "/owner/seal".into()));
         let cmd = binary_cmd(&b, 7, false, Watch::default());
+        assert!(
+            cmd.envs
+                .iter()
+                .all(|(key, _)| !key.as_encoded_bytes().starts_with(b"ATERM_RELEASE_"))
+        );
         let json = binary_cmd(
             &b,
             7,

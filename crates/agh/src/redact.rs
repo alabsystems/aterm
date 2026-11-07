@@ -237,11 +237,13 @@ impl Redactor {
         scan(self.learned(text), true)
     }
 
-    /// Redacts learned values and context-free token prefixes (rule 1) without cross-field rules 2/3.
+    /// Redacts learned values and context-free token prefixes (rule 1) without the context rules
+    /// (2-4), which read across fields: a receipt line's `repo=acme/torchbearer as=anonymous` is
+    /// no `bearer <value>`. Borrows when nothing matches.
     #[inline]
     #[must_use]
-    pub fn learned_and_tokens(&self, text: &str) -> String {
-        scan(self.learned(text), false).into_owned()
+    pub fn learned_and_tokens<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
+        scan(self.learned(text), false)
     }
 
     fn learned<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {

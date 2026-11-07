@@ -3767,7 +3767,7 @@ fn a_remote_turn_into_a_shell_with_no_integration_is_submitted_by_one_enter() {
 
 /// A drive's typed turn whose keys go slower than its 20 s allows (the driven node holds each key
 /// 400 ms before it goes, `ATERM_DEBUG_TURN_KEY_LAG_MS`: m108 behind m14's drive, 2026-11-04)
-/// lands whole: the keys that fit, then the rest as one paste and an Enter; and one whose first
+/// lands whole: the keys that fit, then the rest in one write and an Enter; and one whose first
 /// key does not fit writes nothing. Either way the shell's line is as the turn found it, so the
 /// next command runs alone. What it judges is that property, never how soon the shell answers:
 /// an Enter no look verified still says `pressed=`, and the line's run is the hang detector's.
@@ -3822,7 +3822,7 @@ fn a_drives_typed_turn_slower_than_its_deadline_lands_whole_or_writes_nothing() 
             && typed > 0
             && pasted > 0
             && typed + pasted == keys,
-        "the keys that fit, then the rest as one paste and an Enter: {verdict}"
+        "the keys that fit, then the rest in one write and an Enter: {verdict}"
     );
     ctl_ok(
         &member,
@@ -3963,7 +3963,7 @@ impl ComposerDrive {
 }
 
 /// `verdict` is a typed turn of `keys` graphemes landed whole into a Claude Code composer: not
-/// skipped, the keys that fit and the rest as one paste, its Enter verified by the composer or,
+/// skipped, the keys that fit and the rest in one write, its Enter verified by the composer or,
 /// where no look verified it in its window, named `pressed=`. It judges that property, never how
 /// soon the composer answers.
 fn landed_whole(verdict: &str, keys: usize) {
@@ -3987,29 +3987,30 @@ fn landed(verdict: &str, keys: usize, judge: Option<&str>) {
             && typed > 0
             && pasted > 0
             && typed + pasted == keys,
-        "the keys that fit, then the rest as one paste and an Enter the composer took: {verdict}"
+        "the keys that fit, then the rest in one write and an Enter the composer took: {verdict}"
     );
 }
 
 /// A drive's typed turn into a Claude Code composer that turns DEC 2004 on, as Claude Code does,
 /// its keys slower than a drive's longest turn allows ([`ComposerDrive`]), lands whole: the composer
-/// takes the keys that fit and the rest as one bracketed paste, then an Enter moves the whole line
-/// up; and one whose first key does not fit writes nothing. The composer is then as the turn
-/// found it, so the next line is taken alone ([`landed_whole`]).
+/// takes the keys that fit and the rest as the bytes its keys send, in one write and never a
+/// bracketed paste, then an Enter moves the whole line up; and one whose first key does not fit
+/// writes nothing. The composer is then as the turn found it, so the next line is taken alone
+/// ([`landed_whole`]).
 /// NEGATIVE CONTROLS: cutting the typing at the deadline, as the turn did before its pace, answers
 /// `skipped reason=deadline typed=<n>` and leaves those keys in the composer (m14's drive of m108,
 /// 2026-11-04); the stand-in started as a plain program has its Enter verified by the screen,
-/// `submit_by=screen`; one that leaves DEC 2004 off is pasted no brackets, `bracketed pastes` never
-/// drawn.
+/// `submit_by=screen`; the rest pasted, as it was before the second hostile review of the
+/// turn-deadline work (2026-11-06), draws `bracketed pastes: 1`.
 #[test]
 fn a_drives_typed_turn_into_claude_code_slower_than_its_deadline_lands_whole_or_writes_nothing() {
     let drive = ComposerDrive::new(("afci", "afcm"), "takes plain bracketed", false);
     let line = composer_line();
     landed_whole(&drive.turn(line), line.chars().count());
-    // The whole line went up once, from one bracketed paste, and the composer is empty.
+    // The whole line went up once, from no bracketed paste, and the composer is empty.
     drive.shows(2, &format!("❯ {line}"));
     drive.shows(20, "❯");
-    drive.shows(23, "bracketed pastes: 1");
+    assert_eq!(drive.row(23), "", "the rest was pasted");
     // A first key that does not fit: nothing is written.
     let (_, skipped) = drive_ok(
         &drive.issuer.tmp,
@@ -4046,31 +4047,26 @@ fn a_drives_typed_turn_into_claude_code_slower_than_its_deadline_lands_whole_or_
         format!("❯ {line}"),
         "the first line went up once"
     );
-    assert_eq!(
-        drive.row(23),
-        "bracketed pastes: 1",
-        "nothing else was pasted"
-    );
+    assert_eq!(drive.row(23), "", "nothing was pasted");
 }
 
 /// A drive's typed turn into a starved Claude Code, as a loaded worker is: its keys go late on the
 /// driven node ([`ComposerDrive`]) and its composer reads none of them, its logo still, while they
-/// wait unread in its input. The turn types the keys that fit and pastes the rest, bracketed,
-/// behind them. The composer is held until the whole line waits unread, then past the echo's cap,
-/// so the turn's wait for the composer meets the input unread and goes on waiting; fed, the
+/// wait unread in its input. The turn types the keys that fit and writes the rest behind them as
+/// its keys' bytes. The composer is held until the whole line waits unread, then past the echo's
+/// cap, so the turn's wait for the composer meets the input unread and goes on waiting; fed, the
 /// composer shows the line and the Enter goes then, or, where the turn's time ran out first, at
 /// its end, judged by the screen or by nothing (`pressed=`). While the composer is held, before
-/// the turn's time could be out, nothing but the line's one bracketed paste waits unread, and once
-/// fed the whole line moves up ([`landed`]), however late.
+/// the turn's time could be out, nothing but the line's own bytes wait unread, and once fed the
+/// whole line moves up ([`landed`]), however late.
 /// NEGATIVE CONTROLS: cutting the typing at the deadline, as the turn did before its pace, answers
 /// `skipped reason=deadline typed=<n>` with only those keys in the input; an echo wait that does
-/// not count the unread input presses the Enter at the cap, one byte more waiting unread (85);
-/// the rest pasted as two bracketed writes, two brackets more (96).
+/// not count the unread input presses the Enter at the cap, one byte more waiting unread; the rest
+/// pasted, as it was before the second hostile review of the turn-deadline work, its brackets
+/// more.
 #[test]
 fn a_drives_typed_turn_into_a_starved_claude_code_lands_whole_once_it_reads() {
-    // The paste's two brackets: with one byte for each of the line's graphemes, the whole line's
-    // unread input is `keys + BRACKETS`.
-    const BRACKETS: usize = "\x1b[200~\x1b[201~".len();
+    // With one byte for each of the line's graphemes, the whole line's unread input is `keys`.
     let drive = ComposerDrive::new(("afsi", "afsm"), "takes still bracketed", true);
     let line = composer_line();
     let keys = line.chars().count();
@@ -4087,7 +4083,7 @@ fn a_drives_typed_turn_into_a_starved_claude_code_lands_whole_once_it_reads() {
         let turn = scope.spawn(|| drive.turn(line));
         let mut read = String::new();
         let seen = aterm_spec::wait::within(HANG, POLL_GAP, || {
-            let seen = unread(&mut read) >= keys + BRACKETS;
+            let seen = unread(&mut read) >= keys;
             (seen || turn.is_finished()).then_some(seen)
         })
         .unwrap_or_else(|| panic!("neither the line waited unread nor the turn ended: {read}"));
@@ -4098,7 +4094,7 @@ fn a_drives_typed_turn_into_a_starved_claude_code_lands_whole_once_it_reads() {
         let held = std::time::Instant::now() + crate::turn_submit_live_headless::PAST_THE_ECHO_CAP;
         while seen && early.is_none() && std::time::Instant::now() < held {
             let n = unread(&mut read);
-            if n > keys + BRACKETS && std::time::Instant::now() < out_after {
+            if n > keys && std::time::Instant::now() < out_after {
                 early = Some(read.clone());
             }
             std::thread::sleep(POLL_GAP);
@@ -4109,13 +4105,13 @@ fn a_drives_typed_turn_into_a_starved_claude_code_lands_whole_once_it_reads() {
     assert!(seen, "the whole line never waited unread: {read}");
     assert_eq!(
         early, None,
-        "more than the line's one bracketed paste waited unread (an Enter or a second write): \
-         {verdict}"
+        "more than the line's own bytes waited unread (an Enter, a second write or a paste's \
+         brackets): {verdict}"
     );
     landed(&verdict, keys, None);
     drive.shows(2, &format!("❯ {line}"));
     drive.shows(20, "❯");
-    drive.shows(23, "bracketed pastes: 1");
+    assert_eq!(drive.row(23), "", "the rest was pasted");
 }
 
 /// A drive's typed turn whose issuer goes while the driven node types it, as one whose connection
@@ -4124,7 +4120,7 @@ fn a_drives_typed_turn_into_a_starved_claude_code_lands_whole_once_it_reads() {
 /// answers, and the turn never reads its connection while it types, presses or verifies its
 /// Enter, so the hop can lose the verdict, never cut the typing. The issuer is killed once the
 /// composer shows the first of the keys ([`ComposerDrive`]), before the turn answers (it dies of
-/// the signal); the line then moves up whole, from one bracketed paste, and the driven Mac's
+/// the signal); the line then moves up whole, from no bracketed paste, and the driven Mac's
 /// ledger records the turn run to its Enter, verified or, where its time ran out first, not.
 /// NEGATIVE CONTROL: a relay that hangs up the driven connection when its issuer goes, with a typed
 /// turn that stops on its client's hang-up, leaves part of the line in the composer, which never
@@ -4158,7 +4154,7 @@ fn a_drives_typed_turn_whose_issuer_goes_part_way_lands_whole_on_the_driven_mac(
     );
     drive.shows(2, &whole);
     drive.shows(20, "❯");
-    drive.shows(23, "bracketed pastes: 1");
+    assert_eq!(drive.row(23), "", "the rest was pasted");
     let text = format!("text={}", aterm_control::wire::pct_encode(line));
     let mut ledger = String::new();
     let recorded = aterm_spec::wait::within(HANG, POLL_GAP, || {

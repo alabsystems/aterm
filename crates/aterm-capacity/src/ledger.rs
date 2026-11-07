@@ -727,9 +727,8 @@ impl Laid {
         let offset = original.len() as u64;
         let mut base = vec![0; original.len()];
         self.lock.read_exact_at(&mut base, 0)?;
-        let mut poisoned = original.clone();
-        poisoned[0] = b'@';
-        if &base != original && base != poisoned {
+        if &base != original && !(base.first() == Some(&b'@') && base.get(1..) == original.get(1..))
+        {
             return Err(io::Error::other(
                 "detachment intent's original record changed",
             ));
@@ -1148,6 +1147,26 @@ impl Ledger {
         }
         let _ = reference;
         Ok(CohortClaimState::Unknown)
+    }
+
+    /// TEST SEAM: whether the cohort claim `reference` names is still active (listed, not yet
+    /// retired), looked at without its record's mutation lock, so another crate's test can wait
+    /// for the claim's owner or reaper to retire it without making that drop meet a busy record.
+    ///
+    /// # Errors
+    /// The namespace or its active directory cannot be read; a legacy ledger.
+    #[cfg(any(test, debug_assertions))]
+    pub fn cohort_claim_listed(&self, reference: &crate::CohortClosureRef) -> io::Result<bool> {
+        self.check_mode()?;
+        #[cfg(unix)]
+        if let Mode::Cohort(namespace) = &self.mode {
+            return cohort_ledger::claim_listed(namespace, reference);
+        }
+        let _ = reference;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "a legacy ledger has no cohort claims",
+        ))
     }
 
     /// This user's ledger ([`user_dir`]).

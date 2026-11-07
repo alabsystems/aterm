@@ -1316,6 +1316,7 @@ impl Gated<'_> {
             version: b.version.clone(),
             build: b.build,
             exposes: b.def.exposes.iter().map(|s| (*s).to_string()).collect(),
+            shim_env: Vec::new(),
         };
         let row = Row {
             triple: b.triple,

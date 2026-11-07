@@ -103,70 +103,183 @@ fn hint(wire: &[u8], source: SocketAddr, nonce: &[u8; NONCE]) -> Option<Hint> {
     })
 }
 
-/// Ask now and return the first batch already received, without a settle window.
-/// The caller authenticates these hints and may use another discovery source if
-/// no current member answers. A lab's private service never reaches the live LAN.
-pub(crate) fn probe(within: Duration) -> io::Result<Vec<Hint>> {
-    if cfg!(test)
-        || std::env::var_os(aterm_types::world::MARKER).is_some()
-        || std::env::var_os("CI").is_some()
-        || std::env::var_os(aterm_secrets::discover::LAB_MEMBER_SERVICE_ENV).is_some()
-    {
-        return Ok(Vec::new());
-    }
-    probe_on(&links(&sources(), PORT, Scope::Lan), within)
+/// The sockets and nonce of one bounded native solicitation. Authentication may
+/// continue between batches; replies already queued retain this same nonce.
+pub(crate) struct Probe {
+    active: Vec<(Ipv4Addr, Multicast)>,
+    nonce: [u8; NONCE],
+    deadline: Instant,
+    resend: Instant,
+    seen: BTreeSet<SocketAddr>,
 }
 
-fn probe_on(links: &[(Ipv4Addr, Multicast)], within: Duration) -> io::Result<Vec<Hint>> {
-    if links.is_empty() || within.is_zero() {
-        return Ok(Vec::new());
+impl Probe {
+    /// A lab's private service never reaches the live LAN.
+    pub(crate) fn start(within: Duration) -> io::Result<Self> {
+        if cfg!(test)
+            || std::env::var_os(aterm_types::world::MARKER).is_some()
+            || std::env::var_os("CI").is_some()
+            || std::env::var_os(aterm_secrets::discover::LAB_MEMBER_SERVICE_ENV).is_some()
+        {
+            return Self::on(Vec::new(), within);
+        }
+        Self::on(links(&sources(), PORT, Scope::Lan), within)
     }
-    let mut nonce = [0; NONCE];
-    aterm_uds::rand::fill(&mut nonce)?;
-    let wire = request(&nonce);
-    let mut active = Vec::new();
-    for (_, link) in links {
-        if link.send(&wire).is_ok() {
-            active.push(link);
+
+    pub(crate) fn first(&mut self) -> io::Result<Vec<Hint>> {
+        self.next(self.deadline)
+    }
+
+    /// The complete remaining bounded native union, for a caller whose next
+    /// discovery source is a one-shot list. This never renews collection.
+    pub(crate) fn complete(&mut self, until: Instant) -> io::Result<Vec<Hint>> {
+        let mut all = Vec::new();
+        loop {
+            let batch = self.next(until)?;
+            if batch.is_empty() {
+                return Ok(all);
+            }
+            all.extend(batch);
         }
     }
-    if active.is_empty() {
-        return Ok(Vec::new());
-    }
-    let deadline = Instant::now() + within;
-    let mut resend = Instant::now() + RETRANSMIT;
-    let fds: Vec<_> = active.iter().map(|link| link.as_fd()).collect();
-    loop {
-        let ready = aterm_uds::ready::any_until(&fds, deadline.min(resend))?;
+
+    fn on(links: Vec<(Ipv4Addr, Multicast)>, within: Duration) -> io::Result<Self> {
+        let mut nonce = [0; NONCE];
+        if !links.is_empty() && !within.is_zero() {
+            aterm_uds::rand::fill(&mut nonce)?;
+        }
+        let wire = request(&nonce);
+        let mut active = Vec::new();
+        for (source, link) in links {
+            if !within.is_zero() && link.send(&wire).is_ok() {
+                active.push((source, link));
+            }
+        }
         let now = Instant::now();
-        if now >= deadline {
+        Ok(Self {
+            active,
+            nonce,
+            deadline: now + within,
+            resend: now + RETRANSMIT,
+            seen: BTreeSet::new(),
+        })
+    }
+
+    pub(crate) fn next(&mut self, until: Instant) -> io::Result<Vec<Hint>> {
+        if self.active.is_empty() || self.seen.len() >= MAX_PEERS || Instant::now() >= until {
             return Ok(Vec::new());
         }
-        if now >= resend {
-            for link in &active {
-                let _ = link.send(&wire);
+        let deadline = self.deadline.min(until);
+        let fds: Vec<_> = self.active.iter().map(|(_, link)| link.as_fd()).collect();
+        loop {
+            // A proof may outlast the original collection lease. Drain only what is
+            // ready then; never renew its wait or the caller's final proof deadline.
+            let ready = if Instant::now() >= deadline {
+                let interests: Vec<_> = fds
+                    .iter()
+                    .copied()
+                    .map(|fd| aterm_uds::ready::Watch::new(fd, aterm_uds::ready::Interest::Read))
+                    .collect();
+                aterm_uds::ready::any_interests_now(&interests)?
+            } else {
+                aterm_uds::ready::any_until(&fds, deadline.min(self.resend))?
+            };
+            let now = Instant::now();
+            if now >= until {
+                return Ok(Vec::new());
             }
-            resend = now + RETRANSMIT;
-        }
-        let mut found = BTreeMap::new();
-        for index in ready {
-            // An untrusted flood has a fixed per-read budget.
-            for _ in 0..MAX_PEERS {
-                let Some((wire, source)) = active[index].receive()? else {
-                    break;
-                };
-                if let Some(hint) = hint(&wire, source, &nonce) {
-                    found.entry(hint.address).or_insert(hint);
+            if now < self.deadline && now >= self.resend {
+                let wire = request(&self.nonce);
+                for (_, link) in &self.active {
+                    let _ = link.send(&wire);
+                }
+                self.resend = now + RETRANSMIT;
+            }
+            let mut found = BTreeMap::new();
+            for index in ready {
+                // An untrusted flood has a fixed per-read budget.
+                for _ in 0..MAX_PEERS {
+                    let Some((wire, source)) = self.active[index].1.receive()? else {
+                        break;
+                    };
+                    if let Some(hint) = hint(&wire, source, &self.nonce)
+                        && self.seen.len() < MAX_PEERS
+                        && self.seen.insert(hint.address)
+                    {
+                        found.entry(hint.address).or_insert(hint);
+                    }
                 }
             }
-        }
-        if !found.is_empty() {
-            return Ok(found.into_values().take(MAX_PEERS).collect());
-        }
-        if Instant::now() >= deadline {
-            return Ok(Vec::new());
+            if !found.is_empty() {
+                return Ok(found.into_values().take(MAX_PEERS).collect());
+            }
+            if Instant::now() >= deadline {
+                return Ok(Vec::new());
+            }
         }
     }
+}
+
+#[cfg(test)]
+fn probe_on(links: Vec<(Ipv4Addr, Multicast)>, within: Duration) -> io::Result<Vec<Hint>> {
+    let mut probe = Probe::on(links, within)?;
+    probe.first()
+}
+
+/// Actual loopback UDP with an expired collection lease. Each reply is queued at
+/// the probe before returning, so consumer tests exercise queued continuation
+/// without making scheduler timing into an admission or latency assertion.
+///
+/// Readability alone proves nothing once an earlier datagram is still queued, and
+/// macOS delivers loopback multicast asynchronously on lo0's input thread. So each
+/// reply is followed by a fence the probe ignores; the member hearing its own fence
+/// loop back shows the interface delivered every earlier datagram, from any sender
+/// on this group and port, to every socket joined there.
+#[cfg(test)]
+pub(crate) fn queued_test_probe() -> (Probe, impl Fn(u16, NodeKey) + Send + Sync) {
+    const FENCE: &[u8] = b"aterm-m1-test-fence";
+    let hang = Duration::from_secs(60);
+    let member = Multicast::bind(Ipv4Addr::LOCALHOST, GROUP, 0, Scope::Loopback).unwrap();
+    let mut probe = Probe::on(
+        links(&[Ipv4Addr::LOCALHOST], member.port(), Scope::Loopback),
+        hang,
+    )
+    .unwrap();
+    let until = Instant::now() + hang;
+    let ask = loop {
+        assert!(
+            !aterm_uds::ready::any_until(&[member.as_fd()], until)
+                .unwrap()
+                .is_empty(),
+            "a native request must arrive"
+        );
+        if let Some((wire, _)) = member.receive().unwrap()
+            && wire.len() == REQUEST
+        {
+            break wire;
+        }
+    };
+    probe.deadline = Instant::now();
+    (probe, move |port, key| {
+        member.send(&response(&ask, port, key).unwrap()).unwrap();
+        member.send(FENCE).unwrap();
+        let until = Instant::now() + hang;
+        loop {
+            assert!(
+                !aterm_uds::ready::any_until(&[member.as_fd()], until)
+                    .unwrap()
+                    .is_empty(),
+                "the reply's fence must loop back"
+            );
+            if member
+                .receive()
+                .unwrap()
+                .is_some_and(|(wire, _)| wire == FENCE)
+            {
+                break;
+            }
+        }
+    })
 }
 
 struct ReplyWindow {
@@ -290,7 +403,7 @@ fn serve(
     #[cfg(test)]
     let mut network = network;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    let routes = (network.scope == Scope::Lan)
+    let mut routes = (network.scope == Scope::Lan)
         .then(aterm_uds::network::RouteChanges::open)
         .flatten();
     let mut sockets = Vec::new();
@@ -336,11 +449,15 @@ fn serve(
         for index in ready {
             if index > sockets.len() {
                 #[cfg(any(target_os = "macos", target_os = "linux"))]
-                if routes
+                // A route socket that fails is dropped: it would poll readable again at once
+                // and fail again, a spin; the refresh timer still paces the rounds.
+                match routes
                     .as_ref()
-                    .is_some_and(|routes| routes.wait(Duration::ZERO))
+                    .map(aterm_uds::network::RouteChanges::read_waiting)
                 {
-                    refresh = Instant::now();
+                    Some(Some(true)) => refresh = Instant::now(),
+                    Some(None) => routes = None,
+                    Some(Some(false)) | None => {}
                 }
                 continue;
             }
@@ -445,6 +562,99 @@ mod tests {
         assert!(response(&unknown, 7100, key).is_none());
     }
 
+    /// A later reply carries the original nonce. Starting another solicitation cannot
+    /// recover it, and no DNS or membership authority is involved in receiving it.
+    #[test]
+    fn a_native_solicitation_keeps_later_replies_after_its_first_batch() {
+        let member = Multicast::bind(Ipv4Addr::LOCALHOST, GROUP, 0, Scope::Loopback).unwrap();
+        let client = links(&[Ipv4Addr::LOCALHOST], member.port(), Scope::Loopback);
+        let mut probe = Probe::on(client, HANG).unwrap();
+        let until = Instant::now() + HANG;
+        let ask = loop {
+            aterm_uds::ready::any_until(&[member.as_fd()], until).unwrap();
+            if let Some((wire, _)) = member.receive().unwrap()
+                && wire.len() == REQUEST
+            {
+                break wire;
+            }
+            assert!(Instant::now() < until, "a native request must arrive");
+        };
+        member
+            .send(&response(&ask, 7101, NodeKey::from_bytes([1; 32])).unwrap())
+            .unwrap();
+        let first = probe.next(until).unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|hint| hint.address.port())
+                .collect::<Vec<_>>(),
+            [7101]
+        );
+        // Publish only after the consumer took its first batch. This models a second
+        // member's reply while the caller authenticates the first, without a timing race.
+        member
+            .send(&response(&ask, 7102, NodeKey::from_bytes([2; 32])).unwrap())
+            .unwrap();
+        let next = probe.next(until).unwrap();
+        assert_eq!(
+            next.iter()
+                .map(|hint| hint.address.port())
+                .collect::<Vec<_>>(),
+            [7102]
+        );
+    }
+
+    #[test]
+    fn native_reply_continuation_rejects_duplicates_foreign_nonces_and_expired_proof() {
+        let (mut probe, reply) = queued_test_probe();
+        let until = Instant::now() + HANG;
+        reply(7101, NodeKey::from_bytes([1; 32]));
+        assert_eq!(probe.next(until).unwrap().len(), 1);
+        reply(7101, NodeKey::from_bytes([9; 32]));
+        let sender = Multicast::bind(
+            Ipv4Addr::LOCALHOST,
+            GROUP,
+            probe.active[0].1.port(),
+            Scope::Loopback,
+        )
+        .unwrap();
+        let mut foreign = probe.nonce;
+        foreign[0] ^= 1;
+        sender
+            .send(&response(&request(&foreign), 7199, NodeKey::from_bytes([9; 32])).unwrap())
+            .unwrap();
+        sender.send(b"malformed").unwrap();
+        reply(7102, NodeKey::from_bytes([2; 32]));
+        let later = probe.next(until).unwrap();
+        assert_eq!(
+            later
+                .iter()
+                .map(|hint| hint.address.port())
+                .collect::<Vec<_>>(),
+            [7102]
+        );
+        reply(7103, NodeKey::from_bytes([3; 32]));
+        assert!(
+            probe.next(Instant::now()).unwrap().is_empty(),
+            "a queued reply cannot renew the proof deadline"
+        );
+    }
+
+    #[test]
+    fn native_reply_cardinality_is_global_across_batches() {
+        let (mut probe, reply) = queued_test_probe();
+        let until = Instant::now() + HANG;
+        reply(7200, NodeKey::from_bytes([1; 32]));
+        assert_eq!(probe.next(until).unwrap().len(), 1);
+        for offset in 1..=MAX_PEERS {
+            reply(7200 + offset as u16, NodeKey::from_bytes([2; 32]));
+        }
+        let rest = probe.complete(until).unwrap();
+        assert_eq!(rest.len(), MAX_PEERS - 1);
+        assert_eq!(probe.seen.len(), MAX_PEERS);
+        assert!(probe.next(until).unwrap().is_empty());
+    }
+
     #[test]
     fn native_solicitation_reaches_the_member_handshake_without_dns() {
         let reservation = Multicast::bind(Ipv4Addr::LOCALHOST, GROUP, 0, Scope::Loopback).unwrap();
@@ -478,7 +688,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(bound.recv_timeout(HANG).unwrap(), 1);
-        let hints = probe_on(&client, HANG).unwrap();
+        let hints = probe_on(client, HANG).unwrap();
         assert_eq!(
             hints,
             [Hint {

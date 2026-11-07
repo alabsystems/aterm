@@ -156,6 +156,9 @@ pub(crate) struct Server {
 pub(crate) struct Shared {
     admission: Admission,
     bonjour: Box<dyn Bonjour>,
+    /// Where a connection's lines go: the broker's [`log`], or nowhere when the one client is
+    /// this process (the direct path), which hears each failure itself as a frame.
+    log: fn(std::fmt::Arguments<'_>),
     live: AtomicUsize,
     /// The test seam the server was bound under, carried into each connection's thread.
     #[cfg(any(test, debug_assertions))]
@@ -163,11 +166,16 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
-    /// What serving needs, under this thread's seam.
-    pub(crate) fn new(admission: Admission, bonjour: Box<dyn Bonjour>) -> Self {
+    /// What serving needs, under this thread's seam, its connections' lines going to `log`.
+    pub(crate) fn new(
+        admission: Admission,
+        bonjour: Box<dyn Bonjour>,
+        log: fn(std::fmt::Arguments<'_>),
+    ) -> Self {
         Self {
             admission,
             bonjour,
+            log,
             live: AtomicUsize::new(0),
             #[cfg(any(test, debug_assertions))]
             seam: aterm_uds::lan::seam(),
@@ -252,7 +260,7 @@ impl Server {
         std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o666))?;
         Ok(Self {
             listener,
-            shared: Arc::new(Shared::new(admission, bonjour)),
+            shared: Arc::new(Shared::new(admission, bonjour, log)),
         })
     }
 
@@ -299,7 +307,7 @@ impl Server {
 pub(crate) fn connection(shared: &Shared, stream: &CtlStream) {
     let pid = aterm_uds::fdpass::peer_pid(stream).unwrap_or(0);
     if let Err(why) = shared.admission.check(stream) {
-        log(format_args!("refused pid {pid}: {why}"));
+        (shared.log)(format_args!("refused pid {pid}: {why}"));
         let _ = wire::send(stream, &Frame::Refused { words: why });
         return;
     }
@@ -315,7 +323,7 @@ pub(crate) fn connection(shared: &Shared, stream: &CtlStream) {
     match reader.frame(stream, deadline) {
         Ok(Some(Frame::Hello { protocol, .. })) if protocol == aterm_uds::lan::PROTOCOL => {}
         Ok(Some(Frame::Hello { protocol, build })) => {
-            log(format_args!(
+            (shared.log)(format_args!(
                 "pid {pid} speaks protocol {protocol} (build {build}), this broker {}",
                 aterm_uds::lan::PROTOCOL
             ));
@@ -323,11 +331,11 @@ pub(crate) fn connection(shared: &Shared, stream: &CtlStream) {
         }
         Ok(None) => return,
         Ok(Some(other)) => {
-            log(format_args!("pid {pid} opened with {other:?}"));
+            (shared.log)(format_args!("pid {pid} opened with {other:?}"));
             return;
         }
         Err(error) => {
-            log(format_args!("pid {pid}: {error}"));
+            (shared.log)(format_args!("pid {pid}: {error}"));
             return;
         }
     }
@@ -336,20 +344,20 @@ pub(crate) fn connection(shared: &Shared, stream: &CtlStream) {
         // A hello alone: `aterm lan status`.
         Ok(None) => return,
         Ok(Some(other)) => {
-            log(format_args!("pid {pid} asked {other:?}"));
+            (shared.log)(format_args!("pid {pid} asked {other:?}"));
             return;
         }
         Err(error) => {
-            log(format_args!("pid {pid}: {error}"));
+            (shared.log)(format_args!("pid {pid}: {error}"));
             return;
         }
     };
     if reader.buffered() {
-        log(format_args!("pid {pid} sent bytes past its one request"));
+        (shared.log)(format_args!("pid {pid} sent bytes past its one request"));
         return;
     }
     if let Err((code, words)) = answer(shared, stream, request) {
-        log(format_args!("pid {pid}: {words}"));
+        (shared.log)(format_args!("pid {pid}: {words}"));
         let _ = wire::send(stream, &Frame::Error { code, words });
     }
 }

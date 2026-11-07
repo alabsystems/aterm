@@ -5,6 +5,66 @@
 use super::*;
 
 #[test]
+fn refill_hides_spare_payloads_reuses_matches_and_releases_replacements() {
+    let mut extra = CellExtra::default();
+    extra.set_complex_char(Some(Arc::from("👩‍💻")));
+    let original = Arc::downgrade(extra.complex_char().unwrap());
+    for mark in ['\u{301}', '\u{302}', '\u{303}', '\u{304}', '\u{305}'] {
+        extra.add_combining(mark);
+    }
+    extra.set_extended_flags(0xffff);
+    assert!(extra.prepare_refill());
+    assert!(extra.complex_char().is_none());
+    assert!(extra.combining().is_empty());
+    assert!(!extra.has_data());
+    assert!(!extra.has_claimable_data());
+    extra.set_extended_flags(0xe000);
+    assert_eq!(extra.extended_flags(), 0xe000);
+    assert!(extra.complex_char().is_none());
+    extra.set_extended_flags(0);
+    extra.refill_complex_char("👩‍💻");
+    assert!(std::sync::Weak::ptr_eq(
+        &original,
+        &Arc::downgrade(extra.complex_char().unwrap())
+    ));
+    assert!(extra.finish_refill());
+    assert!(!extra.combining.spilled());
+    assert!(extra.prepare_refill());
+    extra.refill_complex_char("👨‍💻");
+    assert!(original.upgrade().is_none());
+    assert!(extra.finish_refill());
+    let replacement = Arc::downgrade(extra.complex_char().unwrap());
+    assert!(extra.prepare_refill());
+    extra.set_fg_rgb(Some([1, 2, 3]));
+    assert!(extra.finish_refill());
+    assert!(replacement.upgrade().is_none());
+    assert_eq!(extra.fg_rgb(), Some([1, 2, 3]));
+    assert!(extra.complex_char().is_none());
+}
+
+#[test]
+fn unused_combining_storage_is_reusable_and_short_refills_release_spills() {
+    let mut extra = CellExtra::default();
+    for mark in ['\u{301}', '\u{302}', '\u{303}', '\u{304}', '\u{305}'] {
+        extra.add_combining(mark);
+    }
+    extra.set_extended_flags(0xffff);
+    assert!(!extra.retain_overflow_colors());
+    assert_eq!(extra, CellExtra::default());
+    assert!(extra.prepare_refill());
+    for mark in ['\u{301}', '\u{302}', '\u{303}', '\u{304}', '\u{305}'] {
+        extra.add_combining(mark);
+    }
+    assert!(extra.finish_refill());
+    assert_eq!(extra.combining().len(), 5);
+    assert!(extra.prepare_refill());
+    extra.add_combining('\u{301}');
+    assert!(extra.finish_refill());
+    assert!(!extra.combining.spilled());
+    assert_eq!(extra.combining(), &['\u{301}']);
+}
+
+#[test]
 fn mutable_extra_entries_cannot_hide_images_from_the_collection_hint() {
     let image = Arc::new(ImageData {
         bytes: vec![7; 4],

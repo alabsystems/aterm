@@ -115,10 +115,13 @@ impl Timeline {
                 let Some(step) = event["step"].as_str() else {
                     return;
                 };
-                if self.step_children.len() >= MAX_ROWS && !self.step_children.contains_key(step) {
+                let totals = if let Some(totals) = self.step_children.get_mut(step) {
+                    totals
+                } else if self.step_children.len() < MAX_ROWS {
+                    self.step_children.entry(step.to_owned()).or_default()
+                } else {
                     return;
-                }
-                let totals = self.step_children.entry(step.to_owned()).or_default();
+                };
                 totals.children += 1;
                 add_f(&mut totals.cpu_s, event["child_cpu"]["observed_s"].as_f64());
                 if let Some(peak) = event["peak_bytes"].as_u64() {
@@ -145,23 +148,30 @@ impl Timeline {
                 add_u(&mut self.units_fresh, fresh);
                 add_u(&mut self.units_compiled, compiled);
                 add_u(&mut self.output_bytes, event["output_bytes"].as_u64());
-                self.branch(aterm_json::json!({
-                    "kind": "slice", "log": log,
-                    "call": event["call"].as_str().map_or_else(
-                        || format!(
-                            "{} {}",
-                            event["package"].as_str().unwrap_or("?"),
-                            event["target"].as_str().unwrap_or("native")
-                        ),
+                if self.branches.len() < MAX_ROWS {
+                    let call = event["call"].as_str().map_or_else(
+                        || {
+                            format!(
+                                "{} {}",
+                                event["package"].as_str().unwrap_or("?"),
+                                event["target"].as_str().unwrap_or("native")
+                            )
+                        },
                         str::to_owned,
-                    ),
-                    "outcome": event["outcome"],
-                    "execution_s": event["execution_s"],
-                    "cpu_s": event["child_cpu"]["observed_s"],
-                    "peak_bytes": event["peak_bytes"],
-                    "units": event["units"],
-                    "output_bytes": event["output_bytes"],
-                }));
+                    );
+                    self.branches
+                        .push(aterm_json::Value::Object(aterm_json::Map::from([
+                            ("kind".to_owned(), aterm_json::Value::from("slice")),
+                            ("log".to_owned(), aterm_json::Value::from(log)),
+                            ("call".to_owned(), aterm_json::Value::String(call)),
+                            ("outcome".to_owned(), event["outcome"].clone()),
+                            ("execution_s".to_owned(), event["execution_s"].clone()),
+                            ("cpu_s".to_owned(), event["child_cpu"]["observed_s"].clone()),
+                            ("peak_bytes".to_owned(), event["peak_bytes"].clone()),
+                            ("units".to_owned(), event["units"].clone()),
+                            ("output_bytes".to_owned(), event["output_bytes"].clone()),
+                        ])));
+                }
             }
             Some("compile-finished") => {
                 add_u(&mut self.units_fresh, event["units"]["fresh"].as_u64());
@@ -197,12 +207,6 @@ impl Timeline {
                 }
             }
             _ => {}
-        }
-    }
-
-    fn branch(&mut self, row: aterm_json::Value) {
-        if self.branches.len() < MAX_ROWS {
-            self.branches.push(row);
         }
     }
 
@@ -270,15 +274,30 @@ impl Timeline {
         if failed_decisions(event) {
             self.red(ended, event);
         }
-        self.branch(aterm_json::json!({
-            "kind": "verify-stage", "log": log,
-            "call": event["stage"],
-            "started_at_unix_ms": started, "ended_at_unix_ms": ended,
-            "waiting_s": event["waiting_s"], "execution_s": execution_s,
-            "cpu_s": event["child_cpu"]["observed_s"],
-            "starved_s": event["starved_s"],
-            "peak_bytes": event["peak_bytes"],
-        }));
+        if self.branches.len() < MAX_ROWS {
+            self.branches
+                .push(aterm_json::Value::Object(aterm_json::Map::from([
+                    ("kind".to_owned(), aterm_json::Value::from("verify-stage")),
+                    ("log".to_owned(), aterm_json::Value::from(log)),
+                    ("call".to_owned(), event["stage"].clone()),
+                    (
+                        "started_at_unix_ms".to_owned(),
+                        aterm_json::Value::from(started),
+                    ),
+                    (
+                        "ended_at_unix_ms".to_owned(),
+                        aterm_json::Value::from(ended),
+                    ),
+                    ("waiting_s".to_owned(), event["waiting_s"].clone()),
+                    (
+                        "execution_s".to_owned(),
+                        aterm_json::Value::from(execution_s),
+                    ),
+                    ("cpu_s".to_owned(), event["child_cpu"]["observed_s"].clone()),
+                    ("starved_s".to_owned(), event["starved_s"].clone()),
+                    ("peak_bytes".to_owned(), event["peak_bytes"].clone()),
+                ])));
+        }
     }
 
     /// Read every record in `reader`, the log named `log`.
@@ -425,7 +444,7 @@ impl Timeline {
                 "seconds": end.map(|e| e.saturating_sub(at) as f64 / 1000.0),
             }));
         }
-        aterm_json::json!(phases)
+        aterm_json::Value::Array(phases)
     }
 
     /// The timeline as `release status --json` shows it.
@@ -436,17 +455,44 @@ impl Timeline {
             .iter()
             .map(|row| {
                 let children = self.step_children.get(&row.step);
-                aterm_json::json!({
-                    "step": row.step,
-                    "started_at_unix_s": row.started_at_unix_s,
-                    "ended_at_unix_s": row.ended_at_unix_s,
-                    "outcome": row.outcome,
-                    "waiting_s": row.waiting_s,
-                    "execution_s": row.execution_s,
-                    "cpu_s": children.and_then(|c| c.cpu_s),
-                    "peak_bytes": children.and_then(|c| c.peak_bytes),
-                    "children": children.map(|c| c.children),
-                })
+                aterm_json::Value::Object(aterm_json::Map::from([
+                    (
+                        "step".to_owned(),
+                        aterm_json::Value::from(row.step.as_str()),
+                    ),
+                    (
+                        "started_at_unix_s".to_owned(),
+                        aterm_json::Value::from(row.started_at_unix_s),
+                    ),
+                    (
+                        "ended_at_unix_s".to_owned(),
+                        aterm_json::Value::from(row.ended_at_unix_s),
+                    ),
+                    (
+                        "outcome".to_owned(),
+                        aterm_json::Value::from(row.outcome.as_deref()),
+                    ),
+                    (
+                        "waiting_s".to_owned(),
+                        aterm_json::Value::from(row.waiting_s),
+                    ),
+                    (
+                        "execution_s".to_owned(),
+                        aterm_json::Value::from(row.execution_s),
+                    ),
+                    (
+                        "cpu_s".to_owned(),
+                        aterm_json::Value::from(children.and_then(|c| c.cpu_s)),
+                    ),
+                    (
+                        "peak_bytes".to_owned(),
+                        aterm_json::Value::from(children.and_then(|c| c.peak_bytes)),
+                    ),
+                    (
+                        "children".to_owned(),
+                        aterm_json::Value::from(children.map(|c| c.children)),
+                    ),
+                ]))
             })
             .collect();
         // Before the qualify graph runs branches beside each other, the steps run one after
@@ -466,22 +512,52 @@ impl Timeline {
         let seal_count = |n: Option<u64>| if seal_known { Some(n.unwrap_or(0)) } else { n };
         let units = match (self.units_fresh, self.units_compiled) {
             (None, None) => aterm_json::Value::Null,
-            (fresh, compiled) => aterm_json::json!({"fresh": fresh, "compiled": compiled}),
+            (fresh, compiled) => aterm_json::Value::Object(aterm_json::Map::from([
+                ("fresh".to_owned(), aterm_json::Value::from(fresh)),
+                ("compiled".to_owned(), aterm_json::Value::from(compiled)),
+            ])),
         };
-        aterm_json::json!({
-            "run_started_at_unix_s": self.run_started_at_unix_s,
-            "critical_path_s": critical_path_s,
-            "time_to_first_red_s": time_to_first_red_s,
-            "first_red": self.first_red,
-            "steps": steps,
-            "branches": self.branches,
-            "full_hashes": seal_count(self.hashed),
-            "seal_rechecks": seal_count(self.rechecked),
-            "disk_walks": self.disk_walks,
-            "units": units,
-            "output_bytes": self.output_bytes,
-            "publish_phases": self.publish_phases(),
-        })
+        aterm_json::Value::Object(aterm_json::Map::from([
+            (
+                "run_started_at_unix_s".to_owned(),
+                aterm_json::Value::from(self.run_started_at_unix_s),
+            ),
+            (
+                "critical_path_s".to_owned(),
+                aterm_json::Value::from(critical_path_s),
+            ),
+            (
+                "time_to_first_red_s".to_owned(),
+                aterm_json::Value::from(time_to_first_red_s),
+            ),
+            (
+                "first_red".to_owned(),
+                self.first_red.clone().unwrap_or(aterm_json::Value::Null),
+            ),
+            ("steps".to_owned(), aterm_json::Value::Array(steps)),
+            (
+                "branches".to_owned(),
+                aterm_json::Value::Array(self.branches.clone()),
+            ),
+            (
+                "full_hashes".to_owned(),
+                aterm_json::Value::from(seal_count(self.hashed)),
+            ),
+            (
+                "seal_rechecks".to_owned(),
+                aterm_json::Value::from(seal_count(self.rechecked)),
+            ),
+            (
+                "disk_walks".to_owned(),
+                aterm_json::Value::from(self.disk_walks),
+            ),
+            ("units".to_owned(), units),
+            (
+                "output_bytes".to_owned(),
+                aterm_json::Value::from(self.output_bytes),
+            ),
+            ("publish_phases".to_owned(), self.publish_phases()),
+        ]))
     }
 }
 

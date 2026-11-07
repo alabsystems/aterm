@@ -11,6 +11,208 @@ use crate::sig::testkit;
 
 const TRIPLE: &str = "aarch64-apple-darwin";
 
+#[test]
+fn named_controller_retains_its_world_through_background_work_and_cancellation() {
+    if !crate::testdir::isolated_lifecycle(
+        "prerequisite::tests::named_controller_retains_its_world_through_background_work_and_cancellation",
+    ) {
+        return;
+    }
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    fn until(mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !ready() {
+            assert!(
+                Instant::now() < deadline,
+                "native world fixture did not progress"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    struct Release(PathBuf);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = std::fs::write(self.0.join("release"), b"go");
+        }
+    }
+    for cancel in [false, true] {
+        let mut fixture = Fixture::new(Prerequisite::Lake);
+        fixture.historical_lean();
+        crate::store::mark_build_ready(&fixture.root).unwrap();
+        let tool = fixture
+            .session(TRIPLE)
+            .unwrap()
+            .acquire_build(Prerequisite::Lake, 7)
+            .unwrap();
+        let held = super::named::HeldBuild::new(Prerequisite::Lake, tool).unwrap();
+        let home = held.elan_home().unwrap().to_path_buf();
+        let scope = aterm_tempfile::tempdir().unwrap();
+        let scope_path = scope.path().to_path_buf();
+        let settled = Arc::new(AtomicBool::new(false));
+        let signalled = Arc::new(AtomicBool::new(false));
+        let (s, sig) = (settled.clone(), signalled.clone());
+        let (prefix, home_copy, work) = (
+            fixture.layout.prefix.clone(),
+            home.clone(),
+            scope_path.clone(),
+        );
+        let helper = std::thread::spawn(move || {
+            let release = Release(work.clone());
+            until(|| s.load(Ordering::Acquire) && work.join("ready").is_file());
+            assert!(
+                home_copy
+                    .join("toolchains/leanprover--lean4---v4.8.0/bin/lake")
+                    .is_file()
+            );
+            assert!(matches!(
+                crate::lease::reclaim(&prefix, &Subject::build("lean4", 7).unwrap()),
+                crate::lease::Reclaim::Keep(_)
+            ));
+            if cancel {
+                // SAFETY: this isolated test owns its process and its armed native front.
+                assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGTERM) }, 0);
+                until(|| sig.load(Ordering::Acquire));
+            }
+            drop(release);
+        });
+        let script = r#"
+scope=$1
+test "$LEAN_CC" = /usr/bin/cc || exit 90
+(
+  test -f "$ELAN_HOME/toolchains/leanprover--lean4---v4.8.0/bin/lake" || exit 91
+  touch "$scope/ready"
+  while [ ! -e "$scope/release" ]; do /bin/sleep 0.02; done
+  test -f "$ELAN_HOME/toolchains/leanprover--lean4---v4.8.0/bin/lake" || exit 92
+  touch "$scope/done"
+) &
+exit 7
+"#;
+        let outcome = held
+            .run(
+                "/bin/sh",
+                &[
+                    "-c".into(),
+                    script.into(),
+                    "fixture".into(),
+                    scope_path.display().to_string(),
+                ],
+                &mut |line| {
+                    if line.contains("root ended") {
+                        settled.store(true, Ordering::Release);
+                    }
+                    if line.contains("cancellation") {
+                        signalled.store(true, Ordering::Release);
+                    }
+                },
+            )
+            .unwrap();
+        helper.join().unwrap();
+        assert_eq!(outcome.root.code(), Some(7));
+        assert_eq!(outcome.signal, cancel.then_some(libc::SIGTERM));
+        assert!(scope.path().join("done").is_file());
+        assert!(home.is_dir());
+        drop(held);
+        assert!(!home.exists());
+    }
+}
+
+#[test]
+fn named_lean_build_keeps_default_selection_and_binds_its_import_world() {
+    let mut fixture = Fixture::new(Prerequisite::Lake);
+    fixture.historical_lean();
+    fixture.index = fixture.index.replace("lean4=7", "lean4=9");
+    crate::store::mark_build_ready(&fixture.root).unwrap();
+    let before = crate::ops::which(&fixture.layout, "lake");
+    let session = fixture.session(TRIPLE).unwrap();
+    let tool = session.acquire_build(Prerequisite::Lake, 7).unwrap();
+    assert_eq!(tool.version(), "4.8.0");
+    assert_eq!(
+        tool.environment().entries(),
+        &[("LEAN_CC".into(), "/usr/bin/cc".into())]
+    );
+    assert_eq!(tool.root(), fixture.root.canonicalize().unwrap());
+    let held = super::named::HeldBuild::new(Prerequisite::Lake, tool).unwrap();
+    let world = held
+        .elan_home()
+        .unwrap()
+        .join("toolchains/leanprover--lean4---v4.8.0");
+    assert_eq!(
+        world.canonicalize().unwrap(),
+        fixture.root.canonicalize().unwrap()
+    );
+    assert!(
+        held.child_path(std::ffi::OsStr::new("/usr/bin:/bin"))
+            .is_ok()
+    );
+    assert_eq!(crate::ops::which(&fixture.layout, "lake"), before);
+    std::fs::remove_file(&world).unwrap();
+    std::fs::create_dir(&world).unwrap();
+    assert!(
+        held.child_path(std::ffi::OsStr::new("/usr/bin:/bin"))
+            .is_err()
+    );
+}
+
+#[test]
+fn named_prerequisite_refuses_unknown_versions_unstaged_or_changed_payloads() {
+    for fault in ["unknown-version", "unstaged", "changed"] {
+        let mut fixture = Fixture::new(Prerequisite::Lake);
+        fixture.change_package(
+            "version=\"4.31.0\"",
+            if fault == "unknown-version" {
+                "version=\"99.0.0\""
+            } else {
+                "version=\"4.8.0\""
+            },
+        );
+        if fault != "unknown-version" {
+            fixture.change_package("exposes=[", "shim_env=[\"LEAN_CC=/usr/bin/cc\"]\nexposes=[");
+        }
+        if fault != "unstaged" {
+            crate::store::mark_build_ready(&fixture.root).unwrap();
+        }
+        if fault == "changed" {
+            std::fs::write(fixture.executable(), b"changed").unwrap();
+        }
+        assert!(
+            fixture
+                .session(TRIPLE)
+                .unwrap()
+                .acquire_build(Prerequisite::Lake, 7)
+                .is_err(),
+            "{fault}"
+        );
+    }
+}
+
+#[test]
+fn named_lean_refuses_missing_alternate_and_hostile_signed_environments() {
+    for entries in [
+        "[]",
+        "[\"LEAN_CC=/tmp/other-cc\"]",
+        "[\"LEAN_CC=/usr/bin/cc\",\"PATH=/tmp\"]",
+    ] {
+        let mut fixture = Fixture::new(Prerequisite::Lake);
+        fixture.historical_lean();
+        fixture.change_package(
+            "shim_env=[\"LEAN_CC=/usr/bin/cc\"]",
+            &format!("shim_env={entries}"),
+        );
+        crate::store::mark_build_ready(&fixture.root).unwrap();
+        let before = crate::ops::which(&fixture.layout, "lake");
+        assert!(
+            fixture
+                .session(TRIPLE)
+                .unwrap()
+                .acquire_build(Prerequisite::Lake, 7)
+                .is_err()
+        );
+        assert_eq!(crate::ops::which(&fixture.layout, "lake"), before);
+    }
+}
+
 struct Fixture {
     layout: crate::testdir::ScratchLayout,
     want: Prerequisite,
@@ -84,6 +286,11 @@ impl Fixture {
             testkit::NOW,
             triple,
         )
+    }
+
+    fn historical_lean(&mut self) {
+        self.change_package("version=\"4.31.0\"", "version=\"4.8.0\"");
+        self.change_package("exposes=[", "shim_env=[\"LEAN_CC=/usr/bin/cc\"]\nexposes=[");
     }
 
     fn change_package(&mut self, from: &str, to: &str) {

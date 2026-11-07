@@ -23,6 +23,8 @@ pub mod caps;
 pub mod coalitions;
 pub mod cpu_hardware;
 pub mod cpu_policy;
+mod process_thermal;
+pub use process_thermal::{ProcessThermal, ProcessThermalState, process_thermal};
 pub mod identity;
 pub mod iflist;
 #[cfg(target_os = "macos")]

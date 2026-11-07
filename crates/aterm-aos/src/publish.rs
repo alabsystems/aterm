@@ -1087,14 +1087,17 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
             return Err(PublishRefusal::NotAttached);
         };
         let w = &prepared.witness;
-        let mut live = self.live.pair.head.clone();
-        if !self.live.digest_fresh {
-            live.state_digest = state_digest(&self.schema, &self.live.pair.state);
-        }
-        if &live != w.head() {
+        let live = if self.live.digest_fresh {
+            std::borrow::Cow::Borrowed(&self.live.pair.head)
+        } else {
+            let mut h = self.live.pair.head.clone();
+            h.state_digest = state_digest(&self.schema, &self.live.pair.state);
+            std::borrow::Cow::Owned(h)
+        };
+        if live.as_ref() != w.head() {
             return Err(PublishRefusal::StaleHead {
                 expected: Box::new(w.head().clone()),
-                live: Box::new(live),
+                live: Box::new(live.into_owned()),
             });
         }
         let identity = &self.live.identity;
@@ -1230,9 +1233,8 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
         let branch_after = branch
             .checked_add(1)
             .ok_or(PublishRefusal::Exhausted("branch"))?;
-        let identity = self.live.identity.clone();
         let head = Head {
-            identity: identity.digest(),
+            identity: self.live.identity.digest(),
             revision: Revision(rev),
             branch: BranchId(branch),
             state_digest: restored_digest,
@@ -1249,7 +1251,7 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
                     .checked_add(1)
                     .ok_or(PublishRefusal::Exhausted("log epoch"))?;
                 let fresh = checkpoint.with_provenance(Provenance {
-                    identity: identity.clone(),
+                    identity: self.live.identity.clone(),
                     log_epoch: epoch,
                     input_cursor: head.input_cursor,
                     effect_cursor: head.effect_cursor,
@@ -1259,7 +1261,7 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
                 });
                 let log = EventLog::new(
                     LogHeader {
-                        identity: identity.clone(),
+                        identity: self.live.identity.clone(),
                         log_epoch: epoch,
                         first_cursor: head.input_cursor,
                         ancestor: fresh.digest(),
@@ -1278,6 +1280,7 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
         let end_state = self.live.pair.head.state_digest;
         self.next_revision = rev_after;
         self.next_branch = branch_after;
+        let identity = self.live.identity.clone();
         let old = core::mem::replace(
             &mut self.live,
             Live {

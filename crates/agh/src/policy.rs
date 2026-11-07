@@ -670,15 +670,19 @@ impl Router {
         self.owner_row(owner).map_or(Tier::External, |row| row.tier)
     }
 
-    /// The owner's chain (`None`: the default chain).
-    #[must_use]
-    pub fn read_chain(&self, owner: Option<&str>) -> Vec<ChainStep> {
+    fn read_chain_slice(&self, owner: Option<&str>) -> &[ChainStep] {
         let Some(validated) = &self.validated else {
-            return vec![ChainStep::Anonymous];
+            return &[ChainStep::Anonymous];
         };
         owner
             .and_then(|o| self.owner_row(o))
-            .map_or_else(|| validated.default_read.clone(), |row| row.read.clone())
+            .map_or(validated.default_read.as_slice(), |row| row.read.as_slice())
+    }
+
+    /// The owner's chain (`None`: the default chain).
+    #[must_use]
+    pub fn read_chain(&self, owner: Option<&str>) -> Vec<ChainStep> {
+        self.read_chain_slice(owner).to_vec()
     }
 
     /// The owner's writer, when its row names one.
@@ -807,7 +811,6 @@ impl Router {
             return unknown_profile(asked);
         }
         let judged = presence(name);
-        let tried = vec![(ChainStep::Profile(name.to_string()), judged)];
         match judged {
             Presence::Present => Decision::Send {
                 profile: name.to_string(),
@@ -817,21 +820,20 @@ impl Router {
                 RefusalCode::WriterAbsent,
                 format!("the identity's profile {name} is absent"),
                 "agh auth status".to_string(),
-                tried,
+                vec![(ChainStep::Profile(name.to_string()), judged)],
             ),
             Presence::Unusable(slug) => refuse(
                 RefusalCode::WriterUnusable,
                 format!("the identity's profile {name} is unusable: {slug}"),
                 "agh auth status".to_string(),
-                tried,
+                vec![(ChainStep::Profile(name.to_string()), judged)],
             ),
         }
     }
 
     /// The owner as the refusal texts name it: the owner, or `the default` for a path with none.
-    fn owner_label(req: &RouteRequest) -> String {
-        req.owner()
-            .map_or_else(|| "the default".to_string(), str::to_string)
+    fn owner_label(req: &RouteRequest) -> &str {
+        req.owner().unwrap_or("the default")
     }
 
     /// What `agh whoami --for` and `-R` name.
@@ -857,7 +859,8 @@ impl Router {
             };
         }
         let owner = Self::owner_label(req);
-        let chain = if req.target == RouteTarget::Identity {
+        let single_step;
+        let chain: &[ChainStep] = if req.target == RouteTarget::Identity {
             let Some(name) = &req.as_profile else {
                 return refuse(
                     RefusalCode::IdentityNeedsAs,
@@ -869,15 +872,18 @@ impl Router {
             if self.profile(name).is_none() {
                 return unknown_profile(name);
             }
-            vec![ChainStep::Profile(name.clone())]
+            single_step = [ChainStep::Profile(name.clone())];
+            &single_step
         } else {
-            let chain = self.read_chain(req.owner());
-            let chain = match &req.as_profile {
+            let chain = self.read_chain_slice(req.owner());
+            let chain: &[ChainStep] = match &req.as_profile {
                 None => chain,
                 Some(name) if self.profile(name).is_none() => return unknown_profile(name),
                 Some(name) => {
-                    let step = ChainStep::Profile(name.clone());
-                    if !chain.contains(&step) {
+                    if !chain
+                        .iter()
+                        .any(|s| matches!(s, ChainStep::Profile(n) if n == name))
+                    {
                         return refuse(
                             RefusalCode::AsNotInChain,
                             format!("--as {name} is not in {owner}'s read chain"),
@@ -885,19 +891,20 @@ impl Router {
                             Vec::new(),
                         );
                     }
-                    vec![step]
+                    single_step = [ChainStep::Profile(name.clone())];
+                    &single_step
                 }
             };
             let tier = self.target_tier(req);
             let home = req.target != RouteTarget::Unscoped && tier == Tier::Release;
-            for step in &chain {
+            for step in chain {
                 let ChainStep::Profile(name) = step else {
                     continue;
                 };
                 match self.profile(name) {
                     None => return unknown_profile(name),
                     Some(profile) if profile.tier == Tier::Release && !home => {
-                        return tier_mismatch(name, profile.tier, &owner, tier);
+                        return tier_mismatch(name, profile.tier, owner, tier);
                     }
                     Some(_) => {}
                 }
@@ -906,7 +913,7 @@ impl Router {
         };
         let mut tried = Vec::new();
         for step in chain {
-            let ChainStep::Profile(name) = &step else {
+            let ChainStep::Profile(name) = step else {
                 let why = if self.has_config() {
                     AnonymousWhy::ChainFellThrough
                 } else {
@@ -915,7 +922,6 @@ impl Router {
                 return Decision::Anonymous { why };
             };
             let judged = presence(name);
-            tried.push((step.clone(), judged));
             match judged {
                 Presence::Present => {
                     let Some(profile) = self.profile(name) else {
@@ -926,8 +932,11 @@ impl Router {
                         tier: profile.tier,
                     };
                 }
-                Presence::Absent => {}
+                Presence::Absent => {
+                    tried.push((step.clone(), judged));
+                }
                 Presence::Unusable(slug) => {
+                    tried.push((step.clone(), judged));
                     return refuse(
                         RefusalCode::ChainStoppedUnusable,
                         format!(
@@ -1034,7 +1043,6 @@ impl Router {
             return tier_mismatch(writer, profile.tier, owner, tier);
         }
         let judged = presence(writer);
-        let tried = vec![(ChainStep::Profile(writer.to_string()), judged)];
         match judged {
             Presence::Present => Decision::Send {
                 profile: writer.to_string(),
@@ -1047,13 +1055,13 @@ impl Router {
                     "agh auth add {writer} --file PATH --tier {} --owner {owner} --write",
                     profile.tier.slug()
                 ),
-                tried,
+                vec![(ChainStep::Profile(writer.to_string()), judged)],
             ),
             Presence::Unusable(slug) => refuse(
                 RefusalCode::WriterUnusable,
                 format!("the writer for {owner} ({writer}) is unusable: {slug}"),
                 "agh auth status".to_string(),
-                tried,
+                vec![(ChainStep::Profile(writer.to_string()), judged)],
             ),
         }
     }

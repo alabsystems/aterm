@@ -1,17 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The allowed direct path (`docs/DESIGN-lan-broker-2026-11-05.md` §5): while no broker answers,
-//! a process whose code macOS already allowed on the local network serves the broker's protocol
-//! to itself, in-process, over a socketpair, so a Mac updated from a build that had no broker
-//! (0.158.0 and earlier, whose aterm a person once allowed) keeps its LAN until the broker
-//! serves, with no password and no alert (`docs/measured/lan-update-2026-11-06.md`).
+//! The allowed direct path (`docs/DESIGN-lan-broker-2026-11-05.md` §5): while no broker is
+//! installed, a process whose code macOS already allowed on the local network (for its account,
+//! as the app macOS holds responsible for it) serves the broker's protocol to itself,
+//! in-process, over a socketpair, so a Mac updated from a build that had no broker (0.158.0 and
+//! earlier, whose aterm a person once allowed) keeps its LAN until the broker is installed, with
+//! no password and no alert (`docs/measured/lan-update-2026-11-06.md`).
 //!
 //! This crate is below the broker's server (`aterm-lan`), so the server and the reading of
 //! macOS's answer come from above: the `aterm` executable [`provide`]s them once, at start. A
 //! process that provided none (a test binary, a tool) has no direct path, as before. The path is
 //! taken only for [`super::Unavailable::NotInstalled`]: a broker that answers in another protocol
-//! or refuses this process is a broker, and its own words stand.
+//! or refuses this process is a broker, and its own words stand. It serves LAN uses, never a
+//! question about the broker itself (`super::Arrivals`, which hears a broker arrive).
 
 use std::sync::OnceLock;
 

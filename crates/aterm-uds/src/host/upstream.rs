@@ -43,6 +43,8 @@ pub struct PinnedTool {
     pub max_extract_bytes: u64,
     /// License files preserved by both consumers.
     pub licenses: &'static [&'static str],
+    /// Exact signed invocation environment needed by this runtime.
+    pub shim_env: &'static [&'static str],
     /// Files unused by Darwin consumers, omitted only from Darwin packages. Workspace
     /// provisioning retains the original archive tree.
     pub darwin_omit: &'static [&'static str],
@@ -177,6 +179,20 @@ pub const CARCARA: ReferenceTool = ReferenceTool {
 };
 
 impl PinnedTool {
+    /// Select a separately pinned version without changing this tool's default.
+    /// Unlisted historical inputs never inherit the default archive's authority.
+    #[must_use]
+    pub fn versioned(&'static self, version: &str) -> Option<&'static Self> {
+        if version == self.version {
+            return Some(self);
+        }
+        match (self.name, version) {
+            ("lean4", "4.8.0") => Some(&LEAN4_480),
+            ("lean4", "4.30.0-rc2") => Some(&LEAN4_430_RC2),
+            _ => None,
+        }
+    }
+
     /// The archive this recipe admits on `platform`.
     #[must_use]
     pub fn archive_for(&self, platform: &str) -> Option<&Archive> {
@@ -241,6 +257,7 @@ pub const GITLEAKS: PinnedTool = PinnedTool {
     strip: 0,
     max_extract_bytes: 1024 * 1024 * 1024,
     licenses: &["LICENSE"],
+    shim_env: &[],
     darwin_omit: &[],
     hosts: &platforms(&GITLEAKS_ARCHIVES),
     archives: &GITLEAKS_ARCHIVES,
@@ -272,6 +289,7 @@ pub const CPYTHON: PinnedTool = PinnedTool {
     max_extract_bytes: 1024 * 1024 * 1024,
     licenses: &["lib/python3.14/LICENSE.txt"],
     // pip's distlib loads these launchers only under os.name == 'nt'.
+    shim_env: &[],
     darwin_omit: &[
         "lib/python3.14/site-packages/pip/_vendor/distlib/t32.exe",
         "lib/python3.14/site-packages/pip/_vendor/distlib/t64.exe",
@@ -305,6 +323,7 @@ pub const OPENSSL_SIGNING: PinnedTool = PinnedTool {
     strip: 1,
     max_extract_bytes: 1024 * 1024 * 1024,
     licenses: &["LICENSE.txt"],
+    shim_env: &[],
     darwin_omit: &[],
     hosts: &["macos-aarch64", "macos-x86_64"],
     archives: &[OPENSSL_SIGNING_SOURCE],
@@ -321,6 +340,7 @@ pub const NODE: PinnedTool = PinnedTool {
     strip: 1,
     max_extract_bytes: 256 * 1024 * 1024,
     licenses: &["LICENSE"],
+    shim_env: &[],
     darwin_omit: &[],
     hosts: &["macos-aarch64", "macos-x86_64"],
     archives: &[
@@ -366,14 +386,64 @@ pub const LEAN4: PinnedTool = PinnedTool {
     // Include tar headers/padding without changing the ordinary bottle allowance.
     max_extract_bytes: 3 * 1024 * 1024 * 1024,
     licenses: &["LICENSE", "LICENSES"],
+    shim_env: &[],
     darwin_omit: &[],
     hosts: &platforms(&LEAN4_ARCHIVES),
     archives: &LEAN4_ARCHIVES,
 };
 
+/// The historical import world explicitly required by Clean's G33/G71 probes.
+/// Its authenticated upstream release predates GitHub's per-asset digest field.
+pub const LEAN4_480: PinnedTool = PinnedTool {
+    version: "4.8.0",
+    // Leanc documents this override and clears bundled-only linker flags.
+    // Its 2024 bundled linker emits binaries current macOS dyld refuses.
+    shim_env: &["LEAN_CC=/usr/bin/cc"],
+    // Measured: 863,072,279 regular-file bytes, 3,011 archive entries.
+    max_extract_bytes: 1024 * 1024 * 1024,
+    hosts: &["macos-aarch64"],
+    archives: &[Archive {
+        platform: "macos-aarch64",
+        url: "https://github.com/leanprover/lean4/releases/download/v{v}/lean-{v}-darwin_aarch64.tar.zst",
+        sha256: "4c8b593c4611aa1d90f079482548488b5df4dd5059f69d88ed3c6f46a43b504e",
+        bytes: 179_267_194,
+    }],
+    ..LEAN4
+};
+
+/// Clean's exact current kernel-oracle world, retained beside the default runtime.
+pub const LEAN4_430_RC2: PinnedTool = PinnedTool {
+    version: "4.30.0-rc2",
+    hosts: &["macos-aarch64"],
+    archives: &[Archive {
+        platform: "macos-aarch64",
+        url: "https://github.com/leanprover/lean4/releases/download/v{v}/lean-{v}-darwin_aarch64.tar.zst",
+        sha256: "6a23d26241fd78bcc3d1c24be97341bfe3f4635f2e6feabcbb5863035290ab1b",
+        bytes: 517_395_241,
+    }],
+    ..LEAN4
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn historical_lean_versions_do_not_change_the_default_or_admit_unknown_inputs() {
+        assert_eq!(LEAN4.version, "4.31.0");
+        assert!(LEAN4.shim_env.is_empty());
+        assert!(LEAN4_430_RC2.shim_env.is_empty());
+        assert_eq!(LEAN4_480.shim_env, &["LEAN_CC=/usr/bin/cc"]);
+        assert_eq!(LEAN4.versioned("4.31.0"), Some(&LEAN4));
+        for (version, recipe) in [("4.8.0", &LEAN4_480), ("4.30.0-rc2", &LEAN4_430_RC2)] {
+            assert_eq!(LEAN4.versioned(version), Some(recipe));
+            assert_eq!(recipe.name, "lean4");
+            assert!(recipe.archive_for("macos-aarch64").is_some());
+            assert!(recipe.archive_for("macos-x86_64").is_none());
+        }
+        assert!(LEAN4.versioned("4.30.0").is_none());
+        assert!(GITLEAKS.versioned("4.8.0").is_none());
+    }
 
     #[test]
     fn a_shared_source_archive_does_not_admit_unsupported_hosts() {

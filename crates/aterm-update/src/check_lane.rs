@@ -73,18 +73,16 @@ impl Lane {
         guard.source = Some(source.clone());
     }
 
-    pub(crate) fn run_or_join(&self, build: u64, source: &Source, check: impl FnOnce()) {
+    /// Run or join an exact completion that raced this call. Return false when
+    /// another check still owns the lane; an explicit request never queues
+    /// behind unbounded network work.
+    pub(crate) fn run_or_join(&self, build: u64, source: &Source, check: impl FnOnce()) -> bool {
         let before = self.sequence.load(Ordering::Acquire);
-        if let Some(mut guard) = self.try_lock() {
-            check();
-            self.complete(&mut guard, build, source);
-            return;
-        }
-        let mut guard = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| self.recover_poisoned(poisoned));
+        let Some(mut guard) = self.try_lock() else {
+            return false;
+        };
         self.finish_join(&mut guard, before, build, source, check);
+        true
     }
 
     fn finish_join(
@@ -115,6 +113,33 @@ pub(crate) fn after_skip<G, L>(gate: G, lane: L, interval: u64, wait: impl FnOnc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_busy_check_is_reported_without_running_or_waiting_for_its_owner() {
+        let lane = Lane::new();
+        let request = source("one");
+        let owner = lane.try_lock().unwrap();
+        std::thread::scope(|scope| {
+            let (sent, received) = std::sync::mpsc::channel();
+            let (lane, request) = (&lane, &request);
+            scope.spawn(move || {
+                let completed = lane.run_or_join(42, request, || panic!("duplicate check"));
+                let _ = sent.send(completed);
+            });
+            let result = received.recv_timeout(std::time::Duration::from_secs(60));
+            drop(owner);
+            assert!(!result.unwrap(), "the active owner remains untouched");
+        });
+        assert_eq!(lane.sequence.load(Ordering::Acquire), 0);
+        let mut checked = false;
+        assert!(lane.run_or_join(42, &request, || checked = true));
+        assert!(
+            checked,
+            "a later explicit request can run after the owner retires"
+        );
+        let completion = lane.try_lock().unwrap();
+        assert!(completion.answers(0, 42, &request));
+    }
 
     fn source(owner: &str) -> Source {
         Source {

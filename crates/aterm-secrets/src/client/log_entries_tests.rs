@@ -4600,19 +4600,10 @@ fn a_gap_seen_long_after_it_opened_is_still_closed_by_one_holder_first() {
     drop(macs.root);
 }
 
-/// The approver's `aterm-swarm-roster` follows the log's labels (C11 under F15): a Mac a member
-/// let in as `m40` gets `m40` in the roster too, though the fleet-accounts sheet names `m40`
-/// (whose 24-hour hold the person's Allow settled), and a Mac the log does not label that asks
-/// as `m40` (F10's files) gets another label rather than a second `m40`. The log's overlay names
-/// the first Mac in `[machines]` before the approver looks, so the approver gives a still-asking
-/// member the log labels its row too.
-///
-/// NEGATIVE CONTROLS: in `maintain_swarm_roster_on_approve`, skip the fix-up after
-/// `assign_newcomer`: the log's `m40` keeps the roster's own label (`m42`) and the `"the roster
-/// takes the log's label"` assert fails. In `auto_approve_listed`, collect no `unrostered`
-/// member: the log's Mac gets no row and `"a row"` fails.
+/// Both log-bound and envelope-only approvals leave label allocation to registration.
+/// NEGATIVE CONTROL: restoring roster allocation makes either new recipient appear below.
 #[test]
-fn the_approvers_roster_follows_the_labels_the_log_assigned() {
+fn approval_leaves_new_labels_to_the_registry_instead_of_growing_the_roster() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
     let (m22, m7) = (&macs.m22, &macs.m7);
     admin_seed_swarm_roster(m22, &[]).expect("seed the roster");
@@ -4660,22 +4651,23 @@ fn the_approvers_roster_follows_the_labels_the_log_assigned() {
     let roster = crate::swarm_roster::SwarmRoster::from_document(&admin_open(m22).unwrap().doc)
         .unwrap()
         .expect("a roster");
-    let row = |recipient: crate::age::Recipient| {
-        roster
-            .members
-            .iter()
-            .find(|row| row.recipient == recipient.to_bech32())
-            .cloned()
-            .expect("a row")
-    };
-    let logged = row(request.binding().recipient());
-    assert_eq!(logged.label, "m40", "the roster takes the log's label");
-    assert_eq!(logged.claimed_label, None);
-    assert_ne!(
-        row(request2.binding().recipient()).label,
-        "m40",
-        "no second m40"
+    assert_eq!(
+        historical_swarm_roster(m22).unwrap(),
+        Some(roster.clone()),
+        "migration reads the stored label table, never synthetic log display hints"
     );
+    for recipient in [
+        request.binding().recipient(),
+        request2.binding().recipient(),
+    ] {
+        assert!(
+            roster
+                .members
+                .iter()
+                .all(|row| row.recipient != recipient.to_bech32()),
+            "an approval must not allocate a roster label"
+        );
+    }
 
     macs.server.stop();
     drop(macs.root);
@@ -7912,4 +7904,59 @@ fn no_pending_set_goes_by_count_and_a_landed_publish_settles_them_by_its_servers
     let (control, _, kept) = twelve_pending(true);
     assert_eq!(kept, 8, "CONTROL: A3's bound drops the four oldest");
     control.server.stop();
+}
+
+#[test]
+fn legacy_frontier_repair_restores_the_verified_digest_and_keeps_the_damaged_state() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let m22 = Paths::for_home(&root.path().join("m22"));
+    let vault_file = root.path().join("alab.vault");
+    let created =
+        test_create_unbound(&m22, vault_file.to_str().unwrap(), None, Some("m22")).unwrap();
+    admin_keys::legacy::publish_legacy(&m22, &admin_open(&m22).unwrap());
+    admin_commons_init(&m22).expect("commons init");
+    let pinned = format!("{}#{}", vault_file.display(), created.signer);
+    let lineage = decode_key32(&created.signer).expect("lineage");
+    let m7_env = Paths::for_home(&root.path().join("m7-env"));
+    let m7_rec = machine_identity(&m7_env).unwrap().recipient().to_bech32();
+    {
+        let admin = admin_open(&m22).unwrap();
+        let mut doc = admin.doc.clone();
+        doc.add_machine("m7", &m7_rec).unwrap();
+        doc.set_entry(&Audience::Everyone, "shared-api-key", b"sk-shared-01")
+            .unwrap();
+        admin_publish_approved(&m22, &admin, &doc, std::slice::from_ref(&m7_rec)).unwrap();
+    }
+    join_host(&m7_env, &pinned, "m7");
+    enroll_commons(&m22, &m7_env);
+    let genesis_out = root.path().join("alab.genesis");
+    genesis::sign_genesis(&m22, &genesis_out, &lineage, true).expect("sign genesis");
+    {
+        let admin = admin_open(&m22).unwrap();
+        admin_publish(&m22, &admin, &admin.doc.clone()).expect("stamped version");
+    }
+    let full_store = load_records(&m22).expect("load seeded store");
+    let m7 = Paths::for_home(&root.path().join("m7-log"));
+    clone_identity_to(&m7_env, &m7);
+    fsx::write_atomic(&m7.records_file(), &full_store.encode(), 0o600).unwrap();
+    join_host(&m7, &pinned, "m7");
+    let expected = load_state(&m7)
+        .unwrap()
+        .records_digest
+        .expect("applied log digest");
+    let mut state = load_state(&m7).unwrap();
+    state.records_digest = Some([0; 32]);
+    save_state(&m7, &state).expect("damage the applied digest");
+    let damaged = fsx::read_private(&m7.state_file(), MAX_STATE)
+        .unwrap()
+        .expect("damaged state");
+
+    assert!(repair_legacy_frontier(&m7).expect("repair frontier"));
+    assert_eq!(load_state(&m7).unwrap().records_digest, Some(expected));
+    let backup = fsx::read_private(&m7.dir.join("state.before-frontier-repair"), MAX_STATE)
+        .unwrap()
+        .expect("state backup");
+    assert_eq!(backup.as_slice(), damaged.as_slice());
+    assert!(!repair_legacy_frontier(&m7).expect("idempotent repair"));
+    sync(&m7, None).expect("sync after repair");
 }

@@ -572,9 +572,9 @@ const GUI_NAMES: &[&str] = &[
 
 pub(super) const KEEPER_GUI: Rule = Rule {
     id: "keeper-gui",
-    why: "the PTY keeper outlives the window because it is no WindowServer client: linking \
-          AppKit, CoreGraphics or aterm-window, or sending an Objective-C message, would put every \
-          terminal it holds in WindowServer's blast radius",
+    why: "the PTY keeper outlives the window because it is no WindowServer client: its own \
+          code and UDS layer name no GUI framework/API or raw Objective-C message send; \
+          platform observations belong behind their dependency boundary",
     scope: KEEPER_SOURCE,
     check: keeper_gui,
 };
@@ -591,6 +591,33 @@ fn keeper_gui(tree: &Tree<'_>, out: &mut Vec<Finding>) {
 
 /// A GUI framework named in a link attribute (`name = "AppKit"`), or a GUI API by name.
 fn links_gui(text: &str) -> Option<String> {
+    linked_gui_framework(text).or_else(|| {
+        GUI_NAMES
+            .iter()
+            .find(|n| text.contains(**n))
+            .map(|n| format!("names `{n}`"))
+    })
+}
+
+/// GUI evidence in an inspected dependency; raw Foundation runtime sends alone are not GUI.
+pub(super) fn links_gui_dependency(text: &str) -> Option<String> {
+    linked_gui_framework(text).or_else(|| {
+        GUI_NAMES
+            .iter()
+            .filter(|&&n| n != "objc_msgSend")
+            .find(|n| text.contains(**n))
+            .map(|n| format!("names `{n}`"))
+    })
+}
+
+fn linked_gui_framework(text: &str) -> Option<String> {
+    for name in GUI_FRAMEWORKS {
+        if text.contains(&format!("{name}.framework"))
+            || text.contains(&format!("framework={name}"))
+        {
+            return Some(format!("names the `{name}` framework"));
+        }
+    }
     for (at, _) in text.match_indices("name") {
         if at > 0 && is_word(text.as_bytes()[at - 1]) {
             continue;
@@ -603,10 +630,7 @@ fn links_gui(text: &str) -> Option<String> {
             return Some(format!("links the `{name}` framework"));
         }
     }
-    GUI_NAMES
-        .iter()
-        .find(|n| text.contains(**n))
-        .map(|n| format!("names `{n}`"))
+    None
 }
 
 /// The keeper's own source.
@@ -739,17 +763,12 @@ fn restore_stays_local(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     }
 }
 
+#[cfg(test)]
+#[path = "keeper_gui_tests.rs"]
+mod keeper_gui_tests;
+
 /// The keeper's crate: the root of the process closure.
 const KEEPER_CRATE: &str = "crates/aterm-keeper";
-/// Workspace crates that are the GUI.
-const GUI_CRATES: &[&str] = &[
-    "crates/aterm-gui",
-    "crates/aterm-window",
-    "crates/aterm-objc",
-    "crates/aterm-gpu",
-    "crates/aterm-render",
-    "crates/aterm-effects",
-];
 
 /// Is `dep` (a dependency name) a GUI crate from outside the workspace?
 fn is_external_gui(dep: &str) -> bool {
@@ -758,9 +777,9 @@ fn is_external_gui(dep: &str) -> bool {
 
 pub(super) const KEEPER_GUI_DEPS: Rule = Rule {
     id: "keeper-gui-deps",
-    why: "a GUI crate anywhere in the keeper's process closure links its frameworks into the \
-          keeper (the closure is derived from the manifests as cargo resolves it, and its \
-          external packages from Cargo.lock, transitively)",
+    why: "declared GUI frameworks/APIs in the keeper's resolved dependency closure enter its process: \
+          inspect library/build sources rather than crate names, and conservatively reject \
+          opaque external GUI packages reached through Cargo.lock",
     scope: &[],
     check: keeper_gui_deps,
 };
@@ -835,17 +854,7 @@ fn keeper_gui_deps(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         };
         match hop {
             Hop::Member(dir) => {
-                if GUI_CRATES.contains(&dir.as_str()) {
-                    let detail = if chain.is_empty() {
-                        format!("`{dir}` is in the keeper's process closure")
-                    } else {
-                        format!(
-                            "`{dir}` is in the keeper's process closure, through {}",
-                            chain.join(" -> ")
-                        )
-                    };
-                    out.push(finding(at.clone(), detail));
-                }
+                out.extend(super::keeper_native::inspect(tree, &dir));
                 match external_dependency_names(tree.root, &dir) {
                     Ok(deps) => {
                         for dep in deps {
@@ -3213,6 +3222,12 @@ mod tests {
         }
         files.push(("Cargo.lock".to_string(), "version = 4\n".to_string()));
         let root = disk_tree("aterm-census-guards", "keeper-gui-crate", &files);
+        std::fs::write(
+            root.join("crates/aterm-render/src/lib.rs"),
+            "#[link(name = \"AppKit\", kind = \"framework\")]\nunsafe extern \"C\" {}\n",
+        )
+        .unwrap();
+        let corpus = super::super::Corpus::read(&root).unwrap();
         let tree = Tree {
             root: &root,
             corpus: &corpus,
@@ -3221,11 +3236,8 @@ mod tests {
         keeper_gui_deps(&tree, &mut found);
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(found.len(), 1, "{found:?}");
-        assert_eq!(found[0].path, "crates/aterm-render/Cargo.toml");
-        assert!(
-            found[0].detail.contains("in the keeper's process closure"),
-            "{found:?}"
-        );
+        assert_eq!(found[0].path, "crates/aterm-render/src/lib.rs");
+        assert!(found[0].detail.contains("AppKit"), "{found:?}");
 
         let mut files = workspace_manifests(&[
             (
@@ -3252,6 +3264,58 @@ mod tests {
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].path, "crates/aterm-uds/Cargo.toml");
         assert!(found[0].detail.contains("`winit`"), "{found:?}");
+    }
+
+    #[test]
+    fn keeper_framework_check_follows_source_instead_of_crate_names() {
+        use crate::scan_set::test_fixtures::{disk_tree, workspace_manifests};
+        for helper in ["aterm-objc", "native-helper"] {
+            for framework in ["Foundation", "AppKit"] {
+                let deps = format!(
+                    "[dependencies]\nhelper = {{ package = \"{helper}\", path = \"../{helper}\" }}\n"
+                );
+                let mut files = workspace_manifests(&[
+                    (
+                        "aterm-keeper",
+                        "[dependencies]\naterm-uds = { workspace = true }\n",
+                    ),
+                    ("aterm-uds", &deps),
+                    (helper, ""),
+                ]);
+                for name in [
+                    "aterm-gui",
+                    "aterm-types",
+                    "aterm-keeper",
+                    "aterm-uds",
+                    helper,
+                ] {
+                    files.push((format!("crates/{name}/src/lib.rs"), String::new()));
+                }
+                let source = format!(
+                    "#[link(name = \"{framework}\", kind = \"framework\")]\nunsafe extern \"C\" {{}}\n"
+                );
+                files.push(("Cargo.lock".to_owned(), "version = 4\n".to_owned()));
+                let root = disk_tree("aterm-census-guards", "keeper-framework-source", &files);
+                let path = format!("crates/{helper}/src/lib.rs");
+                std::fs::write(root.join(&path), source).unwrap();
+                let corpus = super::super::Corpus::read(&root).unwrap();
+                let tree = Tree {
+                    root: &root,
+                    corpus: &corpus,
+                };
+                let mut found = Vec::new();
+                keeper_gui_deps(&tree, &mut found);
+                let _ = std::fs::remove_dir_all(&root);
+                assert_eq!(
+                    found.len(),
+                    usize::from(framework == "AppKit"),
+                    "{helper} {framework}: {found:?}"
+                );
+                if let Some(finding) = found.first() {
+                    assert_eq!(finding.path, path);
+                }
+            }
+        }
     }
 
     /// The keeper's dependency closure through `Cargo.lock`: a transitive GUI package or a

@@ -21,6 +21,7 @@ pub(crate) const USAGE: &str = "\
   runtime --app BUNDLE --record DIR [--lane measure|cursor|cat|compare|fabric|floors] [--image REF]
       [--cpus N] [--memory-gib N] [--disk-gb N]
       [--display window|headless]
+      [--count-mode sequential|together]
                 Q4: five takes of this committed checkout's verify measure --app BUNDLE, or a
                 perf lane, inside one disposable macOS guest. Copies the resolved Trust compiler
                 and builds the verifier in the guest; no release product runs on the host.
@@ -34,6 +35,8 @@ pub(crate) const USAGE: &str = "\
                 Window is the default: one owned Tart window under the shared display lock.
                 Headless is a presentation-clock negative control; cursor runs only the GUI
                 cursor-pacing burst, to qualify that clock before the full matrix.
+                --count-mode selects B14's sequential control or concurrent count rows, retained
+                with the experiment's provenance. Timing rows always run alone.
 ";
 
 const ROOT: &str = "/opt/aterm/.ubd/runtime.noindex";
@@ -57,6 +60,7 @@ struct Ask {
     memory_mib: u32,
     disk_gb: u32,
     graphics: bool,
+    count_mode: String,
 }
 
 fn parse(args: &[String]) -> Result<Ask, Fail> {
@@ -68,6 +72,7 @@ fn parse(args: &[String]) -> Result<Ask, Fail> {
     let mut memory_mib = MEMORY_MIB;
     let mut disk_gb = DISK_GB;
     let mut graphics = true;
+    let mut count_mode = "sequential".to_owned();
     let mut at = 0;
     while at < args.len() {
         let flag = &args[at];
@@ -77,6 +82,9 @@ fn parse(args: &[String]) -> Result<Ask, Fail> {
             .ok_or_else(|| Fail::usage(format!("{flag} needs a value")))?;
         at += 1;
         match flag.as_str() {
+            "--count-mode" if matches!(value.as_str(), "sequential" | "together") => {
+                count_mode.clone_from(value);
+            }
             "--app" if app.is_none() => app = Some(PathBuf::from(value)),
             "--record" if record.is_none() => record = Some(PathBuf::from(value)),
             "--lane"
@@ -123,6 +131,7 @@ fn parse(args: &[String]) -> Result<Ask, Fail> {
         memory_mib,
         disk_gb,
         graphics,
+        count_mode,
     })
 }
 
@@ -524,7 +533,7 @@ fn run_in(ask: &Ask) -> Res {
         &json!({
             "schema": "aterm-mac-runtime-v1", "source_commit": source, "astream_commit": submodule,
             "bundle_sha256": app_sha, "image": ask.image, "lane": ask.lane,
-            "driver": "gui-launch-agent/Interactive",
+            "driver": "gui-launch-agent/Interactive", "count_mode": ask.count_mode,
             "compiler": compiler.display().to_string(), "compiler_lock_override": tool.lock_override,
             "guest": {"cpus": ask.cpus, "memory_mib": ask.memory_mib, "disk_gb": ask.disk_gb, "graphics": ask.graphics}
         }),
@@ -683,8 +692,9 @@ fn run_in(ask: &Ask) -> Res {
         .collect::<Vec<_>>()
         .join(" ");
     let untimed = format!(
-        "{} export CARGO_MANIFEST_DIR={ROOT}/source/crates/aterm-verify; {ROOT}/target.noindex/debug/aterm-verify {command}",
-        environment(admitted.jobs)
+        "{} export ATERM_MEASURE_COUNT_MODE={}; export CARGO_MANIFEST_DIR={ROOT}/source/crates/aterm-verify; {ROOT}/target.noindex/debug/aterm-verify {command}",
+        environment(admitted.jobs),
+        ask.count_mode
     );
     // Populate every lane's compiler and corpus caches before measuring. This run is retained,
     // too; a red warm-up is never erased by five later green takes.
@@ -702,8 +712,9 @@ fn run_in(ask: &Ask) -> Res {
     )?;
     let mut codes = vec![warm.status.code()];
     let invocation = format!(
-        "{} export CARGO_MANIFEST_DIR={ROOT}/source/crates/aterm-verify; /usr/bin/time -lp {ROOT}/target.noindex/debug/aterm-verify {command}",
-        environment(admitted.jobs)
+        "{} export ATERM_MEASURE_COUNT_MODE={}; export CARGO_MANIFEST_DIR={ROOT}/source/crates/aterm-verify; /usr/bin/time -lp {ROOT}/target.noindex/debug/aterm-verify {command}",
+        environment(admitted.jobs),
+        ask.count_mode
     );
     let mut rows = Vec::new();
     let mut real = Vec::new();
@@ -746,7 +757,7 @@ fn run_in(ask: &Ask) -> Res {
         &json!({"schema": "aterm-mac-runtime-v1",
         "complete": true, "all_exits_zero": exit == 0, "exit": exit, "warmup_exit": warm.status.code(), "warmup_artifacts": warm_artifacts, "source_commit": source, "astream_commit": submodule,
         "bundle_sha256": app_sha, "image": ask.image, "lane": ask.lane,
-        "driver": "gui-launch-agent/Interactive",
+        "driver": "gui-launch-agent/Interactive", "count_mode": ask.count_mode,
         "guest": {"cpus": ask.cpus, "memory_mib": ask.memory_mib, "disk_gb": ask.disk_gb, "graphics": ask.graphics},
         "granted_share": admitted.jobs,
         "command": command, "wall_s": spread(&real), "cpu_s": spread(&cpu), "rows": rows}),
@@ -861,6 +872,15 @@ mod tests {
                 .graphics
         );
         assert!(parse(&["--app", "a", "--record", "r", "--lane", "release"]).is_err());
+        for mode in ["sequential", "together"] {
+            assert_eq!(
+                parse(&["--app", "a", "--record", "r", "--count-mode", mode])
+                    .unwrap()
+                    .count_mode,
+                mode
+            );
+        }
+        assert!(parse(&["--app", "a", "--record", "r", "--count-mode", "skip"]).is_err());
         assert!(lane_args("measure").contains(&format!("{ROOT}/aterm.app")));
         // NEGATIVE CONTROL: cat's old unconditional build silently measured a different binary.
         let cat = lane_args("cat");

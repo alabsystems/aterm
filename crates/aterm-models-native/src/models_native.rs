@@ -1965,7 +1965,6 @@ pub fn native_config_observation_handoff_model() -> Model {
                 reconciliation_failed = 1;
                 queued = 0;
                 dropped_candidate = if Buggy == 1 { 1 } else { dropped_candidate };
-                queued = 0;
             }
             action RetryReconcile when (
                 phase == 0 && gate == 1 && pending > 0 &&

@@ -1536,10 +1536,10 @@ fn ai_accounts_claude_probe(env: &aterm_agent::harness::cli::Env) -> aterm_conve
     let store = env.accounts_store();
     if let Ok(raw) = accounts::Roster::load(&roster_path)
         && !raw.rows.is_empty()
-        && roster_path.parent().is_some_and(|parent| {
-            std::fs::symlink_metadata(parent.join(FLEET_ROSTER_FILE))
-                .is_ok_and(|meta| meta.is_file())
-        })
+        // `is_file` follows a symlink: a fleet file linked to a regular one is present.
+        && roster_path
+            .parent()
+            .is_some_and(|parent| parent.join(FLEET_ROSTER_FILE).is_file())
         && {
             let config_path = roster_path
                 .parent()

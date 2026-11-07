@@ -1290,8 +1290,8 @@ pub fn seed_days(dir: &Path, remembered: &[Known], credit: u32, at_ms: u64) -> i
         }
         let mut credited: Vec<NetworkId> = remembered
             .iter()
+            .filter(|known| known.network.is_strong())
             .map(|known| known.network.clone())
-            .filter(NetworkId::is_strong)
             .collect();
         credited.sort_unstable();
         credited.dedup();

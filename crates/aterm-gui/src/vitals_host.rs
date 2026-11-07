@@ -1849,20 +1849,8 @@ fn hardware_sample(s: aterm_sysprobe::cpu_hardware::Sample) -> aterm_vitals::har
 fn platform_thermal() -> Option<Thermal> {
     #[cfg(target_os = "macos")]
     {
-        use aterm_objc::{class, sel};
-        // SAFETY: `+processInfo` is an immortal singleton; both getters are
-        // plain scalar properties, documented thread-safe (as `spare.rs`'s
-        // `power_constrained` reads them).
-        unsafe {
-            let info =
-                aterm_objc::send::send_id(class(c"NSProcessInfo").as_id(), sel!(processInfo));
-            if info.is_null() {
-                return None;
-            }
-            let low = aterm_objc::send::send_bool(info, sel!(isLowPowerModeEnabled));
-            let raw = aterm_objc::send::send_isize(info, sel!(thermalState));
-            Some(thermal_of(raw, Some(low)))
-        }
+        aterm_sysprobe::process_thermal()
+            .map(|reading| thermal_of(reading.state.raw(), reading.low_power))
     }
     #[cfg(not(target_os = "macos"))]
     {

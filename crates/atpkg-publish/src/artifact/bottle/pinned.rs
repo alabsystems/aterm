@@ -46,6 +46,19 @@ pub(super) fn can_pack(recipe: &PinnedTool, triple: Triple) -> Result<()> {
             recipe.name
         ))
     })?;
+    let environment: Vec<String> = recipe
+        .shim_env
+        .iter()
+        .map(|entry| (*entry).to_owned())
+        .collect();
+    let environment = atpkg::shim_env::ShimEnv::admit(&environment).map_err(Error::refused)?;
+    for (name, value) in environment.entries() {
+        if name == "LEAN_CC" && !atpkg::toolchain::is_executable_file(Path::new(value)) {
+            return Err(Error::cannot_run(
+                "this pinned Lean runtime requires an available host C compiler",
+            ));
+        }
+    }
     let url = archive.url_at(recipe.version);
     super::archive_container(archive_file(&url)?)?;
     let (_, bottle) = super::bottle_row(recipe.name, triple)?;
@@ -104,6 +117,25 @@ fn copy_file(root: &Path, relative_path: &Path, destination: &Path) -> Result<()
     crate::identity::copy_regular_file(&source, destination)
         .map_err(|error| Error::io(format!("copy {}", source.display()), &error))?;
     Ok(())
+}
+
+pub(super) fn invocation_environment(
+    bottle: &crate::programs::BottleDef,
+    version: &str,
+) -> Vec<String> {
+    let crate::programs::BottleOrigin::Pinned(recipe) = bottle.origin else {
+        return Vec::new();
+    };
+    // Generic install-tree packing can carry another independently prepared
+    // version. Only a registered recipe supplies additional invocation state;
+    // the pack-upstream route admits its exact version before preparing anything.
+    recipe.versioned(version).map_or_else(Vec::new, |recipe| {
+        recipe
+            .shim_env
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect()
+    })
 }
 
 fn installed_executable(recipe: &PinnedTool) -> Result<PathBuf> {
@@ -335,11 +367,30 @@ fn qualify(result: &BottleOutcome, recipe: &PinnedTool) -> Result<()> {
     let before = atpkg::tree::tree_root(&stage)
         .map_err(|error| Error::io("hash qualified runtime", &error))?;
     let program = stage.join(installed_executable(recipe)?);
+    let expected: Vec<String> = recipe
+        .shim_env
+        .iter()
+        .map(|entry| (*entry).to_owned())
+        .collect();
+    if manifest.shim_env != expected {
+        return Err(Error::refused(
+            "qualified invocation environment differs from its recipe",
+        ));
+    }
+    let environment =
+        atpkg::shim_env::ShimEnv::admit(&manifest.shim_env).map_err(Error::refused)?;
+    let entries: Vec<_> = environment
+        .entries()
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    let invoke =
+        |program: &Path, args: &[&str], cwd: &Path| run_with_env(program, args, cwd, &entries);
     match recipe.name {
         "gitleaks" => qualify_tree(&program, &result.version, work.path(), &run),
         "cpython" => qualify_python(&program, &result.version, &stage, work.path(), &run),
         "openssl-signing" => openssl::qualify(&program, &result.version, work.path(), &run),
-        "lean4" => lean::qualify(&program, &result.version, work.path(), &run),
+        "lean4" => lean::qualify(&program, &result.version, work.path(), &invoke),
         "node" => {
             node::qualify(&program, &result.version, work.path(), &run)?;
             let (_, bottle) = super::bottle_row(recipe.name, result.triple)?;
@@ -707,6 +758,7 @@ mod tests {
                     strip: 0,
                     max_extract_bytes: super::super::MAX_BOTTLE_EXTRACT_BYTES,
                     licenses: &["LICENSE"],
+                    shim_env: &[],
                     darwin_omit: &[],
                     hosts: &["macos-aarch64"],
                     archives,

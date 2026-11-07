@@ -32,7 +32,7 @@ fn quoted(text: &str) -> Option<&str> {
 /// Every name a compiler error line says is missing, once each.
 #[must_use]
 pub fn missing_names(line: &str) -> BTreeSet<&str> {
-    const KINDS: [&str; 7] = [
+    const KINDS: [&str; 8] = [
         "value ",
         "type ",
         "function ",
@@ -40,6 +40,7 @@ pub fn missing_names(line: &str) -> BTreeSet<&str> {
         "macro ",
         "trait ",
         "constant ",
+        "variant ",
     ];
     let mut out = BTreeSet::new();
     for (at, _) in line.match_indices("cannot find ") {
@@ -203,7 +204,7 @@ mod tests {
             ),
             (
                 "error[E0425]: cannot find function, tuple struct or tuple variant `f` in crate `libc`",
-                &[],
+                &["f"],
             ),
             (
                 "error[E0433]: cannot find struct, variant or union type `kevent` in crate `libc`",

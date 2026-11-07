@@ -405,16 +405,15 @@ fn strip_asset_preamble(body: &str) -> String {
     if !legend {
         return body.to_string();
     }
-    let normalized = if body.contains("\r\n") {
-        std::borrow::Cow::Owned(body.replace("\r\n", "\n"))
-    } else {
-        std::borrow::Cow::Borrowed(body)
-    };
-    let mut rem: &str = &normalized;
+    let mut rem = body;
     for _ in 0..40 {
         let (line, rest) = rem.split_once('\n').unwrap_or((rem, ""));
-        if rule(line) {
-            return rest.trim_matches('\n').to_string();
+        if rule(line.trim_end_matches('\r')) {
+            return if rest.contains("\r\n") {
+                rest.replace("\r\n", "\n").trim_matches('\n').to_string()
+            } else {
+                rest.trim_matches('\n').to_string()
+            };
         }
         if rest.is_empty() {
             break;

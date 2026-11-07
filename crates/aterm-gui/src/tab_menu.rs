@@ -123,7 +123,7 @@ pub(crate) fn ellipsize(s: &str, max: usize) -> String {
 
 /// The text one entry contributes to the width measurement (a separator
 /// contributes nothing — it is drawn as a rule across whatever width wins).
-fn entry_text(entry: &TabMenuEntry) -> &str {
+pub(crate) fn entry_text(entry: &TabMenuEntry) -> &str {
     match entry {
         TabMenuEntry::Header(t) => t.as_str(),
         TabMenuEntry::Event { words, .. } | TabMenuEntry::RewindTo { words, .. } => words,
@@ -193,6 +193,20 @@ pub(crate) fn place(
         w: want_w,
         h,
     })
+}
+
+/// The rows a client reads of a menu laid out at `rect`: each one visible but the rules, with its
+/// index in `entries`.
+#[cfg(a11y_tree)]
+pub(crate) fn reader_rows(
+    entries: &[TabMenuEntry],
+    rect: MenuRect,
+) -> impl Iterator<Item = (usize, &TabMenuEntry)> {
+    entries
+        .iter()
+        .enumerate()
+        .take(visible_entries(rect))
+        .filter(|(_, entry)| !matches!(entry, TabMenuEntry::Separator))
 }
 
 /// Number of entry rows visible inside `rect` (height minus two border rows).

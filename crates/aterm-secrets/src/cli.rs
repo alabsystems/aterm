@@ -560,7 +560,23 @@ fn keep_network_place() {
 pub(crate) struct ServeRole {
     scoped: bool,
     last: Option<(crate::client::AlabRoleContext, String)>,
+    /// Polls in a row whose denial check failed ([`ROLE_UNJUDGED_POLLS`]).
+    unjudged: u32,
 }
+
+/// How many role decisions in a row a held role outlasts a denial check that fails. It counts
+/// decisions, not time: the advertiser decides at its 30 s tick and again whenever it is woken (a
+/// stored version, a network change), so ten take at most five minutes on a quiet server and can
+/// take far less on a busy one. A count keeps the bound deterministic, and a server woken more
+/// often only withdraws authority sooner. A fault of a moment costs a Mac still in nothing, and one
+/// that lasts cannot keep a denied Mac serving for as long as it lasts. A poll that judges this Mac
+/// before the bound starts the count again; once the bound has ended the role, only a poll that
+/// grants it ([`crate::client::AlabRoleObservation::Allowed`]) gives it back, never one that only
+/// keeps a held role. Applied records that are absent do not count: the cached envelope still
+/// judges this Mac, and a warm role outlasts that
+/// (`docs/measured/vault-cold-server-role-2026-11-04.md`); records there and unreadable do.
+#[cfg(unix)]
+pub(crate) const ROLE_UNJUDGED_POLLS: u32 = 10;
 
 #[cfg(all(test, unix))]
 mod role_tests;
@@ -601,6 +617,22 @@ impl ServeRole {
     )]
     #[cfg_attr(
         any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "VaultRoleRetention",
+            action = "FailDenialCheck",
+            reason = "The observer reports a denial check that failed after its one retry"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "VaultRoleRetention",
+            action = "Outlast",
+            reason = "The polls of a server under one fault pass in its environment"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
         aterm_spec_anchor::refines(
             machine = "VaultRoleRetention",
             action = "Observe",
@@ -615,7 +647,12 @@ impl ServeRole {
         alab_key: Option<[u8; 32]>,
     ) -> (Option<String>, Option<String>) {
         use crate::client::AlabRoleObservation::{
-            Allowed, Denied, Missing, NotApplicable, Unavailable,
+            Allowed, Denied, Missing, NotApplicable, Unavailable, Unjudged,
+        };
+        self.unjudged = if matches!(observation, Unjudged(_)) {
+            self.unjudged.saturating_add(1)
+        } else {
+            0
         };
         let held = || {
             (
@@ -644,6 +681,15 @@ impl ServeRole {
                     .last
                     .take()
                     .filter(|(prior, _)| Some(prior) == context.as_ref());
+                self.last.as_ref().map(|(_, label)| label.clone())
+            }
+            Unjudged(context) => {
+                self.scoped = true;
+                let within = self.unjudged <= ROLE_UNJUDGED_POLLS;
+                self.last = self
+                    .last
+                    .take()
+                    .filter(|(prior, _)| within && *prior == context);
                 self.last.as_ref().map(|(_, label)| label.clone())
             }
             Allowed { context, own_label } => {
@@ -700,6 +746,7 @@ impl ServeRole {
             crate::client::AlabRoleObservation::Allowed { .. }
                 | crate::client::AlabRoleObservation::Denied
                 | crate::client::AlabRoleObservation::Unavailable(_)
+                | crate::client::AlabRoleObservation::Unjudged(_)
         );
         let here = match (holds, follows) {
             (true, true) => AlabHere::Server,
@@ -2217,7 +2264,20 @@ mod unix {
     }
 
     fn repair(paths: &Paths, json: bool) -> crate::Result<ExitCode> {
-        let (rows, complete) = repair_with(&mut |job| client::mend_held(paths, job));
+        let (frontier_outcome, frontier_detail) = match client::repair_legacy_frontier(paths) {
+            Ok(true) => ("repaired", "re-acknowledged the verified local membership log; previous state retained beside state.toml".to_owned()),
+            Ok(false) => ("unchanged", "the applied membership frontier matches the verified local log".to_owned()),
+            Err(error) => ("failed", error.to_string()),
+        };
+        let mut rows = vec![aterm_json::json!({
+            "service":"membership-frontier",
+            "outcome":frontier_outcome,
+            "detail":frontier_detail,
+        })];
+        let (service_rows, service_complete) =
+            repair_with(&mut |job| client::mend_held(paths, job));
+        rows.extend(service_rows);
+        let complete = frontier_outcome != "failed" && service_complete;
         if json {
             println!(
                 "{}",

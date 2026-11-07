@@ -154,53 +154,56 @@ fn rules<'v>(
     value: &'v Value,
     at: &str,
     allowed: &[&str],
-) -> Result<Vec<(String, &'v Map)>, String> {
+) -> Result<Vec<(usize, &'v Map)>, String> {
     let items = value
         .as_array()
         .ok_or_else(|| format!("{at} is not a list"))?;
     let mut out = Vec::with_capacity(items.len());
     for (i, item) in items.iter().enumerate() {
-        let here = format!("{at}[{i}]");
         let Value::Object(rule) = item else {
-            return Err(format!("{here} is not an object"));
+            return Err(format!("{at}[{i}] is not an object"));
         };
         if let Some(key) = rule.keys().find(|k| !allowed.contains(&k.as_str())) {
             return Err(format!(
-                "{here}.{key} is not a key ship site deploys here (it reads {})",
+                "{at}[{i}].{key} is not a key ship site deploys here (it reads {})",
                 allowed.join(", ")
             ));
         }
-        out.push((here, rule));
+        out.push((i, rule));
     }
     Ok(out)
 }
 
 /// A rule's pattern as the API names it: `source` or `glob` is `{"glob": …}`, `regex` is
 /// `{"regex": …}` (firebase-tools' `extractPattern`); exactly one, never empty.
-fn pattern(rule: &Map, at: &str) -> Result<Map, String> {
-    let mut found: Vec<(&str, &str)> = Vec::new();
+fn pattern(rule: &Map, at: &str, i: usize) -> Result<Map, String> {
+    let mut count = 0usize;
+    let mut found: Option<(&str, &str)> = None;
     for (key, kind) in [("source", "glob"), ("glob", "glob"), ("regex", "regex")] {
         match rule.get(key) {
             None => {}
-            Some(Value::String(p)) if !p.is_empty() => found.push((kind, p)),
-            Some(_) => return Err(format!("{at}.{key} is not a pattern")),
+            Some(Value::String(p)) if !p.is_empty() => {
+                count += 1;
+                found = Some((kind, p));
+            }
+            Some(_) => return Err(format!("{at}[{i}].{key} is not a pattern")),
         }
     }
-    match found.as_slice() {
-        [(kind, p)] => {
+    match (count, found) {
+        (1, Some((kind, p))) => {
             let mut out = Map::new();
-            out.insert((*kind).into(), Value::String((*p).into()));
+            out.insert(kind.into(), Value::String(p.into()));
             Ok(out)
         }
-        [] => Err(format!("{at} has no pattern (source, glob or regex)")),
+        (0, _) => Err(format!("{at}[{i}] has no pattern (source, glob or regex)")),
         _ => Err(format!(
-            "{at} names more than one pattern (source, glob, regex)"
+            "{at}[{i}] names more than one pattern (source, glob, regex)"
         )),
     }
 }
 
 /// A rule's string field `key`, which must be there.
-fn field<'r>(rule: &'r Map, key: &str, at: &str) -> Result<&'r str, String> {
+fn field<'r>(rule: &'r Map, key: &str, at: std::fmt::Arguments<'_>) -> Result<&'r str, String> {
     rule.get(key)
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
@@ -210,37 +213,32 @@ fn field<'r>(rule: &'r Map, key: &str, at: &str) -> Result<&'r str, String> {
 /// `headers`: `[{pattern, headers: [{key, value}]}]` becomes `[{pattern, headers: {key: value}}]`,
 /// in order, since a later rule's header overrides an earlier one's.
 fn headers(value: &Value) -> Result<Value, String> {
+    const AT: &str = "hosting.headers";
     let mut out = Vec::new();
-    for (at, rule) in rules(
-        value,
-        "hosting.headers",
-        &["source", "glob", "regex", "headers"],
-    )? {
-        let mut entry = pattern(rule, &at)?;
+    for (i, rule) in rules(value, AT, &["source", "glob", "regex", "headers"])? {
+        let mut entry = pattern(rule, AT, i)?;
         let pairs = rule
             .get("headers")
             .and_then(Value::as_array)
             .filter(|pairs| !pairs.is_empty())
-            .ok_or_else(|| format!("{at}.headers is missing or empty"))?;
+            .ok_or_else(|| format!("{AT}[{i}].headers is missing or empty"))?;
         let mut set = Map::new();
         for (j, pair) in pairs.iter().enumerate() {
-            let here = format!("{at}.headers[{j}]");
             let Value::Object(pair) = pair else {
-                return Err(format!("{here} is not an object"));
+                return Err(format!("{AT}[{i}].headers[{j}] is not an object"));
             };
             if let Some(key) = pair.keys().find(|k| *k != "key" && *k != "value") {
-                return Err(format!("{here}.{key} is not key or value"));
+                return Err(format!("{AT}[{i}].headers[{j}].{key} is not key or value"));
             }
-            let name = field(pair, "key", &here)?;
-            let text = pair
-                .get("value")
-                .and_then(Value::as_str)
-                .ok_or_else(|| format!("{here}.value is missing or not a string"))?;
+            let name = field(pair, "key", format_args!("{AT}[{i}].headers[{j}]"))?;
+            let text = pair.get("value").and_then(Value::as_str).ok_or_else(|| {
+                format!("{AT}[{i}].headers[{j}].value is missing or not a string")
+            })?;
             if set
                 .keys()
                 .any(|existing| existing.eq_ignore_ascii_case(name))
             {
-                return Err(format!("{at} sets the header {name} twice"));
+                return Err(format!("{AT}[{i}] sets the header {name} twice"));
             }
             set.insert(name.to_string(), Value::String(text.into()));
         }
@@ -252,17 +250,18 @@ fn headers(value: &Value) -> Result<Value, String> {
 
 /// `redirects`: `[{pattern, destination, type?}]` becomes `[{pattern, location, statusCode}]`.
 fn redirects(value: &Value) -> Result<Value, String> {
+    const AT: &str = "hosting.redirects";
     let allowed = ["source", "glob", "regex", "destination", "type"];
     let mut out = Vec::new();
-    for (at, rule) in rules(value, "hosting.redirects", &allowed)? {
-        let mut entry = pattern(rule, &at)?;
-        let location = field(rule, "destination", &at)?;
+    for (i, rule) in rules(value, AT, &allowed)? {
+        let mut entry = pattern(rule, AT, i)?;
+        let location = field(rule, "destination", format_args!("{AT}[{i}]"))?;
         let status = match rule.get("type") {
             None => 301,
             Some(t) => t
                 .as_i64()
                 .filter(|s| REDIRECT_STATUSES.contains(s))
-                .ok_or_else(|| format!("{at}.type is not one of {REDIRECT_STATUSES:?}"))?,
+                .ok_or_else(|| format!("{AT}[{i}].type is not one of {REDIRECT_STATUSES:?}"))?,
         };
         entry.insert("location".into(), Value::String(location.into()));
         entry.insert("statusCode".into(), Value::from(status));
@@ -274,25 +273,22 @@ fn redirects(value: &Value) -> Result<Value, String> {
 /// `rewrites`: `[{pattern, destination}]` becomes `[{pattern, path}]`. A rewrite to a function,
 /// a Cloud Run service or Dynamic Links needs a deploy of its own, so it is refused by name.
 fn rewrites(value: &Value) -> Result<Value, String> {
+    const AT: &str = "hosting.rewrites";
     let items = value.as_array().ok_or("hosting.rewrites is not a list")?;
     for (i, item) in items.iter().enumerate() {
         for target in ["function", "run", "dynamicLinks", "tag"] {
             if item.get(target).is_some() {
                 return Err(format!(
-                    "hosting.rewrites[{i}] rewrites to {target}: ship site deploys static \
+                    "{AT}[{i}] rewrites to {target}: ship site deploys static \
                      files and path rewrites only"
                 ));
             }
         }
     }
     let mut out = Vec::new();
-    for (at, rule) in rules(
-        value,
-        "hosting.rewrites",
-        &["source", "glob", "regex", "destination"],
-    )? {
-        let mut entry = pattern(rule, &at)?;
-        let path = field(rule, "destination", &at)?;
+    for (i, rule) in rules(value, AT, &["source", "glob", "regex", "destination"])? {
+        let mut entry = pattern(rule, AT, i)?;
+        let path = field(rule, "destination", format_args!("{AT}[{i}]"))?;
         entry.insert("path".into(), Value::String(path.into()));
         out.push(Value::Object(entry));
     }

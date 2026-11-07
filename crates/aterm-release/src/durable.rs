@@ -96,6 +96,91 @@ pub(crate) fn read_file_with_meta(path: &Path) -> std::io::Result<(Vec<u8>, std:
     read_regular_bytes_with_meta(path, MAX_RELEASE_FILE_BYTES)
 }
 
+/// Streams a regular file at `path` up to [`MAX_RELEASE_FILE_BYTES`] through SHA-256 without heap-buffering its contents, refusing symlinks and FIFOs.
+pub(crate) fn sha256_file_with_meta(path: &Path) -> std::io::Result<(String, std::fs::Metadata)> {
+    let (mut file, meta) = open_regular_file_with_meta(path)?;
+    if meta.len() > MAX_RELEASE_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            "file exceeds bound",
+        ));
+    }
+    Ok((sha256_stream(&mut file)?, meta))
+}
+
+/// One `read` of `reader` into `buf`, retried while it is interrupted (`EINTR`), as
+/// `read_to_end` retries it.
+fn read_uninterrupted(reader: &mut impl std::io::Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    loop {
+        match reader.read(buf) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            read => return read,
+        }
+    }
+}
+
+/// The lowercase hex SHA-256 of what `reader` yields, refusing more than [`MAX_RELEASE_FILE_BYTES`].
+fn sha256_stream(reader: &mut impl std::io::Read) -> std::io::Result<String> {
+    let mut hasher = aterm_digest::Sha256::new();
+    let mut buf = [0u8; 8192];
+    let mut total = 0u64;
+    loop {
+        let n = read_uninterrupted(reader, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        total = total.saturating_add(n as u64);
+        if total > MAX_RELEASE_FILE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                "file exceeds bound",
+            ));
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(aterm_codec::hex::encode_lower(&hasher.finalize()))
+}
+
+/// Compares a regular file at `path` against `expected` using a stack buffer without heap-allocating the file's contents, refusing symlinks and FIFOs.
+pub(crate) fn regular_file_equals(path: &Path, expected: &[u8]) -> std::io::Result<bool> {
+    if u64::try_from(expected.len()).unwrap_or(u64::MAX) > MAX_RELEASE_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            "file exceeds bound",
+        ));
+    }
+    let (mut file, meta) = open_regular_file_with_meta(path)?;
+    if meta.len() > MAX_RELEASE_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            "file exceeds bound",
+        ));
+    }
+    if meta.len() != expected.len() as u64 {
+        return Ok(false);
+    }
+    stream_equals(&mut file, expected)
+}
+
+/// Whether `reader` yields exactly `expected`, compared through a stack buffer.
+fn stream_equals(reader: &mut impl std::io::Read, expected: &[u8]) -> std::io::Result<bool> {
+    let mut buf = [0u8; 8192];
+    let mut offset = 0usize;
+    loop {
+        let n = read_uninterrupted(reader, &mut buf)?;
+        if n == 0 {
+            return Ok(offset == expected.len());
+        }
+        let Some(end) = offset.checked_add(n) else {
+            return Ok(false);
+        };
+        if end > expected.len() || buf[..n] != expected[offset..end] {
+            return Ok(false);
+        }
+        offset = end;
+    }
+}
+
 /// Reads a regular file at `path` up to [`MAX_RELEASE_FILE_BYTES`], refusing symlinks and FIFOs.
 pub(crate) fn read_file(path: &Path) -> std::io::Result<Vec<u8>> {
     read_regular_bytes(path, MAX_RELEASE_FILE_BYTES)
@@ -232,5 +317,44 @@ mod tests {
         std::io::Write::write_all(&mut open_append(&log, false).expect("append"), b"b\n")
             .expect("write b");
         assert_eq!(read_text(&log).expect("read log"), "a\nb\n");
+    }
+
+    /// A reader whose every other `read` is interrupted (`EINTR`), as a signal without
+    /// `SA_RESTART` interrupts one on NFS or FUSE.
+    struct Interrupting<'a> {
+        /// What is left to yield.
+        rest: &'a [u8],
+        /// Whether the next `read` is interrupted.
+        interrupt: bool,
+    }
+
+    impl std::io::Read for Interrupting<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.interrupt = !self.interrupt;
+            if self.interrupt {
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            let n = buf.len().min(self.rest.len()).min(3);
+            buf[..n].copy_from_slice(&self.rest[..n]);
+            self.rest = &self.rest[n..];
+            Ok(n)
+        }
+    }
+
+    /// An interrupted read is retried, as `read_to_end` retries it, so the streamed hash and
+    /// comparison finish as the buffered ones do.
+    #[test]
+    fn streams_retry_an_interrupted_read() {
+        let bytes = b"hello release";
+        let reader = || Interrupting {
+            rest: bytes,
+            interrupt: false,
+        };
+        assert_eq!(
+            sha256_stream(&mut reader()).expect("hash"),
+            aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(bytes))
+        );
+        assert!(stream_equals(&mut reader(), bytes).expect("compare"));
+        assert!(!stream_equals(&mut reader(), b"hello relaxed").expect("compare"));
     }
 }

@@ -1173,9 +1173,7 @@ fn translated() -> bool {
 /// caches.
 #[must_use]
 pub fn this_machine(repo: &Path) -> Option<Machine> {
-    let home = std::env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .map(PathBuf::from)?;
+    let home = aterm_uds::host::tool_home()?;
     let tooling = aterm_uds::host::tooling_dir()?;
     Some(Machine {
         platform: platform_of(std::env::consts::OS, std::env::consts::ARCH, translated()),

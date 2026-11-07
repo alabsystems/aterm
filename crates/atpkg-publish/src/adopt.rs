@@ -59,9 +59,6 @@ pub const DEFAULT_BASE: &str = "origin/main";
 /// The override adopt refuses: it would take the lock's place in every build of the key.
 const STAGE2_ENV: &str = "TRUST_STAGE2_BIN";
 
-/// The most of a `LINEAGE` this reads.
-const LINEAGE_MAX: u64 = 64 << 10;
-
 /// What one adoption is given: everything it reads from the machine, explicit.
 #[derive(Clone)]
 pub struct Inputs {
@@ -304,13 +301,6 @@ fn is_release_number(text: &str) -> bool {
             .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())),
         _ => false,
     }
-}
-
-fn is_lower_hex(text: &str, width: usize) -> bool {
-    text.len() == width
-        && text
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// ADOPT `inputs.build`: write its sealed `trust.lock` on `adopt/trust-<build>` in the dedicated
@@ -629,72 +619,14 @@ fn facts(prefix: &Path, build: u64) -> Result<(Facts, atpkg::lease::Lease)> {
 /// What a build's `LINEAGE` says that the lock records.
 pub(crate) struct Lineage {
     pub(crate) compiler_commit: String,
-    /// `<lineage_receipt> sha256:<lineage_receipt_sha256>`.
     pub(crate) receipt: String,
 }
-
 impl Lineage {
-    /// The `LINEAGE` of the build at `dir`: `schema`, `compiler_commit`, `lineage_receipt` and
-    /// `lineage_receipt_sha256`, one `key=value` per line, `#` comments.
-    pub(crate) fn read(dir: &Path) -> Result<Lineage> {
-        use std::io::Read as _;
-        let path = dir.join(atpkg::lineage::LINEAGE_FILE);
-        let unreadable = |why: String| {
-            Error::refused(format!(
-                "{}: {why}: nothing names this build's compiler and lineage receipt",
-                path.display()
-            ))
-        };
-        let file = std::fs::File::open(&path).map_err(|e| unreadable(e.to_string()))?;
-        if !file.metadata().is_ok_and(|m| m.is_file()) {
-            return Err(unreadable("not a regular file".to_string()));
-        }
-        let mut text = String::new();
-        file.take(LINEAGE_MAX)
-            .read_to_string(&mut text)
-            .map_err(|e| unreadable(e.to_string()))?;
-        let mut fields = std::collections::BTreeMap::new();
-        for line in text.lines().map(str::trim) {
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let Some((key, value)) = line.split_once('=') else {
-                return Err(unreadable(format!("`{line}` is not key=value")));
-            };
-            let key = key.trim();
-            if fields.insert(key, value.trim()).is_some() {
-                return Err(unreadable(format!("`{key}` is given twice")));
-            }
-        }
-        let field = |key: &str| fields.get(key).copied().unwrap_or("");
-        if field("schema") != atpkg::lineage::LINEAGE_SCHEMA {
-            return Err(unreadable(format!(
-                "schema `{}` is not {}",
-                field("schema"),
-                atpkg::lineage::LINEAGE_SCHEMA
-            )));
-        }
-        let compiler_commit = field("compiler_commit");
-        if !is_lower_hex(compiler_commit, 40) {
-            return Err(unreadable(format!(
-                "compiler_commit `{compiler_commit}` is not 40 lowercase hex digits"
-            )));
-        }
-        let receipt = field("lineage_receipt");
-        if receipt.is_empty() || receipt.contains(char::is_whitespace) {
-            return Err(unreadable(format!(
-                "lineage_receipt `{receipt}` names no receipt"
-            )));
-        }
-        let digest = field("lineage_receipt_sha256");
-        if !is_lower_hex(digest, 64) {
-            return Err(unreadable(format!(
-                "lineage_receipt_sha256 `{digest}` is not 64 lowercase hex digits"
-            )));
-        }
-        Ok(Lineage {
-            compiler_commit: compiler_commit.to_string(),
-            receipt: format!("{receipt} sha256:{digest}"),
+    pub(crate) fn read(dir: &Path) -> Result<Self> {
+        let summary = atpkg::lineage::LineageSummary::read(dir).map_err(Error::refused)?;
+        Ok(Self {
+            compiler_commit: summary.compiler_commit,
+            receipt: summary.receipt,
         })
     }
 }

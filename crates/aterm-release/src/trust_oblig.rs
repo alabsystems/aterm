@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use aterm_digest::Sha256;
 use serde::Deserialize;
 
-use crate::trust_facts::{hex, one_line};
+use crate::trust_facts::{hex, one_line, one_line_owned};
 
 /// The record's first line.
 pub const RECORD_MAGIC: &str = "# aterm trust obligations 2";
@@ -120,7 +120,7 @@ impl Obligation {
         hasher.update(b"\0");
         hasher.update(self.anchor.as_bytes());
         hasher.update(b"\0");
-        hasher.update(norm_desc(&self.desc).as_bytes());
+        visit_norm_desc(&self.desc, |chunk| hasher.update(chunk.as_bytes()));
         hex(&hasher.finalize()[..8])
     }
 
@@ -128,7 +128,7 @@ impl Obligation {
     /// backquotes.
     #[must_use]
     pub fn said(&self) -> String {
-        one_line(&format!(
+        one_line_owned(format!(
             "{} {} {}:{} `{}`",
             self.function, self.kind, self.file, self.span.l0, self.anchor
         ))
@@ -720,13 +720,13 @@ fn sysroot_tail(raw: &str) -> Option<&str> {
 }
 
 /// The characters `a..b` of `s`.
-fn chars(s: &str, a: u32, b: u32) -> Option<String> {
+fn chars(s: &str, a: u32, b: u32) -> Option<std::borrow::Cow<'_, str>> {
     let (a, b) = (a as usize, b as usize);
     if a > b {
         return None;
     }
     if s.is_ascii() {
-        return s.get(a..b).map(str::to_owned);
+        return s.get(a..b).map(std::borrow::Cow::Borrowed);
     }
     let mut it = s.chars();
     for _ in 0..a {
@@ -737,7 +737,7 @@ fn chars(s: &str, a: u32, b: u32) -> Option<String> {
     for _ in 0..need {
         out.push(it.next()?);
     }
-    Some(out)
+    Some(std::borrow::Cow::Owned(out))
 }
 
 /// Whitespace collapsed to single spaces.
@@ -752,23 +752,26 @@ fn collapse(s: &str) -> String {
     out
 }
 
-/// A description as [`Obligation::key`] compares it: whitespace collapsed, a MIR local
-/// (`` `_7` ``) as `` `_` ``, an interned hash (`@` and 8 or more hex) as `@#`.
-#[must_use]
-pub fn norm_desc(d: &str) -> String {
-    let mut out = String::with_capacity(d.len());
+fn visit_norm_desc<'a>(d: &'a str, mut emit: impl FnMut(&'a str)) {
+    let mut first = true;
     for word in d.split_whitespace() {
-        if !out.is_empty() {
-            out.push(' ');
+        if !first {
+            emit(" ");
         }
+        first = false;
         let b = word.as_bytes();
         let mut i = 0;
+        let mut start = 0;
         while i < b.len() {
             if b[i] == b'`' && b.get(i + 1) == Some(&b'_') {
                 let digits = b[i + 2..].iter().take_while(|c| c.is_ascii_digit()).count();
                 if digits > 0 && b.get(i + 2 + digits) == Some(&b'`') {
-                    out.push_str("`_`");
+                    if start < i {
+                        emit(&word[start..i]);
+                    }
+                    emit("`_`");
                     i += 3 + digits;
+                    start = i;
                     continue;
                 }
             }
@@ -778,16 +781,30 @@ pub fn norm_desc(d: &str) -> String {
                     .take_while(|c| c.is_ascii_hexdigit())
                     .count();
                 if run >= 8 {
-                    out.push_str("@#");
+                    if start < i {
+                        emit(&word[start..i]);
+                    }
+                    emit("@#");
                     i += 1 + run;
+                    start = i;
                     continue;
                 }
             }
-            let ch = word[i..].chars().next().unwrap_or(' ');
-            out.push(ch);
-            i += ch.len_utf8();
+            i += 1;
+        }
+        if start < word.len() {
+            emit(&word[start..]);
         }
     }
+}
+
+/// A description as [`Obligation::key`] compares it: whitespace collapsed, a MIR local
+/// (`` `_7` ``) as `` `_` ``, an interned hash (`@` and 8 or more hex) as `@#`.
+#[cfg(test)]
+#[must_use]
+pub fn norm_desc(d: &str) -> String {
+    let mut out = String::with_capacity(d.len());
+    visit_norm_desc(d, |chunk| out.push_str(chunk));
     out
 }
 
@@ -802,25 +819,29 @@ pub fn anchor_of(lines: &[String], s: Span) -> std::result::Result<String, Strin
             .map(String::as_str)
             .ok_or_else(|| format!("line {i} is past the file's {} lines", lines.len()))
     };
-    let out = |l: &str, a: u32, b: u32| {
+    fn slice_out(
+        l: &str,
+        a: u32,
+        b: u32,
+    ) -> std::result::Result<std::borrow::Cow<'_, str>, String> {
         chars(l, a, b).ok_or_else(|| {
             format!(
                 "columns {a}-{b} are past a line of {} characters",
                 l.chars().count()
             )
         })
-    };
-    let text = if s.l0 == s.l1 {
-        out(line(s.l0)?, s.c0, s.c1)?
+    }
+    let text: std::borrow::Cow<'_, str> = if s.l0 == s.l1 {
+        slice_out(line(s.l0)?, s.c0, s.c1)?
     } else {
         let first = line(s.l0)?;
         let last = line(s.l1)?;
         let len = first.chars().count() as u32;
-        format!(
+        std::borrow::Cow::Owned(format!(
             "{} … {}",
-            out(first, s.c0, len)?.trim(),
-            out(last, 0, s.c1)?.trim()
-        )
+            slice_out(first, s.c0, len)?.trim(),
+            slice_out(last, 0, s.c1)?.trim()
+        ))
     };
     let text = collapse(&text);
     if text.is_empty() {

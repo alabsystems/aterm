@@ -9350,6 +9350,8 @@ struct ProbeHost {
     tail: Mutex<Option<String>>,
     tail_asks: std::sync::atomic::AtomicUsize,
     asks_at_claims: Mutex<Vec<usize>>,
+    /// What the loop told about its own panel (`IdleHost::own_panel`), in order, apart from `said`
+    panel_told: Mutex<Vec<bool>>,
 }
 
 impl ProbeHost {
@@ -9373,6 +9375,10 @@ impl ProbeHost {
             .filter(|s| s.starts_with(prefix))
             .cloned()
             .collect()
+    }
+
+    fn panel_told(&self) -> Vec<bool> {
+        self.panel_told.lock().unwrap().clone()
     }
 }
 
@@ -9469,6 +9475,9 @@ impl IdleHost for ProbeHost {
             Err(miss) => format!("probed:{}", miss.word()),
         };
         self.said.lock().unwrap().push(word);
+    }
+    fn own_panel(&self, open: bool) {
+        self.panel_told.lock().unwrap().push(open);
     }
 }
 

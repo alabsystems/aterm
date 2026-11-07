@@ -881,6 +881,54 @@ pub(crate) fn member_dependency_aliases(
     Ok(aliases)
 }
 
+/// Library and active build-script roots of a normal process dependency.
+///
+/// # Errors
+/// The manifest is unreadable, an explicit source path is malformed, or it escapes the tree.
+pub(crate) fn dependency_source_roots(root: &Path, dir: &str) -> Result<Vec<String>, String> {
+    let rel = format!("{dir}/Cargo.toml");
+    let text = crate::tree::read_to_string(&root.join(&rel))
+        .map_err(|e| format!("cannot read {rel}: {e}"))?;
+    let doc = parse_doc(&text, &rel)?;
+    let mut library = "src/lib.rs".to_string();
+    let mut build = None;
+    let mut disabled = false;
+    for (header, entries) in doc.sections {
+        for (key, value) in entries {
+            if header == "lib" && key == "path" {
+                let Value::Str(path) = value else {
+                    return Err(format!("{rel}: lib.path must be a string"));
+                };
+                library = path;
+            } else if header == "package" && key == "build" {
+                match value {
+                    Value::Bool(false) => disabled = true,
+                    Value::Bool(true) => {}
+                    Value::Str(path) => build = Some(path),
+                    _ => return Err(format!("{rel}: build must be a string or boolean")),
+                }
+            }
+        }
+    }
+    let source = |path: &str| {
+        if Path::new(path).is_absolute() {
+            return Err(format!(
+                "{rel}: source path `{path}` is not repository-relative"
+            ));
+        }
+        normalize_rel(dir, path)
+    };
+    let mut roots = vec![source(&library)?];
+    if !disabled {
+        if let Some(path) = build {
+            roots.push(source(&path)?);
+        } else if crate::tree::is_file(&root.join(dir).join("build.rs")) {
+            roots.push(source("build.rs")?);
+        }
+    }
+    Ok(roots)
+}
+
 /// One manifest's Cargo targets as its text declares them.
 pub(crate) struct ManifestTargets {
     /// It has a `[package]`: a virtual manifest declares no target.
@@ -1878,8 +1926,12 @@ pub(crate) mod test_fixtures {
 
     /// Writes `files` into a temporary directory on disk.
     pub(crate) fn disk_tree(prefix: &str, name: &str, files: &[(String, String)]) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("{prefix}-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = aterm_tempfile::Builder::new()
+            .prefix(&format!("{prefix}-{name}-"))
+            .suffix(".noindex")
+            .tempdir()
+            .expect("fixture directory")
+            .keep();
         for (rel, contents) in files {
             let path = root.join(rel);
             std::fs::create_dir_all(path.parent().expect("rel has a parent")).expect("mkdir");

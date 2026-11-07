@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Sequential acceptance measurement runner.
+//! Acceptance measurement runner with an explicit concurrent count-row experiment.
 
 use std::io::{self, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -61,7 +61,134 @@ impl Counts {
     }
 }
 
+#[allow(dead_code, reason = "count matrices use run_classified instead")]
 pub fn run<R>(target: &str, rows: &[(&str, R)], mut take: impl FnMut(&R) -> Outcome) -> ExitCode {
+    run_selected(target, rows, |selected, out| {
+        run_into(target, selected, |row| take(*row), out)
+    })
+}
+
+/// A count observes an isolated subject over a window. Timing includes any row whose values
+/// depend on another row's CPU, display or throughput work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "the shared runner also serves matrices with only timing rows"
+)]
+pub enum Kind {
+    Count { windowed: bool },
+    Timing,
+}
+
+#[allow(
+    dead_code,
+    reason = "the shared runner also serves matrices with only timing rows"
+)]
+pub fn run_classified<R: Sync>(
+    target: &str,
+    rows: &[(&str, R)],
+    kind: impl Fn(&R) -> Kind + Sync,
+    take: impl Fn(&R) -> Outcome + Sync,
+) -> ExitCode {
+    let together = match std::env::var("ATERM_MEASURE_COUNT_MODE").as_deref() {
+        Ok("sequential") | Err(std::env::VarError::NotPresent) => false,
+        Ok("together") => true,
+        _ => {
+            eprintln!("measure {target}: ATERM_MEASURE_COUNT_MODE takes sequential or together");
+            return ExitCode::from(2);
+        }
+    };
+    run_selected(target, rows, |selected, out| {
+        run_scheduled_into(
+            target,
+            selected,
+            |row| kind(*row),
+            |row| take(*row),
+            together,
+            out,
+        )
+    })
+}
+
+/// A single worker runs windows in order, with one worker per headless count. The caller
+/// reports each completion immediately, then joins every count before starting timing work.
+#[allow(
+    dead_code,
+    reason = "the shared runner also serves matrices with only timing rows"
+)]
+fn run_scheduled_into<R: Sync>(
+    target: &str,
+    rows: &[(&str, R)],
+    kind: impl Fn(&R) -> Kind + Sync,
+    take: impl Fn(&R) -> Outcome + Sync,
+    together: bool,
+    out: &mut dyn Write,
+) -> io::Result<Counts> {
+    if !together {
+        return run_into(target, rows, take, out);
+    }
+    let (mut headless, mut windows, mut timing) = (Vec::new(), Vec::new(), Vec::new());
+    for (i, (_, row)) in rows.iter().enumerate() {
+        match kind(row) {
+            Kind::Count { windowed: false } => headless.push((i, row)),
+            Kind::Count { windowed: true } => windows.push((i, row)),
+            Kind::Timing => timing.push((i, row)),
+        }
+    }
+    let count_len = headless.len() + windows.len();
+    let mut counts = Counts {
+        planned: rows.len(),
+        ..Counts::default()
+    };
+    std::thread::scope(|scope| -> io::Result<()> {
+        let (send, receive) = std::sync::mpsc::channel();
+        let take = &take;
+        for (i, row) in headless {
+            let send = send.clone();
+            scope.spawn(move || {
+                let _ = send.send((i, measured(|| take(row))));
+            });
+        }
+        if !windows.is_empty() {
+            let send = send.clone();
+            scope.spawn(move || {
+                for (i, row) in windows {
+                    let _ = send.send((i, measured(|| take(row))));
+                }
+            });
+        }
+        drop(send);
+        for _ in 0..count_len {
+            let (i, result) = receive
+                .recv()
+                .map_err(|_| io::Error::other("count worker ended without an outcome"))?;
+            report_row(target, rows[i].0, result, &mut counts, out)?;
+        }
+        Ok(())
+    })?;
+    for (i, row) in timing {
+        report_row(target, rows[i].0, measured(|| take(row)), &mut counts, out)?;
+    }
+    report_summary(target, &counts, out)?;
+    Ok(counts)
+}
+
+fn measured(take: impl FnOnce() -> Outcome) -> Outcome {
+    catch_unwind(AssertUnwindSafe(take)).unwrap_or_else(|panic| {
+        let why = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("non-string panic");
+        Outcome::Fail(format!("measurement panicked: {why}"))
+    })
+}
+
+fn run_selected<R>(
+    target: &str,
+    rows: &[(&str, R)],
+    execute: impl FnOnce(&[(&str, &R)], &mut dyn Write) -> io::Result<Counts>,
+) -> ExitCode {
     let options = match selection(std::env::args().skip(1)) {
         Ok(options) => options,
         Err(why) => {
@@ -85,12 +212,8 @@ pub fn run<R>(target: &str, rows: &[(&str, R)], mut take: impl FnMut(&R) -> Outc
         }
         return ExitCode::SUCCESS;
     }
-    match run_into(
-        target,
-        &selected,
-        |row| take(*row),
-        &mut io::stdout().lock(),
-    ) {
+    // A worker may print diagnostics of its own; do not hold stdout's lock while awaiting it.
+    match execute(&selected, &mut io::stdout()) {
         Ok(counts) => ExitCode::from(counts.exit_code()),
         Err(why) => {
             eprintln!("measure {target}: cannot write the measurement report: {why}");
@@ -140,39 +263,46 @@ fn run_into<R>(
         ..Counts::default()
     };
     for (name, row) in rows {
-        let result = catch_unwind(AssertUnwindSafe(|| take(row))).unwrap_or_else(|panic| {
-            let why = panic
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| panic.downcast_ref::<&str>().copied())
-                .unwrap_or("non-string panic");
-            Outcome::Fail(format!("measurement panicked: {why}"))
-        });
-        let (status, detail) = match result {
-            Outcome::Pass(detail) => {
-                counts.passed += 1;
-                ("PASS", detail)
-            }
-            Outcome::Fail(detail) => {
-                counts.failed += 1;
-                ("FAIL", detail)
-            }
-            Outcome::CouldNotRun(detail) => {
-                counts.refused += 1;
-                ("COULD NOT RUN", detail)
-            }
-            Outcome::Unanswered(detail) => {
-                counts.unanswered += 1;
-                ("UNANSWERED", detail)
-            }
-            Outcome::Undecided(detail) => {
-                counts.undecided += 1;
-                ("UNDECIDED", detail)
-            }
-        };
-        writeln!(out, "measure row: {target}::{name} {status}\n{detail}")?;
-        out.flush()?;
+        report_row(target, name, measured(|| take(row)), &mut counts, out)?;
     }
+    report_summary(target, &counts, out)?;
+    Ok(counts)
+}
+
+fn report_row(
+    target: &str,
+    name: &str,
+    result: Outcome,
+    counts: &mut Counts,
+    out: &mut dyn Write,
+) -> io::Result<()> {
+    let (status, detail) = match result {
+        Outcome::Pass(detail) => {
+            counts.passed += 1;
+            ("PASS", detail)
+        }
+        Outcome::Fail(detail) => {
+            counts.failed += 1;
+            ("FAIL", detail)
+        }
+        Outcome::CouldNotRun(detail) => {
+            counts.refused += 1;
+            ("COULD NOT RUN", detail)
+        }
+        Outcome::Unanswered(detail) => {
+            counts.unanswered += 1;
+            ("UNANSWERED", detail)
+        }
+        Outcome::Undecided(detail) => {
+            counts.undecided += 1;
+            ("UNDECIDED", detail)
+        }
+    };
+    writeln!(out, "measure row: {target}::{name} {status}\n{detail}")?;
+    out.flush()
+}
+
+fn report_summary(target: &str, counts: &Counts, out: &mut dyn Write) -> io::Result<()> {
     writeln!(
         out,
         "measure result: {target} planned={} passed={} failed={} refused={} unanswered={} undecided={}",
@@ -182,12 +312,197 @@ fn run_into<R>(
         counts.refused,
         counts.unanswered,
         counts.undecided
-    )?;
-    Ok(counts)
+    )
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn findings_flush_before_the_next_row_or_the_count_phase_ends() {
+        use super::*;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex, mpsc};
+        use std::time::Duration;
+
+        struct Tape {
+            bytes: Arc<Mutex<Vec<u8>>>,
+            release: Option<mpsc::Sender<()>>,
+        }
+        impl Write for Tape {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.bytes.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                if String::from_utf8_lossy(&self.bytes.lock().unwrap())
+                    .contains("fixture::fast FAIL")
+                    && let Some(release) = self.release.take()
+                {
+                    let _ = release.send(());
+                }
+                Ok(())
+            }
+        }
+        for together in [false, true] {
+            let bytes = Arc::new(Mutex::new(Vec::new()));
+            let (release, wait) = mpsc::channel();
+            let wait = Mutex::new(wait);
+            let done = AtomicBool::new(false);
+            let mut tape = Tape {
+                bytes: Arc::clone(&bytes),
+                release: Some(release),
+            };
+            let rows = [("fast", 0), ("window", 1), ("timing", 2)];
+            let counts = run_scheduled_into(
+                "fixture",
+                &rows,
+                |row| {
+                    if *row == 2 {
+                        Kind::Timing
+                    } else {
+                        Kind::Count {
+                            windowed: *row == 1,
+                        }
+                    }
+                },
+                |row| match *row {
+                    0 => Outcome::Fail("early finding".into()),
+                    1 => {
+                        // Buffering until the phase ends cannot release this row. This is
+                        // a hang detector, not an assertion about the reporter's latency.
+                        wait.lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(60))
+                            .unwrap();
+                        done.store(true, Ordering::SeqCst);
+                        Outcome::Pass("window".into())
+                    }
+                    2 => {
+                        assert!(done.load(Ordering::SeqCst));
+                        assert!(
+                            String::from_utf8_lossy(&bytes.lock().unwrap())
+                                .contains("fixture::window PASS")
+                        );
+                        Outcome::Pass("timing".into())
+                    }
+                    _ => unreachable!(),
+                },
+                together,
+                &mut tape,
+            )
+            .unwrap();
+            assert_eq!(counts.planned, 3);
+            assert_eq!(counts.passed, 2);
+            assert_eq!(counts.failed, 1);
+            assert_eq!(counts.exit_code(), 1);
+        }
+    }
+
+    #[test]
+    fn counts_overlap_one_window_at_a_time_and_timing_waits_for_every_count() {
+        use super::*;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Mutex, mpsc};
+        use std::time::Duration;
+
+        let rows = [
+            ("headless-a", 0),
+            ("headless-b", 1),
+            ("window-a", 2),
+            ("window-b", 3),
+            ("timing", 4),
+        ];
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let ready_rx = Mutex::new(ready_rx);
+        let (release_a, wait_a) = mpsc::channel();
+        let (release_b, wait_b) = mpsc::channel();
+        let waits = [Mutex::new(wait_a), Mutex::new(wait_b)];
+        let window = AtomicBool::new(false);
+        let finished = AtomicUsize::new(0);
+        let mut output = Vec::new();
+        let counts = run_scheduled_into(
+            "fixture",
+            &rows,
+            |row| {
+                if *row == 4 {
+                    Kind::Timing
+                } else {
+                    Kind::Count {
+                        windowed: *row >= 2,
+                    }
+                }
+            },
+            |row| {
+                match *row {
+                    0 | 1 => {
+                        ready_tx.send(*row).unwrap();
+                        waits[*row]
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(60))
+                            .unwrap();
+                        finished.fetch_add(1, Ordering::SeqCst);
+                    }
+                    2 | 3 => {
+                        assert!(!window.swap(true, Ordering::SeqCst));
+                        if *row == 2 {
+                            // A sequential runner cannot reach both sends while this window is open.
+                            let rx = ready_rx.lock().unwrap();
+                            let mut ids = [
+                                rx.recv_timeout(Duration::from_secs(60)).unwrap(),
+                                rx.recv_timeout(Duration::from_secs(60)).unwrap(),
+                            ];
+                            ids.sort_unstable();
+                            assert_eq!(ids, [0, 1]);
+                            release_a.send(()).unwrap();
+                            release_b.send(()).unwrap();
+                        }
+                        window.store(false, Ordering::SeqCst);
+                        finished.fetch_add(1, Ordering::SeqCst);
+                    }
+                    4 => {
+                        assert_eq!(finished.load(Ordering::SeqCst), 4);
+                        assert!(!window.load(Ordering::SeqCst));
+                    }
+                    _ => unreachable!(),
+                }
+                Outcome::Pass(row.to_string())
+            },
+            true,
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(counts.passed, 5);
+        let output = String::from_utf8(output).unwrap();
+        for (name, i) in rows {
+            assert!(output.contains(&format!("fixture::{name} PASS\n{i}\n")));
+        }
+        let seen = Mutex::new(Vec::new());
+        let mut output = Vec::new();
+        let counts = run_scheduled_into(
+            "fixture",
+            &rows,
+            |_| Kind::Count { windowed: false },
+            |row| {
+                seen.lock().unwrap().push(*row);
+                if *row == 1 {
+                    panic!("negative control");
+                }
+                Outcome::Pass(row.to_string())
+            },
+            false,
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(*seen.lock().unwrap(), [0, 1, 2, 3, 4]);
+        assert_eq!(counts.failed, 1);
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("negative control")
+        );
+    }
+
     #[test]
     fn every_row_runs_once_in_order_and_a_finding_outweighs_a_refusal() {
         use super::*;

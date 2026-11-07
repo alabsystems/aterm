@@ -527,11 +527,14 @@ fn judge(exe: &Path, since: Since) -> Stamp {
         )
     };
     let tracked = crate::clean::tracked_files(&root).ok_or_else(unlisted)?;
-    let trees = tracked_directories(&tracked);
     let untracked = files
         .iter()
         .find(|path| !tracked.contains(*path))
-        .or_else(|| directories.iter().find(|path| !trees.contains(*path)));
+        .or_else(|| {
+            directories
+                .iter()
+                .find(|path| !is_tracked_directory(&tracked, path))
+        });
     if let Some(untracked) = untracked {
         let kind = if directories.contains(untracked) {
             "directory"
@@ -813,16 +816,17 @@ impl CompiledInputs {
 
 /// Git records files and gitlinks, not directory entries. Their ancestors are the
 /// directory trees a tracked input can establish; empty untracked directories establish none.
-fn tracked_directories(files: &BTreeSet<String>) -> BTreeSet<String> {
-    let mut directories = BTreeSet::new();
-    for file in files {
-        let mut below = file.as_str();
-        while let Some((parent, _)) = below.rsplit_once('/') {
-            directories.insert(parent.to_owned());
-            below = parent;
-        }
-    }
-    directories
+fn is_tracked_directory(files: &BTreeSet<String>, dir: &str) -> bool {
+    let mut prefix = String::with_capacity(dir.len() + 1);
+    prefix.push_str(dir);
+    prefix.push('/');
+    files
+        .range::<str, _>((
+            std::ops::Bound::Included(prefix.as_str()),
+            std::ops::Bound::Unbounded,
+        ))
+        .next()
+        .is_some_and(|first| first.starts_with(&prefix))
 }
 
 /// What reading `path` reads in the checkout at `resolved`, its resolved root: each symbolic

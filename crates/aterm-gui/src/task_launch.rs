@@ -18,6 +18,21 @@ use crate::SessionCtx;
 use crate::session_store::{SessionState, Store};
 use crate::task_record::{TaskMark, TaskRecord, TaskState};
 
+#[cfg(unix)]
+#[path = "task_launch_codex_source.rs"]
+mod codex_source;
+
+/// Actual constructor permission/count fixture for the App drain tests only.
+/// Advertised-layout bytes are synthetic and never executed; no source grant.
+#[cfg(all(test, unix))]
+pub(crate) fn pending_codex_constructor_for_drain() -> (
+    aterm_tempfile::TempDir,
+    Arc<aterm_agent::harness::codex_source_registry::Registry>,
+    aterm_agent::harness::account_work::Lifetime,
+) {
+    codex_source::pending_for_drain()
+}
+
 /// The longest task a worker is given: 64 KiB, raw, the client's cap too.
 pub(crate) const TASK_MAX: usize = aterm_types::control_verbs::MAX_TASK_BYTES;
 
@@ -594,6 +609,9 @@ pub(crate) struct Launch {
     pub(crate) program: Option<crate::program_worker::ProgramRun>,
     /// Account preparation retires after every other launch resource, including an unstarted box.
     pub(crate) account_scope: Option<aterm_agent::harness::account_work::Scope>,
+    /// The actual control server's registry, shared with member validation.
+    #[cfg(unix)]
+    pub(crate) source_registry: Option<Arc<aterm_agent::harness::codex_source_registry::Registry>>,
 }
 
 /// Start the worker's launcher.
@@ -900,6 +918,14 @@ fn run_worker_launch(work: &Launch) {
         stall_refused(work, "its agent has no worker line");
         return;
     };
+    #[cfg(unix)]
+    let mut codex_source = match codex_source::Preparation::begin(work) {
+        Ok(preparation) => preparation,
+        Err(why) => {
+            stall_refused(work, &why);
+            return;
+        }
+    };
     let (caller, found) = worker_starter_of(work, cli);
     let caller = match pooled_starter_held(work, caller, cli) {
         Ok(caller) => caller,
@@ -915,13 +941,22 @@ fn run_worker_launch(work: &Launch) {
         &|note| note_launch(&work.ctx, note),
         &|| InstallingMark::of(&work.ctx),
         &AtpkgStore(&work.ctx),
-        |starter| {
-            let _google_mark =
-                native_google_agent(work.agent).then(|| InstallingMark::of(&work.ctx));
-            if account_preparation_cancelled(work) {
-                return Err("account preparation stopped for shutdown or update".into());
-            }
-            NativeGoogleAdmission::prepare(work.agent, starter, work.account_scope.clone())
+        |admitted| {
+            #[cfg(unix)]
+            let admitted = match codex_source.as_mut() {
+                Some(source) => source
+                    .arm(admitted, cli)
+                    .map_err(aterm_agent::harness::worker::Refused::SignedOut)?,
+                None => admitted,
+            };
+            admitted.prepare(cli, aterm_types::dirs::home_dir().as_deref(), |starter| {
+                let _google_mark =
+                    native_google_agent(work.agent).then(|| InstallingMark::of(&work.ctx));
+                if account_preparation_cancelled(work) {
+                    return Err("account preparation stopped for shutdown or update".into());
+                }
+                NativeGoogleAdmission::prepare(work.agent, starter, work.account_scope.clone())
+            })
         },
     );
     if admission.is_err() && account_preparation_cancelled(work) {
@@ -1004,6 +1039,12 @@ fn run_worker_launch(work: &Launch) {
                         "account preparation stopped for shutdown or update".into(),
                     )));
                 }
+                #[cfg(unix)]
+                if let Some(source) = codex_source.as_ref()
+                    && let Err(why) = source.check(&admitted)
+                {
+                    return Ok(Err(Untyped::Blocked(why)));
+                }
                 if let Err(why) = google.check(&admitted) {
                     return Ok(Err(Untyped::Blocked(why)));
                 }
@@ -1019,6 +1060,13 @@ fn run_worker_launch(work: &Launch) {
             let Some(written) = typed else {
                 return;
             };
+            #[cfg(unix)]
+            if let Some(source) = codex_source.as_mut()
+                && let Err(why) = source.typed()
+            {
+                // The write was observed. Do not relabel it untyped or retry it.
+                note_launch(&work.ctx, format!("typed; {why}"));
+            }
             let note = format!(
                 "typed ({} B, {written}): {} ({}{}{}){}",
                 line.len() + 1,
@@ -1432,13 +1480,13 @@ fn admit_prepared_worker<M, T>(
     installing: &dyn Fn() -> M,
     store: &dyn ProgramStore,
     prepare: impl FnOnce(
-        aterm_agent::harness::worker::Starter,
+        aterm_agent::harness::worker::Admitted,
     ) -> Result<
-        (aterm_agent::harness::worker::Starter, T),
+        (aterm_agent::harness::worker::Admitted, T),
         aterm_agent::harness::worker::Refused,
     >,
 ) -> Result<(aterm_agent::harness::worker::Admitted, T), aterm_agent::harness::worker::Refused> {
-    admit_worker(cli, starter, user, note, installing, store)?.prepare(cli, user, prepare)
+    prepare(admit_worker(cli, starter, user, note, installing, store)?)
 }
 
 /// The task record's `why=` for a worker its launcher refused before its line
@@ -1628,8 +1676,9 @@ pub(crate) fn prompt_fence(terminal: &Terminal, human: u64) -> Option<PromptFenc
 /// Why [`type_launch_line`] did not type a worker's line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Untyped {
-    /// The prompt the launcher saw was redrawn, or is no longer input-ready, and nothing was
-    /// written: its launcher looks again ([`type_at_prompt`]).
+    /// The prompt the launcher saw was redrawn, or is no longer input-ready, or input queued
+    /// before the line had not all gone, and nothing was written: its launcher looks again
+    /// ([`type_at_prompt`]).
     Unsettled,
     /// The shell or its live launch ended, a person used it, or its task moved on: `stalled
     /// why=shell` where the record still says `working`.
@@ -1641,8 +1690,9 @@ pub(crate) enum Untyped {
 
 /// Type `line` at `prompt`, the input-ready prompt `work`'s launcher saw, through `admit` (the
 /// main thread's [`type_launch_line`]). A refusal that wrote nothing because that prompt was
-/// redrawn first ([`Untyped::Unsettled`]: the new tab's grid settling, an async prompt's or a
-/// right prompt's repaint) is no stall: the launcher looks again, for a prompt that holds one
+/// redrawn first, or input queued before it had not all gone ([`Untyped::Unsettled`]: the new
+/// tab's grid settling, an async prompt's or a right prompt's repaint, a report still being
+/// written) is no stall: the launcher looks again, for a prompt that holds one
 /// screen generation for [`PROMPT_SETTLE`] ([`await_prompt`]), and types there, until that look
 /// ends as its first does (the shell ending, a person's use, a task that moved on). Any other
 /// refusal stalls the task. Only a refusal that wrote nothing is tried again, so the line is
@@ -1660,13 +1710,16 @@ pub(crate) fn type_at_prompt<E: std::fmt::Display>(
             Ok(Ok(written)) => return Some(written),
             Ok(Err(Untyped::Unsettled)) => {
                 aterm_log::info!(
-                    "worker session {}: its prompt was redrawn before its line was typed; \
-                     it is typed at the prompt once that settles",
+                    "worker session {}: its prompt was redrawn, or input before its line was \
+                     still queued, before the line was typed; it is typed at the prompt once \
+                     that settles",
                     work.local
                 );
                 note_launch(
                     &work.ctx,
-                    "not yet typed (its prompt was redrawn first; looking again)".to_string(),
+                    "not yet typed (its prompt was redrawn or input before it was queued; looking \
+                     again)"
+                        .to_string(),
                 );
                 match await_prompt(work, PROMPT_SETTLE) {
                     Ok(settled) => prompt = settled,
@@ -1728,7 +1781,8 @@ pub(crate) fn type_scoped_launch_line(
 ///
 /// # Errors
 ///
-/// [`Untyped::Unsettled`] where the screen moved off `prompt` before anything was written;
+/// [`Untyped::Unsettled`] where the screen moved off `prompt`, or input queued before the line
+/// had not all gone, before anything was written;
 /// [`Untyped::Refused`] where the launch is gone, its task moved on ([`task_moved_on`]) or a
 /// person used it; [`Untyped::Blocked`] where its session is parked or halted, or the write was not
 /// taken.
@@ -1793,9 +1847,10 @@ pub(crate) fn type_launch_line(
 }
 
 /// What the fenced press of a worker's line ([`type_launch_line`]) did, as its launcher reads it.
-/// Only a refusal the fence made before a byte was written is [`Untyped::Unsettled`], the one
-/// outcome [`type_at_prompt`] tries again, so a line written whole or in part is never typed
-/// twice; a person's use and a write the sink did not take are final.
+/// Only a refusal made before a byte was written, the fence's or one for input queued before the
+/// line, is [`Untyped::Unsettled`], the one outcome [`type_at_prompt`] tries again, so a line
+/// written whole or in part is never typed twice; a person's use and a write the sink did not
+/// take are final.
 pub(crate) fn launch_line_typed(
     result: crate::control::GuardedInput,
 ) -> Result<&'static str, Untyped> {
@@ -1803,8 +1858,11 @@ pub(crate) fn launch_line_typed(
     use crate::input::Delivery;
     let blocked = |why: &str| Err(Untyped::Blocked(why.to_string()));
     match result {
-        // The fence decides both before a byte is written.
-        GuardedInput::Changed | GuardedInput::Skipped => Err(Untyped::Unsettled),
+        // The fence decides both before a byte is written, and input queued before the line
+        // that had not all gone left no fence judged and nothing written.
+        GuardedInput::Changed | GuardedInput::Skipped | GuardedInput::Queued => {
+            Err(Untyped::Unsettled)
+        }
         GuardedInput::Person => Err(Untyped::Refused(
             "a person used its session before the launch".to_string(),
         )),

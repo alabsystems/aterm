@@ -143,18 +143,22 @@ pub fn query_value(text: &str) -> String {
     encode(text)
 }
 
-/// `k=v&k2=v2` in the given order, keys and values encoded; `""` for none.
-#[must_use]
-pub fn query(pairs: &[(String, String)]) -> String {
-    let mut out = String::with_capacity(pairs.iter().map(|(k, v)| k.len() + v.len() + 2).sum());
+pub(crate) fn query_into(out: &mut String, pairs: &[(String, String)]) {
     for (i, (k, v)) in pairs.iter().enumerate() {
         if i > 0 {
             out.push('&');
         }
-        encode_into(&mut out, k);
+        encode_into(out, k);
         out.push('=');
-        encode_into(&mut out, v);
+        encode_into(out, v);
     }
+}
+
+/// `k=v&k2=v2` in the given order, keys and values encoded; `""` for none.
+#[must_use]
+pub fn query(pairs: &[(String, String)]) -> String {
+    let mut out = String::with_capacity(pairs.iter().map(|(k, v)| k.len() + v.len() + 2).sum());
+    query_into(&mut out, pairs);
     out
 }
 

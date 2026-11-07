@@ -166,102 +166,55 @@ impl Inputs {
 
 /// The payload and its execution root stay protected until the last child is reaped.
 pub struct Selected {
-    /// Signed, physical store payload root.
-    payload: PathBuf,
-    /// Validated physical execution root (which may be a native compat copy).
-    execution: PathBuf,
-    /// Authenticated managed build.
-    build: u64,
-    /// Its signed tree root.
-    tree_root: String,
-    /// Execution compiler content, matched to the signed payload's verified lineage.
-    compiler: atpkg::lineage::Compiler,
-    /// The explicit source authority used for this selection.
+    core: atpkg::project_compiler::Selected,
     authority: Authority,
-    layout: atpkg::Layout,
-    _lease: atpkg::lease::Lease,
 }
-
 impl Selected {
     /// Physical signed payload protected by the held lease.
     #[must_use]
     pub fn payload(&self) -> &Path {
-        &self.payload
+        self.core.payload()
     }
-
     /// Validated executable root, which may be a compat view of the payload.
     #[must_use]
     pub fn execution(&self) -> &Path {
-        &self.execution
+        self.core.execution()
     }
-
-    /// The authenticated managed build, independent of global current changes.
+    /// Authenticated build, independent of global current changes.
     #[must_use]
     pub const fn build(&self) -> u64 {
-        self.build
+        self.core.build()
     }
-
-    /// Fresh signed tree root verified against the payload before its first probe.
+    /// Signed root verified against the payload before its first probe.
     #[must_use]
     pub fn tree_root(&self) -> &str {
-        &self.tree_root
+        self.core.tree_root()
     }
-
-    /// Immutable admitted execution identity and payload lineage proof.
+    /// Execution compiler content matched to the authenticated payload lineage.
     #[must_use]
     pub const fn compiler(&self) -> &atpkg::lineage::Compiler {
-        &self.compiler
+        self.core.compiler()
     }
-
-    /// Exact execution Targo, independent of a later cwd's missing lock.
+    /// Exact execution Targo, independent of later cwd or shim changes.
     #[must_use]
     pub fn targo(&self) -> PathBuf {
-        self.execution.join("bin/targo")
+        self.core.targo()
     }
-
-    /// Recheck payload content and any compat mapping while its native lease is still held.
+    /// Recheck the whole payload and compat mapping under the original lease.
     /// # Errors
-    /// A modified signed payload or execution root.
+    /// Modified signed payload, ownership or execution mapping.
     pub fn recheck(&self) -> Result<()> {
-        if atpkg::lookup::payload_root(&self.layout, "trust", self.build).as_ref()
-            != Some(&self.payload)
-        {
-            return Err(Error::refused(
-                "selected compiler payload ownership changed",
-            ));
-        }
-        let modes = atpkg::store::declared_modes(&self.payload)
-            .map_err(|e| Error::io("read compiler declared modes", &e))?;
-        let root = atpkg::tree::tree_root_declared(&self.payload, &modes)
-            .map_err(|e| Error::io("hash selected compiler", &e))?;
-        if root != self.tree_root {
-            return Err(Error::refused("selected signed compiler payload changed"));
-        }
-        if self.execution != self.payload
-            && atpkg::compat::blocked(&self.layout, self.build).is_some()
-        {
-            return Err(Error::refused("selected compiler compat ownership changed"));
-        }
-        if self.execution != self.payload
-            && !atpkg::compat::root_matches(
-                &trust_lock::build_dir(&self.layout.prefix, self.build),
-                &self.execution,
-                atpkg::seam::Depth::Deep,
-            )
-        {
-            return Err(Error::refused(
-                "selected compiler execution root no longer matches its signed payload",
-            ));
-        }
-        Ok(())
+        self.core.recheck().map_err(core_error)
     }
 }
-
-/// Resolve/authenticate once, with no install or current/shim/default mutation.
-/// `signed_root` is the native signed-head authority (in production `cli::signed_tree_root`).
-/// # Errors
-/// Missing/malformed lock, overrides, missing lease/build, signed content or lineage mismatch,
-/// invalid compat root, or an explicit compiler other than this authority's selection.
+fn core_error(error: atpkg::project_compiler::Error) -> Error {
+    match error {
+        atpkg::project_compiler::Error::Refused(m) => Error::refused(m),
+        atpkg::project_compiler::Error::CannotRun(m) => Error::cannot_run(m),
+        other => Error::cannot_run(other.to_string()),
+    }
+}
+/// Select under the caller's source authority, preserving publisher policy and lease lifetime.
 pub fn select(
     inputs: &Inputs,
     authority: Authority,
@@ -269,175 +222,25 @@ pub fn select(
     signed_root: &dyn Fn(u64) -> std::result::Result<String, String>,
     tools: &dyn Tools,
 ) -> Result<Selected> {
-    if let Some((key, _)) = inputs.overrides.first() {
-        return Err(Error::refused(format!(
-            "{key} overrides project compiler selection; remove it"
-        )));
-    }
-    if atpkg::toolchain::linked_tool_bin(&inputs.prefix, "targo").is_some() {
-        return Err(Error::refused(
-            "a dev-linked Targo overrides managed compiler selection",
-        ));
-    }
-    let (build, requested_payload) = if let Some(lock) = authority.lock() {
-        (
-            lock.build,
-            trust_lock::build_dir(&inputs.prefix, lock.build),
-        )
-    } else {
-        let root = std::fs::canonicalize(inputs.prefix.join("store/trust/current"))
-            .map_err(|e| Error::io("resolve the managed default compiler", &e))?;
-        let name = root.file_name().and_then(OsStr::to_str).unwrap_or("");
-        let build = name
-            .strip_suffix(".noindex")
-            .unwrap_or(name)
-            .parse::<u64>()
-            .map_err(|_| {
-                Error::refused("the managed default does not name a versioned Trust build")
-            })?;
-        let expected = std::fs::canonicalize(trust_lock::build_dir(&inputs.prefix, build))
-            .map_err(|e| Error::io("resolve the default Trust build", &e))?;
-        if expected != root {
-            return Err(Error::refused("managed default escapes its Trust build"));
-        }
-        (build, root)
-    };
-    let subject = atpkg::lease::Subject::build(trust_lock::PROGRAM, build)
-        .ok_or_else(|| Error::refused("invalid managed Trust build"))?;
-    let lease = atpkg::lease::take(
-        &inputs.prefix,
-        &subject,
-        "atpkg-publish project toolchain",
-        atpkg::lease::DEFAULT_WAIT,
+    let core = atpkg::project_compiler::select(
+        &atpkg::project_compiler::Inputs {
+            prefix: inputs.prefix.clone(),
+            repo: inputs.repo.clone(),
+            path: inputs.path.clone(),
+            cargo_home: inputs.cargo_home.clone(),
+            overrides: inputs.overrides.clone(),
+        },
+        authority.lock(),
+        explicit,
+        atpkg::project_compiler::Options {
+            deadline: None,
+            lease_wait: atpkg::lease::DEFAULT_WAIT,
+        },
+        &|build, _| signed_root(build),
+        &|path, _| tools::version(tools, path),
     )
-    .map_err(|e| Error::cannot_run(format!("lease selected Trust build: {e}")))?;
-    let layout = atpkg::Layout {
-        prefix: inputs.prefix.clone(),
-    };
-    let payload = atpkg::lookup::payload_root(&layout, "trust", build)
-        .ok_or_else(|| Error::refused("selected compiler payload has unowned path indirection"))?;
-    if std::fs::canonicalize(requested_payload).ok().as_ref() != Some(&payload) {
-        return Err(Error::refused(
-            "selected compiler path does not name its owned payload",
-        ));
-    }
-    if !atpkg::store::build_is_complete(&trust_lock::build_dir(&inputs.prefix, build)) {
-        return Err(Error::refused("selected Trust build is incomplete"));
-    }
-    let tree_root = signed_root(build).map_err(Error::refused)?;
-    if authority
-        .lock()
-        .is_some_and(|lock| lock.tree_root != tree_root)
-    {
-        return Err(Error::refused(
-            "source lock and fresh signed compiler tree disagree",
-        ));
-    }
-    let modes = atpkg::store::declared_modes(&payload)
-        .map_err(|e| Error::io("read selected compiler modes", &e))?;
-    if atpkg::tree::tree_root_declared(&payload, &modes)
-        .map_err(|e| Error::io("authenticate selected compiler tree", &e))?
-        != tree_root
-    {
-        return Err(Error::refused(
-            "selected compiler payload differs from its signed tree; no compiler ran",
-        ));
-    }
-    let bin = payload.join("bin");
-    let payload_compiler =
-        atpkg::lineage::check_compiler_with(&bin, atpkg::lineage::LineagePolicy::Require, &|p| {
-            tools::version(tools, p)
-        })
-        .map_err(|why| Error::refused(why.join("\n")))?;
-    if let Some(lock) = authority.lock() {
-        if payload_compiler.content.version.commit != lock.compiler_commit {
-            return Err(Error::refused("source lock names another compiler commit"));
-        }
-        let lineage = crate::adopt::Lineage::read(&payload)?;
-        if lineage.compiler_commit != lock.compiler_commit || lock.receipt != lineage.receipt {
-            return Err(Error::refused(
-                "source lock names another compiler lineage receipt",
-            ));
-        }
-    }
-    let execution = match atpkg::compat::needs_root(&payload)
-        .map_err(|e| Error::io("inspect compiler execution layout", &e))?
-    {
-        None => payload.clone(),
-        Some(_) => {
-            if let Some(blocked) = atpkg::compat::blocked(&layout, build) {
-                return Err(Error::refused(format!(
-                    "selected compiler compat path: {blocked}"
-                )));
-            }
-            let root = atpkg::compat::root_dir(&layout, build);
-            if !atpkg::compat::root_matches(
-                &trust_lock::build_dir(&inputs.prefix, build),
-                &root,
-                atpkg::seam::Depth::Deep,
-            ) {
-                return Err(Error::refused(
-                    "required compiler compat root is missing or differs; repair it before running",
-                ));
-            }
-            root
-        }
-    };
-    if let Some(explicit) = explicit {
-        let actual = std::fs::canonicalize(explicit)
-            .map_err(|e| Error::io("resolve explicit compiler", &e))?;
-        if actual != execution.join("bin") {
-            return Err(Error::refused(
-                "explicit compiler does not match the source lock or authenticated managed default",
-            ));
-        }
-    }
-    let movers = atpkg::toolchain::rustc_movers::rustc_movers(
-        Some(&inputs.repo),
-        &|_| None,
-        Some(&inputs.cargo_home),
-    );
-    if !movers.is_empty() {
-        return Err(Error::refused(
-            "Cargo configuration overrides the selected project compiler",
-        ));
-    }
-    let compiler = if execution == payload {
-        payload_compiler
-    } else {
-        // Compat roots intentionally contain executable views, not a second LINEAGE.
-        // Their bytes/mapping were checked deeply against the signed, proven payload.
-        let content = atpkg::lineage::admit_content_with(&execution.join("bin"), &|p| {
-            tools::version(tools, p)
-        })
-        .map_err(|why| Error::refused(why.join("\n")))?;
-        let proven = &payload_compiler.content;
-        if content.version != proven.version
-            || content.trustc_sha256 != proven.trustc_sha256
-            || content.targo_sha256 != proven.targo_sha256
-            || content.driver_sha256 != proven.driver_sha256
-        {
-            return Err(Error::refused(
-                "execution compiler bytes differ from the proven signed payload",
-            ));
-        }
-        atpkg::lineage::Compiler {
-            content,
-            lineage: payload_compiler.lineage,
-        }
-    };
-    let selected = Selected {
-        payload,
-        execution,
-        build,
-        tree_root,
-        compiler,
-        authority,
-        layout,
-        _lease: lease,
-    };
-    selected.recheck()?;
-    Ok(selected)
+    .map_err(core_error)?;
+    Ok(Selected { core, authority })
 }
 
 /// CLI syntax for the pinned, leased child runner.
@@ -492,17 +295,17 @@ pub fn run_controller(
 ) -> Result<()> {
     selected.authority.recheck(&inputs.repo)?;
     selected.recheck()?;
-    let bin = selected.execution.join("bin");
+    let bin = selected.execution().join("bin");
     let path = std::env::join_paths(
         std::iter::once(bin.clone()).chain(std::env::split_paths(&inputs.path)),
     )
     .map_err(|e| Error::cannot_run(format!("selected compiler PATH: {e}")))?;
     eprintln!(
         "toolchain: Trust {} tree {} payload {} execution {}",
-        selected.build,
-        selected.tree_root,
-        selected.payload.display(),
-        selected.execution.display()
+        selected.build(),
+        selected.tree_root(),
+        selected.payload().display(),
+        selected.execution().display()
     );
     let mut child = aterm_uds::spawnfd::transparent(command).into_command();
     child
@@ -513,8 +316,8 @@ pub fn run_controller(
         .env("ATPKG_PROJECT_TRUSTC", bin.join("trustc"))
         .env("ATPKG_PROJECT_TRUSTDOC", bin.join("trustdoc"))
         .env("ATPKG_PROJECT_FRONT", front)
-        .env("ATPKG_PROJECT_PAYLOAD", &selected.payload)
-        .env("ATPKG_PROJECT_EXECUTION", &selected.execution);
+        .env("ATPKG_PROJECT_PAYLOAD", selected.payload())
+        .env("ATPKG_PROJECT_EXECUTION", selected.execution());
     let outcome =
         atpkg::build_admit::supervise_controller(&mut child, &mut |line| eprintln!("{line}"));
     // Both authorities are observed after the native group drains, including a

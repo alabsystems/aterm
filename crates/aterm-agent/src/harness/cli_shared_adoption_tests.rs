@@ -13,6 +13,10 @@ use std::sync::{
 const EMAIL: &str = "owner@example.test";
 const NOW: i64 = 1_800_000_000;
 
+#[cfg(unix)]
+#[path = "cli_shared_native_publication_tests.rs"]
+mod native_publication;
+
 struct Approval {
     cancel_on_current: std::sync::Mutex<Option<crate::harness::account_work::Lifetime>>,
     live: AtomicBool,

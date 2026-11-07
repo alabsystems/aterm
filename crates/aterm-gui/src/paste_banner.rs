@@ -125,14 +125,34 @@ pub(crate) const ANSWER_KEYS: &str = "Enter pastes \u{00b7} Esc cancels";
 /// [`ANSWER_KEYS`] for a window too narrow to carry the verbs beside the question.
 const ANSWER_KEYS_SHORT: &str = "Enter \u{00b7} Esc";
 
+/// The most of a line a screen reader is asked to speak: enough to judge a command by.
+#[cfg(a11y_tree)]
+const SPOKEN_LINE_MAX: usize = 200;
+
 /// Why the paste is asked about: the guard fires only when bracketed paste is off,
 /// so each line end submits.
 pub(crate) const RISK: &str = "Each line may run as a command.";
 
-/// The accessible alert's description: the risk, then the answer keys.
+/// The accessible alert's description: the risk, the answer keys, then the lines a banner with room
+/// for them previews, since a person is asked to approve them. A line stops at [`SPOKEN_LINE_MAX`]
+/// rather than a window's width.
 #[cfg(a11y_tree)]
-pub(crate) fn announcement_detail() -> String {
-    format!("{RISK} {ANSWER_KEYS}")
+pub(crate) fn announcement_detail(text: &str) -> String {
+    let lines = paste_lines(text);
+    let shown = if lines.len() > MAX_PREVIEW_LINES {
+        MAX_PREVIEW_LINES - 1
+    } else {
+        lines.len()
+    };
+    let mut detail = format!("{RISK} {ANSWER_KEYS}");
+    for line in lines.iter().take(shown) {
+        detail.push('\n');
+        detail.push_str(&ellipsized(&sanitized(line), SPOKEN_LINE_MAX));
+    }
+    if lines.len() > shown {
+        detail.push_str(&format!("\n+{} more lines", lines.len() - shown));
+    }
+    detail
 }
 
 /// Row 0's title and the answer keys that fit beside it in `cols`: the risk goes

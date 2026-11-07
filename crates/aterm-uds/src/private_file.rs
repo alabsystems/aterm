@@ -972,6 +972,36 @@ impl PrivateLock {
         busy: &str,
         held: impl FnMut(),
     ) -> io::Result<PrivateLock> {
+        let file = Self::open(dir, name)?;
+        // `None`: a wait no clock can represent, which has no deadline.
+        let deadline = Instant::now().checked_add(within);
+        crate::file_lock::lock_exclusive_with_deadline(&file, deadline, busy, held)?;
+        Ok(Self(file))
+    }
+
+    /// THE LOCK ON `<dir>/<name>` WHENEVER ITS HOLDER LETS IT GO, opened as [`take`](Self::take)
+    /// opens it: one try, then, the lock found held, `held` once and a blocking `flock` that
+    /// sleeps in the kernel until the holder lets go or its process ends. No clock and no
+    /// backoff wakes the thread meanwhile, so a process that waits to be the one keeper of
+    /// something spends nothing while another keeps it, and takes over at once.
+    ///
+    /// # Errors
+    ///
+    /// As [`take`](Self::take), but never `WouldBlock`; and the `flock`'s own error.
+    pub fn wait_for(dir: &Path, name: &str, held: impl FnOnce()) -> io::Result<PrivateLock> {
+        let file = Self::open(dir, name)?;
+        // One try (a past deadline still makes its first attempt), then the kernel's wait.
+        match crate::file_lock::lock_exclusive_until(&file, Instant::now(), "held") {
+            Ok(()) => return Ok(Self(file)),
+            Err(error) if error.kind() != io::ErrorKind::WouldBlock => return Err(error),
+            Err(_) => held(),
+        }
+        crate::file_lock::lock_exclusive_blocking(&file)?;
+        Ok(Self(file))
+    }
+
+    /// The lock file `<dir>/<name>`, admitted as [`take`](Self::take) says, not yet locked.
+    fn open(dir: &Path, name: &str) -> io::Result<std::fs::File> {
         one_component_io(name)?;
         check_private_dir(dir)?;
         let path = dir.join(name);
@@ -984,10 +1014,7 @@ impl PrivateLock {
                 format!("{} is no regular file", path.display()),
             ));
         }
-        // `None`: a wait no clock can represent, which has no deadline.
-        let deadline = Instant::now().checked_add(within);
-        crate::file_lock::lock_exclusive_with_deadline(&file, deadline, busy, held)?;
-        Ok(Self(file))
+        Ok(file)
     }
 }
 
@@ -1013,6 +1040,44 @@ mod tests {
 
     /// The busy text the lock tests hand [`PrivateLock::take`].
     const BUSY: &str = "another holder has it";
+
+    /// A waiter for a held lock is told once, sleeps, and takes the lock when its holder lets go:
+    /// the holder is released from the `held` hook's thread only after the waiter said it found
+    /// the lock held, and the waiter's lock then excludes a try.
+    /// NEGATIVE CONTROL: answering the first try's `WouldBlock` as an error (`=> return
+    /// Err(..)`) fails "the waiter takes it once let go"; never calling `held` hangs the
+    /// release, and the one-minute hang detector fails it.
+    #[test]
+    fn a_waiter_takes_a_held_lock_once_it_is_let_go() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let dir = dir_in(root.path(), "state", 0o700);
+        let first = PrivateLock::take(&dir, ".lock", Duration::ZERO, BUSY).unwrap();
+        let (told, heard) = std::sync::mpsc::channel();
+        let waiter = {
+            let dir = dir.clone();
+            std::thread::spawn(move || {
+                PrivateLock::wait_for(&dir, ".lock", move || told.send(()).unwrap())
+            })
+        };
+        heard
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the waiter found the lock held");
+        drop(first);
+        let held = waiter
+            .join()
+            .unwrap()
+            .expect("the waiter takes it once let go");
+        assert_eq!(
+            PrivateLock::take(&dir, ".lock", Duration::ZERO, BUSY)
+                .err()
+                .map(|e| e.kind()),
+            Some(io::ErrorKind::WouldBlock),
+            "the waiter holds it"
+        );
+        drop(held);
+        let free = PrivateLock::wait_for(&dir, ".lock", || panic!("a free lock is never held"));
+        assert!(free.is_ok());
+    }
 
     #[test]
     fn lock_wait_stops_when_hook_or_backoff_exhausts_the_budget() {

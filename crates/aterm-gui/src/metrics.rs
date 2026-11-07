@@ -610,6 +610,7 @@ label_enum! {
         CrashJournal => "crash_journal",
         UpdateChecker => "update_checker",
         SplitRegridHold => "split_regrid_hold",
+        ParkedTell => "parked_tell",
         KittyAnimation => "kitty_animation",
         RenderEpoch => "render_epoch",
         DebuggerChange => "debugger_change",

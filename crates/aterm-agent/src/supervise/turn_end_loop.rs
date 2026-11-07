@@ -6826,6 +6826,7 @@ impl<C: Ctl> Session<'_, C> {
             own: true,
             since: self.fx.mono(),
         };
+        self.tell_own_panel();
         self.ledger_row_fenced(
             RULE_USAGE_PROBE,
             approvals::Outcome::Typed,
@@ -6835,10 +6836,26 @@ impl<C: Ctl> Session<'_, C> {
         );
     }
 
+    /// THE PROBE'S OWN PANEL, told its host on a change ([`IdleHost::own_panel`]): one stands from
+    /// the `/usage` the probe entered (or the one a restart finds the previous loop's) until the
+    /// probe is closed, and the host's held deadline counts no time under it.
+    pub(super) fn tell_own_panel(&mut self) {
+        let owes = self.probe != UsageProbe::Idle;
+        if owes == std::mem::replace(&mut self.probe_panel_told, owes)
+            || self.fx.replay_lacks_host_door("host.own_panel")
+        {
+            return;
+        }
+        if let Some(host) = &self.stall_host {
+            host.own_panel(owes);
+        }
+    }
+
     /// Clear `self.probe` once the `/usage` panel is gone, and with it the probe's claim on the
     /// line it left ([`OwnBy::Probe`]).
     pub(super) fn probe_closed(&mut self, seq: u64, review: &mut dyn Review) {
         let was = std::mem::replace(&mut self.probe, UsageProbe::Idle);
+        self.tell_own_panel();
         self.probe_hold = None;
         self.probe_seed = None;
         if self
@@ -7459,6 +7476,10 @@ impl<C: Ctl> Session<'_, C> {
         opts: &SuperviseOpts,
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
+        // The Escape closes the panel the probe's `/usage` opened, a write of the same duty as
+        // that `/usage` ([`Self::probe_type`]): with built-in duties on, a write with no duty is
+        // refused at the host's door, which would leave the probe's own panel up.
+        let _duty = self.duty_guard(Scope::Walls);
         let seq = grid.seq;
         let guard = panel.header_guard(&grid.rows);
         if !guard.is_empty() && grid.human_seq.is_some() {

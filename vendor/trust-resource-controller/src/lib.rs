@@ -9,6 +9,8 @@ mod context;
 mod helper_fds;
 mod locator;
 pub use helper_fds::HelperFds;
+mod telemetry;
+pub use telemetry::*;
 mod types;
 pub use context::*;
 mod validate;

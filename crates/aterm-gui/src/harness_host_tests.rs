@@ -11016,7 +11016,13 @@ fn a_move_commits_under_the_lock_and_relaunches_outside_it() {
     let source = a.spawn("s-acct-a", ACCT_TALK_A, "main");
     let idle = a.worker("s-acct-a", &on());
     assert!(
-        matches!(idle.account(usage_wall()), Some(AccountAdvice::Wait { .. })),
+        matches!(
+            idle.account(usage_wall()),
+            Some(AccountAdvice::Again {
+                why: AskAgain::Unwritten,
+                ..
+            })
+        ),
         "no limit row at all: no move"
     );
     a.wall(ACCT_TALK_A, ACCT_NOW - 500);
@@ -13715,9 +13721,10 @@ fn nobody_is_advised_off_an_account_whose_limit_reset_is_in_flight() {
         (a, idle, other)
     };
     let short = |advice: &Option<AccountAdvice>| match advice {
-        Some(AccountAdvice::Wait { until }) => {
-            until.saturating_duration_since(Instant::now()) <= RESET_AGAIN_AFTER
-        }
+        Some(AccountAdvice::Again {
+            until,
+            why: AskAgain::Reset,
+        }) => until.saturating_duration_since(Instant::now()) <= RESET_AGAIN_AFTER,
         _ => false,
     };
 
@@ -13813,34 +13820,220 @@ fn nobody_is_advised_off_an_account_whose_limit_reset_is_in_flight() {
     assert_eq!(other.account(usage_wall()), None);
 
     let again = Instant::now() + RESET_AGAIN_AFTER;
-    let wait = Some(AccountAdvice::Wait { until: again });
+    let wait = Some(AccountAdvice::Again {
+        until: again,
+        why: AskAgain::Reset,
+    });
     let to = |label: &str| AccountAdvice::Move {
         to: label.to_string(),
         yields: None,
     };
-    for advised in [
-        None,
-        Some(to("work-2")),
-        Some(AccountAdvice::Probe { otherwise: None }),
-        Some(AccountAdvice::Probe {
-            otherwise: Some(Box::new(to("work-2"))),
-        }),
-        Some(AccountAdvice::Wait {
-            until: again + Duration::from_secs(3600),
-        }),
+    for at_wall in [true, false] {
+        for advised in [
+            None,
+            Some(to("work-2")),
+            Some(AccountAdvice::Probe { otherwise: None }),
+            Some(AccountAdvice::Probe {
+                otherwise: Some(Box::new(to("work-2"))),
+            }),
+            Some(AccountAdvice::Wait {
+                until: again + Duration::from_secs(3600),
+            }),
+        ] {
+            assert_eq!(
+                account_resetting(advised.clone(), at_wall, again),
+                wait,
+                "{advised:?}"
+            );
+        }
+        let sooner = again - Duration::from_secs(5);
+        assert_eq!(
+            account_resetting(Some(AccountAdvice::Wait { until: sooner }), at_wall, again),
+            Some(AccountAdvice::Again {
+                until: sooner,
+                why: AskAgain::Reset,
+            }),
+            "the roster's sooner wait is asked at, as the reset's: no account opens for it then"
+        );
+        let hold = |until| Some(AccountAdvice::Hold { until });
+        assert_eq!(
+            account_resetting(hold(again + Duration::from_secs(3600)), at_wall, again),
+            hold(again),
+            "a turn end's hold stands, asked again with the reset"
+        );
+        assert_eq!(
+            account_resetting(hold(sooner), at_wall, again),
+            hold(sooner)
+        );
+        let resume = Some(AccountAdvice::Resume { cleared_at: 7 });
+        assert_eq!(account_resetting(resume.clone(), at_wall, again), resume);
+    }
+}
+
+/// A junior's yield stands under a limit reset in flight: the move it yields another Mac's
+/// account by (F19's `yields`) waits for the reset, and its turn end holds what it would type onto
+/// that account to the sooner of the yield and the ask again, for the reason the yield's own hold
+/// gives (work-2 is free, so no reason may say no account can take the session). NEGATIVE
+/// CONTROL: a move that yields nothing is the reset's own ask again, under which the turn end
+/// types.
+#[test]
+fn a_juniors_yield_holds_its_turn_end_under_a_limit_reset_in_flight() {
+    use aterm_agent::supervise::policy::turn_end::{
+        Composer, TurnEndAction, TurnEndReading, TurnEndState, decide_turn_end,
+    };
+    let rows = aterm_phase::prompt::fixtures::rows(&["⏺ Stage 1 is in.", ""]);
+    let t = Instant::now();
+    let decided = |account| {
+        let end = TurnEndReading {
+            phase: aterm_agent::supervise::phase::Phase::Idle,
+            authoritative: true,
+            composer: Composer::Empty,
+            said_tail: Some("Stage 1 is in.".to_string()),
+            program: Program::Claude,
+            autopilot: Autopilot::Cruise,
+            account,
+            ..TurnEndReading::of(
+                &aterm_phase::read(Some("claude"), &rows, Some(2)),
+                &rows,
+                false,
+                Some(Duration::from_secs(180)),
+                None,
+                None,
+            )
+        };
+        let mut st = TurnEndState::default();
+        st.observe(&end, t);
+        decide_turn_end(&st, &end, &on(), t)
+    };
+
+    let a = Accts::new();
+    walled(&a, "s-yield-1", ACCT_TALK_A, LONG_WALL);
+    a.spawn("s-yield-2", ACCT_TALK_B, "main");
+    edited(&a, |state| {
+        state.note_lease("main", "m9", ACCT_NOW + 3600, ACCT_NOW);
+    });
+    let (idle, junior) = (
+        a.worker("s-yield-1", &resetting()),
+        a.worker("s-yield-2", &resetting()),
+    );
+    let yielding = junior.account(AccountPoint::TurnEnd);
+    assert!(
+        matches!(&yielding, Some(AccountAdvice::Move { to, yields: Some(_) }) if to == "work-2"),
+        "{yielding:?}"
+    );
+    let own = decided(yielding);
+    let TurnEndAction::WaitUntil { why: yielded, .. } = &own else {
+        panic!("the yield's own turn end holds: {own:?}");
+    };
+    assert!(matches!(
+        idle.reset_take(&reset_ask(None)),
+        ResetWord::Take(_)
+    ));
+    let held = junior.account(AccountPoint::TurnEnd);
+    let waits = decided(held.clone());
+    assert!(
+        matches!(&waits, TurnEndAction::WaitUntil { why, .. } if why == yielded),
+        "the reset's hold says what the yield's own does, work-2 being free: {held:?}: {waits:?}"
+    );
+    assert!(
+        matches!(held, Some(AccountAdvice::Hold { until })
+            if until <= Instant::now() + RESET_AGAIN_AFTER),
+        "{held:?}"
+    );
+
+    let again = Instant::now() + RESET_AGAIN_AFTER;
+    let to = |yields| {
+        Some(AccountAdvice::Move {
+            to: "work-2".to_string(),
+            yields,
+        })
+    };
+    for until in [
+        again - Duration::from_secs(5),
+        again + Duration::from_secs(600),
     ] {
         assert_eq!(
-            account_resetting(advised.clone(), again),
-            wait,
-            "{advised:?}"
+            account_resetting(to(Some(until)), false, again),
+            Some(AccountAdvice::Hold {
+                until: until.min(again)
+            }),
+            "{until:?}"
         );
     }
-    let sooner = Some(AccountAdvice::Wait {
-        until: again - Duration::from_secs(5),
+    let wait = Some(AccountAdvice::Again {
+        until: again,
+        why: AskAgain::Reset,
     });
-    assert_eq!(account_resetting(sooner.clone(), again), sooner);
-    let resume = Some(AccountAdvice::Resume { cleared_at: 7 });
-    assert_eq!(account_resetting(resume.clone(), again), resume);
+    assert_eq!(account_resetting(to(None), false, again), wait);
+    let typed = decided(wait);
+    assert!(matches!(typed, TurnEndAction::Type { .. }), "{typed:?}");
+}
+
+/// A junior at a usage wall whose limit row is not its own yet is asked about as at a turn end,
+/// so the roster's move yields; but the decider holds only a turn end, so under a limit reset in
+/// flight that move is the reset's short wait, which cuts the wall's wait to the ask again.
+/// NEGATIVE CONTROL: the same junior's turn end under the same reset holds
+/// (`a_juniors_yield_holds_its_turn_end_under_a_limit_reset_in_flight`).
+#[test]
+fn a_juniors_yield_at_a_wall_under_a_limit_reset_in_flight_is_asked_again_shortly() {
+    use aterm_agent::supervise::policy::turn_end::{
+        Composer, TurnEndAction, TurnEndReading, TurnEndState,
+    };
+    let a = Accts::new();
+    walled(&a, "s-yield-1", ACCT_TALK_A, LONG_WALL);
+    a.spawn("s-yield-2", ACCT_TALK_B, "main");
+    edited(&a, |state| {
+        state.note_lease("main", "m9", ACCT_NOW + 3600, ACCT_NOW);
+    });
+    let (idle, junior) = (
+        a.worker("s-yield-1", &resetting()),
+        a.worker("s-yield-2", &resetting()),
+    );
+    let weekly = AccountPoint::Wall {
+        kind: aterm_phase::WallKind::UsageWeekly,
+    };
+    let yielding = junior.account(weekly);
+    assert!(
+        matches!(&yielding, Some(AccountAdvice::Move { to, yields: Some(_) }) if to == "work-2"),
+        "{yielding:?}"
+    );
+    assert!(matches!(
+        idle.reset_take(&reset_ask(None)),
+        ResetWord::Take(_)
+    ));
+    let asked = junior.account(weekly);
+    let t = Instant::now();
+    let wall = TurnEndReading {
+        composer: Composer::Empty,
+        autopilot: Autopilot::Cruise,
+        restartable: true,
+        account: asked.clone(),
+        ..weekly_limit_reading(t)
+    };
+    let mut st = TurnEndState::default();
+    st.observe(&wall, t);
+    let act = aterm_agent::supervise::policy::turn_end::decide_turn_end(&st, &wall, &on(), t);
+    assert!(
+        matches!(act, TurnEndAction::WaitUntil { until, .. } if until <= t + Duration::from_secs(120)),
+        "{asked:?}: {act:?}"
+    );
+    assert!(
+        matches!(asked, Some(AccountAdvice::Again { until, why: AskAgain::Reset })
+            if until <= Instant::now() + RESET_AGAIN_AFTER),
+        "{asked:?}"
+    );
+    let again = Instant::now() + RESET_AGAIN_AFTER;
+    let yields = Some(AccountAdvice::Move {
+        to: "work-2".to_string(),
+        yields: Some(again - Duration::from_secs(5)),
+    });
+    assert_eq!(
+        account_resetting(yields, true, again),
+        Some(AccountAdvice::Again {
+            until: again,
+            why: AskAgain::Reset,
+        })
+    );
 }
 
 #[test]
@@ -14890,11 +15083,15 @@ fn a_limit_row_that_lags_the_screen_is_asked_for_again_a_few_times() {
     let now = Instant::now();
     let again = now + WALL_AGAIN_AFTER;
     let wait = |until| Some(AccountAdvice::Wait { until });
-    assert_eq!(account_lagging(None, again), wait(again));
+    let asked = Some(AccountAdvice::Again {
+        until: again,
+        why: AskAgain::Unwritten,
+    });
+    assert_eq!(account_lagging(None, again), asked);
     assert_eq!(
         account_lagging(wait(now + Duration::from_secs(3600)), again),
-        wait(again),
-        "a later wait is cut"
+        asked,
+        "a later wait is cut, and says it is the host's own ask"
     );
     let sooner = now + Duration::from_secs(5);
     assert_eq!(
@@ -14919,7 +15116,7 @@ fn a_limit_row_that_lags_the_screen_is_asked_for_again_a_few_times() {
     }
 
     let soon = |advice: &Option<AccountAdvice>| {
-        matches!(advice, Some(AccountAdvice::Wait { until })
+        matches!(advice, Some(AccountAdvice::Again { until, why: AskAgain::Unwritten })
             if *until <= Instant::now() + WALL_AGAIN_AFTER)
     };
     let lagged = |idle: &WorkerIdle| idle.kept.lock().unwrap().account.lagged;
@@ -15005,6 +15202,117 @@ fn a_limit_row_that_lags_the_screen_is_asked_for_again_a_few_times() {
     let idle = a.worker("s-acct-lag-key", &on());
     assert_eq!(idle.account(usage_wall()), None);
     assert_eq!(lagged(&idle), 0);
+}
+
+#[test]
+fn the_hosts_own_ask_again_at_a_weekly_wall_says_why_it_waits() {
+    use aterm_agent::supervise::policy::turn_end::{
+        Composer, TurnEndAction, TurnEndReading, TurnEndState, decide_turn_end,
+    };
+    let t = Instant::now();
+    let weekly = TurnEndReading {
+        restartable: true,
+        composer: Composer::Empty,
+        ..weekly_limit_reading(t)
+    };
+    let decide = |account: Option<AccountAdvice>| {
+        let r = TurnEndReading {
+            account,
+            ..weekly.clone()
+        };
+        let mut st = TurnEndState::default();
+        st.observe(&r, t);
+        match decide_turn_end(&st, &r, &on(), t) {
+            TurnEndAction::WaitUntil { why, .. } => why,
+            other => panic!("no wait: {other:?}"),
+        }
+    };
+    let again = t + WALL_AGAIN_AFTER;
+    let opens = || {
+        Some(AccountAdvice::Wait {
+            until: again - Duration::from_secs(10),
+        })
+    };
+    for (advice, why) in [
+        (
+            account_lagging(None, again),
+            "the limit's record is not written yet: asked again",
+        ),
+        (
+            account_resetting(None, true, again),
+            "a limit reset is in flight: asked again",
+        ),
+        (
+            account_resetting(opens(), true, again),
+            "a limit reset is in flight: asked again",
+        ),
+    ] {
+        assert_eq!(decide(advice.clone()), why, "{advice:?}");
+    }
+    for advice in [
+        Some(AccountAdvice::Wait {
+            until: t + Duration::from_secs(20 * 60),
+        }),
+        account_lagging(opens(), again),
+    ] {
+        assert_eq!(
+            decide(advice.clone()),
+            "another account can be used then",
+            "control: the roster's own wait keeps its words where a move is made at the next ask: \
+             {advice:?}"
+        );
+    }
+}
+
+/// A turn end on an account another Mac's senior claim holds yields (F19) while this Mac's limit
+/// reset on it is in flight too: the reset moves nobody off it, and the hold moves nobody either.
+///
+/// NEGATIVE CONTROL: the reset's own ask again holds no plain turn end.
+#[test]
+fn a_turn_ends_hold_stands_while_a_limit_reset_is_in_flight() {
+    use aterm_agent::supervise::policy::turn_end::{
+        Composer, TurnEndAction, TurnEndReading, TurnEndState, decide_turn_end,
+    };
+    let t = Instant::now();
+    let plain = TurnEndReading {
+        restartable: true,
+        composer: Composer::Empty,
+        wall: None,
+        wall_message: String::new(),
+        said_tail: Some("Carrying on.".to_string()),
+        reset_at: None,
+        ..weekly_limit_reading(t)
+    };
+    let decide = |account: Option<AccountAdvice>| {
+        let r = TurnEndReading {
+            account,
+            ..plain.clone()
+        };
+        let mut st = TurnEndState::default();
+        st.observe(&r, t);
+        decide_turn_end(&st, &r, &on(), t)
+    };
+    let alone = decide(None);
+    assert!(matches!(alone, TurnEndAction::Type { .. }), "{alone:?}");
+    let again = t + RESET_AGAIN_AFTER;
+    let held = decide(account_resetting(
+        Some(AccountAdvice::Hold {
+            until: t + Duration::from_secs(300),
+        }),
+        false,
+        again,
+    ));
+    assert!(matches!(&held, TurnEndAction::WaitUntil { .. }), "{held:?}");
+    assert_eq!(
+        held,
+        decide(Some(AccountAdvice::Hold { until: again })),
+        "the hold stands as the roster's own does, asked again at the reset's ask"
+    );
+    assert_eq!(
+        decide(account_resetting(None, false, again)),
+        alone,
+        "control: the reset's own ask holds no turn end"
+    );
 }
 
 #[test]
@@ -32604,7 +32912,7 @@ fn a_superseded_session_at_a_usage_limit_is_not_followed() {
         })
         .expect("walled");
     let again = |advice: Option<AccountAdvice>| {
-        matches!(advice, Some(AccountAdvice::Wait { until })
+        matches!(advice, Some(AccountAdvice::Again { until, why: AskAgain::Unwritten })
             if until <= Instant::now() + WALL_AGAIN_AFTER)
     };
     let unwritten = idle.account(usage_wall());
@@ -35977,6 +36285,7 @@ fn the_startup_deadline_skips_the_harnesss_own_waits() {
         waits: HarnessWaits {
             grace,
             relaunching: relaunching.iter().map(|s| (*s).to_string()).collect(),
+            ..HarnessWaits::default()
         },
         ..Startups::default()
     };
@@ -36369,6 +36678,7 @@ fn the_held_deadline_counts_none_of_the_harnesss_own_waits() {
         waits: HarnessWaits {
             grace,
             relaunching: relaunching.iter().map(|sid| (*sid).to_string()).collect(),
+            ..HarnessWaits::default()
         },
         ..Startups::default()
     };
@@ -36497,6 +36807,144 @@ fn a_held_clock_restarts_within_a_relook_of_what_moved() {
     );
 }
 
+/// THE PROBE'S OWN PANEL IS NO HELD SCREEN (HP1): while the session's loop owes the close of the
+/// `/usage` panel its accounts probe opened, the held deadline counts nothing, and a whole one
+/// follows the panel's close; a panel the probe cannot close is held a deadline past its first.
+/// Negative control: the same panel with no word from the loop is held at the deadline.
+#[test]
+fn the_held_deadline_counts_none_of_the_probes_own_panel() {
+    let w = Arc::new(StartupWorld::default());
+    let hooks = w.hooks();
+    let none = OffSessions::default();
+    let t0 = Instant::now() + Duration::from_secs(3 * 3600);
+    let span = (t0, t0 + 6 * HELD_DEADLINE);
+    let at_panel = HeldRead {
+        panel: true,
+        last_row: Some("Esc to cancel".to_string()),
+        ..held_at("unknown", Progress::default())
+    };
+    let owed_until = |closed: Option<Instant>| {
+        move |books: &mut Startups, at: Instant| {
+            books.waits.own_panel = if closed.is_none_or(|closed| at < closed) {
+                HashMap::from([("s-a".to_string(), t0)])
+            } else {
+                HashMap::new()
+            };
+        }
+    };
+    let held_with = |books: &mut Startups, told: &dyn Fn(&mut Startups, Instant)| {
+        let mut at = t0;
+        while at <= span.1 {
+            told(books, at);
+            w.set(vec![held_worker(
+                "s-a",
+                StartupState::Reopened,
+                at_panel.clone(),
+            )]);
+            let next = look_at_startups(books, at, true, &none, &hooks);
+            if w.marks().iter().any(|(_, m)| matches!(m, Marked::Held(_))) {
+                return Some(at);
+            }
+            at = next?;
+        }
+        None
+    };
+    // The probe's panel, closed just short of the deadline (the stranded worker's stood 137 s).
+    let closed = t0 + HELD_DEADLINE - Duration::from_secs(10);
+    let held = held_with(&mut Startups::default(), &owed_until(Some(closed))).expect("held");
+    assert!(
+        held >= closed + HELD_DEADLINE && held <= closed + HELD_RELOOK + HELD_DEADLINE,
+        "held {:?} after the panel closed",
+        held - closed
+    );
+    // A panel the probe never closes stands past its own deadline, and is held one later.
+    let stuck = held_with(&mut Startups::default(), &owed_until(None)).expect("held");
+    assert!(
+        stuck >= t0 + 2 * HELD_DEADLINE && stuck <= t0 + 2 * HELD_DEADLINE + HELD_RELOOK,
+        "a stuck panel held {:?} after it opened",
+        stuck - t0
+    );
+    // Control: no word from the loop, the same screen is held at the deadline.
+    assert_eq!(
+        held_with(&mut Startups::default(), &|_, _| {}),
+        Some(t0 + HELD_DEADLINE)
+    );
+
+    // A worker held before its loop's word came (a restarted aterm) moves while the panel is the
+    // probe's own; with no word it stands.
+    let mut books = Startups::default();
+    books.waits.own_panel = HashMap::from([("s-a".to_string(), t0)]);
+    w.set(vec![held_worker(
+        "s-a",
+        StartupState::StalledHeld,
+        at_panel.clone(),
+    )]);
+    look_at_startups(&mut books, t0, true, &none, &hooks);
+    assert_eq!(w.marks(), [("s-a".to_string(), Marked::Moved)]);
+    let mut books = Startups::default();
+    assert_eq!(
+        look_at_startups(&mut books, t0, true, &none, &hooks),
+        Some(t0 + HELD_RELOOK)
+    );
+    assert!(w.marks().is_empty(), "a held stall with no word stands");
+
+    // The startup deadline: a successor that never saw the worker start reads the panel as no
+    // composer, and the probe's own panel is not judged there either.
+    let no_composer = StartupSeen::Holds(StartupHold::NoComposer {
+        agent: Program::Claude,
+    });
+    w.set(vec![startup("s-a", StartupState::Working, t0, no_composer)]);
+    let mut books = Startups::default();
+    books.waits.own_panel = HashMap::from([("s-a".to_string(), t0)]);
+    let late = t0 + STARTUP_DEADLINE - Duration::from_secs(1);
+    for at in [t0, late] {
+        assert!(look_at_startups(&mut books, at, true, &none, &hooks).is_some());
+    }
+    assert!(w.marks().is_empty(), "the probe's panel is no stall");
+    books.waits.own_panel.clear();
+    look_at_startups(&mut books, late + HELD_RELOOK, true, &none, &hooks);
+    assert!(w.marks().is_empty(), "a whole deadline after the panel");
+    look_at_startups(&mut books, late + STARTUP_DEADLINE, true, &none, &hooks);
+    assert_eq!(
+        w.marks(),
+        [stalled(
+            "s-a",
+            StartupHold::NoComposer {
+                agent: Program::Claude
+            }
+        )]
+    );
+    let mut plain = Startups::default();
+    look_at_startups(&mut plain, t0, true, &none, &hooks);
+    look_at_startups(&mut plain, t0 + STARTUP_DEADLINE, true, &none, &hooks);
+    assert_eq!(
+        w.marks(),
+        [stalled(
+            "s-a",
+            StartupHold::NoComposer {
+                agent: Program::Claude
+            }
+        )],
+        "control: no word from the loop"
+    );
+}
+
+/// The pass reads each worker's word of its own panel ([`Kept::own_panel`]): the first opening a
+/// worker or its successor told, gone at the close.
+#[test]
+fn the_pass_reads_the_probes_own_panel_off_each_worker() {
+    let mut workers = Workers(HashMap::new());
+    workers.0.insert("s-a".to_string(), idle_worker());
+    workers.0.insert("s-b".to_string(), idle_worker());
+    assert!(own_panels(&workers).is_empty());
+    let opened = Instant::now();
+    with_kept_of(&workers.0["s-a"].kept, |k| k.own_panel = Some(opened));
+    assert_eq!(
+        own_panels(&workers),
+        HashMap::from([("s-a".to_string(), opened)])
+    );
+}
+
 #[test]
 fn the_held_deadline_holds_off_through_a_drivers_hand() {
     let w = Arc::new(StartupWorld::default());
@@ -36509,6 +36957,7 @@ fn the_held_deadline_holds_off_through_a_drivers_hand() {
         waits: HarnessWaits {
             grace,
             relaunching: HashSet::new(),
+            ..HarnessWaits::default()
         },
         ..Startups::default()
     };
@@ -36542,6 +36991,7 @@ fn a_hand_defers_no_stall_where_the_harness_has_no_act() {
         waits: HarnessWaits {
             grace,
             relaunching: HashSet::new(),
+            ..HarnessWaits::default()
         },
         ..Startups::default()
     };
@@ -36600,6 +37050,7 @@ fn a_look_that_could_not_read_the_screen_marks_nothing() {
         waits: HarnessWaits {
             grace,
             relaunching: HashSet::new(),
+            ..HarnessWaits::default()
         },
         ..Startups::default()
     };
@@ -43074,14 +43525,15 @@ fn a_codex_sessions_worker_takes_no_step_of_the_upgrade() {
     until("the Claude Code stepped", || {
         a.stepped.load(Ordering::SeqCst) >= 1
     });
-    assert!(
+    // The two sessions' loops run on their own threads, so the Claude Code's step orders
+    // nothing about the Codex's watch: the wait reads the watch itself.
+    until("the Codex's loop watches beside the agent itself", || {
         a.beside_ran
             .lock()
             .unwrap()
             .iter()
-            .any(|(s, beside)| s == "s-cx" && beside.as_deref() == Some(UNCLAIMED_CODEX_ALAB)),
-        "the Codex's loop watches beside the agent itself"
-    );
+            .any(|(s, beside)| s == "s-cx" && beside.as_deref() == Some(UNCLAIMED_CODEX_ALAB))
+    });
     host.shutdown_and_join();
     let stepped = a.stepped_for.lock().unwrap().clone();
     assert!(

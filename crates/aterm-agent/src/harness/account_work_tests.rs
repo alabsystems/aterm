@@ -130,7 +130,9 @@ fn operation_cancellation_is_isolated_and_does_not_own_retirement() {
     let detached = first.clone();
     let other = lifetime.enter().unwrap();
     let cancellation = first.cancellation();
+    assert!(!cancellation.cancelled());
     cancellation.cancel();
+    assert!(cancellation.cancelled());
     assert!(first.cancelled());
     assert!(detached.cancelled());
     assert!(!other.cancelled());
@@ -139,6 +141,22 @@ fn operation_cancellation_is_isolated_and_does_not_own_retirement() {
     assert!(!cancellation.retired());
     drop(detached);
     assert!(cancellation.retired());
+    assert!(cancellation.cancelled());
     assert!(!other.cancelled());
+    assert!(!lifetime.enter().unwrap().cancelled());
+}
+
+#[test]
+fn cancellation_observation_follows_epoch_pause_without_retaining_work() {
+    let lifetime = Lifetime::default();
+    let work = lifetime.enter().unwrap();
+    let cancellation = work.cancellation();
+    assert!(!cancellation.cancelled());
+    let paused = lifetime.pause().unwrap();
+    assert!(cancellation.cancelled());
+    drop(work);
+    assert!(cancellation.retired());
+    paused.try_wait().unwrap().resume().unwrap();
+    assert!(cancellation.cancelled());
     assert!(!lifetime.enter().unwrap().cancelled());
 }

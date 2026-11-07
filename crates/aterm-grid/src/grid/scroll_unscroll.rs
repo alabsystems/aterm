@@ -60,8 +60,10 @@ impl Grid {
 
         let cols = self.storage.cols;
         for (i, line) in lines.iter().enumerate() {
-            self.fill_row_from_line(row_u16(top + i), line, cols);
+            // The region shift emptied these destination rows in every extras store.
+            self.fill_row_from_line_cleared(row_u16(top + i), line, cols);
         }
+        self.storage.extras.maybe_shrink();
         self.paint_wrap_holes(row_u16(top)..row_u16(top + lines.len()));
 
         let from_ring = n.min(ring);

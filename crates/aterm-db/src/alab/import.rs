@@ -82,7 +82,7 @@ use crate::{
         Collection,
         cell::{self, CellKey, CellValue, Cells, Field, ImportStep, Projection},
         check, guard, keys,
-        secret::{MASK, Sealer, Secret, flag_like},
+        secret::{MASK, Sealer, Secret, cell_claims, flag_like},
     },
 };
 use aterm_codec::hex;
@@ -355,11 +355,12 @@ impl Sheet {
             return Err(Error::new("the sheet's file name cannot be recorded"));
         }
         // A credential column of a sheet is a has-password flag (the owner's `alab-emails.csv`
-        // holds `1` there): only whether it is set is kept, so no review or finding shows a cell.
+        // holds `1` there): only whether it claims one is kept, so no review or finding shows a
+        // cell, and a none word reads as an empty cell.
         for (col, _) in headers.iter().enumerate().filter(|(_, h)| secret_header(h)) {
             for row in &mut records {
                 if let Some(cell) = row.get_mut(col) {
-                    let set = !cell.trim().is_empty();
+                    let set = cell_claims(cell);
                     zeroize::Zeroize::zeroize(cell);
                     *cell = if set { "1".into() } else { String::new() };
                 }
@@ -567,7 +568,7 @@ pub struct Stated {
 pub struct KnownMac {
     pub label: Option<Label>,
     pub aliases: Vec<Label>,
-    /// Its fleet node id, 32 lower-case hex digits.
+    /// Its key-derived node principal, 16 lower-case hex digits without `n-`.
     pub node: Option<String>,
     pub hosts: Vec<String>,
 }
@@ -865,15 +866,19 @@ struct ReadNow<'a> {
     kinds: BTreeSet<&'a str>,
     /// The files read of a kind with several: reading one says nothing of the others.
     files: Vec<&'a Sheet>,
+    /// No sheet read holds a replica's disagreement. While one does, what a source no longer states
+    /// may be what the disagreement hides, so nothing is taken back until it is settled.
+    settled: bool,
 }
 
 impl ReadNow<'_> {
-    /// Whether the source row `row`, key `pk`, is one this run read.
+    /// Whether the source row `row`, key `pk`, is one this run read and can take back from.
     fn covers(&self, pk: &str, row: &cell::Row) -> bool {
         let Some(kind) = row.get("kind").and_then(Value::as_str) else {
             return false;
         };
-        self.kinds.contains(kind)
+        self.settled
+            && self.kinds.contains(kind)
             && (!several_word(kind) || self.files.iter().any(|sheet| sheet.wrote(pk, row)))
     }
 }
@@ -2746,14 +2751,12 @@ impl Planner<'_> {
     }
 
     /// The live machine rows whose fleet node is `node`: one, or a clash any writer could make,
-    /// since `fleet_node` is an owner cell.
+    /// since `node` is an owner cell.
     fn live_by_node(&self, node: &str) -> Vec<String> {
         self.current[MACHINE.name]
             .rows
             .iter()
-            .filter(|(_, row)| {
-                row.live() && row.get("fleet_node").and_then(Value::as_str) == Some(node)
-            })
+            .filter(|(_, row)| row.live() && row.get("node").and_then(Value::as_str) == Some(node))
             .map(|(pk, _)| pk.clone())
             .collect()
     }
@@ -2895,7 +2898,7 @@ impl Planner<'_> {
                 kind: Kind::NodeAmbiguous,
                 collection: Some(MACHINE.name),
                 pk: None,
-                column: Some("fleet_node".to_owned()),
+                column: Some("node".to_owned()),
                 at: vec![at],
             });
             return None;
@@ -2905,7 +2908,7 @@ impl Planner<'_> {
                 kind: Kind::AdoptedByNode,
                 collection: Some(MACHINE.name),
                 pk: Some(pk.clone()),
-                column: Some("fleet_node".to_owned()),
+                column: Some("node".to_owned()),
                 at: Vec::new(),
             });
         }
@@ -2931,9 +2934,6 @@ impl Planner<'_> {
             self.want(&MACHINE, &pk, "label", json!(label), &at);
         }
         self.want(&MACHINE, &pk, "status", json!("active"), &at);
-        if let Some(node) = valid_node(mac) {
-            self.want(&MACHINE, &pk, "fleet_node", json!(node), &at);
-        }
         let hosts = valid_hosts(mac);
         if !hosts.is_empty() {
             self.want(&MACHINE, &pk, "hosts", json!(hosts), &at);
@@ -2988,6 +2988,7 @@ impl Planner<'_> {
                 .iter()
                 .filter(|sheet| sheet.kind.several())
                 .collect(),
+            settled: input.sheets.iter().all(|sheet| sheet.conflicted.is_empty()),
         };
         // The `+tag` rule's cells move only on a run that can see the owner's corrections.
         let logins_read = read.kinds.contains(SheetKind::Logins.word());
@@ -3327,6 +3328,9 @@ impl Planner<'_> {
                                 && (logins_read
                                     || name != ADDRESS.name
                                     || !matches!(column.as_str(), "alias_of" | "kind"))
+                                // An address this run could not resolve may be the one that states
+                                // this mailbox, as it may state a preference.
+                                && !(address_unread && name == ADDRESS.name && column == "mailbox")
                                 && !want.values.contains_key(column.as_str()) =>
                             {
                                 if let Some((ret_sheet, ret_source)) = retract_source(field) {
@@ -3629,7 +3633,7 @@ impl Planner<'_> {
 
 fn valid_node(mac: &KnownMac) -> Option<String> {
     let node = mac.node.as_deref()?.trim();
-    (node.len() == 32 && node.bytes().all(|b| b.is_ascii_hexdigit()))
+    (node.len() == 16 && node.bytes().all(|b| b.is_ascii_hexdigit()))
         .then(|| node.to_ascii_lowercase())
 }
 

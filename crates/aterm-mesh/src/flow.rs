@@ -230,8 +230,13 @@ impl Mesh {
             let flow = flow.as_ref()?;
             (Arc::clone(&flow.stores), Arc::clone(&flow.egress))
         };
-        let peers: Vec<String> = self.heard.lock_or_recover().keys().cloned().collect();
-        if peers.is_empty() {
+        let groups: Vec<String> = self
+            .heard
+            .lock_or_recover()
+            .keys()
+            .map(|peer| relay::group_of(peer))
+            .collect();
+        if groups.is_empty() {
             return None;
         }
         let key = TableKey {
@@ -247,9 +252,9 @@ impl Mesh {
         let mut acks = self.acks.0.lock_or_recover();
         loop {
             // The neighbour's group resumes one past the last record it acked.
-            if peers
+            if groups
                 .iter()
-                .any(|peer| broker.group_start(&relay::group_of(peer)) > offset)
+                .any(|group| broker.group_start(group) > offset)
             {
                 return Some(Pushed::Reached);
             }

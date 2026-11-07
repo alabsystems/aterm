@@ -611,6 +611,21 @@ fn check_tool<'a>(
 /// [`a_placed_test_build_takes_the_workspace_graph_around_its_verb`] reads the rest).
 #[cfg(unix)]
 fn graphed(tool: Tool, args: &[String]) -> Vec<String> {
+    if tool == Tool::Targo
+        && let Some(at) = args
+            .iter()
+            .position(|a| matches!(a.as_str(), "build" | "b"))
+        && !args
+            .iter()
+            .any(|a| matches!(a.as_str(), "--release" | "-r"))
+    {
+        let mut out = args[..at].to_vec();
+        out.extend(TEST_GRAPH_CONFIG.map(str::to_owned));
+        out.push(args[at].clone());
+        out.push(TEST_GRAPH_FLAG.to_owned());
+        out.extend_from_slice(&args[at + 1..]);
+        return out;
+    }
     match args {
         [lane, verb, rest @ ..]
             if tool == Tool::Targo
@@ -1159,12 +1174,12 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
     }
 }
 
-/// A placed `test`, `t` or `bench` gets the test graph around its verb, its `--config` right
-/// before the verb (with every other `--config`, which one after the verb would replace) and its
+/// A placed dev build, `test`, `t` or `bench` gets the test graph around its verb, its `--config`
+/// right before the verb (with every other `--config`, which one after the verb would replace) and its
 /// flag right after it, past the flags and flag values before it and ahead of `--` and the test
 /// binary's own words, once; the build-dir pair still leads (a shim's front strips it there).
-/// NEGATIVE CONTROL: a call that names `-Zfeature-unification` itself, another verb, a `test`
-/// after `--` and an alias, even one to `test`, keep their words as typed.
+/// NEGATIVE CONTROL: release/custom builds, a call that names `-Zfeature-unification` itself,
+/// another verb, a `test` after `--` and an alias, even one to `test`, keep their words as typed.
 #[cfg(unix)]
 #[test]
 fn a_placed_test_build_takes_the_workspace_graph_around_its_verb() {
@@ -1212,7 +1227,33 @@ fn a_placed_test_build_takes_the_workspace_graph_around_its_verb() {
             "--unverified test -Z unstable-options -Zfeature-unification",
             "--unverified test -Z unstable-options -Zfeature-unification",
         ),
-        ("--unverified build -p x", "--unverified build -p x"),
+        ("--unverified build -p x", "--unverified C build F -p x"),
+        ("--unverified b -p x", "--unverified C b F -p x"),
+        (
+            "--unverified build --profile dev",
+            "--unverified C build F --profile dev",
+        ),
+        (
+            "--unverified build --profile=test",
+            "--unverified C build F --profile=test",
+        ),
+        (
+            "--unverified build --release",
+            "--unverified build --release",
+        ),
+        ("--unverified b -r", "--unverified b -r"),
+        (
+            "--unverified build --profile release",
+            "--unverified build --profile release",
+        ),
+        (
+            "--unverified build --profile=gate",
+            "--unverified build --profile=gate",
+        ),
+        (
+            "--unverified build -Zfeature-unification",
+            "--unverified build -Zfeature-unification",
+        ),
         (
             "--unverified run -p x -- test",
             "--unverified run -p x -- test",
@@ -1509,8 +1550,9 @@ fn the_rendered_shim_hands_targo_the_config() {
     assert_eq!(
         run(&["--unverified", "build", "--target-dir", "t"]),
         format!(
-            "--config build.build-dir='{}/t/build.noindex' --unverified build --target-dir t\n",
-            ws.display()
+            "--config build.build-dir='{}/t/build.noindex' --unverified {} build {TEST_GRAPH_FLAG} --target-dir t\n",
+            ws.display(),
+            TEST_GRAPH_CONFIG.join(" ")
         )
     );
 }
@@ -1884,10 +1926,15 @@ fn the_rendered_hops_front_is_named_by_its_target() {
             std::path::Path::new(front.target).file_name(),
             Some(std::ffi::OsStr::new("targo"))
         );
+        let expected = if placed == "config" {
+            graphed(Tool::Targo, &strings(typed))
+        } else {
+            strings(typed)
+        };
         assert!(
             front
                 .args
-                .ends_with(&typed.iter().map(OsString::from).collect::<Vec<_>>()),
+                .ends_with(&expected.iter().map(OsString::from).collect::<Vec<_>>()),
             "{words:?}"
         );
     }

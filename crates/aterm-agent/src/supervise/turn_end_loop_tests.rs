@@ -50,6 +50,9 @@ mod draft_hold_loop;
 #[path = "probe_own_line_tests.rs"]
 mod probe_own_line;
 
+#[path = "probe_door_tests.rs"]
+mod probe_door;
+
 #[path = "command_draft_loop_tests.rs"]
 mod command_draft_loop;
 
@@ -25768,6 +25771,11 @@ fn a_claimed_probe_types_usage_samples_the_settled_panel_and_closes_it() {
             "account:turn-end",
         ],
         "no turn ran between the probe and the point decided again: {lines:#?}"
+    );
+    assert_eq!(
+        host.panel_told(),
+        [true, false],
+        "its panel told standing from its claim to its close"
     );
     let samples = host.samples.lock().unwrap().clone();
     assert_eq!(samples.len(), 1);

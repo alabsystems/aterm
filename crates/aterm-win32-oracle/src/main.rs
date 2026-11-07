@@ -12,6 +12,7 @@ mod oracle;
 mod plants;
 mod source;
 use aterm_json::Value;
+use aterm_toolchain::named_lock;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Output};
@@ -134,9 +135,8 @@ fn find_root(start: &Path) -> Option<PathBuf> {
     start
         .ancestors()
         .find(|p| {
-            std::fs::symlink_metadata(p.join("win32-oracle/Cargo.toml")).is_ok_and(|m| m.is_file())
-                && std::fs::symlink_metadata(p.join("crates/aterm-win32/Cargo.toml"))
-                    .is_ok_and(|m| m.is_file())
+            p.join("win32-oracle/Cargo.toml").is_file()
+                && p.join("crates/aterm-win32/Cargo.toml").is_file()
         })
         .map(Path::to_path_buf)
 }
@@ -160,7 +160,7 @@ fn upstream() -> Result<PathBuf> {
             continue;
         }
         let path = e.path().join(&win_dir);
-        if std::fs::symlink_metadata(path.join("Cargo.toml")).is_ok_and(|m| m.is_file()) {
+        if path.join("Cargo.toml").is_file() {
             hits.push(path)
         }
     }
@@ -536,6 +536,100 @@ fn pretty_json(value: &Value) -> Result<String> {
     Ok(out)
 }
 
+/// The named lock in a build directory, beside cargo's own.
+const TARGET_LOCK: &str = "aterm-win32-oracle.lock";
+
+/// The cache-directory tag cargo writes in a target directory it makes, byte for byte. Stock
+/// cargo 1.99 refuses to `clean` a target directory without it ("missing or invalid
+/// `CACHEDIR.TAG` file", exit 101); [`hold_target`] makes the directory before cargo ever runs
+/// there, so it writes the tag cargo would have.
+const CACHEDIR_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n\
+# This file is a cache directory tag created by cargo.\n\
+# For information about cache directory tags see https://bford.info/cachedir/\n";
+
+/// Make `target` a cargo target directory: the directory, and its [`CACHEDIR_TAG`] unless one
+/// is there (cargo's own, or one written before, is left as it is).
+fn make_target(target: &Path) -> Result<()> {
+    std::fs::create_dir_all(target).map_err(|e| format!("{}: {e}", target.display()))?;
+    let tag = target.join("CACHEDIR.TAG");
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tag)
+    {
+        Ok(mut file) => std::io::Write::write_all(&mut file, CACHEDIR_TAG.as_bytes())
+            .map_err(|e| format!("{}: {e}", tag.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(format!("{}: {e}", tag.display())),
+    }
+}
+
+/// Hold `target`'s named lock for this run of `verb` from `root`: each record, oracle and
+/// oracle-052 step is several cargo processes (a `clean -p`, then a build whose rlib `nm` then
+/// reads), and cargo's own build lock lasts one process, so a second run on the directory
+/// between them deletes or rebuilds what this one reads (WB2-2: `nm inspection failed: … No such
+/// file or directory`, exit 3). A second run waits for the first, naming it on `say` as it starts
+/// and once a minute (`docs/DESIGN-adaptive-build-2026-10-24.md`, LOCK-WAIT); an interrupt ends
+/// the wait, naming it, and the kernel lets the lock go however its holder ends.
+fn hold_target(
+    target: &Path,
+    verb: &str,
+    root: &Path,
+    say: &mut dyn FnMut(&str),
+) -> Result<named_lock::NamedLock> {
+    make_target(target)?;
+    let path = target.join(TARGET_LOCK);
+    let me = named_lock::Holder::me(&format!("aterm-win32-oracle {verb}"), root);
+    let name = |holder: Option<&named_lock::Holder>| {
+        named_lock::name(
+            holder,
+            |since| {
+                i64::try_from(since)
+                    .ok()
+                    .and_then(aterm_uds::zone::local_offset_at)
+                    .unwrap_or(0)
+            },
+            aterm_uds::process::pid_alive,
+        )
+    };
+    let taken = named_lock::take(
+        &path,
+        &me,
+        named_lock::Wait::Block,
+        &mut |holder, waited| {
+            say(&if waited < named_lock::SAY_EVERY {
+                format!(
+                    "win32 oracle: waiting for {}, which holds the build directory ({})",
+                    name(holder),
+                    target.display()
+                )
+            } else {
+                format!(
+                    "win32 oracle: still waiting for {} ({} min)",
+                    name(holder),
+                    waited.as_secs() / 60
+                )
+            });
+        },
+        &|| false,
+    );
+    match taken {
+        Ok(held) => Ok(held),
+        Err(named_lock::Refused::Stopped { holder, .. }) => Err(format!(
+            "interrupted while waiting for {}, which holds the build directory ({}); this run \
+             built nothing",
+            name(holder.as_ref()),
+            target.display()
+        )),
+        Err(named_lock::Refused::Held(holder)) => Err(format!(
+            "{} holds the build directory ({})",
+            name(holder.as_ref()),
+            target.display()
+        )),
+        Err(named_lock::Refused::Io(e)) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
 fn start() -> Result<u8> {
     let mut args = std::env::args().skip(1);
     let Some(verb) = args.next() else {
@@ -600,15 +694,22 @@ fn start() -> Result<u8> {
         let tools = tools(&root, Some(stock.as_str()))?;
         let target =
             target.unwrap_or_else(|| root.join(facade052::WORKSPACE).join("target.noindex"));
+        let _held = hold_target(&target, &verb, &root, &mut |line| println!("{line}"))?;
         return facade052::gate(&root, &tools, &target);
     }
     let up = up.or_else(|| std::env::var_os("WINDOWS_SYS_SRC").map(PathBuf::from));
     // oracle and record build win32-oracle/ frozen. gen and check only read
     // the registry copy its lock pins, so they resolve it only when none is
     // unpacked, and run offline from one a prune left.
-    if verb == "oracle" || verb == "record" {
+    let target = target.unwrap_or_else(|| root.join("win32-oracle/target.noindex"));
+    let _held = if verb == "oracle" || verb == "record" {
         answerable(&root, REFERENCE)?;
-    }
+        Some(hold_target(&target, &verb, &root, &mut |line| {
+            println!("{line}");
+        })?)
+    } else {
+        None
+    };
     let up = match up {
         Some(p) => p,
         None => match upstream() {
@@ -640,7 +741,6 @@ fn start() -> Result<u8> {
     for note in &model.notes {
         println!("note: {note}")
     }
-    let target = target.unwrap_or_else(|| root.join("win32-oracle/target.noindex"));
     match verb.as_str() {
         "gen" => {
             generate(
@@ -674,6 +774,28 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A checkout whose marker files are symlinks to regular files is still the root, as
+    /// `Path::is_file` follows them; one missing a marker is not.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_whose_markers_are_symlinks_is_found() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("checkout");
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).expect("real");
+        for rel in ["win32-oracle/Cargo.toml", "crates/aterm-win32/Cargo.toml"] {
+            let target = real.join(rel.replace('/', "-"));
+            std::fs::write(&target, "").expect("write");
+            let link = root.join(rel);
+            std::fs::create_dir_all(link.parent().expect("parent")).expect("dirs");
+            std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        }
+        let start = root.join("crates/aterm-win32");
+        assert_eq!(find_root(&start), Some(root.clone()));
+        std::fs::remove_file(root.join("win32-oracle/Cargo.toml")).expect("remove");
+        assert_eq!(find_root(&start), None);
+    }
     #[test]
     fn recorded_stream_is_strict_and_keeps_all_answer_kinds() {
         let r =
@@ -684,6 +806,76 @@ mod tests {
         for bad in ["garbage", "offset\tA\tx\t0", "value\tB\t1\nvalue\tB\t2"] {
             assert!(parse_record(bad).is_err(), "{bad}")
         }
+    }
+
+    /// A build directory the oracle makes carries cargo's cache-directory tag, which stock cargo's
+    /// `clean` requires, and one already there is kept. NEGATIVE CONTROL: `hold_target` creating
+    /// the directory alone (no `make_target`) fails "the tag cargo's clean requires".
+    #[test]
+    fn a_build_directory_the_oracle_makes_is_one_cargo_will_clean() {
+        let dir = aterm_tempfile::tempdir().expect("scratch checkout");
+        let target = dir.path().join("target.noindex");
+        drop(
+            hold_target(&target, "oracle", dir.path(), &mut |line| panic!("{line}"))
+                .expect("a free directory"),
+        );
+        let tag = target.join("CACHEDIR.TAG");
+        assert_eq!(
+            std::fs::read_to_string(&tag).expect("the tag cargo's clean requires"),
+            CACHEDIR_TAG
+        );
+        assert!(CACHEDIR_TAG.starts_with("Signature: 8a477f597d28d172789f06886806bc55"));
+        std::fs::write(
+            &tag,
+            "Signature: 8a477f597d28d172789f06886806bc55\n# cargo's own\n",
+        )
+        .expect("rewrite");
+        make_target(&target).expect("again");
+        assert!(
+            std::fs::read_to_string(&tag)
+                .expect("tag")
+                .ends_with("# cargo's own\n"),
+            "a tag already there is kept"
+        );
+    }
+
+    /// A second run on one build directory waits for the first, naming it, and has the directory
+    /// once the first lets go (WB2-2). Negative control: without the lock the second run returns
+    /// at once, naming nobody, and the channel closes before any line.
+    #[test]
+    fn a_second_run_on_one_build_directory_waits_for_the_first() {
+        const HANG: std::time::Duration = std::time::Duration::from_secs(60);
+        let dir = aterm_tempfile::tempdir().expect("scratch checkout");
+        let target = dir.path().join("target.noindex");
+        let first = hold_target(&target, "oracle", dir.path(), &mut |line| {
+            panic!("a free directory is taken at once, not waited for: {line}")
+        })
+        .expect("a free directory");
+        let (said, heard) = std::sync::mpsc::channel();
+        let second = {
+            let (target, root) = (target.clone(), dir.path().to_path_buf());
+            std::thread::spawn(move || {
+                hold_target(&target, "oracle-052", &root, &mut |line| {
+                    let _ = said.send(line.to_string());
+                })
+                .map(drop)
+            })
+        };
+        let line = heard
+            .recv_timeout(HANG)
+            .expect("the second run names the first before it has the directory");
+        assert!(
+            line.contains(&format!("pid {}", std::process::id()))
+                && line.contains("aterm-win32-oracle oracle")
+                && line.contains(&target.display().to_string()),
+            "{line}"
+        );
+        assert!(!second.is_finished(), "it waits while the first holds it");
+        drop(first);
+        second
+            .join()
+            .expect("the waiter")
+            .expect("the second run has the directory once the first lets go");
     }
 
     #[test]

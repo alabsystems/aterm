@@ -26,6 +26,8 @@ pub(crate) const VERB: &str = "__resource-host-v3";
 const MAX_CONNECTIONS: usize = 128;
 struct Endpoint {
     program: PathBuf,
+    native: Option<Arc<trust_resource_provenance::PinnedProgram>>,
+    telemetry: Option<Arc<crate::resource_telemetry::Telemetry>>,
 }
 static ENDPOINT: OnceLock<Endpoint> = OnceLock::new();
 #[cfg(test)]
@@ -33,6 +35,8 @@ pub(crate) fn test_endpoint() -> io::Result<()> {
     let program = std::env::current_exe()?.canonicalize()?;
     let existing = ENDPOINT.get_or_init(|| Endpoint {
         program: program.clone(),
+        native: None,
+        telemetry: None,
     });
     if existing.program == program {
         Ok(())
@@ -44,6 +48,12 @@ pub(super) fn inspector_program() -> io::Result<&'static std::path::Path> {
     ENDPOINT
         .get()
         .map(|endpoint| endpoint.program.as_path())
+        .ok_or_else(refused)
+}
+fn native_program() -> io::Result<Arc<trust_resource_provenance::PinnedProgram>> {
+    ENDPOINT
+        .get()
+        .and_then(|endpoint| endpoint.native.clone())
         .ok_or_else(refused)
 }
 fn refused() -> io::Error {
@@ -137,9 +147,18 @@ fn run(control: CtlStream, status: CtlStream) -> io::Result<()> {
     let listener = aterm_uds::kept_out(|| CtlListener::bind(&path))?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     let instance = store.publish(&program, &listener)?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let native = trust_resource_provenance::Store::open_at(&Store::account_path()?)?
+        .pin_program(program.path(), deadline)?;
+    native.validate_cached_process(
+        trust_resource_provenance::process::read_identity(pid)?,
+        deadline,
+    )?;
     ENDPOINT
         .set(Endpoint {
             program: program.path().to_owned(),
+            native: Some(Arc::new(native)),
+            telemetry: Some(Arc::new(crate::resource_telemetry::Telemetry::new()?)),
         })
         .map_err(|_| refused())?;
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -270,6 +289,20 @@ fn serve_one(stream: &CtlStream, program: &Program, guis: Arc<AtomicUsize>) -> i
             wire::write_frame(stream, &[1], deadline)?;
             crate::forward::serve(stream, |peer| authority.check(peer))
         }
+        Some("native-telemetry") if hello["version"].as_u64() == Some(3) => {
+            let telemetry = ENDPOINT
+                .get()
+                .and_then(|endpoint| endpoint.telemetry.as_ref())
+                .ok_or_else(refused)?;
+            crate::resource_telemetry::serve(
+                stream,
+                peer,
+                &hello,
+                deadline,
+                telemetry,
+                crate::actor::context,
+            )
+        }
         Some("native-context") if hello["version"].as_u64() == Some(3) => {
             crate::resource_context::serve(stream, peer, &hello, deadline, crate::actor::context)
         }
@@ -287,6 +320,24 @@ fn serve_one(stream: &CtlStream, program: &Program, guis: Arc<AtomicUsize>) -> i
                 return Err(refused());
             }
             Ok(())
+        }
+        Some("proxy-member") if hello["version"].as_u64() == Some(3) => {
+            let job = crate::actor::proxy_binding(&hello)?;
+            let native = native_program()?;
+            native.validate_cached_process(
+                trust_resource_provenance::process::read_identity(peer.pid)?,
+                deadline,
+            )?;
+            wire::write_frame(stream, aterm_types::resource_subgroup::PREPARE, deadline)?;
+            let incoming = crate::resource_proxy_intake::receive(
+                stream,
+                &job,
+                &native,
+                deadline,
+                crate::actor::provisional_proxy,
+            )?;
+            crate::actor::submit_proxy(incoming)?;
+            aterm_ctl::resource_subgroup_client::acknowledge(stream, deadline)
         }
         Some("member") => {
             let job = crate::actor::member_binding(&hello)?;

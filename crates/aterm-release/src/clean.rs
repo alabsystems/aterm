@@ -21,6 +21,13 @@ pub enum Dirt {
 #[must_use]
 pub fn dirty_against_head(root: &Path) -> Option<BTreeMap<String, Dirt>> {
     let index = index_entries(root)?;
+    dirty_against_head_with_index(root, &index)
+}
+
+fn dirty_against_head_with_index(
+    root: &Path,
+    index: &[IndexEntry],
+) -> Option<BTreeMap<String, Dirt>> {
     let tracked = out_z(
         root,
         &[
@@ -60,7 +67,7 @@ pub fn dirty_against_head(root: &Path) -> Option<BTreeMap<String, Dirt>> {
         .into_iter()
         .chain(untracked)
         .chain(ignored_rules)
-        .chain(flag_hidden_edits(root, &index)?)
+        .chain(flag_hidden_edits(root, index)?)
         .map(|p| (p, Dirt::Changed))
         .collect();
     for entry in index.iter().filter(|e| e.mode == GITLINK_MODE) {
@@ -112,30 +119,39 @@ pub fn tracked_files(root: &Path) -> Option<BTreeSet<String>> {
 /// The strict judge, for a run that files proofs under `HEAD`'s tree.
 #[must_use]
 pub fn strictly_clean(root: &Path) -> Option<bool> {
-    Some(dirty_against_head(root)?.is_empty() && raw_differences(root)?.is_empty())
+    let index = index_entries(root)?;
+    Some(
+        dirty_against_head_with_index(root, &index)?.is_empty()
+            && raw_differences_with_index(root, &index)?.is_empty(),
+    )
 }
 
 /// Every path of `HEAD`'s tree whose working copy is not the blob it records, by identity.
 #[must_use]
 pub fn raw_differences(root: &Path) -> Option<Vec<String>> {
+    let index = index_entries(root)?;
+    raw_differences_with_index(root, &index)
+}
+
+fn raw_differences_with_index(root: &Path, index: &[IndexEntry]) -> Option<Vec<String>> {
     let listing = out(root, &["ls-tree", "-r", "-z", "--full-tree", "HEAD"])?;
-    let mut differ: Vec<String> = index_entries(root)?
-        .into_iter()
+    let mut differ: Vec<String> = index
+        .iter()
         .filter(|e| e.tag.is_ascii_lowercase() || e.tag == 'S')
-        .map(|e| e.path)
+        .map(|e| e.path.clone())
         .collect();
-    let mut files: Vec<(String, String)> = Vec::new();
+    let mut files: Vec<(std::borrow::Cow<'_, str>, &str)> = Vec::new();
     for rec in listing.split(|b| *b == 0).filter(|r| !r.is_empty()) {
         let tab = rec.iter().position(|b| *b == b'\t')?;
         let meta = std::str::from_utf8(&rec[..tab]).ok()?;
-        let path = String::from_utf8_lossy(&rec[tab + 1..]).into_owned();
+        let path = String::from_utf8_lossy(&rec[tab + 1..]);
         let mut fields = meta.split(' ');
         let (mode, blob) = (fields.next()?, fields.nth(1)?);
-        let full = root.join(&path);
+        let full = root.join(path.as_ref());
         let md = std::fs::symlink_metadata(&full).ok();
         match (mode, md) {
             ("100644" | "100755", Some(m)) if m.is_file() && (mode == "100755") == is_exec(&m) => {
-                files.push((path, blob.to_string()));
+                files.push((path, blob));
             }
             ("120000", Some(m)) if m.file_type().is_symlink() => {
                 let target = std::fs::read_link(&full).ok()?;
@@ -145,26 +161,31 @@ pub fn raw_differences(root: &Path) -> Option<Vec<String>> {
                     target.as_os_str().as_encoded_bytes(),
                 )?;
                 if id != blob {
-                    differ.push(path);
+                    differ.push(path.into_owned());
                 }
             }
             (GITLINK_MODE, Some(m)) if m.is_dir() && is_toplevel(&full) => {
                 if hash(&full, &["rev-parse", "HEAD"], b"")?.as_str() != blob {
-                    differ.push(path.clone());
+                    differ.push(path.as_ref().to_owned());
                 }
                 for p in raw_differences(&full)? {
                     differ.push(format!("{path}/{p}"));
                 }
             }
-            _ => differ.push(path),
+            _ => differ.push(path.into_owned()),
         }
     }
     let (odd, plain): (Vec<_>, Vec<_>) = files
         .into_iter()
         .partition(|(p, _)| p.contains('\n') || p.starts_with('"'));
     for (path, blob) in odd {
-        if hash(root, &["hash-object", "--no-filters", "--", &path], b"")? != blob {
-            differ.push(path);
+        if hash(
+            root,
+            &["hash-object", "--no-filters", "--", path.as_ref()],
+            b"",
+        )? != blob
+        {
+            differ.push(path.into_owned());
         }
     }
     if !plain.is_empty() {
@@ -182,8 +203,8 @@ pub fn raw_differences(root: &Path) -> Option<Vec<String>> {
         let ids = std::str::from_utf8(&ids).ok()?;
         let mut got = ids.lines();
         for (path, blob) in plain {
-            if got.next() != Some(blob.as_str()) {
-                differ.push(path);
+            if got.next() != Some(blob) {
+                differ.push(path.into_owned());
             }
         }
     }
@@ -255,10 +276,16 @@ fn index_entries(root: &Path) -> Option<Vec<IndexEntry>> {
                 GITLINK_MODE => std::borrow::Cow::Borrowed(GITLINK_MODE),
                 other => std::borrow::Cow::Owned(other.to_string()),
             };
+            let blob = fields.next()?;
+            let blob = if tag.is_ascii_lowercase() || tag == 'S' {
+                blob.to_string()
+            } else {
+                String::new()
+            };
             Some(IndexEntry {
                 tag,
                 mode,
-                blob: fields.next()?.to_string(),
+                blob,
                 path: String::from_utf8_lossy(&rec[tab + 1..]).into_owned(),
             })
         })
@@ -324,8 +351,11 @@ fn is_toplevel(dir: &Path) -> bool {
     let Some(top) = out(dir, &["rev-parse", "--show-toplevel"]) else {
         return false;
     };
-    let top = String::from_utf8_lossy(&top).trim().to_string();
-    match (std::fs::canonicalize(top), std::fs::canonicalize(dir)) {
+    let top = String::from_utf8_lossy(&top);
+    match (
+        std::fs::canonicalize(top.trim()),
+        std::fs::canonicalize(dir),
+    ) {
         (Ok(a), Ok(b)) => a == b,
         _ => false,
     }

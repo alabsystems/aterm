@@ -1066,6 +1066,28 @@ mod tests {
         );
     }
 
+    /// An overlay's tree holds no terminal, so a client that read it has read none.
+    #[cfg(a11y_tree)]
+    #[test]
+    fn an_overlay_s_tree_says_nothing_of_what_a_client_read() {
+        let mut app = crate::scripted_redraw_fixture::scripted_app();
+        let wid = WindowId(0);
+        crate::scripted_redraw_fixture::feed(&app, b"earlier words");
+        app.windows.get_mut(&wid).unwrap().a11y_active = true;
+        app.redraw_window(wid);
+        let held = app.windows[&wid].a11y_reads.clone();
+        assert!(
+            held.front.is_some(),
+            "CONTROL: the client read the terminal"
+        );
+        crate::scripted_redraw_fixture::feed(&app, b" and later words");
+
+        open_palette_in(&mut app, wid, "");
+        app.push_a11y_tree(wid);
+
+        assert_eq!(app.windows[&wid].a11y_reads, held);
+    }
+
     fn physical_palette_event(
         app: &mut App,
         wid: WindowId,

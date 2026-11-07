@@ -59,23 +59,36 @@ impl SettledWatch {
     /// held back is due now and the place is still settled. The first look only learns where it
     /// stands.
     pub fn look(&mut self, record: Option<&Record>, now_ms: u64) -> bool {
-        let now = record.and_then(settled);
-        let before = self.last.replace(now.clone());
-        let Some(at) = now else {
+        let now_ref = record.and_then(Record::current).and_then(|stay| {
+            stay.network
+                .as_ref()
+                .map(|network| (network, stay.at == StayAt::AlabLan))
+        });
+        let Some((net, is_alab)) = now_ref else {
+            self.last = Some(None);
             return false;
         };
-        let settled_now = match before {
-            None => return false,
-            Some(before) => before.as_ref() != Some(&at),
+        let settled_now = match &mut self.last {
+            None => {
+                self.last = Some(Some((net.clone(), is_alab)));
+                return false;
+            }
+            Some(before) => {
+                let changed = before.as_ref().map(|(n, a)| (n, *a)) != Some((net, is_alab));
+                if changed {
+                    *before = Some((net.clone(), is_alab));
+                }
+                changed
+            }
         };
         if !settled_now && !self.held {
             return false;
         }
         let rested = self.told.as_ref().is_none_or(|(network, told_ms)| {
-            *network != at.0 || now_ms.saturating_sub(*told_ms) >= REST_MS
+            network != net || now_ms.saturating_sub(*told_ms) >= REST_MS
         });
         if rested {
-            self.told = Some((at.0, now_ms));
+            self.told = Some((net.clone(), now_ms));
             self.held = false;
         } else {
             self.held = true;

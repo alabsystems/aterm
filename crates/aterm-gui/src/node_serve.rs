@@ -1854,8 +1854,8 @@ fn older_build_to_run(older: Option<u64>, image_replaced: impl FnOnce() -> bool)
 }
 
 /// One look of the node job's checker watchdog at `beat`, at `now_secs` (§4.13): a stall the
-/// window's watchdog would act on ([`crate::update_checker_watch::judge`], which suspects at one
-/// look and acts at a later one) is replaced through `respawn`, as the window replaces its own,
+/// window's watchdog would act on ([`crate::update_checker_watch::judge`], which confirms late
+/// heartbeats and backs off known failed starts) is replaced through `respawn`, as the window replaces its own,
 /// and logged. The stall it acted on, and the generation `respawn` started in its place.
 #[cfg(any(target_os = "macos", test))]
 fn mind_node_checker(
@@ -1888,6 +1888,7 @@ fn mind_node_checker(
 #[cfg(target_os = "macos")]
 impl NodeUpdater for LiveNodeUpdater {
     fn start_checker(&self, noticed: Box<dyn Fn() + Send>) {
+        crate::network_moved::observe_for_updater();
         aterm_update::spawn_background_check_with_settings(
             crate::running_build_number(),
             Arc::new(crate::app_config::update_check_settings_setting),

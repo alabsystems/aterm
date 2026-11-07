@@ -1030,14 +1030,28 @@ fn log_tail(path: &Path) -> String {
         Some((String::from_utf8_lossy(&buf).into_owned(), sought))
     })()
     .unwrap_or_default();
-    let all_lines: Vec<&str> = text.lines().collect();
-    let lines = if sought && all_lines.len() > 1 {
-        &all_lines[1..]
-    } else {
-        &all_lines[..]
-    };
-    let from = lines.len().saturating_sub(5);
-    let tail = lines[from..].join(" / ");
+    let mut iter = text.lines().peekable();
+    let first = iter.next();
+    let mut ring = [""; 5];
+    let mut count = 0usize;
+    if let Some(line) = first
+        && (!sought || iter.peek().is_none())
+    {
+        ring[0] = line;
+        count = 1;
+    }
+    for line in iter {
+        ring[count % 5] = line;
+        count += 1;
+    }
+    let kept = count.min(5);
+    let mut tail = String::new();
+    for i in 0..kept {
+        if i > 0 {
+            tail.push_str(" / ");
+        }
+        tail.push_str(ring[(count - kept + i) % 5]);
+    }
     if tail.is_empty() {
         format!("{} is empty", path.display())
     } else {

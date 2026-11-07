@@ -14,6 +14,13 @@ pub trait FromJson: Sized {
     /// # Errors
     /// CouldNotRun, `Sub::Protocol`, why `GitHub's answer does not fit {type}: {e}`.
     fn from_json(value: &Value) -> Result<Self>;
+
+    /// The model `value` holds, taking ownership of `value` as its raw JSON.
+    /// # Errors
+    /// As [`FromJson::from_json`].
+    fn from_json_owned(value: Value) -> Result<Self> {
+        Self::from_json(&value)
+    }
 }
 
 /// `T::from_json`.
@@ -23,8 +30,16 @@ pub fn from_json<T: FromJson>(value: &Value) -> Result<T> {
     T::from_json(value)
 }
 
+/// `T::from_json_owned`.
+/// # Errors
+/// As `FromJson::from_json`.
+pub fn from_json_owned<T: FromJson>(value: Value) -> Result<T> {
+    T::from_json_owned(value)
+}
+
 fn decode<T: serde::de::DeserializeOwned>(value: &Value, name: &str) -> Result<T> {
-    aterm_json::from_value(value.clone())
+    aterm_json::to_vec(value)
+        .and_then(|text| aterm_json::from_slice(&text))
         .map_err(|e| Error::protocol(format!("GitHub's answer does not fit {name}: {e}")))
 }
 
@@ -34,6 +49,12 @@ macro_rules! from_json_raw {
             fn from_json(value: &Value) -> Result<Self> {
                 let mut model: $model = decode(value, stringify!($model))?;
                 model.raw = value.clone();
+                Ok(model)
+            }
+
+            fn from_json_owned(value: Value) -> Result<Self> {
+                let mut model: $model = decode(&value, stringify!($model))?;
+                model.raw = value;
                 Ok(model)
             }
         }
@@ -491,6 +512,17 @@ impl FromJson for ReleaseObject {
                 asset.raw = raw.clone();
             }
         }
+        Ok(release)
+    }
+
+    fn from_json_owned(value: Value) -> Result<Self> {
+        let mut release: ReleaseObject = decode(&value, "ReleaseObject")?;
+        if let Some(raws) = value.get("assets").and_then(Value::as_array) {
+            for (asset, raw) in release.assets.iter_mut().zip(raws) {
+                asset.raw = raw.clone();
+            }
+        }
+        release.raw = value;
         Ok(release)
     }
 }

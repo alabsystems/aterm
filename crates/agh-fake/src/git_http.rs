@@ -290,28 +290,32 @@ fn receive(state: &mut State, index: usize, body: &[u8]) -> Answer {
     let Some(lines) = commands(body) else {
         return text(400, "malformed receive-pack request");
     };
-    let mut parsed = Vec::with_capacity(lines.len());
     for line in &lines {
         let command = line.split(|b| *b == 0).next().unwrap_or(&[]);
         let command = String::from_utf8_lossy(command);
-        let mut words = command.splitn(3, ' ').map(str::to_string);
-        let (Some(old), Some(new), Some(reference)) = (words.next(), words.next(), words.next())
-        else {
+        let mut words = command.splitn(3, ' ');
+        let (Some(_), Some(_), Some(reference)) = (words.next(), words.next(), words.next()) else {
             return text(400, "malformed receive-pack command");
         };
         if reference.contains(' ') || reference.len() > REF_NAME_MAX {
             return text(400, "malformed receive-pack command");
         }
-        parsed.push((old, new, reference));
     }
     let mut report = Vec::new();
     pkt(&mut report, b"unpack ok\n");
-    for (old, new, reference) in parsed {
+    for line in &lines {
+        let command = line.split(|b| *b == 0).next().unwrap_or(&[]);
+        let command = String::from_utf8_lossy(command);
+        let mut words = command.splitn(3, ' ');
+        let (Some(old), Some(new), Some(reference)) = (words.next(), words.next(), words.next())
+        else {
+            unreachable!("validated above");
+        };
         let repo = &mut state.repos[index];
         let status = if new != ZERO {
             format!("ng {reference} only deletes\n")
-        } else if repo.ref_sha(&reference) == Some(old.as_str()) {
-            repo.delete_ref(&reference);
+        } else if repo.ref_sha(reference) == Some(old) {
+            repo.delete_ref(reference);
             format!("ok {reference}\n")
         } else {
             format!("ng {reference} stale info\n")

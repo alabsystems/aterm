@@ -730,19 +730,127 @@ impl Board {
         )
         .ok()
     }
+
+    /// Take the keeper's lock whenever the keeper that holds it lets it go: a thread asleep in
+    /// the kernel meanwhile, on no clock ([`aterm_uds::private_file::PrivateLock::wait_for`]).
+    /// `held` runs once, before that wait, when the first try finds the lock held.
+    /// # Errors
+    /// The board's folder cannot be made private, or its lock file cannot be opened or locked.
+    #[cfg(unix)]
+    pub fn wait_keeper_lock(
+        &self,
+        held: impl FnOnce(),
+    ) -> io::Result<aterm_uds::private_file::PrivateLock> {
+        self.ensure()?;
+        aterm_uds::private_file::PrivateLock::wait_for(&self.dir, KEEPER_LOCK, held)
+    }
+}
+
+/// What a keeper with nothing to ask waits on ([`keep`]): its board's folder changing (a row
+/// written, rewritten or removed, by any process), or the instant its next row comes due
+/// ([`next_due`]). On macOS the folder is a kqueue vnode watch, so at rest the thread sleeps
+/// until one of the two; where no watch can be made (another platform, a folder gone) it reads
+/// the board again every [`KEEP_IDLE`] at most.
+#[cfg(unix)]
+pub(crate) struct Rest {
+    dir: PathBuf,
+    #[cfg(target_os = "macos")]
+    watch: Option<(aterm_uds::nofollow::Watcher, std::os::fd::OwnedFd)>,
+}
+
+#[cfg(unix)]
+impl Rest {
+    /// A rest over the board in `dir`, its watch made now: a change from here on ends the next
+    /// [`Rest::until`].
+    pub(crate) fn new(dir: &Path) -> Self {
+        let mut rest = Self {
+            dir: dir.to_path_buf(),
+            #[cfg(target_os = "macos")]
+            watch: None,
+        };
+        rest.rewatch();
+        rest
+    }
+
+    #[cfg(target_os = "macos")]
+    fn rewatch(&mut self) {
+        use aterm_uds::nofollow::{Kind, Watcher, open_evtonly};
+        if self.watch.is_some() {
+            return;
+        }
+        self.watch = Watcher::new().ok().and_then(|watcher| {
+            // The folder's real path: the watch opens with no link anywhere on its path, and a
+            // state folder may sit under one (`/var` → `/private/var`). A watch reads nothing,
+            // so where it resolves only decides which folder's changes wake the keeper.
+            let real = std::fs::canonicalize(&self.dir).ok()?;
+            let fd = open_evtonly(&real, Kind::Dir).ok()?;
+            watcher.add(std::os::fd::AsFd::as_fd(&fd), 0).ok()?;
+            Some((watcher, fd))
+        });
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn rewatch(&mut self) {
+        let _ = &self.dir;
+    }
+
+    /// Sleeps until the board's folder changes or `due`, whichever comes first (or
+    /// [`KEEP_IDLE`] at most, where no watch is made). Answers whether the folder changed.
+    pub(crate) fn until(&mut self, due: std::time::Instant) -> bool {
+        self.rewatch();
+        let left = due.saturating_duration_since(std::time::Instant::now());
+        #[cfg(target_os = "macos")]
+        if let Some((watcher, _)) = &self.watch {
+            match watcher.wait(left) {
+                Ok(fired) => {
+                    if fired.iter().any(|fired| fired.gone) {
+                        self.watch = None;
+                    }
+                    return !fired.is_empty();
+                }
+                Err(_) => self.watch = None,
+            }
+        }
+        std::thread::sleep(left.min(KEEP_IDLE));
+        false
+    }
+}
+
+/// When a keeper with nothing to ask has its next thing to do, its board unchanged, as of `at`:
+/// its next prune (`pruned`, the last), the next ask after each closed row (`closed_asked`), and
+/// the end of each Mac's backoff still ahead of `at`. A backoff already over is no deadline: its
+/// Mac is asked again with its next row, and a Mac whose rows are all out of asking would
+/// otherwise keep the keeper due in the past, reading the board with no rest. Nothing else comes due on a clock: a row unheard past
+/// [`UNHEARD_ASKED`] or closed past [`CLOSED_ASKED`] only ages further out of asking, and any
+/// other news is a write to the board.
+#[cfg(unix)]
+fn next_due(
+    at: std::time::Instant,
+    pruned: Option<std::time::Instant>,
+    closed_asked: &std::collections::HashMap<String, std::time::Instant>,
+    backoff: &Backoff,
+) -> std::time::Instant {
+    let prune = pruned.map_or(at, |pruned| pruned + KEEP_PRUNE_EVERY);
+    closed_asked
+        .values()
+        .chain(backoff.0.values().map(|(_, until)| until))
+        .copied()
+        .filter(|due| *due > at)
+        .fold(prune, std::cmp::Ord::min)
 }
 
 /// The wait one leg of the keeper asks a Mac for ([`keep`]).
 #[cfg(unix)]
 const KEEP_LEG: Duration = Duration::from_secs(20);
 
-/// How often a keeper with nothing to wait on reads its board again.
+/// How often a keeper with nothing to wait on reads its board again where it cannot watch the
+/// board's folder ([`Rest`]), and how long it waits after a round no Mac waited in.
 #[cfg(unix)]
 const KEEP_IDLE: Duration = Duration::from_secs(5);
 
-/// How often a keeper that found another keeping its board asks for the board again.
+/// How long a keeper whose board's lock could not be opened or waited for waits to try again.
 #[cfg(unix)]
-const KEEP_ELSEWHERE: Duration = Duration::from_secs(30);
+const KEEP_REFUSED: Duration = Duration::from_secs(30);
 
 /// The longest a keeper waits before it asks a Mac that did not answer again.
 #[cfg(unix)]
@@ -809,14 +917,15 @@ impl Backoff {
 }
 
 /// Keep the board of the state folder `state` current for the life of the process: while it holds the board's keeper lock (one keeper per board, whichever aterm took it first; the
-/// others ask for it again every [`KEEP_ELSEWHERE`]), wait on every open row its Macs were
+/// others wait for it in the kernel, [`Board::wait_keeper_lock`]), wait on every open row its Macs were
 /// heard of within [`UNHEARD_ASKED`] and every row closed within [`CLOSED_ASKED`] (every
 /// [`CLOSED_ASKED_EVERY`]), one round of legs ([`crate::await_task`]'s keeper round) after
 /// another, and merge what they read. Each row's leg starts from the newest revision read of
 /// it, so news the board could not write is not read again at once. A Mac that does not answer
-/// is asked again later, backing off to [`KEEP_BACKOFF_MAX`]. Between rounds it sleeps the whole
-/// period, a thread asleep until it is due: nothing ends a keeper but its process, so there is no
-/// stop to look at (ATERM-KI-1105-20: a look every 250 ms was 80 wakes in 20 s at rest).
+/// is asked again later, backing off to [`KEEP_BACKOFF_MAX`]. With nothing to ask it rests
+/// ([`Rest`]) until its board changes or its next row comes due ([`next_due`]), so a keeper of
+/// an idle board wakes on no clock but its hourly prune (ATERM-KI-1105-20: it read its board
+/// every 5 s). Nothing ends a keeper but its process, so there is no stop to look at.
 pub fn keep(state: &Path, keeper: &Keeper<'_>) {
     #[cfg(unix)]
     {
@@ -828,14 +937,18 @@ pub fn keep(state: &Path, keeper: &Keeper<'_>) {
         let mut edges: HashMap<String, u64> = HashMap::new();
         let mut closed_asked: HashMap<String, Instant> = HashMap::new();
         let mut pruned: Option<Instant> = None;
+        let mut rest: Option<Rest> = None;
         loop {
             if held.is_none() {
-                held = board.keeper_lock();
-                if held.is_none() {
-                    std::thread::sleep(KEEP_ELSEWHERE);
-                    continue;
+                match board.wait_keeper_lock(|| {}) {
+                    Ok(lock) => held = Some(lock),
+                    Err(_) => {
+                        std::thread::sleep(KEEP_REFUSED);
+                        continue;
+                    }
                 }
             }
+            let rest = rest.get_or_insert_with(|| Rest::new(board.dir()));
             if pruned.is_none_or(|at| at.elapsed() >= KEEP_PRUNE_EVERY) {
                 board.prune();
                 pruned = Some(Instant::now());
@@ -864,7 +977,7 @@ pub fn keep(state: &Path, keeper: &Keeper<'_>) {
                 })
                 .collect();
             if asked.is_empty() {
-                std::thread::sleep(KEEP_IDLE);
+                rest.until(next_due(at, pruned, &closed_asked, &backoff));
                 continue;
             }
             for row in &mut asked {

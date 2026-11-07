@@ -54,6 +54,8 @@ impl Fixture {
             .route(Some(crate::ai::connector::Flow::Device))
             .unwrap();
         login_drive::Request {
+            publication: None,
+            enrollment: None,
             recovery: Some(login_drive::RecoveryKey([key; 32])),
             admission: None,
             cli: Cli::Kimi,

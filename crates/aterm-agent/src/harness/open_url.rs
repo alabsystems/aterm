@@ -247,6 +247,15 @@ fn valid_oauth_code(code: &str) -> bool {
         && !code.chars().any(|ch| ch.is_whitespace() || ch.is_control())
 }
 
+/// The code and state Claude's hosted paste prompt expects as one `code#state` credential.
+pub(super) fn hosted_credential(callback_url: &str) -> Result<String, &'static str> {
+    let code = one_query_param(callback_url, "code")
+        .ok_or("the hosted OAuth callback has no authorization code")?;
+    let state =
+        one_query_param(callback_url, "state").ok_or("the hosted OAuth callback has no state")?;
+    Ok(format!("{code}#{state}"))
+}
+
 /// Publish one hosted OAuth code for the owning renewal, never in its log or ordinary outcome.
 pub(super) fn write_oauth_code(path: PathBuf, code: &str) -> Result<(), &'static str> {
     if !path.is_absolute() || !valid_oauth_code(code) {
@@ -3865,9 +3874,13 @@ pub(super) fn loopback_http_exchange_until(
 }
 
 fn provider_url(url: &str) -> bool {
+    let magic_token = url
+        .strip_prefix("https://claude.ai/magic-link#")
+        .or_else(|| url.strip_prefix("https://claude.com/magic-link#"))
+        .is_some_and(|token| !token.is_empty() && !token.contains(['\\', '#']));
     (url.starts_with("https://claude.ai/") || url.starts_with("https://claude.com/"))
         && !url.chars().any(|c| c.is_whitespace() || c.is_control())
-        && !url.contains(['\\', '#'])
+        && (magic_token || !url.contains(['\\', '#']))
 }
 
 fn loopback_parts(url: &str) -> Option<(u16, &str, Option<&str>)> {
@@ -4107,11 +4120,10 @@ fn follow_until_page_or_callback_until(
         deadline.left()?;
         if flow.is_callback(&current_url) {
             if flow.hosted() {
-                let code = one_query_param(&current_url, "code")
-                    .ok_or("the hosted OAuth callback has no authorization code")?;
+                let credential = hosted_credential(&current_url)?;
                 let outcome = std::env::var_os(OUTCOME_ENV)
                     .ok_or("the hosted OAuth callback has no renewal input channel")?;
-                write_oauth_code(Path::new(&outcome).with_extension("code"), &code)?;
+                write_oauth_code(Path::new(&outcome).with_extension("code"), &credential)?;
                 return Ok(StepOutcome::CallbackDelivered);
             }
             let cb_resp = exchange("GET", &current_url, &mut BTreeMap::new(), None)?;

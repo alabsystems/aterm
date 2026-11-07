@@ -33,6 +33,7 @@ pub mod perf;
 pub mod plan;
 #[cfg(unix)]
 pub mod provision;
+mod release_test_env;
 pub mod report;
 /// Nothing outlives its run: the run record, the stage-end survivor check and the next run's start ending a dead run's proven members (`docs/DESIGN-leftover-processes-2026-10-16.md` §3.3, §5.4, §8.1).
 pub mod runs;
@@ -48,6 +49,7 @@ pub mod soak;
 pub mod stages;
 pub mod test_history;
 pub mod test_index;
+pub mod test_plan;
 mod test_workers;
 pub mod testrun;
 pub mod unitgraph;
@@ -94,6 +96,10 @@ pub mod exit {
 pub struct EnvSnapshot {
     pub path: OsString,
     pub home: PathBuf,
+    /// Installed check tools, independent of disposable test state.
+    pub tool_home: Option<PathBuf>,
+    /// Signed package store selected before a test HOME replaces the caller's.
+    pub test_package_prefix: Option<PathBuf>,
     pub trust_stage2_bin: Option<PathBuf>,
     /// `XDG_CONFIG_HOME`.
     pub xdg_config_home: Option<PathBuf>,
@@ -141,6 +147,10 @@ impl EnvSnapshot {
         Self {
             path: std::env::var_os("PATH").unwrap_or_default(),
             home: var_path("HOME").unwrap_or_default(),
+            tool_home: aterm_uds::host::tool_home(),
+            test_package_prefix: var_path("ATERM_TEST_PACKAGE_PREFIX")
+                .filter(|p| p.is_absolute())
+                .or_else(|| atpkg::store::resolve_configured().map(|layout| layout.prefix)),
             trust_stage2_bin: var_path("TRUST_STAGE2_BIN"),
             xdg_config_home: var_path("XDG_CONFIG_HOME").filter(|p| !p.as_os_str().is_empty()),
             rustup_home: std::env::var_os("RUSTUP_HOME"),
@@ -574,9 +584,10 @@ pub struct Ctx {
     pub checkers_in_tests: bool,
     /// `--app <APP>`.
     pub measure_artifact: Option<MeasureArtifact>,
-    /// Requested `--test-jobs` ceiling; [`Self::test_jobs`] applies admission.
-    pub test_jobs: u32,
-    /// Requested `--test-threads`, else the caller's own `RUST_TEST_THREADS` ceiling.
+    /// Requested `--test-jobs` ceiling on binaries at once; [`Self::test_jobs`] applies admission.
+    pub test_jobs: Option<u32>,
+    /// Requested `--test-threads`, else the caller's own `RUST_TEST_THREADS`: the widest a test
+    /// binary runs ([`test_plan`]).
     pub test_threads: Option<u32>,
     /// The program cargo runs in place of test binaries ([`testrun::RECORD_FLAG`]) and rustdoc ([`docdriver`]).
     pub test_recorder: Option<PathBuf>,
@@ -636,14 +647,16 @@ pub fn parse_build_jobs(raw: Option<&OsStr>) -> Option<u32> {
 /// What `cargo run` hands the verify process about ITSELF (the `verify` alias is `run -q -p aterm-verify`): `aterm_toolchain::build_cache::CARGO_RUN_ENV`.
 pub const CARGO_RUN_ENV: [&str; 7] = aterm_toolchain::build_cache::CARGO_RUN_ENV;
 
-/// Variables removed from every child's inherited environment: checker policy, what `cargo run` says of the
+/// Variables removed from every child's inherited environment: checker and release policy, what `cargo run` says of the
 /// verify process ([`CARGO_RUN_ENV`]), and the disk claim that covers this run
 /// ([`aterm_capacity::DISK_COVER_ENV`], [`EnvSnapshot::disk_cover`]), which covers no child's
 /// own claim and which a test binary must never read (a release's children would then run its
-/// tests unlike a developer's).
-pub const CHILD_ENV_REMOVED: [&str; 9] = {
-    let mut all = [aterm_capacity::DISK_COVER_ENV; 9];
+/// tests unlike a developer's). Release-shaped test commands explicitly inject their own
+/// marker and disposable HOME through `release_test_env`, including in a Background main lane.
+pub const CHILD_ENV_REMOVED: [&str; 10] = {
+    let mut all = [aterm_capacity::DISK_COVER_ENV; 10];
     all[8] = stages::CHECKERS_ENV;
+    all[9] = "ATERM_RELEASE_*";
     let mut i = 0;
     while i < CARGO_RUN_ENV.len() {
         all[i] = CARGO_RUN_ENV[i];
@@ -738,7 +751,7 @@ impl Ctx {
             compile_only: false,
             checkers_in_tests: false,
             measure_artifact: None,
-            test_jobs: testrun::DEFAULT_JOBS,
+            test_jobs: None,
             test_threads: pinned_threads,
             test_recorder: std::env::current_exe().ok(),
             quiet: None,
@@ -871,42 +884,36 @@ impl Ctx {
         parse_build_jobs(self.env.cargo_build_jobs.as_deref())
     }
 
-    /// The most test binaries that run at once ([`Ctx::test_jobs`], at least one).
+    /// The most test binaries that run at once ([`Ctx::test_jobs`] within the share, at least one).
     #[must_use]
     pub fn test_jobs(&self) -> usize {
         self.test_workers().0
     }
 
-    /// The requested libtest count, capped with the binary count by the held CPU share or host cores.
+    /// The widest a test binary runs: the requested libtest count within the held CPU share or
+    /// host cores ([`test_plan`] picks each binary's width up to it).
     #[must_use]
     pub fn test_threads(&self) -> u32 {
         self.test_workers().1
     }
 
-    pub(crate) fn test_workers_for(
-        &self,
-        share: u32,
-        fallback_cores: impl FnOnce() -> u32,
-    ) -> (usize, u32) {
-        let (jobs, threads) = test_workers::counts(
-            self.test_jobs,
-            self.test_threads.unwrap_or_else(fallback_cores),
-            share,
-        );
+    /// The most binaries at once and the widest binary within `share` ([`test_workers::ceilings`]).
+    pub(crate) fn test_workers_for(&self, share: u32) -> (usize, u32) {
+        let (jobs, threads) = test_workers::ceilings(self.test_jobs, self.test_threads, share);
         (usize::try_from(jobs).unwrap_or(1), threads)
     }
 
+    /// The share the test binaries' charges are drawn from: the admitted share when managed,
+    /// else the host's cores. Invalid managed input is refused before any stage runs; a
+    /// context inspected before that refusal still cannot advertise an unbounded pool.
+    pub(crate) fn test_share(&self) -> u32 {
+        test_workers::admitted_share(&self.env)
+            .map(|share| share.unwrap_or_else(|| self.cores()))
+            .unwrap_or(1)
+    }
+
     fn test_workers(&self) -> (usize, u32) {
-        // Invalid managed input is refused before any stage runs. A context
-        // inspected before that refusal still cannot advertise an unbounded pool.
-        // Host cores bound unmanaged direct concurrency; they do not prove admission
-        // or account for descendants spawned by a test.
-        let mut cores = None;
-        let mut host_cores = || *cores.get_or_insert_with(|| self.cores());
-        let share = test_workers::admitted_share(&self.env)
-            .map(|share| share.unwrap_or_else(&mut host_cores))
-            .unwrap_or(1);
-        self.test_workers_for(share, host_cores)
+        self.test_workers_for(self.test_share())
     }
 
     pub(crate) fn test_thread_override(&self) -> Option<u32> {
@@ -935,7 +942,7 @@ impl Ctx {
     #[must_use]
     pub fn with_test_jobs(mut self, jobs: Option<std::num::NonZeroU32>) -> Self {
         if let Some(n) = jobs {
-            self.test_jobs = n.get();
+            self.test_jobs = Some(n.get());
         }
         self.refresh_test_threads();
         self
@@ -1179,7 +1186,9 @@ pub(crate) fn admit_live(
 /// reaches one of the run's waits (`aterm_toolchain::interrupt::Watch::take`), which ends the run
 /// (`exec::group::stop_run`), and every other wait of its stages, a quiet claim's or another
 /// stage's memory claim's, ends at its next look. A need the run asks to end behind holders that
-/// make no progress ([`STUCK_ENDS`]) ends there too, that stage alone.
+/// make no progress ([`STUCK_ENDS`]) ends there too, that stage alone. Its first line says what
+/// the memory claim this thread admits claims and why ([`claiming`]), so a wait behind other
+/// claims names where its figure came from.
 ///
 /// # Errors
 /// As [`aterm_capacity::admit_until`]: [`aterm_capacity::Error::Stopped`] once the run ends, and
@@ -1203,7 +1212,48 @@ fn admit_in(
         }
         Err(error) => return Err(aterm_capacity::Error::Ledger(error)),
     }
-    aterm_capacity::admit_until(ledger, machine, need, mode, pace, say, &stopping)
+    let mut why = CLAIMING.with(|c| c.borrow().clone());
+    aterm_capacity::admit_until(
+        ledger,
+        machine,
+        need,
+        mode,
+        pace,
+        &mut |line| match why.take() {
+            Some(why) => say(&format!("{line}; it claims {why}")),
+            None => say(line),
+        },
+        &stopping,
+    )
+}
+
+thread_local! {
+    /// What the memory claim this thread admits claims and why ([`claiming`]).
+    static CLAIMING: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// This thread's memory claim says `why` in its first wait line ([`admit_in`]) until the answer
+/// drops, when the one before comes back.
+#[must_use = "the reason is this thread's only while the guard lives"]
+struct Claiming {
+    before: Option<String>,
+    /// A TLS restoration guard stays on the thread where it was installed.
+    _thread: std::marker::PhantomData<*mut ()>,
+}
+
+/// Make `why` what this thread's memory claim says it claims ([`Claiming`]).
+fn claiming(why: String) -> Claiming {
+    Claiming {
+        before: CLAIMING.with(|c| c.replace(Some(why))),
+        _thread: std::marker::PhantomData,
+    }
+}
+
+impl Drop for Claiming {
+    fn drop(&mut self) {
+        let before = self.before.take();
+        CLAIMING.with(|c| *c.borrow_mut() = before);
+    }
 }
 
 /// How long the holders a stage's quiet or memory claim waits behind, and the run's disk claim,
@@ -1738,7 +1788,8 @@ fn admitted_how(claim: &aterm_capacity::Claim, mode: aterm_capacity::Admit) -> S
 /// Claim stage `spec`'s memory ([`plan::StageSpec::mem`]) in this user's capacity ledger before
 /// it starts, admitted by `admit` as `--admit` says ([`Ctx::quiet`], wait unless it says now):
 /// waiting while other runs' claims and what is available leave no room for it, and saying once a
-/// minute what it waits for, until every claim it waits behind is held by a holder that has made
+/// minute what it waits for (the first line what it claims and why, as its time line says it:
+/// [`admit_in`]), until every claim it waits behind is held by a holder that has made
 /// no progress for [`STUCK_ENDS`]; at once under `--admit now`. Short only of
 /// memory no claim holds (other work on the machine), it is admitted alone, as the ledger's ALONE
 /// rule says, and no other memory claim is admitted while it runs. A stage that claims more than
@@ -1783,10 +1834,12 @@ fn claim_memory(
         if alone { need.alone() } else { need }
     };
     let beyond = spec.mem >= budget;
+    let saying = claiming(why.clone());
     let mut admitted = admit(ask(beyond), mode);
     if !beyond && matches!(admitted, Err(aterm_capacity::Error::Never(_))) {
         admitted = admit(ask(true), mode);
     }
+    drop(saying);
     let what = if beyond {
         format!(
             "claimed {why}: more than the {} that can ever be available here, so it asks to run \
@@ -2593,6 +2646,13 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     };
     if let Some(d) = &tools.demoted {
         eprintln!("verify: toolchain: {}", d.sentence());
+    }
+    if parsed.builds_packages_here() {
+        let path_env = tools.path_with_stage2_first(&env.path);
+        let foreign = changed::foreign_specs(&root, &tools, &path_env, &parsed.packages);
+        if !foreign.is_empty() {
+            return stop(exit::USAGE, changed::foreign_refusal(&foreign));
+        }
     }
     let lock_said = lock_notes(&env, &tools);
     for note in &lock_said {

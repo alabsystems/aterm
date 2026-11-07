@@ -237,19 +237,7 @@ impl App {
     /// `auto_apply_intent` or an `AutoApplyManualOnly` latch with a lapse deadline
     /// matching the current stage's build and digest while auto-apply is enabled.
     pub(crate) fn automatic_apply_retry_scheduled(&self, staged_build: u64) -> bool {
-        if !crate::app_config::update_auto_apply(&self.config)
-            || Self::relaunch_nudge_seam_suppresses_auto_apply()
-        {
-            return false;
-        }
-        let Some(digest) = self
-            .native_updater_service
-            .snapshot()
-            .staged
-            .as_ref()
-            .filter(|stage| stage.build == staged_build)
-            .and_then(|stage| crate::app_native::decode_dmg_sha256(&stage.dmg_sha256))
-        else {
+        let Some(digest) = self.automatic_apply_staged_digest(staged_build) else {
             return false;
         };
         self.auto_apply_intent
@@ -259,6 +247,20 @@ impl App {
                     && manual.dmg_sha256 == digest
                     && manual.retry_at.is_some()
             })
+    }
+
+    fn automatic_apply_staged_digest(&self, staged_build: u64) -> Option<[u8; 32]> {
+        if !crate::app_config::update_auto_apply(&self.config)
+            || Self::relaunch_nudge_seam_suppresses_auto_apply()
+        {
+            return None;
+        }
+        self.native_updater_service
+            .snapshot()
+            .staged
+            .as_ref()
+            .filter(|stage| stage.build == staged_build)
+            .and_then(|stage| crate::app_native::decode_dmg_sha256(&stage.dmg_sha256))
     }
 
     /// Typed retry disposition ([`crate::update_apply_trouble::ApplyRetry`]) for
@@ -537,11 +539,9 @@ impl App {
         &self,
         staged_build: u64,
     ) -> Option<std::time::Duration> {
-        if !self.automatic_apply_retry_scheduled(staged_build) {
-            return None;
-        }
+        let digest = self.automatic_apply_staged_digest(staged_build)?;
         self.auto_apply_manual_only
-            .filter(|manual| manual.build == staged_build)
+            .filter(|manual| manual.build == staged_build && manual.dmg_sha256 == digest)
             .and_then(|manual| manual.retry_at)
             .map(|at| at.saturating_duration_since(std::time::Instant::now()))
     }
@@ -2188,6 +2188,31 @@ pub(crate) mod tests {
              predicate under test is never reached"
         );
         build
+    }
+
+    #[test]
+    fn current_intent_never_borrows_another_artifacts_cooldown() {
+        let mut app = App::headless_for_test();
+        let build = stage_one_build(&mut app);
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        app.auto_apply_intent = Some(crate::AutoApplyIntent {
+            build,
+            dmg_sha256: [0xab; 32],
+            retry_at: later,
+            attempts: 0,
+        });
+        app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+            build,
+            dmg_sha256: [0xcd; 32],
+            activation: false,
+            retry_at: Some(later),
+        });
+        assert!(app.automatic_apply_retry_scheduled(build));
+        assert_eq!(app.automatic_apply_retry_in(build), None);
+        app.auto_apply_manual_only.as_mut().unwrap().dmg_sha256 = [0xab; 32];
+        assert!(app.automatic_apply_retry_in(build).is_some());
+        app.auto_apply_manual_only.as_mut().unwrap().retry_at = None;
+        assert_eq!(app.automatic_apply_retry_in(build), None);
     }
 
     #[test]

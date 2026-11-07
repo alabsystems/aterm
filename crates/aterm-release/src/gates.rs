@@ -2424,10 +2424,10 @@ pub(crate) fn handoff_fixtures_of(tree: &GateTree<'_>, release: &str) -> Result<
     }
     let guard = tree.text(HANDOFF_FIXTURE_GUARD)?;
     let tag = format!("v{release}");
-    let pinned: Vec<String> = pinned_desks(&guard)?
+    let pinned: Vec<String> = pinned_desk_slices(&guard)?
         .into_iter()
         .filter(|(row_release, _)| *row_release == tag)
-        .map(|(_, desk)| desk)
+        .map(|(_, desk)| desk.to_string())
         .collect();
     if pinned.is_empty() {
         return Err(handoff_refusal(
@@ -2471,6 +2471,13 @@ pub(crate) fn handoff_fixtures_of(tree: &GateTree<'_>, release: &str) -> Result<
 
 /// The `(release, desk)` rows of the guard's `PINNED_DESKS` table, read from its source.
 pub(crate) fn pinned_desks(guard: &str) -> Result<Vec<(String, String)>> {
+    Ok(pinned_desk_slices(guard)?
+        .into_iter()
+        .map(|(rel, desk)| (rel.to_string(), desk.to_string()))
+        .collect())
+}
+
+fn pinned_desk_slices(guard: &str) -> Result<Vec<(&str, &str)>> {
     let unreadable = |why: &str| {
         Error::new(format!(
             "handoff-fixture gate: cannot read the PINNED_DESKS table in \
@@ -2494,10 +2501,7 @@ pub(crate) fn pinned_desks(guard: &str) -> Result<Vec<(String, String)>> {
     if !literals.len().is_multiple_of(2) {
         return Err(unreadable("an odd number of string literals"));
     }
-    Ok(literals
-        .chunks(2)
-        .map(|row| (row[0].to_string(), row[1].to_string()))
-        .collect())
+    Ok(literals.chunks(2).map(|row| (row[0], row[1])).collect())
 }
 
 /// One row of the guard's required desk set: `desk` is required of every release from `from` on.

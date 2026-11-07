@@ -369,9 +369,163 @@ fn a_real_shell_finishes_its_hang_up_handler_past_the_holdout_tick() {
     );
 }
 
+/// Whether `fd`'s terminal has `CLOCAL` set.
+#[cfg(target_os = "macos")]
+fn clocal_set(fd: i32) -> bool {
+    // SAFETY: every field of `termios` is an integer, so all-zero is valid.
+    let mut t: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: `tcgetattr` reads the test's live master into the valid out-param `t`.
+    unsafe { libc::tcgetattr(fd, &raw mut t) == 0 && t.c_cflag & libc::CLOCAL != 0 }
+}
+
+/// A fifo in `scratch` named `name`, opened read and write so neither end's open waits for the
+/// other: its path and the descriptor.
+#[cfg(target_os = "macos")]
+fn gate_fifo(scratch: &std::path::Path, name: &str) -> (std::path::PathBuf, i32) {
+    use std::os::unix::ffi::OsStrExt as _;
+    let path = scratch.join(format!("{name}.fifo"));
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("a path has no NUL");
+    // SAFETY: `c` is a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
+    // SAFETY: `c` is a valid NUL-terminated path.
+    let gate = unsafe { libc::open(c.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    assert!(gate >= 0, "the gate's fifo opens");
+    (path, gate)
+}
+
+/// Tests in one binary hold reap kills at once, each dropping its own guard as its row ends: one
+/// drop must leave the reap another test still holds at its kill tick, or that shell is killed
+/// mid-handler and its marker never written. A hold that is a flag, not a count, fails here.
+#[test]
+fn a_hold_dropped_beside_another_keeps_the_other_holding() {
+    let first = hold_reap_kills_for_test();
+    let second = hold_reap_kills_for_test();
+    drop(first);
+    assert!(
+        reap_kills_held(),
+        "one hold's drop released the reap another hold still keeps"
+    );
+    drop(second);
+}
+
+/// Ends the test's own shell if it is still there and waits for teardown, which reaps it.
+#[cfg(target_os = "macos")]
+fn end_row(pid: i32, hold: ReapKillHold) {
+    if child_exit_unreaped(pid) == Some(false) {
+        // SAFETY: ending the test's own child, which teardown then reaps.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+    drop(hold);
+    assert!(wait_for_reaps(HANG_DETECTOR), "teardown completed");
+}
+
+/// Mid-handler, the master's close is end of file and no second hang-up: a `cat` the HUP trap runs
+/// on the terminal reads end of file, and the trap goes on to write its marker. Teardown that kept
+/// a duplicate of the master would leave `cat` waiting, and a close without `CLOCAL` would hang
+/// zsh up again. Kills are held throughout, so no `SIGKILL` can be what ends `cat`. This is also
+/// what ends zsh at its prompt holding a `trap ... HUP`'s `exit` until its next input (macOS
+/// 27.0.1, ATERM-KI-1104-7).
 #[cfg(target_os = "macos")]
 #[test]
-fn closing_the_original_master_keeps_exit_handlers_and_drains_their_output() {
+fn the_terminals_close_mid_handler_is_end_of_file_and_no_hang_up() {
+    let scratch = aterm_tempfile::tempdir().expect("scratch");
+    let hold = hold_reap_kills_for_test();
+    let entered = scratch.path().join("zsh-trap.entered");
+    let marker = scratch.path().join("zsh-trap.done");
+    let work = format!("print entered > {}; cat > /dev/null", entered.display());
+    let (script, rc, text) = handler_row(scratch.path(), "zsh-trap", &work, &marker);
+    std::fs::write(rc, text).expect("the rc file");
+    let sh = parked_session(&script);
+    let identity = record_spawned_shell(sh.pid);
+    assert!(identity.verify(), "the live leader verifies");
+    let hung = hangup_and_reap_shell(identity, sh.master).expect("teardown starts");
+    assert_eq!(hung, ShellHangup::Shell(sh.pid), "the shell is hung up");
+    let deadline = Instant::now() + HANG_DETECTOR;
+    while !entered.exists() && Instant::now() < deadline {
+        let _ = read(sh.master, &mut [0u8; 256]);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(entered.exists(), "the trap ran");
+    // SAFETY: the test owns the original master; teardown holds none on macOS, only the slave.
+    unsafe {
+        libc::close(sh.master);
+    }
+    while !marker.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let finished = marker.exists();
+    end_row(sh.pid, hold);
+    assert!(
+        finished,
+        "the trap's `cat` never read end of file, or zsh was hung up again: the master's close \
+         was withheld or was a hang-up"
+    );
+}
+
+/// A foreground job that writes back a termios without `CLOCAL` mid-handler, as a program exiting
+/// on the hang-up writes back the one it saved at start, has the flag put back before the master's
+/// close, and that close then cuts no `zshexit` or bash EXIT trap. A teardown that set the flag only
+/// once, or never, leaves it clear.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_foreground_jobs_write_back_mid_handler_is_undone_before_the_close() {
+    let scratch = aterm_tempfile::tempdir().expect("scratch");
+    for name in ["zsh-zshexit", "bash-exit-trap"] {
+        let hold = hold_reap_kills_for_test();
+        let (gate_path, gate) = gate_fifo(scratch.path(), name);
+        let cleared = scratch.path().join(format!("{name}.cleared"));
+        let marker = scratch.path().join(format!("{name}.done"));
+        let work = format!(
+            "stty -clocal; echo cleared > {}; read line < {}",
+            cleared.display(),
+            gate_path.display()
+        );
+        let (script, rc, text) = handler_row(scratch.path(), name, &work, &marker);
+        std::fs::write(rc, text).expect("the rc file");
+        let sh = parked_session(&script);
+        let identity = record_spawned_shell(sh.pid);
+        assert!(identity.verify(), "the live leader verifies");
+        hangup_and_reap_shell(identity, sh.master).expect("teardown starts");
+        let deadline = Instant::now() + HANG_DETECTOR;
+        while !cleared.exists() && Instant::now() < deadline {
+            let _ = read(sh.master, &mut [0u8; 256]);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(cleared.exists(), "{name}'s `stty -clocal` ran");
+        while !clocal_set(sh.master) && Instant::now() < deadline {
+            let _ = read(sh.master, &mut [0u8; 256]);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let restored = clocal_set(sh.master);
+        // SAFETY: the test owns the original master and the gate's descriptor; the go line is a
+        // few bytes from a valid buffer, written only once the master is closed.
+        let wrote = unsafe {
+            libc::close(sh.master);
+            let wrote = libc::write(gate, b"go\n".as_ptr().cast(), 3);
+            libc::close(gate);
+            wrote
+        };
+        assert_eq!(wrote, 3, "the go line reaches the fifo");
+        while restored && !marker.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let finished = marker.exists();
+        end_row(sh.pid, hold);
+        assert!(
+            restored,
+            "teardown left `CLOCAL` clear after {name}'s foreground job cleared it"
+        );
+        assert!(finished, "the master's close cut {name}'s exit handler");
+    }
+}
+
+/// The master's close, mid-handler, is end of file and no second hang-up, so a `zshexit` or bash
+/// EXIT trap runs to its end; its output past the close fails, as nothing reads it.
+#[cfg(target_os = "macos")]
+#[test]
+fn closing_the_original_master_mid_handler_cuts_no_exit_handler() {
     use std::os::unix::ffi::OsStrExt;
     let scratch = aterm_tempfile::tempdir().expect("scratch");
     for name in ["zsh-zshexit", "bash-exit-trap"] {
@@ -395,8 +549,8 @@ fn closing_the_original_master_keeps_exit_handlers_and_drains_their_output() {
         let sh = parked_session(&script);
         let identity = record_spawned_shell(sh.pid);
         assert!(identity.verify());
-        hangup_and_reap_shell(identity, sh.master).expect("retain terminal before hang-up");
-        // SAFETY: the foreground test owns the original master; teardown owns its duplicate.
+        hangup_and_reap_shell(identity, sh.master).expect("teardown starts");
+        // SAFETY: the foreground test owns the original master; teardown holds none on macOS.
         unsafe {
             libc::close(sh.master);
         }
@@ -418,7 +572,7 @@ fn closing_the_original_master_keeps_exit_handlers_and_drains_their_output() {
         }
         assert!(
             marker.exists(),
-            "{name} completed output beyond the tty buffer"
+            "{name} ran its exit handler to its end past the master's close"
         );
         drop(hold);
         assert!(wait_for_reaps(HANG_DETECTOR), "teardown completed");

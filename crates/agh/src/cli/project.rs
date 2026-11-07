@@ -4,6 +4,7 @@
 
 //! `--fields` and the default projections (design §8.2, §8.3).
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use aterm_json::{Map, Value};
@@ -430,28 +431,50 @@ fn pure_derived(noun: Noun, value: &Map) -> Vec<(&'static str, Value)> {
     }
 }
 
+/// What `--fields` and the default projection read, borrowing `value` when `noun` has no
+/// pure derived fields.
+#[must_use]
+pub fn with_derived_cow(noun: Noun, value: &Value) -> Cow<'_, Value> {
+    let Value::Object(map) = value else {
+        return Cow::Borrowed(value);
+    };
+    let derived = pure_derived(noun, map);
+    if derived.is_empty() {
+        return Cow::Borrowed(value);
+    }
+    let mut out = map.clone();
+    for (key, derived) in derived {
+        out.insert(key.to_string(), derived);
+    }
+    Cow::Owned(Value::Object(out))
+}
+
 /// What `--fields` and the default projection read.
 #[must_use]
 pub fn with_derived(noun: Noun, value: &Value) -> Value {
+    with_derived_cow(noun, value).into_owned()
+}
+
+/// What `--jq` reads without `--fields`, borrowing `value` when `noun` has no pure derived
+/// fields.
+#[must_use]
+pub fn jq_input_cow(noun: Noun, value: &Value) -> Cow<'_, Value> {
     let Value::Object(map) = value else {
-        return value.clone();
+        return Cow::Borrowed(value);
     };
-    let mut out = map.clone();
-    for (key, derived) in pure_derived(noun, map) {
-        out.insert(key.to_string(), derived);
+    let derived = pure_derived(noun, map);
+    if derived.is_empty() {
+        return Cow::Borrowed(value);
     }
-    Value::Object(out)
+    let mut out = map.clone();
+    for (key, derived) in derived {
+        out.entry(key.to_string()).or_insert(derived);
+    }
+    Cow::Owned(Value::Object(out))
 }
 
 /// What `--jq` reads without `--fields`.
 #[must_use]
 pub fn jq_input(noun: Noun, value: &Value) -> Value {
-    let Value::Object(map) = value else {
-        return value.clone();
-    };
-    let mut out = map.clone();
-    for (key, derived) in pure_derived(noun, map) {
-        out.entry(key.to_string()).or_insert(derived);
-    }
-    Value::Object(out)
+    jq_input_cow(noun, value).into_owned()
 }

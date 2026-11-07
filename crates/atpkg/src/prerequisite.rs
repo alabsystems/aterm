@@ -16,8 +16,13 @@ use crate::lookup::{Record, Status};
 use crate::sig::{Anchor, BuildFloor, TrustedIndex};
 use crate::store::Layout;
 
+mod named;
+pub use named::configured_build;
+
 /// Stable native-runner admission capability; older clients refuse the query.
 pub const LEASE_CAPABILITY: &str = "aterm-signed-prerequisite-leases-v1";
+/// Explicit named-build support, independent of the original selected-tool contract.
+pub const NAMED_LEASE_CAPABILITY: &str = "aterm-signed-named-prerequisite-leases-v1";
 
 /// Admit prerequisites from the same configured source, prefix, trust anchor,
 /// freshness cache and durable floors the package manager uses. Payloads must
@@ -44,24 +49,46 @@ fn configured_with(
     who: &str,
     install: bool,
 ) -> Result<(HeldSet, bool), String> {
-    let triple = crate::cli::current_triple();
-    for &want in wants {
-        if !want.supports(triple) {
-            return Err(format!("{} is unavailable on {triple}", want.recipe().name));
-        }
-    }
     let config = crate::config::cached();
     if config.unreadable {
         return Err("the package configuration is unreadable".into());
     }
     let layout =
         crate::store::resolve_from(config).ok_or("the managed package prefix is unavailable")?;
-    let fetcher = crate::source::resolve_fetcher(&layout, None);
+    admitted_in(&layout, wants, who, install)
+}
+
+/// Admit already installed prerequisites from an explicitly selected signed store.
+/// Signature, freshness, tree verification and lease policy are identical to [`configured`].
+///
+/// # Errors
+/// An unsupported host, unavailable signed source or failed package admission.
+pub fn configured_in(
+    layout: &Layout,
+    wants: &[Prerequisite],
+    who: &str,
+) -> Result<HeldSet, String> {
+    admitted_in(layout, wants, who, false).map(|(held, _)| held)
+}
+
+fn admitted_in(
+    layout: &Layout,
+    wants: &[Prerequisite],
+    who: &str,
+    install: bool,
+) -> Result<(HeldSet, bool), String> {
+    let triple = crate::cli::current_triple();
+    for &want in wants {
+        if !want.supports(triple) {
+            return Err(format!("{} is unavailable on {triple}", want.recipe().name));
+        }
+    }
+    let fetcher = crate::source::resolve_fetcher(layout, None);
     let session = Session::resolve(
         fetcher.as_ref(),
-        &layout,
-        &crate::source::effective_anchor(&layout),
-        crate::source::build_floor(&layout),
+        layout,
+        &crate::source::effective_anchor(layout),
+        crate::source::build_floor(layout),
         crate::flow::now_unix(),
         triple,
     )
@@ -75,7 +102,7 @@ fn configured_with(
     }
     let held = session.acquire_all(wants)?;
     crate::source::advance_floors(
-        &layout,
+        layout,
         session.index.index_build,
         session.index.roster_seq(),
     );
@@ -158,6 +185,7 @@ pub struct Session<'a> {
 #[derive(Clone)]
 struct Prepared {
     build: u64,
+    recipe: &'static PinnedTool,
     package: crate::manifest::PkgManifest,
     signed: crate::flow::PackageBytes,
 }
@@ -216,23 +244,58 @@ impl<'a> Session<'a> {
             .pin
             .get(recipe.name)
             .ok_or_else(|| format!("{} has no signed channel pin", recipe.name))?;
-        if !crate::gate::current_build_ok(&channel, recipe.name, Some(build)) {
+        let prepared = self.read_package(want, build, false)?;
+        self.prepared.borrow_mut().push((want, prepared.clone()));
+        Ok(prepared)
+    }
+
+    fn read_package(
+        &self,
+        want: Prerequisite,
+        build: u64,
+        named: bool,
+    ) -> Result<Prepared, String> {
+        let base = want.recipe();
+        let channel = self
+            .index
+            .channel_for(crate::config::CHANNEL, self.triple)
+            .ok_or("the signed stable channel is unavailable")?;
+        if !crate::gate::current_build_ok(&channel, base.name, Some(build)) {
             return Err(format!(
                 "{} {build} is withdrawn or below its signed floor",
-                recipe.name
+                base.name
             ));
         }
         let row = self
             .index
-            .program(recipe.name)
+            .program(base.name)
             .ok_or("the signed index has no prerequisite program")?;
-        let (raw, signature) = self.fetcher.pkg_manifest(&row.repo, recipe.name, build)?;
+        let (raw, signature) = self.fetcher.pkg_manifest(&row.repo, base.name, build)?;
         let verified = self
             .index
             .verify_pkg(raw.clone(), &signature)
-            .map_err(|e| format!("{} package signature: {e:?}", recipe.name))?;
+            .map_err(|e| format!("{} package signature: {e:?}", base.name))?;
         let package = crate::manifest::parse_pkg(&verified)
-            .map_err(|e| format!("{} package manifest: {e:?}", recipe.name))?;
+            .map_err(|e| format!("{} package manifest: {e:?}", base.name))?;
+        let recipe = if named {
+            base.versioned(&package.version)
+                .ok_or("the named prerequisite version has no shared recipe")?
+        } else {
+            base
+        };
+        let platform = match self.triple {
+            "aarch64-apple-darwin" => "macos-aarch64",
+            "x86_64-apple-darwin" => "macos-x86_64",
+            "aarch64-unknown-linux-gnu" => "linux-aarch64",
+            "x86_64-unknown-linux-gnu" => "linux-x86_64",
+            _ => "unsupported",
+        };
+        if !recipe.hosts.contains(&platform) {
+            return Err(format!(
+                "{} {} is unavailable on {}",
+                recipe.name, recipe.version, self.triple
+            ));
+        }
         if !package.is_for(recipe.name)
             || package.build_number != build
             || package.version != recipe.version
@@ -256,13 +319,23 @@ impl<'a> Session<'a> {
         {
             return Err("the signed package has no valid immutable tree root".into());
         }
+        let expected_env: Vec<String> = recipe
+            .shim_env
+            .iter()
+            .map(|entry| (*entry).to_owned())
+            .collect();
+        if package.shim_env != expected_env {
+            return Err(
+                "the signed prerequisite environment differs from its shared recipe".into(),
+            );
+        }
         crate::shim_env::ShimEnv::admit(&package.shim_env)?;
         let prepared = Prepared {
             build,
+            recipe,
             package,
             signed: (raw, signature),
         };
-        self.prepared.borrow_mut().push((want, prepared.clone()));
         Ok(prepared)
     }
 
@@ -369,6 +442,8 @@ impl<'a> Session<'a> {
             program: recipe.name,
             build,
             tree_root: actual,
+            root: root.to_path_buf(),
+            version: prepared.recipe.version,
         };
         tool.validate()?;
         Ok(tool)
@@ -533,6 +608,8 @@ pub struct HeldTool {
     build: u64,
     /// Freshly folded signed payload root.
     tree_root: String,
+    root: PathBuf,
+    version: &'static str,
 }
 
 impl HeldTool {
@@ -552,6 +629,18 @@ impl HeldTool {
     #[must_use]
     pub fn tree_root(&self) -> &str {
         &self.tree_root
+    }
+
+    /// Exact signed upstream version admitted by the shared recipe.
+    #[must_use]
+    pub const fn version(&self) -> &'static str {
+        self.version
+    }
+
+    /// Immutable physical payload root retained by this tool's lease.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     /// The exposed invocation path, valid while this guard is retained.

@@ -370,14 +370,28 @@ impl Ingest {
             let mut landed = self.kicked.swap(false, Ordering::AcqRel);
             let full = self.state.lock_or_recover().waiting.len() >= WAITING_MAX;
             if !full && !self.held() {
-                let took: Vec<Delivered> = {
+                let mut members: Vec<(u64, Vec<u8>)> = Vec::new();
+                let mut tables: Vec<(u64, [u8; 32], Vec<u8>)> = Vec::new();
+                let mut through = None;
+                {
                     let mut queue = self.queue.lock_or_recover();
                     let n = queue.len().min(TAKE);
-                    queue.drain(..n).collect()
-                };
+                    for delivered in queue.drain(..n) {
+                        through = through.max(Some(delivered.offset));
+                        match delivered.record {
+                            Some((Carries::Members, payload)) => {
+                                members.push((delivered.offset, payload));
+                            }
+                            Some((Carries::Table(table), payload)) => {
+                                tables.push((delivered.offset, table, payload));
+                            }
+                            None => {}
+                        }
+                    }
+                }
                 self.room.notify_all();
-                if !took.is_empty() {
-                    landed |= self.settle(&mesh, took);
+                if through.is_some() {
+                    landed |= self.settle(&mesh, members, tables, through);
                 }
             } else if full && !std::mem::replace(&mut self.state.lock_or_recover().asked, true) {
                 aterm_log::warn!(
@@ -424,22 +438,15 @@ impl Ingest {
         }
     }
 
-    /// Hand `took` to the stores: the membership records first, then each table's in runs of at
-    /// most [`BATCH`]. Answers whether a membership record was applied.
-    fn settle(&self, mesh: &Mesh, took: Vec<Delivered>) -> bool {
-        let mut members: Vec<(u64, Vec<u8>)> = Vec::new();
-        let mut tables: Vec<(u64, [u8; 32], Vec<u8>)> = Vec::new();
-        let mut through = None;
-        for delivered in took {
-            through = through.max(Some(delivered.offset));
-            match delivered.record {
-                Some((Carries::Members, payload)) => members.push((delivered.offset, payload)),
-                Some((Carries::Table(table), payload)) => {
-                    tables.push((delivered.offset, table, payload));
-                }
-                None => {}
-            }
-        }
+    /// Hand drained deliveries to the stores: the membership records first, then each table's in
+    /// runs of at most [`BATCH`]. Answers whether a membership record was applied.
+    fn settle(
+        &self,
+        mesh: &Mesh,
+        members: Vec<(u64, Vec<u8>)>,
+        tables: Vec<(u64, [u8; 32], Vec<u8>)>,
+        through: Option<u64>,
+    ) -> bool {
         let landed = self.ingest_members(mesh, members);
         self.ingest_tables(mesh, tables);
         let mut state = self.state.lock_or_recover();
@@ -765,7 +772,7 @@ impl Ingest {
             .iter()
             .copied()
             .collect();
-        let me = mesh.principal().to_owned();
+        let me = mesh.principal();
         let mut found = 0;
         for offset in unread {
             let (page, _) = reader.fetch(offset, MeshLog::Tables.filter(), 1)?;

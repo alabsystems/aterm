@@ -1341,9 +1341,265 @@ pub fn crate_dir_has_lib(root: &std::path::Path, name: &str) -> bool {
     true
 }
 
+/// A `-p` spec no host check can build: it names a package of `Cargo.lock` that this host's
+/// build graph does not hold (the `windows-sys` 0.61.2 facade, which only Windows targets
+/// reach), and cargo panics resolving its features rather than say so.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Foreign {
+    /// The spec as `-p` gave it.
+    pub spec: String,
+    /// The workspace crates that depend on it on some target, when the graph names them.
+    pub consumers: Vec<String>,
+}
+
+/// Every `(name, version)` a `targo tree --format {p}` listing names, whatever its prefix.
+#[must_use]
+pub fn parse_tree_packages(text: &str) -> BTreeSet<(String, String)> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim_start_matches(|c: char| c.is_ascii_digit());
+            let mut words = line.split_whitespace();
+            let name = words.next()?;
+            let version = words.next()?.strip_prefix('v')?;
+            Some((name.to_string(), version.to_string()))
+        })
+        .collect()
+}
+
+/// Every `[[package]]`'s `(name, version)` in a `Cargo.lock`.
+#[must_use]
+pub fn lock_packages(lock: &str) -> BTreeSet<(String, String)> {
+    let mut found = BTreeSet::new();
+    let mut name: Option<&str> = None;
+    for line in lock.lines() {
+        if line.starts_with('[') {
+            name = None;
+        } else if let Some(n) = line
+            .strip_prefix("name = \"")
+            .and_then(|r| r.strip_suffix('"'))
+        {
+            name = Some(n);
+        } else if let Some(v) = line
+            .strip_prefix("version = \"")
+            .and_then(|r| r.strip_suffix('"'))
+            && let Some(n) = name.take()
+        {
+            found.insert((n.to_string(), v.to_string()));
+        }
+    }
+    found
+}
+
+/// Whether the `-p` spec names the package `name` at `version`, as cargo matches one: by name,
+/// and by version when the spec gives one, a partial one (`0.61`) matching each release it
+/// prefixes.
+#[must_use]
+pub fn spec_matches(spec: &str, name: &str, version: &str) -> bool {
+    if crate::scope::spec_name(spec) != Some(name) {
+        return false;
+    }
+    let tail = spec.rsplit_once('#').map_or(spec, |(_, t)| t);
+    match tail.split_once('@') {
+        None => true,
+        Some((_, want)) => {
+            version == want
+                || version
+                    .strip_prefix(want)
+                    .is_some_and(|rest| rest.starts_with('.'))
+        }
+    }
+}
+
+/// The specs of `specs` that name a package of `lock` and none of `graph`, the host's build
+/// graph. A spec the lock does not hold either is left to cargo, which names it.
+#[must_use]
+pub fn outside_graph(
+    specs: &[String],
+    lock: &BTreeSet<(String, String)>,
+    graph: &BTreeSet<(String, String)>,
+) -> Vec<String> {
+    let holds = |set: &BTreeSet<(String, String)>, spec: &str| {
+        set.iter().any(|(n, v)| spec_matches(spec, n, v))
+    };
+    specs
+        .iter()
+        .filter(|spec| holds(lock, spec) && !holds(graph, spec))
+        .cloned()
+        .collect()
+}
+
+/// The `-p` specs of `specs` this host cannot build ([`Foreign`]), each with its consumers. An
+/// unanswered graph read refuses nothing: cargo then judges the specs itself.
+#[must_use]
+pub fn foreign_specs(
+    root: &Path,
+    tools: &Toolchain,
+    path_env: &OsStr,
+    specs: &[String],
+) -> Vec<Foreign> {
+    let Ok(lock) = std::fs::read_to_string(root.join("Cargo.lock")) else {
+        return Vec::new();
+    };
+    let lock = lock_packages(&lock);
+    if !specs
+        .iter()
+        .any(|spec| lock.iter().any(|(n, v)| spec_matches(spec, n, v)))
+    {
+        return Vec::new();
+    }
+    let tree = |args: &[&str]| targo_tree(root, &tools.targo, path_env, args);
+    let Some(graph) = tree(&[
+        "tree",
+        "--workspace",
+        "--prefix",
+        "none",
+        "--format",
+        "{p}",
+        "--edges",
+        "normal,build,dev",
+    ]) else {
+        return Vec::new();
+    };
+    outside_graph(specs, &lock, &parse_tree_packages(&graph))
+        .into_iter()
+        .map(|spec| {
+            let consumers = tree(&[
+                "tree",
+                "--workspace",
+                "--target",
+                "all",
+                "--invert",
+                &spec,
+                "--depth",
+                "1",
+                "--prefix",
+                "depth",
+                "--format",
+                "{p}",
+                "--edges",
+                "normal,build,dev",
+            ])
+            .map(|out| direct_dependents(&out))
+            .unwrap_or_default();
+            Foreign { spec, consumers }
+        })
+        .collect()
+}
+
+/// The names at depth 1 of a `targo tree --invert --prefix depth` listing: what depends on its
+/// root directly.
+#[must_use]
+pub fn direct_dependents(text: &str) -> Vec<String> {
+    let mut names: Vec<String> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix('1'))
+        .filter(|l| !l.starts_with(|c: char| c.is_ascii_digit()))
+        .filter_map(|l| l.split_whitespace().next())
+        .map(str::to_string)
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// The refusal of a run whose `-p` names [`Foreign`] specs: one line naming each, who builds it,
+/// and the command that does (`verify cells` with those specs: a bare `verify cells` takes the
+/// change's scope, which need not hold them).
+#[must_use]
+pub fn foreign_refusal(foreign: &[Foreign]) -> String {
+    let each: Vec<String> = foreign
+        .iter()
+        .map(|f| {
+            let by = match f.consumers.as_slice() {
+                [] => String::new(),
+                all => format!(" ({} builds it for another OS's target)", all.join(", ")),
+            };
+            format!("-p {}{by}", f.spec)
+        })
+        .collect();
+    let (them, it) = if foreign.len() == 1 {
+        ("a package", "it")
+    } else {
+        ("packages", "them")
+    };
+    let cells: String = foreign.iter().map(|f| format!(" -p {}", f.spec)).collect();
+    format!(
+        "verify: {} names {them} this host's build graph does not hold, so no lint, test, doc or \
+         checkers run here can build {it} (cargo panics resolving {it}); the cells build {it} on \
+         the targets that hold {it}: targo --unverified verify cells{cells}. No check was run",
+        each.join(" and ")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `-p` naming a package of the lock that the host's build graph lacks is named, with who
+    /// builds it; one the graph holds, one the lock lacks (a typo cargo names), a partial
+    /// version and a path spec read as cargo reads them.
+    #[test]
+    fn a_spec_outside_the_hosts_graph_is_named_before_cargo_panics_on_it() {
+        let lock = lock_packages(
+            "version = 4\n\n[[package]]\nname = \"windows-sys\"\nversion = \"0.52.0\"\n\n\
+             [[package]]\nname = \"windows-sys\"\nversion = \"0.61.2\"\ndependencies = [\n \
+             \"windows-link\",\n]\n\n[[package]]\nname = \"aterm-core\"\nversion = \"0.148.0\"\n",
+        );
+        assert_eq!(lock.len(), 3, "{lock:?}");
+        let graph = parse_tree_packages(
+            "aterm-core v0.148.0 (/r/crates/aterm-core)\n\
+             windows-sys v0.52.0 (/r/crates/aterm-windows-sys-052)\n\
+             windows-sys v0.52.0 (/r/crates/aterm-windows-sys-052) (*)\n",
+        );
+        let specs = |s: &[&str]| s.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            outside_graph(
+                &specs(&[
+                    "windows-sys@0.61.2",
+                    "windows-sys@0.61",
+                    "path+file:///r/crates/aterm-windows-sys#windows-sys@0.61.2",
+                    "windows-sys@0.52.0",
+                    "aterm-core",
+                    "aterm-nonesuch",
+                    "windows-sys@0.6",
+                ]),
+                &lock,
+                &graph
+            ),
+            specs(&[
+                "windows-sys@0.61.2",
+                "windows-sys@0.61",
+                "path+file:///r/crates/aterm-windows-sys#windows-sys@0.61.2",
+            ]),
+        );
+        let held = parse_tree_packages(
+            "aterm-core v0.148.0 (/r/crates/aterm-core)\n\
+             windows-sys v0.61.2 (/r/crates/aterm-windows-sys)\n",
+        );
+        assert!(
+            outside_graph(&specs(&["windows-sys@0.61.2"]), &lock, &held).is_empty(),
+            "negative control: a graph that holds it refuses nothing"
+        );
+
+        let consumers = direct_dependents(
+            "0windows-sys v0.61.2 (/r/crates/aterm-windows-sys)\n\
+             1aterm-window v0.30.13 (/r/crates/aterm-window)\n\
+             2aterm-gui v0.148.0 (/r/crates/aterm-gui)\n\
+             1aterm-window v0.30.13 (/r/crates/aterm-window) (*)\n",
+        );
+        assert_eq!(consumers, ["aterm-window"]);
+        let line = foreign_refusal(&[Foreign {
+            spec: "windows-sys@0.61.2".into(),
+            consumers,
+        }]);
+        for named in [
+            "-p windows-sys@0.61.2",
+            "aterm-window",
+            "verify cells -p windows-sys@0.61.2.",
+        ] {
+            assert!(line.contains(named), "{named}: {line}");
+        }
+    }
 
     fn select(
         paths: &[String],

@@ -28,7 +28,8 @@ aterm-log = { workspace = true }
 aterm-hash = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-# The keeper thread's background QoS class.
+# The keeper thread's background QoS class, and its wait's poll of the route socket and the
+# path monitor's bell together.
 libc = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]

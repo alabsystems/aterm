@@ -223,6 +223,13 @@ fn roster() -> Vec<Entry> {
             )];
             all.extend(mr::resume_exceptions(&own));
         }
+        let refused = vec![(
+            "s-1".to_string(),
+            Exception::refused_by(Program::Muse, None, "API error 400"),
+            Program::Muse,
+            spot.clone(),
+        )];
+        all.extend(mr::resume_exceptions(&refused));
         for kind in later_kinds() {
             let many: Vec<_> = ["s-1", "s-2", "s-3"]
                 .iter()
@@ -2876,6 +2883,40 @@ fn a_resume_line_an_earlier_process_left_open_ends_after_the_settle() {
     app.ripen_exceptions(Instant::now() + DAY);
     let _ = app.settle_messages(Instant::now() + DAY + DAY);
     assert_eq!(app.messages.digest().len(), 1, "still told of");
+}
+
+/// A refused request's line names the program whose request the API refused, as its reason does
+/// (`Exception::refused_by`): Muse Code's, never Claude's, where the glass's six words drop the
+/// place (`Muse Code's request in tab 2 is refused` is seven). Negative control: Claude Code's
+/// tab keeps `Claude's request` and its place.
+#[test]
+fn a_refused_requests_line_names_the_program_whose_request_it_is() {
+    let line = |agent: Program| {
+        let entries = mr::resume_exceptions(&[(
+            "s-2".to_string(),
+            Exception::refused_by(agent, None, "API error 400"),
+            agent,
+            mr::UpgradeSpot {
+                place: "in tab 2".to_string(),
+                nav: None,
+            },
+        )]);
+        assert_eq!(entries.len(), 1, "{agent:?}");
+        entries[0].message().expect("passes the door")
+    };
+    let muse = line(Program::Muse);
+    assert_eq!(muse.title, "Muse Code's request is refused");
+    assert!(
+        muse.detail
+            .iter()
+            .any(|line| line.starts_with("The API Muse Code calls refuses")),
+        "the reason names Muse Code too: {muse:?}"
+    );
+    // Negative control: Claude Code's request is Claude's.
+    assert_eq!(
+        line(Program::Claude).title,
+        "Claude's request in tab 2 is refused"
+    );
 }
 
 /// A limit's line names the agent its tabs run, or none: a generic screen and tabs running

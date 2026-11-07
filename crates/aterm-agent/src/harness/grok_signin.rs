@@ -1403,6 +1403,7 @@ fn unsigned_why(outcome: &Outcome) -> String {
         Outcome::CompletedHeld => {
             "its completed native response was retained without publication".to_owned()
         }
+        Outcome::CustodyHeld => "an existing saved native response blocks this attempt".to_owned(),
         Outcome::NotRun(why) | Outcome::PageNotOpened(why) | Outcome::Unverified(why) => {
             why.clone()
         }

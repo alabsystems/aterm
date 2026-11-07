@@ -47,7 +47,9 @@ pub fn record_read(pid: u32) -> std::io::Result<Option<Record>> {
     imp::record_read(pid)
 }
 
-/// Every process's record; `None` where the table cannot be read.
+/// Every process's record; `None` where the table cannot be read, or where the kernel did not
+/// answer within a bound (macOS: a process in the middle of an exec holds every read of the
+/// table until that exec finishes).
 #[must_use]
 pub fn records() -> Option<Vec<Record>> {
     imp::records()
@@ -171,6 +173,8 @@ pub(crate) use imp::reaps_unwaited_all;
 mod imp {
     use std::ffi::{CString, c_char, c_int, c_void};
     use std::sync::OnceLock;
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Duration;
 
     use crate::jobs::darwin::{
         KERN_PROC, KERN_PROC_PID, KINFO_COMM_AT, KINFO_FLAG_AT, KINFO_PGID_AT, KINFO_PID_AT,
@@ -396,8 +400,116 @@ mod imp {
             .collect()
     }
 
-    /// The whole table's `kinfo_proc` records (`KERN_PROC_ALL`), a whole number of them.
+    /// How long a read of the whole table is waited for ([`table`]). One read takes about 100 µs
+    /// (749 records, m22, 2026-10-25), but the kernel answers it only once each process it lists
+    /// is through an exec in progress. On 2026-11-06 a `posix_spawn` that never finished (the
+    /// installed aterm's `secrets serve` starting `dns-sd`) held every `KERN_PROC_ALL` read on the
+    /// machine for 13 minutes, `ps` and the process holding the capacity ledger's lock among them,
+    /// while libproc read the same process at once.
+    const TABLE_WAIT: Duration = Duration::from_secs(1);
+
+    /// This process's read of the table, while one is in the kernel ([`Bounded`]).
+    static TABLE: Bounded<Vec<u8>> = Bounded::new();
+
+    /// The whole table's `kinfo_proc` records (`KERN_PROC_ALL`), a whole number of them; `None`
+    /// also where the kernel did not answer within [`TABLE_WAIT`].
     fn table() -> Option<Vec<u8>> {
+        TABLE.read(TABLE_WAIT, table_now)
+    }
+
+    /// Concurrent callers share one kernel read, each waiting at most its own bound.
+    /// A read the kernel never answers holds one worker, not one for each call.
+    pub(super) struct Bounded<T> {
+        flight: Mutex<Option<Arc<Pending<T>>>>,
+    }
+
+    pub(super) struct Pending<T> {
+        answer: Mutex<Option<Option<T>>>,
+        done: Condvar,
+    }
+
+    impl<T: Clone + Send + 'static> Bounded<T> {
+        pub(super) const fn new() -> Self {
+            Self {
+                flight: Mutex::new(None),
+            }
+        }
+
+        /// `read`'s answer, or `None` when it gave none, exceeded this caller's bound,
+        /// panicked, or no worker could be started. Joining a read never starts another.
+        pub(super) fn read(&'static self, within: Duration, read: fn() -> Option<T>) -> Option<T> {
+            self.begin(read).wait(within)
+        }
+
+        pub(super) fn begin(&'static self, read: fn() -> Option<T>) -> Arc<Pending<T>> {
+            let (pending, start) = {
+                let mut flight = self
+                    .flight
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(pending) = flight.as_ref() {
+                    (Arc::clone(pending), false)
+                } else {
+                    let pending = Arc::new(Pending {
+                        answer: Mutex::new(None),
+                        done: Condvar::new(),
+                    });
+                    *flight = Some(Arc::clone(&pending));
+                    (pending, true)
+                }
+            };
+            if start {
+                let worker = Arc::clone(&pending);
+                let spawned = std::thread::Builder::new()
+                    .name("kproc-table".into())
+                    .spawn(move || {
+                        self.finish(&worker, std::panic::catch_unwind(read).ok().flatten());
+                    });
+                if spawned.is_err() {
+                    self.finish(&pending, None);
+                }
+            }
+            pending
+        }
+
+        fn finish(&self, pending: &Pending<T>, answer: Option<T>) {
+            *pending
+                .answer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(answer);
+            *self
+                .flight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            pending.done.notify_all();
+        }
+
+        /// Whether a read is in the kernel now.
+        #[cfg(test)]
+        pub(super) fn in_flight(&self) -> bool {
+            self.flight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some()
+        }
+    }
+
+    impl<T: Clone> Pending<T> {
+        pub(super) fn wait(&self, within: Duration) -> Option<T> {
+            let answer = self
+                .answer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (answer, _) = self
+                .done
+                .wait_timeout_while(answer, within, |answer| answer.is_none())
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            answer.clone().flatten()
+        }
+    }
+
+    /// [`table`]'s read itself, unbounded.
+    fn table_now() -> Option<Vec<u8>> {
         let mut mib = [libc::CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0];
         for _ in 0..4 {
             let len = sysctl_len(&mut mib[..3])?;

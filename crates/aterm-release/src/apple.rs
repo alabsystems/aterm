@@ -1191,10 +1191,16 @@ impl Watch {
 
     /// A line, printed before the errand, saying the named folder is one macOS guards.
     fn consent_note(&self) -> Option<String> {
-        let named = self.named.as_deref()?;
         let home = std::env::var_os("HOME").map(PathBuf::from)?;
-        let resolved = std::fs::canonicalize(named).unwrap_or_else(|_| named.to_path_buf());
-        let home_resolved = std::fs::canonicalize(&home).unwrap_or(home);
+        self.consent_note_for(&home, aterm_uds::runs::canonical)
+    }
+
+    /// Classify both paths with the same resolver, including a nonexistent named child
+    /// beneath an existing symlinked home. Tests inject their home and an inert resolver.
+    fn consent_note_for(&self, home: &Path, resolve: impl Fn(&Path) -> PathBuf) -> Option<String> {
+        let named = self.named.as_deref()?;
+        let resolved = resolve(named);
+        let home_resolved = resolve(home);
         if atpkg::protected::under_app_data(&home_resolved, &resolved) {
             return Some(format!(
                 "{} is inside another app's container that macOS guards: reading it raises a \
@@ -2033,14 +2039,6 @@ mod tests {
     use super::*;
     use crate::release_keychain::fake::{Fake, Kc, World};
 
-    /// A watch over `named` and this test process's own `~/.aterm/apple`.
-    fn env_watch(named: Option<&Path>) -> Watch {
-        Watch::new(
-            std::env::var_os("HOME").map(PathBuf::from).as_deref(),
-            named,
-        )
-    }
-
     const COMMAND_CHILD: &str = "ATERM_APPLE_COMMAND_TEST_CHILD";
 
     fn command_child(mode: &str) -> aterm_uds::spawnfd::Command {
@@ -2609,7 +2607,8 @@ mod tests {
 
     #[test]
     fn nothing_outside_aterms_own_folder_is_read_unless_the_operator_named_it() {
-        let own = env_watch(None);
+        let home = Path::new("/fixture/home");
+        let own = Watch::new(Some(home), None);
         let dirs = own.dirs();
         assert_eq!(dirs.len(), 1, "{dirs:?}");
         assert!(dirs[0].ends_with(".aterm/apple"), "{dirs:?}");
@@ -2619,12 +2618,12 @@ mod tests {
                 .any(|d| d.to_string_lossy().contains("Downloads")),
             "{dirs:?}"
         );
-        let named = env_watch(Some(Path::new("/Users//x/Downloads")));
+        let named = Watch::new(Some(home), Some(Path::new("/fixture/named/Downloads")));
         let dirs = named.dirs();
         assert_eq!(dirs.len(), 2, "{dirs:?}");
         assert_eq!(
             dirs[0],
-            Path::new("/Users//x/Downloads"),
+            Path::new("/fixture/named/Downloads"),
             "the named folder is looked in first"
         );
         assert!(dirs[1].ends_with(".aterm/apple"), "{dirs:?}");
@@ -2632,31 +2631,63 @@ mod tests {
 
     #[test]
     fn the_consent_note_names_only_a_guarded_folder_the_operator_named() {
-        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME in tests"));
-        assert!(env_watch(None).consent_note().is_none());
-        let guarded = env_watch(Some(&home.join("Downloads")));
-        let downloads_note = guarded
-            .consent_note()
-            .expect("Downloads is a guarded folder");
+        let home = Path::new("/fixture/home");
+        let note = |named: Option<&Path>| {
+            Watch::new(Some(home), named).consent_note_for(home, Path::to_path_buf)
+        };
+        assert!(note(None).is_none());
+        assert!(note(Some(&home.join("Downloads"))).is_some());
+        assert!(note(Some(&home.join("Library/Containers/example"))).is_some());
+        assert!(note(Some(&home.join(".aterm/apple-scratch"))).is_none());
+        assert!(note(Some(&home.join("Downloadsx"))).is_none());
+        assert!(note(Some(Path::new("/fixture/other/Downloads"))).is_none());
+    }
+
+    /// NEGATIVE CONTROL: canonicalizing only complete existing paths leaves the missing
+    /// child under the alias while resolving its home, so the guarded root is missed.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_guarded_child_under_a_home_alias_uses_the_same_resolved_prefix() {
+        const PROBE: &str = "ATERM_APPLE_ALIAS_PROBE";
+        if std::env::var_os(PROBE).is_some() {
+            let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+            let named = home.join("Downloads");
+            assert!(
+                Watch::new(Some(&home), Some(&named))
+                    .consent_note()
+                    .is_some()
+            );
+            return;
+        }
+        // Keep the unresolved spelling outside macOS's absolute /Volumes roots, even
+        // when the caller's TMPDIR is on a protected volume.
+        let base = Path::new("/tmp/.ubd");
+        std::fs::create_dir_all(base).unwrap();
+        let dir = aterm_tempfile::Builder::new().tempdir_in(base).unwrap();
+        let resolved_base = std::fs::canonicalize(base).unwrap();
+        let resolved_dir = std::fs::canonicalize(dir.path()).unwrap();
+        let here = base.join(resolved_dir.strip_prefix(&resolved_base).unwrap());
+        let home = here.join("home");
+        let alias = here.join("alias");
+        std::fs::create_dir(&home).unwrap();
+        std::os::unix::fs::symlink(&home, &alias).unwrap();
+        let missing = alias.join("Downloads");
+        let watch = Watch::new(Some(&alias), Some(&missing));
+        let old = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        assert!(watch.consent_note_for(&alias, old).is_none());
+        let mut child = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+        child.args(["--exact", "apple::tests::a_missing_guarded_child_under_a_home_alias_uses_the_same_resolved_prefix"])
+            .env(PROBE, "1").env("HOME", &alias);
+        let output =
+            aterm_uds::deadline::output_within(&mut child, aterm_spec::wait::MUST_HAPPEN).unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            downloads_note.contains("would like to access files"),
-            "{downloads_note}"
+            output.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
         );
-        let app_data = env_watch(Some(
-            &home.join("Library/Containers/com.aterm.nonexistent-test"),
-        ));
-        let app_data_note = app_data
-            .consent_note()
-            .expect("Library/Containers is a guarded App Data root");
-        assert!(
-            app_data_note.contains("would like to access data from other apps")
-                && !app_data_note.contains("one-time"),
-            "{app_data_note}"
-        );
-        let plain = env_watch(Some(&home.join(".aterm").join("apple-scratch")));
-        assert!(plain.consent_note().is_none());
-        let lookalike = env_watch(Some(&home.join("Downloadsx")));
-        assert!(lookalike.consent_note().is_none());
+        assert!(stdout.contains("1 passed"), "{stdout}");
+        assert!(!missing.exists());
     }
 
     #[test]

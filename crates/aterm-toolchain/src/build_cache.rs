@@ -563,8 +563,9 @@ fn decide_line(args: &[String], tool: Tool, m: &Machine<'_>) -> Option<(BuildDir
 }
 
 /// `args` with the `--config` [`decide`] adds, or `None` when it adds none. That pair leads (a
-/// shim's front strips it there); a `test`, `t` or `bench` that `targo` runs also gets the test
-/// graph around that verb ([`with_test_graph`]: its `--config` before the verb, beside this one,
+/// shim's front strips it there); a dev `build`/`b`, or a `test`, `t` or `bench` that `targo`
+/// runs also gets the test graph around that verb ([`with_test_graph`]: its `--config` before
+/// the verb, beside this one,
 /// so neither drops the other), unless it names `-Zfeature-unification` itself, so a narrow test
 /// build shares the workspace one's units. Never for [`Tool::Cargo`], which
 /// refuses `-Z`, nor for an alias, whose own words are its business.
@@ -579,7 +580,8 @@ pub fn with_build_dir(args: &[String], tool: Tool, m: &Machine<'_>) -> Option<Ve
         Some(verb)
             if tool == Tool::Targo
                 && !line.unified
-                && matches!(args[at + verb].as_str(), "test" | "t" | "bench") =>
+                && (matches!(args[at + verb].as_str(), "test" | "t" | "bench")
+                    || line.dev_profile && matches!(args[at + verb].as_str(), "build" | "b")) =>
         {
             insert_test_graph(&args[at..], verb)
         }
@@ -634,6 +636,8 @@ struct Line {
     verb_at: Option<usize>,
     /// A `-Zfeature-unification` before `--`, outside any flag's value.
     unified: bool,
+    /// A dev/test profile, which shares the test graph; release and custom builds keep theirs.
+    dev_profile: bool,
 }
 
 impl Line {
@@ -652,6 +656,7 @@ impl Line {
         let mut verb_at = None;
         let mut unverified = false;
         let mut unified = false;
+        let mut dev_profile = true;
         let mut target_dir = None;
         let mut manifest_path = None;
         let mut words = args.iter().map(String::as_str).enumerate();
@@ -670,6 +675,14 @@ impl Line {
                     manifest_ok(v)
                 }),
                 "--target-dir" => it.next().map(|v| target_dir = Some(v.to_owned())).is_some(),
+                "--release" | "-r" => {
+                    dev_profile = false;
+                    true
+                }
+                "--profile" => it.next().is_some_and(|v| {
+                    dev_profile = matches!(v, "dev" | "test");
+                    true
+                }),
                 "-Z" | "--color" | "--explain" => verb.is_some() || it.next().is_some(),
                 _ => {
                     if let Some(v) = a.strip_prefix("--config=") {
@@ -679,6 +692,9 @@ impl Line {
                         manifest_ok(v)
                     } else if let Some(v) = a.strip_prefix("--target-dir=") {
                         target_dir = Some(v.to_owned());
+                        true
+                    } else if let Some(v) = a.strip_prefix("--profile=") {
+                        dev_profile = matches!(v, "dev" | "test");
                         true
                     } else if a.starts_with("-C") {
                         false
@@ -712,6 +728,7 @@ impl Line {
             alias,
             verb_at,
             unified,
+            dev_profile,
         })
     }
 

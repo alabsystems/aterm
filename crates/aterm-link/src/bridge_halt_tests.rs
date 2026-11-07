@@ -434,6 +434,7 @@ fn removing_or_rotating_the_origin_lifts_its_halts_on_every_mac() {
                 } else {
                     BTreeMap::new()
                 },
+                rank: BTreeMap::new(),
                 gone: [a.clone()].into(),
             };
             handoff

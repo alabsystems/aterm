@@ -568,7 +568,7 @@ fn not_written(path: &Path, e: &str) -> Error {
 }
 
 fn path_word(path: &Path) -> String {
-    super::shell_word(&path.display().to_string())
+    super::shell_word(&path.display().to_string()).into_owned()
 }
 
 fn in_the_way(path: &Path) -> String {
@@ -649,14 +649,15 @@ impl TapeSink {
         header: &TapeHeader,
         redactor: Redactor,
     ) -> Result<TapeSink> {
-        if head_holds_a_credential(&head_text(&shaped_header(header)), &redactor) {
+        let head = shaped_head_text(header);
+        if head_holds_a_credential(&head, &redactor) {
             return Err(Error::local(format!(
                 "the tape {} was not made: {HEAD_CREDENTIAL}",
                 path.display()
             ))
             .with_next("record a command line that names no token"));
         }
-        Ok(Self::create(path, header)?.with_redactor(redactor))
+        Ok(Self::open_within_head(path, head, TAPE_MAX)?.with_redactor(redactor))
     }
 
     /// Create `path` with the file held to `max` bytes in place of `TAPE_MAX`.
@@ -669,7 +670,11 @@ impl TapeSink {
     }
 
     fn open_within(path: &Path, header: &TapeHeader, max: u64) -> Result<TapeSink> {
-        if head_redacts(header) {
+        Self::open_within_head(path, shaped_head_text(header), max)
+    }
+
+    fn open_within_head(path: &Path, head: String, max: u64) -> Result<TapeSink> {
+        if Redactor::shapes_cow(&head) != head {
             return Err(Error::local(format!(
                 "the tape {} was not made: its command line holds a token shape across its \
                  arguments, which a tape redacts",
@@ -677,7 +682,6 @@ impl TapeSink {
             ))
             .with_next("record a command line that names no token"));
         }
-        let head = head_text(&shaped_header(header));
         let written = u64::try_from(head.len()).unwrap_or(u64::MAX);
         if written > max {
             return Err(latched_error(
@@ -840,7 +844,7 @@ impl TapeSink {
             state.remedy = Remedy::Whole;
             return;
         }
-        let Some(text) = render_record(&redacted_record(record, state.redactor.as_ref())) else {
+        let Some(text) = render_redacted_record(record, state.redactor.as_ref()) else {
             state.failed = Some(format!(
                 "the seam made a {} record, which agh's tapes do not hold",
                 record.kind()
@@ -1186,40 +1190,51 @@ impl std::io::Read for DigestReader {
 }
 
 /// `bytes` through `Redactor::shapes`: each valid UTF-8 run shaped, each invalid byte kept as it is.
-pub(crate) fn shaped(bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn shaped(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     per_run(bytes, Redactor::shapes_cow)
 }
 
 /// `bytes` with each valid UTF-8 run through `f` and each invalid byte kept as it is.
-fn per_run<'f>(
-    bytes: &[u8],
+fn per_run<'b, 'f>(
+    bytes: &'b [u8],
     f: impl for<'a> Fn(&'a str) -> std::borrow::Cow<'a, str> + 'f,
-) -> Vec<u8> {
+) -> std::borrow::Cow<'b, [u8]> {
     if let Ok(text) = std::str::from_utf8(bytes) {
-        return f(text).into_owned().into_bytes();
+        return match f(text) {
+            std::borrow::Cow::Borrowed(_) => std::borrow::Cow::Borrowed(bytes),
+            std::borrow::Cow::Owned(redacted) => std::borrow::Cow::Owned(redacted.into_bytes()),
+        };
     }
     let mut out = Vec::with_capacity(bytes.len());
     for chunk in bytes.utf8_chunks() {
         out.extend_from_slice(f(chunk.valid()).as_bytes());
         out.extend_from_slice(chunk.invalid());
     }
-    out
+    std::borrow::Cow::Owned(out)
 }
 
-fn shaped_header(header: &TapeHeader) -> TapeHeader {
-    TapeHeader {
+fn shaped_head_text(header: &TapeHeader) -> String {
+    if header
+        .argv
+        .iter()
+        .all(|arg| matches!(Redactor::shapes_cow(arg), std::borrow::Cow::Borrowed(_)))
+    {
+        return head_text(header);
+    }
+    let shaped = TapeHeader {
         argv: header
             .argv
             .iter()
             .map(|arg| Redactor::shapes(arg))
             .collect(),
         ..header.clone()
-    }
+    };
+    head_text(&shaped)
 }
 
 /// Whether the header item a sink would write for `header` holds a line the shapes would change: two arguments that read as one shape once joined (`Bearer` then a long word).
 pub(crate) fn head_redacts(header: &TapeHeader) -> bool {
-    let head = head_text(&shaped_header(header));
+    let head = shaped_head_text(header);
     Redactor::shapes_cow(&head) != head
 }
 
@@ -1235,30 +1250,45 @@ fn head_holds_a_credential(head: &str, redactor: &Redactor) -> bool {
 
 /// `bytes` through `redactor.apply` (the learned credentials, then the shapes), each valid UTF-8
 /// run redacted and each invalid byte kept; with no redactor, `shaped`.
-fn redacted(bytes: &[u8], redactor: Option<&Redactor>) -> Vec<u8> {
+fn redacted<'a>(bytes: &'a [u8], redactor: Option<&Redactor>) -> std::borrow::Cow<'a, [u8]> {
     match redactor {
         Some(redactor) => per_run(bytes, |text| redactor.apply_cow(text)),
         None => shaped(bytes),
     }
 }
 
-fn redacted_record(record: &EffectRecord, redactor: Option<&Redactor>) -> EffectRecord {
+fn render_redacted_record(record: &EffectRecord, redactor: Option<&Redactor>) -> Option<String> {
+    let mut out = String::new();
     match record {
+        EffectRecord::Clock(ns) => {
+            let _ = writeln!(out, "clock {ns}");
+        }
+        EffectRecord::Mono(ns) => {
+            let _ = writeln!(out, "mono {ns}");
+        }
         EffectRecord::Exchange {
             door,
             request,
             reply,
-        } => EffectRecord::Exchange {
-            door: door.clone(),
-            request: redacted(request, redactor),
-            reply: redacted(reply, redactor),
-        },
-        EffectRecord::Emit { door, bytes } => EffectRecord::Emit {
-            door: door.clone(),
-            bytes: redacted(bytes, redactor),
-        },
-        other => other.clone(),
+        } => {
+            out.push_str("exchange ");
+            token_into(&mut out, door);
+            out.push('\n');
+            pieces(&mut out, '>', &redacted(request, redactor));
+            pieces(&mut out, '<', &redacted(reply, redactor));
+        }
+        EffectRecord::Emit { door, bytes } => {
+            out.push_str("emit ");
+            token_into(&mut out, door);
+            out.push('\n');
+            pieces(&mut out, '|', &redacted(bytes, redactor));
+        }
+        EffectRecord::Rand(_)
+        | EffectRecord::File { .. }
+        | EffectRecord::FileErr { .. }
+        | EffectRecord::Raised { .. } => return None,
     }
+    Some(out)
 }
 
 /// Whether the shapes would change `bytes` on the tape (`shaped`): a canonical request a tape of which could not replay, because the replay asks the unredacted question.

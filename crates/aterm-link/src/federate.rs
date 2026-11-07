@@ -43,8 +43,8 @@
 //!   `bus.log`.
 //! - **The hand-off.** The node service reads the membership log; the bridge does not. It writes
 //!   what the bridge must know to route, [`Handoff`], beside `bus.sock` ([`HANDOFF_FILE`]): the
-//!   current members, which node each rotated one became, and every node gone (removed, or its
-//!   key rotated), whose halts lift.
+//!   current members, which node each rotated one became and how recently its seat retired it,
+//!   and every node gone (removed, or its key rotated), whose halts lift.
 //! - **A person's post to another Mac** (§11 C3c) is written on the person's own lane, sealed by
 //!   this Mac's person key under the node key's certificate ([`crate::person_key`]). No push
 //!   carries a person's lane and no peer's ring takes one. The node service carries each such
@@ -325,24 +325,59 @@ pub fn halt_group(me: &str, dst: &str) -> String {
     format!("/f/{FLEET}/cur/{me}/halt/{dst}")
 }
 
-/// The most retired nodes of one seat a ring names ([`peer_ring`], `olds`), and of this Mac its
-/// bridge's reader's ring ([`old_reads`]): astream attaches at most 16 grants on one connection,
-/// and the ring's own five, the halts' and an inbox's pair fit beside them.
+/// The most retired nodes of one seat a ring names ([`ringed`]): of a peer's, its ring here
+/// ([`peer_ring`], `olds`), and of this Mac, its bridge's reader's ring ([`old_reads`]) and the
+/// moves of the mail its own `bus.log` holds unread for them ([`Lane::Inbox`]). astream attaches
+/// at most 16 grants on one connection: the bridge reads an old node's record under its node ring
+/// (8) and these reads beside it, and a peer's ring holds five of its own.
 pub const RING_OLDS_MAX: usize = 8;
 
-/// The grants of [`OLD_READS_FILE`] for a Mac whose retired nodes are `olds`: the read of each
-/// one's mail lanes (`ro:/f/alab/in/<old>/>`), the first [`RING_OLDS_MAX`] in node order.
+/// The retired nodes of one seat, of `olds`, that a ring names (§11 C3b): the [`RING_OLDS_MAX`] a
+/// key rotation retired last, by `rank` (where the membership log says each stands among the
+/// nodes its seat retired, 0 the last; one with no rank after every ranked one, in node order).
+/// Mail under a node its seat retired earlier is older, so the likelier to have gone past the mail
+/// rule's maximum age. Under [`NODE_ORDER_RING`], the first [`RING_OLDS_MAX`] in node order, as
+/// before.
+#[must_use]
+pub fn ringed(olds: &BTreeSet<String>, rank: &BTreeMap<String, usize>) -> BTreeSet<String> {
+    ringed_by(olds, rank, node_order_ring())
+}
+
+/// [`ringed`], in node order where `node_order` is set.
+fn ringed_by(
+    olds: &BTreeSet<String>,
+    rank: &BTreeMap<String, usize>,
+    node_order: bool,
+) -> BTreeSet<String> {
+    let mut by: Vec<&String> = olds.iter().collect();
+    if !node_order {
+        // Stable, so nodes of one rank, and the unranked, stay in node order.
+        by.sort_by_key(|old| rank.get(*old).copied().unwrap_or(usize::MAX));
+    }
+    by.into_iter().take(RING_OLDS_MAX).cloned().collect()
+}
+
+/// The read of the mail lanes of `old`, a node this Mac held before (`ro:/f/alab/in/<old>/>`): a
+/// grant of [`OLD_READS_FILE`].
+#[must_use]
+pub fn old_read(old: &str) -> String {
+    format!("ro:{}", subject::inbox_filter(FLEET, old))
+}
+
+/// The grants of [`OLD_READS_FILE`] for the retired nodes of this Mac its ring names, `olds`
+/// ([`Handoff::ringed`]): the read of each one's mail lanes ([`old_read`]), at most
+/// [`RING_OLDS_MAX`].
 #[must_use]
 pub fn old_reads(olds: &BTreeSet<String>) -> Vec<String> {
     olds.iter()
         .take(RING_OLDS_MAX)
-        .map(|old| format!("ro:{}", subject::inbox_filter(FLEET, old)))
+        .map(|old| old_read(old))
         .collect()
 }
 
 /// Write [`OLD_READS_FILE`] in `dir` for the Mac `handoff` names (its `me`): each grant of
-/// [`old_reads`] for its retired nodes, minted by `mint`, owner-only. Where it has none, the
-/// file goes.
+/// [`old_reads`] for the retired nodes its ring names ([`Handoff::ringed`]), minted by `mint`,
+/// owner-only. Where it has none, the file goes.
 ///
 /// # Errors
 /// A grant `mint` refuses, or the file's write or removal.
@@ -351,7 +386,7 @@ pub fn write_old_reads(
     handoff: &Handoff,
     mint: &dyn Fn(&str) -> io::Result<Capability>,
 ) -> io::Result<()> {
-    let grants = old_reads(&handoff.retired(&handoff.me));
+    let grants = old_reads(&handoff.ringed(&handoff.me));
     if grants.is_empty() {
         return match std::fs::remove_file(dir.join(OLD_READS_FILE)) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
@@ -416,10 +451,10 @@ pub fn person_post<'a>(subject: &'a str, me: &str) -> Option<(&'a str, &'a str, 
 ///   reading its own, so it finds the high water this Mac holds of it;
 /// - mail addressed to this Mac that the peer's sessions wrote under a node its seat held before
 ///   a key rotation, `olds` (`rw …/in/<me>/*/<old>/*`, §11 C3b): its push carries that mail,
-///   under its own producer now, as it carries what it wrote since. The first
-///   [`RING_OLDS_MAX`] of them, in node order, but this Mac's node or the peer's: the peer's
-///   pushes carry the ones a ring grants alone, whichever they are ([`granted_olds`]), and
-///   journal the mail they leave under any other.
+///   under its own producer now, as it carries what it wrote since. At most [`RING_OLDS_MAX`] of
+///   them, never this Mac's node or the peer's: the node service hands this the ones the peer's
+///   seat retired last ([`ringed`]), and the peer's pushes carry the ones a ring grants alone,
+///   whichever they are ([`granted_olds`]), journaling the mail they leave under any other.
 ///
 /// Nothing else: no presence row, no session log (`ev`), no person's lane, and no reader's group:
 /// this Mac pushes the mail it holds, so nothing reads it here. A person's post from the peer
@@ -457,8 +492,7 @@ pub fn peer_ring(fleet: &str, me: &str, peer: &str, olds: &BTreeSet<String>) -> 
 /// `/f/alab/in/<to>/*/<old>/*` ([`peer_ring`]'s). A push carries those alone, so it never carries
 /// a lane the far end refuses, whichever retired nodes that end's ring names: such a lane fails
 /// every try of the push at its first record, so the push's group never passes it and the push
-/// never follows. This is the first phase of choosing them by how recent each is (§11 C3b), which
-/// a peer can do only once every sender follows its ring.
+/// never follows. So a ring may name the nodes a seat retired last ([`ringed`], §11 C3b).
 #[must_use]
 pub fn granted_olds(
     grants: &[Capability],
@@ -495,6 +529,10 @@ pub struct Handoff {
     pub members: BTreeSet<String>,
     /// Each node a key rotation retired, and the node its seat holds now.
     pub moved: BTreeMap<String, String>,
+    /// Where each node of [`Self::moved`] stands among the nodes its seat retired, by the order
+    /// the membership log says it retired them: 0 the one retired last. The rings name a seat's
+    /// last retired nodes ([`Handoff::ringed`]).
+    pub rank: BTreeMap<String, usize>,
     /// Every node the membership log removed, or whose key a `Node` record rotated, that no
     /// current member's key also names: the log-derived pass revoked it, and every halt it said
     /// lifts (§4.11, "No halt outlives its origin").
@@ -508,8 +546,8 @@ const HANDOFF_HEAD: &str = "mesh-handoff v1";
 pub const HANDOFF_MAX: usize = 1 << 20;
 
 impl Handoff {
-    /// Its file's text: the head line, then `me`, `member`, `moved` and `gone` lines. A bridge
-    /// that predates `gone` skips those lines.
+    /// Its file's text: the head line, then `me`, `member`, `moved`, `rank` and `gone` lines. A
+    /// bridge that predates `gone` or `rank` skips those lines.
     #[must_use]
     pub fn render(&self) -> String {
         let mut out = format!("{HANDOFF_HEAD}\nme {}\n", self.me);
@@ -518,6 +556,9 @@ impl Handoff {
         }
         for (old, new) in &self.moved {
             out.push_str(&format!("moved {old} {new}\n"));
+        }
+        for (old, at) in &self.rank {
+            out.push_str(&format!("rank {old} {at}\n"));
         }
         for node in &self.gone {
             out.push_str(&format!("gone {node}\n"));
@@ -529,7 +570,8 @@ impl Handoff {
     /// node service can say more.
     ///
     /// # Errors
-    /// A head of another version, no `me`, or a line of a known kind whose nodes are not nodes.
+    /// A head of another version, no `me`, or a line of a known kind whose nodes are not nodes,
+    /// or whose rank is not a number.
     pub fn parse(text: &str) -> Result<Self, String> {
         let mut lines = text.lines();
         if lines.next() != Some(HANDOFF_HEAD) {
@@ -552,10 +594,17 @@ impl Handoff {
                 ["moved", old, new] if is_node(old) && is_node(new) && old != new => {
                     out.moved.insert((*old).to_owned(), (*new).to_owned());
                 }
+                ["rank", node, at] if is_node(node) => match at.parse::<usize>() {
+                    // Decimal as `render` writes it: no sign, no leading zero.
+                    Ok(rank) if rank.to_string() == *at => {
+                        out.rank.insert((*node).to_owned(), rank);
+                    }
+                    _ => return bad(),
+                },
                 ["gone", node] if is_node(node) => {
                     out.gone.insert((*node).to_owned());
                 }
-                ["me" | "member" | "moved" | "gone", ..] => return bad(),
+                ["me" | "member" | "moved" | "rank" | "gone", ..] => return bad(),
                 _ => {}
             }
         }
@@ -604,6 +653,13 @@ impl Handoff {
             .filter(|old| *old != node && self.current(old) == Some(node))
             .cloned()
             .collect()
+    }
+
+    /// The retired nodes of `node`'s seat its rings name ([`ringed`]): of [`Self::retired`], the
+    /// [`RING_OLDS_MAX`] a key rotation retired last, by [`Self::rank`].
+    #[must_use]
+    pub fn ringed(&self, node: &str) -> BTreeSet<String> {
+        ringed(&self.retired(node), &self.rank)
     }
 
     /// The current member `node` names: itself when it is one, or the member its seat holds now
@@ -1070,6 +1126,31 @@ thread_local! {
     pub static NODE_ORDER_OLDS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// The negative control of the rings' choice (`node-order-ring`): where it is set, [`ringed`]
+    /// names the first [`RING_OLDS_MAX`] of a seat's retired nodes in node order, as before §11
+    /// C3b's second recency phase, not the ones a key rotation retired last, so past
+    /// [`RING_OLDS_MAX`] of them the node a seat retired last can be left out: a peer's push does
+    /// not carry the mail its seat wrote under it, and the mail this Mac's own `bus.log` holds
+    /// unread for it does not move. [`Routes`] started on a thread where it is set chooses so for
+    /// its moves ([`Lane::Inbox`]).
+    pub static NODE_ORDER_RING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether [`NODE_ORDER_RING`] is on: set on this thread, or named for this process.
+fn node_order_ring() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    {
+        NODE_ORDER_RING.with(std::cell::Cell::get)
+            || aterm_types::negative_control::on("node-order-ring")
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        false
+    }
+}
+
 /// Whether [`NODE_ORDER_OLDS`] is on: set on this thread, or named for this process.
 fn node_order_olds() -> bool {
     #[cfg(any(test, debug_assertions))]
@@ -1225,6 +1306,7 @@ struct Shared {
     own_halts_only: bool,
     one_node: bool,
     node_order_olds: bool,
+    node_order_ring: bool,
     unsealed_carry: bool,
     ungated_inbox: bool,
     give_back_carried: bool,
@@ -1295,6 +1377,7 @@ impl Routes {
             own_halts_only: own_halts_only(),
             one_node: one_node(),
             node_order_olds: node_order_olds(),
+            node_order_ring: node_order_ring(),
             unsealed_carry: unsealed_carry(),
             ungated_inbox: ungated_inbox(),
             give_back_carried: give_back_carried(),
@@ -1320,24 +1403,26 @@ impl Routes {
     /// Route by `handoff` (the members, and each rotated node's successor) and `holders` (the
     /// members that hold a topic): pushes no longer planned stop, new ones start, and the person
     /// carry carries to the members it names. A hand-off that retired more of this Mac's nodes
-    /// than a ring names ([`RING_OLDS_MAX`]) is journaled, naming the ones past the first in node
-    /// order, whose unread mail here does not move ([`Lane::Inbox`]); a push carries the mail
-    /// this Mac wrote under a retired node where its peer's ring grants that node's lanes
-    /// ([`granted_olds`]), and journals the ones whose lanes it does not carry itself.
+    /// than a ring names ([`RING_OLDS_MAX`]) is journaled, naming the ones its seat retired
+    /// earlier than those ([`Handoff::ringed`]), whose unread mail here does not move
+    /// ([`Lane::Inbox`]); a push carries the mail this Mac wrote under a retired node where its
+    /// peer's ring grants that node's lanes ([`granted_olds`]), and journals the ones whose lanes
+    /// it does not carry itself.
     pub fn set(&self, handoff: &Handoff, holders: &BTreeSet<String>) {
         let mut state = self.shared.state.lock_or_recover();
         if state.handoff != *handoff {
-            let past: Vec<String> = handoff
-                .retired(&self.shared.cfg.me)
-                .into_iter()
-                .skip(RING_OLDS_MAX)
-                .collect();
+            let retired = self.shared.retired_by(handoff);
+            let ringed = self.shared.olds_by(handoff);
+            let past: Vec<&String> = retired.difference(&ringed).collect();
             if !past.is_empty() {
                 self.shared.note(&format!(
                     "mesh: mail for {} unread on this Mac's own bus.log does not move: its \
-                     reader's ring reads {RING_OLDS_MAX} of the nodes a key rotation retired of a \
-                     seat, the first in node order",
-                    past.join(" ")
+                     reader's ring reads the {RING_OLDS_MAX} nodes a key rotation retired of its \
+                     seat last",
+                    past.iter()
+                        .map(|old| old.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
                 ));
             }
         }
@@ -1447,34 +1532,45 @@ impl Shared {
     }
 
     /// This Mac's retired nodes whose unread mail on its own `bus.log` moves ([`Lane::Inbox`]), by
-    /// the hand-off (none under [`ONE_NODE`]): the first [`RING_OLDS_MAX`], in node order, the
-    /// ones the reader's ring reads ([`old_reads`]), which holds no more beside the bridge's own;
-    /// the move of any other's is not planned, as [`Routes::set`] says.
+    /// the hand-off (none under [`ONE_NODE`]): the ones its rings name ([`Handoff::ringed`]), the
+    /// [`RING_OLDS_MAX`] its seat retired last, which the reader's ring the node service writes
+    /// from the same hand-off reads ([`write_old_reads`]) and holds no more of beside the
+    /// bridge's own; the move of any other's is not planned, as [`Routes::set`] says.
     fn olds(&self, state: &State) -> BTreeSet<String> {
-        let mut olds = self.retired(state);
-        while olds.len() > RING_OLDS_MAX {
-            olds.pop_last();
-        }
-        olds
+        self.olds_by(&state.handoff)
+    }
+
+    /// [`Self::olds`], by `handoff`.
+    fn olds_by(&self, handoff: &Handoff) -> BTreeSet<String> {
+        ringed_by(
+            &self.retired_by(handoff),
+            &handoff.rank,
+            self.node_order_ring,
+        )
     }
 
     /// Every one of this Mac's retired nodes, by the hand-off (none under [`ONE_NODE`]): those the
     /// watch counts this Mac's mail under ([`State::written`]).
     fn retired(&self, state: &State) -> BTreeSet<String> {
+        self.retired_by(&state.handoff)
+    }
+
+    /// [`Self::retired`], by `handoff`.
+    fn retired_by(&self, handoff: &Handoff) -> BTreeSet<String> {
         if self.one_node {
             BTreeSet::new()
         } else {
-            state.handoff.retired(&self.cfg.me)
+            handoff.retired(&self.cfg.me)
         }
     }
 
     /// The retired nodes a push that carries them ([`Lane::carries_olds`]) is handed: every one
     /// ([`Self::retired`]), of which it carries those its peer's ring grants ([`granted_olds`],
     /// in [`Self::open`]); under [`NODE_ORDER_OLDS`], the first [`RING_OLDS_MAX`] in node order,
-    /// all carried.
+    /// all carried, as before §11 C3b's first recency phase.
     fn carried_olds(&self, state: &State) -> BTreeSet<String> {
         if self.node_order_olds {
-            self.olds(state)
+            ringed_by(&self.retired(state), &BTreeMap::new(), true)
         } else {
             self.retired(state)
         }

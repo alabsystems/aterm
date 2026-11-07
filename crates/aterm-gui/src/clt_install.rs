@@ -41,6 +41,8 @@ use crate::Wake;
 use crate::system_state::{NotOpened, ToolsInstall};
 use aterm_types::macos_setup::Observation;
 
+#[cfg(all(target_os = "macos", debug_assertions))]
+mod lab_fixture;
 mod probe;
 mod receipt;
 mod stop;
@@ -162,32 +164,9 @@ const NOTHING_OWED: &str = "nothing owed";
 /// landed ([`Settling`]): a reading that says the same as before past it is the truth again.
 const SETTLE_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// This launch's reading of the account's record of aterm's own Command Line Tools ask
-/// ([`aterm_types::clt_mark`]: a small file in this account's aterm state, one `opened
-/// <build>` line per build that asked, which `aterm init` reads and writes too where aterm decided
-/// its run, the follow-up of a person's own package install or update), claimed as the tab lands
-/// ([`Mark::claim`]). A build it names never opens the tab by itself again, so a person who closed
-/// it without installing is not asked again by a later launch of that build, nor by another build
-/// that shares this account's state and asked already (a release beside a dev build), nor after
-/// that build's follow-up asked; a build it does not name, an update's, opens it by itself once
-/// more, so updating aterm retries unfinished setup once. The automatic tab lands only where its
-/// claim added the line, so of it and a follow-up of the same build only one asks. The GitHub
-/// repositories row's Install… still opens it on their press. A tab whose program found Low Data
-/// Mode holding the download back, said its install failed (its exit 1: a password macOS refused,
-/// a download that broke), or never started (the window could not save its recovery record, or
-/// `/usr/bin/env` could not run it) takes its build's line back ([`Mark::forget`]) where its
-/// landing's claim added it (or, for a live tab a launch adopted, that adoption's claim, or the
-/// tab's own claim under this build, its landing's or an earlier adoption's, as its recovery
-/// record says): that opening installed nothing, and no person chose that. A stop the tab's
-/// program caught (a person's Ctrl-C, at the password prompt or later,
-/// [`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_STOPPED`]) keeps it, as a closed tab does,
-/// and so does Apple's installer window closed without installing them
-/// ([`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_WINDOW_CLOSED`]: Not Now, Cancel, or Done
-/// on Apple's own failure): each is a person's press. A tab gone with no window to read how it
-/// ended (its window went before the PTY keeper held it, or it ended while no window was up) is
-/// read by the next launch of its build from the tab's receipt, as an opening that installed
-/// nothing: that launch takes back the line the tab's own claim added ([`Mark::launched`]), since
-/// nothing can tell whether a person pressed anything in it.
+/// The durable account-wide administrator ask episode, shared with terminal init. Updates,
+/// failed passwords and unknown child outcomes retain it. Only a proven preprompt outcome can
+/// release this opening's exact claim; explicit Install presses remain available.
 #[derive(Debug, Default)]
 pub(crate) struct Mark {
     path: Option<std::path::PathBuf>,
@@ -205,10 +184,8 @@ fn never_ran(code: i32) -> bool {
 }
 
 impl Mark {
-    /// This account's record, read once at launch for this build
-    /// ([`aterm_stamp::build_id`]), once each tab gone with its end unread gave back what
-    /// its claim added ([`Self::launched`]). A record that cannot be read counts as naming it:
-    /// aterm asks no one twice for want of a reading. Tests read none.
+    /// Read the durable account episode at launch, retaining unknown orphan outcomes.
+    /// Unreadable records hold automatic asks; fixtures use an isolated in-memory default.
     pub(crate) fn for_launch() -> Self {
         #[cfg(test)]
         {
@@ -216,46 +193,36 @@ impl Mark {
         }
         #[cfg(not(test))]
         {
-            aterm_types::clt_mark::path()
-                .map_or_else(Self::default, |path| Self::launched(path, receipt::alive))
+            aterm_types::clt_mark::path().map_or_else(
+                || Self {
+                    path: None,
+                    opened: true,
+                },
+                |path| Self::launched(path, receipt::alive),
+            )
         }
     }
 
-    /// The record at `path` as a launch of this build reads it, once each receipt beside it whose
-    /// tab is gone with its end unread ([`receipt::Receipt::orphans`], `alive` saying whether a
-    /// process runs) gave back what that tab's own claim added on this build: the line goes
-    /// ([`aterm_types::clt_mark::forget`]), and the receipt with it, so this launch opens the tab
-    /// by itself again where setup still owes this Mac its step. Such a tab's window went before
-    /// the PTY keeper held it (a crash in a new Mac's first seconds, before the keeper answers),
-    /// or it ended while no window was up. A receipt whose claim added another build's line is
-    /// that build's to read; one whose claim added none goes, taking back nothing. A line that
-    /// cannot be taken back keeps its receipt for a later launch, and says why in the log.
+    /// An orphan's unknown outcome cannot authorize another automatic password prompt.
+    /// Preserve (or reconstruct) its consumed episode before retiring the exact receipt.
     #[cfg(any(not(test), unix))]
     fn launched(path: std::path::PathBuf, alive: impl Fn(i32, u64) -> bool) -> Self {
-        let build = aterm_stamp::build_id();
         for orphan in receipt::Receipt::orphans(&path, alive) {
-            match orphan.claimed() {
-                Some(claimed) if claimed != build => continue,
-                Some(_) => {
-                    if let Err(error) =
-                        aterm_types::clt_mark::forget(&aterm_types::clt_mark::Live, &path, &build)
-                    {
-                        aterm_log::warn!(
-                            "System State: the Mac Setup tab's mark was not taken back for a tab \
-                             gone with its end unread: {error}"
-                        );
-                        continue;
-                    }
-                    aterm_log::info!(
-                        "System State: a Mac Setup tab an earlier launch of this build opened is \
-                         gone with its end unread: its ask is taken back"
-                    );
-                }
-                None => {}
+            let owner = orphan
+                .claimed()
+                .map(str::to_owned)
+                .unwrap_or_else(aterm_stamp::build_id);
+            if let Err(error) =
+                aterm_types::clt_mark::explicit(&aterm_types::clt_mark::Live, &path, &owner)
+            {
+                aterm_log::warn!(
+                    "System State: could not retain the orphaned installer ask: {error}"
+                );
+                continue;
             }
             orphan.remove_if_matching();
         }
-        let opened = Self::names_this_build(&path);
+        let opened = Self::episode_spent(&path);
         Self {
             path: Some(path),
             opened,
@@ -265,49 +232,34 @@ impl Mark {
     /// A record kept at `path`, as a launch of this build reads it (a test's).
     #[cfg(all(test, unix))]
     pub(crate) fn at(path: std::path::PathBuf) -> Self {
-        let opened = Self::names_this_build(&path);
+        let opened = Self::episode_spent(&path);
         Self {
             path: Some(path),
             opened,
         }
     }
 
-    /// Whether aterm asked for the tools by itself for this account on this build.
+    /// Whether this account has consumed its automatic administrator ask.
     pub(crate) const fn opened(&self) -> bool {
         self.opened
     }
 
-    /// Whether the record at `path` names this build ([`aterm_types::clt_mark::opened_on_build`]).
-    fn names_this_build(path: &std::path::Path) -> bool {
-        aterm_types::clt_mark::opened_on_build(
-            &aterm_types::clt_mark::Live,
-            path,
-            &aterm_stamp::build_id(),
-        )
+    /// Read the durable episode, including historical owners and unreadable records.
+    fn episode_spent(path: &std::path::Path) -> bool {
+        aterm_types::clt_mark::spent(&aterm_types::clt_mark::Live, path)
     }
 
-    /// Read the record again, as the automatic tab's shell is about to be booked: `true` when it
-    /// holds this build now though this launch's reading did not, because another asker of this
-    /// build asked meanwhile (the follow-up of a package install or update, or another window),
-    /// so no shell starts. The landing's claim ([`Mark::claim`]) decides; this look only spares a
-    /// shell it would refuse.
+    /// Refresh before booking a shell so another process's consumed episode holds this launch.
     fn asked_since(&mut self) -> bool {
         if self.opened {
             return false;
         }
-        self.opened = self.path.as_deref().is_some_and(Self::names_this_build);
+        self.opened = self.path.as_deref().is_some_and(Self::episode_spent);
         self.opened
     }
 
-    /// A tab is landing: never by itself again on this build. That promise rests on this claim
-    /// ([`aterm_types::clt_mark::claim`]), made under the record's lock and durable, its directory
-    /// entry included. `true` when this claim added this build's line (or, with no place for the
-    /// record, when this launch's reading alone holds it), which [`Mark::forget`] can then take
-    /// back; `false` when the record named this build already (another asker of it, the follow-up
-    /// of a package install or update or another window, asked first) or the claim failed (a
-    /// record that cannot be read or written, or another asker holding its lock past the wait,
-    /// said in the log), and then this landing takes back nothing. Either way this launch reads
-    /// the record as naming this build from now on.
+    /// Persist the episode as the tab lands. True only for this opening's new claim; a person
+    /// may explicitly retry when false, but that retry cannot release an older claim.
     fn claim(&mut self) -> bool {
         self.opened = true;
         let Some(path) = &self.path else {
@@ -326,22 +278,43 @@ impl Mark {
         }
     }
 
-    /// The opening whose claim added the mark installed nothing, and no person declined it: Low
-    /// Data Mode held the download back, the install failed, or it never started. This build's
-    /// line goes ([`aterm_types::clt_mark::forget`]; the file too, when it names no other build),
-    /// so aterm opens the tab by itself again (once the mode is off, or at the next launch). A
-    /// mark that cannot be rewritten or removed keeps this build for later launches, and says so
-    /// in the log.
+    /// An explicit retry revokes any older opening's release capability under the shared lock.
+    fn explicit(&mut self) -> bool {
+        self.opened = true;
+        let Some(path) = &self.path else {
+            return true;
+        };
+        match aterm_types::clt_mark::explicit(
+            &aterm_types::clt_mark::Live,
+            path,
+            &aterm_stamp::build_id(),
+        ) {
+            Ok(added) => added,
+            Err(error) => {
+                aterm_log::warn!(
+                    "System State: the explicit installer ask was not recorded: {error}"
+                );
+                false
+            }
+        }
+    }
+
+    /// Release the current opening only before its child could reach a password prompt.
     fn forget(&mut self) {
-        self.opened = false;
-        if let Some(path) = &self.path
-            && let Err(error) = aterm_types::clt_mark::forget(
-                &aterm_types::clt_mark::Live,
-                path,
-                &aterm_stamp::build_id(),
-            )
-        {
-            aterm_log::warn!("System State: the Mac Setup tab's mark was not removed: {error}");
+        self.forget_owner(&aterm_stamp::build_id());
+    }
+
+    /// Release exactly the owner carried by the child receipt, including after an update.
+    fn forget_owner(&mut self, owner: &str) {
+        if let Some(path) = &self.path {
+            if let Err(error) =
+                aterm_types::clt_mark::forget(&aterm_types::clt_mark::Live, path, owner)
+            {
+                aterm_log::warn!("System State: the installer ask was not released: {error}");
+            }
+            self.opened = Self::episode_spent(path);
+        } else {
+            self.opened = false;
         }
     }
 }
@@ -479,13 +452,8 @@ pub(crate) struct Terminal {
     /// The window already wrote the tab's last line (its install never started), so its end
     /// adds none.
     told: bool,
-    /// This build's line in the account's [`Mark`] is this tab's own: its landing's claim added
-    /// it ([`Mark::claim`]), or this launch's adoption of a live one an earlier aterm opened did,
-    /// or that tab's own claim under this same build did (its landing's, or an earlier launch's
-    /// adoption), as its recovery record says. An opening that installed nothing takes it back:
-    /// one that failed, one Low Data Mode held back, or one whose program never ran. A tab whose
-    /// line is none of these takes back nothing.
-    spent_mark: bool,
+    /// Exact durable claim owner. Preprompt release never takes another episode's line.
+    claim_owner: Option<String>,
     /// This exact child has already received setup's cancellation signal.
     stop_sent: bool,
 }
@@ -502,7 +470,7 @@ impl Terminal {
             installer_seen: false,
             ended: false,
             told: false,
-            spent_mark: false,
+            claim_owner: None,
             stop_sent: false,
         }
     }
@@ -667,7 +635,7 @@ pub(crate) fn watch_for_tools() {
 
 /// Whether setup's one early elevation owes this Mac a root step beside the tools, from what
 /// this account reads with no prompt (`aterm_machines::root_steps::owed` reads the same for
-/// `aterm init`): developer mode `off` (`DevToolsSecurity -status`), or an enabled mode this
+/// `aterm init`): developer `mode` (`DevToolsSecurity -status`), or an enabled mode this
 /// console account is not authorized to use (`member`), or `rule`, the stat of the
 /// rule that names the Mac after admission ([`aterm_types::macos_setup::ADMITTED_NAME_RULE`]),
 /// reading no root-owned 0440 file while no refused rule stands
@@ -678,12 +646,21 @@ pub(crate) fn watch_for_tools() {
 /// asked for want of a reading. Only macOS reads it.
 #[cfg(any(target_os = "macos", all(test, unix)))]
 pub(crate) fn root_steps_owed_by(
-    off: Option<bool>,
+    mode: aterm_containment::consent::DebuggerMode,
     member: aterm_containment::consent::DebuggerMember,
     rule: std::io::Result<(u32, u32, bool)>,
     refused: bool,
     broker: bool,
 ) -> bool {
+    use aterm_containment::consent::DebuggerMode;
+    let off = match mode {
+        DebuggerMode::Disabled => Some(true),
+        DebuggerMode::Enabled => Some(false),
+        // Apple's recognized unknown-rule answer establishes no missing root step, just as
+        // the CLI batch's `root_steps::owed` reads it. Keep the diagnostic mode, not a tab
+        // whose own program has nothing it may apply.
+        DebuggerMode::Unrecognized | DebuggerMode::Unknown => None,
+    };
     let rule_owed = match rule {
         Ok((uid, mode, file)) => !(file && uid == 0 && mode == 0o440),
         Err(error) => error.kind() == std::io::ErrorKind::NotFound && !refused,
@@ -703,16 +680,9 @@ pub(crate) fn read_root_steps() -> bool {
         .spawn(|| {
             #[cfg(target_os = "macos")]
             {
-                use aterm_containment::consent::{
-                    DebuggerMember, DebuggerMode, ProbeGate, probe_debugger,
-                };
+                use aterm_containment::consent::{DebuggerMember, ProbeGate, probe_debugger};
                 use std::os::unix::fs::MetadataExt as _;
                 let debugger = probe_debugger(ProbeGate::on());
-                let off = match debugger.mode {
-                    DebuggerMode::Disabled | DebuggerMode::Unrecognized => Some(true),
-                    DebuggerMode::Enabled => Some(false),
-                    DebuggerMode::Unknown => None,
-                };
                 // SAFETY: `geteuid` reads this process's effective uid and cannot fail.
                 let uid = unsafe { libc::geteuid() };
                 let member = if uid != 0
@@ -728,7 +698,7 @@ pub(crate) fn read_root_steps() -> bool {
                     std::fs::symlink_metadata(aterm_types::macos_setup::ADMITTED_NAME_RULE_REFUSED)
                         .is_ok();
                 let broker = aterm_uds::lan::install::owed_here();
-                let owed = root_steps_owed_by(off, member, rule, refused, broker);
+                let owed = root_steps_owed_by(debugger.mode, member, rule, refused, broker);
                 aterm_log::info!("System State: setup's one Mac password owes this Mac: {owed}");
                 let _ = crate::workstation_setup::send_setup_wake(Wake::RootStepsOwed(owed));
             }
@@ -804,7 +774,7 @@ fn pressed_tab_then() -> crate::tab_spawn::TabSpawnThen {
                     Ok(sid) => {
                         // The person's press goes whatever the record says; a claim it did not
                         // win takes back nothing later.
-                        let spent = app.workstation_setup.developer_tools_mark.claim();
+                        let spent = app.workstation_setup.developer_tools_mark.explicit();
                         app.start_developer_tools_install(&sid, spent);
                         app.publish_system_state_front();
                     }
@@ -888,7 +858,7 @@ impl App {
         }
         let mut terminal = Terminal::running(session, false, receipt);
         terminal.told = !go;
-        terminal.spent_mark = spent && go;
+        terminal.claim_owner = (spent && go).then_some(build);
         self.workstation_setup.developer_tools_attempt = Some(session);
         self.workstation_setup
             .developer_tools_session
@@ -929,18 +899,8 @@ impl App {
         Ok(changed)
     }
 
-    /// Recover custody only for an adopted exact child with its own recovery record. This
-    /// restores neither setup admission nor a command: adoption never types installer bytes. A
-    /// live one is this build's ask from now on (an update hands an earlier build's tab over):
-    /// its build is claimed in the account's [`Mark`], so a decline under this build keeps it and
-    /// a failure takes it back where this build's line is the tab's own, as for a tab this build
-    /// opened: that adoption's claim added it, or the record says the tab's own claim under this
-    /// build did (its landing's, or an earlier adoption's, which a launch of the same build adopts
-    /// after the window that adopted or opened it went, as the PTY keeper outlives a crash). An
-    /// adoption whose claim added the line rewrites the record to say so
-    /// ([`receipt::Receipt::claim`]; one that cannot says why in the log, and only this launch
-    /// then reads the line as the tab's own). A tab whose own claim added no line (a person's
-    /// Install… after this build asked) takes back none.
+    /// Recover only exact child custody, preserving its original episode owner across updates.
+    /// Adoption never types installer bytes or grants setup authority.
     pub(crate) fn recover_developer_tools_install(&mut self, local: u64) {
         if self
             .workstation_setup
@@ -973,28 +933,35 @@ impl App {
             return;
         };
         let finished = child_ended(child);
-        let build = aterm_stamp::build_id();
-        let own_line = receipt.claimed() == Some(build.as_str());
-        let mut spent_mark = false;
-        if !finished {
-            let added = self.workstation_setup.developer_tools_mark.claim();
-            // The adoption's claim added this build's line: the receipt says so from now on, so
-            // a launch of this build that adopts the tab again (the PTY keeper outlived a crash)
-            // reads the line as the tab's own, as this one does.
-            if added
-                && !own_line
-                && let Err(error) = receipt.claim(&build)
-            {
-                aterm_log::warn!(
-                    "System State: the installer's recovery receipt does not say this build's \
-                     claim: {error}"
-                );
+        let mut owner = receipt.claimed().map(str::to_owned);
+        {
+            let build = owner.clone().unwrap_or_else(aterm_stamp::build_id);
+            if let Some(path) = &self.workstation_setup.developer_tools_mark.path {
+                let retained = if owner.is_none() {
+                    aterm_types::clt_mark::explicit(&aterm_types::clt_mark::Live, path, &build)
+                } else {
+                    aterm_types::clt_mark::claim(&aterm_types::clt_mark::Live, path, &build)
+                };
+                match retained {
+                    Ok(true) if owner.is_none() => {
+                        owner = Some(build.clone());
+                        if let Err(error) = receipt.claim(&build) {
+                            aterm_log::warn!(
+                                "System State: installer receipt claim was not saved: {error}"
+                            );
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        aterm_log::warn!("System State: installer ask was not retained: {error}")
+                    }
+                }
+                self.workstation_setup.developer_tools_mark.opened = true;
             }
-            spent_mark = added || own_line;
         }
         let mut terminal = Terminal::running(local, true, Some(receipt));
         terminal.finished = finished;
-        terminal.spent_mark = spent_mark;
+        terminal.claim_owner = owner;
         if !finished || self.workstation_setup.developer_tools_attempt.is_none() {
             self.workstation_setup.developer_tools_attempt = Some(local);
         }
@@ -1385,30 +1352,10 @@ impl App {
         }
     }
 
-    /// The tab `session`'s program ended with `exit` (`None`: unknown). Exit 0 said the tools
-    /// are installed: the GitHub repositories row is read again at once, the run waiting on it
-    /// wakes, the row stays calm until that reading lands ([`Settling`]), and the shim comes off
-    /// new shells. So does any other end of the current attempt where the tools are there now,
-    /// having come another way while it ran: a tab closed at its password prompt, or one adopted
-    /// from an earlier aterm whose end gives no status, said nothing of them. After exit 0 the
-    /// current attempt's tab closes by itself unless it is its window's last.
-    /// Exit 1 said why the install did not finish, and takes the account's [`Mark`] back where this
-    /// build's line is the tab's own ([`Terminal::spent_mark`]: its landing's claim added it, or
-    /// an adoption's did), so the next launch asks again; after a decline on this build, or an
-    /// ask the package follow-up made, a failed Install… leaves the build's ask spent, and Install
-    /// Command Line Tools… is the way on. A stop's exit said a person stopped it, and Apple's
-    /// window closed without the tools said a person pressed a button there; each keeps the mark,
-    /// as a closed tab does. Low Data Mode's exit takes the opening back (the mark included) and
-    /// waits, calmly, for the mode to end; a non-administrator's leaves the row saying so, with
-    /// no Install…. Any other end said nothing, and the tab ends on the window's line unless the
-    /// window already wrote one; of those, the exits that say its program never started the
-    /// install ([`never_ran`]: its own not-started 2, `/usr/bin/env`'s 126 and 127) take back an
-    /// opening this tab spent, while the rest (a panic, a signal, a closed tab) keep the mark.
-    /// Each but the last two leaves the row to Install… again. Only the current attempt changes
-    /// that state: an older terminal's delayed end keeps its own result.
-    /// A current end but 0 and Low Data Mode's leaves nothing installing the tools: the shim stays
-    /// on new shells, and its line says they are missing rather than on their way until an
-    /// install starts again ([`Self::settle_developer_tools_shim`]).
+    /// Retain the ask after any possible password interaction, including failure and unknown
+    /// status. Only typed preprompt LowData/no-start results release this child's exact owner.
+    /// A delayed result never replaces a newer attempt's state. Actual installed tools refresh
+    /// ordinary repository observation; no exit alone grants repository readiness.
     pub(crate) fn developer_tools_install_ended(
         &mut self,
         session: u64,
@@ -1425,7 +1372,7 @@ impl App {
         terminal.finished = true;
         terminal.ended = true;
         let told = terminal.told;
-        let spent_mark = terminal.spent_mark;
+        let claim_owner = terminal.claim_owner.clone();
         // EOF can precede the child's status. A person may start a retry meanwhile: retain the
         // old terminal's result, but only the current attempt changes the retry's state or shim.
         let current = self.workstation_setup.developer_tools_attempt == Some(session);
@@ -1435,17 +1382,8 @@ impl App {
             }
             Some(aterm_pty::ChildExit::Code(1)) => {
                 aterm_log::info!("System State: the Mac Setup tab said it did not finish");
-                // The program ran and failed (a wrong password, a download that broke), which is
-                // no person's closing the tab: the next launch asks again by itself, where the
-                // line is this tab's own (its landing's or an adoption's claim added it). One a
-                // decline kept, or another asker added (the follow-up of a package install or
-                // update, whose own ask it records), stays.
                 if current {
-                    let setup = &mut self.workstation_setup;
-                    setup.developer_tools_unfinished = true;
-                    if spent_mark {
-                        setup.developer_tools_mark.forget();
-                    }
+                    self.workstation_setup.developer_tools_unfinished = true;
                 }
             }
             Some(aterm_pty::ChildExit::Code(code))
@@ -1479,12 +1417,12 @@ impl App {
                 if code == i32::from(aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_LOW_DATA) =>
             {
                 aterm_log::info!("System State: the Mac Setup tab waits for Low Data Mode");
-                // That opening installed nothing: it is not spent. A pass that still wants the
-                // tools opens the tab by itself once the mode is off.
+                // The tab emits this code only before entering sudo; a later diagnosis of
+                // LowData uses generic failure and retains its password episode.
                 if current {
                     let setup = &mut self.workstation_setup;
-                    if spent_mark {
-                        setup.developer_tools_mark.forget();
+                    if let Some(owner) = &claim_owner {
+                        setup.developer_tools_mark.forget_owner(owner);
                     }
                     if setup.developer_tools == Install::Opened {
                         setup.developer_tools = setup
@@ -1515,10 +1453,10 @@ impl App {
                     setup.developer_tools_unfinished = true;
                     // Its program never ran, so nothing was installed and no person declined:
                     // an opening its landing spent asks again at the next launch.
-                    if spent_mark
+                    if let Some(owner) = &claim_owner
                         && matches!(other, aterm_pty::ChildExit::Code(code) if never_ran(code))
                     {
-                        setup.developer_tools_mark.forget();
+                        setup.developer_tools_mark.forget_owner(owner);
                     }
                 }
                 if !told {
@@ -2764,35 +2702,36 @@ mod tests {
         let gone = || Err(std::io::Error::from(std::io::ErrorKind::NotFound));
         let denied = || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
         use aterm_containment::consent::DebuggerMember::Admin;
+        use aterm_containment::consent::DebuggerMode::{Disabled, Enabled, Unknown};
         assert!(root_steps_owed_by(
-            Some(true),
+            Disabled,
             Admin,
             Ok((0, 0o440, true)),
             false,
             false
         ));
-        assert!(root_steps_owed_by(Some(false), Admin, gone(), false, false));
+        assert!(root_steps_owed_by(Enabled, Admin, gone(), false, false));
         assert!(root_steps_owed_by(
-            Some(false),
+            Enabled,
             Admin,
             Ok((501, 0o440, true)),
             false,
             false
         ));
         assert!(!root_steps_owed_by(
-            Some(false),
+            Enabled,
             Admin,
             Ok((0, 0o440, true)),
             false,
             false
         ));
         assert!(
-            root_steps_owed_by(Some(false), Admin, Ok((0, 0o440, true)), false, true),
+            root_steps_owed_by(Enabled, Admin, Ok((0, 0o440, true)), false, true),
             "the broker alone owes the elevation"
         );
-        assert!(!root_steps_owed_by(None, Admin, denied(), false, false));
+        assert!(!root_steps_owed_by(Unknown, Admin, denied(), false, false));
         assert!(
-            !root_steps_owed_by(Some(false), Admin, gone(), true, false),
+            !root_steps_owed_by(Enabled, Admin, gone(), true, false),
             "refused stands"
         );
     }
@@ -2804,27 +2743,202 @@ mod tests {
     #[test]
     fn enabled_mode_owes_only_a_definitely_unauthorized_console_account() {
         use aterm_containment::consent::DebuggerMember::{Admin, Developer, NotMember, Unknown};
-        for (off, member, owed) in [
-            (Some(false), NotMember, true),
-            (Some(false), Admin, false),
-            (Some(false), Developer, false),
-            (Some(false), Unknown, false),
-            (None, NotMember, false),
+        use aterm_containment::consent::DebuggerMode;
+        for (mode, member, owed) in [
+            (DebuggerMode::Enabled, NotMember, true),
+            (DebuggerMode::Enabled, Admin, false),
+            (DebuggerMode::Enabled, Developer, false),
+            (DebuggerMode::Enabled, Unknown, false),
+            (DebuggerMode::Unknown, NotMember, false),
         ] {
             assert_eq!(
-                root_steps_owed_by(off, member, Ok((0, 0o440, true)), false, false),
+                root_steps_owed_by(mode, member, Ok((0, 0o440, true)), false, false),
                 owed,
-                "{off:?} {member:?}"
+                "{mode:?} {member:?}"
             );
         }
     }
 
-    /// The per-build mark is written durably, the file and then its directory entry, so a
-    /// power loss right after the tab landed never opens it again on that build; a second
-    /// landing's claim writes nothing and adds nothing it could take back.
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    fn assert_debugger_setup_admission(
+        name: &str,
+        ran: aterm_machines::port::Ran,
+        mode: aterm_containment::consent::DebuggerMode,
+        wanted: bool,
+    ) {
+        use aterm_containment::consent::{
+            DebuggerMember, DebuggerMode, ProbeGate, ToolRun, probe_debugger_with,
+        };
+        use aterm_machines::init_clt::{CommandLineTools, Found};
+        use aterm_machines::items::{Ctx, Item as _};
+        use aterm_machines::model::{HostFacts, Probe};
+        use aterm_machines::port::{Fake, Stat};
+        use aterm_machines::root_steps::{self, Owed};
+        use std::path::Path;
+
+        let tmp = aterm_tempfile::tempdir().expect("isolated launch");
+        let debugger = probe_debugger_with(
+            ProbeGate::on(),
+            Some(Path::new("/Applications/aterm.app/Contents/MacOS/aterm")),
+            |_| ToolRun::Exited {
+                code: ran.status,
+                stdout: String::from_utf8(ran.stdout.clone()).expect("fixture stdout"),
+                stderr: String::from_utf8(ran.stderr.clone()).expect("fixture stderr"),
+            },
+            || DebuggerMember::Admin,
+        );
+        assert_eq!(debugger.mode, mode, "{name}");
+        let enabled = match mode {
+            DebuggerMode::Enabled => Some(true),
+            DebuggerMode::Disabled => Some(false),
+            DebuggerMode::Unrecognized | DebuggerMode::Unknown => None,
+        };
+        let child_mode = root_steps::developer_mode(&ran);
+        let sys = Fake::root();
+        sys.on("/usr/sbin/DevToolsSecurity -status", ran).stat_of(
+            aterm_types::macos_setup::ADMITTED_NAME_RULE,
+            Stat {
+                uid: 0,
+                gid: 0,
+                mode: 0o440,
+                dir: false,
+                symlink: false,
+                len: 1,
+            },
+        );
+        let child_owed = root_steps::owed(&sys).contains(&Owed::Debugger);
+        let child_ready = if !wanted {
+            let item = CommandLineTools::new(
+                Box::new(|_| Found::Present("tools already installed".to_owned())),
+                tmp.path().join("aterm"),
+            )
+            .with_owed(Box::new(root_steps::owed));
+            let ctx = Ctx {
+                facts: HostFacts::default(),
+                users: Vec::new(),
+                console: None,
+                host_name: String::new(),
+                cache_dir: tmp.path().to_owned(),
+                disrupt: false,
+            };
+            Some(matches!(item.probe(&sys, &ctx), Probe::Ok { .. }))
+        } else {
+            None
+        };
+        let mut app = App::headless_for_test();
+        app.workstation_setup = crate::workstation_setup::Host::for_launch_marked(
+            None,
+            false,
+            Mark::at(tmp.path().join(name)),
+            crate::clt_shim::Shim::at(tmp.path().join("clt-shim"), || true),
+        );
+        app.root_steps_owed(root_steps_owed_by(
+            debugger.mode,
+            debugger.member,
+            Ok((0, 0o440, true)),
+            false,
+            false,
+        ));
+        assert_eq!(
+            (
+                child_mode,
+                child_owed,
+                app.developer_tools_install_due(false)
+            ),
+            (enabled, wanted, wanted),
+            "{name}: canonical mode, child root debt, automatic GUI tab"
+        );
+        assert!(child_ready.is_none_or(|ready| ready), "{name}");
+        assert!(!app.workstation_setup.developer_tools_mark.opened());
+    }
+
+    /// The launch's real debugger probe must not want a setup tab that its own `base.clt`
+    /// program finds has nothing to do. A recognized unknown rule stays distinct from a
+    /// failed reading, but neither grants elevation. A definitely disabled rule still does.
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    #[test]
+    fn an_unknown_debugger_rule_does_not_open_a_setup_tab_with_no_actionable_root_step() {
+        use aterm_containment::consent::DebuggerMode;
+        use aterm_machines::port::Ran;
+        for (name, status, mode, wanted) in [
+            (
+                "unknown-rule",
+                "Developer mode rights are currently in an unknown state.\n",
+                DebuggerMode::Unrecognized,
+                false,
+            ),
+            (
+                "unread",
+                "the authorization rule could not be read\n",
+                DebuggerMode::Unknown,
+                false,
+            ),
+            (
+                "disabled",
+                "Developer mode is currently disabled.\n",
+                DebuggerMode::Disabled,
+                true,
+            ),
+        ] {
+            assert_debugger_setup_admission(name, Ran::ok(status), mode, wanted);
+        }
+    }
+
+    /// Both startup producers recognize the supported status sentences, including stderr.
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    #[test]
+    fn debugger_setup_uses_supported_status_formats_in_both_producers() {
+        use aterm_containment::consent::DebuggerMode;
+        use aterm_machines::port::Ran;
+        assert_debugger_setup_admission(
+            "disabled-no-adverb",
+            Ran::ok("Developer mode is disabled.\n"),
+            DebuggerMode::Disabled,
+            true,
+        );
+        assert_debugger_setup_admission(
+            "disabled-stderr",
+            Ran::exit(0, "Developer mode is now disabled.\n"),
+            DebuggerMode::Disabled,
+            true,
+        );
+        assert_debugger_setup_admission(
+            "enabled-no-adverb",
+            Ran::ok("Developer mode is enabled.\n"),
+            DebuggerMode::Enabled,
+            false,
+        );
+    }
+
+    /// A malformed substring or disagreeing streams cannot admit a root effect or a setup tab.
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    #[test]
+    fn debugger_setup_rejects_contradictory_or_malformed_status_in_both_producers() {
+        use aterm_containment::consent::DebuggerMode;
+        use aterm_machines::port::Ran;
+        assert_debugger_setup_admission(
+            "contradictory-streams",
+            Ran {
+                status: Some(0),
+                stdout: b"Developer mode is currently disabled.\n".to_vec(),
+                stderr: b"Developer mode is currently enabled.\n".to_vec(),
+            },
+            DebuggerMode::Unknown,
+            false,
+        );
+        assert_debugger_setup_admission(
+            "malformed-prefix",
+            Ran::ok("diagnostic: Developer mode is currently disabled.\n"),
+            DebuggerMode::Unknown,
+            false,
+        );
+    }
+
+    /// The account episode is durable through its directory entry, so a power loss after
+    /// landing cannot grant another automatic request. A second claim writes nothing.
     #[test]
     #[cfg(unix)]
-    fn the_per_build_mark_is_written_durably_with_its_directory() {
+    fn the_ask_episode_is_written_durably_with_its_directory() {
         let dir = aterm_tempfile::tempdir().expect("a state directory");
         let path = dir.path().join("command-line-tools-tab");
         let mut mark = Mark::at(path.clone());

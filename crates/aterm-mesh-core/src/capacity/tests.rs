@@ -56,7 +56,7 @@ fn sheet(rule: &Rule) -> Vec<u64> {
         .collect()
 }
 
-/// The words the island proves `sheet` equal to, by `decide`.
+/// The words the island proves `sheet` equal to by checked bit-step composition.
 fn island_sheet() -> Option<Vec<u64>> {
     const STATED: &str = "theorem sheet_is : sheet =";
     let rest = &ISLAND[ISLAND.find(STATED)? + STATED.len()..];

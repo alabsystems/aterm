@@ -750,8 +750,17 @@ fn choosing_the_held_seeded_number_never_weakens_its_claim_against_a_rival() {
         false,
     )
     .expect("the current seeded holder");
-    assert!(!same.changed);
-    assert_eq!(same.name, before);
+    assert!(same.changed);
+    assert_eq!(same.name.class, Class::Chosen);
+    let node = node_of(node_identity(root.path()).expect("our identity").node()).expect("a node");
+    let mut view = rename_view(root.path(), NOW).expect("reads the signed rival");
+    view.insert(node, Entry::Record(current_record(&same.name)));
+    assert_eq!(
+        settle(&view).standings.get(&node),
+        Some(&aterm_types::machine_name::Standing::Holds(num(7))),
+        "choosing the current seeded number must preserve its winning claim"
+    );
+    assert_eq!(same.name.since, before.since);
     let to = NameTo {
         num: num(7),
         nick: Some(Nickname::parse("MissBunny").expect("a nickname")),
@@ -770,11 +779,11 @@ fn choosing_the_held_seeded_number_never_weakens_its_claim_against_a_rival() {
     assert_eq!(nick.name.title(), "m7 MissBunny");
     assert_eq!(
         (nick.name.class, nick.name.since, nick.name.act),
-        (before.class, before.since, before.act)
+        (same.name.class, same.name.since, same.name.act)
     );
     assert_eq!(
         (nick.name.undo, nick.name.prev, nick.name.was),
-        (before.undo, before.prev, before.was)
+        (same.name.undo, same.name.prev, same.name.was)
     );
 }
 
@@ -1174,13 +1183,62 @@ fn a_move_off_the_policys_server_name_is_refused() {
     .expect("staying on it is no move");
 }
 
-/// A request that keeps the stored number, a nickname typed with it, reads no labels, so an
-/// unreadable vault does not stop it, while a number change needs its labels.
+/// A newly explicit choice of a seeded number needs current labels. Once chosen, keeping
+/// the number for a nickname edit reads no labels, while a number change still needs them.
 #[test]
 fn keeping_the_stored_number_reads_no_labels_but_a_number_change_requires_them() {
     let unreadable = || Err(io::Error::other("the vault is busy"));
     let root = state();
-    ensure(root.path(), label("m7"), never, NOW).expect("a seeded name");
+    let (seeded, _) = ensure(root.path(), label("m7"), never, NOW).expect("a seeded name");
+    let same = NameTo {
+        num: num(7),
+        nick: None,
+    };
+    assert!(
+        set_name(
+            root.path(),
+            &same,
+            unreadable,
+            ByKind::Person,
+            unread,
+            NOW,
+            false
+        )
+        .is_err(),
+        "a new explicit choice requires current labels even when its number was seeded"
+    );
+    assert_eq!(file::read(root.path()).unwrap(), Some(seeded.clone()));
+    let reserved = || {
+        Ok(LabLabels {
+            held: BTreeMap::from([(num(7), client::LabelHold::Reserved)]),
+            ..LabLabels::default()
+        })
+    };
+    assert!(
+        set_name(
+            root.path(),
+            &same,
+            reserved,
+            ByKind::Person,
+            unread,
+            NOW,
+            false
+        )
+        .is_err(),
+        "a fresh role reservation prevents turning a stale seeded number into a chosen claim"
+    );
+    assert_eq!(file::read(root.path()).unwrap(), Some(seeded));
+    let selected = set_name(
+        root.path(),
+        &same,
+        no_labels,
+        ByKind::Person,
+        unread,
+        NOW,
+        false,
+    )
+    .expect("explicitly selects the seeded number");
+    assert_eq!(selected.name.class, Class::Chosen);
     let to = NameTo {
         num: num(7),
         nick: Some(Nickname::parse("Heron").expect("a nickname")),
@@ -1227,13 +1285,27 @@ fn lab_labels_with_no_vault_hold_nothing() {
 
 /// Rename This Mac…'s live line judges each number from one read as [`set_name`] does, in its
 /// words: a number another signed node or the vault holds is refused, a free one passes and this
-/// Mac's own is `Same`; a vault whose labels were not read refuses each number but this Mac's.
+/// Mac's chosen number is `Same`; unread labels refuse each new explicit claim.
 #[test]
 fn a_preview_judges_each_number_in_the_words_the_set_refuses_it() {
     let root = state();
     node_identity(root.path()).expect("our identity");
     let other = NodeIdentity::from_seed(&"b2".repeat(16), &[0x22; 32]).expect("another identity");
-    let (before, _) = ensure(root.path(), label("m7"), never, NOW).expect("a seeded name");
+    ensure(root.path(), label("m7"), never, NOW).expect("a seeded name");
+    let before = set_name(
+        root.path(),
+        &NameTo {
+            num: num(7),
+            nick: None,
+        },
+        no_labels,
+        ByKind::Person,
+        unread,
+        NOW,
+        false,
+    )
+    .expect("a chosen number")
+    .name;
     let theirs = record(&other, Some(86), 3, Some("Otter"));
     write_private(root.path(), PEERS_FILE, entry(&other, &theirs).as_bytes())
         .expect("writes their signed claim");
@@ -1291,12 +1363,12 @@ fn a_preview_judges_each_number_in_the_words_the_set_refuses_it() {
         Some(before),
         "a read changes no name"
     );
-    // The vault's labels judge only a number that moves: kept, the policy's server name (which
-    // follows the roster label m8 while m7 is only seeded) refuses nothing, as in the set.
+    // Keeping a chosen number needs no labels; a move still checks the policy's
+    // server name, which now follows the chosen number rather than the roster label.
     let serves = LabLabels {
         own: BTreeSet::from([num(8)]),
         label: Some(num(8)),
-        servers: BTreeSet::from([num(8)]),
+        servers: BTreeSet::from([num(7)]),
         ..LabLabels::default()
     };
     let served = rename_preview(root.path(), || Ok(serves.clone()), unread, NOW).expect("a read");
@@ -1370,7 +1442,21 @@ fn a_preview_judges_each_number_in_the_words_the_set_refuses_it() {
 fn a_move_judged_without_the_vault_s_labels_is_refused() {
     let root = state();
     node_identity(root.path()).expect("our identity");
-    let (held, _) = ensure(root.path(), label("m7"), never, NOW).expect("a seeded name");
+    ensure(root.path(), label("m7"), never, NOW).expect("a seeded name");
+    let held = set_name(
+        root.path(),
+        &NameTo {
+            num: num(7),
+            nick: None,
+        },
+        no_labels,
+        ByKind::Person,
+        unread,
+        NOW,
+        false,
+    )
+    .expect("a chosen number")
+    .name;
     let node = node_of(node_identity(root.path()).expect("our identity").node()).expect("a node");
     let view = BTreeMap::from([(node, Entry::Record(current_record(&held)))]);
     let settled = settle(&view);

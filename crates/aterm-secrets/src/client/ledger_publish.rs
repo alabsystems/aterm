@@ -6,9 +6,7 @@
 //! (`docs/DESIGN-alab-swarm-2026-10-27.md` §3.4, §8.3, §12.3 C7).
 
 use super::*;
-use crate::swarm_roster::{
-    Newcomer, POLICY_ENTRY, SheetHints, SwarmLease, SwarmPolicy, SwarmRoster, assign_newcomer,
-};
+use crate::swarm_roster::{POLICY_ENTRY, SwarmLease, SwarmPolicy, SwarmRoster};
 
 const SERVER_HEAD_DEADLINE: Duration = Duration::from_secs(5);
 const READ_BACK_DEADLINE: Duration = Duration::from_secs(10);
@@ -404,34 +402,18 @@ pub(super) fn reconcile_merged_metadata_with_log(
         return Ok(());
     }
     let order = head_merge_order(heads);
-    let primary = &heads[order[0]];
-    let primary_recipients: BTreeSet<String> = primary
-        .doc
-        .machines()
-        .into_iter()
-        .map(|m| m.recipient)
-        .collect();
     let mut revoked_recipients: BTreeSet<String> = doc.code_only().into_iter().collect();
     for &idx in &order {
         for r in heads[idx].doc.code_only() {
             revoked_recipients.insert(r);
         }
     }
-    let newly_admitted: Vec<(String, String)> = doc
-        .machines()
-        .into_iter()
-        .filter(|m| {
-            !revoked_recipients.contains(&m.recipient) && !primary_recipients.contains(&m.recipient)
-        })
-        .map(|m| (m.recipient, m.name))
-        .collect();
-
-    // The policy the labels below are assigned under.
+    // Keep the existing policy while historical denial evidence is merged.
     keep_policy(doc, order.iter().map(|&idx| &heads[idx].doc))?;
 
     // Merge `aterm-swarm-roster`: grow-only union of `deny_labels` + `deny_nodes`, prune
     // revoked members (cascading their labels and node keys onto the deny-lists), and
-    // deterministically assign labels for unioned admissions.
+    // preserve historical label evidence without assigning labels to new admissions.
     let mut any_roster = false;
     let mut merged_roster = SwarmRoster::default();
     let mut by_seat: Vec<crate::swarm_roster::SwarmMember> = Vec::new();
@@ -644,90 +626,6 @@ pub(super) fn reconcile_merged_metadata_with_log(
             }
         }
         merged_roster.canonicalize();
-        // Ensure deterministic unique labels across merged branches (`§3.4 rule 5`: recompute
-        // conflicting labels rather than allowing two approvers to hand out one label).
-        let policy = SwarmPolicy::from_document(doc)?.unwrap_or_default();
-        let sheet = SheetHints::from_document(doc);
-        let mut seen_labels = BTreeSet::new();
-        let mut deduped_members = Vec::new();
-        for member in merged_roster.members.clone() {
-            if seen_labels.insert(member.label.clone()) {
-                deduped_members.push(member);
-            } else {
-                let mut temp = SwarmRoster {
-                    members: deduped_members.clone(),
-                    deny_labels: merged_roster.deny_labels.clone(),
-                    deny_nodes: merged_roster.deny_nodes.clone(),
-                };
-                let new_label = assign_newcomer(
-                    &mut temp,
-                    doc,
-                    &policy,
-                    &sheet,
-                    &[],
-                    Newcomer {
-                        recipient: &member.recipient,
-                        requested_host: &member.vault_name,
-                        vault_name: &member.vault_name,
-                        now_ms: member.admitted_ms,
-                    },
-                );
-                if let Some(reassigned) = temp
-                    .members
-                    .iter_mut()
-                    .find(|m| m.recipient == member.recipient)
-                {
-                    if reassigned.node_id.is_none() {
-                        reassigned.node_id = member.node_id;
-                    }
-                    if reassigned.node_key.is_none() {
-                        reassigned.node_key = member.node_key;
-                    }
-                    if reassigned.hint.is_none() {
-                        reassigned.hint = member.hint;
-                    }
-                }
-                seen_labels.insert(new_label);
-                deduped_members = temp.members;
-            }
-        }
-        merged_roster.members = deduped_members;
-        for (recipient, vault_name) in &newly_admitted {
-            let removed_in_log = log.is_some_and(|l| {
-                Recipient::parse(recipient).is_ok_and(|rec| {
-                    l.recipient_is_removed(&rec)
-                        || (!readmit.contains(&rec)
-                            && l.audience_left_out_recipient(
-                                &crate::membership_log::EpochAudience::Everyone,
-                                &rec,
-                            ))
-                        || super::log_entries::recipient_denied_by_roster_or_log(
-                            Some(&merged_roster),
-                            l,
-                            &rec,
-                        )
-                })
-            });
-            if merged_roster.member_by_recipient(recipient).is_none()
-                && !denied_roster_recipients.contains(recipient)
-                && !removed_in_log
-                && !merged_roster.is_label_denied(vault_name)
-            {
-                assign_newcomer(
-                    &mut merged_roster,
-                    doc,
-                    &policy,
-                    &sheet,
-                    &[],
-                    Newcomer {
-                        recipient,
-                        requested_host: vault_name,
-                        vault_name,
-                        now_ms: aterm_time::unix_millis().unwrap_or(0),
-                    },
-                );
-            }
-        }
         doc.set_entry(
             &Audience::Everyone,
             crate::SWARM_ROSTER_ENTRY,

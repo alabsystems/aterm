@@ -361,6 +361,9 @@ impl Procs {
     /// sweep does not hold `pid`.
     #[must_use]
     pub fn work(&self, pid: u32, credited: &[u32]) -> Option<aterm_toolchain::stall::Work> {
+        if !self.procs.iter().any(|p| p.pid == pid) {
+            return None;
+        }
         let procs: Vec<aterm_toolchain::stall::Proc> = self
             .procs
             .iter()
@@ -395,22 +398,20 @@ impl Procs {
         for p in &self.procs {
             let mut at = p.pid;
             let mut steps = 0usize;
-            let owner = loop {
-                if out.contains_key(&at) {
-                    break Some(at);
+            while steps <= self.procs.len() {
+                if let Some(sum) = out.get_mut(&at) {
+                    sum.footprint = sum.footprint.saturating_add(p.footprint);
+                    sum.whole = sum.whole.saturating_add(p.whole);
+                    sum.written = sum.written.saturating_add(p.written);
+                    break;
                 }
                 match parent.get(&at) {
                     Some(&up) if up != at && steps < self.procs.len() => {
                         at = up;
                         steps += 1;
                     }
-                    _ => break None,
+                    _ => break,
                 }
-            };
-            if let Some(sum) = owner.and_then(|o| out.get_mut(&o)) {
-                sum.footprint = sum.footprint.saturating_add(p.footprint);
-                sum.whole = sum.whole.saturating_add(p.whole);
-                sum.written = sum.written.saturating_add(p.written);
             }
         }
         out

@@ -364,7 +364,7 @@ fn border_is_accent_heavy_interior_is_faint() {
         "border should be nearer the accent than the interior"
     );
     assert_eq!(interior, blend_rgb(0, accent, DROP_WASH_ALPHA));
-    assert!(aterm_gpu::drop_border_px(w as u32, h as u32) >= 2);
+    assert!(aterm_render::drop_overlay_border_px(w, h, 0) >= 2);
 }
 
 #[test]

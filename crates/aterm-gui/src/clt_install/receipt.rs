@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Custody evidence for one admitted installer child; never command authority. It also says
-//! which build's line in the account's record ([`super::Mark`]) that tab's own claim added: its
-//! landing's, or a later adoption's, which replaces the receipt whole ([`Receipt::claim`]). So a
-//! launch of that build that adopts the live tab again (the PTY keeper outlived a crash) takes back
-//! on failure exactly the line the tab's own claim added. A receipt whose child is gone names a
-//! tab no launch adopts and whose end no window read ([`Receipt::orphans`]).
+//! Exact installer child custody, never command authority. The claimed owner remains unchanged
+//! across updates. Only a proven preprompt end may release that owner's ask; an unknown orphan
+//! retains the durable hold. An unclaimed receipt cannot release another opening's claim.
 
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};

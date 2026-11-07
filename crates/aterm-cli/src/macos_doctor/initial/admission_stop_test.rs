@@ -103,6 +103,163 @@ impl<'a> InitialSetupAdmissionStopTest<'a> {
         self
     }
 
+    /// Run the real coordinator and native preference stage over inert supplied ports. Only
+    /// a workstation-only fixture is admitted; every other stage refuses without live I/O.
+    pub fn native_workstation_pass(
+        &self,
+        revision: u64,
+        system: impl Fn() -> Box<dyn aterm_machines::port::System>,
+    ) -> Result<Option<(Report, SetupNext)>, String> {
+        if self.plan.selection != preferences(self.plan.selection) {
+            return Err("the inert native coordinator accepts preferences alone".into());
+        }
+        let mut host = NativeWorkstationInitial {
+            sys: system(),
+            workstation: NativeHost::over(
+                system(),
+                Box::new(aterm_machines::init::prepare_workstation_selected),
+            ),
+        };
+        let _lock = HeldLock::take(self.root)?;
+        execute_initial_for_revision(&mut host, self.root, revision, &mut None, SetupHooks::NONE)
+    }
+
+    /// The actual accepted-setting reader over these inert records.
+    pub fn input_activation_revision(&self) -> Result<Option<u64>, String> {
+        input_activation::revision_at(self.root)
+    }
+
+    /// The production scoped-task admission over these inert records.
+    pub fn pending_inputs(&self) -> Result<Option<PendingInputAdmission>, String> {
+        input_pass::capture_at(self.root)
+    }
+
+    /// The production scoped coordinator, retaining the original plan while refusing all
+    /// other stages through the inert host.
+    pub fn native_input_pass(
+        &self,
+        expected: &PendingInputAdmission,
+        system: impl Fn() -> Box<dyn aterm_machines::port::System>,
+    ) -> Result<Option<InitialInputPass>, String> {
+        let mut host = NativeWorkstationInitial {
+            sys: system(),
+            workstation: NativeHost::over(
+                system(),
+                Box::new(aterm_machines::init::prepare_workstation_selected),
+            ),
+        };
+        let _lock = HeldLock::take(self.root)?;
+        input_pass::run_at(&mut host, self.root, expected, SetupHooks::NONE)
+    }
+
+    /// A scoped mark using only the supplied inert console and service facts.
+    pub fn input_park_mark(
+        &self,
+        expected: &PendingInputAdmission,
+        sys: &dyn aterm_machines::port::System,
+    ) -> InitialSetupParkMark {
+        input_pass::park_mark(Some(self.root), expected, ledger::now_secs())
+            .with_console(|| Some(!aterm_machines::console::remote(sys)))
+            .with_keyboard_services(|| sys.keyboard_service_ids())
+    }
+
+    /// The same inert native input ports shared by coordinator and headless startup tests.
+    /// The first observation lacks a service model; the attached observation can verify both
+    /// current keyboard interfaces without invoking a setter.
+    pub fn keyboard_system(attached: bool) -> aterm_machines::port::Fake {
+        use aterm_machines::items::keyboard::{Model, caps_to_control};
+        use aterm_machines::model::{PValue, User};
+        use aterm_machines::port::{Fake as Machine, Ran, Stat};
+
+        let user = User {
+            name: "alice".into(),
+            uid: 501,
+            gid: 20,
+            home: "/Users//alice".into(),
+            shell: "/bin/zsh".into(),
+            admin: false,
+        };
+        let mut sys = Machine::root();
+        sys.euid = user.uid;
+        sys.logged_in(&user);
+        sys.keyboard_services = Some(Ok(if attached { vec![41, 42] } else { vec![41] }));
+        sys.stat_of(
+            "/dev/console",
+            Stat {
+                uid: user.uid,
+                gid: user.gid,
+                mode: 0o600,
+                dir: false,
+                symlink: false,
+                len: 0,
+            },
+        );
+        let census = format!(
+            "Services:\n{:<12}{:<12}{:<16}{:<24}Built-In\n{:<12}{:<12}{:<16}{:<24}0\n{:<12}{:<12}{:<16}{:<24}0\n\nDevices:\n",
+            "VendorID",
+            "ProductID",
+            "RegistryID",
+            "Product",
+            "0xfffe",
+            "0xa9",
+            "0x29",
+            "Fixture keyboard",
+            "0xfffe",
+            "0xa9",
+            "0x2a",
+            "Fixture keyboard"
+        );
+        let filter = |id| {
+            format!(
+                "<dict><key>IORegistryEntryID</key><integer>{id}</integer>\
+                 <key>PrimaryUsagePage</key><integer>1</integer>\
+                 <key>PrimaryUsage</key><integer>6</integer>\
+                 <key>ServiceFilterDebug</key><array><dict><key>plugin</key><dict>\
+                 <key>Class</key><string>IOHIDKeyboardFilter</string>\
+                 <key>HIDKeyboardModifierMappingPairs</key><array/>\
+                 <key>UserKeyMapping</key><array><dict>\
+                 <key>Src</key><integer>30064771129</integer>\
+                 <key>Dst</key><integer>30064771296</integer></dict></array>\
+                 <key>FnFunctionUsageMap</key><array/>\
+                 <key>FnKeyboardUsageMap</key><array/>\
+                 <key>NumLockKeyboardUsageMap</key><array/>\
+                 </dict></dict></array></dict>"
+            )
+        };
+        let dump = format!(
+            "<plist version=\"1.0\"><dict><key>ServiceRecords</key><array>{}{}</array></dict></plist>",
+            filter(41),
+            filter(42)
+        );
+        sys.simulate(move |_, cmd| {
+            let args: Vec<_> = cmd.args.iter().filter_map(|arg| arg.to_str()).collect();
+            match cmd.program.file_name().and_then(|name| name.to_str()) {
+                Some("hidutil") if args.first() == Some(&"list") => Some(Ran::ok(if attached {
+                    &census
+                } else {
+                    "Services:\n\nDevices:\n"
+                })),
+                Some("hidutil") if args.first() == Some(&"property") => Some(Ran::ok(
+                    "RegistryID Key Value\n29 UserKeyMapping ( { HIDKeyboardModifierMappingSrc = 30064771129; HIDKeyboardModifierMappingDst = 30064771296; } )\n2a UserKeyMapping ( { HIDKeyboardModifierMappingSrc = 30064771129; HIDKeyboardModifierMappingDst = 30064771296; } )\n"
+                )),
+                Some("hidutil") if args.first() == Some(&"dump") => Some(Ran::ok(&dump)),
+                Some("defaults") => {
+                    let entries = if args.contains(&"-g") {
+                        [Model { vendor: 0, product: 0 }, Model { vendor: 65534, product: 169 }]
+                            .into_iter()
+                            .map(|model| (model.key(), PValue::Array(vec![caps_to_control()])))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    Some(Ran::ok(&aterm_machines::plist::document(&PValue::Dict(entries))))
+                }
+                _ => None,
+            }
+        });
+        sys
+    }
+
     /// Admit and complete a scratch vault plan, without running its host stages.
     pub fn complete_vault_setup(&mut self) -> Result<u64, String> {
         self.plan.selection.set(Setting::Secrets, true);
@@ -372,6 +529,89 @@ impl<'a> InitialSetupAdmissionStopTest<'a> {
 
     pub fn stop_revision(&self, revision: u64) -> Result<(), String> {
         request_stop_at(self.root, revision)
+    }
+}
+
+struct NativeWorkstationInitial {
+    sys: Box<dyn aterm_machines::port::System>,
+    workstation: NativeHost,
+}
+
+impl InitialHost for NativeWorkstationInitial {
+    fn legacy(&mut self, _root: &Path) -> Result<Option<Report>, String> {
+        Err("the inert native coordinator accepts modern preferences alone".into())
+    }
+
+    fn workstation(
+        &mut self,
+        root: &Path,
+        only: Option<Selection>,
+    ) -> Result<Option<Report>, String> {
+        apply_part_with(
+            root,
+            self.sys.as_ref(),
+            &mut self.workstation,
+            "native-input-fixture",
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(self.sys.now()),
+            Part::Preferences { only },
+        )
+    }
+
+    fn spotlight(&mut self) -> Result<Vec<Row>, String> {
+        Err("no Spotlight port in the native preference fixture".into())
+    }
+
+    fn permissions(&mut self, _plan: &Plan, _revision: u64) -> Result<Vec<Row>, String> {
+        Err("no permissions port in the native preference fixture".into())
+    }
+
+    fn secrets(
+        &mut self,
+        _plan: &Plan,
+        _replaces: Replaces,
+        _password: &mut Option<SecretBytes>,
+    ) -> Result<Vec<Row>, String> {
+        Err("no vault port in the native preference fixture".into())
+    }
+
+    fn secrets_pace(&mut self) -> Option<Pace> {
+        None
+    }
+
+    fn configured_vault(&mut self) -> Result<Option<ConfiguredVault>, String> {
+        Err("no vault port in the native preference fixture".into())
+    }
+
+    fn current_vault(&mut self, _plan: &Plan) -> Result<Vec<Row>, String> {
+        Err("no vault port in the native preference fixture".into())
+    }
+
+    fn current_repositories(&mut self, _vault: Option<&Plan>) -> Result<Vec<Row>, String> {
+        Err("no repository port in the native preference fixture".into())
+    }
+
+    fn repositories(&mut self, _vault: Option<&Plan>) -> Result<Vec<Row>, String> {
+        Err("no repository port in the native preference fixture".into())
+    }
+
+    fn accounts(
+        &mut self,
+        _root: &Path,
+        _on_screen: fn() -> bool,
+    ) -> Result<Option<Report>, String> {
+        Err("no account port in the native preference fixture".into())
+    }
+
+    fn withheld(&mut self, _root: &Path) -> Result<Option<Report>, String> {
+        Ok(None)
+    }
+
+    fn boot_session(&mut self) -> Option<u128> {
+        None
+    }
+
+    fn now_secs(&mut self) -> u64 {
+        self.sys.now()
     }
 }
 

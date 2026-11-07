@@ -51,6 +51,7 @@ pub fn header() -> Header {
         version: "0.2.0".into(),
         build: 9,
         exposes: vec!["ay".into(), "ay-lsp".into()],
+        shim_env: Vec::new(),
     }
 }
 
@@ -365,4 +366,42 @@ fn the_writer_refuses_a_vendor_rows_tool_for_any_other_program() {
     pkgdoc::check_exposes("codex", &["codex".to_string()]).expect("codex's own ALab pack");
     pkgdoc::check_exposes("claude-code-alab", &["claude-alab".to_string()])
         .expect("a harness's own tool");
+}
+
+#[test]
+fn bottle_environment_is_validated_preserved_and_checked() {
+    let mut h = header();
+    h.shim_env = vec!["LEAN_CC=/usr/bin/cc".into()];
+    let a = row(AARCH64_APPLE_DARWIN, Kind::Binary);
+    let a = pkgdoc::BottleRow {
+        triple: a.triple,
+        kind: a.kind,
+        asset: a.asset,
+        sha256: a.sha256,
+        tree_root: a.tree_root,
+        size: a.size,
+        disk_installed: a.disk_installed,
+    };
+    let b = pkgdoc::BottleRow {
+        triple: X86_64_APPLE_DARWIN,
+        asset: "ay-9-x86.tar.zst".into(),
+        ..a.clone()
+    };
+    let doc = pkgdoc::fresh_bottle(&h, &a).unwrap();
+    let parsed: atpkg::PkgManifest =
+        aterm_toml::from_str(std::str::from_utf8(doc.bytes()).unwrap()).unwrap();
+    assert_eq!(parsed.shim_env, h.shim_env);
+    pkgdoc::check_parsed_bottle(&parsed, &h, &a).unwrap();
+    let merged = pkgdoc::merge_bottle(doc.bytes().to_vec(), &h, &b).unwrap();
+    assert!(merged.bytes().starts_with(doc.bytes()));
+    for environment in [vec![], vec!["LEAN_CC=/tmp/other-cc".into()]] {
+        let changed = pkgdoc::Header {
+            shim_env: environment,
+            ..h.clone()
+        };
+        assert!(pkgdoc::merge_bottle(doc.bytes().to_vec(), &changed, &b).is_err());
+        assert!(pkgdoc::check_parsed_bottle(&parsed, &changed, &a).is_err());
+    }
+    h.shim_env = vec!["PATH=/tmp".into()];
+    assert!(pkgdoc::fresh_bottle(&h, &a).is_err());
 }

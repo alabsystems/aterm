@@ -685,29 +685,25 @@ pub enum Decider {
     /// and reaches the LAN only through the LAN broker, as every run does. Rust in Spotlight
     /// searches no folder of the
     /// person's for build folders ([`crate::init_spotlight::Projects::Unread`]). Apple's Command
-    /// Line Tools ask for the Mac password at most once per build, sharing System State's Mac Setup
+    /// Line Tools share the durable account administrator-ask episode, sharing System State's Mac Setup
     /// tab's ask, and never under the person's Stop, read as they run
     /// ([`Self::compose`]).
     Aterm,
 }
 
 impl Decider {
-    /// `base` as a run this one decided composes it: in a run aterm decided, `base.clt` asks for
-    /// the Mac password at most once per build and never while the person's choices hold System
-    /// State's own Mac Setup tab, held by what `unbidden` makes (this account's record
-    /// and a reader of the setup records' holds, [`crate::init_clt::Unbidden::here`], which
-    /// `base.clt` reads as its probe runs and again right before it claims the ask, never here),
-    /// and is deferred naming the person's step otherwise
-    /// ([`crate::init_clt::CommandLineTools::unbidden`]); a person's run asks each time and makes
-    /// no `unbidden`.
+    /// Share the durable administrator-ask record in both modes. Automatic runs additionally
+    /// respect current setup holds and an already-consumed episode. Explicit person retries
+    /// remain available and record their first attempt before sudo can ask.
     pub(crate) fn compose(
         self,
         mut base: Base,
         unbidden: impl FnOnce() -> crate::init_clt::Unbidden,
     ) -> Base {
-        if self == Self::Aterm {
-            base.clt = base.clt.map(|clt| clt.unbidden(unbidden()));
-        }
+        base.clt = base.clt.map(|clt| match self {
+            Self::Aterm => clt.unbidden(unbidden()),
+            Self::Person => clt.explicit(unbidden()),
+        });
         base
     }
 }
@@ -1383,7 +1379,7 @@ fn tab(
             .unfinished()
             .unwrap_or(crate::init_clt::Unfinished::Other);
         out.line(&why.line());
-        why.tab_exit()
+        out.exit(why)
     }
 }
 

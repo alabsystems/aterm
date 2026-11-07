@@ -104,24 +104,22 @@ pub fn place(
     host: &Path,
     sign: &mut dyn FnMut(&Path, &Path) -> Result<(), String>,
 ) -> Result<Placed, String> {
-    let bytes = crate::read_regular_bounded(built, MAX_HELPER_BYTES)
+    let sha256 = crate::sha256_regular_bounded(built, MAX_HELPER_BYTES)
         .map_err(|e| format!("could not read {} ({e})", built.display()))?;
-    let mut h = aterm_digest::Sha256::new();
-    h.update(&bytes);
-    let sha256 = crate::hex(&h.finalize());
     let dir = host.join(&sha256);
     let exe = dir.join(EXE);
-    let placed = |fresh| Placed {
-        sha256: sha256.clone(),
-        exe: exe.clone(),
-        fresh,
-    };
     let placed_regular = || {
         std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) && crate::is_regular_file(&exe)
     };
     if placed_regular() {
-        return Ok(placed(false));
+        return Ok(Placed {
+            sha256,
+            exe,
+            fresh: false,
+        });
     }
+    let bytes = crate::read_regular_bounded(built, MAX_HELPER_BYTES)
+        .map_err(|e| format!("could not read {} ({e})", built.display()))?;
     std::fs::create_dir_all(host)
         .map_err(|e| format!("could not make {} ({e})", host.display()))?;
     static PARTIAL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -207,7 +205,7 @@ pub fn place(
         Ok(true)
     })();
     let _ = std::fs::remove_dir_all(&partial);
-    written.map(placed)
+    written.map(|fresh| Placed { sha256, exe, fresh })
 }
 
 /// The content-addressed directory `exe` runs from, when it is one (`host/<sha256>/`).

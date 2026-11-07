@@ -942,11 +942,13 @@ impl PaneCode {
     /// Its artifact under `build`.
     #[must_use]
     pub fn artifact(self, build: &str) -> ArtifactId {
-        let mut e = Enc::new();
-        e.str(self.artifact_name());
+        let name = self.artifact_name();
+        let note = self.note();
+        let mut e = Enc::with_capacity(name.len() + build.len() + note.len() + 16);
+        e.str(name);
         e.str(build);
-        e.str(self.note());
-        ArtifactId::new(ArtifactKind::Code, self.artifact_name(), 1, e.as_bytes())
+        e.str(note);
+        ArtifactId::new(ArtifactKind::Code, name, 1, e.as_bytes())
     }
 
     /// The reading a slice clocked `clock` parses at under this code.
@@ -1088,7 +1090,9 @@ impl Code<PaneSchema> for PrebuiltPane {
                 })?;
                 let carry =
                     PaneStepCarry::capture(&term, schema.origin.monotonic, PANE_HISTORY_LINES);
-                Arc::make_mut(&mut state.env).cell_px = Some((*width, *height));
+                if state.env.cell_px != Some((*width, *height)) {
+                    Arc::make_mut(&mut state.env).cell_px = Some((*width, *height));
+                }
                 state.checkpoint = checkpoint;
                 state.carry = carry;
                 Ok(PaneObservation::CellPx {
@@ -1113,6 +1117,7 @@ impl Code<PaneSchema> for PrebuiltPane {
                 let moves = true;
                 if let HostOp::Config { config, .. } = op
                     && moves
+                    && state.env.config != *config.0
                 {
                     Arc::make_mut(&mut state.env).config = TerminalConfig::clone(&config.0);
                 }

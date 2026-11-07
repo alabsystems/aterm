@@ -977,10 +977,10 @@ fn a_previously_managed_claim_never_downgrades_to_unsupported_or_released_writes
 
 /// Every window-hosted loop's door (`HostCtl::call_checked` in `aterm-gui`): a write that names no
 /// duty gets `duty_denied`'s words, and one under a duty the session keeps goes on to the host.
-struct HostDoor<'m> {
-    mock: &'m mut Mock,
-    typed: Vec<(crate::harness::contract::Scope, String)>,
-    refused: Vec<String>,
+pub(super) struct HostDoor<'m> {
+    pub(super) mock: &'m mut Mock,
+    pub(super) typed: Vec<(crate::harness::contract::Scope, String)>,
+    pub(super) refused: Vec<String>,
 }
 
 impl Ctl for HostDoor<'_> {
@@ -1018,7 +1018,7 @@ impl Ctl for HostDoor<'_> {
 }
 
 /// A session behind the door, its claim held as a tab's is.
-fn behind_the_door<'d, 'm>(door: &'d mut HostDoor<'m>) -> Session<'d, HostDoor<'m>> {
+pub(super) fn behind_the_door<'d, 'm>(door: &'d mut HostDoor<'m>) -> Session<'d, HostDoor<'m>> {
     let clock = virtual_clock();
     door.mock.run_on(&clock);
     let mut s = Session::new(door, Some("@s-door".to_string()));

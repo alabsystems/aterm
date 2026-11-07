@@ -217,7 +217,15 @@ pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
         crate::durable::copy_regular_fresh(&image, &copied).map_err(|e| e.to_string())?;
         let inspection = inspect_symbols(&copied, &root, false)?;
         let (sha256, bytes) = crate::dmg::sha256_and_size(&copied)?;
-        let report = aterm_json::json!({"binary":copied,"binary_bytes":bytes,"sha256":sha256,"inspection":inspection});
+        let report = aterm_json::Value::Object(aterm_json::Map::from([
+            ("binary".to_string(), aterm_json::json!(copied)),
+            (
+                "binary_bytes".to_string(),
+                aterm_json::Value::Number(bytes.into()),
+            ),
+            ("sha256".to_string(), aterm_json::Value::String(sha256)),
+            ("inspection".to_string(), inspection),
+        ]));
         crate::durable::write_fresh(&out.join("inspection.json"), report.to_string())
             .map_err(|e| e.to_string())?;
         println!("profile-pilot-inspection: {report}");
@@ -439,9 +447,14 @@ pub(crate) fn inspect(binary: &Path, root: &Path) -> Result<aterm_json::Value, S
 
 fn inspect_symbols(binary: &Path, root: &Path, extract: bool) -> Result<aterm_json::Value, String> {
     if cfg!(target_os = "linux") {
-        return Ok(
-            aterm_json::json!({"sections": null, "symbols": null, "dsym": "not applicable on Linux"}),
-        );
+        return Ok(aterm_json::Value::Object(aterm_json::Map::from([
+            ("sections".to_string(), aterm_json::Value::Null),
+            ("symbols".to_string(), aterm_json::Value::Null),
+            (
+                "dsym".to_string(),
+                aterm_json::Value::String("not applicable on Linux".to_string()),
+            ),
+        ])));
     }
     let dsym = root.join("aterm.dSYM");
     if extract {
@@ -520,7 +533,26 @@ fn inspect_symbols(binary: &Path, root: &Path, extract: bool) -> Result<aterm_js
         // names, not the compiler's per-profile crate disambiguator.
         let function = demangle_symbol(name.strip_prefix('_').unwrap_or(name))?;
         let symbolicated = canonical_symbolication(symbolicated.trim(), demangle_symbol)?;
-        symbols.push(aterm_json::json!({"address": address, "function": function, "resolved": resolved, "dsym_symbolication": symbolicated}));
+        symbols.push(aterm_json::Value::Object(aterm_json::Map::from([
+            (
+                "address".to_string(),
+                aterm_json::Value::String(address.to_string()),
+            ),
+            ("function".to_string(), aterm_json::Value::String(function)),
+            (
+                "resolved".to_string(),
+                aterm_json::Value::Array(
+                    resolved
+                        .into_iter()
+                        .map(|s| aterm_json::Value::String(s.to_string()))
+                        .collect(),
+                ),
+            ),
+            (
+                "dsym_symbolication".to_string(),
+                aterm_json::Value::String(symbolicated),
+            ),
+        ])));
         if symbols.len() == 16 {
             break;
         }
@@ -528,9 +560,18 @@ fn inspect_symbols(binary: &Path, root: &Path, extract: bool) -> Result<aterm_js
     if symbols.len() != 16 {
         return Err("fewer than 16 symbolicated text addresses".into());
     }
-    Ok(
-        aterm_json::json!({"sections": sections, "symbols": symbols, "dsym_dwarf_bytes": dsym_bytes, "dsym_dwarf_sha256": dsym_sha256}),
-    )
+    Ok(aterm_json::Value::Object(aterm_json::Map::from([
+        ("sections".to_string(), sections),
+        ("symbols".to_string(), aterm_json::Value::Array(symbols)),
+        (
+            "dsym_dwarf_bytes".to_string(),
+            aterm_json::Value::Number(dsym_bytes.into()),
+        ),
+        (
+            "dsym_dwarf_sha256".to_string(),
+            aterm_json::Value::String(dsym_sha256),
+        ),
+    ])))
 }
 
 // Read file-backed section bytes, excluding UUIDs and link-edit metadata. Bounds
@@ -593,7 +634,32 @@ fn sections(bytes: &[u8]) -> Result<aterm_json::Value, String> {
                             &aterm_digest::Sha256::digest(data),
                         ))
                     };
-                    rows.push(aterm_json::json!({"name": String::from_utf8_lossy(&bytes[section..section+16]).trim_end_matches('\0'), "segment": String::from_utf8_lossy(segment).trim_end_matches('\0'), "size": length, "sha256": digest}));
+                    rows.push(aterm_json::Value::Object(aterm_json::Map::from([
+                        (
+                            "name".to_string(),
+                            aterm_json::Value::String(
+                                String::from_utf8_lossy(&bytes[section..section + 16])
+                                    .trim_end_matches('\0')
+                                    .to_string(),
+                            ),
+                        ),
+                        (
+                            "segment".to_string(),
+                            aterm_json::Value::String(
+                                String::from_utf8_lossy(segment)
+                                    .trim_end_matches('\0')
+                                    .to_string(),
+                            ),
+                        ),
+                        (
+                            "size".to_string(),
+                            aterm_json::Value::Number((length as u64).into()),
+                        ),
+                        (
+                            "sha256".to_string(),
+                            digest.map_or(aterm_json::Value::Null, aterm_json::Value::String),
+                        ),
+                    ])));
                 }
             }
         }
@@ -602,7 +668,7 @@ fn sections(bytes: &[u8]) -> Result<aterm_json::Value, String> {
     if rows.is_empty() {
         return Err("no code/data sections".into());
     }
-    Ok(aterm_json::json!(rows))
+    Ok(aterm_json::Value::Array(rows))
 }
 
 #[cfg(test)]

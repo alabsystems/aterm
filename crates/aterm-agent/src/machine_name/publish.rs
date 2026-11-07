@@ -333,14 +333,18 @@ fn publish_through(
     let Some(system) = system else {
         return Ok(());
     };
-    if all_read(&system.read(), number) {
-        return still(state, number);
+    let observed = system.read();
+    still(state, number)?;
+    if all_read(&observed, number) {
+        return Ok(());
     }
     system
         .apply(number)
         .map_err(|why| judged(state, number, why, Pending::SystemNames))?;
     still(state, number)?;
-    if !all_read(&system.read(), number) {
+    let observed = system.read();
+    still(state, number)?;
+    if !all_read(&observed, number) {
         return Err(judged(
             state,
             number,

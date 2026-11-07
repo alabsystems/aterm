@@ -958,18 +958,28 @@ pub(crate) fn render_json(areas: &[Area]) -> String {
     let areas: Vec<aterm_json::Value> = areas
         .iter()
         .map(|area| {
-            aterm_json::json!({
-                "area": area.name,
-                "state": area.level.word(),
-                "says": scrub_cow(&area.says).as_ref(),
-                "next": area.next.as_ref().map(|step| aterm_json::json!({
-                    "who": step.who.word(),
-                    "act": scrub_cow(&step.act).as_ref(),
-                })),
-            })
+            let next = area.next.as_ref().map_or(aterm_json::Value::Null, |step| {
+                aterm_json::Value::Object(aterm_json::Map::from([
+                    ("who".to_string(), step.who.word().into()),
+                    ("act".to_string(), scrub_cow(&step.act).into_owned().into()),
+                ]))
+            });
+            aterm_json::Value::Object(aterm_json::Map::from([
+                ("area".to_string(), area.name.into()),
+                ("state".to_string(), area.level.word().into()),
+                (
+                    "says".to_string(),
+                    scrub_cow(&area.says).into_owned().into(),
+                ),
+                ("next".to_string(), next),
+            ]))
         })
         .collect();
-    aterm_json::json!({"schema": 1, "areas": areas}).to_string()
+    aterm_json::Value::Object(aterm_json::Map::from([
+        ("schema".to_string(), 1.into()),
+        ("areas".to_string(), aterm_json::Value::Array(areas)),
+    ]))
+    .to_string()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -979,7 +989,7 @@ pub(crate) fn render_json(areas: &[Area]) -> String {
 fn bounded<T: Send + 'static>(
     read: impl FnOnce() -> T + Send + 'static,
 ) -> impl FnOnce(Instant) -> Option<T> {
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(1);
     let spawned = std::thread::Builder::new()
         .name("aterm-status".into())
         .spawn(move || {

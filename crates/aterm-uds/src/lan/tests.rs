@@ -119,6 +119,50 @@ fn broker_arrivals_recheck_an_unready_socket_and_skip_its_retry_on_replacement()
     assert_eq!(changes.wait_for(MUST_HAPPEN), MUST_HAPPEN);
 }
 
+/// A direct path that macOS allowed and whose server answers a hello, as aterm-lan's does.
+#[cfg(target_os = "macos")]
+struct AnswersHello;
+
+#[cfg(target_os = "macos")]
+impl direct::Direct for AnswersHello {
+    fn allowed(&self) -> Result<String, String> {
+        Ok("a stand-in allowance".into())
+    }
+
+    fn serve(&self, stream: CtlStream) {
+        let hello = Frame::Hello {
+            protocol: PROTOCOL,
+            build: "direct-stand-in".into(),
+        };
+        if wire::send(&stream, &hello).is_ok() {
+            let _ = Reader::new(0).frame(&stream, Some(Instant::now() + MUST_HAPPEN));
+        }
+    }
+}
+
+/// The arrival watch hears a broker, never this process's own server: a socket file no broker
+/// listens on (one that exited, crashed or was booted out) is not an arrival, though a LAN use
+/// beside it is served directly. NEGATIVE CONTROL: the same seam's hello answers, from the direct
+/// path, so a watch that took it would announce the stale socket as a broker.
+#[cfg(target_os = "macos")]
+#[test]
+fn broker_arrivals_never_hear_the_direct_path() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let path = root.path().join("broker.sock");
+    drop(crate::CtlListener::bind(&path).unwrap());
+    let seam = Seam {
+        socket: Some(path.clone()),
+        ..Seam::default()
+    };
+    let (mut changes, hello) = seam_here(seam, || {
+        direct::seam_here(&AnswersHello, || (Arrivals::new(), broker::hello()))
+    });
+    let hello = hello.unwrap();
+    assert_eq!(hello.direct.as_deref(), Some("a stand-in allowance"));
+    let heard = direct::seam_here(&AnswersHello, || changes.poll().unwrap());
+    assert!(!heard, "a stale socket beside a direct path is no broker");
+}
+
 /// A stand-in broker at a fresh socket that answers one connection with `answer`, given the
 /// request it read; the seam that points this thread's client at it.
 fn stand_in(

@@ -432,6 +432,8 @@ pub fn verdict_of(
 pub struct Host<'a> {
     /// Exact config selected by the caller; never inferred from a different HOME.
     pub config: Option<&'a Path>,
+    /// Native profile owning source custody, independent of reviewer overrides.
+    pub source_home: Option<&'a Path>,
     /// The child processes.
     pub runner: &'a dyn Runner,
     /// One variable of this process's environment.
@@ -619,6 +621,23 @@ fn run_one(h: &Host<'_>, prepared: &PreparedReview, ask: &Ask<'_>) -> (Answer, O
         );
         return (answer, None);
     }
+    // Native headless reviews have no foreground manager-ready registration.
+    // Keep actual source exclusion until this owned runner has retired its child.
+    let _source_lease = if c.id == "codex" {
+        let lease = h
+            .source_home
+            .ok_or("Codex source profile is unavailable")
+            .and_then(crate::harness::codex_source_gate::SourceWorkLease::for_home);
+        match lease {
+            Ok(lease) => Some(lease),
+            Err(why) => {
+                answer.why = Some(why.into());
+                return (answer, None);
+            }
+        }
+    } else {
+        None
+    };
     let started = Instant::now();
     let ran = h.runner.run(&Job {
         program,

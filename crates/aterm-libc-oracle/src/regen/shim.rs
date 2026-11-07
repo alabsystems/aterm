@@ -532,7 +532,7 @@ fn bodies(cell: &Cell, decls: &Decls, out: &mut Vec<String>) -> Result<(), Strin
     for func in fns {
         let body = handwritten::macro_body(cell.os, &func.name)
             .ok_or_else(|| format!("no body written for {} on {}", func.name, cell.key))?;
-        if let Some(doc) = handwritten::safety_doc(&func.name).filter(|_| func.is_unsafe) {
+        if let Some(doc) = handwritten::safety_doc(cell.os, &func.name).filter(|_| func.is_unsafe) {
             out.extend(["/// # Safety", "///"].map(String::from));
             out.extend(doc.iter().map(|line| format!("/// {line}")));
         }

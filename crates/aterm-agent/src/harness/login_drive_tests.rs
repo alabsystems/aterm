@@ -39,6 +39,8 @@ fn an_injected_clock_without_a_transferable_parent_refuses_native_codex_before_e
     let route = CODEX_SIGNIN.route(None).unwrap();
     assert!(matches!(route.drive, Drive::CodexPkce));
     let request = Request {
+        publication: None,
+        enrollment: None,
         recovery: None,
         admission: None,
         cli: Cli::Codex,
@@ -624,6 +626,8 @@ fn sleep_during_resume_cannot_restart_the_budget_or_enter_a_fresh_provider() {
     };
     let route = KIMI_SIGNIN.route(None).unwrap();
     let request = Request {
+        publication: None,
+        enrollment: None,
         recovery: None,
         admission: None,
         cli: Cli::Kimi,
@@ -1088,6 +1092,8 @@ impl GrokBed {
     fn sign_in(&self, no_desk: Option<&Path>) -> (Drove, Handed) {
         let route = GROK_SIGNIN.route(None).expect("grok's route");
         let req = Request {
+            publication: None,
+            enrollment: None,
             recovery: None,
             admission: None,
             cli: Cli::Grok,
@@ -1233,6 +1239,8 @@ fn a_no_desk_cli_that_is_not_installed_is_named_so() {
     let bed = GrokBed::new();
     let route = GROK_SIGNIN.route(None).expect("grok's route");
     let req = Request {
+        publication: None,
+        enrollment: None,
         recovery: None,
         admission: None,
         cli: Cli::Grok,
@@ -1277,6 +1285,8 @@ fn over_ssh_a_persons_sign_in_opens_no_browser_on_this_machines_desk() {
     let sandbox = Some(Path::new(SANDBOX_EXEC));
     let route = GROK_SIGNIN.route(None).expect("grok's route");
     let grok = Request {
+        publication: None,
+        enrollment: None,
         recovery: None,
         admission: None,
         cli: Cli::Grok,
@@ -1327,6 +1337,8 @@ fn over_ssh_a_persons_sign_in_opens_no_browser_on_this_machines_desk() {
     );
     let route = KIMI_SIGNIN.route(None).expect("kimi's route");
     let kimi = Request {
+        publication: None,
+        enrollment: None,
         recovery: None,
         admission: None,
         cli: Cli::Kimi,
@@ -1374,6 +1386,8 @@ fn over_ssh_a_codex_browser_sign_in_runs_its_device_route_off_this_machines_desk
     let route = CODEX_SIGNIN.route(None).expect("codex's route");
     assert!(calls_back_here(route), "the default is the browser route");
     let codex = Request {
+        publication: None,
+        enrollment: None,
         recovery: None,
         admission: None,
         cli: Cli::Codex,
@@ -1416,6 +1430,8 @@ fn over_ssh_a_codex_browser_sign_in_runs_its_device_route_off_this_machines_desk
         .route(Some(Flow::Browser))
         .expect("grok's browser route");
     let grok = Request {
+        publication: None,
+        enrollment: None,
         recovery: None,
         admission: None,
         cli: Cli::Grok,
@@ -1541,6 +1557,8 @@ fn native_completion_hooks_surround_the_real_driver_and_can_refuse_publication()
         };
         let route = KIMI_SIGNIN.route(None).unwrap();
         let request = Request {
+            publication: None,
+            enrollment: None,
             recovery: None,
             admission: None,
             cli: Cli::Kimi,
@@ -1633,6 +1651,8 @@ fn completed_native_custody_survives_revoked_admission_without_fresh_completion(
                 }
             });
             let request = Request {
+                publication: None,
+                enrollment: None,
                 recovery: Some(admission.key()),
                 admission: Some(&admission),
                 cli: Cli::Codex,
@@ -1706,6 +1726,8 @@ fn retained_native_state_never_becomes_no_start_when_native_setup_fails() {
     };
     let route = KIMI_SIGNIN.route(None).unwrap();
     let req = Request {
+        publication: None,
+        enrollment: None,
         recovery: None,
         admission: None,
         cli: Cli::Kimi,
@@ -1742,6 +1764,8 @@ fn retained_native_state_never_becomes_no_start_when_native_setup_fails() {
         Err("root admission revoked".into())
     });
     let guarded = Request {
+        publication: None,
+        enrollment: None,
         recovery: Some(admission.key()),
         admission: Some(&admission),
         ..req
@@ -1758,6 +1782,8 @@ fn retained_native_state_never_becomes_no_start_when_native_setup_fails() {
     assert!(matches!(result.outcome, Outcome::NotRun(_)));
     let read_only = RecoveryAdmission::new(RecoveryKey([4; 32]), false, |_| Ok(()));
     let guarded = Request {
+        publication: None,
+        enrollment: None,
         recovery: Some(read_only.key()),
         admission: Some(&read_only),
         ..req
@@ -1774,6 +1800,8 @@ fn retained_native_state_never_becomes_no_start_when_native_setup_fails() {
     assert!(matches!(result.outcome, Outcome::Unverified(_)));
     let one_entry = RecoveryAdmission::new(RecoveryKey([4; 32]), true, |_| Ok(()));
     let guarded = Request {
+        publication: None,
+        enrollment: None,
         recovery: Some(one_entry.key()),
         admission: Some(&one_entry),
         ..req
@@ -1851,6 +1879,8 @@ fn native_kimi_cancellation_runs_completion_without_opening_a_window() {
         Ok(())
     });
     let request = Request {
+        publication: None,
+        enrollment: None,
         recovery: Some(admission.key()),
         admission: Some(&admission),
         cli: Cli::Kimi,
@@ -1976,6 +2006,8 @@ fn a_sign_in_whose_resume_its_host_slept_through_starts_no_child() {
     };
     let route = KIMI_SIGNIN.route(None).unwrap();
     let request = Request {
+        publication: None,
+        enrollment: None,
         recovery: None,
         admission: None,
         cli: Cli::Kimi,
@@ -2088,6 +2120,8 @@ fn saved_native_custody_rechecks_work_after_admission_and_completion() {
         });
         let req = Request {
             cli: Cli::Codex,
+            publication: None,
+            enrollment: None,
             row: &row,
             staging: &staging,
             store: &store,

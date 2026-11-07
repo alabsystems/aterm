@@ -60,6 +60,7 @@ impl Prepared {
     /// V3 requires permanent prior-boot retirement; legacy fences are not a v3 entitlement.
     /// # Errors
     /// Invalid layout, any legacy fence, absent/unowned CPU lease or invalid GNU transport.
+    #[cfg(test)]
     pub fn try_new(
         _pool: &Pool,
         debt: &ExternalDebt,
@@ -67,7 +68,30 @@ impl Prepared {
         request: &Request,
         rights: &Delegations,
     ) -> io::Result<Option<Self>> {
+        Self::try_new_mapped(_pool, debt, global_limit, request, rights, None)
+    }
+    /// Preserve the private controller's explicit named-FIFO child targets.
+    /// # Errors
+    /// Invalid or overlapping targets, or any ordinary descriptor admission failure.
+    pub fn try_new_mapped(
+        _pool: &Pool,
+        debt: &ExternalDebt,
+        global_limit: u32,
+        request: &Request,
+        rights: &Delegations,
+        named_targets: Option<[u32; 2]>,
+    ) -> io::Result<Option<Self>> {
         request.validate()?;
+        if let Some(targets) = named_targets
+            && (!matches!(request.gnu, GnuTransport::NamedFifo { descriptors: 2, .. })
+                || targets[0] == targets[1]
+                || targets
+                    .iter()
+                    .any(|target| *target < 3 || *target > i32::MAX as u32)
+                || matches!(request.cpu, CpuDelegation::SharedBorrow { target_fd } if targets.contains(&target_fd)))
+        {
+            return Err(refused("named GNU child targets overlap or differ"));
+        }
         if !request.fence_targets.is_empty() || !rights.fences.is_empty() {
             return Err(refused("v3 subgroup cannot inherit legacy fences"));
         }
@@ -161,13 +185,19 @@ impl Prepared {
                 let named = NamedFifo::new(locator.clone(), witness.clone(), gnu)?;
                 prepared.gnu = Some(ScopedHandoff::named_fifo(named.witnesses()?)?);
                 let mapped = prepared.mapped.as_mut().unwrap();
-                let mut next = 3;
-                for file in &named.files {
-                    while mapped.iter().any(|(_, target)| *target == next) {
+                if let Some(targets) = named_targets {
+                    for (file, target) in named.files.iter().zip(targets) {
+                        mapped.push((duplicate(file.as_fd())?, target as i32));
+                    }
+                } else {
+                    let mut next = 3;
+                    for file in &named.files {
+                        while mapped.iter().any(|(_, target)| *target == next) {
+                            next += 1;
+                        }
+                        mapped.push((duplicate(file.as_fd())?, next));
                         next += 1;
                     }
-                    mapped.push((duplicate(file.as_fd())?, next));
-                    next += 1;
                 }
                 prepared.flags = Some(named.flags());
                 prepared.named = Some(named);

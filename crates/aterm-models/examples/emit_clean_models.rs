@@ -14,6 +14,10 @@ use aterm_spec::interp;
 
 const NS: &str = "Trust.Temporal.FiniteModel";
 
+/// This diagnostic corpus requests kernel proofs within this state budget.
+/// Larger designs stay explicitly bounded and acquire no safety theorem.
+const KERNEL_STATE_BUDGET: usize = 256;
+
 fn nat(value: i64, what: &str) -> Result<u64, String> {
     u64::try_from(value).map_err(|_| format!("negative {what} {value}"))
 }
@@ -494,6 +498,24 @@ fn scalar_model(m: &Model, def: &str, style: Style) -> Result<String, String> {
     ))
 }
 
+/// Name the diagnostic's work request, and make incompleteness explicit for
+/// a design larger than this corpus's proof budget. This metadata grants no
+/// theorem and never applies to a negative progress claim.
+fn kernel_scope(text: &mut String, name: &str, states: usize) {
+    let _ = writeln!(
+        text,
+        "def {name}.stateBudget : Nat := {KERNEL_STATE_BUDGET}"
+    );
+    if states > KERNEL_STATE_BUDGET {
+        let _ = writeln!(
+            text,
+            "def {name}.bounded : String := \"This generated diagnostic requests a \
+             {KERNEL_STATE_BUDGET}-state kernel proof budget for a design with {states} \
+             reachable states; the full kernel obligation remains unproved\""
+        );
+    }
+}
+
 fn names(actions: &[&'static str]) -> String {
     format!(
         "[{}]",
@@ -532,7 +554,9 @@ fn progress_island(index: usize, m: &Model, live: &Liveness) -> Result<(String, 
         )
     };
     let mut text = scalar_model(&design, "design", Style::Protocol)?;
+    kernel_scope(&mut text, "design", committed.states());
     text.push_str(&claim("holds", "design", &live.weak, &live.strong));
+    kernel_scope(&mut text, "holds", committed.states());
     for dropped in live.weak.iter().chain(&live.strong) {
         let keep = |actions: &[&'static str]| -> Vec<&'static str> {
             actions
@@ -556,11 +580,13 @@ fn progress_island(index: usize, m: &Model, live: &Liveness) -> Result<(String, 
         let Ok(isolated) = faithful(&isolated) else {
             continue;
         };
-        text.push_str(&scalar_model(
-            &isolated,
-            &format!("model_with_{mutant}"),
-            Style::Protocol,
-        )?);
+        let model_name = format!("model_with_{mutant}");
+        text.push_str(&scalar_model(&isolated, &model_name, Style::Protocol)?);
+        kernel_scope(
+            &mut text,
+            &model_name,
+            interp::Space::of(&isolated).states(),
+        );
         text.push_str(&claim(
             &format!("fails_mutant_{mutant}"),
             &format!("model_with_{mutant}"),
@@ -661,6 +687,9 @@ fn main() {
             }
         }
         let mut island = scalar_model(model, "design", Style::Protocol).expect("emitted above");
+        // Naming the budget opts small models into the work their actual
+        // proof needs, rather than the compiler's automatic work heuristic.
+        kernel_scope(&mut island, "design", states);
         let _ = write!(
             text,
             "theorem design_safe : safetyVerdict design {states} = CheckVerdict.ok := rfl\n\

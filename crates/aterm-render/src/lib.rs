@@ -5780,6 +5780,22 @@ pub fn continue_chrome_edges(
     }
 }
 
+/// The drop-target overlay's inset border over a `frame_w`×`frame_h` frame, in px: the short side
+/// over 200 within `2..=6`, scaled by `scale_q4` sixteenths (0 keeps it; at least a pixel once
+/// scaled), and at most half the frame on each axis. The CPU presenter and each GPU arm's present
+/// draw their overlay at this width, and the GPU frame oracle's twins hold each arm to it.
+#[inline]
+#[must_use]
+pub fn drop_overlay_border_px(frame_w: usize, frame_h: usize, scale_q4: u8) -> usize {
+    let base = (frame_w.min(frame_h) / 200).clamp(2, 6);
+    let scaled = if scale_q4 == 0 {
+        base
+    } else {
+        (base * usize::from(scale_q4) / 16).max(1)
+    };
+    scaled.min(frame_w / 2).min(frame_h / 2).max(1)
+}
+
 const FONT_DIRS: &[&str] = &[
     #[cfg(target_os = "macos")]
     "Library/Fonts",

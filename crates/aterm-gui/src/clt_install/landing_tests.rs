@@ -746,13 +746,10 @@ fn clt_landing_system_state_shutdown_cannot_republish_a_retired_front_page() {
     assert_eq!(app.messages.live_rows().count(), notices);
 }
 
-/// aterm opens the tab by itself once per account and build on this Mac (design §3.3): its
-/// landing writes this build into the account's mark, and a later launch of the same build that
-/// reads the mark never opens the tab by itself, though its run wants the tools again. Install…
-/// is the way then. Another build's launch, an update's, retries once
-/// ([`aterm_types::clt_mark::opened_on_build`]).
+/// One account episode holds later automatic launches, including updates. Person presses remain
+/// available through the separate explicit path.
 #[test]
-fn clt_landing_opens_the_tab_by_itself_once_per_account_and_build() {
+fn clt_landing_opens_one_automatic_password_episode_per_account() {
     let dir = aterm_tempfile::tempdir().expect("a state directory");
     let mark = dir.path().join("command-line-tools-tab");
     let (mut app, wid) = page();
@@ -771,11 +768,7 @@ fn clt_landing_opens_the_tab_by_itself_once_per_account_and_build() {
     );
 }
 
-/// The account's record is one for both of aterm's own askers: once the follow-up of a package
-/// install or update claimed this build in it (as `aterm init` does right before `sudo` asks), the
-/// automatic tab this launch still wanted opens no more, its opening spent as for a launch that
-/// read the record so, and nothing says the tools are on their way.
-/// NEGATIVE CONTROL: with the record naming only another build, the same launch's tab opens.
+/// A follow-up's attempt holds the GUI before shell booking, including an older build's claim.
 #[test]
 fn clt_landing_the_follow_ups_ask_on_this_build_spends_the_automatic_tab() {
     for asked in [true, false] {
@@ -794,9 +787,12 @@ fn clt_landing_the_follow_ups_ask_on_this_build_spends_the_automatic_tab() {
             "{asked}: read at launch"
         );
         let begun = app.begin_developer_tools_install(aterm);
-        assert_eq!(begun.is_some(), !asked, "{asked}");
-        assert_eq!(app.workstation_setup.developer_tools_mark.opened(), asked);
-        assert_eq!(app.workstation_setup.developer_tools_unfinished, asked);
+        assert!(
+            begun.is_none(),
+            "both current and older attempts hold: {asked}"
+        );
+        assert!(app.workstation_setup.developer_tools_mark.opened());
+        assert!(app.workstation_setup.developer_tools_unfinished);
         if asked {
             assert!(
                 !app.developer_tools_install_due(false),
@@ -846,7 +842,7 @@ fn clt_landing_a_claim_the_follow_up_won_lands_no_tab_and_keeps_its_line() {
             .workstation_setup
             .developer_tools_session
             .iter()
-            .any(|terminal| terminal.spent_mark);
+            .any(|terminal| terminal.claim_owner.is_some());
         if follow_up_asks {
             assert_eq!(tabs(&app), before, "no visible empty install tab");
             assert!(
@@ -886,9 +882,8 @@ fn clt_landing_a_landing_that_failed_after_its_claim_takes_it_back() {
     assert!(!Mark::at(mark).opened(), "taken back");
 }
 
-/// A person's Install… goes whatever the record says, and a tab whose claim added no line (the
-/// follow-up claimed this build first) takes back none: its failure keeps the follow-up's line.
-/// NEGATIVE CONTROL: a pressed tab whose claim added the line takes it back on the same failure.
+/// Explicit Install presses remain available, and failure retains either the older episode or
+/// this press's first consumed episode.
 #[test]
 fn a_pressed_tab_never_takes_back_a_line_it_did_not_add() {
     for follow_up_asked in [true, false] {
@@ -911,11 +906,21 @@ fn a_pressed_tab_never_takes_back_a_line_it_did_not_add() {
         let (landed, read) = land(&mut app, wid, id);
         assert!(landed, "{follow_up_asked}");
         assert_eq!(drain(&read), go_line());
+        if follow_up_asked {
+            // The older automatic child reports no-start after this explicit landing. Its
+            // exact release must not erase the person's now-consumed episode.
+            aterm_types::clt_mark::forget(
+                &aterm_types::clt_mark::Live,
+                &mark,
+                &aterm_stamp::build_id(),
+            )
+            .unwrap();
+            assert!(Mark::at(mark.clone()).opened());
+        }
         app.developer_tools_install_ended(id, Some(aterm_pty::ChildExit::Code(1)));
-        assert_eq!(
+        assert!(
             Mark::at(mark).opened(),
-            follow_up_asked,
-            "{follow_up_asked}: the follow-up's line stays, the tab's own goes"
+            "{follow_up_asked}: an explicit failed attempt also holds automatic retries"
         );
     }
 }
@@ -949,7 +954,7 @@ fn a_tab_whose_program_never_ran_takes_its_opening_back() {
         app.workstation_setup.developer_tools_mark = Mark::at(path.clone());
         app.workstation_setup.developer_tools = Install::Opened;
         let mut terminal = Terminal::running(77, false, None);
-        terminal.spent_mark = spent;
+        terminal.claim_owner = spent.then(aterm_stamp::build_id);
         app.workstation_setup.developer_tools_session = vec![terminal];
         app.workstation_setup.developer_tools_attempt = Some(77);
         app.developer_tools_install_ended(77, Some(end));
@@ -2015,21 +2020,14 @@ fn an_install_that_ended_unfinished_keeps_the_shim_and_ends_its_word_of_an_insta
     }
 }
 
-/// An install whose program said it failed asks again at the next launch by itself where its
-/// landing's claim added the mark, while the tab's other ends keep the account's mark: a person's
-/// Ctrl-C (at the password prompt or later), which the program ends on its stop's own exit, is a
-/// decline, as a closed tab is, and so is Apple's installer window closed without installing them
-/// (a press there), on its own exit.
-/// NEGATIVE CONTROL: a signal (a person closing the tab), a stop and Apple's window closed leave
-/// the mark, and so no launch's want; a failed tab whose claim added none
-/// (`a_pressed_tab_never_takes_back_a_line_it_did_not_add`) leaves it too.
+/// Failed passwords, cancellation and unknown outcomes all retain the durable automatic hold.
 #[test]
-fn a_failed_install_asks_again_at_the_next_launch_and_a_closed_tab_does_not() {
+fn failed_cancelled_and_unknown_attempts_keep_automatic_requests_paused() {
     use aterm_pty::ChildExit;
     let stopped = i32::from(aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_STOPPED);
     let closed = i32::from(aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_WINDOW_CLOSED);
     for (end, asks_again) in [
-        (Some(ChildExit::Code(1)), true),
+        (Some(ChildExit::Code(1)), false),
         (Some(ChildExit::Code(stopped)), false),
         (Some(ChildExit::Code(closed)), false),
         (Some(ChildExit::Signal(1)), false),
@@ -2042,7 +2040,7 @@ fn a_failed_install_asks_again_at_the_next_launch_and_a_closed_tab_does_not() {
         app.workstation_setup.developer_tools_mark = Mark::at(path.clone());
         app.workstation_setup.developer_tools = Install::Opened;
         let mut terminal = Terminal::running(77, false, None);
-        terminal.spent_mark = true;
+        terminal.claim_owner = Some(aterm_stamp::build_id());
         app.workstation_setup.developer_tools_session = vec![terminal];
         app.workstation_setup.developer_tools_attempt = Some(77);
         app.developer_tools_install_ended(77, end);

@@ -601,6 +601,7 @@ fn unread_mail_for_a_macs_old_node_reaches_its_session_once() {
             me: new.node.clone(),
             members: [new.node.clone(), mb.node.clone()].into(),
             moved: [(ma.node.clone(), new.node.clone())].into(),
+            rank: BTreeMap::new(),
             gone: BTreeSet::new(),
         };
         // B's mail for `s-a` at `dst`, as B's push writes it on A's log: under B's producer,
@@ -840,9 +841,11 @@ fn unread_mail_for_a_macs_old_node_reaches_its_session_once() {
         until(&format!("{case}: the late ask moves"), || {
             moved().len() == 2
         });
-        assert!(
-            ma.broker.group_start(&mail_group(&ma.node)) > late,
-            "{case}: the old group passes the late ask"
+        // The old group's commit is its own write, answered after the move lands on the new node,
+        // so it is waited for as the first asks' is above, not read the moment the move shows.
+        until(
+            &format!("{case}: the old group passes the late ask"),
+            || ma.broker.group_start(&mail_group(&ma.node)) > late,
         );
         let held = new.holds(&moved_lane);
         assert_eq!(
@@ -882,6 +885,130 @@ fn unread_mail_for_a_macs_old_node_reaches_its_session_once() {
             "{case}: the late ask's receipt names it as A's log numbers it, not 11"
         );
         drop((routes, served_old));
+    }
+}
+
+/// **UNREAD MAIL UNDER THE NODE A MAC RETIRED LAST REACHES ITS SESSION ONCE** (§11 C3b): A's seat
+/// retired one more node than a ring names, the one it retired last the greatest in node order,
+/// and B's asks to `s-a` wait unread on A's `bus.log` under that node and under the one A retired
+/// first. A's node service moves the mail of the nodes its seat retired last
+/// ([`Handoff::ringed`]) and writes the reader's ring that reads them; A's bridge follows that
+/// ring, whichever nodes it reads, so it delivers the ask under the node retired last once, and
+/// its receipt names the ask by its offset on B, read where the ask came from. The ask under the
+/// node retired first stays on its old group, unread.
+/// NEGATIVE CONTROL: [`crate::federate::NODE_ORDER_RING`], the choice before the second recency
+/// phase: the moves and the reader's ring take the first nodes in node order, so the ask under
+/// the node retired last never reaches `s-a` and its old group holds it, while the one under the
+/// node retired first moves.
+#[test]
+fn unread_mail_under_the_node_a_mac_retired_last_reaches_its_session_once() {
+    use crate::federate::{mail_group, tests::routes_as, NODE_ORDER_RING, RING_OLDS_MAX};
+    for control in [false, true] {
+        let case = format!("control={control}");
+        let (ma, mb) = (Mac::new(55), Mac::new(56));
+        let now = ma.rotated(65);
+        let olds: BTreeSet<String> = (0..=RING_OLDS_MAX)
+            .map(|i| node_of(&key_of(170 + u8::try_from(i).unwrap())))
+            .collect();
+        // Retired in node order: the greatest node last, which node order leaves out.
+        let (first, last) = (
+            olds.first().expect("nine").clone(),
+            olds.last().expect("nine").clone(),
+        );
+        let after = Handoff {
+            me: now.node.clone(),
+            members: [now.node.clone(), mb.node.clone()].into(),
+            moved: olds
+                .iter()
+                .map(|old| (old.clone(), now.node.clone()))
+                .collect(),
+            rank: olds.iter().rev().cloned().zip(0..).collect(),
+            gone: BTreeSet::new(),
+        };
+        // B's ask to `s-a` at `dst`, as B's push writes it on A's log: under B's producer,
+        // numbered by its offset on B.
+        let from_b = |dst: &str, on_b: u64, text: &str| -> u64 {
+            let subject = format!("/f/{FLEET}/in/{dst}/s-a/{}/ask", mb.node);
+            let mut push = ma.client(
+                mb.key,
+                &[format!(
+                    "rw,p={}:/f/{FLEET}/in/{dst}/*/{}/*",
+                    mb.node, mb.node
+                )],
+            );
+            let mut body = Body::new(0);
+            body.from = Some("s-b".to_owned());
+            body.text = text.to_owned();
+            push.publish(pid(&mb.node), on_b, &subject, &body.encode())
+                .expect("B's push lands")
+                .0
+        };
+        let under_last = from_b(&last, 7, "under the last");
+        let under_first = from_b(&first, 8, "under the first");
+        let (moves, stays, stays_at, text) = if control {
+            (&first, &last, under_last, "under the first")
+        } else {
+            (&last, &first, under_first, "under the last")
+        };
+
+        // The node service writes its reader's ring and the hand-off, then starts its pushes.
+        let keys = keys_for(65, Some(&after));
+        NODE_ORDER_RING.with(|on| on.set(control));
+        crate::federate::write_old_reads(keys.path(), &after, &|grant| {
+            Mac::mint(&ma.secret, grant)
+        })
+        .expect("the node service's reader's ring");
+        let net = Arc::new(Net::default());
+        let routes = routes_as(&ma, (&now.node, now.key), &olds, Vec::new(), &net, false);
+        NODE_ORDER_RING.with(|on| on.set(false));
+        routes.set(&after, &BTreeSet::new());
+        let moved_lane = format!("/f/{FLEET}/in/{}/s-a/{}/ask", now.node, mb.node);
+        until(&format!("{case}: the ask under {moves} moves"), || {
+            now.holds(&moved_lane).len() == 1
+                && ma.broker.group_start(&mail_group(moves))
+                    > if control { under_first } else { under_last }
+        });
+        let held = now.holds(&moved_lane);
+        assert_eq!(
+            Body::decode(&held[0].2).0.text,
+            text,
+            "{case}: the ask under the node its ring names"
+        );
+        let copy = held[0].0;
+        assert!(
+            ma.broker.group_start(&mail_group(stays)) <= stays_at,
+            "{case}: the ask under {stays} stays on its old group, unread"
+        );
+
+        let (lane, mut a, _served) = attached(&now, "s-a", keys.path());
+        rounds_until(&format!("{case}: the bridge delivers"), &mut a, || {
+            lane.delivery_offsets() == [copy]
+        });
+        if control {
+            // The one copy is the ask under the node retired first: the one under the node
+            // retired last never reaches s-a.
+            drop(routes);
+            continue;
+        }
+        a.send_receipt(&OwedReceipt {
+            sid: "s-a".to_owned(),
+            rid: 1,
+            off: copy,
+            verdict: "handled".to_owned(),
+            kind: "ask".to_owned(),
+            from: format!("s-b@{}", mb.node),
+            earlier_log: false,
+        })
+        .expect("the receipt goes");
+        let ack = format!("/f/{FLEET}/in/{}/s-b/{}/ack", mb.node, now.node);
+        let receipts = now.holds(&ack);
+        assert_eq!(receipts.len(), 1, "{case}: the receipt is on A's log");
+        assert_eq!(
+            Body::decode(&receipts[0].2).0.re,
+            Some(7),
+            "{case}: the receipt names the ask by its offset on B, read under the ring"
+        );
+        drop(routes);
     }
 }
 
@@ -929,6 +1056,7 @@ fn mail_unread_across_two_rotations_reaches_its_session_once() {
                 .iter()
                 .map(|old| (old.node.clone(), me.node.clone()))
                 .collect(),
+            rank: BTreeMap::new(),
             gone: BTreeSet::new(),
         };
         let generation = |me: &Mac, olds: &[&Mac]| {
@@ -1056,6 +1184,7 @@ fn an_ask_to_a_person_unread_across_two_rotations_names_itself_as_its_senders_ma
                 .iter()
                 .map(|old| (old.node.clone(), me.node.clone()))
                 .collect(),
+            rank: BTreeMap::new(),
             gone: BTreeSet::new(),
         };
         let generation = |me: &Mac, olds: &[&Mac]| {
@@ -1188,6 +1317,7 @@ fn an_ask_from_a_mac_that_rotated_its_key_is_stamped_by_the_push_that_brought_it
                 me: mp.node.clone(),
                 members: [mp.node.clone(), now.node.clone()].into(),
                 moved: moved.into_iter().collect(),
+                rank: BTreeMap::new(),
                 gone: BTreeSet::new(),
             };
             assert_eq!(
@@ -1229,6 +1359,7 @@ fn a_record_the_old_nodes_bridge_delivered_does_not_move() {
             me: new.node.clone(),
             members: [new.node.clone(), mb.node.clone()].into(),
             moved: [(ma.node.clone(), new.node.clone())].into(),
+            rank: BTreeMap::new(),
             gone: BTreeSet::new(),
         };
         // B's mail for `s-a` at `dst`, as B's push writes it on A's log.
@@ -1409,6 +1540,7 @@ fn a_moved_copy_of_what_a_killed_bridge_delivered_names_where_it_was_first() {
             me: new.node.clone(),
             members: [new.node.clone(), mb.node.clone()].into(),
             moved: [(ma.node.clone(), new.node.clone())].into(),
+            rank: BTreeMap::new(),
             gone: BTreeSet::new(),
         };
         let lane_on = |node: &str| format!("/f/{FLEET}/in/{node}/s-a/{}/ask", mb.node);
@@ -1686,6 +1818,7 @@ fn mail_delivered_above_a_held_commit_is_shown_once_across_the_move() {
             me: new.node.clone(),
             members: [new.node.clone(), mb.node.clone()].into(),
             moved: [(ma.node.clone(), new.node.clone())].into(),
+            rank: BTreeMap::new(),
             gone: BTreeSet::new(),
         };
         let lane_on = |node: &str, sid: &str, kind: &str| {
@@ -1898,6 +2031,7 @@ fn a_burst_moved_twice_across_a_second_rotation_is_shown_once() {
             me: mid.node.clone(),
             members: [mid.node.clone(), mb.node.clone()].into(),
             moved: [(ma.node.clone(), mid.node.clone())].into(),
+            rank: BTreeMap::new(),
             gone: BTreeSet::new(),
         };
         let mut lines = Vec::new();
@@ -1944,6 +2078,7 @@ fn a_burst_moved_twice_across_a_second_rotation_is_shown_once() {
                 (mid.node.clone(), last.node.clone()),
             ]
             .into(),
+            rank: BTreeMap::new(),
             gone: BTreeSet::new(),
         };
         let net = Arc::new(Net::default());
@@ -2035,6 +2170,7 @@ fn an_old_nodes_row_held_below_its_lanes_oldest_is_read_there() {
             me: new.node.clone(),
             members: [new.node.clone(), mb.node.clone()].into(),
             moved: [(ma.node.clone(), new.node.clone())].into(),
+            rank: BTreeMap::new(),
             gone: BTreeSet::new(),
         };
         let mut push = ma.client(
@@ -2144,6 +2280,7 @@ fn a_reply_from_where_a_rotation_moved_the_asked_node_is_no_stray() {
             } else {
                 BTreeMap::new()
             },
+            rank: BTreeMap::new(),
             gone: BTreeSet::new(),
         }
         .write(keys.path())
@@ -3286,6 +3423,7 @@ impl Moves {
                 .iter()
                 .map(|old| (old.node.clone(), self.nodes[i].node.clone()))
                 .collect(),
+            rank: BTreeMap::new(),
             gone: BTreeSet::new(),
         }
     }

@@ -112,7 +112,8 @@ impl<S: Schema> fmt::Debug for FoldedRun<S> {
 #[inline]
 #[must_use]
 pub fn empty_chain() -> Digest {
-    Digest::of(OBSERVATION_DOMAIN, &[])
+    static EMPTY: std::sync::OnceLock<Digest> = std::sync::OnceLock::new();
+    *EMPTY.get_or_init(|| Digest::of(OBSERVATION_DOMAIN, &[]))
 }
 
 /// One link of the observation chain.

@@ -20,6 +20,37 @@ fn image_cells(term: &Terminal) -> Vec<(u16, u16, u16, u16)> {
     v
 }
 
+#[test]
+fn kitty_image_over_styled_text_survives_history_rewrap_and_pullback() {
+    for styled in [false, true] {
+        let mut term = Terminal::new(10, 64);
+        term.set_cell_pixel_size(7, 14);
+        if styled {
+            term.process(b"\x1b]8;id=mixed;https://mixed.example\x1b\\\x1b[38;2;12;34;56m\x1b[48;2;65;43;21m");
+        }
+        for row in 1..=8 {
+            term.process(format!("\x1b[{row};1H{}", "x".repeat(64)).as_bytes());
+        }
+        term.process(b"\x1b]8;;\x1b\\\x1b[0m\x1b[2;3H\x1b_Ga=t,f=32,s=1,v=1,i=1,q=2;/wAA/w==\x1b\\\x1b_Ga=p,i=1,p=9,c=4,r=1,q=2\x1b\\\x1b[9;1Hmixed sparse image audit\r\n");
+        let before = image_cells(&term);
+        assert_eq!(before.len(), 4);
+        term.resize(6, 32);
+        let narrow = image_cells(&term);
+        let history_images: usize = term
+            .grid()
+            .checkpoint_lines_bounded(100)
+            .iter()
+            .map(|line| line.image_count())
+            .sum();
+        term.resize(10, 64);
+        assert_eq!(
+            image_cells(&term),
+            before,
+            "styled={styled}, narrow={narrow:?}, captured image spans={history_images}"
+        );
+    }
+}
+
 fn place_card(term: &mut Terminal, args: &str) {
     let payload = [PNG_MAGIC, &[0u8; 16][..]].concat();
     term.process(&osc_1337_file(args, &payload));

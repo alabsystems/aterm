@@ -416,7 +416,7 @@ fn read_notes(file: &str) -> Result<String> {
 /// Usage, `the {op}'s {field} is shaped like a credential; agh journals it as written or not
 /// at all`, next `agh help {verb}`.
 pub(super) fn journaled(inv: &Invocation, op: WriteOp, field: &str, value: &str) -> Result<()> {
-    if crate::redact::Redactor::shapes(value) == value {
+    if crate::redact::Redactor::shapes_cow(value) == value {
         return Ok(());
     }
     Err(inv.usage(format!(

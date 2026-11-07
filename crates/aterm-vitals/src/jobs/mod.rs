@@ -677,6 +677,46 @@ pub struct JobTick {
     /// from then on macOS checks no new program aterm starts (the leftover-processes design's
     /// M13). `None` when not granted or not known.
     pub grant_ms: Option<u64>,
+    /// How each agent call's leader the host watches ended ([`JobRow::leader`]), read since its
+    /// last pass: the kernel's wait status of the process, decoded by the host
+    /// ([`LeaderExit`]). A call whose leader has no line here ends with no status.
+    pub exits: Vec<LeaderExit>,
+}
+
+/// How a process ended, as the kernel's wait status of it says (decoded by the host, which
+/// alone reads the kernel).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ExitOf {
+    /// It exited with this status (`exit(3)`: 3).
+    Code(i32),
+    /// This signal ended it.
+    Signal(i32),
+}
+
+/// The end of a process the host watched ([`JobTick::exits`]): its pid and start, as the job's
+/// leader names them ([`JobRow::leader`]), so a pid taken anew is another process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LeaderExit {
+    /// Its pid.
+    pub pid: u32,
+    /// Its start, as [`JobProc::start`] reads it.
+    pub start: Option<u64>,
+    /// How it ended.
+    pub end: ExitOf,
+}
+
+/// The shells a row may name (`p_comm`, a leading login `-` ignored): an agent call led by one is
+/// its agent's wrapper (`zsh -c …` leads every Claude Code call), not the program it ran.
+const SHELLS: &[&str] = &[
+    "sh", "bash", "zsh", "fish", "dash", "ash", "ksh", "mksh", "oksh", "loksh", "pdksh", "yash",
+    "tcsh", "csh", "nu", "xonsh", "elvish", "ion", "pwsh", "rc", "es",
+];
+
+/// Whether `comm` names a shell (a leading login `-` ignored).
+#[must_use]
+pub fn is_shell_name(comm: &str) -> bool {
+    let name = comm.trim_start_matches('-');
+    SHELLS.contains(&name)
 }
 
 /// One process the host should read in detail.
@@ -715,6 +755,14 @@ pub struct Ended {
     pub ended_ms: u64,
     /// Its exit status, where its block said it.
     pub exit: Option<i32>,
+    /// How an agent call's leader ended, where the host watched it ([`JobTick::exits`]).
+    pub ended_by: Option<ExitOf>,
+    /// The program an agent call ran: its leader's name once that names no shell (the leader
+    /// `exec`ed the program, or the agent ran it with no wrapper), else the last a member other
+    /// than its leader showed, the wrapper's own children first and the wrapper's forks (its
+    /// subshells, named as it is) passed over. `None` where no pass saw one: a call of shell
+    /// builtins alone, or one that ended between passes.
+    pub ran: Option<String>,
     /// The largest lifetime-peak footprint a pass read of a member, bytes.
     pub peak_bytes: Option<u64>,
     /// The most CPU a pass read its members (and the children they reaped) to have spent, ns.

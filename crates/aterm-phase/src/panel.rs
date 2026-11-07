@@ -395,12 +395,13 @@ mod tests {
         assert_eq!(last(&fx::screen(fx::USAGE_SHORT)).trim(), "↓");
     }
 
-    /// THE 2.1.301, 2.1.307 AND 2.1.308 TABS MEASURED IN THE LAB
-    /// (crates/aterm-lab, 2026-10-15 and 2026-10-21), on both renderers: the tab that drew the
-    /// stub's header readings and the enrich error is a panel, a Usage tab
+    /// THE 2.1.301, 2.1.307, 2.1.308 AND 2.1.318 TABS MEASURED IN THE LAB
+    /// (crates/aterm-lab, 2026-10-15, 2026-10-21 and 2026-11-06), on both renderers: the tab that
+    /// drew the stub's header readings and the enrich error is a panel, a Usage tab
     /// and NOT SETTLED, and its last row (`r to retry · Esc to cancel`) is no
     /// tail; the session block alone (no read made) is settled and ends on
-    /// the tail.
+    /// the tail. 2.1.318's week-only tab (no 5h reading, so no `Current session` window) is a
+    /// Usage tab though its rule carries the weekly warning, and one Escape leaves no panel.
     #[test]
     fn the_lab_tabs_read_as_measured() {
         use crate::prompt::fixtures as fx;
@@ -450,6 +451,20 @@ mod tests {
             (
                 "2.1.308 header readings, fullscreen",
                 fx::USAGE_HEADER_READINGS_FULLSCREEN_2_1_308,
+                PanelRenderer::Fullscreen,
+                true,
+                false,
+            ),
+            (
+                "2.1.318 week only, inline",
+                fx::USAGE_WEEK_ONLY_INLINE_2_1_318,
+                PanelRenderer::Inline,
+                true,
+                false,
+            ),
+            (
+                "2.1.318 week only, fullscreen",
+                fx::USAGE_WEEK_ONLY_FULLSCREEN_2_1_318,
                 PanelRenderer::Fullscreen,
                 true,
                 false,
@@ -505,6 +520,10 @@ mod tests {
             (
                 "2.1.308 dismissed, fullscreen",
                 fx::USAGE_DISMISSED_FULLSCREEN_2_1_308,
+            ),
+            (
+                "2.1.318 dismissed, fullscreen",
+                fx::USAGE_DISMISSED_FULLSCREEN_2_1_318,
             ),
         ] {
             assert_eq!(settings_panel(&fx::screen(text)), None, "{what}");

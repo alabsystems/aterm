@@ -134,6 +134,7 @@ pub(super) fn enter(argv: &mut Vec<OsString>) -> Result<Guard, String> {
                 }
                 None => None,
             };
+            aterm_gui::lab_window_custody::retain(&held, memory.as_ref())?;
             return Ok(Guard {
                 held: Some(held),
                 _memory: memory,

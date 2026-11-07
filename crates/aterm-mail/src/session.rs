@@ -23,10 +23,14 @@ pub struct Lease {
 }
 
 pub fn acquire(home: &Path, email: &str) -> Result<Lease, String> {
+    acquire_prefixed(home, "", email)
+}
+
+pub(crate) fn acquire_prefixed(home: &Path, prefix: &str, email: &str) -> Result<Lease, String> {
     #[cfg(unix)]
     {
         const HEX: &[u8; 16] = b"0123456789abcdef";
-        let digest = email_digest(email);
+        let digest = email_digest_prefixed(prefix, email);
         let mut name = [0u8; 69];
         for (i, &b) in digest.iter().enumerate() {
             name[i * 2] = HEX[usize::from(b >> 4)];
@@ -47,7 +51,7 @@ pub fn acquire(home: &Path, email: &str) -> Result<Lease, String> {
     }
     #[cfg(not(unix))]
     {
-        let _ = (home, email);
+        let _ = (home, prefix, email);
         Err("Mail session locking is unavailable on this platform".into())
     }
 }
@@ -125,17 +129,28 @@ fn decode(email: &str, bytes: &[u8]) -> Result<Credentials, String> {
 
 #[cfg(unix)]
 fn email_digest(email: &str) -> [u8; 32] {
+    email_digest_prefixed("", email)
+}
+
+#[cfg(unix)]
+fn email_digest_prefixed(prefix: &str, email: &str) -> [u8; 32] {
     let trimmed = email.trim().as_bytes();
-    if !trimmed.iter().any(u8::is_ascii_uppercase) {
+    if prefix.is_empty() && !trimmed.iter().any(u8::is_ascii_uppercase) {
         return aterm_digest::Sha256::digest(trimmed);
     }
     let mut hasher = aterm_digest::Sha256::new();
-    for chunk in trimmed.chunks(64) {
-        let mut buf = [0u8; 64];
-        for (dst, &src) in buf.iter_mut().zip(chunk) {
-            *dst = src.to_ascii_lowercase();
+    for slice in [prefix.as_bytes(), trimmed] {
+        if !slice.iter().any(u8::is_ascii_uppercase) {
+            hasher.update(slice);
+            continue;
         }
-        hasher.update(&buf[..chunk.len()]);
+        for chunk in slice.chunks(64) {
+            let mut buf = [0u8; 64];
+            for (dst, &src) in buf.iter_mut().zip(chunk) {
+                *dst = src.to_ascii_lowercase();
+            }
+            hasher.update(&buf[..chunk.len()]);
+        }
     }
     hasher.finalize()
 }

@@ -394,7 +394,7 @@ pub fn set_name(
             };
             judge(to.num, held, lab.as_ref(), &fleet, node).map_err(io::Error::other)?;
             let mut next = held.clone();
-            let renumber = current.num != Some(to.num);
+            let renumber = current.num != Some(to.num) || current.class != Class::Chosen;
             if renumber {
                 let latest = view
                     .values()
@@ -409,7 +409,20 @@ pub fn set_name(
                         .checked_add(1)
                         .ok_or_else(|| io::Error::other("the name clock is exhausted"))?,
                 );
-                let claim = renamed(&current, to.num, None, stamp);
+                // Choosing a number this record already holds must not surrender its
+                // evidence rank to a later rival. The existing take chain makes the
+                // explicit claim while preserving that rank, including seeded ranks.
+                let take = if current.num == Some(to.num) && !current.waits {
+                    let generation = current
+                        .tgen
+                        .checked_add(1)
+                        .filter(|generation| *generation < u32::MAX)
+                        .ok_or_else(|| io::Error::other("the name take chain is exhausted"))?;
+                    Some((current.since, current.base_or(node), generation))
+                } else {
+                    None
+                };
+                let claim = renamed(&current, to.num, take, stamp);
                 next.undo = Some(file::Held {
                     num: held.num,
                     class: held.class,
@@ -463,10 +476,12 @@ pub fn set_name(
     .map_err(|e| io::Error::other(e.to_string()))?
 }
 
-/// Whether a rename to `num` moves this Mac's number off `held`'s: a number a migration still
-/// waits on is no claim yet.
+/// Whether selecting `num` makes a new explicit claim: a different number, an automatic or
+/// seeded number not chosen yet, or a number a migration still waits on.
 fn moves(held: &MachineName, num: Number) -> bool {
-    held.num != Some(num) || held.migration == Some(Migration::Waiting)
+    held.num != Some(num)
+        || held.class != Class::Chosen
+        || held.migration == Some(Migration::Waiting)
 }
 
 /// The vault's labels as the pure check keeps them: each number held for another Mac or role,
@@ -555,7 +570,14 @@ fn judge(
              {dialed}.local: name it {num} in the policy's servers first"
         ));
     }
-    let verdict = check(&num.to_string(), fleet, node);
+    let verdict = match check(&num.to_string(), fleet, node) {
+        // Same is a no-op for a chosen number, but selecting a seeded/automatic number
+        // makes a new claim. Its current lab reservation still governs that choice.
+        Verdict::Same if moves(held, num) && lab.is_some_and(|lab| lab.held.contains_key(&num)) => {
+            Verdict::Labelled { by: None }
+        }
+        verdict => verdict,
+    };
     match verdict {
         Verdict::Same | Verdict::Free | Verdict::EarlierName { .. } => Ok(verdict),
         Verdict::TakesAuto { from } => Err(format!("{num} already belongs to {from}")),

@@ -118,7 +118,7 @@ pub(crate) fn begin_with(
                     .argv
                     .iter()
                     .zip(argv)
-                    .any(|(expected, arg)| *expected != Redactor::shapes(arg))
+                    .any(|(expected, arg)| *expected != Redactor::shapes_cow(arg))
             {
                 return Err(Error::replay(
                     Replay::Argv,
@@ -138,7 +138,10 @@ pub(crate) fn begin_with(
             fx.with_source(replay)
         }
         (None, Some(record)) => {
-            if let Some(n) = argv.iter().position(|arg| Redactor::shapes(arg) != *arg) {
+            if let Some(n) = argv
+                .iter()
+                .position(|arg| Redactor::shapes_cow(arg) != *arg)
+            {
                 return Err(Error::usage(format!(
                     "argument {} holds a token shape: a tape of this command line could not \
                      replay",

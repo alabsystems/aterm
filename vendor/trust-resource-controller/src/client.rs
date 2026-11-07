@@ -99,3 +99,12 @@ impl Client {
         }
     }
 }
+
+mod member;
+pub use member::{MemberError, MemberIo, ProxyChild};
+
+mod telemetry;
+pub use telemetry::ReceivedTelemetry;
+
+mod liveness;
+pub use liveness::HostLifeline;

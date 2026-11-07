@@ -129,11 +129,15 @@ fn shown(value: &Value) -> String {
     }
 }
 
-fn tostring(value: &Value) -> String {
+fn tostring_cow(value: &Value) -> std::borrow::Cow<'_, str> {
     match value {
-        Value::String(text) => text.clone(),
-        other => json_text(other),
+        Value::String(text) => std::borrow::Cow::Borrowed(text.as_str()),
+        other => std::borrow::Cow::Owned(json_text(other)),
     }
+}
+
+fn tostring(value: &Value) -> String {
+    tostring_cow(value).into_owned()
 }
 
 fn eval(ast: &Ast, input: &Value, env: Option<&Env<'_>>, out: &mut Vec<Value>) -> Result<()> {
@@ -175,7 +179,7 @@ fn eval(ast: &Ast, input: &Value, env: Option<&Env<'_>>, out: &mut Vec<Value>) -
             let (targets, status) = stream(target, input, env);
             for t in &targets {
                 match items_of(t, None) {
-                    Ok(items) => out.extend(items),
+                    Ok(items) => out.extend(items.cloned()),
                     Err(_) if *opt => {}
                     Err(e) => return Err(e),
                 }
@@ -283,7 +287,7 @@ fn interpolate(
                 let mut next = Vec::with_capacity(texts.len().saturating_mul(values.len()));
                 let mut next_error = None;
                 for value in &values {
-                    let value = tostring(value);
+                    let value = tostring_cow(value);
                     for text in &texts {
                         next.push(format!("{text}{value}"));
                     }
@@ -602,10 +606,33 @@ fn compare(a: &Value, b: &Value) -> Ordering {
     }
 }
 
-fn items_of(value: &Value, what: Option<&str>) -> Result<Vec<Value>> {
+enum IterItems<'a> {
+    Slice(std::slice::Iter<'a, Value>),
+    Map(std::collections::btree_map::Values<'a, String, Value>),
+}
+
+impl<'a> Iterator for IterItems<'a> {
+    type Item = &'a Value;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Slice(iter) => iter.next(),
+            Self::Map(iter) => iter.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Slice(iter) => iter.size_hint(),
+            Self::Map(iter) => iter.size_hint(),
+        }
+    }
+}
+
+fn items_of<'a>(value: &'a Value, what: Option<&str>) -> Result<IterItems<'a>> {
     match value {
-        Value::Array(items) => Ok(items.clone()),
-        Value::Object(map) => Ok(map.values().cloned().collect()),
+        Value::Array(items) => Ok(IterItems::Slice(items.iter())),
+        Value::Object(map) => Ok(IterItems::Map(map.values())),
         other => {
             let who = what.map_or(String::new(), |what| format!("{what} "));
             Err(runtime(&format!(
@@ -658,10 +685,10 @@ fn first_truthy<'v>(obj: &'v Map, names: &[&str]) -> Option<&'v Value> {
 fn from_entries(input: &Value) -> Result<Value> {
     let mut map = Map::new();
     for entry in items_of(input, Some("from_entries"))? {
-        let Value::Object(obj) = &entry else {
+        let Value::Object(obj) = entry else {
             return Err(runtime(&format!(
                 "from_entries wants objects, not {}",
-                type_name(&entry)
+                type_name(entry)
             )));
         };
         let key = match first_truthy(obj, &["key", "Key", "name", "Name", "k", "K"]) {
@@ -684,11 +711,16 @@ fn from_entries(input: &Value) -> Result<Value> {
     Ok(Value::Object(map))
 }
 
-fn any_all(items: &[Value], f: Option<&Ast>, env: Option<&Env<'_>>, want: bool) -> Result<bool> {
+fn any_all(
+    mut items: IterItems<'_>,
+    f: Option<&Ast>,
+    env: Option<&Env<'_>>,
+    want: bool,
+) -> Result<bool> {
     let Some(f) = f else {
         // Same answer as the loop below: `want` on the first item whose
         // truthiness is `want`, else `!want` (`any` wants true, `all` false).
-        let hit = items.iter().any(|item| truthy(item) == want);
+        let hit = items.any(|item| truthy(item) == want);
         return Ok(if hit { want } else { !want });
     };
     for item in items {
@@ -728,7 +760,7 @@ fn call(
             let mut mapped = Vec::new();
             if let Some(f) = args.first() {
                 for item in items_of(input, Some("map"))? {
-                    eval(f, &item, env, &mut mapped)?;
+                    eval(f, item, env, &mut mapped)?;
                 }
             }
             out.push(Value::Array(mapped));
@@ -845,7 +877,7 @@ fn call(
                 let items = items_of(input, Some("join"))?;
                 let sep = string_of(sep, "join")?;
                 let mut joined = String::new();
-                for (i, item) in items.iter().enumerate() {
+                for (i, item) in items.enumerate() {
                     if i > 0 {
                         joined.push_str(sep);
                     }
@@ -942,7 +974,7 @@ fn call(
         Func::Add => {
             let mut sum = Value::Null;
             for item in items_of(input, Some("add"))? {
-                sum = add(&sum, &item)?;
+                sum = add(&sum, item)?;
             }
             out.push(sum);
         }
@@ -950,7 +982,7 @@ fn call(
             let name = if func == Func::Any { "any" } else { "all" };
             let items = items_of(input, Some(name))?;
             out.push(Value::Bool(any_all(
-                &items,
+                items,
                 args.first(),
                 env,
                 func == Func::Any,
@@ -1075,10 +1107,10 @@ fn format(name: &str, input: &Value) -> Result<String> {
             Ok(out)
         }
         "json" => Ok(json_text(input)),
-        "base64" => aterm_codec::base64::encode(tostring(input).as_bytes())
+        "base64" => aterm_codec::base64::encode(tostring_cow(input).as_bytes())
             .map_err(|e| runtime(&format!("@base64: {e}"))),
         "base64d" => {
-            let text: String = tostring(input)
+            let text: String = tostring_cow(input)
                 .chars()
                 .filter(|c| !c.is_ascii_whitespace())
                 .collect();

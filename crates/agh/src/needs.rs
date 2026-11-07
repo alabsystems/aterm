@@ -279,17 +279,23 @@ pub fn list(dirs: &Dirs) -> std::io::Result<Vec<Need>> {
 fn read_need(judged: &aterm_uds::private_file::JudgedDir<'_>, name: &str) -> Option<Need> {
     use aterm_json::Value;
     let bytes = judged.read(name, NEED_MAX).ok()?;
-    let value: Value = aterm_json::from_slice(&bytes).ok()?;
-    if value.get("v").and_then(Value::as_u64) != Some(1) {
+    let Value::Object(mut map) = aterm_json::from_slice(&bytes).ok()? else {
+        return None;
+    };
+    if map.get("v").and_then(Value::as_u64) != Some(1) {
         return None;
     }
-    let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_string);
+    let at_secs = map.get("at_secs").and_then(Value::as_u64)?;
+    let mut take_text = |key: &str| match map.remove(key)? {
+        Value::String(s) => Some(s),
+        _ => None,
+    };
     Some(Need {
-        key: text("key")?,
-        what: text("what")?,
-        why: text("why")?,
-        then: text("then")?,
-        at_secs: value.get("at_secs").and_then(Value::as_u64)?,
+        key: take_text("key")?,
+        what: take_text("what")?,
+        why: take_text("why")?,
+        then: take_text("then")?,
+        at_secs,
     })
 }
 

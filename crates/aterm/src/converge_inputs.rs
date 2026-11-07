@@ -5,11 +5,12 @@
 //! Reuse the existing one-second lane; metadata gates private token/inventory reads.
 
 use aterm_machines::init_github::{
-    RepositoryInputMark, repository_input_mark, repository_input_watch_paths,
+    RepositoryCheckoutMetadata, RepositoryInputMark, RepositoryInputPathCache,
+    repository_input_mark,
 };
 use aterm_machines::port::{Live, System};
 use aterm_secrets::client::Paths;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::PathBuf;
 
@@ -31,11 +32,20 @@ struct Policy {
 struct Metadata {
     files: Vec<(PathBuf, Version)>,
     admission: Admission,
+    checkouts: Option<RepositoryCheckoutMetadata>,
 }
 
 impl Metadata {
-    fn read(sys: &dyn System, paths: &Paths) -> Result<Self, String> {
-        let files: Vec<_> = repository_input_watch_paths(sys)?
+    fn read(
+        sys: &dyn System,
+        paths: &Paths,
+        previous: Option<&RepositoryInputMark>,
+        control: &mut RepositoryInputPathCache,
+    ) -> Result<(Self, bool), String> {
+        let observed = control.observe(sys)?;
+        let prefix: BTreeMap<_, _> = observed.prefix_facts.into_iter().collect();
+        let files: Vec<_> = observed
+            .paths
             .into_iter()
             .map(|path| {
                 let version = sys.file_version(&path).map_err(|why| why.kind());
@@ -52,20 +62,28 @@ impl Metadata {
         let admission = directories
             .into_iter()
             .map(|path| {
-                let policy = sys
-                    .stat(path)
+                let policy = prefix
+                    .get(path)
+                    .copied()
+                    .unwrap_or_else(|| sys.stat(path).map_err(|why| why.kind()))
                     .map(|stat| Policy {
                         uid: stat.uid,
                         gid: stat.gid,
                         mode: stat.mode,
                         dir: stat.dir,
                         symlink: stat.symlink,
-                    })
-                    .map_err(|why| why.kind());
+                    });
                 (path.to_path_buf(), policy)
             })
             .collect();
-        Ok(Self { files, admission })
+        Ok((
+            Self {
+                files,
+                admission,
+                checkouts: previous.map(|mark| mark.checkout_metadata(sys)),
+            },
+            observed.reusable,
+        ))
     }
 }
 
@@ -74,6 +92,7 @@ struct Inputs {
     metadata: Option<Metadata>,
     seen: Option<RepositoryInputMark>,
     held: bool,
+    control: RepositoryInputPathCache,
 }
 
 impl Inputs {
@@ -83,6 +102,7 @@ impl Inputs {
             metadata: None,
             seen: None,
             held: !allowed,
+            control: RepositoryInputPathCache::default(),
         };
         if allowed {
             let _ = inputs.changed(sys, true);
@@ -95,10 +115,12 @@ impl Inputs {
             self.held = true;
             return false;
         }
-        let Ok(metadata) = Metadata::read(sys, &self.paths) else {
+        let Ok((mut metadata, reusable)) =
+            Metadata::read(sys, &self.paths, self.seen.as_ref(), &mut self.control)
+        else {
             return false;
         };
-        if !self.held && self.metadata.as_ref() == Some(&metadata) {
+        if reusable && !self.held && self.metadata.as_ref() == Some(&metadata) {
             return false;
         }
         let Ok(mark) = repository_input_mark(sys) else {
@@ -110,6 +132,9 @@ impl Inputs {
                 .metadata
                 .as_ref()
                 .is_none_or(|prev| prev.admission != metadata.admission);
+        // Retain the state captured with the semantic scope. Resampling after capture could
+        // cache a later repair next to an earlier mark and swallow that repair on the next tick.
+        metadata.checkouts = Some(mark.captured_checkout_metadata());
         self.metadata = Some(metadata);
         self.seen = Some(mark);
         self.held = false;
@@ -143,6 +168,7 @@ pub(super) fn observe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aterm_machines::init_github::repository_input_watch_paths;
     use aterm_machines::model::User;
     use aterm_machines::port::{Fake, Stat};
     use std::sync::Arc;
@@ -343,7 +369,9 @@ mod tests {
             );
         }
         sys.stat_of(parent.to_str().unwrap(), Live::new().stat(&parent).unwrap());
-        let metadata = Metadata::read(&sys, &paths).unwrap();
+        let metadata = Metadata::read(&sys, &paths, None, &mut RepositoryInputPathCache::default())
+            .unwrap()
+            .0;
         let mut inputs = Inputs::new(&sys, &paths, true);
         assert!(!inputs.changed(&sys, true), "blocked but unchanged");
 
@@ -352,7 +380,13 @@ mod tests {
         assert!(client::materialization_ready(&paths).unwrap());
         assert_eq!(std::fs::metadata(&token).unwrap().ino(), before.ino());
         sys.stat_of(parent.to_str().unwrap(), Live::new().stat(&parent).unwrap());
-        assert_eq!(metadata.files, Metadata::read(&sys, &paths).unwrap().files);
+        assert_eq!(
+            metadata.files,
+            Metadata::read(&sys, &paths, None, &mut RepositoryInputPathCache::default())
+                .unwrap()
+                .0
+                .files
+        );
         assert!(inputs.changed(&sys, true), "path admission repaired");
         assert!(!inputs.changed(&sys, true), "one wake for the repair");
         let mut policy = Live::new().stat(&parent).unwrap();
@@ -393,20 +427,37 @@ mod tests {
         let token = format!("{}/.secrets/gh_access_token", user.home);
         let inventory = format!("{}/.secrets/github-repositories.json", user.home);
         let helper = format!("{}/.local/bin/aterm", user.home);
+        let profile = format!("{}/.config/aterm/init.toml", user.home);
+        file(&profile, b"");
         file(&token, b"inert_token_one");
         file(
             &inventory,
-            br#"{"schema":2,"account":"fixture","repositories":[]}"#,
+            br#"{"schema":2,"account":"fixture","repositories":[{"id":1,"name":"code","owner":{"login":"fixture"},"full_name":"fixture/code","clone_url":"https://github.com/fixture/code.git","private":true,"default_branch":"main"}]}"#,
         );
+        let directory = Stat {
+            uid: user.uid,
+            gid: user.gid,
+            mode: 0o700,
+            dir: true,
+            symlink: false,
+            len: 0,
+        };
+        sys.stat_of(&user.home, directory);
+        for parent in std::path::Path::new(&profile).ancestors().skip(1) {
+            sys.stat_of(parent.to_str().unwrap(), directory);
+        }
+        let checkout = format!("{}/code", user.home);
+        sys.stat_of(&checkout, directory);
         file(&helper, b"helper one");
         file(aterm_machines::items::github::CLT_GIT, b"git one");
         let private_reads = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&private_reads);
         sys.on_owned_read(move |_, path| {
-            if path
-                .file_name()
-                .is_some_and(|name| name == "gh_access_token" || name == "github-repositories.json")
-            {
+            if path.file_name().is_some_and(|name| {
+                name == "gh_access_token"
+                    || name == "github-repositories.json"
+                    || name == "init.toml"
+            }) {
                 counted.fetch_add(1, Ordering::SeqCst);
             }
         });
@@ -421,6 +472,29 @@ mod tests {
             0,
             "metadata gates private reads"
         );
+        sys.stat_of(&format!("{checkout}/.git"), directory);
+        assert!(
+            inputs.changed(&sys, true),
+            "an externally completed checkout is useful input"
+        );
+        private_reads.store(0, Ordering::SeqCst);
+        assert!(!inputs.changed(&sys, true));
+        assert_eq!(
+            private_reads.load(Ordering::SeqCst),
+            0,
+            "cached checkout scope gates private reads too"
+        );
+        file(&format!("{checkout}/working.txt"), b"unrelated work");
+        assert!(
+            !inputs.changed(&sys, true),
+            "ordinary worktree content is not observed"
+        );
+        file(&format!("{checkout}/.git/config"), b"repaired origin");
+        assert!(
+            inputs.changed(&sys, true),
+            "in-place Git identity repair is useful input"
+        );
+        assert!(!inputs.changed(&sys, true));
         for (path, bytes) in [
             (token.as_str(), b"inert_token_two".as_slice()),
             (helper.as_str(), b"helper two".as_slice()),
@@ -444,8 +518,83 @@ mod tests {
             !inputs.changed(&sys, true),
             "unrelated settings do not recreate a source change"
         );
+        let selected = format!("{}/selected-token", user.home);
+        file(&selected, b"selected_token_one");
+        let scoped = format!("[github]\naccount='fixture'\ntoken_file='{selected}'\n");
+        file(&profile, scoped.as_bytes());
+        assert!(
+            inputs.changed(&sys, true),
+            "a profile retarget is current input"
+        );
+        assert!(!inputs.changed(&sys, true));
         private_reads.store(0, Ordering::SeqCst);
-        file(&token, b"inert_token_new");
+        file(&token, b"old_unselected_token");
+        assert!(!inputs.changed(&sys, true), "old token paths retire");
+        assert_eq!(private_reads.load(Ordering::SeqCst), 0);
+        file(&selected, b"selected_token_two");
+        assert!(
+            inputs.changed(&sys, true),
+            "new token path remains observed"
+        );
+        let parent = std::path::Path::new(&profile).parent().unwrap();
+        sys.stat_of(
+            parent.to_str().unwrap(),
+            Stat {
+                mode: 0o770,
+                ..directory
+            },
+        );
+        assert!(inputs.changed(&sys, true));
+        assert!(!inputs.changed(&sys, true));
+        sys.stat_of(parent.to_str().unwrap(), directory);
+        assert!(
+            inputs.changed(&sys, true),
+            "unchanged-leaf parent admission repairs wake"
+        );
+        assert!(!inputs.changed(&sys, true));
+        let replacement = format!("{}/replacement-token", user.home);
+        file(&replacement, b"replacement_token_one");
+        let replacement_profile =
+            format!("[github]\naccount='fixture'\ntoken_file='{replacement}'\n").into_bytes();
+        let change_once = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        sys.on_owned_read({
+            let profile = profile.clone();
+            let change_once = Arc::clone(&change_once);
+            move |sys, path| {
+                if path == std::path::Path::new(&profile)
+                    && change_once.swap(false, Ordering::SeqCst)
+                {
+                    sys.file(&profile, &replacement_profile).stat_of(
+                        &profile,
+                        Stat {
+                            uid: 501,
+                            gid: 20,
+                            mode: 0o600,
+                            dir: false,
+                            symlink: false,
+                            len: replacement_profile.len() as u64,
+                        },
+                    );
+                }
+            }
+        });
+        file(
+            &profile,
+            format!("{scoped}# new selection read\n").as_bytes(),
+        );
+        assert!(
+            inputs.changed(&sys, true),
+            "a raced profile read is recaptured, not relabeled"
+        );
+        assert!(!inputs.changed(&sys, true));
+        file(&replacement, b"replacement_token_two");
+        assert!(
+            inputs.changed(&sys, true),
+            "the raced-in selection remains observable"
+        );
+        assert!(!inputs.changed(&sys, true));
+        private_reads.store(0, Ordering::SeqCst);
+        file(&replacement, b"inert_token_new");
         assert!(!inputs.changed(&sys, false), "Stop/off holds the observer");
         assert_eq!(private_reads.load(Ordering::SeqCst), 0);
         assert!(

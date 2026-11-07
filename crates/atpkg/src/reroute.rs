@@ -622,7 +622,9 @@ pub const EXPLICIT_LANE_VERBS: &[&str] = &["trust", "--unverified"];
 /// The program `aterm pkg install` names for `targo`, the tool an explicit lane runs.
 pub const EXPLICIT_LANE_PROGRAM: &str = "trust";
 
-/// Cargo queries that take no lane: an installed `targo` answers them with no line.
+/// Cargo queries that take no lane: an installed `targo` answers them with no line. This steers
+/// lane choice only; which verbs owe no build cache ownership is a separate list, judged by what
+/// each writes (`build_cache::registered`, `docs/DECISION-atpkg-output-free-verbs-2026-11-06.md`).
 pub const LANE_FREE_QUERIES: &[&str] = &["metadata", "locate-project", "version", "--version"];
 
 /// The one line printed when `cargo trust …`/`cargo --unverified …` runs `targo`.

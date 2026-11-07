@@ -378,6 +378,14 @@ fn cargo_in_a_session_gets_the_cache_only_where_it_builds_and_reads_it() {
     assert_eq!(run("trust", &["check"], &[]), "check\n");
     assert_eq!(
         run("trust", &["build", "--unverified"], &[]),
-        format!("--config\n{config}\nbuild\n--unverified\n")
+        format!(
+            "--config\n{config}\n{}\nbuild\n{}\n--unverified\n",
+            atpkg::build_cache::TEST_GRAPH_CONFIG.join("\n"),
+            atpkg::build_cache::TEST_GRAPH_FLAG,
+        )
+    );
+    assert_eq!(
+        run("trust", &["build", "--unverified", "--release"], &[]),
+        format!("--config\n{config}\nbuild\n--unverified\n--release\n")
     );
 }

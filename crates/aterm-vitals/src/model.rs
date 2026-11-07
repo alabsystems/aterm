@@ -2097,9 +2097,12 @@ impl ResourceView {
 
     /// A row of `first` and its `second` series, if it has one. The second binds where its share
     /// of its capacity now is the larger; where neither share is known, where its finite raw
-    /// "now" is the larger, the rule [`Self::busier_columns`] takes each column by, so the
-    /// amount, the deck's no-heat fill and the lens's words name the series its trace draws (the
-    /// R3 lens fixes' review, 2026-11-06).
+    /// "now" is the larger (the R3 lens fixes' review, 2026-11-06). That is the rule
+    /// [`Self::busier_columns`] takes each column by, over another window: this binds on each
+    /// series' 10 s "now", a column on its minute's mean. So the amount, the deck's arrow and
+    /// no-heat fill and the lens's words name the direction the trace's newest column draws while
+    /// each direction's rate holds through the minute; within a minute whose busier direction
+    /// flips, that column can be the other direction's (the second review, 2026-11-06).
     fn of(first: Series, second: Option<Series>, ring_k: i64, over: bool, basis: CapBasis) -> Self {
         let a = heat_of(first.now, first.capacity);
         let b = second.as_ref().and_then(|s| heat_of(s.now, s.capacity));
@@ -6298,10 +6301,12 @@ mod tests {
     /// cooler where the other series' largest reading is the larger share. With no capacity, the
     /// series whose raw mean is the larger, with no heat; a one-series row's are its columns. With
     /// capacities far apart (receiving 100, sending 10) a column's tick never stands below it.
-    /// NEGATIVE CONTROLS: the larger raw figure takes sending's minute in column 0; each figure
-    /// from the series it is the larger share of (the R3 fix as first built) takes sending's
-    /// largest reading in column 0 and, against the far-apart capacities, ticks 7 under a column
-    /// of 50 and 9 under one of 30.
+    /// With no capacity, where one series' mean is the larger and the other's largest reading, the
+    /// column is the larger mean's minute. NEGATIVE CONTROLS: the larger raw figure takes
+    /// sending's minute in column 0; each figure from the series it is the larger share of (the
+    /// R3 fix as first built) takes sending's largest reading in column 0 and, against the
+    /// far-apart capacities, ticks 7 under a column of 50 and 9 under one of 30; with no capacity,
+    /// the larger raw max takes the minute of 5 (largest 20) beside one of 8 (largest 10).
     #[test]
     fn busier_columns_take_each_column_from_its_busier_series() {
         let k = 1_000_000_i64;
@@ -6401,6 +6406,19 @@ mod tests {
             "the minute of the larger raw mean with no capacity"
         );
         assert!(heat.iter().all(|h| h.heat.is_none() && h.max.is_none()));
+        // The larger raw mean in one series and the larger raw max in the other, each way round
+        // (the second review, 2026-11-06): the column is the mean's minute.
+        let mean_or_max = |first: (f64, f64), second: (f64, f64)| {
+            let rx: Arc<[Cell]> = vec![cell(Some(first), 0.0), cell(Some(second), 0.0)].into();
+            let tx: Arc<[Cell]> = vec![cell(Some(second), 0.0), cell(Some(first), 0.0)].into();
+            let (cells, _) = view(&rx, &tx, None, None).busier_columns(10, 2, now);
+            cells.iter().map(|c| (c.mean, c.max)).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            mean_or_max((5.0, 20.0), (8.0, 10.0)),
+            [(Some(8.0), Some(10.0)), (Some(8.0), Some(10.0))],
+            "the minute of the larger raw mean, not of the larger raw max"
+        );
         let one = ResourceView {
             second: None,
             ..view(&rx, &tx, Some(10.0), None)
@@ -6454,8 +6472,9 @@ mod tests {
 
     /// The R3 lens fixes' review (2026-11-06): where neither series' share is known, the second
     /// binds where its finite raw "now" is the larger, the rule `busier_columns` takes each column
-    /// by, so the amount, the deck's no-heat fill and the Network lens's Traffic line name the
-    /// series its trace draws. Read through [`Vitals::absorb`] in the first day of learning, on a
+    /// by on its minute's mean, so with rates that hold through the minute, as here, the amount,
+    /// the deck's no-heat fill and the Network lens's Traffic line name the series its trace's
+    /// newest column draws. Read through [`Vitals::absorb`] in the first day of learning, on a
     /// link that reports no speed: sending 14 MB/s against receiving's 2.1 binds; Processes with
     /// no limits read keeps all, whose count yours never passes; equal figures keep the first.
     /// NEGATIVE CONTROL: the old arm, which bound the first series whenever no share was known,

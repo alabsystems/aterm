@@ -1085,16 +1085,24 @@ impl RouteChanges {
                 Some(false) => return false,
                 None => return wait_out(),
             }
-            match self.drain() {
-                Some(true) => {
-                    let burst = std::time::Instant::now() + BURST;
-                    while self.readable(burst) == Some(true) && self.drain().is_some() {}
-                    return true;
-                }
+            match self.read_waiting() {
+                Some(true) => return true,
                 Some(false) => {}
                 None => return wait_out(),
             }
         }
+    }
+
+    /// Read what a poll found waiting, and the rest of its burst when it named a change of
+    /// network: whether one did. `None` when the socket failed, so a caller that polls it beside
+    /// another descriptor waits out its own time rather than polling a failed socket again at once.
+    pub fn read_waiting(&self) -> Option<bool> {
+        let changed = self.drain()?;
+        if changed {
+            let burst = std::time::Instant::now() + BURST;
+            while self.readable(burst) == Some(true) && self.drain().is_some() {}
+        }
+        Some(changed)
     }
 
     /// Whether a message is waiting by `deadline`; `None` when poll(2) failed otherwise than

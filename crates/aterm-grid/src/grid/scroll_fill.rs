@@ -25,11 +25,15 @@ pub(crate) fn fill_row_into(row: &mut Row, line: &Line, cols: u16) -> ScrolledRo
     };
     let filled = fill_row_cells(row, text, line, cols, &mut |_, extra| match extra {
         RestoredExtra::CombiningMarks(col, marks) => {
-            extras
-                .combining
-                .push((col, aterm_alloc::SmallVec::from_slice(&marks)));
+            extras.combining.push((col, marks.chars().collect()));
         }
-        RestoredExtra::ComplexChar(col, s) => extras.complex_chars.push((col, s)),
+        RestoredExtra::ComplexChar(col, s) => extras.complex_chars.push((col, Arc::from(s))),
+        RestoredExtra::NonBmpChar(col, ch) => {
+            let mut encoded = [0; 4];
+            extras
+                .complex_chars
+                .push((col, Arc::from(&*ch.encode_utf8(&mut encoded))));
+        }
         RestoredExtra::RgbFg(col, rgb) => extras.rgb_fg.push((col, rgb)),
         RestoredExtra::RgbBg(col, rgb) => extras.rgb_bg.push((col, rgb)),
     });
@@ -121,25 +125,32 @@ impl Grid {
         self.storage.extras.maybe_shrink();
     }
 
-    /// Fill a row whose old extras have already been removed by its caller.
-    pub(super) fn fill_row_from_line_cleared(&mut self, row_idx: u16, line: &Line, cols: u16) {
+    /// Fill a row whose visible extras are clear; report restored owned text storage.
+    pub(super) fn fill_row_from_line_cleared(
+        &mut self,
+        row_idx: u16,
+        line: &Line,
+        cols: u16,
+    ) -> bool {
+        let mut owned_text = false;
         let Some(text) = line.as_str() else {
             if let Some(row) = self.row_mut(row_idx) {
                 row.clear();
                 row.set_wrapped(line.is_wrapped());
             }
-            return;
+            return false;
         };
 
         let filled = {
             if row_idx >= self.storage.visible_rows {
-                return;
+                return false;
             }
             let Some(idx) = self.storage.row_index(row_idx) else {
-                return;
+                return false;
             };
+            let visible_rows = self.storage.visible_rows;
             let Some(row) = self.storage.rows.get_mut(idx) else {
-                return;
+                return false;
             };
             let extras = &mut self.storage.cursor_state.extras;
             row.clear();
@@ -147,7 +158,7 @@ impl Grid {
                 if let Some(cell) = row.get_mut(extra.col()) {
                     cell.set_has_extras(true);
                 }
-                apply_row_extra(extras, row_idx, extra);
+                apply_row_extra(extras, row_idx, visible_rows, cols, extra, &mut owned_text);
             });
             row.set_wrapped(line.is_wrapped());
             filled
@@ -231,6 +242,7 @@ impl Grid {
         }
 
         self.mirror_wide_spacer_extras(row_idx);
+        owned_text
     }
 
     pub(super) fn stamp_row_image_spans(
@@ -282,19 +294,16 @@ impl Grid {
         let Some(r) = self.storage.rows.get(idx) else {
             return;
         };
-        let cells = r.as_slice();
-        let mut pairs: aterm_alloc::SmallVec<(u16, u16), 4> = aterm_alloc::SmallVec::new();
-        for i in 1..cells.len() {
-            if !super::scroll_convert::is_spacer(cells, i) {
+        let len = r.as_slice().len();
+        for i in 1..len {
+            // Rendition mirroring does not change wide/spacer flags, so later
+            // pairs can be read directly after each earlier pair is updated.
+            if !super::scroll_convert::is_spacer(self.storage.rows[idx].as_slice(), i) {
                 continue;
             }
             let (Ok(lead), Ok(spacer)) = (u16::try_from(i - 1), u16::try_from(i)) else {
                 break;
             };
-            pairs.push((lead, spacer));
-        }
-
-        for (lead, spacer) in pairs {
             let fg = self.storage.extras.fg_rgb_for(row_idx, lead);
             let bg = self.storage.extras.bg_rgb_for(row_idx, lead);
             let underline = self
@@ -313,6 +322,12 @@ impl Grid {
                 .get(CellCoord::new(row_idx, spacer))
                 .and_then(crate::CellExtra::underline_color_u32)
                 .is_some();
+            if (fg.is_none() || have_fg)
+                && (bg.is_none() || have_bg)
+                && (underline.is_none() || have_underline)
+            {
+                continue;
+            }
             let dst = self.storage.cell_extra_mut(row_idx, spacer);
             if fg.is_some() && !have_fg {
                 dst.set_fg_rgb(fg);
@@ -328,22 +343,25 @@ impl Grid {
 }
 
 #[cfg_attr(test, derive(Debug, PartialEq))]
-enum RestoredExtra {
+enum RestoredExtra<'a> {
     /// Combining marks on a BMP base, attached via `add_combining`.
-    CombiningMarks(u16, aterm_alloc::SmallVec<char, 4>),
-    /// Non-BMP / ZWJ sequence: store as complex char string.
-    ComplexChar(u16, Arc<str>),
+    CombiningMarks(u16, &'a str),
+    /// Multi-scalar grapheme: the consumer stores its owned complex string.
+    ComplexChar(u16, &'a str),
+    /// A single non-BMP scalar fits the existing dense character ring.
+    NonBmpChar(u16, char),
     /// RGB foreground color from scrollback Line attrs.
     RgbFg(u16, [u8; 3]),
     /// RGB background color from scrollback Line attrs.
     RgbBg(u16, [u8; 3]),
 }
 
-impl RestoredExtra {
+impl RestoredExtra<'_> {
     const fn col(&self) -> u16 {
         match self {
             Self::CombiningMarks(col, _)
             | Self::ComplexChar(col, _)
+            | Self::NonBmpChar(col, _)
             | Self::RgbFg(col, _)
             | Self::RgbBg(col, _) => *col,
         }
@@ -352,12 +370,12 @@ impl RestoredExtra {
 
 /// Lay out cells, emitting each extra after its cell is written so the consumer
 /// can mark that cell and store the payload without retaining a batch.
-fn fill_row_cells(
+fn fill_row_cells<'a>(
     row: &mut Row,
-    text: &str,
-    line: &Line,
+    text: &'a str,
+    line: &'a Line,
     cols: u16,
-    sink: &mut impl FnMut(&mut Row, RestoredExtra),
+    sink: &mut impl FnMut(&mut Row, RestoredExtra<'a>),
 ) -> u16 {
     if let Some(filled) = fill_ascii_row_cells(row, text, line, cols, sink) {
         return filled;
@@ -368,12 +386,12 @@ fn fill_row_cells(
 /// Printable ASCII with ordinary cell widths needs no grapheme walk. Restrict
 /// the whole line to the row's width, so the test is bounded and a following
 /// combining character cannot change the last cell we restore.
-fn fill_ascii_row_cells(
+fn fill_ascii_row_cells<'a>(
     row: &mut Row,
-    text: &str,
-    line: &Line,
+    text: &'a str,
+    line: &'a Line,
     cols: u16,
-    sink: &mut impl FnMut(&mut Row, RestoredExtra),
+    sink: &mut impl FnMut(&mut Row, RestoredExtra<'a>),
 ) -> Option<u16> {
     use crate::{CellFlags, PackedColor, PackedColors};
     use aterm_scrollback::CellAttrs;
@@ -434,12 +452,12 @@ fn fill_ascii_row_cells(
     Some(col)
 }
 
-fn fill_row_cells_general(
+fn fill_row_cells_general<'a>(
     row: &mut Row,
-    text: &str,
-    line: &Line,
+    text: &'a str,
+    line: &'a Line,
     cols: u16,
-    sink: &mut impl FnMut(&mut Row, RestoredExtra),
+    sink: &mut impl FnMut(&mut Row, RestoredExtra<'a>),
 ) -> u16 {
     use crate::{CellFlags, PackedColor};
 
@@ -484,15 +502,18 @@ struct LineCellStyle {
     flags: crate::CellFlags,
 }
 
-fn place_line_cell(
+// Keep the scalar decision inside each row-fill specialization rather than
+// passing a row and returning a staged extra through a call for every cell.
+#[inline(always)]
+fn place_line_cell<'a>(
     row: &mut Row,
     col: u16,
     cols: u16,
-    unit_str: &str,
+    unit_str: &'a str,
     chars_consumed: usize,
     style: &LineCellStyle,
     is_wide: bool,
-) -> (u16, Option<RestoredExtra>) {
+) -> (u16, Option<RestoredExtra<'a>>) {
     let c = super::scroll_materialize::char_at(unit_str, 0);
     let base_is_bmp = (c as u32) <= Cell::MAX_DIRECT_CODEPOINT;
 
@@ -507,14 +528,24 @@ fn place_line_cell(
     } else if combining_only {
         let new_col = set_cell(row, col, cols, c, style, is_wide);
         let extra = if new_col > col {
-            let marks: aterm_alloc::SmallVec<char, 4> = unit_str[c.len_utf8()..].chars().collect();
-            Some(RestoredExtra::CombiningMarks(col, marks))
+            Some(RestoredExtra::CombiningMarks(
+                col,
+                &unit_str[c.len_utf8()..],
+            ))
         } else {
             None
         };
         (new_col, extra)
     } else {
-        set_complex_cell(row, col, cols, unit_str, style, is_wide)
+        let new_col = set_complex_cell(row, col, cols, style, is_wide);
+        let extra = (new_col > col).then_some({
+            if chars_consumed == 1 {
+                RestoredExtra::NonBmpChar(col, c)
+            } else {
+                RestoredExtra::ComplexChar(col, unit_str)
+            }
+        });
+        (new_col, extra)
     }
 }
 
@@ -540,14 +571,7 @@ fn set_cell(row: &mut Row, col: u16, cols: u16, c: char, s: &LineCellStyle, is_w
     }
 }
 
-fn set_complex_cell(
-    row: &mut Row,
-    col: u16,
-    cols: u16,
-    unit_str: &str,
-    s: &LineCellStyle,
-    is_wide: bool,
-) -> (u16, Option<RestoredExtra>) {
+fn set_complex_cell(row: &mut Row, col: u16, cols: u16, s: &LineCellStyle, is_wide: bool) -> u16 {
     use crate::CellFlags;
     let flags = if is_wide {
         s.flags.union(CellFlags::WIDE)
@@ -563,34 +587,40 @@ fn set_complex_cell(
             col + 1,
             Cell::with_style(' ', s.fg, s.bg, flags.wide_continuation_of()),
         );
-        (
-            col.saturating_add(2),
-            Some(RestoredExtra::ComplexChar(col, Arc::from(unit_str))),
-        )
+        col.saturating_add(2)
     } else if is_wide {
-        (col, None)
+        col
     } else {
         row.set(col, cell);
-        (
-            col.saturating_add(1),
-            Some(RestoredExtra::ComplexChar(col, Arc::from(unit_str))),
-        )
+        col.saturating_add(1)
     }
 }
 
-fn apply_row_extra(extras: &mut CellExtras, row_idx: u16, extra: RestoredExtra) {
+fn apply_row_extra(
+    extras: &mut CellExtras,
+    row_idx: u16,
+    visible_rows: u16,
+    cols: u16,
+    extra: RestoredExtra<'_>,
+    owned_text: &mut bool,
+) {
     match extra {
+        RestoredExtra::NonBmpChar(col, ch) => {
+            extras.set_complex_char_ring(row_idx, col, ch, visible_rows, cols);
+        }
         RestoredExtra::CombiningMarks(col, marks) => {
             extras.modify(CellCoord::new(row_idx, col), |entry| {
-                for mark in marks {
+                for mark in marks.chars() {
                     entry.add_combining(mark);
                 }
+                *owned_text |= entry.combining().len() > 2;
             });
         }
         RestoredExtra::ComplexChar(col, s) => {
             extras.modify(CellCoord::new(row_idx, col), |entry| {
-                entry.set_complex_char(Some(s))
+                entry.refill_complex_char(s)
             });
+            *owned_text = true;
         }
         RestoredExtra::RgbFg(col, rgb) => {
             extras.modify(CellCoord::new(row_idx, col), |entry| {
@@ -658,6 +688,38 @@ mod tests {
     }
 
     #[test]
+    fn scalar_ring_and_owned_graphemes_replace_without_stale_payloads() {
+        let mut grid = Grid::new(2, 8);
+        grid.restore_visible_from_lines(&[Line::from("👩‍💻"), Line::from("guard")]);
+        let old = Arc::downgrade(grid.extras().complex_char_arc_for(0, 0).unwrap());
+        grid.restore_visible_from_lines(&[Line::from("👩‍💻"), Line::from("guard")]);
+        assert!(std::sync::Weak::ptr_eq(
+            &old,
+            &Arc::downgrade(grid.extras().complex_char_arc_for(0, 0).unwrap())
+        ));
+        grid.restore_visible_from_lines(&[Line::from("👨‍💻"), Line::from("guard")]);
+        assert!(old.upgrade().is_none());
+        let old = Arc::downgrade(grid.extras().complex_char_arc_for(0, 0).unwrap());
+        grid.restore_visible_from_lines(&[Line::from("😀𐐀"), Line::from("guard")]);
+        assert!(old.upgrade().is_none());
+        assert_eq!(grid.row_text(0).as_deref(), Some("😀𐐀"));
+        assert_eq!(grid.complex_char_at(0, 0), Some('😀'));
+        assert_eq!(grid.complex_char_at(0, 2), Some('𐐀'));
+        assert!(grid.extras().complex_char_arc_for(0, 0).is_none());
+        grid.fill_row_from_line(0, &Line::from("👩‍💻"), 8);
+        assert_eq!(grid.row_text(0).as_deref(), Some("👩‍💻"));
+        assert_eq!(grid.complex_char_at(0, 2), None);
+        let replaced = Arc::downgrade(grid.extras().complex_char_arc_for(0, 0).unwrap());
+        grid.fill_row_from_line(0, &Line::from("plain"), 8);
+        assert!(replaced.upgrade().is_none());
+        for col in 0..8 {
+            assert_eq!(grid.complex_char_at(0, col), None);
+        }
+        assert_eq!(grid.row_text(0).as_deref(), Some("plain"));
+        assert_eq!(grid.row_text(1).as_deref(), Some("guard"));
+    }
+
+    #[test]
     fn replacing_a_styled_row_with_plain_text_releases_excess_storage() {
         let cols = 80_u16;
         let attrs = CellAttrs::new(
@@ -694,6 +756,7 @@ mod tests {
         );
         for text in [
             "ASCII",
+            "😀𐐀👩‍💻e\u{301}",
             "e\u{301}日👩‍💻Z",
             "日e\u{301}\u{302}\u{303}\u{304}\u{305}X",
         ] {

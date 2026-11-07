@@ -103,11 +103,11 @@ fn live_uuids(session: &Session<'_>) -> Result<BTreeSet<String>> {
         .collect())
 }
 
-/// The label a row of this Mac carries: the membership log's, else the vault roster's row for this
+/// The migration label a row of this Mac carries: its historical roster label, else the log's
 /// Mac's own recipient, the first that is a label. Nothing else names a Mac here: a host name is
 /// not an identity, however it reads.
 pub(super) fn chosen_label(logged: Option<String>, roster: Option<String>) -> Option<String> {
-    [logged, roster]
+    [roster, logged]
         .into_iter()
         .flatten()
         .find_map(|label| Label::parse(&label).ok())
@@ -168,6 +168,101 @@ fn quiet(outcome: Outcome) -> Registered {
         findings: Vec::new(),
         records: 0,
     }
+}
+
+/// Copy the legacy label snapshot once. The source marker is appended last, so a quota stop
+/// can resume the existing idempotent importer; after completion even owner edits stay put.
+fn roster_migration(
+    session: &Session<'_>,
+    scope: Scope,
+    table: &typed::Table,
+    view: &View,
+    now_ms: u64,
+) -> Result<Vec<Vec<crate::database::Change>>> {
+    use super::{
+        import,
+        registry::{MACHINE, SOURCE},
+    };
+    use crate::typed::cell::{self, CellKey, CellValue};
+    use aterm_json::json;
+    const MARKER: &[u8] = b"aterm/alab/roster-label-migration/1";
+    let marker = keys::source_pk(MARKER);
+    if cell::project(&SOURCE, &view.cells)
+        .rows
+        .contains_key(&marker)
+    {
+        return Ok(Vec::new());
+    }
+    let Some(roster) = aterm_secrets::client::historical_swarm_roster(session.paths())
+        .map_err(crate::table::failure)?
+    else {
+        return Ok(Vec::new());
+    };
+    if roster.members.is_empty() {
+        return Ok(Vec::new());
+    }
+    struct LabelsOnly;
+    impl import::Vendors for LabelsOnly {
+        fn mark(&self, _provider: &str, _cell: &str, _notes: &str) -> import::Mark {
+            import::Mark::Absent
+        }
+    }
+    let macs = super::command::known_macs_from_roster(&roster);
+    let name = format!("{}/{}", table.application, table.role);
+    let sealer = crate::att::sealer(&name, session, scope)?;
+    let input = import::Input {
+        sheets: &[],
+        macs: &macs,
+        vendors: &LabelsOnly,
+        sealer: &sealer,
+        now_ms,
+        births: true,
+        unread: &[],
+    };
+    let plan = import::plan(&input, &view.cells)?;
+    // The importer leaves owner corrections intact and records source disagreements. A
+    // disputed label never grants membership and must not stop unrelated Macs registering.
+    let mut rows = plan.rows;
+    let machines = view.project(&MACHINE);
+    for change in rows.iter_mut().flatten() {
+        if change.collection == MACHINE.name
+            && let Ok(key) = CellKey::parse(&change.key)
+            && key.col == "status"
+            && !machines.rows.contains_key(key.pk)
+            && let Some(value) = change
+                .value
+                .as_mut()
+                .and_then(aterm_json::Value::as_object_mut)
+        {
+            value.insert("x".into(), json!("planned"));
+        }
+    }
+    let mut completed = Vec::new();
+    for (col, x) in [
+        ("kind", json!("swarm-roster")),
+        ("name", json!("one-mesh roster label migration")),
+        (
+            "sha256",
+            json!(aterm_codec::hex::encode_lower(
+                &aterm_digest::Sha256::digest(MARKER)
+            )),
+        ),
+        ("rows", json!(macs.len())),
+        ("at", json!(now_ms)),
+        (typed::LIFECYCLE, json!("live")),
+    ] {
+        completed.push(cell::change(
+            &SOURCE,
+            CellKey {
+                pk: &marker,
+                col,
+                elem: None,
+            },
+            &CellValue::automatic(SOURCE.version, x),
+        )?);
+    }
+    rows.push(completed);
+    Ok(rows)
 }
 
 /// The plan for this Mac over a complete read of the registry.
@@ -401,18 +496,40 @@ impl Registry {
             descriptor(compiled),
             |session, store, scope| {
                 session.writer()?;
-                let log = Log::read_with(session, store, scope, decode)?;
+                let mut log = Log::read_with(session, store, scope, decode)?;
                 log.writable(session.actor())?;
-                let view = View::read(compiled.table, session, &log);
+                let mut view = View::read(compiled.table, session, &log);
                 if !view.complete {
                     return Ok(quiet(Outcome::Incomplete));
+                }
+                let mut migrated = 0;
+                if heard {
+                    let rows = roster_migration(session, scope, compiled.table, &view, now_ms)?;
+                    for changes in pack(rows)? {
+                        if !quota_room(session, &log, &view, 0) {
+                            return Ok(Registered {
+                                outcome: Outcome::QuotaSpent,
+                                findings: Vec::new(),
+                                records: migrated,
+                            });
+                        }
+                        let request =
+                            typed::request_id(APPLICATION, compiled.table.role, &changes)?;
+                        let command = Command::Write { request, changes };
+                        if log.retry(session.actor(), &command)?.is_none() {
+                            application::append(session, store, &command.encode()?)?;
+                            migrated += 1;
+                            log = Log::read_with(session, store, scope, decode)?;
+                            view = View::read(compiled.table, session, &log);
+                        }
+                    }
                 }
                 let plan = planned(session, trust, &view, probe, heard, now_ms)?;
                 if plan.changes.is_empty() {
                     return Ok(Registered {
                         outcome: plan.outcome,
                         findings: plan.findings,
-                        records: 0,
+                        records: migrated,
                     });
                 }
                 let request = typed::request_id(APPLICATION, compiled.table.role, &plan.changes)?;
@@ -424,21 +541,21 @@ impl Registry {
                     return Ok(Registered {
                         outcome: plan.outcome,
                         findings: plan.findings,
-                        records: 0,
+                        records: migrated,
                     });
                 }
                 if !quota_room(session, &log, &view, 0) {
                     return Ok(Registered {
                         outcome: Outcome::QuotaSpent,
                         findings: plan.findings,
-                        records: 0,
+                        records: migrated,
                     });
                 }
                 application::append(session, store, &command.encode()?)?;
                 Ok(Registered {
                     outcome: plan.outcome,
                     findings: plan.findings,
-                    records: 1,
+                    records: migrated + 1,
                 })
             },
         )
@@ -674,7 +791,7 @@ impl Registry {
 
     /// Append `records` as this Mac, one record each (tests drive owner edits, births and
     /// owned rows with it).
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     pub fn write(&self, records: Vec<Vec<crate::database::Change>>) -> Result<()> {
         let compiled = self.generation();
         application::with_store(

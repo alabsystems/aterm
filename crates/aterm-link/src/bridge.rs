@@ -1461,9 +1461,14 @@ pub struct Bridge {
     /// mail this log held unread for one to this node's inbox (`federate::Lane::Inbox`).
     old_nodes: BTreeSet<String>,
     /// The reads of those nodes' mail lanes the node service minted this bridge
-    /// (`federate::OLD_READS_FILE`), each one `federate::old_reads` names and no other: where the
-    /// record each moved one came from lies ([`Bridge::wire_re`]).
+    /// (`federate::OLD_READS_FILE`), each the read of one of them (`federate::old_read`), at most
+    /// `federate::RING_OLDS_MAX`, and no other grant: where the record each moved one came from
+    /// lies ([`Bridge::wire_re`]).
     old_reads: Vec<Cap>,
+    /// The nodes of [`Bridge::old_nodes`] that [`Bridge::old_reads`] reads: the ones the node
+    /// service chose (`federate::ringed`), whose unread mail it moves here, so this bridge follows
+    /// its choice rather than making its own.
+    read_olds: BTreeSet<String>,
     /// With the mesh on, the held topics this bridge last named on its node's topics face
     /// ([`Bridge::say_held_topics`]); `None` until it names them on this attach.
     topics_said: Option<BTreeSet<String>>,
@@ -2007,6 +2012,7 @@ impl Bridge {
             unrouted: None,
             old_nodes: BTreeSet::new(),
             old_reads: Vec::new(),
+            read_olds: BTreeSet::new(),
             topics_said: None,
             topics_refused: false,
             inc: 0,
@@ -11591,11 +11597,15 @@ impl Bridge {
     }
 
     /// Read again which nodes this Mac held before ([`Bridge::old_nodes`]) and the reads of their
-    /// mail lanes ([`Bridge::old_reads`]): with the mesh on, the hand-off's retired nodes whose
-    /// seat is this node, and of the node service's reader's ring the reads of theirs; none while
-    /// either cannot be read. The hand-off is read again only where its file changed, and the
-    /// ring only where this Mac has retired nodes.
+    /// mail lanes ([`Bridge::old_reads`], [`Bridge::read_olds`]): with the mesh on, the
+    /// hand-off's retired nodes whose seat is this node, and of the node service's reader's ring
+    /// each read of one of theirs, at most `federate::RING_OLDS_MAX` (the most this bridge's
+    /// reader attaches beside its node ring); none while either cannot be read. The ring names
+    /// the nodes the node service moves the unread mail of, whichever it chose, so this bridge
+    /// reads back the ones it moved. The hand-off is read again only where its file changed, and
+    /// the ring only where this Mac has retired nodes.
     fn refresh_old_nodes(&mut self) {
+        self.read_olds.clear();
         let Some(root) = self.cfg.mesh.as_ref().map(|mesh| mesh.root.clone()) else {
             self.old_nodes.clear();
             self.old_reads.clear();
@@ -11611,15 +11621,24 @@ impl Bridge {
             self.old_reads.clear();
             return;
         }
-        let wanted = crate::federate::old_reads(&self.old_nodes);
+        let wanted: BTreeMap<String, &String> = self
+            .old_nodes
+            .iter()
+            .map(|old| (crate::federate::old_read(old), old))
+            .collect();
         let file = root.join(crate::federate::OLD_READS_FILE);
-        self.old_reads = read_cap_file(&file.to_string_lossy())
-            .map(|ring| {
-                ring.into_iter()
-                    .filter(|cap| wanted.contains(&cap.grant))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut reads = Vec::new();
+        for cap in read_cap_file(&file.to_string_lossy()).unwrap_or_default() {
+            let Some(old) = wanted.get(&cap.grant) else {
+                continue;
+            };
+            if self.read_olds.len() < crate::federate::RING_OLDS_MAX
+                && self.read_olds.insert((*old).clone())
+            {
+                reads.push(cap);
+            }
+        }
+        self.old_reads = reads;
     }
 
     /// Whether `node` is this Mac's: its node, or one it held before a key rotation.
@@ -11696,7 +11715,7 @@ impl Bridge {
             return Ok(None);
         }
         self.refresh_old_nodes();
-        for old in self.old_nodes.iter().take(crate::federate::RING_OLDS_MAX) {
+        for old in &self.read_olds {
             let filter = match sid {
                 Some(sid) => format!("/f/{}/in/{old}/{sid}/>", self.cfg.fleet),
                 None => subject::inbox_filter(&self.cfg.fleet, old),
@@ -11896,7 +11915,7 @@ impl Bridge {
         at: u64,
         addr: &subject::InAddr,
     ) -> io::Result<Option<Option<(u64, u64)>>> {
-        for old in self.old_nodes.iter().take(crate::federate::RING_OLDS_MAX) {
+        for old in &self.read_olds {
             let lane = format!(
                 "/f/{}/in/{old}/{}/{}/{}",
                 self.cfg.fleet,

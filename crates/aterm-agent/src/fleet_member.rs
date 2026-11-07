@@ -1894,15 +1894,24 @@ fn join_with_denial_deadline(
     // Automatic joins solicit numeric endpoints before trying cached names.
     // The vault's current log selects candidates; register_with still proves
     // the answering node and the fleet before accepting its book.
-    if opts.synced.is_some()
-        && opts.adverts.is_none()
-        && let Ok(hints) = crate::lan_members::probe(Duration::from_millis(500))
-    {
-        let mut direct: Vec<_> = hints
-            .into_iter()
-            .filter(|hint| log.as_ref().is_some_and(|keys| keys.admits(&hint.key)))
-            .map(|hint| (hint.address.ip().to_string(), hint.address.port()))
-            .collect();
+    let native = std::cell::RefCell::new(
+        (opts.synced.is_some() && opts.adverts.is_none())
+            .then(|| crate::lan_members::Probe::start(Duration::from_millis(500)).ok())
+            .flatten(),
+    );
+    if let Some(probe) = native.borrow_mut().as_mut() {
+        // A foreign first reply cannot finish candidate discovery. The current log
+        // selects addresses; registration still authenticates the answering node.
+        let mut direct = loop {
+            let batch = probe.first().unwrap_or_default();
+            if batch.is_empty() {
+                break Vec::new();
+            }
+            let eligible = admitted_native_places(batch, log.as_deref());
+            if !eligible.is_empty() {
+                break eligible;
+            }
+        };
         direct.extend(
             dials
                 .into_iter()
@@ -2028,6 +2037,21 @@ fn join_with_denial_deadline(
     .map_err(failed)
     .inspect_err(|_| say(&out))?;
     let keys = Keyring::read(&places.state);
+    let remaining_native = |until| {
+        let mut remaining = native
+            .borrow_mut()
+            .as_mut()
+            .and_then(|probe| probe.complete(until).ok())
+            .map(|hints| admitted_native_places(hints, log.as_deref()))
+            .unwrap_or_default();
+        remaining.retain(|place| !dials.contains(place));
+        remaining
+    };
+    let native_callback = if native.borrow().is_some() {
+        Some(&remaining_native as &RemainingRegistration<'_>)
+    } else {
+        None
+    };
     let (joined, at, issuer_key) = match register_with(
         &dials,
         (&secret, &me),
@@ -2035,12 +2059,15 @@ fn join_with_denial_deadline(
         (&denied, log.as_deref()),
         &registration,
         reservation.is_some(),
-        &|| {
-            if browsed {
-                Vec::new()
-            } else {
-                advertised_places(opts, &dials)
-            }
+        &RegistrationFallback {
+            native: native_callback,
+            advertised: &|| {
+                if browsed {
+                    Vec::new()
+                } else {
+                    advertised_places(opts, &dials)
+                }
+            },
         },
     ) {
         Ok(registered) => registered,
@@ -2491,6 +2518,19 @@ fn join_with_denial_deadline(
     // `aterm fleet peers` would say the same.
     out.push_str(&void_grants(places).unwrap_or_default());
     Ok(out)
+}
+
+/// Unsigned numeric replies are eligible only for keys admitted by this join's
+/// current log. They remain route hints until register_at proves the peer.
+fn admitted_native_places(
+    hints: Vec<crate::lan_members::Hint>,
+    log: Option<&member::MemberKeys>,
+) -> Vec<(String, u16)> {
+    hints
+        .into_iter()
+        .filter(|hint| log.is_some_and(|keys| keys.admits(&hint.key)))
+        .map(|hint| (hint.address.ip().to_string(), hint.address.port()))
+        .collect()
 }
 
 /// What a [`join`]'s key write found and did.
@@ -3107,6 +3147,15 @@ fn bound_issuer(
     }
 }
 
+type RegistrationTargets = Vec<(String, u16)>;
+type RemainingRegistration<'a> = dyn Fn(Instant) -> RegistrationTargets + 'a;
+
+/// Later native candidates remain ahead of retained names and the name browse.
+struct RegistrationFallback<'a> {
+    native: Option<&'a RemainingRegistration<'a>>,
+    advertised: &'a dyn Fn() -> RegistrationTargets,
+}
+
 /// The join's registration with the first of `dials` whose member records it (any member does,
 /// F17): the answer, where it answered and the key it proved. One that answers another key than
 /// the book binds its node to, proves no node the book binds a key to, or is an aterm before 0.147
@@ -3118,7 +3167,7 @@ fn register_with(
     (denied, log): (&[String], Option<&member::MemberKeys>),
     registration: &Registration,
     place_reserved: bool,
-    more: &dyn Fn() -> Vec<(String, u16)>,
+    more: &RegistrationFallback<'_>,
 ) -> Result<(member::Joined, IpAddr, Option<NodeKey>), JoinFailed> {
     // Only another node's proof there is evidence the place is taken: nothing answering, another
     // secret or this machine's own listener registers as before.
@@ -3141,13 +3190,48 @@ fn register_with(
     let deadline = after_now(join_within());
     // The first place's failure is the one the report names: the place named, or heard last.
     let mut first = None;
-    // The places it knows, then, once none of them answered, those members advertise.
+    // Numeric known places, the complete queued native union, retained names, then
+    // advertised places. A native round cannot hide behind an unresolved known name.
+    // Without a native round the person's original known order is unchanged.
+    let mut native = None;
     let mut advertised = None;
-    let mut known = dials.iter().cloned();
+    let mut known = dials
+        .iter()
+        .filter(|(host, _)| more.native.is_none() || host.parse::<IpAddr>().is_ok())
+        .cloned();
+    let mut names = dials
+        .iter()
+        .filter(|(host, _)| more.native.is_some() && host.parse::<IpAddr>().is_err())
+        .cloned();
+    let mut seen = dials.to_vec();
     while let Some((host, port)) = known
         .next()
-        .or_else(|| advertised.get_or_insert_with(|| more().into_iter()).next())
+        .or_else(|| {
+            native
+                .get_or_insert_with(|| {
+                    more.native
+                        .map_or_else(Vec::new, |next| next(deadline))
+                        .into_iter()
+                })
+                .next()
+        })
+        .or_else(|| names.next())
+        .or_else(|| {
+            advertised
+                .get_or_insert_with(|| {
+                    if Instant::now() >= deadline {
+                        return Vec::new().into_iter();
+                    }
+                    let mut found = (more.advertised)();
+                    found.retain(|place| !seen.contains(place));
+                    found.into_iter()
+                })
+                .next()
+        })
     {
+        if !seen.contains(&(host.clone(), port)) {
+            seen.push((host.clone(), port));
+        }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() && first.is_some() {
             break;
@@ -3645,6 +3729,17 @@ fn named_here(
     what: &str,
     unread: Option<&Missed>,
 ) -> Result<Option<Peer>, String> {
+    if let Some(node) = registry_label_node(places, what)? {
+        return Ok(book
+            .iter()
+            .find(|peer| peer.node.as_deref() == Some(&node))
+            .cloned()
+            .or_else(|| {
+                member::bound_peers(&places.state)
+                    .into_iter()
+                    .find(|peer| peer.node.as_deref() == Some(&node))
+            }));
+    }
     // Before any count: one read off a copy the issuer could not confirm may miss a member.
     if let Some(issuer) = loosely_named_issuer(places, book, what)?
         && (unread.is_some() || uncopied_issuer(places, book).is_some())
@@ -4986,8 +5081,8 @@ fn roster_identities(places: &Places) -> Result<Vec<member::PeerIdentity>, Strin
 }
 
 /// This machine's own node, where `word` names it ([`member::names_node`]). Also matches `[fleet]
-/// machine` in aterm.toml, the locally assigned primary name, and this machine's non-denied
-/// swarm roster label or alias.
+/// machine` in aterm.toml and the locally assigned primary name. A registry label uses the
+/// two-sided binding before any older roster or signed primary name can name this machine.
 fn names_this_machine(places: &Places, word: &str) -> Result<Option<String>, String> {
     let Some(own) = own_node(places) else {
         return Ok(None);
@@ -5001,6 +5096,9 @@ fn names_this_machine(places: &Places, word: &str) -> Result<Option<String>, Str
     let word = word.trim();
     if word.is_empty() {
         return Ok(None);
+    }
+    if let Some(node) = registry_label_node(places, word)? {
+        return Ok((node == own).then_some(own));
     }
     let vault_paths = vault_paths_for(places);
     if vault_paths
@@ -7607,7 +7705,380 @@ fn host_word(places: &Places, what: &str, unread: Option<&Missed>) -> Result<Str
     if member::is_node_word(what) {
         return Ok(what.to_owned());
     }
+    if let Some(node) = registry_label_node(places, what)? {
+        return Ok(node);
+    }
     host_word_among(places, what, unread, &roster_identities(places)?)
+}
+
+/// A registry label is authority only where its owner cell and the seat's signed facts
+/// agree. Transport ids from an older book are selected by key, never by a host name.
+fn registry_label_node(places: &Places, word: &str) -> Result<Option<String>, String> {
+    let Some(label) = registry_label(word) else {
+        return Ok(None);
+    };
+    registry_target(places, &label).map(|seat| seat.map(|seat| seat.transport))
+}
+
+fn registry_label(word: &str) -> Option<String> {
+    aterm_db::machines::Label::parse(word)
+        .ok()
+        .map(|label| label.canonical())
+}
+
+/// The standing seat a person named. Secrets receives the actor, never resolves a label by
+/// itself. An explicit node id needs no registry; a label needs both registry and signed facts.
+struct RegistryTarget {
+    actor: aterm_secrets::membership_log::MemberId,
+    node: String,
+    name: String,
+    transport: String,
+}
+
+fn registry_target(places: &Places, word: &str) -> Result<Option<RegistryTarget>, String> {
+    let explicit = member::is_node_id(word);
+    let label = if explicit { None } else { registry_label(word) };
+    if !explicit && label.is_none() {
+        return Ok(None);
+    }
+    let word = label.as_deref().unwrap_or(word);
+    let Some(paths) = vault_paths_for(places) else {
+        return Ok(None);
+    };
+    let registry = (!explicit)
+        .then(|| aterm_db::alab::Registry::at(paths.clone()).view())
+        .transpose()
+        .map_err(|why| format!("{word}: registry unread: {why}"))?;
+    if registry.as_ref().is_some_and(|view| !view.complete) {
+        return Err(format!(
+            "{word}: registry history incomplete; use a node id"
+        ));
+    }
+    let records = aterm_secrets::client::load_acknowledged_and_ahead(&paths)
+        .map_err(|why| format!("{word}: membership unread: {why}"))?;
+    let Some(log) = records.acknowledged.log() else {
+        return Err(format!("{word}: no acknowledged membership; use a node id"));
+    };
+    let facts = registry
+        .as_ref()
+        .and_then(|view| view.owned.get(aterm_db::alab::registry::MACHINE_FACTS.name));
+    let book = member::bound_peers(&places.state);
+    let own = own_identity(places);
+    let mut claims = Vec::new();
+    for (actor, seat) in log.membership().members() {
+        let Some(key) = seat.node_key.map(NodeKey::from_bytes) else {
+            continue;
+        };
+        if !crate::fleet_log::log_member_keys(log).admits(&key) {
+            continue;
+        }
+        if records
+            .ahead
+            .as_ref()
+            .and_then(|store| store.log())
+            .is_some_and(|ahead| !crate::fleet_log::log_member_keys(ahead).admits(&key))
+        {
+            continue;
+        }
+        let uuid = aterm_codec::hex::encode_lower(seat.binding.machine());
+        let mac = facts
+            .and_then(|facts| facts.rows.get(&uuid))
+            .and_then(|row| row.value.get("mac"))
+            .and_then(aterm_json::Value::as_str);
+        claims.push(LabelSeat {
+            actor: *actor,
+            node: member::node_principal(key)[2..].to_owned(),
+            name: seat.name.clone(),
+            mac: mac.map(str::to_owned),
+            transport: own
+                .as_ref()
+                .filter(|identity| identity.key() == key)
+                .map(|identity| identity.node().to_owned())
+                .or_else(|| {
+                    book.iter()
+                        .find(|peer| peer.key == Some(key))
+                        .and_then(|peer| peer.node.clone())
+                })
+                .unwrap_or_else(|| member::node_principal(key)),
+        });
+    }
+    let transport = if explicit {
+        let matches: Vec<_> = claims
+            .iter()
+            .filter(|seat| seat.transport == word || format!("n-{}", seat.node) == word)
+            .collect();
+        let [seat] = matches.as_slice() else {
+            return Err(format!(
+                "{word}: no unique standing seat binds this node id"
+            ));
+        };
+        seat.transport.clone()
+    } else {
+        let registry = registry
+            .as_ref()
+            .ok_or_else(|| format!("{word}: registry unread"))?;
+        let machines =
+            aterm_db::typed::cell::project(&aterm_db::alab::registry::MACHINE, &registry.cells);
+        resolve_registry_label(word, &machines, &claims)?
+    };
+    let seat = claims
+        .iter()
+        .find(|seat| seat.transport == transport)
+        .ok_or_else(|| format!("{word}: resolved seat is absent"))?;
+    let target = RegistryTarget {
+        actor: seat.actor,
+        node: format!("n-{}", seat.node),
+        name: seat.name.clone(),
+        transport,
+    };
+    eprintln!(
+        "target={word} node={} log_name={} actor={} transport={}",
+        target.node,
+        aterm_codec::tty::one_line(&target.name, 80),
+        aterm_codec::hex::encode_lower(&target.actor),
+        target.transport
+    );
+    Ok(Some(target))
+}
+
+struct LabelSeat {
+    actor: aterm_secrets::membership_log::MemberId,
+    node: String,
+    name: String,
+    mac: Option<String>,
+    transport: String,
+}
+
+fn resolve_registry_label(
+    word: &str,
+    machines: &aterm_db::typed::cell::Projection,
+    seats: &[LabelSeat],
+) -> Result<String, String> {
+    use aterm_json::Value;
+    let rows: Vec<_> = machines
+        .rows
+        .iter()
+        .filter(|(_, row)| {
+            row.live()
+                && row.fields.get("label").is_some_and(|field| {
+                    field
+                        .candidates_x()
+                        .iter()
+                        .any(|value| value.as_str() == Some(word))
+                })
+        })
+        .collect();
+    let sides = || {
+        let rows = rows
+            .iter()
+            .map(|(pk, row)| {
+                let nodes = row.fields.get("node").map(|field| {
+                    field
+                        .candidates_x()
+                        .into_iter()
+                        .filter_map(Value::as_str)
+                        .filter(|node| aterm_codec::hex::is_lower(node, 16))
+                        .collect::<Vec<_>>()
+                        .join("|")
+                });
+                format!(
+                    "{pk} node={}",
+                    nodes
+                        .as_deref()
+                        .filter(|nodes| !nodes.is_empty())
+                        .unwrap_or("unset-or-invalid")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let seats = seats
+            .iter()
+            .map(|seat| {
+                format!(
+                    "n-{} name={} mac={}",
+                    seat.node,
+                    aterm_codec::tty::one_line(&seat.name, 80),
+                    seat.mac.as_deref().unwrap_or("unset")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{word}: registry [{rows}]; signed seats [{seats}]")
+    };
+    let [(pk, row)] = rows.as_slice() else {
+        return Err(format!(
+            "{}; label is absent or ambiguous; use a node id",
+            sides()
+        ));
+    };
+    if ["label", "node"].iter().any(|column| {
+        row.raw.contains(*column)
+            || row
+                .fields
+                .get(*column)
+                .is_none_or(aterm_db::typed::cell::Field::conflicted)
+    }) {
+        return Err(format!(
+            "{}; label binding is missing or conflicted",
+            sides()
+        ));
+    }
+    let node = row.get("node").and_then(Value::as_str);
+    let agreeing: Vec<_> = seats
+        .iter()
+        .filter(|seat| Some(seat.node.as_str()) == node && seat.mac.as_deref() == Some(pk.as_str()))
+        .collect();
+    if agreeing.len() != 1
+        || seats
+            .iter()
+            .filter(|seat| Some(seat.node.as_str()) == node)
+            .count()
+            != 1
+        || seats
+            .iter()
+            .filter(|seat| seat.mac.as_deref() == Some(pk.as_str()))
+            .count()
+            != 1
+    {
+        return Err(format!(
+            "{}; registry and seat disagree; use a node id",
+            sides()
+        ));
+    }
+    Ok(agreeing[0].transport.clone())
+}
+
+#[cfg(test)]
+mod registry_label_tests {
+    use super::*;
+    use aterm_db::typed::cell::{Candidate, CellValue, Field, Projection, Row};
+    use aterm_json::json;
+
+    fn field(value: &str) -> Field {
+        Field::Value(Candidate {
+            operation: [1; 32],
+            value: CellValue::owner(2, json!(value)),
+        })
+    }
+
+    fn registry() -> Projection {
+        let mut rows = Projection::default();
+        rows.rows.insert(
+            "mc-0000000000000007".into(),
+            Row {
+                fields: [
+                    ("label".into(), field("m7")),
+                    ("node".into(), field("0123456789abcdef")),
+                ]
+                .into(),
+                ..Row::default()
+            },
+        );
+        rows
+    }
+
+    fn seat() -> LabelSeat {
+        LabelSeat {
+            actor: [7; 48],
+            node: "0123456789abcdef".into(),
+            name: "log-name-seven".into(),
+            mac: Some("mc-0000000000000007".into()),
+            transport: "00112233445566778899aabbccddeeff".into(),
+        }
+    }
+
+    #[test]
+    fn label_follows_registry_and_uses_book_bound_old_transport() {
+        let mut registry = registry();
+        assert_eq!(
+            resolve_registry_label("m7", &registry, &[seat()]).unwrap(),
+            "00112233445566778899aabbccddeeff"
+        );
+        let mut seat = seat();
+        registry
+            .rows
+            .values_mut()
+            .next()
+            .unwrap()
+            .fields
+            .insert("label".into(), field("m22"));
+        seat.transport = "n-0123456789abcdef".into();
+        assert_eq!(
+            resolve_registry_label("m22", &registry, &[seat]).unwrap(),
+            "n-0123456789abcdef"
+        );
+        assert!(resolve_registry_label("m7", &registry, &[]).is_err());
+    }
+
+    #[test]
+    fn dispute_prints_both_registry_node_and_signed_seat_name() {
+        let registry = registry();
+        let mut seat = seat();
+        seat.mac = Some("mc-0000000000000008".into());
+        let why = resolve_registry_label("m7", &registry, &[seat]).unwrap_err();
+        for evidence in [
+            "0123456789abcdef",
+            "log-name-seven",
+            "mc-0000000000000007",
+            "mc-0000000000000008",
+        ] {
+            assert!(why.contains(evidence), "missing evidence {evidence}: {why}");
+        }
+    }
+
+    #[test]
+    fn conflicted_label_and_duplicate_adoption_refuse() {
+        let mut registry = registry();
+        assert!(resolve_registry_label("m7", &registry, &[seat(), seat()]).is_err());
+        let mut collision = seat();
+        collision.actor = [8; 48];
+        collision.mac = Some("mc-0000000000000008".into());
+        assert!(resolve_registry_label("m7", &registry, &[seat(), collision]).is_err());
+        registry.rows.values_mut().next().unwrap().fields.insert(
+            "label".into(),
+            Field::Conflict {
+                candidates: ["m7", "m8"]
+                    .into_iter()
+                    .map(|value| Candidate {
+                        operation: [1; 32],
+                        value: CellValue::owner(2, json!(value)),
+                    })
+                    .collect(),
+                provisional: Some(json!("m7")),
+            },
+        );
+        assert!(resolve_registry_label("m7", &registry, &[seat()]).is_err());
+    }
+
+    #[test]
+    fn raw_node_diagnostics_never_print_untyped_values() {
+        let mut registry = registry();
+        let row = registry.rows.values_mut().next().unwrap();
+        row.fields
+            .insert("node".into(), field("untyped-private-fixture"));
+        row.raw.insert("node".into());
+        let why = resolve_registry_label("m7", &registry, &[seat()]).unwrap_err();
+        assert!(!why.contains("untyped-private-fixture"));
+        assert!(why.contains("log-name-seven"));
+    }
+
+    #[test]
+    fn typed_label_words_are_canonical_before_lookup() {
+        let label = registry_label("M7-3FA2").expect("a typed clash label");
+        let mut registry = registry();
+        registry
+            .rows
+            .values_mut()
+            .next()
+            .unwrap()
+            .fields
+            .insert("label".into(), field(&label));
+        assert_eq!(
+            resolve_registry_label(&label, &registry, &[seat()]).unwrap(),
+            "00112233445566778899aabbccddeeff"
+        );
+        assert!(registry_label("m7.local").is_none());
+    }
 }
 
 /// [`host_word`] with the swarm roster's `identities` given.

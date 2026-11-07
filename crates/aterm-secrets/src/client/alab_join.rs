@@ -198,6 +198,22 @@ fn resume_with(
     resume_attempt(paths, join, native_attempt)
 }
 
+/// Resume a pending bootstrap of the default vault, the first step of every subscriber pass: by
+/// native proof (`native`), else by the ordinary join (`join`).
+///
+/// Only a pending bootstrap reads [`check_bootstrap_allowed`]: an intent, no vault configured and
+/// sharing on. The gate holds bootstrap work, never a pass over a vault this Mac already has, so
+/// a Mac with no intent (every configured member) returns at once and takes no lock, and a
+/// configured Mac's stale intent is wiped under the lock whatever the gate says. Configured Macs
+/// the gate holds are ordinary: a founder made with `--no-agent` keeps a subscriber-off record,
+/// and setup's choices hold automatic bootstrap where they hold Secrets or plan a vault other
+/// than the default.
+///
+/// The look without the lock ends the pass's part here only on a clean absence. Whatever else it
+/// reads, a wipe's zeroed bytes in flight among them, is read again under the lock.
+///
+/// # Errors
+/// The intent cannot be read, the gate holds a pending bootstrap, or the bootstrap failed.
 fn resume_attempt(
     paths: &Paths,
     join: impl FnOnce(&Paths, ExpectedConfig<'static>) -> crate::Result<()>,
@@ -206,7 +222,9 @@ fn resume_attempt(
         &(dyn Fn() -> crate::Result<()> + Sync),
     ) -> crate::Result<NativeAdmission>,
 ) -> crate::Result<()> {
-    check_bootstrap_allowed(paths)?;
+    if matches!(intent(paths), Ok(None)) {
+        return Ok(());
+    }
     {
         let _lock = StateLock::take(paths)?;
         if intent(paths)?.is_none() {
@@ -219,6 +237,7 @@ fn resume_attempt(
             return Ok(());
         }
     }
+    check_bootstrap_allowed(paths)?;
     let current = || {
         check_bootstrap_allowed(paths)?;
         if config(paths)?.is_some() {
@@ -461,6 +480,55 @@ mod tests {
         .unwrap();
         assert_eq!(config(&paths).unwrap(), Some(selected));
         assert!(!paths.dir.join(FILE).exists());
+    }
+
+    /// The bootstrap gate holds a pending bootstrap alone, never a pass over a vault this Mac
+    /// has, a stale intent beside that vault included. The churn lab's founder, made with
+    /// `--no-agent`, keeps a subscriber-off record; with the gate read first, its subscriber
+    /// failed every pass there and took no record in.
+    #[test]
+    fn the_bootstrap_gate_holds_a_pending_bootstrap_and_never_a_configured_pass() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let waiting = Paths::for_home(&root.path().join("waiting"));
+        prepare_alab_join_retry(&waiting).unwrap();
+        crate::service::record_subscriber_off(&waiting.home).unwrap();
+        let held = resume_attempt(
+            &waiting,
+            |_, _| panic!("a held bootstrap fetches nothing"),
+            |_, _| panic!("a held bootstrap proves nothing"),
+        )
+        .expect_err("the gate holds a pending bootstrap");
+        assert!(held.to_string().contains("bootstrap is held"), "{held}");
+        assert!(pending(&waiting), "the intent waits for the gate");
+
+        let founder = Paths::for_home(&root.path().join("founder"));
+        let source = root.path().join("team.vault");
+        create(&founder, source.to_str().unwrap(), None, Some("founder")).unwrap();
+        crate::service::record_subscriber_off(&founder.home).unwrap();
+        assert!(
+            check_bootstrap_allowed(&founder).is_err(),
+            "the gate is held here too"
+        );
+        let opened = admin_open(&founder).unwrap();
+        let mut doc = opened.doc.clone();
+        doc.set_entry(&Audience::Everyone, "note", b"inert-note")
+            .unwrap();
+        admin_publish(&founder, &opened, &doc).unwrap();
+        let note = crate::materialize::target_path(&founder.home, "note").unwrap();
+        // An intent setup wrote before this Mac had a vault, left beside the one it has now.
+        fsx::write_atomic(&founder.dir.join(FILE), INTENT, 0o600).unwrap();
+        for pass in ["with the stale intent", "with none"] {
+            let _ = std::fs::remove_file(&note);
+            subscriber_pass(&founder, &mut None, &FOUND_NONE).unwrap_or_else(|e| {
+                panic!("a configured Mac's pass {pass} is not the bootstrap gate's: {e}")
+            });
+            assert_eq!(
+                std::fs::read(&note).unwrap(),
+                b"inert-note",
+                "the pass {pass} read the vault"
+            );
+            assert!(!founder.dir.join(FILE).exists(), "the stale intent is gone");
+        }
     }
 
     fn subscriber_attempt(

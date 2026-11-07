@@ -70,9 +70,7 @@ static WARMED: std::sync::OnceLock<Result<(), CouldNotRun>> = std::sync::OnceLoc
 /// # Errors
 /// [`CouldNotRun`] when the take decided nothing.
 pub fn measure(rig: &Rig, row: &PaintRow) -> Result<PaintReport, CouldNotRun> {
-    let _one = super::ONE_TAKE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _one = super::take(true);
     row.validate()?;
     let bench_band = super::instance::Band::take_own();
     super::instance::first_exec(&rig.fake_tui)?;

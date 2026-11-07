@@ -781,10 +781,26 @@ pub fn user_cache(
         .map(|c| c.join("aterm").join(name))
 }
 
-/// [`user_cache`] on this host, from `$HOME` and `$XDG_CACHE_HOME`.
+/// Select the installed check tools independently of a test's disposable HOME.
+#[must_use]
+pub fn tool_home() -> Option<PathBuf> {
+    tool_home_from(
+        std::env::var_os("ATERM_TEST_TOOL_HOME"),
+        std::env::var_os("HOME"),
+    )
+}
+
+fn tool_home_from(selected: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
+    selected
+        .filter(|p| Path::new(p).is_absolute())
+        .or(home)
+        .map(PathBuf::from)
+}
+
+/// [`user_cache`] on this host, from the selected tool home and `$XDG_CACHE_HOME`.
 #[must_use]
 pub fn host_user_cache(name: &str) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = tool_home();
     let xdg = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from);
     user_cache(std::env::consts::OS, home.as_deref(), xdg.as_deref(), name)
 }

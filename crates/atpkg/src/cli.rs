@@ -52,9 +52,9 @@ const TABLE: &[Verb] = &[
         tier: Tier::Daily,
         usage: "aterm pkg install <program>\n\
                 aterm pkg install --default-set    — the whole ALab toolset\n\
-                aterm pkg install trust --build <N> [--retry] — Trust build N beside `current`, \
-                which stays (the build a trust.lock names; --retry: download a held-back build \
-                again now)",
+                aterm pkg install <trust|lean4> --build <N> [--retry] — a signed build beside \
+                `current`, which stays (Trust locks and exact Lean import worlds; --retry: \
+                download a held-back build again now)",
         arity: Arity::Parsed {
             refuse: |rest| parse_install_argv(rest).err(),
         },
@@ -375,7 +375,7 @@ const TABLE: &[Verb] = &[
     Verb {
         name: "lease",
         tier: Tier::Plumbing,
-        usage: "aterm pkg lease (<toolchain-dir> | --tool <name>...) [--who <words>] -- <command> [args…]  — hold a directory, or authenticate and lease named build prerequisites, until the command exits",
+        usage: "aterm pkg lease (<toolchain-dir> | --tool <name>... | --tool <name>=<build>) [--who <words>] -- <command> [args…]  — authenticate and hold prerequisites; an explicit Lean build supplies its exact ELAN_HOME without changing defaults",
         arity: Arity::Own,
         program_flags: None,
         mutates_store: false,
@@ -3752,6 +3752,7 @@ struct LeaseArgs {
 enum LeaseSubject {
     Directory(std::path::PathBuf),
     Prerequisites(Vec<crate::prerequisite::Prerequisite>),
+    NamedPrerequisite(crate::prerequisite::Prerequisite, u64),
 }
 
 fn parse_lease_args(rest: &[String]) -> Result<LeaseArgs, String> {
@@ -3764,6 +3765,7 @@ fn parse_lease_args(rest: &[String]) -> Result<LeaseArgs, String> {
     }
     let mut dir = None;
     let mut tools = Vec::new();
+    let mut named = None;
     let mut who = None;
     let mut it = head.iter();
     while let Some(arg) = it.next() {
@@ -3772,8 +3774,25 @@ fn parse_lease_args(rest: &[String]) -> Result<LeaseArgs, String> {
                 let name = it
                     .next()
                     .ok_or("`--tool` needs an exposed prerequisite name")?;
+                let (name, build) = name
+                    .split_once('=')
+                    .map_or((name.as_str(), None), |(name, build)| (name, Some(build)));
                 let tool = crate::prerequisite::Prerequisite::named(name).ok_or_else(|| format!("unsupported prerequisite {name:?}; use gitleaks, python3.14, openssl-signing or lake"))?;
-                tools.push(tool);
+                if let Some(build) = build {
+                    let build = build
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|build| *build > 0)
+                        .ok_or("a named prerequisite needs a positive build number")?;
+                    if named.replace((tool, build)).is_some() {
+                        return Err(
+                            "name one explicit build per lease; nest leases for additional builds"
+                                .into(),
+                        );
+                    }
+                } else {
+                    tools.push(tool);
+                }
             }
             "--who" if who.is_none() => match it.next() {
                 Some(words) => who = Some(words.clone()),
@@ -3783,11 +3802,18 @@ fn parse_lease_args(rest: &[String]) -> Result<LeaseArgs, String> {
             other => return Err(format!("unexpected argument {other:?}")),
         }
     }
-    let subject = match (dir, tools.is_empty()) {
-        (Some(dir), true) => LeaseSubject::Directory(dir),
-        (None, false) => LeaseSubject::Prerequisites(tools),
-        (None, true) => return Err("name a toolchain directory or --tool prerequisite".into()),
-        (Some(_), false) => return Err("a directory and --tool are mutually exclusive".into()),
+    let subject = match (dir, tools.is_empty(), named) {
+        (Some(dir), true, None) => LeaseSubject::Directory(dir),
+        (None, false, None) => LeaseSubject::Prerequisites(tools),
+        (None, true, Some((tool, build))) => LeaseSubject::NamedPrerequisite(tool, build),
+        (None, true, None) => {
+            return Err("name a toolchain directory or --tool prerequisite".into());
+        }
+        _ => {
+            return Err(
+                "a directory, selected tools and one named build are mutually exclusive".into(),
+            );
+        }
     };
     Ok(LeaseArgs {
         subject,
@@ -3822,6 +3848,7 @@ fn lease_run_name(args: &LeaseArgs) -> String {
 #[derive(Debug)]
 enum LeaseRun {
     Ran(std::process::ExitStatus),
+    Interrupted(i32),
     Missing(crate::lease::Missing),
     NoPrefix,
     NotHeld(crate::lease::Subject, crate::lease::LeaseError),
@@ -3839,6 +3866,30 @@ fn lease_and_run(
 ) -> LeaseRun {
     let dir = match &args.subject {
         LeaseSubject::Directory(dir) => dir,
+        LeaseSubject::NamedPrerequisite(want, build) => {
+            let held = match crate::prerequisite::configured_build(*want, *build, who) {
+                Ok(held) => held,
+                Err(why) => return LeaseRun::PrerequisiteRefused(why),
+            };
+            let tool = held.tool();
+            say(&format!(
+                "atpkg lease: holding {} {} build {} tree {} root {}",
+                tool.program(),
+                tool.version(),
+                tool.build(),
+                tool.tree_root(),
+                tool.root().display()
+            ));
+            let result = match held.run(&args.command[0], &args.command[1..], say) {
+                Ok(outcome) => match outcome.signal {
+                    Some(signal) => LeaseRun::Interrupted(signal),
+                    None => LeaseRun::Ran(outcome.root),
+                },
+                Err(why) => LeaseRun::PrerequisiteRefused(why),
+            };
+            drop(held);
+            return result;
+        }
         LeaseSubject::Prerequisites(wants) => {
             let held = match crate::prerequisite::configured(wants, who) {
                 Ok(held) => held,
@@ -3981,6 +4032,10 @@ fn cmd_lease(rest: &[String]) -> ExitCode {
         println!("{}", crate::prerequisite::LEASE_CAPABILITY);
         return ExitCode::SUCCESS;
     }
+    if rest == ["--named-build-capabilities"] {
+        println!("{}", crate::prerequisite::NAMED_LEASE_CAPABILITY);
+        return ExitCode::SUCCESS;
+    }
     let args = match parse_lease_args(rest) {
         Ok(args) => args,
         Err(why) => return usage_error("lease", Some(&why)),
@@ -3997,6 +4052,7 @@ fn cmd_lease(rest: &[String]) -> ExitCode {
     );
     match run {
         LeaseRun::Ran(status) => crate::platform::exit_code_like(status),
+        LeaseRun::Interrupted(signal) => ExitCode::from(u8::try_from(128 + signal).unwrap_or(1)),
         LeaseRun::NoPrefix => {
             eprintln!("atpkg lease: no package prefix resolves \u{2014} nothing ran");
             ExitCode::from(1)
@@ -6645,7 +6701,7 @@ fn verb_applies_machine_settings(verb: &str) -> bool {
     verb_row(verb).is_some_and(|v| v.applies_machine)
 }
 
-/// A validated named Trust build is staged beside `current`; it neither probes
+/// A validated named build is staged beside `current`; it neither probes
 /// nor applies an unrelated machine plan. Ordinary install policy stays in force.
 fn machine_edit_for_request<T>(
     args: &[String],
@@ -8024,11 +8080,14 @@ fn parse_install_argv(rest: &[String]) -> Result<InstallArgs<'_>, ExitCode> {
             retry: false,
         }),
         [program, flag, _] | [program, flag, _, _]
-            if flag == BUILD_FLAG && program != crate::trust_lock::PROGRAM =>
+            if flag == BUILD_FLAG
+                && program != crate::trust_lock::PROGRAM
+                && program != crate::prerequisite::Prerequisite::Lake.recipe().name =>
         {
             eprintln!(
                 "atpkg install: {BUILD_FLAG} stages the Trust build a trust.lock names: \
-                 `aterm pkg install {} {BUILD_FLAG} <N>`; {program} installs its pinned build",
+                 `aterm pkg install {} {BUILD_FLAG} <N>` or an exact Lean import world with \
+                 `aterm pkg install lean4 {BUILD_FLAG} <N>`; {program} installs its pinned build",
                 crate::trust_lock::PROGRAM
             );
             Err(ExitCode::from(2))
@@ -8054,7 +8113,7 @@ fn parse_install_argv(rest: &[String]) -> Result<InstallArgs<'_>, ExitCode> {
             eprintln!(
                 "atpkg install: one program at a time (got {}); the whole toolset is \
                  `aterm pkg install --default-set`, one build of Trust \
-                 `aterm pkg install trust {BUILD_FLAG} <N> [{RETRY_FLAG}]`",
+                 `aterm pkg install <trust|lean4> {BUILD_FLAG} <N> [{RETRY_FLAG}]`",
                 rest.len()
             );
             Err(ExitCode::from(2))
@@ -8062,11 +8121,11 @@ fn parse_install_argv(rest: &[String]) -> Result<InstallArgs<'_>, ExitCode> {
     }
 }
 
-/// `aterm pkg install trust --build <N>`: Trust build N, verified under the head index and staged
+/// `aterm pkg install <trust|lean4> --build <N>`: a build verified under the head index and staged
 /// beside `current`, which stays ([`crate::flow::install_build`]); held to the tree a `trust.lock`
 /// above this directory names when it names that build, and marked so gc keeps it
-/// ([`crate::trust_lock::mark_locked`]). Only Trust ([`parse_install_argv`] refuses any other
-/// program): a lock names nothing else, and gc would take any other program's unpinned build back.
+/// ([`crate::trust_lock::mark_locked`]). A named Lean build supplies an exact import world;
+/// its consumer holds a named prerequisite lease while using it. It never acquires a Trust lock.
 /// With `retry` ([`RETRY_FLAG`]) the build's stage refusal memo goes first, so a build a refusal
 /// holds back is downloaded again now.
 fn cmd_install_build(program: &str, build: u64, retry: bool) -> ExitCode {
@@ -8082,7 +8141,7 @@ fn cmd_install_build(program: &str, build: u64, retry: bool) -> ExitCode {
         .ok()
         .and_then(|cwd| crate::trust_lock::find(&cwd))
         .and_then(|found| found.lock.ok())
-        .filter(|lock| lock.build == build);
+        .filter(|lock| program == crate::trust_lock::PROGRAM && lock.build == build);
     let req = crate::InstallRequest {
         channel: crate::config::CHANNEL,
         program,
@@ -8104,7 +8163,9 @@ fn cmd_install_build(program: &str, build: u64, retry: bool) -> ExitCode {
     );
     match got {
         Ok(named) => {
-            let _ = crate::trust_lock::mark_locked(&layout.prefix, build);
+            if program == crate::trust_lock::PROGRAM {
+                let _ = crate::trust_lock::mark_locked(&layout.prefix, build);
+            }
             let (said, root) = match &named {
                 crate::flow::NamedBuild::Present { tree_root } => ("is in the store", tree_root),
                 crate::flow::NamedBuild::Staged { tree_root } => ("staged", tree_root),
@@ -8134,6 +8195,27 @@ pub fn signed_tree_root(program: &str, build: u64) -> Result<String, String> {
         return Err("atpkg is disabled (no root key pinned): no index signs a build".to_string());
     }
     let layout = layout().ok_or_else(|| "atpkg's store has no layout here".to_string())?;
+    signed_tree_root_at(&layout, program, build)
+}
+
+/// Read the signed tree root using this explicit configured store and its existing
+/// fetcher, trust anchor, build floor and current native target. No ambient layout
+/// is selected and no package is installed or activated.
+///
+/// The existing fetcher owns its I/O timeout policy: this function provides no
+/// hard deadline or interruption guarantee. Run it outside a scheduling actor.
+///
+/// # Errors
+/// Disabled manager, untrusted or unavailable signed package, withdrawn/floored
+/// build, or missing artifact for the current target.
+pub fn signed_tree_root_at(
+    layout: &crate::store::Layout,
+    program: &str,
+    build: u64,
+) -> Result<String, String> {
+    if !manager_enabled() {
+        return Err("atpkg is disabled (no root key pinned): no index signs a build".to_string());
+    }
     let seams = PassSeams::process();
     let triple = current_triple();
     let req = crate::InstallRequest {
@@ -8143,10 +8225,10 @@ pub fn signed_tree_root(program: &str, build: u64) -> Result<String, String> {
         installed: None,
     };
     let (_, pkg) = crate::flow::signed_pkg(
-        &*resolve_fetcher(&layout),
-        &layout,
-        &(seams.anchor)(&layout),
-        build_floor(&layout),
+        &*resolve_fetcher(layout),
+        layout,
+        &(seams.anchor)(layout),
+        build_floor(layout),
         (seams.now)(),
         &req,
         build,

@@ -760,14 +760,14 @@ pub fn verify(git: &dyn GitRunner, line: &Line) -> Result<String, Stop> {
             format!("the base {} is not on origin/main", short(&line.base)),
         ));
     }
-    let mut prev = line.base.clone();
-    let mut prev_tree = tree_of(git, &prev)?;
+    let mut prev = line.base.as_str();
+    let mut prev_tree = tree_of(git, prev)?;
     let mut landed = None;
     for (i, hop) in line.hops.iter().enumerate() {
         let k = i + 1;
-        named(git, &hop.commit, &format!("hop {k}"))?;
+        named(git, &hop.commit, format_args!("hop {k}"))?;
         let made = read_commit(git, &hop.commit)?;
-        if made.parents != [prev.as_str()] {
+        if made.parents != [prev] {
             return Err(bad(
                 Reason::Parent,
                 format!(
@@ -778,11 +778,11 @@ pub fn verify(git: &dyn GitRunner, line: &Line) -> Result<String, Stop> {
                         .map(|p| short(p))
                         .collect::<Vec<_>>()
                         .join(", "),
-                    short(&prev)
+                    short(prev)
                 ),
             ));
         }
-        named(git, &hop.carries, &format!("hop {k}'s carried commit"))?;
+        named(git, &hop.carries, format_args!("hop {k}'s carried commit"))?;
         if line.hops[..i].iter().any(|h| h.carries == hop.carries) {
             return Err(bad(
                 Reason::Duplicate,
@@ -817,14 +817,14 @@ pub fn verify(git: &dyn GitRunner, line: &Line) -> Result<String, Stop> {
                 ),
             ));
         }
-        if is_ancestor(git, &hop.carries, &prev)? {
+        if is_ancestor(git, &hop.carries, prev)? {
             return Err(bad(
                 Reason::Held,
                 format!(
                     "hop {k} carries {}, which the previous head {} descends from: its patch is in \
                      the line already",
                     short(&hop.carries),
-                    short(&prev)
+                    short(prev)
                 ),
             ));
         }
@@ -839,7 +839,7 @@ pub fn verify(git: &dyn GitRunner, line: &Line) -> Result<String, Stop> {
             return Err(bad(stop.reason, format!("hop {k}: {}", stop.why)));
         }
         let tree = tree_of(git, &hop.commit)?;
-        match hop_tree(git, &prev, &hop.carries)? {
+        match hop_tree(git, prev, &hop.carries)? {
             Merged::Tree(carried) if carried == tree => {}
             Merged::Tree(carried) => {
                 return Err(bad(
@@ -870,7 +870,7 @@ pub fn verify(git: &dyn GitRunner, line: &Line) -> Result<String, Stop> {
                 format!("hop {k} ({}) moves nothing", short(&hop.commit)),
             ));
         }
-        let paths = moved(git, &prev, &hop.commit)?;
+        let paths = moved(git, prev, &hop.commit)?;
         if paths != hop.paths {
             return Err(bad(
                 Reason::Paths,
@@ -882,16 +882,16 @@ pub fn verify(git: &dyn GitRunner, line: &Line) -> Result<String, Stop> {
             ));
         }
         holds_still(git, line, k, &hop.commit, &paths).map_err(judged)?;
-        prev = hop.commit.clone();
+        prev = hop.commit.as_str();
         prev_tree = tree;
     }
-    if !is_ancestor(git, &prev, "origin/main")? {
+    if !is_ancestor(git, prev, "origin/main")? {
         return Err(Stop::new(
             Reason::Unrecorded,
             format!(
                 "the line's head {} is not on origin/main: origin/main does not hold its record \
                  merge",
-                short(&prev)
+                short(prev)
             ),
             drop_line(),
         ));
@@ -911,7 +911,7 @@ pub fn verify(git: &dyn GitRunner, line: &Line) -> Result<String, Stop> {
             short(&line.base),
             carried.len(),
             carried.join(", "),
-            short(&prev)
+            short(prev)
         )
     })
 }
@@ -952,15 +952,12 @@ pub fn landed_since(git: &dyn GitRunner, floor: &str) -> Result<BTreeSet<String>
         };
         range.insert(commit, (tree, words.collect()));
     }
-    let mut trees: BTreeMap<&str, &str> = range
-        .iter()
-        .map(|(&commit, &(tree, _))| (commit, tree))
-        .collect();
+    let mut outside_trees: BTreeMap<&str, &str> = BTreeMap::new();
     let outside: BTreeSet<&str> = range
         .values()
         .filter(|(_, parents)| parents.len() > 1)
         .filter_map(|(_, parents)| parents.first().copied())
-        .filter(|first| !trees.contains_key(*first))
+        .filter(|first| !range.contains_key(*first))
         .collect();
     let read_out;
     if !outside.is_empty() {
@@ -977,7 +974,7 @@ pub fn landed_since(git: &dyn GitRunner, floor: &str) -> Result<BTreeSet<String>
             )));
         }
         for (commit, tree) in outside.into_iter().zip(read) {
-            trees.insert(commit, tree);
+            outside_trees.insert(commit, tree);
         }
     }
     let mut landed = BTreeSet::new();
@@ -992,8 +989,13 @@ pub fn landed_since(git: &dyn GitRunner, floor: &str) -> Result<BTreeSet<String>
         let neutral = parents.len() > 1
             && parents
                 .first()
-                .and_then(|first| trees.get(first))
-                .is_some_and(|first| first == tree);
+                .and_then(|first| {
+                    range
+                        .get(first)
+                        .map(|(t, _)| *t)
+                        .or_else(|| outside_trees.get(first).copied())
+                })
+                .is_some_and(|first| first == *tree);
         let followed = if neutral { &parents[..1] } else { &parents[..] };
         next.extend(followed.iter().copied().filter(|p| !landed.contains(*p)));
     }
@@ -1041,7 +1043,7 @@ pub fn tree_has(git: &dyn GitRunner, rev: &str, path: &str) -> Result<bool, Stop
 /// # Errors
 /// A [`Reason::Spelling`] refusal for another spelling or an object that is no commit; COULD NOT
 /// RUN for an object this clone lacks.
-fn named(git: &dyn GitRunner, sha: &str, role: &str) -> Result<(), Stop> {
+fn named(git: &dyn GitRunner, sha: &str, role: impl fmt::Display) -> Result<(), Stop> {
     if !is_full_sha(sha) {
         return Err(Stop::new(
             Reason::Spelling,
@@ -1069,7 +1071,7 @@ fn is_full_sha(sha: &str) -> bool {
     matches!(sha.len(), 40 | 64) && sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-fn lacks(role: &str, sha: &str) -> Stop {
+fn lacks(role: impl fmt::Display, sha: &str) -> Stop {
     Stop::new(
         Reason::Unread,
         format!("this clone lacks {role} {}", short(sha)),

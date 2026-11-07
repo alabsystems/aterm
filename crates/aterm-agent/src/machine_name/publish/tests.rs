@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
@@ -393,6 +393,24 @@ fn a_request_a_newer_set_replaced_is_superseded_not_pending() {
         Err(Pending::Superseded(SUPERSEDED.to_owned()))
     );
     assert_eq!(*fake.log.borrow(), ["read"], "no apply");
+
+    // The same actual read-time rename when the OS still differs must refuse before
+    // applying the obsolete number, rather than detect supersession only afterward.
+    let policy = Policy::read(&scratch.config, num(64)).expect("a policy");
+    let on_read = || {
+        chosen(&scratch.state, 65);
+    };
+    let mut fake = FakeNames::new(names([Some("m184"); 3]), &nothing);
+    fake.on_read = &on_read;
+    assert_eq!(
+        publish(&scratch.state, &scratch.config, &policy, Some(&fake)),
+        Err(Pending::Superseded(SUPERSEDED.to_owned()))
+    );
+    assert_eq!(
+        *fake.log.borrow(),
+        ["read"],
+        "a superseded read must never reach apply"
+    );
 }
 
 #[test]
@@ -429,6 +447,33 @@ fn a_set_just_after_the_fleet_name_ends_publication_before_macos_is_asked() {
         Err(Pending::Superseded(SUPERSEDED.to_owned()))
     );
     assert!(fake.log.borrow().is_empty(), "macOS not asked");
+}
+
+#[test]
+fn a_final_system_verification_rejects_a_newer_canonical_name() {
+    let scratch = fresh();
+    chosen(&scratch.state, 59);
+    let policy = Policy::read(&scratch.config, num(59)).unwrap();
+    let reads = Cell::new(0);
+    let on_read = || {
+        reads.set(reads.get() + 1);
+        if reads.get() == 2 {
+            chosen(&scratch.state, 60);
+        }
+    };
+    let mut fake = FakeNames::new(names([Some("m184"); 3]), &nothing);
+    fake.after = Some(names([Some("m59"); 3]));
+    fake.on_read = &on_read;
+    assert_eq!(
+        publish(&scratch.state, &scratch.config, &policy, Some(&fake)),
+        Err(Pending::Superseded(SUPERSEDED.to_owned()))
+    );
+    assert_eq!(
+        fake.applied(),
+        ["apply m59"],
+        "the original apply was current when it began"
+    );
+    assert_eq!(reads.get(), 2);
 }
 
 #[test]

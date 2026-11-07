@@ -10,15 +10,18 @@ use std::os::unix::ffi::OsStrExt as _;
 
 pub(super) fn command(job: &Job, input: &Request) -> io::Result<spawnfd::Command> {
     let request = &input.member;
+    compiler::no_loader_overrides(&request.env)?;
     if !job.native_targo {
         return Err(refused("campaign subgroup recipe is not qualified"));
     }
-    let selected = recipe::resolve(request)?;
-    let managed = recipe::managed_artifact("trustc", &selected)
-        .ok_or_else(|| refused("member is not the selected managed native compiler"))?;
-    if managed.target.parent() != job.program.parent() {
+    let compiler = job
+        .compiler
+        .as_ref()
+        .ok_or_else(|| refused("original project compiler lease unavailable"))?;
+    let target = compiler.execution().join("bin/trustc");
+    if recipe::resolve(request)? != target || target.parent() != job.program.parent() {
         return Err(refused(
-            "native compiler is not paired with the admitted driver",
+            "native compiler is not paired with the admitted project driver",
         ));
     }
     let words = match &request.argv[1..] {
@@ -49,7 +52,7 @@ pub(super) fn command(job: &Job, input: &Request) -> io::Result<spawnfd::Command
         arguments.insert(0, std::ffi::OsStr::new("--resource-subgroups-v3"));
         arguments.insert(0, std::ffi::OsStr::new("--resource-worker-v3"));
     }
-    let mut command = spawnfd::command(&managed.target);
+    let mut command = spawnfd::command(&target);
     command
         .arg0(std::ffi::OsStr::from_bytes(&request.argv[0]))
         .args(arguments)
@@ -65,13 +68,6 @@ pub(super) fn command(job: &Job, input: &Request) -> io::Result<spawnfd::Command
                         std::ffi::OsStr::from_bytes(value),
                     )
                 }),
-        )
-        .envs(
-            managed
-                .env
-                .entries()
-                .iter()
-                .map(|(name, value)| (name.as_str(), value.as_str())),
         )
         .env("ATERM_RESOURCE_JOB_V3", job.delegation.encode()?)
         .env(

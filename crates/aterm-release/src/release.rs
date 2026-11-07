@@ -1440,13 +1440,27 @@ impl Run<'_> {
         let elapsed = at.saturating_sub(self.cur_t0);
         let waiting = self.waited.min(elapsed);
         let log = self.b.log_path(self.cur);
-        let event = aterm_json::json!({
-            "schema": 1, "event": "release-stage", "stage": self.cur.name(),
-            "outcome": outcome, "source": self.commit_r(), "version": self.version(),
-            "at_unix_s": at, "waiting_s": waiting,
-            "execution_s": elapsed.saturating_sub(waiting), "log": log,
-            "detail": detail, "public": &self.public,
-        });
+        let log_val = log.to_str().map_or_else(
+            || aterm_json::to_value(&log).expect("path"),
+            |s| s.to_string().into(),
+        );
+        let event = aterm_json::Value::Object(aterm_json::Map::from([
+            ("schema".to_string(), 1.into()),
+            ("event".to_string(), "release-stage".into()),
+            ("stage".to_string(), self.cur.name().into()),
+            ("outcome".to_string(), outcome.into()),
+            ("source".to_string(), self.commit_r().into()),
+            ("version".to_string(), self.version().into()),
+            ("at_unix_s".to_string(), at.into()),
+            ("waiting_s".to_string(), waiting.into()),
+            (
+                "execution_s".to_string(),
+                elapsed.saturating_sub(waiting).into(),
+            ),
+            ("log".to_string(), log_val),
+            ("detail".to_string(), detail.into()),
+            ("public".to_string(), self.public.clone().into()),
+        ]));
         self.say(&format!("release-event: {event}"));
     }
 
@@ -2186,10 +2200,12 @@ impl Run<'_> {
                 claim.priority = self.b.line_priority();
                 // The run that handed this one the release took its first steps' records, its
                 // seal call among them, into its own logs ([`crate::release_timeline::Timeline`]).
-                if let Some(from) = claim.handed_logs.clone() {
-                    let event = aterm_json::json!({
-                        "schema": 1, "event": "handed", "from": from.display().to_string(),
-                    });
+                if let Some(from) = &claim.handed_logs {
+                    let event = aterm_json::Value::Object(aterm_json::Map::from([
+                        ("schema".to_string(), 1.into()),
+                        ("event".to_string(), "handed".into()),
+                        ("from".to_string(), from.display().to_string().into()),
+                    ]));
                     self.say(&format!("release-event: {event}"));
                 }
                 self.claim = Some(claim);

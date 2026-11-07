@@ -4529,71 +4529,6 @@ impl FooterUndo {
     fn is_written(&self) -> bool {
         self.write.is_some()
     }
-
-    /// Frame row `frame_row` of `scratch`, its cells in `cols`, as the program wrote them: each
-    /// cell the write on the glass put there read as the cell it covered, and the row ending
-    /// where it ended before the write padded it. This is what [`undo`] would put back, read
-    /// without writing or allocating.
-    #[cfg(any(a11y_tree, test))]
-    fn program_cells<'a>(
-        &'a self,
-        scratch: &'a RenderInput,
-        frame_row: usize,
-        cols: std::ops::Range<usize>,
-    ) -> impl Iterator<Item = &'a RenderCell> + 'a {
-        let row: &[RenderCell] = scratch.cells.get(frame_row).map_or(&[], Vec::as_slice);
-        let on_row = move || {
-            self.written()
-                .iter()
-                .filter(move |r| r.frame_row == frame_row)
-        };
-        let glassed = on_row().next().is_some()
-            && on_row().all(|r| {
-                row.get(r.col_off..r.col_off + r.painted.len())
-                    .is_some_and(|span| span == r.painted.as_slice())
-            });
-        let len = if glassed {
-            on_row()
-                .next()
-                .map_or(row.len(), |r| r.len_before.min(row.len()))
-        } else {
-            row.len()
-        };
-        let end = cols.end.min(len);
-        (cols.start.min(end)..end).map(move |c| {
-            glassed
-                .then(|| on_row().find(|r| (r.col_off..r.col_off + r.painted.len()).contains(&c)))
-                .flatten()
-                .and_then(|r| r.before.get(c - r.col_off))
-                .unwrap_or(&row[c])
-        })
-    }
-}
-
-/// View of a window's presented [`RenderInput`] with footer glass writes undone.
-#[cfg(any(a11y_tree, test))]
-pub(crate) struct ProgramCells<'a> {
-    scratch: &'a RenderInput,
-    undo: &'a FooterUndo,
-}
-
-#[cfg(any(a11y_tree, test))]
-impl<'a> ProgramCells<'a> {
-    /// Wraps `scratch` with `undo` to read the underlying program cells.
-    pub(crate) const fn of(scratch: &'a RenderInput, undo: &'a FooterUndo) -> Self {
-        Self { scratch, undo }
-    }
-}
-
-#[cfg(any(a11y_tree, test))]
-impl crate::accessibility::CellRows for ProgramCells<'_> {
-    fn cells_in(
-        &self,
-        r: usize,
-        cols: std::ops::Range<usize>,
-    ) -> impl Iterator<Item = &RenderCell> {
-        self.undo.program_cells(self.scratch, r, cols)
-    }
 }
 
 /// The pane's exact terminal extraction that supplied its cells to this frame.
@@ -14125,45 +14060,6 @@ mod tests {
         assert_eq!(s.engine_fill_seq, 40);
         assert_eq!(s.shifted_fill_seq, 40);
         assert_eq!(s.row_rev, vec![100, 101, 102, 103]);
-    }
-
-    #[test]
-    fn the_program_cells_read_what_the_undo_puts_back() {
-        let mut s = engine_fill(4);
-        let original = s.cells.clone();
-        let ground = cell(' ', [0, 0, 0]);
-        let over = row_of("yolo", [1, 1, 1]);
-        let past = row_of("\u{25C6} Opus", [2, 2, 2]);
-        let slot = written(&mut s, vec![(1, 2, over, ground), (2, 20, past, ground)]);
-        let text = |cells: &mut dyn Iterator<Item = &RenderCell>| -> String {
-            cells.map(|c| c.ch).collect()
-        };
-        assert!(text(&mut s.cells[1].iter()).contains("yolo"), "CONTROL");
-        assert!(
-            text(&mut s.cells[2].iter()).ends_with("\u{25C6} Opus"),
-            "CONTROL"
-        );
-        for (row, engine) in original.iter().enumerate() {
-            for cols in [0..40, 0..5, 3..30, 25..40, 13..13] {
-                let want: String = engine
-                    .iter()
-                    .skip(cols.start)
-                    .take(cols.len())
-                    .map(|c| c.ch)
-                    .collect();
-                assert_eq!(
-                    text(&mut slot.program_cells(&s, row, cols.clone())),
-                    want,
-                    "row {row}, columns {cols:?}"
-                );
-            }
-        }
-        let (count, allocations) =
-            crate::work_counts::allocations_in(|| slot.program_cells(&s, 2, 0..40).count());
-        assert_eq!((count, allocations), (original[2].len(), 0));
-        s.cells[1][3].ch = 'M';
-        let presented = text(&mut s.cells[1].iter());
-        assert_eq!(text(&mut slot.program_cells(&s, 1, 0..40)), presented);
     }
 
     #[test]

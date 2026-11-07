@@ -179,7 +179,16 @@ pub fn phone_shaped(text: &str) -> bool {
         }
         let apart = after_digit == bytes.len() || !bytes[after_digit].is_ascii_alphanumeric();
         if total_digits >= PHONE_DIGITS && apart {
-            let mut groups: Vec<(usize, u8)> = Vec::new();
+            let mut groups = [(0usize, 0u8); 8];
+            let mut groups_len = 0usize;
+            let mut push_group = |digits: usize, separator: u8| {
+                if groups_len < groups.len() {
+                    groups[groups_len] = (digits, separator);
+                    groups_len += 1;
+                } else {
+                    groups[groups.len() - 1].0 += digits;
+                }
+            };
             let mut digits = 0;
             let mut separator = b' ';
             for (idx, &b) in bytes[at..end].iter().enumerate() {
@@ -187,7 +196,7 @@ pub fn phone_shaped(text: &str) -> bool {
                     b'0'..=b'9' => digits += 1,
                     b' ' | b'-' | b'.' | b'(' | b')' => {
                         if digits > 0 {
-                            groups.push((digits, separator));
+                            push_group(digits, separator);
                             digits = 0;
                         }
                         separator = b;
@@ -197,9 +206,9 @@ pub fn phone_shaped(text: &str) -> bool {
                 }
             }
             if digits > 0 {
-                groups.push((digits, separator));
+                push_group(digits, separator);
             }
-            if phone_groups(&groups) {
+            if phone_groups(&groups[..groups_len]) {
                 return true;
             }
         }

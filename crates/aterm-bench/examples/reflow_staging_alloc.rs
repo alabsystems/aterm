@@ -67,6 +67,9 @@ fn instructions() -> Option<u64> {
 }
 
 fn main() {
+    history_unscroll();
+    wide_restores();
+    mixed_image_rows();
     inline_image_rows();
     restore_links();
     linked_writes();
@@ -113,6 +116,327 @@ fn main() {
         println!(
             "reflow_staging rows={rows} cols={cols} next_cols={next_cols} allocation_calls={calls} allocated_bytes={bytes} ns={ns} instructions={retired:?} glyphs={expected} history_lines={}",
             term.grid().scrollback_lines()
+        );
+    }
+}
+
+fn history_unscroll() {
+    use aterm_grid::{Grid, ImageData, ImageFormat, ImageRef, ImageScaling};
+    use std::sync::Arc;
+    for rows in [16_u16, 64, 128] {
+        // Stay below the intentional 10,000-cell hyperlink retention budget.
+        let cols = 64;
+        let pull = rows / 2;
+        for style in ["plain", "linked", "image_link"] {
+            let mut source = Terminal::new(1, cols);
+            if style != "plain" {
+                source.process(b"\x1b]8;id=pull;https://pull.example\x1b\\\x1b[38;2;12;34;56m\x1b[48;2;65;43;21m\x1b[4;58;5;7m");
+            }
+            let text = "x".repeat(usize::from(cols));
+            source.process(text.as_bytes());
+            let mut line = source.grid().checkpoint_visible_lines().remove(0);
+            if style == "image_link" {
+                let image = Arc::new(ImageData {
+                    bytes: vec![7; 256],
+                    format: ImageFormat::Png,
+                    cols,
+                    rows: 1,
+                    z_index: 0,
+                    band_lift_px: 0,
+                    cell_offset_px: (0, 0),
+                    scaling: ImageScaling::Fit,
+                    source_rect: None,
+                });
+                let mut pictures = Grid::new(1, cols);
+                for col in 0..cols {
+                    pictures.set_cell_image(
+                        0,
+                        col,
+                        ImageRef {
+                            image: Arc::clone(&image),
+                            cell_row: 0,
+                            cell_col: col,
+                            kitty: None,
+                        },
+                    );
+                }
+                line.set_images(
+                    pictures.checkpoint_visible_lines()[0]
+                        .images()
+                        .unwrap()
+                        .to_vec(),
+                );
+            }
+            let history = vec![line.clone(); usize::from(pull)];
+            let visible = vec![line; usize::from(rows)];
+            let mut grids: Vec<_> = (0..16)
+                .map(|_| {
+                    let mut grid = Grid::with_scrollback(rows, cols, usize::from(rows) * 2);
+                    grid.scroll_in_history(&history);
+                    grid.restore_visible_from_lines(&visible);
+                    grid
+                })
+                .collect();
+            let before_instructions = instructions();
+            let before_calls = CALLS.load(Ordering::Relaxed);
+            let before_bytes = BYTES.load(Ordering::Relaxed);
+            let began = Instant::now();
+            let mut total = 0;
+            for grid in &mut grids {
+                total += black_box(grid).unscroll_from_scrollback(black_box(usize::from(pull)));
+            }
+            let ns = began.elapsed().as_nanos();
+            let calls = CALLS.load(Ordering::Relaxed) - before_calls;
+            let bytes = BYTES.load(Ordering::Relaxed) - before_bytes;
+            let retired = instructions()
+                .zip(before_instructions)
+                .map(|(end, start)| end - start);
+            assert_eq!(total, 16 * usize::from(pull));
+            for grid in &grids {
+                for row in 0..rows {
+                    assert_eq!(grid.row_text(row).as_deref(), Some(text.as_str()));
+                    if style != "plain" {
+                        assert_eq!(grid.fg_rgb_at(row, 0), Some([12, 34, 56]));
+                        assert_eq!(
+                            grid.cell_extra(row, 0)
+                                .unwrap()
+                                .hyperlink_id()
+                                .map(AsRef::as_ref),
+                            Some("pull")
+                        );
+                    }
+                    if style == "image_link" {
+                        assert_eq!(
+                            grid.cell_extra(row, cols - 1)
+                                .unwrap()
+                                .image()
+                                .unwrap()
+                                .cell_col,
+                            cols - 1
+                        );
+                    }
+                }
+            }
+            println!(
+                "history_unscroll rows={rows} cols={cols} pull={pull} style={style} iterations=16 allocation_calls={calls} allocated_bytes={bytes} ns={ns} instructions={retired:?}"
+            );
+        }
+    }
+}
+
+fn wide_restores() {
+    use aterm_grid::{Grid, ImageData, ImageFormat, ImageRef, ImageScaling};
+    use std::sync::Arc;
+    for (glyph, unit, width) in [
+        ("cjk", "日", 2),
+        ("emoji", "😀", 2),
+        ("nonbmp_narrow", "𐐀", 1),
+        ("zwj", "👩‍💻", 2),
+        ("combining", "e\u{301}", 1),
+        ("combining_long", "e\u{301}\u{302}\u{303}\u{304}\u{305}", 1),
+    ] {
+        for (rows, cols) in [(1_u16, 4_u16), (1, 16), (1, 80), (24, 80), (1, 256)] {
+            for style in ["plain", "rgb", "underline", "rgb_image", "rgb_sparse"] {
+                let mut source = Terminal::new(rows, cols);
+                if style != "plain" {
+                    source.process(b"\x1b[4;58;5;7m");
+                }
+                if style == "rgb" || style == "rgb_image" || style == "rgb_sparse" {
+                    source.process(b"\x1b]8;id=wide;https://wide.example\x1b\\\x1b[38;2;12;34;56m\x1b[48;2;65;43;21m");
+                }
+                let text = if style == "rgb_sparse" {
+                    format!("{unit}{}", "x".repeat(usize::from(cols - width)))
+                } else {
+                    unit.repeat(usize::from(cols / width))
+                };
+                for row in 0..rows {
+                    source.process(format!("\x1b[{};1H{text}", row + 1).as_bytes());
+                }
+                let mut lines = source.grid().checkpoint_visible_lines();
+                drop(source);
+                let image = Arc::new(ImageData {
+                    bytes: vec![7; 256],
+                    format: ImageFormat::Png,
+                    cols,
+                    rows,
+                    z_index: 0,
+                    band_lift_px: 0,
+                    cell_offset_px: (0, 0),
+                    scaling: ImageScaling::Fit,
+                    source_rect: None,
+                });
+                if style == "rgb_image" {
+                    let mut pictures = Grid::new(rows, cols);
+                    for row in 0..rows {
+                        for col in 0..cols {
+                            pictures.set_cell_image(
+                                row,
+                                col,
+                                ImageRef {
+                                    image: Arc::clone(&image),
+                                    cell_row: row,
+                                    cell_col: col,
+                                    kitty: None,
+                                },
+                            );
+                        }
+                    }
+                    let image_lines = pictures.checkpoint_visible_lines();
+                    for (line, image_line) in lines.iter_mut().zip(&image_lines) {
+                        line.set_images(image_line.images().unwrap().to_vec());
+                    }
+                }
+                let mut grid = Grid::new(rows, cols);
+                grid.restore_visible_from_lines(&lines);
+                let before_instructions = instructions();
+                let before_calls = CALLS.load(Ordering::Relaxed);
+                let before_bytes = BYTES.load(Ordering::Relaxed);
+                let began = Instant::now();
+                for _ in 0..64 {
+                    black_box(&mut grid).restore_visible_from_lines(black_box(&lines));
+                }
+                let ns = began.elapsed().as_nanos();
+                let calls = CALLS.load(Ordering::Relaxed) - before_calls;
+                let bytes = BYTES.load(Ordering::Relaxed) - before_bytes;
+                let retired = instructions()
+                    .zip(before_instructions)
+                    .map(|(end, start)| end - start);
+                for row in 0..rows {
+                    assert_eq!(grid.row_text(row).as_deref(), Some(text.as_str()));
+                    for col in 0..cols {
+                        assert_eq!(
+                            grid.row(row).unwrap().get(col).unwrap().is_wide(),
+                            width == 2
+                                && if style == "rgb_sparse" {
+                                    col == 0
+                                } else {
+                                    col % 2 == 0
+                                }
+                        );
+                        if style != "plain" {
+                            assert_eq!(
+                                grid.cell_extra(row, col).unwrap().underline_color_u32(),
+                                Some(0x02000007)
+                            );
+                        }
+                        if style == "rgb" || style == "rgb_image" || style == "rgb_sparse" {
+                            assert_eq!(grid.fg_rgb_at(row, col), Some([12, 34, 56]));
+                            assert_eq!(grid.bg_rgb_at(row, col), Some([65, 43, 21]));
+                            assert_eq!(
+                                grid.cell_extra(row, col)
+                                    .unwrap()
+                                    .hyperlink_id()
+                                    .map(AsRef::as_ref),
+                                Some("wide")
+                            );
+                        }
+                        if style == "rgb_image" {
+                            let actual = grid.cell_extra(row, col).unwrap().image().unwrap();
+                            assert!(Arc::ptr_eq(&actual.image, &image));
+                            assert_eq!((actual.cell_row, actual.cell_col), (row, col));
+                        }
+                    }
+                }
+                println!(
+                    "wide_restore rows={rows} cols={cols} style={style} glyph={glyph} iterations=64 allocation_calls={calls} allocated_bytes={bytes} ns={ns} instructions={retired:?}"
+                );
+            }
+        }
+    }
+}
+
+fn mixed_image_rows() {
+    use aterm_grid::{Grid, ImageData, ImageFormat, ImageRef, ImageScaling};
+    use std::sync::Arc;
+    let (rows, cols) = (24_u16, 80_u16);
+    for pattern in ["none", "tiny", "half", "checker", "full"] {
+        let selected = |row: u16, col: u16| match pattern {
+            "none" => false,
+            "tiny" => row == 0 && col < 4,
+            "half" => row < rows / 2,
+            "checker" => (row + col) % 16 == 0,
+            "full" => true,
+            _ => unreachable!(),
+        };
+        let image = Arc::new(ImageData {
+            bytes: vec![7; 256],
+            format: ImageFormat::Png,
+            cols,
+            rows,
+            z_index: 0,
+            band_lift_px: 0,
+            cell_offset_px: (0, 0),
+            scaling: ImageScaling::Fit,
+            source_rect: None,
+        });
+        let mut pictures = Grid::new(rows, cols);
+        let mut cells = 0;
+        for row in 0..rows {
+            for col in 0..cols {
+                if selected(row, col) {
+                    pictures.set_cell_image(
+                        row,
+                        col,
+                        ImageRef {
+                            image: Arc::clone(&image),
+                            cell_row: row,
+                            cell_col: col,
+                            kitty: None,
+                        },
+                    );
+                    cells += 1;
+                }
+            }
+        }
+        let image_lines = pictures.checkpoint_visible_lines();
+        let mut text = Terminal::new(rows, cols);
+        text.process(
+            b"\x1b]8;id=mixed;https://mixed.example\x1b\\\x1b[38;2;12;34;56m\x1b[48;2;65;43;21m",
+        );
+        for row in 0..rows {
+            text.process(
+                format!("\x1b[{};1H{}", row + 1, "x".repeat(usize::from(cols))).as_bytes(),
+            );
+        }
+        let mut lines = text.grid().checkpoint_visible_lines();
+        for (line, images) in lines.iter_mut().zip(&image_lines) {
+            if let Some(spans) = images.images() {
+                line.set_images(spans.to_vec());
+            }
+        }
+        drop(text);
+        drop(pictures);
+        drop(image_lines);
+        let mut restored = Grid::new(rows, cols);
+        restored.restore_visible_from_lines(&lines);
+        let before_instructions = instructions();
+        let before_calls = CALLS.load(Ordering::Relaxed);
+        let before_bytes = BYTES.load(Ordering::Relaxed);
+        let began = Instant::now();
+        for _ in 0..64 {
+            black_box(&mut restored).restore_visible_from_lines(black_box(&lines));
+        }
+        let ns = began.elapsed().as_nanos();
+        let calls = CALLS.load(Ordering::Relaxed) - before_calls;
+        let bytes = BYTES.load(Ordering::Relaxed) - before_bytes;
+        let retired = instructions()
+            .zip(before_instructions)
+            .map(|(end, start)| end - start);
+        for row in 0..rows {
+            for col in 0..cols {
+                let extra = restored.cell_extra(row, col).unwrap();
+                assert_eq!(extra.images().len(), usize::from(selected(row, col)));
+                if let Some(actual) = extra.image() {
+                    assert!(Arc::ptr_eq(&actual.image, &image));
+                    assert_eq!((actual.cell_row, actual.cell_col), (row, col));
+                }
+                assert_eq!(extra.hyperlink_id().map(AsRef::as_ref), Some("mixed"));
+                assert_eq!(restored.fg_rgb_at(row, col), Some([12, 34, 56]));
+                assert_eq!(restored.bg_rgb_at(row, col), Some([65, 43, 21]));
+            }
+        }
+        println!(
+            "mixed_images pattern={pattern} rows={rows} cols={cols} cells={cells} iterations=64 allocation_calls={calls} allocated_bytes={bytes} ns={ns} instructions={retired:?}"
         );
     }
 }

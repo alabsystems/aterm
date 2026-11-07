@@ -442,14 +442,44 @@ impl Exception {
         }
     }
 
-    /// A request the API refuses the same way each time it is sent.
+    /// A request the API refuses the same way each time it is sent, told of Claude Code
+    /// ([`Self::refused_by`]).
     #[must_use]
     pub fn refused(typed: Option<&str>, message: &str) -> Self {
+        Self::refused_by(Program::Claude, typed, message)
+    }
+
+    /// A request the API `program` calls refuses the same way each time it is sent: the why and
+    /// the action name `program`, and only Claude Code's refusals take Claude Code's remedies
+    /// ([`refused_action`]).
+    #[must_use]
+    pub fn refused_by(program: Program, typed: Option<&str>, message: &str) -> Self {
+        let (why, action) = match program {
+            Program::Claude => (
+                "Claude's API refuses this request the same way each time it is sent.".to_string(),
+                refused_action(typed, message).to_string(),
+            ),
+            other @ (Program::Codex
+            | Program::Agy
+            | Program::Muse
+            | Program::Grok
+            | Program::Kimi
+            | Program::Generic) => (
+                format!(
+                    "The API {} calls refuses this request the same way each time it is sent.",
+                    other.product()
+                ),
+                format!(
+                    "Open the tab and do what {}'s last error asks.",
+                    other.product()
+                ),
+            ),
+        };
         Self {
             kind: ExceptionKind::Refused,
             when: Urgency::Later,
-            why: "Claude's API refuses this request the same way each time it is sent.".to_string(),
-            action: refused_action(typed, message).to_string(),
+            why,
+            action,
             clears: "the agent working",
             escalated: false,
             notice: None,
@@ -458,7 +488,8 @@ impl Exception {
     }
 }
 
-/// Action for a refused request ([`Exception::refused`], [`TurnEndState::notice_typed`]).
+/// Action for a request Claude Code's API refused ([`Exception::refused_by`],
+/// [`TurnEndState::notice_typed`]): each remedy is Claude Code's own.
 const REFUSED_ACTIONS: &[(&[&str], &[&str], &str)] = &[
     (
         &["tool_history_mismatch"],
@@ -1192,7 +1223,8 @@ pub fn exception_for(
         WallKind::ApiError {
             cause: aterm_phase::ApiCause::Request,
             ..
-        } if cfg.retry_api_errors && attempts >= FUTILE_AFTER_TRIES => Some(Exception::refused(
+        } if cfg.retry_api_errors && attempts >= FUTILE_AFTER_TRIES => Some(Exception::refused_by(
+            reading.program,
             state.notice_typed(),
             &reading.wall_message,
         )),

@@ -1249,15 +1249,23 @@ impl App {
             .windows
             .get(&wid)
             .is_some_and(|ws| ws.overlay.is_some());
+        // Read before a page's tree reads them again: output landing between the two is then told
+        // again, never lost. An overlay's tree holds no terminal, so it says nothing of what the
+        // client has read of one.
+        let reads = (!has_overlay).then(|| match frame_plan {
+            Some(plan) => self.client_reads(wid, Some(plan)),
+            None => self.client_reads(wid, self.active_visible_leaf_plan(wid).as_ref()),
+        });
         let native_update = (!has_overlay)
             .then(|| match frame_plan {
                 Some(plan) => self.take_native_accessibility_update_from_plan(wid, plan),
                 None => self.take_native_accessibility_update(wid),
             })
             .flatten();
-        let grid_update = (!has_overlay && native_update.is_none())
-            .then(|| self.grid_a11y_tree(wid, frame_plan))
-            .flatten();
+        let grid_update = reads
+            .as_ref()
+            .filter(|_| native_update.is_none())
+            .and_then(|reads| self.grid_a11y_tree_reading(wid, reads));
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
@@ -1276,6 +1284,10 @@ impl App {
         if ws.native_a11y_published.is_none() {
             ws.native_a11y_staged = None;
         }
+        if let Some(reads) = reads {
+            ws.a11y_reads = reads;
+        }
+        ws.a11y_parked_held = false;
         #[cfg(test)]
         ws.a11y_sent.push(update.clone());
         let Some(adapter) = ws.a11y.as_mut() else {
@@ -1284,8 +1296,8 @@ impl App {
         adapter.update_if_active(move || update);
     }
 
-    /// The terminal grid's tree for window `wid` (`a11y_tree::grid_tree`).
-    #[cfg(a11y_tree)]
+    /// The terminal grid's tree for window `wid` (`a11y_tree::grid_tree`), read as a check reads it.
+    #[cfg(all(a11y_tree, any(test, debug_assertions)))]
     pub(crate) fn grid_a11y_tree(
         &self,
         wid: crate::WindowId,
@@ -1295,47 +1307,72 @@ impl App {
             .is_none()
             .then(|| self.active_visible_leaf_plan(wid))
             .flatten();
-        let plan = frame_plan.or(initial_plan.as_ref());
-        let composed = plan.is_some_and(|plan| self.cells_composed_under(wid, plan));
+        let reads = self.client_reads(wid, frame_plan.or(initial_plan.as_ref()));
+        self.grid_a11y_tree_reading(wid, &reads)
+    }
+
+    /// What a client must hear of window `wid` now, laid out by `plan`.
+    #[cfg(a11y_tree)]
+    pub(crate) fn client_reads(
+        &self,
+        wid: crate::WindowId,
+        plan: Option<&crate::tab_model::VisibleLeafPlan>,
+    ) -> crate::a11y_tree::ClientReads {
         let panes = plan
-            .filter(|_| composed)
             .map(|plan| self.grid_a11y_panes(wid, plan))
             .unwrap_or_default();
-        let snap = if !composed {
-            crate::accessibility::AccessibleSnapshot {
-                text: String::new(),
-                rows: 0,
-                cols: usize::from(self.windows.get(&wid)?.cols),
-                cursor: None,
-            }
-        } else if !panes.is_empty() {
-            self.windows
-                .get(&wid)
-                .filter(|ws| !ws.input_scratch.cells.is_empty())
-                .map(|ws| {
-                    let strip = usize::from(self.chrome_rows(wid));
-                    crate::accessibility::AccessibleSnapshot {
-                        text: String::new(),
-                        rows: ws.input_scratch.cells.len().saturating_sub(strip),
-                        cols: usize::from(ws.cols),
-                        cursor: None,
-                    }
-                })?
-        } else {
-            self.grid_snapshot(wid)?
+        let front = self
+            .windows
+            .get(&wid)
+            .filter(|_| panes.is_empty())
+            .map(|ws| (usize::from(ws.rows), usize::from(ws.cols)))
+            .zip(self.front_terminal(wid).map(|front| front.session))
+            .and_then(|((rows, cols), session)| {
+                self.terminal_document(wid, session, rows, cols, true)
+            });
+        crate::a11y_tree::ClientReads {
+            views: plan.map_or_else(Vec::new, |plan| {
+                plan.leaves.iter().map(|leaf| leaf.view).collect()
+            }),
+            panes,
+            front,
+            rewind: self.rewind_a11y(wid),
+            questions: self.grid_a11y_questions(wid),
+            menu: self.grid_a11y_menu(wid),
+            rename: self.grid_a11y_rename(wid),
+            find: self.grid_a11y_find(wid),
+        }
+    }
+
+    /// The terminal grid's tree for window `wid`, its terminals as `reads` holds them.
+    #[cfg(a11y_tree)]
+    fn grid_a11y_tree_reading(
+        &self,
+        wid: crate::WindowId,
+        reads: &crate::a11y_tree::ClientReads,
+    ) -> Option<aterm_a11y::model::TreeUpdate> {
+        let (rows, cols) = {
+            let ws = self.windows.get(&wid)?;
+            (usize::from(ws.rows), usize::from(ws.cols))
+        };
+        let panes = &reads.panes;
+        let (snap, selection) = match &reads.front {
+            Some(document) => (document.snap.clone(), document.selection),
+            None => (
+                crate::accessibility::AccessibleSnapshot {
+                    text: String::new(),
+                    rows: if panes.is_empty() { 0 } else { rows },
+                    cols,
+                    cursor: None,
+                },
+                None,
+            ),
         };
         let geometry = self.grid_a11y_geometry(wid);
         let tabs = self.grid_a11y_tabs(wid);
-        let selection = panes
-            .is_empty()
-            .then(|| self.grid_a11y_selection(wid, &snap, 0, 0..snap.cols))
-            .flatten();
-        let find = self.grid_a11y_find(wid);
         let messages = self.grid_a11y_messages(wid);
         let chips = self.claude_chips_a11y(wid);
-        let menu = self.autopilot_grid_menu(wid);
         let stats = self.stats_a11y(wid);
-        let rewind = self.rewind_a11y(wid);
         let window_title = self
             .windows
             .get(&wid)
@@ -1346,14 +1383,15 @@ impl App {
             geometry,
             &crate::a11y_tree::GridFrame {
                 tabs: &tabs,
-                panes: &panes,
+                panes,
                 selection,
-                find: find.as_ref(),
+                find: reads.find.as_ref(),
+                rename: reads.rename.as_ref(),
                 messages: &messages,
                 chips: &chips,
-                menu: menu.as_ref(),
+                menu: reads.menu.as_ref(),
                 stats: stats.as_ref(),
-                rewind: rewind.as_ref(),
+                rewind: reads.rewind.as_ref(),
                 window_title,
             },
         ))
@@ -1443,8 +1481,8 @@ impl App {
             .collect()
     }
 
-    /// Window `wid`'s visible split panes as one terminal document each, sliced from the
-    /// composed cells the frame was drawn from.
+    /// The terminals of a split or mixed tab `plan` as one document each, read from each pane's own
+    /// terminal.
     #[cfg(a11y_tree)]
     fn grid_a11y_panes(
         &self,
@@ -1457,48 +1495,12 @@ impl App {
         plan.leaves
             .iter()
             .enumerate()
-            .map(|(slot, leaf)| self.grid_a11y_pane(wid, plan, slot, leaf))
-            .collect::<Option<Vec<_>>>()
-            .unwrap_or_default()
-    }
-
-    /// Note that a frame just composed `wid`'s cells under `plan`.
-    #[cfg(a11y_tree)]
-    pub(crate) fn note_cells_composed(
-        &mut self,
-        wid: crate::WindowId,
-        plan: &crate::tab_model::VisibleLeafPlan,
-    ) {
-        let chrome_rows = self.chrome_rows(wid);
-        if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.composed_layout.record(plan, chrome_rows);
-        }
-    }
-
-    #[cfg(not(a11y_tree))]
-    #[inline]
-    pub(crate) fn note_cells_composed(
-        &mut self,
-        _wid: crate::WindowId,
-        _plan: &crate::tab_model::VisibleLeafPlan,
-    ) {
-    }
-
-    /// Whether `wid`'s composed cells were cut under `plan`, so its rects read what they name.
-    #[cfg(a11y_tree)]
-    fn cells_composed_under(
-        &self,
-        wid: crate::WindowId,
-        plan: &crate::tab_model::VisibleLeafPlan,
-    ) -> bool {
-        self.windows
-            .get(&wid)
-            .is_some_and(|ws| ws.composed_layout.holds(plan, self.chrome_rows(wid)))
+            .filter_map(|(slot, leaf)| self.grid_a11y_pane(wid, plan, slot, leaf))
+            .collect()
     }
 
     /// Window `wid`'s mixed-tab tree `update` with the terminal leaves of `plan` beside its
-    /// native leaves, each one terminal document sliced from the composed cells. Cells a frame of
-    /// this layout has not composed say nothing of these leaves, which join with that frame.
+    /// native leaves, each one terminal document read from its terminal.
     #[cfg(a11y_tree)]
     pub(crate) fn with_mixed_terminal_panes(
         &self,
@@ -1506,15 +1508,7 @@ impl App {
         plan: &crate::tab_model::VisibleLeafPlan,
         mut update: aterm_a11y::model::TreeUpdate,
     ) -> Result<aterm_a11y::model::TreeUpdate, String> {
-        if !self.cells_composed_under(wid, plan) {
-            return Ok(update);
-        }
-        let panes: Vec<_> = plan
-            .leaves
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, leaf)| self.grid_a11y_pane(wid, plan, slot, leaf))
-            .collect();
+        let panes = self.grid_a11y_panes(wid, plan);
         if panes.is_empty() {
             return Ok(update);
         }
@@ -1541,9 +1535,10 @@ impl App {
         };
         let tabs = self.grid_a11y_tabs(wid);
         let find = self.grid_a11y_find(wid);
+        let rename = self.grid_a11y_rename(wid);
         let messages = self.grid_a11y_messages(wid);
         let chips = self.claude_chips_a11y(wid);
-        let menu = self.autopilot_grid_menu(wid);
+        let menu = self.grid_a11y_menu(wid);
         let stats = self.stats_a11y(wid);
         let rewind = self.rewind_a11y(wid);
         crate::a11y_tree::splice_chrome(
@@ -1552,6 +1547,7 @@ impl App {
             &crate::a11y_tree::GridFrame {
                 tabs: &tabs,
                 find: find.as_ref(),
+                rename: rename.as_ref(),
                 messages: &messages,
                 chips: &chips,
                 menu: menu.as_ref(),
@@ -1574,97 +1570,102 @@ impl App {
         slot: usize,
         leaf: &crate::tab_model::VisibleLeaf,
     ) -> Option<crate::a11y_tree::GridPane> {
-        self.view_store
+        let session = self
+            .view_store
             .get(leaf.view)
             .copied()
             .and_then(crate::tab_model::View::terminal_session)?;
-        let ws = self.windows.get(&wid)?;
-        let strip = usize::from(self.chrome_rows(wid));
         let row_off = leaf.rect.origin.y.round().max(0.0) as usize;
         let col_off = leaf.rect.origin.x.round().max(0.0) as usize;
         let rows = (leaf.rect.size.height.round() as usize).max(1);
         let cols = (leaf.rect.size.width.round() as usize).max(1);
-        let cursor = (ws.input_scratch.cursor_visible && leaf.focused)
-            .then(|| {
-                let crow = ws.input_scratch.cursor_row.saturating_sub(strip);
-                let ccol = ws.input_scratch.cursor_col;
-                (crow >= row_off
-                    && crow < row_off + rows
-                    && ccol >= col_off
-                    && ccol < col_off + cols)
-                    .then_some((crow - row_off, ccol - col_off))
-            })
-            .flatten();
-        let snap = crate::accessibility::AccessibleSnapshot::from_cells_in(
-            &crate::claude_footer::ProgramCells::of(&ws.input_scratch, &ws.claude_footer_undo),
-            strip + row_off..strip + row_off + rows,
-            col_off..col_off + cols,
-            cursor,
+        let document = self.terminal_document(wid, session, rows, cols, leaf.focused)?;
+        let mut label = format!(
+            "{} — pane {} of {}",
+            crate::accessibility::LABEL,
+            slot + 1,
+            plan.leaves.len()
         );
-        let selection = self.grid_a11y_selection(wid, &snap, row_off, col_off..col_off + cols);
+        // The slider says this of the focused pane's past; any other's has only its label to say it.
+        if self.rewound_front(wid) != Some(session)
+            && let Some(words) = self.rewind_words(wid, session)
+        {
+            label.push_str(", ");
+            label.push_str(&words);
+        }
         Some(crate::a11y_tree::GridPane {
             slot,
-            label: format!(
-                "{} — pane {} of {}",
-                crate::accessibility::LABEL,
-                slot + 1,
-                plan.leaves.len()
-            ),
-            snap,
+            label,
+            snap: document.snap,
             row_off,
             col_off,
             focused: leaf.focused,
-            selection,
+            selection: document.selection,
         })
     }
 
-    /// The painted selection covering one published document: the whole visible grid
-    /// (`row_off = 0`, full column range) or one pane's rectangle.
+    /// What session `session` shows a client in a view of `rows` by `cols` in window `wid`, read
+    /// from its terminal: the rows a frame of that view draws (the past screen while rewound), and
+    /// when `focused` the caret and any composition in progress there. The window's composed cells
+    /// cannot answer this, since they hold another tab's or layout's rows until a frame of this
+    /// one, a frame that proves nothing changed leaves them without their chrome rows, and they
+    /// carry what aterm paints over a program, which reaches a client as its own node.
     #[cfg(a11y_tree)]
-    fn grid_a11y_selection(
+    pub(crate) fn terminal_document(
         &self,
         wid: crate::WindowId,
-        snap: &crate::accessibility::AccessibleSnapshot,
-        row_off: usize,
-        cols: std::ops::Range<usize>,
-    ) -> Option<crate::a11y_tree::GridSpan> {
-        let ws = self.windows.get(&wid)?;
-        let strip = usize::from(self.chrome_rows(wid));
-        let mut keys: Vec<aterm_core::render::SelectionRowKey> = Vec::new();
-        let mut anchor: Option<(usize, usize)> = None;
-        let mut focus: Option<(usize, usize)> = None;
-        for (row, line) in snap.value().split_inclusive('\n').enumerate() {
-            ws.input_scratch
-                .selection_row_key(strip + row_off + row, &mut keys);
-            let Some((lo, hi)) = keys
-                .iter()
-                .filter_map(|k| {
-                    let lo = usize::from(k.lo).max(cols.start);
-                    let hi = usize::from(k.hi).min(cols.end.saturating_sub(1));
-                    (lo <= hi).then_some((lo, hi))
-                })
-                .reduce(|(a_lo, a_hi), (b_lo, b_hi)| (a_lo.min(b_lo), a_hi.max(b_hi)))
-            else {
-                continue;
-            };
-            let trimmed = line.strip_suffix('\n').unwrap_or(line).chars().count();
-            let start = lo.saturating_sub(cols.start).min(trimmed);
-            let end = (hi.saturating_sub(cols.start) + 1).min(trimmed);
-            anchor.get_or_insert((row, start));
-            focus = Some((row, end));
+        session: u64,
+        rows: usize,
+        cols: usize,
+        focused: bool,
+    ) -> Option<crate::a11y_tree::TerminalDocument> {
+        let (term, owner) = self.pool.shown(session)?;
+        let mut cells = aterm_core::render::RenderInput::empty();
+        let ambiguous_cjk = {
+            let site = crate::metrics::TermWaitSite::Redraw;
+            let mut term = crate::term_lock_ui(&term, &owner.ctx.ui_waiting, site);
+            term.cell_frame_into(&mut cells, rows, cols);
+            term.modes().ambiguous_width_double
+        };
+        let composing = self
+            .windows
+            .get(&wid)
+            .filter(|ws| focused && !ws.preedit.is_empty() && cells.display_offset == 0)
+            .filter(|_| {
+                matches!(
+                    self.preedit_owner(wid),
+                    crate::app_input::PreeditOwner::Grid
+                )
+            });
+        if let Some(ws) = composing {
+            cells.overlay_ime_preedit(&ws.preedit, ws.preedit_caret, ambiguous_cjk);
+            cells.cursor_visible = true;
         }
-        let (anchor, focus) = (anchor?, focus?);
-        (anchor != focus).then_some(crate::a11y_tree::GridSpan { anchor, focus })
+        let cursor = (focused && cells.cursor_visible && cells.cursor_col < cols)
+            .then_some((cells.cursor_row, cells.cursor_col));
+        let snap = crate::accessibility::AccessibleSnapshot::from_cells_in(
+            &cells.cells,
+            0..rows,
+            0..cols,
+            cursor,
+        );
+        let selection = crate::a11y_tree::selected_span(&cells, &snap);
+        Some(crate::a11y_tree::TerminalDocument { snap, selection })
     }
 
     /// The find panel's query field for window `wid`, or `None` when find mode is off.
     #[cfg(a11y_tree)]
-    fn grid_a11y_find(&self, wid: crate::WindowId) -> Option<crate::a11y_tree::GridFind> {
+    pub(crate) fn grid_a11y_find(
+        &self,
+        wid: crate::WindowId,
+    ) -> Option<crate::a11y_tree::GridFind> {
         let search = self.windows.get(&wid)?.search.as_ref()?;
-        let caret = search
-            .query
-            .get(..search.cursor)
-            .map_or_else(|| search.query.chars().count(), |head| head.chars().count());
+        let (query, caret) = self.field_as_composed(
+            wid,
+            crate::app_input::PreeditOwner::Find,
+            &search.query,
+            search.cursor,
+        );
         let mut status: Vec<String> = search.spoken_status().into_iter().collect();
         if search.case_sensitive {
             status.push("case sensitive".to_string());
@@ -1673,14 +1674,58 @@ impl App {
             status.push("regular expression".to_string());
         }
         Some(crate::a11y_tree::GridFind {
-            query: search.query.clone(),
+            query,
             caret,
             status: status.join("; "),
         })
     }
 
-    /// The chrome messages window `wid` is showing now: surfaces that speak unprompted
-    /// and then leave, which a screen reader cannot find by exploring.
+    /// The field open over window `wid`'s tab strip, or `None` when it has none.
+    #[cfg(a11y_tree)]
+    fn grid_a11y_rename(&self, wid: crate::WindowId) -> Option<crate::a11y_tree::GridRename> {
+        let edit = self.inline_rename_edit(wid)?;
+        let (text, caret) = self.field_as_composed(
+            wid,
+            crate::app_input::PreeditOwner::Rename,
+            &edit.text,
+            edit.cursor,
+        );
+        let label = match edit.field {
+            crate::session_timeline::MetaField::Role => "Session role",
+            _ => "Session name",
+        };
+        Some(crate::a11y_tree::GridRename { label, text, caret })
+    }
+
+    /// `text` with the composition in progress when `owner` holds it, and the caret as a character
+    /// index for a field whose caret is the byte offset `cursor`.
+    #[cfg(a11y_tree)]
+    fn field_as_composed(
+        &self,
+        wid: crate::WindowId,
+        owner: crate::app_input::PreeditOwner,
+        text: &str,
+        cursor: usize,
+    ) -> (String, usize) {
+        let (head, tail) = text.split_at_checked(cursor).unwrap_or((text, ""));
+        let window = self
+            .windows
+            .get(&wid)
+            .filter(|_| self.preedit_owner(wid) == owner);
+        let composing = window.map_or("", |ws| ws.preedit.as_str());
+        let composed = window
+            .and_then(|ws| ws.preedit_caret)
+            .and_then(|at| composing.get(..at))
+            .unwrap_or(composing);
+        (
+            format!("{head}{composing}{tail}"),
+            head.chars().count() + composed.chars().count(),
+        )
+    }
+
+    /// The chrome messages window `wid` is showing now: surfaces that leave again, which all but a
+    /// hovered link's caption say unprompted, since a screen reader cannot find them by exploring.
+    /// The caption stays silent in the tree until a client reads it.
     #[cfg(a11y_tree)]
     fn grid_a11y_messages(&self, wid: crate::WindowId) -> Vec<crate::a11y_tree::GridMessage> {
         use crate::a11y_tree::{ChromeMessage, GridMessage};
@@ -1801,27 +1846,17 @@ impl App {
             }
         }
 
-        if let Some(pending) = self.paste_banner.as_ref().filter(|p| p.wid == wid) {
-            out.push(GridMessage {
-                message: ChromeMessage::PasteConfirm,
-                context: None,
-                text: crate::paste_banner::question(pending.text()),
-                detail: Some(crate::paste_banner::announcement_detail()),
-                busy: false,
-                progress: None,
-                alarm: false,
-                activates: false,
-                bar_row: None,
-                capsules: Vec::new(),
-            });
-        }
+        out.extend(self.grid_a11y_questions(wid));
 
-        if let Some(pending) = self.close_band(wid) {
+        if let Some(caption) = ws.shown_caption.as_ref().filter(|caption| {
+            self.front_terminal(wid)
+                .is_some_and(|front| front.session == caption.session)
+        }) {
             out.push(GridMessage {
-                message: ChromeMessage::CloseConfirm,
+                message: ChromeMessage::LinkCaption,
                 context: None,
-                text: crate::close_confirm::question(&pending.prompt),
-                detail: Some(crate::close_confirm::answer_keys(&pending.prompt)),
+                text: caption.words.clone(),
+                detail: None,
                 busy: false,
                 progress: None,
                 alarm: false,
@@ -1831,6 +1866,50 @@ impl App {
             });
         }
         out
+    }
+
+    /// The question waiting on an answer in window `wid`. A paste question hides a close question
+    /// until it is answered, as it does on the band and for the keys.
+    #[cfg(a11y_tree)]
+    fn grid_a11y_questions(&self, wid: crate::WindowId) -> Vec<crate::a11y_tree::GridMessage> {
+        use crate::a11y_tree::{ChromeMessage, GridMessage};
+        let mut out: Vec<GridMessage> = Vec::new();
+        if let Some(pending) = self.paste_banner.as_ref().filter(|p| p.wid == wid) {
+            out.push(GridMessage {
+                message: ChromeMessage::PasteConfirm,
+                context: None,
+                text: crate::paste_banner::question(pending.text()),
+                detail: Some(crate::paste_banner::announcement_detail(pending.text())),
+                busy: false,
+                progress: None,
+                alarm: false,
+                activates: false,
+                bar_row: None,
+                capsules: Vec::new(),
+            });
+        } else if let Some(pending) = self.close_band(wid) {
+            out.push(GridMessage {
+                message: ChromeMessage::CloseConfirm,
+                context: None,
+                text: crate::close_confirm::question(&pending.prompt),
+                detail: Some(crate::close_confirm::announcement_detail(&pending.prompt)),
+                busy: false,
+                progress: None,
+                alarm: false,
+                activates: false,
+                bar_row: None,
+                capsules: Vec::new(),
+            });
+        }
+        out
+    }
+
+    /// The popup menu open over window `wid`'s grid: a tab's, which paints over Autopilot's and takes
+    /// the keys first, else Autopilot's.
+    #[cfg(a11y_tree)]
+    fn grid_a11y_menu(&self, wid: crate::WindowId) -> Option<crate::a11y_tree::GridMenu> {
+        self.tab_grid_menu(wid)
+            .or_else(|| self.autopilot_grid_menu(wid))
     }
 
     /// A screen reader activated one of window `wid`'s chrome messages.
@@ -1890,7 +1969,9 @@ impl App {
                     let _ = self.open_messages_entry(wid, None);
                 }
             }
-            ChromeMessage::PasteConfirm | ChromeMessage::CloseConfirm => {}
+            ChromeMessage::PasteConfirm
+            | ChromeMessage::CloseConfirm
+            | ChromeMessage::LinkCaption => {}
         }
     }
 
@@ -2008,7 +2089,11 @@ impl App {
             if req.action == aterm_a11y::model::Action::Click
                 && let Some((epoch, item)) = crate::a11y_tree::menu_item_for(req.target_node)
             {
-                self.choose_autopilot_menu_item_for_reader(wid, epoch, item);
+                if self.tab_grid_menu(wid).is_some() {
+                    self.choose_tab_menu_item_for_reader(wid, epoch, item);
+                } else {
+                    self.choose_autopilot_menu_item_for_reader(wid, epoch, item);
+                }
                 return;
             }
             if req.action == aterm_a11y::model::Action::ShowContextMenu

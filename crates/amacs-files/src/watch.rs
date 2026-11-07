@@ -19,10 +19,13 @@
 //! file the path names now. Where the directory is missing it watches the
 //! nearest one above it that is there, whose every change is a look (each
 //! finding no change until the file is made), so a file whose folder does
-//! not exist yet, or went with it, is heard once both are made. A file no arm
-//! took (a folder refused it, descriptors ran out, or its folders kept being
-//! made while it armed) is armed again every `REARM_EVERY`, and only while
-//! some file is unarmed.
+//! not exist yet, or went with it, is heard once both are made. Every folder
+//! above that one, up to the root, listens only for its own rename or end, one
+//! listener per folder however many files' paths run through it, so a folder
+//! of the path renamed (a project folder moved, a checkout swapped in) is
+//! heard as well. A file no arm took (a folder refused it, descriptors or
+//! watches ran out, or its folders kept being made or moved while it armed)
+//! is armed again every `REARM_EVERY`, and only while some file is unarmed.
 //!
 //! The watch only tells: the host re-reads the file through the document's
 //! own capability and decides (reload a clean buffer in place, or offer
@@ -167,9 +170,11 @@ pub trait FileEvents: Send {
     ///
     /// # Errors
     /// An arm that did not take, which the watch arms again: the platform's,
-    /// when neither the file nor any directory of its can be armed or the file
-    /// is there but descriptors ran out, and [`io::ErrorKind::WouldBlock`]
-    /// when its folders were still being made after every look.
+    /// when neither the file nor any directory of its can be armed, when
+    /// descriptors (or inotify watches) ran out for the file or a folder above
+    /// its own, or when the kernel refused a folder's listener; and
+    /// [`io::ErrorKind::WouldBlock`] when, after every look, its folders were
+    /// still being made or a folder above it kept moving.
     fn arm(&mut self, key: u64, path: &Path) -> io::Result<()>;
 
     /// Stop hearing `key`.
@@ -517,10 +522,11 @@ impl FileEvents for PollEvents {
 }
 
 /// How many more times one arm looks, where a missing folder of the file's was
-/// made while it armed: each look starts again at the file's own folder. A
-/// path still being made when these run out fails the arm, which the watch
-/// arms again later, so a folder made and taken away again and again cannot
-/// keep the watch thread arming.
+/// made, or a folder above it moved, while it armed: each look starts again at
+/// the file's own folder. A path still being made or moved when these run out
+/// fails the arm, which the watch arms again later, so a folder made and taken
+/// away (or renamed back and forth) again and again cannot keep the watch
+/// thread arming.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const ARM_AGAIN: usize = 8;
 
@@ -533,6 +539,184 @@ const ARM_AGAIN: usize = 8;
 fn folders_up(path: &Path) -> impl Iterator<Item = (&Path, &Path)> {
     std::iter::successors(Some(path), |below| below.parent())
         .filter_map(|below| Some((below.parent()?, below)))
+}
+
+/// A folder or a link that looking a path up passes through, named by a path with no link on it,
+/// so a listener opened by that path is on the folder or on the link itself.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[derive(Debug)]
+struct Passed {
+    path: PathBuf,
+    /// A link, whose target the lookup goes on through, rather than a folder.
+    link: bool,
+    /// The folder holds the root of another volume that the lookup goes on into.
+    #[cfg(target_os = "macos")]
+    holds_volume: bool,
+}
+
+/// The most links one lookup reads: XNU's `MAXSYMLINKS` (32), Linux's (40).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const LOOKUP_LINKS: usize = if cfg!(target_os = "linux") { 40 } else { 32 };
+
+/// Every folder and link that looking the folder `path` up passes through, from the root down to
+/// `path` itself, as the kernel walks it: a link's target is looked up in turn, from the root
+/// where it is absolute and from the link's folder otherwise, and `..` goes back to the folder
+/// the lookup came from (the target's, after a link). Behind a link its user cannot read (macOS),
+/// the walk goes on from the folder its target names, by that folder's own path, so the links the
+/// target itself goes through are not passed.
+///
+/// The walk ends early, with what it passed, in two places it cannot follow the kernel: where
+/// the link-free name of a folder runs past the longest path the platform names (a link that
+/// shortens the path can take the lookup there), and where an entry is missing while `path`
+/// still looks up to the folder it did (a `/proc` link, which the kernel follows to a place its
+/// text does not name).
+///
+/// # Errors
+/// [`io::ErrorKind::NotFound`] where `path` does not look up to a folder, or an entry on the way
+/// is missing or neither a folder nor a link and `path` no longer looks up to where it did: the
+/// path moved as it walked. The platform's `ELOOP` past [`LOOKUP_LINKS`] links, and its error
+/// where an entry cannot be read.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn passed_through(path: &Path) -> io::Result<Vec<Passed>> {
+    use std::collections::VecDeque;
+    use std::ffi::OsString;
+    use std::path::Component;
+    enum Step {
+        Root,
+        Up,
+        Name(OsString),
+    }
+    fn steps(path: &Path) -> impl DoubleEndedIterator<Item = Step> + '_ {
+        path.components().filter_map(|component| match component {
+            Component::RootDir => Some(Step::Root),
+            Component::ParentDir => Some(Step::Up),
+            Component::Normal(name) => Some(Step::Name(name.to_os_string())),
+            Component::CurDir | Component::Prefix(_) => None,
+        })
+    }
+    use std::os::unix::fs::MetadataExt as _;
+    let path = std::path::absolute(path)?;
+    let looked_up = |path: &Path| std::fs::metadata(path).map(|there| (there.dev(), there.ino()));
+    let start = looked_up(&path)?;
+    let mut passed = vec![Passed {
+        path: PathBuf::from("/"),
+        link: false,
+        #[cfg(target_os = "macos")]
+        holds_volume: false,
+    }];
+    // The folders from the root down to where the lookup is, by their place in `passed`.
+    let mut chain = vec![0];
+    let mut rest: VecDeque<Step> = steps(&path).collect();
+    let mut links = 0;
+    while let Some(step) = rest.pop_front() {
+        let name = match step {
+            Step::Root => {
+                chain.truncate(1);
+                continue;
+            }
+            Step::Up => {
+                if chain.len() > 1 {
+                    chain.pop();
+                }
+                continue;
+            }
+            Step::Name(name) => name,
+        };
+        let holder = chain.last().copied().unwrap_or(0);
+        let next = passed[holder].path.join(name);
+        let there = match std::fs::symlink_metadata(&next) {
+            Ok(there) => there,
+            Err(error) if error.raw_os_error() == Some(libc::ENAMETOOLONG) => break,
+            // Still missing, and the path still looks up where it did: not a move.
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    && std::fs::symlink_metadata(&next).is_err()
+                    && looked_up(&path).is_ok_and(|now| now == start) =>
+            {
+                break;
+            }
+            Err(error) => return Err(error),
+        };
+        if there.file_type().is_symlink() {
+            links += 1;
+            if links > LOOKUP_LINKS {
+                return Err(io::Error::from_raw_os_error(libc::ELOOP));
+            }
+            let target = link_target(&next);
+            passed.push(Passed {
+                path: next,
+                link: true,
+                #[cfg(target_os = "macos")]
+                holds_volume: false,
+            });
+            match target {
+                Ok(target) => {
+                    for step in steps(&target).rev() {
+                        rest.push_front(step);
+                    }
+                }
+                Err(error) if error.raw_os_error() == Some(libc::ENAMETOOLONG) => break,
+                Err(error) => return Err(error),
+            }
+        } else if there.is_dir() {
+            #[cfg(target_os = "macos")]
+            {
+                if std::fs::symlink_metadata(&passed[holder].path)
+                    .is_ok_and(|folder| folder.dev() != there.dev())
+                {
+                    passed[holder].holds_volume = true;
+                }
+            }
+            chain.push(passed.len());
+            passed.push(Passed {
+                path: next,
+                link: false,
+                #[cfg(target_os = "macos")]
+                holds_volume: false,
+            });
+        } else {
+            return Err(io::Error::from(io::ErrorKind::NotFound));
+        }
+    }
+    Ok(passed)
+}
+
+/// What the link `link` names. On macOS a link made under a strict umask can refuse its reader
+/// (`readlink` needs read access to it) while a lookup still goes through it; there the folder it
+/// names is opened through it for search alone (`O_SEARCH`, which the lookup's own permission
+/// covers) and asked for its own path (`F_GETPATH`), which has no link on it.
+///
+/// # Errors
+/// The platform's where the link cannot be read (or, refused, the folder it names cannot be
+/// opened), and `ENAMETOOLONG` where that folder's own path is longer than the platform names.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn link_target(link: &Path) -> io::Result<PathBuf> {
+    match std::fs::read_link(link) {
+        #[cfg(target_os = "macos")]
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            use std::os::fd::AsRawFd as _;
+            use std::os::unix::ffi::OsStrExt as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let folder = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(O_EVTONLY | libc::O_NONBLOCK | O_SEARCH)
+                .open(link)?;
+            let mut named = vec![0u8; usize::try_from(libc::PATH_MAX).unwrap_or(1024)];
+            // SAFETY: a live descriptor and a buffer of `PATH_MAX` bytes (`MAXPATHLEN`), which
+            // `F_GETPATH` fills with a NUL-terminated path.
+            if unsafe { libc::fcntl(folder.as_raw_fd(), libc::F_GETPATH, named.as_mut_ptr()) } < 0 {
+                let error = io::Error::last_os_error();
+                // XNU's answer for a path that does not fit `MAXPATHLEN`.
+                if error.raw_os_error() == Some(libc::ENOSPC) {
+                    return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
+                }
+                return Err(error);
+            }
+            let end = named.iter().position(|&b| b == 0).unwrap_or(named.len());
+            Ok(PathBuf::from(std::ffi::OsStr::from_bytes(&named[..end])))
+        }
+        read => read,
+    }
 }
 
 /// `poll(2)`'s timeout for a [`FileEvents::wait`] of at most `timeout`: `-1`
@@ -554,6 +738,27 @@ fn poll_millis(timeout: Option<Duration>) -> i32 {
 #[cfg(target_os = "macos")]
 const O_EVTONLY: libc::c_int = 0x0000_8000;
 
+/// `<sys/fcntl.h>`'s `O_SYMLINK`, which the generated libc does not carry: open
+/// a link itself rather than what it names.
+#[cfg(target_os = "macos")]
+const O_SYMLINK: libc::c_int = 0x0020_0000;
+
+/// `<sys/fcntl.h>`'s `O_SEARCH` (`O_EXEC | O_DIRECTORY`), which the generated libc
+/// does not carry: open a folder for search alone, which needs no permission to
+/// list it.
+#[cfg(target_os = "macos")]
+const O_SEARCH: libc::c_int = 0x4000_0000 | libc::O_DIRECTORY;
+
+/// Opens the link `path` itself to hear its events only.
+#[cfg(target_os = "macos")]
+fn open_link_for_events(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_EVTONLY | libc::O_NONBLOCK | O_SYMLINK)
+        .open(path)
+}
+
 /// Opens `path` to hear its events only ([`O_EVTONLY`]), never blocking (a
 /// FIFO swapped in) and never following a link.
 #[cfg(target_os = "macos")]
@@ -572,17 +777,18 @@ fn open_for_events(path: &Path, directory: bool) -> io::Result<std::fs::File> {
 #[cfg(target_os = "macos")]
 mod kqueue {
     //! macOS: one kqueue, a vnode filter on each watched file and on its
-    //! directory (or the nearest one above it that is there), and a user event
-    //! that wakes the wait.
+    //! directory (or the nearest one above it that is there), one on each
+    //! folder above that, shared by every file whose path runs through it, and
+    //! a user event that wakes the wait.
 
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::io;
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::Duration;
 
-    use super::{FileEvents, Waker, open_for_events};
+    use super::{FileEvents, Waker, open_for_events, open_link_for_events};
 
     /// The events that mean a file's bytes, name or attributes moved.
     const FILE_EVENTS: u32 = libc::NOTE_WRITE
@@ -598,12 +804,32 @@ mod kqueue {
     const DIRECTORY_EVENTS: u32 =
         libc::NOTE_WRITE | libc::NOTE_DELETE | libc::NOTE_RENAME | libc::NOTE_REVOKE;
 
+    /// The events that mean a folder above a file's own one was renamed or went, which moves the
+    /// file's path off what its own listeners hold. A write into one is not among them, so a busy
+    /// folder up the path (a home folder) wakes nothing.
+    const ABOVE_EVENTS: u32 = libc::NOTE_DELETE | libc::NOTE_RENAME | libc::NOTE_REVOKE;
+
+    /// The listener on one folder above some keys' own folders, which every key whose path runs
+    /// through that folder shares (closing it drops its filter).
+    struct Above {
+        file: std::fs::File,
+        /// What its filter hears.
+        fflags: u32,
+        keys: BTreeSet<u64>,
+    }
+
     pub(super) struct KqueueEvents {
         kq: Arc<OwnedFd>,
-        /// Each key's open file and directory (closing one drops its filter).
+        /// Each key's open file and directory (closing one drops its filter), the directory
+        /// first.
         armed: BTreeMap<u64, Vec<std::fs::File>>,
         /// Which key each open descriptor hears for.
         keys: BTreeMap<RawFd, u64>,
+        /// The folders above the keys' own, by identity (device and inode): one listener each,
+        /// however many keys' paths run through it.
+        above: BTreeMap<(u64, u64), Above>,
+        /// Which folder above each of those listeners' descriptors is.
+        above_at: BTreeMap<RawFd, (u64, u64)>,
     }
 
     impl KqueueEvents {
@@ -622,6 +848,8 @@ mod kqueue {
                 kq: Arc::new(kq),
                 armed: BTreeMap::new(),
                 keys: BTreeMap::new(),
+                above: BTreeMap::new(),
+                above_at: BTreeMap::new(),
             })
         }
 
@@ -640,17 +868,7 @@ mod kqueue {
             } else {
                 FILE_EVENTS
             };
-            change(
-                &self.kq,
-                libc::kevent {
-                    ident: libc::uintptr_t::try_from(fd).unwrap_or(0),
-                    filter: libc::EVFILT_VNODE,
-                    flags: libc::EV_ADD | libc::EV_CLEAR,
-                    fflags,
-                    data: 0,
-                    udata: std::ptr::null_mut(),
-                },
-            )?;
+            change(&self.kq, vnode_event(fd, fflags))?;
             // Gone or replaced before the filter took, whose event then never comes.
             if !still_at(&file, path)? {
                 return Err(io::Error::from(io::ErrorKind::NotFound));
@@ -662,20 +880,20 @@ mod kqueue {
     }
 
     impl KqueueEvents {
-        /// Listen on the nearest folder of `path`'s that is there ([`super::folders_up`]): the
-        /// folder just below it that was missing, or `None` where that nearest one is `path`'s
-        /// own.
-        fn listen_folder(
+        /// Listen on the nearest folder of `path`'s that is there ([`super::folders_up`]): that
+        /// folder, and the folder just below it that was missing, or `None` where that nearest
+        /// one is `path`'s own.
+        fn listen_folder<'p>(
             &mut self,
             key: u64,
-            path: &Path,
+            path: &'p Path,
             step: &mut impl FnMut(Listen, &Path) -> io::Result<()>,
-        ) -> io::Result<Option<PathBuf>> {
+        ) -> io::Result<(&'p Path, Option<PathBuf>)> {
             for (directory, below) in super::folders_up(path) {
                 let listened = self.listen(key, directory, true, step);
                 step(Listen::Answered, directory)?;
                 match listened {
-                    Ok(()) => return Ok((below != path).then(|| below.to_path_buf())),
+                    Ok(()) => return Ok((directory, (below != path).then(|| below.to_path_buf()))),
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                     Err(error) => return Err(error),
                 }
@@ -683,12 +901,144 @@ mod kqueue {
             Err(io::Error::from(io::ErrorKind::NotFound))
         }
 
-        /// Listen on `path`'s folder, then on `path`, telling `step` how each goes.
+        /// Listen on the folder `path`, or the link itself where `link`, for `fflags` under `key`,
+        /// sharing a listener another key already holds on it, widened to `fflags` where it hears
+        /// less (it is never narrowed while it lives: a key that needed more and left costs the
+        /// others a look when it fires). Nothing where `path` cannot be opened for events (a
+        /// folder or a link this user cannot read).
+        ///
+        /// # Errors
+        /// [`io::ErrorKind::NotFound`] when the folder or link moved or went as it was listened
+        /// on (a link or a file is where the folder was); the platform's when descriptors ran out
+        /// or the kqueue refused a filter.
+        pub(super) fn listen_one(
+            &mut self,
+            key: u64,
+            path: &Path,
+            link: bool,
+            fflags: u32,
+        ) -> io::Result<()> {
+            use std::os::unix::fs::MetadataExt as _;
+            let opened = if link {
+                open_link_for_events(path)
+            } else {
+                open_for_events(path, true)
+            };
+            let file = match opened {
+                Ok(file) => file,
+                Err(error)
+                    if error.kind() == io::ErrorKind::NotFound
+                        || matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) =>
+                {
+                    return Err(error);
+                }
+                // A link or a file where the lookup passed a folder: it moved as the walk ran.
+                Err(error)
+                    if !link
+                        && matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) =>
+                {
+                    return Err(io::Error::from(io::ErrorKind::NotFound));
+                }
+                Err(_) => return Ok(()),
+            };
+            let held = file.metadata()?;
+            let id = (held.dev(), held.ino());
+            if let Some(shared) = self.above.get_mut(&id) {
+                if shared.fflags & fflags != fflags {
+                    // Adding a filter that is there changes what it hears.
+                    change(
+                        &self.kq,
+                        vnode_event(shared.file.as_raw_fd(), shared.fflags | fflags),
+                    )?;
+                    shared.fflags |= fflags;
+                }
+                shared.keys.insert(key);
+                return Ok(());
+            }
+            let fd = file.as_raw_fd();
+            change(&self.kq, vnode_event(fd, fflags))?;
+            // Moved before the filter took, whose event then never comes.
+            if !still_at(&file, path)? {
+                return Err(io::Error::from(io::ErrorKind::NotFound));
+            }
+            self.above_at.insert(fd, id);
+            self.above.insert(
+                id,
+                Above {
+                    file,
+                    fflags,
+                    keys: BTreeSet::from([key]),
+                },
+            );
+            Ok(())
+        }
+
+        /// Listen for `key` on every folder and link that looking `from` up passes through
+        /// ([`super::passed_through`]) and its own listeners do not hold, each for its own rename
+        /// or end ([`Self::listen_one`]): any of them renamed, gone or replaced moves the path off
+        /// what those listeners hold. A link is listened on itself, which hears it replaced (made
+        /// to name another folder), and so is each folder the lookup goes on through behind it.
+        /// One that cannot be opened for events is passed over, and the rest are still listened
+        /// on. The root, which nothing renames, is left out unless it holds a volume's root.
+        ///
+        /// A volume's root, on another device than the folder that holds it, hears nothing when
+        /// the volume is renamed in place (Finder or `diskutil rename`): XNU renames the folder it
+        /// is mounted on instead, which writes only the folder that holds that one, so a folder
+        /// holding a volume's root listens for writes as well.
+        ///
+        /// Then `held` must still name what `key`'s first listener is on (its own folder's, or its
+        /// file's where the folder refused its listen): a folder above renamed before its listen
+        /// took moved it away unheard.
+        ///
+        /// # Errors
+        /// [`io::ErrorKind::NotFound`] when a folder or link on the way moved or went as the walk
+        /// listened on it, so the arm looks again; the platform's when descriptors ran out, the
+        /// kqueue refused a filter, or the lookup failed ([`super::passed_through`]).
+        fn listen_above(&mut self, key: u64, from: &Path, held: &Path) -> io::Result<()> {
+            use std::os::unix::fs::MetadataExt as _;
+            let own: Vec<(u64, u64)> = self
+                .armed
+                .get(&key)
+                .into_iter()
+                .flatten()
+                .filter_map(|file| file.metadata().ok())
+                .map(|there| (there.dev(), there.ino()))
+                .collect();
+            for passed in super::passed_through(from)? {
+                if passed.path.parent().is_none() && !passed.holds_volume {
+                    continue;
+                }
+                if std::fs::symlink_metadata(&passed.path)
+                    .is_ok_and(|there| own.contains(&(there.dev(), there.ino())))
+                {
+                    continue;
+                }
+                let fflags = if passed.holds_volume {
+                    ABOVE_EVENTS | libc::NOTE_WRITE
+                } else {
+                    ABOVE_EVENTS
+                };
+                self.listen_one(key, &passed.path, passed.link, fflags)?;
+            }
+            // The first listener a key holds is its own folder's, or its file's where the folder
+            // refused ([`Self::arm_around`]).
+            let first = self.armed.get(&key).and_then(|files| files.first());
+            match first {
+                Some(first) if still_at(first, held)? => Ok(()),
+                _ => Err(io::Error::from(io::ErrorKind::NotFound)),
+            }
+        }
+
+        /// Listen on `path`'s folder, then on `path`, then on each folder above that one,
+        /// telling `step` how the first two go.
         ///
         /// The folder goes first because it hears a file made but no write into one. Where
         /// `path`'s own folder is there, a file made after its listen is heard there and one made
         /// before it opens below. In the other order a file made between the two has no listener
-        /// of its own, and every later write into it goes unheard.
+        /// of its own, and every later write into it goes unheard. The folders above hear the
+        /// path renamed out from under both ([`Self::listen_above`]), and still do where the
+        /// file's own folder refused its listen (a link, or one this user cannot read) and the
+        /// file's listener took: that is all the key holds there.
         pub(super) fn arm_around(
             &mut self,
             key: u64,
@@ -703,12 +1053,31 @@ mod kqueue {
                 match folder {
                     // Made between its failed open and the listen above it, which hears
                     // nothing inside it: arm again, lower.
-                    Ok(Some(made)) if made.exists() => {}
-                    Ok(_) => return file_answer(file),
-                    Err(error) => return file.or(Err(error)),
+                    Ok((_, Some(made))) if made.exists() => {}
+                    Ok((directory, _)) => match self.listen_above(key, directory, directory) {
+                        // A folder on the way moved as the walk listened: arm again.
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        above => return above.and(file_answer(file)),
+                    },
+                    Err(error) => match (file, path.parent()) {
+                        (Ok(()), Some(own)) => match self.listen_above(key, own, path) {
+                            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                            above => return above,
+                        },
+                        (file, _) => return file.or(Err(error)),
+                    },
                 }
             }
             Err(io::Error::from(io::ErrorKind::WouldBlock))
+        }
+
+        /// How many folders above the keys' own have a listener, and which keys share each.
+        #[cfg(test)]
+        pub(super) fn above(&self) -> Vec<((u64, u64), Vec<u64>)> {
+            self.above
+                .iter()
+                .map(|(id, above)| (*id, above.keys.iter().copied().collect()))
+                .collect()
         }
     }
 
@@ -753,6 +1122,15 @@ mod kqueue {
             for file in self.armed.remove(&key).unwrap_or_default() {
                 self.keys.remove(&file.as_raw_fd());
             }
+            let above_at = &mut self.above_at;
+            self.above.retain(|_, above| {
+                above.keys.remove(&key);
+                let shared = !above.keys.is_empty();
+                if !shared {
+                    above_at.remove(&above.file.as_raw_fd());
+                }
+                shared
+            });
         }
 
         fn wait(&mut self, timeout: Option<Duration>, touched: &mut Vec<u64>) -> io::Result<()> {
@@ -787,11 +1165,14 @@ mod kqueue {
                 if event.filter != libc::EVFILT_VNODE {
                     continue;
                 }
-                if let Some(key) = RawFd::try_from(event.ident)
-                    .ok()
-                    .and_then(|fd| self.keys.get(&fd))
-                {
+                let Ok(fd) = RawFd::try_from(event.ident) else {
+                    continue;
+                };
+                if let Some(key) = self.keys.get(&fd) {
                     touched.push(*key);
+                } else if let Some(above) = self.above_at.get(&fd).and_then(|id| self.above.get(id))
+                {
+                    touched.extend(above.keys.iter().copied());
                 }
             }
             Ok(())
@@ -802,6 +1183,18 @@ mod kqueue {
             Arc::new(move || {
                 let _ = change(&kq, user_event(libc::NOTE_TRIGGER, 0));
             })
+        }
+    }
+
+    /// The change entry that adds a vnode filter for `fflags` on `fd`.
+    fn vnode_event(fd: RawFd, fflags: u32) -> libc::kevent {
+        libc::kevent {
+            ident: libc::uintptr_t::try_from(fd).unwrap_or(0),
+            filter: libc::EVFILT_VNODE,
+            flags: libc::EV_ADD | libc::EV_CLEAR,
+            fflags,
+            data: 0,
+            udata: std::ptr::null_mut(),
         }
     }
 
@@ -845,12 +1238,24 @@ const INOTIFY_HEAD: usize = 16;
 #[cfg(any(target_os = "linux", test))]
 const IN_Q_OVERFLOW: u32 = 0x0000_4000;
 
+/// `<sys/inotify.h>`'s `IN_MOVE_SELF | IN_DELETE_SELF`: the watched folder
+/// itself was renamed or went.
+#[cfg(any(target_os = "linux", test))]
+const INOTIFY_SELF: u32 = 0x0000_0800 | 0x0000_0400;
+
 /// Push the keys a buffer of `struct inotify_event`s touches: each event
 /// whose watch and entry name are a key's (one on the directory itself, with
-/// no name, touches every key on it), and every key after a queue overflow,
-/// whose look then finds which files really changed.
+/// no name, touches every key on it), each one on a folder above a key's own
+/// (`above`, which hears only that folder renamed or gone) touches that key,
+/// and every key after a queue overflow, whose look then finds which files
+/// really changed.
 #[cfg(any(target_os = "linux", test))]
-fn inotify_touched(buffer: &[u8], keys: &BTreeMap<u64, (i32, Vec<u8>)>, touched: &mut Vec<u64>) {
+fn inotify_touched(
+    buffer: &[u8],
+    keys: &BTreeMap<u64, (i32, Vec<u8>)>,
+    above: &BTreeMap<u64, Vec<i32>>,
+    touched: &mut Vec<u64>,
+) {
     let word = |at: usize| {
         buffer
             .get(at..at + 4)
@@ -875,6 +1280,15 @@ fn inotify_touched(buffer: &[u8], keys: &BTreeMap<u64, (i32, Vec<u8>)>, touched:
                     touched.push(*key);
                 }
             }
+            // A watch another key holds as its own folder also hears that folder's entries,
+            // which name one: only the folder's own rename or end touches a key above it.
+            if name.is_empty() && mask & INOTIFY_SELF != 0 {
+                for (key, watches) in above {
+                    if watches.contains(&wd) {
+                        touched.push(*key);
+                    }
+                }
+            }
         }
         at = end;
     }
@@ -884,8 +1298,10 @@ fn inotify_touched(buffer: &[u8], keys: &BTreeMap<u64, (i32, Vec<u8>)>, touched:
 mod inotify {
     //! Linux: one inotify descriptor watching each watched file's directory, or
     //! the nearest one above it that is there (events name the entry, so a
-    //! replace by rename is heard, as is the making of the missing folder), and
-    //! a pipe that wakes the wait.
+    //! replace by rename is heard, as is the making of the missing folder), each
+    //! folder above that for its own rename or end, and a pipe that wakes the
+    //! wait. The kernel keeps one watch per folder, so a watch two keys hold
+    //! stays until neither does.
 
     use std::collections::BTreeMap;
     use std::ffi::CString;
@@ -896,12 +1312,14 @@ mod inotify {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use super::{FileEvents, Waker, inotify_touched};
+    use super::{FileEvents, INOTIFY_SELF, Waker, inotify_touched};
 
     /// `<sys/inotify.h>`'s event bits the generated libc does not carry.
     const IN_MODIFY: u32 = 0x0000_0002;
     const IN_ATTRIB: u32 = 0x0000_0004;
     const IN_CLOSE_WRITE: u32 = 0x0000_0008;
+    /// `<sys/inotify.h>`'s flag that adds a watch's mask to the one its folder has.
+    const IN_MASK_ADD: u32 = 0x2000_0000;
 
     const DIRECTORY_EVENTS: u32 = IN_MODIFY
         | IN_ATTRIB
@@ -919,6 +1337,8 @@ mod inotify {
         wake_write: Arc<OwnedFd>,
         /// Each key's directory watch and entry name.
         keys: BTreeMap<u64, (i32, Vec<u8>)>,
+        /// Each key's watches on the folders above its directory.
+        above: BTreeMap<u64, Vec<i32>>,
     }
 
     impl InotifyEvents {
@@ -943,33 +1363,166 @@ mod inotify {
                 wake_read,
                 wake_write: Arc::new(wake_write),
                 keys: BTreeMap::new(),
+                above: BTreeMap::new(),
             })
+        }
+
+        /// Whether any key still holds `wd`, as its directory or as a folder above it.
+        fn held(&self, wd: i32) -> bool {
+            self.keys.values().any(|(other, _)| *other == wd)
+                || self.above.values().any(|watches| watches.contains(&wd))
+        }
+
+        /// Stop watching each of `watches` no key holds any more.
+        fn release(&self, watches: impl IntoIterator<Item = i32>) {
+            for wd in watches {
+                if !self.held(wd) {
+                    // SAFETY: a live inotify descriptor and a watch it returned.
+                    unsafe { libc::inotify_rm_watch(self.fd.as_raw_fd(), wd) };
+                }
+            }
+        }
+
+        /// Watch every folder and link that looking `folder` up passes through
+        /// ([`super::passed_through`]), but `folder`, `key`'s own watch, and the root, which
+        /// nothing renames, for its own rename or end; a mask added to whatever another key
+        /// watches there. A link is watched itself, which hears it replaced (made to name another
+        /// folder), and so is each folder the lookup goes on through behind it. A folder on
+        /// another device is watched too: a btrfs subvolume can be renamed, and so can the folder
+        /// holding a mount (the mount itself cannot be), which takes the mount with it. One the
+        /// kernel refuses to watch is passed over, and the rest are still watched.
+        ///
+        /// Then `folder` must still be the folder the key's own watch is on: a folder above it
+        /// renamed before its watch took moved it away unheard. The kernel keeps one watch per
+        /// folder, so watching `folder` again answers that watch while the path names it.
+        ///
+        /// # Errors
+        /// [`io::ErrorKind::NotFound`] when a folder or link on the way moved or went as the walk
+        /// watched it, so the arm looks again; the kernel's when it is out of watches, and the
+        /// lookup's where it failed ([`super::passed_through`]).
+        fn watch_above(&mut self, key: u64, folder: &Path) -> io::Result<()> {
+            let own = self.keys.get(&key).map(|(wd, _)| *wd);
+            let mut watches = Vec::new();
+            let walked = (|| {
+                for passed in super::passed_through(folder)? {
+                    if passed.path.parent().is_none() {
+                        continue;
+                    }
+                    let path = CString::new(passed.path.as_os_str().as_bytes())
+                        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+                    let only = if passed.link { 0 } else { libc::IN_ONLYDIR };
+                    // SAFETY: a live inotify descriptor and a NUL-terminated path.
+                    let wd = unsafe {
+                        libc::inotify_add_watch(
+                            self.fd.as_raw_fd(),
+                            path.as_ptr(),
+                            INOTIFY_SELF | IN_MASK_ADD | only | libc::IN_DONT_FOLLOW,
+                        )
+                    };
+                    if wd >= 0 {
+                        if Some(wd) != own {
+                            watches.push(wd);
+                        }
+                        continue;
+                    }
+                    let error = io::Error::last_os_error();
+                    if error.kind() == io::ErrorKind::NotFound
+                        || error.raw_os_error() == Some(libc::ENOSPC)
+                    {
+                        return Err(error);
+                    }
+                    // A link or a file where the lookup passed a folder: it moved as the walk ran.
+                    if !passed.link && error.raw_os_error() == Some(libc::ENOTDIR) {
+                        return Err(io::Error::from(io::ErrorKind::NotFound));
+                    }
+                }
+                Ok(())
+            })();
+            let old = self.above.insert(key, watches).unwrap_or_default();
+            self.release(old);
+            walked?;
+            match self.add_folder_watch(folder) {
+                Ok(wd) if Some(wd) == own => Ok(()),
+                Ok(wd) => {
+                    self.release([wd]);
+                    Err(io::Error::from(io::ErrorKind::NotFound))
+                }
+                Err(_) => Err(io::Error::from(io::ErrorKind::NotFound)),
+            }
+        }
+
+        /// Watch `directory` for its entries' events and its own, as a key's own folder is.
+        fn add_folder_watch(&self, directory: &Path) -> io::Result<i32> {
+            let directory = CString::new(directory.as_os_str().as_bytes())
+                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+            // SAFETY: a live inotify descriptor and a NUL-terminated path.
+            let wd = unsafe {
+                libc::inotify_add_watch(self.fd.as_raw_fd(), directory.as_ptr(), DIRECTORY_EVENTS)
+            };
+            if wd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(wd)
         }
 
         /// Watch the nearest folder of `path`'s that is there ([`super::folders_up`]): its watch,
         /// and the entry below it on the way to `path` (`path` itself, where its own folder is
         /// there).
+        ///
+        /// # Errors
+        /// The kernel's where it refuses a folder's watch, or where a link on the way names
+        /// nothing.
         fn watch_folder<'a>(&self, path: &'a Path) -> io::Result<(i32, &'a Path)> {
             for (directory, below) in super::folders_up(path) {
-                let directory = CString::new(directory.as_os_str().as_bytes())
-                    .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-                // SAFETY: a live inotify descriptor and a NUL-terminated path.
-                let wd = unsafe {
-                    libc::inotify_add_watch(
-                        self.fd.as_raw_fd(),
-                        directory.as_ptr(),
-                        DIRECTORY_EVENTS,
-                    )
-                };
-                if wd >= 0 {
-                    return Ok((wd, below));
-                }
-                let error = io::Error::last_os_error();
-                if error.kind() != io::ErrorKind::NotFound {
-                    return Err(error);
+                match self.add_folder_watch(directory) {
+                    Ok(wd) => return Ok((wd, below)),
+                    // A link naming nothing, whose folder went or is not made yet: where it comes
+                    // back is no folder of this path's, so no watch above the link hears it. The
+                    // arm fails, as a link refuses it on macOS, and the watch arms it again.
+                    Err(error)
+                        if error.kind() == io::ErrorKind::NotFound
+                            && !std::fs::symlink_metadata(directory)
+                                .is_ok_and(|there| there.file_type().is_symlink()) => {}
+                    Err(error) => return Err(error),
                 }
             }
             Err(io::Error::from(io::ErrorKind::InvalidInput))
+        }
+
+        /// [`FileEvents::arm`], running `between` with the folder the key's own watch is on once
+        /// that watch is on and before the folders above it are watched.
+        pub(super) fn arm_then(
+            &mut self,
+            key: u64,
+            path: &Path,
+            mut between: impl FnMut(&Path),
+        ) -> io::Result<()> {
+            for _ in 0..=super::ARM_AGAIN {
+                let (wd, below) = self.watch_folder(path)?;
+                let name = below
+                    .file_name()
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+                if let Some((old_wd, _)) = self.keys.insert(key, (wd, name.as_bytes().to_vec()))
+                    && old_wd != wd
+                {
+                    self.release([old_wd]);
+                }
+                // A folder made between its failed watch and the watch above it, which
+                // hears nothing inside it: arm again, lower.
+                if below != path && below.exists() {
+                    continue;
+                }
+                let folder = below
+                    .parent()
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+                between(folder);
+                match self.watch_above(key, folder) {
+                    // A folder on the way moved as the walk watched: arm again.
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    above => return above,
+                }
+            }
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
         }
 
         fn drain_wakes(&self) {
@@ -1002,42 +1555,25 @@ mod inotify {
                 if read == 0 {
                     return;
                 }
-                inotify_touched(&buffer[..read.min(buffer.len())], &self.keys, touched);
+                inotify_touched(
+                    &buffer[..read.min(buffer.len())],
+                    &self.keys,
+                    &self.above,
+                    touched,
+                );
             }
         }
     }
 
     impl FileEvents for InotifyEvents {
         fn arm(&mut self, key: u64, path: &Path) -> io::Result<()> {
-            for _ in 0..=super::ARM_AGAIN {
-                let (wd, below) = self.watch_folder(path)?;
-                let name = below
-                    .file_name()
-                    .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
-                if let Some((old_wd, _)) = self.keys.insert(key, (wd, name.as_bytes().to_vec()))
-                    && old_wd != wd
-                    && !self.keys.values().any(|(other, _)| *other == old_wd)
-                {
-                    // SAFETY: a live inotify descriptor and a watch it returned.
-                    unsafe { libc::inotify_rm_watch(self.fd.as_raw_fd(), old_wd) };
-                }
-                // A folder made between its failed watch and the watch above it, which
-                // hears nothing inside it: arm again, lower.
-                if below == path || !below.exists() {
-                    return Ok(());
-                }
-            }
-            Err(io::Error::from(io::ErrorKind::WouldBlock))
+            self.arm_then(key, path, |_| {})
         }
 
         fn disarm(&mut self, key: u64) {
-            let Some((wd, _)) = self.keys.remove(&key) else {
-                return;
-            };
-            if !self.keys.values().any(|(other, _)| *other == wd) {
-                // SAFETY: a live inotify descriptor and a watch it returned.
-                unsafe { libc::inotify_rm_watch(self.fd.as_raw_fd(), wd) };
-            }
+            let own = self.keys.remove(&key).map(|(wd, _)| wd);
+            let above = self.above.remove(&key).unwrap_or_default();
+            self.release(own.into_iter().chain(above));
         }
 
         fn wait(&mut self, timeout: Option<Duration>, touched: &mut Vec<u64>) -> io::Result<()> {

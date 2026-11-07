@@ -239,7 +239,9 @@ impl Expr {
             Expr::Neq(a, b) => format!("{} # {}", a.to_tla(), b.to_tla()),
             Expr::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
             Expr::Or(a, b) => format!("({} \\/ {})", a.to_tla(), b.to_tla()),
-            Expr::And(a, b) => format!("{} /\\ {}", a.to_tla(), b.to_tla()),
+            // Grouped as `Or` is: TLA+ gives `/\` and `\/` no relative precedence, so `ty`
+            // refuses an ungrouped mix such as `a \/ b /\ c` (as of its store build 14383).
+            Expr::And(a, b) => format!("({} /\\ {})", a.to_tla(), b.to_tla()),
             Expr::If(c, a, b) => {
                 format!(
                     "(IF {} THEN {} ELSE {})",
@@ -1719,7 +1721,7 @@ mod tests {
         assert!(tla.contains("n # lo"), "inequality: {tla}");
         assert!(
             tla.contains(
-                "EvictOldestContiguous == (\\A n \\in 1..MaxSeq : (live[n] <=> lo =< n /\\ n =< seq))"
+                "EvictOldestContiguous == (\\A n \\in 1..MaxSeq : (live[n] <=> (lo =< n /\\ n =< seq)))"
             ),
             "quantified iff invariant: {tla}"
         );

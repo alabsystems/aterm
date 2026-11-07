@@ -2,7 +2,7 @@
 
 `trust-build-cpu` is original Andrew Yates code shared with the Trust compiler.
 The complete Rust source and upstream README are byte-identical to Trust commit
-`44356f40b6136199962c70933fa77d5012c3a5eb` (version 0.13.0). The upstream licence texts are retained.
+`96d3e94809af7fe781f8d73eaedeb89a4836befa` (version 0.13.0). The upstream licence texts are retained.
 
 The local manifest materializes workspace metadata/dependency requirements,
 points the first-party hash dependency at `../trust-sha2`, preserves upstream

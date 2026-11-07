@@ -1008,8 +1008,10 @@ pub(super) const HOOK_INSTALLER: &str = "scripts/install-git-hooks.sh";
 /// The shell a [`HOOK_INSTALLER`] runs under, as its usage spells it (`bash <installer>`).
 const BASH: &str = "/bin/bash";
 
-/// How long a clone's [`HOOK_INSTALLER`] may run before its process group is killed: minutes,
-/// because an installer may run git over a large worktree (trust's moves the index to format 4).
+/// How long a clone's [`HOOK_INSTALLER`] may run: minutes, because an installer may run git over
+/// a large worktree (trust's moves the index to format 4). An installer still running then is
+/// killed with its process group; one that has exited by then is done, and the budget bounds
+/// nothing it left behind (a job it put in the background lives on, as it would from a shell).
 const HOOK_INSTALLER_BUDGET: Duration = Duration::from_secs(300);
 
 /// The longest outcome line [`install_hooks`] keeps of what an installer printed.
@@ -1090,7 +1092,7 @@ pub(super) fn clone_all(
                     }
                     // Only a clone this lane published: one found in place is another's.
                     let hooks = published
-                        .then(|| install_hooks(sys, user, &repo.name, guard))
+                        .then(|| install_hooks(sys, user, repo, guard))
                         .flatten();
                     results
                         .lock()
@@ -1128,19 +1130,22 @@ pub(super) fn clone_all(
 /// It runs once, as `user`, with [`BASH`] in the clone and the git the setup runs first on
 /// `PATH`. Its outcome is a line for the row (`~/<name>: …`), never a failure of the clone or
 /// of the setup. No clone the setup did not make reaches here, so no existing worktree runs
-/// it; nor does an installer reached through a link (a tracked `scripts` link included, which
-/// would run a file outside the clone) or a directory in its place, nor a guarded pass whose
-/// vault snapshot stopped being current (the check every step of a guarded clone makes first).
-/// Selected required dependencies are attempted first. An ordinary dependency failure does
-/// not suppress the new parent's advisory installer; an invalidated source still does.
+/// it; nor does an installer reached through a link (`~/<name>` itself, or a tracked `scripts`
+/// link, which would run a file outside the clone) or a directory in its place, one inside a
+/// required dependency's gitlink (another repository's file, which may be another owner's),
+/// nor a guarded pass whose vault snapshot stopped being current (the check every step of a
+/// guarded clone makes first). Selected required dependencies are attempted first. An ordinary
+/// dependency failure does not suppress the new parent's advisory installer; an invalidated
+/// source still does.
 fn install_hooks(
     sys: &dyn System,
     user: &User,
-    name: &str,
+    repo: &Repo,
     guard: Option<&CloneGuard<'_>>,
 ) -> Option<String> {
+    let name = &repo.name;
     let clone = Path::new(&user.home).join(name);
-    let outcome = match installer_in(sys, &clone)? {
+    let outcome = match installer_in(sys, user, &clone, &repo.required_submodules)? {
         Err(why) => format!("its {HOOK_INSTALLER} {why}; not run"),
         Ok(()) => match guard.map_or(Ok(()), |guard| (guard.current)()) {
             Err(why) => format!("its {HOOK_INSTALLER} not run: {why}"),
@@ -1150,14 +1155,32 @@ fn install_hooks(
     Some(format!("~/{name}: {outcome}"))
 }
 
-/// Whether `clone` carries a [`HOOK_INSTALLER`] to run: `None` when it has none, else `Ok` for
-/// a file that is neither a directory nor a link, reached through directories alone, or why not.
-/// Each step in is read without following it ([`System::stat`] is an `lstat`), so a link
-/// anywhere on the way is seen. [`Stat`](crate::port::Stat) tells no other kind apart, so a FIFO
-/// or socket there reads as a file: a checkout git made holds none, and one planted after this
-/// look would beat any look here, since `bash` opens the path itself; the installer's time
-/// budget bounds what such a file can do, and its outcome line says so.
-fn installer_in(sys: &dyn System, clone: &Path) -> Option<Result<(), &'static str>> {
+/// Whether `clone` carries a [`HOOK_INSTALLER`] of its own to run: `None` when it has none,
+/// else `Ok` for a file that is neither a directory nor a link, reached from a `clone` folder
+/// that is `user`'s own and no link through directories alone, outside every one of `required`
+/// (the gitlinks the pass populated, whose files are another repository's), or why not. Each step
+/// is read without following it ([`System::stat`] is an `lstat`), `clone` itself first, so a
+/// link anywhere on the way is seen, one swapped in for the clone after its publish included.
+/// [`Stat`](crate::port::Stat) tells no other kind apart, so a FIFO or socket there reads as a
+/// file: a checkout git made holds none. What changes after this look (a link or a file planted
+/// then) would beat any look here, since `bash` opens the path itself; the installer's time
+/// budget bounds what such a file can do while it runs, and its outcome line says what it did.
+fn installer_in(
+    sys: &dyn System,
+    user: &User,
+    clone: &Path,
+    required: &[String],
+) -> Option<Result<(), &'static str>> {
+    match sys.stat(clone) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(_) => return Some(Err("cannot be inspected")),
+        Ok(stat) if stat.symlink => return Some(Err("is reached through a link")),
+        Ok(stat) if !stat.dir => return None,
+        Ok(stat) if stat.uid != user.uid => {
+            return Some(Err("is in a folder another account owns"));
+        }
+        Ok(_) => {}
+    }
     let steps: Vec<_> = Path::new(HOOK_INSTALLER).components().collect();
     let mut at = clone.to_path_buf();
     for (index, step) in steps.iter().enumerate() {
@@ -1172,6 +1195,15 @@ fn installer_in(sys: &dyn System, clone: &Path) -> Option<Result<(), &'static st
             Ok(stat) if stat.dir == file => return Some(Err("is not a regular file")),
             Ok(_) => {}
         }
+    }
+    // Folded as the inventory folds its paths, for a case-insensitive volume.
+    let installer = HOOK_INSTALLER.to_ascii_lowercase();
+    let inside = |gitlink: &String| {
+        let gitlink = gitlink.to_ascii_lowercase();
+        installer == gitlink || installer.starts_with(&format!("{gitlink}/"))
+    };
+    if required.iter().any(inside) {
+        return Some(Err("is inside a required dependency"));
     }
     Some(Ok(()))
 }
@@ -1255,29 +1287,51 @@ pub(super) fn installer_command(sys: &dyn System, user: &User, clone: &Path) -> 
 }
 
 /// What a [`HOOK_INSTALLER`]'s run says, in one line: the first line it printed when it
-/// succeeded, else how it ended, and that the clone stands.
+/// succeeded, else how it ended with the first line of its errors, and that the clone stands.
+/// What the installer printed is quoted and escaped as Rust's `Debug` writes a string (a control,
+/// bidirectional, line-separator or combining character as its `\u{…}` escape), so the row's
+/// reader sees where its words end and nothing in them reorders the row or starts another of its
+/// notes; the escaped words are cut before the escape that would pass [`HOOK_LINE`] characters,
+/// `…` after the quote saying so.
 fn hook_outcome(ran: &Result<crate::port::Ran, crate::port::RunFailed>) -> String {
-    let line = |text: &str| {
-        let line: String = text
-            .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .unwrap_or_default()
-            .chars()
-            .filter(|c| !c.is_control())
-            .take(HOOK_LINE)
-            .collect();
-        (!line.is_empty()).then_some(line)
+    let said = |text: &str| {
+        let line = text.lines().map(str::trim).find(|line| !line.is_empty())?;
+        // Each character is escaped as a string's `Debug` escapes it, and kept whole or not at
+        // all, so the cut never ends inside an escape (a lone `\` would escape the quote).
+        let (mut kept, mut shown, mut cut) = (String::new(), 0usize, false);
+        for c in line.chars() {
+            let one = format!("{:?}", c.to_string());
+            let escape = one
+                .strip_prefix('"')
+                .and_then(|one| one.strip_suffix('"'))
+                .unwrap_or(&one);
+            let width = escape.chars().count();
+            if shown + width > HOOK_LINE {
+                cut = true;
+                break;
+            }
+            kept.push_str(escape);
+            shown += width;
+        }
+        Some(format!("\"{kept}\"{}", if cut { "…" } else { "" }))
     };
     match ran {
-        Ok(ran) if ran.success() => match line(&ran.out()) {
+        Ok(ran) if ran.success() => match said(&ran.out()) {
             Some(said) => format!("ran its {HOOK_INSTALLER}: {said}"),
             None => format!("ran its {HOOK_INSTALLER}"),
         },
-        Ok(ran) => format!(
-            "its {HOOK_INSTALLER} failed ({}); the clone stands",
-            line(&ran.describe()).unwrap_or_default()
-        ),
+        Ok(ran) => {
+            let how = ran.status.map_or_else(
+                || "killed by a signal".to_owned(),
+                |code| format!("exit {code}"),
+            );
+            match said(&ran.err()) {
+                Some(said) => {
+                    format!("its {HOOK_INSTALLER} failed ({how}: {said}); the clone stands")
+                }
+                None => format!("its {HOOK_INSTALLER} failed ({how}); the clone stands"),
+            }
+        }
         Err(failed) => {
             format!("its {HOOK_INSTALLER} did not run to the end ({failed}); the clone stands")
         }

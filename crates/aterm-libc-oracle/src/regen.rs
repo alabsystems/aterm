@@ -289,9 +289,7 @@ impl Reference {
 /// The dump `--docs` holds for `cell`, if any.
 fn supplied_doc(docs: Option<&Path>, cell: &Cell) -> Option<PathBuf> {
     let path = docs?.join(format!("libc-{REFERENCE_VERSION}-{}.json", cell.triple));
-    std::fs::symlink_metadata(&path)
-        .is_ok_and(|m| m.is_file())
-        .then_some(path)
+    path.is_file().then_some(path)
 }
 
 /// The toolchains a run needs: Trust always (the host cell, the formatter),
@@ -615,6 +613,20 @@ mod tests {
         );
         assert_eq!(supplied_doc(Some(dir.path()), &CELLS[1]), None);
         assert_eq!(supplied_doc(None, &CELLS[0]), None);
+    }
+
+    /// A supplied dump that is a symlink to a real one is read, as `Path::is_file` follows it.
+    #[cfg(unix)]
+    #[test]
+    fn a_supplied_dump_reached_through_a_symlink_is_found() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("dump.json");
+        std::fs::write(&real, "{}").expect("write");
+        let docs = dir.path().join("docs");
+        std::fs::create_dir(&docs).expect("docs");
+        let name = format!("libc-{REFERENCE_VERSION}-aarch64-apple-darwin.json");
+        std::os::unix::fs::symlink(&real, docs.join(&name)).expect("symlink");
+        assert_eq!(supplied_doc(Some(&docs), &CELLS[0]), Some(docs.join(name)));
     }
 
     #[test]

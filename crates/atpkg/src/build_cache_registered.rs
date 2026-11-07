@@ -668,6 +668,13 @@ fn record_count(index: &Path) -> Option<usize> {
 /// package attempt was published. The shared gate excludes retirement during this read.
 #[cfg(unix)]
 fn already_recorded(home: &Path, root: &Path, workspace: &Path) -> bool {
+    recorded_while(home, root, workspace, &|| true)
+}
+
+/// [`already_recorded`], where `still` must also hold under the root's shared gate, as its
+/// receipt is read: a target named through a link ([`Linked::still`]) is re-checked there.
+#[cfg(unix)]
+fn recorded_while(home: &Path, root: &Path, workspace: &Path, still: &dyn Fn() -> bool) -> bool {
     let directory = home.join(INDEX);
     let gates = directory.join("locks.noindex");
     if identity(&directory).is_none()
@@ -689,19 +696,21 @@ fn already_recorded(home: &Path, root: &Path, workspace: &Path) -> bool {
     let Ok(_held) = crate::lock::Flock::try_lock_shared(file) else {
         return false;
     };
-    read(&path).is_some_and(|receipt| {
-        receipt.root == root
-            && receipt.pending.is_none()
-            && same(home, &receipt)
-            && match &receipt.package {
-                Some(policy) => {
-                    !receipt.owners_unknown && package::producer_allows(home, policy, workspace)
+    still()
+        && read(&path).is_some_and(|receipt| {
+            receipt.root == root
+                && receipt.pending.is_none()
+                && same(home, &receipt)
+                && match &receipt.package {
+                    Some(policy) => {
+                        !receipt.owners_unknown && package::producer_allows(home, policy, workspace)
+                    }
+                    None => {
+                        receipt.owners_unknown
+                            || receipt.owners.iter().any(|owner| owner == workspace)
+                    }
                 }
-                None => {
-                    receipt.owners_unknown || receipt.owners.iter().any(|owner| owner == workspace)
-                }
-            }
-    })
+        })
 }
 
 /// A producer must not continue on a previously owned cache if it cannot be admitted.
@@ -909,6 +918,283 @@ pub fn create_checked(_: &Path, _: &Path, _: &Path) -> std::io::Result<bool> {
     Ok(false)
 }
 
+/// WHY AN EXPLICIT TARGET NAMED THROUGH A LINK IS NOT OBSERVED AS OWNED ([`through_link`],
+/// [`admit_linked`]), each refusal in its own words.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinkRefusal {
+    /// The link names nothing.
+    Dangling,
+    /// The folder it names cannot be inspected.
+    Unreachable,
+    /// It names another link, or reaches its folder through one.
+    Chain,
+    /// It names something that is no folder.
+    NotFolder,
+    /// Its folder stands on another volume than the link.
+    OtherVolume,
+    /// Its folder is no registered root of this home and no build directory cargo made.
+    Unowned,
+    /// Its folder proves cargo made it, but atpkg never registered it.
+    CargoMade,
+    /// Its folder declares custody, or the index records it, but no receipt binds it here.
+    Foreign,
+    /// The link, or the folder it names, changed between its observation and the re-check
+    /// under the folder's gate.
+    Changed,
+}
+
+#[cfg(unix)]
+impl LinkRefusal {
+    const fn why(self) -> &'static str {
+        match self {
+            Self::Dangling => "the explicit target is a link to no folder (a dangling link)",
+            Self::Unreachable => "the explicit target is a link to a folder atpkg cannot inspect",
+            Self::Chain => {
+                "the explicit target is a link that reaches its folder through another link (a link chain)"
+            }
+            Self::NotFolder => "the explicit target is a link to something that is not a folder",
+            Self::OtherVolume => "the explicit target is a link to a folder on another volume",
+            Self::Unowned => "the explicit target is a link to a folder atpkg does not own",
+            Self::CargoMade => {
+                "the explicit target is a link to a folder cargo made that atpkg never registered; atpkg adopts a folder only by its own name, never through a link"
+            }
+            Self::Foreign => {
+                "the explicit target is a link to a folder whose custody atpkg cannot confirm"
+            }
+            Self::Changed => "the explicit target's link changed while atpkg observed it",
+        }
+    }
+}
+
+/// AN EXPLICIT TARGET NAMED THROUGH A LINK, resolved one hop ([`through_link`]): the name the call
+/// used and the folder it names, each as observed.
+#[cfg(unix)]
+struct Linked {
+    /// The link itself, in a canonical folder of HOME.
+    link: PathBuf,
+    /// The link's own device and inode (it is not followed).
+    node: (u64, u64),
+    /// What the link says.
+    text: PathBuf,
+    /// The folder it names: canonical, a folder (no link) of this user's, on the link's volume.
+    real: PathBuf,
+    /// That folder's identity.
+    identity: Identity,
+}
+
+#[cfg(unix)]
+impl Linked {
+    /// Whether the link still names the folder observed: the same link (its device, inode and
+    /// text), which the kernel resolves to the same canonical folder of the same identity.
+    fn still(&self) -> bool {
+        use std::os::unix::fs::MetadataExt as _;
+        link_seam::rechecking(&self.link);
+        std::fs::symlink_metadata(&self.link).is_ok_and(|meta| {
+            meta.file_type().is_symlink() && (meta.dev(), meta.ino()) == self.node
+        }) && std::fs::read_link(&self.link).is_ok_and(|text| text == self.text)
+            && std::fs::canonicalize(&self.link).is_ok_and(|real| real == self.real)
+            && identity(&self.real).as_ref() == Some(&self.identity)
+    }
+}
+
+/// THE TESTS' CALL AT EACH RE-CHECK OF A LINKED TARGET ([`Linked::still`]), with the link's path:
+/// where a test retargets the link between its observation and the re-check under the gate.
+#[cfg(all(test, unix))]
+mod link_seam {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    type Hook = Box<dyn FnMut(&Path)>;
+
+    thread_local! {
+        static RECHECK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Call `then` with the link's path at each re-check on this thread.
+    pub(super) fn on_recheck(then: impl FnMut(&Path) + 'static) {
+        RECHECK.with(|slot| *slot.borrow_mut() = Some(Box::new(then)));
+    }
+
+    /// Forget this thread's call.
+    pub(super) fn clear() {
+        RECHECK.with(|slot| *slot.borrow_mut() = None);
+    }
+
+    pub(super) fn rechecking(link: &Path) {
+        let call = RECHECK.with(|slot| slot.borrow_mut().take());
+        if let Some(mut call) = call {
+            call(link);
+            RECHECK.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(call);
+                }
+            });
+        }
+    }
+}
+
+#[cfg(all(not(test), unix))]
+mod link_seam {
+    pub(super) const fn rechecking(_: &std::path::Path) {}
+}
+
+/// AN EXPLICIT TARGET NAMED THROUGH A LINK, resolved one hop, read and never written: `None`
+/// where `target` is no link, or a link outside [`scope`], which every other rule reads as it
+/// reads any target. A link in scope, in a folder reached through no link, resolves only to a
+/// folder that stands, no link and reached through none (the kernel's resolution of the link is
+/// that folder's canonical path), on the link's own volume, this user's and private as custody
+/// binds a folder ([`identity`]); each other case is its [`LinkRefusal`]. Ownership is
+/// [`admit_linked`]'s, which re-checks the link under the folder's gate.
+#[cfg(unix)]
+fn through_link(home: &Path, target: &Path) -> Option<Result<Linked, LinkRefusal>> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = std::fs::symlink_metadata(target).ok()?;
+    let parent = target.parent()?;
+    if !meta.file_type().is_symlink() || !scope(home, target) {
+        return None;
+    }
+    match std::fs::canonicalize(parent) {
+        Ok(canonical) if canonical == parent => {}
+        Ok(_) => return Some(Err(LinkRefusal::Chain)),
+        Err(_) => return Some(Err(LinkRefusal::Unreachable)),
+    }
+    let volume = std::fs::symlink_metadata(parent).ok()?.dev();
+    let text = std::fs::read_link(target).ok()?;
+    let resolve = || {
+        // Text that climbs past the root names no folder this reading can bind.
+        let real =
+            normalize_with_cwd(text.clone(), Some(parent)).ok_or(LinkRefusal::Unreachable)?;
+        let folder = match std::fs::symlink_metadata(&real) {
+            Ok(at) if at.file_type().is_symlink() => return Err(LinkRefusal::Chain),
+            Ok(at) if at.is_dir() => at,
+            Ok(_) => return Err(LinkRefusal::NotFolder),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Err(LinkRefusal::Dangling);
+            }
+            Err(_) => return Err(LinkRefusal::Unreachable),
+        };
+        // The kernel's own resolution of the link must be the folder read from its text: a
+        // canonical path, so no link on the way, `..` past one included.
+        match std::fs::canonicalize(target) {
+            Ok(resolved) if resolved == real => {}
+            Ok(_) => return Err(LinkRefusal::Chain),
+            Err(_) => return Err(LinkRefusal::Unreachable),
+        }
+        if folder.dev() != volume {
+            return Err(LinkRefusal::OtherVolume);
+        }
+        let identity = identity(&real).ok_or(LinkRefusal::Unowned)?;
+        Ok(Linked {
+            link: target.to_path_buf(),
+            node: (meta.dev(), meta.ino()),
+            text: text.clone(),
+            real,
+            identity,
+        })
+    };
+    Some(resolve())
+}
+
+/// ADMIT `workspace`'s PRODUCER TO THE FOLDER `linked` NAMES, as one atpkg registered and owns:
+/// its receipt names that folder and its identity, its marker binds the receipt ([`same`]), and
+/// the link, re-checked under the folder's gate, still names it ([`Linked::still`]). The producer
+/// joins the receipt's owners as [`create_with_policy`] records one at a folder's own name, an
+/// owner already on record needing no write. Nothing is written in the folder or through the
+/// link, no receipt is keyed by the link, and a folder atpkg did not make is never adopted
+/// through one: the link is only the name the call used. `Ok(Err(..))` says why the folder is
+/// not owned ([`LinkRefusal`]), read under the admission lock as an adoption reads it.
+///
+/// # Errors
+/// As [`create_checked`]'s: the folder's gate was busy, or the owner its custody needs could not
+/// be recorded.
+#[cfg(unix)]
+fn admit_linked(
+    home: &Path,
+    linked: &Linked,
+    workspace: &Path,
+) -> std::io::Result<Result<(), LinkRefusal>> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let stop = || std::io::Error::other("the managed build cache's owner could not be recorded");
+    let root = linked.real.as_path();
+    if !scope(home, workspace)
+        || std::fs::canonicalize(workspace).ok().as_deref() != Some(workspace)
+        || !super::checkout::MANIFESTS.iter().any(|name| {
+            std::fs::symlink_metadata(workspace.join(name)).is_ok_and(|metadata| metadata.is_file())
+        })
+    {
+        return Err(stop());
+    }
+    if recorded_while(home, root, workspace, &|| linked.still()) {
+        return Ok(Ok(()));
+    }
+    let index = index(home).ok_or_else(stop)?;
+    let admission = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(index.join("locks.noindex/admission.lock"))?;
+    if !admission.metadata()?.is_file() {
+        return Err(stop());
+    }
+    let _admission = crate::lock::Flock::lock(admission)?;
+    let key = key(root).ok_or_else(stop)?;
+    let path = index.join(format!("{key}.json"));
+    let gate = open_gate(&gate_path(&path).ok_or_else(stop)?).ok_or_else(stop)?;
+    let _held = crate::lock::Flock::try_lock(gate).map_err(|_| stop())?;
+    if !linked.still() {
+        return Ok(Err(LinkRefusal::Changed));
+    }
+    let Some(mut receipt) = read(&path).filter(|receipt| {
+        receipt.root == root && receipt.identity == linked.identity && same(home, receipt)
+    }) else {
+        return Ok(Err(
+            if scope(home, root) && adoption::proven(home, root, &path).is_some() {
+                LinkRefusal::CargoMade
+            } else if custody_present(root) || std::fs::symlink_metadata(&path).is_ok() {
+                LinkRefusal::Foreign
+            } else {
+                LinkRefusal::Unowned
+            },
+        ));
+    };
+    if receipt.package.as_ref().is_some_and(|policy| {
+        receipt.owners_unknown || !package::producer_allows(home, policy, workspace)
+    }) {
+        return Err(stop());
+    }
+    let mut changed = false;
+    if receipt.pending.is_some() {
+        if receipt.package.is_some() {
+            return Err(stop());
+        }
+        pending_copy(&index, &key, &receipt).ok_or_else(stop)?;
+        receipt.pending = None;
+        changed = true;
+    }
+    if !receipt.owners.iter().any(|owner| owner == workspace) {
+        if receipt.owners.len() < MAX_OWNERS {
+            receipt.owners.push(workspace.to_path_buf());
+        } else if receipt.package.is_none() {
+            receipt.owners_unknown = true;
+        }
+        changed = true;
+    }
+    if changed {
+        write(&path, &receipt).ok_or_else(stop)?;
+    }
+    Ok(Ok(()))
+}
+
 /// The independently registered cache roots, without walking any workspace or home folder.
 #[must_use]
 pub fn roots(home: &Path) -> Vec<Registered> {
@@ -1086,6 +1372,12 @@ fn target_name(args: &[String], machine: &super::Machine<'_>) -> Option<PathBuf>
 
 #[cfg(unix)]
 fn suppress_unresolved(home: &Path, target: &Path) -> std::io::Result<bool> {
+    // A target named through a link to a folder stands for that folder, the link re-checked
+    // under each gate held; a link that resolves to none is read by its own name, as before.
+    let linked = through_link(home, target).and_then(Result::ok);
+    let target = linked
+        .as_ref()
+        .map_or(target, |linked| linked.real.as_path());
     let candidates = [target.to_path_buf(), target.join(super::TARGET_BUILD_LEAF)];
     let mut protected = false;
     for root in candidates {
@@ -1102,6 +1394,9 @@ fn suppress_unresolved(home: &Path, target: &Path) -> std::io::Result<bool> {
         let path = index.join(format!("{key}.json"));
         let lock = crate::metadata_io::open_regular(&gate_path(&path).ok_or_else(stop)?)?;
         let _held = crate::lock::Flock::try_lock(lock).map_err(|_| stop())?;
+        if linked.as_ref().is_some_and(|linked| !linked.still()) {
+            return Err(std::io::Error::other(LinkRefusal::Changed.why()));
+        }
         let mut receipt = read(&path)
             .filter(|receipt| receipt.root == root && same(home, receipt))
             .ok_or_else(stop)?;
@@ -1161,10 +1456,161 @@ fn short_version_query(word: &str) -> bool {
     })
 }
 
-/// Known builtin commands that produce no build output need no owner observation: queries
-/// and clean. Clean must reach Cargo even for an unregistered target, without adopting it.
-/// A command name used as an option value, an external alias or lint argument proves none of this.
-fn non_producing_command(args: &[String], tool: super::Tool) -> bool {
+/// THE BUILTIN VERBS THAT ONLY READ, judged by what Targo's own code for each writes (trust
+/// `src/tools/targo` at 73409c7360, read 2026-11-06; `docs/DECISION-atpkg-output-free-verbs-2026-11-06.md`
+/// cites each path), never by name: `pkgid`, `verify-project`, `read-manifest`, `locate-project`
+/// and `version` write nothing under a target or build directory, whatever `--target-dir`, `-Z`
+/// option or `--config` the call carries.
+const READING_VERBS: &[&str] = &[
+    "pkgid",
+    "verify-project",
+    "read-manifest",
+    "locate-project",
+    "version",
+];
+
+/// THE BUILTIN VERBS THAT RESOLVE A WORKSPACE AND WRITE NO BUILD OUTPUT, judged as
+/// [`READING_VERBS`] are, unless the call can put their lockfile under a target
+/// ([`lockfile_may_land_in_a_target`]): `fetch` fills the registry under `CARGO_HOME`, and each
+/// may write the workspace's own `Cargo.lock` where the workspace stands. Each also resolves
+/// target platforms, so the compiler's probe cache (`.rustc_info.json`) may be rewritten in a
+/// build directory that already stands, as every build there rewrites it: compiler facts, no
+/// artifact and no directory made (`paths::write` creates no parent), nothing a custody record
+/// keeps. Which verbs run without a lane is [`crate::reroute::LANE_FREE_QUERIES`], a separate
+/// rule. No alias or external `cargo-<verb>` can take a builtin's name: Targo and cargo run the
+/// builtin.
+const RESOLVING_VERBS: &[&str] = &["fetch", "tree", "metadata", "generate-lockfile"];
+
+/// WHETHER A RESOLVING VERB'S LOCKFILE MAY LAND UNDER A TARGET OR BUILD DIRECTORY, which Targo then
+/// makes, `CACHEDIR.TAG` and all (`ops/lockfile.rs`): an embedded manifest, whose lock root is in
+/// the build directory, or a `resolver.lockfile-path`, wherever the call can name one. Targo
+/// reads a manifest path (`--manifest-path` or `-m`) as embedded when it ends in `.rs` or has no
+/// extension (`workspace/parser/mod.rs`'s `is_embedded`). A lockfile path is set by a `--config`
+/// value, or by the config file it names when something stands at that path, as Targo reads it,
+/// by `CARGO_RESOLVER_LOCKFILE_PATH` or its `TARGO_` twin, by the configs of a `-C` directory, by
+/// the deprecated `--lockfile-path`, or by a config Targo reads ([`configs_name_a_lock_root`]).
+/// An `include` may set it too ([`names_lock_root`]). Every word is scanned, so an option value
+/// that looks like one of these counts, as does a short-option cluster that holds `m`. Such a
+/// call is observed as a producer is.
+fn lockfile_may_land_in_a_target(args: &[String], machine: &super::Machine<'_>) -> bool {
+    let mut words = args.iter().map(String::as_str);
+    while let Some(word) = words.next() {
+        let (flag, inline) = if word.starts_with("--") {
+            word.split_once('=')
+                .map_or((word, None), |(flag, value)| (flag, Some(value)))
+        } else if let Some(rest) = word.strip_prefix("-m") {
+            let rest = rest.strip_prefix('=').unwrap_or(rest);
+            (
+                "--manifest-path",
+                Some(rest).filter(|rest| !rest.is_empty()),
+            )
+        } else {
+            (word, None)
+        };
+        let value = match flag {
+            "--manifest-path" | "--config" => inline.or_else(|| words.next()),
+            "--lockfile-path" => return true,
+            _ if flag.starts_with("-C") => return true,
+            _ if flag.starts_with('-')
+                && !flag.starts_with("--")
+                && !flag.starts_with("-Z")
+                && flag.contains('m') =>
+            {
+                return true;
+            }
+            _ => continue,
+        };
+        let Some(value) = value else {
+            return true;
+        };
+        let placed = if flag == "--manifest-path" {
+            Path::new(value)
+                .extension()
+                .is_none_or(|extension| extension == "rs")
+        } else {
+            // Targo reads the value as a config file when something stands at that path, and as
+            // a dotted key otherwise (`context/mod.rs`'s `load_cli_args`).
+            match machine
+                .cwd
+                .map(|cwd| config_text(machine, &cwd.join(value)))
+            {
+                None | Some(Err(())) => true,
+                Some(Ok(Some(text))) => names_lock_root(&text),
+                Some(Ok(None)) => names_lock_root(value),
+            }
+        };
+        if placed {
+            return true;
+        }
+    }
+    [
+        "CARGO_RESOLVER_LOCKFILE_PATH",
+        "TARGO_RESOLVER_LOCKFILE_PATH",
+    ]
+    .iter()
+    .any(|name| (machine.env)(name).is_some())
+        || configs_name_a_lock_root(machine)
+}
+
+/// Whether config text, a file's or a `--config` value's, sets `resolver.lockfile-path` or an
+/// `include`. It is read as TOML, so a quoted key's escapes spell what Targo reads. Text this
+/// TOML 1.0 reader cannot parse (Targo's reads TOML 1.1) may still set either unless it holds
+/// neither word and no backslash, through which an escape could spell one.
+fn names_lock_root(text: &str) -> bool {
+    match aterm_toml::from_str::<aterm_toml::Value>(text) {
+        Ok(config) => {
+            config.get("include").is_some()
+                || config
+                    .get("resolver")
+                    .and_then(|resolver| resolver.get("lockfile-path"))
+                    .is_some()
+        }
+        Err(_) => text.contains("lockfile") || text.contains("include") || text.contains('\\'),
+    }
+}
+
+/// The text of the config file at `path` as Targo reads it, following links as it does: atpkg's
+/// reader refuses a link, so one is read at its canonical path (`.cargo/config -> config.toml`,
+/// the spelling cargo once advised). `Ok(None)` where nothing stands; `Err` where it cannot be
+/// read.
+fn config_text(machine: &super::Machine<'_>, path: &Path) -> Result<Option<String>, ()> {
+    (machine.read)(path).or_else(|()| match std::fs::canonicalize(path) {
+        Ok(real) if real != path => (machine.read)(&real),
+        _ => Err(()),
+    })
+}
+
+/// Whether a config Targo reads for this call sets a lock root ([`names_lock_root`]) or cannot be
+/// read: each `.cargo/config.toml` and `.cargo/config` from the working directory up, then the
+/// package home's. That home is `CARGO_HOME`, or its `TARGO_HOME` twin when `CARGO_HOME` is
+/// unset, against the working directory, or `~/.cargo` where the one chosen is empty
+/// (`context/mod.rs`'s `homedir`, `context/environment.rs`).
+fn configs_name_a_lock_root(machine: &super::Machine<'_>) -> bool {
+    let Some(cwd) = machine.cwd else {
+        return true;
+    };
+    let home = (machine.env)("CARGO_HOME")
+        .or_else(|| (machine.env)("TARGO_HOME"))
+        .filter(|home| !home.is_empty())
+        .map(|home| cwd.join(home))
+        .or_else(|| machine.home.map(|home| home.join(".cargo")));
+    cwd.ancestors()
+        .map(|dir| dir.join(".cargo"))
+        .chain(home)
+        .flat_map(|dir| ["config.toml", "config"].map(|name| dir.join(name)))
+        .any(|file| match config_text(machine, &file) {
+            Err(()) => true,
+            Ok(None) => false,
+            Ok(Some(text)) => names_lock_root(&text),
+        })
+}
+
+/// Known builtin commands that produce no build output need no owner observation: the
+/// [`READING_VERBS`], the [`RESOLVING_VERBS`] whose lockfile stays out of every target, help,
+/// version queries and clean. Clean must reach Cargo even for an unregistered target, without
+/// adopting it. A command name used as an option value, an external alias or lint argument
+/// proves none of this; a free verb still runs through every other rule of the shim's front.
+fn non_producing_command(args: &[String], tool: super::Tool, machine: &super::Machine<'_>) -> bool {
     // A native scheduler capability probe has no command or build output.
     // Recognize only its exact shape; aliases and mixed commands still owe
     // normal cache ownership and build admission.
@@ -1189,7 +1635,7 @@ fn non_producing_command(args: &[String], tool: super::Tool) -> bool {
             }
             "--unverified" | "--locked" | "--offline" | "--frozen" | "--verbose" | "-v" | "-vv"
             | "--quiet" | "-q" => {}
-            _ if short_version_query(word) => return true,
+            _ if short_version_query(word) || word == "--version" => return true,
             _ if word.starts_with("--config=")
                 || word.starts_with("--color=")
                 || word.starts_with("--manifest-path=")
@@ -1199,7 +1645,9 @@ fn non_producing_command(args: &[String], tool: super::Tool) -> bool {
                 || word.starts_with("-C") => {}
             _ => {
                 return matches!(word, "help" | "clean")
-                    || crate::reroute::LANE_FREE_QUERIES.contains(&word);
+                    || READING_VERBS.contains(&word)
+                    || (RESOLVING_VERBS.contains(&word)
+                        && !lockfile_may_land_in_a_target(args, machine));
             }
         }
     }
@@ -1211,6 +1659,10 @@ enum Observation {
     Unmanaged,
     Protected,
     Owned,
+    /// Unmanaged: an explicit target named through a link that does not name a folder atpkg
+    /// owns, for this reason; a producer requiring managed output refuses it in these words.
+    #[cfg(unix)]
+    Refused(LinkRefusal),
 }
 
 fn observe(
@@ -1219,7 +1671,7 @@ fn observe(
     home: &Path,
     machine: &super::Machine<'_>,
 ) -> std::io::Result<Observation> {
-    if non_producing_command(args, tool)
+    if non_producing_command(args, tool, machine)
         || args
             .iter()
             .take_while(|word| word.as_str() != "--")
@@ -1271,6 +1723,19 @@ fn observe(
             }
         });
     };
+    // A target named through a link is the folder it names when atpkg owns that folder, and
+    // never adopted or created through it.
+    #[cfg(unix)]
+    match through_link(home, &chosen.target) {
+        Some(Ok(linked)) => {
+            return Ok(match admit_linked(home, &linked, &owner)? {
+                Ok(()) => Observation::Owned,
+                Err(refusal) => Observation::Refused(refusal),
+            });
+        }
+        Some(Err(refusal)) => return Ok(Observation::Refused(refusal)),
+        None => {}
+    }
     let owned = create_checked(home, &chosen.target, &owner)?;
     if !owned && let Some(super::BuildDir::Target(placement)) = super::decide(args, tool, machine) {
         let child = chosen.target.join(super::TARGET_BUILD_LEAF);
@@ -1299,7 +1764,8 @@ fn observe_on(
     home: &Path,
     machine: &super::Machine<'_>,
 ) -> std::io::Result<bool> {
-    observe(args, tool, home, machine).map(|observed| observed != Observation::Unmanaged)
+    observe(args, tool, home, machine)
+        .map(|observed| matches!(observed, Observation::Protected | Observation::Owned))
 }
 
 /// An inherited directory can be resolved without granting its environment provenance:
@@ -1599,7 +2065,7 @@ fn observe_for_producer(
     machine: &super::Machine<'_>,
     require_explicit: bool,
 ) -> std::io::Result<bool> {
-    if non_producing_command(args, tool) {
+    if non_producing_command(args, tool, machine) {
         return Ok(false);
     }
     // A nested compiler can inherit the exact directory our shim placed. Classify the
@@ -1642,8 +2108,13 @@ fn observe_for_producer(
     {
         return Err(refusal());
     }
-    let owned = observe(args, tool, home, machine)? == Observation::Owned;
+    let observed = observe(args, tool, home, machine)?;
+    let owned = observed == Observation::Owned;
     if require_explicit && explicit && !query && !owned {
+        #[cfg(unix)]
+        if let Observation::Refused(refusal) = observed {
+            return Err(std::io::Error::other(refusal.why()));
+        }
         return Err(refusal());
     }
     Ok(owned)
@@ -2803,7 +3274,7 @@ mod tests {
         );
         assert!(crate::build_admit::classify(&args, super::super::Tool::Targo).is_none());
         for tool in [super::super::Tool::Cargo, super::super::Tool::Tippy] {
-            assert!(!non_producing_command(&args, tool));
+            assert!(!non_producing_command(&args, tool, &machine));
         }
         for args in [
             vec!["--resource-capabilities", "build"],
@@ -2812,7 +3283,11 @@ mod tests {
             vec!["alias", "--resource-capabilities"],
         ] {
             let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
-            assert!(!non_producing_command(&args, super::super::Tool::Targo));
+            assert!(!non_producing_command(
+                &args,
+                super::super::Tool::Targo,
+                &machine
+            ));
         }
     }
 
@@ -4562,11 +5037,9 @@ mod tests {
                 vec![
                     "+nightly".into(),
                     "--config".into(),
-                    "elsewhere.toml".into(),
+                    "net.offline=true".into(),
                     "-Z".into(),
                     "unstable-options".into(),
-                    "-C".into(),
-                    "another-directory".into(),
                     "metadata".into(),
                 ],
             ),
@@ -4606,6 +5079,20 @@ mod tests {
                 vec!["--unverified", "run", "--", "metadata"],
             ),
             (super::super::Tool::Tippy, vec!["metadata"]),
+            // A config file, or another directory's configs, may place the lockfile in a target.
+            (
+                super::super::Tool::Cargo,
+                vec![
+                    "+nightly",
+                    "--config",
+                    "elsewhere.toml",
+                    "-Z",
+                    "unstable-options",
+                    "-C",
+                    "another-directory",
+                    "metadata",
+                ],
+            ),
             (super::super::Tool::Targo, vec!["-vV-not-a-query"]),
             (super::super::Tool::Targo, vec!["--color", "-vV", "build"]),
             (
@@ -4642,6 +5129,961 @@ mod tests {
         drop(permissions);
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert!(!read(&path).unwrap().owners_unknown);
+    }
+
+    /// THE VERBS THAT WRITE NO BUILD OUTPUT OWE NO OWNERSHIP, in every spelling of a target: each
+    /// of [`READING_VERBS`] and [`RESOLVING_VERBS`], named literally here, with a registered
+    /// target in the environment, a fresh one by `--target-dir` (both forms), a `-Z` option,
+    /// `--config build.target-dir=…` (both forms) or `build.build-dir`, upstream cargo's
+    /// `+toolchain`, is observed as nothing: its receipt and marker unchanged and no target made,
+    /// under a gate held and an index that refuses writes, so a mistaken observation fails.
+    /// NEGATIVE CONTROLS: the same verb as an option's value, past `--`, after a building verb,
+    /// behind `trust`, as a lint's argument, or a name that only begins like it, is still
+    /// observed; so is a resolving verb whose lockfile may land in a target, by an embedded
+    /// manifest or a `resolver.lockfile-path` in each place a call can name one, while a reading
+    /// verb with the same words stays free.
+    #[test]
+    fn output_free_verbs_owe_no_ownership_in_every_target_spelling() {
+        struct RestorePermissions<'a>(&'a Path, std::fs::Permissions);
+        impl Drop for RestorePermissions<'_> {
+            fn drop(&mut self) {
+                std::fs::set_permissions(self.0, self.1.clone()).unwrap();
+            }
+        }
+
+        let world = World::new();
+        world.build();
+        let path = world.path();
+        let before = std::fs::read(&path).unwrap();
+        let marker = std::fs::read(world.target.join(MARKER)).unwrap();
+        let fresh = world.home.join("fetch-only.noindex");
+        let env =
+            |name: &str| (name == "CARGO_TARGET_DIR").then(|| world.target.as_os_str().to_owned());
+        let machine = super::super::Machine {
+            home: Some(&world.home),
+            root: None,
+            cwd: Some(&world.owner),
+            env: &env,
+            read: &|_| Ok(None),
+            writable: &|_| Some(false),
+        };
+        let index = path.parent().unwrap();
+        let permissions =
+            RestorePermissions(index, std::fs::metadata(index).unwrap().permissions());
+        std::fs::set_permissions(index, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let gate = crate::metadata_io::open_regular(&gate_path(&path).unwrap()).unwrap();
+        let held = crate::lock::Flock::try_lock(gate).unwrap();
+        let fresh_at = fresh.display().to_string();
+        let config = format!("build.target-dir='{fresh_at}'");
+        for verb in [
+            "fetch",
+            "tree",
+            "metadata",
+            "generate-lockfile",
+            "pkgid",
+            "verify-project",
+            "read-manifest",
+            "locate-project",
+            "version",
+        ] {
+            let spellings: [(super::super::Tool, Vec<String>); 10] = [
+                (
+                    super::super::Tool::Targo,
+                    vec![verb.into(), "--locked".into()],
+                ),
+                (
+                    super::super::Tool::Targo,
+                    vec![
+                        "--unverified".into(),
+                        verb.into(),
+                        "--target-dir".into(),
+                        fresh_at.clone(),
+                    ],
+                ),
+                (
+                    super::super::Tool::Targo,
+                    vec![verb.into(), format!("--target-dir={fresh_at}")],
+                ),
+                (
+                    super::super::Tool::Targo,
+                    vec![
+                        "-Z".into(),
+                        "unstable-options".into(),
+                        verb.into(),
+                        "--target-dir".into(),
+                        fresh_at.clone(),
+                    ],
+                ),
+                (
+                    super::super::Tool::Targo,
+                    vec![
+                        "-Zbuild-std".into(),
+                        "--offline".into(),
+                        verb.into(),
+                        "-Zgc".into(),
+                    ],
+                ),
+                (
+                    super::super::Tool::Targo,
+                    vec!["--config".into(), config.clone(), verb.into()],
+                ),
+                (
+                    super::super::Tool::Targo,
+                    vec![
+                        format!("--config={config}"),
+                        "--unverified".into(),
+                        verb.into(),
+                    ],
+                ),
+                (
+                    super::super::Tool::Targo,
+                    vec![
+                        "--config".into(),
+                        format!("build.build-dir='{fresh_at}'"),
+                        verb.into(),
+                        "--config".into(),
+                        config.clone(),
+                    ],
+                ),
+                (
+                    super::super::Tool::Cargo,
+                    vec![
+                        "+nightly".into(),
+                        verb.into(),
+                        format!("--target-dir={fresh_at}"),
+                    ],
+                ),
+                (
+                    super::super::Tool::Cargo,
+                    vec![
+                        "-v".into(),
+                        "--frozen".into(),
+                        verb.into(),
+                        "--target-dir".into(),
+                        fresh_at.clone(),
+                    ],
+                ),
+            ];
+            for (tool, args) in spellings {
+                assert!(
+                    non_producing_command(&args, tool, &machine),
+                    "{tool:?} {args:?}"
+                );
+                assert!(
+                    !observe_for_producer(&args, tool, &world.home, &machine, true).unwrap(),
+                    "{tool:?} {args:?}"
+                );
+                assert!(
+                    !observe_on(&args, tool, &world.home, &machine).unwrap(),
+                    "{args:?}"
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), before, "{args:?}");
+                assert_eq!(std::fs::read(world.target.join(MARKER)).unwrap(), marker);
+                assert!(!fresh.exists(), "{args:?}");
+            }
+        }
+        for (tool, words) in [
+            (
+                super::super::Tool::Targo,
+                vec!["--config", "fetch", "build"],
+            ),
+            (
+                super::super::Tool::Targo,
+                vec!["--unverified", "run", "--", "fetch"],
+            ),
+            (
+                super::super::Tool::Targo,
+                vec!["--unverified", "build", "fetch"],
+            ),
+            (super::super::Tool::Targo, vec!["trust", "fetch"]),
+            (
+                super::super::Tool::Targo,
+                vec!["--unverified", "fetch-alias"],
+            ),
+            (super::super::Tool::Targo, vec!["--unverified", "treehouse"]),
+            (super::super::Tool::Tippy, vec!["fetch"]),
+            (super::super::Tool::Tippy, vec!["tree"]),
+        ] {
+            let args = words.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert!(
+                !non_producing_command(&args, tool, &machine),
+                "{tool:?} {args:?}"
+            );
+            assert!(
+                observe_on(&args, tool, &world.home, &machine).is_err(),
+                "a possible producer must still observe its owners: {tool:?} {args:?}"
+            );
+        }
+        let lockfile = fresh.join("Cargo.lock").display().to_string();
+        let config_file = world.owner.join(".cargo").join("config.toml");
+        let named_file = world.owner.join("net.retry=2");
+        let benign_file = world.owner.join("ci.toml");
+        let words = |words: &[&str]| words.iter().map(|word| (*word).to_owned()).collect();
+        // Words before the verb, words after it, `CARGO_RESOLVER_LOCKFILE_PATH`, and what the
+        // workspace's own config reads as.
+        type Case = (
+            Vec<String>,
+            Vec<String>,
+            Option<String>,
+            Result<Option<String>, ()>,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                vec![],
+                words(&["--manifest-path", "script.rs"]),
+                None,
+                Ok(None),
+            ),
+            (
+                vec![],
+                words(&["--manifest-path=tools/helper"]),
+                None,
+                Ok(None),
+            ),
+            (
+                words(&["--manifest-path", "/elsewhere/build.rs"]),
+                vec![],
+                None,
+                Ok(None),
+            ),
+            (
+                vec![],
+                vec![
+                    "--config".into(),
+                    format!("resolver.lockfile-path='{lockfile}'"),
+                ],
+                None,
+                Ok(None),
+            ),
+            (
+                vec![format!(
+                    "--config=resolver.\"\\u006cockfile-path\"='{lockfile}'"
+                )],
+                vec![],
+                None,
+                Ok(None),
+            ),
+            (
+                vec![],
+                words(&["--config", "include='more.toml'"]),
+                None,
+                Ok(None),
+            ),
+            (vec![], words(&["--config", "net.retry=2"]), None, Ok(None)),
+            (vec![], words(&["--config"]), None, Ok(None)),
+            (
+                words(&["-Z", "unstable-options", "-C", "elsewhere"]),
+                vec![],
+                None,
+                Ok(None),
+            ),
+            (words(&["-Celsewhere"]), vec![], None, Ok(None)),
+            (
+                vec![],
+                words(&["--lockfile-path", "x/Cargo.lock"]),
+                None,
+                Ok(None),
+            ),
+            (vec![], vec![], Some(lockfile.clone()), Ok(None)),
+            (
+                vec![],
+                vec![],
+                None,
+                Ok(Some(format!("[resolver]\nlockfile-path = '{lockfile}'\n"))),
+            ),
+            (
+                vec![],
+                vec![],
+                None,
+                Ok(Some("include = ['more.toml']\n".into())),
+            ),
+            (
+                vec![],
+                vec![],
+                None,
+                Ok(Some("[resolver]\n\"\\u006cockfile-path\" = 'x'\n".into())),
+            ),
+            (vec![], vec![], None, Err(())),
+            (vec![], words(&["-m", "script.rs"]), None, Ok(None)),
+            (vec![], words(&["-mtools/helper"]), None, Ok(None)),
+            (vec![], words(&["-m=helper.rs"]), None, Ok(None)),
+            (vec![], words(&["-qm", "sub/Cargo.toml"]), None, Ok(None)),
+            (
+                vec![],
+                vec![],
+                None,
+                Ok(Some("[resolver\nlockfile-path = 'x'\n".into())),
+            ),
+        ];
+        // Calls whose words or configs only look like those: an ordinary manifest by either
+        // spelling and either name, a long flag or a `-Z` option holding an `m`, another resolver
+        // key, a config file that sets neither, a value naming nothing that stands and no lock
+        // root, a backslash in a value (as aterm's own `.cargo/config.toml` has one), a key named
+        // only in a comment, and TOML 1.1 that names neither.
+        let free: Vec<Case> = vec![
+            (vec![], words(&["-m", "sub/Cargo.toml"]), None, Ok(None)),
+            (vec![], words(&["-m", "sub/Targo.toml"]), None, Ok(None)),
+            (vec![], words(&["--manifest-path", "sub/other.toml"]), None, Ok(None)),
+            (words(&["-Zminimal-versions"]), vec![], None, Ok(None)),
+            (words(&["--config", "ci.toml"]), vec![], None, Ok(None)),
+            (words(&["--config", "extra.toml"]), vec![], None, Ok(None)),
+            (vec![], vec![], None, Ok(Some("net = { retry = 2, }\n".into()))),
+            (
+                vec![],
+                words(&["--manifest-path=sub/Cargo.toml", "--format-version=1"]),
+                None,
+                Ok(None),
+            ),
+            (
+                vec![],
+                words(&["--config", "resolver.feature-unification=\"workspace\""]),
+                None,
+                Ok(None),
+            ),
+            (
+                vec![],
+                vec![],
+                None,
+                Ok(Some(
+                    "[alias]\nverify = \"run --config resolver.feature-unification=\\\"workspace\\\" -p aterm-verify --\"\n"
+                        .into(),
+                )),
+            ),
+            (
+                vec![],
+                vec![],
+                None,
+                Ok(Some(
+                    "[resolver]\nfeature-unification = \"workspace\" # lockfile-path = 'x'\n".into(),
+                )),
+            ),
+        ];
+        let cases = cases
+            .into_iter()
+            .map(|case| (case, true))
+            .chain(free.into_iter().map(|case| (case, false)));
+        for ((before_verb, after_verb, lock_env, config), placed) in cases {
+            let env = |name: &str| match name {
+                "CARGO_TARGET_DIR" => Some(world.target.as_os_str().to_owned()),
+                "CARGO_RESOLVER_LOCKFILE_PATH" => lock_env.clone().map(Into::into),
+                _ => None,
+            };
+            let read = |path: &Path| -> Result<Option<String>, ()> {
+                if path == config_file {
+                    config.clone()
+                } else if path == named_file {
+                    Ok(Some(format!("[resolver]\nlockfile-path = '{lockfile}'\n")))
+                } else {
+                    Ok((path == benign_file).then(|| "[net]\nretry = 2\n".into()))
+                }
+            };
+            let placing = super::super::Machine {
+                env: &env,
+                read: &read,
+                ..machine
+            };
+            for verb in READING_VERBS.iter().chain(RESOLVING_VERBS) {
+                let mut args = before_verb.clone();
+                args.push((*verb).to_owned());
+                args.extend(after_verb.iter().cloned());
+                let observed_as_producer = placed && RESOLVING_VERBS.contains(verb);
+                assert_eq!(
+                    non_producing_command(&args, super::super::Tool::Targo, &placing),
+                    !observed_as_producer,
+                    "{args:?} {lock_env:?} {config:?}"
+                );
+                let observed = observe_for_producer(
+                    &args,
+                    super::super::Tool::Targo,
+                    &world.home,
+                    &placing,
+                    true,
+                );
+                assert_eq!(
+                    observed.is_err(),
+                    observed_as_producer,
+                    "{args:?} {observed:?}"
+                );
+                assert!(observed.is_err() || !observed.unwrap(), "{args:?}");
+                assert_eq!(std::fs::read(&path).unwrap(), before, "{args:?}");
+                assert_eq!(std::fs::read(world.target.join(MARKER)).unwrap(), marker);
+                assert!(!fresh.exists(), "{args:?}");
+            }
+        }
+        // The package home's config counts too, the home chosen as Targo chooses it: `CARGO_HOME`
+        // (against the working directory), its `TARGO_HOME` twin where `CARGO_HOME` is unset, or
+        // `~/.cargo` where the chosen one is empty or none is set.
+        let package_home = world.home.join("package-home");
+        let package_home_at = package_home.as_os_str().to_owned();
+        // Read from outside the home, so no ancestor's config stands in for the package home's.
+        let elsewhere = world.home.parent().unwrap().join("elsewhere");
+        let dot_cargo = world.home.join(".cargo").join("config");
+        for (cargo_home, targo_home, config) in [
+            (
+                Some(package_home_at.clone()),
+                None,
+                package_home.join("config.toml"),
+            ),
+            (
+                Some("../home/package-home".into()),
+                None,
+                package_home.join("config.toml"),
+            ),
+            (
+                None,
+                Some(package_home_at.clone()),
+                package_home.join("config"),
+            ),
+            (
+                Some("".into()),
+                Some(package_home_at.clone()),
+                dot_cargo.clone(),
+            ),
+            (None, None, dot_cargo.clone()),
+        ] {
+            let env = |name: &str| match name {
+                "CARGO_HOME" => cargo_home.clone(),
+                "TARGO_HOME" => targo_home.clone(),
+                _ => None,
+            };
+            // Paths compare as Targo would read them: the relative home joined to the cwd.
+            let read = |path: &Path| {
+                let path = normalize_with_cwd(path.to_path_buf(), None).unwrap();
+                Ok((path == config).then(|| "[resolver]\nlockfile-path = 'x/Cargo.lock'\n".into()))
+            };
+            let homed = super::super::Machine {
+                cwd: Some(&elsewhere),
+                env: &env,
+                read: &read,
+                ..machine
+            };
+            assert!(
+                lockfile_may_land_in_a_target(&words(&["fetch"]), &homed),
+                "{cargo_home:?} {targo_home:?}"
+            );
+            let read = |_: &Path| Ok(None);
+            let plain = super::super::Machine {
+                read: &read,
+                ..homed
+            };
+            assert!(!lockfile_may_land_in_a_target(&words(&["fetch"]), &plain));
+        }
+        // An explicit `CARGO_HOME` hides its `TARGO_HOME` twin, as in Targo.
+        let env = |name: &str| match name {
+            "CARGO_HOME" => Some(world.home.join("chosen").into_os_string()),
+            "TARGO_HOME" => Some(package_home_at.clone()),
+            _ => None,
+        };
+        let read = |path: &Path| {
+            Ok(path
+                .starts_with(&package_home)
+                .then(|| "include = ['x.toml']\n".into()))
+        };
+        let twinned = super::super::Machine {
+            cwd: Some(&elsewhere),
+            env: &env,
+            read: &read,
+            ..machine
+        };
+        assert!(!lockfile_may_land_in_a_target(&words(&["fetch"]), &twinned));
+        // A lockfile path in the `TARGO_` twin of its variable, and a call with no working
+        // directory to read configs from, may place the lockfile too.
+        let env =
+            |name: &str| (name == "TARGO_RESOLVER_LOCKFILE_PATH").then(|| "x/Cargo.lock".into());
+        let read = |_: &Path| Ok(None);
+        let twin = super::super::Machine {
+            env: &env,
+            read: &read,
+            ..machine
+        };
+        assert!(lockfile_may_land_in_a_target(&words(&["fetch"]), &twin));
+        let env = |_: &str| None;
+        let nowhere = super::super::Machine {
+            cwd: None,
+            env: &env,
+            read: &read,
+            ..machine
+        };
+        assert!(lockfile_may_land_in_a_target(&words(&["fetch"]), &nowhere));
+        // A config that is a link (`.cargo/config -> config.toml`), which atpkg's own reader
+        // refuses, is read at its canonical path, as Targo reads it; a dangling one cannot be
+        // read at all.
+        let linked = world.home.join("linked-config");
+        std::fs::create_dir_all(linked.join(".cargo")).unwrap();
+        std::os::unix::fs::symlink("config.toml", linked.join(".cargo").join("config")).unwrap();
+        let no_follow = |path: &Path| match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_symlink() => Err(()),
+            Ok(_) => Ok(Some(std::fs::read_to_string(path).unwrap())),
+            Err(_) => Ok(None),
+        };
+        let env = |_: &str| None;
+        let through = super::super::Machine {
+            cwd: Some(&linked),
+            env: &env,
+            read: &no_follow,
+            ..machine
+        };
+        for (text, placed) in [
+            ("[resolver]\nfeature-unification = 'workspace'\n", false),
+            ("[resolver]\nlockfile-path = 'x/Cargo.lock'\n", true),
+        ] {
+            std::fs::write(linked.join(".cargo").join("config.toml"), text).unwrap();
+            assert_eq!(
+                lockfile_may_land_in_a_target(&words(&["fetch"]), &through),
+                placed,
+                "{text}"
+            );
+        }
+        std::fs::remove_file(linked.join(".cargo").join("config.toml")).unwrap();
+        assert!(lockfile_may_land_in_a_target(&words(&["fetch"]), &through));
+        drop(held);
+        drop(permissions);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// The `*.json` receipts of `home`'s index, by name, with their bytes.
+    fn receipts(home: &Path) -> Vec<(std::ffi::OsString, Vec<u8>)> {
+        let mut found = std::fs::read_dir(home.join(INDEX))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .map(|path| {
+                (
+                    path.file_name().unwrap().to_owned(),
+                    std::fs::read(&path).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        found.sort();
+        found
+    }
+
+    /// The producer call of `owner`'s workspace building into `target`.
+    fn build_into(owner: &Path, target: &Path) -> Vec<String> {
+        vec![
+            "--unverified".into(),
+            "build".into(),
+            format!("--manifest-path={}", owner.join("Cargo.toml").display()),
+            format!("--target-dir={}", target.display()),
+        ]
+    }
+
+    /// A TARGET NAMED THROUGH A LINK TO A FOLDER ATPKG OWNS IS THAT FOLDER: a build of another
+    /// workspace through a link (its text relative, as Macs set up before 2026-09-10 have
+    /// `crates/target -> target.noindex`, or absolute) is observed as owned, its workspace joins
+    /// the folder's own receipt, and nothing else changes: the marker, the link, the count of
+    /// registered roots, no receipt keyed by the link and none for a build leaf under it. A second
+    /// build reads its owner on record and writes nothing. An unresolved producer through the link
+    /// protects the folder's receipt as its own name would. Each fails without link resolution:
+    /// the link's name has no receipt of its own while the folder's marker shows through it.
+    #[test]
+    fn a_target_named_through_a_link_to_an_owned_folder_is_that_folder() {
+        for text in [PathBuf::from("outputs.noindex"), PathBuf::new()] {
+            let world = World::new();
+            world.build();
+            let text = if text.as_os_str().is_empty() {
+                world.target.clone()
+            } else {
+                text
+            };
+            let link = world.home.join("target");
+            std::os::unix::fs::symlink(&text, &link).unwrap();
+            let marker = std::fs::read(world.target.join(MARKER)).unwrap();
+            let other = world.another_owner();
+            let machine = super::super::Machine {
+                home: Some(&world.home),
+                root: None,
+                cwd: Some(&other),
+                env: &|_| None,
+                read: &|_| Ok(None),
+                writable: &|_| Some(true),
+            };
+            let args = build_into(&other, &link);
+            assert_eq!(
+                observe(&args, super::super::Tool::Targo, &world.home, &machine).unwrap(),
+                Observation::Owned,
+                "{text:?}"
+            );
+            let receipt = read(&world.path()).unwrap();
+            assert_eq!(receipt.root, world.target);
+            assert_eq!(receipt.owners, [world.owner.clone(), other.clone()]);
+            assert!(!receipt.owners_unknown);
+            assert_eq!(std::fs::read(world.target.join(MARKER)).unwrap(), marker);
+            assert_eq!(std::fs::read_link(&link).unwrap(), text);
+            assert!(!link.join(super::super::TARGET_BUILD_LEAF).exists());
+            let registered = roots(&world.home);
+            assert_eq!(registered.len(), 1);
+            assert_eq!(registered[0].root, world.target);
+            let keyed_by_link = world
+                .home
+                .join(INDEX)
+                .join(format!("{}.json", key(&link).unwrap()));
+            assert!(std::fs::symlink_metadata(keyed_by_link).is_err());
+
+            let recorded = receipts(&world.home);
+            assert!(
+                observe_for_producer(
+                    &args,
+                    super::super::Tool::Targo,
+                    &world.home,
+                    &machine,
+                    true
+                )
+                .unwrap()
+            );
+            assert_eq!(
+                receipts(&world.home),
+                recorded,
+                "an owner on record writes nothing"
+            );
+
+            let unresolved = [
+                "--unverified".into(),
+                "unknown-alias".into(),
+                format!("--target-dir={}", link.display()),
+            ];
+            assert_eq!(
+                observe(
+                    &unresolved,
+                    super::super::Tool::Targo,
+                    &world.home,
+                    &machine
+                )
+                .unwrap(),
+                Observation::Protected
+            );
+            assert!(read(&world.path()).unwrap().owners_unknown);
+            assert_eq!(roots(&world.home).len(), 1);
+        }
+    }
+
+    /// A LINK TO A FOLDER ATPKG DOES NOT OWN IS REFUSED, EACH CASE IN ITS OWN WORDS, and nothing is
+    /// written: no marker in the folder, no receipt in the index, the link as it was. A folder
+    /// with no custody; one cargo made that atpkg never registered (never adopted through the
+    /// link, though at its own name it would be); a link to nothing; a link to a link to an owned
+    /// folder, or to an owned folder through a linked folder on the way, or in a folder reached
+    /// through a link; text that climbs past the root; a folder on another volume (`/dev`); a folder whose marker no receipt binds; a
+    /// file. NEGATIVE CONTROL: the cargo-made folder named by its own path is adopted.
+    #[test]
+    fn links_to_folders_atpkg_does_not_own_refuse_each_in_its_own_words() {
+        use std::os::unix::fs::MetadataExt as _;
+        let world = World::new();
+        world.build();
+        let other = world.another_owner();
+        let machine = super::super::Machine {
+            home: Some(&world.home),
+            root: None,
+            cwd: Some(&other),
+            env: &|_| None,
+            read: &|_| Ok(None),
+            writable: &|_| Some(true),
+        };
+        let folder = |name: &str| {
+            let at = world.home.join(name);
+            std::fs::DirBuilder::new().mode(0o700).create(&at).unwrap();
+            at
+        };
+        let plain = folder("plain.noindex");
+        let cargo_made = folder("cargo-made.noindex");
+        let tag = cargo_made.join("CACHEDIR.TAG");
+        std::fs::write(
+            &tag,
+            "Signature: 8a477f597d28d172789f06886806bc55\n\
+             # This file is a cache directory tag created by cargo.\n\
+             # For information about cache directory tags see https://bford.info/cachedir/\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&tag, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(cargo_made.join(".rustc_info.json"), b"{}").unwrap();
+        let foreign = folder("foreign.noindex");
+        std::fs::copy(world.target.join(MARKER), foreign.join(MARKER)).unwrap();
+        let file = world.home.join("a-file");
+        std::fs::write(&file, b"not a folder").unwrap();
+        let hop = world.home.join("hop");
+        std::os::unix::fs::symlink("outputs.noindex", &hop).unwrap();
+        std::os::unix::fs::symlink(".", world.home.join("via")).unwrap();
+        assert_ne!(
+            std::fs::metadata("/dev").unwrap().dev(),
+            std::fs::metadata(&world.home).unwrap().dev(),
+            "the other volume must be one"
+        );
+        let index = receipts(&world.home);
+        for (name, text, refusal) in [
+            (
+                "unowned",
+                PathBuf::from("plain.noindex"),
+                LinkRefusal::Unowned,
+            ),
+            (
+                "cargo",
+                PathBuf::from("cargo-made.noindex"),
+                LinkRefusal::CargoMade,
+            ),
+            (
+                "dangling",
+                PathBuf::from("nothing.noindex"),
+                LinkRefusal::Dangling,
+            ),
+            ("chain", PathBuf::from("hop"), LinkRefusal::Chain),
+            (
+                "detour",
+                PathBuf::from("via/outputs.noindex"),
+                LinkRefusal::Chain,
+            ),
+            ("volume", PathBuf::from("/dev"), LinkRefusal::OtherVolume),
+            (
+                "foreign",
+                PathBuf::from("foreign.noindex"),
+                LinkRefusal::Foreign,
+            ),
+            ("file", PathBuf::from("a-file"), LinkRefusal::NotFolder),
+            // Named as `via/link-parent`: a link to an owned folder, in a folder reached
+            // through a link.
+            (
+                "parent",
+                PathBuf::from("outputs.noindex"),
+                LinkRefusal::Chain,
+            ),
+            (
+                "above-root",
+                PathBuf::from(format!("{}dev", "../".repeat(64))),
+                LinkRefusal::Unreachable,
+            ),
+        ] {
+            let link = world.home.join(format!("link-{name}"));
+            std::os::unix::fs::symlink(&text, &link).unwrap();
+            let named = if name == "parent" {
+                world.home.join("via").join(format!("link-{name}"))
+            } else {
+                link.clone()
+            };
+            let args = build_into(&other, &named);
+            assert_eq!(
+                observe(&args, super::super::Tool::Targo, &world.home, &machine).unwrap(),
+                Observation::Refused(refusal),
+                "{name}"
+            );
+            let refused = observe_for_producer(
+                &args,
+                super::super::Tool::Targo,
+                &world.home,
+                &machine,
+                true,
+            )
+            .unwrap_err();
+            assert_eq!(refused.to_string(), refusal.why(), "{name}");
+            assert_eq!(receipts(&world.home), index, "{name}");
+            assert_eq!(std::fs::read_link(&link).unwrap(), text, "{name}");
+        }
+        let messages = [
+            LinkRefusal::Unowned,
+            LinkRefusal::CargoMade,
+            LinkRefusal::Dangling,
+            LinkRefusal::Chain,
+            LinkRefusal::OtherVolume,
+            LinkRefusal::Foreign,
+            LinkRefusal::NotFolder,
+            LinkRefusal::Unreachable,
+            LinkRefusal::Changed,
+        ]
+        .map(LinkRefusal::why);
+        assert_eq!(
+            messages
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            messages.len(),
+            "each refusal has its own words"
+        );
+        for untouched in [&plain, &cargo_made] {
+            assert!(!untouched.join(MARKER).exists());
+        }
+        assert!(!world.home.join("nothing.noindex").exists());
+
+        assert!(create_checked(&world.home, &cargo_made, &other).unwrap());
+        assert!(cargo_made.join(MARKER).is_file());
+    }
+
+    /// A LINK RETARGETED BETWEEN ITS OBSERVATION AND THE RE-CHECK UNDER THE FOLDER'S GATE IS
+    /// REFUSED: a link to one owned folder, moved to another owned folder at the first re-check
+    /// (the shared gate's, for an owner already on record) or the second (the exclusive gate's,
+    /// for a new one), or with the link left as it was and another folder renamed into its
+    /// folder's path, is refused as changed, and neither folder's receipt gains the producer. An
+    /// unresolved call through the link, moved at its re-check under the folder's gate, is refused
+    /// as changed too, and the first folder's receipt is left as it was. NEGATIVE CONTROL: with no
+    /// move, the same calls are owned, and the unresolved one suppresses the folder's retirement.
+    #[test]
+    fn a_link_retargeted_between_observation_and_the_gate_is_refused() {
+        for (moved_at, recorded, swapped) in [
+            (Some(1), true, false),
+            (Some(1), false, false),
+            (Some(2), false, false),
+            (Some(1), true, true),
+            (Some(2), false, true),
+            (None, false, false),
+        ] {
+            let world = World::new();
+            world.build();
+            let second = world.home.join("second.noindex");
+            assert!(create_checked(&world.home, &second, &world.owner).unwrap());
+            let producer = if recorded {
+                world.owner.clone()
+            } else {
+                world.another_owner()
+            };
+            let machine = super::super::Machine {
+                home: Some(&world.home),
+                root: None,
+                cwd: Some(&producer),
+                env: &|_| None,
+                read: &|_| Ok(None),
+                writable: &|_| Some(true),
+            };
+            let link = world.home.join("target");
+            std::os::unix::fs::symlink("outputs.noindex", &link).unwrap();
+            let index = receipts(&world.home);
+            let rechecks = std::rc::Rc::new(std::cell::Cell::new(0));
+            let seen = rechecks.clone();
+            let (first, aside) = (world.target.clone(), world.home.join("aside.noindex"));
+            let swap = second.clone();
+            link_seam::on_recheck(move |link| {
+                seen.set(seen.get() + 1);
+                if Some(seen.get()) != moved_at {
+                } else if swapped {
+                    // The link as it was, its folder's path now another folder's.
+                    std::fs::rename(&first, &aside).unwrap();
+                    std::fs::rename(&swap, &first).unwrap();
+                } else {
+                    std::fs::remove_file(link).unwrap();
+                    std::os::unix::fs::symlink("second.noindex", link).unwrap();
+                }
+            });
+            let observed = observe(
+                &build_into(&producer, &link),
+                super::super::Tool::Targo,
+                &world.home,
+                &machine,
+            );
+            link_seam::clear();
+            let label =
+                format!("moved at {moved_at:?}, owner on record {recorded}, swapped {swapped}");
+            if moved_at.is_some() {
+                assert_eq!(
+                    observed.unwrap(),
+                    Observation::Refused(LinkRefusal::Changed),
+                    "{label}"
+                );
+                assert_eq!(receipts(&world.home), index, "{label}");
+            } else {
+                assert_eq!(observed.unwrap(), Observation::Owned, "{label}");
+                assert!(rechecks.get() >= 1, "{label}");
+                assert!(read(&world.path()).unwrap().owners.contains(&producer));
+            }
+        }
+        for moved in [true, false] {
+            let world = World::new();
+            world.build();
+            let second = world.home.join("second.noindex");
+            assert!(create_checked(&world.home, &second, &world.owner).unwrap());
+            let link = world.home.join("target");
+            std::os::unix::fs::symlink("outputs.noindex", &link).unwrap();
+            let machine = super::super::Machine {
+                home: Some(&world.home),
+                root: None,
+                cwd: Some(&world.owner),
+                env: &|_| None,
+                read: &|_| Ok(None),
+                writable: &|_| Some(true),
+            };
+            let index = receipts(&world.home);
+            if moved {
+                link_seam::on_recheck(|link| {
+                    std::fs::remove_file(link).unwrap();
+                    std::os::unix::fs::symlink("second.noindex", link).unwrap();
+                });
+            }
+            let unresolved = [
+                "--unverified".into(),
+                "unknown-alias".into(),
+                format!("--target-dir={}", link.display()),
+            ];
+            let observed = observe(
+                &unresolved,
+                super::super::Tool::Targo,
+                &world.home,
+                &machine,
+            );
+            link_seam::clear();
+            if moved {
+                assert_eq!(
+                    observed.unwrap_err().to_string(),
+                    LinkRefusal::Changed.why()
+                );
+                assert_eq!(receipts(&world.home), index);
+            } else {
+                assert_eq!(observed.unwrap(), Observation::Protected);
+                assert!(read(&world.path()).unwrap().owners_unknown);
+            }
+        }
+        // Shapes only one part of the re-check sees: the link replaced by a new link of the same
+        // text (its own inode alone differs), and the link's folder moved deeper with a link left
+        // in its place (the same link, text and folder, the kernel resolving it elsewhere).
+        for shape in ["relinked", "parent moved"] {
+            let world = World::new();
+            world.build();
+            let producer = world.another_owner();
+            let machine = super::super::Machine {
+                home: Some(&world.home),
+                root: None,
+                cwd: Some(&producer),
+                env: &|_| None,
+                read: &|_| Ok(None),
+                writable: &|_| Some(true),
+            };
+            let links = world.home.join("links");
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&links)
+                .unwrap();
+            let link = links.join("target");
+            std::os::unix::fs::symlink("../outputs.noindex", &link).unwrap();
+            let index = receipts(&world.home);
+            let home = world.home.clone();
+            let mut moved = false;
+            link_seam::on_recheck(move |link| {
+                if std::mem::replace(&mut moved, true) {
+                    return;
+                }
+                if shape == "relinked" {
+                    std::fs::remove_file(link).unwrap();
+                    std::os::unix::fs::symlink("../outputs.noindex", link).unwrap();
+                } else {
+                    let deeper = home.join("deeper");
+                    std::fs::DirBuilder::new()
+                        .mode(0o700)
+                        .create(&deeper)
+                        .unwrap();
+                    std::fs::rename(home.join("links"), deeper.join("links")).unwrap();
+                    std::os::unix::fs::symlink("deeper/links", home.join("links")).unwrap();
+                }
+            });
+            let observed = observe(
+                &build_into(&producer, &link),
+                super::super::Tool::Targo,
+                &world.home,
+                &machine,
+            );
+            link_seam::clear();
+            assert_eq!(
+                observed.unwrap(),
+                Observation::Refused(LinkRefusal::Changed),
+                "{shape}"
+            );
+            assert_eq!(receipts(&world.home), index, "{shape}");
+        }
     }
 
     #[cfg(target_os = "macos")]

@@ -1110,28 +1110,91 @@ pub(crate) fn pilot_build(
         None => target_dir.join("release/aterm"),
     };
     let gui_rlib_to_binary_s = crate::profile_pilot::gui_link_interval(&log, &binary)?;
-    let inspection = crate::profile_pilot::inspect(&binary, root)
-        .unwrap_or_else(|error| aterm_json::json!({"error": error}));
+    let inspection = crate::profile_pilot::inspect(&binary, root).unwrap_or_else(|error| {
+        aterm_json::Value::Object(aterm_json::Map::from([(
+            "error".to_string(),
+            aterm_json::Value::String(error),
+        )]))
+    });
     let (sha256, bytes) = crate::dmg::sha256_and_size(&binary)?;
     let retained = root.join("aterm");
     std::fs::rename(&binary, &retained).map_err(|e| format!("retain pilot artifact: {e}"))?;
     // Preserve evidence, not eight cold intermediate graphs. Nothing in this
     // experiment executes the image whose intermediate directory is removed.
     std::fs::remove_dir_all(&target_dir).map_err(|e| format!("clear pilot intermediates: {e}"))?;
-    Ok(aterm_json::json!({
-        "arm": arm.name(), "slice": target.unwrap_or(NATIVE_SLICE),
-        "wall_s": wall, "cpu_s": usage.cpu_ns.map(|ns| ns as f64 / 1e9),
-        "peak_bytes": usage.peak_bytes,
-        "accounting": "wait4: reaped child and waited descendants",
-        "binary": retained, "binary_bytes": bytes, "sha256": sha256,
-        "granted_cores": claim.cores(), "waiting_s": waiting_s,
-        "gui_rlib_to_binary_s": gui_rlib_to_binary_s,
-        "units": usage.units.map(|u| aterm_json::json!({"fresh": u.fresh, "compiled": u.compiled, "output_bytes": u.output_bytes})),
-        "starved_s": null,
-        "inspection": inspection, "log": log,
-        "load_before": load_before, "load_after": aterm_sysprobe::load_average(),
-        "max_load1": max_load1,
-    }))
+    Ok(aterm_json::Value::Object(aterm_json::Map::from([
+        (
+            "arm".to_string(),
+            aterm_json::Value::String(arm.name().to_string()),
+        ),
+        (
+            "slice".to_string(),
+            aterm_json::Value::String(target.unwrap_or(NATIVE_SLICE).to_string()),
+        ),
+        ("wall_s".to_string(), aterm_json::Value::from(wall)),
+        (
+            "cpu_s".to_string(),
+            usage.cpu_ns.map_or(aterm_json::Value::Null, |ns| {
+                aterm_json::Value::from(ns as f64 / 1e9)
+            }),
+        ),
+        (
+            "peak_bytes".to_string(),
+            usage.peak_bytes.map_or(aterm_json::Value::Null, |b| {
+                aterm_json::Value::Number(b.into())
+            }),
+        ),
+        (
+            "accounting".to_string(),
+            aterm_json::Value::String("wait4: reaped child and waited descendants".to_string()),
+        ),
+        ("binary".to_string(), aterm_json::json!(retained)),
+        (
+            "binary_bytes".to_string(),
+            aterm_json::Value::Number(bytes.into()),
+        ),
+        ("sha256".to_string(), aterm_json::Value::String(sha256)),
+        (
+            "granted_cores".to_string(),
+            aterm_json::Value::Number((claim.cores() as u64).into()),
+        ),
+        ("waiting_s".to_string(), aterm_json::Value::from(waiting_s)),
+        (
+            "gui_rlib_to_binary_s".to_string(),
+            aterm_json::Value::from(gui_rlib_to_binary_s),
+        ),
+        (
+            "units".to_string(),
+            usage.units.map_or(aterm_json::Value::Null, |u| {
+                aterm_json::Value::Object(aterm_json::Map::from([
+                    (
+                        "fresh".to_string(),
+                        aterm_json::Value::Number(u.fresh.into()),
+                    ),
+                    (
+                        "compiled".to_string(),
+                        aterm_json::Value::Number(u.compiled.into()),
+                    ),
+                    (
+                        "output_bytes".to_string(),
+                        aterm_json::Value::Number(u.output_bytes.into()),
+                    ),
+                ]))
+            }),
+        ),
+        ("starved_s".to_string(), aterm_json::Value::Null),
+        ("inspection".to_string(), inspection),
+        ("log".to_string(), aterm_json::json!(log)),
+        ("load_before".to_string(), aterm_json::json!(load_before)),
+        (
+            "load_after".to_string(),
+            aterm_json::json!(aterm_sysprobe::load_average()),
+        ),
+        (
+            "max_load1".to_string(),
+            max_load1.map_or(aterm_json::Value::Null, aterm_json::Value::from),
+        ),
+    ])))
 }
 
 /// Run the existing host-only library/wasm instruments against the sealed source,
@@ -1615,22 +1678,105 @@ fn build_cpu_event(
 ) -> String {
     format!(
         "release-event: {}",
-        aterm_json::json!({
-            "schema": 1, "event": "build-child-finished", "call": call,
-            "package": package, "target": target, "verb": verb,
-            "log": log.map(|path| path.to_string_lossy().into_owned()),
-            "units": usage.units.map(|u| aterm_json::json!({
-                "fresh": u.fresh, "compiled": u.compiled, "unknown": u.unknown,
-            })),
-            "output_bytes": usage.units.map(|u| u.output_bytes),
-            "outcome": if status.success() { "ok" } else { "FAIL" },
-            "exit_code": status.code(), "execution_s": wall.as_secs_f64(),
-            "child_cpu": usage.cpu_ns.map(|ns| aterm_json::json!({
-                "scope": "reaped-child-and-waited-descendants",
-                "observed_s": std::time::Duration::from_nanos(ns).as_secs_f64(),
-            })),
-            "peak_bytes": usage.peak_bytes,
-        })
+        aterm_json::Value::Object(aterm_json::Map::from([
+            ("schema".to_string(), aterm_json::Value::Number(1u64.into())),
+            (
+                "event".to_string(),
+                aterm_json::Value::String("build-child-finished".to_string()),
+            ),
+            (
+                "call".to_string(),
+                aterm_json::Value::String(call.to_string())
+            ),
+            (
+                "package".to_string(),
+                aterm_json::Value::String(package.to_string()),
+            ),
+            (
+                "target".to_string(),
+                target.map_or(aterm_json::Value::Null, |t| {
+                    aterm_json::Value::String(t.to_string())
+                }),
+            ),
+            (
+                "verb".to_string(),
+                aterm_json::Value::String(verb.to_string())
+            ),
+            (
+                "log".to_string(),
+                log.map_or(aterm_json::Value::Null, |path| {
+                    aterm_json::Value::String(path.to_string_lossy().into_owned())
+                }),
+            ),
+            (
+                "units".to_string(),
+                usage.units.map_or(aterm_json::Value::Null, |u| {
+                    aterm_json::Value::Object(aterm_json::Map::from([
+                        (
+                            "fresh".to_string(),
+                            aterm_json::Value::Number(u.fresh.into()),
+                        ),
+                        (
+                            "compiled".to_string(),
+                            aterm_json::Value::Number(u.compiled.into()),
+                        ),
+                        (
+                            "unknown".to_string(),
+                            aterm_json::Value::Number(u.unknown.into()),
+                        ),
+                    ]))
+                }),
+            ),
+            (
+                "output_bytes".to_string(),
+                usage.units.map_or(aterm_json::Value::Null, |u| {
+                    aterm_json::Value::Number(u.output_bytes.into())
+                }),
+            ),
+            (
+                "outcome".to_string(),
+                aterm_json::Value::String(if status.success() { "ok" } else { "FAIL" }.to_string(),),
+            ),
+            (
+                "exit_code".to_string(),
+                status
+                    .code()
+                    .map_or(aterm_json::Value::Null, |c| aterm_json::Value::Number(
+                        (c as i64).into()
+                    )),
+            ),
+            (
+                "execution_s".to_string(),
+                aterm_json::Value::from(wall.as_secs_f64()),
+            ),
+            (
+                "child_cpu".to_string(),
+                usage.cpu_ns.map_or(aterm_json::Value::Null, |ns| {
+                    aterm_json::Value::Object(aterm_json::Map::from([
+                        (
+                            "scope".to_string(),
+                            aterm_json::Value::String(
+                                "reaped-child-and-waited-descendants".to_string(),
+                            ),
+                        ),
+                        (
+                            "observed_s".to_string(),
+                            aterm_json::Value::from(
+                                std::time::Duration::from_nanos(ns).as_secs_f64(),
+                            ),
+                        ),
+                    ]))
+                }),
+            ),
+            (
+                "peak_bytes".to_string(),
+                usage
+                    .peak_bytes
+                    .map_or(aterm_json::Value::Null, |b| aterm_json::Value::Number(
+                        b.into()
+                    )),
+            ),
+        ]))
     )
 }
 

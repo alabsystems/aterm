@@ -27,6 +27,31 @@ use crate::ai::connector::Completion;
 #[path = "codex_shared_login.rs"]
 pub mod shared;
 
+#[path = "codex_app_login_custody.rs"]
+mod custody;
+#[path = "codex_enrollment_artifact_bridge.rs"]
+mod enrollment_artifact_bridge;
+#[path = "codex_grant_completion.rs"]
+mod grant_completion;
+use custody::legacy_reader_allowed;
+pub use custody::{OWNER_MARKER_SUFFIX, OWNER_MARKER_TEXT, legacy_file_reader_allowed};
+pub(super) use enrollment_artifact_bridge::reconcile_retained_enrollment;
+
+#[path = "codex_app_login_rejection.rs"]
+mod code_rejection;
+#[path = "codex_app_login_refresh_transport.rs"]
+mod refresh_transport;
+pub(in crate::harness) use code_rejection::{
+    CodeRejection, MAX_REJECTION_BODY, is_definitive_code_rejection,
+};
+pub(in crate::harness) use grant_completion::NoGrantCapture;
+pub(in crate::harness) use grant_completion::{CapturedLogin, CodeGrantCapture};
+pub use grant_completion::{FreshCodeGrant, StagedWitness};
+pub(in crate::harness) use refresh_transport::{
+    ReceivedRefresh, RefreshExchange, exchange_owned_refresh, merge_owned_refresh,
+    owned_refresh_token_digest,
+};
+
 /// Per-account credential file inside a Codex login directory (`CODEX_AUTH_PATH`).
 pub const AUTH_FILE: &str = "auth.json";
 
@@ -719,6 +744,12 @@ impl RefreshedTokens {
 /// must honor this journal too if they share the login.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RefreshJournal {
+    EnrollmentResponse {
+        admission: Box<super::codex_enrollment::Staging>,
+        predecessor: Option<String>,
+        candidate: NativeCredential,
+        digest: String,
+    },
     Attempted {
         token: String,
     },
@@ -731,6 +762,200 @@ enum RefreshJournal {
         token: Option<String>,
         tokens: RefreshedTokens,
     },
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct NativeCredential(String);
+
+impl std::fmt::Debug for NativeCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NativeCredential(<redacted>)")
+    }
+}
+
+fn credential_digest(bytes: &[u8]) -> String {
+    aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(bytes))
+}
+
+/// A reserved credential receipt, including an unreadable obstruction, owns its stage.
+/// This observation grants neither completion nor recovery and must never be used to replay HTTP.
+pub(super) fn retains_credential_custody(home: &Path) -> bool {
+    !matches!(std::fs::symlink_metadata(beside_auth(home, JOURNAL_SUFFIX)), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+}
+
+fn require_private_enrollment_directory(home: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        aterm_uds::private_file::JudgedDir::private(home)
+            .map(|_| ())
+            .map_err(|_| "enrollment directory is not private".into())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = home;
+        Err("native enrollment recovery is unavailable on this platform".into())
+    }
+}
+
+/// Materialize only the exact response of a fresh, Store-admitted enrollment recovery.
+/// The caller separately checks current account authority before checked publication.
+pub(super) fn materialize_enrollment(
+    admission: &super::codex_enrollment::Staging,
+    deadline: WakeDeadline,
+    work: Option<&super::account_work::Scope>,
+    store: &super::accounts::Store,
+    signer: &super::accounts::SigninTurn,
+) -> Result<String, String> {
+    let home = &admission.directory;
+    require_private_enrollment_directory(home)?;
+    if deadline.passed() || work.is_some_and(super::account_work::Scope::cancelled) {
+        return Err("enrollment recovery work expired".into());
+    }
+    let _held = AuthLock::try_take(&auth_path_in_home(home))
+        .map_err(|_| "enrollment credential lock unavailable")?
+        .ok_or("enrollment credential is busy")?;
+    materialize_enrollment_held(admission, deadline, work, store, signer, &_held)
+}
+
+fn materialize_enrollment_held(
+    admission: &super::codex_enrollment::Staging,
+    deadline: WakeDeadline,
+    work: Option<&super::account_work::Scope>,
+    store: &super::accounts::Store,
+    signer: &super::accounts::SigninTurn,
+    _held: &AuthLock,
+) -> Result<String, String> {
+    let home = &admission.directory;
+    require_private_enrollment_directory(home)?;
+    signer
+        .check_store(store)
+        .map_err(|_| "enrollment signer changed")?;
+    if deadline.passed() || work.is_some_and(super::account_work::Scope::cancelled) {
+        return Err("enrollment recovery work expired".into());
+    }
+    let Some(RefreshJournal::EnrollmentResponse {
+        admission: recorded,
+        predecessor,
+        candidate,
+        digest,
+    }) = RefreshJournal::read(home).map_err(|_| "enrollment response unavailable")?
+    else {
+        return Err("no sealed enrollment response".into());
+    };
+    if recorded.as_ref() != admission
+        || !admission.directories_current()
+        || std::fs::canonicalize(home).ok().as_ref() != Some(home)
+    {
+        return Err("enrollment response admission changed".into());
+    }
+    let current = match std::fs::symlink_metadata(auth_path_in_home(home)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Ok(_) => Some(credential_digest(
+            read_auth_file_bounded(home)
+                .ok_or("enrollment credential unreadable")?
+                .as_bytes(),
+        )),
+        Err(_) => return Err("enrollment credential unreadable".into()),
+    };
+    if current.as_ref() != Some(&digest) {
+        if current != predecessor {
+            return Err("enrollment credential was replaced".into());
+        }
+        let doc: Value =
+            aterm_json::from_str(&candidate.0).map_err(|_| "invalid enrollment response")?;
+        let parsed = stored_auth_from_doc(doc).ok_or("invalid enrollment response")?;
+        if conflicting_users(&parsed) {
+            return Err("conflicting enrollment identity".into());
+        }
+        signer
+            .check_store(store)
+            .map_err(|_| "enrollment signer changed")?;
+        let directories_current = admission.directories_current();
+        if !directories_current
+            || deadline.passed()
+            || work.is_some_and(super::account_work::Scope::cancelled)
+        {
+            return Err("enrollment recovery work expired".into());
+        }
+        super::upgrade_models::write_atomic(&auth_path_in_home(home), &candidate.0)
+            .map_err(|_| "enrollment credential publication failed")?;
+    }
+    signer
+        .check_store(store)
+        .map_err(|_| "enrollment signer changed")?;
+    let directories_current = admission.directories_current();
+    if !directories_current
+        || deadline.passed()
+        || work.is_some_and(super::account_work::Scope::cancelled)
+    {
+        return Err("enrollment recovery work expired".into());
+    }
+    flush_auth_directory(home).map_err(|_| "enrollment credential flush failed")?;
+    Ok(digest)
+}
+
+pub(super) fn enrollment_bytes_current(
+    admission: &super::codex_enrollment::Staging,
+    digest: &str,
+) -> bool {
+    read_auth_file_bounded(&admission.directory)
+        .is_some_and(|bytes| credential_digest(bytes.as_bytes()) == digest)
+}
+
+pub(super) fn sealed_enrollment_digest(
+    admission: &super::codex_enrollment::Staging,
+) -> Result<Option<String>, String> {
+    match RefreshJournal::read(&admission.directory).map_err(|_| "enrollment journal unreadable")? {
+        None => Ok(None),
+        Some(RefreshJournal::EnrollmentResponse {
+            admission: recorded,
+            digest,
+            ..
+        }) if recorded.as_ref() == admission && enrollment_bytes_current(admission, &digest) => {
+            Ok(Some(digest))
+        }
+        _ => Err("enrollment response changed".into()),
+    }
+}
+
+/// A bounded, nonmutating hint only. Fresh admission and locked materialization recheck it.
+pub(super) fn enrollment_response_available(admission: &super::codex_enrollment::Staging) -> bool {
+    matches!(RefreshJournal::read(&admission.directory), Ok(Some(RefreshJournal::EnrollmentResponse { admission: recorded, .. })) if recorded.as_ref() == admission)
+}
+
+/// Remove only the response named by a fenced, trusted Store's durable Applied record.
+/// No account writer is acquired under the credential lock and no credential is modified.
+pub(super) fn cleanup_applied_enrollment(
+    applied: &super::codex_enrollment::AppliedArtifact,
+) -> Result<(), String> {
+    let admission = applied.admission();
+    let home = &admission.directory;
+    if applied.generation() == 0
+        || !admission.directories_current()
+        || std::fs::canonicalize(home).ok().as_ref() != Some(home)
+    {
+        return Err("enrollment cleanup directory changed".into());
+    }
+    if matches!(std::fs::symlink_metadata(beside_auth(home, JOURNAL_SUFFIX)), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Ok(());
+    }
+    let _held = AuthLock::try_take(&auth_path_in_home(home))
+        .map_err(|_| "enrollment cleanup lock unavailable")?
+        .ok_or("enrollment cleanup credential busy")?;
+    require_private_enrollment_directory(home)?;
+    match RefreshJournal::read(home).map_err(|_| "enrollment cleanup journal unreadable")? {
+        None => Ok(()),
+        Some(RefreshJournal::EnrollmentResponse {
+            admission: recorded,
+            digest,
+            ..
+        }) if recorded.as_ref() == admission && digest == applied.digest() => {
+            RefreshJournal::discard(home).map_err(|_| "enrollment cleanup failed")?;
+            flush_auth_directory(home).map_err(|_| "enrollment cleanup flush failed".into())
+        }
+        _ => Err("enrollment cleanup response differs".into()),
+    }
 }
 
 fn refresh_token_digest(token: &str) -> String {
@@ -767,6 +992,19 @@ fn authentication_digest(doc: &Value) -> Option<String> {
 impl RefreshJournal {
     fn to_value(&self) -> Value {
         match self {
+            Self::EnrollmentResponse {
+                admission,
+                predecessor,
+                candidate,
+                digest,
+            } => json!({
+                "aterm_codex_refresh": 3,
+                "state": "enrollment_response",
+                "admission": admission,
+                "predecessor": predecessor,
+                "candidate": candidate.0,
+                "digest": digest,
+            }),
             Self::Attempted { token } | Self::Rejected { token } => json!({
                 "aterm_codex_refresh": 2,
                 "state": if matches!(self, Self::Rejected { .. }) { "rejected" } else { "attempted" },
@@ -790,6 +1028,32 @@ impl RefreshJournal {
     }
 
     fn of_value(value: &Value) -> Option<RefreshJournal> {
+        if value.get("aterm_codex_refresh")?.as_u64()? == 3 {
+            let object = value.as_object()?;
+            if object.len() != 6 || value.get("state")?.as_str()? != "enrollment_response" {
+                return None;
+            }
+            let admission: super::codex_enrollment::Staging =
+                aterm_json::from_value(value.get("admission")?.clone()).ok()?;
+            let candidate = value.get("candidate")?.as_str()?;
+            let digest = value.get("digest")?.as_str()?;
+            if candidate.len() > AUTH_FILE_MAX
+                || credential_digest(candidate.as_bytes()) != digest
+                || !admission.request.valid()
+            {
+                return None;
+            }
+            let predecessor = match value.get("predecessor")? {
+                Value::Null => None,
+                value => Some(value.as_str()?.to_owned()),
+            };
+            return Some(Self::EnrollmentResponse {
+                admission: Box::new(admission),
+                predecessor,
+                candidate: NativeCredential(candidate.to_owned()),
+                digest: digest.to_owned(),
+            });
+        }
         let text = |key: &str| {
             value
                 .get(key)
@@ -835,10 +1099,22 @@ impl RefreshJournal {
 
     /// Kept durably beside `home`'s login (`0600`, with the rename flushed too).
     fn write(&self, home: &Path) -> std::io::Result<()> {
+        self.write_before_publish(home, || Ok(()))
+    }
+
+    fn write_before_publish(
+        &self,
+        home: &Path,
+        before_publish: impl FnOnce() -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
         let mut rendered = aterm_json::to_string(&self.to_value())
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         rendered.push('\n');
-        super::upgrade_models::write_atomic(&beside_auth(home, JOURNAL_SUFFIX), &rendered)?;
+        super::upgrade_models::write_atomic_before_publish(
+            &beside_auth(home, JOURNAL_SUFFIX),
+            &rendered,
+            before_publish,
+        )?;
         flush_auth_directory(home)
     }
 
@@ -884,7 +1160,10 @@ impl RefreshJournal {
                 return Err(invalid());
             }
         }
-        let limit = AUTH_FILE_MAX as u64;
+        // A JSON string may escape every candidate byte as six bytes; metadata is bounded separately.
+        let limit = (AUTH_FILE_MAX as u64)
+            .saturating_mul(6)
+            .saturating_add(65_536);
         if metadata.len() > limit {
             return Err(invalid());
         }
@@ -919,9 +1198,15 @@ impl RefreshJournal {
 /// changed but still carries the spent token. Legacy responses have only the base binding.
 /// The caller holds [`AuthLock`].
 fn recover_journal_held(home: &Path) -> Result<(), Refreshed> {
+    if !legacy_reader_allowed(home) {
+        return Err(Refreshed::Failed);
+    }
     let Some(journal) = RefreshJournal::read(home).map_err(|_| Refreshed::Failed)? else {
         return Ok(());
     };
+    if matches!(&journal, RefreshJournal::EnrollmentResponse { .. }) {
+        return Err(Refreshed::Failed);
+    }
     let current = load_stored_auth(home).ok_or(Refreshed::Failed)?;
     let current_token = current.refresh_token.as_deref().map(refresh_token_digest);
     match journal {
@@ -1446,6 +1731,9 @@ fn refresh_admitted(
     let Some(deadline) = Instant::now().checked_add(wait).filter(|_| !wait.is_zero()) else {
         return Refreshed::Failed;
     };
+    if !legacy_reader_allowed(home) {
+        return Refreshed::Failed;
+    }
     let prior_user = token_user(stored.id_token.as_deref(), &stored.access_token);
     if prior_user == TokenUser::Conflicting {
         return Refreshed::Failed;
@@ -2149,9 +2437,17 @@ fn read_login_snapshot_using(
     expected_email: Option<&str>,
     usage_client: Option<&Client>,
 ) -> LoginSnapshot {
-    let get_usage = |stored: &StoredAuth, left: Duration| match usage_client {
-        Some(client) => get_usage_once_using(usage_url, stored, left, expected_email, client),
-        None => get_usage_once(usage_url, stored, left, expected_email),
+    if !legacy_reader_allowed(home) {
+        return LoginSnapshot::unread();
+    }
+    let get_usage = |stored: &StoredAuth, left: Duration| {
+        if !legacy_reader_allowed(home) {
+            return None;
+        }
+        match usage_client {
+            Some(client) => get_usage_once_using(usage_url, stored, left, expected_email, client),
+            None => get_usage_once(usage_url, stored, left, expected_email),
+        }
     };
     let deadline = Instant::now()
         .checked_add(wait)
@@ -2237,6 +2533,9 @@ fn read_login_snapshot_using(
             Refreshed::Failed => return LoginSnapshot::unread(),
         }
     }
+    if !legacy_reader_allowed(home) {
+        return LoginSnapshot::unread();
+    }
     LoginSnapshot::read(
         usage_reading(status, &body, now),
         &stored,
@@ -2280,6 +2579,9 @@ fn confirmed_signed_out(
         return LoginSnapshot::unread();
     };
     let rotated = loop {
+        if !legacy_reader_allowed(home) {
+            return LoginSnapshot::unread();
+        }
         if let Some(rotated) = reload_updated_disk_auth(home, stored) {
             break Some(rotated);
         }
@@ -2291,6 +2593,9 @@ fn confirmed_signed_out(
     };
     let login = rotated.as_ref().unwrap_or(stored);
     let left = deadline.saturating_duration_since(Instant::now());
+    if !legacy_reader_allowed(home) {
+        return LoginSnapshot::unread();
+    }
     let response = match usage_client {
         Some(client) => get_usage_once_using(usage_url, login, left, expected_email, client),
         None => get_usage_once(usage_url, login, left, expected_email),
@@ -2298,6 +2603,9 @@ fn confirmed_signed_out(
     let Some((status, body)) = response else {
         return LoginSnapshot::unread();
     };
+    if !legacy_reader_allowed(home) {
+        return LoginSnapshot::unread();
+    }
     if status == 401 && rotated.is_none() {
         return LoginSnapshot::read(Reading::SignedOut, login, usage_url, fallback_token_url);
     }
@@ -3135,7 +3443,120 @@ fn serve_callback_loop(server: CallbackServer) {
     done.store(true, Ordering::SeqCst);
 }
 
+/// Per-invocation custody, sealed only by the native producer after durable publication.
+#[derive(Default)]
+pub struct PublicationCustody(std::sync::OnceLock<SavedPublication>);
+
+impl std::fmt::Debug for PublicationCustody {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PublicationCustody")
+            .finish_non_exhaustive()
+    }
+}
+
+struct SavedPublication {
+    deadline: WakeDeadline,
+    target: PublicationTarget,
+    digest: String,
+    work: Option<super::account_work::Cancellation>,
+}
+
+struct PublicationTarget {
+    home: std::path::PathBuf,
+    #[cfg(unix)]
+    identity: aterm_uds::directory_identity::Identity,
+}
+
+impl PublicationTarget {
+    fn capture(home: &Path) -> Option<Self> {
+        let home = std::fs::canonicalize(home).ok()?;
+        #[cfg(unix)]
+        let identity = aterm_uds::directory_identity::read(&home).ok()?;
+        Some(Self {
+            home,
+            #[cfg(unix)]
+            identity,
+        })
+    }
+
+    fn current(&self, home: &Path) -> bool {
+        if std::fs::canonicalize(home).ok().as_ref() != Some(&self.home) {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            aterm_uds::directory_identity::read(home).ok() == Some(self.identity)
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    }
+}
+
+impl PublicationCustody {
+    pub(super) fn is_saved(&self) -> bool {
+        self.0.get().is_some()
+    }
+    fn seal(
+        &self,
+        target: PublicationTarget,
+        deadline: WakeDeadline,
+        work: Option<&super::account_work::Scope>,
+        digest: String,
+    ) -> Option<()> {
+        if !target.current(&target.home)
+            || credential_digest(read_auth_file_bounded(&target.home)?.as_bytes()) != digest
+        {
+            return None;
+        }
+        self.0
+            .set(SavedPublication {
+                deadline,
+                target,
+                digest,
+                work: work.map(super::account_work::Scope::cancellation),
+            })
+            .ok()
+    }
+
+    pub(super) fn require_current(&self, home: &Path) -> Result<(), String> {
+        let Some(saved) = self.0.get() else {
+            return Ok(());
+        };
+        let bytes_current = read_auth_file_bounded(home)
+            .is_some_and(|bytes| credential_digest(bytes.as_bytes()) == saved.digest);
+        if !bytes_current || !saved.target.current(home) {
+            return Err("native publication work or credential changed".into());
+        }
+        self.require_work_current()
+    }
+
+    /// A final work fence after the caller's last filesystem authority observation.
+    pub(super) fn require_work_current(&self) -> Result<(), String> {
+        if self.0.get().is_some_and(|saved| {
+            saved
+                .work
+                .as_ref()
+                .is_some_and(super::account_work::Cancellation::cancelled)
+                || saved.deadline.passed()
+        }) {
+            return Err("native publication work stopped".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+pub(super) struct NativeDestination<'a> {
+    pub enrollment: Option<&'a super::codex_enrollment::Artifact>,
+    pub publication: Option<&'a PublicationCustody>,
+}
+
 struct CodeExchange<'a> {
+    enrollment: Option<&'a super::codex_enrollment::Artifact>,
+    publication: Option<&'a PublicationCustody>,
     home: &'a Path,
     endpoints: &'a Endpoints,
     redirect_uri: &'a str,
@@ -3146,8 +3567,24 @@ struct CodeExchange<'a> {
     now: i64,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ExchangeError {
+    Unsealed,
+    Retained,
+    Protected,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::harness) enum EnrollmentCut {
+    BeforeSeal,
+    AfterSeal,
+    AfterAuthWrite,
+    AfterAuthFlush,
+}
+
 impl CodeExchange<'_> {
-    fn exchange(self) -> Option<Option<String>> {
+    fn exchange(self) -> Result<Option<String>, ExchangeError> {
         let mut entropy = [0u8; 32];
         let owner = SystemRandom::new()
             .fill(&mut entropy)
@@ -3164,7 +3601,7 @@ impl CodeExchange<'_> {
             project = "aterm_agent::harness::codex_app_login::tests::login_transition"
         )
     )]
-    fn persist(self, owner: Option<&str>) -> Option<Option<String>> {
+    fn persist(self, owner: Option<&str>) -> Result<Option<String>, ExchangeError> {
         self.persist_using(owner, |home, deadline| {
             AuthLock::within(home, deadline.instant())
         })
@@ -3174,113 +3611,405 @@ impl CodeExchange<'_> {
         self,
         owner: Option<&str>,
         take_lock: impl FnOnce(&Path, WakeDeadline) -> Option<AuthLock>,
-    ) -> Option<Option<String>> {
-        let Self {
-            home,
-            endpoints,
-            redirect_uri,
-            code,
-            code_verifier,
-            deadline,
-            work,
-            now,
-        } = self;
-        let owner = owner.filter(|owner| !owner.is_empty())?;
-        let token_url = &endpoints.token_url;
-        if deadline.passed()
-            || work.is_some_and(super::account_work::Scope::cancelled)
-            || !is_allowed_auth_endpoint(token_url)
-        {
-            return None;
+    ) -> Result<Option<String>, ExchangeError> {
+        self.persist_inner(
+            owner,
+            take_lock,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    fn persist_inner(
+        self,
+        owner: Option<&str>,
+        take_lock: impl FnOnce(&Path, WakeDeadline) -> Option<AuthLock>,
+        #[cfg(test)] cut: Option<EnrollmentCut>,
+    ) -> Result<Option<String>, ExchangeError> {
+        self.persist_capturing_inner(
+            owner,
+            None::<NoGrantCapture>,
+            take_lock,
+            #[cfg(test)]
+            cut,
+        )
+        .0
+    }
+
+    #[cfg(test)]
+    fn persist_capturing<C: CodeGrantCapture>(
+        self,
+        owner: Option<&str>,
+        capture: Option<C>,
+    ) -> (Option<Option<String>>, Option<C::Output>) {
+        let (result, captured) = self.persist_capturing_result(owner, capture);
+        (result.ok(), captured)
+    }
+
+    fn persist_capturing_result<C: CodeGrantCapture>(
+        self,
+        owner: Option<&str>,
+        capture: Option<C>,
+    ) -> (Result<Option<String>, ExchangeError>, Option<C::Output>) {
+        self.persist_capturing_inner(
+            owner,
+            capture,
+            |home, deadline| AuthLock::within(home, deadline.instant()),
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    #[expect(
+        dead_code,
+        reason = "nothing calls this native custody step yet, tests included; its production caller lands with the custody RPC: drop this then"
+    )]
+    fn persist_capturing_using<C: CodeGrantCapture>(
+        self,
+        owner: Option<&str>,
+        capture: Option<C>,
+        take_lock: impl FnOnce(&Path, WakeDeadline) -> Option<AuthLock>,
+    ) -> (Option<Option<String>>, Option<C::Output>) {
+        let (result, captured) = self.persist_capturing_inner(owner, capture, take_lock, None);
+        (result.ok(), captured)
+    }
+
+    // The admitted enrollment journal and the managed grant carrier are
+    // independent custody channels. Publication failure must retain the carrier;
+    // carrier existence must never pretend an enrollment journal was sealed.
+    fn persist_capturing_inner<C: CodeGrantCapture>(
+        self,
+        owner: Option<&str>,
+        mut capture: Option<C>,
+        take_lock: impl FnOnce(&Path, WakeDeadline) -> Option<AuthLock>,
+        #[cfg(test)] cut: Option<EnrollmentCut>,
+    ) -> (Result<Option<String>, ExchangeError>, Option<C::Output>) {
+        let mut retained = None;
+        let mut response_sealed = false;
+        let mut protected = false;
+        let home = self.home;
+        let mut dispatched = false;
+        let result = (|| {
+            let Self {
+                enrollment,
+                publication,
+                home,
+                endpoints,
+                redirect_uri,
+                code,
+                code_verifier,
+                deadline,
+                work,
+                now,
+            } = self;
+            if publication.is_some_and(PublicationCustody::is_saved) {
+                protected = true;
+                return None;
+            }
+            if let Some(enrollment) = enrollment {
+                enrollment.bind_deadline(deadline).ok()?;
+            }
+            let owner = owner.filter(|owner| !owner.is_empty())?;
+            let token_url = &endpoints.token_url;
+            if work.is_some_and(super::account_work::Scope::cancelled)
+                || deadline.passed()
+                || !is_allowed_auth_endpoint(token_url)
+            {
+                return None;
+            }
+            // Take the publication lock before spending the authorization code. A lock refusal
+            // must not leave a successful exchange with nowhere serialized to save its tokens.
+            // Preparing the destination first also lets a first sign-in take the lock.
+            prepare_auth_dest(home).ok()?;
+            let publication_target = if publication.is_some() {
+                Some(PublicationTarget::capture(home)?)
+            } else {
+                None
+            };
+            let _held = take_lock(home, deadline.within(SIGN_IN_LOCK_WAIT))?;
+            let existing_journal = RefreshJournal::read(home).ok()?;
+            if matches!(
+                existing_journal.as_ref(),
+                Some(RefreshJournal::EnrollmentResponse { .. })
+            ) {
+                protected = true;
+                return None;
+            }
+            let predecessor = if enrollment.is_some() || capture.is_some() {
+                match std::fs::symlink_metadata(auth_path_in_home(home)) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Ok(_) => Some(credential_digest(read_auth_file_bounded(home)?.as_bytes())),
+                    Err(_) => return None,
+                }
+            } else {
+                None
+            };
+            if let Some(enrollment) = enrollment {
+                if !enrollment.staging().directories_current() {
+                    protected = true;
+                    return None;
+                }
+                if std::fs::canonicalize(home).ok().as_ref()
+                    != Some(&enrollment.staging().directory)
+                {
+                    return None;
+                }
+                // A previously sealed native response belongs to its admitted attempt.
+                if existing_journal.is_some() {
+                    return None;
+                }
+            }
+            match std::fs::symlink_metadata(beside_auth(home, JOURNAL_SUFFIX)) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(md) if md.is_file() && !md.file_type().is_symlink() => {}
+                Ok(_) | Err(_) => return None,
+            }
+            let form = encode_form(&[
+                ("grant_type", "authorization_code"),
+                ("client_id", CLIENT_ID),
+                ("code", code),
+                ("redirect_uri", redirect_uri),
+                ("code_verifier", code_verifier),
+            ]);
+            if let Some(capture) = capture.as_mut() {
+                capture.begin_exchange().ok()?;
+            }
+            if publication_target
+                .as_ref()
+                .is_some_and(|target| !target.current(home))
+                || work.is_some_and(super::account_work::Scope::cancelled)
+            {
+                return None;
+            }
+            // Scope observation can wait on its lifetime state mutex. Only
+            // the budget left after that wait can admit this single POST.
+            let wait = deadline.remaining().min(EXCHANGE_WAIT);
+            if wait.is_zero() {
+                return None;
+            }
+            // From this point any transport error may have reached the provider.
+            dispatched = true;
+            let resp = http_client(token_url, wait)
+                .request(Method::Post, token_url)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .header("Accept", "application/json")
+                .header("User-Agent", "codex-cli")
+                .header("originator", ORIGINATOR)
+                .limit(MESSAGE_MAX)
+                .backstop(wait)
+                .send(form.as_bytes())
+                .ok()?;
+            if resp.status() != 200 {
+                // A completed TLS response may contain unexpected sensitive
+                // bytes even when it cannot authorize a native grant.
+                if let Some(capture) = capture.take() {
+                    let rejection =
+                        StagedWitness::open(&auth_path_in_home(home))
+                            .ok()
+                            .and_then(|witness| {
+                                CodeRejection::mint(resp.status(), resp.body(), witness, &_held)
+                            });
+                    retained = Some(match rejection {
+                        Some(rejection) => capture.retain_rejected(rejection),
+                        None => capture.retain_unverified(resp.body()),
+                    });
+                }
+                return None;
+            }
+            let built = (|| {
+                let payload: Value = aterm_json::from_slice(resp.body()).ok()?;
+                let id_token = payload
+                    .get("id_token")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())?;
+                let access_token = payload
+                    .get("access_token")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())?;
+                let refresh_token = payload
+                    .get("refresh_token")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let id_claims = parse_jwt_claims(id_token)?;
+                let access_claims = parse_jwt_claims(access_token)?;
+                if token_user(Some(id_token), access_token) == TokenUser::Conflicting {
+                    return None;
+                }
+                let account_id = id_claims.account_id.or(access_claims.account_id);
+                let email = id_claims.email.or(access_claims.email);
+                // Only bind an issuer that actually names this token exchange. Explicit
+                // transport overrides retain legacy absent provenance, never a false issuer.
+                let provenance = refresh_endpoint(&endpoints.issuer)
+                    .filter(|_| {
+                        format!("{}/oauth/token", endpoints.issuer.trim_end_matches('/'))
+                            == *token_url
+                    })
+                    .map(|_| json!({"issuer":endpoints.issuer, "client_id":CLIENT_ID}));
+                let stamp =
+                    aterm_types::rfc3339::format_rfc3339(u64::try_from(now.max(0)).unwrap_or(0));
+                let mut doc = json!({
+                    "auth_mode": "chatgpt",
+                    "OPENAI_API_KEY": Value::Null,
+                    "tokens": {
+                        "id_token": id_token,
+                        "access_token": access_token,
+                        "refresh_token": refresh_token,
+                        "account_id": account_id,
+                        "login_owner_id": owner,
+                    },
+                    "last_refresh": stamp,
+                });
+                if let Some(provenance) = provenance {
+                    doc.as_object_mut()?
+                        .get_mut("tokens")?
+                        .as_object_mut()?
+                        .insert("oauth_provenance".into(), provenance);
+                }
+                Some((doc, email))
+            })();
+            let Some((doc, email)) = built else {
+                if let Some(capture) = capture.take() {
+                    retained = Some(capture.retain_unverified(resp.body()));
+                }
+                return None;
+            };
+            if let Some(capture) = capture.take() {
+                let mut bytes = match aterm_json::to_vec(&doc) {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        retained = Some(capture.retain_unverified(resp.body()));
+                        return None;
+                    }
+                };
+                bytes.push(b'\n');
+                let identity = stored_auth_from_doc(doc.clone())
+                    .filter(|stored| stored.refresh_token.is_some())
+                    .and_then(|stored| stored_identity(&stored));
+                let witness = StagedWitness::open(&auth_path_in_home(home));
+                let output = match (identity, witness) {
+                    (Some(identity), Ok(witness)) => {
+                        match FreshCodeGrant::mint(
+                            identity,
+                            owner,
+                            bytes,
+                            witness,
+                            predecessor.as_deref(),
+                            &_held,
+                        ) {
+                            Ok(grant) => capture.retain_verified(grant),
+                            Err(bytes) => {
+                                let bytes = Secret::from_vec(bytes);
+                                capture.retain_unverified(bytes.expose())
+                            }
+                        }
+                    }
+                    _ => {
+                        let bytes = Secret::from_vec(bytes);
+                        capture.retain_unverified(bytes.expose())
+                    }
+                };
+                let durable = C::verified_durable(&output);
+                retained = Some(output);
+                if !durable {
+                    return None;
+                }
+            }
+            if let Some(enrollment) = enrollment {
+                if !enrollment.staging().directories_current() {
+                    protected = true;
+                    return None;
+                }
+                if retains_credential_custody(home) {
+                    protected = true;
+                    return None;
+                }
+                let mut candidate = aterm_json::to_string(&doc).ok()?;
+                candidate.push('\n');
+                if candidate.len() > AUTH_FILE_MAX {
+                    return None;
+                }
+                let current = match std::fs::symlink_metadata(auth_path_in_home(home)) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Ok(_) => Some(credential_digest(read_auth_file_bounded(home)?.as_bytes())),
+                    Err(_) => return None,
+                };
+                let receipt = RefreshJournal::EnrollmentResponse {
+                    admission: Box::new(enrollment.staging().clone()),
+                    predecessor: predecessor.clone(),
+                    digest: credential_digest(candidate.as_bytes()),
+                    candidate: NativeCredential(candidate.clone()),
+                };
+                #[cfg(test)]
+                let saved = if cut == Some(EnrollmentCut::BeforeSeal) {
+                    receipt.write_before_publish(home, || {
+                        Err(std::io::ErrorKind::PermissionDenied.into())
+                    })
+                } else {
+                    receipt.write(home)
+                };
+                #[cfg(not(test))]
+                let saved = receipt.write(home);
+                response_sealed = saved.is_ok()
+                    || RefreshJournal::read(home).ok().flatten().as_ref() == Some(&receipt);
+                saved.ok()?;
+                #[cfg(test)]
+                if cut == Some(EnrollmentCut::AfterSeal) {
+                    return None;
+                }
+                if current != predecessor {
+                    return None;
+                }
+                super::upgrade_models::write_atomic(&auth_path_in_home(home), &candidate).ok()?;
+                #[cfg(test)]
+                if cut == Some(EnrollmentCut::AfterAuthWrite) {
+                    return None;
+                }
+                flush_auth_directory(home).ok()?;
+                #[cfg(test)]
+                if cut == Some(EnrollmentCut::AfterAuthFlush) {
+                    return None;
+                }
+                if let Some(publication) = publication {
+                    publication.seal(
+                        publication_target?,
+                        deadline,
+                        work,
+                        credential_digest(candidate.as_bytes()),
+                    )?;
+                }
+                return Some(email);
+            }
+            write_auth_doc(home, &doc).ok()?;
+            flush_auth_directory(home).ok()?;
+            RefreshJournal::discard(home).ok()?;
+            flush_auth_directory(home).ok()?;
+            if let Some(publication) = publication {
+                response_sealed = true;
+                let mut candidate = aterm_json::to_string(&doc).ok()?;
+                candidate.push('\n');
+                publication.seal(
+                    publication_target?,
+                    deadline,
+                    work,
+                    credential_digest(candidate.as_bytes()),
+                )?;
+            }
+            Some(email)
+        })();
+        if !dispatched && let Some(capture) = capture.take() {
+            retained = Some(capture.not_dispatched());
         }
-        // Take the publication lock before spending the authorization code. A lock refusal
-        // must not leave a successful exchange with nowhere serialized to save its tokens.
-        // Preparing the destination first also lets a first sign-in take the lock.
-        prepare_auth_dest(home).ok()?;
-        let _held = take_lock(home, deadline.within(SIGN_IN_LOCK_WAIT))?;
-        match std::fs::symlink_metadata(beside_auth(home, JOURNAL_SUFFIX)) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Ok(md) if md.is_file() && !md.file_type().is_symlink() => {}
-            Ok(_) | Err(_) => return None,
-        }
-        let wait = deadline.remaining().min(EXCHANGE_WAIT);
-        if wait.is_zero() || work.is_some_and(super::account_work::Scope::cancelled) {
-            return None;
-        }
-        let form = encode_form(&[
-            ("grant_type", "authorization_code"),
-            ("client_id", CLIENT_ID),
-            ("code", code),
-            ("redirect_uri", redirect_uri),
-            ("code_verifier", code_verifier),
-        ]);
-        if deadline.passed() || work.is_some_and(super::account_work::Scope::cancelled) {
-            return None;
-        }
-        let resp = http_client(token_url, wait)
-            .request(Method::Post, token_url)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .header("Accept", "application/json")
-            .header("User-Agent", "codex-cli")
-            .header("originator", ORIGINATOR)
-            .limit(MESSAGE_MAX)
-            .backstop(wait)
-            .send(form.as_bytes())
-            .ok()?;
-        if resp.status() != 200 {
-            return None;
-        }
-        let payload: Value = aterm_json::from_slice(resp.body()).ok()?;
-        let id_token = payload
-            .get("id_token")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())?;
-        let access_token = payload
-            .get("access_token")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())?;
-        let refresh_token = payload
-            .get("refresh_token")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let id_claims = parse_jwt_claims(id_token)?;
-        let access_claims = parse_jwt_claims(access_token)?;
-        if token_user(Some(id_token), access_token) == TokenUser::Conflicting {
-            return None;
-        }
-        let account_id = id_claims.account_id.or(access_claims.account_id);
-        let email = id_claims.email.or(access_claims.email);
-        // Only bind an issuer that actually names this token exchange. Explicit
-        // transport overrides retain legacy absent provenance, never a false issuer.
-        let provenance = refresh_endpoint(&endpoints.issuer)
-            .filter(|_| {
-                format!("{}/oauth/token", endpoints.issuer.trim_end_matches('/')) == *token_url
-            })
-            .map(|_| json!({"issuer":endpoints.issuer, "client_id":CLIENT_ID}));
-        let stamp = aterm_types::rfc3339::format_rfc3339(u64::try_from(now.max(0)).unwrap_or(0));
-        let mut doc = json!({
-            "auth_mode": "chatgpt",
-            "OPENAI_API_KEY": Value::Null,
-            "tokens": {
-                "id_token": id_token,
-                "access_token": access_token,
-                "refresh_token": refresh_token,
-                "account_id": account_id,
-                "login_owner_id": owner,
-            },
-            "last_refresh": stamp,
+        let protected =
+            protected || (!response_sealed && result.is_none() && retains_credential_custody(home));
+        let result = result.ok_or(if protected {
+            ExchangeError::Protected
+        } else if response_sealed {
+            ExchangeError::Retained
+        } else {
+            ExchangeError::Unsealed
         });
-        if let Some(provenance) = provenance {
-            doc.as_object_mut()?
-                .get_mut("tokens")?
-                .as_object_mut()?
-                .insert("oauth_provenance".into(), provenance);
-        }
-        write_auth_doc(home, &doc).ok()?;
-        flush_auth_directory(home).ok()?;
-        RefreshJournal::discard(home).ok()?;
-        flush_auth_directory(home).ok()?;
-        Some(email)
+        (result, retained)
     }
 }
 
@@ -3296,256 +4025,330 @@ pub fn login_with(
     email: Option<&str>,
     deadline: WakeDeadline,
 ) -> Drove {
-    let rng = SystemRandom::new();
-    let mut verifier_bytes = [0u8; 32];
-    let mut state_bytes = [0u8; 32];
-    if rng.fill(&mut verifier_bytes).is_err() || rng.fill(&mut state_bytes).is_err() {
-        return Drove {
-            outcome: Outcome::NotRun("system random number generator failed".to_owned()),
-            host: None,
-        };
-    }
-    let (Some(code_verifier), Some(state)) = (
-        base64url_encode(&verifier_bytes),
-        base64url_encode(&state_bytes),
-    ) else {
-        return Drove {
-            outcome: Outcome::Failed,
-            host: None,
-        };
-    };
-    let challenge_digest = aterm_digest::Sha256::digest(code_verifier.as_bytes());
-    let Some(code_challenge) = base64url_encode(&challenge_digest) else {
-        return Drove {
-            outcome: Outcome::Failed,
-            host: None,
-        };
-    };
+    login_with_custody(
+        home,
+        endpoints,
+        approver,
+        hosts,
+        email,
+        deadline,
+        None::<NoGrantCapture>,
+    )
+    .into_parts()
+    .0
+}
 
-    let probe_port = endpoints
-        .callback_ports
-        .first()
-        .copied()
-        .unwrap_or(LOOPBACK_PORTS[0]);
-    let probe_redirect = format!("http://127.0.0.1:{probe_port}/auth/callback");
-    let probe_url =
-        build_authorize_url(&endpoints.issuer, &probe_redirect, &code_challenge, &state);
-    let host = https_host(&probe_url);
-    if !pinned(&probe_url, hosts) {
-        return Drove {
-            outcome: Outcome::OffPin,
-            host,
-        };
-    }
-    if !is_loopback_endpoint(&endpoints.token_url) && !pinned(&endpoints.token_url, hosts) {
-        return Drove {
-            outcome: Outcome::OffPin,
-            host: https_host(&endpoints.token_url),
-        };
-    }
-    if deadline.passed() {
-        return Drove {
-            outcome: Outcome::Hung,
-            host,
-        };
-    }
+pub(in crate::harness) fn login_with_custody<C: CodeGrantCapture>(
+    home: &Path,
+    endpoints: &Endpoints,
+    approver: &mut dyn Approver,
+    hosts: &[&str],
+    email: Option<&str>,
+    deadline: WakeDeadline,
+    capture: Option<C>,
+) -> CapturedLogin<C::Output> {
+    login_with_enrollment_custody(
+        home,
+        endpoints,
+        approver,
+        hosts,
+        email,
+        deadline,
+        (NativeDestination::default(), capture),
+    )
+}
 
-    let listener = match bind_callback_listener(&endpoints.callback_ports, deadline) {
-        Ok(listener) => listener,
-        Err(e) => {
+pub(in crate::harness) fn login_with_enrollment_custody<C: CodeGrantCapture>(
+    home: &Path,
+    endpoints: &Endpoints,
+    approver: &mut dyn Approver,
+    hosts: &[&str],
+    email: Option<&str>,
+    deadline: WakeDeadline,
+    custody: (NativeDestination<'_>, Option<C>),
+) -> CapturedLogin<C::Output> {
+    let (destination, mut capture) = custody;
+    let mut retained = None;
+    let drove = (|| {
+        let rng = SystemRandom::new();
+        let mut verifier_bytes = [0u8; 32];
+        let mut state_bytes = [0u8; 32];
+        if rng.fill(&mut verifier_bytes).is_err() || rng.fill(&mut state_bytes).is_err() {
             return Drove {
-                outcome: Outcome::NotRun(format!(
-                    "could not bind loopback OAuth callback on 127.0.0.1: {e}"
-                )),
+                outcome: Outcome::NotRun("system random number generator failed".to_owned()),
+                host: None,
+            };
+        }
+        let (Some(code_verifier), Some(state)) = (
+            base64url_encode(&verifier_bytes),
+            base64url_encode(&state_bytes),
+        ) else {
+            return Drove {
+                outcome: Outcome::Failed,
+                host: None,
+            };
+        };
+        let challenge_digest = aterm_digest::Sha256::digest(code_verifier.as_bytes());
+        let Some(code_challenge) = base64url_encode(&challenge_digest) else {
+            return Drove {
+                outcome: Outcome::Failed,
+                host: None,
+            };
+        };
+
+        let probe_port = endpoints
+            .callback_ports
+            .first()
+            .copied()
+            .unwrap_or(LOOPBACK_PORTS[0]);
+        let probe_redirect = format!("http://127.0.0.1:{probe_port}/auth/callback");
+        let probe_url =
+            build_authorize_url(&endpoints.issuer, &probe_redirect, &code_challenge, &state);
+        let host = https_host(&probe_url);
+        if !pinned(&probe_url, hosts) {
+            return Drove {
+                outcome: Outcome::OffPin,
                 host,
             };
         }
-    };
-    let port = match listener.local_addr() {
-        Ok(addr) => addr.port(),
-        Err(e) => {
+        if !is_loopback_endpoint(&endpoints.token_url) && !pinned(&endpoints.token_url, hosts) {
             return Drove {
-                outcome: Outcome::NotRun(format!("could not read loopback callback port: {e}")),
+                outcome: Outcome::OffPin,
+                host: https_host(&endpoints.token_url),
+            };
+        }
+        if deadline.passed() {
+            return Drove {
+                outcome: Outcome::Hung,
                 host,
             };
         }
-    };
-    let redirect_uri = format!("http://127.0.0.1:{port}/auth/callback");
-    let auth_url = build_authorize_url(&endpoints.issuer, &redirect_uri, &code_challenge, &state);
-    let host = https_host(&auth_url);
-    if !pinned(&auth_url, hosts) {
-        return Drove {
-            outcome: Outcome::OffPin,
-            host,
-        };
-    }
 
-    let work = approver.work_scope();
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let done = Arc::new(AtomicBool::new(false));
-    let (tx, rx) = mpsc::channel();
-    let mut server = {
-        let worker_cancelled = Arc::clone(&cancelled);
-        let done = Arc::clone(&done);
-        let expected_state = state;
-        let worker_work = work.clone();
-        let run = move || {
-            serve_callback_loop(CallbackServer {
-                listener,
-                port,
-                expected_state,
-                cancelled: worker_cancelled,
-                done,
-                tx,
-                deadline,
-                work: worker_work,
-            });
+        let listener = match bind_callback_listener(&endpoints.callback_ports, deadline) {
+            Ok(listener) => listener,
+            Err(e) => {
+                return Drove {
+                    outcome: Outcome::NotRun(format!(
+                        "could not bind loopback OAuth callback on 127.0.0.1: {e}"
+                    )),
+                    host,
+                };
+            }
         };
-        let run: Box<dyn FnOnce() + Send> = match work.clone() {
-            Some(scope) => Box::new(scope.wrap(run)),
-            None => Box::new(run),
+        let port = match listener.local_addr() {
+            Ok(addr) => addr.port(),
+            Err(e) => {
+                return Drove {
+                    outcome: Outcome::NotRun(format!("could not read loopback callback port: {e}")),
+                    host,
+                };
+            }
         };
-        let worker = match std::thread::Builder::new()
-            .name("codex-callback".to_owned())
-            .spawn(run)
-        {
-            Ok(worker) => worker,
-            Err(_) => {
+        let redirect_uri = format!("http://127.0.0.1:{port}/auth/callback");
+        let auth_url =
+            build_authorize_url(&endpoints.issuer, &redirect_uri, &code_challenge, &state);
+        let host = https_host(&auth_url);
+        if !pinned(&auth_url, hosts) {
+            return Drove {
+                outcome: Outcome::OffPin,
+                host,
+            };
+        }
+
+        let work = approver.work_scope();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let mut server = {
+            let worker_cancelled = Arc::clone(&cancelled);
+            let done = Arc::clone(&done);
+            let expected_state = state;
+            let worker_work = work.clone();
+            let run = move || {
+                serve_callback_loop(CallbackServer {
+                    listener,
+                    port,
+                    expected_state,
+                    cancelled: worker_cancelled,
+                    done,
+                    tx,
+                    deadline,
+                    work: worker_work,
+                });
+            };
+            let run: Box<dyn FnOnce() + Send> = match work.clone() {
+                Some(scope) => Box::new(scope.wrap(run)),
+                None => Box::new(run),
+            };
+            let worker = match std::thread::Builder::new()
+                .name("codex-callback".to_owned())
+                .spawn(run)
+            {
+                Ok(worker) => worker,
+                Err(_) => {
+                    return Drove {
+                        outcome: Outcome::Failed,
+                        host,
+                    };
+                }
+            };
+            CallbackOwner {
+                cancelled: Arc::clone(&cancelled),
+                worker: Some(worker),
+            }
+        };
+
+        let finished = || done.load(Ordering::SeqCst);
+        let page = match approver.approve(&Handoff {
+            url: &auth_url,
+            code: None,
+            completion: Completion::Loopback,
+            hosts,
+            email,
+            finished: &finished,
+            deadline: super::login_drive::Deadline::waking(deadline, &Instant::now),
+        }) {
+            Approval::Approved { page } => page,
+            Approval::NotRun(why) => {
+                let _ = server.join();
+                return Drove {
+                    outcome: Outcome::PageNotOpened(why),
+                    host,
+                };
+            }
+            Approval::NeedsYou(why) => {
+                let _ = server.join();
+                return Drove {
+                    outcome: Outcome::NeedsYou(why),
+                    host,
+                };
+            }
+            Approval::NeedsSignIn(why) => {
+                let _ = server.join();
+                return Drove {
+                    outcome: Outcome::NeedsSignIn(why),
+                    host,
+                };
+            }
+            Approval::Refused(why) => {
+                let _ = server.join();
+                return Drove {
+                    outcome: Outcome::Refused(why),
+                    host,
+                };
+            }
+            Approval::BotCheck(why) => {
+                let _ = server.join();
+                return Drove {
+                    outcome: Outcome::BotCheck(why),
+                    host,
+                };
+            }
+        };
+
+        // One tick at a time, so a callback wait the host slept past ends within a tick of its waking.
+        let callback = deadline.recv(&rx);
+        if !server.join() {
+            return Drove {
+                outcome: Outcome::Failed,
+                host,
+            };
+        }
+
+        let code = match callback {
+            Ok(CallbackOutcome::Code(code)) => code,
+            Ok(CallbackOutcome::Failed) => {
+                return Drove {
+                    outcome: Outcome::Failed,
+                    host,
+                };
+            }
+            Ok(CallbackOutcome::Expired) | Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Drove {
+                    outcome: Outcome::Hung,
+                    host,
+                };
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return Drove {
                     outcome: Outcome::Failed,
                     host,
                 };
             }
         };
-        CallbackOwner {
-            cancelled: Arc::clone(&cancelled),
-            worker: Some(worker),
-        }
-    };
 
-    let finished = || done.load(Ordering::SeqCst);
-    let page = match approver.approve(&Handoff {
-        url: &auth_url,
-        code: None,
-        completion: Completion::Loopback,
-        hosts,
-        email,
-        finished: &finished,
-        deadline: super::login_drive::Deadline::waking(deadline, &Instant::now),
-    }) {
-        Approval::Approved { page } => page,
-        Approval::NotRun(why) => {
-            let _ = server.join();
-            return Drove {
-                outcome: Outcome::PageNotOpened(why),
-                host,
-            };
-        }
-        Approval::NeedsYou(why) => {
-            let _ = server.join();
-            return Drove {
-                outcome: Outcome::NeedsYou(why),
-                host,
-            };
-        }
-        Approval::NeedsSignIn(why) => {
-            let _ = server.join();
-            return Drove {
-                outcome: Outcome::NeedsSignIn(why),
-                host,
-            };
-        }
-        Approval::Refused(why) => {
-            let _ = server.join();
-            return Drove {
-                outcome: Outcome::Refused(why),
-                host,
-            };
-        }
-        Approval::BotCheck(why) => {
-            let _ = server.join();
-            return Drove {
-                outcome: Outcome::BotCheck(why),
-                host,
-            };
-        }
-    };
-
-    // One tick at a time, so a callback wait the host slept past ends within a tick of its waking.
-    let callback = deadline.recv(&rx);
-    if !server.join() {
-        return Drove {
-            outcome: Outcome::Failed,
-            host,
-        };
-    }
-
-    let code = match callback {
-        Ok(CallbackOutcome::Code(code)) => code,
-        Ok(CallbackOutcome::Failed) => {
-            return Drove {
-                outcome: Outcome::Failed,
-                host,
-            };
-        }
-        Ok(CallbackOutcome::Expired) | Err(mpsc::RecvTimeoutError::Timeout) => {
+        // Retain the original work budget across publication-lock admission and exchange.
+        let left = deadline.remaining();
+        if left.is_zero() {
             return Drove {
                 outcome: Outcome::Hung,
                 host,
             };
         }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            return Drove {
-                outcome: Outcome::Failed,
-                host,
-            };
-        }
-    };
-
-    // Retain the original work budget across publication-lock admission and exchange.
-    let left = deadline.remaining();
-    if left.is_zero() {
-        return Drove {
-            outcome: Outcome::Hung,
-            host,
+        let now = crate::supervise::limit::unix_now();
+        let exchange = CodeExchange {
+            enrollment: destination.enrollment,
+            publication: destination.publication,
+            home,
+            endpoints,
+            redirect_uri: &redirect_uri,
+            code: &code,
+            code_verifier: &code_verifier,
+            deadline,
+            work: work.as_ref(),
+            now,
         };
-    }
-    let now = crate::supervise::limit::unix_now();
-    let exchanged = CodeExchange {
-        home,
-        endpoints,
-        redirect_uri: &redirect_uri,
-        code: &code,
-        code_verifier: &code_verifier,
-        deadline,
-        work: work.as_ref(),
-        now,
-    }
-    .exchange();
-    match exchanged {
-        Some(_)
-            if deadline.passed()
-                || work
-                    .as_ref()
-                    .is_some_and(super::account_work::Scope::cancelled) =>
-        {
-            Drove {
+        let (exchanged, output) = match capture.take() {
+            None => (exchange.exchange(), None),
+            Some(capture) => {
+                let mut entropy = [0u8; 32];
+                let owner = SystemRandom::new()
+                    .fill(&mut entropy)
+                    .ok()
+                    .and_then(|()| base64url_encode(&entropy));
+                exchange.persist_capturing_result(owner.as_deref(), Some(capture))
+            }
+        };
+        retained = output;
+        match exchanged {
+            Ok(_)
+                if deadline.passed()
+                    || work
+                        .as_ref()
+                        .is_some_and(super::account_work::Scope::cancelled) =>
+            {
+                Drove {
+                    outcome: Outcome::CompletedHeld,
+                    host,
+                }
+            }
+            Ok(signed_in_email) => Drove {
+                outcome: Outcome::SignedIn {
+                    email: signed_in_email,
+                    page,
+                },
+                host,
+            },
+            Err(ExchangeError::Retained) => Drove {
                 outcome: Outcome::CompletedHeld,
                 host,
-            }
-        }
-        Some(signed_in_email) => Drove {
-            outcome: Outcome::SignedIn {
-                email: signed_in_email,
-                page,
             },
-            host,
-        },
-        None => Drove {
-            outcome: Outcome::Failed,
-            host,
-        },
+            Err(ExchangeError::Protected) => Drove {
+                outcome: Outcome::CustodyHeld,
+                host,
+            },
+            Err(ExchangeError::Unsealed) => Drove {
+                outcome: Outcome::Failed,
+                host,
+            },
+        }
+    })();
+    // The capture remains here only when CodeExchange was never invoked.
+    // Once invoked, that exchange owns all sent/unknown classification.
+    if let Some(capture) = capture.take() {
+        retained = Some(capture.not_dispatched());
     }
+    CapturedLogin { drove, retained }
 }
 
 /// Runs Codex's native loopback PKCE browser sign-in in `home` against OpenAI's production OAuth

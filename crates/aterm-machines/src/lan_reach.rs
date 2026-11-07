@@ -2,16 +2,18 @@
 // Copyright 2026 Andrew Yates
 
 //! What of aterm's reaches the LAN through the root LAN broker on macOS
-//! (`docs/DESIGN-lan-broker-2026-11-05.md`), and whether the broker answers: a vault at a URL on
-//! the LAN is reached through it, so a step that would reach one waits while it does not; a
-//! vault at a path, or at a URL off the LAN, waits for nothing.
+//! (`docs/DESIGN-lan-broker-2026-11-05.md`), or while none is installed through the allowed
+//! direct path (`aterm_uds::lan::direct`), and whether either answers: a vault at a URL on the
+//! LAN is reached through them, so a step that would reach one waits while neither does; a vault
+//! at a path, or at a URL off the LAN, waits for nothing.
 
 use std::time::Duration;
 
-/// Why the LAN broker, through which aterm reaches the LAN on macOS, does not answer: its
-/// hello's error in its own words (not installed, another protocol, refused), from
-/// `aterm_uds::lan::broker::hello`. `None` where it answers, and off macOS, where the LAN is
-/// reached in-process.
+/// Why aterm cannot reach the LAN on macOS: the LAN broker's hello's error in its own words (not
+/// installed and no allowed direct path, another protocol, refused), from
+/// `aterm_uds::lan::broker::hello`. `None` where a hello is answered (by the broker, or while
+/// none is installed by the allowed direct path, `aterm_uds::lan::direct`), and off macOS, where
+/// the LAN is reached in-process.
 #[must_use]
 pub fn broker_unready() -> Option<String> {
     if !cfg!(target_os = "macos") {
@@ -56,11 +58,12 @@ pub const ABSENT_POLL: Duration = Duration::from_secs(2);
 /// upgrade that restarts it) and so its next arrival.
 pub const PRESENT_POLL: Duration = Duration::from_secs(30);
 
-/// Call `arrived` each time the LAN broker starts answering after it did not, for as long as
-/// this process lives: a step deferred until the broker answers (the vault's look, a reach of a
-/// vault on the LAN) is woken by its arrival, never by a person. Asks every [`ABSENT_POLL`]
-/// while it is absent and every [`PRESENT_POLL`] while it answers. Off macOS, where nothing
-/// waits for a broker, it returns at once.
+/// Call `arrived` each time a hello starts being answered after it was not ([`broker_unready`]:
+/// the LAN broker's, or while none is installed the allowed direct path's), for as long as this
+/// process lives: a step deferred until one answers (the vault's look, a reach of a vault on the
+/// LAN) is woken by its arrival, never by a person. Asks every [`ABSENT_POLL`] while none answers
+/// and every [`PRESENT_POLL`] while one does. Off macOS, where nothing waits for a broker, it
+/// returns at once.
 pub fn watch_arrivals(arrived: impl FnMut()) {
     if !cfg!(target_os = "macos") {
         return;

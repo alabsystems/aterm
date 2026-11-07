@@ -287,10 +287,9 @@ pub fn lab(cells: &Cells) -> (Vec<Finding>, Vec<check::Finding>) {
         let elsewhere: BTreeSet<String> = row
             .fields
             .get("addr")
-            .map(cell::Field::candidates_x)
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(Value::as_str)
+            .map_or(&[][..], cell::Field::candidates)
+            .iter()
+            .filter_map(|c| c.value.x.as_str())
             .filter_map(|text| keys::address_pk(text).ok())
             .filter(|derived| derived != pk && addresses.rows.contains_key(derived))
             .collect();

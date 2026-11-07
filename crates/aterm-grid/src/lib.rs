@@ -16,6 +16,7 @@ pub mod damage;
 pub mod extra;
 pub mod extra_collection;
 mod extra_collection_shifts;
+mod extra_map;
 /// Page-backed storage internals ([`PageStore`]; [`Row`] is their safe boundary).
 #[cfg(any(test, debug_assertions))]
 pub mod page;

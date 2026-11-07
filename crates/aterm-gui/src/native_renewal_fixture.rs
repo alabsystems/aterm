@@ -642,6 +642,7 @@ pub fn run_native_renewal_host_fixture(config: NativeRenewalFixture) -> Result<(
         store,
         proxy: event_loop.create_proxy(),
         account_services: AccountServices {
+            source_registry: Arc::new(Default::default()),
             lifetime: Default::default(),
             interactive_browser: false,
         },

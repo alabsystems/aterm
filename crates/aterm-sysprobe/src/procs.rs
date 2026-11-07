@@ -798,35 +798,48 @@ pub(crate) mod imp {
     /// usage goes unread (another user's `sudo`, which may reap a member and pass its time up
     /// later). From the whole table, or from each one's `kinfo_proc` where the sweep holds no
     /// more than [`UNWAITED_AT_ONCE`]; one whose record names another parent is a new process at
-    /// the pid and stays unread.
+    /// the pid and stays unread. Where the table was wanted and not read, every one stays unread:
+    /// a table the kernel did not answer in time ([`crate::kproc::records`]) waits on a process
+    /// in the middle of an exec, and its own `kinfo_proc` would wait on it too.
     fn read_unwaited(procs: &mut [ProcessReading]) {
+        read_unwaited_by(procs, crate::kproc::reaps_unwaited_all, |pid| {
+            c_int::try_from(pid)
+                .ok()
+                .and_then(crate::jobs::macos_kinfo)
+                .map(|k| (k.ppid, k.reaps_unwaited))
+        });
+    }
+
+    /// [`read_unwaited`] by `table`, the whole table's `(pid, ppid, reaps unwaited)` rows, and
+    /// `one`, a pid's `(ppid, reaps unwaited)`.
+    pub(super) fn read_unwaited_by(
+        procs: &mut [ProcessReading],
+        table: impl FnOnce() -> Option<Vec<(u32, u32, bool)>>,
+        one: impl Fn(u32) -> Option<(u32, bool)>,
+    ) {
         let wanted: Vec<usize> = procs
             .iter()
             .enumerate()
             .filter(|(_, p)| p.reaps_unwaited.is_none())
             .map(|(i, _)| i)
             .collect();
-        let table = (wanted.len() > UNWAITED_AT_ONCE)
-            .then(crate::kproc::reaps_unwaited_all)
-            .flatten()
-            .map(|all| {
+        let table = (wanted.len() > UNWAITED_AT_ONCE).then(|| {
+            table().map(|all| {
                 all.into_iter()
                     .map(|(pid, ppid, flag)| (pid, (ppid, flag)))
                     .collect::<std::collections::HashMap<u32, (u32, bool)>>()
-            });
+            })
+        });
         for i in wanted {
             let p = &mut procs[i];
-            p.reaps_unwaited = match &table {
-                Some(all) => all
-                    .get(&p.pid)
-                    .filter(|(ppid, _)| *ppid == p.ppid)
-                    .map(|(_, flag)| *flag),
-                None => c_int::try_from(p.pid)
-                    .ok()
-                    .and_then(crate::jobs::macos_kinfo)
-                    .filter(|k| k.ppid == p.ppid)
-                    .map(|k| k.reaps_unwaited),
+            let row = match &table {
+                Some(Some(all)) => all.get(&p.pid).copied(),
+                Some(None) => None,
+                None => one(p.pid),
             };
+            p.reaps_unwaited = row
+                .filter(|(ppid, _)| *ppid == p.ppid)
+                .map(|(_, flag)| flag);
         }
     }
 }
@@ -894,6 +907,49 @@ pub(crate) mod stopped_spinner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sweep whose table was wanted and not read leaves every process's `reaps_unwaited`
+    /// unread and reads no process's own record, which would wait on what the table waited on;
+    /// a table read fills it in where its row names the swept parent; and a sweep of no more
+    /// than `UNWAITED_AT_ONCE` reads each one's record. NEGATIVE CONTROL: before 2026-11-06 an
+    /// unread table fell back to each one's record (`one` called 13 times here).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_unread_table_leaves_reaps_unwaited_unread_and_reads_no_record() {
+        let sweep = |n: u32| -> Vec<ProcessReading> {
+            (1..=n)
+                .map(|pid| ProcessReading {
+                    pid,
+                    ppid: 1,
+                    ..ProcessReading::default()
+                })
+                .collect()
+        };
+        let ones = std::cell::Cell::new(0);
+        let one = |_: u32| {
+            ones.set(ones.get() + 1);
+            Some((1, true))
+        };
+        let mut procs = sweep(13);
+        imp::read_unwaited_by(&mut procs, || None, one);
+        assert_eq!(ones.get(), 0, "no process's own record is read");
+        assert!(procs.iter().all(|p| p.reaps_unwaited.is_none()));
+
+        let mut procs = sweep(13);
+        imp::read_unwaited_by(&mut procs, || Some(vec![(1, 1, true), (2, 9, true)]), one);
+        assert_eq!(ones.get(), 0);
+        assert_eq!(procs[0].reaps_unwaited, Some(true));
+        assert_eq!(
+            procs[1].reaps_unwaited, None,
+            "its row names another parent"
+        );
+        assert_eq!(procs[2].reaps_unwaited, None, "no row");
+
+        let mut procs = sweep(3);
+        imp::read_unwaited_by(&mut procs, || panic!("a small sweep reads no table"), one);
+        assert_eq!(ones.get(), 3);
+        assert!(procs.iter().all(|p| p.reaps_unwaited == Some(true)));
+    }
 
     /// A name at its reader's cut is the first longer name that begins with it and is below its
     /// own cut; one below the cut is whole and pulls no longer reader; a longer reader's name that

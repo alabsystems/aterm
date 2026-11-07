@@ -1351,17 +1351,23 @@ impl Shared {
 
     /// [`Mesh::holders`].
     pub(crate) fn holders(&self) -> BTreeSet<String> {
-        let Some(seats) = self.mesh.seats_by_principal() else {
-            return BTreeSet::new();
+        let candidates: Vec<String> = {
+            let board = self.board.lock_or_recover();
+            board
+                .marks
+                .iter()
+                .filter(|(principal, mark)| {
+                    *principal != &self.mesh.me.principal && !mark.row.topics.is_empty()
+                })
+                .map(|(principal, _)| principal.clone())
+                .collect()
         };
-        let board = self.board.lock_or_recover();
-        seats
-            .into_keys()
-            .filter(|principal| {
-                board
-                    .row(principal)
-                    .is_some_and(|(_, row)| !row.topics.is_empty())
-            })
+        if candidates.is_empty() {
+            return BTreeSet::new();
+        }
+        candidates
+            .into_iter()
+            .filter(|principal| self.mesh.seat_key(principal).is_some())
             .collect()
     }
 }

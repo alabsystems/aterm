@@ -84,8 +84,7 @@ impl Pattern {
     /// Whether the pattern matches `path`, a `/`-joined path under `public/`.
     #[must_use]
     pub fn matches(&self, path: &str) -> bool {
-        let parts: Vec<&str> = path.split('/').collect();
-        segments(&self.0, &parts)
+        segments(&self.0, Some(path))
     }
 
     /// Whether the pattern ignores everything under the directory `dir`: it is `X/**` and
@@ -93,23 +92,37 @@ impl Pattern {
     #[must_use]
     pub fn prunes(&self, dir: &str) -> bool {
         match self.0.split_last() {
-            Some((last, head)) if last == "**" && !head.is_empty() => {
-                let parts: Vec<&str> = dir.split('/').collect();
-                segments(head, &parts)
-            }
+            Some((last, head)) if last == "**" && !head.is_empty() => segments(head, Some(dir)),
             _ => false,
         }
     }
 }
 
-/// Whether `pattern`'s segments match `path`'s.
-fn segments(pattern: &[String], path: &[&str]) -> bool {
+fn split_first_seg(path: Option<&str>) -> Option<(&str, Option<&str>)> {
+    let rem = path?;
+    match rem.split_once('/') {
+        Some((seg, rest)) => Some((seg, Some(rest))),
+        None => Some((rem, None)),
+    }
+}
+
+/// Whether `pattern`'s segments match `path`'s `/`-separated segments.
+fn segments(pattern: &[String], path: Option<&str>) -> bool {
     match pattern.split_first() {
-        None => path.is_empty(),
+        None => path.is_none(),
         Some((first, rest)) if first == "**" => {
-            (0..=path.len()).any(|skip| segments(rest, &path[skip..]))
+            let mut cur = path;
+            loop {
+                if segments(rest, cur) {
+                    return true;
+                }
+                let Some((_, next)) = split_first_seg(cur) else {
+                    return false;
+                };
+                cur = next;
+            }
         }
-        Some((first, rest)) => path.split_first().is_some_and(|(seg, more)| {
+        Some((first, rest)) => split_first_seg(path).is_some_and(|(seg, more)| {
             segment(first.as_bytes(), seg.as_bytes()) && segments(rest, more)
         }),
     }
@@ -201,18 +214,31 @@ pub fn list(
             let path = at.join(name);
             if kind.is_file() {
                 let bytes = match overlay.get(&rel) {
-                    Some(bytes) => bytes.clone(),
-                    None => crate::durable::read_regular_bytes(&path, 64 * 1024 * 1024)
-                        .map_err(|e| format!("cannot read {}: {e}", path.display()))?,
+                    Some(bytes) => {
+                        if super::key::holds_a_private_key(bytes) {
+                            return Err(format!(
+                                "{} is a private key (a JSON key with a private_key, such as the \
+                                 deployer's service-account key): the site would serve it to anyone — \
+                                 move it out of public/ or name it in firebase.json's hosting.ignore",
+                                path.display()
+                            ));
+                        }
+                        bytes.clone()
+                    }
+                    None => {
+                        let bytes = crate::durable::read_regular_bytes(&path, 64 * 1024 * 1024)
+                            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+                        if super::key::holds_a_private_key(&bytes) {
+                            return Err(format!(
+                                "{} is a private key (a JSON key with a private_key, such as the \
+                                 deployer's service-account key): the site would serve it to anyone — \
+                                 move it out of public/ or name it in firebase.json's hosting.ignore",
+                                path.display()
+                            ));
+                        }
+                        bytes
+                    }
                 };
-                if super::key::holds_a_private_key(&bytes) {
-                    return Err(format!(
-                        "{} is a private key (a JSON key with a private_key, such as the \
-                         deployer's service-account key): the site would serve it to anyone — \
-                         move it out of public/ or name it in firebase.json's hosting.ignore",
-                        path.display()
-                    ));
-                }
                 found.insert(rel, bytes);
             } else {
                 return Err(format!(
@@ -224,7 +250,7 @@ pub fn list(
         }
     }
     for (rel, bytes) in overlay {
-        if !ignored(rel) && !found.contains_key(rel) {
+        if !found.contains_key(rel) && !ignored(rel) {
             if super::key::holds_a_private_key(bytes) {
                 return Err(format!(
                     "{} is a private key (a JSON key with a private_key, such as the \

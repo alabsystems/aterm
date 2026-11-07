@@ -676,6 +676,7 @@ fn only_an_accepted_present_changes_the_caption_a_press_may_open() {
             line,
             col,
         },
+        words: String::new(),
     };
     let a = caption("/p/a.rs", Some(3), Some(2));
     let b = caption("/q/b.rs", Some(9), None);
@@ -690,6 +691,7 @@ fn only_an_accepted_present_changes_the_caption_a_press_may_open() {
         session: 7,
         cell: (2, 3),
         names: CaptionNames::Url("https://a.example/".into()),
+        words: String::new(),
     };
     commit_presented_caption(&mut shown, Some(url.clone()), &Ok(Some(3)));
     assert_eq!(shown, Some(url));

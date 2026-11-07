@@ -623,7 +623,24 @@ pub(in crate::harness) fn adopt(
         }
         Ok(())
     };
-    let current = || {
+    let publication = super::super::codex_app_login::PublicationCustody::default();
+    let check_publication = || -> Result<(), String> {
+        if publication.is_saved() {
+            signin.check_store(store)?;
+            publication.require_current(&staging)?;
+            signin.check_store(store)?;
+            publication.require_work_current()?;
+        }
+        Ok(())
+    };
+    let publication_current = || {
+        check_publication().map_err(|reason| RenewalFailure {
+            reason,
+            ..RenewalFailure::deferred()
+        })
+    };
+    let current = || -> Result<(), RenewalFailure> {
+        publication_current()?;
         work_current()?;
         if !super::super::accounts_sync::shared_adoption_on(roster_path) {
             return Err("automatic shared adoption is off".into());
@@ -632,7 +649,8 @@ pub(in crate::harness) fn adopt(
             return Err("local account roster changed during shared adoption".into());
         }
         custody_current(&store.load_logins(env.now)?.0)?;
-        authority.current(&grant, &row)
+        authority.current(&grant, &row)?;
+        publication_current()
     };
     let request_recovery = |outcome| {
         current()?;
@@ -643,7 +661,10 @@ pub(in crate::harness) fn adopt(
             .latest(grant.source)
             .filter(|attempt| attempt.intent == retained.intent && attempt.outcome == outcome)
             .ok_or("shared recovery attempt changed")?;
-        authority.request_recovery(&grant, &row, &attempt.intent)
+        publication_current()?;
+        authority
+            .request_recovery(&grant, &row, &attempt.intent)
+            .map_err(RenewalFailure::from)
     };
     current()?;
     if !private_staging_directory(&store.logins_dir())? || !private_staging_directory(&staging)? {
@@ -666,187 +687,213 @@ pub(in crate::harness) fn adopt(
     }
     .admit(run_provider);
     let context = shared_provider::Context {
+        publication: (cli == Cli::Codex).then_some(&publication),
         env,
         store,
         host,
         admission: Some(&native_admission),
     };
-    let mut execution_error = None;
-    if run_provider {
-        current()?;
-        if selected_browser.is_none() {
-            selected_browser = Some(browser(store, host, &row, cli)?);
+    let result = (|| {
+        let mut execution_error = None;
+        if run_provider {
+            current()?;
+            if selected_browser.is_none() {
+                selected_browser = Some(browser(store, host, &row, cli)?);
+            }
+            if pending.is_some() {
+                store.transact_logins(env.now, &mut None, |_, current| {
+                    work_current()?;
+                    authority.current(&grant, &row)?;
+                    custody_current(current)?;
+                    if accounts::roster_text(&target)? != before {
+                        return Err("local account roster changed before retry".into());
+                    }
+                    current
+                        .shared
+                        .resume_not_started(token.as_ref().ok_or("missing shared attempt")?)?;
+                    Ok(Vec::new())
+                })?;
+            }
+            current()?;
+            match provider.execute_attempt(
+                &context,
+                &row,
+                &staging,
+                selected_browser
+                    .as_ref()
+                    .ok_or("shared provider has no prepared opener")?,
+            ) {
+                shared_provider::Execution::Deferred(why) => {
+                    return Err(RenewalFailure {
+                        reason: why,
+                        ..RenewalFailure::deferred()
+                    });
+                }
+                shared_provider::Execution::Completed => {}
+                shared_provider::Execution::Unknown(why) => execution_error = Some(why),
+                shared_provider::Execution::NotStarted(why) => {
+                    if publication.is_saved() {
+                        return Err(RenewalFailure::deferred());
+                    }
+                    store.transact_logins(host.now().max(env.now), &mut None, |_, current| {
+                        work_current()?;
+                        custody_current(current)?;
+                        if accounts::roster_text(&target)? != before {
+                            return Err(
+                                "local account roster changed before retaining no-effect proof"
+                                    .into(),
+                            );
+                        }
+                        current.shared.not_started(
+                            token.as_ref().ok_or("missing shared attempt")?,
+                            host.now().max(env.now),
+                        )?;
+                        Ok(Vec::new())
+                    })?;
+                    return Err(why.into());
+                }
+            }
+            current()?;
         }
-        if pending.is_some() {
-            store.transact_logins(env.now, &mut None, |_, current| {
+        // Recovery observes only the exact retained attempt; no provider replay.
+        current()?;
+        let observed = provider.observe(&context, &row, &staging);
+        current()?;
+        let proof = match observed {
+            Ok(Some(proof)) => proof,
+            Err(shared_provider::ObservationError::Unavailable(why)) => {
+                current()?;
+                return Err(why.into());
+            }
+            missing => {
+                request_recovery(Outcome::Pending)?;
+                if let Some(why) = execution_error {
+                    return Err(why.into());
+                }
+                return missing
+                    .map(|_| false)
+                    .map_err(|error| RenewalFailure::from(error.to_string()));
+            }
+        };
+        let principal = proof.principal();
+        let identity_custody = store.load_logins(host.now().max(env.now))?.0;
+        if !accounts::email_matches(proof.identity(), &email)
+            || grant
+                .expected_principal
+                .is_some_and(|expected| principal != expected)
+            || !identity_custody
+                .shared
+                .principal_allowed(grant.source, principal)
+        {
+            // A verified account can still contradict the root's pinned identity.
+            // Keep its consumed attempt intact and ask for a distinct preparation.
+            request_recovery(Outcome::Pending)?;
+            return Err("staged shared login contradicts the approved identity".into());
+        }
+        current()?;
+        let after = if is_new {
+            accounts::append_rows_for(
+                cli,
+                before.as_deref().unwrap_or(""),
+                std::slice::from_ref(&row),
+            )?
+        } else {
+            before
+                .clone()
+                .ok_or("existing account roster disappeared")?
+        };
+        let now = host.now().max(env.now);
+        let held = store
+            .acquire_within(&accounts::LOCK_LADDER)
+            .map_err(|why| why.to_string())?
+            .ok_or(accounts::LOCK_HELD)?;
+        let published = store.transact_sync_held(
+            &held,
+            now,
+            &mut None,
+            accounts::SyncTarget {
+                path: &target,
+                before: before.as_deref(),
+                after: Some(&after),
+                mode,
+            },
+            |state, current| {
                 work_current()?;
+                check_publication()?;
                 authority.current(&grant, &row)?;
                 custody_current(current)?;
                 if accounts::roster_text(&target)? != before {
-                    return Err("local account roster changed before retry".into());
+                    return Err("local account roster changed before publication".into());
                 }
-                current
-                    .shared
-                    .resume_not_started(token.as_ref().ok_or("missing shared attempt")?)?;
-                Ok(Vec::new())
-            })?;
-        }
-        current()?;
-        match provider.execute_attempt(
-            &context,
-            &row,
-            &staging,
-            selected_browser
-                .as_ref()
-                .ok_or("shared provider has no prepared opener")?,
-        ) {
-            shared_provider::Execution::Deferred(why) => {
-                return Err(RenewalFailure {
-                    reason: why,
-                    ..RenewalFailure::deferred()
-                });
-            }
-            shared_provider::Execution::Completed => {}
-            shared_provider::Execution::Unknown(why) => execution_error = Some(why),
-            shared_provider::Execution::NotStarted(why) => {
-                store.transact_logins(host.now().max(env.now), &mut None, |_, current| {
-                    work_current()?;
-                    custody_current(current)?;
-                    if accounts::roster_text(&target)? != before {
-                        return Err(
-                            "local account roster changed before retaining no-effect proof".into(),
-                        );
+                if !super::super::accounts_sync::shared_adoption_on(roster_path) {
+                    return Err("automatic shared adoption is off".into());
+                }
+                proof.check_current()?;
+                work_current()?;
+                // A bounded file or native credential read can outlive the previous
+                // authority observation; it grants no permission to publish later.
+                authority.current(&grant, &row)?;
+                if !super::super::accounts_sync::shared_adoption_on(roster_path) {
+                    return Err("automatic shared adoption is off".into());
+                }
+                let generation = current
+                    .generation_clock
+                    .checked_add(1)
+                    .ok_or("local generation exhausted")?;
+                work_current()?;
+                check_publication()?;
+                current.shared.finish(
+                    token.take().ok_or("shared adoption already completed")?,
+                    Outcome::Published { generation },
+                    Some((&email, principal)),
+                    now,
+                )?;
+                // Pending custody retains this exact staging directory until the
+                // atomic sync receipt commits. A separate renewal checkpoint here
+                // would outlive a failed pre-receipt edit and obstruct its retry.
+                let events = accounts::note_renewed(
+                    state,
+                    current,
+                    &row.label,
+                    own_dir,
+                    staging_text,
+                    proof.subscription(),
+                    now,
+                );
+                if events.is_empty() {
+                    return Err("local login capacity is exhausted".into());
+                }
+                if is_new {
+                    state.prepared_accounts.insert(row.label.clone());
+                    // This account never owned the process's default home.
+                    if let Some(binding) = current.labels.get_mut(&row.label) {
+                        binding.was.clear();
                     }
-                    current.shared.not_started(
-                        token.as_ref().ok_or("missing shared attempt")?,
-                        host.now().max(env.now),
-                    )?;
-                    Ok(Vec::new())
-                })?;
-                return Err(why.into());
-            }
-        }
-        current()?;
-    }
-    // Recovery observes only the exact retained attempt; no provider replay.
-    current()?;
-    let observed = provider.observe(&context, &row, &staging);
-    current()?;
-    let proof = match observed {
-        Ok(Some(proof)) => proof,
-        Err(shared_provider::ObservationError::Unavailable(why)) => {
-            current()?;
+                }
+                accounts::note_identity(current, &row.label, accounts::Proof::Status, Some(&email));
+                Ok(events)
+            },
+            || {
+                work_current()?;
+                check_publication()?;
+                Ok(())
+            },
+        );
+        if let Err(why) = published {
+            publication_current()?;
             return Err(why.into());
         }
-        missing => {
-            request_recovery(Outcome::Pending)?;
-            if let Some(why) = execution_error {
-                return Err(why.into());
-            }
-            return missing
-                .map(|_| false)
-                .map_err(|error| RenewalFailure::from(error.to_string()));
-        }
-    };
-    let principal = proof.principal();
-    let identity_custody = store.load_logins(host.now().max(env.now))?.0;
-    if !accounts::email_matches(proof.identity(), &email)
-        || grant
-            .expected_principal
-            .is_some_and(|expected| principal != expected)
-        || !identity_custody
-            .shared
-            .principal_allowed(grant.source, principal)
-    {
-        // A verified account can still contradict the root's pinned identity.
-        // Keep its consumed attempt intact and ask for a distinct preparation.
-        request_recovery(Outcome::Pending)?;
-        return Err("staged shared login contradicts the approved identity".into());
+        Ok(true)
+    })();
+    if result.is_err() {
+        publication
+            .require_work_current()
+            .map_err(|reason| RenewalFailure {
+                reason,
+                ..RenewalFailure::deferred()
+            })?;
     }
-    current()?;
-    let after = if is_new {
-        accounts::append_rows_for(
-            cli,
-            before.as_deref().unwrap_or(""),
-            std::slice::from_ref(&row),
-        )?
-    } else {
-        before
-            .clone()
-            .ok_or("existing account roster disappeared")?
-    };
-    let now = host.now().max(env.now);
-    let held = store
-        .acquire_within(&accounts::LOCK_LADDER)
-        .map_err(|why| why.to_string())?
-        .ok_or(accounts::LOCK_HELD)?;
-    store.transact_sync_held(
-        &held,
-        now,
-        &mut None,
-        accounts::SyncTarget {
-            path: &target,
-            before: before.as_deref(),
-            after: Some(&after),
-            mode,
-        },
-        |state, current| {
-            work_current()?;
-            authority.current(&grant, &row)?;
-            custody_current(current)?;
-            if accounts::roster_text(&target)? != before {
-                return Err("local account roster changed before publication".into());
-            }
-            if !super::super::accounts_sync::shared_adoption_on(roster_path) {
-                return Err("automatic shared adoption is off".into());
-            }
-            proof.check_current()?;
-            work_current()?;
-            // A bounded file or native credential read can outlive the previous
-            // authority observation; it grants no permission to publish later.
-            authority.current(&grant, &row)?;
-            if !super::super::accounts_sync::shared_adoption_on(roster_path) {
-                return Err("automatic shared adoption is off".into());
-            }
-            let generation = current
-                .generation_clock
-                .checked_add(1)
-                .ok_or("local generation exhausted")?;
-            work_current()?;
-            current.shared.finish(
-                token.take().ok_or("shared adoption already completed")?,
-                Outcome::Published { generation },
-                Some((&email, principal)),
-                now,
-            )?;
-            // Pending custody retains this exact staging directory until the
-            // atomic sync receipt commits. A separate renewal checkpoint here
-            // would outlive a failed pre-receipt edit and obstruct its retry.
-            let events = accounts::note_renewed(
-                state,
-                current,
-                &row.label,
-                own_dir,
-                staging_text,
-                proof.subscription(),
-                now,
-            );
-            if events.is_empty() {
-                return Err("local login capacity is exhausted".into());
-            }
-            if is_new {
-                state.prepared_accounts.insert(row.label.clone());
-                // This account never owned the process's default home.
-                if let Some(binding) = current.labels.get_mut(&row.label) {
-                    binding.was.clear();
-                }
-            }
-            accounts::note_identity(current, &row.label, accounts::Proof::Status, Some(&email));
-            Ok(events)
-        },
-        || Ok(()),
-    )?;
-    Ok(true)
+    result
 }
 
 /// Observe a private directory without creating it or following a leaf link.

@@ -233,7 +233,14 @@ mod measuring {
                 kept
             })
             .collect();
-        support::run("spin", &rows, |row| take(&rig, row))
+        support::run_classified(
+            "spin",
+            &rows,
+            |row| support::Kind::Count {
+                windowed: row.scene.windowed(),
+            },
+            |row| take(&rig, row),
+        )
     }
 }
 

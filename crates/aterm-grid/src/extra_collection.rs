@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use aterm_hash::FxHashMap;
+use crate::extra_map::ExtraMap;
 
 use crate::cell::Cell;
 use crate::extra::{CellCoord, CellExtra};
@@ -804,11 +804,18 @@ enum ImageHint {
     Pending(CellCoord),
 }
 
+/// Owned workspace for one restoration; sparse cleanup visits only retained slots.
+#[must_use = "finish the refill to release unused spare storage"]
+pub(crate) struct ExtraRefill {
+    coords: Vec<CellCoord>,
+    scan: bool,
+}
+
 /// Storage for cell extras across the grid.
 #[derive(Debug, Clone, Default)]
 pub struct CellExtras {
     /// Map from cell coordinate to extra data.
-    pub(crate) data: FxHashMap<CellCoord, CellExtra>,
+    pub(crate) data: ExtraMap,
     /// Accumulated row offset for O(1) full-screen scroll.
     row_offset: u16,
     /// Cached upper bound on internal `coord.row` across `data`.
@@ -822,6 +829,8 @@ pub struct CellExtras {
     /// empty between calls, it keeps its capacity so the cold path does not
     /// allocate.
     hyperlink_scratch: Vec<CellCoord>,
+    /// Empty between restores; provisioned when a cold restore owns heap storage.
+    refill_scratch: Vec<CellCoord>,
     /// Upper bound on the number of hyperlink-bearing entries in `data`, which
     /// guards [`Self::enforce_hyperlink_limit`]: `data.len()` also counts marks,
     /// colours, flags and images, so guarding on it would walk the whole map on
@@ -833,37 +842,19 @@ pub struct CellExtras {
     image_hint: ImageHint,
 }
 
-/// Reset or insert the empty entry at internal key `key` for a writer's new cell:
-/// the rule [`CellExtras::fresh`] and `set_range_uniform`'s map path share.
-#[inline]
-fn fresh_slot(
-    data: &mut FxHashMap<CellCoord, CellExtra>,
-    key: CellCoord,
-) -> (&mut CellExtra, bool) {
-    use std::collections::hash_map::Entry;
-    match data.entry(key) {
-        Entry::Vacant(slot) => (slot.insert(CellExtra::default()), false),
-        Entry::Occupied(slot) => {
-            let extra = slot.into_mut();
-            let had_link = extra.hyperlink().is_some();
-            *extra = CellExtra::default();
-            (extra, had_link)
-        }
-    }
-}
-
 impl CellExtras {
     /// Create empty extras storage.
     #[must_use]
     #[inline]
     pub(crate) fn new() -> Self {
         Self {
-            data: FxHashMap::default(),
+            data: ExtraMap::default(),
             row_offset: 0,
             max_row_cache: MaxRowCache::new(),
             complex_ring: None,
             rgb_ring: None,
             hyperlink_scratch: Vec::new(),
+            refill_scratch: Vec::new(),
             hyperlink_upper_bound: 0,
             image_hint: ImageHint::Absent,
         }
@@ -1202,7 +1193,7 @@ impl CellExtras {
         let was_empty = self.data.is_empty();
         self.max_row_cache.on_insert(key.row, was_empty);
         let bound = &mut self.hyperlink_upper_bound;
-        let extra = self.data.entry(key).or_default();
+        let extra = self.data.get_or_default(key);
         if extra.hyperlink().is_none() {
             *bound += 1;
         }
@@ -1234,7 +1225,7 @@ impl CellExtras {
         let was_empty = self.data.is_empty();
         self.max_row_cache.on_insert(internal_row, was_empty);
         let bound = &mut self.hyperlink_upper_bound;
-        let (extra, had_link) = fresh_slot(&mut self.data, key);
+        let (extra, had_link) = self.data.fresh(key);
         if had_link {
             *bound = bound.saturating_sub(1);
         }
@@ -1517,13 +1508,14 @@ impl CellExtras {
         self.max_row_cache.set_exact_opt(max_row);
     }
 
-    /// Prepare visible restoration, preserving existing per-cell image storage.
-    /// The caller finishes a refill when this returns true, removing unused slots.
-    pub(crate) fn prepare_rows_for_restore(&mut self, rows: core::ops::Range<u16>) -> bool {
-        if !self.any_image() {
-            self.clear_rows_retaining_capacity(rows);
-            return false;
-        }
+    /// Prepare visible restoration, preserving reusable per-cell heap storage.
+    /// The returned workspace must be passed to [`Self::finish_rows_restore`].
+    pub(crate) fn prepare_rows_for_restore(&mut self, rows: core::ops::Range<u16>) -> ExtraRefill {
+        let mut refill = ExtraRefill {
+            coords: std::mem::take(&mut self.refill_scratch),
+            scan: false,
+        };
+        refill.coords.clear();
         if let Some(ring) = &mut self.rgb_ring {
             ring.clear_rows(rows.clone());
         }
@@ -1533,7 +1525,10 @@ impl CellExtras {
         #[cfg(any(test, debug_assertions))]
         crate::test_counters::count_extras_clear_ops(self.data.len());
         let offset = self.row_offset;
-        let mut retained = false;
+        // Point cleanup needs lookups/removals; switch to one sequential map
+        // pass when more than a quarter of its entries would need that work.
+        let point_budget = self.data.len() / 4;
+        let mut retained = 0;
         let mut max_row: Option<u16> = None;
         let mut images = false;
         self.data.retain(|coord, extra| {
@@ -1541,10 +1536,10 @@ impl CellExtras {
                 return false;
             }
             if rows.contains(&(coord.row - offset)) {
-                if !extra.prepare_image_refill() {
+                if !extra.prepare_refill() {
                     return false;
                 }
-                retained = true;
+                retained += 1;
             }
             images |= extra.image().is_some();
             max_row = Some(max_row.map_or(coord.row, |m| m.max(coord.row)));
@@ -1556,29 +1551,73 @@ impl CellExtras {
         } else {
             ImageHint::Absent
         };
-        retained
+        refill.scan = retained > point_budget;
+        if retained != 0 && !refill.scan {
+            // Unrelated target entries have been discarded. Build an index
+            // only for sparse cleanup; dense restores need no index writes.
+            #[cfg(any(test, debug_assertions))]
+            crate::test_counters::count_extras_clear_ops(self.data.len());
+            refill.coords.extend(self.data.keys().filter_map(|coord| {
+                let row = coord.row - offset;
+                rows.contains(&row)
+                    .then_some(CellCoord::new(row, coord.col))
+            }));
+        }
+        refill
     }
 
-    /// Remove unused refill entries and recover exact image-presence metadata.
-    pub(crate) fn finish_rows_restore(&mut self) {
-        #[cfg(any(test, debug_assertions))]
-        crate::test_counters::count_extras_clear_ops(self.data.len());
-        let mut max_row: Option<u16> = None;
-        let mut images = false;
-        self.data.retain(|coord, extra| {
-            if !extra.finish_image_refill() {
-                return false;
-            }
-            images |= extra.image().is_some();
-            max_row = Some(max_row.map_or(coord.row, |m| m.max(coord.row)));
-            true
-        });
-        self.max_row_cache.set_exact_opt(max_row);
-        self.image_hint = if images {
-            ImageHint::Possible
+    /// Remove unused refill entries with sparse point work or a dense map pass.
+    /// `owned_text` reports restored complex strings or spilled combining marks,
+    /// admitting their next sparse workspace without an additional map scan.
+    pub(crate) fn finish_rows_restore(&mut self, mut refill: ExtraRefill, owned_text: bool) {
+        if refill.scan {
+            #[cfg(any(test, debug_assertions))]
+            crate::test_counters::count_extras_clear_ops(self.data.len());
+            let mut max_row: Option<u16> = None;
+            let mut images = false;
+            self.data.retain(|coord, extra| {
+                if !extra.finish_refill() {
+                    return false;
+                }
+                images |= extra.image().is_some();
+                max_row = Some(max_row.map_or(coord.row, |m| m.max(coord.row)));
+                true
+            });
+            self.max_row_cache.set_exact_opt(max_row);
+            self.image_hint = if images {
+                ImageHint::Possible
+            } else {
+                ImageHint::Absent
+            };
         } else {
-            ImageHint::Absent
-        };
+            #[cfg(any(test, debug_assertions))]
+            crate::test_counters::count_extras_clear_ops(refill.coords.len());
+            for coord in &refill.coords {
+                let Some(key) = self.internal_coord_checked(*coord) else {
+                    continue;
+                };
+                if self
+                    .data
+                    .get_mut(&key)
+                    .is_some_and(|extra| !extra.finish_refill())
+                {
+                    self.data.remove(&key);
+                    self.max_row_cache.on_remove(key.row, self.data.is_empty());
+                }
+            }
+            // Preparation ruled out images in reset slots. Nonimage writes
+            // preserve that fact; actual image stamps arm the hint themselves.
+        }
+        if owned_text || self.any_image() {
+            refill.coords.clear();
+            // Reserve the next operation's point budget on cold admission,
+            // rather than allocating inside its first steady-state refill.
+            let capacity = self.data.len() / 4 + 1;
+            if refill.coords.capacity() < capacity {
+                refill.coords.reserve_exact(capacity);
+            }
+            self.refill_scratch = refill.coords;
+        }
     }
 
     /// Clear extras inside a rectangular area in one pass, including both rings, which the fast write paths fill directly (a DECCRA overwrite must wipe them).
@@ -1671,7 +1710,7 @@ impl CellExtras {
         let mut replaced_links = 0usize;
         for col in col_start..col_end {
             let coord = CellCoord::new(internal_row, col);
-            let (extra, had_link) = fresh_slot(&mut self.data, coord);
+            let (extra, had_link) = self.data.fresh(coord);
             replaced_links += usize::from(had_link);
             if let Some(rgb) = vals.fg_rgb {
                 extra.set_fg_rgb(Some(rgb));
@@ -1701,11 +1740,12 @@ impl CellExtras {
     /// Clear all extras and release map capacity.
     #[inline]
     pub fn clear(&mut self) {
-        self.data = FxHashMap::default();
+        self.data = ExtraMap::default();
         self.row_offset = 0;
         self.max_row_cache.set_empty();
         self.hyperlink_upper_bound = 0;
         self.image_hint = ImageHint::Absent;
+        self.refill_scratch = Vec::new();
         if let Some(ring) = &mut self.complex_ring {
             ring.clear();
         }
@@ -1854,8 +1894,7 @@ impl CellExtras {
         self.settle_image_candidate();
         #[cfg(any(test, debug_assertions))]
         crate::test_counters::count_extras_shift_ops(self.data.len());
-        let mut new_data =
-            FxHashMap::with_capacity_and_hasher(self.data.len(), aterm_hash::FxBuildHasher);
+        let mut new_data = ExtraMap::with_capacity(self.data.len());
         let mut max_row: Option<u16> = None;
         for (coord, extra) in self.data.drain() {
             if coord.row >= total {
@@ -1869,28 +1908,24 @@ impl CellExtras {
         self.max_row_cache.set_exact_opt(max_row);
     }
 
-    /// Shrink the map after retain-style removals when capacity exceeds 4x len (and 64, to avoid thrashing small maps).
+    /// Shrink after removals when retained capacity exceeds 4x len (and 64, to avoid thrashing small maps).
     #[inline]
     pub(crate) fn maybe_shrink(&mut self) {
-        let cap = self.data.capacity();
+        let cap = self.data.retained_capacity();
         let len = self.data.len();
         if cap > 64 && cap > len.saturating_mul(4) {
             self.data.shrink_to_fit();
         }
     }
 
-    /// Calculate total memory used.
+    /// Estimate inline storage, retained tables/rings and per-entry payload heaps.
     #[must_use]
     pub(crate) fn memory_used(&self) -> usize {
-        let base = std::mem::size_of::<Self>().saturating_add(
-            self.data
-                .capacity()
-                .saturating_mul(std::mem::size_of::<CellCoord>()),
-        );
+        let base = std::mem::size_of::<Self>().saturating_add(self.data.heap_bytes());
         let extras_mem = self
             .data
             .values()
-            .map(CellExtra::memory_used)
+            .map(CellExtra::heap_memory_used)
             .fold(0, usize::saturating_add);
         let rgb_mem = self.rgb_ring.as_ref().map(|r| r.heap_bytes()).unwrap_or(0);
         let complex_mem = self
@@ -1901,6 +1936,12 @@ impl CellExtras {
         base.saturating_add(extras_mem)
             .saturating_add(rgb_mem)
             .saturating_add(complex_mem)
+            .saturating_add(
+                self.hyperlink_scratch
+                    .capacity()
+                    .saturating_add(self.refill_scratch.capacity())
+                    .saturating_mul(std::mem::size_of::<CellCoord>()),
+            )
     }
 
     /// Number of valid extras entries excluding scrolled-off rows.
@@ -2082,6 +2123,82 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sparse_refill_cleanup_work_follows_heap_slots_not_unrelated_extras() {
+        use std::sync::Arc;
+        for cols in [80_u16, 256] {
+            for kind in ["image", "complex", "combining"] {
+                let mut extras = CellExtras::new();
+                let image = Arc::new(crate::ImageData {
+                    bytes: vec![7; 256],
+                    format: crate::ImageFormat::Png,
+                    cols,
+                    rows: 24,
+                    z_index: 0,
+                    band_lift_px: 0,
+                    cell_offset_px: (0, 0),
+                    scaling: crate::ImageScaling::Fit,
+                    source_rect: None,
+                });
+                for row in 0..24 {
+                    for col in 0..cols {
+                        extras
+                            .get_or_create(CellCoord::new(row, col))
+                            .set_fg_rgb(Some([1, 2, 3]));
+                    }
+                }
+                let mut stale = Vec::new();
+                for col in 0..4 {
+                    let coord = CellCoord::new(0, col);
+                    if kind == "complex" {
+                        let payload: Arc<str> = Arc::from("👩‍💻");
+                        stale.push(Arc::downgrade(&payload));
+                        extras.get_or_create(coord).set_complex_char(Some(payload));
+                    } else if kind == "combining" {
+                        for mark in ['\u{301}', '\u{302}', '\u{303}', '\u{304}', '\u{305}'] {
+                            extras.get_or_create(coord).add_combining(mark);
+                        }
+                    } else {
+                        extras.set_image(
+                            CellCoord::new(0, col),
+                            crate::ImageRef {
+                                image: Arc::clone(&image),
+                                cell_row: 0,
+                                cell_col: col,
+                                kitty: None,
+                            },
+                        );
+                    }
+                }
+                let refill = extras.prepare_rows_for_restore(0..24);
+                for row in 0..24 {
+                    for col in 0..cols {
+                        extras
+                            .get_or_create(CellCoord::new(row, col))
+                            .set_fg_rgb(Some([4, 5, 6]));
+                    }
+                }
+                crate::test_counters::take_extras_clear_ops();
+                extras.finish_rows_restore(refill, false);
+                let work = crate::test_counters::take_extras_clear_ops();
+                assert!(
+                    work <= 4,
+                    "{cols} columns: sparse cleanup visited {work} entries"
+                );
+                assert!(!extras.any_image());
+                assert!(extras.refill_scratch.is_empty());
+                assert_eq!(extras.refill_scratch.capacity(), 0);
+                assert_eq!(Arc::strong_count(&image), 1);
+                assert!(stale.iter().all(|weak| weak.upgrade().is_none()));
+                for row in 0..24 {
+                    for col in 0..cols {
+                        assert_eq!(extras.fg_rgb_for(row, col), Some([4, 5, 6]));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn image_refill_clears_stale_payloads_and_preserves_outside_rows_at_offsets() {
         use std::sync::Arc;
         for offset in [0_u16, 1, 128] {
@@ -2115,11 +2232,17 @@ mod tests {
             old.set_complex_char(Some(Arc::from("old")));
             old.add_combining('\u{0301}');
             old.set_fg_rgb(Some([8, 9, 10]));
+            // Unrelated outside entries keep both refills in sparse mode.
+            for col in 1..4 {
+                extras
+                    .get_or_create(CellCoord::new(2, col))
+                    .set_fg_rgb(Some([11, 12, 13]));
+            }
             for row in [0, 2] {
                 extras.set_complex_char_ring(row, 0, '\u{1F680}', 3, 4);
                 extras.set_rgb_ring_range(row, 0, 1, Some([1, 2, 3]), Some([4, 5, 6]), 3, 4);
             }
-            assert!(extras.prepare_rows_for_restore(0..1));
+            let refill = extras.prepare_rows_for_restore(0..1);
             let reset = extras.get(CellCoord::new(0, 0)).unwrap();
             assert!(reset.image().is_none());
             assert!(reset.hyperlink().is_none());
@@ -2128,16 +2251,19 @@ mod tests {
             assert!(reset.fg_rgb().is_none());
             assert_eq!(extras.fg_rgb_for(0, 0), None);
             assert_eq!(extras.fg_rgb_for(2, 0), Some([1, 2, 3]));
+            for col in 1..4 {
+                assert_eq!(extras.fg_rgb_for(2, col), Some([11, 12, 13]));
+            }
             let ring = extras.complex_ring.as_ref().unwrap();
             assert_eq!(ring.get(0, 0), None);
             assert_eq!(ring.get(2, 0), Some('\u{1F680}'));
-            extras.finish_rows_restore();
+            extras.finish_rows_restore(refill, false);
             assert!(extras.get(CellCoord::new(0, 0)).is_none());
             assert!(extras.get(CellCoord::new(2, 0)).unwrap().image().is_some());
             assert!(extras.any_image());
             assert_eq!(Arc::strong_count(&image), 2);
-            assert!(extras.prepare_rows_for_restore(2..3));
-            extras.finish_rows_restore();
+            let refill = extras.prepare_rows_for_restore(2..3);
+            extras.finish_rows_restore(refill, false);
             assert!(extras.is_empty());
             assert!(!extras.any_image());
             assert_eq!(Arc::strong_count(&image), 1);

@@ -190,6 +190,22 @@ impl Lease {
         &self.path
     }
 
+    /// Duplicate the original held lease for explicit child inheritance.
+    /// The returned close-on-exec descriptor shares the same close-only lock;
+    /// dropping this Lease cannot permit GC until every duplicate has closed.
+    /// Recipients must preserve close-only handling: never unlock or relock it.
+    /// This checks custody only, never SDK content authenticity or immutability.
+    ///
+    /// # Errors
+    /// The original named/held lease is unsafe or changed, or duplication fails.
+    #[cfg(unix)]
+    pub fn try_clone_descriptor(&self) -> io::Result<std::os::fd::OwnedFd> {
+        self.check_current()?;
+        let descriptor = self.file.try_clone_fd()?;
+        self.check_current()?;
+        Ok(descriptor)
+    }
+
     /// Check that the named slot still denotes this actual held description.
     /// This checks lease custody, not SDK authenticity or immutable SDK bytes.
     /// Failure leaves the original lock held and never adopts a replacement.
@@ -1102,7 +1118,11 @@ mod tests {
         let subject = trust(91);
         let lease = take(root.path(), &subject, "retained SDK user", Duration::ZERO).unwrap();
         let path = lease.path().to_path_buf();
-        let duplicate = lease.file.try_clone().unwrap();
+        let duplicate = lease.try_clone_descriptor().unwrap();
+        use std::os::fd::AsRawFd as _;
+        // SAFETY: F_GETFD only reads flags of the live owned descriptor.
+        let flags = unsafe { libc::fcntl(duplicate.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
 
         drop(lease);
 
@@ -1149,6 +1169,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             lease.check_current().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            lease.try_clone_descriptor().unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
         assert!(

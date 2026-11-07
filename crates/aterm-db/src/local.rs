@@ -25,6 +25,8 @@ use std::{
 };
 
 const CONFIG: &str = "database.json";
+/// The namespace of the dataset a fleet key decides.
+pub(crate) const FLEET_NAMESPACE: &str = "alab";
 const IDENTITY: &str = "identity";
 /// Most retained journal bytes in one database generation.
 pub(crate) const MAX_JOURNAL: usize = 128 * 1024 * 1024;
@@ -291,7 +293,12 @@ impl FleetKeys {
         let mut control_incarnation = [0u8; 16];
         control_incarnation.copy_from_slice(&incarnation[..16]);
         Ok(Self {
-            manifest: Manifest::deterministic(&root_seed, id, control_incarnation, "alab")?,
+            manifest: Manifest::deterministic(
+                &root_seed,
+                id,
+                control_incarnation,
+                FLEET_NAMESPACE,
+            )?,
             root_seed: *root_seed,
             key: aterm_digest::hkdf_expand_32(&prk, b"encryption-key"),
         })
@@ -359,6 +366,16 @@ pub(crate) fn belongs_to_fleet(dir: &Path, fleet_secret: &[u8]) -> Result<bool> 
     let _lock = lock(dir)?;
     Ok(keys.hold(&Credentials::load(dir)?))
 }
+/// Whether `dir` holds the fleet's dataset, under any key. It reads without the writer lock, as a
+/// sync round reads its credentials: a neighbour's write changes neither the namespace nor this
+/// answer, and a verb's own open answers busy.
+pub(crate) fn holds_fleet_tables(dir: &Path) -> Result<bool> {
+    if missing(dir, CONFIG)? {
+        return Ok(false);
+    }
+    Ok(Credentials::load(dir)?.manifest.namespace == FLEET_NAMESPACE)
+}
+
 /// Whether `dir` holds a dataset other than the one `fleet_secret` decides.
 pub(crate) fn holds_another_dataset(dir: &Path, fleet_secret: &[u8]) -> Result<bool> {
     if missing(dir, CONFIG)? {
@@ -819,7 +836,7 @@ impl Database {
         let target = self
             .history
             .command(&operation)
-            .map(|(_, c)| c.clone())
+            .map(|(_, c)| c)
             .ok_or_else(|| Error::new("target is not a supported retained command"))?;
         if target.is_control() && self.credentials.root_seed.is_none() {
             return Err(Error::new(
@@ -831,12 +848,9 @@ impl Database {
         } else {
             self.credentials.capability.actor
         };
-        if let Some((_, old)) = self
-            .history
-            .find_request(&actor, request)
-            .map(|(id, c)| (id, c.clone()))
-        {
-            if matches!(&old, Command::Revert { operation: prior, .. } if *prior == operation) {
+        if let Some((_, old)) = self.history.find_request(&actor, request) {
+            if matches!(old, Command::Revert { operation: prior, .. } if *prior == operation) {
+                let old = old.clone();
                 return self.commit(old);
             }
             return Err(Error::new(
@@ -849,16 +863,18 @@ impl Database {
                 "permanent safety stops cannot be reverted; authorize a new object generation",
             ));
         }
+        let mut keys = Vec::with_capacity(affected.len());
+        for change in affected {
+            keys.push((change.collection.clone(), change.key.clone()));
+        }
         let view = self.view();
         if !view.causal.ordered.contains(&operation) || view.invalid.contains(&operation) {
             return Err(Error::new("target is pending, refused or quarantined"));
         }
-        let mut keys = Vec::with_capacity(affected.len());
-        for change in affected {
-            let key = (change.collection.clone(), change.key.clone());
+        for key in &keys {
             let cell = view
                 .cells
-                .get(&key)
+                .get(key)
                 .ok_or_else(|| Error::new("target is no longer current"))?;
             if cell.stopped
                 || cell.candidates.len() != 1
@@ -868,7 +884,6 @@ impl Database {
                     "another edit changed an affected key; resolve it before reverting",
                 ));
             }
-            keys.push(key);
         }
         let past = self.history.before(&operation)?;
         let mut changes = Vec::with_capacity(keys.len());

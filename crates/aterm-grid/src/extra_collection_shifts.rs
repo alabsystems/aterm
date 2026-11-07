@@ -5,7 +5,7 @@
 //! Region and column shifts for [`CellExtras`]: scroll-region shifts and ICH/DCH
 //! column shifts. Each touches a subset of rows, so each drain-rebuilds (O(E)).
 
-use aterm_hash::FxHashMap;
+use crate::extra_map::ExtraMap;
 
 use super::extra_collection::CellExtras;
 use crate::extra::{CellCoord, CellExtra};
@@ -29,8 +29,7 @@ impl CellExtras {
             return;
         }
         let shift_start = top.checked_add(n);
-        let mut new_data =
-            FxHashMap::with_capacity_and_hasher(self.data.len(), aterm_hash::FxBuildHasher);
+        let mut new_data = ExtraMap::with_capacity(self.data.len());
         let mut max_row: Option<u16> = None;
         for (coord, extra) in self.data.drain() {
             // Internal row < offset: stale, drop.
@@ -76,8 +75,7 @@ impl CellExtras {
             return;
         }
         let drop_start = bottom.saturating_sub(n.saturating_sub(1));
-        let mut new_data =
-            FxHashMap::with_capacity_and_hasher(self.data.len(), aterm_hash::FxBuildHasher);
+        let mut new_data = ExtraMap::with_capacity(self.data.len());
         let mut max_row: Option<u16> = None;
         for (coord, extra) in self.data.drain() {
             if coord.row < offset {
@@ -118,8 +116,7 @@ impl CellExtras {
         crate::test_counters::count_extras_shift_ops(self.data.len());
         let offset = self.take_row_offset();
         let shift_start = top.checked_add(n);
-        let mut new_data =
-            FxHashMap::with_capacity_and_hasher(self.data.len(), aterm_hash::FxBuildHasher);
+        let mut new_data = ExtraMap::with_capacity(self.data.len());
         let mut max_row: Option<u16> = None;
         for (coord, extra) in self.data.drain() {
             if coord.row < offset {
@@ -163,8 +160,7 @@ impl CellExtras {
         crate::test_counters::count_extras_shift_ops(self.data.len());
         let offset = self.take_row_offset();
         let drop_start = bottom.saturating_sub(n.saturating_sub(1));
-        let mut new_data =
-            FxHashMap::with_capacity_and_hasher(self.data.len(), aterm_hash::FxBuildHasher);
+        let mut new_data = ExtraMap::with_capacity(self.data.len());
         let mut max_row: Option<u16> = None;
         for (coord, extra) in self.data.drain() {
             if coord.row < offset {

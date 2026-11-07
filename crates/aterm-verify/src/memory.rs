@@ -23,10 +23,25 @@
 //! warmer cache can have taken less than this one will); then the most its stage, selection and
 //! variant kept in another checkout; then the most a plain `targo` build of the same selection
 //! whose work holds the stage's kept ([`plain_like`], BUILD-ADMIT's book); and where none of those
-//! either, a stage that compiles ([`compiles`]) claims the cold figure, 16 GiB and at most half
-//! of physical memory ([`aterm_capacity::cold_claim`]), and any other stage claims nothing
-//! ([`need`]). A stage that touches no target directory ([`Lane::Pure`]: the formatter, the
-//! censuses) is never measured and never claims.
+//! either, a stage that compiles ([`compiles`]) claims what records of narrower selections of its
+//! stage and variant, in any checkout, kept, where together they name every crate of its own:
+//! the sum of what each part of that cover weighs, the most any record of it, or of a selection
+//! inside it, kept; the cover whose sum is least; at least the most any narrower record kept;
+//! and a fifth more, at least 1 GiB more, never more than the cold figure ([`composed`]). The sum
+//! bounds the union's peak on a premise, the one a wider selection's bound rests on too: one
+//! cargo run of the union compiles no unit its parts' runs did not, with as many jobs at once, so
+//! the compilers it holds together at its peak split among the parts, and each part's share is
+//! units that part's own run compiled, which its peak bounds only where that run compiled them.
+//! A run over a warm cache compiles little and keeps a light peak, so a part weighs at least what
+//! a selection inside it kept, which its own run compiles too, and the union at least what any
+//! narrower selection kept, one that straddles the parts included; a part whose every record is
+//! warm still weighs light, and nothing here can tell. The margin is for the premise's other
+//! gaps: the union's run can hold together two of a part's units its own run never overlapped,
+//! and a dependency two parts build with different features builds once with both, a unit no
+//! part's run built. A selection that names a crate no narrower record holds claims the cold
+//! figure, 16 GiB and at most half of physical memory ([`aterm_capacity::cold_claim`]); and any
+//! other stage claims nothing ([`need`]). A stage that touches no target directory
+//! ([`Lane::Pure`]: the formatter, the censuses) is never measured and never claims.
 
 use std::cell::RefCell;
 use std::fmt;
@@ -112,15 +127,16 @@ pub enum Kept {
 /// or the lab started kept ([`plain_like`]).
 pub const PLAIN_RECORD: &str = aterm_capacity::book::TARGO_RECORD;
 
-/// Whether stage `id` compiles, and so claims [`aterm_capacity::cold_claim`] until a run of it is
-/// measured: each such stage runs a cargo or rustdoc build of its own (a test, lint, doctest,
-/// checkers or measuring compile, a cell's or the libc oracle's workspace, the export's release
-/// tools, the web modules, the conformance and Objective-C drives' binaries, `spec-check`, the
-/// aterm the codex-alab proof drives, the lab the Linux lane boots its VM with, which claims its
-/// guest's memory as a claim of its own). The stages that run only what
-/// an earlier stage built (the test run, the checkers run, the measuring rows), the ones that
-/// touch no target directory, and the forge's do not. Every stage is named here, so a new one is
-/// placed by the compiler, not by a list it can be left out of.
+/// Whether stage `id` compiles, and so claims [`aterm_capacity::cold_claim`] until a run of it,
+/// or runs of narrower selections that cover its own ([`composed`]), are measured: each such
+/// stage runs a cargo or rustdoc build of its own (a test, lint, doctest, checkers or measuring
+/// compile, a cell's or the libc oracle's workspace, the export's release tools, the web modules,
+/// the conformance and Objective-C drives' binaries, `spec-check`, the aterm the codex-alab proof
+/// drives, the lab the Linux lane boots its VM with, which claims its guest's memory as a claim
+/// of its own). The stages that run only what an earlier stage built (the test run, the checkers
+/// run, the measuring rows), the ones that touch no target directory, and the forge's do not.
+/// Every stage is named here, so a new one is placed by the compiler, not by a list it can be
+/// left out of.
 #[must_use]
 pub const fn compiles(id: StageId) -> bool {
     match id {
@@ -148,6 +164,14 @@ pub const fn compiles(id: StageId) -> bool {
         | StageId::GuiSmoke
         | StageId::Forge => false,
     }
+}
+
+/// Whether stage `id` runs test binaries side by side ([`crate::test_plan::dispatch`]), as many at
+/// once as their charges fit in its share, and so claims [`aterm_capacity::cold_claim`] until a
+/// run of it is measured, as a compile does: the test run and the checkers run.
+#[must_use]
+pub const fn runs_binaries_together(id: StageId) -> bool {
+    matches!(id, StageId::Test | StageId::SpecCheckers)
 }
 
 /// Whether `spec` is measured and claims memory: every stage but one that touches no target
@@ -209,6 +233,8 @@ pub struct Meter {
     held: Mutex<Held>,
     units: Option<Mutex<Units>>,
     cpu: Mutex<std::collections::BTreeMap<(u32, u64), u64>>,
+    /// Each live group's CPU rate between its last two reads, cores, and when it was last read.
+    rates: Mutex<std::collections::BTreeMap<u32, (std::time::Instant, f64)>>,
 }
 
 impl Meter {
@@ -226,6 +252,7 @@ impl Meter {
         Arc::new(Meter {
             held: Mutex::default(),
             cpu: Mutex::default(),
+            rates: Mutex::default(),
             units: Some(Mutex::new(Units {
                 reader,
                 floor,
@@ -267,15 +294,39 @@ impl Meter {
     /// least the stage's peak can be. A read that found no member (the group ended before it was
     /// read) books nothing: it is no reading of what the group held.
     pub fn book(&self, pgid: u32, members: &[aterm_sysprobe::MemberUsage]) {
+        self.book_at(pgid, members, std::time::Instant::now());
+    }
+
+    /// [`Meter::book`] as of `now`. The group's CPU rate ([`Meter::live_rate`]) is the CPU its
+    /// members gained since the group's last read over the time between the reads: a member first
+    /// seen brings all it has used, so a burst it started with is not left out.
+    pub(crate) fn book_at(
+        &self,
+        pgid: u32,
+        members: &[aterm_sysprobe::MemberUsage],
+        now: std::time::Instant,
+    ) {
         if members.is_empty() {
             return;
         }
         {
             let mut cpu = self.cpu.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut gained = 0_u64;
             for member in members {
                 let counter = cpu.entry((member.pid, member.start)).or_default();
+                gained = gained.saturating_add(member.cpu_ns.saturating_sub(*counter));
                 *counter = (*counter).max(member.cpu_ns);
             }
+            let mut rates = self.rates.lock().unwrap_or_else(PoisonError::into_inner);
+            let rate = rates.get(&pgid).map_or(0.0, |(at, _)| {
+                let span = now.saturating_duration_since(*at).as_secs_f64();
+                if span > 0.0 {
+                    std::time::Duration::from_nanos(gained).as_secs_f64() / span
+                } else {
+                    0.0
+                }
+            });
+            rates.insert(pgid, (now, rate));
         }
         let mut h = self.held.lock().unwrap_or_else(PoisonError::into_inner);
         let sum = members
@@ -302,13 +353,26 @@ impl Meter {
         }
     }
 
-    /// The group `pgid` ended: what it held is the stage's no longer.
+    /// The group `pgid` ended: what it held is the stage's no longer, nor the cores it used.
     pub fn ended(&self, pgid: u32) {
         self.held
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .live
             .remove(&pgid);
+        self.rates
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&pgid);
+    }
+
+    /// The cores the stage's live process groups use now: the sum of each one's rate between its
+    /// last two reads ([`Meter::book_at`]), every member of the group counted, the descendants its
+    /// leader never waits for included. `None` when no group is read (every platform but macOS).
+    #[must_use]
+    pub fn live_rate(&self) -> Option<f64> {
+        let rates = self.rates.lock().unwrap_or_else(PoisonError::into_inner);
+        (!rates.is_empty()).then(|| rates.values().map(|(_, rate)| rate).sum())
     }
 
     /// Retain observed CPU after groups exit, counting a process incarnation once
@@ -553,8 +617,14 @@ pub enum How {
     /// From the peaks a plain `targo` build of its selection kept ([`plain_like`]), with none of
     /// its own kept anywhere.
     Plain(Learned),
+    /// From records of narrower selections that name every crate of its own ([`composed`]),
+    /// with none of its own kept anywhere, nor a plain build's, and it compiles.
+    Composed(Cover),
     /// No peak kept, and it compiles: the cold figure ([`aterm_capacity::cold_claim`]).
     Cold,
+    /// No peak kept, and it runs test binaries side by side ([`runs_binaries_together`]): the
+    /// cold figure too.
+    Together,
     /// No peak kept, and it compiles nothing.
     Light,
     /// It touches no target directory ([`metered`]): never measured, never claimed.
@@ -609,10 +679,55 @@ impl fmt::Display for StageNeed {
                     aterm_capacity::size(l.peak)
                 )
             }
+            How::Composed(c) => {
+                let parts: Vec<String> = c
+                    .parts
+                    .iter()
+                    .map(|p| {
+                        let most = aterm_capacity::size(p.most);
+                        match &p.inside {
+                            None => format!("{} ({most})", p.key.selection()),
+                            Some(inside) => format!(
+                                "{} ({most}, kept by {} inside it)",
+                                p.key.selection(),
+                                inside.selection()
+                            ),
+                        }
+                    })
+                    .collect();
+                let bound = if aterm_capacity::peak_claim(c.peak) > self.bytes {
+                    "at most the cold figure (16 GiB, at most half of physical memory)"
+                } else {
+                    "at least 1 GiB"
+                };
+                let sum = format!(
+                    "the sum of what runs of {} kept ({})",
+                    and_list(&parts),
+                    aterm_capacity::size(c.sum)
+                );
+                match &c.inside {
+                    None => write!(
+                        f,
+                        "{bytes}, {sum} and a fifth more, {bound}: no run of it is kept"
+                    ),
+                    Some((inside, most)) => write!(
+                        f,
+                        "{bytes}, the most a run of {} inside it kept ({}), more than {sum}, and \
+                         a fifth more, {bound}: no run of it is kept",
+                        inside.selection(),
+                        aterm_capacity::size(*most)
+                    ),
+                }
+            }
             How::Cold => write!(
                 f,
                 "{bytes} cold: no run of it is kept, and it compiles (16 GiB, at most half of \
                  physical memory)"
+            ),
+            How::Together => write!(
+                f,
+                "{bytes} cold: no run of it is kept, and it runs test binaries side by side (16 \
+                 GiB, at most half of physical memory)"
             ),
             How::Light => f.write_str("nothing: no run of it is kept, and it compiles nothing"),
             How::Unmetered => f.write_str("nothing: it touches no target directory"),
@@ -685,15 +800,207 @@ pub fn plain_like(plain: &Records, key: &Key) -> Option<Learned> {
         })
 }
 
+/// `a`, `a and b`, `a, b and c`.
+fn and_list(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// A COVER OF NARROWER SELECTIONS ([`composed`]): records of a stage's narrower selections, of its
+/// variant and in any checkout, that together name every crate of its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Cover {
+    /// Each part, by selection.
+    pub parts: Vec<CoverPart>,
+    /// What the parts weigh, summed, bytes.
+    pub sum: u64,
+    /// The record of a selection inside the key's that kept the most of any, and that most,
+    /// bytes, where that is more than `sum`: it straddles the parts, and its run compiled nothing
+    /// the key's will not.
+    pub inside: Option<(Key, u64)>,
+    /// What the stage claims by, bytes: `sum`, or what `inside` kept.
+    pub peak: u64,
+}
+
+/// One part of a [`Cover`]: a narrower selection, and what it weighs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoverPart {
+    /// The record of its selection that kept the most of it.
+    pub key: Key,
+    /// What it weighs, bytes: the most any record of it, or of a selection inside it, kept.
+    pub most: u64,
+    /// The record of a selection inside it that kept `most`, where that is more than any record
+    /// of its own kept: its own run compiled less than that one did (a warmer cache).
+    pub inside: Option<Key>,
+}
+
+/// The most steps [`composed`]'s search takes: past them, the least cover it found stands. Its
+/// first descent finds a cover in at most a step a crate, so a selection some cover names
+/// always finds one.
+const COVER_STEPS: usize = 10_000;
+
+/// A narrower selection [`composed`]'s search may take.
+struct Weighed<'a> {
+    /// The crates it names (bit `i`: the key's `i`th).
+    names: u128,
+    /// What it weighs ([`CoverPart::most`]).
+    most: u64,
+    /// The record of it that kept the most of it.
+    key: &'a Key,
+    /// The record inside it that kept `most`, where that is more ([`CoverPart::inside`]).
+    inside: Option<&'a Key>,
+}
+
+/// The least-sum search of [`composed`]: each step covers the lowest crate not yet covered with
+/// each part that names it, lightest first, and leaves a branch whose sum reaches the least found.
+struct CoverSearch<'a> {
+    /// Each narrower selection once, lightest first.
+    parts: &'a [Weighed<'a>],
+    /// Every crate of the key.
+    full: u128,
+    /// The steps left.
+    steps: usize,
+    /// The parts taken on this branch.
+    taken: Vec<usize>,
+    /// The least sum found, and its parts.
+    best: Option<(u64, Vec<usize>)>,
+}
+
+impl CoverSearch<'_> {
+    /// Search on from a branch that covers `covered` at `sum`.
+    fn descend(&mut self, covered: u128, sum: u64) {
+        if covered == self.full {
+            if self.best.as_ref().is_none_or(|(least, _)| sum < *least) {
+                self.best = Some((sum, self.taken.clone()));
+            }
+            return;
+        }
+        if self.steps == 0 || self.best.as_ref().is_some_and(|(least, _)| sum >= *least) {
+            return;
+        }
+        self.steps -= 1;
+        let next = 1u128 << (self.full & !covered).trailing_zeros();
+        let parts = self.parts;
+        for (i, part) in parts.iter().enumerate() {
+            if part.names & next != 0 {
+                self.taken.push(i);
+                self.descend(covered | part.names, sum.saturating_add(part.most));
+                self.taken.pop();
+            }
+        }
+    }
+}
+
+/// WHAT NARROWER SELECTIONS KEPT, for a stage whose record `key` names a selection of two crates
+/// or more (at most 128): the records of its stage and variant, in any checkout, over selections
+/// inside its own, whose crates together name every crate of `key`'s, the cover whose sum is
+/// least ([`COVER_STEPS`]). Each part weighs the most any checkout's record of it, or of a
+/// selection inside it, kept ([`CoverPart::most`]): its own run compiles at least what a run of
+/// a selection inside it did, so a light record of it (a run over a warm cache) bounds nothing
+/// that heavier one contradicts. For the same reason the cover claims by the most any narrower
+/// record kept where that is more than its sum ([`Cover::inside`]: one that straddles the
+/// parts). A part may share crates with another: the sum still bounds their union. `None` where
+/// a crate of the selection is in no narrower record: nothing bounds what its units take.
+#[must_use]
+pub fn composed(records: &Records, key: &Key) -> Option<Cover> {
+    let crates = key.crates.as_deref()?;
+    if crates.len() < 2 || crates.len() > 128 {
+        return None;
+    }
+    let full = u128::MAX >> (128 - crates.len());
+    let names = |theirs: &[String]| {
+        theirs.iter().try_fold(0u128, |m, c| {
+            crates.iter().position(|k| k == c).map(|i| m | (1u128 << i))
+        })
+    };
+    let mut own: Vec<(u128, u64, &Key)> = Vec::new();
+    for row in records.rows() {
+        let k = &row.key;
+        if k.stage != key.stage || k.variant != key.variant {
+            continue;
+        }
+        let Some(mask) = k.crates.as_deref().and_then(names) else {
+            continue;
+        };
+        let Some(most) = row.peaks.iter().map(|p| p.bytes).max() else {
+            continue;
+        };
+        if mask == 0 || mask == full {
+            continue;
+        }
+        match own.iter_mut().find(|p| p.0 == mask) {
+            Some(p) if p.1 >= most => {}
+            Some(p) => *p = (mask, most, k),
+            None => own.push((mask, most, k)),
+        }
+    }
+    if own.iter().fold(0u128, |m, p| m | p.0) != full {
+        return None;
+    }
+    // The selection inside `within` that kept the most, where that is more than `above`; of two
+    // that kept as much, the one whose crates sort first.
+    let heaviest = |within: u128, above: u64| {
+        own.iter()
+            .filter(|q| q.0 & !within == 0 && q.1 > above)
+            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.2.crates.cmp(&a.2.crates)))
+    };
+    let mut parts: Vec<Weighed> = own
+        .iter()
+        .map(|&(names, most, key)| {
+            let inside = heaviest(names, most);
+            Weighed {
+                names,
+                most: inside.map_or(most, |q| q.1),
+                key,
+                inside: inside.map(|q| q.2),
+            }
+        })
+        .collect();
+    parts.sort_by(|a, b| {
+        a.most
+            .cmp(&b.most)
+            .then_with(|| a.key.crates.cmp(&b.key.crates))
+    });
+    let mut search = CoverSearch {
+        parts: &parts,
+        full,
+        steps: COVER_STEPS,
+        taken: Vec::new(),
+        best: None,
+    };
+    search.descend(0, 0);
+    let (sum, taken) = search.best?;
+    let mut parts: Vec<CoverPart> = taken
+        .into_iter()
+        .map(|i| CoverPart {
+            key: parts[i].key.clone(),
+            most: parts[i].most,
+            inside: parts[i].inside.cloned(),
+        })
+        .collect();
+    parts.sort_by(|a, b| a.key.crates.cmp(&b.key.crates));
+    let inside = heaviest(full, sum).map(|q| (q.2.clone(), q.1));
+    Some(Cover {
+        parts,
+        sum,
+        peak: inside.as_ref().map_or(sum, |(_, most)| *most),
+        inside,
+    })
+}
+
 /// What stage `spec`, its record kept under `key` ([`StageKey::of_run`]), claims on a machine of
 /// `physical` bytes (`None`: unread), by `records`: its learned peak and a fifth more, at least
 /// 1 GiB more ([`aterm_capacity::peak_claim`]); with none kept in its checkout, the most its
 /// stage and selection kept in another ([`Records::elsewhere`]: a new worktree's first run, the
 /// common case, would otherwise claim the cold figure for a compile some other worktree measured);
 /// with none of those, the most a plain build of the same work kept in `plain`
-/// ([`plain_like`]); with none kept anywhere, the cold figure for a stage that compiles
-/// ([`aterm_capacity::cold_claim`]) and nothing for any other; nothing for a stage that touches
-/// no target directory ([`metered`]).
+/// ([`plain_like`]); with none kept anywhere, for a stage that compiles, the sum of what narrower
+/// selections that cover its own weigh and a fifth more, at most the cold figure ([`composed`]),
+/// else the cold figure ([`aterm_capacity::cold_claim`]), and nothing for any other stage;
+/// nothing for a stage that touches no target directory ([`metered`]).
 #[must_use]
 pub fn need(
     records: &Records,
@@ -725,9 +1032,22 @@ pub fn need(
             bytes: aterm_capacity::peak_claim(l.peak),
             how: How::Plain(l),
         },
-        None if compiles(spec.id) => StageNeed {
+        None if compiles(spec.id) => {
+            let cold = aterm_capacity::cold_claim(physical);
+            match composed(records, key) {
+                Some(c) => StageNeed {
+                    bytes: aterm_capacity::peak_claim(c.peak).min(cold),
+                    how: How::Composed(c),
+                },
+                None => StageNeed {
+                    bytes: cold,
+                    how: How::Cold,
+                },
+            }
+        }
+        None if runs_binaries_together(spec.id) => StageNeed {
             bytes: aterm_capacity::cold_claim(physical),
-            how: How::Cold,
+            how: How::Together,
         },
         None => StageNeed {
             bytes: 0,

@@ -31,6 +31,7 @@ mod grants;
 mod graph;
 mod identity_read;
 mod installer;
+mod keeper_native;
 mod keys;
 mod lifeline;
 mod m6_names;
@@ -38,6 +39,7 @@ mod machines;
 mod mint;
 mod mirror_rows;
 mod mktemp;
+mod release_test_state;
 mod rules;
 mod rustup_keg;
 mod seam_caller;
@@ -130,6 +132,7 @@ pub const GUARDS: &[Rule] = &[
     conflict_marker::CONFLICT_MARKER,
     mirror_rows::MIRROR_ROWS,
     unmounted_test::UNMOUNTED_TEST,
+    release_test_state::RELEASE_TEST_STATE,
     win_resources::WIN_RESOURCES,
 ];
 

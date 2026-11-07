@@ -12,6 +12,19 @@
 
 #![cfg_attr(not(unix), allow(dead_code))]
 
+static PASS_ENDED: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+pub(crate) fn on_pass_ended(ended: fn()) {
+    let _ = PASS_ENDED.set(ended);
+}
+
+#[cfg(unix)]
+fn pass_ended() {
+    if let Some(ended) = PASS_ENDED.get() {
+        ended();
+    }
+}
+
 /// Whether this process runs the converge pass's window lane, or the Secrets stage's pass: a
 /// windowed instance (not `headless`) on a Unix desktop whose first-run setup is not running now
 /// (`unified_setup`: the setup's own startup then starts the lane, `crate::start_converge_lane`,
@@ -120,14 +133,15 @@ fn moved_line(woke: crate::network_moved::Woke) -> String {
 }
 
 /// Start one pass for the first-launch Secrets stage that just ended (`--trigger setup`),
-/// without waiting for it: the setup's later stages go on. The process's reaper collects it.
+/// without waiting for it: the setup's later stages go on. The process's reaper collects it
+/// and queues the same completion observation as the window lane.
 pub(crate) fn start_after_secrets() {
     #[cfg(unix)]
     if runs(false, false, &env_set) {
         after_secrets(&mut |trigger| {
             std::env::current_exe()
                 .and_then(|exe| aterm_secrets::converge::start(&exe, trigger))
-                .map(drop)
+                .map(|child| hand_off_pass(child, pass_ended))
         });
     }
 }
@@ -172,21 +186,54 @@ impl Ended {
 /// Run one pass for `trigger` from `exe` and wait for it.
 #[cfg(unix)]
 fn pass(exe: &std::path::Path, trigger: &str) -> Ended {
-    let mut child = match aterm_secrets::converge::start(exe, trigger) {
+    pass_starting(|| aterm_secrets::converge::start(exe, trigger), pass_ended)
+}
+
+#[cfg(unix)]
+fn pass_starting(
+    start: impl FnOnce() -> std::io::Result<aterm_uds::spawnfd::Child>,
+    ended: impl FnOnce(),
+) -> Ended {
+    let mut child = match start() {
         Ok(child) => child,
         Err(error) => return Ended::Unstarted(error.to_string()),
     };
     match child.wait() {
-        Ok(status) if status.success() => Ended::Ran,
-        Ok(status) if status.code() == Some(i32::from(aterm_secrets::converge::HELD)) => {
-            Ended::Held
+        Ok(status) => {
+            let result = ended_status(status);
+            if result != Ended::Held {
+                ended();
+            }
+            result
         }
-        Ok(status) if status.code() == Some(i32::from(aterm_secrets::converge::UNFINISHED)) => {
-            Ended::Unfinished
-        }
-        Ok(status) => Ended::Failed(status.code()),
         Err(error) => Ended::Unstarted(error.to_string()),
     }
+}
+
+#[cfg(unix)]
+fn ended_status(status: std::process::ExitStatus) -> Ended {
+    match status.code() {
+        _ if status.success() => Ended::Ran,
+        Some(code) if code == i32::from(aterm_secrets::converge::HELD) => Ended::Held,
+        Some(code) if code == i32::from(aterm_secrets::converge::UNFINISHED) => Ended::Unfinished,
+        code => Ended::Failed(code),
+    }
+}
+
+#[cfg(unix)]
+fn hand_off_pass(mut child: aterm_uds::spawnfd::Child, mut ended: impl FnMut() + Send + 'static) {
+    aterm_uds::reaper::hand_off(move || match child.try_wait() {
+        Ok(Some(status)) => {
+            if ended_status(status) != Ended::Held {
+                ended();
+            }
+            true
+        }
+        // spawnfd permanently retires custody after ECHILD. No terminal status was learned,
+        // so release this waiter without turning lost custody into a completion notification.
+        Err(error) if error.raw_os_error() == Some(libc::ECHILD) => true,
+        Ok(None) | Err(_) => false,
+    });
 }
 
 /// The aterm.log line for a lane pass that ended as `ended`; none for one that ran.
@@ -208,6 +255,93 @@ fn ended_line(ended: &Ended) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reaped_elsewhere_child_releases_its_waiter_without_claiming_completion() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        struct Released(mpsc::Sender<()>);
+        impl Drop for Released {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        let child = aterm_uds::spawnfd::command("/usr/bin/true")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let until = Instant::now() + Duration::from_secs(60);
+        loop {
+            let mut status = 0;
+            // SAFETY: this test exclusively owns this native child. Reap it outside its
+            // handle to exercise spawnfd's real lost-custody latch, without signalling a PID.
+            let got = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if got == pid {
+                break;
+            }
+            assert!(
+                got >= 0
+                    || std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            );
+            assert!(Instant::now() < until, "the native child did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let notified = Arc::new(AtomicBool::new(false));
+        let called = Arc::clone(&notified);
+        let (send, receive) = mpsc::channel();
+        let released = Released(send);
+        hand_off_pass(child, move || {
+            let _held = &released;
+            called.store(true, Ordering::Release);
+        });
+        receive.recv_timeout(Duration::from_secs(60)).unwrap();
+        assert!(!notified.load(Ordering::Acquire));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn actual_terminal_children_queue_readback_in_both_window_and_setup_paths() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        for (program, expected) in [
+            ("/usr/bin/true", Ended::Ran),
+            ("/usr/bin/false", Ended::Failed(Some(1))),
+        ] {
+            let mut notified = false;
+            let result = pass_starting(
+                || aterm_uds::spawnfd::command(program).spawn(),
+                || notified = true,
+            );
+            assert_eq!(result, expected);
+            assert!(
+                notified,
+                "a failed child may have completed part of the work too"
+            );
+
+            let child = aterm_uds::spawnfd::command(program).spawn().unwrap();
+            let (send, receive) = mpsc::channel();
+            hand_off_pass(child, move || send.send(()).unwrap());
+            receive.recv_timeout(Duration::from_secs(60)).unwrap();
+            assert!(
+                receive.recv_timeout(Duration::from_secs(60)).is_err(),
+                "one child has one terminal notification"
+            );
+        }
+        let mut notified = false;
+        assert!(matches!(
+            pass_starting(
+                || Err(std::io::ErrorKind::NotFound.into()),
+                || notified = true
+            ),
+            Ended::Unstarted(_)
+        ));
+        assert!(!notified, "a failed start is no completion");
+    }
 
     /// The window's lane runs for a windowed launch with no first-run setup running, outside a
     /// private state root and CI; headless, a setup running now, `ATERM_STATE_HOME` or `CI` each

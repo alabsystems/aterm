@@ -121,12 +121,14 @@ impl LinuxProver for Chain<'_> {
         let head = self.fetch(authority, "aterm-appcast.toml", APPCAST_LIMIT)?;
         let head_sig = self.fetch(authority, "aterm-appcast.toml.sig", SIG_LIMIT)?;
         let current = self.appcast(&roster, &head, &head_sig, &authority.tag)?;
+        let archived;
         let manifest = if release.tag == authority.tag {
-            current.clone()
+            &current
         } else {
             let bytes = self.fetch(release, &proof, APPCAST_LIMIT)?;
             let sig = self.fetch(release, &format!("{proof}.sig"), SIG_LIMIT)?;
-            self.appcast(&roster, &bytes, &sig, &release.tag)?
+            archived = self.appcast(&roster, &bytes, &sig, &release.tag)?;
+            &archived
         };
         let floor = current.min_build.unwrap_or(0);
         if manifest.build_number < floor.max(manifest.min_build.unwrap_or(0)) {

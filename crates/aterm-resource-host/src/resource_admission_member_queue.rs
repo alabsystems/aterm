@@ -8,7 +8,7 @@ use crate::subgroup_delegation::Prepared;
 use aterm_ctl::resource_subgroup_client::{AuthorizedSubgroup, Delegations, Rights};
 use aterm_types::resource_admission::Event;
 use aterm_types::resource_subgroup::Request;
-use std::os::fd::OwnedFd;
+use std::os::{fd::OwnedFd, unix::ffi::OsStrExt as _};
 
 struct Pending {
     request: Request,
@@ -18,10 +18,15 @@ struct Pending {
     stderr: OwnedFd,
     delegated: Delegations,
     events: job::Events,
+    proof: Option<crate::resource_producer::TransportProof>,
+    arg0: Option<Vec<u8>>,
+    timeout: Option<Duration>,
+    named_targets: Option<[u32; 2]>,
 }
 struct Active {
     attempt: member::OwnedAttempt<Prepared>,
     peer: Peer,
+    proof: Option<crate::resource_producer::TransportProof>,
     cpu: Option<u32>,
     bound: bool,
     terminal: bool,
@@ -89,6 +94,29 @@ impl member::MemberResources for Prepared {
 }
 impl Owner {
     pub(in super::super) fn submit_member(&mut self, incoming: AuthorizedSubgroup) {
+        let timeout = incoming
+            .request
+            .member
+            .timeout_ms
+            .map(Duration::from_millis);
+        self.submit_member_proved(incoming, None, None, timeout, None);
+    }
+    pub(super) fn submit_member_proved(
+        &mut self,
+        incoming: AuthorizedSubgroup,
+        proof: Option<crate::resource_producer::TransportProof>,
+        arg0: Option<Vec<u8>>,
+        timeout: Option<Duration>,
+        named_targets: Option<[u32; 2]>,
+    ) {
+        // Never tell a replaying caller that an already-known binding had no
+        // execution. Closing its new channel preserves unknown delivery.
+        if !matches!(
+            self.journal.fresh(&incoming.request.member.binding),
+            Ok(true)
+        ) {
+            return;
+        }
         let accepted = members::Authorization::of(&incoming.request, incoming.peer)
             .is_ok_and(|check| self.authorize_member(&check));
         let AuthorizedSubgroup {
@@ -136,6 +164,10 @@ impl Owner {
                         stderr,
                         delegated,
                         events,
+                        proof,
+                        arg0,
+                        timeout,
+                        named_targets,
                     })),
                 },
             );
@@ -176,15 +208,20 @@ impl Owner {
             State::Pending(mut pending) => {
                 let allowed = members::Authorization::of(&pending.request, pending.peer)
                     .is_ok_and(|check| members::live(&self.fence, &self.debt, job, &check));
-                if !allowed || pending.events.cancelled() || self.faulted {
+                let proof_valid = pending
+                    .proof
+                    .as_ref()
+                    .is_none_or(|proof| proof.validate().is_ok());
+                if !allowed || !proof_valid || pending.events.cancelled() || self.faulted {
                     refuse_pending(*pending, "member cancelled or original coverage lost")
                 } else {
-                    match Prepared::try_new(
+                    match Prepared::try_new_mapped(
                         &self.pool,
                         &self.debt,
                         self.pool.slots().get(),
                         &pending.request,
                         &pending.delegated,
+                        pending.named_targets,
                     ) {
                         Ok(None) => State::Pending(pending),
                         Ok(Some(prepared))
@@ -249,6 +286,9 @@ impl Owner {
             Ok(command) => command,
             Err(_) => return refuse_pending(pending, "member executable recipe is not qualified"),
         };
+        if let Some(arg0) = &pending.arg0 {
+            command.arg0(std::ffi::OsStr::from_bytes(arg0));
+        }
         let coverage = match job::inspection(&self.fence, &self.debt, job) {
             Ok(coverage) => coverage,
             Err(_) => return refuse_pending(pending, "member original resources unavailable"),
@@ -268,6 +308,10 @@ impl Owner {
             stderr,
             delegated: _,
             events,
+            proof,
+            arg0: _,
+            timeout,
+            named_targets: _,
         } = pending;
         command
             .stdin(spawnfd::Stdio::from(stdin))
@@ -280,17 +324,19 @@ impl Owner {
                 fence: &self.fence,
                 debt: &self.debt,
                 peer,
+                proof: proof.as_ref(),
             },
             command,
             prepared,
             events,
             request.member.binding,
-            request.member.timeout_ms.map(Duration::from_millis),
+            timeout,
             crate::actor::wake,
         );
         State::Active(Box::new(Active {
             attempt,
             peer,
+            proof,
             cpu,
             bound: false,
             terminal: false,
@@ -318,6 +364,7 @@ impl Owner {
             fence: &self.fence,
             debt: &self.debt,
             peer: active.peer,
+            proof: active.proof.as_ref(),
         };
         let progress = active.attempt.poll(&mut custody, cause);
         if progress.uncertain

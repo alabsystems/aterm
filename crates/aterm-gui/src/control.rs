@@ -138,7 +138,7 @@ pub(crate) use control_session::turn_ids_for_handoff;
 #[cfg(unix)]
 pub(crate) use control_session::turn_ids_past_handoff_ceiling;
 #[cfg(test)]
-pub(crate) use control_session::{RestWrite, rest_writes, turn_paste_event, typed_key_events};
+pub(crate) use control_session::{RestWrite, rest_run_event, rest_writes, typed_key_events};
 pub(crate) use control_session::{TURN_ID_RESERVE, raise_turn_ids, turn_ids_minted};
 #[cfg(test)]
 pub(crate) use control_session::{TurnIo, cmd_turn};
@@ -2620,7 +2620,17 @@ impl Drop for BridgeLostGuard {
 
 struct AccountServices {
     lifetime: aterm_agent::harness::account_work::Lifetime,
+    source_registry: Arc<aterm_agent::harness::codex_source_registry::Registry>,
     interactive_browser: bool,
+}
+
+/// The control host's actual source registry. Constructors must share this
+/// instance with authenticated source dispatch, never create a private registry.
+pub(crate) fn source_registry() -> Option<Arc<aterm_agent::harness::codex_source_registry::Registry>>
+{
+    BRIDGE_CONTEXT
+        .get()
+        .map(|context| Arc::clone(&context.account_services.source_registry))
 }
 
 impl AccountServices {
@@ -2834,12 +2844,20 @@ impl control_lanes::LaneService for ControlWorkerContext {
     }
 
     fn release(&self, id: u64) {
-        release_connection_claims(&self.store, Some(&self.proxy), id);
+        release_source_connection_claims(
+            &self.store,
+            Some(&self.proxy),
+            id,
+            &self.account_services.source_registry,
+        );
     }
 
     #[cfg(unix)]
     fn has_live_claim(&self, id: u64) -> bool {
-        connection_has_live_claim(&self.store, id, crate::metrics::now_us())
+        self.account_services
+            .source_registry
+            .has_live_connection(id)
+            || connection_has_live_claim(&self.store, id, crate::metrics::now_us())
     }
 }
 
@@ -3493,6 +3511,7 @@ pub(crate) fn spawn(
                 proxy: proxy.clone(),
                 account_services: AccountServices {
                     lifetime: account_work,
+                    source_registry: Arc::new(Default::default()),
                     interactive_browser,
                 },
                 token: token.clone(),
@@ -6290,11 +6309,17 @@ struct ConnectionScope<'a> {
     _serving: ServingFd,
     store: &'a Store,
     proxy: &'a EventLoopProxy<Wake>,
+    source_registry: &'a aterm_agent::harness::codex_source_registry::Registry,
 }
 
 #[cfg(unix)]
 impl<'a> ConnectionScope<'a> {
-    fn enter(store: &'a Store, proxy: &'a EventLoopProxy<Wake>, stream: &CtlStream) -> Self {
+    fn enter(
+        store: &'a Store,
+        proxy: &'a EventLoopProxy<Wake>,
+        stream: &CtlStream,
+        source_registry: &'a aterm_agent::harness::codex_source_registry::Registry,
+    ) -> Self {
         let id = NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed);
         SERVING_CONNECTION.with(|serving| serving.set(Some(id)));
         CONNECTION_CLAIMED.with(|claimed| claimed.set(false));
@@ -6303,6 +6328,7 @@ impl<'a> ConnectionScope<'a> {
             _serving: ServingFd::enter(stream),
             store,
             proxy,
+            source_registry,
         }
     }
 }
@@ -6314,7 +6340,12 @@ impl Drop for ConnectionScope<'_> {
         if !CONNECTION_CLAIMED.with(|claimed| claimed.replace(false)) {
             return;
         }
-        release_connection_claims(self.store, Some(self.proxy), self.id);
+        release_source_connection_claims(
+            self.store,
+            Some(self.proxy),
+            self.id,
+            self.source_registry,
+        );
     }
 }
 
@@ -6445,6 +6476,17 @@ mod connection_claim_tests {
     }
 }
 
+fn release_source_connection_claims(
+    store: &Store,
+    proxy: Option<&EventLoopProxy<Wake>>,
+    conn: u64,
+    source_registry: &aterm_agent::harness::codex_source_registry::Registry,
+) {
+    source_registry.connection_closed(conn);
+    crate::native_act::source_connection_closed(conn);
+    release_connection_claims(store, proxy, conn);
+}
+
 fn release_connection_claims(store: &Store, proxy: Option<&EventLoopProxy<Wake>>, conn: u64) {
     let handles = store.read().unwrap_or_else(|p| p.into_inner()).snapshot();
     let now = crate::metrics::now_us();
@@ -6481,7 +6523,8 @@ fn serve_preresolved(
     sock_dir: &std::path::Path,
     recovery_count_admission: &crate::keeper_link::RecoveryCountAdmission,
 ) -> ServeDisposition {
-    let _connection = ConnectionScope::enter(store, proxy, stream);
+    let _connection =
+        ConnectionScope::enter(store, proxy, stream, &account_services.source_registry);
     let _principal = ServingPrincipal::enter(Principal::Instance);
     if arm_authenticated_read_poll(stream).is_err() {
         return ServeDisposition::Close;
@@ -10329,6 +10372,19 @@ fn serve_session_verb(
     if verb == "codex-rotation" {
         return crate::native_act::serve_codex_rotation(self_ctx, master, rest);
     }
+    if verb == "codex-auth" {
+        // Source members retain their authenticated connection past replies;
+        // its actual release must always invalidate the registry token.
+        note_connection_claim();
+        return crate::native_act::serve_codex_auth(
+            self_ctx,
+            master,
+            rest,
+            &cx.account_services.lifetime,
+            &cx.account_services.source_registry,
+            serving_connection(),
+        );
+    }
     if verb == "codex-accounts-change" {
         return crate::native_act::serve_codex_enrollment(
             self_ctx,
@@ -10479,6 +10535,7 @@ fn serve_session_verb(
         foreground: None,
         guard_at_cursor: false,
         entering_command: false,
+        standing: None,
     };
 
     if verb == "send"

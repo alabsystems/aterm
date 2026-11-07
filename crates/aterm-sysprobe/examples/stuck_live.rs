@@ -279,6 +279,7 @@ impl Host {
             process_limit: self.process_limit,
             held,
             grant_ms: None,
+            exits: Vec::new(),
         })
     }
 }

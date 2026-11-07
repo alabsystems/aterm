@@ -429,8 +429,12 @@ impl Ledger {
         )
     )]
     pub(super) fn recover(&mut self, done: u16, legacy: Option<Stage>) -> bool {
+        self.recover_scoped(done, legacy, u16::MAX)
+    }
+
+    pub(super) fn recover_scoped(&mut self, done: u16, legacy: Option<Stage>, scope: u16) -> bool {
         let before = *self;
-        let recorded = self.running | legacy.map_or(0, Stage::bit);
+        let recorded = (self.running | legacy.map_or(0, Stage::bit)) & scope;
         for stage in Stage::ALL {
             let bit = stage.bit();
             if recorded & bit == 0 {
@@ -458,8 +462,8 @@ impl Ledger {
                 }
             }
         }
-        self.running = 0;
-        self.quit = 0;
+        self.running &= !scope;
+        self.quit &= !scope;
         *self != before
     }
 

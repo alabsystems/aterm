@@ -1267,12 +1267,35 @@ fn a_failed_model_call_is_an_api_wall() {
     assert_eq!(r.wall.map(|w| w.kind), Some(api(Some(500), true)));
     assert_eq!(r.said_tail, None);
     let rows = screen(SERVER_ERROR_FINAL);
-    let bad = edited(
-        &rows,
-        "◆ model failed",
-        "◆ model failed: API error 400: bad request (invalid_request_error)",
-    );
-    assert_eq!(wall(&bad).map(|w| w.kind), Some(api(Some(400), false)));
+    // A refused status is the request's, never the server's: sent again it meets the same.
+    for (code, words) in [
+        (400, "bad request (invalid_request_error)"),
+        (403, "forbidden (permission_error)"),
+        (404, "model not found (not_found_error)"),
+        (422, "unprocessable entity (invalid_request_error)"),
+    ] {
+        let msg = format!("◆ model failed: API error {code}: {words}");
+        let bad = edited(&rows, "◆ model failed", &msg);
+        assert_eq!(
+            wall(&bad).map(|w| w.kind),
+            Some(WallKind::ApiError {
+                code: Some(code),
+                retryable: false,
+                cause: ApiCause::Request,
+            }),
+            "{msg}"
+        );
+    }
+    // CONTROL: 401 and 451 are the 4xx statuses the cause leaves the server's.
+    for code in [401, 451] {
+        let msg = format!("◆ model failed: API error {code}: unavailable");
+        let other = edited(&rows, "◆ model failed", &msg);
+        assert_eq!(
+            wall(&other).map(|w| w.kind),
+            Some(api(Some(code), false)),
+            "{msg}"
+        );
+    }
     let unnamed = edited(&rows, "◆ model failed", "◆ model failed: connection failed");
     assert_eq!(wall(&unnamed).map(|w| w.kind), Some(api(None, true)));
     for msg in [

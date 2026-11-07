@@ -155,7 +155,14 @@ fn private_refs(rel: &str, data: &[u8], out: &mut Vec<Finding>) {
         line,
         detail: detail.to_string(),
     };
-    if find_ignore_ascii_case(rel.as_bytes(), PRIVATE_ORG.as_bytes()).is_some() {
+    // An ASCII path folds in place; any other is lowercased whole, so a letter whose
+    // Unicode lowercase is ASCII (`İ` to `i` and U+0307) still spells the org.
+    let named = if rel.is_ascii() {
+        find_ignore_ascii_case(rel.as_bytes(), PRIVATE_ORG.as_bytes()).is_some()
+    } else {
+        rel.to_lowercase().contains(PRIVATE_ORG)
+    };
+    if named {
         out.push(finding(0, "its path names the private org"));
     }
     let needles = private_ref_needles();

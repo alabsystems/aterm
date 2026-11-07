@@ -187,9 +187,8 @@ fn find_root(start: &Path) -> Option<PathBuf> {
     start
         .ancestors()
         .find(|dir| {
-            std::fs::symlink_metadata(dir.join("libc-oracle/Cargo.toml")).is_ok_and(|m| m.is_file())
-                && std::fs::symlink_metadata(dir.join("crates/aterm-libc/src/lib.rs"))
-                    .is_ok_and(|m| m.is_file())
+            dir.join("libc-oracle/Cargo.toml").is_file()
+                && dir.join("crates/aterm-libc/src/lib.rs").is_file()
         })
         .map(Path::to_path_buf)
 }
@@ -383,6 +382,28 @@ mod tests {
 
     fn args(words: &[&str]) -> Result<Args, String> {
         parse(words.iter().map(OsString::from))
+    }
+
+    /// A checkout whose marker files are symlinks to regular files is still the root, as
+    /// `Path::is_file` follows them; one missing a marker is not.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_whose_markers_are_symlinks_is_found() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("checkout");
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).expect("real");
+        for rel in ["libc-oracle/Cargo.toml", "crates/aterm-libc/src/lib.rs"] {
+            let target = real.join(rel.replace('/', "-"));
+            std::fs::write(&target, "").expect("write");
+            let link = root.join(rel);
+            std::fs::create_dir_all(link.parent().expect("parent")).expect("dirs");
+            std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        }
+        let start = root.join("crates/aterm-libc/src");
+        assert_eq!(find_root(&start), Some(root.clone()));
+        std::fs::remove_file(root.join("libc-oracle/Cargo.toml")).expect("remove");
+        assert_eq!(find_root(&start), None);
     }
 
     #[test]

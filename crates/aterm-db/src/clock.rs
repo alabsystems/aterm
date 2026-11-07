@@ -804,19 +804,22 @@ impl Clocks {
             .retain(|machine, _| members.contains_key(machine) && machine != me);
         self.changed |= self.state.readings.len() != before;
         let judged = standing(&self.state.readings, members, me, self.state.last, now_ms);
+        let moved = self.written.as_ref().is_none_or(|(standing, written)| {
+            *standing != judged.standing
+                || written.len() != self.state.readings.len()
+                || self.state.readings.iter().any(|(machine, reading)| {
+                    written.get(machine) != Some(&reading.class(self.state.last))
+                })
+        });
+        if !moved && !self.due(now, keep) {
+            return false;
+        }
         let classes: BTreeMap<[u8; 16], Class> = self
             .state
             .readings
             .iter()
             .map(|(machine, reading)| (*machine, reading.class(self.state.last)))
             .collect();
-        let moved = self
-            .written
-            .as_ref()
-            .is_none_or(|(standing, written)| *standing != judged.standing || *written != classes);
-        if !moved && !self.due(now, keep) {
-            return false;
-        }
         self.state.last = judged.standing;
         self.written = Some((judged.standing, classes));
         self.changed = false;

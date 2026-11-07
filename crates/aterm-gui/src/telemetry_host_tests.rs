@@ -259,6 +259,8 @@ fn an_agent_call_row_is_sampled_from_its_job() {
         last_read_ms: Some(18_000),
         ended_ms: 20_000,
         exit: None,
+        ended_by: None,
+        ran: Some("targo".to_owned()),
         peak_bytes: Some(1 << 30),
         cpu_ns: Some(42_000_000_000),
         stuck: false,
@@ -314,9 +316,9 @@ fn the_verb_frames_its_lines_and_its_json() {
     lines.push(spawn.line());
     log.append(&lines).expect("append");
 
-    let summary = cmd_in(tmp.path(), "", false, 10_000);
+    let summary = cmd_in(tmp.path(), "", false, 10_000, (5, 4, 1));
     let mut it = summary.lines();
-    assert_eq!(it.next(), Some("OK 3"), "{summary}");
+    assert_eq!(it.next(), Some("OK 4"), "{summary}");
     assert!(
         it.next()
             .is_some_and(|l| l.starts_with("telemetry schema=1 rows=4 "))
@@ -326,15 +328,237 @@ fn the_verb_frames_its_lines_and_its_json() {
             .is_some_and(|l| l.starts_with("kind=command n=3 failed=1 "))
     );
     assert!(it.next().is_some_and(|l| l.starts_with("kind=spawn n=1 ")));
+    assert_eq!(
+        it.next(),
+        Some("calls watched=5 read=4 missed=1"),
+        "{summary}"
+    );
 
-    let rows = cmd_in(tmp.path(), "rows --kind command --limit 2", false, 10_000);
+    let rows = cmd_in(
+        tmp.path(),
+        "rows --kind command --limit 2",
+        false,
+        10_000,
+        (0, 0, 0),
+    );
     assert!(rows.starts_with("OK 3\n"), "{rows}");
     assert_eq!(rows.matches("kind=command").count(), 2);
 
-    let json = cmd_in(tmp.path(), "since=5s", true, 10_000);
+    let json = cmd_in(tmp.path(), "since=5s", true, 10_000, (0, 0, 0));
     assert!(json.starts_with("OK 1\n{"), "{json}");
     assert!(json.contains(r#""rows_read":0"#), "{json}");
 
-    assert!(cmd_in(tmp.path(), "--since yesterday", false, 10_000).starts_with("ERR telemetry:"));
-    assert!(cmd_in(tmp.path(), "bogus", false, 10_000).starts_with("ERR usage:"));
+    assert!(
+        cmd_in(tmp.path(), "--since yesterday", false, 10_000, (0, 0, 0))
+            .starts_with("ERR telemetry:")
+    );
+    assert!(cmd_in(tmp.path(), "bogus", false, 10_000, (0, 0, 0)).starts_with("ERR usage:"));
+}
+
+fn call(ended_by: Option<aterm_vitals::jobs::ExitOf>, stuck: bool) -> aterm_vitals::jobs::Ended {
+    aterm_vitals::jobs::Ended {
+        tab: 3,
+        block: None,
+        kind: aterm_vitals::jobs::JobKind::AgentCall,
+        consumer: aterm_vitals::jobs::Consumer::Agent,
+        id: "a77".to_owned(),
+        command: String::new(),
+        name: "zsh".to_owned(),
+        opened_ms: 10_000,
+        last_read_ms: Some(18_000),
+        ended_ms: 20_000,
+        exit: None,
+        ended_by,
+        ran: Some("sleep".to_owned()),
+        peak_bytes: None,
+        cpu_ns: None,
+        stuck,
+    }
+}
+
+#[test]
+fn an_agent_call_row_says_how_its_leader_ended() {
+    use aterm_vitals::jobs::ExitOf;
+    let at = |ended_by, stuck| {
+        let r = agent_call_row(&call(ended_by, stuck), 21_000, 0, "m14", facts()).expect("row");
+        (r.outcome, r.stop, r.code, r.sig)
+    };
+    assert_eq!(
+        at(Some(ExitOf::Code(0)), false),
+        (Outcome::Ok, Stop::Exit, Some(0), None)
+    );
+    assert_eq!(
+        at(Some(ExitOf::Code(3)), false),
+        (Outcome::Fail, Stop::Exit, Some(3), None)
+    );
+    assert_eq!(
+        at(Some(ExitOf::Signal(15)), false),
+        (Outcome::Fail, Stop::Signal, None, Some(15)),
+        "a death by a signal has no exit status"
+    );
+    assert_eq!(
+        at(None, false),
+        (Outcome::Unknown, Stop::Unknown, None, None),
+        "an unwatched call's end is unknown, never guessed"
+    );
+    assert_eq!(
+        at(Some(ExitOf::Code(0)), true),
+        (Outcome::Ok, Stop::Stalled, Some(0), None),
+        "a call judged stuck at its last pass keeps the status it ended with"
+    );
+}
+
+#[test]
+fn an_agent_call_is_labelled_by_the_program_it_ran_never_its_wrapper() {
+    let ran = agent_call_row(&call(None, false), 21_000, 0, "m14", facts()).expect("row");
+    assert_eq!(ran.label, "sleep", "not the wrapper `zsh`");
+    assert_eq!(
+        ran.key,
+        Some(Digest::key(&Kind::AgentCall, "sleep", None)),
+        "keyed by the program, as no join named its command"
+    );
+    let builtins = aterm_vitals::jobs::Ended {
+        ran: None,
+        ..call(None, false)
+    };
+    let row = agent_call_row(&builtins, 21_000, 0, "m14", facts()).expect("row");
+    assert_eq!(
+        (row.label.as_str(), row.key),
+        ("-", None),
+        "no program seen"
+    );
+}
+
+/// A live agent call's row for `pid`, its leader started at `start`.
+#[cfg(target_vendor = "apple")]
+fn live_call(pid: u32, start: Option<u64>) -> aterm_vitals::jobs::JobRow {
+    aterm_vitals::jobs::JobRow {
+        leader: (pid, start),
+        ..crate::vitals_jobs::tests::call_row(
+            3,
+            aterm_vitals::jobs::Consumer::Agent,
+            false,
+            1,
+            pid,
+            "zsh",
+        )
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+fn birth(pid: u32) -> Option<u64> {
+    aterm_uds::process::read_birth(i32::try_from(pid).ok()?).map(|b| b.0)
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_watched_leader_hands_the_next_pass_its_status_decoded() {
+    use aterm_vitals::jobs::ExitOf;
+    for (script, end) in [
+        ("read _; exit 3", ExitOf::Code(3)),
+        ("read _; kill -TERM $$", ExitOf::Signal(15)),
+    ] {
+        let mut child = aterm_uds::spawnfd::command("/bin/sh")
+            .args(["-c", script])
+            .stdin(aterm_uds::spawnfd::Stdio::piped())
+            .spawn()
+            .expect("spawn");
+        let pid = child.id();
+        let start = birth(pid);
+        let mut calls = CallWatch::new(true);
+        calls.watch(&[live_call(pid, start)]);
+        assert_eq!(calls.watching(), 1, "a live leader is watched");
+        assert!(calls.read(|_| true).is_empty(), "nothing ended yet");
+        drop(child.stdin.take());
+        let _ = child.wait();
+        // The sweep no longer lists the reaped leader: its event is read, waited for briefly.
+        let exits = calls.read(|_| false);
+        assert_eq!(
+            exits,
+            vec![aterm_vitals::jobs::LeaderExit { pid, start, end }],
+            "{script}"
+        );
+        assert_eq!(calls.watching(), 0, "its watch is let go");
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_pid_taken_anew_or_never_read_is_never_watched_as_the_calls() {
+    let mut child = aterm_uds::spawnfd::command("/bin/sleep")
+        .arg("600")
+        .spawn()
+        .expect("spawn");
+    let pid = child.id();
+    let start = birth(pid).expect("a live child's birth");
+    let mut calls = CallWatch::new(true);
+    // The row read another process's start under this pid: the watch is let go at once.
+    calls.watch_with(&[live_call(pid, Some(start + 1))], birth);
+    assert_eq!(calls.watching(), 0, "another process's pid");
+    calls.watch_with(&[live_call(pid, None)], birth);
+    assert_eq!(calls.watching(), 0, "a start never read");
+    calls.watch_with(&[live_call(pid, Some(start))], birth);
+    assert_eq!(calls.watching(), 1, "the true start is watched");
+    // A pass whose sweep missed the leader, though it lives, keeps its watch.
+    assert!(calls.read(|_| false).is_empty());
+    assert_eq!(
+        calls.watching(),
+        1,
+        "a live leader's watch outlives a partial sweep"
+    );
+    // A call the engine no longer holds open lets its watch go.
+    calls.watch_with(&[], birth);
+    assert_eq!(calls.watching(), 0);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn past_the_cap_a_call_waits_for_a_free_watch() {
+    let mut kids: Vec<_> = (0..=CALL_WATCH_CAP)
+        .map(|_| {
+            aterm_uds::spawnfd::command("/bin/sleep")
+                .arg("600")
+                .spawn()
+                .expect("spawn")
+        })
+        .collect();
+    let rows: Vec<_> = kids
+        .iter()
+        .map(|k| live_call(k.id(), birth(k.id())))
+        .collect();
+    let mut calls = CallWatch::new(true);
+    calls.watch_with(&rows, birth);
+    assert_eq!(calls.watching(), CALL_WATCH_CAP);
+    calls.watch_with(&rows[1..], birth);
+    calls.watch_with(&rows[1..], birth);
+    assert_eq!(
+        calls.watching(),
+        CALL_WATCH_CAP,
+        "the call past the cap is watched once one ends"
+    );
+    for k in &mut kids {
+        let _ = k.kill();
+        let _ = k.wait();
+    }
+}
+
+#[test]
+fn a_call_that_ends_with_no_status_is_counted_missed() {
+    use aterm_vitals::jobs::{ExitOf, JobKind};
+    let shell = aterm_vitals::jobs::Ended {
+        kind: JobKind::Shell,
+        ..call(None, false)
+    };
+    let ended = [call(None, false), call(Some(ExitOf::Code(0)), false), shell];
+    assert_eq!(count_missed(&ended), 1, "only the call with no status");
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_test_pass_watches_nothing() {
+    let mut calls = CallWatch::new(false);
+    calls.watch(&[live_call(std::process::id(), birth(std::process::id()))]);
+    assert_eq!(calls.watching(), 0);
 }

@@ -174,9 +174,11 @@ pub use retirement::{
     machine_named_in_vault, repair_half_done_revokes, rotate_fleet_code_text,
 };
 #[cfg(any(test, debug_assertions))]
+pub use roster::admin_seed_swarm_roster;
+#[cfg(any(test, debug_assertions))]
 pub use roster::test_unwaited_roster;
 pub(crate) use roster::with_roster_observation;
-pub use roster::{admin_seed_swarm_roster, resolve_local_swarm_label, swarm_lease_holder};
+pub use roster::{historical_swarm_roster, resolve_local_swarm_label, swarm_lease_holder};
 #[cfg(any(test, debug_assertions))]
 pub use seat_ask::test_read_dropped;
 pub use seat_ask::{
@@ -1272,9 +1274,11 @@ pub fn default_host_name() -> String {
     if let Some(name) = read_etc_hostname() {
         candidates.push(name);
     }
-    if let Some(tag) = candidates.iter().find_map(|c| extract_machine_tag(c)) {
-        return tag;
-    }
+    host_name_hint(&candidates)
+}
+
+/// Prefer ComputerName, then LocalHostName. A log name is a display hint, not an owner label.
+fn host_name_hint(candidates: &[String]) -> String {
     for candidate in candidates {
         let first = candidate
             .split(|c: char| c.is_whitespace() || c == '.' || c == '-' || c == '_')
@@ -1309,59 +1313,6 @@ fn read_etc_hostname() -> Option<String> {
                 .map(|s| s.trim().to_owned())
         })
         .flatten()
-}
-
-fn extract_machine_tag(raw: &str) -> Option<String> {
-    let stem = raw
-        .trim()
-        .strip_suffix(".local")
-        .unwrap_or_else(|| raw.trim());
-    let tokens: Vec<&str> = stem
-        .split(|c: char| c.is_whitespace() || matches!(c, '.' | '-' | '_' | '(' | ')'))
-        .filter(|s| !s.is_empty())
-        .collect();
-    for (idx, &tok) in tokens.iter().enumerate() {
-        let lower = tok.to_ascii_lowercase();
-        let Some(digits) = lower.strip_prefix('m') else {
-            continue;
-        };
-        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-        let Ok(num) = digits.parse::<u32>() else {
-            continue;
-        };
-        if idx > 0
-            && (1..=5).contains(&num)
-            && (tok.starts_with('M')
-                || tokens.get(idx - 1).is_some_and(|prev| {
-                    matches!(
-                        prev.to_ascii_lowercase().as_str(),
-                        "mac"
-                            | "mini"
-                            | "imac"
-                            | "studio"
-                            | "air"
-                            | "pro"
-                            | "macbook"
-                            | "macbookair"
-                            | "macbookpro"
-                    )
-                })
-                || tokens.get(idx + 1).is_some_and(|next| {
-                    let nl = next.to_ascii_lowercase();
-                    matches!(nl.as_str(), "max" | "pro" | "ultra" | "air")
-                        || (nl.ends_with("gb")
-                            && nl[..nl.len() - 2].bytes().all(|b| b.is_ascii_digit()))
-                }))
-        {
-            continue;
-        }
-        if text::valid_machine_name(&lower) {
-            return Some(lower);
-        }
-    }
-    None
 }
 
 /// 80-bit SHA-256 prefix of `recipient` in lowercase RFC 4648 base32 (`xxxx-xxxx-xxxx-xxxx`).
@@ -7359,6 +7310,38 @@ fn pass_line(
 /// path the digest of its source and text, and 0), and the files that were not as written then.
 type Repaired = Option<(([u8; 32], u64), BTreeSet<String>)>;
 
+/// Re-acknowledge the raw, verified membership log when the applied digest alone prevents any
+/// read. The explicit repair retains the prior state before changing only that digest, and never
+/// accepts an unverified store or rewrites identity, membership, proof or vault contents.
+pub(crate) fn repair_legacy_frontier(paths: &Paths) -> crate::Result<bool> {
+    let Some(_config) = config(paths)? else {
+        return Ok(false);
+    };
+    let _lock = StateLock::take(paths)
+        .map_err(|error| Error::new(format!("membership state lock failed: {error}")))?;
+    let configured = load_records(paths)
+        .map_err(|error| Error::new(format!("verified local membership log failed: {error}")))?;
+    let log = configured
+        .log()
+        .ok_or_else(|| Error::new("the local membership log cannot be verified"))?;
+    let digest = log_entries::records_heads_digest(log);
+    let mut state = load_state(paths)
+        .map_err(|error| Error::new(format!("applied membership state failed: {error}")))?;
+    if state.records_digest == Some(digest) {
+        return Ok(false);
+    }
+    let before = fsx::read_private(&paths.state_file(), MAX_STATE)?
+        .ok_or_else(|| Error::new("the applied membership state is unavailable"))?;
+    aterm_journal::write_private_durable(
+        &paths.dir,
+        "state.before-frontier-repair",
+        before.as_slice(),
+    )?;
+    state.records_digest = Some(digest);
+    save_state(paths, &state)?;
+    Ok(true)
+}
+
 /// Whether this pass repairs the files a version wrote, rather than long-polling: when they are
 /// not as written, or one an entry left this Mac's own is gone ([`unsettled`]), once per
 /// version and set of such files. Another file changed since (or one put back that changed
@@ -9516,13 +9499,8 @@ fn auto_approve_listed(
     // A Mac a member let in through the membership log is in `[machines]` already (the log's
     // overlay names it), so the approver never approves it. While it still asks with its
     // `Allowed`, the version served does not address it yet: the publish below names it there,
-    // so its locker arrives and it stops asking, and gives it the roster row its log label names
-    // (C11 under F15).
-    let swarm_roster = crate::swarm_roster::SwarmRoster::from_document(&doc)
-        .ok()
-        .flatten();
+    // so its locker arrives and it stops asking. Registry registration supplies its owner label.
     let mut log_labels = None;
-    let mut unrostered = Vec::new();
     let mut unaddressed = false;
     for request in pending.iter().cloned() {
         let answer = Answered::of(&request);
@@ -9542,28 +9520,6 @@ fn auto_approve_listed(
                 && log_member(&mut log_labels)?
             {
                 unaddressed = true;
-            }
-            if let Some(swarm_roster) = &swarm_roster
-                && !swarm_roster
-                    .members
-                    .iter()
-                    .any(|row| row.recipient == request.recipient)
-                && !unrostered
-                    .iter()
-                    .any(|(recipient, _, _): &(String, String, String)| {
-                        *recipient == request.recipient
-                    })
-                && log_member(&mut log_labels)?
-                && let Some(machine) = doc
-                    .machines()
-                    .into_iter()
-                    .find(|machine| machine.recipient == request.recipient)
-            {
-                unrostered.push((
-                    request.recipient.clone(),
-                    request.host.clone(),
-                    machine.name,
-                ));
             }
         } else if let Some(answer) =
             answer.filter(|answer| answered.iter().any(|held| held.matches(answer)))
@@ -9662,19 +9618,8 @@ fn auto_approve_listed(
             .map(|roster| roster.to_toml())
     };
     let roster_before = rostered(&doc);
-    if !done.approved.is_empty() || !unrostered.is_empty() {
-        newly_named.extend(unrostered);
-        let labels = match log_labels {
-            Some(labels) => labels,
-            None => roster::log_labels(paths)?,
-        };
-        roster::maintain_swarm_roster_on_approve(
-            admin,
-            &mut doc,
-            &newly_named,
-            &labels,
-            aterm_time::unix_millis().unwrap_or(0),
-        )?;
+    if !done.approved.is_empty() {
+        roster::maintain_swarm_roster_on_approve(&mut doc, &newly_named)?;
     }
     if !done.approved.is_empty() || unaddressed || rostered(&doc) != roster_before {
         let published = publish_as(paths, admin, &doc, false, &admissions, false);
@@ -10234,11 +10179,8 @@ fn approve_observed_request_opened(
     doc.add_machine(&host, recipient)
         .map_err(|e| Error::new(e.to_string()))?;
     roster::maintain_swarm_roster_on_approve(
-        admin,
         &mut doc,
         &[(recipient.to_owned(), request.host.clone(), host.clone())],
-        &roster::log_labels(paths)?,
-        aterm_time::unix_millis().unwrap_or(0),
     )?;
     let published = admin_publish_approved(paths, admin, &doc, &[recipient.to_owned()])?;
     let approved_recipients = [recipient.to_owned()];
@@ -20341,7 +20283,7 @@ mod commons_tests {
 
 #[cfg(test)]
 mod edit_scratch_tests {
-    use super::{Paths, Scratch, extract_machine_tag};
+    use super::{Paths, Scratch, host_name_hint};
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -20441,23 +20383,13 @@ mod edit_scratch_tests {
     }
 
     #[test]
-    fn extract_machine_tag_finds_mid_string_machine_id_and_skips_apple_silicon_chip_names() {
+    fn computer_name_precedes_a_local_hostname_label_hint() {
         assert_eq!(
-            extract_machine_tag("MacbookAir-m27-M5-32GB-4TB.local"),
-            Some("m27".to_string())
+            host_name_hint(&["Workstation".into(), "m22.local".into()]),
+            "workstation"
         );
-        assert_eq!(
-            extract_machine_tag("m22-Macbook-M5-Max-128GB-8TB.local"),
-            Some("m22".to_string())
-        );
-        assert_eq!(
-            extract_machine_tag("Andrew's MacBook Pro (m15)"),
-            Some("m15".to_string())
-        );
-        assert_eq!(extract_machine_tag("MacBook-Pro-M4-Max.local"), None);
-        assert_eq!(extract_machine_tag("Mac-mini-M4"), None);
-        assert_eq!(extract_machine_tag("Mac-mini-M4.local"), None);
-        assert_eq!(extract_machine_tag("mac-mini-m4"), None);
+        assert_eq!(host_name_hint(&["m22-Macbook.local".into()]), "m22");
+        assert_eq!(host_name_hint(&[]), "machine");
     }
 }
 

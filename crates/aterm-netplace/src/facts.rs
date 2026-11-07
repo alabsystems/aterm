@@ -30,6 +30,9 @@ pub trait Sense: Send {
 
     /// Waits at most `most` for the network to change; `true` when it did.
     fn wait(&self, most: Duration) -> bool;
+
+    /// Told once each time the keeper's lock is found held, before the candidate waits for it.
+    fn lock_held(&self) {}
 }
 
 /// Whether `name` is a tunnel's interface: a VPN's `utun`, `ipsec`, `ppp`, `tun`, `tap` or
@@ -287,10 +290,23 @@ fn path_key(route: Option<&RouteFacts>) -> PathKey {
     })
 }
 
+#[cfg(target_os = "macos")]
+fn same_path_key(held: &PathKey, route: Option<&RouteFacts>) -> bool {
+    match (held.as_ref(), route) {
+        (None, None) => true,
+        (Some((iface, addr, hw)), Some(route)) => {
+            iface == &route.interface
+                && *addr == route.address
+                && hw.as_deref() == route.gateway_hw.as_deref()
+        }
+        _ => false,
+    }
+}
+
 /// The reading `held` keeps for the route `key` at `now`: only a satisfied reading (none is never
 /// kept) read on that very route within `kept_for`, so a move, or a gateway read since, reads the
 /// path again at once.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 fn kept_path(
     held: Option<&(Instant, PathKey, PathFacts)>,
     key: &PathKey,
@@ -298,6 +314,18 @@ fn kept_path(
 ) -> Option<PathFacts> {
     held.filter(|(at, on, _)| on == key && now.saturating_duration_since(*at) < kept_for)
         .map(|(_, _, read)| *read)
+}
+
+#[cfg(target_os = "macos")]
+fn kept_path_for_route(
+    held: Option<&(Instant, PathKey, PathFacts)>,
+    route: Option<&RouteFacts>,
+    (now, kept_for): (Instant, Duration),
+) -> Option<PathFacts> {
+    held.filter(|(at, on, _)| {
+        same_path_key(on, route) && now.saturating_duration_since(*at) < kept_for
+    })
+    .map(|(_, _, read)| *read)
 }
 
 /// The path this Mac's traffic takes now as a Network.framework path monitor's first update reads
@@ -311,10 +339,9 @@ fn kept_path(
 #[must_use]
 pub fn path_once(route: Option<&RouteFacts>) -> Option<PathFacts> {
     static KEPT: Mutex<Option<(Instant, PathKey, PathFacts)>> = Mutex::new(None);
-    let key = path_key(route);
-    if let Some(read) = kept_path(
+    if let Some(read) = kept_path_for_route(
         KEPT.lock().unwrap_or_else(PoisonError::into_inner).as_ref(),
-        &key,
+        route,
         (Instant::now(), PATH_KEPT),
     ) {
         return Some(read);
@@ -337,6 +364,7 @@ pub fn path_once(route: Option<&RouteFacts>) -> Option<PathFacts> {
             link: link_of(reading.link),
         });
     if let Some(read) = read {
+        let key = path_key(route);
         *KEPT.lock().unwrap_or_else(PoisonError::into_inner) = Some((Instant::now(), key, read));
     }
     read
@@ -540,7 +568,9 @@ pub fn scripted() -> Option<Script> {
 }
 
 /// The live facts: the kernel's tables, this process's route-change socket, and on macOS a path
-/// monitor whose every reading wakes [`Sense::wait`].
+/// monitor whose every reading that changed wakes [`Sense::wait`]. A wait sleeps on the route
+/// socket and the path's bell together, so between changes it wakes only at its own deadline
+/// (ATERM-KI-1105-20: it used to wake every 5 s to look at the path).
 pub struct Live {
     routes: Option<aterm_uds::network::RouteChanges>,
     path: Arc<PathState>,
@@ -553,6 +583,143 @@ struct PathState {
     reading: Mutex<Option<PathFacts>>,
     changed: AtomicBool,
     wake: Condvar,
+    /// The bell a waiter on the route socket also hears when `changed` is set.
+    #[cfg(target_os = "macos")]
+    bell: Option<Bell>,
+}
+
+/// A nonblocking pipe a path reading rings and a wait polls beside the route socket.
+#[cfg(target_os = "macos")]
+struct Bell {
+    hear: std::io::PipeReader,
+    ring: std::io::PipeWriter,
+}
+
+#[cfg(target_os = "macos")]
+impl Bell {
+    fn new() -> Option<Self> {
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+        let (hear, ring) = aterm_uds::kept_out(std::io::pipe).ok()?;
+        for fd in [hear.as_fd(), ring.as_fd()] {
+            // SAFETY: F_GETFL only reads the flags of this live borrowed descriptor.
+            let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+            if flags < 0 {
+                return None;
+            }
+            // SAFETY: F_SETFL changes the same descriptor's status flags; both ends are ours.
+            if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+                return None;
+            }
+        }
+        Some(Self { hear, ring })
+    }
+
+    /// A byte for the waiter. A full transport is already readable, so it needs no further byte.
+    fn ring(&self) {
+        use std::io::Write as _;
+        let _ = (&self.ring).write_all(&[1]);
+    }
+
+    /// Drains readiness, including after the change flag was consumed without polling.
+    /// A concurrent change stays latched even if this drains its notification too.
+    fn hush(&self) {
+        use std::io::Read as _;
+        loop {
+            match (&self.hear).read(&mut [0; 256]) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+impl PathState {
+    /// A reading changed: tell a waiter on the condition variable or on the route socket. The
+    /// bell coalesces readings while `changed` is set. Its nonblocking I/O also protects the
+    /// monitor's queue when a wait consumes the flag before a notification is written.
+    #[cfg(target_os = "macos")]
+    fn tell(&self) {
+        let told = self.changed.swap(true, Ordering::SeqCst);
+        self.wake.notify_all();
+        if !told && let Some(bell) = &self.bell {
+            bell.ring();
+        }
+    }
+
+    /// The bell's end a wait polls, where this platform rings one.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn bell_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        #[cfg(target_os = "macos")]
+        {
+            self.bell
+                .as_ref()
+                .map(|bell| std::os::fd::AsFd::as_fd(&bell.hear))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
+
+    /// Drains the bell's readiness without clearing the latched path change.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn hush(&self) {
+        #[cfg(target_os = "macos")]
+        if let Some(bell) = &self.bell {
+            bell.hush();
+        }
+    }
+}
+
+/// What woke a [`Live`] wait on the route socket and the bell.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Woke {
+    Routes,
+    Bell,
+    Deadline,
+    Failed,
+}
+
+/// Polls `routes` and `bell` until one is readable or `left` passes.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn poll_both(
+    routes: &aterm_uds::network::RouteChanges,
+    bell: Option<std::os::fd::BorrowedFd<'_>>,
+    left: Duration,
+) -> Woke {
+    use std::os::fd::{AsFd as _, AsRawFd as _};
+    let mut fds = [
+        libc::pollfd {
+            fd: routes.as_fd().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: bell.map_or(-1, |bell| bell.as_raw_fd()),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    let millis = libc::c_int::try_from(left.as_millis()).unwrap_or(libc::c_int::MAX);
+    // SAFETY: `fds` is two live pollfds (a negative fd is ignored by poll) and the count is 2.
+    let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, millis) };
+    if ready < 0 {
+        return if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            Woke::Deadline
+        } else {
+            Woke::Failed
+        };
+    }
+    if fds[1].revents != 0 {
+        Woke::Bell
+    } else if fds[0].revents != 0 {
+        Woke::Routes
+    } else {
+        Woke::Deadline
+    }
 }
 
 impl std::fmt::Debug for Live {
@@ -565,7 +732,11 @@ impl Live {
     /// Starts the readers: the route-change socket and, on macOS, the path monitor.
     #[must_use]
     pub fn start() -> Self {
-        let path = Arc::new(PathState::default());
+        let path = Arc::new(PathState {
+            #[cfg(target_os = "macos")]
+            bell: Bell::new(),
+            ..PathState::default()
+        });
         #[cfg(target_os = "macos")]
         let monitor = {
             let path = Arc::clone(&path);
@@ -584,8 +755,7 @@ impl Live {
                 let mut held = path.reading.lock().unwrap_or_else(PoisonError::into_inner);
                 if *held != Some(facts) {
                     *held = Some(facts);
-                    path.changed.store(true, Ordering::SeqCst);
-                    path.wake.notify_all();
+                    path.tell();
                 }
             })
         };
@@ -600,9 +770,6 @@ impl Live {
         }
     }
 }
-
-/// The longest one wait on the route socket lasts before a path reading is looked at.
-const SLICE: Duration = Duration::from_secs(5);
 
 impl Sense for Live {
     fn facts(&self) -> Facts {
@@ -625,17 +792,33 @@ impl Sense for Live {
         let deadline = Instant::now() + most;
         loop {
             if self.path.changed.swap(false, Ordering::SeqCst) {
+                self.path.hush();
                 return true;
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return false;
             }
-            let slice = left.min(SLICE);
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             if let Some(routes) = &self.routes {
-                if routes.wait(slice) {
-                    return true;
+                match poll_both(routes, self.path.bell_fd(), left) {
+                    Woke::Bell => self.path.hush(),
+                    // Read what came: a message that names no change of network is passed over,
+                    // and a socket that fails is waited out like a failed poll, never polled
+                    // again at once (it would poll readable and fail again, a spin).
+                    Woke::Routes => match routes.read_waiting() {
+                        Some(true) => return true,
+                        Some(false) => {}
+                        None => {
+                            std::thread::sleep(left);
+                            return false;
+                        }
+                    },
+                    Woke::Deadline => {}
+                    Woke::Failed => {
+                        std::thread::sleep(left);
+                        return false;
+                    }
                 }
                 continue;
             }
@@ -644,10 +827,12 @@ impl Sense for Live {
                 .reading
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
+            // The monitor sets `changed` with `reading` held, so a change between the look above
+            // and this wait is seen here rather than slept through.
             let _ = self
                 .path
                 .wake
-                .wait_timeout(held, slice)
+                .wait_timeout_while(held, left, |_| !self.path.changed.load(Ordering::SeqCst))
                 .unwrap_or_else(PoisonError::into_inner);
         }
     }
@@ -661,6 +846,7 @@ pub struct Scripted {
     facts: Mutex<(Facts, u64, u64)>,
     wake: Condvar,
     waits: std::sync::atomic::AtomicUsize,
+    lock_waits: std::sync::atomic::AtomicUsize,
 }
 
 impl Scripted {
@@ -671,7 +857,14 @@ impl Scripted {
             facts: Mutex::new((facts, 0, 0)),
             wake: Condvar::new(),
             waits: std::sync::atomic::AtomicUsize::new(0),
+            lock_waits: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// How many times a candidate over these facts found the keeper's lock held and waited.
+    #[must_use]
+    pub fn lock_waits(&self) -> usize {
+        self.lock_waits.load(Ordering::SeqCst)
     }
 
     /// How many waits began: a test's witness that its reader got as far as waiting.
@@ -709,7 +902,15 @@ impl Sense for Arc<Scripted> {
         held.2 = held.1;
         changed
     }
+
+    fn lock_held(&self) {
+        self.lock_waits.fetch_add(1, Ordering::SeqCst);
+    }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "facts_bell_tests.rs"]
+mod bell_tests;
 
 #[cfg(test)]
 mod tests {

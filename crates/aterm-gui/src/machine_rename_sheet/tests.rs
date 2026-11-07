@@ -115,7 +115,7 @@ fn the_fields_refuse_what_is_no_name_and_ask_nothing_of_what_was_left_alone() {
             "{number:?} {word:?}"
         );
     }
-    // An unnumbered Mac's nickname alone is set as Change Nickname… sets it.
+    // An unnumbered Mac's nickname alone keeps its unnumbered identity.
     let unnumbered = read("m0", "Linnet");
     for number in [left("m0"), typed("m0")] {
         assert_eq!(
@@ -128,7 +128,7 @@ fn the_fields_refuse_what_is_no_name_and_ask_nothing_of_what_was_left_alone() {
         );
     }
     let (_root, preview) = preview();
-    let snapshot = Snapshot::Read(Box::new(preview));
+    let snapshot = Snapshot::read(preview);
     assert_eq!(
         line(&snapshot, &unnumbered, &left("m0"), &left("Linnet")),
         Line {
@@ -139,7 +139,7 @@ fn the_fields_refuse_what_is_no_name_and_ask_nothing_of_what_was_left_alone() {
     assert_eq!(
         line(&snapshot, &unnumbered, &left("m0"), &typed("Puffin")),
         Line {
-            text: "This Mac has no number yet; Rename makes its nickname Puffin.".to_owned(),
+            text: "This Mac has no number yet; Save makes its nickname Puffin.".to_owned(),
             renames: true,
         }
     );
@@ -162,7 +162,7 @@ fn the_fields_refuse_what_is_no_name_and_ask_nothing_of_what_was_left_alone() {
             &typed("Puffin")
         )
         .text,
-        "Rename keeps this Mac's number and makes its nickname Puffin.",
+        "Save keeps this Mac's number and makes its nickname Puffin.",
         "nor does a nickname alone"
     );
 }
@@ -261,7 +261,7 @@ fn a_number_that_holds_no_claim_is_claimed_only_when_typed() {
     let held = Held::of_read(&preview);
     assert!(held.waits);
     assert_eq!((held.name.as_str(), held.number_text()), ("m7", ""));
-    let snapshot = Snapshot::Read(Box::new(preview));
+    let snapshot = Snapshot::read(preview);
     let word = held.word.clone();
     let open = Field::open(None, held.number_text());
     assert_eq!(rename_to(&open, &left(&word), &held), Ok(RenameTo::Keep));
@@ -283,7 +283,7 @@ fn a_number_that_holds_no_claim_is_claimed_only_when_typed() {
     assert_eq!(
         line(&snapshot, &held, &typed("m7"), &left(&word)),
         Line {
-            text: "Rename claims m7, which this Mac shows but has not claimed yet.".to_owned(),
+            text: "Save claims m7, which this Mac shows but has not claimed yet.".to_owned(),
             renames: true,
         }
     );
@@ -305,7 +305,7 @@ fn a_shared_nickname_is_said_and_refuses_nothing() {
     let (_root, preview) = preview();
     let otter = Nickname::parse("Otter").expect("a nickname");
     let held = Held::of_read(&preview);
-    let snapshot = Snapshot::Read(Box::new(preview.with_taken_for_test(vec![otter])));
+    let snapshot = Snapshot::read(preview.with_taken_for_test(vec![otter]));
     for number in [left("m7"), typed("m87")] {
         let said = line(&snapshot, &held, &number, &typed("otter"));
         assert!(said.renames, "{said:?}");
@@ -365,7 +365,7 @@ fn preview() -> (aterm_tempfile::TempDir, RenamePreview) {
 /// after one that failed, Rename stays available, since the set checks the number itself.
 #[test]
 fn rename_is_unavailable_only_while_the_fields_or_the_read_refuse() {
-    let (_root, preview) = preview();
+    let (root, preview) = preview();
     let fresh = Held::of_read(&preview);
     assert_eq!(
         (fresh.name.as_str(), fresh.read, fresh.waits),
@@ -373,7 +373,7 @@ fn rename_is_unavailable_only_while_the_fields_or_the_read_refuse() {
     );
     let stale = shown("m7", &fresh.word);
     let word = fresh.word.clone();
-    let read = Snapshot::Read(Box::new(preview));
+    let read = Snapshot::read(preview);
     let reading = Snapshot::Reading;
     let unread = Snapshot::Unread("the books are unread".to_owned());
     for (snapshot, held) in [(&read, &fresh), (&reading, &stale), (&unread, &stale)] {
@@ -393,27 +393,69 @@ fn rename_is_unavailable_only_while_the_fields_or_the_read_refuse() {
             "free: {snapshot:?}"
         );
     }
-    assert_eq!(
-        line(&read, &fresh, &left("m7"), &left(&word)).text,
-        format!(
-            "This Mac is m7 {}. Type another number or nickname.",
-            fresh.nick
-        )
-    );
     let held_by_vault = line(&read, &fresh, &typed("m20"), &left(&word));
     assert!(!held_by_vault.renames);
     let Snapshot::Read(preview) = &read else {
         unreachable!("a read")
     };
-    let why = preview.judge(num(20)).expect_err("the vault holds m20");
+    let why = preview
+        .preview
+        .judge(num(20))
+        .expect_err("the vault holds m20");
     assert!(held_by_vault.text.starts_with(&why), "{held_by_vault:?}");
     assert!(line(&reading, &stale, &typed("m20"), &left(&word)).renames);
     assert!(line(&unread, &stale, &typed("m20"), &left(&word)).renames);
     assert_eq!(
         line(&unread, &stale, &left("m7"), &left(&word)).text,
         "This Mac's name could not be read here (the books are unread). Type a number or \
-         nickname; Rename checks it.",
+         nickname; Save checks it.",
         "an untouched form says nothing of a view the failed read could not check"
+    );
+
+    // Selecting this very seeded number still uses its fresh lab verdict, not a special
+    // success caption that bypasses the normal reservation/unread feedback.
+    let now = FLOOR_MS + 300 * 86_400_000;
+    let reserved = rename_preview(
+        root.path(),
+        || {
+            Ok(LabLabels {
+                held: BTreeMap::from([(num(7), LabelHold::Label)]),
+                ..LabLabels::default()
+            })
+        },
+        || Ok(None),
+        now,
+    )
+    .unwrap();
+    let held = Held::of_read(&reserved);
+    assert!(reserved.judge(num(7)).is_err());
+    assert!(
+        !line(
+            &Snapshot::read(reserved),
+            &held,
+            &left(held.number_text()),
+            &left(&held.word)
+        )
+        .renames
+    );
+    let unavailable = rename_preview(
+        root.path(),
+        || Err(std::io::Error::other("fixture labels unavailable")),
+        || Ok(None),
+        now,
+    )
+    .unwrap();
+    let held = Held::of_read(&unavailable);
+    let pending = line(
+        &Snapshot::read(unavailable),
+        &held,
+        &left(held.number_text()),
+        &left(&held.word),
+    );
+    assert!(pending.renames);
+    assert!(
+        pending.text.contains("fixture labels unavailable"),
+        "{pending:?}"
     );
 }
 
@@ -433,17 +475,17 @@ fn a_number_the_vault_could_not_judge_is_left_for_the_set_to_check() {
     .expect("a read");
     let held = Held::of_read(&preview);
     let word = held.word.clone();
-    let snapshot = Snapshot::Read(Box::new(preview));
+    let snapshot = Snapshot::read(preview);
     assert_eq!(
         line(&snapshot, &held, &typed("m87"), &left(&word)),
         Line {
-            text: "m87 could not be checked here (the vault is busy); Rename checks it.".to_owned(),
+            text: "m87 could not be checked here (the vault is busy); Save checks it.".to_owned(),
             renames: true,
         }
     );
     assert_eq!(
         line(&snapshot, &held, &left("m7"), &typed("Kestrel")).text,
-        "Rename keeps this Mac's number and makes its nickname Kestrel."
+        "Save keeps this Mac's number and makes its nickname Kestrel."
     );
 }
 
@@ -468,10 +510,4 @@ fn a_read_reaches_only_the_press_that_asked_for_it() {
         "a read after its press ended"
     );
     assert!(slot.is_none());
-}
-
-#[test]
-fn a_refusal_reads_as_a_sentence_without_recasing_a_number() {
-    assert_eq!(sentence("the vault is busy"), "The vault is busy.");
-    assert_eq!(sentence("m20 is held."), "m20 is held.");
 }

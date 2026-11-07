@@ -7,15 +7,19 @@
 //! read here from its bytes alone, so nothing of fleet_db's code is needed once it is deleted.
 //!
 //! Each table becomes one [`Sheet`] of kind [`SheetKind::FleetDb`], its own source
-//! (`<file>#<table>`), whose header row is every column the table's rows hold: the known ones in
+//! (`<file>#<table>`), whose header row is every column the table's rows or their concurrent values
+//! hold: the known ones in
 //! [`DUMP_TABLES`] order, then any other in name order, so **every column is carried or
 //! reported**. [`DUMP_TABLES`] says where each known column goes: a registry cell, a `Secret`
 //! cell, a relation the registry already states another way, the row's key, or nowhere by the
 //! design's word (`ip`: addresses come from presence). A column it does not name is an
-//! [`Kind::Unmapped`] finding, by name only. A password never enters the sheet's cells: it is
-//! held as a [`Secret`] at its coordinate ([`Sheet::secrets`]), so no review, finding or log
-//! shows it. A row the replica holds concurrent values for (`_conflicts`) imports only the
-//! columns its values agree on; each other is a [`Kind::DumpConflicted`] finding.
+//! [`Kind::Unmapped`] finding, by name only, and its text never enters the sheet: it may be a
+//! credential by a word no list here holds, and a review shows the text at a finding's coordinates.
+//! A password never enters the sheet's cells either: it is held as a [`Secret`] at its coordinate
+//! ([`Sheet::secrets`]), so no review, finding or log shows it. A row the replica holds concurrent values for (`_conflicts`) imports only the
+//! columns its values agree on, a password's by what it says ([`cell_as_compared`]) and any other's
+//! by its text; each other, but for a column the design carries nowhere, is a
+//! [`Kind::DumpConflicted`] finding, whatever the row's own cell holds.
 //!
 //! A dump holds passwords, so its source key and `sha256` are a keyed digest ([`super::keyed_source`],
 //! under the newest `[everyone]` epoch's key), never a plain hash a reader of the shared `source`
@@ -31,7 +35,7 @@ use crate::{
     machines::Label,
     typed::{
         guard, keys,
-        secret::{Secret, cell_as_compared},
+        secret::{Secret, cell_as_compared, flag_says},
     },
 };
 use aterm_codec::hex;
@@ -230,18 +234,27 @@ pub fn dump_sheets(
         if file.is_empty() || guard::text(&file, 128).is_err() {
             return Err(Error::new("the dump's file name cannot be recorded"));
         }
-        // Every column any row holds, the known first: what a read adds (`has_password`,
-        // `_conflicts`) is not a column.
+        // Every column any row or concurrent value holds, since the digest order alone decides
+        // which value a row shows, the known first: what a read adds (`_conflicts`, a concurrent
+        // delete's `_deleted`, an email row's `has_password`) is not a column.
         let known_set: BTreeSet<&str> = columns.iter().map(|(c, _)| *c).collect();
         let mut headers: Vec<String> = columns.iter().map(|(c, _)| (*c).to_owned()).collect();
         let mut others = BTreeSet::new();
         for item in items {
             let row = item.as_object().ok_or_else(malformed)?;
-            for key in row.keys() {
-                if !key.starts_with('_')
-                    && key != "has_password"
-                    && !known_set.contains(key.as_str())
-                {
+            let concurrent = row
+                .get("_conflicts")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_object);
+            for key in std::iter::once(row)
+                .chain(concurrent)
+                .flat_map(|fields| fields.keys())
+            {
+                let added = matches!(key.as_str(), "_conflicts" | "_deleted")
+                    || (table == Dump::Emails && key == "has_password");
+                if !added && !known_set.contains(key.as_str()) {
                     others.insert(key.clone());
                 }
             }
@@ -263,7 +276,12 @@ pub fn dump_sheets(
                     }
                     cells.push(String::new());
                 } else {
-                    cells.push(text(value));
+                    let cell = text(value);
+                    cells.push(if col >= columns.len() && !cell.trim().is_empty() {
+                        UNREAD_CELL.to_owned()
+                    } else {
+                        cell
+                    });
                 }
             }
             // The replica's concurrent values: a column they disagree on is never imported,
@@ -283,10 +301,15 @@ pub fn dump_sheets(
                     continue;
                 }
                 for (col, header) in headers.iter().enumerate() {
+                    // A column the design carries nowhere is none of the registry's business.
+                    if matches!(columns.get(col), Some((_, Carry::Dropped(_)))) {
+                        continue;
+                    }
                     let disagree = if is_secret[col] {
                         cell_as_compared(row.get(header)) != cell_as_compared(other.get(header))
                     } else {
-                        row.get(header) != other.get(header)
+                        let read = |cell: Option<&Value>| text(cell.unwrap_or(&Value::Null));
+                        read(row.get(header)).trim() != read(other.get(header)).trim()
                     };
                     if disagree {
                         conflicted.insert((row_at, col));
@@ -313,6 +336,10 @@ pub fn dump_sheets(
     }
     Ok(sheets)
 }
+
+/// What a sheet holds for a cell of a column this build does not name: it says the row holds
+/// something, and nothing of what.
+const UNREAD_CELL: &str = "(withheld: a column this build does not read)";
 
 /// One row of a dump table as the planner reads it.
 struct Read<'s> {
@@ -355,6 +382,22 @@ impl Read<'_> {
     fn row_conflicted(&self) -> bool {
         self.sheet.conflicted.contains(&(self.row, usize::MAX))
     }
+
+    /// The columns of this row its concurrent values disagree on, a whole-row mark included.
+    fn conflicts(&self) -> impl Iterator<Item = usize> + '_ {
+        self.sheet
+            .conflicted
+            .range((self.row, 0)..(self.row + 1, 0))
+            .map(|(_, col)| *col)
+    }
+}
+
+/// A column's name as a finding may carry it, which a read of a replica's column cannot promise.
+fn column_named(header: &str) -> Option<String> {
+    guard::text(header, 64)
+        .is_ok()
+        .then(|| header.to_owned())
+        .filter(|h| !h.contains('@'))
 }
 
 /// The provider word fleet_db's `ai_accounts.provider` names.
@@ -380,10 +423,7 @@ impl Planner<'_> {
                     kind: Kind::Unmapped,
                     collection: Some(collection),
                     pk: None,
-                    column: guard::text(header, 64)
-                        .is_ok()
-                        .then(|| header.clone())
-                        .filter(|h| !h.contains('@')),
+                    column: column_named(header),
                     at: Vec::new(),
                 });
             }
@@ -402,17 +442,58 @@ impl Planner<'_> {
             };
             if cells.iter().all(|c| c.trim().is_empty())
                 && !sheet.secrets.keys().any(|(r, _)| *r == read.row)
+                && read.conflicts().next().is_none()
             {
                 continue;
             }
-            match table {
+            let pk = match table {
                 Dump::Emails => self.dump_email(&read, &account_addresses)?,
                 Dump::Phones => self.dump_phone(&read)?,
                 Dump::Accounts => self.dump_account(&read)?,
                 Dump::Computers => self.dump_computer(&read),
-            }
+            };
+            self.disagreements(collection, table, pk, &read);
         }
         Ok(())
+    }
+
+    /// A finding for every column of a row its concurrent values disagree on ([`dump_sheets`] marks
+    /// no [`Carry::Dropped`] one) and for a whole-row mark, whatever the row's own cell holds and
+    /// whichever value the digest order showed, so no read above can leave one out and the order
+    /// cannot decide `covered`. `pk` is `None` while the row's key is undecided.
+    fn disagreements(
+        &mut self,
+        collection: &'static str,
+        table: Dump,
+        pk: Option<String>,
+        read: &Read<'_>,
+    ) {
+        for col in read.conflicts() {
+            let Some(header) = read.sheet.headers.get(col) else {
+                self.findings.insert(Finding {
+                    kind: Kind::DumpConflicted,
+                    collection: Some(collection),
+                    pk: pk.clone(),
+                    column: None,
+                    at: Vec::new(),
+                });
+                continue;
+            };
+            // This build's own word for a column it knows, `password` included; the guard is for
+            // a name only a replica's row says.
+            let column = if known(table).iter().any(|(column, _)| column == header) {
+                Some(header.clone())
+            } else {
+                column_named(header)
+            };
+            self.findings.insert(Finding {
+                kind: Kind::DumpConflicted,
+                collection: Some(collection),
+                pk: pk.clone(),
+                column,
+                at: vec![read.at(col)],
+            });
+        }
     }
 
     /// A column of a row the replica holds concurrent values for: a finding, never written.
@@ -499,18 +580,22 @@ impl Planner<'_> {
         }
     }
 
-    fn dump_email(&mut self, read: &Read<'_>, account_addresses: &BTreeSet<String>) -> Result<()> {
+    fn dump_email(
+        &mut self,
+        read: &Read<'_>,
+        account_addresses: &BTreeSet<String>,
+    ) -> Result<Option<String>> {
         let kind = read.sheet.kind;
         let email = read.col("email");
         let Some(address) = self.address_of(read.n, read.sheet, read.row, read.cells, email) else {
-            return Ok(());
+            return Ok(None);
         };
         let email_at = read.at(email.unwrap_or(0));
         let Some(pk) = self.address(&address, kind, &email_at) else {
-            return Ok(());
+            return Ok(None);
         };
         if self.row_conflict(ADDRESS.name, &pk, read) {
-            return Ok(());
+            return Ok(Some(pk));
         }
         if let Some((value, at)) =
             self.agreed(ADDRESS.name, &pk, "protected", read.get("protected"))
@@ -523,14 +608,6 @@ impl Planner<'_> {
         // A flag the replica holds concurrent values for guards the row, as a conflicted
         // registry cell does, and is not written.
         if read.conflicted("protected") {
-            if read.get("protected").is_none() {
-                self.agreed(
-                    ADDRESS.name,
-                    &pk,
-                    "protected",
-                    Some((String::new(), email_at.clone(), true)),
-                );
-            }
             self.protected.insert(pk.clone());
         }
         for column in ["assigned_computers", "services"] {
@@ -573,15 +650,20 @@ impl Planner<'_> {
             };
             self.want(&ADDRESS, &pk, "status", json!(word), &at);
         }
-        let alias = read
-            .get("account_type")
-            .is_some_and(|(word, _, _)| word.eq_ignore_ascii_case("alias"));
+        // A word the replica holds concurrent values for decides nothing: not what the row is, nor
+        // where its password and mailbox go.
+        let undecided = read.conflicted("account_type");
+        let alias = !undecided
+            && read
+                .get("account_type")
+                .is_some_and(|(word, _, _)| word.eq_ignore_ascii_case("alias"));
         let root = self
             .agreed(ADDRESS.name, &pk, "root_account", read.get("root_account"))
             .and_then(|(text, at)| Some((keys::address(&text).ok()?, at)))
             .filter(|(root, _)| *root != address);
         let mut mailbox = None;
         match (alias, root) {
+            _ if undecided => {}
             (true, Some((root, at))) => {
                 self.corrected.insert(pk.clone());
                 if let Some(root_pk) = self.address(&root, kind, &at) {
@@ -607,6 +689,10 @@ impl Planner<'_> {
                     "password",
                     Some((String::new(), at, true)),
                 );
+            } else if flag_says(&secret) == Some(false) {
+                // A none word claims no password and no login: it is judged against the registry
+                // and makes nothing, as an empty cell makes nothing.
+                self.want_secret(&ADDRESS, &pk, "password", secret, &at);
             } else if protected {
                 self.findings.insert(Finding {
                     kind: Kind::ProtectedSecret,
@@ -615,6 +701,8 @@ impl Planner<'_> {
                     column: Some("password".to_owned()),
                     at: vec![at],
                 });
+            } else if undecided {
+                // Reported with the word: nothing says yet whether this row can hold it.
             } else if alias {
                 // An alias signs in through its root's mailbox: a password on it has no row.
                 self.findings.insert(Finding {
@@ -632,17 +720,12 @@ impl Planner<'_> {
                     mailbox = Some(mb);
                 }
             }
-        } else if read.conflicted("password") {
-            // A concurrent value claims what this row's own empty cell does not.
-            self.agreed(
-                ADDRESS.name,
-                &pk,
-                "password",
-                Some((String::new(), email_at.clone(), true)),
-            );
         }
+        // The provider's default decides whether a webmail is carried, so one the replica holds
+        // concurrent values for decides nothing.
         if let Some((url, at)) =
             self.agreed(ADDRESS.name, &pk, "webmail_url", read.get("webmail_url"))
+            && !read.conflicted("provider")
         {
             let default = read
                 .get("provider")
@@ -681,12 +764,14 @@ impl Planner<'_> {
             }
         }
         self.dump_note(&ADDRESS, &pk, read);
-        Ok(())
+        Ok(Some(pk))
     }
 
-    fn dump_phone(&mut self, read: &Read<'_>) -> Result<()> {
+    fn dump_phone(&mut self, read: &Read<'_>) -> Result<Option<String>> {
         let Some((number, at, conflicted)) = read.get("phone") else {
-            return Ok(());
+            let key = read.at(read.col("phone").unwrap_or(0));
+            self.find(Kind::FreeText, Some(PHONE.name), None, vec![key]);
+            return Ok(None);
         };
         let label = read
             .get("label")
@@ -695,21 +780,14 @@ impl Planner<'_> {
             })
             .map(|(text, _, _)| text);
         if conflicted {
-            self.findings.insert(Finding {
-                kind: Kind::DumpConflicted,
-                collection: Some(PHONE.name),
-                pk: None,
-                column: Some("number".to_owned()),
-                at: vec![at],
-            });
-            return Ok(());
+            return Ok(None);
         }
         let Some(pk) = self.phone(&number, label.as_deref(), &at)? else {
             self.find(Kind::FreeText, Some(PHONE.name), None, vec![at]);
-            return Ok(());
+            return Ok(None);
         };
         if self.row_conflict(PHONE.name, &pk, read) {
-            return Ok(());
+            return Ok(Some(pk));
         }
         for (column, cell, limit) in [
             ("owner_carrier", "carrier", 64),
@@ -739,57 +817,54 @@ impl Planner<'_> {
             });
         }
         self.dump_note(&PHONE, &pk, read);
-        Ok(())
+        Ok(Some(pk))
     }
 
-    fn dump_account(&mut self, read: &Read<'_>) -> Result<()> {
+    fn dump_account(&mut self, read: &Read<'_>) -> Result<Option<String>> {
+        // The address a row signs in with, and the columns that decide its realm, region and flow:
+        // one the replica holds concurrent values for decides nothing, and [`Self::disagreements`]
+        // names it.
+        if read.conflicted("email") {
+            return Ok(None);
+        }
         let kind = read.sheet.kind;
         let email = read.col("email");
         let Some(address) = self.address_of(read.n, read.sheet, read.row, read.cells, email) else {
-            return Ok(());
+            return Ok(None);
         };
         let email_at = read.at(email.unwrap_or(0));
         let Some(address_pk) = self.address(&address, kind, &email_at) else {
-            return Ok(());
+            return Ok(None);
         };
-        // The columns that decide the account's realm, region and flow: one the replica holds
-        // concurrent values for decides nothing.
-        if let Some(column) = ["provider", "tier", "notes", "service"]
+        if ["provider", "tier", "notes", "service"]
             .into_iter()
-            .find(|column| read.conflicted(column))
+            .any(|column| read.conflicted(column))
         {
-            self.findings.insert(Finding {
-                kind: Kind::DumpConflicted,
-                collection: Some(ACCOUNT.name),
-                pk: None,
-                column: Some(column.to_owned()),
-                at: vec![read.get(column).map_or(email_at, |(_, at, _)| at)],
-            });
-            return Ok(());
+            return Ok(None);
         }
         let Some((provider, provider_at, _)) = read.get("provider") else {
             self.find(Kind::FreeText, Some(ACCOUNT.name), None, vec![email_at]);
-            return Ok(());
+            return Ok(None);
         };
         let Some(provider) = provider_word(&provider) else {
             self.find(Kind::FreeText, Some(ACCOUNT.name), None, vec![provider_at]);
-            return Ok(());
+            return Ok(None);
         };
         let (tier, tier_at) = read
             .get("tier")
             .map_or((String::new(), provider_at.clone()), |(t, at, _)| (t, at));
         let notes = read.get("notes").map(|(t, _, _)| t).unwrap_or_default();
         let (terms, paused) = match self.input.vendors.mark(provider, &tier, &notes) {
-            Mark::Absent => return Ok(()),
+            Mark::Absent => return Ok(None),
             Mark::Unread => {
                 self.unsettled_logins.insert(address_pk.clone());
                 self.find(Kind::FreeText, Some(ACCOUNT.name), None, vec![tier_at]);
-                return Ok(());
+                return Ok(None);
             }
             Mark::Held => {
                 self.hold_kimi(&address, &address_pk);
                 self.find(Kind::Held, Some(ACCOUNT.name), None, vec![tier_at]);
-                return Ok(());
+                return Ok(None);
             }
             Mark::Member(terms) => (terms, false),
             Mark::Paused(terms) => (terms, true),
@@ -797,13 +872,13 @@ impl Planner<'_> {
         let Some((realm, _)) = provider_realm(provider, terms.region) else {
             self.hold_kimi(&address, &address_pk);
             self.find(Kind::Held, Some(ACCOUNT.name), None, vec![tier_at]);
-            return Ok(());
+            return Ok(None);
         };
         let Some(pk) = self.account(&address, &address_pk, realm, &provider_at) else {
-            return Ok(());
+            return Ok(None);
         };
         if self.row_conflict(ACCOUNT.name, &pk, read) {
-            return Ok(());
+            return Ok(Some(pk));
         }
         // fleet_db's `service` names the product where it is one of the provider's; otherwise
         // the provider's default, and the word a finding.
@@ -847,12 +922,27 @@ impl Planner<'_> {
             &address_pk,
             "receiving_mailbox",
             read.get("receiving_mailbox"),
-        ) && let Ok(receiving) = keys::address(&receiving)
-            && receiving != address
-            && !self.protected.contains(&address_pk)
-            && let Some(mb) = self.mailbox(&receiving, kind, &at)?
-        {
-            self.want(&ADDRESS, &address_pk, "mailbox", json!(mb), &at);
+        ) {
+            match keys::address(&receiving) {
+                Ok(receiving) if receiving == address => {}
+                // A protected row holds no mailbox, so only its link to its root can say this.
+                Ok(receiving) if self.protected.contains(&address_pk) => {
+                    let root = keys::address_pk(&receiving).ok();
+                    let linked = self
+                        .row_get(ADDRESS.name, &address_pk)
+                        .and_then(|row| row.values.get("alias_of"))
+                        .is_some_and(|want| root.is_some_and(|root| want.x == json!(root)));
+                    if !linked {
+                        self.uncarried(ADDRESS.name, &address_pk, "receiving_mailbox", at);
+                    }
+                }
+                Ok(receiving) => {
+                    if let Some(mb) = self.mailbox(&receiving, kind, &at)? {
+                        self.want(&ADDRESS, &address_pk, "mailbox", json!(mb), &at);
+                    }
+                }
+                Err(_) => self.uncarried(ADDRESS.name, &address_pk, "receiving_mailbox", at),
+            }
         }
         if let Some((labels, at)) = self.agreed(
             ACCOUNT.name,
@@ -879,29 +969,31 @@ impl Planner<'_> {
             }
         }
         self.dump_note(&ACCOUNT, &pk, read);
-        Ok(())
+        Ok(Some(pk))
     }
 
-    fn dump_computer(&mut self, read: &Read<'_>) {
+    fn dump_computer(&mut self, read: &Read<'_>) -> Option<String> {
         let kind = read.sheet.kind;
         let Some((raw, at, _)) = read.get("label") else {
-            return;
+            let key = read.at(read.col("label").unwrap_or(0));
+            self.find(Kind::FreeText, Some(MACHINE.name), None, vec![key]);
+            return None;
         };
         let Ok(label) = Label::parse(&raw) else {
             self.find(Kind::FreeText, Some(MACHINE.name), None, vec![at]);
-            return;
+            return None;
         };
-        let Some(pk) = self.machine_for(label, &at) else {
-            return;
-        };
+        let pk = self.machine_for(label, &at)?;
         if self.row_conflict(MACHINE.name, &pk, read) {
-            return;
+            return Some(pk);
         }
         // A placeholder minted this run stays `planned`: fleet_db wrote `active` for every row.
         let placeholder = self
             .row_get(MACHINE.name, &pk)
             .and_then(|row| row.values.get("status"))
             .is_some_and(|want| want.x == json!("planned"));
+        // And that word says no more of one an earlier read minted.
+        let held_planned = self.held(&MACHINE, &pk, "status") == Some(&json!("planned"));
         for (column, cell, limit) in [
             ("make", "make", 32),
             ("arch", "arch", 16),
@@ -959,7 +1051,10 @@ impl Planner<'_> {
                 }
             }
         }
-        if let Some(at) = nick_at {
+        // One cell made of both columns: a disagreement on either leaves it as it is.
+        if let Some(at) =
+            nick_at.filter(|_| !read.conflicted("aliases") && !read.conflicted("nickname_aliases"))
+        {
             nick_aliases.truncate(8);
             self.want(&MACHINE, &pk, "nickname_aliases", json!(nick_aliases), &at);
         }
@@ -986,7 +1081,9 @@ impl Planner<'_> {
             }
         }
         if !placeholder
-            && let Some((status, at)) = self.agreed(MACHINE.name, &pk, "status", read.get("status"))
+            && let Some((status, at)) = self
+                .agreed(MACHINE.name, &pk, "status", read.get("status"))
+                .filter(|(status, _)| !(held_planned && status.eq_ignore_ascii_case("active")))
         {
             let word = status.to_ascii_lowercase();
             if super::super::registry::MACHINE_STATUS.contains(&word.as_str()) {
@@ -1051,6 +1148,7 @@ impl Planner<'_> {
             self.uncarried(MACHINE.name, &pk, "assigned_emails", at);
         }
         self.dump_note(&MACHINE, &pk, read);
+        Some(pk)
     }
 }
 

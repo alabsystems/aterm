@@ -8388,13 +8388,12 @@ fn authorize_pinned_browser_until(
                     if cb_url.split('?').next()
                         == Some("https://platform.claude.com/oauth/code/callback")
                     {
-                        let code = super::open_url::extract_query_param(cb_url, "code")
-                            .ok_or("the hosted OAuth callback has no authorization code")?;
+                        let credential = super::open_url::hosted_credential(cb_url)?;
                         let outcome = std::env::var_os(super::open_url::OUTCOME_ENV)
                             .ok_or("the hosted OAuth callback has no renewal input channel")?;
                         super::open_url::write_oauth_code(
                             Path::new(&outcome).with_extension("code"),
-                            &code,
+                            &credential,
                         )?;
                         return Ok(200);
                     }

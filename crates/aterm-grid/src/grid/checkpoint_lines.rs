@@ -95,10 +95,8 @@ impl Grid {
             };
             let row_extras = Self::extract_row_extras(row, extras, r);
             let len = super::scrollback_reflow::history_row_len(row, self.row_at_screen(r + 1));
-            lines.push(Self::row_to_line_with_stored_extras_at_len(
-                row,
-                &row_extras,
-                len,
+            lines.push(Self::row_to_line_with_owned_extras_at_len(
+                row, row_extras, len,
             ));
         }
 
@@ -112,10 +110,11 @@ impl Grid {
         let Some(first) = (0..rows).find(|&r| self.row(r).is_some()) else {
             return;
         };
-        let retained_images = self.storage.extras.prepare_rows_for_restore(first..rows);
+        let refill = self.storage.extras.prepare_rows_for_restore(first..rows);
+        let mut owned_text = false;
         for r in first..rows {
             match visible.get(r as usize) {
-                Some(line) => self.fill_row_from_line_cleared(r, line, cols),
+                Some(line) => owned_text |= self.fill_row_from_line_cleared(r, line, cols),
                 None => {
                     if let Some(row) = self.row_mut(r) {
                         row.clear();
@@ -123,9 +122,7 @@ impl Grid {
                 }
             }
         }
-        if retained_images {
-            self.storage.extras.finish_rows_restore();
-        }
+        self.storage.extras.finish_rows_restore(refill, owned_text);
         self.storage.extras.maybe_shrink();
     }
 

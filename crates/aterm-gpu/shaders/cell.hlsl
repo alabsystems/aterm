@@ -153,9 +153,10 @@ GlowVsOut vs_glow(uint vi : SV_VertexID, uint4 rect_u : LOC0, uint4 c0 : LOC1, u
     return o;
 }
 
-// The fragment's 0-based column inside its quad (see the WGSL twin).
+// The fragment's 0-based column inside its quad (shaders/cell.metal's twin
+// says why the quarter-pixel bias).
 uint glow_column(float lx, float w) {
-    return f2u(clamp(floor(lx), 0.0, max(w - 1.0, 0.0)));
+    return f2u(clamp(floor(lx + 0.25), 0.0, max(w - 1.0, 0.0)));
 }
 
 // aterm_render::glow_lerp, per channel and for alpha alike, at column i of a

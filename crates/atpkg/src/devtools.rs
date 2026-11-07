@@ -1605,12 +1605,15 @@ fn prime() -> Result<(), RefreshFailed> {
         let by = std::time::Instant::now() + REACH_CEILING + PRIME_CEILING;
         let token =
             aterm_uds::rand::hex_token::<8>().map_err(|e| failed(format!("no name: {e}")))?;
-        let dir = std::env::temp_dir().join(format!("aterm-devtools-prime-{token}"));
-        crate::prereq::private_dir(&dir).map_err(|e| failed(format!("{}: {e}", dir.display())))?;
-        let remove = crate::prereq::RemoveOnDrop(&dir);
+        let remove = aterm_tempfile::Builder::new()
+            .prefix("aterm-devtools-prime-")
+            .suffix(".noindex")
+            .tempdir()
+            .map_err(|e| failed(format!("no private probe directory: {e}")))?;
+        let dir = remove.path().to_path_buf();
         let name = format!("aterm-devtools-{token}");
         let program = dir.join(&name);
-        crate::metadata_io::copy_regular_file(std::path::Path::new("/usr/bin/true"), &program)
+        crate::metadata_io::copy_regular_file(std::path::Path::new("/bin/echo"), &program)
             .map_err(|e| failed(format!("copy: {e}")))?;
         let program = program
             .to_str()
@@ -1620,15 +1623,14 @@ fn prime() -> Result<(), RefreshFailed> {
             &["--force", "--sign", "-", "--identifier", &name, program],
         )
         .map_err(failed)?;
-        let out = match aterm_uds::deadline::output_until(
-            &mut aterm_uds::spawnfd::command(program),
-            by,
-        ) {
-            // Its own exit shows it ran, so its directory may go.
-            Ok(out) if out.status.code().is_some() => out,
+        let mut probe = aterm_uds::spawnfd::command(program);
+        probe.arg(&name);
+        let out = match aterm_uds::deadline::output_until(&mut probe, by) {
+            // Its own marker proves execution from this copy before its directory goes.
+            Ok(out) if prime_ran(&out, &name) => out,
             other => {
-                // Killed, signalled or unstarted: macOS may still be assessing its first exec.
-                std::mem::forget(remove);
+                // Without a completed marker, macOS may still be assessing its first exec.
+                let _kept = remove.keep();
                 let why = match other {
                     Err(aterm_uds::deadline::RunError::TimedOut) => {
                         return Err(RefreshFailed::NotSettled(Some(format!(
@@ -1636,7 +1638,9 @@ fn prime() -> Result<(), RefreshFailed> {
                             dir.display()
                         ))));
                     }
-                    Ok(out) => format!("ended by {}", out.status),
+                    Ok(out) => {
+                        format!("ended by {} without a complete execution proof", out.status)
+                    }
                     Err(e) => e.to_string(),
                 };
                 return Err(failed(format!(
@@ -1659,9 +1663,39 @@ fn prime() -> Result<(), RefreshFailed> {
     }
 }
 
+/// A completed child that wrote its unique marker ran from the copy being assessed.
+#[cfg(target_os = "macos")]
+fn prime_ran(out: &std::process::Output, marker: &str) -> bool {
+    out.status.code().is_some() && out.stdout == format!("{marker}\n").as_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_prime_exit_without_its_marker_does_not_authorize_removing_the_copy() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let mut out = std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: b"own-copy\n".to_vec(),
+            stderr: Vec::new(),
+        };
+        assert!(prime_ran(&out, "own-copy"));
+        assert!(!prime_ran(&out, "another-copy"));
+        out.stdout.clear();
+        assert!(
+            !prime_ran(&out, "own-copy"),
+            "a successful exit alone proves nothing"
+        );
+        out.stdout = b"own-copy\n".to_vec();
+        out.status = std::process::ExitStatus::from_raw(libc::SIGKILL);
+        assert!(
+            !prime_ran(&out, "own-copy"),
+            "an unsettled child keeps its copy"
+        );
+    }
 
     /// A prime whose program outlived its ceiling, inside the verb (its [`PRIME_UNSETTLED`] exit)
     /// or around it (the verb's own run timed out), did not settle: macOS's queue is backed up,

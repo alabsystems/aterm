@@ -1452,10 +1452,10 @@ fn a_rotated_seat_is_ringed_and_continued_under_each_node_it_held() {
     let p = astream_broker::identity_principal;
     let id = |k: &[u8; 32]| astream_cap::producer_id_of(&p(k));
     assert_eq!(
-        crate::logs::retired_of(&read, &b),
+        crate::logs::ringed_of(&read, &b),
         [p(&b_old), p(&b_older)].into()
     );
-    assert!(crate::logs::retired_of(&read, &key(9)).is_empty());
+    assert!(crate::logs::ringed_of(&read, &key(9)).is_empty());
     let mut olds = vec![id(&b_old), id(&b_older)];
     olds.sort_unstable();
     let mut lineage = crate::logs::lineage(&read, &me);
@@ -1467,10 +1467,54 @@ fn a_rotated_seat_is_ringed_and_continued_under_each_node_it_held() {
         [(id(&b), olds)],
         "none for this Mac's own rotation"
     );
-    let ring = crate::logs::ring("alab", &p(&me), &p(&b), &crate::logs::retired_of(&read, &b));
+    let ring = crate::logs::ring("alab", &p(&me), &p(&b), &crate::logs::ringed_of(&read, &b));
     for old in [&b_old, &b_older] {
         let grant = format!("rw,p={}:/f/alab/in/{}/*/{}/*", p(&b), p(&me), p(old));
         assert!(ring.contains(&grant), "{grant} in {ring:?}");
+    }
+}
+
+/// **A SEAT'S RING NAMES THE NODES IT RETIRED LAST** (§11 C3b): seat `b` retired one more node
+/// key than a ring names, the one it retired last the greatest principal; the ring `b` is served
+/// names the [`RING_OLDS_MAX`](aterm_link::federate::RING_OLDS_MAX) it retired last by the
+/// standings' order (`Standings::recency`), whatever their principals' order, and leaves out the
+/// one it retired first.
+/// NEGATIVE CONTROL: [`aterm_link::federate::NODE_ORDER_RING`], the choice before the second
+/// recency phase: the first in principal order, which leave out the key `b` retired last.
+#[test]
+fn a_seats_ring_names_the_nodes_it_retired_last() {
+    use aterm_link::federate::{NODE_ORDER_RING, RING_OLDS_MAX};
+    let key = |tag: u8| [tag; 32];
+    let (me, b) = (key(1), key(2));
+    // Principal order is tag order: `b` retired them in that order, the greatest last.
+    let olds: Vec<[u8; 32]> = (0..=RING_OLDS_MAX)
+        .map(|i| key(0xb0 + u8::try_from(i).unwrap()))
+        .collect();
+    let read = Standings {
+        current: [me, b].into(),
+        retired: olds.iter().copied().collect(),
+        rotated: olds.iter().map(|old| (*old, b)).collect(),
+        recency: olds.iter().rev().copied().zip(0..).collect(),
+        ..Standings::default()
+    };
+    let p = astream_broker::identity_principal;
+    let (first, last) = (p(&olds[0]), p(&olds[RING_OLDS_MAX]));
+    let grant = |old: &str| format!("rw,p={}:/f/alab/in/{}/*/{old}/*", p(&b), p(&me));
+    for control in [false, true] {
+        let case = format!("control={control}");
+        NODE_ORDER_RING.with(|on| on.set(control));
+        let ringed = crate::logs::ringed_of(&read, &b);
+        NODE_ORDER_RING.with(|on| on.set(false));
+        assert_eq!(ringed.len(), RING_OLDS_MAX, "{case}: bounded");
+        assert_eq!(ringed.contains(&last), !control, "{case}: the last retired");
+        assert_eq!(
+            ringed.contains(&first),
+            control,
+            "{case}: the first retired"
+        );
+        let ring = crate::logs::ring("alab", &p(&me), &p(&b), &ringed);
+        assert_eq!(ring.contains(&grant(&last)), !control, "{case}: {ring:?}");
+        assert_eq!(ring.contains(&grant(&first)), control, "{case}: {ring:?}");
     }
 }
 

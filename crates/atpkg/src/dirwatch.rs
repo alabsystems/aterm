@@ -44,6 +44,36 @@ impl Watcher {
         self.imp.add(file, Kind::File)
     }
 
+    /// Watch a directory while refusing a link anywhere on its path at the kernel open.
+    /// # Errors
+    /// The scoped open/watch fails, or this platform has no strict scoped opener.
+    pub fn add_dir_scoped(&self, dir: &Path) -> io::Result<WatchId> {
+        #[cfg(target_os = "macos")]
+        {
+            self.imp.add_scoped(dir, Kind::Dir)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = dir;
+            Err(io::ErrorKind::Unsupported.into())
+        }
+    }
+
+    /// Watch a regular file while refusing a link anywhere on its path at the kernel open.
+    /// # Errors
+    /// The scoped open/watch fails, or this platform has no strict scoped opener.
+    pub fn add_file_scoped(&self, file: &Path) -> io::Result<WatchId> {
+        #[cfg(target_os = "macos")]
+        {
+            self.imp.add_scoped(file, Kind::File)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = file;
+            Err(io::ErrorKind::Unsupported.into())
+        }
+    }
+
     /// Stop watch `id`.
     pub fn remove(&self, id: WatchId) {
         self.imp.remove(id);
@@ -177,6 +207,19 @@ mod imp {
                 .read(true)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
                 .open(path)?;
+            self.add_opened(file, kind)
+        }
+
+        pub(super) fn add_scoped(&self, path: &Path, kind: Kind) -> io::Result<WatchId> {
+            let want = match kind {
+                Kind::Dir => aterm_uds::nofollow::Kind::Dir,
+                Kind::File => aterm_uds::nofollow::Kind::File,
+            };
+            let fd = aterm_uds::nofollow::open_evtonly(path, want)?;
+            self.add_opened(std::fs::File::from(fd), kind)
+        }
+
+        fn add_opened(&self, file: std::fs::File, kind: Kind) -> io::Result<WatchId> {
             let meta = file.metadata()?;
             let fflags = match kind {
                 Kind::Dir if meta.is_dir() => {

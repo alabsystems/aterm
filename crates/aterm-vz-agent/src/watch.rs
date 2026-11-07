@@ -42,7 +42,10 @@ pub fn run<S: Stream>(
     tick: Duration,
 ) -> io::Result<()> {
     let mut out = conn.try_clone()?;
-    send(&mut out, &Frame::Hello(hello.clone()))?;
+    wire::write_hello(&mut out, hello).map_err(|e| match e {
+        wire::WireError::Io(e) => e,
+        other => io::Error::other(other.to_string()),
+    })?;
     let (tx, events) = mpsc::channel();
 
     let host = tx.clone();
@@ -95,7 +98,7 @@ pub fn run<S: Stream>(
     // job left for the host to name.
     let mut bus_wait: Option<String> = None;
     loop {
-        if let Some(b) = &booted {
+        if let Some(b) = booted.take() {
             match system.user_bus() {
                 Ok(()) => {
                     // `Ready` implies the agent already listens for commands: its start
@@ -103,8 +106,8 @@ pub fn run<S: Stream>(
                     send(
                         &mut out,
                         &Frame::Ready(Ready {
-                            state: b.state.clone(),
-                            failed_units: b.failed_units.clone(),
+                            state: b.state,
+                            failed_units: b.failed_units,
                         }),
                     )?;
                     break;
@@ -118,6 +121,7 @@ pub fn run<S: Stream>(
                         ));
                         bus_wait = Some(why);
                     }
+                    booted = Some(b);
                 }
             }
         }

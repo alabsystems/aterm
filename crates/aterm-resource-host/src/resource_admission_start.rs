@@ -51,6 +51,7 @@ impl Owner {
                     reason: "child preparation refused before launch".into(),
                 });
                 self.failed.push(Failed {
+                    _compiler: pending.recipe.as_ref().and_then(|r| r.compiler.clone()),
                     binding: pending.submission.request.binding,
                     custody,
                     spawned: None,
@@ -80,6 +81,7 @@ impl Owner {
                 // An unbound or unknown native outcome has no affirmative
                 // Refused/Started fact. Closing yields transport-unknown.
                 self.failed.push(Failed {
+                    _compiler: pending.recipe.as_ref().and_then(|r| r.compiler.clone()),
                     binding: pending.submission.request.binding,
                     custody,
                     spawned,
@@ -126,6 +128,7 @@ impl Owner {
             delegation,
             program,
             native_targo,
+            compiler: pending.recipe.as_ref().and_then(|r| r.compiler.clone()),
             members: BTreeMap::new(),
             events: pending.events,
             custody,

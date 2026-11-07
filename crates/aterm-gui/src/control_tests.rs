@@ -13,10 +13,12 @@ fn account_service_context_carries_the_apps_epoch_and_browser_policy_to_harmless
     let mut app = crate::App::headless_for_test();
     let serving = AccountServices {
         lifetime: app.account_work.clone(),
+        source_registry: Arc::new(Default::default()),
         interactive_browser: true,
     };
     let headless = AccountServices {
         lifetime: app.account_work.clone(),
+        source_registry: Arc::new(Default::default()),
         interactive_browser: false,
     };
     app.account_drain = crate::app_account_work::Drain::for_launch(&app.account_work, true);
@@ -6374,7 +6376,6 @@ fn escalated_op_fences_argument_dependent_seams() {
         "LiftHold",
         "ToggleStatsLens",
         "RecordUnseenKeys",
-        "ChangeNickname",
         "RenameMachine",
     ] {
         let refusal = super::control_media::invoke_refusal(name).expect("refused");
@@ -11893,14 +11894,17 @@ fn cap_gives_a_typed_turn_room_to_press_a_long_text() {
     let run = |args: &str| -> (String, usize, Vec<String>) {
         let keys = Cell::new(0usize);
         let pasted = RefCell::new(Vec::<String>::new());
-        let key = |_: InputEvent| {
-            keys.set(keys.get() + 1);
+        // A rest's run is the bytes of its keys in one write; the head's keys go one by one.
+        let key = |ev: InputEvent| {
+            match ev {
+                InputEvent::KeySequence(bytes) => pasted
+                    .borrow_mut()
+                    .push(String::from_utf8(bytes).expect("a run of plain keys")),
+                _ => keys.set(keys.get() + 1),
+            }
             true
         };
-        let paste = |t: &str| {
-            pasted.borrow_mut().push(t.to_string());
-            true
-        };
+        let paste = |_: &str| -> bool { panic!("a typed turn writes no paste") };
         let press = |_: &str| true;
         let momentum = || Ok((0.0, Instant::now()));
         let store = session_store::new_store();
@@ -11945,19 +11949,19 @@ fn cap_gives_a_typed_turn_room_to_press_a_long_text() {
             pasted.concat()
         ),
         "abcde ".repeat(50),
-        "one paste, exactly the text past the cap: {pasted:?}"
+        "one write, exactly the text past the cap: {pasted:?}"
     );
     assert_eq!(pasted.len(), 1);
 
     let (verdict, keys, pasted) = run("cap=300");
     assert!(verdict.ends_with(" typed=300 pasted=0"), "{verdict}");
     assert_eq!(keys, 300);
-    assert!(pasted.is_empty(), "nothing is pasted: {pasted:?}");
+    assert!(pasted.is_empty(), "no rest is written: {pasted:?}");
 
     let (verdict, keys, pasted) = run("cap=100");
     assert!(verdict.ends_with(" typed=100 pasted=200"), "{verdict}");
     assert_eq!(keys, 100);
-    assert_eq!(pasted.len(), 1, "one paste: {pasted:?}");
+    assert_eq!(pasted.len(), 1, "one write: {pasted:?}");
 
     let (verdict, keys, pasted) = run("cap=999999");
     assert!(verdict.ends_with(" typed=300 pasted=0"), "{verdict}");
@@ -11972,10 +11976,10 @@ fn cap_gives_a_typed_turn_room_to_press_a_long_text() {
 
 /// A TYPED TURN'S REST PRESSES ITS TABS (the hostile review of the turn-deadline work,
 /// 2026-11-06): wherever the cap stops the keys of `col1<Tab>col2 x`, the rest goes as typing it
-/// would, its text pasted and its Tab pressed as the Tab key, in order, so a shell under bracketed
-/// paste still completes where the keys would have; each of the text's keys is counted once,
-/// typed or pasted. NEGATIVE CONTROL: with the rest pasted in one piece, the Tab is inside a
-/// paste for every cap that stops the keys before it (1 to 4).
+/// would, each run of its text one write of its keys' bytes and its Tab pressed as the Tab key, in
+/// order, so a shell still completes where the keys would have; each of the text's keys is
+/// counted once, typed or written in a run. NEGATIVE CONTROL: with the rest written in one piece,
+/// the Tab is inside a run for every cap that stops the keys before it (1 to 4).
 #[test]
 fn a_typed_turn_s_rest_presses_its_tabs_wherever_the_cap_stops_the_keys() {
     use std::cell::RefCell;
@@ -11990,8 +11994,14 @@ fn a_typed_turn_s_rest_presses_its_tabs_wherever_the_cap_stops_the_keys() {
         // Each write in order: (pressed as a key, what it wrote).
         let writes = RefCell::new(Vec::<(bool, String)>::new());
         let key = |ev: InputEvent| {
-            let InputEvent::Key { key, mods, .. } = ev else {
-                panic!("a typed key is a key event: {ev:?}");
+            let (key, mods) = match ev {
+                InputEvent::Key { key, mods, .. } => (key, mods),
+                InputEvent::KeySequence(bytes) => {
+                    let run = String::from_utf8(bytes).expect("a run of plain keys");
+                    writes.borrow_mut().push((false, run));
+                    return true;
+                }
+                other => panic!("a typed key is a key event or a run: {other:?}"),
             };
             assert!(mods.is_empty(), "no shifted key in {TEXT:?}");
             let written = match key {
@@ -12003,10 +12013,7 @@ fn a_typed_turn_s_rest_presses_its_tabs_wherever_the_cap_stops_the_keys() {
             writes.borrow_mut().push((true, written));
             true
         };
-        let paste = |t: &str| {
-            writes.borrow_mut().push((false, t.to_string()));
-            true
-        };
+        let paste = |_: &str| -> bool { panic!("a typed turn writes no paste") };
         let press = |_: &str| true;
         let momentum = || Ok((0.0, Instant::now()));
         let store = session_store::new_store();
@@ -12041,7 +12048,7 @@ fn a_typed_turn_s_rest_presses_its_tabs_wherever_the_cap_stops_the_keys() {
         assert_eq!(written, TEXT, "cap={cap}: {writes:?}");
         assert!(
             !writes.iter().any(|(key, w)| !key && w.contains('\t')),
-            "cap={cap}: the Tab was pasted: {writes:?}"
+            "cap={cap}: the Tab went in a run: {writes:?}"
         );
         let keys = writes.iter().filter(|(key, _)| *key).count();
         let pasted: usize = writes
@@ -12059,7 +12066,7 @@ fn a_typed_turn_s_rest_presses_its_tabs_wherever_the_cap_stops_the_keys() {
     assert_eq!(
         writes[4..],
         [(true, "\t".to_string()), (false, "col2 x".to_string())],
-        "past the cap: the Tab pressed, then the rest pasted in one piece"
+        "past the cap: the Tab pressed, then the rest in one write"
     );
 }
 
@@ -12441,7 +12448,18 @@ fn composer_turn_on(
                 tx.send((bytes, 0, delay)).expect("the echo thread");
             }
         };
-        let key = |_: InputEvent| {
+        // A rest's run: the bytes its keys send, in one write (plain keys, so their text).
+        let run = |rest: &str| {
+            for g in rest.graphemes() {
+                c.push(g);
+            }
+            echo(keys.borrow().len() + rest.graphemes().count());
+            true
+        };
+        let key = |ev: InputEvent| {
+            if let InputEvent::KeySequence(bytes) = &ev {
+                return run(std::str::from_utf8(bytes).expect("a run of plain keys"));
+            }
             sent_at.borrow_mut().push(Instant::now());
             let k = keys.borrow().len() + 1;
             if drawn.load(Ordering::SeqCst) + 1 < k {
@@ -12453,13 +12471,7 @@ fn composer_turn_on(
             echo(k);
             true
         };
-        let paste = |rest: &str| {
-            for g in rest.graphemes() {
-                c.push(g);
-            }
-            echo(keys.borrow().len() + rest.graphemes().count());
-            true
-        };
+        let paste = |_: &str| -> bool { panic!("a typed turn writes no paste") };
         let press = |_: &str| {
             enters.set(enters.get() + 1);
             h.term.lock().unwrap().process(b"\r\nresponse-line\r\n");
@@ -13321,12 +13333,13 @@ fn a_typed_turn_fenced_on_no_input_frame_types_every_key() {
 /// 2026-11-04): a drive's turn (`timeout=20000`) to a loaded Claude Code worker, its keys going
 /// at about 5 a second, answered `skipped reason=deadline typed=106 submitted=0` and left the 106
 /// in the composer, and each retry stacked another. Here every key takes 60 ms and the text needs
-/// over 5 s of them in a 3 s turn: the turn types while the next key and one paste of the rest still
-/// fit, pastes the rest, and submits the whole text. One whose first key does not fit writes
-/// nothing, and one with the time types every key. A key that alone runs past the deadline
-/// still ends in the paste, never a cut, and a program that never stops drawing (a working
-/// agent's spinner) does not keep the submit from its window. The program's composer is the
-/// model: what the keys and the pastes put there, which the Enter takes whole.
+/// over 5 s of them in a 3 s turn: the turn types while the next key and one write of the rest
+/// still fit, writes the rest as its keys' bytes, and submits the whole text. One whose first key
+/// does not fit writes nothing, and one with the time types every key. A key that alone runs past
+/// the deadline still ends in the rest's write, never a cut, and a program that never stops
+/// drawing (a working agent's spinner) does not keep the submit from its window. The program's
+/// composer is the model: what the keys and the rest's writes put there, which the Enter takes
+/// whole.
 /// NEGATIVE CONTROLS: with the per-key `now >= deadline` cut in place of the pace, or beside it,
 /// the slow arm or the long key's answers `reason=deadline typed=<k>` and leaves those `k`
 /// graphemes in the composer, no Enter; with the echo's settle waited to the deadline, the
@@ -13344,7 +13357,8 @@ fn a_typed_turn_slower_than_its_deadline_lands_whole_or_writes_nothing() {
     struct Landed {
         verdict: String,
         keys: usize,
-        pastes: usize,
+        /// The rest's runs, each one write of its keys' bytes.
+        runs: usize,
         composer: String,
         sent: Vec<String>,
         /// When the turn began, and when its Enter went.
@@ -13356,22 +13370,24 @@ fn a_typed_turn_slower_than_its_deadline_lands_whole_or_writes_nothing() {
         let h = registered_session(0, -1, b"");
         store.write().unwrap().register(h.clone());
         let graphemes: Vec<&str> = text.graphemes().collect();
-        let (keys, pastes) = (Cell::new(0usize), Cell::new(0usize));
+        let (keys, runs) = (Cell::new(0usize), Cell::new(0usize));
         let composer = RefCell::new(String::new());
         let sent = RefCell::new(Vec::new());
         let pressed = Cell::new(None);
         // A key the program takes `per_key` to read: a loaded worker behind a drive.
-        let key = |_: InputEvent| {
+        let key = |ev: InputEvent| {
+            if let InputEvent::KeySequence(bytes) = &ev {
+                runs.set(runs.get() + 1);
+                let run = std::str::from_utf8(bytes).expect("a run of plain keys");
+                composer.borrow_mut().push_str(run);
+                return true;
+            }
             std::thread::sleep(per_key(keys.get()));
             composer.borrow_mut().push_str(graphemes[keys.get()]);
             keys.set(keys.get() + 1);
             true
         };
-        let paste = |rest: &str| {
-            pastes.set(pastes.get() + 1);
-            composer.borrow_mut().push_str(rest);
-            true
-        };
+        let paste = |_: &str| -> bool { panic!("a typed turn writes no paste") };
         let press = |_: &str| {
             pressed.set(Some(Instant::now()));
             sent.borrow_mut().push(composer.take());
@@ -13423,7 +13439,7 @@ fn a_typed_turn_slower_than_its_deadline_lands_whole_or_writes_nothing() {
         Landed {
             verdict: out.lines().next().unwrap_or("").to_string(),
             keys: keys.get(),
-            pastes: pastes.get(),
+            runs: runs.get(),
             composer: composer.take(),
             sent: sent.take(),
             began,
@@ -13457,7 +13473,7 @@ fn a_typed_turn_slower_than_its_deadline_lands_whole_or_writes_nothing() {
         t.verdict
     );
     assert!(typed < n, "the deadline left no room to press every key");
-    assert_eq!(t.pastes, 1, "the rest went as one paste");
+    assert_eq!(t.runs, 1, "the rest went in one write");
 
     for opts in ["timeout=0", "cadence=2000 timeout=1000"] {
         let t = run(opts, slow, text);
@@ -13468,7 +13484,7 @@ fn a_typed_turn_slower_than_its_deadline_lands_whole_or_writes_nothing() {
             t.verdict
         );
         assert_eq!(
-            (t.keys, t.pastes, t.composer.as_str(), t.sent.len()),
+            (t.keys, t.runs, t.composer.as_str(), t.sent.len()),
             (0, 0, "", 0),
             "{opts}: nothing written, the composer as the turn found it"
         );
@@ -13481,9 +13497,9 @@ fn a_typed_turn_slower_than_its_deadline_lands_whole_or_writes_nothing() {
         t.verdict
     );
     assert_eq!(t.sent, [text]);
-    assert_eq!(t.pastes, 0, "nothing pasted");
+    assert_eq!(t.runs, 0, "no rest written");
 
-    // The fifth key alone outlasts the 3 s turn: the rest still goes as the paste.
+    // The fifth key alone outlasts the 3 s turn: the rest still goes in its write.
     let long = |k: usize| {
         if k == 4 {
             Duration::from_millis(3_500)
@@ -13496,7 +13512,7 @@ fn a_typed_turn_slower_than_its_deadline_lands_whole_or_writes_nothing() {
     assert_eq!(t.sent, [text], "{}", t.verdict);
     assert_eq!(t.composer, "", "nothing left in the composer");
     assert!(
-        t.verdict.ends_with(&format!(" typed=5 pasted={}", n - 5)) && t.pastes == 1,
+        t.verdict.ends_with(&format!(" typed=5 pasted={}", n - 5)) && t.runs == 1,
         "{}",
         t.verdict
     );
@@ -20189,6 +20205,50 @@ fn a_guarded_submit_into_a_busy_sink_after_typing_keeps_its_id_in_doubt() {
     assert_eq!(pastes.get(), 1, "typed exactly once");
 }
 
+/// A GUARDED ENTER THAT WAS A TURN'S FIRST WRITE AND WROTE NOTHING GIVES ITS `id=` BACK (fourth
+/// review of the turn-deadline work, 2026-11-06): a typed turn of control characters alone types
+/// nothing, so its guarded Enter is its first write, and a guard that misses writes nothing at
+/// all: the turn answers `reason=guard` and a retry with the same `id=` is judged again, as a
+/// `key if=` skip's is. NEGATIVE CONTROL: with the turn marked written before its Enter, the
+/// retry answers `OK 0 dup=1`.
+#[test]
+#[cfg(unix)]
+fn a_guarded_first_enter_that_wrote_nothing_gives_its_id_back() {
+    let store = session_store::new_store();
+    let h = registered_session(0, -1, b"> ");
+    store.write().unwrap().register(h.clone());
+    let key = format!("{}:4:1", h.ctx.nonce.to_hex());
+    let turn = || {
+        crate::pty_idem::guarded_waking(
+            &h.ctx,
+            Scope::Owner,
+            "turn",
+            Some(key.as_str()),
+            &|| {},
+            |witness| {
+                cmd_turn(
+                    &h.term,
+                    &store,
+                    0,
+                    "typed=1 submit=guarded:^never submit_window=20 idle=5 timeout=60000 \u{1b}",
+                    &h.ctx,
+                    &TurnIo {
+                        witness: Some(witness),
+                        ..TurnIo::paste_only()
+                    },
+                )
+            },
+        )
+    };
+    for attempt in 0..2 {
+        let reply = turn();
+        assert!(
+            reply.starts_with("OK 0 turn skipped reason=guard submitted=0 "),
+            "attempt {attempt}: {reply}"
+        );
+    }
+}
+
 /// A guarded submit fenced on the person (`if-human=`) judges the person under the lock at every
 /// try of its Enter, the retries the busy sink calls for included: a gesture while the sink takes
 /// none of the Enter cuts the turn (`reason=person`, the text left standing), never an Enter after
@@ -20325,7 +20385,14 @@ fn a_turn_that_wrote_nothing_leaves_its_id_for_the_retry() {
     };
     let keys = std::cell::Cell::new(0u32);
     let exit_on_key = std::cell::Cell::new(false);
-    let key_press = |_: InputEvent| {
+    let key_press = |ev: InputEvent| {
+        // A rest's run is text written, the bytes of its keys in one write.
+        if let InputEvent::KeySequence(bytes) = &ev {
+            typed
+                .borrow_mut()
+                .push_str(std::str::from_utf8(bytes).expect("a run of plain keys"));
+            return true;
+        }
         keys.set(keys.get() + 1);
         if exit_on_key.get() {
             store
@@ -20410,8 +20477,8 @@ fn a_turn_that_wrote_nothing_leaves_its_id_for_the_retry() {
     hold_on_paste.set(true);
     let held = turn(2, "idle=5 timeout=60000 hi");
     assert!(
-        held.starts_with("OK 0 turn skipped reason=halted submitted=0 "),
-        "{held}"
+        held.starts_with("OK 0 turn skipped reason=halted typed=0 pasted=2 submitted=0 "),
+        "a halt after the paste says what of its text stands: {held}"
     );
     assert!(crate::fabric::apply_hold_for_test(&h.ctx, None));
     hold_on_paste.set(false);
@@ -20450,14 +20517,14 @@ fn a_turn_that_wrote_nothing_leaves_its_id_for_the_retry() {
     );
     assert_eq!(keys.get(), 3, "typed nothing twice");
 
-    // A head of control characters presses no key, so the remainder's paste is the first write.
+    // A head of control characters presses no key, so the remainder's run is the first write.
     exit_on_key.set(false);
     let control_head = "submit=none typed=1 cap=1 idle=5 timeout=60000 \u{1}hi";
     assert_eq!(turn(5, control_head), "ERR exited\n");
     assert_eq!(
         typed.borrow().as_str(),
         "hihi",
-        "nothing pasted into the exited session"
+        "nothing written into the exited session"
     );
     store
         .write()
@@ -20471,9 +20538,9 @@ fn a_turn_that_wrote_nothing_leaves_its_id_for_the_retry() {
     assert_eq!(
         turn(5, control_head),
         "OK 0 dup=1\n",
-        "the remainder's paste spent the sequence"
+        "the remainder's run spent the sequence"
     );
-    assert_eq!(typed.borrow().as_str(), "hihihi", "pasted once");
+    assert_eq!(typed.borrow().as_str(), "hihihi", "written once");
     assert_eq!(keys.get(), 3, "and no key pressed");
 }
 
@@ -20638,7 +20705,7 @@ fn a_turn_whose_first_write_is_refused_whole_gives_its_id_to_the_retry() {
     room.set(1);
     assert_eq!(
         turn(6, rest_after),
-        "ERR paste delivery failed\n",
+        "ERR key delivery failed\n",
         "the remainder refused whole follows a key"
     );
     room.set(u32::MAX);
@@ -23066,4 +23133,162 @@ fn board_answers_this_macs_board_and_takes_no_words() {
             "{words}"
         );
     }
+}
+
+/// A TURN `lease release force` PREEMPTED WRITES NOTHING MORE (disconnect F1 of the second
+/// hostile review of the turn-deadline work, 2026-11-06): the lease help offers `release force`
+/// to preempt a wedged turn, and a turn it preempted went on writing its keys, its rest and its
+/// Enter behind whatever turn took the slot next. Now each key, run, paste and press first looks
+/// for its own slot: a typed turn preempted after its third key answers
+/// `reason=preempted typed=3 pasted=0` with nothing more typed, a plain turn preempted while its
+/// paste goes presses no Enter and says its paste stands (`typed=0 pasted=5`, third review), and
+/// a turn preempted once its first Enter went presses no more.
+/// NEGATIVE CONTROL: with no look at the slot, every key of the text and the Enter are written.
+#[test]
+fn a_turn_preempted_by_a_forced_release_writes_nothing_more() {
+    use std::cell::Cell;
+    use std::time::Instant;
+
+    use crate::input::InputEvent;
+
+    let store = session_store::new_store();
+    let h = registered_session(0, -1, b"");
+    store.write().unwrap().register(h.clone());
+    let force = || assert_eq!(cmd_lease(&h.ctx, "release force"), "OK lease released\n");
+    let momentum = || Ok((0.0, Instant::now()));
+
+    let keys = Cell::new(0usize);
+    let presses = Cell::new(0usize);
+    let key = |_: InputEvent| {
+        keys.set(keys.get() + 1);
+        if keys.get() == 3 {
+            force();
+        }
+        true
+    };
+    let press = |_: &str| {
+        presses.set(presses.get() + 1);
+        true
+    };
+    let out = cmd_turn(
+        &h.term,
+        &store,
+        0,
+        "typed=1 cadence=1 idle=20 timeout=10000 submit_window=200 abcdef",
+        &h.ctx,
+        &TurnIo {
+            press: &press,
+            key: &key,
+            momentum: &momentum,
+            ..TurnIo::paste_only()
+        },
+    );
+    assert!(
+        out.starts_with("OK 0 turn skipped reason=preempted typed=3 pasted=0 submitted=0 "),
+        "{out}"
+    );
+    assert_eq!((keys.get(), presses.get()), (3, 0), "{out}");
+
+    let paste = |_: &str| {
+        force();
+        true
+    };
+    let out = cmd_turn(
+        &h.term,
+        &store,
+        0,
+        "idle=20 timeout=10000 submit_window=200 hello",
+        &h.ctx,
+        &TurnIo {
+            paste: &paste,
+            press: &press,
+            ..TurnIo::paste_only()
+        },
+    );
+    assert!(
+        out.starts_with("OK 0 turn skipped reason=preempted typed=0 pasted=5 submitted=0 "),
+        "the paste stands: {out}"
+    );
+    assert_eq!(presses.get(), 0, "no Enter after the preemption: {out}");
+
+    let pasted = |_: &str| true;
+    let pressed_then_preempted = |_: &str| {
+        presses.set(presses.get() + 1);
+        force();
+        true
+    };
+    let out = cmd_turn(
+        &h.term,
+        &store,
+        0,
+        "idle=20 timeout=10000 submit_window=200 presses=3 hello",
+        &h.ctx,
+        &TurnIo {
+            paste: &pasted,
+            press: &pressed_then_preempted,
+            ..TurnIo::paste_only()
+        },
+    );
+    assert_eq!(presses.get(), 1, "one Enter, no re-press: {out}");
+    assert!(out.contains(" pressed=1"), "{out}");
+}
+
+/// A HEAD THAT TYPES NO KEY STILL ASKS THE PACE (disconnect F5 of the second hostile review of
+/// the turn-deadline work, 2026-11-06): a typed turn whose head is control characters alone
+/// (`cap=1` on an ESC) presses no key, so its rest's first write is its first, and it now goes
+/// only where the rest and the submit fit before `timeout=`, as a first key does: one that does
+/// not fit writes nothing (`reason=deadline typed=0 pasted=0`); one that does writes the rest as
+/// its keys' bytes in one write. NEGATIVE CONTROL: with the pace asked before keys alone, the
+/// rest of the slow turn is written past its deadline and its Enter pressed.
+#[test]
+fn a_typed_turn_whose_head_types_no_key_writes_its_rest_only_where_the_pace_fits() {
+    use std::cell::RefCell;
+    use std::time::Instant;
+
+    use crate::input::InputEvent;
+
+    let store = session_store::new_store();
+    let h = registered_session(0, -1, b"");
+    store.write().unwrap().register(h.clone());
+    let momentum = || Ok((0.0, Instant::now()));
+    let writes = RefCell::new(Vec::<InputEvent>::new());
+    let key = |ev: InputEvent| {
+        writes.borrow_mut().push(ev);
+        true
+    };
+    let press = |_: &str| {
+        writes
+            .borrow_mut()
+            .push(InputEvent::KeySequence(b"<enter>".to_vec()));
+        true
+    };
+    let turn = |line: &str| {
+        cmd_turn(
+            &h.term,
+            &store,
+            0,
+            line,
+            &h.ctx,
+            &TurnIo {
+                press: &press,
+                key: &key,
+                momentum: &momentum,
+                ..TurnIo::paste_only()
+            },
+        )
+    };
+    let out = turn("typed=1 cap=1 cadence=2000 idle=20 timeout=1000 \u{1b}hello world");
+    assert!(
+        out.starts_with("OK 0 turn skipped reason=deadline typed=0 pasted=0 submitted=0 "),
+        "{out}"
+    );
+    assert!(writes.borrow().is_empty(), "nothing written: {out}");
+
+    let out = turn("typed=1 cap=1 cadence=1 idle=20 timeout=10000 submit=none \u{1b}hello world");
+    assert!(out.contains(" typed=0 pasted=11"), "{out}");
+    assert_eq!(
+        *writes.borrow(),
+        [InputEvent::KeySequence(b"hello world".to_vec())],
+        "the rest as its keys' bytes, in one write: {out}"
+    );
 }

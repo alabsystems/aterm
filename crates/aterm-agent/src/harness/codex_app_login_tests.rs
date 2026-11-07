@@ -13,11 +13,334 @@ use std::time::{Duration, Instant};
 
 use super::*;
 
+// Synthetic journal metadata for low-level credential guards only. This does not
+// claim Store admission; end-to-end tests obtain Artifact from the actual writer.
+fn native_receipt_fixture(home: &Path, now: i64) -> RefreshJournal {
+    use crate::harness::{accounts, codex_enrollment};
+    let token = make_chatgpt_jwt(Some("owner@example.test"), "pro", now + 3600);
+    let candidate = aterm_json::to_string(&json!({
+        "auth_mode":"chatgpt", "tokens":{
+            "id_token":token, "access_token":token, "refresh_token":"sealed-native-secret"
+        }
+    }))
+    .unwrap();
+    RefreshJournal::EnrollmentResponse {
+        admission: Box::new(codex_enrollment::Staging {
+            request: codex_enrollment::Request {
+                id: "a".repeat(32),
+                caller: "b".repeat(64),
+                label: "one".into(),
+                revision: "c".repeat(64),
+            },
+            store: home.parent().unwrap().to_path_buf(),
+            directory: home.canonicalize().unwrap(),
+            store_identity: None,
+            directory_identity: None,
+            parent: accounts::RenewalParent::capture(&accounts::Logins::default(), "one"),
+            workflow: 1,
+            policy: "d".repeat(64),
+            selection: None,
+        }),
+        predecessor: Some(credential_digest(
+            read_auth_file_bounded(home).unwrap().as_bytes(),
+        )),
+        digest: credential_digest(candidate.as_bytes()),
+        candidate: NativeCredential(candidate),
+    }
+}
+
+#[test]
+fn an_existing_native_response_blocks_ordinary_exchange_without_losing_custody() {
+    for boundary in 0..3 {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let home = tmp.path().join("login");
+        let now = 1_790_000_000;
+        hour_login(&home, now, Some("original-refresh"));
+        native_receipt_fixture(&home, now).write(&home).unwrap();
+        let auth = std::fs::read(home.join(AUTH_FILE)).unwrap();
+        let journal = std::fs::read(beside_auth(&home, JOURNAL_SUFFIX)).unwrap();
+        let held =
+            (boundary == 1).then(|| AuthLock::try_take(&home.join(AUTH_FILE)).unwrap().unwrap());
+        let (port, server) = provider(|_, _| ("200 OK", json!({})));
+        let result = CodeExchange {
+            publication: None,
+            enrollment: None,
+            home: &home,
+            endpoints: &Endpoints {
+                issuer: format!("http://127.0.0.1:{port}"),
+                token_url: format!("http://127.0.0.1:{port}/oauth/token"),
+                callback_ports: vec![],
+            },
+            redirect_uri: "http://127.0.0.1/callback",
+            code: "unspent",
+            code_verifier: "verifier",
+            deadline: WakeDeadline::after(if boundary == 2 {
+                Duration::ZERO
+            } else {
+                aterm_spec::wait::MUST_HAPPEN
+            }),
+            work: None,
+            now,
+        }
+        .exchange();
+        drop(held);
+        let seen = provider_seen(port, server);
+        assert_eq!(result, Err(ExchangeError::Protected));
+        assert!(seen.is_empty());
+        assert_eq!(std::fs::read(home.join(AUTH_FILE)).unwrap(), auth);
+        assert_eq!(
+            std::fs::read(beside_auth(&home, JOURNAL_SUFFIX)).unwrap(),
+            journal
+        );
+    }
+}
+
+#[test]
+fn native_response_journal_is_redacted_and_generic_refresh_cannot_apply_or_discard_it() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let home = tmp.path().join("login");
+    let now = 1_790_000_000;
+    hour_login(&home, now, Some("original-refresh"));
+    let receipt = native_receipt_fixture(&home, now);
+    let debug = format!("{receipt:?}");
+    assert!(!debug.contains("sealed-native-secret"));
+    if let RefreshJournal::EnrollmentResponse { candidate, .. } = &receipt {
+        assert!(!debug.contains(&candidate.0));
+    }
+    receipt.write(&home).unwrap();
+    let auth = std::fs::read(home.join(AUTH_FILE)).unwrap();
+    let journal = std::fs::read(beside_auth(&home, JOURNAL_SUFFIX)).unwrap();
+    let held = AuthLock::try_take(&home.join(AUTH_FILE)).unwrap().unwrap();
+    let recovered = recover_journal_held(&home);
+    drop(held);
+    assert!(recovered.is_err());
+    assert_eq!(std::fs::read(home.join(AUTH_FILE)).unwrap(), auth);
+    assert_eq!(
+        std::fs::read(beside_auth(&home, JOURNAL_SUFFIX)).unwrap(),
+        journal
+    );
+    let mut invalid = receipt.to_value();
+    invalid
+        .as_object_mut()
+        .unwrap()
+        .insert("digest".into(), json!("0".repeat(64)));
+    assert!(RefreshJournal::of_value(&invalid).is_none());
+}
+
+/// Exercise the actual native exchange for a caller's genuine Store-admitted artifact.
+/// The fixture owns and joins its only local HTTP provider before returning.
+pub(in crate::harness) fn native_enrollment_exchange_fixture(
+    request: &crate::harness::login_drive::Request<'_>,
+    cut: Option<EnrollmentCut>,
+    now: i64,
+    work: Option<&crate::harness::account_work::Scope>,
+    email: &str,
+) -> crate::harness::login_drive::Drove {
+    let artifact = request.enrollment.expect("actual enrollment admission");
+    let home = &artifact.staging().directory;
+    native_exchange_fixture(
+        home,
+        NativeDestination {
+            enrollment: Some(artifact),
+            publication: request.publication,
+        },
+        cut,
+        now,
+        work,
+        email,
+    )
+}
+
+#[cfg(unix)]
+pub(in crate::harness) fn native_ordinary_exchange_fixture(
+    request: &crate::harness::login_drive::Request<'_>,
+    now: i64,
+    work: &crate::harness::account_work::Scope,
+    email: &str,
+) -> crate::harness::login_drive::Drove {
+    assert!(request.enrollment.is_none());
+    assert!(request.publication.is_some());
+    native_exchange_fixture(
+        request.staging,
+        NativeDestination {
+            enrollment: None,
+            publication: request.publication,
+        },
+        None,
+        now,
+        Some(work),
+        email,
+    )
+}
+
+pub(in crate::harness) fn native_enrollment_owner_fixture(
+    artifact: &crate::harness::codex_enrollment::Artifact,
+    cut: Option<EnrollmentCut>,
+    now: i64,
+    prepared: crate::harness::codex_grant_owner::PreparedGrant,
+) -> (
+    crate::harness::login_drive::Drove,
+    crate::harness::codex_grant_owner::CaptureOutcome,
+) {
+    let (drove, captured) = native_exchange_capturing(
+        &artifact.staging().directory,
+        NativeDestination {
+            enrollment: Some(artifact),
+            publication: None,
+        },
+        cut,
+        now,
+        None,
+        "main@example.test",
+        Some(prepared),
+    );
+    (
+        drove,
+        captured.expect("actual code exchange retains its outcome"),
+    )
+}
+
+fn native_exchange_fixture(
+    home: &Path,
+    destination: NativeDestination<'_>,
+    cut: Option<EnrollmentCut>,
+    now: i64,
+    work: Option<&crate::harness::account_work::Scope>,
+    email: &str,
+) -> crate::harness::login_drive::Drove {
+    native_exchange_capturing(
+        home,
+        destination,
+        cut,
+        now,
+        work,
+        email,
+        None::<NoGrantCapture>,
+    )
+    .0
+}
+
+fn native_exchange_capturing<C: CodeGrantCapture>(
+    home: &Path,
+    destination: NativeDestination<'_>,
+    cut: Option<EnrollmentCut>,
+    now: i64,
+    work: Option<&crate::harness::account_work::Scope>,
+    email: &str,
+    capture: Option<C>,
+) -> (crate::harness::login_drive::Drove, Option<C::Output>) {
+    let provider_home = home.to_path_buf();
+    let email = email.to_owned();
+    let (port, server) = provider(move |_, _| {
+        assert!(
+            AuthLock::try_take(&provider_home.join(AUTH_FILE))
+                .unwrap()
+                .is_none()
+        );
+        let token = make_chatgpt_jwt(Some(&email), "pro", now + 3600);
+        (
+            "200 OK",
+            json!({
+                "id_token":token, "access_token":token, "refresh_token":"native-fixture-response"
+            }),
+        )
+    });
+    let exchange = CodeExchange {
+        publication: destination.publication,
+        enrollment: destination.enrollment,
+        home,
+        endpoints: &Endpoints {
+            issuer: DEFAULT_ISSUER.into(),
+            token_url: format!("http://127.0.0.1:{port}/oauth/token"),
+            callback_ports: vec![],
+        },
+        redirect_uri: "http://127.0.0.1/callback",
+        code: "one-use-code",
+        code_verifier: "verifier",
+        deadline: WakeDeadline::after(aterm_spec::wait::MUST_HAPPEN),
+        work,
+        now,
+    };
+    let mut entropy = [0u8; 32];
+    SystemRandom::new().fill(&mut entropy).unwrap();
+    let owner = base64url_encode(&entropy).unwrap();
+    let (result, captured) = exchange.persist_capturing_inner(
+        Some(&owner),
+        capture,
+        |home, deadline| AuthLock::within(home, deadline.instant()),
+        cut,
+    );
+    let seen = provider_seen(port, server);
+    assert_eq!(seen, ["POST /oauth/token"]);
+    use crate::harness::login_drive::{Drove, Outcome};
+    (
+        Drove {
+            outcome: match result {
+                Ok(email) => Outcome::SignedIn { email, page: false },
+                Err(ExchangeError::Retained) => Outcome::CompletedHeld,
+                Err(ExchangeError::Protected) => Outcome::CustodyHeld,
+                Err(ExchangeError::Unsealed) => Outcome::Failed,
+            },
+            host: None,
+        },
+        captured,
+    )
+}
+
+/// Refresh the genuine caller's published native credential against one owned local provider.
+#[cfg(unix)]
+pub(in crate::harness) fn native_enrollment_refresh_fixture(home: &Path, now: i64) {
+    let stored = load_stored_auth(home).expect("genuine published enrollment credential");
+    assert!(!beside_auth(home, JOURNAL_SUFFIX).exists());
+    let before = stored.refresh_token.clone();
+    let provider_home = home.to_path_buf();
+    let (port, server) = provider(move |_, _| {
+        assert!(
+            AuthLock::try_take(&provider_home.join(AUTH_FILE))
+                .unwrap()
+                .is_none()
+        );
+        let token = make_chatgpt_jwt(Some("main@example.test"), "pro", now + 7200);
+        (
+            "200 OK",
+            json!({
+                "id_token":token, "access_token":token, "refresh_token":"native-fixture-refreshed"
+            }),
+        )
+    });
+    let refreshed = refresh_outcome(
+        home,
+        &stored,
+        &format!("http://127.0.0.1:{port}/oauth/token"),
+        aterm_spec::wait::MUST_HAPPEN,
+        now,
+        Some("main@example.test"),
+    );
+    let seen = provider_seen(port, server);
+    assert_eq!(seen, ["POST /oauth/token"]);
+    let Refreshed::Done(refreshed) = refreshed else {
+        panic!("the published native credential must permit a fresh local refresh");
+    };
+    assert_ne!(refreshed.refresh_token, before);
+    assert_eq!(
+        refreshed.refresh_token.as_deref(),
+        Some("native-fixture-refreshed")
+    );
+    assert_eq!(
+        load_stored_auth(home).unwrap().refresh_token,
+        refreshed.refresh_token
+    );
+    assert!(!beside_auth(home, JOURNAL_SUFFIX).exists());
+}
+
 #[path = "codex_stored_identity_tests.rs"]
 mod stored_identity_tests;
 
 #[path = "codex_row_identity_tests.rs"]
 mod row_identity_tests;
+
+#[path = "codex_grant_completion_tests.rs"]
+mod grant_completion_tests;
 
 const HOSTS: &[&str] = &["auth.openai.com"];
 
@@ -1072,6 +1395,8 @@ fn login_case(case: i64) -> [(&'static str, i64); 6] {
         Duration::from_secs(60)
     };
     let exchange = || CodeExchange {
+        publication: None,
+        enrollment: None,
         home: tmp.path(),
         endpoints: &endpoints,
         redirect_uri: "http://127.0.0.1/callback",
@@ -1083,6 +1408,8 @@ fn login_case(case: i64) -> [(&'static str, i64); 6] {
     };
     let perform = || {
         CodeExchange {
+            publication: None,
+            enrollment: None,
             home: tmp.path(),
             endpoints: &endpoints,
             redirect_uri: "http://127.0.0.1/callback",
@@ -1101,13 +1428,19 @@ fn login_case(case: i64) -> [(&'static str, i64); 6] {
     } else {
         perform()
     };
-    let first = result.as_ref().and_then(|_| load_stored_auth(tmp.path()));
+    let first = result
+        .as_ref()
+        .ok()
+        .and_then(|_| load_stored_auth(tmp.path()));
     if case == 17 {
         result = perform();
     }
     let _ = TcpStream::connect(("127.0.0.1", port));
     server.join().unwrap();
-    let after = result.as_ref().and_then(|_| load_stored_auth(tmp.path()));
+    let after = result
+        .as_ref()
+        .ok()
+        .and_then(|_| load_stored_auth(tmp.path()));
     let owner = |stored: &StoredAuth| {
         stored.doc["tokens"]
             .get("login_owner_id")
@@ -1142,7 +1475,7 @@ fn login_case(case: i64) -> [(&'static str, i64); 6] {
                 })
         }
     });
-    let kept = result.is_some() || std::fs::read(tmp.path().join(AUTH_FILE)).unwrap() == before;
+    let kept = result.is_ok() || std::fs::read(tmp.path().join(AUTH_FILE)).unwrap() == before;
     let seen = seen.lock().unwrap();
     for request in seen.iter() {
         assert_eq!(request.method, "POST");
@@ -1162,7 +1495,7 @@ fn login_case(case: i64) -> [(&'static str, i64); 6] {
     );
     [
         ("phase", 1),
-        ("result", i64::from(result.is_some())),
+        ("result", i64::from(result.is_ok())),
         ("posted", i64::from(!seen.is_empty())),
         ("kept", i64::from(kept)),
         ("fresh", i64::from(fresh)),
@@ -3454,6 +3787,8 @@ fn sign_in_takes_the_publication_lock_before_spending_its_code() {
         };
         assert!(
             CodeExchange {
+                publication: None,
+                enrollment: None,
                 home: &home,
                 endpoints: &endpoints,
                 redirect_uri: "http://127.0.0.1/callback",
@@ -3464,7 +3799,7 @@ fn sign_in_takes_the_publication_lock_before_spending_its_code() {
                 now
             }
             .exchange()
-            .is_none()
+            .is_err()
         );
         assert!(provider_seen(port, server).is_empty());
         assert_eq!(std::fs::read(home.join(AUTH_FILE)).unwrap(), before);
@@ -3493,6 +3828,8 @@ fn first_sign_in_holds_its_lock_during_the_token_exchange() {
     });
     assert_eq!(
         CodeExchange {
+            publication: None,
+            enrollment: None,
             home: &home,
             endpoints: &Endpoints {
                 issuer: format!("http://127.0.0.1:{port}"),
@@ -3507,7 +3844,7 @@ fn first_sign_in_holds_its_lock_during_the_token_exchange() {
             now
         }
         .exchange(),
-        Some(Some("owner@example.test".into()))
+        Ok(Some("owner@example.test".into()))
     );
     assert_eq!(provider_seen(port, server), ["POST /oauth/token"]);
     assert_eq!(
@@ -3515,6 +3852,111 @@ fn first_sign_in_holds_its_lock_during_the_token_exchange() {
         Some("new-refresh")
     );
     assert!(AuthLock::try_take(&home.join(AUTH_FILE)).unwrap().is_some());
+}
+
+#[cfg(unix)]
+#[test]
+fn code_exchange_rechecks_original_budget_after_the_actual_scope_mutex_wait() {
+    use crate::harness::account_work::Lifetime;
+    use crate::harness::wake_deadline::SleepSeam;
+    for slept in [false, true] {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let home = tmp.path().join("login");
+        let now = 1_790_000_000;
+        hour_login(&home, now, Some("original-refresh"));
+        RefreshJournal::Attempted {
+            token: refresh_token_digest("original-refresh"),
+        }
+        .write(&home)
+        .unwrap();
+        let before = std::fs::read(home.join(AUTH_FILE)).unwrap();
+        let evidence = std::fs::read(beside_auth(&home, JOURNAL_SUFFIX)).unwrap();
+        let (port, server) = provider(move |_, _| {
+            let access = make_chatgpt_jwt(Some("owner@example.test"), "pro", now + 3600);
+            (
+                "200 OK",
+                json!({"id_token":access,"access_token":access,"refresh_token":"new-refresh"}),
+            )
+        });
+        let lifetime = Lifetime::default();
+        let scope = lifetime.enter().unwrap();
+        let cancellation = scope.cancellation();
+        let waiting = scope.cancellation_wait_for_test();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_home = home.clone();
+        let worker = std::thread::spawn(move || {
+            let seam = SleepSeam::hold();
+            seam.sleeper().slept(Duration::from_secs(3600));
+            let deadline = WakeDeadline::after(Duration::from_secs(3600));
+            CodeExchange {
+                publication: None,
+                enrollment: None,
+                home: &worker_home,
+                endpoints: &Endpoints {
+                    issuer: format!("http://127.0.0.1:{port}"),
+                    token_url: format!("http://127.0.0.1:{port}/oauth/token"),
+                    callback_ports: vec![],
+                },
+                redirect_uri: "http://127.0.0.1/callback",
+                code: "code",
+                code_verifier: "verifier",
+                deadline,
+                work: Some(&scope),
+                now,
+            }
+            .persist_using(Some("new-owner"), |home, lock_deadline| {
+                let held = AuthLock::within(home, lock_deadline.instant())?;
+                let _ = ready_tx.send(seam.sleeper());
+                release_rx
+                    .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                    .ok()?;
+                Some(held)
+            })
+        });
+        let ready = ready_rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+        let held = ready.as_ref().ok().map(|_| lifetime.hold_state_for_test());
+        let released = release_tx.send(());
+        // The epoch stays open. This witness names actual Scope mutex contention,
+        // after all earlier admission checks and the real AuthLock acquisition.
+        let contended = waiting.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+        if slept
+            && contended.is_ok()
+            && let Ok(sleeper) = &ready
+        {
+            sleeper.slept(Duration::from_secs(7200));
+        }
+        drop(held);
+        let result = worker.join();
+        let seen = provider_seen(port, server);
+        ready.expect("real AuthLock acquired before the Scope contention");
+        assert!(released.is_ok());
+        contended.expect("worker attempted the actual held Scope mutex");
+        let result = result.unwrap();
+        if slept {
+            assert!(
+                seen.is_empty(),
+                "expired original work must send no token POST: {seen:?}"
+            );
+            assert_eq!(result, Err(ExchangeError::Protected));
+            assert_eq!(std::fs::read(home.join(AUTH_FILE)).unwrap(), before);
+            assert_eq!(
+                std::fs::read(beside_auth(&home, JOURNAL_SUFFIX)).unwrap(),
+                evidence
+            );
+        } else {
+            assert_eq!(result, Ok(Some("owner@example.test".into())));
+            assert_eq!(seen, ["POST /oauth/token"]);
+            assert!(!beside_auth(&home, JOURNAL_SUFFIX).exists());
+        }
+        assert!(cancellation.retired());
+        assert!(
+            lifetime.enter().is_some(),
+            "the original epoch was never closed"
+        );
+        assert!(lifetime.pause().unwrap().try_wait().is_ok());
+        assert!(AuthLock::try_take(&home.join(AUTH_FILE)).unwrap().is_some());
+    }
 }
 
 #[cfg(unix)]
@@ -3554,6 +3996,8 @@ fn code_exchange_rechecks_original_work_after_the_actual_publication_lock() {
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(scope.clone().wrap(move || {
             let result = CodeExchange {
+                publication: None,
+                enrollment: None,
                 home: &worker_home,
                 endpoints: &Endpoints {
                     issuer: format!("http://127.0.0.1:{port}"),
@@ -3593,11 +4037,11 @@ fn code_exchange_rechecks_original_work_after_the_actual_publication_lock() {
         result.unwrap();
         let result = result_rx.recv().unwrap();
         if stopped == 0 {
-            assert_eq!(result, Some(Some("owner@example.test".into())));
+            assert_eq!(result, Ok(Some("owner@example.test".into())));
             assert_eq!(seen, ["POST /oauth/token"]);
             assert!(!beside_auth(&home, JOURNAL_SUFFIX).exists());
         } else {
-            assert_eq!(result, None);
+            assert_eq!(result, Err(ExchangeError::Protected));
             assert!(seen.is_empty());
             assert_eq!(std::fs::read(home.join(AUTH_FILE)).unwrap(), before);
             assert_eq!(
@@ -3740,6 +4184,8 @@ fn sign_in_and_stale_journal_recovery_keep_evidence_until_publication_is_durable
     let fault = aterm_durable::seam::FailingDirs::with(aterm_durable::seam::EIO);
     assert!(
         CodeExchange {
+            publication: None,
+            enrollment: None,
             home: &home,
             endpoints: &Endpoints {
                 issuer: format!("http://127.0.0.1:{port}"),
@@ -3754,7 +4200,7 @@ fn sign_in_and_stale_journal_recovery_keep_evidence_until_publication_is_durable
             now
         }
         .exchange()
-        .is_none()
+        .is_err()
     );
     assert_eq!(std::fs::read(&journal).unwrap(), evidence);
     assert_eq!(
@@ -4890,7 +5336,7 @@ fn credential_debug_redacts_stored_and_refreshed_tokens() {
 
 /// NEGATIVE CONTROL: `CodeExchange::persist` refuses a non-regular `auth.json` or
 /// `auth.json.refreshed` before spending the one-use authorization code, keeps an existing
-/// journal intact when the HTTP exchange fails, and discards a corrupt or same-token journal once
+/// legacy refresh journal intact when the HTTP exchange fails, and discards that journal once
 /// the newly signed-in `auth.json` is written so subsequent refreshes succeed.
 #[test]
 fn code_exchange_validates_and_clears_refresh_journal_around_publication() {
@@ -4947,6 +5393,8 @@ fn code_exchange_validates_and_clears_refresh_journal_around_publication() {
         .expect("journal directory");
     assert_eq!(
         CodeExchange {
+            publication: None,
+            enrollment: None,
             home: &bad_journal_home,
             endpoints: &endpoints,
             redirect_uri: "http://127.0.0.1/callback",
@@ -4957,7 +5405,7 @@ fn code_exchange_validates_and_clears_refresh_journal_around_publication() {
             now: 1_790_000_000
         }
         .exchange(),
-        None
+        Err(ExchangeError::Protected)
     );
     assert_eq!(
         *seen.lock().expect("seen lock"),
@@ -4970,6 +5418,8 @@ fn code_exchange_validates_and_clears_refresh_journal_around_publication() {
     std::fs::create_dir_all(bad_auth_home.join(AUTH_FILE)).expect("auth.json directory");
     assert_eq!(
         CodeExchange {
+            publication: None,
+            enrollment: None,
             home: &bad_auth_home,
             endpoints: &endpoints,
             redirect_uri: "http://127.0.0.1/callback",
@@ -4980,11 +5430,11 @@ fn code_exchange_validates_and_clears_refresh_journal_around_publication() {
             now: 1_790_000_000
         }
         .exchange(),
-        None
+        Err(ExchangeError::Unsealed)
     );
     assert_eq!(*seen.lock().expect("seen lock"), 0);
 
-    // 3. Corrupt or rejected prior journal stays intact on a 400 exchange, then is discarded on a
+    // 3. A rejected legacy refresh journal stays intact on a 400 exchange, then is discarded on a
     //    200 sign-in so `recover_journal_held` succeeds even when the provider re-issues the same
     //    refresh token string.
     let relogin_home = tmp.path().join("relogin");
@@ -5007,6 +5457,8 @@ fn code_exchange_validates_and_clears_refresh_journal_around_publication() {
 
     assert_eq!(
         CodeExchange {
+            publication: None,
+            enrollment: None,
             home: &relogin_home,
             endpoints: &endpoints,
             redirect_uri: "http://127.0.0.1/callback",
@@ -5017,17 +5469,16 @@ fn code_exchange_validates_and_clears_refresh_journal_around_publication() {
             now: 1_790_000_000
         }
         .exchange(),
-        None
+        Err(ExchangeError::Protected)
     );
     assert!(
         beside_auth(&relogin_home, JOURNAL_SUFFIX).is_file(),
         "failed exchange must leave the prior refresh journal intact"
     );
 
-    // Also overwrite with truncated journal bytes to exercise corrupt-journal cleanup on sign-in.
-    std::fs::write(beside_auth(&relogin_home, JOURNAL_SUFFIX), b"{truncated")
-        .expect("corrupt journal");
     let signed_in = CodeExchange {
+        publication: None,
+        enrollment: None,
         home: &relogin_home,
         endpoints: &endpoints,
         redirect_uri: "http://127.0.0.1/callback",
@@ -5038,10 +5489,10 @@ fn code_exchange_validates_and_clears_refresh_journal_around_publication() {
         now: 1_790_000_000,
     }
     .exchange();
-    assert_eq!(signed_in, Some(Some("relogin@example.test".to_owned())));
+    assert_eq!(signed_in, Ok(Some("relogin@example.test".to_owned())));
     assert!(
         !beside_auth(&relogin_home, JOURNAL_SUFFIX).exists(),
-        "successful sign-in must discard stale or corrupt auth.json.refreshed"
+        "successful sign-in must discard the prior legacy refresh journal"
     );
     let _held = AuthLock::within(
         &relogin_home,

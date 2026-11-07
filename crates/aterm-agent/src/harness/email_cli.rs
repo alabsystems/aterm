@@ -21,7 +21,7 @@ mod session;
 #[path = "gmail_connect.rs"]
 mod gmail_connect;
 
-const HELP: &str = "aterm email connect-gmail ACCOUNT [--client-file FILE] [--timeout 1..300]\naterm email session ACCOUNT [--folder ID] [--limit 1..100] [--timeout 1..3600]\naterm email accounts\naterm email folders ACCOUNT\naterm email list ACCOUNT [--folder ID] [--limit 1..100]\naterm email read ACCOUNT MESSAGE_ID [--folder ID]\naterm email watch ACCOUNT [--folder ID] [--limit 1..100] [--timeout 1..3600]\n\nOutputs JSON Lines. Uses configured Proton, Gmail or IMAP accounts. No window opens.\nReading uses PEEK and does not mark messages read. Watch emits an initial snapshot,\nchanged snapshots, then a completion event at its deadline. --timeout also bounds\nconnection and reads (default: 60 seconds). No send or delete commands. Session defaults to a one-hour lifetime and accepts JSON Lines requests\n(folders, list, read, select, wait, ping, quit) over one authenticated connection.\n";
+const HELP: &str = "aterm email connect-gmail ACCOUNT [--client-file FILE] [--timeout 1..300]\naterm email session ACCOUNT [--folder ID] [--limit 1..100] [--timeout 1..3600]\naterm email accounts\naterm email folders ACCOUNT\naterm email list ACCOUNT [--folder ID] [--limit 1..100]\naterm email read ACCOUNT MESSAGE_ID [--folder ID]\naterm email source ACCOUNT MESSAGE_ID [--folder ID]\naterm email magic-link ACCOUNT MESSAGE_ID [--folder ID]\naterm email watch ACCOUNT [--folder ID] [--limit 1..100] [--timeout 1..3600]\n\nOutputs JSON Lines. Uses configured Proton, Gmail or IMAP accounts. No window opens.\nReading uses PEEK and does not mark messages read. Watch emits an initial snapshot,\nchanged snapshots, then a completion event at its deadline. --timeout also bounds\nconnection and reads (default: 60 seconds). No send or delete commands. Session defaults to a one-hour lifetime and accepts JSON Lines requests\n(folders, list, read, select, wait, ping, quit) over one authenticated connection.\n";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Command {
@@ -30,6 +30,8 @@ enum Command {
     Folders,
     List,
     Read(String),
+    Source(String),
+    MagicLink(String),
     Watch,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,6 +70,8 @@ fn parse(args: &[String]) -> Result<Option<Options>, String> {
         "list" => Command::List,
         "watch" => Command::Watch,
         "read" => Command::Read(String::new()),
+        "source" => Command::Source(String::new()),
+        "magic-link" => Command::MagicLink(String::new()),
         _ => return Err("Unknown email command; use aterm email --help".into()),
     };
     if options.command == Command::Session {
@@ -79,7 +83,7 @@ fn parse(args: &[String]) -> Result<Option<Options>, String> {
         .ok_or("A mailbox email address is required")?
         .to_ascii_lowercase();
     let mut index = 2;
-    if let Command::Read(id) = &mut options.command {
+    if let Command::Read(id) | Command::Source(id) | Command::MagicLink(id) = &mut options.command {
         *id = args
             .get(index)
             .filter(|id| !id.is_empty() && !id.chars().any(char::is_control))
@@ -481,6 +485,17 @@ impl Connection {
             }
         }
     }
+    fn raw_source(&mut self, id: &str, end: Instant) -> Result<String, Failure> {
+        remaining(end)?;
+        match &mut self.source {
+            #[cfg(unix)]
+            Source::Proton(shared) => Self::proton(shared, end, |mailbox| {
+                mailbox.read_source(id).map(|(message, _)| message.text)
+            }),
+            Source::Imap(_) => Err("Raw message source is unavailable for this mailbox".into()),
+        }
+    }
+
     fn select(&mut self, folder: &str, end: Instant) -> Result<(), Failure> {
         remaining(end)?;
         match &mut self.source {
@@ -567,6 +582,24 @@ fn run(home: &Path, options: &Options, output: &mut impl Write) -> Result<(), Fa
         return emit(
             output,
             json!({"schema":1,"type":"folders","account":options.account,"folders":folders}),
+        );
+    }
+    if let Command::MagicLink(id) = &options.command {
+        let connection = connection.as_mut().ok_or("No mailbox connection")?;
+        let source = connection.raw_source(id, end)?;
+        let url = super::open_url::extract_magic_link_from_email(&source, None)
+            .ok_or("No Claude magic link is present in this message")?;
+        return emit(
+            output,
+            json!({"schema":1,"type":"magic-link","account":options.account,"folder":connection.folder,"url":url}),
+        );
+    }
+    if let Command::Source(id) = &options.command {
+        let connection = connection.as_mut().ok_or("No mailbox connection")?;
+        let source = connection.raw_source(id, end)?;
+        return emit(
+            output,
+            json!({"schema":1,"type":"source","account":options.account,"folder":connection.folder,"source":source}),
         );
     }
     if let Command::Read(id) = &options.command {
@@ -793,6 +826,8 @@ mod tests {
             Duration::from_secs(3600)
         );
         assert!(options(&["read", "me@example.test", "-opaque-id"]).is_ok());
+        assert!(options(&["source", "me@example.test", "-opaque-id"]).is_ok());
+        assert!(options(&["magic-link", "me@example.test", "-opaque-id"]).is_ok());
         let parsed = options(&[
             "watch",
             "Me@Example.Test",

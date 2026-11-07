@@ -10,7 +10,7 @@ use crate::client::{Call, CallBody};
 use crate::error::{Error, Kind, Result, SideEffect};
 use crate::github::{How, encode_body};
 use crate::journal::{IntentStore, IntentView, Settled};
-use crate::model::{RepoObject, Sha256Digest, from_json};
+use crate::model::{RepoObject, Sha256Digest, from_json_owned};
 use crate::policy::{Permit, PermitTarget, RouteRequest, RouteTarget};
 use crate::retry::{Idempotency, RetryPolicy};
 use crate::slug::Slug;
@@ -236,7 +236,7 @@ impl Repos<'_> {
             if answer.status != 201 {
                 return None;
             }
-            let repo: RepoObject = from_json(&answer.json().ok()?).ok()?;
+            let repo: RepoObject = from_json_owned(answer.json().ok()?).ok()?;
             validate_repo(permit, &repo).ok()?;
             Some((repo.id, repo_url(&repo).to_string()))
         };
@@ -245,7 +245,7 @@ impl Repos<'_> {
             .one_shot_judged(&call, &permit.permit, &draft, intents, &created)?
         {
             Outcome::Done(answer) => {
-                let repo = from_json(&answer.json()?)?;
+                let repo = from_json_owned(answer.json()?)?;
                 validate_repo(permit, &repo)?;
                 Ok(done(repo, Effect::Created))
             }

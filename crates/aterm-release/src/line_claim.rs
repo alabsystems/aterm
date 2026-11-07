@@ -788,20 +788,35 @@ impl Rows {
 }
 
 fn completed_row(text: &str) -> Option<String> {
-    let text = text
-        .trim()
+    let trimmed = text.trim();
+    let text = trimmed
         .strip_prefix("release-event: ")
-        .or_else(|| text.trim().strip_prefix("verify-event: "))
-        .unwrap_or(text.trim());
-    let event: aterm_json::Value = aterm_json::from_str(text).ok()?;
-    let kind = event["event"].as_str()?;
+        .or_else(|| trimmed.strip_prefix("verify-event: "))
+        .unwrap_or(trimmed);
+    if !text.starts_with('{') {
+        return None;
+    }
+    let aterm_json::Value::Object(mut event) = aterm_json::from_str(text).ok()? else {
+        return None;
+    };
+    let kind = event.get("event").and_then(aterm_json::Value::as_str)?;
     if !matches!(
         kind,
         "stage-finished" | "test-binary-finished" | "check-finished" | "test-case-failed"
     ) {
         return None;
     }
-    let summary = aterm_json::json!({ "event": kind, "stage": event.get("stage"), "check": event.get("check"), "test": event.get("test"), "outcome": event.get("outcome"), "detail": event.get("detail"), "findings": event.get("findings") });
+    let kind = event.remove("event")?;
+    let mut take = |key: &str| event.remove(key).unwrap_or(aterm_json::Value::Null);
+    let summary = aterm_json::Value::Object(aterm_json::Map::from([
+        ("event".to_string(), kind),
+        ("stage".to_string(), take("stage")),
+        ("check".to_string(), take("check")),
+        ("test".to_string(), take("test")),
+        ("outcome".to_string(), take("outcome")),
+        ("detail".to_string(), take("detail")),
+        ("findings".to_string(), take("findings")),
+    ]));
     Some(summary.to_string())
 }
 

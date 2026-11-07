@@ -5,7 +5,7 @@
 
 use super::*;
 
-pub(super) fn revision(records: &Records) -> Option<u64> {
+fn pending(records: &Records) -> Option<(&Plan, Progress)> {
     let (plan, true) = records.plan.as_ref()? else {
         return None;
     };
@@ -14,12 +14,19 @@ pub(super) fn revision(records: &Records) -> Option<u64> {
         || !progress.belongs_to(plan)
         || progress.completed
         || progress.stopped_by(records.stop_request)
-        || progress.done & Stage::Workstation.bit() != 0
         || !matches!(
             records.decision,
             Decision::Pending | Decision::Applied(true)
         )
     {
+        return None;
+    }
+    Some((plan, progress))
+}
+
+pub(super) fn revision(records: &Records) -> Option<u64> {
+    let (plan, progress) = pending(records)?;
+    if progress.done & Stage::Workstation.bit() != 0 {
         return None;
     }
     let held = holds(records);
@@ -31,6 +38,19 @@ pub(super) fn revision(records: &Records) -> Option<u64> {
                 && progress.only.is_none_or(|only| only.contains(*setting))
                 && !held.holds(*setting)
         })
+        .then_some(progress.revision)
+}
+
+pub(super) fn repositories_revision(root: &Path, records: &Records) -> Option<u64> {
+    let (plan, progress) = pending(records)?;
+    if !plan.selection.contains(Setting::Repositories)
+        || progress.done & Stage::Repositories.bit() != 0
+        || holds(records).holds(Setting::Repositories)
+    {
+        return None;
+    }
+    let ledger = ledger::load(root, progress.revision);
+    (!ledger.frozen && ledger.ledger.parked(Stage::Repositories).is_none())
         .then_some(progress.revision)
 }
 
@@ -65,4 +85,28 @@ pub fn initial_setup_pending_workstation_revision() -> Result<Option<u64>, Strin
     ensure_person_scope()?;
     let observation = observation_at(&state_root()?).map_err(|error| error.to_string())?;
     Ok(revision(&observation.records))
+}
+
+/// The current admitted, unheld Repositories revision with an unfinished and unparked stage.
+/// A background child may request an ordinary guarded observation for it, never infer that
+/// the stage completed from the child's exit or authorize another effect.
+///
+/// # Errors
+/// This account's scope or its setup records cannot be read.
+pub fn initial_setup_pending_repositories() -> Result<Option<InitialSetupAdmission>, String> {
+    ensure_person_scope()?;
+    let root = state_root()?;
+    let observation = observation_at(&root).map_err(|error| error.to_string())?;
+    Ok(
+        repositories_revision(&root, &observation.records).and_then(|revision| {
+            observation
+                .records
+                .plan
+                .map(|(plan, _)| InitialSetupAdmission {
+                    plan,
+                    revision,
+                    completed: false,
+                })
+        }),
+    )
 }

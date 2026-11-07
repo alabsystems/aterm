@@ -25,12 +25,13 @@ pub(super) struct Recipe {
     pub(super) environment: Vec<(OsString, OsString)>,
     pub(super) cwd: PathBuf,
     pub(super) width: u32,
+    pub(super) compiler: Option<compiler::Selection>,
 }
 impl Recipe {
     pub(super) fn probe(
         request: &Submission,
         physical: u32,
-    ) -> io::Result<std::sync::mpsc::Receiver<io::Result<Self>>> {
+    ) -> io::Result<std::sync::mpsc::Receiver<io::Result<Option<Self>>>> {
         // This copy is private input for recipe selection, never a peer or
         // admission credential. Only the queue head may own an active probe.
         let copied = Submission {
@@ -53,12 +54,15 @@ impl Recipe {
             })?;
         Ok(receive)
     }
-    pub(super) fn qualify(request: &Submission, physical: u32) -> io::Result<Self> {
+    pub(super) fn qualify(request: &Submission, physical: u32) -> io::Result<Option<Self>> {
         if request.cpu_units > physical {
             return Err(refused("requested CPU width exceeds this host"));
         }
         let mut program = resolve(request)?;
-        let executable = program.file_name().and_then(|name| name.to_str());
+        let executable = program
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned);
         let requested = Path::new(OsStr::from_bytes(&request.argv[0]))
             .file_name()
             .and_then(|name| name.to_str());
@@ -87,11 +91,30 @@ impl Recipe {
         // Never execute an arbitrary argv merely because its basename claims
         // to be a native capability query. Partial overlap requires the actual
         // manager-selected complete artifact, not PATH or stdout as authority.
-        let managed = requested
-            .filter(|name| matches!(*name, "ay" | "targo"))
-            .and_then(|name| managed_artifact(name, &program));
+        let compiler = if requested == Some("targo") {
+            let Some(selected) = compiler::select(request, &program)? else {
+                return Ok(None);
+            };
+            program = selected.targo();
+            Some(selected)
+        } else {
+            None
+        };
+        if let Some(selected) = &compiler {
+            compiler::paired_environment(selected.execution(), &mut environment)?;
+        }
+        let managed = if compiler.is_some() {
+            Some(atpkg::ops::Managed {
+                target: program.clone(),
+                env: atpkg::shim_env::ShimEnv::NONE,
+            })
+        } else {
+            requested
+                .filter(|name| *name == "ay")
+                .and_then(|name| managed_artifact(name, &program))
+        };
         if managed.is_some()
-            && [requested, executable]
+            && [requested, executable.as_deref()]
                 .iter()
                 .any(|name| matches!(name, Some("ay" | "targo")))
         {
@@ -155,14 +178,15 @@ impl Recipe {
         {
             arguments.insert(1, "--resource-subgroups-v3".into());
         }
-        Ok(Self {
+        Ok(Some(Self {
             kind,
             program,
             arguments,
             environment,
             cwd,
             width,
-        })
+            compiler,
+        }))
     }
     pub(super) fn command(&self, request: &Submission) -> spawnfd::Command {
         let mut command = spawnfd::command(&self.program);
@@ -208,6 +232,7 @@ pub(super) fn stale_fd_var(name: &[u8], value: &[u8]) -> bool {
     matches!(
         name,
         b"TRUST_CPU_HANDOFF"
+            | b"ATERM_SDK_LEASE_V3"
             | b"ATERM_RESOURCE_INSPECTOR"
             | b"ATERM_RESOURCE_JOB_V3"
             | b"TRUST_JOBSERVER_HANDOFF"

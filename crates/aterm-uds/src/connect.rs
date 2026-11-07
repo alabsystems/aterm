@@ -83,7 +83,9 @@ pub fn until(path: &Path, deadline: Instant) -> io::Result<CtlStream> {
 /// a debug build's partition cut ([`crate::partition::check`]) refuses one before any socket is
 /// made. On macOS a local-network `addr` ([`crate::lan::is_local_network`]) is then dialled by the
 /// root LAN broker ([`crate::lan::connect`]), whose socket macOS's Local Network privacy does not
-/// gate, and comes back passed to this process; every other address is dialled here.
+/// gate, and comes back passed to this process; while no broker is installed, by this process's
+/// own server when macOS already allowed its code ([`crate::lan::direct`]); every other address is
+/// dialled here.
 ///
 /// # Errors
 /// A zero `timeout` (std refuses one too) or one past the clock's range (`InvalidInput`), an

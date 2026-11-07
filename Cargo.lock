@@ -146,7 +146,7 @@ version = "0.2.0"
 
 [[package]]
 name = "aterm"
-version = "0.160.0"
+version = "0.161.0"
 dependencies = [
  "agh",
  "astream-broker",
@@ -244,6 +244,7 @@ dependencies = [
  "aterm-capacity",
  "aterm-codec",
  "aterm-ctl",
+ "aterm-db",
  "aterm-digest",
  "aterm-dirfd",
  "aterm-durable",
@@ -864,6 +865,7 @@ dependencies = [
  "aterm-lexicon",
  "aterm-link",
  "aterm-log",
+ "aterm-machines",
  "aterm-mail",
  "aterm-mesh",
  "aterm-messages",
@@ -911,6 +913,7 @@ dependencies = [
  "aterm-theme-pack",
  "aterm-time",
  "aterm-toml",
+ "aterm-toolchain",
  "aterm-types",
  "aterm-uds",
  "aterm-update",
@@ -1078,6 +1081,7 @@ dependencies = [
  "aterm-grapheme",
  "aterm-http",
  "aterm-json",
+ "aterm-lan",
  "aterm-link",
  "aterm-net",
  "aterm-netplace",
@@ -1933,6 +1937,7 @@ dependencies = [
  "aterm-dl",
  "aterm-durable",
  "aterm-json",
+ "aterm-objc",
  "aterm-spec",
  "aterm-tempfile",
  "aterm-uds",
@@ -2101,6 +2106,7 @@ dependencies = [
  "aterm-forge",
  "aterm-hash",
  "aterm-json",
+ "aterm-models-capacity",
  "aterm-models-misc",
  "aterm-png",
  "aterm-pty",
@@ -2219,6 +2225,7 @@ dependencies = [
  "aterm-json",
  "aterm-tempfile",
  "aterm-toml",
+ "aterm-toolchain",
  "aterm-uds",
 ]
 

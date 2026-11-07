@@ -399,7 +399,7 @@ pub fn join_vault(old: &str, new: &str) -> Result<String> {
         .collect();
     let emptied = |table: &dyn TableLike| {
         !routes(table)
-            && (read_names(table).is_empty()
+            && (read_strs(table).next().is_none()
                 || owner_name(table).is_some_and(|name| {
                     routed.iter().any(|r| r.eq_ignore_ascii_case(name))
                         || name.eq_ignore_ascii_case(aterm_types::channel::PUBLIC_OWNER)
@@ -448,7 +448,7 @@ pub fn join_vault(old: &str, new: &str) -> Result<String> {
 /// Whether an owner row or `[default]` routes to a profile: it names a writer, or a reader
 /// other than anonymous.
 fn routes(table: &dyn TableLike) -> bool {
-    table.get("write").is_some() || read_names(table).iter().any(|step| step != "anonymous")
+    table.get("write").is_some() || read_strs(table).any(|step| step != "anonymous")
 }
 
 /// Each owner row's name, lowercased, and whether it `routes`, whichever form `owners` takes.
@@ -520,26 +520,26 @@ fn not_owner_tables() -> Error {
     Error::usage("agh.toml's owners is not [[owners]] tables").with_next(config::POLICY_CHECK)
 }
 
-fn read_names(table: &dyn TableLike) -> Vec<String> {
+fn read_strs(table: &dyn TableLike) -> impl Iterator<Item = &str> {
     table
         .get("read")
         .and_then(Item::as_array)
-        .map(|array| {
-            array
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|array| array.iter().filter_map(Value::as_str))
+}
+
+fn read_names(table: &dyn TableLike) -> Vec<String> {
+    read_strs(table).map(str::to_string).collect()
 }
 
 fn drop_from_read(table: &mut dyn TableLike, name: &str) -> bool {
-    let read = read_names(table);
-    if !read.iter().any(|step| step == name) {
+    if !read_strs(table).any(|step| step == name) {
         return false;
     }
-    let kept: Vec<String> = read.into_iter().filter(|step| step != name).collect();
+    let kept: Vec<String> = read_strs(table)
+        .filter(|&step| step != name)
+        .map(str::to_string)
+        .collect();
     set_value(table, "read", read_array(&kept));
     true
 }

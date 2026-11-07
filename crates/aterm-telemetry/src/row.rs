@@ -944,7 +944,8 @@ fn parse_row_ref<'a>(
 /// A gap line: `dropped` rows lost before `at_ms`.
 #[must_use]
 pub fn gap_line(at_ms: u64, dropped: u64) -> String {
-    seal(format!(
-        "schema={SCHEMA} at={at_ms} kind=gap dropped={dropped}"
-    ))
+    let mut out = String::with_capacity(64);
+    let _ = write!(out, "schema={SCHEMA} at={at_ms} kind=gap dropped={dropped}");
+    seal_in_place(&mut out);
+    out
 }

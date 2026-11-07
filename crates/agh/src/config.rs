@@ -1563,6 +1563,7 @@ fn new_repos(wanted: &str) -> aterm_toml::edit::Value {
 #[cfg(unix)]
 fn append_writers_row(text: &str, caller: &str, wanted: &str) -> String {
     use aterm_toml::edit::Value;
+    use std::fmt::Write as _;
     let mut appended = text.to_string();
     if !appended.is_empty() && !appended.ends_with('\n') {
         appended.push('\n');
@@ -1570,11 +1571,12 @@ fn append_writers_row(text: &str, caller: &str, wanted: &str) -> String {
     if !appended.is_empty() {
         appended.push('\n');
     }
-    appended.push_str(&format!(
+    let _ = write!(
+        appended,
         "[[writers]]\ncaller = {}\nrepos = {}\n",
         Value::from(caller),
         new_repos(wanted)
-    ));
+    );
     appended
 }
 

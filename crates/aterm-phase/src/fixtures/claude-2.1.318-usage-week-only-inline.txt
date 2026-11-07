@@ -1,0 +1,38 @@
+# claude-code 2.1.318 · MEASURED 2026-11-06, `aterm ctl text` of a private headless aterm (144x50, aterm 0.159.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, no `apiKeyHelper` and no OAuth token but a scratch `.credentials.json` and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · 2.5 s after Enter on /usage, as a Max 5x subscriber (the token's scopes user:inference user:profile, the composed oauthAccount of ana@example.com seeded in the scratch .claude.json), the inline renderer: the stub's answers carry the 7d header readings alone (0.98, its reset 3 days on, no 5h reading), so the Usage tab draws the week's window alone, no Current session; the usage body's read refused by the black hole (Could not refresh usage data); harness off
+❯ hi
+
+⏺ Hi! I am the local lab stub, not a model. (reply 1)
+
+✻ Sautéed for 0s · done 8:01 AM
+
+❯ /usage
+  ⎿  Settings dialog dismissed
+
+❯ hello again
+
+⏺ Hi! I am the local lab stub, not a model. (reply 2)
+
+✻ Churned for 0s · done 8:01 AM
+
+❯ /usage
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Settings  Status   Config   Usage   Stats
+
+  Session
+
+  Total cost:            $0.1151
+  Total duration (API):  0s
+  Total duration (wall): 1m 7s
+  Total code changes:    0 lines added, 0 lines removed
+  Usage by model:
+       claude-opus-5-5:  28.6k input, 36 output, 0 cache read, 0 cache write ($0.1151)
+  Prompt cache (main):   2 requests · 0% of input tokens from cache · no misses · no prompt caching reported by the API
+
+  Current week (all models)
+  █████████████████████████████████████████████████  98% used
+  Resets Nov 9 at 12:21pm (America/Los_Angeles)
+
+  Could not refresh usage data
+
+  r to retry · Esc to cancel

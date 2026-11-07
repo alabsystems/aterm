@@ -2458,14 +2458,14 @@ impl Waiter {
             .flatten();
         // Coverage reads the claims before `counted` leaves out the ancestors': an ancestor's held
         // quiet claim is what covers this one.
-        let mut need = self.record.need.clone();
+        let mut need = std::borrow::Cow::Borrowed(&self.record.need);
         // Ancestor coverage is resource exclusion only. Even a measured parent supplies no
         // CPU window here: this waiter samples its own admission and later its own entry.
         if self.record.accounting == crate::Accounting::Holder
             && need.quiet.is_some()
             && covered(self.record.pid, &records, procs.as_ref())
         {
-            need.quiet = None;
+            need.to_mut().quiet = None;
         }
         let bound = if measured {
             self.record.need.quiet
@@ -2489,7 +2489,7 @@ impl Waiter {
             && loaded_cover(self.record.pid, &records, procs.as_ref());
         let past = past || spent;
         if past && need.quiet.is_some() {
-            need.quiet = Some(f64::INFINITY);
+            need.to_mut().quiet = Some(f64::INFINITY);
         }
         let records = if self.record.accounting == crate::Accounting::CohortOwned {
             records

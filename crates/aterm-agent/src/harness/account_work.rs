@@ -49,6 +49,8 @@ impl Lifetime {
             shared: self.0.clone(),
             epoch: state.epoch.clone(),
             cancelled: Arc::new(AtomicBool::new(false)),
+            #[cfg(all(test, unix))]
+            cancellation_wait: std::sync::OnceLock::new(),
         })))
     }
 
@@ -64,12 +66,19 @@ impl Lifetime {
             epoch: state.epoch.clone(),
         })
     }
+
+    #[cfg(all(test, unix))]
+    pub(super) fn hold_state_for_test(&self) -> impl Sized + '_ {
+        self.0.state.lock().unwrap()
+    }
 }
 
 struct Operation {
     shared: Arc<Shared>,
     epoch: Arc<Epoch>,
     cancelled: Arc<AtomicBool>,
+    #[cfg(all(test, unix))]
+    cancellation_wait: std::sync::OnceLock<std::sync::mpsc::Sender<()>>,
 }
 
 impl Drop for Operation {
@@ -91,12 +100,22 @@ impl Scope {
     pub fn cancellation(&self) -> Cancellation {
         Cancellation {
             operation: Arc::downgrade(&self.0),
+            owner: Arc::downgrade(&self.0.shared),
             cancelled: self.0.cancelled.clone(),
         }
     }
 
     /// Whether this operation or its original admission epoch has been cancelled.
     pub fn cancelled(&self) -> bool {
+        #[cfg(all(test, unix))]
+        if let Some(waiting) = self.0.cancellation_wait.get()
+            && matches!(
+                self.0.shared.state.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            )
+        {
+            let _ = waiting.send(());
+        }
         let state = self
             .0
             .shared
@@ -106,6 +125,13 @@ impl Scope {
         self.0.cancelled.load(Ordering::Acquire)
             || state.closed
             || !Arc::ptr_eq(&state.epoch, &self.0.epoch)
+    }
+
+    #[cfg(all(test, unix))]
+    pub(super) fn cancellation_wait_for_test(&self) -> std::sync::mpsc::Receiver<()> {
+        let (send, receive) = std::sync::mpsc::channel();
+        self.0.cancellation_wait.set(send).unwrap();
+        receive
     }
 
     /// Retains this scope until all work captures have retired, even without a run.
@@ -118,11 +144,22 @@ impl Scope {
 /// Cancels one operation without retaining any of its work captures.
 #[derive(Clone)]
 pub struct Cancellation {
+    owner: std::sync::Weak<Shared>,
     operation: Weak<Operation>,
     cancelled: Arc<AtomicBool>,
 }
 
 impl Cancellation {
+    /// Whether this original operation stopped or has already retired.
+    pub fn cancelled(&self) -> bool {
+        self.operation
+            .upgrade()
+            .is_none_or(|operation| Scope(operation).cancelled())
+    }
+    /// Lifetime namespace only, independent of whether the operation has retired.
+    pub fn owned_by(&self, lifetime: &Lifetime) -> bool {
+        self.owner.ptr_eq(&Arc::downgrade(&lifetime.0))
+    }
     /// Requests cancellation of this exact operation and all its scope clones.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);

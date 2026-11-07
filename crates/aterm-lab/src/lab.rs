@@ -71,9 +71,11 @@ pub struct UpOpts {
     pub reroute: bool,
     /// The instance reads the stub's own base URL as Claude Code's default route
     /// ([`aterm_agent::harness::netwatch::LAB_ROUTE_SEAM`]), so a lab Claude Code on the stub
-    /// with a stored login is a roster row's process: `claude-rotation-proof`'s, and `forever
+    /// with a stored login is a roster row's process: `claude-rotation-proof`'s, `forever
     /// --mode sysmsg`'s expired-login chains on Claude Code but under `--token-login`
-    /// (`forever::sysmsg::login::stored_arm`); no `LAB_*` variable.
+    /// (`forever::sysmsg::login::stored_arm`), and `LAB_ROUTE_SEAM=1` at `up`, for a lab whose
+    /// tab runs a roster row's login by hand (the accounts probe's live check,
+    /// docs/SPEC-claude-accounts-probe-2026-10-01.md §6 L5).
     pub route_seam: bool,
     /// `LAB_HOME_IMAGE=<size>` (`16g`): the scratch's `home/` is a sparse APFS image of that size,
     /// a volume of its own, which the `down` that removes the scratch detaches
@@ -124,7 +126,7 @@ impl UpOpts {
             clock: set("LAB_CLOCK"),
             window: false,
             reroute: set("LAB_REROUTE"),
-            route_seam: false,
+            route_seam: set("LAB_ROUTE_SEAM"),
             home_image: Some(var("LAB_HOME_IMAGE")).filter(|v| !v.is_empty()),
             jail_scan: set("LAB_JAIL_SCAN"),
             fabric: false,

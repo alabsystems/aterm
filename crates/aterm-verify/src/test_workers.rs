@@ -22,11 +22,15 @@ pub(crate) fn admitted_share(env: &EnvSnapshot) -> Result<Option<u32>, &'static 
         .ok_or("BUILD_SLOT_HELD=1 requires positive decimal CARGO_BUILD_JOBS")
 }
 
-/// Preferences are ceilings. Division avoids overflow even for u32::MAX requests.
-pub(crate) fn counts(jobs: u32, threads: u32, share: u32) -> (u32, u32) {
-    let (jobs, threads) = (jobs.max(1), threads.max(1));
-    let threads = threads.min(share.max(1));
-    (jobs.min(share.max(1) / threads), threads)
+/// The most binaries at once and the widest binary, within `share`: each preference is a
+/// ceiling, and an absent one is the share. What the binaries running hold together is their
+/// charges, which [`crate::test_plan::dispatch`] keeps within the share.
+pub(crate) fn ceilings(jobs: Option<u32>, threads: Option<u32>, share: u32) -> (u32, u32) {
+    let share = share.max(1);
+    (
+        jobs.unwrap_or(share).clamp(1, share),
+        threads.unwrap_or(share).clamp(1, share),
+    )
 }
 
 #[cfg(test)]
@@ -34,21 +38,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_workers_share_one_ceiling_without_overflow() {
-        for share in [1, 2, 6, 32, u32::MAX] {
-            for jobs in [1, 2, 8, u32::MAX] {
-                for threads in [1, 2, 6, 32, u32::MAX] {
-                    let (actual_jobs, actual_threads) = counts(jobs, threads, share);
-                    assert!(actual_jobs > 0 && actual_threads > 0);
-                    assert!(actual_jobs <= jobs && actual_threads <= threads);
-                    assert!(u64::from(actual_jobs) * u64::from(actual_threads) <= u64::from(share));
+    fn test_worker_ceilings_stay_within_the_share_without_overflow() {
+        for share in [0, 1, 2, 6, 32, u32::MAX] {
+            for jobs in [None, Some(1), Some(2), Some(8), Some(u32::MAX)] {
+                for threads in [None, Some(1), Some(2), Some(6), Some(32), Some(u32::MAX)] {
+                    let (j, t) = ceilings(jobs, threads, share);
+                    assert!(j > 0 && t > 0);
+                    assert!(j <= share.max(1) && t <= share.max(1));
+                    assert!(jobs.is_none_or(|asked| j <= asked));
+                    assert!(threads.is_none_or(|asked| t <= asked));
                 }
             }
         }
-        assert_eq!(counts(8, 32, 6), (1, 6));
-        assert_eq!(counts(8, 2, 6), (3, 2));
-        assert_eq!(counts(2, 2, 6), (2, 2));
-        assert_eq!(counts(0, 0, 0), (1, 1));
+        assert_eq!(ceilings(None, None, 6), (6, 6));
+        assert_eq!(ceilings(Some(8), Some(32), 6), (6, 6));
+        assert_eq!(ceilings(Some(2), Some(3), 6), (2, 3));
+        assert_eq!(ceilings(Some(0), Some(0), 0), (1, 1));
     }
 
     #[test]
@@ -101,7 +106,7 @@ mod tests {
             )
         };
         let managed = make(Some("1".into()));
-        assert_eq!((managed.test_jobs(), managed.test_threads()), (3, 2));
+        assert_eq!((managed.test_jobs(), managed.test_threads()), (6, 2));
         assert_eq!(managed.build_jobs_ceiling(), Some(6));
         let forward = managed
             .with_test_jobs(NonZeroU32::new(2))
@@ -123,14 +128,14 @@ mod tests {
         let huge = make(Some("1".into()))
             .with_test_jobs(NonZeroU32::new(u32::MAX))
             .with_test_threads(NonZeroU32::new(u32::MAX));
-        assert_eq!((huge.test_jobs(), huge.test_threads()), (1, 6));
+        assert_eq!((huge.test_jobs(), huge.test_threads()), (6, 6));
         let small = make(Some("1".into())).with_test_jobs(NonZeroU32::new(1));
         assert_eq!((small.test_jobs(), small.test_threads()), (1, 2));
         let unmanaged = make(None);
         assert_eq!(
             (unmanaged.test_jobs(), unmanaged.test_threads()),
             (
-                usize::try_from((unmanaged.cores() / 2).clamp(1, 8)).unwrap(),
+                usize::try_from(unmanaged.cores()).unwrap(),
                 unmanaged.cores().min(2)
             )
         );
@@ -144,12 +149,7 @@ mod tests {
             },
             PathBuf::from("/tmp"),
         );
-        assert_eq!(default.test_threads(), default.cores().min(6));
-        assert!(
-            u64::try_from(default.test_jobs()).expect("job count")
-                * u64::from(default.test_threads())
-                <= 6
-        );
+        assert_eq!((default.test_jobs(), default.test_threads()), (6, 6));
         assert_eq!(default.test_thread_override(), Some(default.test_threads()));
     }
 
@@ -166,11 +166,15 @@ mod tests {
                 },
                 PathBuf::from("/tmp"),
             );
-            assert_eq!((ctx.test_jobs(), ctx.test_threads()), (1, ctx.cores()));
+            let cores = usize::try_from(ctx.cores()).unwrap();
+            assert_eq!((ctx.test_jobs(), ctx.test_threads()), (cores, ctx.cores()));
             let huge = ctx
                 .with_test_jobs(NonZeroU32::new(u32::MAX))
                 .with_test_threads(NonZeroU32::new(u32::MAX));
-            assert_eq!((huge.test_jobs(), huge.test_threads()), (1, huge.cores()));
+            assert_eq!(
+                (huge.test_jobs(), huge.test_threads()),
+                (cores, huge.cores())
+            );
             assert_eq!(huge.test_thread_override(), Some(huge.cores()));
             assert_eq!(
                 huge.child_env_add

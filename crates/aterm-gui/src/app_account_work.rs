@@ -5,8 +5,80 @@
 
 use aterm_agent::harness::account_work::{Drained, Pause};
 use aterm_window::event_loop::ActiveEventLoop;
+use std::time::{Duration, Instant};
 
 use crate::{App, CloseOutcome, Wake, WindowId};
+
+const WORKER_RETRY: Duration = Duration::from_secs(1);
+
+/// A cancelled constructor that has not bound a real child can release its
+/// permission. Claimed children and provider-response custody retain their real
+/// lifetimes. Keep retrying off the event loop: a previously admitted launch
+/// worker can insert its reservation after an earlier sweep.
+fn drain_account_sources(
+    mut pause: Pause,
+    sources: Option<&aterm_agent::harness::codex_source_registry::Registry>,
+) -> Drained {
+    let Some(sources) = sources else {
+        return pause.wait();
+    };
+    loop {
+        let _ = sources.revoke_cancelled_unclaimed();
+        pause = match pause.try_wait() {
+            Ok(drained) => return drained,
+            Err(pause) => pause,
+        };
+        std::thread::park_timeout(std::time::Duration::from_millis(10));
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct Settlement {
+    drained: Drained,
+    sealed: bool,
+}
+
+impl Settlement {
+    pub(crate) fn durably_sealed(&self) -> bool {
+        self.sealed
+    }
+}
+
+pub(crate) enum DrainInput {
+    Wait(Pause),
+    Ready(Drained),
+}
+
+fn enrollment_pending(lifetime: &aterm_agent::harness::account_work::Lifetime) -> bool {
+    #[cfg(unix)]
+    return App::enrollment_retirement_pending(lifetime);
+    #[cfg(not(unix))]
+    {
+        let _ = lifetime;
+        false
+    }
+}
+
+pub(crate) fn settle_accounts(
+    input: DrainInput,
+    lifetime: &aterm_agent::harness::account_work::Lifetime,
+) -> Settlement {
+    let drained = match input {
+        DrainInput::Wait(pause) => {
+            let sources = crate::control::source_registry();
+            drain_account_sources(pause, sources.as_deref())
+        }
+        DrainInput::Ready(drained) => drained,
+    };
+    #[cfg(unix)]
+    let sealed = App::seal_enrollment_retirement(lifetime);
+    #[cfg(not(unix))]
+    let sealed = {
+        let _ = lifetime;
+        true
+    };
+    Settlement { drained, sealed }
+}
 
 pub(crate) enum Continuation {
     Quit,
@@ -31,6 +103,8 @@ pub(crate) struct Drain {
     drained: Option<Drained>,
     pause: Option<Pause>,
     failed: bool,
+    worker_retry_at: Option<Instant>,
+    retirement_pending: bool,
     #[cfg(unix)]
     handoff_attempt: Option<u64>,
 }
@@ -65,11 +139,16 @@ impl App {
 
     /// Close admission immediately; only the worker waits for already admitted resources.
     pub(crate) fn accounts_drained_before(&mut self, continuation: Continuation) -> bool {
-        if self.account_drain.drained.is_some() {
+        if self.account_drain.drained.is_some() && !self.account_drain.retirement_pending {
             return true;
         }
         if self.account_drain.pending.is_some() {
-            let ready = self.take_retired_account_pause();
+            let ready = self.take_retired_account_pause().or_else(|| {
+                self.account_drain
+                    .retirement_pending
+                    .then(|| self.account_drain.drained.take())
+                    .flatten()
+            });
             // A quit supersedes an update that has not launched. Its closed epoch transfers
             // directly to shutdown, rather than briefly reopening account admission.
             if !matches!(continuation, Continuation::Handoff { .. }) {
@@ -82,9 +161,21 @@ impl App {
                 self.account_drain.pending = Some(continuation);
             }
             if let Some(drained) = ready {
+                if enrollment_pending(&self.account_work) {
+                    self.account_drain.drained = Some(drained);
+                    self.account_drain.retirement_pending = true;
+                    self.dispatch_account_drain(self.account_drain.serial);
+                    if self.account_drain.retirement_pending {
+                        return false;
+                    }
+                    self.account_drain.pending = None;
+                    return true;
+                }
                 self.account_drain.pending = None;
                 self.account_drain.drained = Some(drained);
                 self.account_drain.failed = false;
+                self.account_drain.worker_retry_at = None;
+                self.account_drain.retirement_pending = false;
                 return true;
             }
             return false;
@@ -104,6 +195,15 @@ impl App {
         let pause = match pause.try_wait() {
             Ok(drained) => {
                 self.account_drain.drained = Some(drained);
+                if enrollment_pending(&self.account_work) {
+                    self.account_drain.pending = Some(continuation);
+                    self.account_drain.retirement_pending = true;
+                    self.dispatch_account_drain(serial);
+                    if self.account_drain.retirement_pending {
+                        return false;
+                    }
+                    self.account_drain.pending = None;
+                }
                 return true;
             }
             Err(pause) => pause,
@@ -116,43 +216,129 @@ impl App {
     }
 
     fn dispatch_account_drain(&mut self, serial: u64) {
+        if self.account_drain.pause.is_none() && self.account_drain.drained.is_none() {
+            return;
+        }
         let Some(proxy) = self.proxy.clone() else {
-            self.account_drain.failed = true;
+            self.note_account_drain_worker_unavailable();
+            if self.account_drain.drained.is_some() {
+                self.account_drain.failed = false;
+                aterm_log::info!(
+                    "account resources retired; enrollment retirement metadata worker has no event proxy"
+                );
+                self.account_drain.retirement_pending = false;
+            }
             return;
         };
         // Spawn before transferring the unique Pause. A refused or dropped unstarted worker
         // cannot destroy the App's only proof-producing handle.
-        let (send, receive) = std::sync::mpsc::sync_channel::<Pause>(1);
+        let (send, receive) = std::sync::mpsc::sync_channel::<DrainInput>(1);
+        let lifetime = self.account_work.clone();
         match std::thread::Builder::new()
             .name("aterm-account-drain".into())
             .spawn(move || {
-                if let Ok(pause) = receive.recv() {
-                    let drained = pause.wait();
+                if let Ok(input) = receive.recv() {
+                    let drained = settle_accounts(input, &lifetime);
                     let _ = proxy.send_event(Wake::AccountsDrained { serial, drained });
                 }
             }) {
             Ok(_) => {
-                if let Some(pause) = self.account_drain.pause.take()
-                    && let Err(error) = send.send(pause)
+                self.account_drain.failed = false;
+                self.account_drain.worker_retry_at = None;
+                let input = self
+                    .account_drain
+                    .pause
+                    .take()
+                    .map(DrainInput::Wait)
+                    .or_else(|| self.account_drain.drained.take().map(DrainInput::Ready));
+                if let Some(input) = input
+                    && let Err(error) = send.send(input)
                 {
-                    self.account_drain.pause = Some(error.0);
-                    self.account_drain.failed = true;
+                    match error.0 {
+                        DrainInput::Wait(pause) => self.account_drain.pause = Some(pause),
+                        DrainInput::Ready(drained) => self.account_drain.drained = Some(drained),
+                    }
+                    self.note_account_drain_worker_unavailable();
+                    if self.account_drain.drained.is_some() {
+                        self.account_drain.retirement_pending = false;
+                        self.account_drain.failed = false;
+                    }
                 }
             }
             Err(error) => {
                 if !self.account_drain.failed {
-                    aterm_log::info!("account work drain waits on the event loop: {error}");
+                    if self.account_drain.drained.is_some() {
+                        aterm_log::info!(
+                            "account resources retired; enrollment retirement metadata worker unavailable: {error}"
+                        );
+                    } else {
+                        aterm_log::info!("account work drain waits on the event loop: {error}");
+                    }
                 }
-                self.account_drain.failed = true;
+                self.note_account_drain_worker_unavailable();
+                if self.account_drain.drained.is_some() {
+                    self.account_drain.retirement_pending = false;
+                    self.account_drain.failed = false;
+                }
             }
         }
     }
 
-    /// A worker-creation failure keeps the original Pause; the event loop can still prove
-    /// settlement without spawning, blocking, or treating a timeout as completion.
+    fn note_account_drain_worker_unavailable(&mut self) {
+        self.account_drain.failed = true;
+        self.account_drain.worker_retry_at = self
+            .account_drain
+            .pause
+            .as_ref()
+            .map(|_| Instant::now() + WORKER_RETRY);
+    }
+
+    fn retry_account_drain_worker(&mut self, now: Instant) -> bool {
+        if !self.account_drain.failed
+            || self.account_drain.pause.is_none()
+            || self.account_drain.pending.is_none()
+            || self.account_drain.worker_retry_at.is_none_or(|at| now < at)
+        {
+            return false;
+        }
+        self.account_drain.worker_retry_at = None;
+        self.dispatch_account_drain(self.account_drain.serial);
+        true
+    }
+
+    /// A worker-creation failure keeps the original Pause and retries at a bounded pace.
+    /// Resource retirement never depends on metadata availability; only a successful seal
+    /// enables later recovery.
     pub(crate) fn poll_account_drain(&mut self, el: &ActiveEventLoop) {
         if let Some(drained) = self.take_retired_account_pause() {
-            self.finish_account_drain(el, self.account_drain.serial, drained);
+            if enrollment_pending(&self.account_work) {
+                self.account_drain.drained = Some(drained);
+                self.account_drain.retirement_pending = true;
+                self.dispatch_account_drain(self.account_drain.serial);
+                if !self.account_drain.retirement_pending
+                    && let Some(drained) = self.account_drain.drained.take()
+                {
+                    self.finish_account_drain(
+                        el,
+                        self.account_drain.serial,
+                        Settlement {
+                            drained,
+                            sealed: false,
+                        },
+                    );
+                }
+            } else {
+                self.finish_account_drain(
+                    el,
+                    self.account_drain.serial,
+                    Settlement {
+                        drained,
+                        sealed: true,
+                    },
+                );
+            }
+        } else {
+            self.retry_account_drain_worker(Instant::now());
         }
     }
 
@@ -255,6 +441,8 @@ impl App {
         let continuation = self.account_drain.pending.take()?;
         self.account_drain.drained = Some(drained);
         self.account_drain.failed = false;
+        self.account_drain.worker_retry_at = None;
+        self.account_drain.retirement_pending = false;
         if matches!(continuation, Continuation::ResumeAfterDrain) {
             self.resume_drained_accounts();
             return None;
@@ -266,9 +454,9 @@ impl App {
         &mut self,
         el: &ActiveEventLoop,
         serial: u64,
-        drained: Drained,
+        settlement: Settlement,
     ) {
-        let Some(continuation) = self.accept_account_drain(serial, drained) else {
+        let Some(continuation) = self.accept_account_settlement(serial, settlement) else {
             return;
         };
         match continuation {
@@ -362,6 +550,23 @@ impl App {
         }
     }
 
+    pub(crate) fn accept_account_settlement(
+        &mut self,
+        serial: u64,
+        settlement: Settlement,
+    ) -> Option<Continuation> {
+        if self.account_drain.serial != serial {
+            return None;
+        }
+        if !settlement.durably_sealed() {
+            aterm_log::info!(
+                "account resources retired; enrollment retirement metadata remains uncertain"
+            );
+        }
+        let Settlement { drained, .. } = settlement;
+        self.accept_account_drain(serial, drained)
+    }
+
     /// Account settlement completed after the original request was accepted. A temporary
     /// refusal retains that request's artifact and retry cadence instead of waiting for a check.
     fn account_update_start_outcome(
@@ -390,6 +595,75 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn paused_app_retires_the_actual_unclaimed_constructor_and_releases_its_gate() {
+        let (root, sources, lifetime) = crate::task_launch::pending_codex_constructor_for_drain();
+        let gate = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.path().join("home/.aterm/codex-source-custody/gate"))
+            .unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "observe the actual pending constructor's kernel exclusion"
+        )]
+        let before = gate.try_lock();
+        assert!(matches!(before, Err(std::fs::TryLockError::WouldBlock)));
+        let pause = lifetime
+            .pause()
+            .unwrap()
+            .try_wait()
+            .expect_err("the real constructor still owns its App scope");
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        let worker_sources = sources.clone();
+        let worker = std::thread::spawn(move || {
+            send.send(drain_account_sources(pause, Some(&worker_sources)))
+                .unwrap();
+        });
+        let drained = receive
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("cancelled unclaimed constructor must retire");
+        worker.join().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "verify revocation released the actual constructor gate"
+        )]
+        gate.try_lock().unwrap();
+        assert_eq!(sources.revoke_cancelled_unclaimed().unwrap(), 0);
+        drained.resume().unwrap();
+        assert!(lifetime.enter().is_some());
+    }
+
+    #[test]
+    fn source_cleanup_does_not_retire_other_owned_account_work() {
+        for registered in [false, true] {
+            let lifetime = aterm_agent::harness::account_work::Lifetime::default();
+            let work = lifetime.enter().unwrap();
+            let pause = lifetime.pause().unwrap();
+            assert!(work.cancelled());
+            let (send, receive) = std::sync::mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || {
+                let sources =
+                    registered.then(aterm_agent::harness::codex_source_registry::Registry::default);
+                let drained = drain_account_sources(pause, sources.as_ref());
+                send.send(drained).unwrap();
+            });
+            assert!(matches!(
+                receive.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            assert!(lifetime.enter().is_none());
+            drop(work);
+            let drained = receive
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .expect("actual owned work retired");
+            worker.join().unwrap();
+            drained.resume().unwrap();
+            assert!(lifetime.enter().is_some());
+        }
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
@@ -573,6 +847,33 @@ mod tests {
             app.auto_apply_intent.is_none(),
             "a real failure is not a cheap preflight retry"
         );
+    }
+
+    #[test]
+    fn unavailable_retirement_metadata_does_not_turn_real_resource_retirement_into_a_quit_stall() {
+        let mut app = App::headless_for_test();
+        let work = app.account_work.enter().unwrap();
+        assert!(!app.accounts_drained_before(Continuation::Quit));
+        drop(work);
+        let drained = app.take_retired_account_pause().unwrap();
+        let serial = app.account_drain.serial;
+        assert!(matches!(
+            app.accept_account_settlement(
+                serial,
+                Settlement {
+                    drained,
+                    sealed: false
+                }
+            ),
+            Some(Continuation::Quit)
+        ));
+        assert!(app.account_drain.drained.is_some());
+        assert!(!app.account_drain.failed);
+        assert!(!app.account_drain.retirement_pending);
+        assert!(app.account_drain.worker_retry_at.is_none());
+        assert!(app.account_work.enter().is_none());
+        app.resume_drained_accounts();
+        assert!(app.account_work.enter().is_some());
     }
 
     #[test]
@@ -855,5 +1156,32 @@ mod tests {
         app.resume_drained_accounts();
         assert!(host.enter().is_some());
         assert!(menu.enter().is_some());
+    }
+    #[test]
+    fn unavailable_drain_worker_retries_without_losing_custody_or_reopening_admission() {
+        let mut app = App::headless_for_test();
+        assert!(app.proxy.is_none());
+        let work = app.account_work.enter().unwrap();
+        assert!(!app.accounts_drained_before(Continuation::ResumeAfterDrain));
+        let serial = app.account_drain.serial;
+        let due = app
+            .account_drain
+            .worker_retry_at
+            .expect("unavailable dispatch is retried");
+        assert!(work.cancelled());
+        assert!(!app.retry_account_drain_worker(due - Duration::from_nanos(1)));
+        assert_eq!(app.account_drain.worker_retry_at, Some(due));
+        assert!(app.retry_account_drain_worker(due));
+        assert_eq!(app.account_drain.serial, serial);
+        assert!(app.account_drain.pause.is_some());
+        assert!(app.account_drain.worker_retry_at.is_some());
+        assert!(app.account_work.enter().is_none());
+
+        drop(work);
+        let drained = app.take_retired_account_pause().unwrap();
+        assert!(app.accept_account_drain(serial, drained).is_none());
+        assert!(app.account_drain.worker_retry_at.is_none());
+        assert!(!app.retry_account_drain_worker(due + WORKER_RETRY));
+        assert!(app.account_work.enter().is_some());
     }
 }

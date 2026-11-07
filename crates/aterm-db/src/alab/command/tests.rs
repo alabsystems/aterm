@@ -2227,6 +2227,70 @@ fn a_spelling_is_not_reported_beside_a_column_that_really_disagrees() {
     assert_eq!(reported, ["notes"], "{applied}");
 }
 
+/// A record the replica holds and its dump leaves out is no cell the registry could cover: here a
+/// peer's second record, waiting for its first. It changes the digest though the dump is the same,
+/// so the deletion's digest check sees a late arrival, and the first's arrival lifts it.
+/// NEGATIVE CONTROL: with `record_coverage` counting the dump's cells alone, the import says
+/// covered: `` left: Bool(true) right: Bool(false) ``.
+#[test]
+fn an_import_does_not_cover_a_record_the_dump_withholds() {
+    let lab = Lab::new(&[Role::Writer]);
+    let paths = &lab.paths[0];
+    let dir = replica_fixture(paths, 1, "active");
+    let secret = crate::fleet_db::resolve_fleet_secret(&dir).unwrap();
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let peer_dir = tmp.path().join("peer");
+    crate::local::ensure_fleet(&peer_dir, &secret).unwrap();
+    let mut peer = crate::local::Database::open(&peer_dir).unwrap();
+    let mut wires = Vec::new();
+    for i in 2..=3 {
+        let before: std::collections::BTreeSet<_> =
+            peer.history.index.inventory().copied().collect();
+        let (email, row) = email_row(i, "active");
+        crate::fleet_db::put_row(&mut peer, "emails", &email, row).unwrap();
+        let new = peer
+            .history
+            .index
+            .inventory()
+            .copied()
+            .find(|id| !before.contains(id))
+            .unwrap();
+        wires.push(peer.history.wire(&new).unwrap().to_vec());
+    }
+    let go = |list: &[&str]| {
+        let mut never = |_: &Path| -> Result<()> { panic!("no review") };
+        run(paths, &words(list), Some(&Stand), &mut never, NOW).unwrap()
+    };
+    let apply = ["import", "--fleet-db", "--authoritative", "--apply"];
+    let digest = ["import", "--fleet-db", "--digest"];
+    let clean = go(&apply);
+    assert_eq!(clean["replica"]["covered"], json!(true), "{clean}");
+    assert_eq!(go(&digest)["digest"], clean["replica"]["digest"]);
+
+    let mut db = crate::fleet_db::open_at(&dir).unwrap();
+    db.ingest(&wires[1]).unwrap();
+    drop(db);
+    let late = go(&digest);
+    assert_eq!(late["withheld"], json!(1), "{late}");
+    assert_ne!(late["digest"], clean["replica"]["digest"]);
+    let dry = go(&["import", "--fleet-db", "--authoritative"]);
+    assert_eq!(dry["replica_withheld"], json!(1), "{dry}");
+    let applied = go(&apply);
+    assert_eq!(applied["replica"]["covered"], json!(false), "{applied}");
+    assert_eq!(applied["replica"]["uncovered"], json!(1), "{applied}");
+    assert_eq!(
+        applied["replica"]["cells"][0]["why"],
+        json!("withheld-operations"),
+        "{applied}"
+    );
+
+    let mut db = crate::fleet_db::open_at(&dir).unwrap();
+    db.ingest(&wires[0]).unwrap();
+    drop(db);
+    let applied = go(&apply);
+    assert_eq!(applied["replica"]["covered"], json!(true), "{applied}");
+}
+
 /// fleet_db's write verbs on this Mac's replica work before its import and refuse, pointing to
 /// `aterm db emails`, once its own import recorded it covered; its reads still work. A record
 /// that says uncovered refuses nothing.

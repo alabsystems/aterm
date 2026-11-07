@@ -16,6 +16,97 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 const HANG: Duration = Duration::from_secs(60);
 
+/// A one-shot registration fallback receives the complete remaining native union,
+/// filtered by the same membership verdict. Numeric claims grant no membership.
+#[test]
+fn remaining_native_fleet_candidates_keep_the_complete_log_admitted_union() {
+    let (mut probe, reply) = crate::lan_members::queued_test_probe();
+    let current = NodeKey::from_bytes([1; 32]);
+    let removed = NodeKey::from_bytes([2; 32]);
+    let foreign = NodeKey::from_bytes([3; 32]);
+    let keys: member::MemberKeys = [
+        (current, member::Standing::Member),
+        (removed, member::Standing::Out("removed".into())),
+    ]
+    .into_iter()
+    .collect();
+    reply(7300, foreign);
+    let first = probe.next(Instant::now() + HANG).unwrap();
+    assert!(admitted_native_places(first, Some(&keys)).is_empty());
+    for (port, key) in [(7301, current), (7302, removed), (7303, current)] {
+        reply(port, key);
+    }
+    let all = probe.complete(Instant::now() + HANG).unwrap();
+    let admitted = admitted_native_places(all.clone(), Some(&keys));
+    assert_eq!(
+        admitted,
+        [("127.0.0.1".into(), 7301), ("127.0.0.1".into(), 7303)]
+    );
+    assert!(admitted_native_places(all.clone(), None).is_empty());
+    assert!(
+        admitted_native_places(all, Some(&member::MemberKeys::unreadable("unread"))).is_empty()
+    );
+}
+
+#[test]
+fn native_fleet_registration_finishes_before_discovery_fallback() {
+    let (issuer, code, _serving) = issuing("native-before-discovery");
+    let reader = World::new("native-before-discovery-reader");
+    member::ensure_private_dir(&reader.places.state).unwrap();
+    let me = member::node_identity(&reader.places.state).unwrap();
+    let code = JoinCode::parse(&code).unwrap();
+    let secret = FleetSecret::new(&code.secret).unwrap();
+    let registration = Registration {
+        node: me.node().into(),
+        host: "127.0.0.1".into(),
+        port: closed_port(),
+        version: aterm_stamp::app_version().into(),
+        key: None,
+        signed: None,
+    }
+    .signed_in(&reader.places.state, &me)
+    .unwrap();
+    let issuer_at = code.hint.unwrap();
+    let native_calls = Cell::new(0);
+    let named = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    named.set_nonblocking(true).unwrap();
+    let registered = register_with(
+        &[
+            ("127.0.0.1".into(), closed_port()),
+            ("localhost".into(), named.local_addr().unwrap().port()),
+        ],
+        (&secret, &me),
+        (&Keyring::default(), None),
+        (&[], None),
+        &registration,
+        true,
+        &RegistrationFallback {
+            native: Some(&|until| {
+                assert!(until > Instant::now());
+                native_calls.set(native_calls.get() + 1);
+                vec![("127.0.0.1".into(), closed_port()), issuer_at.clone()]
+            }),
+            advertised: &|| panic!("the actual native registration needs no discovery"),
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(named.accept(), Err(why) if why.kind() == io::ErrorKind::WouldBlock),
+        "a retained hostname never gets ahead of the queued numeric member"
+    );
+    assert_eq!(native_calls.get(), 1);
+    assert_eq!(
+        registered.0.issuer.node,
+        member::node_id(&issuer.places.state).unwrap()
+    );
+    assert!(
+        member::read_peers(&issuer.places.state)
+            .unwrap()
+            .iter()
+            .any(|peer| peer.node.as_deref() == Some(me.node()))
+    );
+}
+
 #[test]
 fn canonical_name_publication_rejects_a_superseded_number() {
     use aterm_types::machine_name::Number;
@@ -5000,7 +5091,10 @@ fn a_join_to_an_issuer_past_the_lan_is_refused_by_its_kind() {
         (&[], None),
         &registration,
         false,
-        &Vec::new,
+        &RegistrationFallback {
+            native: None,
+            advertised: &Vec::new,
+        },
     );
     assert!(
         matches!(&refused, Err(JoinFailed::Dial(Unreached::NotFleet(_)))),
@@ -11949,7 +12043,7 @@ fn roster_identities_and_names_this_machine_bind_node_keys_and_enforce_deny_list
             store: srv_dir.path().to_path_buf(),
             advertise: None,
             pins: Vec::new(),
-            hold: Duration::from_millis(50),
+            hold: HANG,
             keep_awake: false,
         },
     )
@@ -12065,10 +12159,11 @@ fn roster_identities_and_names_this_machine_bind_node_keys_and_enforce_deny_list
     // Even if `[fleet] machine = "m4"` is in `aterm.toml`, `names_this_machine` must reject it.
     std::fs::create_dir_all(member.places.config.parent().unwrap()).unwrap();
     std::fs::write(&member.places.config, "[fleet]\nmachine = \"m4\"\n").unwrap();
-    assert_eq!(names_this_machine(&member.places, "m4").unwrap(), None);
+    assert!(names_this_machine(&member.places, "m4").is_err());
 
-    // Once the denied alias is removed from m100's aliases, both `m100` and alias `m32` name this machine.
-    // And if surviving member `m25` has a legacy `vault_name` (`"m4-2"`) colliding with denied `"m4"`,
+    // Removing the denied alias preserves the roster's key metadata, but a registry binding
+    // is still required before these labels or aliases can name this machine.
+    // If surviving member `m25` has a legacy `vault_name` (`"m4-2"`) colliding with denied `"m4"`,
     // `m25` remains in `roster_identities` under `m25` with its denied `vault_name`/`host` stripped.
     let adm2 = aterm_secrets::client::admin_open(&paths).expect("admin open");
     let mut doc2 = adm2.doc.clone();
@@ -12090,15 +12185,12 @@ fn roster_identities_and_names_this_machine_bind_node_keys_and_enforce_deny_list
         .expect("surviving m25 must stay in roster_identities despite denied vault_name m4-2");
     assert_eq!(m25_after.vault_name, None);
     assert_eq!(m25_after.host, None);
-    assert_eq!(
-        names_this_machine(&member.places, "m100").unwrap(),
-        Some(own.node().to_owned())
-    );
-    assert_eq!(
-        names_this_machine(&member.places, "m32").unwrap(),
-        Some(own.node().to_owned())
-    );
-    assert_eq!(names_this_machine(&member.places, "m4").unwrap(), None);
+    for word in ["m100", "m32", "m4"] {
+        assert!(
+            names_this_machine(&member.places, word).is_err(),
+            "a roster-only name cannot bypass the registry: {word}"
+        );
+    }
 
     // `drive_grants` and `drive_fleet_in` must refuse a peer whose node_key is denied in
     // `aterm-swarm-roster`, while `join_places` and `issuer_copies` filter it out.
@@ -12108,9 +12200,7 @@ fn roster_identities_and_names_this_machine_bind_node_keys_and_enforce_deny_list
         failure_words(denied_err).contains("a revoked node may not be granted drive"),
         "expected revoked drive grant refusal"
     );
-    let Err(drive_refused) =
-        drive_fleet_in(&member.places, denied_id.node(), Duration::from_millis(50))
-    else {
+    let Err(drive_refused) = drive_fleet_in(&member.places, denied_id.node(), HANG) else {
         panic!("denied node must not be driven");
     };
     assert!(
@@ -12136,8 +12226,8 @@ fn roster_identities_and_names_this_machine_bind_node_keys_and_enforce_deny_list
         !dials.contains(&("192.168.1.78".to_owned(), 7100)),
         "denied peer must be excluded from join_places: {dials:?}"
     );
-    let (granted, _) =
-        drive_grants(&member.places, &["m22".to_owned()], None).expect("active m22 may drive");
+    let (granted, _) = drive_grants(&member.places, &[peer_id.node().to_owned()], None)
+        .expect("active bound peer may drive");
     assert_eq!(granted.len(), 1);
     assert_eq!(granted[0].node, peer_id.node());
 
@@ -12155,8 +12245,8 @@ fn roster_identities_and_names_this_machine_bind_node_keys_and_enforce_deny_list
     };
     set(0o644);
     let (unread, _) = denied_and_log(&member.places);
-    let grant = drive_grants(&member.places, &["m22".to_owned()], None);
-    let drive = drive_fleet_in(&member.places, peer_id.node(), Duration::from_millis(50));
+    let grant = drive_grants(&member.places, &[peer_id.node().to_owned()], None);
+    let drive = drive_fleet_in(&member.places, peer_id.node(), HANG);
     let joined = join(&member.places, &sync_here(), &code);
     set(0o600);
     assert_eq!(unread, None, "an unreadable deny list is no list");
@@ -12173,8 +12263,8 @@ fn roster_identities_and_names_this_machine_bind_node_keys_and_enforce_deny_list
         "no join while the deny list is unread"
     );
     assert!(
-        drive_grants(&member.places, &["m22".to_owned()], None).is_ok(),
-        "m22 is granted again once the list reads"
+        drive_grants(&member.places, &[peer_id.node().to_owned()], None).is_ok(),
+        "bound peer is granted again once the list reads"
     );
     running.stop();
 }

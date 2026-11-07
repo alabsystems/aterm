@@ -80,8 +80,8 @@ pub(crate) fn release_wait(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
         if let WaitEvent::Heartbeat { elapsed, last } = event {
             let line = format!(
                 "agh: waiting verb=release.wait repo={} for={} elapsed={}s last={}",
-                field(&ctx.redactor.apply(&repo)),
-                field(&ctx.redactor.apply(&fors)),
+                field(&ctx.redactor.apply_cow(&repo)),
+                field(&ctx.redactor.apply_cow(&fors)),
                 elapsed.as_secs(),
                 quote(last)
             );

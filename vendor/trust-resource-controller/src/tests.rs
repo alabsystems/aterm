@@ -281,3 +281,74 @@ fn context_unavailable_is_bound_observation_denial_not_execution_refusal() {
     assert!(ContextResponse::decode(&extra, &query).is_err());
     assert!(ContextUnavailable::for_query(&query, "".into()).is_err());
 }
+
+#[test]
+fn telemetry_preserves_unknown_zero_and_original_age_and_rejects_cross_call_or_role() {
+    let query = TelemetryQuery {
+        query: ContextQuery { binding: request().binding, call_attempt: [9; 16] },
+    };
+    assert!(TelemetryQuery::decode(&query.encode().unwrap()).unwrap() == query);
+    let original_root =
+        Identity { pid: 42, birth: 100, birth_kind: BirthKind::MacosWallMicroseconds };
+    let context = ContextReply {
+        call_attempt: query.query.call_attempt,
+        context: Context {
+            session: query.query.binding.session.clone(),
+            root_attempt: query.query.binding.root_attempt,
+            host: "apple:host".into(),
+            boot: "abcd".into(),
+            original_root,
+            subject: Subject::Root { identity: original_root },
+            cpu: Cpu::CooperativeShared {
+                ceiling: 28,
+                native_manifest: FileIdentity { device: 1, inode: 10 },
+            },
+            memory: Memory {
+                bytes: 1 << 30,
+                namespace: [1; 16],
+                marker: "1-42-1".into(),
+                epoch: [2; 16],
+                guard: FileIdentity { device: 1, inode: 11 },
+            },
+        },
+    };
+    let mut reply = TelemetryReply {
+        context,
+        snapshot: Snapshot {
+            cpus: 28,
+            busy_millicores: None,
+            available_memory_bytes: Some(0),
+            pressure: Pressure::Critical,
+            thermal: Thermal::Unknown,
+            sample_age_ns: 7_000_000_000,
+            window_ns: 0,
+        },
+    };
+    let bytes = reply.encode().unwrap();
+    assert_eq!(
+        TelemetryResponse::decode(&bytes, &query).unwrap(),
+        TelemetryResponse::Ready(reply.clone())
+    );
+    assert!(ContextResponse::decode(&bytes, &query.query).is_err());
+    assert!(
+        StatusFrame::decode(&bytes, query.query.binding.root_attempt, query.query.call_attempt)
+            .is_err()
+    );
+    let mut wrong = query.clone();
+    wrong.query.call_attempt = [8; 16];
+    assert!(TelemetryResponse::decode(&bytes, &wrong).is_err());
+    let mut trailing = bytes;
+    trailing.push(0);
+    assert!(TelemetryResponse::decode(&trailing, &query).is_err());
+    reply.snapshot.busy_millicores = Some(0);
+    assert!(reply.encode().is_err()); // no valid CPU interval, even for zero busy
+    reply.snapshot.window_ns = 1_000_000_000;
+    reply.snapshot.busy_millicores = Some(28_001);
+    assert!(reply.encode().is_err());
+    reply.snapshot.busy_millicores = Some(28_000);
+    assert!(reply.encode().is_ok());
+    let denied = TelemetryResponse::Unavailable(
+        ContextUnavailable::for_query(&query.query, "custody unavailable".into()).unwrap(),
+    );
+    assert_eq!(TelemetryResponse::decode(&denied.encode().unwrap(), &query).unwrap(), denied);
+}

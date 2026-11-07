@@ -3,7 +3,9 @@
 
 //! Canonical CPU and memory authority. Opening never migrates or repairs a
 //! machine. The durable account transition and shared debt domain must exist.
-use aterm_capacity::build_cpu::{ExternalDebt, LegacyRetirement, Pool, PreparedRecovery};
+#[cfg(test)]
+use aterm_capacity::build_cpu::LegacyRetirement;
+use aterm_capacity::build_cpu::{ExternalDebt, NativeDomain, Pool, PreparedRecovery};
 use aterm_capacity::{
     Claim, Ledger, Live, Waiter, cohort_namespace::Namespace, leadership::Fence,
     retained_cohort::RetainedCohort,
@@ -22,6 +24,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "resource_admission_compiler.rs"]
+mod compiler;
 #[path = "resource_admission_context.rs"]
 mod context;
 #[path = "resource_admission_failure.rs"]
@@ -40,6 +44,8 @@ mod member_queue;
 mod member_recipe;
 #[path = "resource_admission_members.rs"]
 pub(super) mod members;
+#[path = "resource_admission_proxy.rs"]
+mod proxy;
 #[path = "resource_admission_queue.rs"]
 mod queue;
 #[path = "resource_admission_recipe.rs"]
@@ -53,6 +59,8 @@ mod start;
 mod tests;
 
 pub(super) struct Owner {
+    // Retain the exact validated canonical domain; tests use a fresh private scope.
+    _domain: Option<NativeDomain>,
     fence: Fence,
     ledger: Ledger,
     pool: Pool,
@@ -68,7 +76,7 @@ struct Pending {
     submission: AuthorizedSubmission,
     events: job::Events,
     recipe: Option<recipe::Recipe>,
-    probe: Option<std::sync::mpsc::Receiver<io::Result<recipe::Recipe>>>,
+    probe: Option<std::sync::mpsc::Receiver<io::Result<Option<recipe::Recipe>>>>,
     waiter: Option<Waiter>,
     claim: Option<Claim>,
     recovery: Option<PreparedRecovery>,
@@ -78,6 +86,7 @@ enum Custody {
     Cooperative(Claim),
 }
 struct Failed {
+    _compiler: Option<compiler::Selection>,
     binding: Binding,
     custody: Custody,
     spawned: Option<Box<spawnfd::Spawned>>,
@@ -89,6 +98,7 @@ struct Job {
     delegation: aterm_types::resource_subgroup::JobContext,
     program: PathBuf,
     native_targo: bool,
+    compiler: Option<compiler::Selection>,
     members: BTreeMap<[u8; 16], member_queue::Slot>,
     events: job::Events,
     custody: Custody,
@@ -115,6 +125,7 @@ fn refused(reason: &str) -> io::Error {
 }
 
 struct Resources {
+    domain: NativeDomain,
     ledger: Ledger,
     namespace: Namespace,
     pool: Pool,
@@ -136,16 +147,13 @@ impl Resources {
         }
         let namespace = Namespace::resolve(ledger.dir())?
             .ok_or_else(|| refused("canonical retained namespace unavailable"))?;
-        let capacity = aterm_capacity::ledger::user_dir()
-            .ok_or_else(|| refused("canonical CPU parent unavailable"))?;
-        let pool = Pool::open_existing(&capacity)?
-            .ok_or_else(|| refused("canonical CPU pool unavailable"))?;
-        let retirement = LegacyRetirement::open_canonical()?;
-        retirement.ensure_prior_boot()?;
-        let debt = ExternalDebt::open(&pool, &retirement)?
+        let domain = NativeDomain::open_canonical()?;
+        let pool = domain.pool().clone();
+        let debt = ExternalDebt::open(&pool, domain.legacy())?
             .ok_or_else(|| refused("mandatory shared debt domain unavailable"))?;
         let journal = journal::Journal::open(&namespace, &debt)?;
         Ok(Self {
+            domain,
             ledger,
             namespace,
             pool,
@@ -163,6 +171,7 @@ impl Owner {
     }
     pub(super) fn open() -> io::Result<Self> {
         let Resources {
+            domain,
             ledger,
             namespace,
             pool,
@@ -171,6 +180,7 @@ impl Owner {
         } = Resources::open()?;
         let fence = Fence::acquire(&namespace, Instant::now() + Duration::from_millis(100))?;
         let mut owner = Self {
+            _domain: Some(domain),
             fence,
             ledger,
             pool,
@@ -307,4 +317,9 @@ impl Owner {
             })
             .fold(Duration::from_millis(50), Duration::min)
     }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+pub(super) fn member_fixture(args: &[std::ffi::OsString]) -> std::process::ExitCode {
+    tests::member_fixture(args)
 }

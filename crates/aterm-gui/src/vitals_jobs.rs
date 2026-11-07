@@ -267,6 +267,9 @@ pub(crate) struct JobsPass {
     /// The tab a session-mate's environment ties each program outside every job that has not
     /// started to, by pid, as the leftover pass last judged it ([`Self::tie_held`]).
     ties: BTreeMap<u32, aterm_vitals::left::Tie>,
+    /// The kernel's exit watches on agent calls' leaders, whose statuses each pass hands the
+    /// engine ([`crate::telemetry_host::CallWatch`]).
+    calls: crate::telemetry_host::CallWatch,
 }
 
 impl JobsPass {
@@ -289,6 +292,7 @@ impl JobsPass {
             view: None,
             naming_fresh: false,
             ties: BTreeMap::new(),
+            calls: crate::telemetry_host::CallWatch::new(!cfg!(test)),
         }
     }
 
@@ -402,6 +406,9 @@ impl JobsPass {
         );
         name_tied(&mut held, &self.ties);
         let lanes = self.reader.lanes();
+        // The statuses of watched calls' leaders read since the last pass: read after the sweep,
+        // so a leader it no longer lists has left its event or is waited on briefly for it.
+        let exits = self.calls.read(|pid| sweep.iter().any(|p| p.pid == pid));
         let tick = JobTick {
             at_ms,
             read_ms,
@@ -421,9 +428,11 @@ impl JobsPass {
             process_limit: self.process_limit,
             held,
             grant_ms: grant.grant_ms,
+            exits,
         };
         let view = self.jobs.absorb(&tick);
         crate::telemetry_host::jobs_passed(&mut self.jobs, at_ms);
+        self.calls.watch(&view.rows);
         self.naming_fresh = true;
         self.next_ms = Some(at_ms + next_pass_ms(view.demand));
         self.view = Some(Arc::new(view));

@@ -81,7 +81,11 @@
 //! authorized binds nothing, since a log holds inert records anyone can sign. A key that a Mac
 //! now out ever bound reads removed, whoever else claims it; else a key that is one member's
 //! current node key is that member's, and one that is two members' is contested; else a key a
-//! member bound and has since replaced is retired; every other key is unknown.
+//! member bound and has since replaced is retired; every other key is unknown. Each member's
+//! retired keys come in the order it replaced them ([`Membership::retired`]): by each key's
+//! newest binding, the record whose strict causal past is larger standing later (at a tie, the
+//! higher id), so every Mac that holds the same records orders them alike, whatever order they
+//! came in, and one signer's records stand in the order it signed them.
 
 use super::reach::Reach;
 use super::{Body, Entrant, Founder, Kind, MemberId, Record, RecordId};
@@ -212,6 +216,10 @@ pub(super) enum Mutant {
     PassOverEveryRecord,
     /// The log keeps its weighing when it holds a record of this kind.
     CarryAcross(Kind),
+    /// A member's retired node keys stand by where each newest binding came in on this Mac, not
+    /// by its causal past, so two Macs that took concurrent bindings in different orders order
+    /// that member's keys differently.
+    RankByArrival,
 }
 
 #[cfg(test)]
@@ -363,7 +371,14 @@ pub struct Membership {
     voided: BTreeSet<RecordId>,
     unproved: Vec<Founder>,
     nodes: BTreeMap<[u8; 32], NodeStanding>,
+    retired: RetiredBySeat,
 }
+
+/// Each member's retired node keys, the one it replaced last first ([`Membership::retired`]).
+type RetiredBySeat = BTreeMap<MemberId, Vec<[u8; 32]>>;
+
+/// Where a record stands among the records that bind node keys ([`Graph::rank`]).
+type Rank = (u64, RecordId);
 
 impl Membership {
     /// Every member, by actor.
@@ -538,6 +553,13 @@ impl Membership {
     /// Every node key whose standing is not [`NodeStanding::Unknown`], by key.
     pub const fn nodes(&self) -> &BTreeMap<[u8; 32], NodeStanding> {
         &self.nodes
+    }
+    /// The node keys `seat` bound and has since replaced, each key [`Self::node`] reads as
+    /// [`NodeStanding::Retired`] of it, once: the one it replaced last first (the module's
+    /// "node-key index"). Empty for a seat that replaced none.
+    #[must_use]
+    pub fn retired(&self, seat: &MemberId) -> &[[u8; 32]] {
+        self.retired.get(seat).map_or(&[], Vec::as_slice)
     }
 }
 
@@ -1536,7 +1558,7 @@ impl<'a> Graph<'a> {
                 claimed_labels.insert(seat.label.to_owned());
             }
         }
-        let nodes = self.nodes(
+        let (nodes, retired) = self.nodes(
             &members,
             (&removed, &superseded_by, &removed_recipients),
             &effects.out,
@@ -1598,6 +1620,7 @@ impl<'a> Graph<'a> {
             voided,
             unproved,
             nodes,
+            retired,
         }
     }
 
@@ -1778,7 +1801,9 @@ impl<'a> Graph<'a> {
     }
 
     /// The node-key index: the standing of every key the genesis, a binding `Admit` or an
-    /// authorized `Node` binds, none of them void, given who is in and who is out.
+    /// authorized `Node` binds, none of them void, given who is in and who is out; and each
+    /// member's retired keys, the one it replaced last first ([`Membership::retired`]), by each
+    /// key's newest binding ([`Self::rank`]).
     fn nodes(
         &self,
         members: &BTreeMap<MemberId, Member>,
@@ -1790,14 +1815,24 @@ impl<'a> Graph<'a> {
         out: &BTreeSet<MemberId>,
         (authorized, void): (&[bool], &[bool]),
         standing: &Standing,
-    ) -> BTreeMap<[u8; 32], NodeStanding> {
+    ) -> (BTreeMap<[u8; 32], NodeStanding>, RetiredBySeat) {
         // Every Mac each key was bound to. Never a raw scan: a log holds inert records anyone
         // can sign, and an `Admit` carries no proof by `entrant.node_key`, so a removed Mac's
         // cut-off, self-signed or Sybil `Admit` binds nothing.
         let mut bound: BTreeMap<[u8; 32], BTreeSet<MemberId>> = BTreeMap::new();
+        // Each key's newest binding, by rank.
+        let mut newest: BTreeMap<[u8; 32], Rank> = BTreeMap::new();
+        let mut bind_at = |key: [u8; 32], i: usize| {
+            let rank = self.rank(i);
+            newest
+                .entry(key)
+                .and_modify(|was| *was = (*was).max(rank))
+                .or_insert(rank);
+        };
         for seat in self.founders() {
             if let Some(key) = seat.node_key.filter(|k| *k != [0; 32]) {
                 bound.entry(key).or_default().insert(seat.member());
+                bind_at(key, 0);
             }
         }
         for (i, record) in self.records.iter().enumerate().skip(1) {
@@ -1832,6 +1867,7 @@ impl<'a> Graph<'a> {
                 _ => continue,
             };
             bound.entry(key).or_default().insert(mac);
+            bind_at(key, i);
         }
         let mut current: BTreeMap<[u8; 32], Vec<MemberId>> = BTreeMap::new();
         for (actor, member) in members {
@@ -1840,7 +1876,7 @@ impl<'a> Graph<'a> {
                 bound.entry(key).or_default().insert(*actor);
             }
         }
-        bound
+        let nodes: BTreeMap<[u8; 32], NodeStanding> = bound
             .into_iter()
             .filter_map(|(key, macs)| {
                 let standing = if let Some(out) = macs.iter().find(|m| {
@@ -1864,7 +1900,44 @@ impl<'a> Graph<'a> {
                 };
                 Some((key, standing))
             })
-            .collect()
+            .collect();
+        let mut retired = RetiredBySeat::new();
+        for (key, standing) in &nodes {
+            if let NodeStanding::Retired(seat) = standing {
+                retired.entry(*seat).or_default().push(*key);
+            }
+        }
+        // The one replaced last first; a key with no binding ranked, after every ranked one.
+        for keys in retired.values_mut() {
+            keys.sort_unstable_by_key(|key| std::cmp::Reverse((newest.get(key), *key)));
+        }
+        (nodes, retired)
+    }
+
+    /// Where record `i` stands among the records that bind node keys, by its content alone: the
+    /// size of its strict causal past, then its id. A record stands above every record in its
+    /// past, so one signer's records stand in the order it signed them, and every Mac that holds
+    /// the same records ranks them alike, whatever order they came in.
+    fn rank(&self, i: usize) -> Rank {
+        let id = *self.records[i].id();
+        #[cfg(test)]
+        if MUTANT.get() == Some(Mutant::RankByArrival) {
+            return (i as u64, id);
+        }
+        #[cfg(test)]
+        if let Some(past) = &self.oracle {
+            return (
+                past[i].0.iter().map(|w| u64::from(w.count_ones())).sum(),
+                id,
+            );
+        }
+        let past = self
+            .reach
+            .row(i)
+            .iter()
+            .map(|w| u64::from(w.count_ones()))
+            .sum();
+        (past, id)
     }
 
     /// P1's revocation ([`aterm_mesh_core::revocation`]) of this view: every bound seat row

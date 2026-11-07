@@ -43,7 +43,7 @@ use crate::supervise::policy::turn_end::{
     AccountAdvice, AccountBad, AccountPoint, AgentResumed, HostTurn, Reach, Restart, RestartAnswer,
     RestartAsk, RestartClaim,
 };
-use crate::supervise::policy::turn_end::{HeldBy, Ready, RosterWord, SignInNext};
+use crate::supervise::policy::turn_end::{AskAgain, HeldBy, Ready, RosterWord, SignInNext};
 use crate::supervise::run::{
     Guard, HostStep, IdlePoint, Lasting, ProbeMiss, ProbeNo, StallSeen, StuckSurvey, UsageSeen,
     WaitPlan,
@@ -441,9 +441,21 @@ enum AdviceWire {
     Hold {
         until: i64,
     },
+    Again {
+        until: i64,
+        why: AskAgainWire,
+    },
     Resume {
         cleared_at: i64,
     },
+}
+
+/// [`AskAgain`] as a tape holds it.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum AskAgainWire {
+    Unwritten,
+    Reset,
 }
 
 impl AdviceWire {
@@ -463,6 +475,13 @@ impl AdviceWire {
             },
             AccountAdvice::Hold { until } => AdviceWire::Hold {
                 until: offset_ns(origin, *until),
+            },
+            AccountAdvice::Again { until, why } => AdviceWire::Again {
+                until: offset_ns(origin, *until),
+                why: match why {
+                    AskAgain::Unwritten => AskAgainWire::Unwritten,
+                    AskAgain::Reset => AskAgainWire::Reset,
+                },
             },
             AccountAdvice::Resume { cleared_at } => AdviceWire::Resume {
                 cleared_at: *cleared_at,
@@ -486,6 +505,13 @@ impl AdviceWire {
             },
             AdviceWire::Hold { until } => AccountAdvice::Hold {
                 until: instant_at(origin, until)?,
+            },
+            AdviceWire::Again { until, why } => AccountAdvice::Again {
+                until: instant_at(origin, until)?,
+                why: match why {
+                    AskAgainWire::Unwritten => AskAgain::Unwritten,
+                    AskAgainWire::Reset => AskAgain::Reset,
+                },
             },
             AdviceWire::Resume { cleared_at } => AccountAdvice::Resume { cleared_at },
         })

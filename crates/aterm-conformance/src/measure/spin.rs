@@ -596,9 +596,13 @@ fn pet_fields(line: &str) -> String {
 /// deeply sleeping pet at full motion ([`PET_READY`]), resting as its scene needs
 /// ([`rest_unready`]), as it opened or as it ended, or its footprint could not be read.
 pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
-    let _one = super::ONE_TAKE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _one = super::take(false);
+    static WINDOW: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _window = row.scene.windowed().then(|| {
+        WINDOW
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    });
     super::instance::first_exec(&rig.fake_tui)?;
     let settle = if row.scene.pet() {
         PET_DEEP_SLEEP

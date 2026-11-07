@@ -148,21 +148,28 @@ pub(super) fn unlock_packet(bytes: &[u8], password: &[u8]) -> Result<Zeroizing<V
     let length = key_len(cipher)?;
     let mut key = Zeroizing::new([0u8; 32]);
     let mut filled = 0usize;
-    let mut input = Zeroizing::new(Vec::with_capacity(salt.len() + password.len()));
-    input.extend_from_slice(salt);
-    input.extend_from_slice(password);
+    let input_len = salt.len() + password.len();
+    if input_len == 0 {
+        return Err("Empty key derivation input".into());
+    }
+    let mut input = Zeroizing::new([0u8; 4104]);
+    input[..salt.len()].copy_from_slice(salt);
+    input[salt.len()..input_len].copy_from_slice(password);
+    let total = count.max(input_len);
+    let mut stride = input_len;
+    while stride * 2 <= input.len() && stride < total {
+        input.copy_within(..stride, stride);
+        stride *= 2;
+    }
     for prefix in 0..4 {
         if filled >= length {
             break;
         }
         let mut digest = ring::digest::Context::new(algorithm);
         digest.update(&[0; 4][..prefix]);
-        let mut left = count.max(input.len());
-        if input.is_empty() {
-            return Err("Empty key derivation input".into());
-        }
+        let mut left = total;
         while left > 0 {
-            let n = left.min(input.len());
+            let n = left.min(stride);
             digest.update(&input[..n]);
             left -= n;
         }

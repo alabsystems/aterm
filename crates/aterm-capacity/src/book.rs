@@ -599,23 +599,19 @@ pub struct Found {
 /// own.
 #[must_use]
 pub fn chain(own: &Records, key: &Key, analogue: Option<(&Records, &Key)>) -> Option<Found> {
-    let found = |l: Learned, via: Via| Found {
-        peak: l.peak,
-        runs: l.runs,
-        via,
-    };
+    let found = |peak: u64, runs: usize, via: Via| Found { peak, runs, via };
     let like = analogue.and_then(|(records, like)| {
         records
             .learned(like)
             .or_else(|| records.elsewhere(like))
             .map(|l| {
-                let from = l.wider.clone().unwrap_or_else(|| like.clone());
-                found(l, Via::Analogue(from))
+                let from = l.wider.unwrap_or_else(|| like.clone());
+                found(l.peak, l.runs, Via::Analogue(from))
             })
     });
     let far = own.elsewhere(key).map(|l| {
-        let from = l.wider.clone().unwrap_or_else(|| key.clone());
-        found(l, Via::Elsewhere(from))
+        let from = l.wider.unwrap_or_else(|| key.clone());
+        found(l.peak, l.runs, Via::Elsewhere(from))
     });
     let mine = own.rows.iter().find(|r| r.key == *key).and_then(|r| {
         r.most().map(|peak| Found {
@@ -632,8 +628,8 @@ pub fn chain(own: &Records, key: &Key, analogue: Option<(&Records, &Key)>) -> Op
         return Some(most);
     }
     own.most_of(|k| k != key && k.holds(key)).map(|l| {
-        let from = l.wider.clone().unwrap_or_else(|| key.clone());
-        found(l, Via::Wider(from))
+        let from = l.wider.unwrap_or_else(|| key.clone());
+        found(l.peak, l.runs, Via::Wider(from))
     })
 }
 

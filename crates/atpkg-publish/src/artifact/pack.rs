@@ -973,6 +973,7 @@ pub fn pack_with(ctx: &Ctx, request: &PackRequest, tools: &dyn Tools) -> Result<
         version,
         build: build_number,
         exposes: sel.exposes.clone(),
+        shim_env: Vec::new(),
     };
     let row = Row {
         triple: request.triple,

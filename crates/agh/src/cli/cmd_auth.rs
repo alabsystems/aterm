@@ -20,7 +20,7 @@ use crate::identity::import::{ImportRequest, import_from_gh_metered};
 use crate::identity::provision::{self, AddFrom, AddOptions, AddRequest, Added};
 use crate::identity::vault::Found;
 use crate::identity::{self, tilde};
-use crate::policy::{ChainStep, Presence, Router, Tier};
+use crate::policy::{ChainStep, Presence, Tier};
 use crate::slug::Slug;
 
 /// `platform` in `auth status`'s report.
@@ -288,20 +288,18 @@ pub(crate) fn auth_status(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let present = read.is_some();
     let mut profiles = Vec::new();
     let mut faults = Vec::new();
-    let mut vault_faults = Vec::new();
     let mut vault_next: Option<String> = None;
     let mut unusable: Option<(String, &'static str, Option<String>)> = None;
     let mut refusal = None;
     let mut routing = if present { FROM_CONFIG } else { "anonymous" };
-    let adoption = match &read {
-        None => ctx.adoption().cloned(),
+    let joins_vault = match read {
+        None => true,
         Some(Err(found)) => {
-            faults.clone_from(found);
-            None
+            faults = found;
+            false
         }
         Some(Ok(validated)) => {
-            let router = Router::from_validated(validated.clone());
-            let mut named = router.profiles();
+            let mut named: Vec<_> = validated.profiles().values().collect();
             named.sort_unstable_by(|a, b| a.name.cmp(&b.name));
             for profile in named {
                 profiles.push(profile_row(
@@ -312,16 +310,16 @@ pub(crate) fn auth_status(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
                     FROM_CONFIG,
                 ));
             }
-            unusable = referenced_unusable(validated, &*ctx.env, &home);
-            if validated.joins_vault() {
-                ctx.adoption().cloned()
-            } else {
-                None
-            }
+            unusable = referenced_unusable(&validated, &*ctx.env, &home);
+            validated.joins_vault()
         }
     };
+    if joins_vault {
+        let _ = ctx.adoption();
+    }
+    let adoption = joins_vault.then_some(ctx.adoption.as_ref()).flatten();
     if let Some(adoption) = adoption {
-        profiles.extend(vault_rows(&adoption, &*ctx.env, &home, &ctx.redactor));
+        profiles.extend(vault_rows(adoption, &*ctx.env, &home, &ctx.redactor));
         profiles.sort_unstable_by(|a, b| {
             a.get("profile")
                 .and_then(Value::as_str)
@@ -338,14 +336,14 @@ pub(crate) fn auth_status(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
                 _ => None,
             });
         }
-        vault_faults = adoption.faults().to_vec();
         vault_next = adoption.next_step();
         refusal = adoption.refusal().cloned();
     }
+    let vault_faults = adoption.map_or(&[][..], |a| a.faults());
     let ambient = ambient_rows(&*ctx.env, &profiles);
     let listed: Vec<Value> = faults
         .iter()
-        .chain(&vault_faults)
+        .chain(vault_faults)
         .map(|fault| json!({"rule": fault.rule, "what": ctx.redactor.apply(&fault.what)}))
         .collect();
     let value = json!({

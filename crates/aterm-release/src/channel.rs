@@ -223,20 +223,35 @@ pub fn validate_channel_asset_set(
             )));
         }
     }
-    let mut observed: Vec<String> = names
+    let mut observed: Vec<&str> = names
         .iter()
-        .filter(|n| !SOURCE_ATTESTATION_ASSETS.contains(&n.as_str()))
-        .cloned()
+        .map(String::as_str)
+        .filter(|n| !SOURCE_ATTESTATION_ASSETS.contains(n))
         .collect();
     observed.sort_unstable();
-    if observed == required {
+    if observed.len() == required.len()
+        && observed
+            .iter()
+            .zip(&required)
+            .all(|(&obs, req)| obs == req.as_str())
+    {
         return Ok(());
     }
-    let missing: Vec<&String> = required.iter().filter(|n| !observed.contains(n)).collect();
-    let extra: Vec<&String> = observed.iter().filter(|n| !required.contains(n)).collect();
+    let missing: Vec<&String> = required
+        .iter()
+        .filter(|n| observed.binary_search(&n.as_str()).is_err())
+        .collect();
+    let extra: Vec<&&str> = observed
+        .iter()
+        .filter(|&&n| {
+            required
+                .binary_search_by(|req| req.as_str().cmp(n))
+                .is_err()
+        })
+        .collect();
     let duplicated: Vec<&String> = required
         .iter()
-        .filter(|n| observed.iter().filter(|o| o == n).count() > 1)
+        .filter(|n| observed.iter().filter(|&&o| o == n.as_str()).count() > 1)
         .collect();
     Err(Error::new(format!(
         "the release's asset set does not match what this cut publishes \
@@ -354,7 +369,9 @@ pub fn linux_asset_names(version: &str) -> Vec<String> {
 #[must_use]
 pub fn binds_to_version(names: &[String], version: &str) -> bool {
     let publishable = publishable_asset_names(version);
-    names.iter().all(|name| publishable.contains(name))
+    names
+        .iter()
+        .all(|name| publishable.binary_search(name).is_ok())
 }
 
 /// Which of `names` on an adopted source release a withdrawal removes.
@@ -375,7 +392,10 @@ pub fn withdrawable_assets(
         None => {
             let publishable = publishable_asset_names(version);
             let app: Vec<String> = app.cloned().collect();
-            if let Some(foreign) = app.iter().find(|name| !publishable.contains(name)) {
+            if let Some(foreign) = app
+                .iter()
+                .find(|name| publishable.binary_search(name).is_err())
+            {
                 return Err(format!(
                     "carries {foreign}, which no cut of v{version} publishes"
                 ));

@@ -118,19 +118,20 @@ fn status_cmd() -> Cmd {
     Cmd::new(DEVTOOLS_SECURITY).arg("-status")
 }
 
-/// Whether `-status` said developer mode is on; `None` for any other answer.
+/// Whether the complete `-status` run definitely said developer mode is on or off, using the
+/// same classifier as the prompt-free GUI probe; unreadable or ambiguous output admits no step.
 #[must_use]
 pub fn developer_mode(ran: &Ran) -> Option<bool> {
-    if !ran.success() {
-        return None;
-    }
-    let out = ran.out();
-    if out.contains("currently enabled") {
-        Some(true)
-    } else if out.contains("currently disabled") {
-        Some(false)
-    } else {
-        None
+    use aterm_containment::consent::{DebuggerMode, ToolRun, classify_devtools_status};
+    let run = ToolRun::Exited {
+        code: ran.status,
+        stdout: std::str::from_utf8(&ran.stdout).ok()?.to_owned(),
+        stderr: std::str::from_utf8(&ran.stderr).ok()?.to_owned(),
+    };
+    match classify_devtools_status(&run).0 {
+        DebuggerMode::Enabled => Some(true),
+        DebuggerMode::Disabled => Some(false),
+        DebuggerMode::Unrecognized | DebuggerMode::Unknown => None,
     }
 }
 
@@ -566,6 +567,43 @@ mod tests {
                 .on(STATUS, Ran::ok("Developer mode is currently enabled.\n"))
                 .stat_of(ADMITTED_NAME_RULE, rule_stat(uid, mode));
             assert_eq!(owed(&planted), vec![Owed::NameRule], "{uid} {mode:o}");
+        }
+    }
+
+    /// The raw process boundary requires complete UTF-8 streams and a successful definite
+    /// answer. Neither a valid prefix before corrupt bytes nor a failed tool can authorize
+    /// the root item, even if the other stream looks like a disabled-mode sentence.
+    #[test]
+    fn debugger_setup_refuses_incomplete_or_unsuccessful_tool_results() {
+        let disabled = b"Developer mode is currently disabled.\n";
+        let mut corrupt = disabled.to_vec();
+        corrupt.push(0xff);
+        for ran in [
+            Ran {
+                status: Some(0),
+                stdout: corrupt,
+                stderr: Vec::new(),
+            },
+            Ran {
+                status: Some(0),
+                stdout: disabled.to_vec(),
+                stderr: vec![0xff],
+            },
+            Ran::exit(1, "Developer mode is currently disabled.\n"),
+            Ran {
+                status: None,
+                stdout: disabled.to_vec(),
+                stderr: Vec::new(),
+            },
+        ] {
+            assert_eq!(developer_mode(&ran), None, "{ran:?}");
+            let sys = Fake::root();
+            sys.on(STATUS, ran);
+            assert!(matches!(
+                DeveloperMode.probe(&sys, &ctx(&[])),
+                Probe::Unusable { .. }
+            ));
+            assert!(!owed(&sys).contains(&Owed::Debugger));
         }
     }
 

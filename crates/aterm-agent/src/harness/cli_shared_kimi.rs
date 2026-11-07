@@ -312,6 +312,8 @@ fn request<'a>(
         .of(Some(region))
         .ok_or("Kimi device sign-in has no approved hosts")?;
     Ok(login_drive::Request {
+        publication: None,
+        enrollment: None,
         recovery: context.admission.map(login_drive::RecoveryAdmission::key),
         admission: context.admission,
         cli: Cli::Kimi,

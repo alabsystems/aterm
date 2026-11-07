@@ -83,12 +83,9 @@ impl<'a> CellDataView<'a> {
     #[inline]
     pub fn marks(self) -> impl Iterator<Item = char> + Clone + 'a {
         let extra = self.cell_extra();
-        let complex = match self {
-            Self::History(_) => extra
-                .and_then(CellExtra::complex_char)
-                .map_or("", |s| s.as_ref()),
-            Self::Live(_) => "",
-        };
+        let complex = extra
+            .and_then(CellExtra::complex_char)
+            .map_or("", |s| s.as_ref());
         let mut tail = complex.chars();
         let _ = tail.next(); // The complex string starts with the base scalar.
         let combining = extra.map_or(&[][..], CellExtra::combining);

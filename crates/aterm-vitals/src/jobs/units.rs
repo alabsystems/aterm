@@ -11,9 +11,9 @@ use super::step::{self, Cx, Evidence, Fault, Progress, Track};
 use super::wait::{self, JobFacts, Scene};
 use super::{
     BUSY_ORPHAN_MS, Block, BlockMeter, Class, ClassTable, Consumer, Demand, EXITED_KEEP_MS, Ended,
-    Findings, GateWord, HELD_AT_ONCE, HeldEpisode, HeldProc, Holder, InputGate, JobCounters,
-    JobKind, JobProc, JobRow, JobTab, JobTick, JobsView, KERNEL_WAIT_MS, MemberMap, Named,
-    NamedRow, NamedWait, ProcState, Standing, StartWait, Stop, StoppedUnstarted, SweepProc,
+    ExitOf, Findings, GateWord, HELD_AT_ONCE, HeldEpisode, HeldProc, Holder, InputGate,
+    JobCounters, JobKind, JobProc, JobRow, JobTab, JobTick, JobsView, KERNEL_WAIT_MS, MemberMap,
+    Named, NamedRow, NamedWait, ProcState, Standing, StartWait, Stop, StoppedUnstarted, SweepProc,
     TermWord, TierB, TtyMode, Verdict, WaitName, Want, ZOMBIE_AGE_MS, ZombieParent, Zombies,
     command_class,
 };
@@ -246,6 +246,12 @@ struct Job {
     /// The last name a member other than the shell gave, the exited row's: the program exits
     /// before the shell writes `D`, and a tick between the two sees the shell alone.
     member_name: String,
+    /// An agent call's program as the passes last named it ([`ran_name`]; [`Ended::ran`]), kept
+    /// as `member_name` is: the wrapper outlives what it ran, and the pass that finds the call
+    /// gone sees none of it.
+    ran: String,
+    /// How an agent call's leader ended, once the host read it ([`JobTick::exits`]).
+    ended_by: Option<ExitOf>,
     members: MemberMap,
     outputs: HashMap<(u64, u64), u64>,
     pty_bytes: Option<u64>,
@@ -1288,6 +1294,19 @@ impl Jobs {
                     _ => true,
                 }
         };
+        // Each watched leader's end goes to the open call it leads, by its pid and start both: a
+        // pid taken anew is another process, and a call whose start was never read takes none.
+        for exit in &tick.exits {
+            if let Some(job) = self.jobs.iter_mut().find(|j| {
+                j.kind == JobKind::AgentCall
+                    && j.exited_ms.is_none()
+                    && j.key.leader == exit.pid
+                    && j.key.start.is_some()
+                    && j.key.start == exit.start
+            }) {
+                job.ended_by = Some(exit.end);
+            }
+        }
 
         let mut elsewhere_all: HashMap<u32, (usize, Standing)> = HashMap::new();
         for (i, j) in self.jobs.iter().enumerate() {
@@ -2769,6 +2788,11 @@ impl Jobs {
             if live.iter().any(|p| Some(*p) != job.shell) {
                 job.member_name.clone_from(&leader_name);
             }
+            if job.kind == JobKind::AgentCall
+                && let Some(ran) = ran_name(job, &live, &sweep, &facts)
+            {
+                job.ran = ran;
+            }
             job.last_name.clone_from(&leader_name);
             job.meter.read(&now, job.shell);
             job.meter.stuck = out.verdict == Verdict::Stuck;
@@ -2792,6 +2816,9 @@ impl Jobs {
                     last_read_ms: last_read,
                     ended_ms: at,
                     exit: job.exit,
+                    ended_by: job.ended_by,
+                    ran: (job.kind == JobKind::AgentCall && !job.ran.is_empty())
+                        .then(|| job.ran.clone()),
                     peak_bytes: job.meter.peak,
                     cpu_ns: job.meter.cpu_ns,
                     stuck: job.meter.stuck,
@@ -3265,6 +3292,8 @@ impl Job {
             lines_seen: false,
             last_name: String::new(),
             member_name: String::new(),
+            ran: String::new(),
+            ended_by: None,
             members: BTreeMap::new(),
             outputs: HashMap::new(),
             pty_bytes: None,
@@ -3333,6 +3362,8 @@ impl Job {
             lines_seen: false,
             last_name: m.name.clone(),
             member_name: m.name.clone(),
+            ran: String::new(),
+            ended_by: None,
             members,
             outputs: HashMap::new(),
             pty_bytes: None,
@@ -4406,6 +4437,50 @@ fn now_name(
         .chain(live.iter().copied().filter(not_shell))
         .chain(job.shell.filter(|s| live.contains(s)))
         .find_map(name_of)
+}
+
+/// The program an agent call runs now ([`Ended::ran`]), read only while its leader lives: the
+/// leader while it names no shell (it `exec`ed the program, or the agent ran it bare), else the
+/// first live member other than the leader that a name was read for, the leader's own children
+/// before the rest, each lowest pid first; a member named as the leader is passed over, a fork of
+/// the wrapper (`$(…)`, a pipeline's subshell) and no program it ran. `None` while nothing but the
+/// wrapper and its forks lives, and once the leader is gone.
+fn ran_name(
+    job: &Job,
+    live: &[u32],
+    sweep: &HashMap<u32, &SweepProc>,
+    facts: &HashMap<u32, &JobProc>,
+) -> Option<String> {
+    let name_of = |pid: u32| {
+        facts
+            .get(&pid)
+            .map(|f| shown_name(f))
+            .or_else(|| sweep.get(&pid).map(|s| s.name.clone()))
+            .filter(|n| !n.is_empty())
+    };
+    let leader = job.key.leader;
+    // Once the leader is gone the call is over: what it left running is no program it ran.
+    if !live.contains(&leader) {
+        return None;
+    }
+    let wrapper = name_of(leader);
+    if let Some(name) = wrapper.as_deref()
+        && !super::is_shell_name(name)
+    {
+        return wrapper;
+    }
+    let parent = |pid: u32| {
+        facts
+            .get(&pid)
+            .map(|f| f.ppid)
+            .or_else(|| sweep.get(&pid).map(|s| s.ppid))
+    };
+    let others = || live.iter().copied().filter(|p| *p != leader);
+    others()
+        .filter(|p| parent(*p) == Some(leader))
+        .chain(others().filter(|p| parent(*p) != Some(leader)))
+        .filter_map(name_of)
+        .find(|n| wrapper.as_deref() != Some(n.as_str()))
 }
 
 /// A process's name as rows show it: the build a front becomes ([`JobProc::becomes`]), else its

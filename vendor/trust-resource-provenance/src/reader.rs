@@ -10,13 +10,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 
-use crate::private::{self, identity, stamp};
+use crate::private::{self, identity};
 use crate::process::{self, Identity, Presence};
 use crate::schema::{Book, MAX_JSON, Record, hex, refused};
 
-const MAX_IMAGE: u64 = 1024 * 1024 * 1024;
+mod image_pin;
+pub use image_pin::PinnedProgram;
 
 #[derive(Debug)]
 struct Backing {
@@ -46,6 +48,7 @@ struct Image {
     file: File,
     before: Metadata,
     directory: File,
+    directory_before: Metadata,
 }
 
 /// A connected native ancestor with pinned image and socket identities.
@@ -196,64 +199,20 @@ impl Instance {
         before.is_some_and(|old| old.birth != self.birth())
             && process::read_identity(self.pid()).ok() == before
     }
+    fn image_ref(&self) -> image_pin::ImageRef<'_> {
+        image_pin::ImageRef {
+            store: &self.store,
+            path: &self.helper,
+            digest: &self.record.digest,
+            image: self.record.image,
+            directory: self.record.directory,
+        }
+    }
     fn open_image(&self, deadline: Instant) -> io::Result<Image> {
-        self.store.check()?;
-        let parent = self.helper.parent().ok_or_else(|| refused("missing helper parent"))?;
-        let directory = private::directory(parent)?;
-        if identity(&directory.metadata()?) != self.record.directory
-            || directory.metadata()?.mode() & 0o7777 != 0o500
-        {
-            return Err(refused("immutable image directory changed"));
-        }
-        let mut file = private::open_private(&directory, OsStr::new("aterm"))?;
-        let before = file.metadata()?;
-        if identity(&before) != self.record.image
-            || before.mode() & 0o7777 != 0o500
-            || before.len() == 0
-            || before.len() > MAX_IMAGE
-        {
-            return Err(refused("invalid immutable helper"));
-        }
-        let mut hash = Sha256::new();
-        let mut bytes = [0; 65536];
-        let mut total = 0_u64;
-        loop {
-            expired(deadline)?;
-            let count = file.read(&mut bytes)?;
-            if count == 0 {
-                break;
-            }
-            total =
-                total.checked_add(count as u64).ok_or_else(|| refused("image size overflow"))?;
-            if total > MAX_IMAGE {
-                return Err(refused("oversized helper image"));
-            }
-            hash.update(&bytes[..count]);
-        }
-        if total != before.len()
-            || hex(&hash.finalize()) != self.record.digest
-            || stamp(&before) != stamp(&file.metadata()?)
-        {
-            return Err(refused("immutable helper content changed"));
-        }
-        let image = Image { file, before, directory };
-        self.check_image(&image)?;
-        Ok(image)
+        self.image_ref().open(deadline)
     }
     fn check_image(&self, image: &Image) -> io::Result<()> {
-        self.store.check()?;
-        let parent = private::directory(
-            self.helper.parent().ok_or_else(|| refused("missing helper parent"))?,
-        )?;
-        let current = private::open_private(&parent, OsStr::new("aterm"))?;
-        if !same_file(&parent, &image.directory)?
-            || parent.metadata()?.mode() & 0o7777 != 0o500
-            || stamp(&current.metadata()?) != stamp(&image.before)
-            || stamp(&image.file.metadata()?) != stamp(&image.before)
-        {
-            return Err(refused("pinned helper backing changed"));
-        }
-        Ok(())
+        self.image_ref().check(image)
     }
     /// Connect as the actual caller; the live kernel peer proves endpoint ownership.
     pub fn connect_ancestor(&self, deadline: Instant) -> io::Result<Option<Host>> {
@@ -406,6 +365,7 @@ impl PinnedHelper {
                 file: self.image.file.try_clone()?,
                 before: self.image.before.clone(),
                 directory: self.image.directory.try_clone()?,
+                directory_before: self.image.directory_before.clone(),
             },
             socket_parent: self.socket_parent.try_clone()?,
             stream,

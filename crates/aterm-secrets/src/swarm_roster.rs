@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Swarm identity, policy, seeding, and newcomer label assignment
-//! (`docs/DESIGN-alab-swarm-2026-10-27.md` §3.2, §4.1, §12.3 C11).
+//! Historical swarm denial evidence and steward policy.
 //!
-//! One canonical `m<N>` label names each Mac across `--host`, `/monitor`, the
-//! account pool, fleet registration, and census. The roster lives in the
+//! Owner labels live in the registry. The historical roster lives in the
 //! reserved `[everyone]` vault entry [`ROSTER_ENTRY`] (`aterm-swarm-roster`),
-//! while steward policy and reserved labels live in [`POLICY_ENTRY`]
+//! until D6 converts its denials to log removals. It never allocates labels;
+//! steward policy and reserved labels live in [`POLICY_ENTRY`]
 //! (`aterm-swarm-policy`).
 
 use crate::text::{Audience, Document};
@@ -23,12 +22,6 @@ pub const POLICY_ENTRY: &str = "aterm-swarm-policy";
 
 /// Reserved admin vault entry carrying the active steward lease (`holder`, `epoch`, `until`).
 pub const LEASE_ENTRY: &str = "aterm-swarm-lease";
-
-/// Hold window (24 h) before an unclaimed sheet-named `m<N>` label promotes to a newcomer.
-pub const SHEET_CLAIM_HOLD_MS: u64 = 24 * 60 * 60 * 1_000;
-
-/// Legacy sheet rename offset (`N` paired with `N - 68`, `DESIGN-alab-swarm` §2.1 F6).
-pub const RENAME_PAIR_OFFSET: u32 = 68;
 
 /// Default release Mac label that policy always reserves (`DESIGN-alab-swarm` §3.2).
 pub const DEFAULT_RESERVED_RELEASE_LABEL: &str = "m3";
@@ -769,8 +762,6 @@ pub fn decide_lease_action(
 pub struct SheetHints {
     /// Every `m<N>` number referenced anywhere in the sheet.
     pub numbers: BTreeSet<u32>,
-    /// Each account row's list of `m<N>` numbers (used to fold F6 `N` / `N - 68` rename pairs).
-    pub shared_rows: Vec<Vec<u32>>,
 }
 
 impl SheetHints {
@@ -798,19 +789,12 @@ impl SheetHints {
             else {
                 continue;
             };
-            let mut row_nums = Vec::new();
             for cell in machines {
                 if let Some(word) = cell.as_str()
                     && let Some((n, _)) = leading_m_label(word)
                 {
                     self.numbers.insert(n);
-                    if !row_nums.contains(&n) {
-                        row_nums.push(n);
-                    }
                 }
-            }
-            if !row_nums.is_empty() {
-                self.shared_rows.push(row_nums);
             }
         }
     }
@@ -832,96 +816,10 @@ impl SheetHints {
         }
         out
     }
-
-    /// Return folded F6 legacy alias (`m<N - 68>`) for `n` when the sheet pairs `n` and `n - 68`
-    /// and no live member holds `m<N - 68>`.
-    #[must_use]
-    pub fn paired_legacy_aliases(
-        &self,
-        n: u32,
-        live_numbers: &BTreeSet<u32>,
-        reserved: &BTreeSet<String>,
-    ) -> Vec<String> {
-        if n <= RENAME_PAIR_OFFSET {
-            return Vec::new();
-        }
-        let old = n - RENAME_PAIR_OFFSET;
-        let old_label = format!("m{old}");
-        if live_numbers.contains(&old) || reserved.contains(&old_label) {
-            return Vec::new();
-        }
-        let paired = if self.shared_rows.is_empty() {
-            self.numbers.contains(&n) && self.numbers.contains(&old)
-        } else {
-            self.shared_rows
-                .iter()
-                .any(|row| row.contains(&n) && row.contains(&old))
-        };
-        if paired { vec![old_label] } else { Vec::new() }
-    }
-}
-
-/// Compute the next free `m<N>` number strictly above every `m<N>` seen in `sheet`,
-/// `roster` (labels, aliases, pending claims, deny-list), `reserved`, `doc.machines()`,
-/// and `bonjour_hosts`.
-#[must_use]
-pub fn next_free_number(
-    roster: &SwarmRoster,
-    doc: &Document,
-    reserved: &BTreeSet<String>,
-    sheet: &SheetHints,
-    bonjour_hosts: &[String],
-) -> u32 {
-    let mut max_seen = 0_u32;
-    let mut observe = |n: u32| {
-        if n > max_seen {
-            max_seen = n;
-        }
-    };
-    for &n in &sheet.numbers {
-        observe(n);
-    }
-    for member in &roster.members {
-        if let Some((n, _)) = leading_m_label(&member.label) {
-            observe(n);
-        }
-        for alias in &member.aliases {
-            if let Some((n, _)) = leading_m_label(alias) {
-                observe(n);
-            }
-        }
-        if !roster.is_member_denied(member)
-            && let Some(claimed) = &member.claimed_label
-            && let Some((n, canon)) = leading_m_label(claimed)
-            && canon == *claimed
-        {
-            observe(n);
-        }
-    }
-    for denied in &roster.deny_labels {
-        if let Some((n, _)) = leading_m_label(denied) {
-            observe(n);
-        }
-    }
-    for res in reserved {
-        if let Some((n, _)) = leading_m_label(res) {
-            observe(n);
-        }
-    }
-    for machine in doc.machines() {
-        if let Some((n, _)) = leading_m_label(&machine.name) {
-            observe(n);
-        }
-    }
-    for host in bonjour_hosts {
-        if let Some((n, _)) = leading_m_label(host) {
-            observe(n);
-        }
-    }
-    max_seen.saturating_add(1).max(1)
 }
 
 /// Admission timestamp and vault sequence used to order seeding (`DESIGN-alab-swarm` §3.2).
+#[cfg(any(test, debug_assertions))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SeedAdmission {
     /// Author timestamp in Unix ms (`0` if unrecorded).
@@ -930,361 +828,42 @@ pub struct SeedAdmission {
     pub sequence: u64,
 }
 
-/// Seed `aterm-swarm-roster` once from `doc.machines()` in admission-date order (§3.2).
-///
-/// - Each member keeps the `m<N>` its `host_overrides` (LocalHostName/ComputerName) or
-///   `[machines]` name **starts with**; a later admission never takes an earlier member's `m<N>`.
-/// - On collision between two members whose names start with the same `m<N>`, the earlier
-///   admission keeps `m<N>` and the later one gets `next_free` with the old `m<N>` as an alias.
-/// - Non-admins never take a reserved label (`m3` or another steward's label) unless explicitly
-///   named in `policy.release_hosts` under that `[machines]` name.
-/// - Folds F6 `N` / `N - 68` rename pairs from `sheet` into `aliases`.
+/// Build a historical roster fixture. Shipped code never allocates a roster label.
+#[cfg(any(test, debug_assertions))]
 #[must_use]
 pub fn seed_roster(
     doc: &Document,
     admissions: &BTreeMap<String, SeedAdmission>,
-    policy: &SwarmPolicy,
-    sheet: &SheetHints,
-    bonjour_hosts: &[String],
+    _policy: &SwarmPolicy,
+    _sheet: &SheetHints,
+    _bonjour_hosts: &[String],
     host_overrides: &BTreeMap<String, String>,
 ) -> SwarmRoster {
-    let admins: BTreeSet<String> = doc.admins().into_iter().collect();
-    let reserved = policy.effective_reserved(doc, None);
-    let mut indexed: Vec<(usize, crate::text::Machine, SeedAdmission)> = doc
-        .machines()
-        .into_iter()
-        .enumerate()
-        .map(|(idx, m)| {
-            let adm = admissions.get(&m.recipient).copied().unwrap_or_default();
-            (idx, m, adm)
-        })
-        .collect();
-    indexed.sort_by_key(|(idx, _, adm)| (adm.admitted_ms, adm.sequence, *idx));
-
     let mut roster = SwarmRoster::default();
-    let mut taken_labels = BTreeSet::new();
-
-    for (_, machine, adm) in indexed {
-        let source_name = host_overrides
+    for (index, machine) in doc.machines().into_iter().enumerate() {
+        let name = host_overrides
             .get(&machine.recipient)
-            .map_or(machine.name.as_str(), String::as_str);
-        let is_admin = admins.contains(&machine.name);
-        let is_release_host = leading_m_label(&machine.name).is_some_and(|(_, lbl)| {
-            machine.name.eq_ignore_ascii_case(&lbl)
-                && policy.release_hosts.iter().any(|r| r == &lbl)
-        });
-        let candidate = leading_m_label(source_name);
-        let mut aliases = Vec::new();
-        let label = match candidate {
-            Some((_, ref lbl))
-                if !taken_labels.contains(lbl)
-                    && (is_admin || is_release_host || !reserved.contains(lbl)) =>
-            {
-                lbl.clone()
-            }
-            Some((_, lbl)) => {
-                if !reserved.contains(&lbl) {
-                    aliases.push(lbl);
-                }
-                let next = next_free_number(&roster, doc, &reserved, sheet, bonjour_hosts);
-                format!("m{next}")
-            }
-            None => {
-                let next = next_free_number(&roster, doc, &reserved, sheet, bonjour_hosts);
-                format!("m{next}")
-            }
-        };
-        taken_labels.insert(label.clone());
-        let mut member = SwarmMember {
-            hint: None,
-            hw_hint: None,
+            .unwrap_or(&machine.name);
+        let label =
+            leading_m_label(name).map_or_else(|| format!("m{}", index + 1), |(_, label)| label);
+        roster.members.push(SwarmMember {
+            admitted_ms: admissions
+                .get(&machine.recipient)
+                .map_or(0, |a| a.admitted_ms),
             recipient: machine.recipient,
             vault_name: machine.name,
             label,
-            aliases,
-            admitted_ms: adm.admitted_ms,
+            aliases: Vec::new(),
+            hint: None,
+            hw_hint: None,
             claimed_label: None,
             claimed_at_ms: None,
             node_id: None,
             node_key: None,
-        };
-        member.normalize_aliases();
-        roster.members.push(member);
-    }
-
-    let live_numbers: BTreeSet<u32> = roster
-        .members
-        .iter()
-        .filter_map(|m| leading_m_label(&m.label).map(|(n, _)| n))
-        .collect();
-    let alias_owners: BTreeSet<String> = roster
-        .members
-        .iter()
-        .flat_map(|m| m.aliases.iter().cloned())
-        .collect();
-    for member in &mut roster.members {
-        if let Some((n, _)) = leading_m_label(&member.label) {
-            for folded in sheet.paired_legacy_aliases(n, &live_numbers, &reserved) {
-                if !alias_owners.contains(&folded) {
-                    member.aliases.push(folded);
-                }
-            }
-            member.normalize_aliases();
-        }
+        });
     }
     roster.canonicalize();
     roster
-}
-
-/// Promote any 24 h sheet-label claims whose hold has elapsed without a competing claimant.
-pub fn promote_due_claims(
-    roster: &mut SwarmRoster,
-    doc: &Document,
-    policy: &SwarmPolicy,
-    sheet: &SheetHints,
-    now_ms: u64,
-) -> bool {
-    let reserved = policy.effective_reserved(doc, Some(roster));
-    let denied_indices: BTreeSet<usize> = roster
-        .members
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, m)| roster.is_member_denied(m).then_some(idx))
-        .collect();
-    let mut claim_counts: BTreeMap<String, usize> = BTreeMap::new();
-    for (idx, m) in roster.members.iter().enumerate() {
-        if denied_indices.contains(&idx) {
-            continue;
-        }
-        if let Some(claim) = m
-            .claimed_label
-            .as_deref()
-            .and_then(leading_m_label)
-            .map(|(_, c)| c)
-        {
-            *claim_counts.entry(claim).or_insert(0) += 1;
-        }
-    }
-    let mut held_labels: BTreeSet<String> = roster
-        .members
-        .iter()
-        .enumerate()
-        .filter(|(idx, _)| !denied_indices.contains(idx))
-        .flat_map(|(_, m)| std::iter::once(m.label.clone()).chain(m.aliases.iter().cloned()))
-        .collect();
-    let deny_labels: BTreeSet<String> = roster
-        .deny_labels
-        .iter()
-        .filter_map(|d| leading_m_label(d).map(|(_, c)| c))
-        .collect();
-
-    let mut changed = false;
-    for (idx, member) in roster.members.iter_mut().enumerate() {
-        if denied_indices.contains(&idx) {
-            continue;
-        }
-        let (Some(raw_target), Some(since)) = (member.claimed_label.clone(), member.claimed_at_ms)
-        else {
-            continue;
-        };
-        let Some((_, target)) = leading_m_label(&raw_target) else {
-            continue;
-        };
-        let unique_claimant = claim_counts.get(&target).copied() == Some(1);
-        let free = !held_labels.contains(&target)
-            && !reserved.contains(&target)
-            && !deny_labels.contains(&target);
-        if unique_claimant && free && now_ms.saturating_sub(since) >= SHEET_CLAIM_HOLD_MS {
-            let provisional = std::mem::replace(&mut member.label, target.clone());
-            member.aliases.push(provisional);
-            member.claimed_label = None;
-            member.claimed_at_ms = None;
-            member.normalize_aliases();
-            held_labels.insert(target);
-            changed = true;
-        }
-    }
-    if changed {
-        let live_numbers: BTreeSet<u32> = roster
-            .members
-            .iter()
-            .enumerate()
-            .filter(|(idx, _)| !denied_indices.contains(idx))
-            .filter_map(|(_, m)| leading_m_label(&m.label).map(|(n, _)| n))
-            .collect();
-        for (idx, member) in roster.members.iter_mut().enumerate() {
-            if denied_indices.contains(&idx) {
-                continue;
-            }
-            if let Some((n, _)) = leading_m_label(&member.label) {
-                for folded in sheet.paired_legacy_aliases(n, &live_numbers, &reserved) {
-                    if !held_labels.contains(&folded)
-                        && !deny_labels.contains(&folded)
-                        && !claim_counts.contains_key(&folded)
-                    {
-                        held_labels.insert(folded.clone());
-                        member.aliases.push(folded);
-                    }
-                }
-                member.normalize_aliases();
-            }
-        }
-        roster.canonicalize();
-    }
-    changed
-}
-
-/// Parameters for assigning a newcomer's `m<N>` label in the approver.
-pub struct Newcomer<'a> {
-    /// Newcomer's `age1…` recipient.
-    pub recipient: &'a str,
-    /// Host name the newcomer asked for (`request.host`).
-    pub requested_host: &'a str,
-    /// Machine name assigned in `[machines]` (`free_name`).
-    pub vault_name: &'a str,
-    /// Unix time in milliseconds of this approval.
-    pub now_ms: u64,
-}
-
-/// Assign a canonical `m<N>` label for `newcomer` in `roster` (`DESIGN-alab-swarm` §3.2):
-///
-/// 1. Promotes any existing 24 h sheet claims that are now due.
-/// 2. If `newcomer.recipient` already has a row in `roster`, updates its `vault_name`
-///    and returns its existing label.
-/// 3. Otherwise inspects `leading_m_label(newcomer.requested_host)`:
-///    - Never assigns a label in `policy.effective_reserved` (`m3`, stewards), `deny_labels`,
-///      or already held (as label or alias) by a member.
-///    - If `m<N>` is named in `sheet`, or a live member (one the vault names, not denied)
-///      claims it, and no member holds it, assigns provisional `next_free` and records a 24 h
-///      claim on `m<N>` (two claimants promote neither: [`promote_due_claims`]).
-///    - If `m<N>` is completely free, keeps `m<N>`.
-///    - Otherwise (including non-`m<N>` names like `Mac-mini-M4`), assigns `next_free`
-///      strictly above every `m<N>` in sheet, members, reserved policy, and `bonjour_hosts`.
-pub fn assign_newcomer(
-    roster: &mut SwarmRoster,
-    doc: &Document,
-    policy: &SwarmPolicy,
-    sheet: &SheetHints,
-    bonjour_hosts: &[String],
-    newcomer: Newcomer<'_>,
-) -> String {
-    promote_due_claims(roster, doc, policy, sheet, newcomer.now_ms);
-
-    if let Some(pos) = roster
-        .members
-        .iter()
-        .enumerate()
-        .filter(|(_, m)| m.recipient == newcomer.recipient)
-        .max_by_key(|(idx, m)| {
-            (
-                !roster.is_member_denied(m),
-                m.node_key.is_some() || m.node_id.is_some(),
-                m.admitted_ms,
-                std::cmp::Reverse(*idx),
-            )
-        })
-        .map(|(idx, _)| idx)
-    {
-        roster.members[pos].vault_name = newcomer.vault_name.to_owned();
-        return roster.members[pos].label.clone();
-    }
-
-    let reserved = policy.effective_reserved(doc, Some(roster));
-    let active_recipients: BTreeSet<String> =
-        doc.machines().into_iter().map(|m| m.recipient).collect();
-
-    let live = |m: &SwarmMember| {
-        !roster.is_member_denied(m)
-            && (active_recipients.contains(&m.recipient) || m.recipient == newcomer.recipient)
-    };
-    let held_labels: BTreeSet<String> = roster
-        .members
-        .iter()
-        .filter(|m| live(m))
-        .flat_map(|m| std::iter::once(m.label.clone()).chain(m.aliases.iter().cloned()))
-        .collect();
-    // A label a live row claims is under that claim's 24 h hold, whether or not the sheet still
-    // names its number: asking for it joins the claim, as asking for one the sheet names does,
-    // and never takes it outright.
-    let claimed_labels: BTreeSet<String> = roster
-        .members
-        .iter()
-        .filter(|m| live(m))
-        .filter_map(|m| {
-            m.claimed_label
-                .as_deref()
-                .and_then(leading_m_label)
-                .map(|(_, claimed)| claimed)
-        })
-        .collect();
-
-    let mut claimed_label = None;
-    let mut claimed_at_ms = None;
-    let label = match leading_m_label(newcomer.requested_host) {
-        Some((n, wanted))
-            if !reserved.contains(&wanted)
-                && !roster.is_label_denied(&wanted)
-                && !held_labels.contains(&wanted) =>
-        {
-            if sheet.numbers.contains(&n) || claimed_labels.contains(&wanted) {
-                let provisional = next_free_number(roster, doc, &reserved, sheet, bonjour_hosts);
-                claimed_label = Some(wanted);
-                claimed_at_ms = Some(newcomer.now_ms);
-                format!("m{provisional}")
-            } else {
-                wanted
-            }
-        }
-        _ => {
-            let next = next_free_number(roster, doc, &reserved, sheet, bonjour_hosts);
-            format!("m{next}")
-        }
-    };
-
-    let live_numbers: BTreeSet<u32> = roster
-        .members
-        .iter()
-        .filter(|m| !roster.is_member_denied(m))
-        .filter_map(|m| leading_m_label(&m.label).map(|(n, _)| n))
-        .chain(leading_m_label(&label).map(|(n, _)| n))
-        .collect();
-    let mut aliases = Vec::new();
-    if claimed_label.is_none()
-        && let Some((n, _)) = leading_m_label(&label)
-    {
-        for folded in sheet.paired_legacy_aliases(n, &live_numbers, &reserved) {
-            if !held_labels.contains(&folded)
-                && !roster.is_label_denied(&folded)
-                && !roster.members.iter().any(|m| {
-                    !roster.is_member_denied(m)
-                        && m.claimed_label
-                            .as_deref()
-                            .and_then(leading_m_label)
-                            .is_some_and(|(_, c)| c == folded)
-                })
-            {
-                aliases.push(folded);
-            }
-        }
-    }
-
-    let mut member = SwarmMember {
-        recipient: newcomer.recipient.to_owned(),
-        vault_name: newcomer.vault_name.to_owned(),
-        label: label.clone(),
-        aliases,
-        hint: None,
-        hw_hint: None,
-        admitted_ms: newcomer.now_ms,
-        claimed_label,
-        claimed_at_ms,
-        node_id: None,
-        node_key: None,
-    };
-    member.normalize_aliases();
-    roster.members.push(member);
-    roster.canonicalize();
-    label
 }
 
 fn required_str(row: &Table, key: &str, idx: usize) -> Result<String> {
@@ -1359,692 +938,31 @@ fn normalize_word_set(raw: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::age::Identity;
 
-    fn sample_recipient(seed_byte: u8) -> String {
-        Identity::from_secret_bytes([seed_byte; 32])
-            .recipient()
-            .to_bech32()
-    }
-
-    /// The lab model's hint rides its own roster field: it round-trips apart from the signer-salted
-    /// `hint`, and a roster without it still reads.
-    /// NEGATIVE CONTROL: with `to_toml` not writing `hw_hint`, the reread member's is `None`.
+    /// Negative control: dropping historical aliases when rendering loses the revoked key.
     #[test]
-    fn hw_hint_round_trips_in_its_own_field() {
-        let roster = |line: &str| {
-            format!(
-                "[[member]]\nrecipient = \"{}\"\nvault_name = \"seven\"\nlabel = \"m7\"\n{line}",
-                sample_recipient(7)
-            )
-        };
-        let read = SwarmRoster::from_toml(&roster(
-            "hint = \"salted\"\nhw_hint = \"aaaaaaaaaaaaaaaa\"\n",
-        ))
-        .unwrap();
-        assert_eq!(read.members[0].hw_hint.as_deref(), Some("aaaaaaaaaaaaaaaa"));
-        let again = SwarmRoster::from_toml(&read.to_toml()).unwrap();
-        assert_eq!(
-            again.members[0].hw_hint.as_deref(),
-            Some("aaaaaaaaaaaaaaaa")
-        );
-        assert_eq!(again.members[0].hint.as_deref(), Some("salted"));
-        assert_eq!(
-            SwarmRoster::from_toml(&roster("")).unwrap().members[0].hw_hint,
-            None
-        );
-    }
-
-    /// Names that start with `m<N>` parse to canonical `(N, "m<N>")`, while mid-string
-    /// `m<N>` tokens (`Mac-mini-M4`) or alphanumeric suffixes (`m3pro`) return `None`.
-    /// NEGATIVE CONTROL: a token-anywhere rule like `normalize_machine_id` misreads `Mac-mini-M4` as `m4`.
-    #[test]
-    fn leading_m_label_requires_m_prefix_and_rejects_mac_mini_m4() {
-        assert_eq!(leading_m_label("m22"), Some((22, "m22".to_owned())));
-        assert_eq!(
-            leading_m_label("M100.local"),
-            Some((100, "m100".to_owned()))
-        );
-        assert_eq!(leading_m_label("m4-mac-mini"), Some((4, "m4".to_owned())));
-        assert_eq!(leading_m_label("M9 (2)"), Some((9, "m9".to_owned())));
-
-        // Negative controls: mid-string tokens, chip names, zero.
-        assert_eq!(leading_m_label("Mac-mini-M4"), None);
-        assert_eq!(leading_m_label("macbook-m3"), None);
-        assert_eq!(leading_m_label("andrews-m12"), None);
-        assert_eq!(leading_m_label("m3pro"), None);
-        assert_eq!(leading_m_label("m0"), None);
-        assert_eq!(leading_m_label("m04"), None);
-    }
-
-    /// Seeding orders members by admission date: an earlier `m<N>` keeps its label, a later
-    /// colliding `m<N>` gets `next_free` above sheet + members + Bonjour with the old `m<N>`
-    /// recorded as an alias, `Mac-mini-M4` is not `m4`, and F6 `N`/`N-68` pairs fold `m32`
-    /// onto `m100`.
-    #[test]
-    fn seed_roster_orders_by_admission_date_folds_n_minus_68_and_skips_sheet_and_bonjour() {
-        let r_admin = sample_recipient(1);
-        let r_early = sample_recipient(2);
-        let r_late_dup = sample_recipient(3);
-        let r_m100 = sample_recipient(4);
-        let r_stock = sample_recipient(5);
-
-        let mut doc = Document::new_vault("m22", &r_admin);
-        doc.add_machine("m12-2", &r_late_dup).unwrap();
-        doc.add_machine("m12", &r_early).unwrap();
-        doc.add_machine("m100", &r_m100).unwrap();
-        doc.add_machine("mac-mini-m4", &r_stock).unwrap();
-
-        let mut admissions = BTreeMap::new();
-        admissions.insert(
-            r_admin.clone(),
-            SeedAdmission {
-                admitted_ms: 1_000,
-                sequence: 1,
-            },
-        );
-        // Even though `m12-2` appeared earlier in `[machines]`, `r_early` has the earlier admission date!
-        admissions.insert(
-            r_early.clone(),
-            SeedAdmission {
-                admitted_ms: 2_000,
-                sequence: 2,
-            },
-        );
-        admissions.insert(
-            r_late_dup.clone(),
-            SeedAdmission {
-                admitted_ms: 3_000,
-                sequence: 3,
-            },
-        );
-        admissions.insert(
-            r_m100.clone(),
-            SeedAdmission {
-                admitted_ms: 4_000,
-                sequence: 4,
-            },
-        );
-        admissions.insert(
-            r_stock.clone(),
-            SeedAdmission {
-                admitted_ms: 5_000,
-                sequence: 5,
-            },
-        );
-
-        let sheet = SheetHints::from_fleet_toml(
-            r#"
-[[account]]
-label = "acct-1"
-machines = ["m32", "m100"]
-class = "max"
-email = "one@example.org"
-
-[[account]]
-label = "acct-2"
-machines = ["m111"]
-class = "max"
-email = "two@example.org"
-"#,
-        );
-        let bonjour = vec!["m115.local".to_owned()];
-        let mut overrides = BTreeMap::new();
-        overrides.insert(r_stock.clone(), "Mac-mini-M4".to_owned());
-
-        let roster = seed_roster(
-            &doc,
-            &admissions,
-            &SwarmPolicy::default(),
-            &sheet,
-            &bonjour,
-            &overrides,
-        );
-
-        // Earlier admission keeps m12; later m12-2 gets m116 (above m111 in sheet and m115 on Bonjour) with alias m12.
-        let early = roster.member_by_recipient(&r_early).unwrap();
-        assert_eq!(early.label, "m12");
-        assert!(early.aliases.is_empty());
-
-        let late_dup = roster.member_by_recipient(&r_late_dup).unwrap();
-        assert_eq!(late_dup.label, "m116");
-        assert_eq!(late_dup.aliases, vec!["m12".to_owned()]);
-
-        // m100 folds m32 (100 - 68 = 32) from the shared sheet row.
-        let m100 = roster.member_by_recipient(&r_m100).unwrap();
-        assert_eq!(m100.label, "m100");
-        assert_eq!(m100.aliases, vec!["m32".to_owned()]);
-        assert_eq!(
-            roster.member_by_label_or_alias("m32").unwrap().recipient,
-            r_m100
-        );
-
-        // Mac-mini-M4 does NOT become m4; it gets next_free (m117).
-        let stock = roster.member_by_recipient(&r_stock).unwrap();
-        assert_eq!(stock.label, "m117");
-        assert_ne!(stock.label, "m4");
-        assert!(roster.member_by_label_or_alias("m4").is_none());
-
-        // Round-trip TOML preserves every field.
-        let reparsed = SwarmRoster::from_toml(&roster.to_toml()).unwrap();
-        assert_eq!(reparsed, roster);
-    }
-
-    /// Reserved labels (`m3` and stewards in `aterm-swarm-policy`) are never assigned to newcomers,
-    /// free `m<N>` prefixes are kept, and sheet-named unclaimed labels wait 24 h under a provisional
-    /// `next_free` label (promoting only when uncontested).
-    #[test]
-    fn approver_keeps_free_label_refuses_reserved_m3_and_holds_sheet_labels_24h() {
-        let r_admin = sample_recipient(10);
-        let r_free = sample_recipient(11);
-        let r_wants_m3 = sample_recipient(12);
-        let r_wants_steward = sample_recipient(13);
-        let r_sheet_claim = sample_recipient(14);
-        let r_contested_a = sample_recipient(15);
-        let r_contested_b = sample_recipient(16);
-
-        let mut doc = Document::new_vault("m22", &r_admin);
-        let policy = SwarmPolicy {
-            network_id: Some("alab-lan".to_owned()),
-            reserved_labels: vec!["m3".to_owned()],
-            release_hosts: vec!["m3".to_owned(), "m22".to_owned()],
-            servers: Vec::new(),
-            stewards: vec![
-                StewardPolicy {
-                    label: "m22".to_owned(),
-                    rank: 2,
-                    always_on: false,
-                },
-                StewardPolicy {
-                    label: "m7".to_owned(),
-                    rank: 1,
-                    always_on: true,
-                },
-            ],
-        };
-        let sheet = SheetHints::from_fleet_toml(
-            r#"
-[[account]]
-label = "acct-1"
-machines = ["m20", "m21", "m110"]
-class = "max"
-email = "one@example.org"
-"#,
-        );
-        let bonjour = vec!["m112.local".to_owned()];
-
-        let mut roster = seed_roster(
-            &doc,
-            &BTreeMap::new(),
-            &policy,
-            &sheet,
-            &bonjour,
-            &BTreeMap::new(),
-        );
-        assert_eq!(roster.member_by_recipient(&r_admin).unwrap().label, "m22");
-
-        // 1. Free m<N> not in sheet -> kept immediately.
-        doc.add_machine("m50", &r_free).unwrap();
-        let lbl_free = assign_newcomer(
-            &mut roster,
-            &doc,
-            &policy,
-            &sheet,
-            &bonjour,
-            Newcomer {
-                recipient: &r_free,
-                requested_host: "m50.local",
-                vault_name: "m50",
-                now_ms: 10_000,
-            },
-        );
-        assert_eq!(lbl_free, "m50");
-
-        // 2. A newcomer named `m3` does NOT get `m3` (reserved release Mac) -> gets m113 (above m112 Bonjour).
-        doc.add_machine("m3", &r_wants_m3).unwrap();
-        let lbl_m3 = assign_newcomer(
-            &mut roster,
-            &doc,
-            &policy,
-            &sheet,
-            &bonjour,
-            Newcomer {
-                recipient: &r_wants_m3,
-                requested_host: "m3",
-                vault_name: "m3",
-                now_ms: 11_000,
-            },
-        );
-        assert_ne!(lbl_m3, "m3", "a newcomer named m3 must never get m3");
-        assert_eq!(lbl_m3, "m113");
-
-        // 3. A newcomer named `m7` (reserved steward in policy) does NOT get `m7` -> gets m114.
-        doc.add_machine("m7", &r_wants_steward).unwrap();
-        let lbl_steward = assign_newcomer(
-            &mut roster,
-            &doc,
-            &policy,
-            &sheet,
-            &bonjour,
-            Newcomer {
-                recipient: &r_wants_steward,
-                requested_host: "m7",
-                vault_name: "m7",
-                now_ms: 12_000,
-            },
-        );
-        assert_ne!(lbl_steward, "m7");
-        assert_eq!(lbl_steward, "m114");
-
-        // 4. Sheet-named `m20` held by no member gets provisional `m115` with a 24 h hold.
-        let t0 = 100_000_u64;
-        doc.add_machine("m20", &r_sheet_claim).unwrap();
-        let lbl_provisional = assign_newcomer(
-            &mut roster,
-            &doc,
-            &policy,
-            &sheet,
-            &bonjour,
-            Newcomer {
-                recipient: &r_sheet_claim,
-                requested_host: "m20",
-                vault_name: "m20",
-                now_ms: t0,
-            },
-        );
-        assert_eq!(lbl_provisional, "m115");
-        assert_eq!(
-            roster
-                .member_by_recipient(&r_sheet_claim)
-                .unwrap()
-                .claimed_label
-                .as_deref(),
-            Some("m20")
-        );
-
-        // Before 24 h: stays provisional.
-        assert!(!promote_due_claims(
-            &mut roster,
-            &doc,
-            &policy,
-            &sheet,
-            t0 + SHEET_CLAIM_HOLD_MS - 1
-        ));
-        assert_eq!(
-            roster.member_by_recipient(&r_sheet_claim).unwrap().label,
-            "m115"
-        );
-
-        // At 24 h with no competing claimant: promotes to m20 and keeps m115 as alias!
-        assert!(promote_due_claims(
-            &mut roster,
-            &doc,
-            &policy,
-            &sheet,
-            t0 + SHEET_CLAIM_HOLD_MS
-        ));
-        let promoted = roster.member_by_recipient(&r_sheet_claim).unwrap();
-        assert_eq!(promoted.label, "m20");
-        assert_eq!(promoted.aliases, vec!["m115".to_owned()]);
-        assert!(promoted.claimed_label.is_none());
-
-        // Negative control on 24 h hold: two competing claimants for sheet-named `m21` never auto-promote.
-        doc.add_machine("m21", &r_contested_a).unwrap();
-        doc.add_machine("m21-2", &r_contested_b).unwrap();
-        let _ = assign_newcomer(
-            &mut roster,
-            &doc,
-            &policy,
-            &sheet,
-            &bonjour,
-            Newcomer {
-                recipient: &r_contested_a,
-                requested_host: "m21",
-                vault_name: "m21",
-                now_ms: t0,
-            },
-        );
-        let _ = assign_newcomer(
-            &mut roster,
-            &doc,
-            &policy,
-            &sheet,
-            &bonjour,
-            Newcomer {
-                recipient: &r_contested_b,
-                requested_host: "m21",
-                vault_name: "m21-2",
-                now_ms: t0 + 1_000,
-            },
-        );
-        assert!(!promote_due_claims(
-            &mut roster,
-            &doc,
-            &policy,
-            &sheet,
-            t0 + SHEET_CLAIM_HOLD_MS + 10_000
-        ));
-        assert_ne!(
-            roster.member_by_recipient(&r_contested_a).unwrap().label,
-            "m21"
-        );
-        assert_ne!(
-            roster.member_by_recipient(&r_contested_b).unwrap().label,
-            "m21"
-        );
+    fn historical_label_denials_survive_without_an_allocator() {
+        let old = r#"deny_labels = ["m4"]
+deny_nodes = []
+[[member]]
+recipient = "historical-recipient"
+vault_name = "old-name"
+label = "m100"
+aliases = ["m4"]
+node_key = "historical-node-key"
+"#;
+        let roster = SwarmRoster::from_toml(old).unwrap();
+        assert!(roster.is_member_denied(&roster.members[0]));
+        let copy = SwarmRoster::from_toml(&roster.to_toml()).unwrap();
+        assert_eq!(roster, copy);
+        assert!(copy.is_member_denied(&copy.members[0]));
     }
 
     #[test]
-    fn member_by_label_or_alias_prefers_active_row_over_denied_row() {
-        let r_old = Identity::generate().unwrap().recipient().to_bech32();
-        let r_new = Identity::generate().unwrap().recipient().to_bech32();
-        let old_node = "11111111111111111111111111111111";
-        let new_node = "22222222222222222222222222222222";
-        let roster = SwarmRoster {
-            deny_labels: Vec::new(),
-            deny_nodes: vec![old_node.to_owned()],
-            members: vec![
-                SwarmMember {
-                    recipient: r_old.clone(),
-                    vault_name: "m5".to_owned(),
-                    label: "m5".to_owned(),
-                    aliases: vec!["m105".to_owned()],
-                    hint: None,
-                    hw_hint: None,
-                    admitted_ms: 1_000,
-                    claimed_label: None,
-                    claimed_at_ms: None,
-                    node_id: Some(old_node.to_owned()),
-                    node_key: None,
-                },
-                SwarmMember {
-                    recipient: r_new.clone(),
-                    vault_name: "m5-2".to_owned(),
-                    label: "m5".to_owned(),
-                    aliases: Vec::new(),
-                    hint: None,
-                    hw_hint: None,
-                    admitted_ms: 2_000,
-                    claimed_label: None,
-                    claimed_at_ms: None,
-                    node_id: Some(new_node.to_owned()),
-                    node_key: None,
-                },
-            ],
-        };
-        let found = roster.member_by_label_or_alias("m5").unwrap();
-        assert_eq!(found.recipient, r_new);
-        assert!(!roster.is_member_denied(found));
-        // When only the denied row matches an alias, it is still returned so callers can see it is denied.
-        let alias_found = roster.member_by_label_or_alias("m105").unwrap();
-        assert_eq!(alias_found.recipient, r_old);
-        assert!(roster.is_member_denied(alias_found));
-    }
-
-    #[test]
-    fn assign_newcomer_and_promote_due_claims_never_fold_denied_or_claimed_legacy_aliases() {
-        let r_admin = Identity::generate().unwrap().recipient().to_bech32();
-        let r_m70 = Identity::generate().unwrap().recipient().to_bech32();
-        let r_claim_m10 = Identity::generate().unwrap().recipient().to_bech32();
-
-        let mut doc = Document::new_vault("m1", &r_admin);
-        doc.add_machine("m70", &r_m70).unwrap();
-        doc.add_machine("m10", &r_claim_m10).unwrap();
-
-        let policy = SwarmPolicy::default();
-        // Sheet pairs m2 <-> m70 (`70 - 68 = 2`), and names m10 (for a 24h claim hold),
-        // but NOT 70 itself so m70 is assigned directly on join.
-        let mut sheet = SheetHints::default();
-        sheet.numbers.insert(2);
-        sheet.numbers.insert(10);
-        sheet.shared_rows.push(vec![2, 70]);
-
-        let mut roster = SwarmRoster {
-            deny_labels: vec!["m2".to_owned()],
-            deny_nodes: Vec::new(),
-            members: vec![SwarmMember {
-                recipient: r_admin,
-                vault_name: "m1".to_owned(),
-                label: "m1".to_owned(),
-                aliases: Vec::new(),
-                hint: None,
-                hw_hint: None,
-                admitted_ms: 1_000,
-                claimed_label: None,
-                claimed_at_ms: None,
-                node_id: None,
-                node_key: None,
-            }],
-        };
-
-        // 1. `assign_newcomer` for `m70` when paired legacy label `"m2"` is in `deny_labels`:
-        //    must NOT fold `"m2"` into `m70.aliases` (which would mark `m70` denied).
-        let assigned_m70 = assign_newcomer(
-            &mut roster,
-            &doc,
-            &policy,
-            &sheet,
-            &[],
-            Newcomer {
-                recipient: &r_m70,
-                requested_host: "m70",
-                vault_name: "m70",
-                now_ms: 2_000,
-            },
-        );
-        assert_eq!(assigned_m70, "m70");
-        let m70_row = roster.member_by_recipient(&r_m70).unwrap();
-        assert!(
-            !m70_row.aliases.contains(&"m2".to_owned()),
-            "denied legacy alias m2 must not be folded into m70: {:?}",
-            m70_row.aliases
-        );
-        assert!(!roster.is_member_denied(m70_row));
-
-        // 2. `promote_due_claims` when another member (`r_claim_m10`) promotes after 24h:
-        //    must NOT fold denied `"m2"` into `m70.aliases` either.
-        let provisional = assign_newcomer(
-            &mut roster,
-            &doc,
-            &policy,
-            &sheet,
-            &[],
-            Newcomer {
-                recipient: &r_claim_m10,
-                requested_host: "m10",
-                vault_name: "m10",
-                now_ms: 3_000,
-            },
-        );
-        assert_eq!(provisional, "m71");
-        assert!(promote_due_claims(
-            &mut roster,
-            &doc,
-            &policy,
-            &sheet,
-            3_000 + SHEET_CLAIM_HOLD_MS
-        ));
-        let m70_after = roster.member_by_recipient(&r_m70).unwrap();
-        assert!(
-            !m70_after.aliases.contains(&"m2".to_owned()),
-            "promote_due_claims must not fold denied m2 into m70: {:?}",
-            m70_after.aliases
-        );
-        assert!(!roster.is_member_denied(m70_after));
-
-        // 3. A denied row in `roster.members` carrying `claimed_label = Some("m11")` must neither
-        //    promote itself out of `deny_labels` nor block an active member's 24h claim on `"m11"`.
-        let r_denied_claimant = Identity::generate().unwrap().recipient().to_bech32();
-        let r_active_claimant = Identity::generate().unwrap().recipient().to_bech32();
-        doc.add_machine("m11", &r_active_claimant).unwrap();
-        sheet.numbers.insert(11);
-        roster.deny_labels.push("m40".to_owned());
-        roster.members.push(SwarmMember {
-            recipient: r_denied_claimant.clone(),
-            vault_name: "m40".to_owned(),
-            label: "m40".to_owned(),
-            aliases: Vec::new(),
-            hint: None,
-            hw_hint: None,
-            admitted_ms: 3_500,
-            claimed_label: Some("m11".to_owned()),
-            claimed_at_ms: Some(3_500),
-            node_id: None,
-            node_key: None,
-        });
-        assert!(
-            !promote_due_claims(
-                &mut roster,
-                &doc,
-                &policy,
-                &sheet,
-                3_500 + SHEET_CLAIM_HOLD_MS
-            ),
-            "denied row m40 must not promote its claimed_label m11"
-        );
-        assert_eq!(
-            roster
-                .member_by_recipient(&r_denied_claimant)
-                .unwrap()
-                .label,
-            "m40"
-        );
-        let _ = assign_newcomer(
-            &mut roster,
-            &doc,
-            &policy,
-            &sheet,
-            &[],
-            Newcomer {
-                recipient: &r_active_claimant,
-                requested_host: "m11",
-                vault_name: "m11",
-                now_ms: 4_000,
-            },
-        );
-        assert!(
-            promote_due_claims(
-                &mut roster,
-                &doc,
-                &policy,
-                &sheet,
-                4_000 + SHEET_CLAIM_HOLD_MS
-            ),
-            "denied row's stale claim on m11 must not block active claimant from promoting"
-        );
-        assert_eq!(
-            roster
-                .member_by_recipient(&r_active_claimant)
-                .unwrap()
-                .label,
-            "m11"
-        );
-
-        // 4. A denied row's forged or unpromoted `claimed_label = Some("m999")` must not inflate
-        //    `next_free_number` when assigning the next newcomer.
-        if let Some(m40) = roster
-            .members
-            .iter_mut()
-            .find(|m| m.recipient == r_denied_claimant)
-        {
-            m40.claimed_label = Some("m999".to_owned());
-        }
-        let r_next = Identity::generate().unwrap().recipient().to_bech32();
-        let next_assigned = assign_newcomer(
-            &mut roster,
-            &doc,
-            &policy,
-            &sheet,
-            &[],
-            Newcomer {
-                recipient: &r_next,
-                requested_host: "Mac-mini",
-                vault_name: "Mac-mini",
-                now_ms: 4_500,
-            },
-        );
-        assert_eq!(
-            next_assigned, "m73",
-            "denied row's forged claimed_label m999 must not inflate next_free_number: {next_assigned}"
-        );
-    }
-
-    /// A label a live row claims under its 24 h hold is not handed to a later Mac that asks for
-    /// it once the sheet no longer names its number: the later Mac joins the claim, and two
-    /// claimants promote neither. Control: the claim of a Mac the vault does not name holds
-    /// nothing, and the later Mac takes the label.
-    #[test]
-    fn a_label_under_a_live_claim_is_joined_not_taken_by_a_later_mac() {
-        let r_admin = Identity::generate().unwrap().recipient().to_bech32();
-        let policy = SwarmPolicy::default();
-        let mut naming_15 = SheetHints::default();
-        naming_15.numbers.insert(15);
-        let not_naming = SheetHints::default();
-        for (live, takes) in [(true, false), (false, true)] {
-            let r_early = Identity::generate().unwrap().recipient().to_bech32();
-            let r_late = Identity::generate().unwrap().recipient().to_bech32();
-            let mut doc = Document::new_vault("m1", &r_admin);
-            if live {
-                doc.add_machine("early", &r_early).unwrap();
-            }
-            doc.add_machine("late", &r_late).unwrap();
-            let mut roster = SwarmRoster {
-                deny_labels: Vec::new(),
-                deny_nodes: Vec::new(),
-                members: vec![SwarmMember {
-                    recipient: r_admin.clone(),
-                    vault_name: "m1".to_owned(),
-                    label: "m1".to_owned(),
-                    aliases: Vec::new(),
-                    hint: None,
-                    hw_hint: None,
-                    admitted_ms: 1_000,
-                    claimed_label: None,
-                    claimed_at_ms: None,
-                    node_id: None,
-                    node_key: None,
-                }],
-            };
-            let ask = |roster: &mut SwarmRoster, sheet: &SheetHints, recipient: &str, at| {
-                assign_newcomer(
-                    roster,
-                    &doc,
-                    &policy,
-                    sheet,
-                    &[],
-                    Newcomer {
-                        recipient,
-                        requested_host: "m15",
-                        vault_name: if recipient == r_early {
-                            "early"
-                        } else {
-                            "late"
-                        },
-                        now_ms: at,
-                    },
-                )
-            };
-            assert_eq!(ask(&mut roster, &naming_15, &r_early, 5_000), "m16");
-            let claim = |roster: &SwarmRoster, recipient: &str| {
-                roster
-                    .member_by_recipient(recipient)
-                    .unwrap()
-                    .claimed_label
-                    .clone()
-            };
-            assert_eq!(claim(&roster, &r_early).as_deref(), Some("m15"));
-            let late = ask(&mut roster, &not_naming, &r_late, 5_500);
-            assert_eq!(late == "m15", takes, "live {live}: {late}");
-            if live {
-                assert_eq!(claim(&roster, &r_late).as_deref(), Some("m15"));
-                assert!(!promote_due_claims(
-                    &mut roster,
-                    &doc,
-                    &policy,
-                    &not_naming,
-                    5_500 + SHEET_CLAIM_HOLD_MS
-                ));
-            }
+    fn local_hostname_tags_are_leading_only() {
+        assert_eq!(leading_m_label("M22.local"), Some((22, "m22".into())));
+        for word in ["Mac-mini-M4", "macbook-m3", "m0", "m3pro"] {
+            assert_eq!(leading_m_label(word), None);
         }
     }
 }

@@ -148,6 +148,24 @@ fn a_private_reference_in_any_wide_encoding_is_found() {
     assert!(clean.is_empty(), "{clean:#?}");
 }
 
+/// The path check folds Unicode case, as the engine's `rel.lower()` did: a path whose last
+/// letter of the org is `İ` (U+0130, lowercased `i` and U+0307) still names it, and one
+/// without the org does not.
+#[test]
+fn a_path_naming_the_private_org_in_unicode_case_is_found() {
+    let upper = PRIVATE_ORG.to_ascii_uppercase();
+    let dotted = format!("docs/{}\u{130}.md", &upper[..upper.len() - 1]);
+    let mut found = Vec::new();
+    private_refs(&dotted, b"", &mut found);
+    assert!(
+        found.iter().any(|f| f.line == 0),
+        "{dotted:?} names the org: {found:#?}"
+    );
+    let mut clean = Vec::new();
+    private_refs("docs/\u{130}stanbul.md", b"", &mut clean);
+    assert!(clean.is_empty(), "{clean:#?}");
+}
+
 #[test]
 fn the_export_is_written_as_exported_for_gitleaks() {
     let home = concat!("/Us", "ers/someone/x");

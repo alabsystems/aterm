@@ -92,10 +92,10 @@ fn gigabytes(bytes: u64) -> u64 {
 #[cfg(target_os = "macos")]
 fn fleet_node() -> Option<String> {
     let state = aterm_types::dirs::state_dir()?;
-    aterm_net::fleet_member::read_node_id(&state)
+    aterm_net::fleet_member::read_node_identity(&state)
         .ok()
         .flatten()
-        .filter(|node| aterm_codec::hex::is_lower(node, 32))
+        .map(|identity| aterm_net::fleet_member::node_principal(identity.key())[2..].to_owned())
 }
 
 /// What one command printed, trimmed, with a one-minute hang detector.
@@ -105,12 +105,17 @@ fn output(program: &str, args: &[&str]) -> Option<String> {
     command.args(args);
     let out = aterm_uds::deadline::output_within(&mut command, std::time::Duration::from_secs(60))
         .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8(out.stdout).ok())
-        .flatten()
-        .map(|text| text.trim().to_owned())
-        .filter(|text| !text.is_empty())
+    if !out.status.success() {
+        return None;
+    }
+    let mut text = String::from_utf8(out.stdout).ok()?;
+    let trimmed_len = text.trim_end().len();
+    text.truncate(trimmed_len);
+    let leading = text.len() - text.trim_start().len();
+    if leading > 0 {
+        text.drain(..leading);
+    }
+    (!text.is_empty()).then_some(text)
 }
 
 /// This Mac: `None` where it cannot state its model or its hardware, which its row needs. Off

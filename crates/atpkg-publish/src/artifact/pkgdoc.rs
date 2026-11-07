@@ -68,6 +68,8 @@ pub struct Header {
     pub build: Build,
     /// The tools it shims.
     pub exposes: Vec<String>,
+    /// Exact validated environment exported by the managed invocation.
+    pub shim_env: Vec<String>,
 }
 
 /// One target's `[[artifact]]` row.
@@ -423,11 +425,53 @@ pub fn fresh(header: &Header, row: &Row) -> Result<Doc> {
          exposes = [{exposes}]\n\n",
         header.program, header.version, header.build
     );
+    append_environment(&mut s, header)?;
     s.push_str(&render_row(row)?);
     Ok(Doc {
         bytes: s.into_bytes(),
         base_len: 0,
     })
+}
+
+fn append_environment(text: &mut String, header: &Header) -> Result<()> {
+    atpkg::shim_env::ShimEnv::admit(&header.shim_env).map_err(Error::refused)?;
+    if !header.shim_env.is_empty() {
+        let values = aterm_toml::Value::Array(
+            header
+                .shim_env
+                .iter()
+                .cloned()
+                .map(aterm_toml::Value::String)
+                .collect(),
+        );
+        text.push_str(&format!("shim_env = {values}\n\n"));
+    }
+    Ok(())
+}
+
+fn check_base_environment(doc: &aterm_toml::Value, header: &Header) -> Result<()> {
+    let entries: Vec<String> = match doc.get("shim_env") {
+        None => Vec::new(),
+        Some(value) => value
+            .as_array()
+            .and_then(|items| {
+                items
+                    .iter()
+                    .map(|entry| entry.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .ok_or_else(|| {
+                Error::refused("the merge base's shim_env is not an array of strings")
+            })?,
+    };
+    atpkg::shim_env::ShimEnv::admit(&entries).map_err(Error::refused)?;
+    atpkg::shim_env::ShimEnv::admit(&header.shim_env).map_err(Error::refused)?;
+    if entries != header.shim_env {
+        return Err(Error::refused(
+            "the merge base's invocation environment differs from this pack",
+        ));
+    }
+    Ok(())
 }
 
 /// The tools a manifest shims, as a set: the order a list was written in is no part of
@@ -502,6 +546,7 @@ pub fn merge(base: Vec<u8>, header: &Header, row: &Row) -> Result<Doc> {
             header.version
         )));
     }
+    check_base_environment(&doc, header)?;
     let base_exposes = base_exposes(&doc, program)?;
     if tool_set(base_exposes.iter().copied()) != tool_set(header.exposes.iter().map(String::as_str))
     {
@@ -560,6 +605,7 @@ pub fn check_parsed(parsed: &atpkg::PkgManifest, header: &Header, row: &Row) -> 
         )));
     }
     if parsed.version != header.version
+        || parsed.shim_env != header.shim_env
         || tool_set(parsed.exposes.iter().map(String::as_str))
             != tool_set(header.exposes.iter().map(String::as_str))
     {
@@ -623,6 +669,7 @@ pub fn fresh_bottle(header: &Header, row: &BottleRow) -> Result<Doc> {
          exposes = [{exposes}]\n\n",
         header.program, header.version, header.build
     );
+    append_environment(&mut s, header)?;
     s.push_str(&render_bottle_row(row)?);
     Ok(Doc {
         bytes: s.into_bytes(),
@@ -673,6 +720,7 @@ pub fn merge_bottle(base: Vec<u8>, header: &Header, row: &BottleRow) -> Result<D
             header.version
         )));
     }
+    check_base_environment(&doc, header)?;
     let base_exposes = base_exposes(&doc, program)?;
     if tool_set(base_exposes.iter().copied()) != tool_set(header.exposes.iter().map(String::as_str))
     {
@@ -735,6 +783,7 @@ pub fn check_parsed_bottle(
         )));
     }
     if parsed.version != header.version
+        || parsed.shim_env != header.shim_env
         || tool_set(parsed.exposes.iter().map(String::as_str))
             != tool_set(header.exposes.iter().map(String::as_str))
     {

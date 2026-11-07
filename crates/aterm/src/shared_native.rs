@@ -352,12 +352,28 @@ fn selection_scope(paths: &Paths, deadline: Instant) -> Result<Value, String> {
         let trust = bootstrap.trust();
         let request = bootstrap.request().map_err(|e| e.to_string())?;
         let binding = request.binding();
-        Ok(
-            json!({"network":aterm_codec::hex::encode_lower(&trust.network),
-        "authority":aterm_codec::hex::encode_lower(&trust.authority),
-        "genesis":aterm_codec::hex::encode_lower(&trust.genesis),
-        "actor":aterm_codec::hex::encode_lower(&binding.actor()),"recipient":binding.recipient().to_bech32()}),
-        )
+        Ok(Value::Object(aterm_json::Map::from([
+            (
+                "network".to_string(),
+                Value::String(aterm_codec::hex::encode_lower(&trust.network)),
+            ),
+            (
+                "authority".to_string(),
+                Value::String(aterm_codec::hex::encode_lower(&trust.authority)),
+            ),
+            (
+                "genesis".to_string(),
+                Value::String(aterm_codec::hex::encode_lower(&trust.genesis)),
+            ),
+            (
+                "actor".to_string(),
+                Value::String(aterm_codec::hex::encode_lower(&binding.actor())),
+            ),
+            (
+                "recipient".to_string(),
+                Value::String(binding.recipient().to_bech32()),
+            ),
+        ])))
     })
 }
 
@@ -416,7 +432,13 @@ fn retain_selection(paths: &Paths, provider: Provider, scope: &Value) -> Result<
     )
     .map_err(|e| e.to_string())?;
     let mut rows = selections(paths)?;
-    let row = json!({"provider":provider.name(),"scope":scope});
+    let row = Value::Object(aterm_json::Map::from([
+        (
+            "provider".to_string(),
+            Value::String(provider.name().to_string()),
+        ),
+        ("scope".to_string(), scope.clone()),
+    ]));
     if let Some(existing) = rows
         .iter_mut()
         .find(|row| row["provider"].as_str() == Some(provider.name()))
@@ -428,8 +450,11 @@ fn retain_selection(paths: &Paths, provider: Provider, scope: &Value) -> Result<
     } else {
         rows.push(row);
     }
-    let bytes = aterm_json::to_vec(&json!({"schema":1,"selections":rows}))
-        .map_err(|_| "native selection could not be encoded")?;
+    let bytes = aterm_json::to_vec(&Value::Object(aterm_json::Map::from([
+        ("schema".to_string(), Value::Number(1u64.into())),
+        ("selections".to_string(), Value::Array(rows)),
+    ])))
+    .map_err(|_| "native selection could not be encoded")?;
     fsx::write_atomic(&paths.dir.join(SELECTION), &bytes, 0o600).map_err(|e| e.to_string())
 }
 
@@ -478,16 +503,59 @@ fn retain(
     if request == "00000000000000000000000000000000" {
         return Err("native preparation request could not be created".into());
     }
-    let row = json!({"account":account,"network":network,"decision":decision,
-        "configuration":aterm_codec::hex::encode_lower(&observed.configuration),"generation":observed.generation,
-        "provider":observed.provider.name(),"request":request,"state":status,"observed_at_unix":aterm_time::unix_secs().unwrap_or(0),"current_validity":"unknown","evidence":if status=="access-verified" {"historical-credential-access-only"}else{"no-access-proof"},"execution":"requires-current-signed-assignment"});
-    if let Some(old) = rows.iter_mut().find(|r| same(r)) {
+    let old = rows.iter_mut().find(|r| same(r));
+    let row = Value::Object(aterm_json::Map::from([
+        ("account".to_string(), Value::String(account)),
+        ("network".to_string(), Value::String(network)),
+        ("decision".to_string(), Value::String(decision)),
+        (
+            "configuration".to_string(),
+            Value::String(aterm_codec::hex::encode_lower(&observed.configuration)),
+        ),
+        (
+            "generation".to_string(),
+            Value::Number(observed.generation.into()),
+        ),
+        (
+            "provider".to_string(),
+            Value::String(observed.provider.name().to_string()),
+        ),
+        ("request".to_string(), Value::String(request)),
+        ("state".to_string(), Value::String(status.to_string())),
+        (
+            "observed_at_unix".to_string(),
+            Value::Number(aterm_time::unix_secs().unwrap_or(0).into()),
+        ),
+        (
+            "current_validity".to_string(),
+            Value::String("unknown".to_string()),
+        ),
+        (
+            "evidence".to_string(),
+            Value::String(
+                if status == "access-verified" {
+                    "historical-credential-access-only"
+                } else {
+                    "no-access-proof"
+                }
+                .to_string(),
+            ),
+        ),
+        (
+            "execution".to_string(),
+            Value::String("requires-current-signed-assignment".to_string()),
+        ),
+    ]));
+    if let Some(old) = old {
         *old = row;
     } else {
         rows.push(row);
     }
-    let bytes = aterm_json::to_vec(&json!({"schema":1,"records":rows}))
-        .map_err(|_| "native records could not be encoded")?;
+    let bytes = aterm_json::to_vec(&Value::Object(aterm_json::Map::from([
+        ("schema".to_string(), Value::Number(1u64.into())),
+        ("records".to_string(), Value::Array(rows)),
+    ])))
+    .map_err(|_| "native records could not be encoded")?;
     fsx::write_atomic(&approved.paths.dir.join(RECORDS), &bytes, 0o600).map_err(|e| e.to_string())
 }
 
@@ -1143,9 +1211,18 @@ pub(super) fn try_run(args: &[OsString]) -> Option<ExitCode> {
             if args.len() != 2 {
                 return Err("native-status takes no options".into());
             }
-            return Ok(
-                json!({"kind":"historical-native-preparation-observations","authority":"none","current_validity":"unknown","records":records(&paths)?}),
-            );
+            return Ok(Value::Object(aterm_json::Map::from([
+                (
+                    "kind".to_string(),
+                    Value::String("historical-native-preparation-observations".to_string()),
+                ),
+                ("authority".to_string(), Value::String("none".to_string())),
+                (
+                    "current_validity".to_string(),
+                    Value::String("unknown".to_string()),
+                ),
+                ("records".to_string(), Value::Array(records(&paths)?)),
+            ])));
         }
         if verb == "native-run" {
             let provider = args

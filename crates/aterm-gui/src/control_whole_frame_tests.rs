@@ -263,6 +263,65 @@ fn a_read_facing_an_unfinished_frame_at_its_bound_says_frame_open() {
     }
 }
 
+/// A FENCED WRITE NEVER OVERTAKES ORDERED INPUT (paste F3 of the second hostile review of the
+/// turn-deadline work, 2026-11-06): while a job of the session's ordered egress is still queued
+/// (a plain turn's paste its writer has not finished), a fenced press (the guarded submit's
+/// Enter) writes nothing and answers [`GuardedInput::Queued`], which its callers look at again,
+/// judging no fence on a screen the queued input has not reached (third review): a guard that
+/// misses is a miss only once the queue drained, when the press goes where the fence holds.
+/// NEGATIVE CONTROLS: without the queue's check the Enter is written at once, ahead of the paste
+/// it follows; with the check after the fence's, the missing guard answers `Skipped`, final for
+/// a guarded submit, while input is still queued.
+#[test]
+#[cfg(unix)]
+fn a_fenced_press_waits_behind_input_queued_in_order() {
+    use std::os::fd::FromRawFd as _;
+    let (h, rx) = guarded_pipe_session(1);
+    // SAFETY: guarded_pipe_session returned this new write descriptor; the session and sink
+    // borrow it, and no other owner closes it.
+    let _write_end = unsafe { std::os::fd::OwnedFd::from_raw_fd(h.master) };
+    let h = session(h, EVENTUALLY);
+    burst(&h, WHOLE);
+    let generation = crate::control::screen_gen(&term_lock(&h.term));
+    let as_stands = InputFence {
+        generation: Some(generation),
+        ..InputFence::default()
+    };
+    let miss = crate::control::compile_guard(Some("^never.drawn.here$"))
+        .expect("the guard compiles")
+        .expect("a guard was given");
+    let missing = InputFence {
+        guard: Some(&*miss),
+        guard_at_cursor: true,
+        ..InputFence::default()
+    };
+    let press = |fence: &InputFence<'_>| {
+        input_if_fenced_observed(
+            &h.term,
+            &h.ctx,
+            InputEvent::KeySequence(b"\r".to_vec()),
+            fence,
+            ReadOn::Control,
+            None,
+        )
+    };
+    h.ctx.sink.claim_ordered_egress();
+    assert_eq!(press(&as_stands), GuardedInput::Queued);
+    assert_eq!(
+        press(&missing),
+        GuardedInput::Queued,
+        "no fence judged on a screen the queued input has not reached"
+    );
+    assert!(
+        drain_pipe(&rx).is_empty(),
+        "nothing overtook the queued input"
+    );
+    h.ctx.sink.retire_ordered_egress();
+    assert_eq!(press(&missing), GuardedInput::Skipped);
+    assert_eq!(press(&as_stands), GuardedInput::Pressed(Delivery::Full));
+    assert_eq!(drain_pipe(&rx), b"\r", "pressed once the queue drained");
+}
+
 #[test]
 #[cfg(unix)]
 fn a_row_fence_declines_an_unfinished_frame_and_the_event_loop_never_waits() {

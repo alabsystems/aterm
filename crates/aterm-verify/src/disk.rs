@@ -212,10 +212,11 @@ pub fn selection_of(ctx: &Ctx) -> atpkg::admit_disk::Selection {
 /// ([`selection_of`]) in the machine's record ([`MACHINE_FOOTPRINT`]) where this user has a state
 /// directory and the build directory is the one verify places ([`Ctx::main_build_dir`]): one
 /// the caller chose is not measured, so a run there grows `<target>/verify` alone, which bounds
-/// nothing another checkout's build writes. `None` when no check it runs builds.
+/// nothing another checkout's build writes. A compiler stage in the unskipped plan is needed
+/// before claiming build space: a GUI-only pacing burst claims no build directories.
 #[must_use]
 pub fn run_of(ctx: &Ctx) -> Option<atpkg::admit_disk::Run> {
-    if !ctx.checks.iter().any(|c| builds(*c)) {
+    if !ctx.checks.iter().any(|c| builds(*c)) || !crate::plan::has_compiler_stage(ctx) {
         return None;
     }
     let build = ctx
@@ -506,6 +507,34 @@ fn answer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_planned_compiler_claims_build_disk() {
+        let measure = || {
+            Ctx::new(
+                PathBuf::from("/w/aterm"),
+                crate::Scope::workspace(),
+                crate::EnvSnapshot::default(),
+                PathBuf::from("/tmp/x"),
+            )
+            .with_checks(&[Check::Measure])
+        };
+        let app = || Some(crate::MeasureArtifact::unnamed("/release/aterm.app"));
+        assert!(
+            run_of(
+                &measure()
+                    .with_measure_artifact(app())
+                    .with_cursor_pacing(true)
+            )
+            .is_none()
+        );
+        assert!(run_of(&measure()).is_none());
+        // Negative controls: compiling benches still needs disk, including a prebuild without
+        // a bundle and the headless matrices left by --no-windows.
+        assert!(run_of(&measure().with_compile_only(true)).is_some());
+        assert!(run_of(&measure().with_measure_artifact(app())).is_some());
+        assert!(run_of(&measure().with_measure_artifact(app()).with_no_windows(true)).is_some());
+    }
 
     /// The build directory a value names, as targo's `--config` spells it, for the cache and the
     /// pinned target alike; anything else names none.

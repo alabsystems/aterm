@@ -439,8 +439,10 @@ THE ROW (schema=1; one line, space-separated key=value, a checksum last)
           a secret passed as an argument included, can confirm the guess from its key
   label   one word: for a command, a program the kernel saw run (its own, or the wrapper
           or interpreter that ran it) or a shell builtin or keyword aterm knows (`while`),
-          `-` when none was confirmed; for an agent call, the name the kernel showed its
-          job; for a spawn, the agent; for an admission, the first word of the description
+          `-` when none was confirmed; for an agent call, the program it ran as the kernel
+          named it (its leader, or what the agent's shell wrapper started: `zsh -c 'git
+          status'` is `git`), `-` (and key=-) when it ran shell builtins alone; for a
+          spawn, the agent; for an admission, the first word of the description
           its claimant wrote (`targo`, `lab`)
   sid     the session's public id (`s-…`, as `aterm ctl @<sid>` and the survey name it),
           `-` for a spawn or an admission, or before the sweep has read the session
@@ -462,7 +464,11 @@ WHERE THE FIGURES COME FROM
   command     wall from the block's C and D times; CPU from the shell's own rusage and
               what it reaped, read at C and at D (unknown when both arrive in one read
               of the tab's output); peak memory and stalled from the jobs engine
-  agent-call  the jobs engine's job: its open and end, its members' CPU and peak memory
+  agent-call  the jobs engine's job: its open and end, its members' CPU and peak memory;
+              how it ended is its leader's own exit status, which a kernel exit watch
+              reads though aterm is not its parent (code= its exit code, or sig= the
+              signal that ended it); a call no pass saw live with its start read, one past
+              the 64 watches at once, and every call off macOS end unknown
   spawn       the spawn verb's own time; CPU, memory and cache are na
   admission   wall_ms and wait_ms are both the admission's wait: an admitted claim's own
               clock (meter=exact), a refused or ended one's stopwatch (stamped); CPU and
@@ -485,8 +491,11 @@ THE SUMMARY
   telemetry schema=1 rows= dropped= torn= files= bytes= since= oldest= host= facts= dir=
   kind=<k> n= failed= stalled= wall_p50_ms= wall_p90_ms= wall_unknown= cpu_p50_ms=
   cpu_p90_ms= cpu_unknown= peak_p50_mib= peak_p90_mib= peak_unknown=
+  calls watched= read= missed=
   Percentiles are nearest-rank over the rows that knew the figure; *_unknown counts the
-  rest. `-` means no row knew it."#,
+  rest. `-` means no row knew it. The calls line is this aterm's exit watches on agent
+  calls since it started: leaders watched, statuses read, and calls that ended with
+  none."#,
         ),
     },
     Topic {
@@ -3177,12 +3186,15 @@ CLOSING A TAB
   shell gets SIGHUP. A shell that already ignored it has its process group
   SIGKILLed about 250 ms later. Any other gets about 1.5 s to finish its
   `trap ... HUP`, `zshexit` or EXIT trap before the same; one that catches SIGHUP
-  and carries on holds aterm's quit that long. Closing a tab or window also closes
-  the terminal, and that second hang-up can end a `zshexit` or bash EXIT trap
-  sooner (ATERM-KI-1104-7). As the shell ends, the system
-  hangs up the job in front, and the shell passes the hang-up on to its other
-  jobs. A program that ignores SIGHUP has asked to outlive its terminal, and it
-  does:
+  and carries on holds aterm's quit that long. On macOS aterm sets the
+  terminal's `clocal` first and puts it back every 10 ms while the shell
+  handles the hang-up, since a program that exits on SIGHUP writes back a
+  termios without it; closing the tab or window is then end of file for the
+  shell, not a second hang-up that could end its `zshexit` or EXIT trap, unless
+  such a write-back lands within those 10 ms of the close (ATERM-KI-1104-7). As
+  the shell ends, the system hangs up the job in front, and the shell passes the
+  hang-up on to its other jobs. A program that ignores SIGHUP has asked to
+  outlive its terminal, and it does:
     make                  in front: ended
     make &                behind: ended
     nohup make [&]        ignores SIGHUP: survives, in front or behind

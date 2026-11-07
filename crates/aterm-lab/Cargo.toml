@@ -163,6 +163,10 @@ aterm-vz = { workspace = true }
 # The guest agent's ports and wire codec (`COMMAND_PORT`, `Exit`). Already in the
 # graph through aterm-vz.
 aterm-vz-agent = { workspace = true }
+# `lab mac nux lan-allowed`'s base: macOS's Local Network answer for the app under test,
+# written into the guest's nehelper record by aterm-lan's debug-only writer
+# (`grant::allow`) and read back by its reader, the one the app itself reads.
+aterm-lan = { workspace = true }
 
 [dev-dependencies]
 # `trail-gallery burst`'s key schedule is checked against the flying kitty's

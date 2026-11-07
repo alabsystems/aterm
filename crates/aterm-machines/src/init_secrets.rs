@@ -313,10 +313,11 @@ pub trait SecretsOps: Send + Sync {
         None
     }
 
-    /// Why this Mac's LAN cannot be reached, in the broker's own words: on macOS the root LAN
-    /// broker, through which every LAN act of aterm's goes, does not answer its hello
-    /// ([`crate::lan_reach::broker_unready`]); `None` where it answers, and elsewhere. A port that
-    /// reaches no LAN of its own (a test's) answers `None`.
+    /// Why this Mac's LAN cannot be reached, in the broker's own words: on macOS no hello is
+    /// answered, neither by the root LAN broker, through which aterm's LAN acts go, nor while none
+    /// is installed by the allowed direct path ([`crate::lan_reach::broker_unready`]); `None`
+    /// where one answers, and elsewhere. A port that reaches no LAN of its own (a test's) answers
+    /// `None`.
     fn broker_unready(&self) -> Option<String> {
         None
     }
@@ -1098,7 +1099,8 @@ pub fn items(
 
 /// What the row says first where a run neither looked for the ALab vault nor reached a vault on
 /// the LAN, because the LAN broker, through which aterm reaches this Mac's network on macOS,
-/// does not answer ([`SecretsOps::broker_unready`]): there is no way to the LAN without it.
+/// does not answer and no allowed direct path serves in its place
+/// ([`SecretsOps::broker_unready`]): there is no other way to the LAN without an alert.
 const LAN_BROKER_WAIT: &str = "not looked for or reached yet, for the LAN broker: ";
 
 /// The row's words where the LAN broker does not answer, `why` its own ([`LAN_BROKER_WAIT`]).
@@ -3982,8 +3984,9 @@ pub(crate) mod tests {
         assert_eq!(ops.probes(), 0);
     }
 
-    /// Every LAN act of aterm's on a Mac goes through the root LAN broker, so without one no look
-    /// for the ALab vault runs, wherever the run is, and the row waits for the broker (deferred,
+    /// Every LAN act of aterm's on a Mac goes through the root LAN broker (or, before one is
+    /// installed, the allowed direct path, which no test has), so without either no look for the
+    /// ALab vault runs, wherever the run is, and the row waits for the broker (deferred,
     /// not failed). NEGATIVE CONTROL: with the `broker_unready` gate removed from `items_at`, the run
     /// looks (one probe) and the test fails; with the broker there, it looks and joins.
     #[test]

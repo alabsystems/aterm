@@ -536,7 +536,13 @@ fn dead_actions(transcript: &str) -> Vec<String> {
         .lines()
         .find_map(|l| l.find(MARKER).map(|i| &l[i + MARKER.len()..]))
         .map(|names| {
+            // `ty` (store build 14383 on) also quotes the list inside a sentence, as in
+            // `…: A, B. It is not reflected in this run's verdict or exit code.`; a TLA+
+            // action name holds no `.`, so the list ends at the first one.
             names
+                .split('.')
+                .next()
+                .unwrap_or_default()
                 .split(',')
                 .map(|n| n.trim().to_string())
                 .filter(|n| !n.is_empty())
@@ -959,6 +965,15 @@ mod tests {
                  action(s) (never fired): Slip\n"
             ),
             ["Slip"]
+        );
+        // ty store build 14383's first such line, on stdout before the note on stderr.
+        assert_eq!(
+            dead_actions(
+                "  SOUNDNESS_DEVIATION: a vacuity warning was suppressed by \
+                 --allow-vacuous=dead-action: 2 dead action(s) (never fired): Never, Never2. It \
+                 is not reflected in this run's verdict or exit code.\n"
+            ),
+            ["Never", "Never2"]
         );
         assert!(dead_actions("No errors found (exhaustive).\n").is_empty());
     }

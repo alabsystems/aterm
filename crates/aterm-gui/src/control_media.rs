@@ -2392,9 +2392,6 @@ pub(crate) fn invoke_refusal(name: &str) -> Option<String> {
             crate::menu::MenuAction::RecordUnseenKeys => {
                 "View \u{25b8} Record Keys Not Echoed\u{2026}, then aterm's alert"
             }
-            crate::menu::MenuAction::ChangeNickname => {
-                "the machine menu \u{25b8} Change Nickname\u{2026}; from a shell, `aterm name nick`"
-            }
             crate::menu::MenuAction::RenameMachine => {
                 "the machine menu \u{25b8} Rename This Mac\u{2026}; from a shell, `aterm name set`"
             }
@@ -3922,14 +3919,17 @@ impl crate::App {
         worker: WorkerStart,
     ) -> Result<crate::task_launch::Launch, String> {
         #[cfg(unix)]
-        let account_scope = if crate::task_launch::native_google_agent(worker.order.agent) {
-            Some(
+        let account_scope = match worker.order.agent {
+            aterm_phase::Program::Agy | aterm_phase::Program::Codex => Some(
                 self.account_work
                     .enter()
                     .ok_or("account preparation is paused for shutdown or update")?,
-            )
-        } else {
-            None
+            ),
+            aterm_phase::Program::Claude
+            | aterm_phase::Program::Grok
+            | aterm_phase::Program::Kimi
+            | aterm_phase::Program::Muse
+            | aterm_phase::Program::Generic => None,
         };
         #[cfg(not(unix))]
         let account_scope = None;
@@ -3990,6 +3990,8 @@ impl crate::App {
             approve: self.harness_policy.get().policy.approve,
             program: worker.order.program,
             account_scope,
+            #[cfg(unix)]
+            source_registry: crate::control::source_registry(),
         })
     }
 

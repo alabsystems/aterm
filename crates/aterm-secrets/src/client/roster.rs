@@ -6,10 +6,9 @@
 
 use super::*;
 use crate::membership_log::Log;
-use crate::swarm_roster::{
-    Newcomer, POLICY_ENTRY, ROSTER_ENTRY, SeedAdmission, SheetHints, SwarmPolicy, SwarmRoster,
-    assign_newcomer, leading_m_label, seed_roster,
-};
+use crate::swarm_roster::{ROSTER_ENTRY, SwarmRoster, leading_m_label};
+#[cfg(any(test, debug_assertions))]
+use crate::swarm_roster::{SeedAdmission, SheetHints, SwarmPolicy, seed_roster};
 
 /// Read the verified `aterm-swarm-roster` from the locally applied vault copy, if present.
 ///
@@ -82,6 +81,24 @@ fn base_swarm_roster_for(
         }
     }
     Ok(None)
+}
+
+/// The authenticated historical label table, without synthetic log members. Registration
+/// migrates only this stored snapshot; a log display hint must never become an owner label.
+///
+/// # Errors
+/// The applied vault is unreadable, malformed, or held by a writer.
+pub fn historical_swarm_roster(paths: &Paths) -> crate::Result<Option<SwarmRoster>> {
+    with_roster_observation(paths, |observation| match observation {
+        RosterObservation::Held(lock) => base_swarm_roster_for(&Reads::new(paths), lock),
+        RosterObservation::Standalone => Ok(None),
+    })?
+    .ok_or_else(|| {
+        Error::of_kind(
+            crate::ErrorKind::VaultBusy,
+            "historical roster migration waits for the vault writer",
+        )
+    })
 }
 
 /// Whether `state` applied no version of `expected` and the vault file is absent: the log alone
@@ -1297,6 +1314,7 @@ fn vault_recorded_name(
 /// # Errors
 /// This Mac is not an admin of a configured vault, an existing policy/roster is malformed, or the
 /// publication fails.
+#[cfg(any(test, debug_assertions))]
 pub fn admin_seed_swarm_roster(
     paths: &Paths,
     bonjour_hosts: &[String],
@@ -1315,6 +1333,7 @@ pub fn admin_seed_swarm_roster(
     Ok(roster)
 }
 
+#[cfg(any(test, debug_assertions))]
 fn admissions_map(admin: &Admin, doc: &Document) -> BTreeMap<String, SeedAdmission> {
     let mut map = BTreeMap::new();
     for machine in doc.machines() {
@@ -1333,6 +1352,7 @@ fn admissions_map(admin: &Admin, doc: &Document) -> BTreeMap<String, SeedAdmissi
     map
 }
 
+#[cfg(any(test, debug_assertions))]
 fn build_seeded_roster(
     admin: &Admin,
     doc: &Document,
@@ -1352,31 +1372,8 @@ fn build_seeded_roster(
     Ok(roster)
 }
 
-fn swarm_roster_enabled(admin: &Admin, doc: &Document) -> bool {
-    alab_vault(&admin.config)
-        || doc.entry(&Audience::Everyone, ROSTER_ENTRY).is_some()
-        || doc.entries().iter().any(|entry| entry.name == POLICY_ENTRY)
-}
-
-pub(super) fn load_or_seed_swarm_roster_with_log(
-    admin: &Admin,
-    doc: &Document,
-    log: &(BTreeMap<String, String>, Vec<String>),
-) -> crate::Result<SwarmRoster> {
-    if let Some(existing) = SwarmRoster::from_document(doc)? {
-        return Ok(existing);
-    }
-    let policy = SwarmPolicy::from_document(doc)?.unwrap_or_default();
-    let sheet = SheetHints::from_document(doc);
-    let admissions = admissions_map(admin, &admin.published_doc);
-    Ok(seed_roster(
-        &admin.published_doc,
-        &admissions,
-        &policy,
-        &sheet,
-        &log.1,
-        &log.0,
-    ))
+pub(super) fn historical_roster(doc: &Document) -> crate::Result<SwarmRoster> {
+    Ok(SwarmRoster::from_document(doc)?.unwrap_or_default())
 }
 
 /// The labels the membership log at `paths` holds (F15: the allowing member assigns `m<N>` in
@@ -1437,104 +1434,35 @@ pub(super) fn log_labels(paths: &Paths) -> crate::Result<(BTreeMap<String, Strin
     Ok((by_recipient, all))
 }
 
-/// Update `aterm-swarm-roster` in `doc` when the approver admits `newly_approved`
-/// (`(recipient, requested_host, vault_name)`), as C11 under F15 has it: the allowing member
-/// assigned the `m<N>` in its `Admit`, so the roster follows the membership log (`log`, from
-/// [`log_labels`]).
-///
-/// - A Mac the log labels with a bare `m<N>` takes that label as given, the sheet's 24-hour hold
-///   included (the person's Allow settled it), unless another live row holds it (one of a Mac
-///   the vault still names, which the deny-lists do not name), the deny-list names it, or the
-///   policy reserves it; then it gets the roster's own label.
-/// - A Mac the log does not label (F10's fallback, a reinstalled Mac, a code approval) never
-///   takes an `m<N>` the log holds for another Mac: asking under one, it gets the next free one,
-///   which counts the log's labels.
-/// - A Mac whose log label carries a split's suffix (`m40-3fa2`) gets the next free one: the
-///   roster holds bare `m<N>` labels only.
-///
-/// No-op on personal vaults that carry neither `aterm-swarm-roster` nor `aterm-swarm-policy`.
+/// Keep only existing historical denial evidence aligned with envelope renames.
+/// Registry registration owns labels; an approval never creates a roster label row.
 pub(super) fn maintain_swarm_roster_on_approve(
-    admin: &Admin,
     doc: &mut Document,
     newly_approved: &[(String, String, String)],
-    log: &(BTreeMap<String, String>, Vec<String>),
-    now_ms: u64,
 ) -> crate::Result<()> {
-    if newly_approved.is_empty() || !swarm_roster_enabled(admin, doc) {
+    let Some(mut roster) = SwarmRoster::from_document(doc)? else {
         return Ok(());
-    }
-    let policy = SwarmPolicy::from_document(doc)?.unwrap_or_default();
-    let sheet = SheetHints::from_document(doc);
-    let mut roster = load_or_seed_swarm_roster_with_log(admin, doc, log)?;
-    let (log_by_recipient, log_held) = log;
-    let log_numbers: BTreeSet<String> = log_held
-        .iter()
-        .filter_map(|label| leading_m_label(label).map(|(_, canonical)| canonical))
-        .collect();
-    let held_by_log =
-        |host: &str| leading_m_label(host).is_some_and(|(_, label)| log_numbers.contains(&label));
-    // The Macs the vault still names: a row of one it removed holds no label, as in
-    // [`assign_newcomer`].
-    let active: BTreeSet<String> = doc.machines().into_iter().map(|m| m.recipient).collect();
-    for (recipient, requested_host, vault_name) in newly_approved {
-        let fresh = !roster.members.iter().any(|row| &row.recipient == recipient);
-        let logged = log_by_recipient
-            .get(recipient)
-            .filter(|label| crate::membership_log::is_label(label));
-        let requested: &str = match (logged, log_by_recipient.get(recipient)) {
-            (Some(label), _) => label,
-            (None, Some(_)) => "",
-            (None, None) if held_by_log(requested_host) => "",
-            (None, None) => requested_host,
-        };
-        let assigned = assign_newcomer(
-            &mut roster,
-            doc,
-            &policy,
-            &sheet,
-            log_held,
-            Newcomer {
-                recipient,
-                requested_host: requested,
-                vault_name,
-                now_ms,
-            },
-        );
-        let Some(label) = logged.filter(|label| fresh && **label != assigned) else {
-            continue;
-        };
-        let held_elsewhere = roster.members.iter().any(|row| {
-            &row.recipient != recipient
-                && !roster.is_member_denied(row)
-                && active.contains(&row.recipient)
-                && (row.label == *label || row.aliases.contains(label))
-        });
-        if held_elsewhere
-            || roster.is_label_denied(label)
-            || policy
-                .effective_reserved(doc, Some(&roster))
-                .contains(label)
-        {
-            continue;
-        }
+    };
+    let mut changed = false;
+    for (recipient, _, vault_name) in newly_approved {
         if let Some(row) = roster
             .members
             .iter_mut()
-            .find(|row| &row.recipient == recipient)
+            .find(|row| row.recipient == *recipient)
+            && row.vault_name != *vault_name
         {
-            row.label.clone_from(label);
-            row.claimed_label = None;
-            row.claimed_at_ms = None;
-            row.normalize_aliases();
+            row.vault_name.clone_from(vault_name);
+            changed = true;
         }
-        roster.canonicalize();
     }
-    doc.set_entry(
-        &Audience::Everyone,
-        ROSTER_ENTRY,
-        roster.to_toml().as_bytes(),
-    )
-    .map_err(|e| Error::new(e.to_string()))?;
+    if changed {
+        doc.set_entry(
+            &Audience::Everyone,
+            ROSTER_ENTRY,
+            roster.to_toml().as_bytes(),
+        )
+        .map_err(|e| Error::new(e.to_string()))?;
+    }
     Ok(())
 }
 
@@ -1751,251 +1679,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// Seeding a vault's `aterm-swarm-roster` never materializes a file in `~/.secrets`,
-    /// `resolve_local_swarm_label` reads the member's assigned `m<N>` label (ignoring
-    /// `~/.aterm/machine.toml` `id = "m22"`), and approving a newcomer named `m3` or
-    /// `Mac-mini-M4` through `approve_request` assigns `next_free` rather than `m3` or `m4`.
-    #[test]
-    fn swarm_roster_stays_unmaterialized_and_approver_assigns_labels_end_to_end() {
-        // Every server it reads is its own on loopback, which answers.
-        let _answering = ServersAnswering::set();
-        let root = aterm_tempfile::tempdir().unwrap();
-        let server_dir = root.path().join("server");
-        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let running = crate::server::start(
-            socket,
-            &crate::server::Options {
-                listen: "127.0.0.1:0".parse().unwrap(),
-                store: server_dir,
-                advertise: None,
-                pins: Vec::new(),
-                hold: Duration::from_millis(200),
-                keep_awake: false,
-            },
-        )
-        .unwrap();
-        let url = format!("http://{}/v1/test", running.addr);
-
-        let admin_paths = Paths::for_home(&root.path().join("admin"));
-        let created = create(&admin_paths, &url, None, Some("m22")).unwrap();
-        let pinned_source = format!("{url}#{}", created.signer);
-
-        // Poison `~/.aterm/machine.toml` on the member to prove swarm identity never reads it!
-        let member_m4_home = root.path().join("member-m4");
-        std::fs::create_dir_all(member_m4_home.join(".aterm")).unwrap();
-        std::fs::write(member_m4_home.join(".aterm/machine.toml"), "id = \"m22\"\n").unwrap();
-
-        // Seed `aterm-swarm-roster` on the admin.
-        let seeded = admin_seed_swarm_roster(&admin_paths, &[]).unwrap();
-        assert_eq!(seeded.members.len(), 1);
-        assert_eq!(seeded.members[0].label, "m22");
-        assert!(
-            !admin_paths
-                .home
-                .join(".secrets")
-                .join(ROSTER_ENTRY)
-                .exists(),
-            "reserved entry must never materialize into ~/.secrets"
-        );
-
-        // Put `aterm-swarm-policy` and `fleet-accounts.toml` in the vault so `m110` is in the sheet.
-        {
-            let adm = admin_open(&admin_paths).unwrap();
-            let mut doc = adm.doc.clone();
-            let policy = SwarmPolicy {
-                network_id: Some("test-net".to_owned()),
-                reserved_labels: vec!["m3".to_owned(), "m22".to_owned()],
-                release_hosts: vec!["m3".to_owned(), "m22".to_owned()],
-                servers: Vec::new(),
-                stewards: Vec::new(),
-            };
-            let admins = doc.admins();
-            doc.set_entry(
-                &Audience::Hosts(admins),
-                POLICY_ENTRY,
-                policy.to_toml().as_bytes(),
-            )
-            .unwrap();
-            doc.set_entry(
-                &Audience::Everyone,
-                "fleet-accounts.toml",
-                br#"
-[[account]]
-label = "acct-1"
-machines = ["m110"]
-class = "max"
-email = "one@example.org"
-"#,
-            )
-            .unwrap();
-            doc.set_entry(
-                &Audience::Everyone,
-                crate::SWARM_LEASE_ENTRY,
-                b"holder = \"m22\"\nepoch = 1\n",
-            )
-            .unwrap();
-            doc.set_open(false).unwrap();
-            admin_publish(&admin_paths, &adm, &doc).unwrap();
-        }
-
-        // Join two newcomers by code: one named `mac-mini-m4` (from `Mac-mini-M4`) and one named `m3`.
-        let member_m4_paths = Paths::for_home(&member_m4_home);
-        let m4_id = machine_identity(&member_m4_paths).unwrap();
-        let m4_joined = join(
-            &member_m4_paths,
-            &JoinOptions {
-                source: pinned_source.clone(),
-                host: Some("mac-mini-m4".to_owned()),
-                interactive: false,
-                wait: Duration::ZERO,
-                confirm: &|_| false,
-                password: JoinPassword::Given(None),
-                fetched: None,
-                requested: &|| {},
-                say: &|_| {},
-            },
-        )
-        .unwrap();
-        assert!(matches!(m4_joined, JoinOutcome::Pending { .. }));
-        approve_request(&admin_paths, &m4_id.recipient().to_bech32()).unwrap();
-        sync(&member_m4_paths, None).unwrap();
-
-        let member_m3_paths = Paths::for_home(&root.path().join("member-m3"));
-        let m3_id = machine_identity(&member_m3_paths).unwrap();
-        let m3_joined = join(
-            &member_m3_paths,
-            &JoinOptions {
-                source: pinned_source,
-                host: Some("m3".to_owned()),
-                interactive: false,
-                wait: Duration::ZERO,
-                confirm: &|_| false,
-                password: JoinPassword::Given(None),
-                fetched: None,
-                requested: &|| {},
-                say: &|_| {},
-            },
-        )
-        .unwrap();
-        assert!(matches!(m3_joined, JoinOutcome::Pending { .. }));
-        approve_request(&admin_paths, &m3_id.recipient().to_bech32()).unwrap();
-        sync(&member_m3_paths, None).unwrap();
-
-        // Neither member has `aterm-swarm-roster` materialized as a file!
-        assert!(
-            !member_m4_paths
-                .home
-                .join(".secrets")
-                .join(ROSTER_ENTRY)
-                .exists()
-        );
-        assert!(
-            !member_m3_paths
-                .home
-                .join(".secrets")
-                .join(ROSTER_ENTRY)
-                .exists()
-        );
-
-        // `Mac-mini-M4` (`mac-mini-m4`) got m111 (above sheet's m110), NOT m4 and NOT `~/.aterm/machine.toml`'s m22!
-        let resolved_m4 =
-            resolve_local_swarm_label(&member_m4_paths, &["Mac-mini-M4".to_owned()]).unwrap();
-        assert_eq!(resolved_m4.as_deref(), Some("m111"));
-
-        // Newcomer named `m3` got m112, NOT reserved `m3`!
-        let resolved_m3 = resolve_local_swarm_label(&member_m3_paths, &["m3".to_owned()]).unwrap();
-        assert_eq!(resolved_m3.as_deref(), Some("m112"));
-        assert!(
-            !member_m4_paths
-                .home
-                .join(".secrets")
-                .join(crate::SWARM_LEASE_ENTRY)
-                .exists()
-        );
-        assert_eq!(
-            swarm_lease_holder(&member_m4_paths).unwrap().as_deref(),
-            Some("m22")
-        );
-        {
-            let lock = StateLock::take(&member_m4_paths).unwrap();
-            assert_eq!(
-                swarm_roster_until(&member_m4_paths, std::time::Instant::now())
-                    .unwrap_err()
-                    .kind(),
-                crate::ErrorKind::VaultBusy,
-            );
-            let under_lock = swarm_roster_held(&member_m4_paths, &lock)
-                .unwrap()
-                .expect("roster remains readable by same-thread StateLock holder");
-            assert!(
-                under_lock.member_by_label_or_alias("m111").is_some(),
-                "expected m111 in roster under StateLock, got {under_lock:?}"
-            );
-        }
-
-        // A Mac the log labels m110 takes it over a row that still says m110 when that row is
-        // of a Mac the vault removed, or one whose node is denied. Control: a live row of a Mac
-        // the vault names keeps m110, and the newcomer keeps the roster's own label.
-        let adm = admin_open(&admin_paths).unwrap();
-        for (case, named, denied, takes) in [
-            ("removed", false, false, true),
-            ("denied", true, true, true),
-            ("live", true, false, false),
-        ] {
-            let mut doc = adm.doc.clone();
-            let stale = Identity::generate().unwrap().recipient().to_bech32();
-            if named {
-                doc.add_machine(&format!("stale-{case}"), &stale).unwrap();
-            }
-            let mut roster = SwarmRoster::from_document(&doc).unwrap().unwrap();
-            roster.members.push(crate::swarm_roster::SwarmMember {
-                recipient: stale,
-                vault_name: format!("stale-{case}"),
-                label: "m110".to_owned(),
-                aliases: Vec::new(),
-                hint: None,
-                hw_hint: None,
-                admitted_ms: 1_000,
-                claimed_label: None,
-                claimed_at_ms: None,
-                node_id: Some("stale-node".to_owned()),
-                node_key: None,
-            });
-            if denied {
-                roster.deny_nodes.push("stale-node".to_owned());
-            }
-            doc.set_entry(
-                &Audience::Everyone,
-                ROSTER_ENTRY,
-                roster.to_toml().as_bytes(),
-            )
-            .unwrap();
-            let newcomer = Identity::generate().unwrap().recipient().to_bech32();
-            doc.add_machine(&format!("logged-{case}"), &newcomer)
-                .unwrap();
-            let log = (
-                BTreeMap::from([(newcomer.clone(), "m110".to_owned())]),
-                vec!["m110".to_owned()],
-            );
-            maintain_swarm_roster_on_approve(
-                &adm,
-                &mut doc,
-                &[(
-                    newcomer.clone(),
-                    "m110".to_owned(),
-                    format!("logged-{case}"),
-                )],
-                &log,
-                9_000,
-            )
-            .unwrap();
-            let after = SwarmRoster::from_document(&doc).unwrap().unwrap();
-            let label = &after.member_by_recipient(&newcomer).unwrap().label;
-            assert_eq!(label == "m110", takes, "{case}: {label}");
-        }
-        running.stop();
     }
 
     #[test]

@@ -76,8 +76,8 @@ pub fn cargo(
         .ok_or("oracle requires absolute stock Cargo/RUSTC (STOCK EXCEPTION for Windows std)")?;
     let target = target.to_str().ok_or("non-UTF8 target directory")?;
     let mut clean = words(&[
+        // Not `-q`: a quiet clean that cargo refuses exits 101 saying nothing.
         "clean",
-        "-q",
         "-p",
         "aterm-win32-under-test",
         "-p",

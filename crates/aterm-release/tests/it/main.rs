@@ -46,6 +46,9 @@ mod channel;
 #[path = "../../src/check_record.rs"]
 #[allow(dead_code)]
 mod check_record;
+#[path = "../../src/checkout_bin.rs"]
+#[allow(dead_code)]
+mod checkout_bin;
 #[path = "../../src/clean.rs"]
 #[allow(dead_code)]
 mod clean;

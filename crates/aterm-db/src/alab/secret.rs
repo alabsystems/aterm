@@ -82,10 +82,23 @@ impl Journal {
                 "local reveal journal is not a private regular file",
             ));
         }
-        let mut line = aterm_json::to_vec(&aterm_json::json!({
-            "table": cell.table, "collection": cell.collection, "row": cell.row,
-            "column": cell.column, "surface": surface.as_str(), "when_ms": when_ms,
-        }))
+        #[derive(serde::Serialize)]
+        struct RevealRecord<'a> {
+            collection: &'a str,
+            column: &'a str,
+            row: &'a str,
+            surface: &'static str,
+            table: &'a str,
+            when_ms: u64,
+        }
+        let mut line = aterm_json::to_vec(&RevealRecord {
+            collection: cell.collection,
+            column: cell.column,
+            row: cell.row,
+            surface: surface.as_str(),
+            table: cell.table,
+            when_ms,
+        })
         .map_err(|_| Error::new("cannot encode local reveal record"))?;
         line.push(b'\n');
         file.write_all(&line)

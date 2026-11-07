@@ -8,6 +8,10 @@
 use super::*;
 use serde::{Deserialize, Serialize};
 
+type NativePublicationResult =
+    Result<Option<super::super::codex_grant_owner::OwnerWitnessTransition>, String>;
+type NoNativePublication = for<'a> fn(ActualPublicationPermit<'a>) -> NativePublicationResult;
+
 const RECEIPT: &str = "sync-commit.json";
 const WITNESS: &str = "sync-commit.seen";
 const MAX_RECEIPT: u64 = 32 * 1024 * 1024;
@@ -475,6 +479,39 @@ impl Store {
         self.transact_roster_records_held(held, roster, now, note, edit, WakeRule::Events)
     }
 
+    /// Native publication adds an authenticated owner baseline only after the
+    /// real renewal generation is derived and before canonical images exist.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "only tests reach this native custody step until its production caller lands; drop this then"
+        )
+    )]
+    pub(in crate::harness) fn transact_roster_logins_native_within(
+        &self,
+        ladder: &[std::time::Duration],
+        roster: &Path,
+        now: i64,
+        note: &mut Option<String>,
+        edit: impl FnOnce(&Roster, &mut State, &mut Logins) -> Result<Vec<Event>, String>,
+        native_publication: impl FnOnce(ActualPublicationPermit<'_>) -> NativePublicationResult,
+    ) -> Result<Vec<Event>, String> {
+        let held = self
+            .acquire_within(ladder)
+            .map_err(|why| why.to_string())?
+            .ok_or_else(|| LOCK_HELD.to_owned())?;
+        self.transact_roster_records_native_held(
+            &held,
+            roster,
+            now,
+            note,
+            edit,
+            WakeRule::Always,
+            Some(native_publication),
+        )
+    }
+
     fn transact_roster_records_held(
         &self,
         held: &Lock,
@@ -484,13 +521,40 @@ impl Store {
         edit: impl FnOnce(&Roster, &mut State, &mut Logins) -> Result<Vec<Event>, String>,
         wake: WakeRule,
     ) -> Result<Vec<Event>, String> {
+        self.transact_roster_records_native_held(
+            held,
+            roster,
+            now,
+            note,
+            edit,
+            wake,
+            None::<NoNativePublication>,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "existing held transaction plus its optional native publication callback"
+    )]
+    fn transact_roster_records_native_held(
+        &self,
+        held: &Lock,
+        roster: &Path,
+        now: i64,
+        note: &mut Option<String>,
+        edit: impl FnOnce(&Roster, &mut State, &mut Logins) -> Result<Vec<Event>, String>,
+        wake: WakeRule,
+        native_publication: Option<
+            impl FnOnce(ActualPublicationPermit<'_>) -> NativePublicationResult,
+        >,
+    ) -> Result<Vec<Event>, String> {
         let (target, mode) = super::super::cli::roster_target(roster)?;
         self.recover_sync_held(held, &target)?;
         let text = read(&target, MAX_ROSTER_BYTES)?
             .ok_or_else(|| format!("{}: account roster is missing", roster.display()))?;
         let raw = Roster::parse_for(self.cli, &text)?;
         let cli = self.cli;
-        self.transact_images_held(
+        self.transact_images_native_held(
             held,
             now,
             note,
@@ -509,6 +573,7 @@ impl Store {
                 Ok(events)
             },
             || Ok(()),
+            native_publication,
         )
     }
 
@@ -887,6 +952,33 @@ impl Store {
         edit: impl FnOnce(&mut State, &mut Logins) -> Result<Vec<Event>, String>,
         auxiliary: impl FnOnce() -> Result<(), String>,
     ) -> Result<Vec<Event>, String> {
+        self.transact_images_native_held(
+            held,
+            now,
+            note,
+            publication,
+            edit,
+            auxiliary,
+            None::<NoNativePublication>,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "existing held transaction plus its optional native publication callback"
+    )]
+    fn transact_images_native_held(
+        &self,
+        held: &Lock,
+        now: i64,
+        note: &mut Option<String>,
+        publication: Publication<'_>,
+        edit: impl FnOnce(&mut State, &mut Logins) -> Result<Vec<Event>, String>,
+        auxiliary: impl FnOnce() -> Result<(), String>,
+        native_publication: Option<
+            impl FnOnce(ActualPublicationPermit<'_>) -> NativePublicationResult,
+        >,
+    ) -> Result<Vec<Event>, String> {
         let Publication { target, wake } = publication;
         let (mut state, state_note, machine_kept) = self.state_as_stored(now)?;
         let (mut logins, login_note) = self.logins_as_stored(now)?;
@@ -941,6 +1033,22 @@ impl Store {
             workflow_scope::finish(&before.1, raw_after.as_ref(), &mut logins, &mut events)?;
         let auth_changed = auth_changed || workflow_changed;
         advance_sign_in_receipts(&before.1, &mut logins, &state, &events)?;
+        if let Some(native_publication) = native_publication {
+            let derived = logins.clone();
+            if let Some(transition) =
+                native_publication(ActualPublicationPermit::new(&before.1, &derived))?
+            {
+                if !transition.is_fresh_activation() || transition.expected().is_some() {
+                    return Err("native publication requires fresh activation evidence".into());
+                }
+                logins.enrollment.cas_owner_witness(&transition)?;
+                logins.enrollment.commit(
+                    &derived.enrollment,
+                    &Default::default(),
+                    &logins.labels,
+                )?;
+            }
+        }
         let old_state = read(&self.state_file(), MAX_STATE_BYTES)?;
         let old_logins = read(&self.logins_file(), MAX_LOGINS_BYTES)?;
         let new_state = if state != before.0 || (!events.is_empty() && old_state.is_none()) {

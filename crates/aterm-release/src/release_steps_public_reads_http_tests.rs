@@ -157,7 +157,13 @@ fn public_http_reads_refuse_inherited_headers_without_changing_private_authentic
         let mut real = Real::new(&root, Some(&root), true, false).unwrap();
         real.prerequisites = Some(crate::managed_prerequisites::Tools::Simulated);
         let (stage, _) = real
-            .dry_run_command(&root.join("engine"), "c0ffee", &root.join("clone"), &reads)
+            .dry_run_command(
+                &root.join("engine"),
+                "c0ffee",
+                &root.join("clone"),
+                &reads,
+                &root.join("agh"),
+            )
             .unwrap();
         let reads: Vec<(String, std::ffi::OsString)> = stage
             .get_envs()
@@ -238,7 +244,13 @@ fn public_reads_override_inherited_git_parameters_and_preserve_private_authentic
     let mut real = Real::new(&root, Some(&root), true, false).unwrap();
     real.prerequisites = Some(crate::managed_prerequisites::Tools::Simulated);
     let (stage, _) = real
-        .dry_run_command(&root.join("engine"), "c0ffee", &root.join("clone"), &reads)
+        .dry_run_command(
+            &root.join("engine"),
+            "c0ffee",
+            &root.join("clone"),
+            &reads,
+            &root.join("agh"),
+        )
         .unwrap();
     let reads: Vec<(String, std::ffi::OsString)> = stage
         .get_envs()

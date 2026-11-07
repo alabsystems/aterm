@@ -8,7 +8,9 @@ description = "Native retained resource admission, execution and recovery"
 
 [target.'cfg(unix)'.dependencies]
 aterm-capacity = { workspace = true }
-trust-resource-controller = { workspace = true }
+# One dependency shape in dev and tests: the native-context fixtures use the client.
+# Selecting it here compiles the same library everywhere without activating any RPC caller.
+trust-resource-controller = { workspace = true, features = ["client"] }
 trust-resource-provenance = { workspace = true }
 aterm-ctl = { workspace = true }
 aterm-types = { workspace = true }
@@ -25,8 +27,12 @@ libc = { workspace = true }
 jobserver_utils = { workspace = true }
 
 [dev-dependencies]
-trust-resource-controller = { workspace = true, features = ["client"] }
 aterm-tempfile = { workspace = true }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "resource-member-native"
+path = "tests/member_native_main.rs"
+harness = false

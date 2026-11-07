@@ -28,7 +28,7 @@ path = "src/recovery_material/tests.rs"
 
 [package.metadata.aterm-origin]
 project = "Trust"
-commit = "44356f40b6136199962c70933fa77d5012c3a5eb"
+commit = "96d3e94809af7fe781f8d73eaedeb89a4836befa"
 path = "crates/trust-build-cpu"
 
 [workspace]

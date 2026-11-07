@@ -14,7 +14,23 @@
 # wgpu on Venus there drew 36 of the first 100 frames differently, readbacks
 # holding a neighbouring frame's bytes, so nothing repeatable could be
 # recorded. Every row was drawn by wgpu; a stated re-record names its rows and
-# its drawer here. src/frame_record_tests.rs compares these rows as a signal
+# its drawer here. Re-recorded: the aarch64 block's eight `heat/layered/…` and
+# `heat/present/…` rows, drawn by the first-party GL arm in the same guest on
+# 2026-10-30 (HR-ORACLE) once the bloom extract's glow ramp read its column a
+# quarter pixel up (`glow_column` in shaders/cell.glsl): wgpu's rows, equal to
+# the GL arm's before, read it a column short where llvmpipe's interpolant
+# lands a hair under a half-res texel's column edge, 141 to 209 texels past
+# their CPU twins. The x86_64 block's same eight rows were re-recorded from
+# the GL arm under the bias the same day: the only rows its run moved, each
+# 0 off its twin (the widest frame 2.1 codes). That arm was not run without
+# the bias, so whether wgpu's x86_64 rows were its bytes before is not
+# measured. Added 2026-10-30 (HR-ORACLE's review), frames wgpu never drew:
+# the aarch64 block's `heat/present/cropped-haze` and `rim/present/cropped`,
+# recorded from the first-party GL arm in the same guest, each 0 off its CPU
+# twin, and on 2026-11-06 the x86_64 block's same two rows, drawn by the GL
+# arm on the merge with main c78058e12d (46e20aca7e), each 0 off its twin;
+# that run drew the aarch64 rows again identically.
+# src/frame_record_tests.rs compares these rows as a signal
 # on the adapter they name (its `frame-record` lines are these rows, and
 # `frame-record: moved:` names a frame drawn otherwise); since
 # ORACLE-ADAPTER (2026-10-26) the verdict is each frame's CPU twin, decided
@@ -54,9 +70,9 @@ aarch64	llvmpipe (LLVM 20.1.2, 128 bits)	fx/readback/0	264x126	0b9cac968c484dcfd
 aarch64	llvmpipe (LLVM 20.1.2, 128 bits)	fx/readback/1	264x126	0b9cac968c484dcfdf73bec7483d8db948153bb0b750132f734ee5af7b0c52dd
 aarch64	llvmpipe (LLVM 20.1.2, 128 bits)	fx/readback/2	264x126	0b9cac968c484dcfdf73bec7483d8db948153bb0b750132f734ee5af7b0c52dd
 aarch64	llvmpipe (LLVM 20.1.2, 128 bits)	cursor_blend/readback/0	264x126	533e5967d3e53dd7d5a02158354fc9c5f854eb75f3e1d85aa47853dbe33bc2e0
-aarch64	llvmpipe (LLVM 20.1.2, 128 bits)	heat/layered/0	264x126	fa854940c28195b637d12e5b63e89e8a67a5fc7579c0eb8d786d56e152132288
-aarch64	llvmpipe (LLVM 20.1.2, 128 bits)	heat/layered/1	264x126	fa854940c28195b637d12e5b63e89e8a67a5fc7579c0eb8d786d56e152132288
-aarch64	llvmpipe (LLVM 20.1.2, 128 bits)	heat/layered/2	264x126	fa854940c28195b637d12e5b63e89e8a67a5fc7579c0eb8d786d56e152132288
+aarch64	llvmpipe (LLVM 20.1.2, 128 bits)	heat/layered/0	264x126	ffb1b0b4c62a09180fc8932805869e833505d33583759aeb803416f354534bb4
+aarch64	llvmpipe (LLVM 20.1.2, 128 bits)	heat/layered/1	264x126	ffb1b0b4c62a09180fc8932805869e833505d33583759aeb803416f354534bb4
+aarch64	llvmpipe (LLVM 20.1.2, 128 bits)	heat/layered/2	264x126	ffb1b0b4c62a09180fc8932805869e833505d33583759aeb803416f354534bb4
 aarch64	llvmpipe (LLVM 20.1.2, 128 bits)	heat/readback	264x126	0ac864d04ca6004e900cbba2564618feb00949f540bf6bafa023a212814b998b
 aarch64	llvmpipe (LLVM 20.1.2, 128 bits)	text_cursor/present/0	264x126	665de9e493ba8aa0e024cc6c91a6f4910f5cf627181e28a2b42eb6376a495f28
 aarch64	llvmpipe (LLVM 20.1.2, 128 bits)	text_cursor/present/1	264x126	0794d0aa4357b731643324c578badb32d0dcd900eaab9022f4b8e382cd4ea2a1
@@ -113,11 +129,13 @@ aarch64	llvmpipe (LLVM 20.1.2, 128 bits)	fx/present/1	264x126	ec536ec92cec45f4a4
 aarch64	llvmpipe (LLVM 20.1.2, 128 bits)	fx/present/2	264x126	ccff1fd4b0aa9fd69fded6b8264c6e33292a663a126bd01a76549ea13d4ae365
 aarch64	llvmpipe (LLVM 20.1.2, 128 bits)	fx/present/changed	264x126	894d1acbb221192e6255b76604cdb26d0ce2384316ad7238d14f0db184b409f7
 aarch64	llvmpipe (LLVM 20.1.2, 128 bits)	fx/present/cropped	275x72	39b88b63d4305dd36ff72b36849570da5dbde8998f66f63b61ede7a2fd262db2
-aarch64	llvmpipe (LLVM 20.1.2, 128 bits)	heat/present/0	264x126	2e41432cdf6e9d8007cb3a2c1b7dded4945401f8ccae1e8615d55682c4d625d2
-aarch64	llvmpipe (LLVM 20.1.2, 128 bits)	heat/present/1	264x126	0d68e9f38fa3ab1bd6be7303afe1a2a1ec82820e0e24b250303c5dae4bf80cc0
-aarch64	llvmpipe (LLVM 20.1.2, 128 bits)	heat/present/2	264x126	d537ce9f0e47e48354d992b78944585fc0dd81a3c629f930ea7f921e63c86af7
-aarch64	llvmpipe (LLVM 20.1.2, 128 bits)	heat/present/changed	264x126	3f1fe3902fdfac4ef5415cd48f3a69b6b4b0517bb0347a5aa4128dc24a6883d4
-aarch64	llvmpipe (LLVM 20.1.2, 128 bits)	heat/present/cropped	275x72	b5dc08e48fa037084678ae0a972c019d6d3be21889ec17db8c735c1bb2bc44c7
+aarch64	llvmpipe (LLVM 20.1.2, 128 bits)	heat/present/0	264x126	58d95bd6ac0fcc05c1e5d2bf48e429bd4514f97ab5d521eeb72c6386d3c8bf3f
+aarch64	llvmpipe (LLVM 20.1.2, 128 bits)	heat/present/1	264x126	f9fabd2c6c394738fe58ac01fefe798a72cb4515f7f218b148553399573a188a
+aarch64	llvmpipe (LLVM 20.1.2, 128 bits)	heat/present/2	264x126	3b02c8daad5faca84c18c25026e9335e4a82f109753ba1aaebae191de87e1569
+aarch64	llvmpipe (LLVM 20.1.2, 128 bits)	heat/present/changed	264x126	96d56c5deaed278092c9664155d0e2287ec7c9a64788d3ea6fa973c8499382a7
+aarch64	llvmpipe (LLVM 20.1.2, 128 bits)	heat/present/cropped	275x72	f0f1fb451d7bbf71b6d5bc9cc3f8e58b4cc66ab8da04107e273cde1c5c266c59
+aarch64	llvmpipe (LLVM 20.1.2, 128 bits)	heat/present/cropped-haze	275x72	04a2761fdb8cbf7467c3558871e180f03b7980f8e8bea2635abe4aed2194f5e1
+aarch64	llvmpipe (LLVM 20.1.2, 128 bits)	rim/present/cropped	891x709	7eae125cc9bdf707958d53edfc2425a4f3f520a956c52de642e09cc3af7e66e8
 aarch64	llvmpipe (LLVM 20.1.2, 128 bits)	window/opaque/readback	264x126	b1c2ac9dd2ac5061ab5f94dac5e8b27c868efa8b33e14bb6081a0a95f044a9c9
 aarch64	llvmpipe (LLVM 20.1.2, 128 bits)	window/translucent/readback	264x126	0907d2dd6148f95bffa750d5c0df0fb3c2fc832454ee1197321c6a332648d6cf
 aarch64	llvmpipe (LLVM 20.1.2, 128 bits)	video/take/0	264x126	665de9e493ba8aa0e024cc6c91a6f4910f5cf627181e28a2b42eb6376a495f28
@@ -157,9 +175,9 @@ x86_64	llvmpipe (LLVM 20.1.2, 256 bits)	fx/readback/0	264x126	9b3b320e8db2444748
 x86_64	llvmpipe (LLVM 20.1.2, 256 bits)	fx/readback/1	264x126	9b3b320e8db244474893d900a1d42a3821490d41755b620a785c814a7cb21cd5
 x86_64	llvmpipe (LLVM 20.1.2, 256 bits)	fx/readback/2	264x126	9b3b320e8db244474893d900a1d42a3821490d41755b620a785c814a7cb21cd5
 x86_64	llvmpipe (LLVM 20.1.2, 256 bits)	cursor_blend/readback/0	264x126	260451d32777afe23e15a5cd301aca4701a659ca1e6f83cb5eefdfa88f5b7b0a
-x86_64	llvmpipe (LLVM 20.1.2, 256 bits)	heat/layered/0	264x126	9d6497a0ae3601440e6c655710c3e6aad012d0eef7ae39b9df4b7f833108e3b1
-x86_64	llvmpipe (LLVM 20.1.2, 256 bits)	heat/layered/1	264x126	9d6497a0ae3601440e6c655710c3e6aad012d0eef7ae39b9df4b7f833108e3b1
-x86_64	llvmpipe (LLVM 20.1.2, 256 bits)	heat/layered/2	264x126	9d6497a0ae3601440e6c655710c3e6aad012d0eef7ae39b9df4b7f833108e3b1
+x86_64	llvmpipe (LLVM 20.1.2, 256 bits)	heat/layered/0	264x126	b7912c906c1275e1ea40a25688375ffe1b883b67bd179e029850d6bc5f93e887
+x86_64	llvmpipe (LLVM 20.1.2, 256 bits)	heat/layered/1	264x126	b7912c906c1275e1ea40a25688375ffe1b883b67bd179e029850d6bc5f93e887
+x86_64	llvmpipe (LLVM 20.1.2, 256 bits)	heat/layered/2	264x126	b7912c906c1275e1ea40a25688375ffe1b883b67bd179e029850d6bc5f93e887
 x86_64	llvmpipe (LLVM 20.1.2, 256 bits)	heat/readback	264x126	b31290692e12b011a08e88c81f8ed80572246c3eedec60bf14a46ea3ca58f2d2
 x86_64	llvmpipe (LLVM 20.1.2, 256 bits)	text_cursor/present/0	264x126	545fabf80c1e625235183dcfb1587bf947885bad75dfb7e6f2f86cad609e48d7
 x86_64	llvmpipe (LLVM 20.1.2, 256 bits)	text_cursor/present/1	264x126	8f09bf1491f69850bdd44ab6dccfb6906174e22f56d3b8a899ed2cfe8bf0bb81
@@ -216,11 +234,13 @@ x86_64	llvmpipe (LLVM 20.1.2, 256 bits)	fx/present/1	264x126	4872003a82ae8ad6cc1
 x86_64	llvmpipe (LLVM 20.1.2, 256 bits)	fx/present/2	264x126	58b85804e41d5f316649f956dc7a216035533d8adfd018d4ccfb52ee63624c29
 x86_64	llvmpipe (LLVM 20.1.2, 256 bits)	fx/present/changed	264x126	13cb53374cfebd110e6b10de4dbb5aa03123b27f8f2078e942cf9aa42c0cb328
 x86_64	llvmpipe (LLVM 20.1.2, 256 bits)	fx/present/cropped	275x72	043fc426c9583b53d29038e6d49ddcc70a74364eebf7cd44b9a4de5cf9e41d75
-x86_64	llvmpipe (LLVM 20.1.2, 256 bits)	heat/present/0	264x126	c62b8e5d8727bb02f6ce100b4ca3ef28662eeb411b0f01ffd1b0ffbe9c6de432
-x86_64	llvmpipe (LLVM 20.1.2, 256 bits)	heat/present/1	264x126	76e592d33da2986b527d976c35a787953144399af86880aef369cea18141159b
-x86_64	llvmpipe (LLVM 20.1.2, 256 bits)	heat/present/2	264x126	95ea05f870d5bb9b22904bab3e70bbf4053b4c248571861ab4d85f7569628c1f
-x86_64	llvmpipe (LLVM 20.1.2, 256 bits)	heat/present/changed	264x126	a6ec73aab8a76ccc4775cb5f0beb3a66da71fdf967fd6c00e8c01e803c635914
-x86_64	llvmpipe (LLVM 20.1.2, 256 bits)	heat/present/cropped	275x72	a7a220b16eaf68fe4ee79c215f1a7179c6d3086cca76fb5ec425b3512aa03c1b
+x86_64	llvmpipe (LLVM 20.1.2, 256 bits)	heat/present/0	264x126	cccbf41d90f404f789e9dd25d9c2e7d0ba4c087632a6d092cc7d6035a0a065b0
+x86_64	llvmpipe (LLVM 20.1.2, 256 bits)	heat/present/1	264x126	619ab6341dfab1cc370fee83c0b4b992508036210c86a26f9641e641a9b68d64
+x86_64	llvmpipe (LLVM 20.1.2, 256 bits)	heat/present/2	264x126	8c3df6f111d1aef10fdface685c698142df20569cf16b56c5f0aa57d065ab4da
+x86_64	llvmpipe (LLVM 20.1.2, 256 bits)	heat/present/changed	264x126	488c7493c4796e22f772e91e06f9e7e44cdd07a6272cad44c6e63371a9d40129
+x86_64	llvmpipe (LLVM 20.1.2, 256 bits)	heat/present/cropped	275x72	76486b78f2bdc1df8f7ebecf6f9b3ec6e41492cbd459ab0f4a4df1a95a13165b
+x86_64	llvmpipe (LLVM 20.1.2, 256 bits)	heat/present/cropped-haze	275x72	7450557d72bfee60bdb481471b0efd324c28eac0fa982c3a65d8df327d515807
+x86_64	llvmpipe (LLVM 20.1.2, 256 bits)	rim/present/cropped	891x709	10712782fbef01b5d2c2fa79ed4e6f09a7a903ac4cbac7ade6de33e16fb5ef61
 x86_64	llvmpipe (LLVM 20.1.2, 256 bits)	window/opaque/readback	264x126	7665e81597cf06ebd3b61ae4a0703c82a176316e66d7388b5089c772154e3ad1
 x86_64	llvmpipe (LLVM 20.1.2, 256 bits)	window/translucent/readback	264x126	f09c4cd38dcbc06ae0d33753cf4e52ddf498d069f5bf88ddc27cca52a2836748
 x86_64	llvmpipe (LLVM 20.1.2, 256 bits)	video/take/0	264x126	545fabf80c1e625235183dcfb1587bf947885bad75dfb7e6f2f86cad609e48d7

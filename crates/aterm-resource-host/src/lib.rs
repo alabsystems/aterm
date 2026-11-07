@@ -19,7 +19,19 @@ mod inspection;
 #[cfg(unix)]
 mod resource_context;
 #[cfg(unix)]
+mod resource_machine;
+#[cfg(unix)]
 mod resource_memory;
+#[cfg(unix)]
+mod resource_producer;
+#[cfg(unix)]
+mod resource_proxy;
+#[cfg(unix)]
+mod resource_proxy_backend;
+#[cfg(unix)]
+mod resource_proxy_intake;
+#[cfg(unix)]
+mod resource_telemetry;
 #[cfg(unix)]
 mod runtime;
 #[cfg(target_os = "macos")]
@@ -33,5 +45,19 @@ pub use client::{authorize, capabilities_at, inspect_at, submit};
 pub use enrollment::answer as answer_enrollment;
 #[cfg(unix)]
 pub use inspection::lookup as inspect_native;
+/// Dispatch private native roles before initializing the GUI or ordinary CLI.
 #[cfg(unix)]
-pub use runtime::entry;
+pub fn entry(args: &[std::ffi::OsString]) -> Option<std::process::ExitCode> {
+    if let Some(code) =
+        resource_proxy::entry(args, &mut resource_proxy_backend::NativeBackend::account())
+    {
+        return Some(code);
+    }
+    runtime::entry(args)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "resource_native_fixture.rs"]
+mod native_fixture;
+#[cfg(all(test, target_os = "macos"))]
+pub use native_fixture::entry as native_member_fixture;

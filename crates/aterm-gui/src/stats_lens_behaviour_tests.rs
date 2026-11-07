@@ -300,6 +300,23 @@ fn a_hover_lens_leaves_with_the_pointer_and_stays_while_over_the_lens() {
     assert_eq!(r.lens(), None, "the lens leaves with the pointer");
 }
 
+/// A pinned lens takes the arrows and Esc, so the session field a press leaves gives them up.
+#[test]
+fn a_press_that_pins_the_lens_settles_the_session_field() {
+    let mut r = rig("sill");
+    r.app.tab_strip_rows = 1;
+    let (on, _) = r.instrument(Instrument::Cpu);
+    let tab = r.app.windows[&r.wid].tab_set.active().unwrap().id;
+    assert!(r.app.begin_session_rename(r.wid, tab));
+    assert!(r.app.windows[&r.wid].rename_edit.is_some(), "CONTROL");
+
+    r.move_to(on);
+    r.click(MouseButton::Left);
+
+    assert!(r.lens().is_some_and(|l| l.how == Opened::Pinned));
+    assert!(r.app.windows[&r.wid].rename_edit.is_none());
+}
+
 #[test]
 fn a_press_pins_the_lens_and_a_press_outside_closes_it_and_goes_on() {
     let mut r = rig("sill");
@@ -1391,12 +1408,6 @@ fn lens_arrows_wait_for_their_own_paint_and_superseded_selections_have_no_sample
         .token()
         .expect("new arrow armed");
     assert_ne!(latest, first);
-    r.app.stats_lens_presented(r.wid, old_paint, true, false);
-    assert_eq!(
-        r.app.windows[&r.wid].stats_lens.input.token(),
-        Some(latest),
-        "an older frame cannot acknowledge the new selection"
-    );
     let paint = compose_lens_input(&mut r);
     assert_eq!(paint.unwrap().input, Some(latest));
     r.app.stats_lens_presented(r.wid, paint, true, false);

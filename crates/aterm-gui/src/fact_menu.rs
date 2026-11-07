@@ -1724,6 +1724,7 @@ impl App {
         anchor: (usize, usize),
         keyboard: bool,
     ) {
+        self.settle_rename_edit(wid);
         self.close_autopilot_menu();
         self.autopilot_menu_spent = None;
         if fact == Fact::Account {

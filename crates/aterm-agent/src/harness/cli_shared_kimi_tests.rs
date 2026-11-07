@@ -304,6 +304,7 @@ fn kimi_adapter_uses_intrinsic_device_route_and_requires_explicit_region() {
     };
     let store = accounts::Store::at_for(&env.state, Cli::Kimi, temp.path());
     let context = Context {
+        publication: None,
         admission: None,
         env: &env,
         store: &store,

@@ -302,6 +302,8 @@ impl App {
     pub(crate) fn pool_insert(&mut self, session: crate::Session) -> u64 {
         let sid = self.pool.insert(session);
         self.recover_developer_tools_install(sid);
+        #[cfg(all(target_os = "macos", debug_assertions))]
+        self.seed_lab_installer_custody();
         self.install_session_colors(sid);
         sid
     }

@@ -704,9 +704,18 @@ struct AdmissionInputs<'a> {
     lane: HandoffLaneFacts,
 }
 
+/// Successor arguments with any consumed lab custody offer replaced by its held descriptions.
+#[cfg(unix)]
+fn running_successor_args(lifeline: Option<i32>) -> Vec<std::ffi::OsString> {
+    let args = aterm_update::running_window_successor_args(std::env::args_os().skip(1), lifeline);
+    #[cfg(any(debug_assertions, feature = "dev-seams"))]
+    let args = crate::lab_window_custody::successor_args(args);
+    args
+}
+
+#[cfg(unix)]
 /// The successor command an overlap handoff starts: this executable with this process's
 /// arguments, told what it updates from, and bound to the authorized artifact.
-#[cfg(unix)]
 fn launched_successor_command(
     exe: &std::path::Path,
     build: u64,
@@ -720,10 +729,7 @@ fn launched_successor_command(
     let mut command = std::process::Command::new(exe);
     crate::control_socket_identity::bind_command(&mut command);
     command
-        .args(aterm_update::running_window_successor_args(
-            std::env::args_os().skip(1),
-            None,
-        ))
+        .args(running_successor_args(None))
         .env("ATERM_UPDATED_FROM", build.to_string())
         .env(aterm_update::RELAUNCH_OF_RUNNING_ENV, "1");
     #[cfg(target_os = "macos")]
@@ -2466,6 +2472,8 @@ fn run_handoff_worker(
         .collect::<Vec<_>>();
     child_inherit.push(proof_wr.as_raw_fd());
     child_inherit.push(commit_rd.as_raw_fd());
+    #[cfg(any(debug_assertions, feature = "dev-seams"))]
+    child_inherit.extend(crate::lab_window_custody::descriptors());
     let handed = child_inherit.clone();
     let strip = aterm_uds::spawnfd::InheritStrip::prepare();
     // SAFETY: pre-exec closure calls only async-signal-safe functions (`setpgid`, `fcntl`, `InheritStrip::apply`) on captured integers.
@@ -5141,10 +5149,7 @@ impl App {
                 )]
                 let mut command = std::process::Command::new(&exe);
                 command
-                    .args(aterm_update::running_window_successor_args(
-                        std::env::args_os().skip(1),
-                        lifeline_fd,
-                    ))
+                    .args(running_successor_args(lifeline_fd))
                     .env("ATERM_UPDATED_FROM", build.to_string())
                     .env(aterm_update::RELAUNCH_OF_RUNNING_ENV, "1");
                 let bound = apply_attempt
@@ -5185,6 +5190,11 @@ impl App {
                 self.prepare_cold_exec(build, same_image.is_some(), mode.is_automatic());
                 let error = self.run_cold_exec(|| {
                     let _lifeline = cold_exec_hand_over();
+                    #[cfg(any(debug_assertions, feature = "dev-seams"))]
+                    let _lab = match crate::lab_window_custody::inherit_for_exec() {
+                        Ok(held) => held,
+                        Err(error) => return error,
+                    };
                     let _older_image =
                         crate::descriptor_limit::lower_for_older_image(target_build, build);
                     aterm_update::exec_keeping_sigpipe(&mut command)
@@ -5361,6 +5371,12 @@ impl App {
 
         #[cfg(target_os = "macos")]
         if lane == HandoffLane::OutOfBand {
+            #[cfg(any(debug_assertions, feature = "dev-seams"))]
+            if crate::lab_window_custody::present() {
+                return Err(crate::UpdateHandoffStartError::refused(
+                    "a guarded lab window requires descriptor inheritance for its successor",
+                ));
+            }
             return self.prelaunch_out_of_band_handoff(PrelaunchArgs {
                 attempt_id,
                 build,

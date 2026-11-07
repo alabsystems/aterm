@@ -115,6 +115,12 @@ pub(crate) fn answer_keys(prompt: &ConfirmPrompt) -> String {
     format!("Enter {verb} \u{00b7} Esc cancels")
 }
 
+/// The accessible alert's description: what the answer ends, then the keys.
+#[cfg(a11y_tree)]
+pub(crate) fn announcement_detail(prompt: &ConfirmPrompt) -> String {
+    format!("{} {}", prompt.body, answer_keys(prompt))
+}
+
 /// [`answer_keys`] for a window too narrow to carry the verbs beside the question.
 const ANSWER_KEYS_SHORT: &str = "Enter \u{00b7} Esc";
 

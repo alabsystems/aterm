@@ -235,12 +235,12 @@ impl LabView {
             .into_iter()
             .filter(|(_, row)| row.live())
             .filter_map(|(_, row)| {
-                let machine = text(&row, "machine")?;
-                let account = text(&row, "account")?;
-                (machines.get(&machine).is_some_and(|m| m.live) && accounts.contains_key(&account))
+                let machine = row.get("machine").and_then(Value::as_str)?;
+                let account = row.get("account").and_then(Value::as_str)?;
+                (machines.get(machine).is_some_and(|m| m.live) && accounts.contains_key(account))
                     .then(|| Preference {
-                        machine,
-                        account,
+                        machine: machine.to_owned(),
+                        account: account.to_owned(),
                         rank: row.get("rank").and_then(Value::as_u64),
                     })
             })
@@ -442,8 +442,8 @@ impl LabView {
             .iter()
             .filter(|(_, row)| row.live())
             .filter_map(|(pk, row)| {
-                let addr = text(row, "addr")?;
-                (self.address_index.row(&addr) == Some(pk.as_str())).then_some(())?;
+                let addr = row.get("addr").and_then(Value::as_str)?;
+                (self.address_index.row(addr) == Some(pk.as_str())).then_some(())?;
                 let found = mail::effective(
                     &self.addresses,
                     &self.address_index,
@@ -473,10 +473,12 @@ impl LabView {
             .rows
             .iter()
             .filter(|(_, row)| row.live() && row.get("alias_of").is_some())
-            .filter_map(|(pk, row)| Some((pk, text(row, "addr")?)))
+            .filter_map(|(pk, row)| Some((pk, row.get("addr").and_then(Value::as_str)?)))
             .filter(|(pk, addr)| self.address_index.row(addr) == Some(pk.as_str()))
-            .map(|(pk, addr)| (addr.to_ascii_lowercase(), self.alias_targets_of(pk)))
-            .filter(|(_, targets)| !targets.is_empty())
+            .filter_map(|(pk, addr)| {
+                let targets = self.alias_targets_of(pk);
+                (!targets.is_empty()).then(|| (addr.to_ascii_lowercase(), targets))
+            })
             .collect()
     }
 

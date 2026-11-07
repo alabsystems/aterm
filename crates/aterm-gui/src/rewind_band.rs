@@ -271,19 +271,26 @@ impl App {
 }
 
 impl App {
-    /// The focused pane's open Rewind view for window `wid`'s accessibility tree, as a slider over its instants.
+    /// What session `session`'s Rewind band says in window `wid`, while a past screen is shown.
     #[cfg(a11y_tree)]
-    pub(crate) fn rewind_a11y(&self, wid: WindowId) -> Option<crate::a11y_tree::GridRewind> {
-        let session = self.rewound_front(wid)?;
+    pub(crate) fn rewind_words(&self, wid: WindowId, session: u64) -> Option<String> {
         let view = self.pool.rewind(session).filter(|v| v.shown.is_some())?;
         let s = self.pool.get(session)?;
-        let words = crate::rewind::band_text(
+        Some(crate::rewind::band_text(
             view,
             crate::harness_screen::unix_ms_now(),
             self.rewind_offset_s(view.shown_unix_ms),
             s.ctx.job_feed.bytes(),
             self.rewind_effects_status(wid),
-        );
+        ))
+    }
+
+    /// The focused pane's open Rewind view for window `wid`'s accessibility tree, as a slider over its instants.
+    #[cfg(a11y_tree)]
+    pub(crate) fn rewind_a11y(&self, wid: WindowId) -> Option<crate::a11y_tree::GridRewind> {
+        let session = self.rewound_front(wid)?;
+        let view = self.pool.rewind(session).filter(|v| v.shown.is_some())?;
+        let words = self.rewind_words(wid, session)?;
         let pane = self
             .rewound_panes(wid)
             .into_iter()

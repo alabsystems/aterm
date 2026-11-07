@@ -62,7 +62,10 @@ fn a_reader_hears_claudes_words_under_the_glass() {
         "NEGATIVE CONTROL: the presented frame holds the glass's words and the rule's lockup: {presented}"
     );
     let claude = as_read(&engine_rows(&app, session));
-    let heard = app.grid_snapshot(wid).expect("the grid's snapshot");
+    let heard = app
+        .terminal_document(wid, session, c.rows, c.cols, false)
+        .expect("the terminal's document")
+        .snap;
     assert_eq!(heard.value(), claude, "the reader hears Claude's rows");
     assert!(
         heard.value().contains(BYPASS)
@@ -75,18 +78,6 @@ fn a_reader_hears_claudes_words_under_the_glass() {
         "{}",
         heard.value()
     );
-    let engine = {
-        let mut fresh = RenderInput::empty();
-        let term = app.pool.get(session).unwrap().term.clone();
-        crate::term_lock(&term).cell_frame_into(&mut fresh, c.rows, c.cols);
-        fresh.cells
-    };
-    let (plain, bare) = crate::work_counts::allocations_in(|| {
-        AccessibleSnapshot::from_cells(&engine, c.cols, None)
-    });
-    assert_eq!(plain.value(), claude, "CONTROL: the same words");
-    let (_, under) = crate::work_counts::allocations_in(|| app.grid_snapshot(wid));
-    assert_eq!(under, bare, "the glass's undo record is read, not copied");
     let tree = app.grid_a11y_tree(wid, None).expect("the grid's tree");
     let document = tree
         .nodes

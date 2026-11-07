@@ -6089,6 +6089,69 @@ impl App {
         true
     }
 
+    /// Window `wid`'s open tab menu for its accessibility tree, where the last frame laid it out.
+    #[cfg(a11y_tree)]
+    pub(crate) fn tab_grid_menu(&self, wid: WindowId) -> Option<crate::a11y_tree::GridMenu> {
+        use std::hash::{Hash, Hasher};
+        let ws = self.windows.get(&wid)?;
+        let menu = ws.tab_menu.as_ref()?;
+        let rect = ws.tab_menu_rect?;
+        let top = rect.row.checked_sub(usize::from(self.chrome_rows(wid)))?;
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        menu.tab.hash(&mut hash);
+        let mut items = Vec::new();
+        let mut selected = None;
+        for (i, entry) in crate::tab_menu::reader_rows(&menu.entries, rect) {
+            let label = crate::tab_menu::entry_text(entry).to_owned();
+            label.hash(&mut hash);
+            if menu.highlight == Some(i) {
+                selected = Some(items.len());
+            }
+            items.push(crate::a11y_tree::GridMenuItem {
+                label,
+                checked: None,
+                disabled: !crate::tab_menu::is_selectable(entry),
+                row: top + 1 + i,
+            });
+        }
+        Some(crate::a11y_tree::GridMenu {
+            label: "Tab menu".to_owned(),
+            epoch: crate::a11y_tree::menu_epoch_from(hash.finish()),
+            items,
+            selected,
+            row: top,
+            col: rect.col,
+            width: rect.w,
+            height: rect.h,
+        })
+    }
+
+    /// Activate `item` from a screen reader if `epoch` matches the painted tab menu.
+    #[cfg(a11y_tree)]
+    pub(crate) fn choose_tab_menu_item_for_reader(
+        &mut self,
+        wid: WindowId,
+        epoch: u32,
+        item: usize,
+    ) {
+        if self
+            .tab_grid_menu(wid)
+            .is_none_or(|menu| menu.epoch != epoch)
+        {
+            return;
+        }
+        let entry = self.windows.get(&wid).and_then(|ws| {
+            let (menu, rect) = (ws.tab_menu.as_ref()?, ws.tab_menu_rect?);
+            crate::tab_menu::reader_rows(&menu.entries, rect)
+                .nth(item)
+                .filter(|(_, entry)| crate::tab_menu::is_selectable(entry))
+                .map(|(i, _)| i)
+        });
+        if let Some(i) = entry {
+            self.activate_tab_menu_entry(wid, i);
+        }
+    }
+
     /// Activate entry `i` of the open menu on `wid` and dismiss the card.
     pub(crate) fn activate_tab_menu_entry(&mut self, wid: WindowId, i: usize) {
         let session_action = self.windows.get(&wid).and_then(|ws| {

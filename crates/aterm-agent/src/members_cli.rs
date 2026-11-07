@@ -601,8 +601,8 @@ fn allowed_line(fix: Option<&str>) -> String {
 
 /// The two sources an automatic join can try without waiting for every member to be named.
 trait MemberDiscovery: Sync {
-    fn direct(&self, _within: Duration) -> aterm_secrets::Result<Vec<String>> {
-        Ok(Vec::new())
+    fn begin(&self, _within: Duration) -> aterm_secrets::Result<NumericMembers> {
+        Ok(Vec::new().into())
     }
     fn more(&self, within: Duration) -> aterm_secrets::Result<Vec<String>>;
 }
@@ -616,13 +616,10 @@ impl<F: Fn() -> aterm_secrets::Result<Vec<String>> + Sync> MemberDiscovery for F
 struct NativeMembers;
 
 impl MemberDiscovery for NativeMembers {
-    fn direct(&self, within: Duration) -> aterm_secrets::Result<Vec<String>> {
-        Ok(
-            crate::lan_members::probe(within.min(Duration::from_millis(500)))?
-                .into_iter()
-                .map(|hint| hint.address.to_string())
-                .collect(),
-        )
+    fn begin(&self, within: Duration) -> aterm_secrets::Result<NumericMembers> {
+        Ok(NumericMembers::Probe(crate::lan_members::Probe::start(
+            within.min(Duration::from_millis(500)),
+        )?))
     }
 
     fn more(&self, within: Duration) -> aterm_secrets::Result<Vec<String>> {
@@ -630,6 +627,47 @@ impl MemberDiscovery for NativeMembers {
             Ok(Vec::new())
         } else {
             discover::browse_members(within)
+        }
+    }
+}
+
+/// One owned numeric round. Explicit addresses and supplied complete sets need no
+/// solicitation; a live probe keeps its nonce and sockets across authentication.
+enum NumericMembers {
+    Fixed(Option<Vec<String>>),
+    Probe(crate::lan_members::Probe),
+}
+
+impl From<Vec<String>> for NumericMembers {
+    fn from(found: Vec<String>) -> Self {
+        Self::Fixed(Some(found))
+    }
+}
+
+impl NumericMembers {
+    fn next(&mut self, until: std::time::Instant) -> aterm_secrets::Result<Vec<String>> {
+        match self {
+            Self::Fixed(found) => Ok(found.take().unwrap_or_default()),
+            Self::Probe(probe) => Ok(probe
+                .next(until)?
+                .into_iter()
+                .map(|hint| hint.address.to_string())
+                .collect()),
+        }
+    }
+
+    fn complete(&mut self, until: std::time::Instant) -> aterm_secrets::Result<Vec<String>> {
+        let mut all = Vec::new();
+        loop {
+            let found = self.next(until)?;
+            if found.is_empty() {
+                return Ok(all);
+            }
+            for at in found {
+                if !all.contains(&at) {
+                    all.push(at);
+                }
+            }
         }
     }
 }
@@ -1004,30 +1042,48 @@ fn discover_and_ask(
 ) -> aterm_secrets::Result<AskedMembers> {
     let staged = args.phrase.is_none() && args.at.is_empty();
     let began = std::time::Instant::now();
-    let mut all = if args.at.is_empty() {
-        reach.browse.direct(BROWSE_WITHIN).unwrap_or_default()
+    let mut numeric = if args.at.is_empty() {
+        reach
+            .browse
+            .begin(BROWSE_WITHIN)
+            .unwrap_or_else(|_| Vec::new().into())
     } else {
-        args.at.clone()
+        args.at.clone().into()
     };
-    let browse_left = BROWSE_WITHIN.saturating_sub(began.elapsed());
-    let until = std::time::Instant::now() + PROVE_WITHIN;
-    let tried_early = staged && proves;
-    if tried_early {
-        current()?;
-        match (reach.prove)(me, &all, first_proof_share(until), current) {
-            Proved::In => return Ok((Proved::In, Vec::new(), Vec::new())),
-            Proved::SignedMaybe => return Ok((Proved::SignedMaybe, Vec::new(), Vec::new())),
-            Proved::No => {}
-        }
+    if staged && proves {
+        let until = began + PROVE_WITHIN;
+        let (proved, all) = staged_member_proof(
+            numeric,
+            until,
+            |ats, deadline| (reach.prove)(me, ats, deadline, current),
+            || {
+                reach.browse.more(
+                    BROWSE_WITHIN
+                        .saturating_sub(began.elapsed())
+                        .min(until.saturating_duration_since(std::time::Instant::now())),
+                )
+            },
+            current,
+        )?;
+        let (heard, missed) = match proved {
+            Proved::No => join::ask_all_admitted(reach.dial, joining, &all, current),
+            Proved::In | Proved::SignedMaybe => (Vec::new(), Vec::new()),
+        };
+        return Ok((proved, heard, missed));
     }
+    let until = std::time::Instant::now() + PROVE_WITHIN;
     current()?;
-    let mut more = Vec::new();
+    let mut all = numeric.complete(until).unwrap_or_default();
     if args.at.is_empty() {
-        let found = match reach.browse.more(browse_left) {
+        let found = match reach
+            .browse
+            .more(BROWSE_WITHIN.saturating_sub(began.elapsed()))
+        {
             Ok(found) => found,
             Err(_) if !all.is_empty() => Vec::new(),
             Err(error) => return Err(error),
         };
+        let mut more = Vec::new();
         for at in found {
             if !all.contains(&at) && !more.contains(&at) {
                 more.push(at);
@@ -1035,12 +1091,9 @@ fn discover_and_ask(
         }
         all.extend(more.iter().cloned());
     }
-    let candidates = if staged { &more } else { &all };
     current()?;
-    // The early proof includes retained routes even without numeric hints. Only new
-    // candidates get the remaining deadline; do not repeat an empty retained turn.
-    let proved = if proves && (!candidates.is_empty() || !tried_early) {
-        (reach.prove)(me, candidates, until, current)
+    let proved = if proves {
+        (reach.prove)(me, &all, until, current)
     } else {
         Proved::No
     };
@@ -1307,8 +1360,29 @@ pub fn ask_members_admitted(
     home: &Path,
     current: &(dyn Fn() -> Result<(), String> + Sync),
 ) -> Result<usize, String> {
+    let state = aterm_types::dirs::state_dir().ok_or("no state directory")?;
+    ask_members_at_state(Paths::for_home(home), &state, &NativeMembers, current)
+}
+
+/// The ordinary subscriber producer, with its actual node storage and discovery adapter.
+fn ask_members_at_state(
+    paths: Paths,
+    state: &Path,
+    discovery: &dyn MemberDiscovery,
+    current: &(dyn Fn() -> Result<(), String> + Sync),
+) -> Result<usize, String> {
     current()?;
-    let me = Me::at(Paths::for_home(home))?;
+    let expected = client::config(&paths).map_err(|error| error.to_string())?;
+    let me = Me::at_state(paths, state)?;
+    let authorized = || {
+        current().map_err(aterm_secrets::Error::new)?;
+        if client::config(&me.paths)? != expected {
+            return Err(aterm_secrets::Error::new(
+                "the vault source changed during member discovery",
+            ));
+        }
+        Ok(())
+    };
     if client::status(&me.paths)
         .is_ok_and(|status| matches!(status.membership, client::Membership::In { .. }))
         && !client::seat_asks(&me.paths)
@@ -1317,37 +1391,36 @@ pub fn ask_members_admitted(
     }
     // A lab identity's subscriber asks no live ALab member ([`join_tried`]).
     client::refuse_lab_member_browse(&me.paths).map_err(|error| error.to_string())?;
-    current()?;
-    let direct = crate::lan_members::probe(Duration::from_millis(500))
-        .unwrap_or_default()
-        .into_iter()
-        .map(|hint| hint.address.to_string())
-        .collect();
+    authorized().map_err(|error| error.to_string())?;
+    let began = std::time::Instant::now();
+    let until = began + PROVE_WITHIN;
+    let numeric = discovery
+        .begin(BROWSE_WITHIN)
+        .unwrap_or_else(|_| Vec::new().into());
     ask_discovered(
-        direct,
-        |ats| {
-            prove_routes(
-                &me,
-                ats,
-                Some(std::time::Instant::now() + PROVE_WITHIN),
-                true,
-                &|| {
-                    current().map_err(aterm_secrets::Error::new)?;
-                    client::check_bootstrap_allowed(&me.paths)
-                },
-            )
+        numeric,
+        until,
+        |ats, deadline| {
+            prove_routes_at_state(&me, state, ats, Some(deadline), true, &|| {
+                authorized()?;
+                client::check_bootstrap_allowed(&me.paths)
+            })
         },
         || {
-            current()?;
-            discover::browse_members(BROWSE_WITHIN).map_err(|error| error.to_string())
+            discovery
+                .more(
+                    BROWSE_WITHIN
+                        .saturating_sub(began.elapsed())
+                        .min(until.saturating_duration_since(std::time::Instant::now())),
+                )
+                .map_err(|error| error.to_string())
         },
+        &authorized,
         |ats| {
-            current()?;
+            authorized().map_err(|error| error.to_string())?;
             let dial: &Dial<'_> = &dial;
-            let (heard, _) = join::ask_all_admitted(dial, &me.joining()?, ats, &|| {
-                current().map_err(aterm_secrets::Error::new)
-            });
-            current()?;
+            let (heard, _) = join::ask_all_admitted(dial, &me.joining()?, ats, &authorized);
+            authorized().map_err(|error| error.to_string())?;
             if heard.is_empty() {
                 return Err("no ALab member answers on this network".to_owned());
             }
@@ -1374,11 +1447,7 @@ pub fn bootstrap_from_members(
     }
     let me = Me::at(paths.clone()).map_err(aterm_secrets::Error::new)?;
     let until = std::time::Instant::now() + PROVE_WITHIN;
-    let ats: Vec<_> = crate::lan_members::probe(Duration::from_millis(500))
-        .unwrap_or_default()
-        .into_iter()
-        .map(|hint| hint.address.to_string())
-        .collect();
+    let mut probe = crate::lan_members::Probe::start(Duration::from_millis(500)).ok();
     let authorized = || {
         current()?;
         if client::config(paths)?.is_some() {
@@ -1389,7 +1458,21 @@ pub fn bootstrap_from_members(
         Ok(())
     };
     Ok(
-        match prove_routes(&me, &ats, Some(until), true, &authorized) {
+        match bootstrap_native_proof(
+            until,
+            || {
+                Ok(probe
+                    .as_mut()
+                    .map(|probe| probe.next(until))
+                    .transpose()?
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|hint| hint.address.to_string())
+                    .collect())
+            },
+            |ats, deadline| prove_routes(&me, ats, Some(deadline), true, &authorized),
+            &authorized,
+        )? {
             Proved::In => client::NativeAdmission::Admitted,
             Proved::SignedMaybe => client::NativeAdmission::Uncertain,
             Proved::No => {
@@ -1400,43 +1483,135 @@ pub fn bootstrap_from_members(
     )
 }
 
+/// The native-only bootstrap's proof turn, under its caller's original deadline.
+fn bootstrap_native_proof(
+    until: std::time::Instant,
+    mut next: impl FnMut() -> aterm_secrets::Result<Vec<String>>,
+    prove: impl FnMut(&[String], std::time::Instant) -> Proved,
+    current: &Current<'_>,
+) -> aterm_secrets::Result<Proved> {
+    current()?;
+    let ats = next().unwrap_or_default();
+    current()?;
+    native_proof_batches(ats, first_proof_share(until), until, next, prove, current)
+        .map(|(outcome, _)| outcome)
+}
+
+/// Only definite refusals advance the held native round. Its caller fixes both
+/// phase deadlines once; no batch gets another collection or proof lease.
+fn native_proof_batches(
+    mut batch: Vec<String>,
+    first_until: std::time::Instant,
+    until: std::time::Instant,
+    mut next: impl FnMut() -> aterm_secrets::Result<Vec<String>>,
+    mut prove: impl FnMut(&[String], std::time::Instant) -> Proved,
+    current: &Current<'_>,
+) -> aterm_secrets::Result<(Proved, Vec<String>)> {
+    let mut all = Vec::new();
+    let mut first = true;
+    loop {
+        current()?;
+        let mut fresh = Vec::new();
+        for at in batch {
+            if !all.contains(&at) && !fresh.contains(&at) {
+                fresh.push(at);
+            }
+        }
+        if !first && fresh.is_empty() {
+            return Ok((Proved::No, all));
+        }
+        let deadline = if first { first_until } else { until };
+        first = false;
+        let outcome = prove(&fresh, deadline);
+        all.extend(fresh);
+        match outcome {
+            Proved::In | Proved::SignedMaybe => return Ok((outcome, all)),
+            Proved::No => {}
+        }
+        current()?;
+        if std::time::Instant::now() >= until {
+            return Ok((Proved::No, all));
+        }
+        batch = next().unwrap_or_default();
+    }
+}
+
 /// Only authenticated proof ends discovery. An untrusted first batch that
 /// proves nothing continues to the other members; a possibly signed admission
 /// sends nothing more until its ordinary retry can observe the records.
 fn ask_discovered(
-    mut direct: Vec<String>,
-    mut prove: impl FnMut(&[String]) -> Proved,
+    direct: impl Into<NumericMembers>,
+    until: std::time::Instant,
+    prove: impl FnMut(&[String], std::time::Instant) -> Proved,
     more: impl FnOnce() -> Result<Vec<String>, String>,
+    current: &Current<'_>,
     ask: impl FnOnce(&[String]) -> Result<usize, String>,
 ) -> Result<usize, String> {
-    if !direct.is_empty() {
-        match prove(&direct) {
-            Proved::In | Proved::SignedMaybe => return Ok(1),
-            Proved::No => {}
-        }
+    let (outcome, all) = staged_member_proof(
+        direct,
+        until,
+        prove,
+        || more().map_err(aterm_secrets::Error::new),
+        current,
+    )
+    .map_err(|error| error.to_string())?;
+    ask_after_proof(outcome, || ask(&all))
+}
+
+/// Automatic CLI and subscriber rounds share one bounded proof policy. An empty numeric
+/// batch still tries retained peers; only genuinely new DNS hints get the remaining turn.
+fn staged_member_proof(
+    direct: impl Into<NumericMembers>,
+    until: std::time::Instant,
+    mut prove: impl FnMut(&[String], std::time::Instant) -> Proved,
+    more: impl FnOnce() -> aterm_secrets::Result<Vec<String>>,
+    current: &Current<'_>,
+) -> aterm_secrets::Result<(Proved, Vec<String>)> {
+    let mut numeric = direct.into();
+    current()?;
+    let direct = numeric.next(until).unwrap_or_default();
+    current()?;
+    let native_until = first_proof_share(until);
+    let (outcome, mut direct) = native_proof_batches(
+        direct,
+        native_until,
+        native_until,
+        || numeric.next(native_until),
+        &mut prove,
+        current,
+    )?;
+    match outcome {
+        Proved::In | Proved::SignedMaybe => return Ok((outcome, direct)),
+        Proved::No => {}
     }
-    let additional = match more() {
-        Ok(more) => more
-            .into_iter()
-            .filter(|at| !direct.contains(at))
-            .collect::<Vec<_>>(),
+    current()?;
+    let found = more();
+    current()?;
+    let found = match found {
+        Ok(found) => found,
         Err(_) if !direct.is_empty() => Vec::new(),
         Err(error) => return Err(error),
     };
+    let mut additional = Vec::new();
+    for at in found {
+        if !direct.contains(&at) && !additional.contains(&at) {
+            additional.push(at);
+        }
+    }
     let outcome = if additional.is_empty() {
         Proved::No
     } else {
-        prove(&additional)
+        prove(&additional, until)
     };
     direct.extend(additional);
-    ask_after_proof(outcome, || ask(&direct))
+    Ok((outcome, direct))
 }
 
 /// The fresh-address path's share of a bounded proof: half the time left, so
 /// recovery over a previously held fleet keeps the rest.
 fn first_proof_share(until: std::time::Instant) -> std::time::Instant {
     let now = std::time::Instant::now();
-    now + until.saturating_duration_since(now) / 2
+    (now + until.saturating_duration_since(now) / 2).min(until)
 }
 
 /// What proving this Mac to the members came to ([`proved_back`]).
@@ -1546,7 +1721,21 @@ fn prove_routes(
     default_alab: bool,
     authorized: &(dyn Fn() -> aterm_secrets::Result<()> + Sync),
 ) -> Proved {
-    use aterm_net::fleet_member::{read_join_code, read_node_identity, read_peers};
+    let Some(state) = aterm_types::dirs::state_dir() else {
+        return Proved::No;
+    };
+    prove_routes_at_state(me, &state, ats, until, default_alab, authorized)
+}
+
+fn prove_routes_at_state(
+    me: &Me,
+    state: &Path,
+    ats: &[String],
+    until: Option<std::time::Instant>,
+    default_alab: bool,
+    authorized: &(dyn Fn() -> aterm_secrets::Result<()> + Sync),
+) -> Proved {
+    use aterm_net::fleet_member::read_node_identity;
     let Ok(lock) = join::ProofLock::take(&me.paths, until) else {
         return Proved::No;
     };
@@ -1556,10 +1745,7 @@ fn prove_routes(
     if authorized().is_err() {
         return Proved::No;
     }
-    let Some(state) = aterm_types::dirs::state_dir() else {
-        return Proved::No;
-    };
-    let Some(node) = read_node_identity(&state).ok().flatten() else {
+    let Some(node) = read_node_identity(state).ok().flatten() else {
         return Proved::No;
     };
     if *node.key().bytes() != me.node {
@@ -1602,10 +1788,24 @@ fn prove_routes(
         Proved::No => {}
         done => return done,
     }
-    if let Ok(code) = read_join_code(&state)
-        && let Ok(secret) = aterm_net::fleet::FleetSecret::new(&code.secret)
-    {
-        let peers: Vec<_> = read_peers(&state)
+    prove_retained_routes(&me.paths, state, &joining, &node, until, &scope.admission)
+}
+
+/// The same retained route for CLI and subscriber proofs, after the caller captured its
+/// exact source/current policy and took the cross-process proof lock.
+fn prove_retained_routes(
+    paths: &Paths,
+    state: &Path,
+    joining: &Joining<'_>,
+    node: &aterm_net::fleet::NodeIdentity,
+    until: Option<std::time::Instant>,
+    admission: &join::ProofAdmission<'_>,
+) -> Proved {
+    use aterm_net::fleet_member::read_peers;
+    // Every joined member holds the canonical private key. Only the issuer has an
+    // invitation file, whose absence or stale contents must not hide retained routes.
+    if let Ok(secret) = aterm_net::fleet::read_key_file(state) {
+        let peers: Vec<_> = read_peers(state)
             .unwrap_or_default()
             .into_iter()
             .filter(|peer| peer.node.is_some())
@@ -1615,12 +1815,12 @@ fn prove_routes(
             // The next try comes after the subscriber's pause, by when a member that may have
             // signed has posted its records to the servers.
             match proof_outcome(crate::vault_join::prove_over_fleet_admitted(
-                &me.paths,
-                &joining,
-                (&secret, &node),
+                paths,
+                joining,
+                (&secret, node),
                 &peers,
                 until,
-                Some(&scope.admission),
+                Some(admission),
             )) {
                 Proved::No => {}
                 done => return done,
@@ -3060,32 +3260,31 @@ mod tests {
             client::status(&mac.paths).unwrap().membership,
             client::Membership::Pending
         );
-        for paths in [mac.paths.clone(), Paths::for_home(&mac.paths.home)] {
-            assert!(!join::pending_proof(&paths).unwrap());
-            let expected = client::config(&paths).unwrap();
-            assert!(expected.as_ref().is_some_and(client::alab_vault));
-            let device = Device::open(&paths).unwrap().unwrap();
-            let joining = Joining {
-                device: &device,
-                records_bound: aterm_secrets::crossing::RecordsBound::uncrossed(),
-                node: mac.node,
-                name: mac.name.clone(),
-                model: mac.model.clone(),
-            };
-            let proving = join::ProofLock::take(&paths, None).unwrap().unwrap();
-            let current = || Ok(());
-            let scope =
-                ProofScope::read(&paths, expected.as_ref(), true, &current, &proving).unwrap();
-            let captured = Mutex::new(Vec::new());
-            let tried = std::thread::scope(|threads| {
-                let dial = |_: &str| -> aterm_secrets::Result<Box<dyn Stream>> {
-                    let (mut member, joiner) = UnixStream::pair()?;
-                    for stream in [&member, &joiner] {
-                        stream.set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))?;
-                        stream.set_write_timeout(Some(aterm_spec::wait::MUST_HAPPEN))?;
-                    }
-                    let captured = &captured;
-                    threads.spawn(move || {
+        let paths = Paths::for_home(&mac.paths.home);
+        assert!(!join::pending_proof(&paths).unwrap());
+        let expected = client::config(&paths).unwrap();
+        assert!(expected.as_ref().is_some_and(client::alab_vault));
+        let device = Device::open(&paths).unwrap().unwrap();
+        let joining = Joining {
+            device: &device,
+            records_bound: aterm_secrets::crossing::RecordsBound::uncrossed(),
+            node: mac.node,
+            name: mac.name.clone(),
+            model: mac.model.clone(),
+        };
+        let proving = join::ProofLock::take(&paths, None).unwrap().unwrap();
+        let current = || Ok(());
+        let scope = ProofScope::read(&paths, expected.as_ref(), true, &current, &proving).unwrap();
+        let captured = Mutex::new(Vec::new());
+        let tried = std::thread::scope(|threads| {
+            let dial = |_: &str| -> aterm_secrets::Result<Box<dyn Stream>> {
+                let (mut member, joiner) = UnixStream::pair()?;
+                for stream in [&member, &joiner] {
+                    stream.set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))?;
+                    stream.set_write_timeout(Some(aterm_spec::wait::MUST_HAPPEN))?;
+                }
+                let captured = &captured;
+                threads.spawn(move || {
                         // A legacy member advertises a syntactically valid greeting, then
                         // refuses this extension before issuing any possession challenge.
                         writeln!(member,
@@ -3098,28 +3297,27 @@ mod tests {
                         captured.lock().unwrap().push(line);
                         member.write_all(b"NO why=unsupported-authority\n").unwrap();
                     });
-                    Ok(Box::new(joiner))
-                };
-                scope.direct(&paths, &dial, &joining, &|_| [0; 64], &[M1.to_owned()])
-            });
-            assert!(matches!(proof_outcome(tried), Proved::No));
-            let requests = captured.lock().unwrap();
-            assert_eq!(requests.len(), 1);
-            let request = &requests[0];
-            assert!(request.starts_with("prove "));
-            let nonce = request
-                .split_ascii_whitespace()
-                .find_map(|field| field.strip_prefix("authority="))
-                .expect("the production selector must use the admitted witness path");
-            assert_eq!(nonce.len(), 64);
-            assert!(nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
-            assert_eq!(std::fs::read(&source).unwrap(), saved.as_bytes());
-            assert!(!join::pending_proof(&paths).unwrap());
-            assert_eq!(
-                client::status(&paths).unwrap().membership,
-                client::Membership::Pending
-            );
-        }
+                Ok(Box::new(joiner))
+            };
+            scope.direct(&paths, &dial, &joining, &|_| [0; 64], &[M1.to_owned()])
+        });
+        assert!(matches!(proof_outcome(tried), Proved::No));
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert!(request.starts_with("prove "));
+        let nonce = request
+            .split_ascii_whitespace()
+            .find_map(|field| field.strip_prefix("authority="))
+            .expect("the production selector must use the admitted witness path");
+        assert_eq!(nonce.len(), 64);
+        assert!(nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(std::fs::read(&source).unwrap(), saved.as_bytes());
+        assert!(!join::pending_proof(&paths).unwrap());
+        assert_eq!(
+            client::status(&paths).unwrap().membership,
+            client::Membership::Pending
+        );
     }
 
     /// A member whose vault state a pass holds (an admission publishing on the admin Mac, an
@@ -3493,29 +3691,46 @@ mod tests {
             assert_eq!(
                 ask_discovered(
                     vec!["192.0.2.1:7100".into()],
-                    |_| outcome.take().unwrap(),
+                    std::time::Instant::now() + PROVE_WITHIN,
+                    |_, _| outcome.take().unwrap(),
                     || panic!("a direct proof needs no browse"),
+                    &|| Ok(()),
                     |_| panic!("an admission that may have signed sends no ask")
                 ),
                 Ok(1)
             );
         }
         let attempts = std::cell::RefCell::new(Vec::new());
+        let deadlines = std::cell::RefCell::new(Vec::new());
+        let until = std::time::Instant::now() + PROVE_WITHIN;
         assert_eq!(
             ask_discovered(
                 vec!["192.0.2.1:7100".into()],
-                |ats| {
+                until,
+                |ats, deadline| {
                     attempts.borrow_mut().push(ats.to_vec());
+                    deadlines.borrow_mut().push(deadline);
                     if ats == ["member.local:7100"] {
                         Proved::In
                     } else {
                         Proved::No
                     }
                 },
-                || Ok(vec!["192.0.2.1:7100".into(), "member.local:7100".into()]),
+                || Ok(vec![
+                    "192.0.2.1:7100".into(),
+                    "member.local:7100".into(),
+                    "member.local:7100".into()
+                ]),
+                &|| Ok(()),
                 |_| panic!("the continued discovery proved a member")
             ),
             Ok(1)
+        );
+        let deadlines = deadlines.borrow();
+        assert!(deadlines[0] < deadlines[1]);
+        assert_eq!(
+            deadlines[1], until,
+            "later hints retain only the original final deadline"
         );
         assert_eq!(
             *attempts.borrow(),
@@ -3527,12 +3742,43 @@ mod tests {
     }
 
     #[test]
+    fn an_elapsed_round_never_renews_the_retained_proof_deadline() {
+        let until = std::time::Instant::now() - Duration::from_secs(1);
+        let attempts = std::cell::Cell::new(0);
+        let (outcome, found) = staged_member_proof(
+            Vec::new(),
+            until,
+            |ats, deadline| {
+                assert!(ats.is_empty());
+                assert!(
+                    deadline <= until,
+                    "discovery cannot renew an elapsed proof round"
+                );
+                attempts.set(attempts.get() + 1);
+                Proved::No
+            },
+            || Ok(Vec::new()),
+            &|| Ok(()),
+        )
+        .unwrap();
+        assert!(matches!(outcome, Proved::No));
+        assert!(found.is_empty());
+        assert_eq!(
+            attempts.get(),
+            1,
+            "an empty DNS set never repeats retained proof"
+        );
+    }
+
+    #[test]
     fn failed_direct_proofs_keep_all_reachable_members_for_the_plain_request() {
         assert_eq!(
             ask_discovered(
                 vec!["192.0.2.1:7100".into()],
-                |_| Proved::No,
+                std::time::Instant::now() + PROVE_WITHIN,
+                |_, _| Proved::No,
                 || Ok(vec!["member.local:7100".into()]),
+                &|| Ok(()),
                 |ats| {
                     assert_eq!(ats, ["192.0.2.1:7100", "member.local:7100"]);
                     Ok(2)

@@ -112,7 +112,7 @@ fn invalid(message: &'static str) -> io::Error {
 #[cfg(feature = "observations")]
 mod observation;
 #[cfg(feature = "observations")]
-pub use observation::Observation;
+pub use observation::{Measurements, MemoryPressure, Observation, ThermalPressure};
 
 #[cfg(all(unix, feature = "observations"))]
 mod monitor;
@@ -121,7 +121,7 @@ pub use monitor::Monitor;
 #[cfg(all(unix, feature = "observations"))]
 mod host_policy;
 #[cfg(all(unix, feature = "observations"))]
-pub use host_policy::HostPolicy;
+pub use host_policy::{HostPolicy, ObservationSource};
 
 /// One nonblocking observation. Held-owner metadata can be absent or invalid;
 /// an unreadable identity must never turn a held kernel lease into a free slot.
@@ -199,3 +199,8 @@ pub use external_debt::ExternalDebt;
 mod recovery_material;
 #[cfg(unix)]
 pub use recovery_material::{PreparedRecovery, RecoveryAuthority, RecoveryMaterial};
+
+#[cfg(unix)]
+mod native_domain;
+#[cfg(unix)]
+pub use native_domain::NativeDomain;

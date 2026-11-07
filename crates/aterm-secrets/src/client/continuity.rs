@@ -5,6 +5,10 @@
 //! (owner, 2026-11-02: the owner's labels drifting is a defect;
 //! `docs/DESIGN-automatic-lan-admission-2026-11-02.md` "Seat continuity").
 //!
+//! These labels are log display hints. Owner labels and aliases belong to the registry;
+//! returning to a seat never allocates or renames a roster label. Its machine row survives
+//! through registration's adoption proof, independently of the log's displayed name.
+//!
 //! The only proof that a Mac is a seat's Mac is re-admission by proof ([`super::readmit`]): the
 //! Mac proves, on a fresh challenge, the fleet node key the membership log reads as that seat's,
 //! and a member removes the old seat and seats the new key under its label. A new Mac proves

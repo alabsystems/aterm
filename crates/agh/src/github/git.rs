@@ -10,7 +10,7 @@ use crate::client::Github;
 use crate::error::{Error, Kind, Result};
 use crate::github::{How, limit_after_sort, repo_root};
 use crate::model::{
-    BranchObject, CommitObject, CompareObject, FromJson, TagObject, TreeObject, from_json,
+    BranchObject, CommitObject, CompareObject, FromJson, TagObject, TreeObject, from_json_owned,
 };
 use crate::page::{LinkScope, ListOpts, Listing};
 use crate::path;
@@ -92,7 +92,7 @@ impl<'a> Git<'a> {
             &LinkScope::Repo(self.slug.clone()),
         )?;
         let mut listing = walked
-            .map(|value| from_json::<T>(&value))
+            .map(from_json_owned::<T>)
             .map_err(|e| e.with_repo(self.slug.to_string()))?;
         listing.items.sort_unstable_by(|a, b| name(a).cmp(name(b)));
         limit_after_sort(&mut listing, opts.limit);
@@ -112,9 +112,16 @@ impl<'a> Git<'a> {
         let value = self
             .read(&call)
             .map_err(|error| error.why_if_not_found(no_commit))?;
-        match value.as_array().and_then(|items| items.first()) {
-            Some(first) => from_json(first).map_err(|e| e.with_repo(self.slug.to_string())),
-            None => Err(Error::new(Kind::NotFound, no_commit()).with_repo(self.slug.to_string())),
+        match value {
+            Value::Array(items) => match items.into_iter().next() {
+                Some(first) => {
+                    from_json_owned(first).map_err(|e| e.with_repo(self.slug.to_string()))
+                }
+                None => {
+                    Err(Error::new(Kind::NotFound, no_commit()).with_repo(self.slug.to_string()))
+                }
+            },
+            _ => Err(Error::new(Kind::NotFound, no_commit()).with_repo(self.slug.to_string())),
         }
     }
 
@@ -150,7 +157,7 @@ impl<'a> Git<'a> {
             .with_limit(Some(limit))
             .with_max_pages(pages.max(ListOpts::STANDARD.max_pages));
         crate::page::walk(self.gh, first, &opts, &LinkScope::Repo(self.slug.clone()))?
-            .map(|value| from_json::<CommitObject>(&value))
+            .map(from_json_owned::<CommitObject>)
             .map_err(|e| e.with_repo(self.slug.to_string()))
     }
 
@@ -166,7 +173,7 @@ impl<'a> Git<'a> {
             .how
             .get(self.at(&rest), RouteTarget::Repo(self.slug.clone()));
         match self.read(&call) {
-            Ok(value) => from_json(&value)
+            Ok(value) => from_json_owned(value)
                 .map(CompareResult::Compared)
                 .map_err(|e| e.with_repo(self.slug.to_string())),
             Err(error) if not_found_saying(&error, "No common ancestor") => {
@@ -220,8 +227,8 @@ impl<'a> Git<'a> {
         }
         let value = self.read(&call)?;
         let mut tree: TreeObject =
-            from_json(&value).map_err(|e| e.with_repo(self.slug.to_string()))?;
-        if let Some(raws) = value.get("tree").and_then(Value::as_array) {
+            from_json_owned(value).map_err(|e| e.with_repo(self.slug.to_string()))?;
+        if let Some(raws) = tree.raw.get("tree").and_then(Value::as_array) {
             for (entry, raw) in tree.tree.iter_mut().zip(raws) {
                 entry.raw = raw.clone();
             }

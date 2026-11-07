@@ -11,12 +11,13 @@ fn unavailable() -> io::Error {
     io::ErrorKind::Unsupported.into()
 }
 impl Prepared {
-    pub(crate) fn try_new(
+    pub(crate) fn try_new_mapped(
         _: &Pool,
         _: &ExternalDebt,
         _: u32,
         _: &Request,
         _: &Delegations,
+        _: Option<[u32; 2]>,
     ) -> io::Result<Option<Self>> {
         Err(unavailable())
     }

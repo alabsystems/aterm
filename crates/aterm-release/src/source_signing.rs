@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 
 use aterm_uds::spawnfd::{Command, Stdio, command};
 
+use crate::checkout_bin::absolute;
+
 #[derive(Clone, Debug)]
 pub(crate) struct Tools {
     openssl: PathBuf,
@@ -249,6 +251,13 @@ impl Tools {
     }
 }
 
+/// The source signer's helper, `crates/atpkg-keys`, as [`crate::checkout_bin`] builds it.
+const HELPER: crate::checkout_bin::Bin = crate::checkout_bin::Bin {
+    package: "atpkg-keys",
+    env: "ATPKG_KEYS",
+    what: "source-signing helper",
+};
+
 /// Build the source signer's helper through the selected checkout's Cargo
 /// graph. An explicit helper remains authoritative and is never replaced.
 pub(crate) fn prepare_helper(
@@ -256,99 +265,12 @@ pub(crate) fn prepare_helper(
     explicit: Option<&OsStr>,
     build: impl FnOnce(&[OsString]) -> Result<Vec<u8>, String>,
 ) -> Result<PathBuf, String> {
-    if let Some(path) = explicit.filter(|value| !value.is_empty()) {
-        return ready_helper(absolute(path, "ATPKG_KEYS")?);
-    }
-    let mut args: Vec<OsString> = [
-        "--unverified",
-        "build",
-        "--locked",
-        "--profile",
-        "gate",
-        "-p",
-        "atpkg-keys",
-        "--bin",
-        "atpkg-keys",
-        "--message-format=json",
-    ]
-    .into_iter()
-    .map(OsString::from)
-    .collect();
-    // The selected driver may be the compiler's own targo, rather than the
-    // atpkg shim. Give it the same quiet shared cache layout as verification.
-    let env = aterm_verify::EnvSnapshot::capture();
-    let target = env
-        .cargo_target_dir
-        .clone()
-        .unwrap_or_else(|| repo.join("target"));
-    if let Some(layout) = aterm_verify::main_build_dir(&env, repo)
-        .or_else(|| aterm_verify::fallback_build_dir(&env, repo, &target))
-    {
-        args.extend([OsString::from("--config"), layout.into()]);
-    }
-    args.push("--manifest-path".into());
-    args.push(repo.join("Cargo.toml").into_os_string());
-    ready_helper(built_helper(repo, &build(&args)?)?)
+    crate::checkout_bin::prepare(repo, &HELPER, explicit, build)
 }
 
-fn ready_helper(path: PathBuf) -> Result<PathBuf, String> {
-    if aterm_toolchain::is_executable_file(&path) {
-        Ok(path)
-    } else {
-        Err(format!(
-            "source-signing helper {} is not an executable file",
-            path.display()
-        ))
-    }
-}
-
+#[cfg(test)]
 fn built_helper(repo: &Path, output: &[u8]) -> Result<PathBuf, String> {
-    let manifest = repo.join("crates/atpkg-keys/Cargo.toml");
-    let mut found = std::collections::BTreeSet::new();
-    for line in output.split(|byte| *byte == b'\n') {
-        if !line
-            .windows(b"compiler-artifact".len())
-            .any(|w| w == b"compiler-artifact")
-            || !line
-                .windows(b"atpkg-keys".len())
-                .any(|w| w == b"atpkg-keys")
-        {
-            continue;
-        }
-        let Ok(row) = aterm_json::from_slice::<aterm_json::Value>(line) else {
-            continue;
-        };
-        if row["reason"].as_str() == Some("compiler-artifact")
-            && row["target"]["name"].as_str() == Some("atpkg-keys")
-            && row["target"]["kind"]
-                .as_array()
-                .is_some_and(|kinds| kinds.iter().any(|kind| kind.as_str() == Some("bin")))
-            && row["manifest_path"].as_str().map(Path::new) == Some(manifest.as_path())
-            && let Some(exe) = row["executable"]
-                .as_str()
-                .map(PathBuf::from)
-                .filter(|path| path.is_absolute())
-        {
-            found.insert(exe);
-        }
-    }
-    if found.len() != 1 {
-        return Err(
-            "the atpkg-keys build did not identify exactly one helper from this checkout".into(),
-        );
-    }
-    found
-        .pop_first()
-        .ok_or_else(|| "the atpkg-keys build reported no helper".into())
-}
-
-fn absolute(value: &OsStr, name: &str) -> Result<PathBuf, String> {
-    let path = PathBuf::from(value);
-    if path.is_absolute() {
-        Ok(path)
-    } else {
-        Err(format!("{name} must name an absolute executable path"))
-    }
+    crate::checkout_bin::built(repo, &HELPER, output)
 }
 
 fn run(mut cmd: Command, program: &Path, args: &[OsString]) -> Result<Vec<u8>, String> {

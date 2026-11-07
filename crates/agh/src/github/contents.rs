@@ -10,7 +10,7 @@ use crate::client::{Accept, Call, Github};
 use crate::error::{Error, Kind, Result, Sub};
 use crate::github::raw::Media;
 use crate::github::{How, repo_root};
-use crate::model::{ContentEntry, from_json};
+use crate::model::{ContentEntry, from_json_owned};
 use crate::page::{Consistency, End, Listing};
 use crate::path;
 use crate::policy::RouteTarget;
@@ -114,7 +114,7 @@ impl<'a> Contents<'a> {
         let value = answered
             .json()
             .map_err(|e| e.with_repo(self.slug.to_string()))?;
-        let Some(array) = value.as_array() else {
+        let Value::Array(array) = value else {
             return Err(match entry_type(&value) {
                 None => self.invalid(format!("{path} is a file: use agh cat")),
                 Some(kind @ ("file" | "symlink")) => {
@@ -126,8 +126,8 @@ impl<'a> Contents<'a> {
             });
         };
         let mut items = array
-            .iter()
-            .map(from_json::<ContentEntry>)
+            .into_iter()
+            .map(from_json_owned::<ContentEntry>)
             .collect::<Result<Vec<_>>>()
             .map_err(|e| e.with_repo(self.slug.to_string()))?;
         items.sort_unstable_by(|a, b| a.name.cmp(&b.name));

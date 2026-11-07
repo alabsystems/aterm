@@ -5,12 +5,162 @@
 //! its selected credential and default inventory, so unrelated init settings do not stop work.
 //! Readiness observation also tracks the actual admitted Git command and payload.
 
-use super::{Asked, Github, TOKEN_FILE, asked, inventory, profile, read_token};
+use super::{Asked, Github, INPUT_MAX, TOKEN_FILE, asked, decode, inventory, profile, read_token};
 use crate::model::User;
-use crate::port::System;
+use crate::port::{OwnedFileMetadata, Stat, System};
 use std::path::{Path, PathBuf};
 
 type FileVersion = Result<[u8; 32], std::io::ErrorKind>;
+type PrefixFacts = Vec<(PathBuf, Result<Stat, std::io::ErrorKind>)>;
+
+#[derive(Clone, PartialEq, Eq)]
+struct PrefixPolicy(u32, u32, u32, bool, bool);
+
+#[derive(Clone, PartialEq, Eq)]
+struct ProfileKey {
+    uid: u32,
+    home: PathBuf,
+    file: Result<OwnedFileMetadata, std::io::ErrorKind>,
+    prefix: Vec<(PathBuf, Result<PrefixPolicy, std::io::ErrorKind>)>,
+}
+
+struct ProfileFrame {
+    key: ProfileKey,
+    facts: PrefixFacts,
+}
+
+impl ProfileFrame {
+    fn read(sys: &dyn System, user: &User, path: &Path) -> Self {
+        let facts: PrefixFacts = path
+            .ancestors()
+            .skip(1)
+            .map(|path| (path.to_path_buf(), sys.stat(path).map_err(|e| e.kind())))
+            .collect();
+        let prefix = facts
+            .iter()
+            .map(|(path, stat)| {
+                (
+                    path.clone(),
+                    stat.map(|s| PrefixPolicy(s.uid, s.gid, s.mode, s.dir, s.symlink)),
+                )
+            })
+            .collect();
+        let file = sys
+            .owned_file_metadata(path, user.uid, INPUT_MAX, false)
+            .map_err(|e| e.kind());
+        Self {
+            key: ProfileKey {
+                uid: user.uid,
+                home: PathBuf::from(&user.home),
+                file,
+                prefix,
+            },
+            facts,
+        }
+    }
+
+    fn settled(&self, now: u64) -> bool {
+        self.key.prefix.iter().all(|(_, fact)| fact.is_ok())
+            && match self.key.file {
+                Ok(metadata) => metadata.settled_at(now),
+                Err(std::io::ErrorKind::NotFound) => true,
+                Err(_) => false,
+            }
+    }
+
+    fn accepts(
+        &self,
+        read: &std::io::Result<crate::port::OwnedFileRead>,
+        after: &Self,
+        started: u64,
+    ) -> bool {
+        let descriptor_matches = match (&self.key.file, read) {
+            (Ok(expected), Ok(read)) => *expected == read.metadata,
+            (Err(std::io::ErrorKind::NotFound), Err(error)) => {
+                error.kind() == std::io::ErrorKind::NotFound
+            }
+            _ => false,
+        };
+        self.key == after.key && descriptor_matches && self.settled(started)
+    }
+}
+
+/// Per-observer memo of profile-derived paths alone. No credential bytes,
+/// executable choice, source authority or permission to use a file is cached.
+#[derive(Default)]
+pub struct RepositoryInputPathCache {
+    profile: Option<(ProfileKey, Vec<PathBuf>)>,
+}
+
+/// Declared paths and the fresh prefix facts already read while deriving them.
+pub struct RepositoryControlPaths {
+    pub paths: Vec<PathBuf>,
+    pub prefix_facts: PrefixFacts,
+    /// Only a coherent settled profile permits the observer's metadata fast path.
+    pub reusable: bool,
+}
+
+impl std::fmt::Debug for RepositoryInputPathCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RepositoryInputPathCache")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for RepositoryControlPaths {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RepositoryControlPaths")
+            .finish_non_exhaustive()
+    }
+}
+
+impl RepositoryInputPathCache {
+    /// Observe current paths, resolving Git and launcher links every time. Only
+    /// unchanged settled profile selection avoids another owned content read.
+    /// # Errors
+    /// This process's own account cannot be identified.
+    pub fn observe(&mut self, sys: &dyn System) -> Result<RepositoryControlPaths, String> {
+        let user = account(sys)?;
+        let path = Path::new(&user.home).join(".config/aterm/init.toml");
+        let started = sys.now();
+        let before = ProfileFrame::read(sys, &user, &path);
+        let (selected, reusable) = if let Some((_, selected)) = self
+            .profile
+            .as_ref()
+            .filter(|(key, _)| *key == before.key && before.settled(started))
+        {
+            (selected.clone(), true)
+        } else {
+            let read = sys.read_owned_file_observed(&path, user.uid, INPUT_MAX, false);
+            let selected = match &read {
+                Ok(read) => selected_paths(decode(&read.bytes).map(Some), &user),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // A second read here could see a transient profile and memoize its
+                    // selection under two surrounding Missing observations (ABA).
+                    selected_paths(Ok(None), &user)
+                }
+                // Unsupported, busy or changing observations keep ordinary profile
+                // reading behavior. They cannot populate the memo or skip a retry.
+                Err(_) => selected_paths(profile(sys, &user), &user),
+            };
+            let after = ProfileFrame::read(sys, &user, &path);
+            let reusable = before.accepts(&read, &after, started);
+            self.profile = reusable.then(|| (before.key.clone(), selected.clone()));
+            (selected, reusable)
+        };
+        let mut paths = dynamic_paths(sys, &user);
+        paths.extend(selected);
+        paths.sort();
+        paths.dedup();
+        Ok(RepositoryControlPaths {
+            paths,
+            prefix_facts: before.facts,
+            reusable,
+        })
+    }
+}
 
 /// Local source, pinned-helper and Git changes that can invalidate a completed repository stage.
 /// Observing this mark grants no authority over inputs or effects and runs no program.
@@ -20,6 +170,22 @@ pub struct RepositoryInputMark {
     helper: Result<(PathBuf, [u8; 32]), std::io::ErrorKind>,
     git: Vec<(PathBuf, FileVersion)>,
     paths: Vec<PathBuf>,
+    checkouts: super::checkout_inputs::Checkouts,
+}
+
+impl RepositoryInputMark {
+    /// Resample the previously derived private-inventory scope using metadata alone.
+    /// This reads no private inventory, credential or worktree content and starts no program.
+    #[must_use]
+    pub fn checkout_metadata(&self, sys: &dyn System) -> super::RepositoryCheckoutMetadata {
+        self.checkouts.observe(sys)
+    }
+
+    /// Metadata captured with this mark, before any later filesystem changes.
+    #[must_use]
+    pub fn captured_checkout_metadata(&self) -> super::RepositoryCheckoutMetadata {
+        self.checkouts.metadata()
+    }
 }
 
 impl std::fmt::Debug for RepositoryInputMark {
@@ -63,6 +229,7 @@ pub fn repository_input_mark(sys: &dyn System) -> Result<RepositoryInputMark, St
             })
             .collect(),
         paths: watch_paths(sys, &user),
+        checkouts: super::checkout_inputs::Checkouts::capture(sys, &user),
     })
 }
 
@@ -75,10 +242,42 @@ pub fn repository_input_mark(sys: &dyn System) -> Result<RepositoryInputMark, St
 /// This process's own account cannot be identified.
 pub fn repository_input_watch_paths(sys: &dyn System) -> Result<Vec<PathBuf>, String> {
     let user = account(sys)?;
+    let mut paths = watch_paths(sys, &user);
+    paths.extend(super::checkout_inputs::Checkouts::capture(sys, &user).paths());
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+/// Cheap control paths for metadata polling. Inventory-derived checkout paths are cached
+/// separately in [`RepositoryInputMark`], rather than reparsing private inputs each tick.
+///
+/// # Errors
+/// This process's own account cannot be identified.
+pub fn repository_input_control_watch_paths(sys: &dyn System) -> Result<Vec<PathBuf>, String> {
+    let user = account(sys)?;
     Ok(watch_paths(sys, &user))
 }
 
+/// Declared checkout and Git control boundaries from the selected private inventory.
+/// Callers must retain no-follow admission when arming their existing filesystem watches.
+///
+/// # Errors
+/// This process's own account cannot be identified.
+pub fn repository_checkout_watch_paths(sys: &dyn System) -> Result<Vec<PathBuf>, String> {
+    let user = account(sys)?;
+    Ok(super::checkout_inputs::Checkouts::capture(sys, &user).paths())
+}
+
 fn watch_paths(sys: &dyn System, user: &User) -> Vec<PathBuf> {
+    let mut paths = dynamic_paths(sys, user);
+    paths.extend(selected_paths(profile(sys, user), user));
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn dynamic_paths(sys: &dyn System, user: &User) -> Vec<PathBuf> {
     let home = Path::new(&user.home);
     let launcher = crate::git_credential::Helper::launcher(user);
     let mut paths = vec![home.join(".config/aterm/init.toml"), launcher.clone()];
@@ -112,7 +311,14 @@ fn watch_paths(sys: &dyn System, user: &User) -> Vec<PathBuf> {
         let Some(next) = next else { break };
         link = next;
     }
-    match profile(sys, user).and_then(|profile| asked(profile.and_then(|p| p.github), user)) {
+    paths.extend(git_paths(sys));
+    paths
+}
+
+fn selected_paths(profile: Result<Option<super::Config>, String>, user: &User) -> Vec<PathBuf> {
+    let home = Path::new(&user.home);
+    let mut paths = Vec::new();
+    match profile.and_then(|profile| asked(profile.and_then(|p| p.github), user)) {
         Ok(Asked::Default) => {
             paths.push(home.join(TOKEN_FILE));
             paths.push(home.join(inventory::FILE));
@@ -120,9 +326,6 @@ fn watch_paths(sys: &dyn System, user: &User) -> Vec<PathBuf> {
         Ok(Asked::Scoped(source) | Asked::Profile(source)) => paths.push(source.token_file),
         Ok(Asked::Off) | Err(_) => {}
     }
-    paths.extend(git_paths(sys));
-    paths.sort();
-    paths.dedup();
     paths
 }
 
@@ -139,6 +342,56 @@ fn git_paths(sys: &dyn System) -> Vec<PathBuf> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_profile_memo_requires_the_read_descriptor_and_every_prefix_to_match() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let home = scratch.path().canonicalize().unwrap();
+        let parent = home.join(".config/aterm");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = parent.join("init.toml");
+        let other = parent.join("other-profile");
+        for (path, bytes) in [
+            (&path, b"[develop]\ncheckouts=[]\n".as_slice()),
+            (&other, b"# other owned version\n".as_slice()),
+        ] {
+            std::fs::write(path, bytes).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let user = User {
+            name: "fixture".into(),
+            uid: path.metadata().unwrap().uid(),
+            gid: 0,
+            home: home.to_string_lossy().into_owned(),
+            shell: String::new(),
+            admin: false,
+        };
+        let sys = crate::port::Live::new();
+        let before = ProfileFrame::read(&sys, &user, &path);
+        let read = sys.read_owned_file_observed(&path, user.uid, INPUT_MAX, false);
+        let after = ProfileFrame::read(&sys, &user, &path);
+        let settled = sys.now().saturating_add(3);
+        assert!(
+            before.accepts(&read, &after, settled),
+            "valid settled descriptor control"
+        );
+        assert!(
+            !before.accepts(&read, &after, 0),
+            "unsettled data never populate the memo"
+        );
+        // A different owned descriptor cannot borrow the pathname's later metadata,
+        // including when a namespace changes away and back between path observations.
+        let substituted = sys.read_owned_file_observed(&other, user.uid, INPUT_MAX, false);
+        assert!(!before.accepts(&substituted, &after, settled));
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let changed = ProfileFrame::read(&sys, &user, &path);
+        assert!(
+            !before.accepts(&read, &changed, settled),
+            "prefix admission is part of the key"
+        );
+    }
 
     #[test]
     fn a_dangling_helper_keeps_its_declared_target_observable() {

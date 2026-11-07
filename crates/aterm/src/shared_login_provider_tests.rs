@@ -134,6 +134,7 @@ mod native_reader {
             "the default host must stay inert"
         );
         let context = Context {
+            publication: None,
             admission: None,
             env: &env,
             store: &store,
@@ -171,6 +172,7 @@ mod native_reader {
         let host = Native(Inert);
         assert!(host.native_credential_setup());
         let context = Context {
+            publication: None,
             admission: None,
             env: &env,
             store: &store,

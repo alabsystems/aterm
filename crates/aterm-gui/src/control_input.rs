@@ -694,6 +694,10 @@ pub(crate) struct InputFence<'a> {
     pub guard_at_cursor: bool,
     /// The worker's initial command still targets an input-ready shell block.
     pub entering_command: bool,
+    /// The writer's own standing, judged under the lock of its write after the person's (a
+    /// turn's guarded Enter: the turn still holds its slot). Its loss writes nothing and
+    /// answers [`GuardedInput::Skipped`]; the writer, which knows what it judged, says why.
+    pub standing: Option<&'a (dyn Fn() -> bool + Sync)>,
 }
 
 impl InputFence<'_> {
@@ -759,6 +763,10 @@ pub(crate) enum GuardedInput {
     Skipped,
     Changed,
     Person,
+    /// Input queued for the program in order (a paste its writer is still writing, a key behind
+    /// it) had not all gone: nothing was written and no fence past the person and the writer's
+    /// standing was judged, so the same write may be tried again once it has.
+    Queued,
     Pressed(Delivery),
 }
 
@@ -776,6 +784,14 @@ pub(crate) fn input_if_fenced_observed(
     let terminal = term_lock_whole_when(term, on.lane(), |_| waits);
     if fence.human.is_some_and(|n| ctx.human_input.seq() != n) {
         return GuardedInput::Person;
+    }
+    if fence.standing.is_some_and(|stands| !stands()) {
+        return GuardedInput::Skipped;
+    }
+    // Input queued for the program in order goes first: a write now would overtake it, and the
+    // screen any fence would judge is one that input has not reached, so none is judged.
+    if ctx.sink.ordered_egress_count() > 0 {
+        return GuardedInput::Queued;
     }
     if fence.reads_rows() && crate::frame_unfinished_now(&terminal) {
         return GuardedInput::Changed;
@@ -889,7 +905,9 @@ pub(crate) fn guarded_input_reply(decision: GuardedInput) -> String {
         GuardedInput::Changed => "OK skipped reason=changed\n".to_string(),
         GuardedInput::Person => "OK skipped reason=person\n".to_string(),
         GuardedInput::Pressed(Delivery::Full) => "OK\n".to_string(),
-        GuardedInput::Pressed(Delivery::BusyZero) => "ERR busy sink\n".to_string(),
+        GuardedInput::Queued | GuardedInput::Pressed(Delivery::BusyZero) => {
+            "ERR busy sink\n".to_string()
+        }
         GuardedInput::Pressed(Delivery::PartialInDoubt { accepted }) => {
             format!("ERR write failed partial accepted={accepted}\n")
         }

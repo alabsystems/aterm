@@ -205,6 +205,7 @@ fn shared_of(macs: &[Mac; 3], i: usize, wide: bool) -> Shared {
         own_halts_only: own_halts_only(),
         one_node: one_node(),
         node_order_olds: node_order_olds(),
+        node_order_ring: node_order_ring(),
         unsealed_carry: unsealed_carry(),
         ungated_inbox: ungated_inbox(),
         give_back_carried: false,
@@ -282,6 +283,7 @@ impl Routing {
                 .map(|j| self.node(j).to_owned())
                 .collect(),
             moved: BTreeMap::new(),
+            rank: BTreeMap::new(),
             gone: BTreeSet::new(),
         }
     }

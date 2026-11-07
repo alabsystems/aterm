@@ -232,6 +232,13 @@ pub struct Real {
     prepared_source_helper: Option<PathBuf>,
     scanner_tools: Option<scanner_tools::Report>,
     scanner_probe: scanner_tools::Probe,
+    /// How a step builds a dev binary of this checkout ([`Real::build_checkout_bin`]; a test's
+    /// stand-in answers cargo's JSON messages itself).
+    checkout_build: CheckoutBuild,
+    /// The caller's [`ENGINE_AGH_ENV`], read once when the backend is made: the engine's agh
+    /// when set ([`Real::engine_agh`]). A test sets it, so a cut run with `PUBLISH_AGH` does
+    /// not hand the test's engine stand-in the release's agh.
+    engine_agh_explicit: Option<std::ffi::OsString>,
     /// The release's one disk claim ([`Backend::claim_disk`]), named to every child it starts.
     disk_claim: Option<atpkg::admit_disk::Whole>,
     fleet_line: Option<crate::line_claim::Claim>,
@@ -328,6 +335,8 @@ impl Real {
             prepared_source_helper: None,
             scanner_tools: None,
             scanner_probe: scanner_tools::run,
+            checkout_build: Real::build_checkout_bin,
+            engine_agh_explicit: std::env::var_os(ENGINE_AGH_ENV),
             disk_claim: None,
             fleet_line: None,
         })
@@ -1040,6 +1049,61 @@ impl Real {
         Ok(copy)
     }
 
+    /// `targo` with `args` in this checkout, as a step builds a dev binary of it (`what`) to hand a
+    /// child: [`Real::child`], its output kept in the step's log, its stdout (cargo's JSON
+    /// messages) the answer.
+    fn build_checkout_bin(
+        &self,
+        what: &str,
+        args: &[std::ffi::OsString],
+    ) -> Result<Vec<u8>, String> {
+        use aterm_verify::provision::Host as _;
+        let targo = aterm_verify::provision::System::new(&self.repo).targo()?;
+        let mut cmd = self.child(targo, None);
+        cmd.args(args);
+        let out = self.output_forwarded(&mut cmd).map_err(|e| e.to_string())?;
+        if let Ok(mut log) = crate::durable::open_append(&self.step_log(self.step), true) {
+            let _ = log.write_all(&out.stdout);
+            let _ = log.write_all(&out.stderr);
+        }
+        if !out.status.success() {
+            return Err(format!(
+                "{what} build exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        Ok(out.stdout)
+    }
+
+    /// The agh the engine's dry run reads GitHub through ([`ENGINE_AGH_ENV`]): the caller's own,
+    /// or this checkout's dev client, built in the gate profile ([`crate::checkout_bin`]). The
+    /// engine sends every GitHub read through agh, which routes each owner to the token its vault
+    /// holds for it and reads the public tier anonymously when the engine asks; with no
+    /// `PUBLISH_AGH` it runs the `agh` on PATH, which is the installed app's link to `aterm`,
+    /// resolved to `aterm` before it runs (`aterm help: unknown topic 'repo'`) and as old as that
+    /// install.
+    fn engine_agh(&self) -> Result<PathBuf, Refusal> {
+        let explicit = self.engine_agh_explicit.as_deref();
+        crate::checkout_bin::prepare(&self.repo, &ENGINE_AGH, explicit, |args| {
+            println!("export guards: building this checkout's agh, the engine's GitHub client");
+            (self.checkout_build)(self, ENGINE_AGH.what, args)
+        })
+        .map_err(|why| {
+            Refusal::new(
+                format!(
+                    "the engine reads GitHub only through agh, and no agh it can run is here: \
+                     {why}"
+                ),
+                format!(
+                    "fix this checkout's agh build (targo --unverified build -p agh --bin agh), \
+                     or set {ENGINE_AGH_ENV} to a qualified agh's absolute path, then run it \
+                     again"
+                ),
+            )
+        })
+    }
+
     fn metadata_toolchain(&self) -> Option<Refusal> {
         let dir = match rustup_dir() {
             Ok(dir) => dir,
@@ -1122,8 +1186,12 @@ impl Real {
             ));
         }
         let toolchain = self.metadata_toolchain();
+        let agh = match self.engine_agh() {
+            Ok(agh) => agh,
+            Err(why) => return not_run(why),
+        };
         let pubbin = engine.join("bin/pub");
-        let (mut stage, handed) = match self.dry_run_command(&engine, r, &root, &reads) {
+        let (mut stage, handed) = match self.dry_run_command(&engine, r, &root, &reads, &agh) {
             Ok(command) => command,
             Err(why) => return not_run(why),
         };
@@ -1178,20 +1246,23 @@ impl Real {
     }
 
     /// The engine's dry run of `r` over the clone at `root`, `pub stage aterm --dry-run
-    /// --no-check --commit R --repo-path <root>` from the scratch `engine`: [`Real::scrubbed`],
-    /// with this rustup's directory first on PATH and `reads` ([`public_reads`]) in its
-    /// environment, handed this cutter for its transforms only as `r`'s own build
-    /// ([`hand_transforms_cutter`], whose line it returns beside it).
+    /// --no-check --commit R --repo-path <root>` from the scratch `engine`: [`Real::engine_child`],
+    /// with this rustup's directory first on PATH, `reads` ([`public_reads`]) and `agh` as its
+    /// GitHub client ([`ENGINE_AGH_ENV`], [`Real::engine_agh`]) in its environment, handed this
+    /// cutter for its transforms only as `r`'s own build ([`hand_transforms_cutter`], whose line
+    /// it returns beside it).
     fn dry_run_command(
         &self,
         engine: &Path,
         r: &str,
         root: &Path,
         reads: &[(String, std::ffi::OsString)],
+        agh: &Path,
     ) -> Result<(Command, String), Refusal> {
         let mut stage = self.engine_child(engine, None)?;
         stage
             .env("PUBLICATION_ENGINE", engine)
+            .env(ENGINE_AGH_ENV, agh)
             .env(
                 "PATH",
                 rustup_dir().map_or_else(|_| publication_path(), |dir| path_with(&dir)),
@@ -2107,9 +2178,15 @@ impl Arrivals {
             let _ = writeln!(
                 self.file,
                 "release-event: {}",
-                aterm_json::json!({
-                    "schema": 1, "event": "publish-line", "at_unix_ms": now_ms(), "line": &*text,
-                })
+                aterm_json::Value::Object(aterm_json::Map::from([
+                    ("schema".to_string(), 1.into()),
+                    ("event".to_string(), "publish-line".into()),
+                    (
+                        "at_unix_ms".to_string(),
+                        now_ms().map_or(aterm_json::Value::Null, Into::into),
+                    ),
+                    ("line".to_string(), text.into_owned().into()),
+                ]))
             );
             self.line.clear();
             rest = &rest[pos + 1..];
@@ -2153,19 +2230,38 @@ fn step_child_event(
         program.push(' ');
         program.push_str(&arg.to_string_lossy());
     }
+    let child_cpu = usage.map_or(aterm_json::Value::Null, |u| {
+        aterm_json::Value::Object(aterm_json::Map::from([
+            (
+                "scope".to_string(),
+                "reaped-child-and-waited-descendants".into(),
+            ),
+            ("observed_s".to_string(), u.cpu.as_secs_f64().into()),
+        ]))
+    });
+    let peak_bytes = usage
+        .map(|u| u.maxrss)
+        .filter(|b| *b > 0)
+        .map_or(aterm_json::Value::Null, Into::into);
     format!(
         "release-event: {}",
-        aterm_json::json!({
-            "schema": 1, "event": "step-child-finished", "step": step.name(),
-            "program": program,
-            "started_at_unix_ms": started_at_unix_ms, "ended_at_unix_ms": ended_at_unix_ms,
-            "exit_code": exit_code,
-            "child_cpu": usage.map(|u| aterm_json::json!({
-                "scope": "reaped-child-and-waited-descendants",
-                "observed_s": u.cpu.as_secs_f64(),
-            })),
-            "peak_bytes": usage.map(|u| u.maxrss).filter(|b| *b > 0),
-        })
+        aterm_json::Value::Object(aterm_json::Map::from([
+            ("schema".to_string(), 1.into()),
+            ("event".to_string(), "step-child-finished".into()),
+            ("step".to_string(), step.name().into()),
+            ("program".to_string(), program.into()),
+            (
+                "started_at_unix_ms".to_string(),
+                started_at_unix_ms.map_or(aterm_json::Value::Null, Into::into),
+            ),
+            (
+                "ended_at_unix_ms".to_string(),
+                ended_at_unix_ms.map_or(aterm_json::Value::Null, Into::into),
+            ),
+            ("exit_code".to_string(), exit_code.into()),
+            ("child_cpu".to_string(), child_cpu),
+            ("peak_bytes".to_string(), peak_bytes),
+        ]))
     )
 }
 
@@ -2423,6 +2519,22 @@ fn rustup_dir() -> Result<PathBuf, aterm_uds::host::Absent> {
     Ok(rustup.parent().map_or_else(PathBuf::new, Path::to_path_buf))
 }
 
+/// How [`Real`] builds a dev binary of its checkout: `targo` with the arguments it is handed (and
+/// what the binary is called in its error), answering cargo's JSON messages
+/// ([`Real::build_checkout_bin`]).
+type CheckoutBuild = fn(&Real, &str, &[std::ffi::OsString]) -> Result<Vec<u8>, String>;
+
+/// The variable the publication engine's GitHub transport (`bin/pub_github.py`) reads for the
+/// agh it runs, an absolute path; with none it runs the `agh` on PATH.
+const ENGINE_AGH_ENV: &str = "PUBLISH_AGH";
+
+/// The engine's GitHub client, `crates/agh`'s dev shim, as [`crate::checkout_bin`] builds it.
+const ENGINE_AGH: crate::checkout_bin::Bin = crate::checkout_bin::Bin {
+    package: "agh",
+    env: ENGINE_AGH_ENV,
+    what: "agh",
+};
+
 /// Git config for the export engine's public reads, as `(key, value)`. Only the engine's
 /// `git@github.com:alabsystems/<name>.git` release URLs are rewritten to HTTPS; private origins
 /// retain their transport. An empty public credential helper clears inherited helpers, and the
@@ -2583,16 +2695,13 @@ fn public_reads(
         Some(n) if n.bytes().all(|b| b.is_ascii_digit()) => n.parse::<usize>().ok(),
         Some(_) => None,
     };
-    let mut policy: Vec<(String, String)> = PUBLIC_READS
-        .iter()
-        .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
-        .collect();
+    let mut policy: Vec<(&str, &str)> = PUBLIC_READS.to_vec();
     let mut seen = std::collections::BTreeSet::new();
     for key in header_keys {
         if let Some(key) = public_header_key(key)?
             && seen.insert(key)
         {
-            policy.push((key.to_owned(), String::new()));
+            policy.push((key, ""));
         }
     }
     let Some((base, count)) = base.and_then(|base| Some((base, base.checked_add(policy.len())?)))
@@ -2944,13 +3053,19 @@ pub enum EngineCause {
     GitleaksBroke,
     /// A remote (the origins, the staging repository, the public tags) could not be read, or moved while it was.
     Network,
+    /// agh, the engine's GitHub transport, did not answer a read: no token it routes for the
+    /// owner can read the repository, an anonymous read found it private, or the agh is not one
+    /// the engine can use.
+    Transport,
     /// The engine's own checkout, records or lock.
     Engine,
     /// The commit is not on its origin's main, or the source clone is not one the engine stages.
     Source,
 }
 
-const MACHINE_REFUSALS: [(&str, EngineCause); 17] = [
+const MACHINE_REFUSALS: [(&str, EngineCause); 19] = [
+    ("GitHub transport", EngineCause::Transport),
+    ("Agh ", EngineCause::Transport),
     ("gitleaks not installed", EngineCause::NoGitleaks),
     ("gitleaks crashed", EngineCause::GitleaksBroke),
     ("release notes: cannot ", EngineCause::Network),
@@ -2991,6 +3106,15 @@ impl EngineCause {
                               git@ remote; an alabsystems one is read anonymously over HTTPS, \
                               so it must be public), then run it again"
                 .into(),
+            Self::Transport => format!(
+                "the engine reads GitHub through agh: an agh that lacks the verb the engine \
+                 runs (`no help for: repo fetch`, `unknown topic 'repo'`) is older than the \
+                 engine, so unset {ENGINE_AGH_ENV} (this checkout's agh is then built) or point \
+                 it at a current one; else `agh whoami --for OWNER/REPO` names the identity agh \
+                 routes for the repository it names, and a private one reads only with a vault \
+                 token that can read it (`agh auth add`, or `aterm secrets sync`); an \
+                 alabsystems one is read anonymously, so it must be public; then run it again"
+            ),
             Self::Engine => {
                 "fix the publication engine's checkout or records it names, then run it again"
                     .into()
@@ -3544,10 +3668,22 @@ impl Backend for Real {
         #[cfg(unix)]
         let observation = aterm_agent::operational::observe();
         #[cfg(not(unix))]
-        let observation = aterm_json::json!({"state":"unknown", "reason":"operational observation is unavailable on this platform"});
-        let record = aterm_json::json!({"schema":1,
-            "attempt":self.logs.to_string_lossy().into_owned(), "observed_at":now(),
-            "observation":observation});
+        let observation = aterm_json::Value::Object(aterm_json::Map::from([
+            ("state".to_string(), "unknown".into()),
+            (
+                "reason".to_string(),
+                "operational observation is unavailable on this platform".into(),
+            ),
+        ]));
+        let record = aterm_json::Value::Object(aterm_json::Map::from([
+            ("schema".to_string(), 1.into()),
+            (
+                "attempt".to_string(),
+                self.logs.to_string_lossy().into_owned().into(),
+            ),
+            ("observed_at".to_string(), now().into()),
+            ("observation".to_string(), observation),
+        ]));
         match aterm_json::to_vec(&record)
             .map_err(|e| e.to_string())
             .and_then(|bytes| {
@@ -4267,24 +4403,8 @@ impl Backend for Real {
         let explicit = std::env::var_os("ATPKG_KEYS");
         let helper =
             crate::source_signing::prepare_helper(&self.repo, explicit.as_deref(), |args| {
-                use aterm_verify::provision::Host as _;
-                let targo = system.targo()?;
                 println!("validation tools: building this checkout's source-signing helper");
-                let mut cmd = self.child(targo, None);
-                cmd.args(args);
-                let out = self.output_forwarded(&mut cmd).map_err(|e| e.to_string())?;
-                if let Ok(mut log) = crate::durable::open_append(&self.step_log(self.step), true) {
-                    let _ = log.write_all(&out.stdout);
-                    let _ = log.write_all(&out.stderr);
-                }
-                if !out.status.success() {
-                    return Err(format!(
-                        "source-signing helper build exited {}: {}",
-                        out.status,
-                        String::from_utf8_lossy(&out.stderr)
-                    ));
-                }
-                Ok(out.stdout)
+                (self.checkout_build)(self, "source-signing helper", args)
             })
             .map_err(|why| {
                 Refusal::new(
@@ -5176,13 +5296,15 @@ pub fn check(repo: &Path, opts: &CheckOptions) -> i32 {
 /// # Errors
 /// The commit names no commit, or its `Cargo.toml` carries no release version.
 fn checked(repo: &Path, opts: &CheckOptions) -> Result<Precheck, String> {
-    checked_with(repo, opts, crate::managed_prerequisites::Tools::acquire)
+    checked_with(repo, opts, |_| {})
 }
 
+/// [`checked`], with `adjust` applied to the engine's backend before its gates run (a test's
+/// stand-ins: how it acquires its prerequisites, how it builds this checkout's binaries).
 fn checked_with(
     repo: &Path,
     opts: &CheckOptions,
-    prerequisite_acquire: crate::managed_prerequisites::Acquire,
+    adjust: impl FnOnce(&mut Real),
 ) -> Result<Precheck, String> {
     let rev = opts.commit.as_deref().unwrap_or("HEAD");
     let git = GitCli::new(repo);
@@ -5225,6 +5347,10 @@ fn checked_with(
     }
     let commit = found.commit.clone();
     let ready = Real::new(repo, opts.engine.as_deref(), true, false)
+        .map(|mut real| {
+            adjust(&mut real);
+            real
+        })
         .and_then(|real| Ok((real, Scratch::read_only(repo)?)))
         .map_err(|why| {
             Refusal::new(
@@ -5234,7 +5360,6 @@ fn checked_with(
         });
     match ready {
         Ok((mut real, scratch)) => {
-            real.prerequisite_acquire = prerequisite_acquire;
             let mut left = None;
             if export {
                 let (outcome, export) = real.export_gate(&scratch, &commit);
@@ -5774,6 +5899,23 @@ mod tests {
                 "astream public release main fetch failed: Host key verification failed.",
                 EngineCause::Network,
             ),
+            // The engine's agh transport (2026-11-05), measured on this Mac on 2026-11-06 with
+            // the installed agh: a read through it is agh's to route, not the network's.
+            (
+                "cannot query publication engine origin/main: pub GitHub transport: Agh exited 2: \
+                 aterm help: unknown topic 'repo'",
+                EngineCause::Transport,
+            ),
+            (
+                "astream public release main fetch failed: pub GitHub transport: Agh exited 4: \
+                 agh: not_found exit=4",
+                EngineCause::Transport,
+            ),
+            (
+                "Agh lacks the required exact anonymous fetch capability; select the qualified \
+                 client with PUBLISH_AGH",
+                EngineCause::Transport,
+            ),
             (
                 "publication engine HEAD a does not exactly match queried origin/main b",
                 EngineCause::Engine,
@@ -5972,6 +6114,8 @@ mod tests {
                 )
             })
             .collect();
+        let agh = agh_standin(&repo);
+        aterm_verify::standin(&agh, "exit 0");
         let stub = |say: &str, code: i32| {
             std::fs::create_dir_all(engine.join("bin")).unwrap();
             let pubbin = engine.join("bin/pub");
@@ -5981,10 +6125,12 @@ mod tests {
                     "#!/bin/sh\nhere=$(cd \"$(dirname \"$0\")/..\" && pwd)\n\
                      if [ \"$1\" = scanner-preflight ]; then cat '{scanner}'; exit 0; fi\n\
                      [ -n \"$PUBLISH_SCANNER_TOOLS\" ] && cmp -s \"$PUBLISH_SCANNER_TOOLS\" '{scanner}' || exit 10\n\
+                     [ \"$PUBLISH_AGH\" = '{agh}' ] || exit 11\n\
                      echo '{{\"row\":1}}' \
                      >> \"$here/verification-log.jsonl\"\n[ \"$1 $2 $3 $4\" = 'stage aterm \
                      --dry-run --no-check' ] || exit 9\n{dump}printf '%s' '{say}'\nexit {code}\n",
                     scanner = scanner_report.display(),
+                    agh = agh.display(),
                 ),
             )
             .unwrap();
@@ -6011,17 +6157,19 @@ mod tests {
             export: true,
             ..CheckOptions::default()
         };
-        let export = |commit: &str| {
-            let found = checked_with(
-                &repo,
-                &opts(commit, &engine),
-                crate::managed_prerequisites::simulated,
-            )
+        let export_built = |commit: &str, build: CheckoutBuild| {
+            let found = checked_with(&repo, &opts(commit, &engine), |real| {
+                real.prerequisite_acquire = crate::managed_prerequisites::simulated;
+                real.checkout_build = build;
+                // This test builds the checkout's agh, whatever PUBLISH_AGH its caller set.
+                real.engine_agh_explicit = None;
+            })
             .expect("a release");
             let gate = found.gates.last().expect("the export gate");
             assert_eq!(gate.name, EXPORT_GATE);
             (gate.outcome.clone(), found.exit_code())
         };
+        let export = |commit: &str| export_built(commit, built_agh);
         let exported = "== exported 1 of 1 tracked files from r\n";
         stub(&format!("{exported}== guard ok: no forbidden content\n"), 0);
         let (outcome, code) = export("HEAD");
@@ -6050,23 +6198,64 @@ mod tests {
         assert!(matches!(outcome, Outcome::CouldNotRun(_)), "{outcome:?}");
         assert_eq!(code, 3);
         stub(&format!("{exported}== guard ok: no forbidden content\n"), 0);
+        // No agh the engine can read GitHub through: the gate stops before the dry run, and its
+        // refusal names what would.
+        let (outcome, code) = export_built("HEAD", broken_agh);
+        match &outcome {
+            Outcome::CouldNotRun(why) => assert!(
+                why.why.contains("only through agh")
+                    && why.why.contains("error[E0425]")
+                    && why.remedy.contains("PUBLISH_AGH"),
+                "{why:?}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(code, 3);
         std::fs::write(repo.join("new.rs"), "\n").unwrap();
         git(&repo, &["add", "-A"]);
         git(&repo, &["commit", "-q", "-m", "unpushed"]);
         let (outcome, code) = export("HEAD");
         assert!(matches!(outcome, Outcome::CouldNotRun(_)), "{outcome:?}");
         assert_eq!(code, 3);
-        let found = checked_with(
-            &repo,
-            &opts("HEAD~1", &root.join("none")),
-            crate::managed_prerequisites::simulated,
-        )
+        let found = checked_with(&repo, &opts("HEAD~1", &root.join("none")), |real| {
+            real.prerequisite_acquire = crate::managed_prerequisites::simulated;
+        })
         .unwrap();
         assert!(matches!(
             found.gates.last().map(|g| &g.outcome),
             Some(Outcome::CouldNotRun(_))
         ));
         assert!(checked(&repo, &opts("no-such-commit", &engine)).is_err());
+    }
+
+    /// Where the stand-in agh of the checkout at `repo` is "built", outside the checkout.
+    fn agh_standin(repo: &Path) -> PathBuf {
+        repo.with_file_name("agh-build").join("agh")
+    }
+
+    /// A build of the checkout's agh that cargo answers with the stand-in's path.
+    fn built_agh(real: &Real, what: &str, args: &[std::ffi::OsString]) -> Result<Vec<u8>, String> {
+        let pair = |flag: &str, value: &str| args.windows(2).any(|w| w[0] == flag && w[1] == value);
+        assert!(
+            what == "agh" && pair("-p", "agh") && pair("--bin", "agh"),
+            "{what}: {args:?}"
+        );
+        let manifest = real.repo.join("crates/agh/Cargo.toml");
+        Ok(aterm_json::json!({
+            "reason": "compiler-artifact",
+            "manifest_path": manifest.to_str().unwrap(),
+            "target": {"name": "agh", "kind": ["bin"]},
+            "executable": agh_standin(&real.repo).to_str().unwrap(),
+        })
+        .to_string()
+        .into_bytes())
+    }
+
+    /// A build of the checkout's agh that does not compile.
+    fn broken_agh(_: &Real, what: &str, _: &[std::ffi::OsString]) -> Result<Vec<u8>, String> {
+        Err(format!(
+            "{what} build exited exit status: 101: error[E0425]"
+        ))
     }
 
     /// [`PUBLIC_READS`] numbered from `base`, the way [`public_reads`] hands them to the engine.
@@ -6138,6 +6327,7 @@ mod tests {
                 "c0ffee",
                 &root.join("clone"),
                 &reads(Some("1")).unwrap(),
+                &root.join("agh"),
             )
             .unwrap();
         // This test process was never judged at its start, so it is no commit's build: the dry
@@ -6885,6 +7075,7 @@ mod tests {
                 "candidate",
                 &export,
                 &public_reads_at(0),
+                &root.join("agh"),
             )
             .unwrap();
         let report = scanner_tools::prepare(

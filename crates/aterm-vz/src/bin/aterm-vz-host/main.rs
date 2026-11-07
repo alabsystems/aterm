@@ -21,10 +21,9 @@ mod vz;
 const USAGE: &str = "usage: aterm-vz-host serve <state-dir>";
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    match args.as_slice() {
-        ["serve", state] => serve(Path::new(state)),
+    let mut args = std::env::args().skip(1);
+    match (args.next().as_deref(), args.next(), args.next()) {
+        (Some("serve"), Some(state), None) => serve(Path::new(&state)),
         _ => usage(),
     }
 }

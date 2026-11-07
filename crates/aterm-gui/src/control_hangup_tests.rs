@@ -182,6 +182,51 @@ fn a_typed_turn_whose_caller_hangs_up_mid_typing_still_types_and_submits() {
     );
 }
 
+/// A TURN WHOSE FIRST WRITE IS ITS ENTER IS COMMITTED BY IT (disconnect F3 of the second hostile
+/// review of the turn-deadline work, 2026-11-06): a text of control characters alone types no
+/// key and writes no run, so its Enter is its first write, and once that Enter went a caller who
+/// hangs up no longer stops the re-press at the main thread's gate, as after any other write.
+/// NEGATIVE CONTROL: with the Enter entering no `CommittedInput`, the re-press is refused for the
+/// hangup and the turn answers `ERR key delivery failed` after an Enter that went.
+#[test]
+fn a_turn_whose_enter_was_its_first_write_re_presses_after_its_caller_goes() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (client, server) = CtlStream::pair().expect("socket pair");
+    let client = Mutex::new(Some(client));
+    let presses = AtomicUsize::new(0);
+    let handle = crate::session_store::test_handle(0);
+    let store = crate::session_store::new_store();
+    let _serving = ServingFd::enter(&server);
+    let press = |key: &str| {
+        assert_eq!(key, "enter");
+        if main_hop_refused_for_hangup() {
+            return false;
+        }
+        if presses.fetch_add(1, Ordering::SeqCst) == 0 {
+            drop(client.lock().expect("client slot").take());
+            until_seen("the hangup to become visible to the lane", caller_hung_up);
+        }
+        true
+    };
+    let reply = cmd_turn(
+        &handle.term,
+        &store,
+        0,
+        "idle=1 timeout=5000 submit_window=200 presses=2 typed=1 cadence=1 \u{1b}",
+        &handle.ctx,
+        &TurnIo {
+            press: &press,
+            ..TurnIo::paste_only()
+        },
+    );
+    assert_eq!(presses.load(Ordering::SeqCst), 2, "{reply}");
+    assert!(
+        !reply.starts_with("ERR"),
+        "the turn ran to its verdict: {reply}"
+    );
+}
+
 #[test]
 fn a_turn_whose_caller_hung_up_before_typing_types_nothing() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -266,16 +311,13 @@ fn a_turn_whose_caller_hung_up_writes_nothing_on_a_route_with_no_gate() {
     assert_eq!(writes.load(Ordering::SeqCst), 0, "nothing pressed: {reply}");
     assert_eq!(reply, "ERR key delivery failed\n");
     // A typed head of control characters alone presses no key: the rest past the cap is the
-    // first write, a paste, and then a Tab key the rest presses.
-    for (rest, failed) in [
-        ("hello", "ERR paste delivery failed\n"),
-        ("\thello", "ERR key delivery failed\n"),
-    ] {
+    // first write, a run of its keys' bytes, and then a Tab key the rest presses.
+    for rest in ["hello", "\thello"] {
         let reply = turn(&format!(
             "idle=1 timeout=5000 submit_window=300 presses=1 typed=1 cadence=1 cap=1 \u{1b}{rest}"
         ));
         assert_eq!(writes.load(Ordering::SeqCst), 0, "nothing written: {reply}");
-        assert_eq!(reply, failed);
+        assert_eq!(reply, "ERR key delivery failed\n");
     }
 }
 

@@ -1177,7 +1177,12 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
         }
         // A live request of this Mac's that no need in the ledger stands for (its need ended
         // and was raised again under a new id before a pass wrote the end) would hold its want
-        // and purpose against its successor for good: the requester supersedes it.
+        // and purpose against its successor for good: the requester supersedes it. So does one a
+        // custodian's record ended here while a successor stands: another member reads that
+        // record against its own clock and members (a lapse counts 30 days from its own receipt
+        // of this Mac's last word), so until it does, the old request is live there and the
+        // successor is the second live one for its want and purpose. Only the requester's own
+        // record ends it on every Mac at once; it is written once.
         if writer {
             let standing: BTreeSet<[u8; 16]> = needs
                 .iter()
@@ -1187,8 +1192,21 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
                     _ => None,
                 }))
                 .collect();
+            let succeeded = |thread: &Thread| {
+                thread
+                    .retired
+                    .as_ref()
+                    .is_some_and(|(_, attested)| *attested)
+                    && needs.iter().any(|need| {
+                        need.want == thread.want
+                            && need.purpose == thread.purpose
+                            && !need.state.ended()
+                    })
+            };
             for thread in book.threads.values().filter(|thread| {
-                thread.requester == me && !thread.ended() && !standing.contains(&thread.id)
+                thread.requester == me
+                    && !standing.contains(&thread.id)
+                    && (!thread.ended() || succeeded(thread))
             }) {
                 let record = retired_record(
                     &thread.id,
@@ -1196,6 +1214,9 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
                     "no need in the requester's ledger stands for it",
                     "",
                 );
+                if thread.ended() && log.retry(me, &record.command()?)?.is_some() {
+                    continue;
+                }
                 commit(session, store, &log, &record)?;
                 report.answered += 1;
             }
@@ -1240,10 +1261,10 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
     report.decided = need::absorb(paths, &moves)
         .map_err(crate::table::failure)?
         .iter()
-        .filter(|need| {
+        .filter(|(moved, _)| {
             moves
                 .iter()
-                .any(|(id, step)| *id == need.id && matches!(step, Absorb::Decided(_)))
+                .any(|(id, step)| id == moved && matches!(step, Absorb::Decided(_)))
         })
         .count();
     source::cleanup(paths, network, &book, now_ms)?;

@@ -141,7 +141,7 @@ pub fn valid_slug(slug: &str) -> bool {
 pub fn parse_releases(text: &str) -> Result<Vec<Release>, String> {
     let mut out = Vec::new();
     let mut push_item = |item: Value| {
-        if let Some(r) = release(&item) {
+        if let Some(r) = release(item) {
             out.push(r);
         }
     };
@@ -229,10 +229,24 @@ fn truthy(v: Option<&Value>) -> Option<bool> {
 }
 
 /// The first of `keys` that holds a non-empty string.
-fn first_str<'v>(r: &'v Value, keys: &[&str]) -> &'v str {
+fn first_str<'v>(r: &'v aterm_json::Map, keys: &[&str]) -> &'v str {
     keys.iter()
-        .find_map(|k| r.get(k).and_then(Value::as_str).filter(|s| !s.is_empty()))
+        .find_map(|k| r.get(*k).and_then(Value::as_str).filter(|s| !s.is_empty()))
         .unwrap_or("")
+}
+
+/// Removes and returns the first of `keys` that holds a non-empty string.
+fn take_first_str(r: &mut aterm_json::Map, keys: &[&str]) -> String {
+    for &k in keys {
+        if r.get(k)
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty())
+            && let Some(Value::String(s)) = r.remove(k)
+        {
+            return s;
+        }
+    }
+    String::new()
 }
 
 /// A byte count, or `None` when the JSON carries none (absent, null, a string, a bool, a negative).
@@ -248,38 +262,51 @@ fn asset_size(v: Option<&Value>) -> Option<u64> {
 }
 
 /// One release object (the REST shape).
-fn release(r: &Value) -> Option<Release> {
-    r.as_object()?;
-    let assets = r
-        .get("assets")
-        .and_then(Value::as_array)
-        .map(|list| {
-            list.iter()
-                .filter(|a| a.is_object())
-                .map(|a| Asset {
-                    name: a.get("name").and_then(Value::as_str).unwrap_or("").into(),
-                    size: asset_size(a.get("size")),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+fn release(r: Value) -> Option<Release> {
+    let Value::Object(mut r) = r else {
+        return None;
+    };
+    let assets = match r.remove("assets") {
+        Some(Value::Array(list)) => list
+            .into_iter()
+            .filter_map(|a| {
+                let Value::Object(mut a) = a else {
+                    return None;
+                };
+                let size = asset_size(a.get("size"));
+                let name = match a.remove("name") {
+                    Some(Value::String(s)) => s,
+                    _ => String::new(),
+                };
+                Some(Asset { name, size })
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
     let date: String = first_str(
-        r,
+        &r,
         &["published_at", "publishedAt", "created_at", "createdAt"],
     )
     .chars()
     .take(10)
     .collect();
+    let prerelease = truthy(r.get("prerelease"))
+        .or_else(|| truthy(r.get("isPrerelease")))
+        .unwrap_or(false);
+    let draft = truthy(r.get("draft"))
+        .or_else(|| truthy(r.get("isDraft")))
+        .unwrap_or(false);
+    let tag = take_first_str(&mut r, &["tag_name", "tagName"]);
+    let body = match r.remove("body") {
+        Some(Value::String(s)) => s,
+        _ => String::new(),
+    };
     Some(Release {
-        tag: first_str(r, &["tag_name", "tagName"]).into(),
-        prerelease: truthy(r.get("prerelease"))
-            .or_else(|| truthy(r.get("isPrerelease")))
-            .unwrap_or(false),
-        draft: truthy(r.get("draft"))
-            .or_else(|| truthy(r.get("isDraft")))
-            .unwrap_or(false),
+        tag,
+        prerelease,
+        draft,
         date,
-        body: r.get("body").and_then(Value::as_str).unwrap_or("").into(),
+        body,
         assets,
     })
 }
@@ -444,16 +471,12 @@ impl fmt::Display for Refused {
 }
 
 /// Whether `r` is a complete app release.
-fn complete_mac_app(r: &Release) -> bool {
+fn complete_mac_app(r: &Release, dmg: &str) -> bool {
     let v = r.version();
-    [
-        dmg_name(v),
-        format!("aterm-{v}-mac.zip"),
-        "aterm-appcast.toml".into(),
-        "aterm-appcast.toml.sig".into(),
-    ]
-    .iter()
-    .all(|n| r.named(n).is_some())
+    r.named("aterm-appcast.toml").is_some()
+        && r.named("aterm-appcast.toml.sig").is_some()
+        && r.named(&format!("aterm-{v}-mac.zip")).is_some()
+        && r.named(dmg).is_some()
 }
 
 fn stable_minor_releases(releases: &[Release]) -> Vec<&Release> {
@@ -474,7 +497,7 @@ fn elect_mac_from_stable<'r>(
     for &candidate in stable {
         let name = dmg_name(candidate.version());
         match candidate.named(&name) {
-            Some(dmg) if complete_mac_app(candidate) => {
+            Some(dmg) if complete_mac_app(candidate, &name) => {
                 let mac = MacDownload {
                     tag: candidate.tag.clone(),
                     version: candidate.version().into(),

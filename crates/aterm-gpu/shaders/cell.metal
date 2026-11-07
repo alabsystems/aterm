@@ -124,11 +124,14 @@ vertex GlowVsOut vs_glow(uint vi [[vertex_id]],
 }
 
 // The fragment's 0-based column inside its quad, from its x in the quad's own
-// px. At full res the pixel centre interpolates to i + 0.5, so the floor is i
-// with half a pixel of margin either side; at half res each fragment reads the
-// quad's own column under its centre. The clamp only guards the edges.
+// px. At full res the pixel centre interpolates to i + 0.5; at half res (the
+// bloom's extract) it lands on column i's left edge, i itself, where an
+// interpolator a hair low (llvmpipe's) floors to i - 1 and drifts the ramp a
+// column, against `aterm_render::bloom::apply`, which reads column i. The
+// quarter-pixel bias floors both to i, with a quarter pixel of margin on the
+// near side. The clamp only guards the edges.
 static inline uint glow_column(float lx, float w) {
-    return uint(clamp(floor(lx), 0.0, max(w - 1.0, 0.0)));
+    return uint(clamp(floor(lx + 0.25), 0.0, max(w - 1.0, 0.0)));
 }
 
 // floor(n / d) for d >= 1, as the GPU's emulated integer divide gives it but

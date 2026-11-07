@@ -126,6 +126,30 @@ unsafe { ((*set).__opaque[fd / bits] & (1 << (fd % bits))) != 0 }",
 
 const GNU_LINUX_MACROS: &[MacroBody] = &[
     MacroBody {
+        name: "CMSG_DATA",
+        is_const: false,
+        body: r"// SAFETY: the caller supplies a header in its valid control-message allocation.
+unsafe { cmsg.add(1).cast_mut().cast::<c_uchar>() }",
+    },
+    MacroBody {
+        name: "CMSG_NXTHDR",
+        is_const: false,
+        body: r"// SAFETY: both pointers describe the caller's valid control allocation/header.
+unsafe {
+    if (*cmsg).cmsg_len < ::core::mem::size_of::<cmsghdr>() {
+        return ::core::ptr::null_mut();
+    }
+    let next = cmsg.cast::<u8>().wrapping_add(cmsg_align((*cmsg).cmsg_len)).cast::<cmsghdr>();
+    if (next as usize) < (cmsg as usize) {
+        return ::core::ptr::null_mut();
+    }
+    let max = (*mhdr).msg_control as usize + (*mhdr).msg_controllen;
+    if next as usize + ::core::mem::size_of::<cmsghdr>() > max {
+        ::core::ptr::null_mut()
+    } else { next.cast_mut() }
+}",
+    },
+    MacroBody {
         name: "WSTOPSIG",
         is_const: true,
         body: "(status >> 8) & 0xff",
@@ -248,7 +272,13 @@ pub fn macro_body(os: Os, name: &str) -> Option<&'static MacroBody> {
 
 /// `# Safety` doc lines for a public unsafe macro.
 #[must_use]
-pub fn safety_doc(name: &str) -> Option<&'static [&'static str]> {
+pub fn safety_doc(os: Os, name: &str) -> Option<&'static [&'static str]> {
+    if os == Os::GnuLinux && name == "CMSG_NXTHDR" {
+        return Some(&[
+            "`mhdr` must describe one valid control allocation; `cmsg` must point",
+            "to a valid header within it whose length can be read.",
+        ]);
+    }
     const ARITHMETIC: &[&str] = &[
         "Always sound: this is arithmetic only. It is `unsafe` because",
         "upstream declares it so, and the signature is part of the contract.",

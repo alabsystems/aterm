@@ -16,6 +16,83 @@ use aterm_secrets::membership_log::RecordBudgets;
 
 const NOW_MS: u64 = 1_760_000_000_000;
 
+#[test]
+fn registry_labels_override_a_stale_local_name_and_resolve_both_node_ids() {
+    use aterm_db::{
+        alab::{
+            Registry,
+            register::{Outcome, Probe},
+            registry::MACHINE,
+        },
+        typed::cell::{self, CellKey, CellValue},
+    };
+    let lab = Lab::new("registry-label-authority");
+    let registry = Registry::at(lab.paths.clone());
+    registry.open().unwrap();
+    let own = own_node();
+    let principal = member::node_principal(own.key());
+    let probe = Probe {
+        hw_model: "Mac16,8".into(),
+        hosts: vec!["m42-studio".into()],
+        node: Some(principal[2..].to_owned()),
+        platform_uuid: "C3396674-FCD3-52E5-A1C1-BD5B9E8F5C43".into(),
+        ..Probe::default()
+    };
+    let pass = registry
+        .register(&lab.places.config, &probe, true, NOW_MS)
+        .unwrap();
+    let Outcome::Adopted { mac, .. } = pass.outcome else {
+        panic!("expected adoption of the migrated historical row")
+    };
+    registry
+        .write(vec![vec![
+            cell::change(
+                &MACHINE,
+                CellKey {
+                    pk: &mac,
+                    col: "label",
+                    elem: None,
+                },
+                &CellValue::owner(MACHINE.version, aterm_json::Value::from("m42")),
+            )
+            .unwrap(),
+        ]])
+        .unwrap();
+    write_private(&lab.places.state, member::NAME_FILE, b"m22\n").unwrap();
+    assert_eq!(
+        names_this_machine(&lab.places, "M42").unwrap(),
+        Some(own.node().to_owned())
+    );
+    assert!(
+        names_this_machine(&lab.places, "m22").is_err(),
+        "a stale primary or roster label cannot bypass the registry"
+    );
+    registry
+        .write(vec![vec![
+            cell::change(
+                &MACHINE,
+                CellKey {
+                    pk: &mac,
+                    col: "label",
+                    elem: None,
+                },
+                &CellValue::owner(MACHINE.version, aterm_json::Value::from("m42-1234")),
+            )
+            .unwrap(),
+        ]])
+        .unwrap();
+    assert_eq!(
+        names_this_machine(&lab.places, "M42-1234").unwrap(),
+        Some(own.node().to_owned())
+    );
+    assert!(names_this_machine(&lab.places, "m42").is_err());
+    let derived = registry_target(&lab.places, &principal).unwrap().unwrap();
+    let old = registry_target(&lab.places, own.node()).unwrap().unwrap();
+    assert_eq!(derived.actor, old.actor);
+    assert_eq!(derived.transport, own.node());
+    assert_eq!(derived.node, principal);
+}
+
 struct Lab {
     root: aterm_tempfile::TempDir,
     running: Option<aterm_secrets::server::Running>,

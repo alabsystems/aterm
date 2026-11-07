@@ -27,11 +27,112 @@ use aterm_secrets::commons::roster::Role;
 use std::{collections::BTreeSet, time::Instant};
 
 const NOW: u64 = 400 * 86_400_000;
-const NODE: &str = "0123456789abcdef0123456789abcdef";
-const OTHER_NODE: &str = "fedcba9876543210fedcba9876543210";
+const NODE: &str = "0123456789abcdef";
+const OTHER_NODE: &str = "fedcba9876543210";
 const HINT: &str = "aaaaaaaaaaaaaaaa";
 const ME: &str = "11111111111111111111111111111111";
 const OLD: &str = "22222222222222222222222222222222";
+
+#[test]
+fn an_adopted_mac_publishes_its_node_once_and_keeps_an_owner_correction() {
+    let identity = me();
+    let probe = probe();
+    let live = [ME.to_owned()].into();
+    let input = Input {
+        me: &identity,
+        probe: &probe,
+        live: &live,
+        heard: true,
+        now_ms: NOW,
+    };
+    let pk = "mc-0000000000000007";
+    let cells = apply(&[machine(pk, &[("label", json!("m7"))])]);
+    let machines = cell::project(&MACHINE, &cells);
+    let first = own_node(&input, &machines, pk).unwrap();
+    assert_eq!(first.len(), 1);
+    let cells = apply(&[machine(pk, &[("label", json!("m7"))]), first]);
+    assert!(
+        own_node(&input, &cell::project(&MACHINE, &cells), pk)
+            .unwrap()
+            .is_empty()
+    );
+    let corrected = apply(&[machine(pk, &[("node", json!(OTHER_NODE))])]);
+    assert!(
+        own_node(&input, &cell::project(&MACHINE, &corrected), pk)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn fresh_registry_labels_respect_retired_rows_and_aliases_without_a_log_hint() {
+    let mut reserved = machine(
+        "mc-0000000000000001",
+        &[("label", json!("m1")), ("row", json!("retired"))],
+    );
+    reserved.push(alias("mc-0000000000000001", "m2"));
+    let cells = apply(&[reserved]);
+    let plan = run(
+        &Me {
+            label: None,
+            ..me()
+        },
+        &Probe {
+            hosts: vec!["m2-studio".into()],
+            ..probe()
+        },
+        &[ME],
+        true,
+        &cells,
+        &facts(&[]),
+    );
+    assert!(matches!(plan.outcome, Outcome::Born { .. }));
+    assert_eq!(written_row(&plan)["label"], json!("m3"));
+    assert_eq!(written_row(&plan)["mac"], json!(keys::machine_pk(ME)));
+}
+
+#[test]
+fn a_conflicted_registry_label_reserves_each_candidate() {
+    use crate::typed::cell::{Candidate, Field, Projection, Row};
+    let mut machines = Projection::default();
+    machines.rows.insert(
+        "mc-0000000000000001".into(),
+        Row {
+            fields: [(
+                "label".into(),
+                Field::Conflict {
+                    candidates: ["m1", "m2"]
+                        .into_iter()
+                        .map(|label| Candidate {
+                            operation: [1; 32],
+                            value: CellValue::owner(MACHINE.version, json!(label)),
+                        })
+                        .collect(),
+                    provisional: Some(json!("m1")),
+                },
+            )]
+            .into(),
+            ..Row::default()
+        },
+    );
+    let me = me();
+    let probe = probe();
+    let live = [ME.to_owned()].into();
+    assert_eq!(
+        birth_label(
+            &Input {
+                me: &me,
+                probe: &probe,
+                live: &live,
+                heard: true,
+                now_ms: NOW
+            },
+            &machines
+        )
+        .unwrap(),
+        "m3"
+    );
+}
 
 fn me() -> Me {
     Me {
@@ -70,7 +171,7 @@ fn machine(pk: &str, cells: &[(&str, Value)]) -> Vec<Change> {
                     col,
                     elem: None,
                 },
-                &CellValue::owner(1, x.clone()),
+                &CellValue::owner(MACHINE.version, x.clone()),
             )
             .unwrap()
         })
@@ -85,7 +186,7 @@ fn alias(pk: &str, label: &str) -> Change {
             col: "aliases",
             elem: Some(label),
         },
-        &CellValue::owner(1, json!(true)),
+        &CellValue::owner(MACHINE.version, json!(true)),
     )
     .unwrap()
 }
@@ -178,7 +279,7 @@ fn adoption_runs_the_rules_in_order() {
                 &[
                     ("label", json!("m71")),
                     ("status", json!("active")),
-                    ("fleet_node", json!(NODE)),
+                    ("node", json!(NODE)),
                 ],
             ));
         }
@@ -245,9 +346,15 @@ fn adoption_runs_the_rules_in_order() {
             mac: by_label.into()
         }
     );
-    // No Mac edits an existing machine row, in any of these.
+    // Adoption can publish only the adopting Mac's node on an existing machine row.
     for adopted in [&first, &second, &third, &fourth] {
-        assert!(adopted.changes.iter().all(|c| c.collection != MACHINE.name));
+        assert!(
+            adopted
+                .changes
+                .iter()
+                .filter(|c| c.collection == MACHINE.name)
+                .all(|change| change.key.ends_with(".node"))
+        );
     }
 }
 
@@ -359,7 +466,7 @@ fn a_candidate_someone_else_holds_or_that_names_another_mac_is_not_adopted() {
             &[
                 ("label", json!("m70")),
                 ("status", json!("active")),
-                ("fleet_node", json!(node)),
+                ("node", json!(node)),
             ],
         )
     };
@@ -385,7 +492,7 @@ fn a_candidate_someone_else_holds_or_that_names_another_mac_is_not_adopted() {
         &[
             ("label", json!("m70")),
             ("status", json!("active")),
-            ("fleet_node", json!(NODE)),
+            ("node", json!(NODE)),
             ("hosts", json!(["MAC-SEVEN.local"])),
         ],
     )]);
@@ -413,17 +520,16 @@ fn a_candidate_someone_else_holds_or_that_names_another_mac_is_not_adopted() {
             .collect()]),
     );
     let born = &birth.rows[&keys::machine_pk(ME)];
-    assert_eq!(born.get("fleet_node"), None);
+    assert_eq!(born.get("node"), None);
     assert_eq!(born.get("hosts"), Some(&json!(["mac-mine"])));
-    assert_eq!(
-        written_row(&plan)["node"],
-        json!(NODE),
-        "the facts row states what it read"
+    assert!(
+        written_row(&plan).get("node").is_none(),
+        "the legacy facts node column cannot carry the mesh principal; the signed mac binding does"
     );
     // Two live rows naming this node hold the Mac.
     let two = apply(&[
         row(a, NODE),
-        machine(b, &[("label", json!("m71")), ("fleet_node", json!(NODE))]),
+        machine(b, &[("label", json!("m71")), ("node", json!(NODE))]),
     ]);
     let plan = run(&me(), &probe(), &[ME], true, &two, &none);
     assert_eq!(
@@ -453,21 +559,24 @@ fn a_candidate_someone_else_holds_or_that_names_another_mac_is_not_adopted() {
         &[
             ("label", json!("m7")),
             ("status", json!("planned")),
-            ("fleet_node", json!(OTHER_NODE)),
+            ("node", json!(OTHER_NODE)),
             ("hosts", json!(["mac-seven"])),
         ],
     )]);
     let plan = run(&me(), &probe(), &[ME], true, &foreign, &none);
-    assert_eq!(
-        (plan.outcome.clone(), kinds(&plan)),
-        (Outcome::Held, vec!["label-held"])
+    assert!(matches!(plan.outcome, Outcome::Born { .. }));
+    assert!(
+        plan.changes
+            .iter()
+            .filter(|change| change.collection == MACHINE.name)
+            .all(|change| !change.key.starts_with(a))
     );
     // An ended row stays ended.
     let ended = apply(&[machine(
         a,
         &[
             ("label", json!("m70")),
-            ("fleet_node", json!(NODE)),
+            ("node", json!(NODE)),
             ("row", json!("retired")),
         ],
     )]);
@@ -509,13 +618,15 @@ fn a_candidate_someone_else_holds_or_that_names_another_mac_is_not_adopted() {
         &active,
         &none,
     );
-    // It holds the label, so no birth goes beside it, and its preferences stay reachable.
-    assert_eq!(
-        (plan.outcome.clone(), kinds(&plan)),
-        (Outcome::Held, vec!["label-held"])
+    // A fresh registry label leaves the other Mac's row and preferences alone.
+    assert!(matches!(plan.outcome, Outcome::Born { .. }));
+    assert!(
+        plan.changes
+            .iter()
+            .filter(|change| change.collection == MACHINE.name)
+            .all(|change| !change.key.starts_with(a))
     );
-    assert!(plan.changes.is_empty());
-    // An alias holds it too; an ended row does not.
+    // An alias reserves its number too.
     let mut under_alias = machine(a, &[("label", json!("m99")), ("status", json!("active"))]);
     under_alias.push(alias(a, "m7"));
     let plan = run(
@@ -529,7 +640,7 @@ fn a_candidate_someone_else_holds_or_that_names_another_mac_is_not_adopted() {
         &apply(&[under_alias]),
         &none,
     );
-    assert_eq!(kinds(&plan), ["label-held"]);
+    assert!(matches!(plan.outcome, Outcome::Born { .. }));
     let ended = apply(&[machine(
         a,
         &[("label", json!("m7")), ("row", json!("retired"))],
@@ -568,10 +679,10 @@ fn a_birth_waits_for_a_round_and_lands_with_its_machine_and_model() {
         .cloned()
         .collect()]);
     let machines = cell::project(&MACHINE, &cells);
-    assert_eq!(machines.rows[&pk].get("label"), Some(&json!("m7")));
+    assert_eq!(machines.rows[&pk].get("label"), Some(&json!("m1")));
     assert_eq!(machines.rows[&pk].get("status"), Some(&json!("active")));
     assert_eq!(machines.rows[&pk].get("model"), Some(&json!("Mac16-8")));
-    assert_eq!(machines.rows[&pk].get("fleet_node"), Some(&json!(NODE)));
+    assert_eq!(machines.rows[&pk].get("node"), Some(&json!(NODE)));
     let models = cell::project(&MODEL, &cells);
     assert_eq!(
         models.rows["Mac16-8"].get("chip_family"),
@@ -631,16 +742,14 @@ fn a_birth_waits_for_a_round_and_lands_with_its_machine_and_model() {
         (plan.outcome.clone(), kinds(&plan)),
         (Outcome::Held, vec!["own-machine-retired"])
     );
-    // No label to state: the row waits, and nothing is guessed.
+    // A missing log hint does not prevent this enrollment from creating its registry row.
     let unnamed = Me {
         label: None,
         ..me()
     };
     let plan = run(&unnamed, &probe(), &[ME], true, &empty, &none);
-    assert_eq!(
-        (plan.outcome.clone(), kinds(&plan)),
-        (Outcome::Held, vec!["no-label"])
-    );
+    assert!(matches!(plan.outcome, Outcome::Born { .. }));
+    assert_eq!(written_row(&plan)["label"], json!("m1"));
 }
 
 /// A row is rewritten only on a change or when `seen` is 30 days old: a same reading writes
@@ -654,6 +763,7 @@ fn a_facts_row_is_written_only_on_a_change_or_at_thirty_days() {
     let empty = Cells::new();
     let born = run(&me(), &probe(), &[ME], true, &empty, &facts(&[]));
     let stored = written_row(&born).clone();
+    let empty = apply(&[born.changes]);
     let read = |seen: u64| {
         let mut row = stored.clone();
         if let Value::Object(object) = &mut row {
@@ -853,6 +963,148 @@ fn name_macs(lab: &Lab) {
     }
 }
 
+/// Negative control: skipping migration gives this Mac the local hostname's m999; replaying
+/// migration after the marker overwrites the owner's later m5 edit.
+#[test]
+fn legacy_labels_and_aliases_migrate_once_before_own_node_publication() {
+    use aterm_secrets::{
+        client,
+        swarm_roster::{ROSTER_ENTRY, SwarmRoster},
+        text::Audience,
+    };
+    let lab = Lab::new(&[Role::Writer]);
+    name_macs(&lab);
+    let admin = client::admin_open(&lab.paths[0]).unwrap();
+    let mut doc = admin.doc.clone();
+    let mut old = SwarmRoster::from_document(&doc).unwrap().unwrap();
+    old.members[0].aliases.push("m101".into());
+    doc.set_entry(&Audience::Everyone, ROSTER_ENTRY, old.to_toml().as_bytes())
+        .unwrap();
+    client::admin_publish(&lab.paths[0], &admin, &doc).unwrap();
+    client::sync(&lab.paths[0], None).unwrap();
+    let registry = Registry::at(lab.paths[0].clone());
+    registry.open().unwrap();
+    let probe = Probe {
+        hosts: vec!["m999.local".into()],
+        ..probe()
+    };
+    let first = registry
+        .register(&lab_config(&lab, 0), &probe, true, NOW)
+        .unwrap();
+    assert!(first.records > 0);
+    let view = registry.view().unwrap();
+    let machines = view.project(&MACHINE);
+    let (pk, row) = machines
+        .rows
+        .iter()
+        .find(|(_, row)| row.get("label") == Some(&json!("m1")))
+        .unwrap();
+    assert_eq!(machines.rows.len(), 1);
+    assert!(row.fields["aliases"].has_member("m101"));
+    assert_eq!(row.get("node"), Some(&json!(NODE)));
+    registry
+        .write(vec![machine(pk, &[("label", json!("m5"))])])
+        .unwrap();
+    let again = registry
+        .register(&lab_config(&lab, 0), &probe, true, NOW + 1)
+        .unwrap();
+    assert_eq!(again.records, 0);
+    assert_eq!(
+        registry.view().unwrap().project(&MACHINE).rows[pk].get("label"),
+        Some(&json!("m5"))
+    );
+}
+
+#[test]
+fn a_lab_registry_moves_machine_schema_and_publishes_its_own_node_once() {
+    use crate::typed::{Collection, SCHEMA, owned::SchemaState};
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    name_macs(&lab);
+    let registry = Registry::at(lab.paths[0].clone());
+    registry.open().unwrap();
+    let old = Collection {
+        version: 1,
+        unique: &[&["label"], &["fleet_node"]],
+        ..MACHINE
+    };
+    let pk = "mc-0000000000000007";
+    registry
+        .write(vec![vec![
+            Change {
+                collection: SCHEMA.into(),
+                key: MACHINE.name.into(),
+                value: Some(old.schema_row()),
+            },
+            cell::change(
+                &MACHINE,
+                CellKey {
+                    pk,
+                    col: "label",
+                    elem: None,
+                },
+                &CellValue::owner(1, json!("m1")),
+            )
+            .unwrap(),
+            cell::change(
+                &MACHINE,
+                CellKey {
+                    pk,
+                    col: "status",
+                    elem: None,
+                },
+                &CellValue::owner(1, json!("planned")),
+            )
+            .unwrap(),
+            cell::change(
+                &MACHINE,
+                CellKey {
+                    pk,
+                    col: "fleet_node",
+                    elem: None,
+                },
+                &CellValue::owner(1, json!("00112233445566778899aabbccddeeff")),
+            )
+            .unwrap(),
+        ]])
+        .unwrap();
+    assert!(matches!(
+        registry.view().unwrap().schema(MACHINE.name),
+        SchemaState::One { version: 1, .. }
+    ));
+    assert!(registry.publish_schema().unwrap() > 0);
+    assert_eq!(registry.publish_schema().unwrap(), 0);
+    assert!(matches!(
+        registry.view().unwrap().schema(MACHINE.name),
+        SchemaState::One { version: 2, .. }
+    ));
+    let done = registry
+        .register(&lab_config(&lab, 0), &probe(), true, NOW)
+        .unwrap();
+    assert!(matches!(
+        done.outcome,
+        Outcome::Adopted {
+            rule: Rule::Planned,
+            ..
+        }
+    ));
+    let view = registry.view().unwrap();
+    assert_eq!(
+        view.project(&MACHINE).rows[pk].get("node"),
+        Some(&json!(NODE))
+    );
+    assert_eq!(
+        view.owned[MACHINE_FACTS.name].rows[&keys::uuid32(&machine_of(&lab, 0))].value["mac"],
+        json!(pk)
+    );
+    assert_eq!(
+        registry
+            .register(&lab_config(&lab, 0), &probe(), true, NOW)
+            .unwrap()
+            .records,
+        0
+    );
+}
+
 /// On a real lab, a pass declares nothing: with no registry it writes nothing and leaves none
 /// declared, under `[commons] exclude_tables` it does not touch a held registry, and once a peer's
 /// repair brings the registry, each Mac writes its own row at its own key, with a birth of its
@@ -904,16 +1156,13 @@ fn a_pass_declares_nothing_respects_exclusions_and_writes_once() {
     let done = second
         .register(&lab_config(&lab, 1), &probe(), true, NOW)
         .unwrap();
-    assert_eq!(
-        done.outcome,
-        Outcome::Born {
-            mac: keys::machine_pk(&uuid)
-        }
-    );
-    assert_eq!(done.records, 1);
+    let Outcome::Adopted { mac, .. } = &done.outcome else {
+        panic!("the historical row should be adopted: {:?}", done.outcome);
+    };
+    assert!(done.records > 0);
     let view = second.view().unwrap();
     let row = &view.owned[MACHINE_FACTS.name].rows[&uuid];
-    assert_eq!(row.value["mac"], json!(keys::machine_pk(&uuid)));
+    assert_eq!(row.value["mac"], json!(mac));
     assert_eq!(row.value["label"], json!("m2"));
     let trust = lab.bootstrap(1).trust();
     assert_eq!(
@@ -924,11 +1173,7 @@ fn a_pass_declares_nothing_respects_exclusions_and_writes_once() {
         view.project(&MODEL).rows["Mac16-8"].get("chip_family"),
         Some(&json!("M4"))
     );
-    assert!(
-        view.project(&MACHINE)
-            .rows
-            .contains_key(&keys::machine_pk(&uuid))
-    );
+    assert!(view.project(&MACHINE).rows.contains_key(mac));
     let again = second
         .register(&lab_config(&lab, 1), &probe(), true, NOW)
         .unwrap();
@@ -939,9 +1184,8 @@ fn a_pass_declares_nothing_respects_exclusions_and_writes_once() {
     let view = first.view().unwrap();
     assert_eq!(
         view.owned[MACHINE_FACTS.name].rows[&uuid].value["mac"],
-        json!(keys::machine_pk(&uuid))
+        json!(mac)
     );
-    let mine = keys::uuid32(&machine_of(&lab, 0));
     let hardware = Probe {
         platform_uuid: "C3396674-FCD3-52E5-A1C1-BD5B9E8F5C44".into(),
         node: Some(OTHER_NODE.into()),
@@ -951,12 +1195,7 @@ fn a_pass_declares_nothing_respects_exclusions_and_writes_once() {
     let done = first
         .register(&lab_config(&lab, 0), &hardware, true, NOW)
         .unwrap();
-    assert_eq!(
-        done.outcome,
-        Outcome::Born {
-            mac: keys::machine_pk(&mine)
-        }
-    );
+    assert!(matches!(done.outcome, Outcome::Adopted { .. }));
     assert!(done.findings.is_empty(), "{:?}", done.findings);
 }
 
@@ -1026,7 +1265,13 @@ fn rounds_wake_passes_and_only_the_registrys_evidence_ends_a_rest() {
         .unwrap()
         .unwrap();
     assert!(
-        matches!(heard.outcome, Outcome::Born { .. }),
+        matches!(
+            heard.outcome,
+            Outcome::Adopted {
+                rule: Rule::Planned,
+                ..
+            }
+        ),
         "{:?}",
         heard.outcome
     );
@@ -1037,25 +1282,22 @@ fn rounds_wake_passes_and_only_the_registrys_evidence_ends_a_rest() {
     assert_eq!(later.outcome, Outcome::Unchanged);
 }
 
-/// A row's label is the membership log's, else the roster's, the first that is a label.
-/// NEGATIVE CONTROL: with `chosen_label` preferring the roster, the first assertion reads `m8`.
+/// Migration preserves the owner's historical roster label ahead of a log display hint.
+/// NEGATIVE CONTROL: preferring the log loses the historical owner's label to a display hint.
 #[test]
-fn the_membership_log_names_a_mac_before_the_roster() {
+fn migration_preserves_the_roster_label_ahead_of_a_log_hint() {
     use super::super::store::chosen_label;
     let word = |s: &str| Some(s.to_owned());
-    assert_eq!(chosen_label(word("m7-3fa2"), word("m8")), word("m7-3fa2"));
+    assert_eq!(chosen_label(word("m7-3fa2"), word("m8")), word("m8"));
     assert_eq!(chosen_label(None, word("m8")), word("m8"));
     assert_eq!(chosen_label(word("not a label!"), word("m8")), word("m8"));
     assert_eq!(chosen_label(None, None), None);
 }
 
-/// A host name is not an identity: with no log label and no roster row for this Mac, a host called
-/// `m12-studio` still has no label, so it holds and writes nothing, whatever a roster name
-/// resolver would have read off that name.
-/// NEGATIVE CONTROL: with `me` taking `m12` when the log and the roster name nothing, as a resolver
-/// reading the host name does, the pass is `Born`.
+/// A hostname chooses a free display label, while the enrollment's authenticated uuid still
+/// determines the machine row and the signed facts key. No log or roster label is needed.
 #[test]
-fn a_host_name_never_names_a_mac() {
+fn a_hostname_supplies_a_label_without_replacing_the_enrollment_identity() {
     let lab = Lab::new(&[Role::Writer]);
     let registry = Registry::at(lab.paths[0].clone());
     registry.open().unwrap();
@@ -1066,8 +1308,25 @@ fn a_host_name_never_names_a_mac() {
     let pass = registry
         .register(&lab_config(&lab, 0), &hosts, true, NOW)
         .unwrap();
-    assert_eq!((pass.outcome, pass.records), (Outcome::Held, 0));
-    assert_eq!(pass.findings[0].kind, "no-label");
+    let uuid = keys::uuid32(&machine_of(&lab, 0));
+    assert_eq!(
+        (pass.outcome, pass.records),
+        (
+            Outcome::Born {
+                mac: keys::machine_pk(&uuid)
+            },
+            1
+        )
+    );
+    let view = registry.view().unwrap();
+    assert_eq!(
+        view.project(&MACHINE).rows[&keys::machine_pk(&uuid)].get("label"),
+        Some(&json!("m12"))
+    );
+    assert_eq!(
+        view.owned[MACHINE_FACTS.name].rows[&uuid].value["mac"],
+        json!(keys::machine_pk(&uuid))
+    );
 }
 
 /// `aterm db alab check` says why this Mac has no row, which the registry alone cannot since there
@@ -1097,11 +1356,11 @@ fn check_answers_why_this_mac_is_unregistered_and_writes_nothing() {
         .write(vec![
             machine(
                 "mc-1000000000000001",
-                &[("label", json!("m70")), ("fleet_node", json!(NODE))],
+                &[("label", json!("m70")), ("node", json!(NODE))],
             ),
             machine(
                 "mc-1000000000000002",
-                &[("label", json!("m71")), ("fleet_node", json!(NODE))],
+                &[("label", json!("m71")), ("node", json!(NODE))],
             ),
         ])
         .unwrap();
@@ -1177,12 +1436,13 @@ fn a_real_drained_round_wakes_the_registrar_and_it_registers() {
     assert_eq!(heard.recv_timeout(hang).unwrap(), Some(Outcome::Deferred));
     registrar.round(drained);
     let uuid = keys::uuid32(&machine_of(&lab, 1));
-    assert_eq!(
+    assert!(matches!(
         heard.recv_timeout(hang).unwrap(),
-        Some(Outcome::Born {
-            mac: keys::machine_pk(&uuid)
+        Some(Outcome::Adopted {
+            rule: Rule::Planned,
+            ..
         })
-    );
+    ));
     drop(registrar);
     assert!(
         second.view().unwrap().owned[MACHINE_FACTS.name]
@@ -1220,7 +1480,13 @@ fn a_transient_empty_probe_does_not_spend_evidence_or_start_rest() {
         .expect("probe now ready")
         .unwrap();
     assert!(
-        matches!(done.outcome, Outcome::Born { .. }),
+        matches!(
+            done.outcome,
+            Outcome::Adopted {
+                rule: Rule::Planned,
+                ..
+            }
+        ),
         "{:?}",
         done.outcome
     );
@@ -1276,7 +1542,7 @@ node_id = "fedcba9876543210fedcba9876543210"
             candidates: vec![
                 crate::database::Candidate {
                     operation: [1; 32],
-                    value: CellValue::owner(1, json!("Mac99-1")).encode(),
+                    value: CellValue::owner(MACHINE.version, json!("Mac99-1")).encode(),
                 },
                 crate::database::Candidate {
                     operation: [2; 32],

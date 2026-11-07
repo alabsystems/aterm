@@ -143,7 +143,8 @@ pub(crate) struct CheckerStall {
     pub(crate) checks: u64,
 }
 
-/// Judge one look (pure: the event loop and the tests ask the same question).
+/// Judge one look. Late heartbeats require confirmation; observed thread-start
+/// failures require only their retry backoff. The window and node share this.
 pub(crate) fn judge(
     state: &mut CheckerWatchState,
     beat: Option<CheckerBeat>,
@@ -158,7 +159,10 @@ pub(crate) fn judge(
     if state.acted_on == Some(beat.generation) {
         return None;
     }
+    // A failed thread creation is observed absence, not a heartbeat that may
+    // merely be late. Its retry backoff already elapsed in `classify`.
     match state.suspect {
+        _ if phase == CheckerPhase::StartFailed => {}
         Some(suspect) if suspect.is(&beat) && now_secs >= suspect.confirm_at => {}
         Some(suspect) if suspect.is(&beat) => return None,
         _ => {
@@ -358,6 +362,30 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_thread_start_retries_after_backoff_without_stall_confirmation() {
+        let mut state = CheckerWatchState::default();
+        let failed = beat(9, CheckerPhase::StartFailed, 100);
+        let due = 100 + checker_watch::START_RETRY.as_secs();
+        assert_eq!(next_look_in(&state, Some(failed), due - 1), Some(1));
+        assert!(judge(&mut state, Some(failed), due - 1).is_none());
+        assert_eq!(judge(&mut state, Some(failed), due).unwrap().generation, 9);
+        assert!(judge(&mut state, Some(failed), due + 1).is_none());
+        assert_eq!(next_look_in(&state, Some(failed), due + 1), None);
+        let again = beat(10, CheckerPhase::StartFailed, due);
+        assert!(judge(&mut state, Some(again), due + 1).is_none());
+        assert_eq!(
+            judge(
+                &mut state,
+                Some(again),
+                due + checker_watch::START_RETRY.as_secs()
+            )
+            .unwrap()
+            .generation,
+            10
+        );
+    }
     use crate::update_words::LiveHealth as _;
     use aterm_update::checker_watch::{
         CHECK_PHASE_BUDGET, CHECKER_LOCK_WAIT, LaneHolder, STALL_CONFIRM, STALL_SLACK,

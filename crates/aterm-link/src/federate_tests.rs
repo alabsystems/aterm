@@ -151,22 +151,48 @@ fn a_hand_off_reads_back_and_follows_each_rotation_to_a_member() {
             ("n-00000000000000b2".into(), "n-000000000000000c".into()),
         ]
         .into(),
+        rank: [
+            ("n-00000000000000b1".into(), 1),
+            ("n-00000000000000b2".into(), 0),
+        ]
+        .into(),
         gone: ["n-00000000000000b1", "n-00000000000000dd"]
             .map(String::from)
             .into(),
     };
     let text = handoff.render();
     assert!(text.contains("gone n-00000000000000dd\n"), "{text}");
+    assert!(text.contains("rank n-00000000000000b2 0\n"), "{text}");
     assert_eq!(Handoff::parse(&text), Ok(handoff.clone()));
     assert_eq!(
         Handoff::parse(&format!("{text}later a word this build does not know\n")),
         Ok(handoff.clone()),
         "a later node service may say more"
     );
+    // A reader that predates `rank` skips its lines, and reads the rest alike.
+    let unranked: String = text
+        .lines()
+        .filter(|line| !line.starts_with("rank "))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    assert_eq!(
+        Handoff::parse(&unranked),
+        Ok(Handoff {
+            rank: BTreeMap::new(),
+            ..handoff.clone()
+        })
+    );
     for bad in [
         format!("{text}member n-xyz\n"),
         format!("{text}moved n-000000000000000a\n"),
         format!("{text}gone n-xyz\n"),
+        format!("{text}rank n-xyz 0\n"),
+        format!("{text}rank n-00000000000000b1\n"),
+        format!("{text}rank n-00000000000000b1 x\n"),
+        format!("{text}rank n-00000000000000b1 01\n"),
+        format!("{text}rank n-00000000000000b1 +1\n"),
+        format!("{text}rank n-00000000000000b1 -1\n"),
+        format!("{text}rank n-00000000000000b1 1 2\n"),
         "mesh-handoff v2\nme n-000000000000000a\n".to_owned(),
         "mesh-handoff v1\nmember n-000000000000000a\n".to_owned(),
     ] {
@@ -221,6 +247,7 @@ fn the_plan_pushes_only_to_members_this_mac_wrote_to() {
             .map(String::from)
             .into(),
         moved: [("n-00000000000000b0".into(), "n-000000000000000b".into())].into(),
+        rank: BTreeMap::new(),
         gone: BTreeSet::new(),
     };
     let written = [
@@ -284,6 +311,7 @@ fn the_halts_go_to_every_member_but_this_mac() {
             .map(String::from)
             .into(),
         moved: BTreeMap::new(),
+        rank: BTreeMap::new(),
         gone: ["n-00000000000000ff".to_string()].into(),
     };
     let halts = |dst: &str| Lane::Halts { dst: dst.into() };
@@ -704,6 +732,7 @@ pub(crate) fn move_once(mac: &Mac, me: &Mac, old: &str, state: &std::path::Path)
         own_halts_only: false,
         one_node: false,
         node_order_olds: false,
+        node_order_ring: false,
         unsealed_carry: false,
         ungated_inbox: false,
         give_back_carried: false,
@@ -729,6 +758,7 @@ pub(crate) fn members(me: &Mac, of: &[&str]) -> Handoff {
         me: me.node.clone(),
         members: of.iter().map(|node| (*node).to_owned()).collect(),
         moved: BTreeMap::new(),
+        rank: BTreeMap::new(),
         gone: BTreeSet::new(),
     }
 }
@@ -978,28 +1008,89 @@ fn rotated_from(a: &Mac, new: &str, b: &Mac) -> Handoff {
         me: new.to_owned(),
         members: [new.to_owned(), b.node.clone()].into(),
         moved: [(a.node.clone(), new.to_owned())].into(),
+        rank: BTreeMap::new(),
         gone: BTreeSet::new(),
     }
 }
 
-/// **A MAC CARRIES THE RETIRED NODES A PEER'S RING NAMES, AND SAYS WHICH IT DOES NOT** (§11 C3b):
-/// a peer's ring names the first [`RING_OLDS_MAX`] nodes a key rotation retired of a seat; so with
-/// one more retired node than that, this Mac's own-inbox moves take the same first ones, its
-/// pushes carry the ones a ring grants
-/// (`a_push_carries_the_retired_nodes_its_peers_ring_grants_whichever_they_are`), and the journal
-/// names the one left, once.
-/// NEGATIVE CONTROL: with [`RING_OLDS_MAX`] retired nodes, every one is taken and nothing said.
+/// **A RING NAMES THE NODES A SEAT RETIRED LAST** (§11 C3b): of more retired nodes than a ring
+/// holds, [`ringed`] names the [`RING_OLDS_MAX`] the membership log ranks latest, whatever their
+/// node order, and a node it does not rank after every one it does, in node order; a peer's ring
+/// takes the mail its seat wrote under each of them ([`peer_ring`]), and no other.
+/// NEGATIVE CONTROL: [`NODE_ORDER_RING`], the choice before the second recency phase: the first
+/// in node order, which leave out the node retired last and name the one retired first.
 #[test]
-fn a_mac_carries_the_retired_nodes_a_peers_ring_names_and_says_which_it_does_not() {
+fn a_ring_names_the_nodes_a_seat_retired_last() {
+    let (me, peer) = (node_of(&key_of(98)), node_of(&key_of(99)));
+    let olds: BTreeSet<String> = (0..=RING_OLDS_MAX)
+        .map(|i| node_of(&key_of(130 + u8::try_from(i).unwrap())))
+        .collect();
+    // Retired in node order: the greatest node last, which node order leaves out.
+    let recent: Vec<String> = olds.iter().rev().cloned().collect();
+    let rank: BTreeMap<String, usize> = recent.iter().cloned().zip(0..).collect();
+    let (last, first) = (&recent[0], &recent[RING_OLDS_MAX]);
+    let grant = |old: &str| format!("rw,p={peer}:/f/{FLEET}/in/{me}/*/{old}/*");
+    for control in [false, true] {
+        let case = format!("control={control}");
+        NODE_ORDER_RING.with(|on| on.set(control));
+        let named = ringed(&olds, &rank);
+        NODE_ORDER_RING.with(|on| on.set(false));
+        assert_eq!(named.len(), RING_OLDS_MAX, "{case}: bounded");
+        assert_eq!(named.contains(last), !control, "{case}: the last retired");
+        assert_eq!(named.contains(first), control, "{case}: the first retired");
+        let ring = peer_ring(FLEET, &me, &peer, &named);
+        for old in &olds {
+            assert_eq!(
+                ring.contains(&grant(old)),
+                named.contains(old),
+                "{case}: {old}"
+            );
+        }
+    }
+    let only_last: BTreeMap<String, usize> = [(last.clone(), 0)].into();
+    let mut want: BTreeSet<String> = olds.iter().take(RING_OLDS_MAX - 1).cloned().collect();
+    want.insert(last.clone());
+    assert_eq!(
+        ringed(&olds, &only_last),
+        want,
+        "the ranked first, then the rest in node order"
+    );
+}
+
+/// **A MAC MOVES THE MAIL OF THE NODES ITS SEAT RETIRED LAST, AND SAYS WHICH IT DOES NOT** (§11
+/// C3b): with one more retired node than a ring names, this Mac's own-inbox moves take the
+/// [`RING_OLDS_MAX`] its seat retired last ([`Handoff::ringed`]), whatever their node order, the
+/// ones the reader's ring the node service writes from the same hand-off reads
+/// ([`write_old_reads`]); its pushes carry the ones a peer's ring grants
+/// (`a_push_carries_the_retired_nodes_its_peers_ring_grants_whichever_they_are`); and the journal
+/// names the one retired first, once.
+/// NEGATIVE CONTROL: [`NODE_ORDER_RING`], the choice before the second recency phase: the moves
+/// take the first in node order, which leave out the node retired last, and the journal names
+/// that one; and with [`RING_OLDS_MAX`] retired nodes every one is taken and nothing said.
+#[test]
+fn a_mac_moves_the_mail_of_the_nodes_its_seat_retired_last_and_says_which_it_does_not() {
     let a = Mac::new(20);
     let net = Arc::new(Net::default());
-    for count in [RING_OLDS_MAX + 1, RING_OLDS_MAX] {
-        let case = format!("count={count}");
+    for (count, control) in [
+        (RING_OLDS_MAX + 1, false),
+        (RING_OLDS_MAX + 1, true),
+        (RING_OLDS_MAX, false),
+    ] {
+        let case = format!("count={count} control={control}");
         let olds: BTreeSet<String> = (0..count)
             .map(|i| node_of(&key_of(100 + u8::try_from(i).unwrap())))
             .collect();
+        // Retired in node order: the greatest node last, which node order leaves out.
+        let rank: BTreeMap<String, usize> = olds.iter().rev().cloned().zip(0..).collect();
+        let named: BTreeSet<String> = if control {
+            olds.iter().take(RING_OLDS_MAX).cloned().collect()
+        } else {
+            olds.iter().rev().take(RING_OLDS_MAX).cloned().collect()
+        };
+        let left: Vec<&String> = olds.difference(&named).collect();
         let notes = Arc::new(Mutex::new(Vec::<String>::new()));
         let noted = Arc::clone(&notes);
+        NODE_ORDER_RING.with(|on| on.set(control));
         let routes = routes_noting(
             &a,
             (&a.node, a.key),
@@ -1015,10 +1106,13 @@ fn a_mac_carries_the_retired_nodes_a_peers_ring_names_and_says_which_it_does_not
                 .iter()
                 .map(|old| (old.clone(), a.node.clone()))
                 .collect(),
+            rank,
             gone: BTreeSet::new(),
         };
         routes.set(&handoff, &BTreeSet::new());
         routes.set(&handoff, &BTreeSet::new());
+        let reads = old_reads(&handoff.ringed(&a.node));
+        NODE_ORDER_RING.with(|on| on.set(false));
         let moves: BTreeSet<String> = routes
             .status()
             .into_keys()
@@ -1027,27 +1121,29 @@ fn a_mac_carries_the_retired_nodes_a_peers_ring_names_and_says_which_it_does_not
                 _ => None,
             })
             .collect();
-        let named: BTreeSet<String> = olds.iter().take(RING_OLDS_MAX).cloned().collect();
-        assert_eq!(moves, named, "{case}: the ring's first nodes, moved");
-        let ring = peer_ring(FLEET, &node_of(&key_of(99)), &a.node, &olds);
-        for old in &olds {
-            let grant = format!(
-                "rw,p={}:/f/{FLEET}/in/{}/*/{old}/*",
-                a.node,
-                node_of(&key_of(99))
-            );
-            assert_eq!(ring.contains(&grant), named.contains(old), "{case}: {old}");
-        }
+        assert_eq!(moves, named, "{case}: the nodes the ring names, moved");
+        assert_eq!(
+            reads,
+            named.iter().map(|old| old_read(old)).collect::<Vec<_>>(),
+            "{case}: the reader's ring reads the nodes moved"
+        );
         let said = notes.lock().unwrap().clone();
-        let left = olds.iter().last().unwrap();
-        if count > RING_OLDS_MAX {
-            assert_eq!(said.len(), 1, "{case}: once: {said:?}");
-            assert!(
-                said[0].contains(left.as_str()),
-                "{case}: names {left}: {said:?}"
-            );
-        } else {
+        if left.is_empty() {
             assert!(said.is_empty(), "{case}: {said:?}");
+        } else {
+            assert_eq!(said.len(), 1, "{case}: once: {said:?}");
+            for old in &left {
+                assert!(
+                    said[0].contains(old.as_str()),
+                    "{case}: names {old}: {said:?}"
+                );
+            }
+            for old in &named {
+                assert!(
+                    !said[0].contains(old.as_str()),
+                    "{case}: not {old}: {said:?}"
+                );
+            }
         }
         drop(routes);
     }
@@ -1055,8 +1151,8 @@ fn a_mac_carries_the_retired_nodes_a_peers_ring_names_and_says_which_it_does_not
 
 /// **A PUSH CARRIES THE RETIRED NODES ITS PEER'S RING GRANTS, WHICHEVER THEY ARE** (§11 C3b, the
 /// first phase of choosing them by how recent each is): A's seat retired one more node than a ring
-/// names, and B's ring names the last [`RING_OLDS_MAX`] of them in node order, not the first, as a
-/// ring that chose by recency would. A's push to B carries the mail A wrote under the last one,
+/// names, in node order, and B's ring names the [`RING_OLDS_MAX`] it retired last ([`ringed`]):
+/// the last in node order, not the first. A's push to B carries the mail A wrote under the last one,
 /// passes what it wrote under the first uncarried, journaling the first alone as not carried, once
 /// across a reopen, and carries what it writes after.
 /// NEGATIVE CONTROL: [`NODE_ORDER_OLDS`], each push carrying the first in node order as before:
@@ -1083,7 +1179,13 @@ fn a_push_carries_the_retired_nodes_its_peers_ring_grants_whichever_they_are() {
             olds.first().expect("nine").clone(),
             olds.last().expect("nine").clone(),
         );
-        let granted: BTreeSet<String> = olds.iter().skip(1).cloned().collect();
+        let rank: BTreeMap<String, usize> = olds.iter().rev().cloned().zip(0..).collect();
+        let granted = ringed(&olds, &rank);
+        assert_eq!(
+            granted,
+            olds.iter().skip(1).cloned().collect::<BTreeSet<_>>(),
+            "{case}: all but the one retired first"
+        );
         let net = Arc::new(Net::default());
         let notes = Arc::new(Mutex::new(Vec::<String>::new()));
         let noted = Arc::clone(&notes);
@@ -1125,6 +1227,7 @@ fn a_push_carries_the_retired_nodes_its_peers_ring_grants_whichever_they_are() {
                 .iter()
                 .map(|old| (old.clone(), a.node.clone()))
                 .collect(),
+            rank: rank.clone(),
             gone: BTreeSet::new(),
         };
         routes.set(&handoff, &BTreeSet::new());

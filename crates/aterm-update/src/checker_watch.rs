@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 pub enum CheckerPhase {
     /// Registered, before the loop's first stamp.
     Starting,
+    /// The OS refused to create this generation's thread; no worker can stamp it.
+    StartFailed,
     /// Asking the host for the current channel and policy, or pausing after it did not answer.
     Settings,
     /// Reading the bundle under this executable and verifying its signature when newer.
@@ -34,6 +36,7 @@ impl CheckerPhase {
             Self::LockWait => 4,
             Self::Checking => 5,
             Self::Waiting => 6,
+            Self::StartFailed => 7,
         }
     }
 
@@ -45,6 +48,7 @@ impl CheckerPhase {
             4 => Self::LockWait,
             5 => Self::Checking,
             6 => Self::Waiting,
+            7 => Self::StartFailed,
             _ => Self::Starting,
         }
     }
@@ -60,6 +64,7 @@ impl CheckerPhase {
             Self::LockWait => "lock-wait",
             Self::Checking => "checking",
             Self::Waiting => "waiting",
+            Self::StartFailed => "start-failed",
         }
     }
 
@@ -74,6 +79,7 @@ impl CheckerPhase {
             Self::LockWait => "waiting for another aterm's check to finish",
             Self::Checking => "checking for a new version",
             Self::Waiting => "waiting between checks",
+            Self::StartFailed => "waiting to retry a failed thread start",
         }
     }
 }
@@ -95,6 +101,9 @@ pub const STALL_CONFIRM: Duration = STALL_SLACK;
 
 /// How many replacement threads one process may start.
 pub const MAX_RESPAWNS: u64 = 3;
+
+/// Backoff after the OS refused a checker thread, without spending a live-worker slot.
+pub const START_RETRY: Duration = Duration::from_secs(5);
 
 /// The process-wide monotonic anchor every stamp is measured from.
 fn anchor() -> Instant {
@@ -196,7 +205,7 @@ pub enum CheckerVerdict {
         /// Running seconds until the stamp crosses its threshold.
         stale_in_secs: u64,
     },
-    /// Unstamped for `for_secs` running seconds, past twice the phase budget plus [`STALL_SLACK`].
+    /// Unstamped for `for_secs` running seconds, past its phase's stall or failed-start threshold.
     Stalled {
         /// Running seconds since the last stamp.
         for_secs: u64,
@@ -210,6 +219,7 @@ pub enum CheckerVerdict {
 #[must_use]
 pub fn phase_budget_secs(phase: CheckerPhase, max_interval_secs: u64) -> u64 {
     match phase {
+        CheckerPhase::StartFailed => START_RETRY.as_secs(),
         CheckerPhase::LockWait => CHECKER_LOCK_WAIT.as_secs(),
         CheckerPhase::Checking => CHECK_PHASE_BUDGET.as_secs(),
         CheckerPhase::Starting => {
@@ -221,10 +231,14 @@ pub fn phase_budget_secs(phase: CheckerPhase, max_interval_secs: u64) -> u64 {
     }
 }
 
-/// The running-second age past which a stamp in `phase` is a stall.
+/// The running-second age past which a stamp in `phase` is a stall. A known
+/// failed start uses only its retry backoff, without late-heartbeat slack.
 #[inline]
 #[must_use]
 pub fn stall_threshold_secs(phase: CheckerPhase, max_interval_secs: u64) -> u64 {
+    if phase == CheckerPhase::StartFailed {
+        return START_RETRY.as_secs();
+    }
     phase_budget_secs(phase, max_interval_secs)
         .saturating_mul(2)
         .saturating_add(STALL_SLACK.as_secs())
@@ -236,14 +250,15 @@ pub fn stall_threshold_secs(phase: CheckerPhase, max_interval_secs: u64) -> u64 
 pub fn classify(beat: &CheckerBeat, now_secs: u64) -> CheckerVerdict {
     let age = now_secs.saturating_sub(beat.at_secs);
     let threshold = stall_threshold_secs(beat.phase, beat.max_interval_secs);
-    if age > threshold {
+    if age > threshold || (beat.phase == CheckerPhase::StartFailed && age == threshold) {
         CheckerVerdict::Stalled {
             for_secs: age,
             phase: beat.phase,
         }
     } else {
         CheckerVerdict::Fresh {
-            stale_in_secs: (threshold - age).saturating_add(1),
+            stale_in_secs: (threshold - age)
+                .saturating_add(u64::from(beat.phase != CheckerPhase::StartFailed)),
         }
     }
 }
@@ -441,11 +456,26 @@ impl CheckerWatch {
         Some(next)
     }
 
-    /// The replacement [`Self::supersede`] counted was never started: give its slot back.
-    pub fn unstarted(&self) {
+    /// No thread started for this generation. Retain retirement of its predecessor,
+    /// return any replacement slot, and wake the host for a bounded retry.
+    pub fn unstarted(&self, generation: u64) {
+        let now = now_secs();
+        if self
+            .beat
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |word| {
+                (generation_of(word) == generation && phase_of(word) == CheckerPhase::Starting)
+                    .then(|| pack(generation, CheckerPhase::StartFailed, now))
+            })
+            .is_err()
+        {
+            return;
+        }
         let _ = self
             .respawns
             .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+        if let Some(wake) = self.phase_wake.get() {
+            wake();
+        }
     }
 }
 
@@ -675,7 +705,7 @@ mod tests {
         }
         assert_eq!(watch.supersede(live), None, "MAX_RESPAWNS is a ceiling");
         assert_eq!(watch.snapshot().unwrap().respawns, MAX_RESPAWNS);
-        watch.unstarted();
+        watch.unstarted(live);
         assert_eq!(watch.snapshot().unwrap().respawns, MAX_RESPAWNS - 1);
         assert!(watch.supersede(live).is_some(), "the slot is spent again");
     }
@@ -778,6 +808,7 @@ mod tests {
     fn every_phase_round_trips_through_the_packed_word() {
         for phase in [
             CheckerPhase::Starting,
+            CheckerPhase::StartFailed,
             CheckerPhase::Settings,
             CheckerPhase::BundleProbe,
             CheckerPhase::LockWait,
@@ -792,5 +823,53 @@ mod tests {
             );
             assert_eq!(word & SECS_MASK, 12_345);
         }
+    }
+
+    #[test]
+    fn refused_thread_starts_retry_without_reviving_or_spending_worker_slots() {
+        use std::sync::Arc;
+        let watch = CheckerWatch::new();
+        let wakes = Arc::new(AtomicU64::new(0));
+        let seen = Arc::clone(&wakes);
+        watch.set_phase_wake(Box::new(move || {
+            seen.fetch_add(1, Ordering::Relaxed);
+        }));
+        let first = watch.register(10_000);
+        watch.unstarted(first);
+        let failed = watch.snapshot().unwrap();
+        assert_eq!(failed.phase, CheckerPhase::StartFailed);
+        assert_eq!(failed.respawns, 0);
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            classify(&failed, failed.at_secs + START_RETRY.as_secs() - 1),
+            CheckerVerdict::Fresh { stale_in_secs: 1 }
+        );
+        assert!(matches!(
+            classify(&failed, failed.at_secs + START_RETRY.as_secs()),
+            CheckerVerdict::Stalled {
+                phase: CheckerPhase::StartFailed,
+                ..
+            }
+        ));
+        let mut current = first;
+        for _ in 0..MAX_RESPAWNS + 1 {
+            let next = watch.supersede(current).unwrap();
+            watch.unstarted(current);
+            assert_eq!(
+                watch.snapshot().unwrap().respawns,
+                1,
+                "stale failure ignored"
+            );
+            watch.unstarted(next);
+            watch.unstarted(next);
+            assert_eq!(watch.snapshot().unwrap().respawns, 0, "returned only once");
+            assert!(!watch.beat(current, CheckerPhase::Checking));
+            current = next;
+        }
+        let next = watch.supersede(current).unwrap();
+        assert!(watch.beat(next, CheckerPhase::Checking));
+        watch.unstarted(next);
+        assert_eq!(watch.snapshot().unwrap().phase, CheckerPhase::Checking);
+        assert_eq!(watch.snapshot().unwrap().respawns, 1);
     }
 }

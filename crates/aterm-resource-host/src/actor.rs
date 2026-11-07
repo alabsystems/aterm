@@ -44,6 +44,12 @@ enum Message {
     },
     Submit(Box<AuthorizedSubmission>),
     SubmitMember(Box<aterm_ctl::resource_subgroup_client::AuthorizedSubgroup>),
+    SubmitProxy(Box<crate::resource_proxy_intake::Incoming>),
+    ProvisionalProxy {
+        request: Box<trust_resource_controller::Request>,
+        helper: Peer,
+        reply: SyncSender<bool>,
+    },
     AuthorizeMember {
         request: owner::members::Authorization,
         reply: SyncSender<bool>,
@@ -141,6 +147,25 @@ pub(super) fn submit_member(
 ) -> io::Result<()> {
     send(Message::SubmitMember(Box::new(member)))
 }
+pub(super) fn provisional_proxy(
+    request: &trust_resource_controller::Request,
+    helper: Peer,
+) -> bool {
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::ProvisionalProxy {
+        request: Box::new(request.clone()),
+        helper,
+        reply,
+    })
+    .is_ok()
+        && read.recv_timeout(RPC).unwrap_or(false)
+}
+pub(super) fn proxy_binding(value: &aterm_json::Value) -> io::Result<Binding> {
+    owner::members::binding_role(value, "proxy-member")
+}
+pub(super) fn submit_proxy(incoming: crate::resource_proxy_intake::Incoming) -> io::Result<()> {
+    send(Message::SubmitProxy(Box::new(incoming)))
+}
 /// Observe only original custody for the authenticated kernel peer tree.
 pub fn inspect(peer: Peer, session: &str) -> io::Result<Inspection> {
     let (reply, read) = mpsc::sync_channel(1);
@@ -209,6 +234,14 @@ fn run(receiver: mpsc::Receiver<Message>, mut owner: owner::Owner) {
                     let _ = reply.try_send(owner.authorize_member(&request));
                 }
                 Message::SubmitMember(member) => owner.submit_member(*member),
+                Message::SubmitProxy(incoming) => owner.submit_proxy(*incoming),
+                Message::ProvisionalProxy {
+                    request,
+                    helper,
+                    reply,
+                } => {
+                    let _ = reply.try_send(owner.provisional_proxy(&request, helper));
+                }
                 Message::Context { peer, query, reply } => {
                     let _ = reply.try_send(owner.context(peer, &query));
                 }
@@ -244,4 +277,9 @@ pub(super) fn wake() {
     if let Ok(handle) = actor() {
         let _ = handle.sender.try_send(Message::Wake);
     }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn member_fixture(args: &[std::ffi::OsString]) -> std::process::ExitCode {
+    owner::member_fixture(args)
 }

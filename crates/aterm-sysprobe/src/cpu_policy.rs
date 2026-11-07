@@ -559,7 +559,8 @@ pub fn collector_entry_within(args: &[std::ffi::OsString], role: Duration, ack: 
     let role_started = Instant::now();
     let closed = Arc::new(AtomicBool::new(false));
     // This watchdog covers blocking sysctl/getpriority calls and pipe writes too.
-    // Only this fixed collector role owns it; ordinary sysprobe readers get no timer.
+    // Only this fixed collector role owns it; ordinary sysprobe readers get no watchdog (the
+    // whole process table's read alone is waited for a bound, `kproc`'s `TABLE_WAIT`).
     let watchdog_closed = Arc::clone(&closed);
     if std::thread::Builder::new()
         .name("cpu-policy-deadline".into())

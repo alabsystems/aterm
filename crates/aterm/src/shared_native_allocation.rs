@@ -160,9 +160,16 @@ fn state(paths: &Paths) -> Result<Vec<Value>, String> {
     Ok(rows)
 }
 
-fn save(paths: &Paths, rows: &[Value]) -> Result<(), String> {
-    let bytes = aterm_json::to_vec(&json!({"schema":1,"queues":rows}))
-        .map_err(|_| "native queue could not be encoded")?;
+fn save(paths: &Paths, rows: &mut Vec<Value>) -> Result<(), String> {
+    let mut doc = Value::Object(aterm_json::Map::from([
+        ("schema".to_string(), Value::Number(1u64.into())),
+        ("queues".to_string(), Value::Array(std::mem::take(rows))),
+    ]));
+    let bytes = aterm_json::to_vec(&doc);
+    if let Some(Value::Array(saved)) = doc.as_object_mut().and_then(|o| o.remove("queues")) {
+        *rows = saved;
+    }
+    let bytes = bytes.map_err(|_| "native queue could not be encoded")?;
     fsx::write_atomic(&paths.dir.join(FILE), &bytes, 0o600).map_err(|e| e.to_string())
 }
 
@@ -210,7 +217,7 @@ fn next(row: &mut Value) -> Result<u64, String> {
         .ok_or("native allocation ticket counter exhausted")?;
     row.as_object_mut()
         .unwrap()
-        .insert("serial".into(), json!(order));
+        .insert("serial".into(), Value::Number(order.into()));
     Ok(order)
 }
 
@@ -247,7 +254,10 @@ fn choose(
                 continue;
             }
             let order = next(row)?;
-            items_mut(row, "tickets").push(json!({"actor":actor,"order":order}));
+            items_mut(row, "tickets").push(Value::Object(aterm_json::Map::from([
+                ("actor".to_string(), Value::String(actor.clone())),
+                ("order".to_string(), Value::Number(order.into())),
+            ])));
         }
     }
     let mut kept: Vec<_> = warm
@@ -267,7 +277,10 @@ fn choose(
             .any(|grant| grant["member"].as_str() == Some(member.as_str()))
         {
             let order = next(row)?;
-            items_mut(row, "grants").push(json!({"member":member,"order":order}));
+            items_mut(row, "grants").push(Value::Object(aterm_json::Map::from([
+                ("member".to_string(), Value::String(member.clone())),
+                ("order".to_string(), Value::Number(order.into())),
+            ])));
         }
     }
     if !allocate {
@@ -306,13 +319,16 @@ fn choose(
         }
         kept.push(member.to_owned());
         let order = next(row)?;
-        items_mut(row, "grants").push(json!({"member":member,"order":order}));
+        items_mut(row, "grants").push(Value::Object(aterm_json::Map::from([
+            ("member".to_string(), Value::String(member.to_owned())),
+            ("order".to_string(), Value::Number(order.into())),
+        ])));
         for ticket in items_mut(row, "tickets") {
             if ticket["actor"].as_str() == Some(actor) {
                 ticket
                     .as_object_mut()
                     .unwrap()
-                    .insert("order".into(), json!(order));
+                    .insert("order".into(), Value::Number(order.into()));
             }
         }
     }
@@ -444,7 +460,7 @@ pub(super) fn step_at(
             ready,
         )?;
         if !ready {
-            save(paths, &rows)?;
+            save(paths, &mut rows)?;
             continue;
         }
         let mut changed = assignment.clone();
@@ -454,7 +470,7 @@ pub(super) fn step_at(
         changed.automatic.as_mut().unwrap().actor = view.local.actor();
         changed.automatic.as_mut().unwrap().machine = *view.local.machine();
         if changed == assignment {
-            save(paths, &rows)?;
+            save(paths, &mut rows)?;
             continue;
         }
         policy.set(changed)?;
@@ -506,7 +522,7 @@ pub(super) fn step_at(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert((paths.dir.clone(), provider.name()), now + COOLDOWN);
-        save(paths, &rows)?;
+        save(paths, &mut rows)?;
         return Ok(1);
     }
     Ok(0)

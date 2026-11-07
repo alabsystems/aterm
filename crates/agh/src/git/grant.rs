@@ -89,19 +89,28 @@ impl Grant {
     /// parse.
     #[cfg(any(unix, test, debug_assertions))]
     fn from_json(nonce: &str, bytes: &[u8]) -> Option<Grant> {
-        let value: aterm_json::Value = aterm_json::from_slice(bytes).ok()?;
-        if value.get("v")?.as_u64()? != 1 {
+        let aterm_json::Value::Object(mut map) = aterm_json::from_slice(bytes).ok()? else {
+            return None;
+        };
+        if map.get("v")?.as_u64()? != 1 {
             return None;
         }
-        let number = |key: &str| value.get(key).and_then(aterm_json::Value::as_u64);
-        let text = |key: &str| value.get(key).and_then(aterm_json::Value::as_str);
+        let number =
+            |map: &aterm_json::Map, key: &str| map.get(key).and_then(aterm_json::Value::as_u64);
+        let pid = u32::try_from(number(&map, "pid")?).ok()?;
+        let start = number(&map, "start")?;
+        let expires_at = number(&map, "expires_at")?;
+        let slug = Slug::parse(map.get("slug").and_then(aterm_json::Value::as_str)?).ok()?;
+        let aterm_json::Value::String(profile) = map.remove("profile")? else {
+            return None;
+        };
         Some(Grant {
             nonce: nonce.to_string(),
-            slug: Slug::parse(text("slug")?).ok()?,
-            profile: text("profile")?.to_string(),
-            pid: u32::try_from(number("pid")?).ok()?,
-            start: number("start")?,
-            expires_at: number("expires_at")?,
+            slug,
+            profile,
+            pid,
+            start,
+            expires_at,
         })
     }
 }

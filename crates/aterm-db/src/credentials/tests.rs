@@ -1100,3 +1100,117 @@ fn a_note_an_earlier_build_kept_with_a_newline_still_reaches_the_table() {
         "{text}"
     );
 }
+
+/// A request the lab lapsed (no word from this Mac on it for 30 days: its windows stayed shut)
+/// is raised again at once while its need holds, as its line says, with no consumer to raise
+/// it: a need by hand posts a new request, under a new id, at the next pass, and supersedes the
+/// lapsed one, once, so a member whose clock does not count the lapse yet (it took this Mac's
+/// last word in later) reads the new request live and sweeps it rather than drop it as a second
+/// live request for its want. A retirement whose reason still holds (a decline, `not-held` with
+/// no Mac holding the value) stays retired.
+/// NEGATIVE CONTROL: the supersede is written once; a later pass writes no other.
+#[test]
+fn a_lapsed_request_is_raised_again_at_once_while_its_need_holds() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    for paths in &lab.paths {
+        need::test_alab_policy(paths);
+    }
+    let (custodian, requester) = (&lab.paths[0], &lab.paths[1]);
+    let mailbox = Want::parse("mailbox:m29").unwrap();
+    need::raise(requester, Want::Notary, Purpose::ByHand).unwrap();
+    need::raise(requester, mailbox.clone(), Purpose::ByHand).unwrap();
+    let now = aterm_time::unix_millis().unwrap();
+    assert_eq!(pass_at(requester, now).unwrap().posted, 2);
+    let first: Vec<[u8; 16]> = need::list(requester)
+        .unwrap()
+        .iter()
+        .map(|need| need.id)
+        .collect();
+    repair_commons(&lab, 3);
+    let lapse = aterm_time::unix_millis().unwrap() + need::LAPSE_SECS * MS;
+    let lapsed = custodian_pass_at(custodian, lapse).unwrap().unwrap();
+    assert_eq!(
+        lapsed
+            .retired
+            .iter()
+            .map(|(_, reason)| *reason)
+            .collect::<Vec<_>>(),
+        [Reason::Lapsed; 2],
+        "{lapsed:?}"
+    );
+    repair_commons(&lab, 3);
+    assert_eq!(pass_at(requester, lapse).unwrap().decided, 2);
+    for need in need::list(requester).unwrap() {
+        assert_eq!(need.state, State::Local, "{}", need.line);
+        assert!(!first.contains(&need.id), "a new request id: {need:?}");
+        assert_eq!((need.raises, need.raised_again_on_change), (2, Some(true)));
+    }
+    let reposted = pass_at(requester, lapse).unwrap();
+    assert_eq!(
+        (reposted.posted, reposted.answered),
+        (2, 2),
+        "the next pass posts both again and supersedes the lapsed two"
+    );
+    let book = pass_at(requester, lapse).unwrap();
+    assert_eq!(
+        book.answered, 2,
+        "the new requests' Stills (30 days on): the supersede is not written again"
+    );
+    assert!(
+        book.inert
+            .iter()
+            .all(|(_, why)| why == "the request has ended"),
+        "{:?}",
+        book.inert
+    );
+    assert_eq!(
+        book.threads.iter().filter(|thread| !thread.ended()).count(),
+        2,
+        "{:?}",
+        book.threads
+    );
+    repair_commons(&lab, 3);
+    let early = pass_at(custodian, now).unwrap();
+    assert!(
+        !early
+            .inert
+            .iter()
+            .any(|(_, why)| why == "a second live request for one want and purpose"),
+        "a member that does not count the lapse yet reads the new requests live: {:?}",
+        early.inert
+    );
+    assert_eq!(
+        early
+            .threads
+            .iter()
+            .filter(|thread| !thread.ended())
+            .count(),
+        2,
+        "{:?}",
+        early.threads
+    );
+    assert_eq!(early.swept, 2, "and sweeps them");
+    let needs = need::list(requester).unwrap();
+    let retire = |want: &Want, reason| {
+        let need = needs.iter().find(|need| need.want == *want).unwrap();
+        assert!(!need.state.ended(), "{}", need.line);
+        let retirement = Retirement {
+            reason,
+            evidence: "a custodian".into(),
+            note: String::new(),
+            generation: None,
+        };
+        (need.id, Absorb::Decided(Decision::Retired(retirement)))
+    };
+    let held = [
+        retire(&Want::Notary, Reason::Declined),
+        retire(&mailbox, Reason::NotHeld),
+    ];
+    assert_eq!(need::absorb(requester, &held).unwrap().len(), 2);
+    for need in need::list(requester).unwrap() {
+        assert_eq!(need.state, State::Retired, "{}", need.line);
+        assert!(held.iter().any(|(id, _)| *id == need.id), "{need:?}");
+        assert_eq!(need.raises, 2);
+    }
+    assert_eq!(pass_at(requester, lapse).unwrap().posted, 0);
+}

@@ -16,6 +16,7 @@
 mod common;
 
 mod conformance_end_by_proof;
+mod conformance_test_dispatch;
 mod gate_contract;
 mod profile_reuse;
 mod tether_entry;

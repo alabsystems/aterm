@@ -150,12 +150,14 @@ impl Request {
 
     /// The value of query parameter `name`, form-decoded as GitHub reads a query: a `+` is a
     /// space, and `%2B` a `+`.
-    pub(crate) fn query(&self, name: &str) -> Option<String> {
+    pub(crate) fn query(&self, name: &str) -> Option<std::borrow::Cow<'_, str>> {
         self.raw_query().find(|(k, _)| *k == name).map(|(_, v)| {
             if v.contains('+') {
-                aterm_codec::pct::decode(&v.replace('+', " "))
+                std::borrow::Cow::Owned(aterm_codec::pct::decode(&v.replace('+', " ")))
+            } else if v.contains('%') {
+                std::borrow::Cow::Owned(aterm_codec::pct::decode(v))
             } else {
-                aterm_codec::pct::decode(v)
+                std::borrow::Cow::Borrowed(v)
             }
         })
     }
@@ -1050,7 +1052,7 @@ fn user_repos(state: &State, req: &Request, ctx: &Ctx) -> Answer {
                 || (collaborator && r.is_member(Some(login)))
         })
         .filter(|r| r.visible_to(Some(login)))
-        .filter(|r| match visibility.as_str() {
+        .filter(|r| match visibility.as_ref() {
             "public" => !r.spec.private,
             "private" => r.spec.private,
             _ => true,
@@ -1081,7 +1083,7 @@ fn owner_repos(state: &State, req: &Request, ctx: &Ctx, id: u64, org: bool) -> A
                 !r.spec.private
             }
         })
-        .filter(|r| match kind.as_str() {
+        .filter(|r| match kind.as_ref() {
             "public" => !r.spec.private,
             "private" => r.spec.private,
             "forks" => false,
@@ -1140,7 +1142,6 @@ fn repo_route(state: &State, req: &Request, ctx: &Ctx, index: usize, rest: &[&st
 /// hide.
 fn release_by_tag(state: &State, repo: &Repo, tag: &str) -> Answer {
     let found = published(state, repo)
-        .into_iter()
         .filter(|r| r.spec.tag == tag && !r.hidden)
         .max_by(|a, b| (&a.spec.created_at, a.id).cmp(&(&b.spec.created_at, b.id)));
     found.map_or_else(Answer::not_found, |r| {
@@ -1260,12 +1261,12 @@ fn ref_page<'r>(
 }
 
 /// The repository's published releases.
-fn published<'s>(state: &'s State, repo: &Repo) -> Vec<&'s Release> {
+fn published<'s>(state: &'s State, repo: &Repo) -> impl Iterator<Item = &'s Release> {
+    let repo_id = repo.id;
     state
         .releases
         .iter()
-        .filter(|r| r.repo == repo.id && !r.spec.draft)
-        .collect()
+        .filter(move |r| r.repo == repo_id && !r.spec.draft)
 }
 
 /// Handles `/releases` newest first, without what the listing lag hides; a page starting past
@@ -1302,9 +1303,7 @@ fn releases(state: &State, req: &Request, ctx: &Ctx, repo: &Repo) -> Answer {
 fn latest(state: &State, repo: &Repo) -> Answer {
     let set = match repo.latest {
         Latest::None => return Answer::not_found(),
-        Latest::Set(id) => published(state, repo)
-            .into_iter()
-            .find(|r| r.id == id && !r.hidden),
+        Latest::Set(id) => published(state, repo).find(|r| r.id == id && !r.hidden),
         Latest::Auto => None,
     };
     let found = set.or_else(|| auto_latest(state, repo, None));
@@ -1467,7 +1466,7 @@ fn wrapped_base64(bytes: &[u8]) -> String {
 fn contents(state: &State, req: &Request, repo: &Repo, path: &str) -> Answer {
     let reference = req
         .query("ref")
-        .unwrap_or_else(|| repo.spec.default_branch.clone());
+        .unwrap_or_else(|| repo.spec.default_branch.as_str().into());
     if !repo.knows(&reference) {
         return Answer::error(404, &format!("No commit found for the ref {reference}"));
     }
@@ -1520,23 +1519,19 @@ fn contents(state: &State, req: &Request, repo: &Repo, path: &str) -> Answer {
     } else {
         format!("{path}/")
     };
-    let under: Vec<&&File> = files
-        .iter()
-        .filter(|f| f.path.starts_with(&prefix))
-        .collect();
-    if under.is_empty() && !path.is_empty() {
-        return Answer::not_found();
-    }
     let mut names: Vec<(String, Option<&File>)> = Vec::new();
-    for file in under {
+    for &file in files.iter().filter(|f| f.path.starts_with(&prefix)) {
         let rest = &file.path[prefix.len()..];
         let (name, is_file) = match rest.split_once('/') {
-            Some((dir, _)) => (dir.to_string(), false),
-            None => (rest.to_string(), true),
+            Some((dir, _)) => (dir, false),
+            None => (rest, true),
         };
-        if !names.iter().any(|(n, _)| *n == name) {
-            names.push((name, is_file.then_some(*file)));
+        if !names.iter().any(|(n, _)| n == name) {
+            names.push((name.to_string(), is_file.then_some(file)));
         }
+    }
+    if names.is_empty() && !path.is_empty() {
+        return Answer::not_found();
     }
     names.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let items: Vec<Value> = names
@@ -1566,11 +1561,10 @@ fn tree(state: &State, req: &Request, repo: &Repo, reference: &str) -> Answer {
     let resolved = repo.resolve(reference);
     let mut entries: Vec<(String, Option<&File>)> = Vec::new();
     for file in repo.files_at(reference) {
-        let parts: Vec<&str> = file.path.split('/').collect();
-        for depth in 1..parts.len() {
-            let dir = parts[..depth].join("/");
-            if !entries.iter().any(|(p, _)| *p == dir) {
-                entries.push((dir, None));
+        for (idx, _) in file.path.match_indices('/') {
+            let dir = &file.path[..idx];
+            if !entries.iter().any(|(p, _)| p == dir) {
+                entries.push((dir.to_string(), None));
             }
         }
         entries.push((file.path.clone(), Some(file)));
@@ -1627,7 +1621,7 @@ fn commit_json(state: &State, repo: &Repo, index: usize) -> Value {
 fn commits(state: &State, req: &Request, repo: &Repo) -> Answer {
     let reference = req
         .query("sha")
-        .unwrap_or_else(|| repo.spec.default_branch.clone());
+        .unwrap_or_else(|| repo.spec.default_branch.as_str().into());
     let Some(top) = repo.commit_index(&reference) else {
         return Answer::not_found();
     };
@@ -1644,8 +1638,8 @@ fn commits(state: &State, req: &Request, repo: &Repo) -> Answer {
                         || (q.starts_with(p.as_str()) && q.as_bytes().get(p.len()) == Some(&b'/'))
                 })
             });
-            let after = since.as_ref().is_none_or(|s| c.date.as_str() >= s.as_str());
-            let by = author.as_ref().is_none_or(|a| {
+            let after = since.as_deref().is_none_or(|s| c.date.as_str() >= s);
+            let by = author.as_deref().is_none_or(|a| {
                 c.author_login
                     .as_ref()
                     .is_some_and(|l| l.eq_ignore_ascii_case(a))
@@ -1694,25 +1688,25 @@ fn compare(state: &State, req: &Request, repo: &Repo, raw_range: &str) -> Answer
             &format!("No common ancestor between {base} and {head}."),
         );
     };
-    let all: Vec<usize> = match (repo.commit_index(merge_base), repo.commit_index(head)) {
-        (Some(from), Some(to)) if from < to => (from + 1..=to).collect(),
-        _ => Vec::new(),
+    let all = match (repo.commit_index(merge_base), repo.commit_index(head)) {
+        (Some(from), Some(to)) if from < to => (from + 1)..(to + 1),
+        _ => 0..0,
     };
     let unpaged = req.query("page").is_none() && req.query("per_page").is_none();
     let (listed, link, first) = if unpaged {
-        let tail = all[all.len().saturating_sub(COMPARE_COMMITS)..].to_vec();
-        (tail, None, true)
+        let start = all.end.saturating_sub(COMPARE_COMMITS).max(all.start);
+        ((start..all.end).collect::<Vec<_>>(), None, true)
     } else {
         let paging = Paging::of(req, all.len());
         let api = state.ports.api;
         let full = repo.full_name();
         let base_url = format!("http://127.0.0.1:{api}/repos/{full}/compare/{raw_range}");
         let link = paging.link(req, &base_url);
-        (paging.take(all.iter().copied()), link, paging.number == 1)
+        (paging.take(all.clone()), link, paging.number == 1)
     };
     let mut files: Vec<String> = Vec::new();
     if first {
-        for &i in &all {
+        for i in all {
             for p in &repo.commits[i].paths {
                 if files.len() < COMPARE_FILES && !files.contains(p) {
                     files.push(p.clone());
@@ -1762,7 +1756,6 @@ fn web(state: &State, req: &Request) -> Answer {
         .filter(|r| !r.spec.private)
         .and_then(|r| {
             published(state, r)
-                .into_iter()
                 .filter(|rel| rel.spec.tag == tag && !rel.hidden)
                 .find_map(|rel| rel.assets.iter().find(|a| a.spec.name == name))
         });
@@ -2218,7 +2211,6 @@ fn published_tag(state: &State, repo: u64, tag: &str, except: Option<u64>) -> bo
 /// than `except`.
 fn auto_latest<'s>(state: &'s State, repo: &Repo, except: Option<u64>) -> Option<&'s Release> {
     published(state, repo)
-        .into_iter()
         .filter(|r| !r.spec.prerelease && !r.hidden && Some(r.id) != except)
         .max_by(|a, b| (&a.spec.created_at, a.id).cmp(&(&b.spec.created_at, b.id)))
 }

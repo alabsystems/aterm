@@ -146,12 +146,24 @@ fn with_nothing_kept_a_compiling_stage_claims_the_cold_figure() {
         );
         assert_eq!((n.bytes, &n.how), (want, &How::Cold), "{physical:?}");
     }
+    // The test run starts its binaries side by side: unmeasured, it claims the cold figure too
+    // (A9). NEGATIVE CONTROL: a stage that runs only what an earlier one built, one at a time
+    // (a measuring row), still claims nothing.
     let run = spec(StageId::Test, Lane::MainTarget);
     let n = need(
         &none,
         &Records::default(),
         &run,
         &over(&run, &gui()),
+        Some(24 * GIB),
+    );
+    assert_eq!((n.bytes, n.how), (12 * GIB, How::Together));
+    let rows = spec(StageId::MeasuringTests, Lane::MainTarget);
+    let n = need(
+        &none,
+        &Records::default(),
+        &rows,
+        &over(&rows, &gui()),
         Some(24 * GIB),
     );
     assert_eq!((n.bytes, n.how), (0, How::Light));
@@ -497,6 +509,244 @@ fn a_stage_verify_never_ran_claims_what_a_plain_build_of_it_kept() {
         n.how,
         How::Cold,
         "a variant verify keeps is no plain build's"
+    );
+}
+
+/// A SELECTION NEVER RUN, OF CRATES RUN IN NARROWER SELECTIONS, CLAIMS THEIR SUM: on a 48 GiB
+/// Mac, `-p a -p b` in a new checkout, with `-p a` kept at 3 GiB in /one and `-p b` at 2 and then
+/// 4 GiB in /two, claims the sum of the most each kept (7 GiB) and a fifth more, 8.4 GiB, not the
+/// cold 16, and says so. Of the covers of `-p a -p b -p c`, the least: `-p a -p b`, weighed at the
+/// 4 GiB `-p b` inside it kept (its own run kept 2), and `-p c` (1 GiB), over the three singles'
+/// 8; parts may share a crate; a sum whose claim passes the cold figure claims the cold figure.
+/// The rules before it come first: `-p a -p b`'s own record in another checkout (5 GiB) and a
+/// wider selection's in its checkout (12 GiB, more than the sum). NEGATIVE CONTROL: with `-p c`
+/// in no narrower record of the stage and variant (a lint's record of it is another stage's, and
+/// one of another variant, its lib alone, compiles less), `-p a -p b -p c` claims the cold figure;
+/// and the test run, which compiles nothing, still claims nothing over the same records.
+#[test]
+fn a_selection_of_crates_kept_apart_claims_their_sum() {
+    let at = |checkout: &str, id: StageId, crates: &[&str]| Key {
+        checkout: checkout.to_owned(),
+        ..Key::of(id, &packages(crates))
+    };
+    let tc = StageId::TestCompile;
+    let need_of = |r: &Records, crates: &[&str]| {
+        need(
+            r,
+            &Records::default(),
+            &compile(),
+            &at("/new", tc, crates),
+            Some(48 * GIB),
+        )
+    };
+    let mut r = Records::default();
+    r.push(at("/one", tc, &["a"]), 3 * GIB, 1);
+    r.push(at("/two", tc, &["b"]), 2 * GIB, 2);
+    r.push(at("/two", tc, &["b"]), 4 * GIB, 3);
+    r.push(at("/one", StageId::Tippy, &["c"]), GIB, 4);
+    r.push(
+        Key {
+            variant: Some(crate::shape::LIB_VARIANT.to_owned()),
+            ..at("/one", tc, &["c"])
+        },
+        GIB,
+        4,
+    );
+    let part = |key: Key, most: u64| CoverPart {
+        key,
+        most,
+        inside: None,
+    };
+    let n = need_of(&r, &["a", "b"]);
+    assert_eq!(
+        (n.bytes, &n.how),
+        (
+            aterm_capacity::peak_claim(7 * GIB),
+            &How::Composed(Cover {
+                parts: vec![
+                    part(at("/one", tc, &["a"]), 3 * GIB),
+                    part(at("/two", tc, &["b"]), 4 * GIB)
+                ],
+                sum: 7 * GIB,
+                inside: None,
+                peak: 7 * GIB,
+            })
+        ),
+        "{n}"
+    );
+    assert!(
+        n.to_string().contains(
+            "the sum of what runs of -p a (3 GiB) and -p b (4 GiB) kept (7 GiB) and a fifth \
+             more, at least 1 GiB"
+        ),
+        "{n}"
+    );
+    let n = need_of(&r, &["a", "b", "c"]);
+    assert_eq!((n.bytes, &n.how), (16 * GIB, &How::Cold), "{n}");
+
+    r.push(at("/one", tc, &["c"]), GIB, 5);
+    r.push(at("/two", tc, &["a", "b"]), 2 * GIB, 6);
+    let n = need_of(&r, &["a", "b", "c"]);
+    assert_eq!(
+        (n.bytes, &n.how),
+        (
+            aterm_capacity::peak_claim(5 * GIB),
+            &How::Composed(Cover {
+                parts: vec![
+                    CoverPart {
+                        inside: Some(at("/two", tc, &["b"])),
+                        ..part(at("/two", tc, &["a", "b"]), 4 * GIB)
+                    },
+                    part(at("/one", tc, &["c"]), GIB)
+                ],
+                sum: 5 * GIB,
+                inside: None,
+                peak: 5 * GIB,
+            })
+        ),
+        "the least cover, each part weighed at least at what a selection inside it kept"
+    );
+    assert!(
+        n.to_string()
+            .contains("-p a -p b (4 GiB, kept by -p b inside it) and -p c (1 GiB) kept (5 GiB)"),
+        "{n}"
+    );
+    let mut shared = Records::default();
+    shared.push(at("/one", tc, &["a", "b"]), 2 * GIB, 1);
+    shared.push(at("/two", tc, &["b", "c"]), 3 * GIB, 2);
+    assert_eq!(
+        need_of(&shared, &["a", "b", "c"]).bytes,
+        aterm_capacity::peak_claim(5 * GIB),
+        "parts that share a crate"
+    );
+    let mut heavy = Records::default();
+    heavy.push(at("/one", tc, &["a"]), 10 * GIB, 1);
+    heavy.push(at("/one", tc, &["b"]), 9 * GIB, 2);
+    let n = need_of(&heavy, &["a", "b"]);
+    assert_eq!(
+        (n.bytes, matches!(n.how, How::Composed(_))),
+        (16 * GIB, true)
+    );
+    assert!(n.to_string().contains("at most the cold figure"), "{n}");
+
+    r.push(at("/two", tc, &["a", "b"]), 5 * GIB, 7);
+    assert!(
+        matches!(need_of(&r, &["a", "b"]).how, How::Elsewhere(_)),
+        "its own record in another checkout"
+    );
+    r.push(at("/new", tc, &["a", "b", "c", "d"]), 12 * GIB, 8);
+    assert_eq!(
+        need_of(&r, &["a", "b", "c"]).bytes,
+        aterm_capacity::peak_claim(12 * GIB),
+        "a wider selection's in its checkout"
+    );
+    let run = spec(StageId::Test, Lane::MainTarget);
+    let mut runs = Records::default();
+    runs.push(Key::of(StageId::Test, &packages(&["a"])), 3 * GIB, 1);
+    runs.push(Key::of(StageId::Test, &packages(&["b"])), 3 * GIB, 2);
+    let n = need(
+        &runs,
+        &Records::default(),
+        &run,
+        &over(&run, &packages(&["a", "b"])),
+        Some(48 * GIB),
+    );
+    // A test run is not composed from its parts' records: it runs binaries side by side (A9),
+    // so with no record of its own it claims the cold figure.
+    assert_eq!(
+        (n.bytes, n.how),
+        (aterm_capacity::cold_claim(Some(48 * GIB)), How::Together)
+    );
+}
+
+/// A COVER WEIGHS AT LEAST WHAT SELECTIONS INSIDE IT KEPT: with the lint's `-p a -p b` kept at
+/// 205 MiB (a run over a warm cache, which compiled little), `-p c` at 1 GiB and `-p a` at
+/// 10 GiB, `-p a -p b -p c` in a new checkout claims `-p a -p b` at the 10 GiB `-p a` inside it
+/// kept, and `-p c`: 11 GiB and a fifth more, not the warm run's 205 MiB and `-p c`'s 1 GiB and
+/// the margin, and says so. With `-p b -p c` kept at 12 GiB too, a record that straddles that
+/// least cover's parts, it claims those 12 GiB and a fifth more, and says why. NEGATIVE CONTROL:
+/// with no run of `-p a` kept, nothing contradicts `-p a -p b`'s light record, and the same
+/// selection claims what it and `-p c` kept.
+#[test]
+fn a_cover_weighs_at_least_what_selections_inside_it_kept() {
+    let at = |checkout: &str, crates: &[&str]| Key {
+        checkout: checkout.to_owned(),
+        ..Key::of(StageId::Tippy, &packages(crates))
+    };
+    let lint = spec(StageId::Tippy, Lane::TippyTarget);
+    let need_of = |r: &Records| {
+        need(
+            r,
+            &Records::default(),
+            &lint,
+            &at("/new", &["a", "b", "c"]),
+            Some(48 * GIB),
+        )
+    };
+    let warm = GIB / 5;
+    let mut r = Records::default();
+    r.push(at("/old", &["a", "b"]), warm, 1);
+    r.push(at("/old", &["c"]), GIB, 2);
+    let n = need_of(&r);
+    assert_eq!(n.bytes, aterm_capacity::peak_claim(warm + GIB), "{n}");
+
+    r.push(at("/other", &["a"]), 10 * GIB, 3);
+    let weighed = vec![
+        CoverPart {
+            key: at("/old", &["a", "b"]),
+            most: 10 * GIB,
+            inside: Some(at("/other", &["a"])),
+        },
+        CoverPart {
+            key: at("/old", &["c"]),
+            most: GIB,
+            inside: None,
+        },
+    ];
+    let n = need_of(&r);
+    assert_eq!(
+        (n.bytes, &n.how),
+        (
+            aterm_capacity::peak_claim(11 * GIB),
+            &How::Composed(Cover {
+                parts: weighed.clone(),
+                sum: 11 * GIB,
+                inside: None,
+                peak: 11 * GIB,
+            })
+        ),
+        "{n}"
+    );
+    assert!(
+        n.to_string().contains(
+            "the sum of what runs of -p a -p b (10 GiB, kept by -p a inside it) and -p c (1 GiB) \
+             kept (11 GiB)"
+        ),
+        "{n}"
+    );
+
+    r.push(at("/other", &["b", "c"]), 12 * GIB, 4);
+    let n = need_of(&r);
+    assert_eq!(
+        (n.bytes, &n.how),
+        (
+            aterm_capacity::peak_claim(12 * GIB),
+            &How::Composed(Cover {
+                parts: weighed,
+                sum: 11 * GIB,
+                inside: Some((at("/other", &["b", "c"]), 12 * GIB)),
+                peak: 12 * GIB,
+            })
+        ),
+        "a record that straddles the parts"
+    );
+    assert!(
+        n.to_string().contains(
+            "the most a run of -p b -p c inside it kept (12 GiB), more than the sum of what runs \
+             of -p a -p b (10 GiB, kept by -p a inside it) and -p c (1 GiB) kept (11 GiB), and a \
+             fifth more"
+        ),
+        "{n}"
     );
 }
 

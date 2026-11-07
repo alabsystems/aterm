@@ -82,7 +82,7 @@ pub(crate) fn carried_origins<'a>(ops: impl IntoIterator<Item = &'a Command>) ->
     ops.into_iter()
         .filter_map(Command::changes)
         .flatten()
-        .filter_map(|change| change.value.as_ref().and_then(cell::carried))
+        .filter_map(|change| change.value.as_ref().and_then(cell::carried_refs))
         .flat_map(|items| items.into_iter().map(|(operation, _)| operation))
         .collect()
 }
@@ -119,7 +119,6 @@ pub(crate) fn restate(
         {
             continue;
         }
-        let mut old: BTreeMap<Digest, Value> = cell::origins(cell).into_iter().collect();
         let secret = table.collection(collection).and_then(|known| {
             let parsed = CellKey::parse(key).ok()?;
             (parsed.elem.is_none()
@@ -128,9 +127,9 @@ pub(crate) fn restate(
                     .is_some_and(|column| matches!(column.ty, typed::Ty::Secret)))
             .then_some(parsed)
         });
-        let now: BTreeMap<Digest, Value> = target
+        let now: BTreeMap<Digest, &Value> = target
             .get(coord)
-            .map(cell::origins)
+            .map(cell::origins_refs)
             .unwrap_or_default()
             .into_iter()
             .collect();
@@ -139,15 +138,19 @@ pub(crate) fn restate(
                 .as_ref()
                 .is_none_or(|parsed| opens_in(value, collection, parsed.pk, parsed.col, reseal.1))
         };
-        if old
-            .keys()
-            .all(|origin| carried.contains(origin) && now.get(origin).is_none_or(opens))
-        {
+        let old_refs = cell::origins_refs(cell);
+        if old_refs.iter().all(|(origin, _)| {
+            carried.contains(origin) && now.get(origin).copied().is_none_or(opens)
+        }) {
             continue;
         }
+        let mut old: BTreeMap<Digest, Value> = old_refs
+            .into_iter()
+            .map(|(origin, value)| (origin, value.clone()))
+            .collect();
         if let Some(parsed) = &secret {
             for (origin, value) in &mut old {
-                if let Some(there) = now.get(origin).filter(|there| opens(there)) {
+                if let Some(&there) = now.get(origin).filter(|&&there| opens(there)) {
                     value.clone_from(there);
                     continue;
                 }
@@ -157,10 +160,14 @@ pub(crate) fn restate(
         let mut merged: BTreeMap<Digest, Value> = now
             .iter()
             .filter(|(origin, _)| !held.contains(*origin) || old.contains_key(*origin))
-            .map(|(origin, value)| (*origin, value.clone()))
+            .map(|(origin, value)| (*origin, (*value).clone()))
             .collect();
         merged.extend(old);
-        if merged == now {
+        if merged.len() == now.len()
+            && merged
+                .iter()
+                .all(|(origin, value)| now.get(origin) == Some(&value))
+        {
             continue;
         }
         let value = cell::carry(&merged).ok_or_else(|| {
@@ -371,19 +378,28 @@ fn cover_row(
         ));
     }
     let pk = keys::roll_pk(from, uuid);
-    let covered: Vec<Value> = frontier
-        .iter()
-        .map(|(actor, sequence)| json!({"a": actor, "s": sequence}))
-        .collect();
     if target
         .rows
         .get(&pk)
         .and_then(|row| row.get("covered"))
         .and_then(Value::as_array)
-        == Some(&covered)
+        .is_some_and(|arr| {
+            arr.len() == frontier.len()
+                && arr.iter().zip(frontier).all(|(item, (actor, sequence))| {
+                    item.as_object().is_some_and(|obj| {
+                        obj.len() == 2
+                            && obj.get("a").and_then(Value::as_str) == Some(actor.as_str())
+                            && obj.get("s").and_then(Value::as_u64) == Some(*sequence)
+                    })
+                })
+        })
     {
         return Ok(Vec::new());
     }
+    let covered: Vec<Value> = frontier
+        .iter()
+        .map(|(actor, sequence)| json!({"a": actor, "s": sequence}))
+        .collect();
     let cell = |col: &str, x: Value| {
         cell::change(
             &ROLL,
@@ -537,7 +553,7 @@ pub(crate) fn unopened(
         {
             continue;
         }
-        if cell::origins(cell)
+        if cell::origins_refs(cell)
             .iter()
             .any(|(_, value)| !opens_in(value, collection, parsed.pk, parsed.col, sealer))
         {

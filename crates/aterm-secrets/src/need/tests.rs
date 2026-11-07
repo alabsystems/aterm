@@ -1039,6 +1039,89 @@ fn a_withdrawal_by_hand_says_so_and_keeps_its_note() {
     );
 }
 
+/// A lab retirement the ledger takes in is raised again at once when its reason has already
+/// changed: a lapse (this Mac is taking it in, so it is back) comes back as a new request under
+/// a new id, as its line says, though a need raised by hand has no consumer to raise it. Each
+/// move comes back with the id it named.
+/// NEGATIVE CONTROL: a decline, a `not-held` (no offer in the ledger's facts) and a
+/// `requester-gone` taken in the same way stay retired under the same id.
+#[test]
+fn a_lapse_the_ledger_takes_in_is_raised_again_at_once_and_a_standing_reason_is_not() {
+    let vault = vault();
+    crate::need::test_alab_policy(&vault.member);
+    let wants = [
+        Want::Notary,
+        Want::SiteDeployerKey,
+        Want::Mailbox("m29".into()),
+        Want::parse("gh:dev").unwrap(),
+    ];
+    for want in &wants {
+        let raised = raise(&vault.member, want.clone(), Purpose::ByHand).unwrap();
+        assert!(!raised.state.ended(), "{}", raised.line);
+    }
+    // As a pass leaves them once the table holds each request (a flush needs a Writer).
+    let mut rows: Vec<Need> = ledger::load(&vault.member)
+        .unwrap()
+        .into_iter()
+        .map(|need| Need {
+            state: State::Open,
+            wait: Wait::Holders,
+            posted: true,
+            ..need
+        })
+        .collect();
+    ledger::save(&vault.member, &mut rows).unwrap();
+    let id = |want: &Want| rows.iter().find(|need| need.want == *want).unwrap().id;
+    let retired = |want: &Want, reason| {
+        let retirement = Retirement {
+            reason,
+            evidence: "a custodian".into(),
+            note: String::new(),
+            generation: None,
+        };
+        (id(want), Absorb::Decided(Decision::Retired(retirement)))
+    };
+    let moves = [
+        retired(&Want::Notary, Reason::Lapsed),
+        retired(&Want::SiteDeployerKey, Reason::Declined),
+        retired(&Want::Mailbox("m29".into()), Reason::NotHeld),
+        retired(&Want::parse("gh:dev").unwrap(), Reason::RequesterGone),
+    ];
+    let moved = absorb(&vault.member, &moves).unwrap();
+    assert_eq!(
+        moved.iter().map(|(named, _)| *named).collect::<Vec<_>>(),
+        moves.iter().map(|(named, _)| *named).collect::<Vec<_>>(),
+        "each move comes back with the id it named"
+    );
+    let after = ledger::load(&vault.member).unwrap();
+    assert_eq!(
+        after,
+        moved
+            .iter()
+            .map(|(_, need)| need.clone())
+            .collect::<Vec<_>>()
+    );
+    let lapsed = &after[0];
+    assert_eq!(lapsed.state, State::Local, "{}", lapsed.line);
+    assert_ne!(lapsed.id, id(&Want::Notary), "a new request id");
+    assert_ne!(lapsed.id, [0; 16]);
+    assert_eq!(
+        (lapsed.raises, lapsed.raised_again_on_change, lapsed.posted),
+        (2, Some(true), false)
+    );
+    assert!(lapsed.retired.is_none() && lapsed.record.is_none());
+    for (standing, reason) in
+        after[1..]
+            .iter()
+            .zip([Reason::Declined, Reason::NotHeld, Reason::RequesterGone])
+    {
+        assert_eq!(standing.state, State::Retired, "{}", standing.line);
+        assert_eq!(standing.id, id(&standing.want), "{standing:?}");
+        assert_eq!(standing.retired.as_ref().map(|r| r.reason), Some(reason));
+        assert_eq!(standing.raises, 1);
+    }
+}
+
 #[test]
 fn a_non_alab_vault_hands_out_nothing_by_request() {
     let vault = vault();

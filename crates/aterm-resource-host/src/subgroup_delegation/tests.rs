@@ -363,6 +363,34 @@ fn named_prepared_configures_authenticated_fifo_role_and_original_flags() {
 }
 
 #[test]
+fn named_controller_targets_remain_exact_and_cannot_alias() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let root = aterm_tempfile::tempdir().unwrap();
+    let (pool, debt, _retired) = pool(root.path());
+    let (path, file, witness) = fifo(root.path(), "mapped-fifo");
+    let mut supplied = rights();
+    supplied.gnu = vec![file.try_clone().unwrap().into(), file.into()];
+    let request = request(
+        CpuDelegation::FixedBorrow { units: 1 },
+        GnuTransport::NamedFifo {
+            locator: path.as_os_str().as_bytes().to_vec(),
+            witness,
+            descriptors: 2,
+        },
+    );
+    assert!(
+        Prepared::try_new_mapped(&pool, &debt, 1, &request, &supplied, Some([71, 71])).is_err()
+    );
+    let mut prepared =
+        Prepared::try_new_mapped(&pool, &debt, 1, &request, &supplied, Some([71, 73]))
+            .unwrap()
+            .unwrap();
+    let mut command = spawnfd::command("/usr/bin/true");
+    prepared.configure(&mut command).unwrap();
+    assert_eq!(command.guard_targets().collect::<Vec<_>>(), [71, 73]);
+}
+
+#[test]
 #[ignore = "started only by the held-child adapter fixture"]
 fn held_member() {
     if std::env::var_os("ATERM_ADAPTER_MEMBER").is_none() {

@@ -74,11 +74,13 @@ fn said_whole(log: &str, said: &str) -> bool {
         .any(|l| l.split("; ").any(|part| part.trim_end() == said))
 }
 
-/// What an in-process run's seams saw: each admission asked for (what, bytes, mode), and each
-/// stage's look at the ledger as it ran (its title, and the held claims' what and bytes).
+/// What an in-process run's seams saw: each admission asked for (what, bytes, mode), each line
+/// its wait said, and each stage's look at the ledger as it ran (its title, and the held claims'
+/// what and bytes).
 #[derive(Debug, Default)]
 struct Seen {
     asked: Vec<(String, u64, Admit)>,
+    said: Vec<String>,
     looked: Vec<(String, Vec<(String, u64)>)>,
 }
 
@@ -103,6 +105,7 @@ impl Scratch {
             ledger: OnceLock::new(),
             seen: Mutex::new(Seen {
                 asked: Vec::new(),
+                said: Vec::new(),
                 looked: Vec::new(),
             }),
         }
@@ -112,7 +115,8 @@ impl Scratch {
         Ledger::at(self.ledger.get().expect("the test set its ledger"))
     }
 
-    /// Admit `need` in the scratch ledger as the live seam does ([`crate::admit_in`]), noting it.
+    /// Admit `need` in the scratch ledger as the live seam does ([`crate::admit_in`]), noting it
+    /// and what its wait says.
     fn admit(&self, need: Need, mode: Admit) -> Result<Claim, Error> {
         self.seen
             .lock()
@@ -128,7 +132,13 @@ impl Scratch {
             },
             need,
             mode,
-            &mut |_| {},
+            &mut |line| {
+                self.seen
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .said
+                    .push(line.to_owned());
+            },
         )
     }
 
@@ -627,7 +637,8 @@ fn now_stage(_: &Ctx, spec: &StageSpec) -> Report {
 
 /// Under `--admit now` a stage's memory claim is taken at once, however short the machine is:
 /// beside a 15 GiB claim this process holds, 20 GiB available leaves 5 for the lint's 12, and it
-/// starts within the hang detector, its time line saying how it was admitted. NEGATIVE CONTROL:
+/// starts within the hang detector, its time line saying how it was admitted and its wait's first
+/// line what it claims and why ([`crate::claiming`], set by the stage's claim). NEGATIVE CONTROL:
 /// the same claim under `--admit wait` waits for room, and fails the hang detector by name.
 #[test]
 fn under_admit_now_a_memory_claim_is_taken_at_once() {
@@ -660,6 +671,60 @@ fn under_admit_now_a_memory_claim_is_taken_at_once() {
             .map(|(_, _, mode)| *mode)
             .collect::<Vec<_>>(),
         [Admit::Now]
+    );
+    assert!(
+        matches!(seen.said.first(), Some(line) if line.contains("it would wait")
+            && line.contains("; it claims 12 GiB cold: no run of it is kept")),
+        "{:?}",
+        seen.said
+    );
+    drop(holder);
+}
+
+/// A memory claim's first wait line says what it claims and why, as its time line does
+/// ([`crate::claiming`]): beside a 15 GiB claim, 20 GiB available leaves 5 for a stage's 8, and its
+/// `--admit now` line says it would wait and then where its figure came from. NEGATIVE CONTROL:
+/// the same claim with no reason set says the line alone.
+#[test]
+fn a_memory_claims_wait_line_says_where_its_figure_came_from() {
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let ledger = Ledger::at(dir.path().join("ledger"));
+    let holder = aterm_capacity::admit_with(
+        &ledger,
+        &machine(),
+        Need::new("holder").mem_gib(15),
+        Admit::Wait,
+        Pace::default(),
+        &mut |_| {},
+    )
+    .expect("the holder's claim");
+    let said = |why: Option<&str>| {
+        let _saying = why.map(|w| crate::claiming(w.to_owned()));
+        let mut lines: Vec<String> = Vec::new();
+        let claim = crate::admit_in(
+            &ledger,
+            &machine(),
+            Pace::default(),
+            Need::new("verify tippy lint (-p a -p b)").mem_gib(8),
+            Admit::Now,
+            &mut |line| lines.push(line.to_owned()),
+        )
+        .expect("admitted by --admit now");
+        drop(claim);
+        lines
+    };
+    let why = "8 GiB, the sum of what runs of -p a (3 GiB) and -p b (3.6 GiB) kept (6.6 GiB) and a \
+               fifth more, at least 1 GiB: no run of it is kept";
+    let lines = said(Some(why));
+    assert!(
+        matches!(&lines[..], [line] if line.contains("it would wait")
+            && line.ends_with(&format!("; it claims {why}"))),
+        "{lines:?}"
+    );
+    let lines = said(None);
+    assert!(
+        matches!(&lines[..], [line] if line.contains("it would wait") && !line.contains("it claims")),
+        "{lines:?}"
     );
     drop(holder);
 }

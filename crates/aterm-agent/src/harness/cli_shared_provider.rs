@@ -49,6 +49,7 @@ pub trait LoginProof {
 /// The composing executable chooses a closed provider adapter after validating
 /// the exact root configuration. Catalog strings never construct effects.
 pub struct Context<'a> {
+    pub publication: Option<&'a super::super::codex_app_login::PublicationCustody>,
     /// Current root authority for the exact retained native attempt.
     pub admission: Option<&'a super::super::login_drive::RecoveryAdmission>,
     pub env: &'a Env,
@@ -424,7 +425,8 @@ impl CodexOauth {
 fn codex_execution(outcome: super::super::login_drive::Outcome) -> Execution {
     match outcome {
         super::super::login_drive::Outcome::SignedIn { .. } => Execution::Completed,
-        super::super::login_drive::Outcome::CompletedHeld => {
+        super::super::login_drive::Outcome::CompletedHeld
+        | super::super::login_drive::Outcome::CustodyHeld => {
             Execution::Deferred("completed native login retained without publication".into())
         }
         super::super::login_drive::Outcome::NotRun(why) => Execution::NotStarted(why),
@@ -472,6 +474,8 @@ fn codex_request<'a>(
         .of(row.vendor.region)
         .ok_or("shared Codex route is incomplete")?;
     Ok(super::super::login_drive::Request {
+        publication: context.publication,
+        enrollment: None,
         recovery: None,
         admission: None,
         cli: Cli::Codex,

@@ -50,6 +50,14 @@ pub struct LegacyRetirement {
     record: Record,
 }
 
+pub(crate) fn kernel_boot() -> io::Result<String> {
+    boot::current()
+}
+
+pub(crate) fn parse_kernel_boot(value: &str) -> io::Result<String> {
+    boot::parse(value)
+}
+
 fn nominal_width(pool: Option<&crate::Pool>) -> io::Result<u32> {
     let pool = pool
         .ok_or_else(|| invalid("canonical native host pool must exist before legacy retirement"))?;
@@ -57,6 +65,10 @@ fn nominal_width(pool: Option<&crate::Pool>) -> io::Result<u32> {
 }
 
 impl LegacyRetirement {
+    pub(crate) fn nominal_width(&self) -> u32 {
+        self.record.width
+    }
+
     /// Account-owned default namespace of supported legacy build-slot versions.
     /// Neither a scratch HOME nor a caller's custom namespace selects authority.
     pub fn canonical_layout() -> io::Result<(PathBuf, u32)> {
@@ -64,8 +76,14 @@ impl LegacyRetirement {
         // The sealed host pool is global across callers. In particular,
         // available_parallelism can reflect a Linux caller's affinity/quota,
         // which must never change the canonical retirement's identity.
-        let pool = crate::Pool::open_existing(&crate::capacity_dir()?)?;
-        Ok((path, nominal_width(pool.as_ref())?))
+        let width = match crate::Pool::open_existing(&crate::capacity_dir()?) {
+            Ok(pool) => nominal_width(pool.as_ref())?,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                crate::native_domain::canonical_legacy_width()?
+            }
+            Err(error) => return Err(error),
+        };
+        Ok((path, width))
     }
 
     /// Open only the canonical machine retirement, never a request-provided path.

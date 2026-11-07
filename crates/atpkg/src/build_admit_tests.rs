@@ -1096,10 +1096,15 @@ fn a_front_holds_its_claim_until_a_deaf_leftover_is_drained() {
     // host can run the subshell late) ends it as any process, and the test would read no leftover.
     const DEAF: &str = "exec 3<&0; (trap '' TERM; echo ATPKG_DEAF; exec cat <&3) & \
                         echo \"ATPKG_CHILD $!\"; echo \"ATPKG_ROOT $$\"; wait";
+    // Gone as the front's own meter reads it: an exited process (a zombie, or on XNU one whose
+    // exit has begun) runs nothing again, though signal 0 still answers for it through its exit's
+    // kernel tail, which can outlast the front's end.
     let alive = |pid: i32| {
-        // SAFETY: `kill` with signal 0 sends nothing: it asks whether `pid` still exists.
-        let sent = unsafe { libc::kill(pid, 0) };
-        sent == 0
+        !matches!(
+            aterm_uds::process::process_presence(pid),
+            aterm_uds::process::ProcessPresence::Exited
+                | aterm_uds::process::ProcessPresence::Absent
+        )
     };
     let spawn_front = |grace_ms: &str| {
         use std::io::BufRead as _;
@@ -1260,8 +1265,13 @@ fn a_front_passes_on(sig: libc::c_int, build: &str) {
         aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the front's end", || {
             front.try_wait().ok().flatten()
         });
-    // SAFETY: `kill` with signal 0 sends nothing: it asks whether `child` still exists.
-    let alive = unsafe { libc::kill(child, 0) } == 0;
+    // Gone as the front's own meter reads it: an exited cat (a zombie, or on XNU one whose exit has
+    // begun) runs nothing again, though signal 0 still answers for it through its exit's kernel
+    // tail, which can outlast the front's end.
+    let alive = !matches!(
+        aterm_uds::process::process_presence(child),
+        aterm_uds::process::ProcessPresence::Exited | aterm_uds::process::ProcessPresence::Absent
+    );
     drop(front.stdin.take());
     assert_eq!(status.signal(), Some(sig), "{sig}: {status:?}");
     assert!(!alive, "the cat the build named outlived signal {sig}");

@@ -45,7 +45,29 @@ fn short(sha: &str) -> &str {
 
 /// Replaces tabs, carriage returns, and newlines in `s` with spaces for single-line records.
 pub(crate) fn one_line(s: &str) -> String {
-    s.replace(['\t', '\r', '\n'], " ")
+    if s.bytes().any(|b| matches!(b, b'\t' | b'\r' | b'\n')) {
+        s.replace(['\t', '\r', '\n'], " ")
+    } else {
+        s.to_string()
+    }
+}
+
+/// Borrows `s` when it is already a single tab-free line, or replaces tabs/CR/LF with spaces.
+pub(crate) fn one_line_cow(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.bytes().any(|b| matches!(b, b'\t' | b'\r' | b'\n')) {
+        std::borrow::Cow::Owned(s.replace(['\t', '\r', '\n'], " "))
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
+}
+
+/// Returns `s` unchanged when it is already a single tab-free line, or replaces tabs/CR/LF with spaces.
+pub(crate) fn one_line_owned(s: String) -> String {
+    if s.bytes().any(|b| matches!(b, b'\t' | b'\r' | b'\n')) {
+        s.replace(['\t', '\r', '\n'], " ")
+    } else {
+        s
+    }
 }
 
 /// The `--reason` of `trust run` or `trust judge` (`verb`): the words a lowered floor's row keeps
@@ -270,9 +292,9 @@ impl Backstop {
     fn fields(&self) -> String {
         format!(
             "{}\t{}\t{}",
-            one_line(&self.key),
-            one_line(&self.stop),
-            one_line(&self.said)
+            one_line_cow(&self.key),
+            one_line_cow(&self.stop),
+            one_line_cow(&self.said)
         )
     }
 
@@ -974,32 +996,57 @@ impl Measured {
     }
 
     fn to_fields(&self) -> String {
-        [
-            one_line(&self.rc),
-            u8::from(self.transport).to_string(),
-            self.refused.to_string(),
-            self.lapsed.to_string(),
-            self.cancelled.to_string(),
-            self.budget_rows.to_string(),
-            self.skipped.map_or_else(|| "-".into(), |n| n.to_string()),
-            one_line(&self.ceiling),
-            one_line(&self.peak),
-            one_line(&self.launch),
-            one_line(&self.held),
-            one_line(&self.held_what),
-            one_line(&self.refused_why),
-            one_line(&self.wall_budget),
-            one_line(&self.ended),
-            self.rss.to_string(),
-            self.pace.map_or_else(|| "-".into(), |p| p.text()),
-            self.backstops
-                .as_ref()
-                .map_or_else(|| "-".into(), |b| b.len().to_string()),
-            one_line(&self.trustd_lost),
-            one_line(&self.could_not_run),
-            one_line(&self.summary),
-        ]
-        .join("\t")
+        let mut out = String::with_capacity(128);
+        let _ = write!(
+            out,
+            "{}\t{}\t{}\t{}\t{}\t{}\t",
+            one_line_cow(&self.rc),
+            u8::from(self.transport),
+            self.refused,
+            self.lapsed,
+            self.cancelled,
+            self.budget_rows,
+        );
+        match self.skipped {
+            Some(n) => {
+                let _ = write!(out, "{n}\t");
+            }
+            None => out.push_str("-\t"),
+        }
+        let _ = write!(
+            out,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t",
+            one_line_cow(&self.ceiling),
+            one_line_cow(&self.peak),
+            one_line_cow(&self.launch),
+            one_line_cow(&self.held),
+            one_line_cow(&self.held_what),
+            one_line_cow(&self.refused_why),
+            one_line_cow(&self.wall_budget),
+            one_line_cow(&self.ended),
+            self.rss,
+        );
+        match self.pace {
+            Some(p) => {
+                out.push_str(&p.text());
+                out.push('\t');
+            }
+            None => out.push_str("-\t"),
+        }
+        match &self.backstops {
+            Some(b) => {
+                let _ = write!(out, "{}\t", b.len());
+            }
+            None => out.push_str("-\t"),
+        }
+        let _ = write!(
+            out,
+            "{}\t{}\t{}",
+            one_line_cow(&self.trustd_lost),
+            one_line_cow(&self.could_not_run),
+            one_line_cow(&self.summary),
+        );
+        out
     }
 
     /// The fields of [`Measured::to_fields`], and how many `backstop` lines follow.
@@ -1258,16 +1305,15 @@ impl Default for MemRow {
 
 impl MemRow {
     fn fields(&self) -> String {
-        [
-            &self.f,
-            &self.ram,
-            &self.at,
-            &self.need,
-            &self.bound,
-            &self.when,
-        ]
-        .map(|v| one_line(v))
-        .join("\t")
+        format!(
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            one_line_cow(&self.f),
+            one_line_cow(&self.ram),
+            one_line_cow(&self.at),
+            one_line_cow(&self.need),
+            one_line_cow(&self.bound),
+            one_line_cow(&self.when),
+        )
     }
 
     fn from_fields(f: &[&str]) -> Option<MemRow> {
@@ -1465,9 +1511,13 @@ pub struct Seen {
 
 impl Seen {
     fn fields(&self) -> String {
-        [&self.outcome, &self.ceil, &self.peak, &self.when]
-            .map(|v| one_line(v))
-            .join("\t")
+        format!(
+            "{}\t{}\t{}\t{}",
+            one_line_cow(&self.outcome),
+            one_line_cow(&self.ceil),
+            one_line_cow(&self.peak),
+            one_line_cow(&self.when),
+        )
     }
 
     fn from_fields(f: &[&str]) -> Option<Option<Seen>> {
@@ -2133,6 +2183,7 @@ impl Facts {
     }
 }
 
+#[derive(Clone)]
 struct Floor {
     proved: String,
     total: String,
@@ -2140,10 +2191,7 @@ struct Floor {
     why: String,
 }
 
-fn floor_of(ratchet: Option<&str>, name: &str) -> Option<Floor> {
-    let row = ratchet?
-        .lines()
-        .find(|l| l.split('\t').next() == Some(name))?;
+fn parse_floor_row(row: &str) -> Floor {
     let mut f = row.split('\t');
     let _ = f.next();
     let mut col = || {
@@ -2151,12 +2199,29 @@ fn floor_of(ratchet: Option<&str>, name: &str) -> Option<Floor> {
             .map_or("", |s| s.trim_end_matches('\t'))
             .to_string()
     };
-    Some(Floor {
+    Floor {
         proved: col(),
         total: col(),
         driver: col(),
         why: col(),
-    })
+    }
+}
+
+fn floor_of(ratchet: Option<&str>, name: &str) -> Option<Floor> {
+    let row = ratchet?
+        .lines()
+        .find(|l| l.split('\t').next() == Some(name))?;
+    Some(parse_floor_row(row))
+}
+
+fn floors_index(ratchet: Option<&str>) -> BTreeMap<&str, Floor> {
+    let mut out = BTreeMap::new();
+    for row in ratchet.unwrap_or("").lines() {
+        if let Some(name) = row.split('\t').next().filter(|n| !n.is_empty()) {
+            out.entry(name).or_insert_with(|| parse_floor_row(row));
+        }
+    }
+    out
 }
 
 fn refused_path_note(r: &PathRefusal, names: &[&str], me: u32) -> String {
@@ -2203,20 +2268,39 @@ pub struct FloorRun {
 /// what that run stopped is unknown.
 #[must_use]
 pub fn floor_run(backstops: Option<&str>, name: &str) -> Option<FloorRun> {
+    floor_run_lines(
+        backstops
+            .unwrap_or("")
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .filter_map(|l| l.strip_prefix(name)?.strip_prefix('\t')),
+    )
+}
+
+fn floor_run_lines<'a>(lines: impl Iterator<Item = &'a str>) -> Option<FloorRun> {
     let mut cancelled = None;
     let mut stops = Vec::new();
-    for rest in backstops
-        .unwrap_or("")
-        .lines()
-        .filter(|l| !l.starts_with('#'))
-        .filter_map(|l| l.strip_prefix(name)?.strip_prefix('\t'))
-    {
+    for rest in lines {
         match rest.strip_prefix(RUN_ROW) {
             Some(n) => cancelled = Some(parse_uint(n)?),
             None => stops.extend(Backstop::from_fields(rest)),
         }
     }
     cancelled.map(|cancelled| FloorRun { stops, cancelled })
+}
+
+fn backstops_index(backstops: Option<&str>) -> BTreeMap<&str, Vec<&str>> {
+    let mut out: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for line in backstops
+        .unwrap_or("")
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+    {
+        if let Some((name, rest)) = line.split_once('\t') {
+            out.entry(name).or_default().push(rest);
+        }
+    }
+    out
 }
 
 /// `backstops` (the text of [`BACKSTOPS`]) with `name`'s rows replaced by `run`'s, its head row
@@ -2577,6 +2661,8 @@ pub fn judge(
     // What a run of the crates in `by_clock` needs to be decided ([`Pace::unstarved`]).
     let mut clock_need: Option<String> = None;
     let (mut trustd_dirty, mut trustd_block) = (false, None::<(String, String)>);
+    let initial_floors = floors_index(ratchet);
+    let initial_backstops = backstops_index(backstops);
     let mut ratchet_now: Option<String> = ratchet.map(str::to_string);
     let mut backstops_now: Option<String> = backstops.map(str::to_string);
     let mut rewrote = false;
@@ -2750,7 +2836,11 @@ pub fn judge(
             fail = true;
             continue;
         };
-        let row = floor_of(ratchet_now.as_deref(), name);
+        let row = if rewrote {
+            floor_of(ratchet_now.as_deref(), name)
+        } else {
+            initial_floors.get(name).cloned()
+        };
         let floor: Option<u64> = match &row {
             None => None,
             Some(r) if r.proved.is_empty() => None,
@@ -2777,7 +2867,14 @@ pub fn judge(
         let floor_total = row.as_ref().map_or("", |r| r.total.as_str());
         let floor_why = row.as_ref().map_or("", |r| r.why.as_str());
         let own_floor = floor_driver.is_empty() || floor_driver == driver_row;
-        let credit = credit(m, floor_run(backstops_now.as_deref(), name));
+        let run_backstops = if rewrote {
+            floor_run(backstops_now.as_deref(), name)
+        } else {
+            initial_backstops
+                .get(name)
+                .and_then(|lines| floor_run_lines(lines.iter().copied()))
+        };
+        let credit = credit(m, run_backstops);
         let starved = m.pace.filter(Pace::starved);
         // What the machine is credited with: nothing in a run that was not starved.
         let clock = if starved.is_some() { credit.n } else { 0 };

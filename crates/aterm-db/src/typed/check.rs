@@ -86,7 +86,27 @@ fn refs<'a>(ty: &Ty, value: &'a aterm_json::Value, out: &mut Vec<(&'static str, 
 /// Every finding over the projected `tables`, keyed by collection name, against their compiled
 /// `schemas`. A reference into a collection that is not among `tables` is not checked.
 pub fn findings(schemas: &[&Collection], tables: &BTreeMap<&str, &Projection>) -> Vec<Finding> {
+    #[derive(PartialEq, Eq, PartialOrd, Ord)]
+    enum UniqueVal<'a> {
+        Str(&'a str),
+        Json(String),
+    }
+
+    fn unique_val<'a>(row: &'a super::cell::Row, column: &str) -> Option<UniqueVal<'a>> {
+        let value = row
+            .fields
+            .get(column)
+            .filter(|field| !field.conflicted())
+            .and_then(super::cell::Field::value)
+            .filter(|value| !value.is_null())?;
+        match value {
+            aterm_json::Value::String(s) => Some(UniqueVal::Str(s.as_str())),
+            other => aterm_json::to_string(other).ok().map(UniqueVal::Json),
+        }
+    }
+
     let mut found = Vec::new();
+    let mut targets = Vec::new();
     for schema in schemas {
         let Some(projection) = tables.get(schema.name) else {
             continue;
@@ -132,7 +152,7 @@ pub fn findings(schemas: &[&Collection], tables: &BTreeMap<&str, &Projection>) -
                 let Some(column) = schema.column(name) else {
                     continue;
                 };
-                let mut targets = Vec::new();
+                targets.clear();
                 match (column.ty, field) {
                     (Ty::Set(Ty::Ref(target)), super::cell::Field::Set(elements)) => {
                         for (elem, f) in elements {
@@ -153,7 +173,7 @@ pub fn findings(schemas: &[&Collection], tables: &BTreeMap<&str, &Projection>) -
                         }
                     }
                 }
-                for (target, key) in targets {
+                for &(target, key) in &targets {
                     if let Some(other) = tables.get(target)
                         && !other.rows.contains_key(key)
                     {
@@ -168,29 +188,38 @@ pub fn findings(schemas: &[&Collection], tables: &BTreeMap<&str, &Projection>) -
             }
         }
         for unique in schema.unique {
-            let mut groups = BTreeMap::<Vec<String>, Vec<&str>>::new();
-            for (pk, row) in projection.rows.iter().filter(|(_, row)| row.live()) {
-                let values: Option<Vec<String>> = unique
-                    .iter()
-                    .map(|column| {
-                        row.fields
-                            .get(*column)
-                            .filter(|field| !field.conflicted())
-                            .and_then(super::cell::Field::value)
-                            .filter(|value| !value.is_null())
-                            .and_then(|value| aterm_json::to_string(value).ok())
-                    })
-                    .collect();
-                if let Some(values) = values {
-                    groups.entry(values).or_default().push(pk.as_str());
+            if let [column] = *unique {
+                let mut groups = BTreeMap::<UniqueVal<'_>, Vec<&str>>::new();
+                for (pk, row) in projection.rows.iter().filter(|(_, row)| row.live()) {
+                    if let Some(val) = unique_val(row, column) {
+                        groups.entry(val).or_default().push(pk.as_str());
+                    }
                 }
-            }
-            for pks in groups.into_values().filter(|pks| pks.len() > 1) {
-                found.push(Finding::Unique {
-                    collection: schema.name.to_owned(),
-                    columns: unique.iter().map(|c| (*c).to_owned()).collect(),
-                    pks: pks.into_iter().map(str::to_owned).collect(),
-                });
+                for pks in groups.into_values().filter(|pks| pks.len() > 1) {
+                    found.push(Finding::Unique {
+                        collection: schema.name.to_owned(),
+                        columns: vec![(*column).to_owned()],
+                        pks: pks.into_iter().map(str::to_owned).collect(),
+                    });
+                }
+            } else {
+                let mut groups = BTreeMap::<Vec<UniqueVal<'_>>, Vec<&str>>::new();
+                for (pk, row) in projection.rows.iter().filter(|(_, row)| row.live()) {
+                    let values: Option<Vec<UniqueVal<'_>>> = unique
+                        .iter()
+                        .map(|column| unique_val(row, column))
+                        .collect();
+                    if let Some(values) = values {
+                        groups.entry(values).or_default().push(pk.as_str());
+                    }
+                }
+                for pks in groups.into_values().filter(|pks| pks.len() > 1) {
+                    found.push(Finding::Unique {
+                        collection: schema.name.to_owned(),
+                        columns: unique.iter().map(|c| (*c).to_owned()).collect(),
+                        pks: pks.into_iter().map(str::to_owned).collect(),
+                    });
+                }
             }
         }
     }

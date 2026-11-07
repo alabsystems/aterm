@@ -449,6 +449,48 @@ fn switching_tabs_under_a_stationary_pointer_takes_the_caption_away() {
     );
 }
 
+/// The destination is not in the cells, so a client reads it where the frame painted it.
+#[cfg(a11y_tree)]
+#[test]
+fn a_shown_caption_reaches_a_client() {
+    use aterm_a11y::model::{Live, Role};
+    let mut app = crate::scripted_redraw_fixture::scripted_app();
+    let wid = WindowId(0);
+    app.windows.get_mut(&wid).unwrap().a11y_active = true;
+    feed(&app, wid, PHISH);
+    let caption = |app: &App| -> Option<String> {
+        let tree = app.windows[&wid].a11y_sent.last().expect("a tree");
+        tree.nodes
+            .iter()
+            .find(|(_, node)| node.role() == Role::Label)
+            .and_then(|(_, node)| node.value().map(str::to_owned))
+    };
+    app.redraw_window(wid);
+    assert_eq!(caption(&app), None, "CONTROL: no hover, no caption");
+
+    hover(&mut app, wid, 0, LINK_COL);
+    app.redraw_window(wid);
+
+    let words = caption(&app).expect("the caption");
+    assert!(words.contains("evil.example"), "{words}");
+    let tree = app.windows[&wid].a11y_sent.last().expect("a tree");
+    let label = tree
+        .nodes
+        .iter()
+        .find(|(_, node)| node.role() == Role::Label);
+    assert_eq!(
+        label.expect("the caption").1.live(),
+        Some(Live::Off),
+        "a pointer's path over a page of links is no speech"
+    );
+
+    // The tab that came to the front holds no such link, frame or no frame.
+    let next = app.next_session_id;
+    app.push_stub_tab(wid, crate::stub_session(next));
+    app.push_a11y_tree(wid);
+    assert_eq!(caption(&app), None, "a caption speaks for its own tab");
+}
+
 #[test]
 fn a_hover_resolved_over_another_session_is_never_painted() {
     let mut app = App::headless_for_test();

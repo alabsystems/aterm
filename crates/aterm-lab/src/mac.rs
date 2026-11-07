@@ -87,17 +87,32 @@ pub(crate) struct Prep {
     /// The guest helper put at [`PERSON_HELPER`] and granted Accessibility and the event-post
     /// grant by its identifier ([`PERSON_ID`]): its file in the share.
     pub person: Option<String>,
+    /// macOS's Local Network answer of Allow, for the image's account, for the ad-hoc aterm nux
+    /// installs ([`NUX_APP_EXE`]), written into nehelper's record while SIP is off
+    /// ([`lan_allow`]): a Mac whose aterm a person once allowed.
+    pub lan_allow: bool,
 }
 
-/// The name of the prepared base for `image` and `prep`: [`base_name`], then `-noclt` and
-/// `-personid` (grants that require [`PERSON_ID`]) as `prep` asks. Not `-person-<…>`: a lab from
-/// before identifier grants named its base `-person-<digest>` and deletes every other base under
-/// that prefix when it prepares its own.
+/// The executable nux installs and launches (`/Applications/aterm.app`): what a
+/// [`Prep::lan_allow`] base's answer names.
+pub(crate) const NUX_APP_EXE: &str = "/Applications/aterm.app/Contents/MacOS/aterm";
+
+/// The share's copy of the rewritten nehelper record ([`lan_allow`]).
+#[cfg(any(test, debug_assertions))]
+const LAN_ALLOWED_FILE: &str = "nehelper-allowed.plist";
+
+/// The name of the prepared base for `image` and `prep`: [`base_name`], then `-noclt`,
+/// `-lanallow` and `-personid` (grants that require [`PERSON_ID`]) as `prep` asks. Not
+/// `-person-<…>`: a lab from before identifier grants named its base `-person-<digest>` and
+/// deletes every other base under that prefix when it prepares its own.
 #[must_use]
 pub(crate) fn prep_name(image: &str, prep: &Prep) -> String {
     let mut name = base_name(image, prep.fda);
     if prep.no_clt {
         name.push_str("-noclt");
+    }
+    if prep.lan_allow {
+        name.push_str("-lanallow");
     }
     if prep.person.is_some() {
         name.push_str("-personid");
@@ -757,13 +772,14 @@ pub(crate) fn prepared_base(
     prepared_base_with(tart, image, &prep, run, share, between)
 }
 
-/// [`prepared_base`] for `prep` ([`prep_name`]): the grants written while the image's SIP is off,
-/// then SIP turned on, then the Command Line Tools removed (`no_clt`, held to `xcode-select -p`
-/// failing). A new person base deletes the image's older person bases of the same kind.
+/// [`prepared_base`] for `prep` ([`prep_name`]): the grants and the Local Network answer written
+/// while the image's SIP is off, then SIP turned on, then the Command Line Tools removed
+/// (`no_clt`, held to `xcode-select -p` failing). A new person base deletes the image's older
+/// person bases of the same kind.
 ///
 /// # Errors
-/// As [`prepared_base`]; a grant asked of an image with SIP on (NOT RUN); a CLT-less base whose
-/// `xcode-select -p` still answers.
+/// As [`prepared_base`]; a grant or answer asked of an image with SIP on, or an answer the
+/// image's record cannot take (NOT RUN); a CLT-less base whose `xcode-select -p` still answers.
 pub(crate) fn prepared_base_with(
     tart: &str,
     image: &str,
@@ -796,10 +812,14 @@ pub(crate) fn prepared_base_with(
                 "mac: the guest helper at {PERSON_HELPER} granted Accessibility and event posting"
             );
         }
+        if prep.lan_allow {
+            lan_allow(vm, share)?;
+            println!("mac: nehelper's record answers Allow for {NUX_APP_EXE} on the local network");
+        }
         vm.sh(SIP_ON, STEP)?;
-    } else if fda || prep.person.is_some() {
+    } else if fda || prep.person.is_some() || prep.lan_allow {
         return Err(not_run(
-            "a grant (--fda, the person) needs an image with SIP off: it is written to the TCC database before SIP is turned on",
+            "a grant (--fda, the person) or a Local Network answer needs an image with SIP off: it is written to a SIP-protected file before SIP is turned on",
         ));
     }
     if prep.no_clt {
@@ -835,6 +855,77 @@ pub(crate) fn prepared_base_with(
         }
     }
     Ok(base)
+}
+
+/// Write the answer an Allow press writes for the ad-hoc aterm at [`NUX_APP_EXE`], for the
+/// image's account, into nehelper's record (`aterm_lan::grant::allow`), while SIP is off: the
+/// record is read out, rewritten here and staged in the share, and copied over nehelper's with
+/// nehelper stopped before and after, so neither its old self nor a relaunch writes its own
+/// state over it. The press is a person's and the lab never fakes it; what it measures is what
+/// follows the answer. The copy is read back through the reader the app itself uses; whether
+/// nehelper keeps it across the boots that follow is the row's to read, in each clone
+/// (`lan-allowed` is NOT RUN on a clone whose record no longer allows the app).
+///
+/// # Errors
+/// NOT RUN: an account with no directory UUID, a record the writer refuses (no configuration
+/// for the account, no rule to take the shape of), or a copy that does not read as the answer.
+#[cfg(any(test, debug_assertions))]
+fn lan_allow(vm: &Vm, share: &Path) -> Result<(), Fail> {
+    // The account `tart exec` runs as in the image, whose Local Network configuration the app
+    // nux opens answers from.
+    const IMAGE_ACCOUNT: &str = "admin";
+    let plist = aterm_lan::grant::NEHELPER_PLIST;
+    let said = vm.sh(
+        &format!("dscl . -read /Users/{IMAGE_ACCOUNT} GeneratedUID"),
+        STEP,
+    )?;
+    let user = said
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| not_run(format!("{IMAGE_ACCOUNT}'s GeneratedUID: {said}")))?;
+    let code = aterm_lan::grant::Code {
+        identifier: "com.aterm.aterm".to_owned(),
+        team: None,
+        executable: NUX_APP_EXE.to_owned(),
+        user: user.to_owned(),
+    };
+    let record = |when: &str| -> Result<Vec<u8>, Fail> {
+        let read = vm.exec(&format!("/bin/cat {plist}"), STEP)?;
+        if read.status.success() {
+            Ok(read.stdout)
+        } else {
+            Err(not_run(format!(
+                "{plist} {when}: {}",
+                String::from_utf8_lossy(&read.stderr)
+            )))
+        }
+    };
+    let allowed = aterm_lan::grant::allow(&record("as the image holds it")?, &code)
+        .map_err(|why| not_run(format!("the image's Local Network record: {why}")))?;
+    let staged = share.join(LAN_ALLOWED_FILE);
+    crate::util::write_fresh(&staged, &allowed)
+        .map_err(|e| Fail::die(format!("{}: {e}", staged.display())))?;
+    vm.sh(
+        &format!(
+            "set -e; sudo -n killall nehelper || true;              sudo -n cp '{GUEST_SHARE}/{LAN_ALLOWED_FILE}' {plist};              sudo -n chown root:wheel {plist}; sudo -n chmod 644 {plist}; /bin/sync;              sudo -n killall nehelper || true"
+        ),
+        STEP,
+    )?;
+    aterm_lan::grant::allowed(&record("after the copy")?, &code).map_err(|why| {
+        not_run(format!(
+            "the copied record does not read as the answer: {why}"
+        ))
+    })?;
+    Ok(())
+}
+
+/// A release lab has no writer of macOS's record (`aterm_lan::grant::allow` is a debug-only
+/// seam); `targo --unverified lab` is a debug build.
+#[cfg(not(any(test, debug_assertions)))]
+fn lan_allow(_: &Vm, _: &Path) -> Result<(), Fail> {
+    Err(not_run(
+        "a release lab has no writer of macOS's Local Network record: run the debug lab",
+    ))
 }
 
 /// Remove the Command Line Tools and reset the developer directory, then hold `xcode-select -p`
@@ -1444,6 +1535,20 @@ mod tests {
             );
             assert!(person.starts_with(&kind), "{person}");
             assert!(!person.starts_with(&format!("{kind}-person-")), "{person}");
+            // An allowed base is a kind of its own, and never under the old person prefix.
+            let allowed = prep_name(
+                IMAGE,
+                &Prep {
+                    no_clt,
+                    lan_allow: true,
+                    ..Prep::default()
+                },
+            );
+            assert_eq!(allowed, format!("{kind}-lanallow"));
+            assert!(
+                !allowed.starts_with(&format!("{kind}-person-")),
+                "{allowed}"
+            );
         }
     }
 

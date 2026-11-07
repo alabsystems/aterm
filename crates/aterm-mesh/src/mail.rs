@@ -14,7 +14,7 @@
 //! other member, so a halt floods the mesh (§11 C4), and names in the hand-off each node the log
 //! removed or rotated away, whose halts the bridge lifts.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -29,23 +29,39 @@ fn principal_of(link: &Link) -> String {
     astream_broker::identity_principal(link.peer().key.bytes())
 }
 
+/// Whether `link`'s peer has principal `node`.
+fn link_is_node(link: &Link, node: &str) -> bool {
+    let buf = crate::logs::principal_buf(link.peer().key.bytes());
+    crate::logs::principal_str(&buf) == node
+}
+
 /// The hand-off for the Mac `me` from the standings the mesh applied: the current members, this
 /// Mac among them unless the log took it out (one the log has not seated yet counts in); each
-/// rotated node and the one its seat holds now; and every node gone, each key the log removed or
+/// rotated node and the one its seat holds now, and where it stands among the nodes its seat
+/// retired (`Standings::recency`); and every node gone, each key the log removed or
 /// a `Node` record retired that no member's key names, this Mac's own included, whose halts the
 /// bridge lifts (§4.11, §11 C4: "No halt outlives its origin", on the removed Mac too).
 #[must_use]
 pub fn handoff_of(me: String, standings: &crate::Standings) -> Handoff {
     let node_of = aterm_link::federate::node_of;
-    let out: BTreeSet<String> = standings
+    let mut gone: BTreeSet<String> = standings
         .removed
         .iter()
         .chain(&standings.retired)
         .map(node_of)
         .collect();
     let mut members: BTreeSet<String> = standings.current.iter().map(node_of).collect();
-    if !out.contains(&me) {
+    if !gone.contains(&me) {
         members.insert(me.clone());
+    }
+    gone.retain(|node| !members.contains(node));
+    let mut rank: BTreeMap<String, usize> = BTreeMap::new();
+    for (old, at) in &standings.recency {
+        if standings.rotated.contains_key(old) {
+            rank.entry(node_of(old))
+                .and_modify(|was| *was = (*was).min(*at))
+                .or_insert(*at);
+        }
     }
     Handoff {
         moved: standings
@@ -53,7 +69,8 @@ pub fn handoff_of(me: String, standings: &crate::Standings) -> Handoff {
             .iter()
             .map(|(old, new)| (node_of(old), node_of(new)))
             .collect(),
-        gone: out.difference(&members).cloned().collect(),
+        rank,
+        gone,
         members,
         me,
     }
@@ -270,7 +287,8 @@ impl MailLinks {
                             aterm_log::warn!(
                                 "mesh: the fabric's reader's ring could not be written ({why}); \
                                  until it is, a receipt for mail moved across this Mac's key \
-                                 rotation names it by its offset here"
+                                 rotation names it by its offset here, and a copy moved again \
+                                 names the earliest offset this Mac's bridge reads it back to"
                             );
                             kept.said = Some(why);
                         }
@@ -438,7 +456,7 @@ fn dest_of(
         .links()
         .into_iter()
         .chain(mail.links())
-        .find(|link| principal_of(link) == node && crate::overlay::proves_a_seat(mesh, link));
+        .find(|link| link_is_node(link, node) && crate::overlay::proves_a_seat(mesh, link));
     let link = match held {
         Some(link) => link,
         None => {
@@ -447,7 +465,7 @@ fn dest_of(
             for (_, addr) in hints().into_iter().filter(|(to, _)| to == node) {
                 match mail.dial(addr, crate::overlay::DIAL_WITHIN) {
                     Ok(link)
-                        if principal_of(&link) == node
+                        if link_is_node(&link, node)
                             && crate::overlay::proves_a_seat(mesh, &link) =>
                     {
                         linked = Some(link);
@@ -498,6 +516,7 @@ mod tests {
             removed: [removed, b].into(),
             retired: [old].into(),
             rotated: [(old, new)].into(),
+            recency: [(old, 0)].into(),
         };
         let handoff = handoff_of(node_of(&me), &standings);
         assert_eq!(handoff.me, node_of(&me));
@@ -508,6 +527,11 @@ mod tests {
         assert_eq!(
             handoff.moved,
             BTreeMap::from([(node_of(&old), node_of(&new))])
+        );
+        assert_eq!(
+            handoff.rank,
+            BTreeMap::from([(node_of(&old), 0)]),
+            "where the rotated node stands among its seat's retired nodes"
         );
         assert_eq!(
             handoff.gone,

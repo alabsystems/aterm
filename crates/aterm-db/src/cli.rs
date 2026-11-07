@@ -367,6 +367,26 @@ pub fn run(words: &[String]) -> Result<Value> {
     }
     let dir_word = take(&mut options, "--dir")?;
     let dir = Path::new(dir_word);
+    // The fleet tables' rules (a rekey cut short, a covered record) live in fleet_db's verbs, and
+    // these write cells beneath them. A read stays, as the only one of a rekey's kept folder, under
+    // the session rule (`fleet_db_reveals`).
+    if matches!(
+        command,
+        "put"
+            | "stop"
+            | "revert"
+            | "import-csv"
+            | "budget-create"
+            | "spend"
+            | "machine-name"
+            | "revoke-writes"
+    ) && local::holds_fleet_tables(dir)?
+    {
+        return Err(Error::new(
+            "this folder holds the fleet tables: write them with `aterm db emails`, `computers`, \
+             `phones` or `ai-accounts`, not a private verb",
+        ));
+    }
     let value = match command {
         "request" => {
             empty(&options)?;
@@ -375,6 +395,11 @@ pub fn run(words: &[String]) -> Result<Value> {
         "init" => {
             let namespace = options.remove("--namespace").unwrap_or("accounts");
             empty(&options)?;
+            if namespace == local::FLEET_NAMESPACE {
+                return Err(Error::new(
+                    "that namespace is the fleet tables', which a fleet key makes",
+                ));
+            }
             local::init(dir, namespace)?;
             status(&Database::open(dir)?)
         }
@@ -839,13 +864,21 @@ fn status(db: &Database) -> Value {
     json!({"dataset":hex::encode_lower(&db.credentials.manifest.id),"root":hex::encode_lower(&db.credentials.manifest.root),"actor":hex::encode_lower(&db.credentials.capability.actor),"namespace":db.credentials.manifest.namespace,"retained":db.history.index.inventory().count(),"visible":view.causal.ordered.len(),"pending":view.causal.pending.len(),"quarantined":view.causal.quarantined.iter().map(|a|hex::encode_lower(a)).collect::<Vec<_>>(),"invalid":view.invalid.len(),"refused":db.history.refusals().map(|(id,reason)|json!({"operation":hex::encode_lower(id),"reason":reason})).collect::<Vec<_>>(),"authority_fault":view.authority_fault,"retired_writers":view.revocations.keys().map(|actor|hex::encode_lower(actor)).collect::<Vec<_>>(),"budgets":budgets})
 }
 
-/// Whether fleet_db's `words` show or write plaintext: `--show-passwords` (`--reveal`), or a
-/// `dump` to a file, its file read as fleet_db reads it (the word after `--dir` is its folder).
+/// Whether `words` show or write fleet_db's plaintext: `--show-passwords` (`--reveal`), a `dump`
+/// to a file, its file read as fleet_db reads it (the word after `--dir` is its folder), or a
+/// private `get` or `scan` of a folder that holds the fleet tables, which print what is stored. A
+/// folder that cannot be told apart counts as one.
 #[cfg(unix)]
 fn fleet_db_reveals(words: &[String]) -> bool {
     if words
         .iter()
         .any(|w| w == "--show-passwords" || w == "--reveal")
+    {
+        return true;
+    }
+    if matches!(words.first().map(String::as_str), Some("get" | "scan"))
+        && let Some(dir) = words.windows(2).find(|pair| pair[0] == "--dir")
+        && local::holds_fleet_tables(Path::new(&dir[1])).unwrap_or(true)
     {
         return true;
     }
@@ -884,6 +917,154 @@ mod reveal_gate_tests {
         for open in ["dump", "dump --dir /r", "emails", "put emails a@b {}"] {
             assert!(!fleet_db_reveals(&words(open)), "{open}");
         }
+    }
+}
+
+#[cfg(test)]
+mod private_verb_tests {
+    use super::*;
+
+    fn line(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| (*word).to_owned()).collect()
+    }
+
+    /// A private write passes none of fleet_db's gates, so it is refused on the fleet tables; a read
+    /// stays, the only one of a rekey's kept folder, under the session rule; and no private `init`
+    /// makes a dataset that says it holds them.
+    /// NEGATIVE CONTROL: with `run` skipping the refusal, the `put` goes through:
+    /// `` called `Result::unwrap_err()` on an `Ok` value ``.
+    #[cfg(unix)]
+    #[test]
+    fn a_private_verb_does_not_write_the_fleet_tables_and_its_read_is_a_reveal() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let fleet = tmp.path().join("fleet");
+        local::ensure_fleet(&fleet, &[0x5a; 32]).unwrap();
+        let d = fleet.to_str().unwrap();
+        let request = "11".repeat(16);
+        for words in [
+            vec![
+                "put",
+                "--dir",
+                d,
+                "--collection",
+                "computers",
+                "--key",
+                "m1",
+                "--value",
+                "{}",
+                "--request",
+                &request,
+            ],
+            vec![
+                "revert",
+                "--dir",
+                d,
+                "--operation",
+                &request,
+                "--request",
+                &request,
+            ],
+            vec![
+                "import-csv",
+                "--dir",
+                d,
+                "--file",
+                "/nonexistent",
+                "--request",
+                &request,
+            ],
+        ] {
+            let refused = run(&line(&words)).unwrap_err();
+            assert!(refused.to_string().contains("fleet tables"), "{refused}");
+        }
+        for verb in [
+            "stop",
+            "budget-create",
+            "spend",
+            "machine-name",
+            "revoke-writes",
+        ] {
+            let refused = run(&line(&[verb, "--dir", d])).unwrap_err();
+            assert!(
+                refused.to_string().contains("fleet tables"),
+                "{verb}: {refused}"
+            );
+        }
+        let scan = ["scan", "--dir", d, "--collection", "emails"];
+        assert!(run(&line(&scan)).is_ok());
+        assert!(fleet_db_reveals(&line(&scan)));
+        assert!(fleet_db_reveals(&line(&[
+            "get",
+            "--dir",
+            d,
+            "--collection",
+            "c",
+            "--key",
+            "k"
+        ])));
+
+        let other = tmp.path().join("other");
+        local::init(&other, "accounts").unwrap();
+        let o = other.to_str().unwrap();
+        assert!(!fleet_db_reveals(&line(&[
+            "scan",
+            "--dir",
+            o,
+            "--collection",
+            "c"
+        ])));
+
+        let reserved = tmp.path().join("reserved");
+        let r = reserved.to_str().unwrap();
+        assert!(run(&line(&["init", "--dir", r, "--namespace", "alab"])).is_err());
+        assert!(!reserved.join("database.json").exists());
+    }
+
+    /// A neighbour holding the writer lock changes neither what a folder is nor its answer: another
+    /// dataset's read stays a retryable busy, and the fleet tables' stay refused.
+    /// NEGATIVE CONTROL: with `holds_fleet_tables` taking the lock, the other dataset reads as a
+    /// reveal: `` assertion failed: !fleet_db_reveals(&line(&scan)) ``.
+    #[cfg(unix)]
+    #[test]
+    fn a_private_verb_beside_a_writer_reads_its_folder_rightly() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let other = tmp.path().join("other");
+        local::init(&other, "accounts").unwrap();
+        let o = other.to_str().unwrap();
+        let scan = ["scan", "--dir", o, "--collection", "c"];
+        let neighbour = Database::open(&other).unwrap();
+        assert!(!fleet_db_reveals(&line(&scan)));
+        assert!(run(&line(&scan)).unwrap_err().is_busy());
+        drop(neighbour);
+
+        let fleet = tmp.path().join("fleet");
+        local::ensure_fleet(&fleet, &[0x5a; 32]).unwrap();
+        let d = fleet.to_str().unwrap();
+        let neighbour = Database::open(&fleet).unwrap();
+        assert!(fleet_db_reveals(&line(&[
+            "scan",
+            "--dir",
+            d,
+            "--collection",
+            "emails"
+        ])));
+        let request = "11".repeat(16);
+        let refused = run(&line(&[
+            "put",
+            "--dir",
+            d,
+            "--collection",
+            "c",
+            "--key",
+            "k",
+            "--value",
+            "{}",
+            "--request",
+            &request,
+        ]))
+        .unwrap_err();
+        assert!(refused.to_string().contains("fleet tables"), "{refused}");
+        drop(neighbour);
     }
 }
 

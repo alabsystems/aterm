@@ -196,7 +196,7 @@ fn a_clone_the_setup_published_runs_its_own_hook_installer_once() {
     for (reply, outcome) in [
         (
             Some(Ran::ok(&format!("{INSTALLED}\n  ssh keepalive: set\n"))),
-            format!("~/new: ran its {HOOK_INSTALLER}: {INSTALLED}"),
+            format!("~/new: ran its {HOOK_INSTALLER}: {INSTALLED:?}"),
         ),
         (
             Some(Ran::exit(
@@ -204,8 +204,8 @@ fn a_clone_the_setup_published_runs_its_own_hook_installer_once() {
                 "ERROR: core.hooksPath is already set to 'elsewhere'.\n       Refusing\n",
             )),
             format!(
-                "~/new: its {HOOK_INSTALLER} failed (exit 1: ERROR: core.hooksPath is already \
-                 set to 'elsewhere'.); the clone stands"
+                "~/new: its {HOOK_INSTALLER} failed (exit 1: \"ERROR: core.hooksPath is \
+                 already set to 'elsewhere'.\"); the clone stands"
             ),
         ),
         (
@@ -294,7 +294,7 @@ fn a_clone_the_setup_published_runs_its_own_hook_installer_once() {
     );
     assert_eq!(
         cloned.hooks,
-        [format!("~/new: ran its {HOOK_INSTALLER}: {INSTALLED}")]
+        [format!("~/new: ran its {HOOK_INSTALLER}: {INSTALLED:?}")]
     );
 
     let (sys, who, repo, _, installer) = clone_carrying(false);
@@ -320,10 +320,30 @@ fn a_clone_the_setup_published_runs_its_own_hook_installer_once() {
     );
 }
 
+/// The listed repository github.com/me/`name`, which requires no submodule.
+fn named(name: &str) -> Repo {
+    Repo {
+        owner: "me".into(),
+        name: name.into(),
+        default_branch: Some("main".into()),
+        size_kib: 0,
+        fork: false,
+        archived: false,
+        required_submodules: Vec::new(),
+    }
+}
+
 /// A real repository carrying an installer: [`install_hooks`] runs it with real bash and git,
 /// in the clone, as this account, and the installer's own `git config --local` lands in the
 /// clone; a failing installer is a line that names its exit and first error; a link in the
 /// installer's place, and a clone without one, run nothing.
+///
+/// AN INSTALLER RUNS ONLY FROM THE CLONE'S OWN TREE (installer F1 and F6 of the hostile review
+/// of the hook installer, 2026-11-06): a link swapped in for `~/<name>` after its publish, and an
+/// installer inside a required dependency's gitlink (another repository's file), run nothing,
+/// and their rows say why. NEGATIVE CONTROLS: without the look at `~/<name>` itself, the link's
+/// target's installer runs (the walk starts inside it, where every step is a plain folder);
+/// without the gitlink rule, the dependency's installer runs.
 #[test]
 fn the_installer_a_real_clone_carries_runs_in_it_and_says_what_it_did() {
     crate::items::github::need_clt_git();
@@ -359,12 +379,12 @@ fn the_installer_a_real_clone_carries_runs_in_it_and_says_what_it_did() {
              core.hooksPath)) in $(basename \"$(pwd -P)\")\"\necho second line\n",
         ),
     );
-    let outcome = install_hooks(&sys, &who, "fixture", None).expect("it carries one");
+    let outcome = install_hooks(&sys, &who, &named("fixture"), None).expect("it carries one");
     assert_eq!(
         outcome,
         format!(
-            "~/fixture: ran its {HOOK_INSTALLER}: Fixture git hooks: installed \
-             (core.hooksPath = scripts/hooks) in fixture"
+            "~/fixture: ran its {HOOK_INSTALLER}: \"Fixture git hooks: installed \
+             (core.hooksPath = scripts/hooks) in fixture\""
         )
     );
     assert_eq!(
@@ -381,11 +401,11 @@ fn the_installer_a_real_clone_carries_runs_in_it_and_says_what_it_did() {
         Some("#!/usr/bin/env bash\necho 'ERROR: refused here' >&2\necho more >&2\nexit 3\n"),
     );
     assert_eq!(
-        install_hooks(&sys, &who, "refuses", None).as_deref(),
+        install_hooks(&sys, &who, &named("refuses"), None).as_deref(),
         Some(
             format!(
-                "~/refuses: its {HOOK_INSTALLER} failed (exit 3: ERROR: refused here); the \
-                 clone stands"
+                "~/refuses: its {HOOK_INSTALLER} failed (exit 3: \"ERROR: refused here\"); \
+                 the clone stands"
             )
             .as_str()
         )
@@ -396,7 +416,7 @@ fn the_installer_a_real_clone_carries_runs_in_it_and_says_what_it_did() {
     std::fs::write(&target, format!("touch {}\n", marker.display())).unwrap();
     std::os::unix::fs::symlink(&target, linked.join(HOOK_INSTALLER)).unwrap();
     assert_eq!(
-        install_hooks(&sys, &who, "linked", None).as_deref(),
+        install_hooks(&sys, &who, &named("linked"), None).as_deref(),
         Some(format!("~/linked: its {HOOK_INSTALLER} is reached through a link; not run").as_str())
     );
     // A tracked `scripts` link, which git checks out as a link: the installer path reads as a
@@ -416,20 +436,71 @@ fn the_installer_a_real_clone_carries_runs_in_it_and_says_what_it_did() {
         "the path reads as a regular file through the link"
     );
     assert_eq!(
-        install_hooks(&sys, &who, "through", None).as_deref(),
+        install_hooks(&sys, &who, &named("through"), None).as_deref(),
         Some(
             format!("~/through: its {HOOK_INSTALLER} is reached through a link; not run").as_str()
         )
     );
     assert!(!marker.exists(), "a linked installer ran");
 
+    // `~/<name>` swapped for a link once it was published: the folder it names carries an
+    // installer, every step to which is a plain folder of this account's.
+    let real = repo(
+        "real",
+        Some(&format!(
+            "#!/usr/bin/env bash\ntouch {}\n",
+            marker.display()
+        )),
+    );
+    std::os::unix::fs::symlink(&real, home.path().join("swapped")).unwrap();
+    assert_eq!(
+        install_hooks(&sys, &who, &named("swapped"), None).as_deref(),
+        Some(
+            format!("~/swapped: its {HOOK_INSTALLER} is reached through a link; not run").as_str()
+        )
+    );
+    assert!(!marker.exists(), "the swapped-in folder's installer ran");
+
+    // A required gitlink at `scripts` (or the installer's own path, in either case): the file
+    // there is the dependency's, populated by this pass from its own remote.
+    repo(
+        "vendored",
+        Some(&format!(
+            "#!/usr/bin/env bash\ntouch {}\n",
+            marker.display()
+        )),
+    );
+    for gitlink in ["scripts", "Scripts/install-git-hooks.sh"] {
+        let mut vendored = named("vendored");
+        vendored.required_submodules = vec!["vendor/lib".into(), gitlink.into()];
+        assert_eq!(
+            install_hooks(&sys, &who, &vendored, None).as_deref(),
+            Some(
+                format!(
+                    "~/vendored: its {HOOK_INSTALLER} is inside a required dependency; not run"
+                )
+                .as_str()
+            ),
+            "{gitlink}"
+        );
+    }
+    assert!(!marker.exists(), "a dependency's installer ran");
+    let mut beside = named("vendored");
+    beside.required_submodules = vec!["scripts-lib".into(), "vendor/scripts".into()];
+    assert_eq!(
+        install_hooks(&sys, &who, &beside, None).as_deref(),
+        Some(format!("~/vendored: ran its {HOOK_INSTALLER}").as_str()),
+        "a gitlink beside the installer's folder is not around it"
+    );
+    std::fs::remove_file(&marker).unwrap();
+
     repo("bare", None);
-    assert_eq!(install_hooks(&sys, &who, "bare", None), None);
+    assert_eq!(install_hooks(&sys, &who, &named("bare"), None), None);
     // A file named `scripts`: nothing is under it, so the clone carries no installer.
     let plain = repo("plain", None);
     std::fs::remove_dir(plain.join("scripts")).unwrap();
     std::fs::write(plain.join("scripts"), b"a file, not a folder\n").unwrap();
-    assert_eq!(install_hooks(&sys, &who, "plain", None), None);
+    assert_eq!(install_hooks(&sys, &who, &named("plain"), None), None);
     home.close().unwrap();
 }
 
@@ -440,12 +511,13 @@ fn the_profile_stage_row_says_what_a_new_clones_hook_installer_did() {
     for (reply, says) in [
         (
             Ran::ok(&format!("{INSTALLED}\n")),
-            format!("; ~/new: ran its {HOOK_INSTALLER}: {INSTALLED}"),
+            format!("; ~/new: ran its {HOOK_INSTALLER}: {INSTALLED:?}"),
         ),
         (
             Ran::exit(1, "ERROR: refused\n"),
             format!(
-                "; ~/new: its {HOOK_INSTALLER} failed (exit 1: ERROR: refused); the clone stands"
+                "; ~/new: its {HOOK_INSTALLER} failed (exit 1: \"ERROR: refused\"); the clone \
+                 stands"
             ),
         ),
     ] {
@@ -493,7 +565,7 @@ fn the_profile_stage_row_says_what_a_new_clones_hook_installer_did() {
 fn a_guard_or_switch_after_the_clones_still_says_what_their_installers_did() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    let says = format!("~/new: ran its {HOOK_INSTALLER}: {INSTALLED}");
+    let says = format!("~/new: ran its {HOOK_INSTALLER}: {INSTALLED:?}");
     for stop in [true, false] {
         let (sys, who, repo, _, installer) = clone_carrying(true);
         let config = config();
@@ -564,7 +636,7 @@ fn a_stopped_pass_keeps_every_line_besides_the_stop() {
             .to_owned(),
         "~/c: clone failed: late Stop came too".to_owned(),
     ];
-    let hooks = [format!("~/b: ran its {HOOK_INSTALLER}: {INSTALLED}")];
+    let hooks = [format!("~/b: ran its {HOOK_INSTALLER}: {INSTALLED:?}")];
     assert_eq!(
         stopped_after_clones(
             "late Stop".to_owned(),
@@ -623,4 +695,61 @@ fn every_read_back_answer_carries_every_installer_outcome() {
         );
         assert_eq!(with_hooks(probe.clone(), &[]), probe);
     }
+}
+
+/// WHAT AN INSTALLER PRINTED IS QUOTED, ESCAPED (installer F3 of the hostile review of the hook
+/// installer, 2026-11-06): a bidirectional override, a line separator `str::lines` keeps and a
+/// `; ` that would start another of the row's notes reach the row inside quotes, each control,
+/// bidirectional and separator character as its escape, on success and on failure alike.
+/// NEGATIVE CONTROL: the earlier filter, which dropped only `char::is_control`, passes the
+/// override and the separator through and leaves the forged note unquoted.
+#[test]
+fn an_installers_words_reach_the_row_quoted_and_escaped() {
+    let forged = "done\u{202e}gnihton\u{2028}; ~/other: ran its x\u{1b}[2J\n";
+    assert_eq!(
+        hook_outcome(&Ok(Ran::ok(forged))),
+        format!(
+            "ran its {HOOK_INSTALLER}: \"done\\u{{202e}}gnihton\\u{{2028}}; ~/other: ran its \
+             x\\u{{1b}}[2J\""
+        )
+    );
+    assert_eq!(
+        hook_outcome(&Ok(Ran::exit(2, "  \n\u{200f}refused \"here\"\n"))),
+        format!(
+            "its {HOOK_INSTALLER} failed (exit 2: \"\\u{{200f}}refused \\\"here\\\"\"); the \
+             clone stands"
+        )
+    );
+    assert_eq!(
+        hook_outcome(&Ok(Ran::exit(2, ""))),
+        format!("its {HOOK_INSTALLER} failed (exit 2); the clone stands")
+    );
+    // The escaped words are what is cut, never inside an escape (third and fourth reviews,
+    // 2026-11-06): a line of controls, six characters each escaped, shows the whole escapes that
+    // fit in HOOK_LINE characters, `…` after the quote; a backslash at the cut is left out whole,
+    // never kept as a lone `\` that escapes the closing quote; a line HOOK_LINE characters long
+    // shows whole.
+    let controls = "\u{1b}".repeat(HOOK_LINE);
+    let escapes = "\\u{1b}".repeat(HOOK_LINE / 6);
+    assert_eq!(
+        hook_outcome(&Ok(Ran::ok(&controls))),
+        format!("ran its {HOOK_INSTALLER}: \"{escapes}\"…")
+    );
+    let pathlike = format!("{}\\x", "p".repeat(HOOK_LINE - 1));
+    assert_eq!(
+        hook_outcome(&Ok(Ran::ok(&pathlike))),
+        format!(
+            "ran its {HOOK_INSTALLER}: \"{}\"…",
+            "p".repeat(HOOK_LINE - 1)
+        )
+    );
+    let full = "x".repeat(HOOK_LINE);
+    assert_eq!(
+        hook_outcome(&Ok(Ran::ok(&full))),
+        format!("ran its {HOOK_INSTALLER}: \"{full}\"")
+    );
+    assert_eq!(
+        hook_outcome(&Ok(Ran::ok(&format!("{full}y")))),
+        format!("ran its {HOOK_INSTALLER}: \"{full}\"…")
+    );
 }

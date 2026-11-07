@@ -13,6 +13,47 @@ use crate::typed::{grid::tests::put, keys};
 use aterm_secrets::commons::roster::Role;
 use std::path::Path;
 
+/// A rekey cut short right after its rename leaves no `database.json` at the replica's path: the
+/// nouns stay with fleet_db, each spelling of a verb names the rekey, and the import refuses alike.
+/// NEGATIVE CONTROL: with `serves` reading the missing file as no replica:
+/// `` assertion failed: !serves(paths) ``.
+#[test]
+fn a_rekey_cut_short_after_its_rename_keeps_the_nouns_with_fleet_db() {
+    let lab = Lab::new(&[Role::Writer]);
+    let paths = &lab.paths[0];
+    let dir = replica_fixture(paths, 2, "active");
+    let db = crate::local::Database::open(&dir).unwrap();
+    let id = aterm_codec::hex::encode_lower(&db.credentials.manifest.id[..8]);
+    drop(db);
+    aterm_uds::private_file::write_private(&dir, crate::fleet_db::REKEY_UNFINISHED, b"0").unwrap();
+    std::fs::rename(
+        &dir,
+        dir.with_file_name(format!("lab-db.before-rekey-{id}")),
+    )
+    .unwrap();
+
+    assert!(!serves(paths));
+    for line in [
+        &["emails"][..],
+        &["emails", "--edit"],
+        &["emails", "--digest"],
+    ] {
+        let held = dir.clone();
+        let refused = crate::fleet_db::try_run_with(&words(line), move || Ok(held)).unwrap_err();
+        assert!(refused.to_string().contains("aterm db rekey"), "{refused}");
+    }
+    let mut never = |_: &Path| -> Result<()> { panic!("no review") };
+    let refused = super::super::run(
+        paths,
+        &words(&["import", "--fleet-db", "--authoritative"]),
+        Some(&Stand),
+        &mut never,
+        NOW,
+    )
+    .unwrap_err();
+    assert!(refused.to_string().contains("aterm db rekey"), "{refused}");
+}
+
 /// A lab whose registry holds `n` imported mailbox logins, each password
 /// `synthetic-pass-<n>`.
 fn imported(n: usize) -> Lab {

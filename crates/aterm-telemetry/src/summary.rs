@@ -240,31 +240,55 @@ pub fn render_rows(
 ) -> String {
     let mut out = head(reading, since_ms, dir);
     out.push('\n');
-    let mut tail: Vec<&Row> = reading
-        .rows
-        .iter()
-        .rev()
-        .filter(|r| kind.is_none_or(|k| r.kind.word() == k))
-        .take(limit)
-        .collect();
-    tail.reverse();
-    for row in tail {
-        row.write_body(&mut out);
-        out.push('\n');
+    if let Some(k) = kind {
+        let mut tail: Vec<&Row> = reading
+            .rows
+            .iter()
+            .rev()
+            .filter(|r| r.kind.word() == k)
+            .take(limit)
+            .collect();
+        tail.reverse();
+        for row in tail {
+            row.write_body(&mut out);
+            out.push('\n');
+        }
+    } else {
+        for row in &reading.rows[reading.rows.len().saturating_sub(limit)..] {
+            row.write_body(&mut out);
+            out.push('\n');
+        }
     }
     out
 }
 
 fn fig_json(f: &Fig<u64>) -> aterm_json::Value {
     match f {
-        Fig::Known(v) => aterm_json::json!(v),
-        Fig::Na => aterm_json::json!("na"),
-        Fig::Unknown(source) => aterm_json::json!({ "unknown": source }),
+        Fig::Known(v) => aterm_json::Value::Number((*v).into()),
+        Fig::Na => aterm_json::Value::String("na".to_owned()),
+        Fig::Unknown(source) => aterm_json::Value::Object(aterm_json::Map::from([(
+            "unknown".to_owned(),
+            aterm_json::Value::String(source.clone()),
+        )])),
     }
 }
 
+fn opt_u64_json(v: Option<u64>) -> aterm_json::Value {
+    v.map_or(aterm_json::Value::Null, |n| {
+        aterm_json::Value::Number(n.into())
+    })
+}
+
 fn spread_json(s: &Spread) -> aterm_json::Value {
-    aterm_json::json!({ "n": s.n, "unknown": s.unknown, "p50": s.p50, "p90": s.p90 })
+    aterm_json::Value::Object(aterm_json::Map::from([
+        ("n".to_owned(), aterm_json::Value::Number(s.n.into())),
+        (
+            "unknown".to_owned(),
+            aterm_json::Value::Number(s.unknown.into()),
+        ),
+        ("p50".to_owned(), opt_u64_json(s.p50)),
+        ("p90".to_owned(), opt_u64_json(s.p90)),
+    ]))
 }
 
 /// The summary as one JSON object (`--json`).

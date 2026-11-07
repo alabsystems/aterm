@@ -14,16 +14,41 @@
 
 use std::io;
 use std::path::Path;
-use std::sync::{Mutex, mpsc};
+use std::sync::{Mutex, OnceLock, mpsc};
 use std::time::Duration;
 
 use amacs_files::watch::FileWatch;
 use aterm_agent::machine_name::{InFleet, NameTo, NickTo};
 use aterm_secrets::client::Paths;
-use aterm_types::machine_name::{Nickname, Refusal};
+use aterm_types::machine_name::Number;
 use aterm_window::event_loop::EventLoopProxy;
 
 use crate::Wake;
+
+pub(crate) mod naming;
+#[cfg(test)]
+mod publication_tests;
+
+type SystemNameApply = fn(Number) -> Result<(), String>;
+static SYSTEM_NAME_APPLY: OnceLock<SystemNameApply> = OnceLock::new();
+
+pub(crate) fn on_system_name_apply(apply: SystemNameApply) {
+    let _ = SYSTEM_NAME_APPLY.set(apply);
+}
+
+struct MacSystemNames;
+
+impl aterm_agent::machine_name::publish::SystemNames for MacSystemNames {
+    fn read(&self) -> [Option<String>; 3] {
+        aterm_agent::machine_name::publish::read_system_names()
+    }
+
+    fn apply(&self, number: Number) -> Result<(), String> {
+        SYSTEM_NAME_APPLY
+            .get()
+            .ok_or("macOS naming is unavailable in this application")?(number)
+    }
+}
 
 /// What the title and the menu's first row show.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,7 +59,7 @@ pub(crate) struct MachineView {
     pub(crate) name: String,
     /// The nickname as the menu bar shows it (`Heron`).
     pub(crate) nick: String,
-    /// The nickname as stored, which Change Nickname…'s field starts with (`heron`).
+    /// The nickname as stored, which the Nickname field starts with (`heron`).
     pub(crate) word: String,
     /// Whether this machine is in a fleet: its vault's standing, or a fleet key that reads
     /// ([`InFleet`], §11.85).
@@ -257,38 +282,23 @@ fn read_loop(
     }
 }
 
-/// The title of the alert Change Nickname… raises (§5.4).
-pub(crate) const NICK_ALERT_TITLE: &str = "Change Nickname";
-/// The alert's buttons, in order: Change takes Return and Cancel Escape; New Random Noun has no
-/// key of its own (with keyboard navigation on, Tab and Space reach every button).
-pub(crate) const NICK_BUTTONS: [&str; 3] = ["Change", "Cancel", "New Random Noun"];
-
-/// What `invoke ChangeNickname` answers when a control client's, aterm's accessibility tree's or
-/// a relayed gesture dispatched it: the press is the person's own, and an agent has the command.
-pub(crate) const NICK_PERSON_ONLY: &str = "Change Nickname\u{2026} is the person's own act at the window; from a shell, `aterm name nick`";
 /// What it answers before the title's reader has read this machine's name.
-pub(crate) const NICK_UNREAD: &str = "aterm has not read this Mac's name yet";
+pub(crate) const NAME_UNREAD: &str = "aterm has not read this Mac's name yet";
 /// What it answers when no alert can be shown: a headless instance's, or one off the window
 /// thread.
-pub(crate) const NICK_NOT_ASKED: &str = "nothing was changed: aterm could not show its question";
+pub(crate) const NAME_NOT_ASKED: &str = "nothing was changed: aterm could not show its question";
 
 /// What a control client should use instead of opening the person's rename alert.
 pub(crate) const NAME_PERSON_ONLY: &str =
     "Rename This Mac\u{2026} is the person's own act at the window; from a shell, `aterm name set`";
 
-/// Which machine-name field an alert edits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum EditKind {
-    Nickname,
-    Name,
-}
-
 enum NameChange {
     Nickname(NickTo),
     Name(NameTo),
+    Synchronize(Number),
 }
 
-/// What Rename's answer `to` sets: a nickname alone as Change Nickname… sets it, another number
+/// What Rename's answer `to` sets: a nickname alone, another number
 /// (or a number that holds no claim yet) as `aterm name set` does, and nothing for fields that
 /// ask for nothing.
 fn rename_change(to: crate::machine_rename_sheet::RenameTo) -> Option<NameChange> {
@@ -297,17 +307,8 @@ fn rename_change(to: crate::machine_rename_sheet::RenameTo) -> Option<NameChange
         RenameTo::Keep => None,
         RenameTo::Nick(nick) => Some(NameChange::Nickname(NickTo::Word(nick))),
         RenameTo::Name(to) => Some(NameChange::Name(to)),
+        RenameTo::Synchronize(number) => Some(NameChange::Synchronize(number)),
     }
-}
-
-/// The failure a press of `kind` starts from: the one `unset` keeps when the same menu row made
-/// it, taken; one another row made stays for that row's next press.
-fn unset_for(unset: &mut Option<NameUnset>, kind: EditKind) -> Option<NameUnset> {
-    unset
-        .as_ref()
-        .is_some_and(|unset| unset.asked.kind == kind)
-        .then(|| unset.take())
-        .flatten()
 }
 
 /// What a failed set keeps for its row's next press: the press's `asked`, `why` worded for the
@@ -316,7 +317,7 @@ fn unset_of(generation: u64, asked: &Asked, why: &str) -> NameUnset {
     NameUnset {
         generation,
         asked: asked.clone(),
-        why: format!("The name was not changed: {why}."),
+        why: format!("Last attempt: {why}"),
     }
 }
 
@@ -325,77 +326,17 @@ fn unset_of(generation: u64, asked: &Asked, why: &str) -> NameUnset {
 /// alone, and for a random noun).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Asked {
-    pub(crate) kind: EditKind,
     pub(crate) number: Option<String>,
     pub(crate) nick: Option<String>,
 }
 
-/// The alert's text: where the nickname shows, and, above it, why the last answer took no effect
-/// (`why`).
-pub(crate) fn nickname_alert_body(view: &MachineView, why: Option<&str>) -> String {
-    let lead = format!(
-        "This Mac's nickname shows in the menu bar beside its number, {}. Type another, a word \
-         that starts with a letter, or let aterm pick a new random noun.",
-        view.name
-    );
-    match why {
-        Some(why) => format!("{why}\n\n{lead}"),
-        None => lead,
-    }
-}
-
 /// Rename This Mac…'s text, above its fields: why the last answer took no effect (`why`) first.
 pub(crate) fn rename_alert_body(why: Option<&str>) -> String {
-    let lead = "Other Macs in this fleet reach this Mac by its number, and the menu bar shows its \
-                nickname beside it. The line under the fields checks each number against this \
-                fleet and its vault as you type; a field left empty keeps what this Mac has.";
+    let lead =
+        "Use one number across aterm, the fleet and macOS. Empty fields keep their current values.";
     match why {
         Some(why) => format!("{why}\n\n{lead}"),
         None => lead.to_owned(),
-    }
-}
-
-/// What the person answered the nickname alert.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum NickAnswer {
-    /// Change (or Return), with the field's text.
-    Typed(String),
-    /// New Random Noun.
-    Random,
-    /// Cancel, Escape, or any other end of the alert.
-    Cancel,
-}
-
-/// The answer `response`, the alert's modal response, stands for; `typed` reads the field, only
-/// for Change.
-pub(crate) fn nick_answer(response: isize, typed: impl FnOnce() -> String) -> NickAnswer {
-    use crate::appkit::consts::{NS_ALERT_FIRST_BUTTON_RETURN, NS_ALERT_THIRD_BUTTON_RETURN};
-    match response {
-        NS_ALERT_FIRST_BUTTON_RETURN => NickAnswer::Typed(typed()),
-        NS_ALERT_THIRD_BUTTON_RETURN => NickAnswer::Random,
-        _ => NickAnswer::Cancel,
-    }
-}
-
-/// What `answer` asks of [`aterm_agent::machine_name::set_nick`], `held` being the nickname as
-/// stored (the field's first text): nothing for a cancel or for the held word typed back, so an
-/// untouched field changes nothing (a drawn noun stays drawn), and for a typed word that is no
-/// nickname the refusal the alert shows above its text next time.
-pub(crate) fn nick_to(answer: &NickAnswer, held: &str) -> Result<Option<NickTo>, String> {
-    match answer {
-        NickAnswer::Cancel => Ok(None),
-        NickAnswer::Random => Ok(Some(NickTo::Random)),
-        NickAnswer::Typed(text) => {
-            let word = text.trim();
-            if word == held {
-                return Ok(None);
-            }
-            match Nickname::parse(word) {
-                Ok(nick) => Ok(Some(NickTo::Word(nick))),
-                Err(Refusal::Empty) => Err("Type a nickname first.".to_owned()),
-                Err(why) => Err(format!("\u{201c}{word}\u{201d} is no nickname: {why}.")),
-            }
-        }
     }
 }
 
@@ -503,7 +444,18 @@ fn read_preview(press: u64) {
                 vault_roster_label,
                 aterm_netplace::unix_ms_now(),
             ) {
-                Ok(preview) => Snapshot::Read(Box::new(preview)),
+                Ok(preview) => match aterm_types::dirs::aterm_config_path() {
+                    Some(config) => {
+                        let names = naming::NamingStatus::read(
+                            &state,
+                            &config,
+                            preview.name(),
+                            &MacSystemNames,
+                        );
+                        Snapshot::named(preview, names)
+                    }
+                    None => Snapshot::Unread("aterm has no configuration path".into()),
+                },
                 Err(why) => {
                     aterm_log::info!("machine name: the rename's read failed: {why}");
                     Snapshot::Unread(why.to_string())
@@ -514,10 +466,42 @@ fn read_preview(press: u64) {
     aterm_objc::run_on_main(move |_| crate::machine_rename_sheet::deliver(press, snapshot));
 }
 
+/// A canonical edit and any publication that still needs the person's explicit retry.
+struct NameEdit {
+    name: aterm_agent::machine_name::file::MachineName,
+    changed: bool,
+    shared: bool,
+    publication: Option<aterm_agent::machine_name::publish::Pending>,
+}
+
+fn change_number(
+    state: &Path,
+    config: &Path,
+    to: &NameTo,
+    system: &dyn aterm_agent::machine_name::publish::SystemNames,
+    lab: impl FnOnce() -> io::Result<aterm_secrets::client::LabLabels>,
+    roster: impl FnOnce() -> io::Result<Option<String>>,
+    stamp: u64,
+) -> Result<NameEdit, String> {
+    use aterm_agent::machine_name::{publish, set_name};
+    use aterm_net::fleet_member::name_record::ByKind;
+    // Refuse naming holds and invalid configuration before changing the canonical name.
+    let policy = publish::Policy::read(config, to.num)?;
+    let set = set_name(state, to, lab, ByKind::Person, roster, stamp, false)
+        .map_err(|why| why.to_string())?;
+    let publication = publish::publish(state, config, &policy, Some(system)).err();
+    Ok(NameEdit {
+        name: set.name,
+        changed: set.changed,
+        shared: set.shared,
+        publication,
+    })
+}
+
 /// Apply one queued edit off the window thread, releasing its persistence locks before
-/// `post_read` serializes the resulting snapshot and its publication with the file watcher.
+/// `post_read` serializes the resulting snapshot with the file watcher.
 fn apply_change(proxy: &EventLoopProxy<Wake>, job: NameJob) {
-    use aterm_agent::machine_name::{set_name, set_nick};
+    use aterm_agent::machine_name::set_nick;
     use aterm_net::fleet_member::name_record::ByKind;
     let Some(state) = aterm_types::dirs::state_dir() else {
         report_unset(proxy, &job, "aterm has no state folder".to_owned());
@@ -528,15 +512,41 @@ fn apply_change(proxy: &EventLoopProxy<Wake>, job: NameJob) {
     let stamp = aterm_netplace::unix_ms_now();
     let set = match &job.to {
         NameChange::Nickname(to) => set_nick(&state, to, ByKind::Person, roster, stamp, false)
-            .map(|set| (set.name, set.changed, set.shared)),
-        NameChange::Name(to) => {
+            .map(|set| NameEdit {
+                name: set.name,
+                changed: set.changed,
+                shared: set.shared,
+                publication: None,
+            })
+            .map_err(|why| why.to_string()),
+        NameChange::Name(to) => (|| {
+            let config =
+                aterm_types::dirs::aterm_config_path().ok_or("aterm has no configuration path")?;
             let lab = || aterm_agent::machine_name::lab_labels(vault.as_ref());
-            set_name(&state, to, lab, ByKind::Person, roster, stamp, false)
-                .map(|set| (set.name, set.changed, set.shared))
-        }
+            change_number(&state, &config, to, &MacSystemNames, lab, roster, stamp)
+        })(),
+        NameChange::Synchronize(number) => (|| {
+            let config =
+                aterm_types::dirs::aterm_config_path().ok_or("aterm has no configuration path")?;
+            let publication = naming::synchronize(&state, &config, *number, &MacSystemNames).err();
+            let name = aterm_agent::machine_name::file::read(&state)
+                .map_err(|why| why.to_string())?
+                .ok_or("this Mac's saved name is unavailable")?;
+            Ok(NameEdit {
+                name,
+                changed: false,
+                shared: false,
+                publication,
+            })
+        })(),
     };
     match set {
-        Ok((name, changed, shared)) => {
+        Ok(NameEdit {
+            name,
+            changed,
+            shared,
+            publication,
+        }) => {
             aterm_log::info!(
                 "machine name: the person set {} ({}{})",
                 name.title(),
@@ -554,23 +564,26 @@ fn apply_change(proxy: &EventLoopProxy<Wake>, job: NameJob) {
                     "machine name: not read after the change ({why}); the title follows at its reader's next read"
                 );
             }
+            if let Some(pending) = publication {
+                // The canonical save succeeded. Untouched fields follow the fresh name on
+                // the next panel open; a retry never silently reasserts an older number.
+                let unset = NameUnset {
+                    generation: job.generation,
+                    asked: Asked {
+                        number: None,
+                        nick: None,
+                    },
+                    why: format!("Last synchronization attempt: {}", pending.why()),
+                };
+                aterm_log::info!("machine name: {}", unset.why);
+                let _ = proxy.send_event(Wake::MachineNameNotSet(unset));
+            }
         }
-        Err(why) => report_unset(proxy, &job, why.to_string()),
+        Err(why) => report_unset(proxy, &job, why),
     }
 }
 
 impl crate::App {
-    /// Change Nickname… (§5.4 of `docs/DESIGN-machine-names-2026-11-04.md`): ask the person for
-    /// this Mac's nickname in an alert, then set it on the window's name writer, after every
-    /// change pressed before it. A typed word that is no nickname asks again with its refusal and
-    /// the word kept; the last set's failure, if one came back since, leads the alert, its field
-    /// at the word that press set. A gesture the person did not make, a headless instance,
-    /// a name not read yet, or an alert that cannot be shown changes nothing, is journaled, and is
-    /// said on the invoke's reply.
-    pub(crate) fn change_nickname(&mut self) {
-        self.change_machine_nickname();
-    }
-
     /// Rename This Mac… (§5.3): ask for this Mac's number and nickname in two fields over a live
     /// line ([`crate::machine_rename_sheet`]), whose read the window's writer runs after every
     /// change pressed before it, then set the answer on that writer: a number through
@@ -581,8 +594,8 @@ impl crate::App {
     /// the person did not make, a headless instance, a name not read yet, or an alert that cannot
     /// be shown changes nothing, is journaled, and is said on the invoke's reply.
     pub(crate) fn rename_machine(&mut self) {
-        use crate::machine_rename_sheet::{Answer, Field, TITLE, ask, begin, end, rename_to};
-        let Some((view, unset)) = self.machine_edit_starts(EditKind::Name) else {
+        use crate::machine_rename_sheet::{Answer, TITLE, ask, begin, end};
+        let Some((view, unset)) = self.machine_edit_starts() else {
             return;
         };
         let mut why = unset.as_ref().map(|u| u.why.clone());
@@ -602,26 +615,21 @@ impl crate::App {
                 nick.as_deref(),
             ) else {
                 end(press);
-                return self.machine_edit_refused(EditKind::Name, NICK_NOT_ASKED);
+                return self.machine_edit_refused(NAME_NOT_ASKED);
             };
             let Answer::Rename {
                 number: typed_number,
                 nick: typed_nick,
-                held,
+                requested,
             } = answer
             else {
                 return end(press);
             };
-            let fields = (
-                Field::open(typed_number.as_deref(), held.number_text()),
-                Field::open(typed_nick.as_deref(), &held.word),
-            );
             let asked = Asked {
-                kind: EditKind::Name,
                 number: typed_number,
                 nick: typed_nick,
             };
-            let change = match rename_to(&fields.0, &fields.1, &held) {
+            let change = match requested {
                 Ok(to) => rename_change(to),
                 Err(refusal) => {
                     why = Some(refusal);
@@ -638,70 +646,29 @@ impl crate::App {
         }
     }
 
-    /// Change Nickname…'s alert over [`nick_to`].
-    fn change_machine_nickname(&mut self) {
-        let Some((view, unset)) = self.machine_edit_starts(EditKind::Nickname) else {
-            return;
-        };
-        let mut why = unset.as_ref().map(|u| u.why.clone());
-        let mut field = unset
-            .and_then(|u| u.asked.nick)
-            .unwrap_or_else(|| view.word.clone());
-        loop {
-            let body = nickname_alert_body(&view, why.as_deref());
-            let Some(answer) = crate::menu::ask_nickname(NICK_ALERT_TITLE, &body, &field) else {
-                return self.machine_edit_refused(EditKind::Nickname, NICK_NOT_ASKED);
-            };
-            match nick_to(&answer, &view.word) {
-                Ok(None) => return,
-                Ok(Some(to)) => {
-                    let asked = Asked {
-                        kind: EditKind::Nickname,
-                        number: None,
-                        nick: match &to {
-                            NickTo::Word(word) => Some(word.as_str().to_owned()),
-                            NickTo::Random => None,
-                        },
-                    };
-                    return self.queue_machine_change(NameChange::Nickname(to), asked);
-                }
-                Err(refusal) => {
-                    why = Some(refusal);
-                    if let NickAnswer::Typed(text) = answer {
-                        field = text;
-                    }
-                }
-            }
-        }
-    }
-
-    fn machine_edit_refused(&mut self, kind: EditKind, why: &str) {
-        aterm_log::info!("machine name: {kind:?} changed nothing: {why}");
+    fn machine_edit_refused(&mut self, why: &str) {
+        aterm_log::info!("machine name: changed nothing: {why}");
         self.pending_action_refusal = Some(why.to_owned());
     }
 
-    /// The view an edit of `kind` starts from, and the last set of that kind's failure, if one
-    /// came back since; `None`, refused, for a gesture the person did not make, a headless
+    /// The view this panel starts from and the last request's failure, if one came back since;
+    /// `None`, refused, for a gesture the person did not make, a headless
     /// instance, or a name not read yet.
-    fn machine_edit_starts(&mut self, kind: EditKind) -> Option<(MachineView, Option<NameUnset>)> {
+    fn machine_edit_starts(&mut self) -> Option<(MachineView, Option<NameUnset>)> {
         if let Some(who) = self.gesture_unvouched() {
-            aterm_log::info!("machine name: refused a gesture by {who:?} to change {kind:?}");
-            let why = match kind {
-                EditKind::Nickname => NICK_PERSON_ONLY,
-                EditKind::Name => NAME_PERSON_ONLY,
-            };
-            self.machine_edit_refused(kind, why);
+            aterm_log::info!("machine name: refused a gesture by {who:?}");
+            self.machine_edit_refused(NAME_PERSON_ONLY);
             return None;
         }
         if crate::menu::process_is_headless() {
-            self.machine_edit_refused(kind, NICK_NOT_ASKED);
+            self.machine_edit_refused(NAME_NOT_ASKED);
             return None;
         }
         let Some(view) = self.machine_view.clone() else {
-            self.machine_edit_refused(kind, NICK_UNREAD);
+            self.machine_edit_refused(NAME_UNREAD);
             return None;
         };
-        let unset = unset_for(&mut self.machine_unset, kind);
+        let unset = self.machine_unset.take();
         Some((view, unset))
     }
 

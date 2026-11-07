@@ -1532,7 +1532,7 @@ impl TurnIo<'static> {
     }
 }
 
-/// The typed-prefix cap of `turn typed=1`: at most this many graphemes are pressed one key at a time, the remainder going as the rest's writes ([`rest_writes`]: one paste where it holds no Tab or line break). 240 at the default cadence is ~17 s of typing, inside the default 240 s deadline with room for the reply; a turn whose keys go slower than its deadline allows pastes the rest sooner ([`TypingPace`]).
+/// The typed-prefix cap of `turn typed=1`: at most this many graphemes are pressed one key at a time, the remainder going as the rest's writes ([`rest_writes`]: one write of its keys' bytes where it holds no Tab or line break). 240 at the default cadence is ~17 s of typing, inside the default 240 s deadline with room for the reply; a turn whose keys go slower than its deadline allows writes the rest sooner ([`TypingPace`]).
 pub(crate) const TYPED_CAP: usize = 240;
 
 /// The most graphemes `turn typed=1 cap=<n>` may ask to have pressed one key at a time.
@@ -1609,7 +1609,7 @@ fn typed_key_event(g: &str) -> Option<InputEvent> {
     })
 }
 
-/// `turn typed=1`'s press list for `text`, one event per grapheme ([`typed_key_event`]), pure so the tuple a typed turn presses is pinned beside the tuple a keyboard presses without an event loop. Each event carries the byte offset of its grapheme in `text`: where the paste of the rest starts when the turn stops pressing before that key ([`TypingPace`]).
+/// `turn typed=1`'s press list for `text`, one event per grapheme ([`typed_key_event`]), pure so the tuple a typed turn presses is pinned beside the tuple a keyboard presses without an event loop. Each event carries the byte offset of its grapheme in `text`: where the writes of the rest start when the turn stops pressing before that key ([`TypingPace`]).
 pub(crate) fn typed_key_events(text: &str) -> Vec<(usize, InputEvent)> {
     use aterm_grapheme::GraphemeClusters;
     text.grapheme_indices()
@@ -1629,18 +1629,22 @@ pub(crate) fn turn_paste_event(text: &str) -> InputEvent {
 /// One write of a `typed=1` turn's rest ([`rest_writes`]).
 #[derive(Debug)]
 pub(crate) enum RestWrite {
-    /// A run of text the typing would have pressed as character keys, pasted.
-    Paste {
+    /// A run of text the typing would have pressed as character keys, written as those keys'
+    /// bytes in one write ([`rest_run_event`]).
+    Run {
         /// The run, with no Tab, line break or other control character in it.
         text: String,
-        /// Its graphemes as the turn's text segments them, one key each had they been typed.
-        graphemes: usize,
+        /// The key of each of its graphemes as the turn's text segments them ([`typed_key_event`]),
+        /// the keys typing it presses. A control character typing drops still parts the
+        /// graphemes either side of it, which the run's text alone would join.
+        keys: Vec<InputEvent>,
     },
     /// A Tab or Enter, pressed as the key the typing presses.
     Key(InputEvent),
 }
 
-/// Whether the typed key `ev` is one a rest presses rather than pastes ([`rest_writes`]).
+/// Whether the typed key `ev` is one a rest presses on its own rather than in a run
+/// ([`rest_writes`]).
 fn presses_in_rest(ev: &InputEvent) -> bool {
     use aterm_types::keyboard::{Key, NamedKey};
     matches!(
@@ -1653,41 +1657,64 @@ fn presses_in_rest(ev: &InputEvent) -> bool {
 }
 
 /// The writes of a `typed=1` turn's `rest`, the text after the last key it typed
-/// ([`TypingPace`]): what typing it would have sent, in as few writes as that allows. Each Tab
-/// and line break goes as the Tab or Enter key typing presses, since a paste under DEC 2004
-/// delivers neither as that key: a pasted Tab is text a shell never completes on, and a pasted
-/// line break one no composer submits on (with 2004 off their bytes are the keys' either way).
-/// Each run of other text between them is one paste of the graphemes typing presses as keys,
-/// without the control characters typing drops ([`typed_key_event`]), so the keys typed and the
-/// writes of the rest are the whole text as typing it would have gone.
+/// ([`TypingPace`]): what typing it would have sent, in as few writes as that allows. Each run
+/// of text between its Tabs and line breaks is one write of the bytes its keys send
+/// ([`rest_run_event`]), without the control characters typing drops ([`typed_key_event`]), and
+/// each Tab and line break goes as the Tab or Enter key typing presses, on its own: a fenced
+/// turn's hold judges what the program drew of each write, and a line break ends what a program
+/// reads as one line. The keys typed and the writes of the rest are the whole text as typing it
+/// would have gone, byte for byte, in every keyboard mode.
 pub(crate) fn rest_writes(rest: &str) -> Vec<RestWrite> {
     use aterm_grapheme::GraphemeClusters;
     let mut writes = Vec::new();
     let mut run = String::new();
-    let mut graphemes = 0usize;
-    let flush = |writes: &mut Vec<RestWrite>, run: &mut String, graphemes: &mut usize| {
-        if !run.is_empty() {
-            writes.push(RestWrite::Paste {
+    let mut keys = Vec::new();
+    let flush = |writes: &mut Vec<RestWrite>, run: &mut String, keys: &mut Vec<InputEvent>| {
+        if !keys.is_empty() {
+            writes.push(RestWrite::Run {
                 text: std::mem::take(run),
-                graphemes: std::mem::take(graphemes),
+                keys: std::mem::take(keys),
             });
         }
     };
     for g in rest.graphemes() {
         match typed_key_event(g) {
             Some(ev) if presses_in_rest(&ev) => {
-                flush(&mut writes, &mut run, &mut graphemes);
+                flush(&mut writes, &mut run, &mut keys);
                 writes.push(RestWrite::Key(ev));
             }
-            Some(_) => {
+            Some(ev) => {
                 run.push_str(g);
-                graphemes += 1;
+                keys.push(ev);
             }
             None => {}
         }
     }
-    flush(&mut writes, &mut run, &mut graphemes);
+    flush(&mut writes, &mut run, &mut keys);
     writes
+}
+
+/// The one write of a rest's run ([`RestWrite::Run`]): the bytes each of its `keys` sends under
+/// `keyboard`, the program's keyboard mode as the seam's mirror last read it
+/// ([`crate::input::typed_bytes`]), in one [`InputEvent::KeySequence`]. Not a paste: a program
+/// may take a bracketed paste otherwise than the keys, and where the cap or the pace cuts the
+/// text depends on load. Fish 4.9 escapes each quote of a paste whose token is open in quotes, so
+/// `'fix it'` with the rest pasted after `'f` reads `'fix it\'`, a quote left open that the Enter
+/// continues (measured on a `lab instance`, 2026-11-06), and vim inserts a paste with no mapping
+/// or abbreviation. The keys' bytes are fixed under the mode the mirror holds when the turn
+/// writes the run, as a typed key's are when it is pressed and a keyboard's are: a program that
+/// changes its keyboard mode after input was written reads that input as encoded before the
+/// change, run and key alike.
+pub(crate) fn rest_run_event(
+    keys: &[InputEvent],
+    keyboard: aterm_types::keyboard::KeyboardMode,
+) -> InputEvent {
+    InputEvent::KeySequence(
+        keys.iter()
+            .filter_map(|ev| crate::input::typed_bytes(ev, keyboard))
+            .flatten()
+            .collect(),
+    )
 }
 
 /// How many writes [`rest_writes`] makes of `text[at..]`, for `at` each grapheme's offset in
@@ -1698,17 +1725,17 @@ fn rest_write_counts(text: &str) -> Vec<(usize, usize)> {
     let graphemes: Vec<(usize, &str)> = text.grapheme_indices().collect();
     let mut counts = Vec::with_capacity(graphemes.len() + 1);
     counts.push((text.len(), 0));
-    // The writes from here on, and whether the first of them is a paste the text here joins.
-    let (mut writes, mut opens_paste) = (0usize, false);
+    // The writes from here on, and whether the first of them is a run the text here joins.
+    let (mut writes, mut opens_run) = (0usize, false);
     for &(at, g) in graphemes.iter().rev() {
         match typed_key_event(g) {
             Some(ev) if presses_in_rest(&ev) => {
                 writes += 1;
-                opens_paste = false;
+                opens_run = false;
             }
             Some(_) => {
-                writes += usize::from(!opens_paste);
-                opens_paste = true;
+                writes += usize::from(!opens_run);
+                opens_run = true;
             }
             None => {}
         }
@@ -1720,18 +1747,18 @@ fn rest_write_counts(text: &str) -> Vec<(usize, usize)> {
 
 /// THE PACE OF A TYPED TURN: a `turn typed=1` never leaves part of its text in the composer for
 /// its deadline. Before each key it asks whether that key, the writes of everything after it
-/// ([`rest_writes`]: one paste, plus a key and a paste for each Tab or line break), the
+/// ([`rest_writes`]: one run, plus a key and a run for each Tab or line break), the
 /// longest wait a typing hold has needed so far, and the submit's share of the turn
 /// ([`TypingPace::new`]) still end by the deadline, at the pace its keys have gone so far and never
 /// faster than `cadence=`. The moment they would not, the rest of the text goes as those writes
-/// (each paste bracketed where the program turned DEC 2004 on), none of which cuts part-way, and
+/// (each run its keys' bytes in one write, [`rest_run_event`]), none of which cuts part-way, and
 /// the turn goes on to its submit. Typing that keeps delivering is never cut: a drive's turn
 /// (`timeout=20000`) to a loaded Claude Code worker whose keys went at about 5 a second answered
 /// `skipped reason=deadline typed=106` and left the 106 in its composer, and each retry stacked
 /// another (m14 driving m108, 2026-11-04). Before its first key the turn can still
 /// end as it found the composer, and does when that key does not fit: `reason=deadline typed=0
-/// pasted=0`, never a paste whose submit the deadline leaves no time to see, which a retry would
-/// send again. The echo's settle after the paste ends in time for the submit's share
+/// pasted=0`, never a rest whose submit the deadline leaves no time to see, which a retry would
+/// send again. The echo's settle after the rest ends in time for the submit's share
 /// ([`press_by`]); a Claude Code composer's echo is still waited for, which alone shows the
 /// program took the text before its Enter is judged. A
 /// fenced turn's wait for a program that draws nothing of what it was sent is a hang detector,
@@ -1798,7 +1825,7 @@ impl TypingPace {
 
     /// Whether the next key, after `typed`, still fits at `now` under `deadline`: its hold's wait
     /// at the longest so far, it, the `rest` writes after it ([`rest_write_counts`]; at least the
-    /// one paste a rest takes), and the reserve, each key and write at [`TypingPace::per_key`].
+    /// one run a rest takes), and the reserve, each key and write at [`TypingPace::per_key`].
     fn fits(
         &self,
         typed: usize,
@@ -1846,7 +1873,7 @@ fn press_by(
     deadline.min(deadline.checked_sub(window).unwrap_or(typed).max(settled))
 }
 
-/// Split `text` at the `cap`th grapheme ([`TYPED_CAP`] unless the turn said `cap=`): `(typed prefix, pasted remainder)`.
+/// Split `text` at the `cap`th grapheme ([`TYPED_CAP`] unless the turn said `cap=`): `(typed prefix, the rest [`rest_writes`] writes)`.
 pub(crate) fn split_typed_cap(text: &str, cap: usize) -> (&str, &str) {
     use aterm_grapheme::GraphemeClusters;
     match text.grapheme_indices().nth(cap) {
@@ -2592,11 +2619,18 @@ enum GuardedSubmit {
     /// The person made a gesture since the caller's read (`if-human=`), judged under the lock at
     /// every try: nothing of this press was written.
     Person,
-    /// The sink took none of the Enter until the submit window ended: nothing of this press was written.
+    /// The sink took none of the Enter, or input queued before it had not all gone, until the
+    /// submit window ended: nothing of this press was written.
     Busy,
+    /// `lease release force` took the turn's slot before a try: nothing of this press was
+    /// written.
+    Preempted,
     Failed(String),
 }
 
+/// The guarded Enter of a turn, tried until `window` while the sink takes none of it or input
+/// queued before it has not all gone, and never once `preempted` says the turn's slot is gone,
+/// judged before each try and again under the terminal lock the try writes under.
 fn guarded_submit(
     term: &Arc<Mutex<Terminal>>,
     ctx: &SessionCtx,
@@ -2604,18 +2638,24 @@ fn guarded_submit(
     human: Option<u64>,
     window: std::time::Instant,
     mark: Option<&crate::control_input_ack::InputMark>,
+    preempted: &(dyn Fn() -> bool + Sync),
 ) -> GuardedSubmit {
     use super::control_input::GuardedInput;
     use crate::input::Delivery;
     const BUSY_RETRY: std::time::Duration = std::time::Duration::from_millis(5);
     loop {
+        if preempted() {
+            return GuardedSubmit::Preempted;
+        }
         let Some(enter) = crate::control::parse_key("enter") else {
             return GuardedSubmit::Failed("ERR internal: `enter` did not parse\n".to_string());
         };
+        let stands = || !preempted();
         let fence = super::control_input::InputFence {
             guard: Some(guard),
             guard_at_cursor: true,
             human,
+            standing: Some(&stands),
             ..super::control_input::InputFence::default()
         };
         match super::control_input::input_if_fenced_observed(
@@ -2629,12 +2669,20 @@ fn guarded_submit(
             GuardedInput::Pressed(Delivery::Full) => {
                 return GuardedSubmit::Pressed;
             }
+            // A slot lost under the lock is a skip the fence says nothing more of.
+            GuardedInput::Skipped | GuardedInput::Changed if preempted() => {
+                return GuardedSubmit::Preempted;
+            }
             GuardedInput::Skipped | GuardedInput::Changed => return GuardedSubmit::Missed,
             GuardedInput::Person => return GuardedSubmit::Person,
-            GuardedInput::Pressed(Delivery::BusyZero) if std::time::Instant::now() < window => {
+            GuardedInput::Queued | GuardedInput::Pressed(Delivery::BusyZero)
+                if std::time::Instant::now() < window =>
+            {
                 std::thread::sleep(BUSY_RETRY);
             }
-            GuardedInput::Pressed(Delivery::BusyZero) => return GuardedSubmit::Busy,
+            GuardedInput::Queued | GuardedInput::Pressed(Delivery::BusyZero) => {
+                return GuardedSubmit::Busy;
+            }
             decision @ GuardedInput::Pressed(_) => {
                 return GuardedSubmit::Failed(super::control_input::guarded_input_reply(decision));
             }
@@ -3089,16 +3137,34 @@ fn turn_attempt(
         hold = held;
     }
 
+    // A turn stopped after it wrote: what stands of its text, a typed turn's keys and runs or a
+    // plain turn's paste, is in the verdict, so its caller reads the text left in place.
+    let stopped = |why: &str, (keys, pasted): (usize, usize)| -> String {
+        if typed || pasted > 0 {
+            typed_cut(term, why, keys, pasted, turn_id)
+        } else {
+            let seq = term_lock(term).content_seq();
+            format!("OK 0 turn skipped reason={why} submitted=0 seq={seq} id={turn_id}\n")
+        }
+    };
     let halted = |landed: Option<(usize, usize)>| -> Option<String> {
         let refusal = crate::fabric::halt_refusal(ctx, "turn")?;
         Some(match landed {
             None => refusal,
-            Some((keys, pasted)) if typed => typed_cut(term, "halted", keys, pasted, turn_id),
-            Some(_) => {
-                let seq = term_lock(term).content_seq();
-                format!("OK 0 turn skipped reason=halted submitted=0 seq={seq} id={turn_id}\n")
-            }
+            Some(landed) => stopped("halted", landed),
         })
+    };
+    // `lease release force` took the turn's slot (a wedged turn's preemption): the turn writes
+    // nothing more, and what it wrote stands, as a halt leaves it. A write already past its
+    // check still goes; each later one, each try of a guarded Enter included, is checked first.
+    let lease_gone = || {
+        !matches!(
+            ctx.turn_lease.lock().unwrap_or_else(|p| p.into_inner()).as_ref(),
+            Some(crate::Lease::Turn { id, .. }) if *id == turn_id
+        )
+    };
+    let preempted = |landed: (usize, usize)| -> Option<String> {
+        lease_gone().then(|| stopped("preempted", landed))
     };
     // The answer for a write a route did not deliver. The turn's first write, refused whole,
     // wrote nothing at all: it answers the `ERR busy …` line `send` does and clears `wrote`, so
@@ -3194,6 +3260,9 @@ fn turn_attempt(
                 if let Some(cut) = halted(committed.is_some().then_some((typed_keys, 0))) {
                     return cut;
                 }
+                if let Some(cut) = preempted((typed_keys, 0)) {
+                    return cut;
+                }
                 if gone_before_writing() {
                     return KEY_DELIVERY_FAILED.to_string();
                 }
@@ -3214,32 +3283,38 @@ fn turn_attempt(
                 typed_keys += 1;
             }
             // The rest of the text, past the cap or from the key the pace stopped before, as
-            // typing it would have gone: its runs pasted, its Tabs and line breaks pressed.
-            for write in rest_writes(&text[rest_at..]) {
-                // The loop checks before each key only: a head of control characters, which
-                // `typed_key_events` drops, presses none and leaves the rest's first write the
-                // turn's first.
+            // typing it would have gone: each run its keys' bytes in one write, its Tabs and line
+            // breaks pressed.
+            let writes = rest_writes(&text[rest_at..]);
+            // The pace asks before each key only, and a head of control characters, which
+            // `typed_key_events` drops, presses none: the rest's first write is then the turn's
+            // first, and goes only where the rest and the submit fit, as a first key does.
+            if typed_keys == 0
+                && !writes.is_empty()
+                && !pace.fits(0, writes.len() - 1, Instant::now(), deadline)
+            {
+                return typed_cut(term, "deadline", 0, 0, turn_id);
+            }
+            for write in writes {
                 if exited(store) {
                     return "ERR exited\n".to_string();
                 }
-                // A paste with a digit in it waits as a typed digit does, for the program to
+                // A run with a digit in it waits as a typed digit does, for the program to
                 // read and draw what went before it: a box mounted meanwhile would take the
-                // digit. Typing waits on the key just before a digit, so a paste waits on a Tab or
+                // digit. Typing waits on the key just before a digit, so a run waits on a Tab or
                 // Enter the rest pressed just before it only when it starts with the digit, and
                 // otherwise on the last text written, as the keys of its own run would have: a
                 // composer's Tab may move no caret, and typing waits on that for no later digit.
                 let sent = match &write {
-                    RestWrite::Paste { text, .. }
+                    RestWrite::Run { text, .. }
                         if text.starts_with(|c: char| c.is_ascii_digit()) =>
                     {
                         sent_from
                     }
-                    RestWrite::Paste { text, .. }
-                        if text.contains(|c: char| c.is_ascii_digit()) =>
-                    {
+                    RestWrite::Run { text, .. } if text.contains(|c: char| c.is_ascii_digit()) => {
                         text_from
                     }
-                    RestWrite::Paste { .. } => None,
+                    RestWrite::Run { .. } => None,
                     RestWrite::Key(ev) => sent_from.filter(|_| is_digit_key(ev)),
                 };
                 match hold
@@ -3251,7 +3326,7 @@ fn turn_attempt(
                     }
                     Some(Ok(cursor)) => {
                         sent_from = Some(cursor);
-                        if matches!(write, RestWrite::Paste { .. }) {
+                        if matches!(write, RestWrite::Run { .. }) {
                             text_from = Some(cursor);
                         }
                     }
@@ -3264,25 +3339,25 @@ fn turn_attempt(
                 ) {
                     return cut;
                 }
-                let failed = match write {
-                    RestWrite::Paste { .. } => PASTE_DELIVERY_FAILED,
-                    RestWrite::Key(_) => KEY_DELIVERY_FAILED,
-                };
+                if let Some(cut) = preempted((typed_keys, pasted_graphemes)) {
+                    return cut;
+                }
                 if gone_before_writing() {
-                    return failed.to_string();
+                    return KEY_DELIVERY_FAILED.to_string();
                 }
                 if typed_keys == 0 && pasted_graphemes == 0 {
                     note_ctl_input();
                 }
                 let first = !wrote.replace(true);
                 let delivered = match write {
-                    RestWrite::Paste { text, graphemes } => {
-                        (io.paste)(&text).then_some((0, graphemes))
+                    RestWrite::Run { keys, .. } => {
+                        (io.key)(rest_run_event(&keys, ctx.modes.keyboard_mode()))
+                            .then_some((0, keys.len()))
                     }
                     RestWrite::Key(ev) => (io.key)(ev).then_some((1, 0)),
                 };
                 let Some((keys, graphemes)) = delivered else {
-                    return undelivered(first, failed);
+                    return undelivered(first, KEY_DELIVERY_FAILED);
                 };
                 committed.get_or_insert_with(crate::control::CommittedInput::enter);
                 typed_keys += keys;
@@ -3297,6 +3372,9 @@ fn turn_attempt(
             }
             if person_moved() {
                 return typed_cut(term, "person", 0, 0, turn_id);
+            }
+            if let Some(cut) = preempted((0, 0)) {
+                return cut;
             }
             if gone_before_writing() {
                 return PASTE_DELIVERY_FAILED.to_string();
@@ -3418,11 +3496,19 @@ fn turn_attempt(
             if press_no > 0 && ctx.update_parked.is_parked() {
                 break;
             }
-            if let Some(cut) = halted(
-                committed
-                    .is_some()
-                    .then_some((typed_keys, pasted_graphemes)),
-            ) {
+            // What a cut before the Enter leaves standing: the keys typed and the runs written,
+            // or what the paste of the text kept (`Terminal::paste_kept_text`).
+            let pasted = || {
+                if typed {
+                    pasted_graphemes
+                } else {
+                    aterm_grapheme::GraphemeClusters::graphemes(
+                        Terminal::paste_kept_text(text).as_str(),
+                    )
+                    .count()
+                }
+            };
+            if let Some(cut) = halted(committed.is_some().then(|| (typed_keys, pasted()))) {
                 if press_no > 0 {
                     break;
                 }
@@ -3430,19 +3516,17 @@ fn turn_attempt(
             }
             // A gesture since the caller's read stops the turn before its Enter: the text stands
             // where it was put, the person's to send. A re-press follows an Enter that went.
-            // What a person's cut leaves standing: the keys typed, or the text pasted whole.
-            let pasted = || {
-                if typed {
-                    pasted_graphemes
-                } else {
-                    aterm_grapheme::GraphemeClusters::graphemes(text).count()
-                }
-            };
             if person_moved() {
                 if press_no > 0 {
                     break;
                 }
                 return typed_cut(term, "person", typed_keys, pasted(), turn_id);
+            }
+            if let Some(cut) = preempted((typed_keys, pasted())) {
+                if press_no > 0 {
+                    break;
+                }
+                return cut;
             }
             // A text that typed no key and pasted nothing (control characters alone) makes the
             // Enter its first write, judged as any first write is.
@@ -3464,17 +3548,32 @@ fn turn_attempt(
             note_ctl_input();
             let first = !wrote.replace(true);
             if let Some(guard) = submit_matcher.as_deref() {
-                match guarded_submit(term, ctx, guard, if_human, window, io.mark) {
+                let outcome =
+                    guarded_submit(term, ctx, guard, if_human, window, io.mark, &lease_gone);
+                if !matches!(outcome, GuardedSubmit::Pressed | GuardedSubmit::Failed(_)) {
+                    term_lock(term).watch_disarm(id);
+                    // None of this Enter was written: one that was to be the turn's first write
+                    // (a text of control characters alone) leaves the turn unwritten, and its
+                    // `id=` goes back, as a fence's skip gives a `key if=` its id back.
+                    if first {
+                        wrote.set(false);
+                    }
+                }
+                match outcome {
                     GuardedSubmit::Pressed => {}
+                    GuardedSubmit::Preempted => {
+                        if press_no > 0 {
+                            break;
+                        }
+                        return stopped("preempted", (typed_keys, pasted()));
+                    }
                     GuardedSubmit::Person => {
-                        term_lock(term).watch_disarm(id);
                         if press_no > 0 {
                             break;
                         }
                         return typed_cut(term, "person", typed_keys, pasted(), turn_id);
                     }
                     GuardedSubmit::Missed => {
-                        term_lock(term).watch_disarm(id);
                         if press_no == 0 {
                             let seq = term_lock(term).content_seq();
                             return format!(
@@ -3485,10 +3584,9 @@ fn turn_attempt(
                         break;
                     }
                     GuardedSubmit::Busy => {
-                        term_lock(term).watch_disarm(id);
                         // A re-press the sink took none of wrote nothing, as a missed one: an
                         // earlier Enter went, so the verdict says `pressed=<n>`. A first one is
-                        // its own reply, never `ERR busy`: the text is typed, and that head
+                        // its own reply, never `ERR busy`: where the text is typed, that head
                         // would give an `id=` back for a retry that types it again.
                         if press_no > 0 {
                             break;
@@ -3506,6 +3604,9 @@ fn turn_attempt(
                 return undelivered(first, KEY_DELIVERY_FAILED);
             }
             pressed += 1;
+            // The Enter is a write like any other: whatever the caller does now, the turn's later
+            // hops, a re-press included, are past the main thread's hang-up gate.
+            committed.get_or_insert_with(crate::control::CommittedInput::enter);
             let mut advanced = false;
             let mut composer_gone = false;
             // A press the screen showed but codex began no turn for: no submit, and no press more,
@@ -10458,10 +10559,12 @@ mod turn_halt_tests {
             assert!(!whole.reply.contains("reason=halted"), "{}", whole.reply);
             assert_eq!((whole.writes, whole.presses), (5, 1), "remote={remote}");
 
+            // What stands of a plain turn halted after its paste is the paste (third review of
+            // the turn-deadline work, 2026-11-06): a drive reads the text left in the composer.
             let cut = run(PLAIN, Some(1), remote);
             assert!(
                 cut.reply
-                    .starts_with("OK 0 turn skipped reason=halted submitted=0 "),
+                    .starts_with("OK 0 turn skipped reason=halted typed=0 pasted=5 submitted=0 "),
                 "{}",
                 cut.reply
             );
@@ -10480,6 +10583,137 @@ mod turn_halt_tests {
                 assert_eq!((before.writes, before.presses), (0, 0), "remote={remote}");
             }
         }
+    }
+
+    /// A GUARDED ENTER LOOKS FOR ITS TURN'S SLOT BEFORE EACH TRY (third review of the
+    /// turn-deadline work, 2026-11-06): retrying behind input queued in order, as it does while a
+    /// program reads nothing, the guarded submit of a turn `lease release force` preempted stops
+    /// at the next try, writing nothing, and never presses into the turn that took the slot.
+    /// NEGATIVE CONTROL: with the slot looked for once, before the first try, it retries until its
+    /// window ends (`Busy`, here the 60 s hang detector).
+    #[test]
+    fn a_guarded_enter_stops_retrying_once_its_turn_is_preempted() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::time::{Duration, Instant};
+
+        use super::{GuardedSubmit, guarded_submit};
+
+        let handle = test_handle(0);
+        let (term, ctx) = (handle.term.clone(), handle.ctx.clone());
+        let guard = crate::control::compile_guard(Some("^$"))
+            .expect("the guard compiles")
+            .expect("a guard was given");
+        ctx.sink.claim_ordered_egress();
+        // Each try looks before its lock and under it: the third look, the second try's first,
+        // is the slot's loss.
+        let looks = AtomicU32::new(0);
+        let preempted = || looks.fetch_add(1, Ordering::SeqCst) + 1 >= 3;
+        let hang = Instant::now() + Duration::from_secs(60);
+        assert!(matches!(
+            guarded_submit(&term, &ctx, &*guard, None, hang, None, &preempted),
+            GuardedSubmit::Preempted
+        ));
+        assert_eq!(
+            looks.load(Ordering::SeqCst),
+            3,
+            "the first try met the queue, the second stopped before its lock"
+        );
+        // CONTROL: never preempted, the queued input runs a short window out.
+        let soon = Instant::now() + Duration::from_millis(20);
+        assert!(matches!(
+            guarded_submit(&term, &ctx, &*guard, None, soon, None, &|| false),
+            GuardedSubmit::Busy
+        ));
+        ctx.sink.retire_ordered_egress();
+    }
+
+    /// A GUARDED ENTER JUDGES ITS TURN'S SLOT UNDER THE LOCK IT WRITES UNDER (fourth and fifth
+    /// reviews of the turn-deadline work, 2026-11-06): the slot taken while the try waits for the
+    /// terminal lock (held here by the test, as another read or write holds it) stops the try
+    /// there, nothing written,
+    /// and the submit answers `Preempted`. NEGATIVE CONTROL: with the slot looked for only before
+    /// the lock, however often, the Enter is written into whatever turn took the slot.
+    #[test]
+    #[cfg(unix)]
+    fn a_guarded_enter_judges_its_turn_s_slot_under_the_lock_it_writes_under() {
+        use std::io::Read as _;
+        use std::os::fd::AsRawFd as _;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use std::time::{Duration, Instant};
+
+        use super::{GuardedSubmit, guarded_submit};
+
+        let (master, mut program) = std::os::unix::net::UnixStream::pair().expect("a pair");
+        let handle = crate::session_store::test_handle_on(0, master.as_raw_fd());
+        let (term, ctx) = (handle.term.clone(), handle.ctx.clone());
+        aterm_pty::set_nonblocking(ctx.sink.master(), true).expect("a non-blocking master");
+        ctx.sink.note_master_nonblocking(true);
+        program
+            .set_nonblocking(true)
+            .expect("a non-blocking reader");
+        let written = |program: &mut std::os::unix::net::UnixStream| {
+            let mut buf = [0u8; 16];
+            match program.read(&mut buf) {
+                Ok(n) => buf[..n].to_vec(),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Vec::new(),
+                Err(e) => panic!("reading the program's end: {e}"),
+            }
+        };
+        let guard = crate::control::compile_guard(Some("^$"))
+            .expect("the guard compiles")
+            .expect("a guard was given");
+        let hang = Instant::now() + Duration::from_secs(60);
+        // The terminal is held while the try's first look, before the lock, finds the slot; the
+        // slot goes, and only then is the terminal let go.
+        let looks = AtomicU32::new(0);
+        let gone = AtomicBool::new(false);
+        // A look is counted once its answer is read, so the first one (before the lock) has
+        // found the slot whatever the order of the two threads.
+        let preempted = || {
+            let lost = gone.load(Ordering::SeqCst);
+            looks.fetch_add(1, Ordering::SeqCst);
+            lost
+        };
+        let outcome = std::thread::scope(|s| {
+            let held = crate::term_lock(&term);
+            let trying =
+                s.spawn(|| guarded_submit(&term, &ctx, &*guard, None, hang, None, &preempted));
+            while looks.load(Ordering::SeqCst) == 0 {
+                assert!(Instant::now() < hang, "the try never looked for its slot");
+                aterm_uds::deadline::poll_yield();
+            }
+            gone.store(true, Ordering::SeqCst);
+            drop(held);
+            trying.join().expect("the try ran")
+        });
+        assert!(matches!(outcome, GuardedSubmit::Preempted));
+        assert!(written(&mut program).is_empty(), "no Enter was written");
+        // CONTROL: a slot that stands, the Enter is written.
+        assert!(matches!(
+            guarded_submit(&term, &ctx, &*guard, None, hang, None, &|| false),
+            GuardedSubmit::Pressed
+        ));
+        assert_eq!(written(&mut program), b"\r");
+    }
+
+    /// What stands of a plain turn halted after its paste is what the paste kept (fourth review
+    /// of the turn-deadline work, 2026-11-06): one of control characters alone kept none, so its
+    /// cut says no text stands. NEGATIVE CONTROL: counted from the text as given, it says
+    /// `pasted=2`, which a drive reads as text left in the composer.
+    #[test]
+    fn a_plain_turn_of_control_characters_halted_after_its_paste_leaves_nothing_standing() {
+        let cut = run(
+            "idle=1 presses=1 submit_window=50 timeout=60000 \u{1}\u{2}",
+            Some(1),
+            false,
+        );
+        assert!(
+            cut.reply
+                .starts_with("OK 0 turn skipped reason=halted submitted=0 "),
+            "{}",
+            cut.reply
+        );
+        assert_eq!((cut.writes, cut.presses), (1, 0));
     }
 }
 

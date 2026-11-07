@@ -244,7 +244,8 @@ pub(crate) fn entropy_byte() -> u8 {
 pub(crate) enum Waited {
     /// Full delay elapsed normally.
     Elapsed,
-    /// System sleep/wake gap of the given duration was detected.
+    /// A wake signal, network change, or system sleep gap was detected; the
+    /// duration is any observed wall-clock excess, zero when there was none.
     Woke(Duration),
 }
 
@@ -253,10 +254,11 @@ pub(crate) fn is_wake_gap(slice: Duration, observed: Duration) -> bool {
     observed.saturating_sub(slice) >= SLEEP_GAP
 }
 
-/// Cross-thread signal notified when the OS reports a system wake.
+/// Cross-thread wake signal, also polling the host's settled network changes.
 pub(crate) struct WakeSignal {
     posts: std::sync::Mutex<u64>,
     posted: std::sync::Condvar,
+    network_changed: std::sync::OnceLock<Box<dyn Fn() -> bool + Send + Sync>>,
 }
 
 impl WakeSignal {
@@ -264,6 +266,21 @@ impl WakeSignal {
         Self {
             posts: std::sync::Mutex::new(0),
             posted: std::sync::Condvar::new(),
+            network_changed: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The host supplies a cheap, non-networking, consuming change probe.
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn set_network_probe(&self, probe: Box<dyn Fn() -> bool + Send + Sync>) {
+        let _ = self.network_changed.set(probe);
+    }
+
+    fn poll_network(&self) {
+        if self.network_changed.get().is_some_and(|probe| probe()) {
+            // Publish to every generation's waiter, even when a retiring
+            // checker was the one that consumed the host's change signal.
+            self.post();
         }
     }
 
@@ -287,6 +304,7 @@ impl WakeSignal {
 
     /// Wait up to `timeout` for a post past the `seen`-th; whether one came.
     fn wait_past(&self, seen: u64, timeout: Duration) -> bool {
+        self.poll_network();
         let posts = self
             .posts
             .lock()
@@ -295,11 +313,16 @@ impl WakeSignal {
             .posted
             .wait_timeout_while(posts, timeout, |posts| *posts == seen)
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *posts != seen
+        if *posts != seen {
+            return true;
+        }
+        drop(posts);
+        self.poll_network();
+        self.posts() != seen
     }
 }
 
-/// Process-wide system wake signal.
+/// Process-wide system wake and network-change signal.
 #[cfg(target_os = "macos")]
 pub(crate) static SYSTEM_WOKE: WakeSignal = WakeSignal::new();
 
@@ -884,6 +907,41 @@ mod tests {
             );
             assert_eq!(next_check_unix(), None, "cleared once the wait is over");
         }
+    }
+
+    #[test]
+    fn a_network_change_wakes_every_checker_generation_once() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let signal = WakeSignal::new();
+        let pending = Arc::new(AtomicBool::new(true));
+        let probe = Arc::clone(&pending);
+        signal.set_network_probe(Box::new(move || probe.swap(false, Ordering::AcqRel)));
+        let seen = signal.posts();
+        assert!(matches!(
+            sleep_watching_for_wake(&signal, seen, Duration::from_secs(60)),
+            Waited::Woke(_)
+        ));
+        assert!(
+            signal.wait_past(seen, Duration::ZERO),
+            "another waiter sees the same move"
+        );
+        assert!(
+            !signal.wait_past(signal.posts(), Duration::ZERO),
+            "the move is consumed"
+        );
+    }
+
+    #[test]
+    fn a_network_change_at_the_end_of_a_wait_slice_is_not_delayed_again() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let signal = WakeSignal::new();
+        let polls = AtomicUsize::new(0);
+        signal.set_network_probe(Box::new(move || polls.fetch_add(1, Ordering::AcqRel) == 1));
+        assert!(signal.wait_past(0, Duration::ZERO));
+        assert_eq!(signal.posts(), 1);
     }
 
     #[test]

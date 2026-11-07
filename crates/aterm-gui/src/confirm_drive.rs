@@ -24,12 +24,12 @@ pub(crate) const NOT_RUN: i32 = 2;
 #[cfg(target_os = "macos")]
 pub(crate) const HUNG: i32 = 3;
 
-/// Raise each confirmation five times (click proceed, click Cancel, press Return, keypad Enter,
-/// and Escape) and return the exit code above.
+/// Drive the machine-name panel, or also the owner and menu confirmations when `rename_only`
+/// is false, and return the exit code above.
 #[cfg(target_os = "macos")]
 #[must_use]
-pub fn run_confirm_drive() -> i32 {
-    macos::run(crate::platform::Windowed::launch())
+pub fn run_confirm_drive(rename_only: bool) -> i32 {
+    macos::run(crate::platform::Windowed::launch(), rename_only)
 }
 
 #[cfg(target_os = "macos")]
@@ -90,7 +90,7 @@ mod macos {
         stuck: bool,
     }
 
-    pub(super) fn run(windowed: Windowed) -> i32 {
+    pub(super) fn run(windowed: Windowed, rename_only: bool) -> i32 {
         if appkit::MainThread::new().is_none() {
             eprintln!("objc-confirm-drive: NOT RUN — not on the main thread");
             return NOT_RUN;
@@ -107,67 +107,69 @@ mod macos {
             );
             appkit::send_v(app, sel!(finishLaunching));
         }
-        let (title, body, proceed) = crate::app_overview::stop_worker_sheet(LABEL);
-        let runtime = AppRtMacOS {
-            probe_preferences: false,
-        };
         let mut findings = Vec::new();
-        if let Err(why) = crate::askpass_sheet::check_password_disclosure(
-            appkit::MainThread::new().expect("main thread checked"),
-        ) {
-            findings.push(format!("password details: {why}"));
-        }
-        for (owner, title, body, proceed) in [
-            (true, title, body.as_str(), proceed),
-            (
-                false,
-                "Menu confirmation",
-                "Confirm this menu action?",
-                "Proceed",
-            ),
-        ] {
-            let rounds = [
-                (Answer::Click(proceed), true),
-                (Answer::Click("Cancel"), false),
-                (Answer::Key("Return", "\r", 0x24), !owner),
-                (Answer::Key("keypad Enter", "\u{3}", 0x4c), !owner),
-                (Answer::Key("Escape", "\u{1b}", 0x35), false),
-            ];
-            for (answer, want) in rounds {
-                let done = Arc::new(AtomicBool::new(false));
-                let helper = {
-                    let done = Arc::clone(&done);
-                    std::thread::spawn(move || answer_when_up(answer, &done, windowed))
-                };
-                let got = if owner {
-                    runtime.confirm_owner(title, body, proceed)
-                } else {
-                    runtime.confirm(title, body, proceed)
-                };
-                done.store(true, Ordering::Release);
-                // The helper may be waiting on the main queue: serve it until it ends.
-                let deadline = Instant::now() + HANG;
-                while !helper.is_finished() {
-                    if Instant::now() > deadline {
-                        eprintln!(
-                            "objc-confirm-drive: HUNG — the helper did not end within a minute"
-                        );
-                        return HUNG;
+        if !rename_only {
+            let (title, body, proceed) = crate::app_overview::stop_worker_sheet(LABEL);
+            let runtime = AppRtMacOS {
+                probe_preferences: false,
+            };
+            if let Err(why) = crate::askpass_sheet::check_password_disclosure(
+                appkit::MainThread::new().expect("main thread checked"),
+            ) {
+                findings.push(format!("password details: {why}"));
+            }
+            for (owner, title, body, proceed) in [
+                (true, title, body.as_str(), proceed),
+                (
+                    false,
+                    "Menu confirmation",
+                    "Confirm this menu action?",
+                    "Proceed",
+                ),
+            ] {
+                let rounds = [
+                    (Answer::Click(proceed), true),
+                    (Answer::Click("Cancel"), false),
+                    (Answer::Key("Return", "\r", 0x24), !owner),
+                    (Answer::Key("keypad Enter", "\u{3}", 0x4c), !owner),
+                    (Answer::Key("Escape", "\u{1b}", 0x35), false),
+                ];
+                for (answer, want) in rounds {
+                    let done = Arc::new(AtomicBool::new(false));
+                    let helper = {
+                        let done = Arc::clone(&done);
+                        std::thread::spawn(move || answer_when_up(answer, &done, windowed))
+                    };
+                    let got = if owner {
+                        runtime.confirm_owner(title, body, proceed)
+                    } else {
+                        runtime.confirm(title, body, proceed)
+                    };
+                    done.store(true, Ordering::Release);
+                    // The helper may be waiting on the main queue: serve it until it ends.
+                    let deadline = Instant::now() + HANG;
+                    while !helper.is_finished() {
+                        if Instant::now() > deadline {
+                            eprintln!(
+                                "objc-confirm-drive: HUNG — the helper did not end within a minute"
+                            );
+                            return HUNG;
+                        }
+                        run_loop_once();
                     }
-                    run_loop_once();
+                    let Ok(seen) = helper.join() else {
+                        eprintln!("objc-confirm-drive: FINDING — the helper panicked");
+                        return FINDING;
+                    };
+                    judge(
+                        answer,
+                        want,
+                        got,
+                        &seen,
+                        (title, body, proceed),
+                        &mut findings,
+                    );
                 }
-                let Ok(seen) = helper.join() else {
-                    eprintln!("objc-confirm-drive: FINDING — the helper panicked");
-                    return FINDING;
-                };
-                judge(
-                    answer,
-                    want,
-                    got,
-                    &seen,
-                    (title, body, proceed),
-                    &mut findings,
-                );
             }
         }
         if let Err(code) = rename::rounds(windowed, &mut findings) {
@@ -175,12 +177,12 @@ mod macos {
         }
         if findings.is_empty() {
             println!(
-                "objc-confirm-drive: PASS — owner and menu confirmations showed their words and \
-                 buttons; proceed and Cancel clicks, Return/keypad Enter defaults and Escape matched each policy; \
-                 Rename This Mac's live line followed its fields and the read it was handed, Return did nothing \
-                 while it refused, each untouched field followed a read newer than the view while a typed one \
-                 stayed, the caret staying in the field being edited, a number a migration waits on emptied its \
-                 field and was claimed by typing it, and Rename answered only what was typed"
+                "objc-confirm-drive: PASS — {}",
+                if rename_only {
+                    "machine-name panel controls and typed-field delivery"
+                } else {
+                    "confirmation and machine-name panel controls"
+                }
             );
             PASS
         } else {
@@ -397,19 +399,24 @@ mod macos {
     /// its fields through their field editor, as typing does, hands the alert a read through the
     /// main queue, as the name writer does, and reads the line and Rename back.
     mod rename {
+        use std::path::PathBuf;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::Instant;
 
-        use aterm_agent::machine_name::{InFleet, RenamePreview, ensure, rename_preview};
+        use aterm_agent::machine_name::{
+            InFleet, NameTo, RenamePreview, ensure, publish, rename_preview, set_name,
+        };
+        use aterm_net::fleet_member::name_record::ByKind;
         use aterm_objc::{Id, class, sel};
         use aterm_secrets::client::{LabLabels, LabelHold};
-        use aterm_types::machine_name::Number;
+        use aterm_types::machine_name::{Class, Nickname, Number};
 
         use super::{HANG, HUNG, STEP, post_key, run_loop_once};
         use crate::appkit;
         use crate::machine_rename_sheet::{self as sheet, Answer, Field, Held, Snapshot};
         use crate::machine_title::MachineView;
+        use crate::machine_title::naming::NamingStatus;
         use crate::platform::Windowed;
 
         /// What the helper saw of the alert after one step.
@@ -441,6 +448,87 @@ mod macos {
             Expect(Option<String>, Option<String>, bool),
             /// Post these keys, in order.
             Keys(&'static [(&'static str, u16)]),
+        }
+
+        /// Real publication facts, with macOS values supplied by this display-only fixture.
+        #[derive(Clone)]
+        struct NamingCase {
+            state: PathBuf,
+            config: PathBuf,
+            values: [Option<String>; 3],
+        }
+
+        impl publish::SystemNames for NamingCase {
+            fn read(&self) -> [Option<String>; 3] {
+                self.values.clone()
+            }
+            fn apply(&self, _: Number) -> Result<(), String> {
+                Err("the display fixture never renames macOS".to_owned())
+            }
+        }
+
+        impl NamingCase {
+            fn snapshot(&self, preview: &RenamePreview) -> Snapshot {
+                Snapshot::named(
+                    preview.clone(),
+                    NamingStatus::read(&self.state, &self.config, preview.name(), self),
+                )
+            }
+        }
+
+        fn naming_cases(
+            now: u64,
+        ) -> Result<
+            (
+                aterm_tempfile::TempDir,
+                RenamePreview,
+                NamingCase,
+                NamingCase,
+            ),
+            String,
+        > {
+            use std::os::unix::fs::PermissionsExt as _;
+            let root = aterm_tempfile::tempdir().map_err(|e| e.to_string())?;
+            let state = root.path().join("state");
+            std::fs::create_dir(&state).map_err(|e| e.to_string())?;
+            std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| e.to_string())?;
+            let config = root.path().join("aterm.toml");
+            let number = Number::new(7).ok_or("m7 is no number")?;
+            set_name(
+                &state,
+                &NameTo {
+                    num: number,
+                    nick: None,
+                },
+                || Ok(LabLabels::default()),
+                ByKind::Person,
+                || Ok(None),
+                now,
+                false,
+            )
+            .map_err(|e| e.to_string())?;
+            let pending = NamingCase {
+                state: state.clone(),
+                config: config.clone(),
+                values: std::array::from_fn(|_| Some("m6".to_owned())),
+            };
+            let policy = publish::Policy::read(&config, number)?;
+            if !matches!(
+                publish::publish(&state, &config, &policy, Some(&pending)),
+                Err(publish::Pending::SystemNames(_))
+            ) {
+                return Err(
+                    "the inert macOS refusal did not leave OS publication pending".to_owned(),
+                );
+            }
+            let preview = rename_preview(&state, || Ok(LabLabels::default()), || Ok(None), now)
+                .map_err(|e| e.to_string())?;
+            let synchronized = NamingCase {
+                values: std::array::from_fn(|_| Some(number.to_string())),
+                ..pending.clone()
+            };
+            Ok((root, preview, pending, synchronized))
         }
 
         /// Run each round; a hung helper is `Err` with the drive's exit code.
@@ -503,6 +591,18 @@ mod macos {
                     return Ok(());
                 }
             };
+            let (_naming_root, named_preview, pending, synchronized) = match naming_cases(now) {
+                Ok(cases) => cases,
+                Err(why) => {
+                    findings.push(format!("rename: no inert publication fixture: {why}"));
+                    return Ok(());
+                }
+            };
+            assert_eq!(
+                preview.name().class,
+                Class::Seeded,
+                "the native unchanged-Save control must start with a real seeded name"
+            );
             let word = preview.name().nick.as_str().to_owned();
             let waiting_word = waiting.name().nick.as_str().to_owned();
             // A nickname the read does not hold, for a view a change pressed before outdated.
@@ -514,14 +614,22 @@ mod macos {
                 word: word.to_owned(),
                 fleet: InFleet::Out,
             };
-            let fresh = Held::of_read(&preview);
             let w = || word.clone();
             let s = |text: &str| text.to_owned();
             let typed = |text: &str| Some(text.to_owned());
-            let rename = |number: Option<String>, nick: Option<String>| Answer::Rename {
+            let rename = |number: Option<String>, nick: Option<String>, requested| Answer::Rename {
                 number,
                 nick,
-                held: fresh.clone(),
+                requested: Ok(requested),
+            };
+            let named = |number| {
+                sheet::RenameTo::Name(NameTo {
+                    num: Number::new(number).expect("a fixture machine number"),
+                    nick: None,
+                })
+            };
+            let nicknamed = |word: &str| {
+                sheet::RenameTo::Nick(Nickname::parse(word).expect("a fixture nickname"))
             };
             const RETURN: (&str, u16) = ("\r", 0x24);
             const ESCAPE: (&str, u16) = ("\u{1b}", 0x35);
@@ -532,15 +640,19 @@ mod macos {
             type Round<'a> = (
                 &'a str,
                 &'a RenamePreview,
+                Option<&'a NamingCase>,
+                &'static str,
                 MachineView,
                 Prefill,
                 Vec<Step>,
                 Answer,
             );
-            let rounds: [Round<'_>; 8] = [
+            let rounds: [Round<'_>; 10] = [
                 (
                     "a number the vault holds",
                     &preview,
+                    None,
+                    "Save",
                     view("m7", &word),
                     (None, None),
                     vec![
@@ -555,6 +667,8 @@ mod macos {
                 (
                     "a free number typed before the read",
                     &preview,
+                    None,
+                    "Save",
                     view("m7", &word),
                     (None, None),
                     vec![
@@ -565,11 +679,13 @@ mod macos {
                         Step::Expect(typed("m87"), None, true),
                         Step::Keys(&[RETURN]),
                     ],
-                    rename(typed("m87"), None),
+                    rename(typed("m87"), None, named(87)),
                 ),
                 (
                     "a nickname",
                     &preview,
+                    None,
+                    "Save",
                     view("m7", &word),
                     (None, None),
                     vec![
@@ -578,11 +694,13 @@ mod macos {
                         Step::Expect(None, typed("Marigold"), true),
                         Step::Keys(&[RETURN]),
                     ],
-                    rename(None, typed("Marigold")),
+                    rename(None, typed("Marigold"), nicknamed("Marigold")),
                 ),
                 (
                     "untouched fields over a stale view",
                     &preview,
+                    None,
+                    "Save",
                     view("m5", other),
                     (None, None),
                     vec![
@@ -594,11 +712,13 @@ mod macos {
                         Step::Expect(None, None, true),
                         Step::Keys(&[RETURN]),
                     ],
-                    rename(None, None),
+                    rename(None, None, named(7)),
                 ),
                 (
                     "a nickname typed before a read that moves the number",
                     &preview,
+                    None,
+                    "Save",
                     view("m5", &word),
                     (None, None),
                     vec![
@@ -609,11 +729,13 @@ mod macos {
                         Step::Expect(None, typed("Marigold"), true),
                         Step::Keys(&[RETURN]),
                     ],
-                    rename(None, typed("Marigold")),
+                    rename(None, typed("Marigold"), nicknamed("Marigold")),
                 ),
                 (
                     "a number typed before a read that changes the nickname",
                     &preview,
+                    None,
+                    "Save",
                     view("m7", other),
                     (None, None),
                     vec![
@@ -624,11 +746,13 @@ mod macos {
                         Step::Expect(typed("m87"), None, true),
                         Step::Keys(&[RETURN]),
                     ],
-                    rename(typed("m87"), None),
+                    rename(typed("m87"), None, named(87)),
                 ),
                 (
                     "a failed set's number that the outdated view also shows",
                     &preview,
+                    None,
+                    "Save",
                     view("m5", other),
                     (typed("m5"), None),
                     vec![
@@ -638,11 +762,13 @@ mod macos {
                         Step::Expect(typed("m5"), None, true),
                         Step::Keys(&[RETURN]),
                     ],
-                    rename(typed("m5"), None),
+                    rename(typed("m5"), None, named(5)),
                 ),
                 (
                     "a number a migration waits on, claimed by typing it",
                     &waiting,
+                    None,
+                    "Save",
                     view("m7", &waiting_word),
                     (None, None),
                     vec![
@@ -657,17 +783,68 @@ mod macos {
                     Answer::Rename {
                         number: typed("m7"),
                         nick: None,
-                        held: Held::of_read(&waiting),
+                        requested: Ok(named(7)),
+                    },
+                ),
+                (
+                    "saved number with pending macOS publication",
+                    &named_preview,
+                    Some(&pending),
+                    "Retry Sync",
+                    view("m7", named_preview.name().nick.as_str()),
+                    (None, None),
+                    vec![
+                        Step::Deliver,
+                        Step::Expect(None, None, true),
+                        Step::Keys(&[RETURN]),
+                    ],
+                    Answer::Rename {
+                        number: None,
+                        nick: None,
+                        requested: Ok(sheet::RenameTo::Synchronize(
+                            Number::new(7).expect("a fixture number"),
+                        )),
+                    },
+                ),
+                (
+                    "synchronized aterm fleet and macOS names",
+                    &named_preview,
+                    Some(&synchronized),
+                    "Save",
+                    view("m7", named_preview.name().nick.as_str()),
+                    (None, None),
+                    vec![
+                        Step::Deliver,
+                        Step::Expect(None, None, true),
+                        Step::Keys(&[RETURN]),
+                    ],
+                    Answer::Rename {
+                        number: None,
+                        nick: None,
+                        requested: Ok(sheet::RenameTo::Keep),
                     },
                 ),
             ];
-            for (name, preview, view, (number, nick), steps, want) in rounds {
+            for (name, preview, naming, primary, view, (number, nick), steps, want) in rounds {
                 let press = sheet::begin();
                 let done = Arc::new(AtomicBool::new(false));
                 let helper = {
-                    let (done, preview, view) = (Arc::clone(&done), preview.clone(), view.clone());
+                    let (done, preview, naming, view) = (
+                        Arc::clone(&done),
+                        preview.clone(),
+                        naming.cloned(),
+                        view.clone(),
+                    );
                     std::thread::spawn(move || {
-                        drive(windowed, press, &steps, &preview, &view, &done)
+                        drive(
+                            windowed,
+                            press,
+                            &steps,
+                            &preview,
+                            (naming.as_ref(), primary),
+                            &view,
+                            &done,
+                        )
                     })
                 };
                 let got = sheet::ask(
@@ -715,6 +892,7 @@ mod macos {
             press: u64,
             steps: &[Step],
             preview: &RenamePreview,
+            (naming, primary): (Option<&NamingCase>, &'static str),
             view: &MachineView,
             done: &AtomicBool,
         ) -> Vec<String> {
@@ -739,7 +917,10 @@ mod macos {
                         }
                     }
                     Step::Deliver => {
-                        let snapshot = Snapshot::Read(Box::new(preview.clone()));
+                        let snapshot = naming.map_or_else(
+                            || Snapshot::read(preview.clone()),
+                            |naming| naming.snapshot(preview),
+                        );
                         aterm_objc::run_on_main(move |_| sheet::deliver(press, snapshot));
                         delivered = true;
                     }
@@ -761,7 +942,10 @@ mod macos {
                     Step::Expect(number, nick, renames) => {
                         let (snapshot, held) = if delivered {
                             (
-                                Snapshot::Read(Box::new(preview.clone())),
+                                naming.map_or_else(
+                                    || Snapshot::read(preview.clone()),
+                                    |naming| naming.snapshot(preview),
+                                ),
                                 Held::of_read(preview),
                             )
                         } else {
@@ -802,7 +986,7 @@ mod macos {
                         }
                         let mut buttons = seen.buttons.clone();
                         buttons.sort_unstable();
-                        if buttons != ["Cancel", "Rename"] {
+                        if buttons != ["Cancel", if delivered { primary } else { "Save" }] {
                             findings.push(format!("its buttons were {:?}", seen.buttons));
                         }
                         if !seen.texts.iter().any(|text| text == sheet::TITLE) {
@@ -906,7 +1090,7 @@ mod macos {
             unsafe {
                 if appkit::send_bool_cls(view, sel!(isKindOfClass:), class(c"NSButton")) {
                     let title = appkit::nsstring_to_rust(appkit::send_id(view, sel!(title)));
-                    if title == sheet::BUTTONS[0] {
+                    if title == sheet::BUTTONS[0] || title == "Retry Sync" {
                         look.renames = Some(appkit::send_bool(view, sel!(isEnabled)));
                     }
                     look.buttons.push(title);

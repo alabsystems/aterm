@@ -693,12 +693,10 @@ fn fill_row_mixed_content_allocation_free_path() {
         "col 2 should be WIDE_CONTINUATION"
     );
 
-    let emoji_extra = grid.storage.extras.get(CellCoord::new(0, 3));
-    assert!(emoji_extra.is_some(), "col 3 should have extras for emoji");
     assert_eq!(
-        emoji_extra.unwrap().complex_char().map(|s| &**s),
-        Some("🎉"),
-        "col 3 complex_char should be 🎉"
+        grid.complex_char_at(0, 3),
+        Some('🎉'),
+        "col 3 resolves to the restored emoji"
     );
 
     let combining_extra = grid.storage.extras.get(CellCoord::new(0, 5));

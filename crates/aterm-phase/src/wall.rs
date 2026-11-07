@@ -499,15 +499,29 @@ fn api_error(head: &str, full: &str) -> Option<WallKind> {
             .iter()
             .any(|&(phrase, tag)| tag == Tag::Refused && full.contains(phrase))
     };
+    let unnamed = if refused_words() {
+        ApiCause::Request
+    } else if names(CONFIG_WORDS) {
+        ApiCause::Config
+    } else if names(OVERLONG_WORDS) {
+        ApiCause::Overlong
+    } else if names(CUT_OFF_WORDS) {
+        ApiCause::CutOff
+    } else if names(UNREACHABLE_WORDS) {
+        ApiCause::Unreachable
+    } else {
+        ApiCause::Server
+    };
+    Some(api_wall(code, unnamed))
+}
+
+/// The API wall of an error that printed status `code`, ITS CAUSE THE STATUS'S ([`ApiCause`]): a refused status ([`refused_status`]) is the request's, any other the server's, and only an error with no status takes `unnamed`, the cause its words name. Whether it is retryable follows from the same cause and status. Claude Code's notice (on the screen and in aterm-agent's transcript) and Muse Code's failed model call are named through it.
+#[must_use]
+pub fn api_wall(code: Option<u16>, unnamed: ApiCause) -> WallKind {
     let cause = match code {
         Some(c) if refused_status(c) => ApiCause::Request,
         Some(_) => ApiCause::Server,
-        None if refused_words() => ApiCause::Request,
-        None if names(CONFIG_WORDS) => ApiCause::Config,
-        None if names(OVERLONG_WORDS) => ApiCause::Overlong,
-        None if names(CUT_OFF_WORDS) => ApiCause::CutOff,
-        None if names(UNREACHABLE_WORDS) => ApiCause::Unreachable,
-        None => ApiCause::Server,
+        None => unnamed,
     };
     let retryable = match (cause, code) {
         (ApiCause::Config | ApiCause::Request, _) => false,
@@ -515,11 +529,11 @@ fn api_error(head: &str, full: &str) -> Option<WallKind> {
         (ApiCause::Server, Some(c)) => matches!(c, 408 | 409 | 429) || c >= 500,
         (ApiCause::Server, None) => true,
     };
-    Some(WallKind::ApiError {
+    WallKind::ApiError {
         code,
         retryable,
         cause,
-    })
+    }
 }
 
 fn api_status(rest: &str) -> Option<u16> {

@@ -2921,8 +2921,16 @@ fn reap_shell_scheduled(
     reap_shell_draining(identity, kill_at, deadline, grace, ignored_hangup, None);
 }
 
-/// Retain and drain the terminal while its shell handles the original hang-up.
-/// The existing reap deadlines still bound ownership of the descriptor.
+/// Hangs the shell up and reaps it on a thread of its own, so that no close of the master is a
+/// second hang-up while the shell handles the first.
+///
+/// On macOS teardown first sets `CLOCAL` on the terminal and keeps it set ([`Held::Carrier`]):
+/// the master's close is then end of file and no hang-up, so no master is retained, and the
+/// caller's close both spares a `zshexit` or EXIT trap and ends a shell that waits on input, as
+/// zsh at its prompt does before running a `trap ... HUP`'s `exit` (ATERM-KI-1104-7). Elsewhere,
+/// or if the flag cannot be set, the terminal is retained as a close-on-exec duplicate drained
+/// until the shell settles or the kill tick ([`Held::Master`]). The existing reap deadlines bound
+/// both.
 ///
 /// # Errors
 /// Returns an error before hanging up if the nonblocking master cannot be retained.
@@ -2937,7 +2945,10 @@ pub fn hangup_and_reap_shell(identity: ShellIdentity, master: i32) -> io::Result
             "PTY teardown requires a nonblocking master",
         ));
     }
-    let held = dup_fd(master)?;
+    let held = match carrier_watch(master) {
+        Some(slave) => Held::Carrier(slave),
+        None => Held::Master(dup_fd(master)?),
+    };
     let ignored = ignores_hangup(&identity);
     let hung = hangup_shell(&identity, master);
     let grace = InGrace::enter();
@@ -2954,13 +2965,100 @@ pub fn hangup_and_reap_shell(identity: ShellIdentity, master: i32) -> io::Result
     Ok(hung)
 }
 
+/// What teardown keeps of a terminal while its shell handles the hang-up, until the shell settles
+/// or the kill tick.
+enum Held {
+    /// A duplicate of the master, drained, so the caller's close is not the last close.
+    Master(std::os::fd::OwnedFd),
+    /// A descriptor on the slave through which `CLOCAL` is put back each reap tick
+    /// ([`keep_clocal`]). It holds no master, so the master's last close still reaches the shell
+    /// as end of file.
+    Carrier(std::os::fd::OwnedFd),
+}
+
+impl Held {
+    /// One reap tick's upkeep: drain the retained master, or put `CLOCAL` back.
+    fn tend(&self) {
+        use std::os::fd::AsRawFd;
+        match self {
+            // The existing bounded drain cannot let a noisy job postpone the kill tick.
+            Self::Master(master) => {
+                let _ = drain_master(master.as_raw_fd(), &mut |_| {});
+            }
+            Self::Carrier(slave) => {
+                let _ = keep_clocal(slave.as_raw_fd());
+            }
+        }
+    }
+}
+
+/// Opens `master`'s slave (never as a controlling terminal, never waiting) and sets `CLOCAL` on
+/// it: `Some` once the flag reads back. With it, XNU's `ttymodem` sends the session leader no
+/// `SIGHUP` when the master's last close drops the carrier, and `ptcclose` still marks the
+/// terminal gone, so the slave reads end of file and its writes fail. Set at teardown, not at
+/// spawn: a master closed any other way (aterm's crash) still hangs the session up.
+///
+/// The flag is not set once: a foreground program that exits on the hang-up (vim, less, a
+/// readline or curses program) writes back the termios it saved at start, which lacks `CLOCAL`,
+/// and a shell may write its own back once that job is reaped. The reaper therefore puts the flag
+/// back every tick through this descriptor, so a write-back within one tick (10 ms) of the
+/// master's last close is what still makes that close a hang-up. Linux hangs the slave up on the
+/// master's close whatever the flag says, so there this answers `None` and the master is
+/// retained.
+#[cfg(target_os = "macos")]
+fn carrier_watch(master: i32) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    let name = pts_name(master).ok()?;
+    // SAFETY: `name` is a NUL-terminated pts path; `open` reads it and returns a fresh fd or -1.
+    let fd = unsafe {
+        libc::open(
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOCTTY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: `fd` is the descriptor `open` just returned, owned by nothing else.
+    let slave = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    keep_clocal(slave.as_raw_fd()).then_some(slave)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn carrier_watch(_master: i32) -> Option<std::os::fd::OwnedFd> {
+    None
+}
+
+/// Sets `CLOCAL` on `tty`'s termios if it is clear and says whether it holds, read back. A program
+/// that writes its termios between this read and this write loses that write to the copy read
+/// here, `CLOCAL` added; teardown accepts that for a terminal about to close.
+fn keep_clocal(tty: i32) -> bool {
+    // SAFETY: every field of `termios` is an integer, so all-zero is valid.
+    let mut t: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: `tcgetattr` reads the live descriptor `tty` into the valid out-param `t`, and
+    // `tcsetattr` writes that termios, `CLOCAL` added, back to the same descriptor.
+    unsafe {
+        if libc::tcgetattr(tty, &raw mut t) != 0 {
+            return false;
+        }
+        if t.c_cflag & libc::CLOCAL != 0 {
+            return true;
+        }
+        t.c_cflag |= libc::CLOCAL;
+        if libc::tcsetattr(tty, libc::TCSANOW, &raw const t) != 0 {
+            return false;
+        }
+        libc::tcgetattr(tty, &raw mut t) == 0 && t.c_cflag & libc::CLOCAL != 0
+    }
+}
+
 fn reap_shell_draining(
     identity: ShellIdentity,
     mut kill_at: Option<u32>,
     deadline: u32,
     mut grace: InGrace,
     ignored_hangup: bool,
-    mut master: Option<std::os::fd::OwnedFd>,
+    mut held: Option<Held>,
 ) {
     let pid = identity.pid;
     if pid <= 1 {
@@ -2969,10 +3067,8 @@ fn reap_shell_draining(
     const POLL: std::time::Duration = REAP_POLL;
     let mut status: libc::c_int = 0;
     for tick in 0..deadline {
-        if let Some(held) = master.as_ref() {
-            use std::os::fd::AsRawFd;
-            // The existing bounded drain cannot let a noisy job postpone the kill tick.
-            let _ = drain_master(held.as_raw_fd(), &mut |_| {});
+        if let Some(held) = held.as_ref() {
+            held.tend();
         }
         // Distinct branch.
         if !identity.verify() {
@@ -2991,10 +3087,9 @@ fn reap_shell_draining(
         }
         #[cfg(any(test, debug_assertions))]
         if Some(tick) == kill_at {
-            while HOLD_REAP_KILLS.load(std::sync::atomic::Ordering::Acquire) {
-                if let Some(held) = master.as_ref() {
-                    use std::os::fd::AsRawFd;
-                    let _ = drain_master(held.as_raw_fd(), &mut |_| {});
+            while reap_kills_held() {
+                if let Some(held) = held.as_ref() {
+                    held.tend();
                 }
                 std::thread::sleep(POLL);
             }
@@ -3016,7 +3111,7 @@ fn reap_shell_draining(
             REAP_KILL_TICK.with(|t| t.set(Some(tick)));
         }
         if Some(tick) == kill_at {
-            drop(master.take());
+            drop(held.take());
             grace.leave();
         }
         #[cfg(test)]
@@ -3093,25 +3188,33 @@ pub fn wait_for_reaps(bound: std::time::Duration) -> bool {
     *in_grace == 0
 }
 
+/// How many [`ReapKillHold`]s are alive. A count, not a flag: tests holding at once in one binary
+/// each drop their own guard, and one drop must not release a reap another test still holds.
 #[cfg(any(test, debug_assertions))]
-static HOLD_REAP_KILLS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static HOLD_REAP_KILLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Test seam holding every [`reap_shell`] in its grace window until the guard drops.
+/// Test seam holding every [`reap_shell`] in its grace window until every guard drops.
 #[cfg(any(test, debug_assertions))]
 #[must_use]
 pub fn hold_reap_kills_for_test() -> ReapKillHold {
-    HOLD_REAP_KILLS.store(true, std::sync::atomic::Ordering::Release);
+    HOLD_REAP_KILLS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     ReapKillHold(())
 }
 
-/// [`hold_reap_kills_for_test`]'s guard: dropping it lets the held reaps go on.
+/// Whether any [`ReapKillHold`] is alive, which keeps a reap at its kill tick.
+#[cfg(any(test, debug_assertions))]
+fn reap_kills_held() -> bool {
+    HOLD_REAP_KILLS.load(std::sync::atomic::Ordering::Acquire) > 0
+}
+
+/// [`hold_reap_kills_for_test`]'s guard: once it and every other drops, the held reaps go on.
 #[cfg(any(test, debug_assertions))]
 pub struct ReapKillHold(());
 
 #[cfg(any(test, debug_assertions))]
 impl Drop for ReapKillHold {
     fn drop(&mut self) {
-        HOLD_REAP_KILLS.store(false, std::sync::atomic::Ordering::Release);
+        HOLD_REAP_KILLS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 

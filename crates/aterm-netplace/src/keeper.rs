@@ -2,9 +2,10 @@
 // Copyright 2026 Andrew Yates
 
 //! THE KEEPER and THE READER. Exactly one long-lived process per Mac keeps the record: whichever
-//! holds `<state>/netplace/keeper.lock` (the window, the node job, a vault job; [`start`]). It
-//! takes the lock with a try only, never a wait, and a process that did not get it tries again
-//! every [`RETRY`]. The keeper reads the facts, steps the place ([`crate::place::step`]) and
+//! holds `<state>/netplace/keeper.lock` (the window, the node job, a vault job; [`start`]). A
+//! process that did not get it waits for it in the kernel
+//! ([`aterm_uds::private_file::PrivateLock::wait_for`]): it spends nothing while another keeps
+//! the place and takes over the moment that keeper ends (ATERM-KI-1105-20). The keeper reads the facts, steps the place ([`crate::place::step`]) and
 //! writes the record only when it changed, waking on a route change, a path change, or its own
 //! timer: [`MOVED_EVERY`] while a move settles, [`CHECKING_EVERY`] while the place is checking
 //! or back home with no member heard, [`STEADY_EVERY`] otherwise. Its thread runs at background
@@ -25,9 +26,6 @@ use crate::record::{self, Written};
 
 /// The keeper's lock file name.
 pub const LOCK: &str = "keeper.lock";
-
-/// How often a process that did not get the keeper's lock tries again.
-pub const RETRY: Duration = Duration::from_secs(60);
 
 /// The keeper's look while a move settles (the gateway's hardware address unread).
 pub const MOVED_EVERY: Duration = Duration::from_secs(2);
@@ -178,7 +176,7 @@ impl Candidate {
 
 /// STARTS THIS PROCESS'S KEEPER CANDIDATE for the state root `state` (once per process; a
 /// second call returns `None`): a background thread over the live facts that keeps the place
-/// while it holds `keeper.lock` and tries for it every [`RETRY`] otherwise.
+/// while it holds `keeper.lock` and otherwise waits for it.
 #[must_use]
 pub fn start(state: &Path) -> Option<Candidate> {
     if STARTED.swap(true, Ordering::SeqCst) {
@@ -214,24 +212,25 @@ fn spawn(dir: PathBuf, sense: Box<dyn FnOnce() -> Box<dyn Sense> + Send>) -> Opt
     }
 }
 
-/// Tries for the lock, keeps while held, and tries again every [`RETRY`], until `stop`.
+/// How long a candidate whose lock could not be opened or waited for (its folder not private, a
+/// failed `flock`) waits before it tries again: no wait on another keeper, which blocks instead.
+const REFUSED_AGAIN: Duration = Duration::from_secs(60);
+
+/// Waits for the lock, keeps while held, until `stop`. A candidate stopped while it waits lets the
+/// lock go as soon as it gets it.
 fn candidate_loop(dir: &Path, sense: &dyn Sense, stop: &AtomicBool) {
     while !stop.load(Ordering::SeqCst) {
         let held = aterm_uds::private_file::ensure_private_dir(dir).and_then(|_| {
-            aterm_uds::private_file::PrivateLock::take(
-                dir,
-                LOCK,
-                Duration::ZERO,
-                "another process keeps the network place",
-            )
+            aterm_uds::private_file::PrivateLock::wait_for(dir, LOCK, || sense.lock_held())
         });
         match held {
             Ok(lock) => {
                 keep(dir, sense, stop);
                 drop(lock);
             }
-            Err(_) => {
-                sense.wait(RETRY);
+            Err(e) => {
+                aterm_log::warn!("network place: the keeper's lock is refused: {e}");
+                sense.wait(REFUSED_AGAIN);
             }
         }
     }
@@ -377,12 +376,16 @@ mod tests {
     }
 
     /// One keeper writes and a second candidate in the same state root writes nothing: once the
-    /// second has tried for the lock and gone to wait, the record still names the first, and a
-    /// scripted move reaches the record through the first. When the first stops and lets its
-    /// lock go, the second takes over from the first's record.
-    /// NEGATIVE CONTROL: keeping without the lock (`Err(_) => keep(dir, sense, stop)` in
-    /// `candidate_loop`) makes the second write its own record before it waits, and "the second
-    /// wrote nothing" fails.
+    /// second has found the lock held and gone to wait for it, the record still names the first,
+    /// and a scripted move reaches the record through the first. When the first stops and lets
+    /// its lock go, the second, which never looked again on a clock, takes over from the first's
+    /// record at once (within the one-minute hang detector, which a retry every minute would
+    /// not meet from a wait begun before the release).
+    /// NEGATIVE CONTROL: keeping without the lock (`|| { keep(dir, sense, stop); sense.lock_held() }`
+    /// as `wait_for`'s hook in `candidate_loop`) makes the second write its own record before it
+    /// waits, and "the second wrote nothing" fails; going back to a try and a sleep of a minute
+    /// (`PrivateLock::take` with `Duration::ZERO`, `sense.wait(REFUSED_AGAIN)` on its refusal)
+    /// counts no lock wait, and "the second's wait" fails.
     #[test]
     fn one_keeper_writes_and_a_second_waits_and_takes_over() {
         let root = aterm_tempfile::tempdir().expect("a scratch directory");
@@ -403,7 +406,7 @@ mod tests {
             Box::new(move || Box::new(sense) as Box<dyn Sense>),
         )
         .expect("the second");
-        until_true("the second's wait", || second_facts.waits() >= 1);
+        until_true("the second's wait", || second_facts.lock_waits() >= 1);
         assert_eq!(
             record::read(&dir).and_then(|w| w.keeper_started_ms),
             first_start,
@@ -417,17 +420,17 @@ mod tests {
         );
         first.stop();
         first_facts.set(facts(9));
-        // The first lets its lock go: taking it here (with the hang detector's wait) proves it.
-        let released =
-            aterm_uds::private_file::PrivateLock::take(&dir, LOCK, Duration::from_secs(60), "held")
-                .expect("the first let its lock go");
-        drop(released);
         second_facts.set(facts(7));
         let taken = until(&dir, |w| w.keeper_started_ms != first_start);
         assert_eq!(
             taken.record.stays.len(),
             3,
             "the second keeps from the first's record"
+        );
+        assert_eq!(
+            second_facts.lock_waits(),
+            1,
+            "the second waited once, on no clock"
         );
         second.stop();
         second_facts.set(facts(7));

@@ -248,7 +248,7 @@ fn newest<'r>(list: impl IntoIterator<Item = &'r Reading>) -> Option<&'r Reading
 /// that names no reset still speaks only for a window `length` long, so once a whole window
 /// (and the tolerance) has passed since it was read, its window has reset, and it is no
 /// current figure.
-fn usage(length: u64, readings: &[Reading], now: u64) -> Option<Usage> {
+fn usage(length: u64, readings: &[Reading], current: &mut Vec<Reading>, now: u64) -> Option<Usage> {
     let current_of = |r: &Reading| Usage::Current {
         pct: r.pct,
         reset: None,
@@ -272,13 +272,11 @@ fn usage(length: u64, readings: &[Reading], now: u64) -> Option<Usage> {
             }
         });
     };
-    let mut current: Vec<&Reading> = readings
-        .iter()
-        .filter(|r| {
-            r.reset
-                .is_some_and(|res| res.saturating_add(RESET_TOLERANCE_S) > now)
-        })
-        .collect();
+    current.clear();
+    current.extend(readings.iter().copied().filter(|r| {
+        r.reset
+            .is_some_and(|res| res.saturating_add(RESET_TOLERANCE_S) > now)
+    }));
     if current.is_empty() {
         // Every reset has passed: only a reading made since speaks for the new window, while
         // that window can still be the current one.
@@ -304,24 +302,24 @@ fn usage(length: u64, readings: &[Reading], now: u64) -> Option<Usage> {
     current.sort_unstable_by_key(|r| (r.reset, r.t, r.by));
     let mut last_group_start = current.len() - 1;
     while last_group_start > 0
-        && reset_of(current[last_group_start]).abs_diff(reset_of(current[last_group_start - 1]))
+        && reset_of(&current[last_group_start]).abs_diff(reset_of(&current[last_group_start - 1]))
             <= RESET_TOLERANCE_S
     {
         last_group_start -= 1;
     }
     // The newest group names the current window; a group a whole window before it is the
     // window that ended, not a disagreement about this one.
-    let newest_reset = reset_of(current[last_group_start]);
+    let newest_reset = reset_of(&current[last_group_start]);
     let mut overlap_start = last_group_start;
     while overlap_start > 0
         && newest_reset
-            .saturating_sub(reset_of(current[overlap_start - 1]))
+            .saturating_sub(reset_of(&current[overlap_start - 1]))
             .saturating_add(RESET_TOLERANCE_S)
             < length
     {
         overlap_start -= 1;
         while overlap_start > 0
-            && reset_of(current[overlap_start]).abs_diff(reset_of(current[overlap_start - 1]))
+            && reset_of(&current[overlap_start]).abs_diff(reset_of(&current[overlap_start - 1]))
                 <= RESET_TOLERANCE_S
         {
             overlap_start -= 1;
@@ -336,7 +334,7 @@ fn usage(length: u64, readings: &[Reading], now: u64) -> Option<Usage> {
         .first()
         .map_or(0, |r| reset_of(r).saturating_sub(length));
     let fig = figure(
-        overlapping.iter().copied().chain(
+        overlapping.iter().chain(
             readings
                 .iter()
                 .filter(|r| r.reset.is_none() && r.t >= start),
@@ -419,24 +417,30 @@ impl Snapshots {
                     });
             }
         }
+        let mut five = Vec::new();
+        let mut week = Vec::new();
+        let mut current = Vec::new();
         by_account
             .into_iter()
             .map(|((cli, account), macs)| {
-                let readings =
-                    |pct: fn(&QuotaRow) -> Option<u16>, reset: fn(&QuotaRow) -> Option<u64>| {
-                        macs.iter()
-                            .filter_map(|m| {
-                                pct(m.row).map(|p| Reading {
-                                    pct: p,
-                                    t: m.row.at,
-                                    reset: reset(m.row),
-                                    by: m.node,
-                                })
-                            })
-                            .collect::<Vec<_>>()
-                    };
-                let five = readings(|r| r.pct5, |r| r.five_hour_reset);
-                let week = readings(|r| r.pct7, |r| r.week_reset);
+                five.clear();
+                five.extend(macs.iter().filter_map(|m| {
+                    m.row.pct5.map(|p| Reading {
+                        pct: p,
+                        t: m.row.at,
+                        reset: m.row.five_hour_reset,
+                        by: m.node,
+                    })
+                }));
+                week.clear();
+                week.extend(macs.iter().filter_map(|m| {
+                    m.row.pct7.map(|p| Reading {
+                        pct: p,
+                        t: m.row.at,
+                        reset: m.row.week_reset,
+                        by: m.node,
+                    })
+                }));
                 let wall = macs
                     .iter()
                     .filter_map(|m| m.row.walled_until.filter(|&u| u > now).map(|u| (m.node, u)))
@@ -448,8 +452,8 @@ impl Snapshots {
                 AccountView {
                     cli,
                     account,
-                    five_hour: usage(FIVE_HOUR_S, &five, now),
-                    week: usage(WEEK_S, &week, now),
+                    five_hour: usage(FIVE_HOUR_S, &five, &mut current, now),
+                    week: usage(WEEK_S, &week, &mut current, now),
                     wall,
                     last_used,
                     macs,

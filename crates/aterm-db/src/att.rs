@@ -678,7 +678,7 @@ pub(crate) fn archived_ops(table: &Table, session: &Session<'_>, ops: &[Op]) -> 
             }
             let Some(changes) = decode(record.payload())
                 .ok()
-                .and_then(|command| command.changes().map(<[Change]>::to_vec))
+                .and_then(Command::into_changes)
             else {
                 continue;
             };

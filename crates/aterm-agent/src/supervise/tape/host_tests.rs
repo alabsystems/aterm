@@ -563,6 +563,16 @@ fn an_answers_instant_keeps_its_span_from_the_origin() {
             moved(&wait, from, to),
             Some(AccountAdvice::Wait { until: to + span })
         );
+        for why in [AskAgain::Unwritten, AskAgain::Reset] {
+            let again = Some(AccountAdvice::Again { until: later, why });
+            assert_eq!(
+                moved(&again, from, to),
+                Some(AccountAdvice::Again {
+                    until: to + span,
+                    why
+                })
+            );
+        }
         let yields = |until| {
             Some(AccountAdvice::Move {
                 to: "work".to_string(),

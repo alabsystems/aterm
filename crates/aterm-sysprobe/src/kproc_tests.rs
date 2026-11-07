@@ -419,3 +419,95 @@ mod live {
         assert_eq!(image_inode(0), None);
     }
 }
+
+/// The bounded read of the whole table ([`super::imp::Bounded`]).
+#[cfg(target_os = "macos")]
+mod bounded {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex};
+    use std::time::Duration;
+
+    use aterm_spec::wait::{MUST_HAPPEN, until_within};
+
+    use super::super::imp::Bounded;
+
+    /// A read the kernel holds ends the wait with no answer, and while it is still in the kernel
+    /// a second caller starts nothing and has its own bound; once it returns, a read is answered.
+    /// The held read stands for a `KERN_PROC_ALL` read behind a process in the middle of an exec
+    /// (2026-11-06: 13 minutes): before the bound, the first call here never returned.
+    #[test]
+    fn a_read_the_kernel_holds_ends_the_wait_and_starts_no_second() {
+        static BOUNDED: Bounded<u32> = Bounded::new();
+        static OPEN: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
+        static READS: AtomicUsize = AtomicUsize::new(0);
+        fn held() -> Option<u32> {
+            READS.fetch_add(1, Ordering::SeqCst);
+            let (open, opened) = &OPEN;
+            let mut now = open.lock().unwrap();
+            while !*now {
+                now = opened.wait(now).unwrap();
+            }
+            Some(7)
+        }
+        fn answered() -> Option<u32> {
+            READS.fetch_add(1, Ordering::SeqCst);
+            Some(9)
+        }
+        assert_eq!(BOUNDED.read(Duration::from_millis(20), held), None);
+        assert!(BOUNDED.in_flight(), "the held read is still in the kernel");
+        assert_eq!(BOUNDED.read(Duration::from_millis(20), answered), None);
+        assert_eq!(READS.load(Ordering::SeqCst), 1, "no second read started");
+        *OPEN.0.lock().unwrap() = true;
+        OPEN.1.notify_all();
+        until_within(MUST_HAPPEN, "the held read returned", || {
+            (!BOUNDED.in_flight()).then_some(())
+        });
+        assert_eq!(BOUNDED.read(MUST_HAPPEN, answered), Some(9));
+        assert_eq!(READS.load(Ordering::SeqCst), 2);
+    }
+
+    /// A read that panics lets go of the flag, so the next read starts.
+    #[test]
+    fn a_read_that_panics_lets_the_next_one_start() {
+        static BOUNDED: Bounded<u32> = Bounded::new();
+        fn panics() -> Option<u32> {
+            panic!("a read that panics")
+        }
+        fn answered() -> Option<u32> {
+            Some(3)
+        }
+        assert_eq!(BOUNDED.read(MUST_HAPPEN, panics), None);
+        until_within(MUST_HAPPEN, "the panicked read let go", || {
+            (!BOUNDED.in_flight()).then_some(())
+        });
+        assert_eq!(BOUNDED.read(MUST_HAPPEN, answered), Some(3));
+    }
+
+    /// NEGATIVE CONTROL: refusing the second caller or starting its alternative
+    /// worker loses the shared answer. Both callers are registered before release.
+    #[test]
+    fn concurrent_callers_share_the_one_in_flight_answer() {
+        static BOUNDED: Bounded<u32> = Bounded::new();
+        static OPEN: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
+        static READS: AtomicUsize = AtomicUsize::new(0);
+        fn held() -> Option<u32> {
+            READS.fetch_add(1, Ordering::SeqCst);
+            let mut open = OPEN.0.lock().unwrap();
+            while !*open {
+                open = OPEN.1.wait(open).unwrap();
+            }
+            Some(7)
+        }
+        fn other() -> Option<u32> {
+            READS.fetch_add(1, Ordering::SeqCst);
+            Some(9)
+        }
+        let first = BOUNDED.begin(held);
+        let second = BOUNDED.begin(other);
+        *OPEN.0.lock().unwrap() = true;
+        OPEN.1.notify_all();
+        assert_eq!(first.wait(MUST_HAPPEN), Some(7));
+        assert_eq!(second.wait(MUST_HAPPEN), Some(7));
+        assert_eq!(READS.load(Ordering::SeqCst), 1);
+    }
+}

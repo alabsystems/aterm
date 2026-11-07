@@ -652,6 +652,8 @@ pub enum Outcome {
     /// A complete native response was saved, but work ended before fresh approval.
     /// The artifact remains in its original staging directory; this grants no adoption authority.
     CompletedHeld,
+    /// A retained native response prevents this attempt from starting. It grants no completion.
+    CustodyHeld,
     /// It ended without saying it is done, or with another exit (`None`: a signal ended it).
     Exited(Option<i32>),
     /// The URL it named is not `https` on a pinned host: nothing was opened, and it was ended.
@@ -689,6 +691,7 @@ impl Outcome {
         match self {
             Outcome::SignedIn { .. } => "signed-in".to_owned(),
             Outcome::CompletedHeld => "completed-held".to_owned(),
+            Outcome::CustodyHeld => "custody-held".to_owned(),
             Outcome::Exited(Some(code)) => format!("exited-{code}"),
             Outcome::Exited(None) => "signalled".to_owned(),
             Outcome::OffPin => "off-pin".to_owned(),
@@ -1284,6 +1287,10 @@ impl Eq for RecoveryAdmission {}
 /// the row, and the staging directory it signs into.
 #[derive(Debug, Clone, Copy)]
 pub struct Request<'a> {
+    /// Optional native producer custody retained through account publication.
+    pub publication: Option<&'a super::codex_app_login::PublicationCustody>,
+    /// An exact native enrollment destination minted before provider admission.
+    pub enrollment: Option<&'a super::codex_enrollment::Artifact>,
     /// Optional admitted recovery identity; manual and unscoped flows carry none.
     pub recovery: Option<RecoveryKey>,
     /// A live root check, required for root-scoped recovery and browser publication.
@@ -1453,181 +1460,230 @@ fn sign_in_until(
     approver: &mut dyn Approver,
     deadline: Deadline<'_>,
 ) -> Drove {
-    let not_run = |why: String| Drove {
-        outcome: Outcome::NotRun(why),
-        host: None,
-    };
-    let work = approver.work_scope();
-    if work
-        .as_ref()
-        .is_some_and(super::account_work::Scope::cancelled)
-    {
-        return not_run("automatic account work is cancelled".into());
-    }
-    let Some(signin) = req.signin() else {
-        return not_run("this CLI has no sign-in in this build".to_owned());
-    };
-    if matches!(req.route.drive, Drive::NativeGoogle) {
-        return not_run("native Google login requires its typed grant driver".into());
-    }
-    if deadline.expired() {
-        return not_run("native sign-in deadline expired".into());
-    }
-    if !matches!(req.route.drive, Drive::Lines { .. }) && deadline.wake_parent().is_none() {
-        return not_run("the injected sign-in clock has no transferable native deadline".into());
-    }
-    if req
-        .admission
-        .is_some_and(|admission| !admission.enter_native())
-    {
-        return Drove {
-            outcome: Outcome::Unverified(
-                "retained native admission is read-only or already entered".into(),
-            ),
-            host: None,
-        };
-    }
-    if let Err(why) = req.check_admission() {
-        return not_run(why);
-    }
-    let retained = match approver.resume(req, deadline) {
-        Ok(Resume::Completed(outcome)) => {
-            return complete_sign_in(
-                req,
-                approver,
-                Drove {
-                    outcome,
-                    host: None,
-                },
-                deadline,
-                true,
-                CompletionCustody::Ordinary,
-            );
-        }
-        Ok(Resume::Fresh) => false,
-        Ok(Resume::NativeSeed) => true,
-        Err(why) => {
+    sign_in_until_custody(
+        req,
+        (program, lead),
+        path,
+        no_desk,
+        var,
+        approver,
+        (deadline, None::<super::codex_app_login::NoGrantCapture>),
+    )
+    .into_parts()
+    .0
+}
+
+fn sign_in_until_custody<C: super::codex_app_login::CodeGrantCapture>(
+    req: &Request<'_>,
+    (program, lead): (&Path, &[OsString]),
+    path: Option<&OsStr>,
+    no_desk: Option<&Path>,
+    var: &dyn Fn(&str) -> Option<OsString>,
+    approver: &mut dyn Approver,
+    (deadline, mut capture): (Deadline<'_>, Option<C>),
+) -> super::codex_app_login::CapturedLogin<C::Output> {
+    let mut custody = None;
+    let drove = (|| {
+        if capture.is_some()
+            && (req.cli != Cli::Codex || !matches!(req.route.drive, Drive::CodexPkce))
+        {
             return Drove {
-                outcome: Outcome::Unverified(why),
+                outcome: Outcome::NotRun(
+                    "native grant custody requires the Codex PKCE route".into(),
+                ),
                 host: None,
             };
         }
-    };
-    let not_run = |why: String| Drove {
-        outcome: if retained {
-            Outcome::Unverified(why)
-        } else {
-            Outcome::NotRun(why)
-        },
-        host: None,
-    };
-    if deadline.expired() {
-        return not_run("native sign-in deadline expired".into());
-    }
-    let Drive::Lines {
-        grammar,
-        completion,
-        ..
-    } = &req.route.drive
-    else {
-        let Some(native_deadline) = deadline.wake_parent() else {
+
+        let not_run = |why: String| Drove {
+            outcome: Outcome::NotRun(why),
+            host: None,
+        };
+        let work = approver.work_scope();
+        if work
+            .as_ref()
+            .is_some_and(super::account_work::Scope::cancelled)
+        {
+            return not_run("automatic account work is cancelled".into());
+        }
+        let Some(signin) = req.signin() else {
+            return not_run("this CLI has no sign-in in this build".to_owned());
+        };
+        if matches!(req.route.drive, Drive::NativeGoogle) {
+            return not_run("native Google login requires its typed grant driver".into());
+        }
+        if deadline.expired() {
+            return not_run("native sign-in deadline expired".into());
+        }
+        if !matches!(req.route.drive, Drive::Lines { .. }) && deadline.wake_parent().is_none() {
             return not_run(
                 "the injected sign-in clock has no transferable native deadline".into(),
             );
+        }
+        if req
+            .admission
+            .is_some_and(|admission| !admission.enter_native())
+        {
+            return Drove {
+                outcome: Outcome::Unverified(
+                    "retained native admission is read-only or already entered".into(),
+                ),
+                host: None,
+            };
+        }
+        if let Err(why) = req.check_admission() {
+            return not_run(why);
+        }
+        let retained = match approver.resume(req, deadline) {
+            Ok(Resume::Completed(outcome)) => {
+                return complete_sign_in(
+                    req,
+                    approver,
+                    Drove {
+                        outcome,
+                        host: None,
+                    },
+                    deadline,
+                    true,
+                    CompletionCustody::Ordinary,
+                );
+            }
+            Ok(Resume::Fresh) => false,
+            Ok(Resume::NativeSeed) => true,
+            Err(why) => {
+                return Drove {
+                    outcome: Outcome::Unverified(why),
+                    host: None,
+                };
+            }
         };
-        if native_deadline.passed() {
+        let not_run = |why: String| Drove {
+            outcome: if retained {
+                Outcome::Unverified(why)
+            } else {
+                Outcome::NotRun(why)
+            },
+            host: None,
+        };
+        if deadline.expired() {
+            return not_run("native sign-in deadline expired".into());
+        }
+        let Drive::Lines {
+            grammar,
+            completion,
+            ..
+        } = &req.route.drive
+        else {
+            let Some(native_deadline) = deadline.wake_parent() else {
+                return not_run(
+                    "the injected sign-in clock has no transferable native deadline".into(),
+                );
+            };
+            if native_deadline.passed() {
+                return not_run("native sign-in deadline expired".into());
+            }
+            if let Err(why) = approver.begin(req).and_then(|()| req.check_admission()) {
+                return not_run(why);
+            }
+            let (drove, retained_response) = super::codex_app_login::login_with_enrollment_custody(
+                req.staging,
+                &super::codex_app_login::Endpoints::default(),
+                approver,
+                req.hosts,
+                req.row.email.as_deref(),
+                native_deadline,
+                (
+                    super::codex_app_login::NativeDestination {
+                        enrollment: req.enrollment,
+                        publication: req.publication,
+                    },
+                    capture.take(),
+                ),
+            )
+            .into_parts();
+            custody = retained_response;
+            let completion_custody = if matches!(drove.outcome, Outcome::SignedIn { .. }) {
+                CompletionCustody::NativeSaved
+            } else {
+                CompletionCustody::Ordinary
+            };
+            return complete_sign_in(req, approver, drove, deadline, retained, completion_custody);
+        };
+        let sandbox = if signin.no_desk.contains(&std::env::consts::OS) {
+            let Some(sandbox) = no_desk.filter(|sandbox| sandbox.is_file()) else {
+                return not_run(format!(
+                    "{} opens this machine's default browser through the OS, and the sandbox that \
+                 stops it ({}) is not here; nothing was run",
+                    req.cli.connector().product,
+                    no_desk.unwrap_or(Path::new(SANDBOX_EXEC)).display()
+                ));
+            };
+            if let Some(why) = sandbox_refusal(sandbox) {
+                return not_run(format!(
+                    "{} opens this machine's default browser through the OS, and the sandbox that \
+                 stops it cannot run here: {why}; run it from a terminal that is not sandboxed; \
+                 nothing was run",
+                    req.cli.connector().product
+                ));
+            }
+            Some(sandbox)
+        } else {
+            None
+        };
+        let (program, path, _opener_free) =
+            match child_program(program, path, signin.no_opener, &req.store.dir, var) {
+                Ok(child) => child,
+                Err(e) => return not_run(format!("no private PATH could be made: {e}")),
+            };
+        if sandbox.is_some() && !program.is_file() {
+            return not_run(format!(
+                "`{}` is not installed here (found neither at that path nor on `PATH`)",
+                program.display()
+            ));
+        }
+        let sandboxed: Vec<OsString>;
+        let (program, lead) = match sandbox {
+            Some(sandbox) => {
+                sandboxed = no_desk_argv(&program, lead);
+                (sandbox, sandboxed.as_slice())
+            }
+            None => (program.as_path(), lead),
+        };
+        let env = child_env(req.cli, signin, req.staging, &path, var);
+        let email = req.row.email.as_deref();
+        let args = child_args(req.route, req.row.vendor.region);
+        if deadline.expired() {
             return not_run("native sign-in deadline expired".into());
         }
         if let Err(why) = approver.begin(req).and_then(|()| req.check_admission()) {
             return not_run(why);
         }
-        let drove = super::codex_app_login::login_in_home(
-            req.staging,
+        let drove = drive_until(
+            &Spec {
+                program,
+                lead,
+                args: &args,
+                env: &env,
+                cwd: req.staging,
+                grammar,
+                completion: *completion,
+                hosts: req.hosts,
+                email,
+                hang: deadline.remaining().unwrap_or_default(),
+            },
             approver,
-            req.hosts,
-            req.row.email.as_deref(),
-            native_deadline,
+            deadline,
         );
-        let custody = if matches!(drove.outcome, Outcome::SignedIn { .. }) {
-            CompletionCustody::NativeSaved
-        } else {
-            CompletionCustody::Ordinary
-        };
-        return complete_sign_in(req, approver, drove, deadline, retained, custody);
-    };
-    let sandbox = if signin.no_desk.contains(&std::env::consts::OS) {
-        let Some(sandbox) = no_desk.filter(|sandbox| sandbox.is_file()) else {
-            return not_run(format!(
-                "{} opens this machine's default browser through the OS, and the sandbox that \
-                 stops it ({}) is not here; nothing was run",
-                req.cli.connector().product,
-                no_desk.unwrap_or(Path::new(SANDBOX_EXEC)).display()
-            ));
-        };
-        if let Some(why) = sandbox_refusal(sandbox) {
-            return not_run(format!(
-                "{} opens this machine's default browser through the OS, and the sandbox that \
-                 stops it cannot run here: {why}; run it from a terminal that is not sandboxed; \
-                 nothing was run",
-                req.cli.connector().product
-            ));
-        }
-        Some(sandbox)
-    } else {
-        None
-    };
-    let (program, path, _opener_free) =
-        match child_program(program, path, signin.no_opener, &req.store.dir, var) {
-            Ok(child) => child,
-            Err(e) => return not_run(format!("no private PATH could be made: {e}")),
-        };
-    if sandbox.is_some() && !program.is_file() {
-        return not_run(format!(
-            "`{}` is not installed here (found neither at that path nor on `PATH`)",
-            program.display()
-        ));
-    }
-    let sandboxed: Vec<OsString>;
-    let (program, lead) = match sandbox {
-        Some(sandbox) => {
-            sandboxed = no_desk_argv(&program, lead);
-            (sandbox, sandboxed.as_slice())
-        }
-        None => (program.as_path(), lead),
-    };
-    let env = child_env(req.cli, signin, req.staging, &path, var);
-    let email = req.row.email.as_deref();
-    let args = child_args(req.route, req.row.vendor.region);
-    if deadline.expired() {
-        return not_run("native sign-in deadline expired".into());
-    }
-    if let Err(why) = approver.begin(req).and_then(|()| req.check_admission()) {
-        return not_run(why);
-    }
-    let drove = drive_until(
-        &Spec {
-            program,
-            lead,
-            args: &args,
-            env: &env,
-            cwd: req.staging,
-            grammar,
-            completion: *completion,
-            hosts: req.hosts,
-            email,
-            hang: deadline.remaining().unwrap_or_default(),
-        },
-        approver,
-        deadline,
-    );
-    complete_sign_in(
-        req,
-        approver,
-        drove,
-        deadline,
-        retained,
-        CompletionCustody::Ordinary,
-    )
+        complete_sign_in(
+            req,
+            approver,
+            drove,
+            deadline,
+            retained,
+            CompletionCustody::Ordinary,
+        )
+    })();
+    super::codex_app_login::CapturedLogin::new(drove, custody)
 }
 
 /// Evidence supplied only by the native Codex return boundary after its durable save.
@@ -1645,7 +1701,7 @@ fn complete_sign_in(
     retained: bool,
     custody: CompletionCustody,
 ) -> Drove {
-    if drove.outcome == Outcome::CompletedHeld {
+    if matches!(drove.outcome, Outcome::CompletedHeld | Outcome::CustodyHeld) {
         return drove;
     }
     if retained && let Outcome::NotRun(why) | Outcome::PageNotOpened(why) = &drove.outcome {
@@ -1719,6 +1775,33 @@ pub fn sign_in_live_scoped(
         var,
         &mut approver,
         HANG,
+    )
+}
+
+pub(in crate::harness) fn sign_in_live_scoped_custody(
+    req: &Request<'_>,
+    home: &Path,
+    var: &dyn Fn(&str) -> Option<OsString>,
+    work: Option<super::account_work::Scope>,
+    capture: super::codex_grant_owner::PreparedGrant,
+) -> super::codex_app_login::CapturedLogin<super::codex_grant_owner::CaptureOutcome> {
+    let program = program_of(req.cli, home);
+    let mut approver = super::headless_oauth::VendorApprover::new(
+        req.cli,
+        &req.row.label,
+        req.row.email.as_deref(),
+        &req.store.shared_dir(),
+        Some(home),
+    )
+    .with_work(work);
+    sign_in_until_custody(
+        req,
+        (&program, &[]),
+        None,
+        Some(Path::new(SANDBOX_EXEC)),
+        var,
+        &mut approver,
+        (Deadline::after(HANG), Some(capture)),
     )
 }
 

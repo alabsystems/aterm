@@ -442,7 +442,12 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
         crate::red_now(ctx, crate::checks::Check::Cells, r);
         let label = format!("cell {} ({})", cell.name, cell.triple);
         let started = Instant::now();
-        let outcome = if cell.triple == host {
+        let outcome = if let Some(why) = cell_ended(ctx) {
+            CellOutcome::CouldNotRun {
+                status: "NOT-STARTED".to_string(),
+                detail: vec![why],
+            }
+        } else if cell.triple == host {
             CellOutcome::Skipped {
                 why: "this machine's own triple, judged by its own build".to_string(),
                 fix: "targo --unverified verify lint test".to_string(),
@@ -457,37 +462,63 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
             }
         };
         let took = format!("{label}: {}s", started.elapsed().as_secs());
-        match outcome {
-            CellOutcome::Unselected => r.pass(format!(
-                "{label} — the selection holds nothing this cell builds for its target, so it \
-                 cannot change what the cell compiles (--all checks the whole graph)"
-            )),
-            CellOutcome::Checked(summary) => {
-                r.pass(format!("{label} — {summary}"));
-                r.raw(took);
-            }
-            CellOutcome::Skipped { why, fix } => r.skip(format!("{label} — {why} (fix: {fix})")),
-            CellOutcome::Failed { status, detail } => {
-                r.fail(format!("{label} — {status}"));
-                r.raw(took);
-                r.raw(detail.join("\n"));
-            }
-            CellOutcome::CouldNotRun { status, detail } => {
-                let reason = detail
-                    .first()
-                    .and_then(|s| s.lines().next())
-                    .map(|s| format!(": {}", s.chars().take(240).collect::<String>()))
-                    .unwrap_or_default();
-                r.cannot_run(format!("{label} — {status}{reason}"));
-                r.raw(took);
-                r.raw(detail.join("\n"));
-            }
-        }
+        record_cell(r, &label, took, outcome);
     }
     if owes_win32_oracles(&cells, &ctx.scope, ctx.cells_pulled) {
         win32_oracles(ctx, r, rustup.as_ref().err());
     }
     audit_policy(ctx, r, &policy, &cells);
+}
+
+/// Why the run's end keeps the next cell from starting, if it does: the halt's words once the
+/// run's first proven red ended it ([`Ctx::halted`]), else the interrupt's once one is ending the
+/// run. A cell started then would find every child it spawns refused, and its row would name the
+/// resolver's failure (`UNRESOLVED`) rather than the run's end.
+fn cell_ended(ctx: &Ctx) -> Option<String> {
+    ctx.halted().map(str::to_owned).or_else(|| {
+        crate::stopping().then(|| {
+            "the run was interrupted before this cell started, so it decided nothing".to_owned()
+        })
+    })
+}
+
+/// One cell's row under `label`, then how long it took and what it printed. A COULD NOT RUN row
+/// names its cause (the first line of what the machine said: a spawn error, a full disk, the
+/// run's interrupt, a toolchain's refusal) in the row itself, as the check's terminal line shows
+/// only the row: the lines under it reach the log alone.
+fn record_cell(r: &mut Report, label: &str, took: String, outcome: CellOutcome) {
+    match outcome {
+        CellOutcome::Unselected => r.pass(format!(
+            "{label} — the selection holds nothing this cell builds for its target, so it \
+             cannot change what the cell compiles (--all checks the whole graph)"
+        )),
+        CellOutcome::Checked(summary) => {
+            r.pass(format!("{label} — {summary}"));
+            r.raw(took);
+        }
+        CellOutcome::Skipped { why, fix } => r.skip(format!("{label} — {why} (fix: {fix})")),
+        CellOutcome::Failed { status, detail } => {
+            r.fail(format!("{label} — {status}"));
+            r.raw(took);
+            r.raw(detail.join("\n"));
+        }
+        CellOutcome::CouldNotRun { status, detail } => {
+            let cause = detail
+                .iter()
+                .flat_map(|d| d.lines())
+                .map(str::trim)
+                .find(|l| !l.is_empty());
+            r.cannot_run(match cause {
+                Some(cause) => format!(
+                    "{label} — {status}: {}",
+                    cause.chars().take(240).collect::<String>()
+                ),
+                None => format!("{label} — {status}: the cell's check named no cause"),
+            });
+            r.raw(took);
+            r.raw(detail.join("\n"));
+        }
+    }
 }
 
 /// The windows-sys oracles (`aterm-win32-oracle`'s two verbs) and what each holds to its
@@ -617,10 +648,7 @@ fn win32_oracles(ctx: &Ctx, r: &mut Report, no_rustup: Option<&aterm_uds::host::
         } else {
             None
         };
-        match why {
-            Some(why) => r.cannot_run(format!("{label} — {why}")),
-            None => r.record_child(&out, outcome, label),
-        }
+        r.record_oracle(&out, outcome, &label, why);
     }
 }
 
@@ -2056,6 +2084,102 @@ mod tests {
 
     fn names(list: &[&str]) -> BTreeSet<String> {
         list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// A cell that could not run says why on the check's terminal line, which shows the row and
+    /// nothing written under it: the run's interrupt (the 2026-10-24 bare `COULD-NOT-RUN`), a
+    /// full disk, a toolchain's refusal.
+    #[test]
+    fn a_cell_that_could_not_run_names_its_cause_on_the_terminal_line() {
+        let label = "cell linux-arm (aarch64-unknown-linux-gnu)";
+        let terminal = |outcome: CellOutcome| {
+            let mut r = Report::new("cells");
+            record_cell(&mut r, label, format!("{label}: 143s"), outcome);
+            let result = crate::report::judge(
+                crate::checks::Check::Cells,
+                &[&r],
+                143.0,
+                "",
+                "targo --unverified verify cells --cell linux-arm".into(),
+                None,
+            );
+            assert_eq!(result.outcome, Outcome::Fail(Severity::CouldNotRun));
+            crate::report::render(&result, 5)
+        };
+        for (status, detail, cause) in [
+            (
+                "COULD-NOT-RUN",
+                vec!["the run was interrupted while this child ran".to_string()],
+                "the run was interrupted while this child ran",
+            ),
+            (
+                "COULD-NOT-RUN",
+                vec!["the child ran out of disk (No space left on device)".to_string()],
+                "No space left on device",
+            ),
+            (
+                "NO-TOOLCHAIN",
+                vec!["\nrustup: toolchain 'stable' is not installed\nmore".to_string()],
+                "rustup: toolchain 'stable' is not installed",
+            ),
+        ] {
+            let shown = terminal(CellOutcome::CouldNotRun {
+                status: status.into(),
+                detail,
+            });
+            let first = shown.lines().next().unwrap_or_default();
+            assert!(first.contains(&format!("{label} — {status}: ")), "{shown}");
+            assert!(first.contains(cause), "{shown}");
+        }
+        let shown = terminal(CellOutcome::CouldNotRun {
+            status: "COULD-NOT-RUN".into(),
+            detail: Vec::new(),
+        });
+        assert!(
+            shown
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .contains("named no cause"),
+            "{shown}"
+        );
+    }
+
+    /// A cell the run's halt keeps from starting says so on its row, rather than the resolver's
+    /// failure every child it spawned would meet (`UNRESOLVED`, the cause three lines under it).
+    /// CONTROL: a run its halt has not ended starts it.
+    #[test]
+    fn a_cell_the_runs_end_kept_from_starting_names_that_end() {
+        let ctx = Ctx::new(
+            PathBuf::from("/r"),
+            crate::scope::Scope::workspace(),
+            crate::EnvSnapshot::default(),
+            PathBuf::from("/tmp"),
+        )
+        .with_halt(crate::sched::Halt::at_first_red("the run", |_| {}));
+        assert_eq!(cell_ended(&ctx), None, "control: nothing has ended the run");
+        assert!(ctx.halt.red("lint"));
+        let why = cell_ended(&ctx).expect("the halt ended the run");
+        assert_eq!(Some(why.as_str()), ctx.halted());
+        let label = "cell linux-arm (aarch64-unknown-linux-gnu)";
+        let mut r = Report::new("cells");
+        record_cell(
+            &mut r,
+            label,
+            format!("{label}: 0s"),
+            CellOutcome::CouldNotRun {
+                status: "NOT-STARTED".into(),
+                detail: vec![why],
+            },
+        );
+        let row = format!(
+            "{label} — NOT-STARTED: {}",
+            ctx.halted().unwrap_or_default()
+        );
+        assert_eq!(
+            r.outcomes().collect::<Vec<_>>(),
+            [(Outcome::Fail(Severity::CouldNotRun), row.as_str())]
+        );
     }
 
     /// A dev edge holds a cone crate there for its tests only, so a cell's closure starts from what

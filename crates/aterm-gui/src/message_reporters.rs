@@ -6458,18 +6458,29 @@ fn resume_tab_entry(
     agent: aterm_phase::Program,
     spot: &UpgradeSpot,
 ) -> Entry {
-    let (head, tail, severity, note) = match exception.kind {
-        ExceptionKind::Context => ("Context", " cannot be compacted", Severity::Info, ""),
-        ExceptionKind::Refused => ("Claude's request", " is refused", Severity::Info, ""),
+    let (head, tail, severity, note): (std::borrow::Cow<'_, str>, _, _, _) = match exception.kind {
+        ExceptionKind::Context => ("Context".into(), " cannot be compacted", Severity::Info, ""),
+        // The request is the tab's program's (`Exception::refused_by`), which `why` names too.
+        ExceptionKind::Refused => (
+            format!("{}'s request", resume_agent_word(agent)).into(),
+            " is refused",
+            Severity::Info,
+            "",
+        ),
         ExceptionKind::Dialog => (
-            "Dialog",
+            "Dialog".into(),
             " stops Claude",
             Severity::Warn,
             " for over an hour",
         ),
-        _ => (resume_agent_word(agent), " has stalled", Severity::Warn, ""),
+        _ => (
+            resume_agent_word(agent).into(),
+            " has stalled",
+            Severity::Warn,
+            "",
+        ),
     };
-    let title = placed_title(head, &spot.place, tail);
+    let title = placed_title(&head, &spot.place, tail);
     let title = if aterm_messages::text::glass_title_fault(&title).is_none() {
         title
     } else {

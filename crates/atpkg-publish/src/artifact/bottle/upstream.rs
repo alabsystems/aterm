@@ -327,6 +327,12 @@ pub fn pack(ctx: &Ctx, request: &Request) -> Result<BottleOutcome> {
     let (_, definition) = super::bottle_row(&request.program, request.triple)?;
     match definition.origin {
         crate::programs::BottleOrigin::Pinned(recipe) => {
+            let recipe = recipe.versioned(&request.version).ok_or_else(|| {
+                Error::refused(format!(
+                    "{} has no shared upstream pin for version {}",
+                    request.program, request.version
+                ))
+            })?;
             return super::pinned::pack(ctx, request, recipe);
         }
         crate::programs::BottleOrigin::Reference(_) => {

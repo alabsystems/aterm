@@ -7,6 +7,18 @@ use aterm_core::terminal::Terminal;
 
 const EMOJI_LINE: &[u8] = b"Q\xf0\x9f\x98\x80Z"; // Q😀Z
 
+#[test]
+fn checkpoint_restoration_preserves_live_cluster_render_payloads() {
+    let mut term = Terminal::new(2, 16);
+    term.process("\x1b]8;id=cluster;https://cluster.example\x1b\\\x1b[38;2;100;200;150m👩‍💻 e\u{301}\u{302}\u{303}\u{304}\u{305}".as_bytes());
+    let before = term.cell_frame(2, 16);
+    let mut restored = Terminal::from_checkpoint(&term.checkpoint());
+    let after = restored.cell_frame(2, 16);
+    assert_eq!(after.clusters, before.clusters);
+    assert_eq!(after.combining, before.combining);
+    assert_eq!(after.cells, before.cells);
+}
+
 fn emoji_row(t: &Terminal, max_rows: u16) -> Option<String> {
     (0..max_rows).find_map(|r| {
         let text = t.row_text(usize::from(r))?;

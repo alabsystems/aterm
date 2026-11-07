@@ -1301,6 +1301,90 @@ fn the_latest_node_record_wins_and_the_key_it_replaced_is_retired() {
     }
 }
 
+/// **A SEAT'S RETIRED NODE KEYS COME THE ONE IT REPLACED LAST FIRST, IN EVERY ARRIVAL ORDER**
+/// ([`Membership::retired`], one-mesh §11 C3b): A binds node keys 1 to 9 in turn after its
+/// entry key, so its entry key and keys 1 to 8 are retired, key 8 replaced last, whatever the
+/// keys' own order; binding key 3 again makes it A's and leaves key 9 the one replaced last. Then
+/// A binds keys 10, 11 and 12 on three copies of the log at one sequence, a fork, and key 13 after
+/// all three: every order the four records come in gives the three forked keys first, by id,
+/// then the rest as before.
+/// NEGATIVE CONTROL: `Mutant::RankByArrival`, each key ranked by where its newest binding came
+/// in on this Mac: the forked keys' order then follows the order they came in.
+#[test]
+fn a_seats_retired_node_keys_come_the_one_it_replaced_last_first_in_every_arrival_order() {
+    use super::eval::{MUTANT, Mutant};
+    let mut lab = found(&[(A, "m1"), (B, "m2")]);
+    let entry_key = [A.0; 32];
+    for tag in 1..=9 {
+        lab.keep(node(&lab, A, tag));
+    }
+    let linear: Vec<[u8; 32]> = (1..=8).rev().map(node_key).chain([entry_key]).collect();
+    assert_eq!(lab.membership().retired(&A.id()), linear.as_slice());
+    let mut by_key = linear.clone();
+    by_key.sort_unstable();
+    assert_ne!(
+        by_key, linear,
+        "the keys' own order is not the order A replaced them"
+    );
+    assert!(lab.membership().retired(&B.id()).is_empty());
+    lab.keep(node(&lab, A, 3));
+    let rebound: Vec<[u8; 32]> = [9, 8, 7, 6, 5, 4, 2, 1]
+        .into_iter()
+        .map(node_key)
+        .chain([entry_key])
+        .collect();
+    let membership = lab.membership();
+    assert_eq!(membership.retired(&A.id()), rebound.as_slice());
+    assert_eq!(membership.node(&node_key(3)), NodeStanding::Member(A.id()));
+
+    let forks: Vec<Record> = [10, 11, 12]
+        .into_iter()
+        .map(|tag| node(&lab, A, tag))
+        .collect();
+    let mut joined = lab.clone();
+    for fork in &forks {
+        joined.keep(fork.clone());
+    }
+    let last = node(&joined, A, 13);
+    let mut forked: Vec<(RecordId, [u8; 32])> = forks
+        .iter()
+        .zip([10, 11, 12])
+        .map(|(fork, tag)| (*fork.id(), node_key(tag)))
+        .collect();
+    forked.sort_unstable_by(|a, b| b.cmp(a));
+    let want: Vec<[u8; 32]> = forked
+        .into_iter()
+        .map(|(_, key)| key)
+        .chain([node_key(3)])
+        .chain(rebound)
+        .collect();
+    let records: Vec<Record> = forks.into_iter().chain([last]).collect();
+    let orders = permutations(records.len());
+    let retired_in = |order: &[usize]| -> Vec<[u8; 32]> {
+        let mut log = lab.clone();
+        for &i in order {
+            log.insert(records[i].clone()).unwrap();
+        }
+        log.membership().retired(&A.id()).to_vec()
+    };
+    for order in &orders {
+        assert_eq!(retired_in(order), want, "order {order:?}");
+    }
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            MUTANT.set(None);
+        }
+    }
+    let _clear = Clear;
+    MUTANT.set(Some(Mutant::RankByArrival));
+    let seen: BTreeSet<Vec<[u8; 32]>> = orders.iter().map(|order| retired_in(order)).collect();
+    assert!(
+        seen.len() > 1,
+        "the mutant orders the forks as they came in: {seen:?}"
+    );
+}
+
 #[test]
 fn a_removed_macs_node_keys_read_removed_even_when_a_member_claims_one() {
     let mut lab = found(&[(A, "m1"), (B, "m2")]);

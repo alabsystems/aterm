@@ -512,7 +512,7 @@ mod unix {
                 Err(Error::usage(format!(
                     "{}: main is fetched into a ref under refs/ that is no branch, tag or \
                      remote-tracking ref, by a name git accepts",
-                    Redactor::shapes(into)
+                    Redactor::shapes_cow(into)
                 )))
             }
             GitOp::FetchRef {
@@ -914,8 +914,12 @@ mod unix {
     /// char boundary. Redacting first means a token that straddles the cut is replaced whole,
     /// never left as a tail that neither the learned value nor a token shape matches.
     pub(super) fn kept(bytes: &[u8], redactor: &Redactor) -> String {
-        let text = redactor.apply(&String::from_utf8_lossy(bytes));
+        let raw = String::from_utf8_lossy(bytes);
+        let text = redactor.apply_cow(&raw);
         let from = text.len().saturating_sub(OUT_KEEP);
+        if from == 0 {
+            return text.into_owned();
+        }
         let from = (from..=text.len())
             .find(|&i| text.is_char_boundary(i))
             .unwrap_or(text.len());

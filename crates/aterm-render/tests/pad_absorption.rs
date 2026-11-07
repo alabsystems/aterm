@@ -6,8 +6,8 @@
 
 use aterm_models_render::pad_absorption_model;
 use aterm_render::{
-    AxisPlacement, band_offset, band_offset_y, continue_chrome_edges, frame_placement, pad_split,
-    place_frame_bands,
+    AxisPlacement, band_offset, band_offset_y, continue_chrome_edges, drop_overlay_border_px,
+    frame_placement, pad_split, place_frame_bands,
 };
 
 const PADS: &[usize] = &[0, 1, 2, 3, 4, 7, 8];
@@ -340,5 +340,27 @@ fn chrome_rows_continue_their_edge_pixels_through_the_remainder_bands() {
                 "row {y}"
             );
         }
+    }
+}
+
+#[test]
+fn drop_overlay_border_is_the_short_side_over_200_scaled_and_capped() {
+    for ((w, h, q4), want) in [
+        ((264, 126, 0), 2),
+        ((1200, 900, 0), 4),
+        ((600, 800, 0), 3),
+        ((900, 1200, 16), 4),
+        ((5000, 2000, 0), 6),
+        ((1200, 900, 24), 6),
+        ((1200, 900, 40), 10),
+        ((1200, 900, 1), 1),
+        ((5000, 2000, 255), 95),
+        ((3, 100, 0), 1),
+        ((100, 9, 40), 4),
+        ((1, 1, 0), 1),
+        ((0, 0, 16), 1),
+        ((usize::MAX, usize::MAX, 255), 95),
+    ] {
+        assert_eq!(drop_overlay_border_px(w, h, q4), want, "{w}x{h} at {q4}/16");
     }
 }

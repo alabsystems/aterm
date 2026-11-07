@@ -919,6 +919,38 @@ fn a_refused_request_is_told_with_the_remedy_its_notice_names() {
     }
 }
 
+/// A refused request is told in the words of the program whose API refused it, and only Claude
+/// Code's refusals take Claude Code's remedies. CONTROL: Claude Code's words and remedies are as
+/// they were.
+#[test]
+fn a_refused_request_names_the_program_whose_api_refused_it() {
+    let message = "◆ model failed: API error 404: model not found (not_found_error). Run /model \
+                   to pick a different model.";
+    for program in [Program::Muse, Program::Codex, Program::Generic] {
+        let e = Exception::refused_by(program, Some("model_not_found"), message);
+        assert_eq!((e.kind, e.when), (ExceptionKind::Refused, Urgency::Later));
+        assert!(
+            e.why.contains(program.product()) && !e.why.contains("Claude"),
+            "{program:?}: {e:?}"
+        );
+        assert_eq!(
+            e.action,
+            format!(
+                "Open the tab and do what {}'s last error asks.",
+                program.product()
+            ),
+            "{program:?}"
+        );
+    }
+    let claude = Exception::refused_by(Program::Claude, Some("model_not_found"), message);
+    assert_eq!(claude, Exception::refused(Some("model_not_found"), message));
+    assert_eq!(
+        claude.why,
+        "Claude's API refuses this request the same way each time it is sent."
+    );
+    assert!(claude.action.contains("/model"), "{claude:?}");
+}
+
 #[test]
 fn the_long_contexts_usage_credits_are_an_account_limit() {
     let t = t0();

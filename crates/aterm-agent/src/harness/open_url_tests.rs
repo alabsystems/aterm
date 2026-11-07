@@ -494,6 +494,19 @@ fn every_refusal_is_exit_one_and_names_no_url() {
 }
 
 #[test]
+fn a_magic_link_with_a_fragment_token_is_extracted_from_html() {
+    let raw = concat!(
+        "From: Claude <no-reply@claude.ai>\r\n",
+        "To: <m15-3@example.test>\r\n\r\n",
+        "<a href=\"https://claude.ai/magic-link#opaque-token\">Sign in</a>"
+    );
+    assert_eq!(
+        extract_magic_link_from_email(raw, Some("m15-3@example.test")).as_deref(),
+        Some("https://claude.ai/magic-link#opaque-token")
+    );
+}
+
+#[test]
 fn mailbox_links_and_approval_keep_their_recipient_origin_and_callback() {
     let raw_eml = concat!(
         "From: Claude <no-reply@claude.ai>\r\n",
@@ -4144,6 +4157,7 @@ fn a_hosted_claude_callback_is_exact_and_its_code_is_taken_once() {
     let callback = "https://platform.claude.com/oauth/code/callback?code=secret&state=expected";
     assert!(flow.is_callback(callback));
     assert!(flow.admits_provider_url(callback));
+    assert_eq!(hosted_credential(callback), Ok("secret#expected".into()));
     for wrong in [
         "https://platform.claude.com/oauth/code/callback?code=secret&state=other",
         "https://platform.claude.com/oauth/code/callback?state=expected",

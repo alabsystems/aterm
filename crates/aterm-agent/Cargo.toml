@@ -199,6 +199,8 @@ aterm-dirfd = { workspace = true }
 aterm-secrets = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
+# Registry labels are resolved against signed machine facts before a person acts on a seat.
+aterm-db.workspace = true
 # Local authenticated native receipts use the same durable astream journal as secrets.
 aterm-journal = { workspace = true }
 # Native agy sign-in uses the controlling-terminal spawn seam; no raw PTY operations here.

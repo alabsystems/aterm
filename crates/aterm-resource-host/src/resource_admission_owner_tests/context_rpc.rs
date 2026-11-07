@@ -83,6 +83,7 @@ fn host() {
             .collect();
     pending.recipe = Some(recipe::Recipe {
         kind: recipe::Kind::Ay,
+        compiler: None,
         program: program.path().to_owned(),
         arguments,
         environment,

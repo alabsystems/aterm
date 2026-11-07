@@ -9,8 +9,13 @@
 //! local-network address, and gives it nothing until a person answers. A root launchd daemon is
 //! exempt (`docs/measured/local-network-exemption-2026-11-05.md`), and a socket it makes keeps
 //! working in the process it is passed to. So on macOS every outbound LAN act of aterm's asks the
-//! broker, whose root-owned image setup's one elevation installs; there is no direct fallback,
-//! which would raise the question again. Off macOS the same calls act in-process.
+//! broker, whose root-owned image setup's one elevation installs. The one exception is the
+//! allowed direct path ([`direct`]): while no broker is installed, a process whose code macOS
+//! already allowed on the local network, for this account and as the app macOS holds responsible
+//! for it, serves the broker's protocol to itself, which raises no question since macOS asks only
+//! code it holds no answer for; any other fallback would raise the question again. Below, "the
+//! broker" is whichever serves its protocol: the root broker, or that direct path while none is
+//! installed. Off macOS the same calls act in-process.
 
 use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
 use std::path::PathBuf;
@@ -113,7 +118,8 @@ impl std::fmt::Display for Unavailable {
 /// Why a LAN act of aterm's did not happen: the broker is not there to ask, or the act failed.
 #[derive(Debug)]
 pub enum LanError {
-    /// No broker to ask ([`Unavailable`]): there is no direct fallback on macOS.
+    /// No broker to ask ([`Unavailable`]), and on macOS no allowed direct path ([`direct`]) to
+    /// serve the act instead.
     Unavailable(Unavailable),
     /// The act itself failed (the broker's refusal of a destination, a connect, a Bonjour error),
     /// or the exchange with the broker did.
@@ -208,7 +214,7 @@ pub struct UdpOptions {
 /// was named or a name resolved to it.
 ///
 /// A name resolves first ([`resolve`]: on macOS a name [`is_local_name`] names is resolved by the
-/// root LAN broker, as `.local` resolution is gated too), and each of its addresses is dialled in
+/// broker, as `.local` resolution is gated too), and each of its addresses is dialled in
 /// turn. On macOS an address [`is_local_network`] classifies is dialled by the broker and the
 /// connection passed to this process; every other address, and every one off macOS, is dialled
 /// here.
@@ -273,7 +279,9 @@ fn with_port(mut addr: SocketAddr, port: u16) -> SocketAddr {
 }
 
 /// A bound UDP socket with its groups joined: on macOS made by the root LAN broker and passed to
-/// this process, so what it sends to the LAN (the mDNS group) is not gated; off macOS made here.
+/// this process, so what it sends to the LAN (the mDNS group) is not gated, or while none is
+/// installed made in this process by the allowed direct path ([`direct`]), whose code macOS
+/// already allowed; off macOS made here.
 ///
 /// # Errors
 /// [`LanError::Unavailable`] on macOS without a broker, or [`LanError::Io`]: a bind
@@ -287,7 +295,7 @@ pub fn udp(options: UdpOptions) -> Result<UdpSocket, LanError> {
 }
 
 /// The addresses `name` resolves to within `within`: on macOS a [`is_local_name`] name is
-/// resolved by the root LAN broker (mDNSResponder applies the asking process's policy); every
+/// resolved by the broker (mDNSResponder applies the asking process's policy); every
 /// other name, and every name off macOS, resolves here.
 ///
 /// # Errors

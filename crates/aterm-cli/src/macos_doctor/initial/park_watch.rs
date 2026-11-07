@@ -71,6 +71,7 @@ impl ParkWatch {
         };
         let mut folders = Vec::new();
         let mut input_files = Vec::new();
+        let mut checkout_files = Vec::new();
         if watches.secrets {
             let home = aterm_types::dirs::home_dir()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no home directory"))?;
@@ -87,20 +88,37 @@ impl ParkWatch {
                 folders.extend(packaged_git_folders(&layout.prefix));
             }
             input_files.extend(
-                aterm_machines::init_github::repository_input_watch_paths(
+                aterm_machines::init_github::repository_input_control_watch_paths(
                     &aterm_machines::port::Live::new(),
                 )
                 .map_err(io::Error::other)?,
             );
             folders.extend(repository_input_folders(&input_files));
+            let sys = aterm_machines::port::Live::new();
+            let user = aterm_machines::port::System::identity(&sys)
+                .map_err(io::Error::other)?
+                .user;
+            for path in aterm_machines::init_github::repository_checkout_watch_paths(&sys)
+                .map_err(io::Error::other)?
+            {
+                folders.push(FolderTarget {
+                    target: path.clone(),
+                    floor: PathBuf::from(&user.home),
+                    follow_links: false,
+                    owner: Some(user.uid),
+                });
+                checkout_files.push((path.clone(), PathBuf::from(&user.home), user.uid));
+                input_files.push(path);
+            }
         }
         if !folders.is_empty() {
             watch.files = Some(if input_files.is_empty() {
                 watch_folders(folders, Arc::clone(&stop), Arc::clone(&lost), changed)?
             } else {
-                watch_paths(
+                watch_paths_scoped(
                     folders,
                     input_files,
+                    checkout_files,
                     Arc::clone(&stop),
                     Arc::clone(&lost),
                     changed,
@@ -166,6 +184,48 @@ struct FolderTarget {
     target: PathBuf,
     floor: PathBuf,
     follow_links: bool,
+    owner: Option<u32>,
+}
+
+impl FolderTarget {
+    fn nearest(&self) -> Option<PathBuf> {
+        if let Some(uid) = self.owner {
+            self.target
+                .ancestors()
+                .take_while(|path| path.starts_with(&self.floor))
+                .find(|path| owned_directory(path, &self.floor, uid))
+                .map(Path::to_path_buf)
+        } else {
+            nearest(&self.target, &self.floor, self.follow_links)
+        }
+    }
+}
+
+/// A selected checkout may be replaced with a link while a park is alive. Inspect every
+/// component from its trusted home before opening a deeper directory or direct leaf.
+fn owned_directory(path: &Path, floor: &Path, uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let Ok(tail) = path.strip_prefix(floor) else {
+        return false;
+    };
+    let mut at = floor.to_path_buf();
+    let safe = |path: &Path| {
+        std::fs::symlink_metadata(path)
+            .is_ok_and(|s| s.is_dir() && s.uid() == uid && s.mode() & 0o022 == 0)
+    };
+    if !safe(&at) {
+        return false;
+    }
+    for part in tail.components() {
+        let std::path::Component::Normal(name) = part else {
+            return false;
+        };
+        at.push(name);
+        if !safe(&at) {
+            return false;
+        }
+    }
+    true
 }
 
 impl From<(PathBuf, PathBuf)> for FolderTarget {
@@ -174,6 +234,7 @@ impl From<(PathBuf, PathBuf)> for FolderTarget {
             target,
             floor,
             follow_links: true,
+            owner: None,
         }
     }
 }
@@ -188,6 +249,7 @@ fn secrets_folders(home: &Path) -> Vec<FolderTarget> {
             target: home.join(".secrets"),
             floor: home.to_path_buf(),
             follow_links: false,
+            owner: None,
         },
     ]
 }
@@ -230,6 +292,7 @@ struct ArmedFolder {
 struct Folders {
     targets: Vec<FolderTarget>,
     files: Vec<PathBuf>,
+    scoped_files: BTreeMap<PathBuf, (PathBuf, u32)>,
     /// The nearest directory each target currently reaches.
     watched: Vec<Option<(PathBuf, atpkg::dirwatch::WatchId)>>,
     armed: BTreeMap<PathBuf, ArmedFolder>,
@@ -242,6 +305,7 @@ impl Folders {
         Self {
             targets,
             files: Vec::new(),
+            scoped_files: BTreeMap::new(),
             watched,
             armed: BTreeMap::new(),
             armed_files: BTreeMap::new(),
@@ -263,12 +327,8 @@ impl Folders {
         fired: &BTreeSet<atpkg::dirwatch::WatchId>,
     ) -> io::Result<()> {
         loop {
-            let coverage: Vec<_> = self
-                .targets
-                .iter()
-                .map(|target| nearest(&target.target, &target.floor, target.follow_links))
-                .collect();
-            let mut wanted = BTreeMap::<PathBuf, bool>::new();
+            let coverage: Vec<_> = self.targets.iter().map(FolderTarget::nearest).collect();
+            let mut wanted = BTreeMap::<PathBuf, (bool, bool)>::new();
             for (target, closest) in self.targets.iter().zip(&coverage) {
                 if let Some(closest) = closest {
                     for folder in closest
@@ -277,11 +337,15 @@ impl Folders {
                     {
                         // The materialized root itself refuses links. Its parents, including
                         // the login's home path, retain their ordinary path resolution.
-                        let follow = target.follow_links || folder != target.target.as_path();
+                        let follow = target.owner.is_none()
+                            && (target.follow_links || folder != target.target.as_path());
                         wanted
                             .entry(folder.to_path_buf())
-                            .and_modify(|links| *links &= follow)
-                            .or_insert(follow);
+                            .and_modify(|(links, scoped)| {
+                                *links &= follow;
+                                *scoped |= target.owner.is_some();
+                            })
+                            .or_insert((follow, target.owner.is_some()));
                     }
                 }
             }
@@ -297,7 +361,7 @@ impl Folders {
             let mut added = Vec::new();
             let result = (|| -> io::Result<()> {
                 // Prefix paths sort before their children, so parents are armed first.
-                for (path, follow) in wanted {
+                for (path, (follow, scoped)) in wanted {
                     let resolved = if follow {
                         path.canonicalize()?
                     } else {
@@ -310,7 +374,11 @@ impl Folders {
                     let id = if let Some(on) = keep {
                         on.id
                     } else {
-                        let id = watcher.add_dir(&resolved)?;
+                        let id = if scoped {
+                            watcher.add_dir_scoped(&resolved)?
+                        } else {
+                            watcher.add_dir(&resolved)?
+                        };
                         added.push(id);
                         id
                     };
@@ -340,9 +408,12 @@ impl Folders {
                 .collect();
             // Creation before a parent was first armed must not leave the new directory
             // unwatched. Later creations are heard by the retained parent watches.
-            if self.targets.iter().zip(coverage).all(|(target, before)| {
-                nearest(&target.target, &target.floor, target.follow_links) == before
-            }) {
+            if self
+                .targets
+                .iter()
+                .zip(coverage)
+                .all(|(target, before)| target.nearest() == before)
+            {
                 return self.arm_files(watcher, fired, &changed);
             }
         }
@@ -360,6 +431,13 @@ impl Folders {
         let mut added = Vec::new();
         let armed = (|| {
             for path in &self.files {
+                if let Some((floor, uid)) = self.scoped_files.get(path)
+                    && !path
+                        .parent()
+                        .is_some_and(|parent| owned_directory(parent, floor, *uid))
+                {
+                    continue;
+                }
                 match std::fs::symlink_metadata(path) {
                     Ok(metadata) if metadata.is_file() => {}
                     Ok(_) => continue, // A link's parent hears its replacement; its target is separate.
@@ -374,7 +452,11 @@ impl Folders {
                 let id = if let Some(id) = kept {
                     *id
                 } else {
-                    let id = watcher.add_file(path)?;
+                    let id = if self.scoped_files.contains_key(path) {
+                        watcher.add_file_scoped(path)?
+                    } else {
+                        watcher.add_file(path)?
+                    };
                     added.push(id);
                     id
                 };
@@ -419,7 +501,18 @@ fn watch_folders(
 
 fn watch_paths(
     targets: Vec<FolderTarget>,
+    files: Vec<PathBuf>,
+    stop: Arc<AtomicBool>,
+    lost: Arc<AtomicBool>,
+    changed: fn(),
+) -> io::Result<Arc<atpkg::dirwatch::Watcher>> {
+    watch_paths_scoped(targets, files, Vec::new(), stop, lost, changed)
+}
+
+fn watch_paths_scoped(
+    targets: Vec<FolderTarget>,
     mut files: Vec<PathBuf>,
+    scoped: Vec<(PathBuf, PathBuf, u32)>,
     stop: Arc<AtomicBool>,
     lost: Arc<AtomicBool>,
     changed: fn(),
@@ -429,6 +522,10 @@ fn watch_paths(
     files.sort();
     files.dedup();
     folders.files = files;
+    folders.scoped_files = scoped
+        .into_iter()
+        .map(|(path, floor, uid)| (path, (floor, uid)))
+        .collect();
     folders.arm(&watcher)?;
     if folders.watched.iter().any(Option::is_none) {
         // Nothing at or below a floor to watch: the park keeps its timer.
@@ -611,6 +708,110 @@ fn watch_network(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    static CHECKOUT_FIRED: AtomicUsize = AtomicUsize::new(0);
+
+    fn checkout_fired() {
+        CHECKOUT_FIRED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn selected_checkout_arrival_and_in_place_git_repair_rearm_the_existing_queue() {
+        use std::io::Write as _;
+        use std::os::unix::fs::MetadataExt as _;
+
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let home = scratch.path().canonicalize().unwrap();
+        let uid = std::fs::metadata(&home).unwrap().uid();
+        let root = home.join("code");
+        std::fs::create_dir(&root).unwrap();
+        let admin = root.join(".git");
+        let config = admin.join("config");
+        let paths = vec![root, admin.clone(), config.clone()];
+        let targets = paths
+            .iter()
+            .map(|path| FolderTarget {
+                target: path.clone(),
+                floor: home.clone(),
+                follow_links: false,
+                owner: Some(uid),
+            })
+            .collect();
+        let scoped = paths
+            .iter()
+            .map(|path| (path.clone(), home.clone(), uid))
+            .collect();
+        let stop = Arc::new(AtomicBool::new(false));
+        let lost = Arc::new(AtomicBool::new(false));
+        let watcher = watch_paths_scoped(
+            targets,
+            paths,
+            scoped,
+            Arc::clone(&stop),
+            Arc::clone(&lost),
+            checkout_fired,
+        )
+        .unwrap();
+        for path in [&admin, &config] {
+            let before = CHECKOUT_FIRED.load(Ordering::SeqCst);
+            if path == &admin {
+                std::fs::create_dir(path).unwrap()
+            } else {
+                std::fs::write(path, b"origin01").unwrap()
+            }
+            until("the selected checkout boundary was not heard", || {
+                CHECKOUT_FIRED.load(Ordering::SeqCst) > before
+            });
+        }
+        let before = CHECKOUT_FIRED.load(Ordering::SeqCst);
+        let inode = std::fs::metadata(&config).unwrap().ino();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&config)
+            .unwrap();
+        file.write_all(b"origin02").unwrap();
+        until("in-place Git metadata repair was not heard", || {
+            CHECKOUT_FIRED.load(Ordering::SeqCst) > before
+        });
+        assert_eq!(std::fs::metadata(&config).unwrap().ino(), inode);
+        assert!(!lost.load(Ordering::Acquire));
+        stop.store(true, Ordering::Release);
+        watcher.wake().unwrap();
+    }
+
+    #[test]
+    fn a_checkout_parent_replaced_by_a_link_cannot_enlist_its_destination() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let home = scratch.path().canonicalize().unwrap();
+        let uid = std::fs::metadata(&home).unwrap().uid();
+        let root = home.join("code");
+        let foreign = home.join("unselected");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(foreign.join(".git")).unwrap();
+        std::os::unix::fs::symlink(&foreign, root.join("linked")).unwrap();
+        let target = FolderTarget {
+            target: root.join("linked/.git/config"),
+            floor: home.clone(),
+            follow_links: false,
+            owner: Some(uid),
+        };
+        assert_eq!(target.nearest(), Some(root.clone()));
+        assert!(!owned_directory(&root.join("linked/.git"), &home, uid));
+        std::fs::rename(&root, home.join("saved-code")).unwrap();
+        std::os::unix::fs::symlink(&foreign, &root).unwrap();
+        assert_eq!(target.nearest(), Some(home));
+        let watcher = atpkg::dirwatch::Watcher::new().unwrap();
+        // A swap after the component check is also refused at the actual kernel open.
+        assert!(watcher.add_dir_scoped(&root.join(".git")).is_err());
+        std::fs::write(foreign.join(".git/config"), b"unselected config").unwrap();
+        assert!(watcher.add_file_scoped(&root.join(".git/config")).is_err());
+        assert!(
+            watcher.add_dir(&root.join(".git")).is_ok(),
+            "the old caller policy remains unchanged"
+        );
+    }
 
     /// Wait, as a one-minute hang detector, until `done`.
     fn until(what: &str, done: impl Fn() -> bool) {

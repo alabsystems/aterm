@@ -58,7 +58,8 @@ fn cargo(
         "oracle-052 requires absolute stock Cargo/RUSTC (STOCK EXCEPTION for Windows std)",
     )?;
     let target = target.to_str().ok_or("non-UTF8 target directory")?;
-    let mut clean = words(&["clean", "-q", "-p", UNDER_TEST, "-p", PACKAGE]);
+    // Not `-q`: a quiet clean that cargo refuses exits 101 saying nothing.
+    let mut clean = words(&["clean", "-p", UNDER_TEST, "-p", PACKAGE]);
     clean.extend(words(&FROZEN));
     clean.extend(words(&["--target", triple, "--target-dir", target]));
     required(

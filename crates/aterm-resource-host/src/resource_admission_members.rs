@@ -7,6 +7,9 @@ use super::*;
 use aterm_types::resource_subgroup::{Capability, CpuDelegation, Request};
 
 pub(in super::super) fn binding(value: &aterm_json::Value) -> io::Result<Binding> {
+    binding_role(value, "member")
+}
+pub(in super::super) fn binding_role(value: &aterm_json::Value, role: &str) -> io::Result<Binding> {
     let map = value
         .as_object()
         .ok_or_else(|| refused("invalid member routing context"))?;
@@ -14,7 +17,7 @@ pub(in super::super) fn binding(value: &aterm_json::Value) -> io::Result<Binding
     if map.len() != fields.len()
         || fields.iter().any(|field| !map.contains_key(*field))
         || value["version"].as_u64() != Some(3)
-        || value["role"].as_str() != Some("member")
+        || value["role"].as_str() != Some(role)
     {
         return Err(refused("invalid member routing context"));
     }

@@ -233,11 +233,14 @@ pub struct ViewIo<'a> {
 /// Whether the registry serves the four nouns on this Mac: it does unless this Mac holds a
 /// fleet_db replica, its own import recorded nothing beside it, and no Mac's import has filled
 /// its registry yet, when fleet_db keeps them. Once this Mac's import ran, a registry that
-/// cannot be read says so rather than handing the nouns back to the replica.
+/// cannot be read says so rather than handing the nouns back to the replica. A rekey cut short
+/// right after its rename holds the replica in its kept folder, and fleet_db's refusal names it.
 #[must_use]
 pub fn serves(paths: &Paths) -> bool {
     let dir = super::replica_dir(paths);
-    if std::fs::symlink_metadata(dir.join("database.json")).is_err() {
+    if std::fs::symlink_metadata(dir.join("database.json")).is_err()
+        && crate::fleet_db::refuse_unfinished(&dir).is_ok()
+    {
         return true;
     }
     if !matches!(crate::alab::import::covered::read(&dir), Ok(None)) {

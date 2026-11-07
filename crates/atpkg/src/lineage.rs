@@ -1184,3 +1184,77 @@ fn find_byte(hay: &[u8], needle: u8) -> Option<usize> {
 #[cfg(test)]
 #[path = "lineage_tests.rs"]
 mod tests;
+
+/// Bounded compiler/receipt summary used by both project selection and adoption.
+pub struct LineageSummary {
+    /// Full lowercase commit recorded by LINEAGE.
+    pub compiler_commit: String,
+    /// Recorded receipt filename and its SHA256.
+    pub receipt: String,
+}
+impl LineageSummary {
+    /// Read the existing bounded LINEAGE summary without changing its payload.
+    /// # Errors
+    /// Missing/nonregular/unreadable data, malformed or duplicate fields, schema, commit or receipt.
+    pub fn read(dir: &Path) -> Result<LineageSummary, String> {
+        use std::io::Read as _;
+        let path = dir.join(LINEAGE_FILE);
+        let unreadable = |why: String| {
+            format!(
+                "{}: {why}: nothing names this build's compiler and lineage receipt",
+                path.display()
+            )
+        };
+        let file = std::fs::File::open(&path).map_err(|e| unreadable(e.to_string()))?;
+        if !file.metadata().is_ok_and(|m| m.is_file()) {
+            return Err(unreadable("not a regular file".to_string()));
+        }
+        let mut text = String::new();
+        file.take(64 << 10)
+            .read_to_string(&mut text)
+            .map_err(|e| unreadable(e.to_string()))?;
+        let mut fields = std::collections::BTreeMap::new();
+        for line in text.lines().map(str::trim) {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                return Err(unreadable(format!("`{line}` is not key=value")));
+            };
+            let key = key.trim();
+            if fields.insert(key, value.trim()).is_some() {
+                return Err(unreadable(format!("`{key}` is given twice")));
+            }
+        }
+        let field = |key: &str| fields.get(key).copied().unwrap_or("");
+        if field("schema") != LINEAGE_SCHEMA {
+            return Err(unreadable(format!(
+                "schema `{}` is not {}",
+                field("schema"),
+                LINEAGE_SCHEMA
+            )));
+        }
+        let compiler_commit = field("compiler_commit");
+        if !aterm_codec::hex::is_lower(compiler_commit, 40) {
+            return Err(unreadable(format!(
+                "compiler_commit `{compiler_commit}` is not 40 lowercase hex digits"
+            )));
+        }
+        let receipt = field("lineage_receipt");
+        if receipt.is_empty() || receipt.contains(char::is_whitespace) {
+            return Err(unreadable(format!(
+                "lineage_receipt `{receipt}` names no receipt"
+            )));
+        }
+        let digest = field("lineage_receipt_sha256");
+        if !aterm_codec::hex::is_lower(digest, 64) {
+            return Err(unreadable(format!(
+                "lineage_receipt_sha256 `{digest}` is not 64 lowercase hex digits"
+            )));
+        }
+        Ok(LineageSummary {
+            compiler_commit: compiler_commit.to_string(),
+            receipt: format!("{receipt} sha256:{digest}"),
+        })
+    }
+}

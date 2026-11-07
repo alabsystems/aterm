@@ -2892,7 +2892,7 @@ pub(super) mod tests {
     fn a_guard_or_switch_after_the_clone_still_says_what_its_installer_did() {
         use std::sync::atomic::{AtomicBool, Ordering};
         const INSTALLED: &str = "Trust git hooks: installed (core.hooksPath = scripts/hooks)";
-        let says = format!("$HOME/trust: ran its {}: {INSTALLED}", repos::HOOK_INSTALLER);
+        let says = format!("$HOME/trust: ran its {}: {INSTALLED:?}", repos::HOOK_INSTALLER);
         for stop in [true, false] {
             let (sys, item) = listing(&["trust".to_owned()], &[]);
             let home = Path::new(&item.user.home);
@@ -2961,7 +2961,7 @@ pub(super) mod tests {
                 true,
                 Ran::ok(&format!("{INSTALLED}\n")),
                 format!(
-                    "{present}; $HOME/trust: ran its {}: {INSTALLED}",
+                    "{present}; $HOME/trust: ran its {}: {INSTALLED:?}",
                     repos::HOOK_INSTALLER
                 ),
             ),
@@ -2969,7 +2969,7 @@ pub(super) mod tests {
                 true,
                 Ran::exit(1, "ERROR: refused\n"),
                 format!(
-                    "{present}; $HOME/trust: its {} failed (exit 1: ERROR: refused); the clone \
+                    "{present}; $HOME/trust: its {} failed (exit 1: \"ERROR: refused\"); the clone \
                      stands",
                     repos::HOOK_INSTALLER
                 ),

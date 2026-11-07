@@ -150,6 +150,20 @@ pub const USAGE: &str = "\
                                    FAILED unless aterm.log names the lab vault its own look heard (the
                                    broker's log of the service beside it); NOT RUN on an app whose
                                    executable does not name the variable
+                  lan-allowed      (by name only, alone; implies --sudo-asks; not with --app,
+                                   --standard-user, --person or --reader) an update on a Mac whose
+                                   aterm a person allowed on the local network, with no broker:
+                                   its base (-lanallow) holds macOS's answer of Allow for the app
+                                   built here, written into nehelper's record while the image's SIP
+                                   is off (the press is a person's; the lab writes its answer, never
+                                   a press), and setup's Mac password goes unanswered. FAILED unless
+                                   the first tab's aterm lan status serves itself under that
+                                   allowance, an ssh through aterm lan fdpass reaches a peer at the
+                                   guest's address on tart's network and at its own .local name
+                                   (resolved through the same path), the same lan status under
+                                   tart exec (the guest agent responsible) reads no broker (the
+                                   negative control), aterm.log names no LanHeld, no broker comes
+                                   to serve, and macOS asks nothing about aterm
                   terminal-launch  a bare aterm on a terminal (Terminal.app's shape) to its shell's first
                                    prompt, cold then warm
                   app-launch       the app opened to its first tab's prompt, cold then warm
@@ -488,6 +502,7 @@ pub enum Scenario {
     DevtoolsControl,
     FirstLaunch,
     FirstLaunchVault,
+    LanAllowed,
     TerminalLaunch,
     AppLaunch,
     Vault,
@@ -551,8 +566,9 @@ pub const FAULTS: [Scenario; 13] = [
 
 /// The rows run only by name, never in `all`: `first-launch-vault`, a second whole first launch
 /// that judges the vault found with no press, NOT RUN until the app names its knob
-/// ([`lan::LAB_VAULT_SERVICE_ENV`]).
-pub const BY_NAME: [Scenario; 1] = [Scenario::FirstLaunchVault];
+/// ([`lan::LAB_VAULT_SERVICE_ENV`]); and `lan-allowed`, whose base holds macOS's Local Network
+/// answer for the app built here ([`crate::mac::Prep::lan_allow`]), so it runs alone.
+pub const BY_NAME: [Scenario; 2] = [Scenario::FirstLaunchVault, Scenario::LanAllowed];
 
 /// The rows that read a window's accessibility tree (`tree`; `mac_nux_reveal.rs`, one-mesh design
 /// §11 A17c), after [`FAULTS`]': `lab reveal-tab`'s world in the person base, and its negative
@@ -578,6 +594,7 @@ impl Scenario {
             Scenario::DevtoolsControl => "devtools-control",
             Scenario::FirstLaunch => "first-launch",
             Scenario::FirstLaunchVault => "first-launch-vault",
+            Scenario::LanAllowed => "lan-allowed",
             Scenario::TerminalLaunch => "terminal-launch",
             Scenario::AppLaunch => "app-launch",
             Scenario::Vault => "vault",
@@ -622,6 +639,7 @@ impl Scenario {
             self,
             Scenario::FirstLaunch
                 | Scenario::FirstLaunchVault
+                | Scenario::LanAllowed
                 | Scenario::InitApply
                 | Scenario::InstallSh
                 | Scenario::PassHeld
@@ -758,6 +776,7 @@ pub fn parse(args: &[String], image: String) -> Result<Ask, Fail> {
         None => ALL.to_vec(),
     };
     let standard_user = take_flag(&mut a, "--standard-user");
+    let lan_allowed = scenarios.contains(&Scenario::LanAllowed);
     let sudo_asks = take_flag(&mut a, "--sudo-asks");
     if sudo_asks && standard_user {
         return Err(Fail::usage(
@@ -806,6 +825,29 @@ pub fn parse(args: &[String], image: String) -> Result<Ask, Fail> {
     } else {
         image
     };
+    if lan_allowed {
+        let alone = scenarios == [Scenario::LanAllowed];
+        let why = if !alone {
+            Some(
+                "runs alone: its base holds macOS's Local Network answer, which no other row's Mac has",
+            )
+        } else if app.is_some() {
+            Some("answers for the app built here (ad hoc, at /Applications/aterm.app), not --app")
+        } else if standard_user {
+            Some("is the image's administrator's answer: no --standard-user")
+        } else if person || reader {
+            Some(
+                "needs nobody at the console: the person base's helper presses Allow, which the lab never fakes",
+            )
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            return Err(Fail::usage(format!("mac nux: lan-allowed {why}")));
+        }
+    }
+    // `lan-allowed` measures a Mac whose broker nobody installed: setup's elevation must ask.
+    let sudo_asks = sudo_asks || lan_allowed;
     let keep = take_flag(&mut a, "--keep");
     let record = match a.iter().position(|w| w == "--record") {
         Some(at) => {
@@ -6270,6 +6312,7 @@ fn row_body(
         Scenario::DevtoolsControl => devtools_control(g, row),
         Scenario::FirstLaunch => first_launch(g, ask, row),
         Scenario::FirstLaunchVault => lan::first_launch_vault(g, ask, row),
+        Scenario::LanAllowed => lan::lan_allowed(g, row),
         Scenario::TerminalLaunch => terminal_launch(g, row),
         Scenario::AppLaunch => app_launch(g, row),
         Scenario::Vault => vault(g, row),
@@ -6458,6 +6501,7 @@ pub fn cmd_nux(args: &[String]) -> Res {
         // The reader reads dialogs, and the tree rows' helper a window's tree, through the person
         // base's Accessibility grant.
         person: (ask.person || ask.reader || reads_tree).then(|| GUEST_HELPER.to_owned()),
+        lan_allow: ask.scenarios.contains(&Scenario::LanAllowed),
     };
     pull_room(&tart, &ask.image, &crate::mac::prep_name(&ask.image, &prep))?;
     let base =
@@ -6597,6 +6641,12 @@ mod tests {
         );
         assert!(!ALL.contains(&Scenario::FirstLaunchVault));
         assert!(!FAULTS.contains(&Scenario::FirstLaunchVault));
+        assert_eq!(
+            parse_scenarios("lan-allowed").unwrap(),
+            [Scenario::LanAllowed]
+        );
+        assert!(!ALL.contains(&Scenario::LanAllowed));
+        assert!(!FAULTS.contains(&Scenario::LanAllowed));
         // The fault rows come by name or as `faults`, never with `all`, and after its rows.
         assert_eq!(parse_scenarios("faults").unwrap(), FAULTS);
         assert!(
@@ -6687,6 +6737,22 @@ mod tests {
                 .code,
             2
         );
+        // `lan-allowed` runs alone with sudo asking, on the app built here, nobody at the
+        // console. NEGATIVE CONTROLS: each flag or row its base cannot answer for is refused.
+        let ask = parse(&args(&["--scenario", "lan-allowed"]), "i".into()).unwrap();
+        assert!(ask.sudo_asks && !ask.person && !ask.reader && ask.app.is_none());
+        for refused in [
+            &["--scenario", "lan-allowed,doctor"][..],
+            &["--scenario", "lan-allowed", "--app", "/x/aterm.app"],
+            &["--scenario", "lan-allowed", "--standard-user"],
+            &["--scenario", "lan-allowed", "--person"],
+            &["--scenario", "lan-allowed", "--reader"],
+        ] {
+            let fail = parse(&args(refused), "i".into()).unwrap_err();
+            assert_eq!(fail.code, 2, "{refused:?}");
+            let said = fail.msg.unwrap_or_default();
+            assert!(said.contains("lan-allowed"), "{refused:?}: {said}");
+        }
         // Only the rows that run the app need it built or handed over.
         let needing: Vec<_> = ALL.into_iter().filter(|s| !s.needs_app()).collect();
         assert_eq!(

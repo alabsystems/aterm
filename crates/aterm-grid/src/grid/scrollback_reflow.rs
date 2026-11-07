@@ -6,6 +6,7 @@
 
 use aterm_rle::Rle;
 use aterm_scrollback::{CellAttrs, HyperlinkSpan, ImageSpan, Line, UnderlineColorSpan};
+use std::{collections::BTreeMap, ops::Range, sync::Arc};
 
 use super::Grid;
 
@@ -412,8 +413,16 @@ fn emit_logical_line<'a>(
         return;
     }
     let first_out = out.len();
+    let mut image_rows: aterm_alloc::SmallVec<ImageSourceRow<'_>, 4> = aterm_alloc::SmallVec::new();
     for line in run {
+        let start = units.len();
         collect_units(line, units);
+        if let Some(spans) = line.images() {
+            image_rows.push(ImageSourceRow {
+                units: start..units.len(),
+                spans,
+            });
+        }
         if units.len() >= MAX_LOGICAL_WIDTH {
             break;
         }
@@ -421,7 +430,7 @@ fn emit_logical_line<'a>(
 
     if units.is_empty() {
         out.push(Line::new());
-        carry_image_spans(run, new_cols, out, first_out);
+        carry_image_spans(&image_rows, units, new_cols, out, first_out, 0);
         return;
     }
 
@@ -458,30 +467,171 @@ fn emit_logical_line<'a>(
     if row >= skip_rows {
         out.push(build_line(&units[seg_start..], row != 0));
     }
-    if skip_rows == 0 {
-        carry_image_spans(run, new_cols, out, first_out);
+    carry_image_spans(&image_rows, units, new_cols, out, first_out, skip_rows);
+}
+
+struct ImageSourceRow<'a> {
+    units: Range<usize>,
+    spans: &'a [ImageSpan],
+}
+
+struct ImageRowSegment {
+    source: Range<usize>,
+    row: usize,
+    col: usize,
+}
+
+/// Project image-covered text cells through the text's greedy wrap. Tiles past
+/// the source text stay relative to that row's origin and clip at the new edge.
+fn carry_image_spans(
+    sources: &[ImageSourceRow<'_>],
+    units: &[Unit<'_>],
+    new_cols: u16,
+    out: &mut [Line],
+    first_out: usize,
+    skipped: usize,
+) {
+    if sources.is_empty() {
+        return;
+    }
+    let cols = usize::from(new_cols);
+    let (mut next, mut row, mut col) = (0, 0, 0);
+    let mut images = ImageProjection {
+        rows: BTreeMap::new(),
+        cols: new_cols,
+        first_out,
+        skipped,
+        out_len: out.len(),
+    };
+    let mut segments: aterm_alloc::SmallVec<ImageRowSegment, 4> = aterm_alloc::SmallVec::new();
+    for source in sources {
+        for unit in &units[next..source.units.start] {
+            let width = usize::from(unit.width);
+            if col + width > cols && col > 0 {
+                row += 1;
+                col = 0;
+            }
+            col += width;
+        }
+        // A soft row origin resolves after the next unit's early wrap, just
+        // like rewrap_cell_row's cursor projection.
+        if let Some(unit) = units.get(source.units.start)
+            && col + usize::from(unit.width) > cols
+            && col > 0
+        {
+            row += 1;
+            col = 0;
+        }
+        let origin = (row, col);
+        let mut source_col = 0;
+        let image_end = source
+            .spans
+            .iter()
+            .map(|span| usize::from(span.end_col))
+            .max()
+            .unwrap_or(0);
+        next = source.units.start;
+        segments.clear();
+        for unit in &units[source.units.clone()] {
+            if source_col >= image_end {
+                break;
+            }
+            let width = usize::from(unit.width);
+            if col + width > cols && col > 0 {
+                row += 1;
+                col = 0;
+            }
+            if let Some(last) = segments.last_mut()
+                && last.row == row
+                && last.col + last.source.len() == col
+            {
+                last.source.end += width;
+            } else {
+                segments.push(ImageRowSegment {
+                    source: source_col..source_col + width,
+                    row,
+                    col,
+                });
+            }
+            source_col += width;
+            col += width;
+            next += 1;
+        }
+        for span in source.spans {
+            let start = usize::from(span.start_col);
+            let end = usize::from(span.end_col);
+            let at = segments.partition_point(|segment| segment.source.end <= start);
+            for segment in segments[at..]
+                .iter()
+                .take_while(|segment| segment.source.start < end)
+            {
+                let from = start.max(segment.source.start);
+                let to = end.min(segment.source.end);
+                images.push(
+                    span,
+                    from..to,
+                    segment.row,
+                    segment.col + from - segment.source.start,
+                );
+            }
+            if end > source_col {
+                let from = start.max(source_col);
+                images.push(span, from..end, origin.0, origin.1 + from);
+            }
+        }
+    }
+    for (target, mut spans) in images.rows {
+        spans.sort_by_key(|span| aterm_types::layer_order(span.image.z_index, span.kitty));
+        out[target].set_images(spans);
     }
 }
 
-fn carry_image_spans(run: &[Line], new_cols: u16, out: &mut [Line], first_out: usize) {
-    let [line] = run else {
-        return;
-    };
-    let Some(spans) = line.images() else {
-        return;
-    };
-    let Some(target) = out.get_mut(first_out) else {
-        return;
-    };
-    let clipped: Vec<ImageSpan> = spans
-        .iter()
-        .filter(|span| span.start_col < new_cols)
-        .map(|span| ImageSpan {
-            end_col: span.end_col.min(new_cols),
-            ..span.clone()
-        })
-        .collect();
-    target.set_images(clipped);
+struct ImageProjection {
+    rows: BTreeMap<usize, Vec<ImageSpan>>,
+    cols: u16,
+    first_out: usize,
+    skipped: usize,
+    out_len: usize,
+}
+
+impl ImageProjection {
+    fn push(&mut self, span: &ImageSpan, source: Range<usize>, row: usize, col: usize) {
+        if source.is_empty() || col >= usize::from(self.cols) || row < self.skipped {
+            return;
+        }
+        let target = self.first_out + row - self.skipped;
+        if target >= self.out_len {
+            return;
+        }
+        let Some(first_cell_col) = span.first_cell_col.checked_add(
+            u16::try_from(source.start - usize::from(span.start_col)).unwrap_or(u16::MAX),
+        ) else {
+            return;
+        };
+        let start_col = u16::try_from(col).unwrap_or(u16::MAX);
+        let end_col =
+            u16::try_from((col + source.len()).min(usize::from(self.cols))).unwrap_or(self.cols);
+        let spans = self.rows.entry(target).or_default();
+        if let Some(last) = spans.last_mut()
+            && Arc::ptr_eq(&last.image, &span.image)
+            && last.kitty == span.kitty
+            && last.image_row == span.image_row
+            && last.end_col == start_col
+            && last
+                .first_cell_col
+                .checked_add(last.end_col - last.start_col)
+                == Some(first_cell_col)
+        {
+            last.end_col = end_col;
+        } else {
+            spans.push(ImageSpan {
+                start_col,
+                end_col,
+                first_cell_col,
+                ..span.clone()
+            });
+        }
+    }
 }
 
 fn collect_units<'a>(line: &'a Line, units: &mut Vec<Unit<'a>>) {
@@ -603,6 +753,147 @@ fn build_line(units: &[Unit<'_>], wrapped: bool) -> Line {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn projection_image(z_index: i32) -> Arc<crate::ImageData> {
+        Arc::new(crate::ImageData {
+            bytes: vec![7; 256],
+            format: crate::ImageFormat::Png,
+            cols: 16,
+            rows: 2,
+            z_index,
+            band_lift_px: 0,
+            cell_offset_px: (0, 0),
+            scaling: crate::ImageScaling::Fit,
+            source_rect: None,
+        })
+    }
+
+    fn projected_tiles(lines: &[Line]) -> Vec<(usize, u16, u16, u16)> {
+        lines
+            .iter()
+            .enumerate()
+            .flat_map(|(row, line)| {
+                line.images().unwrap_or(&[]).iter().flat_map(move |span| {
+                    (span.start_col..span.end_col).map(move |col| {
+                        let (image_row, image_col) = span.tile_at(col).unwrap();
+                        (row, col, image_row, image_col)
+                    })
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn wrapped_source_images_split_join_and_survive_retained_tails() {
+        let image = projection_image(0);
+        let witness = Arc::downgrade(&image);
+        let mut head = Line::from("abcd");
+        head.set_images(vec![ImageSpan::new(1, 4, 0, 1, Arc::clone(&image))]);
+        let mut tail = Line::from("efgh");
+        tail.set_wrapped(true);
+        tail.set_images(vec![ImageSpan::new(0, 4, 0, 4, Arc::clone(&image))]);
+        let input = vec![head, tail];
+        let joined = reflow_scrollback_lines(&input, 8);
+        assert_eq!(joined.len(), 1);
+        assert_eq!(
+            joined[0].images().unwrap().len(),
+            1,
+            "contiguous tiles coalesce"
+        );
+        assert_eq!(
+            projected_tiles(&joined),
+            (1..8).map(|col| (0, col, 0, col)).collect::<Vec<_>>()
+        );
+        let split = reflow_scrollback_lines(&input, 3);
+        assert_eq!(
+            projected_tiles(&split),
+            vec![
+                (0, 1, 0, 1),
+                (0, 2, 0, 2),
+                (1, 0, 0, 3),
+                (1, 1, 0, 4),
+                (1, 2, 0, 5),
+                (2, 0, 0, 6),
+                (2, 1, 0, 7),
+            ]
+        );
+        for keep in 0..=split.len() + 1 {
+            let newest = reflow_newest_rows(&input, 3, keep);
+            assert_semantically_equal(&newest, &split[split.len().saturating_sub(keep)..]);
+        }
+        drop(input);
+        drop(image);
+        assert!(witness.upgrade().is_some());
+        assert!(
+            joined
+                .iter()
+                .chain(&split)
+                .flat_map(|line| line.images().unwrap_or(&[]))
+                .all(|span| Arc::ptr_eq(&span.image, &witness.upgrade().unwrap()))
+        );
+        drop(joined);
+        drop(split);
+        assert!(witness.upgrade().is_none());
+    }
+
+    #[test]
+    fn image_projection_respects_wide_early_wrap_and_tile_offsets() {
+        let wide = CellAttrs::new(
+            CellAttrs::DEFAULT.fg,
+            CellAttrs::DEFAULT.bg,
+            crate::CellFlags::WIDE.bits(),
+        );
+        let mut tail = Line::with_attrs("日z", [wide, CellAttrs::DEFAULT].into_iter().collect());
+        tail.set_wrapped(true);
+        tail.set_images(vec![ImageSpan::new(0, 3, 1, 2, projection_image(0))]);
+        let input = [Line::from("ab"), tail];
+        let out = reflow_scrollback_lines(&input, 3);
+        assert_eq!(out[0].as_str(), Some("ab"));
+        assert_eq!(out[1].as_str(), Some("日z"));
+        assert_eq!(
+            projected_tiles(&out),
+            vec![(1, 0, 1, 2), (1, 1, 1, 3), (1, 2, 1, 4)]
+        );
+        let narrow = reflow_scrollback_lines(&input, 1);
+        assert_eq!(projected_tiles(&narrow), vec![(2, 0, 1, 2), (3, 0, 1, 4)]);
+    }
+
+    #[test]
+    fn image_only_rows_clip_without_creating_text_or_wraps() {
+        let mut line = Line::new();
+        line.set_images(vec![ImageSpan::new(0, 12, 1, 2, projection_image(0))]);
+        let out = reflow_scrollback_lines(&[line], 5);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].as_str(), Some(""));
+        assert_eq!(
+            projected_tiles(&out),
+            (0..5).map(|col| (0, col, 1, col + 2)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn joined_image_fragments_keep_draw_key_and_equal_key_order() {
+        for (head_z, tail_z) in [(3, -1), (0, 0)] {
+            let head_image = projection_image(head_z);
+            let tail_image = projection_image(tail_z);
+            let mut head = Line::from("a");
+            head.set_images(vec![ImageSpan::new(0, 4, 0, 0, Arc::clone(&head_image))]);
+            let mut tail = Line::from("b");
+            tail.set_wrapped(true);
+            tail.set_images(vec![ImageSpan::new(0, 1, 0, 0, Arc::clone(&tail_image))]);
+            let out = reflow_scrollback_lines(&[head, tail], 8);
+            let spans = out[0].images().unwrap();
+            assert_eq!(spans.len(), 2);
+            let expected = if head_z == tail_z {
+                [&head_image, &tail_image]
+            } else {
+                [&tail_image, &head_image]
+            };
+            for (actual, expected) in spans.iter().zip(expected) {
+                assert!(Arc::ptr_eq(&actual.image, expected));
+            }
+        }
+    }
 
     fn styled(text: &str, wrapped: bool) -> Line {
         let mut l = Line::from(text);

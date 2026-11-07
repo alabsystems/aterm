@@ -11,7 +11,7 @@ use crate::client::{Accept, Answered, Call, CallBody, Github, method_refusal};
 use crate::error::{Error, IdentityRef, Result};
 use crate::github::How;
 use crate::journal::{IntentStore, Settled};
-use crate::model::{UserObject, from_json};
+use crate::model::{UserObject, from_json_owned};
 use crate::page::{End, LinkScope, ListOpts};
 use crate::policy::{Access, Permit, RouteRequest, RouteTarget};
 use crate::retry::Idempotency;
@@ -345,7 +345,7 @@ impl<'a> Raw<'a> {
                 let path = format!("/users/{}", crate::path::segment(owner));
                 let answered = self.gh.call(&Call::get(path, route).probe_404(!no_probe))?;
                 lookups = answered.requests;
-                let user: UserObject = from_json(&answered.json()?)?;
+                let user: UserObject = from_json_owned(answered.json()?)?;
                 LinkScope::Owner { id: user.id }
             }
             _ => LinkScope::Exact,

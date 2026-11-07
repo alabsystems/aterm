@@ -227,6 +227,100 @@ fn one_keeper_holds_a_board() {
     );
 }
 
+/// A keeper that found the board kept waits for its lock and takes it when the first lets go:
+/// the first lets go only once the waiter showed it found the lock held.
+/// NEGATIVE CONTROL: `wait_keeper_lock` as one try (`self.keeper_lock().ok_or(..)`) refuses the
+/// second while the first holds, never reporting it held, and "the waiter found the lock held"
+/// fails.
+#[cfg(unix)]
+#[test]
+fn a_waiting_keeper_takes_the_board_when_the_first_lets_go() {
+    let (_dir, board) = scratch();
+    let first = board.keeper_lock().expect("the first keeper");
+    let (held, found_held) = std::sync::mpsc::channel();
+    let waiter = {
+        let board = board.clone();
+        std::thread::spawn(move || {
+            board.wait_keeper_lock(move || {
+                let _ = held.send(());
+            })
+        })
+    };
+    found_held
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the waiter found the lock held");
+    drop(first);
+    let second = waiter
+        .join()
+        .expect("the waiter")
+        .expect("the second takes it once the first lets go");
+    assert!(board.keeper_lock().is_none(), "the second keeps it");
+    drop(second);
+}
+
+/// A keeper with nothing to ask is due at its next prune, a closed row's next ask, or a Mac's
+/// backoff's end, whichever is first, and at nothing sooner: an idle board wakes it hourly.
+/// A backoff already over is no deadline: a Mac whose rows are all out of asking does not keep
+/// the keeper due in the past.
+/// NEGATIVE CONTROL: `next_due` as `at + KEEP_IDLE` (the read every 5 s) fails "an idle board
+/// is due at its prune"; without its `> at` filter it fails "a backoff over is no deadline".
+#[cfg(unix)]
+#[test]
+fn an_idle_keeper_is_due_at_its_next_prune_ask_or_backoff() {
+    let at = std::time::Instant::now();
+    let mut closed_asked = std::collections::HashMap::new();
+    let mut backoff = Backoff::default();
+    assert_eq!(
+        next_due(at, Some(at), &closed_asked, &backoff),
+        at + KEEP_PRUNE_EVERY,
+        "an idle board is due at its prune"
+    );
+    closed_asked.insert("s-0b1".to_owned(), at + CLOSED_ASKED_EVERY);
+    assert_eq!(
+        next_due(at, Some(at), &closed_asked, &backoff),
+        at + CLOSED_ASKED_EVERY
+    );
+    let wait = backoff.unanswered("m1".to_owned(), at);
+    assert!(wait < CLOSED_ASKED_EVERY, "PRECONDITION: {wait:?}");
+    assert_eq!(next_due(at, Some(at), &closed_asked, &backoff), at + wait);
+    assert_eq!(
+        next_due(at, None, &closed_asked, &backoff),
+        at,
+        "never pruned"
+    );
+    let later = at + wait + Duration::from_secs(1);
+    assert_eq!(
+        next_due(later, Some(at), &std::collections::HashMap::new(), &backoff),
+        at + KEEP_PRUNE_EVERY,
+        "a backoff over is no deadline"
+    );
+}
+
+/// A keeper at rest wakes when a row is written to its board, by whatever process, well before
+/// its next due an hour away; the write is caught even when it lands before the rest begins.
+/// NEGATIVE CONTROL: `Rest::until` sleeping to `due` without its watch hangs past the
+/// one-minute hang detector, and "the write ended the rest" fails.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_resting_keeper_wakes_when_its_board_is_written() {
+    let (_dir, board) = scratch();
+    board.ensure().expect("the board's folder");
+    let mut rest = Rest::new(board.dir());
+    board
+        .record(&worker("s-0c1", "L", now_ms()))
+        .expect("record");
+    let (done, ended) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let changed = rest.until(std::time::Instant::now() + Duration::from_secs(3600));
+        let _ = done.send(changed);
+    });
+    assert_eq!(
+        ended.recv_timeout(Duration::from_secs(60)),
+        Ok(true),
+        "the write ended the rest"
+    );
+}
+
 #[test]
 fn a_label_is_taken_off_a_spawn_before_it_leaves_this_mac() {
     let words = |w: &[&str]| w.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();

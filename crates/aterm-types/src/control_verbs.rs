@@ -2614,14 +2614,16 @@ pub const VERBS: &[VerbSpec] = &[
          ran (`kind=command`: wall time from its OSC 133 C to D, the CPU the shell and what it \
          reaped spent between them), each agent tool call the jobs engine saw end \
          (`kind=agent-call`, sampled at its 2 s passes: wall an upper bound, CPU and peak \
-         memory lower bounds), each `spawn` (`kind=spawn`) and each claim decided in this \
+         memory lower bounds; its end its leader's exit status, read by a kernel exit watch; \
+         `label=` the program it ran, never the agent's shell wrapper), each `spawn` (`kind=spawn`) and each claim decided in this \
          account's capacity ledger (`kind=admission`, written by the claimant: `wall_ms` and \
          `wait_ms` its wait, CPU and peak `na`). The first line is `telemetry \
          schema=1 rows= dropped= torn= files= bytes= since= oldest= host= facts= dir=` \
          (`dropped=`: rows the writer lost, said by its `gap` lines; `torn=`: lines a crash cut, \
          skipped), then `kind=<k> n= failed= stalled= wall_p50_ms= wall_p90_ms= wall_unknown= \
          cpu_p50_ms= cpu_p90_ms= cpu_unknown= peak_p50_mib= peak_p90_mib= peak_unknown=` per \
-         kind. `telemetry rows` prints the newest `--limit` rows (50) as the log spells them: \
+         kind, and last `calls watched= read= missed=` (this aterm's exit watches on agent \
+         calls' leaders, the statuses read, the calls that ended with none). `telemetry rows` prints the newest `--limit` rows (50) as the log spells them: \
          `key=` and `dir=` are digests (`key=-` for a command no program was confirmed for), \
          `label=` one word (a confirmed program, a shell builtin or keyword, an admission's \
          claimant) and `sid=` the session's public id, never a command line; \
@@ -2805,32 +2807,40 @@ pub const VERBS: &[VerbSpec] = &[
             "`, the text typed and not submitted, and a re-press it takes none of stops the \
              re-presses as a miss does). `typed=1` presses key by key at \
              `cadence=<ms>` (default 70) up to `cap=<n>` graphemes (default 240, max 4096) and \
-             pastes the rest (`typed=<keys> pasted=<graphemes>`) as typing it would go: its \
-             text pasted, each Tab or line break in it pressed as its key between the pastes. \
+             writes the rest as typing it would go (`typed=<keys> pasted=<graphemes>`, \
+             `pasted=` counting the rest's graphemes): each run of its text in one write of the \
+             bytes its keys send under the program's keyboard mode, never a bracketed paste, \
+             which a program may take otherwise than the keys (fish escapes the quotes of a \
+             paste in a quoted word), and each Tab or line break pressed as its key between \
+             the runs. \
              The timeout never leaves part \
              of the text typed (a fenced turn's waits for its program aside, below): a key \
              goes only while it, the rest's writes and the submit's window (at most half of `timeout=`, with the echo's 150 ms settle) still \
              fit before `timeout=` at the pace the keys have gone, with room for the longest \
              wait a fenced key has needed so far, and once they would not the rest goes so \
-             (each paste bracketed where the program asked for bracketed paste), so the submit \
+             (each run its keys' bytes in one write), so the submit \
              takes the whole text; the echo's settle then waits only while that share of the \
              submit still fits (a Claude Code composer's echo is waited for as ever, since an \
              Enter before it shows proves nothing; an echo that spends the submit's share sends \
              the Enter late, `pressed=<n>` when unverified). A turn \
              whose first key does not fit writes nothing (`OK 0 turn skipped \
              reason=deadline typed=0 pasted=0 submitted=0 seq=<n> id=<n>`, the composer as it \
-             was). Once its first key or paste has gone, a turn types and submits whatever its \
-             caller does, its Enter after the text (into a session not in front, once its \
-             paste has reached that session's input, up to 30 s: one not all there by then is \
-             left queued and unsubmitted, `ERR paste delivery failed`); a caller already gone \
+             was). Once its first write has gone, a turn types and submits whatever its \
+             caller does, its Enter after the text (into a session not in front, once a plain \
+             turn's paste has reached that session's input, up to 30 s: one not all there by \
+             then is left queued and unsubmitted, `ERR paste delivery failed`), except that an \
+             `if-supervisor=` fence is judged at each write, so a claim that ends meanwhile (its \
+             holder's connection gone) refuses the rest and ends the turn in doubt (`ERR key \
+             delivery failed`); a caller already gone \
              when it would first write gets nothing written (`ERR paste delivery failed`, or \
              `ERR key delivery failed` for a first key or Enter). A person's \
              key or a screen or input-frame change stops it with `OK 0 turn skipped \
              reason=<person|changed> typed=<k> pasted=<p> submitted=0 seq=<n> id=<n>`, the part \
              typed left standing. Fenced on a composer box, a key waits for an open DEC 2026 \
              frame to close, a digit also for the program to read and draw the key before it \
-             (as does the pasted rest, where it holds a digit), and a guarded submit for the \
-             program to draw the last write, key or paste; a wait gives its time back to \
+             (as does a run of the rest, where it holds a digit), and a guarded submit for the \
+             program to draw the last write, and for input queued before it to go; a wait gives \
+             its time back to \
              `timeout=` once it ends, so the time the turn has left bounds each wait, not their \
              sum: one that outlasts it, as one the program never ends does or one slower than \
              the room the pace keeps (the submit's share, and the longest wait so far), is cut \
@@ -2846,7 +2856,7 @@ pub const VERBS: &[VerbSpec] = &[
              `if-human=<n>` (`status human_seq=`, the `text --json` read's `human_seq`) fences on \
              the person: any gesture since, one that moves no fenced row among them, is `OK 0 \
              turn skipped reason=person submitted=0 seq=<n> id=<n>`, judged under the fence's \
-             lock, and again before a paste and before the first submit press (`reason=person \
+             lock, and again before a plain turn's paste and before the first submit press (`reason=person \
              typed=<k> pasted=<p>`, the text left unsubmitted). \
              The settled screen is read on a whole frame too (` frame=open` when not). \
              `if-supervisor=<holder>` fences on the live supervisor claim; `cause=` links the \
@@ -2857,8 +2867,13 @@ pub const VERBS: &[VerbSpec] = &[
              whatever it answered, and any other refused write that ends the turn leaves it in \
              doubt; see `send`). A `hold` before the bytes land is `ERR halted …`; one after \
              but before the first submit press stops it (`OK 0 turn skipped reason=halted[ \
-             typed=<k> pasted=<p>] submitted=0 seq=<n> id=<n>`, `typed=` on a `typed=1` turn); a \
-             later one only ends re-presses. Into a `stalled` or stopped program it is `ERR busy \
+             typed=<k> pasted=<p>] submitted=0 seq=<n> id=<n>`, the fields where text stands: a \
+             `typed=1` turn's keys and runs, a plain turn's paste as `typed=0 pasted=<p>`, the \
+             graphemes it kept); a \
+             later one only ends re-presses. `lease release force` preempts a turn the same way: \
+             it writes nothing more, what it wrote standing (`OK 0 turn skipped \
+             reason=preempted[ typed=<k> pasted=<p>] submitted=0 seq=<n> id=<n>`), and once an \
+             Enter has gone it only ends re-presses. Into a `stalled` or stopped program it is `ERR busy \
              input-unread …` (`turn` takes no `unread=ok`); input over 1 s old appends \
              `warn=input-unread input_bytes=<n> input_wait_ms=<ms>`. Its first write refused \
              whole, by a full input queue or the `if-supervisor=` fence, is `ERR busy \
@@ -2971,7 +2986,9 @@ pub const VERBS: &[VerbSpec] = &[
          if=Do.you.want.to.proceed 1`): a match writes and replies `OK seq=<n>`; no match writes \
          nothing, releases `id=` (so a retry is re-evaluated rather than `dup=1`), and replies \
          `OK skipped seq=<n>`; invalid regex is `ERR badregex`; a full/contended sink is `ERR \
-         busy sink` (or `ERR write failed partial accepted=<n>`). `if-gen=<epoch>.<seq>` (`status \
+         busy sink` (or `ERR write failed partial accepted=<n>`), and so is input queued before \
+         it still being written (a paste draining), judged after `if-supervisor=` and \
+         `if-human=` and before every other fence, nothing written. `if-gen=<epoch>.<seq>` (`status \
          gen=`, `agent_gen=`) and `if-fp=<hex16>` (`status hash=`, `agent_fp=`, `turn hash=`) \
          reply `OK skipped reason=changed seq=<n>` if the screen moved (`if-seq=` is rejected as \
          `ERR usage`). A row fence (`if=`, `if-fp=`) waits as `text` does for an unfinished DEC \
@@ -3182,6 +3199,14 @@ pub const VERBS: &[VerbSpec] = &[
         Session,
         "observe this Codex session's account pool",
         "Authenticated Codex only. Versioned cached account metadata, without credentials or assignment authority.",
+    ).input(Input::NONE),
+    v(
+        "codex-auth",
+        Signal,
+        Status,
+        Session,
+        "private Codex session credential source and refresh",
+        "Qualified kernel-authenticated Codex peers only. Native session-owned materialization and refresh; no caller paths, credentials or account-selection authority are accepted.",
     ).input(Input::NONE),
     v(
         "codex-accounts-change",

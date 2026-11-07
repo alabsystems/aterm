@@ -560,6 +560,153 @@ fn a_removal_a_writer_made_durable_is_read_while_it_holds_the_lock() {
     lab.server.stop();
 }
 
+/// A denial check that keeps failing holds a role for [`crate::cli::ROLE_UNJUDGED_POLLS`] polls and
+/// no more, whichever file it was and whether or not the signer denied this Mac, because this Mac
+/// cannot tell which. A Mac still in gets its role back once the fault clears; a denied one does
+/// not. A new server gets none from any of it. With the applied records absent the cached envelope
+/// still judges this Mac, so a held role outlasts the bound, as
+/// `docs/measured/vault-cold-server-role-2026-11-04.md` decided for a warm server. Records that are
+/// there and cannot be read (their mode refused, their bytes corrupt) judge nothing and may hold a
+/// removal the envelope is behind, so where the envelope does not deny this Mac they get the bound,
+/// as the vault file does. A denial that envelope holds ends the role at the first poll, whatever
+/// became of the records.
+///
+/// NEGATIVE CONTROLS (2026-11-06): with the bound gone from `ServeRole::apply`, the role outlasts it
+/// (`denied false, the vault file refused by its mode: the bound ends it`); with the records gone
+/// read as a check that judged nothing (`Judgement::EnvelopeClear` mapped to `Unjudged`), the
+/// role ends (`denied false, the applied records gone: a warm role outlasts it`); with
+/// `EnvelopeClear` given to records that are there (no `records_storage::absent` gate), the role
+/// outlasts the bound (`denied false, the records file refused by its mode (writable by others):
+/// the bound ends it`); with the envelope's denial read as clear while custody fails, the role
+/// stands (`denied true, the records file refused by its mode (writable by others): the
+/// envelope's denial ends it`).
+#[test]
+fn a_denial_check_that_keeps_failing_ends_a_held_role() {
+    use std::os::unix::fs::PermissionsExt as _;
+    type Fault<'a> = (&'a str, &'a dyn Fn(), &'a dyn Fn());
+    /// What a held role does while the fault lasts.
+    #[derive(Clone, Copy)]
+    enum During {
+        /// It stands for the bound and the bound ends it.
+        Bounded,
+        /// It stands past the bound: the cached envelope judged this Mac.
+        Outlasts,
+        /// The first poll ends it: the cached envelope denies this Mac.
+        Denied,
+    }
+    let _answering = ServersAnswering::set();
+    let lab = two_macs(&[]);
+    let m7 = &lab.m7;
+    let signer = configured(m7).unwrap().signer;
+    on_the_alab_line(signer);
+    let mut roles: [crate::cli::ServeRole; 10] = Default::default();
+    for role in &mut roles {
+        assert_eq!(poll_role(&lab, signer, role).as_deref(), Some("m7"));
+    }
+    let mut roles = roles.iter_mut();
+    let mode = |path: std::path::PathBuf, mode| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    let held = std::cell::RefCell::new(Vec::new());
+    let refused_vault: Fault = (
+        "the vault file refused by its mode",
+        &|| mode(m7.cache_file(), 0o644),
+        &|| mode(m7.cache_file(), 0o600),
+    );
+    let corrupt_state: Fault = (
+        "a corrupt state.toml",
+        &|| {
+            *held.borrow_mut() = std::fs::read(m7.state_file()).unwrap();
+            fsx::write_atomic(&m7.state_file(), b"not valid toml [", 0o600).unwrap();
+        },
+        &|| fsx::write_atomic(&m7.state_file(), &held.borrow(), 0o600).unwrap(),
+    );
+    let refused_records: Fault = (
+        "the records file refused by its mode (writable by others)",
+        &|| mode(m7.records_data_file().unwrap(), 0o666),
+        &|| mode(m7.records_data_file().unwrap(), 0o600),
+    );
+    let corrupt_records: Fault = (
+        "a corrupt records file",
+        &|| {
+            let data = m7.records_data_file().unwrap();
+            *held.borrow_mut() = std::fs::read(&data).unwrap();
+            fsx::write_atomic(&data, b"not membership records", 0o600).unwrap();
+        },
+        &|| fsx::write_atomic(&m7.records_data_file().unwrap(), &held.borrow(), 0o600).unwrap(),
+    );
+    let records_gone: Fault = (
+        "the applied records gone",
+        &|| {
+            *held.borrow_mut() = std::fs::read(m7.records_file()).unwrap();
+            std::fs::remove_file(m7.records_file()).unwrap();
+        },
+        &|| {
+            save_records(m7, &held.borrow()).unwrap();
+        },
+    );
+    let label = Some("m7".to_owned());
+    let mut under = |denied: bool, during: During, (fault, begin, end): Fault| {
+        let row = format!("denied {denied}, {fault}");
+        let role = roles.next().unwrap();
+        begin();
+        match during {
+            During::Bounded | During::Outlasts => {
+                for poll in 0..crate::cli::ROLE_UNJUDGED_POLLS {
+                    let during = poll_role(&lab, signer, role);
+                    assert_eq!(during, label, "{row}, poll {poll}");
+                }
+            }
+            During::Denied => {}
+        }
+        match during {
+            During::Bounded => assert_eq!(
+                poll_role(&lab, signer, role),
+                None,
+                "{row}: the bound ends it"
+            ),
+            During::Outlasts => assert_eq!(
+                poll_role(&lab, signer, role),
+                label,
+                "{row}: a warm role outlasts it"
+            ),
+            During::Denied => assert_eq!(
+                poll_role(&lab, signer, role),
+                None,
+                "{row}: the envelope's denial ends it"
+            ),
+        }
+        assert_eq!(
+            poll_role(&lab, signer, &mut crate::cli::ServeRole::default()),
+            None,
+            "{row}: a new server"
+        );
+        end();
+        let again = if denied { None } else { label.clone() };
+        assert_eq!(
+            poll_role(&lab, signer, role),
+            again,
+            "{row}: once it clears"
+        );
+    };
+    let records = [refused_records, corrupt_records];
+    for fault in [refused_vault, corrupt_state].into_iter().chain(records) {
+        under(false, During::Bounded, fault);
+    }
+    under(false, During::Outlasts, records_gone);
+    publish_roster(&lab, b"deny_labels = [\"m7\"]\n");
+    for fault in [refused_vault, corrupt_state] {
+        under(true, During::Bounded, fault);
+    }
+    // A denial the cached envelope holds is read whatever became of the records, so no bound
+    // comes into it.
+    for fault in records.into_iter().chain([records_gone]) {
+        under(true, During::Denied, fault);
+    }
+    off_the_alab_line();
+    lab.server.stop();
+}
+
 /// [`two_macs`] before its genesis: `m7` has applied a version of a vault that holds no log.
 fn macs_on_a_vault_with_no_log(root: &Path) -> (crate::server::Running, Paths, Paths) {
     let server = log_entries_tests::start_loopback_server(&root.join("s1"));

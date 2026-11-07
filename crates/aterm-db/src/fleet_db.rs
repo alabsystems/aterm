@@ -532,10 +532,22 @@ fn password_weight(row: &Value) -> u8 {
 
 /// Whether a row's password cell says a password exists: it holds one, or a has-password word.
 fn claims_a_password(row: &Value) -> bool {
-    match row.get("password").and_then(Value::as_str).map(str::trim) {
-        None | Some("") => false,
-        Some(cell) => crate::typed::secret::flag_says_str(cell).unwrap_or(true),
-    }
+    row.get("password")
+        .and_then(Value::as_str)
+        .is_some_and(crate::typed::secret::cell_claims)
+}
+
+/// Whether a stored email candidate claims a password after [`drop_read_fields`].
+fn claims_stored_password(row: &Value) -> bool {
+    row.get("password")
+        .and_then(Value::as_str)
+        .is_some_and(|pw| {
+            if pw == REDACTED {
+                crate::typed::secret::cell_claims(HAS_PASSWORD)
+            } else {
+                crate::typed::secret::cell_claims(pw)
+            }
+        })
 }
 
 /// A row as a conflict judges it: password cells that say the same thing do not disagree, however
@@ -589,7 +601,7 @@ fn project_cell(logical_table: &str, cell: &Cell) -> Option<Value> {
         shown
     };
     let mut row = read(&winner.value);
-    if cell.candidates.len() == 1 && !any_protected {
+    if cell.candidates.len() == 1 && (!any_protected || !claims_stored_password(&winner.value)) {
         return Some(row);
     }
     // A stored password outlives a concurrent empty cell or has-password word, as a row outlives a
@@ -616,14 +628,12 @@ fn project_cell(logical_table: &str, cell: &Cell) -> Option<Value> {
         // A protected row shows no password, but one a concurrent value claims is a disagreement,
         // the only sign of it left: a word says so, never the value, so `tables` counts it and the
         // import reports the cell (one-mesh design §4.7).
-        if any_protected && !is_tombstone(&candidate.value) {
-            let mut stored = candidate.value.clone();
-            drop_read_fields(logical_table, &mut stored);
-            if claims_a_password(&stored)
-                && let Some(obj) = shown.as_object_mut()
-            {
-                obj.insert("password".into(), Value::from(HAS_PASSWORD));
-            }
+        if any_protected
+            && !is_tombstone(&candidate.value)
+            && claims_stored_password(&candidate.value)
+            && let Some(obj) = shown.as_object_mut()
+        {
+            obj.insert("password".into(), Value::from(HAS_PASSWORD));
         }
         if as_compared(logical_table, &shown) != row_compared && !conflicts.contains(&shown) {
             conflicts.push(shown);
@@ -765,14 +775,11 @@ pub fn redact_row(logical_table: &str, mut row: Value, show_passwords: bool) -> 
     if show_passwords {
         return row;
     }
-    if logical_table == "emails"
-        && let Some(obj) = row.as_object_mut()
-    {
-        let has_pw = obj
-            .get("password")
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.trim().is_empty());
-        obj.insert("has_password".into(), Value::Bool(has_pw));
+    if logical_table == "emails" {
+        let has_pw = claims_a_password(&row);
+        if let Some(obj) = row.as_object_mut() {
+            obj.insert("has_password".into(), Value::Bool(has_pw));
+        }
     }
     redact_credentials(&mut row);
     row
@@ -999,21 +1006,13 @@ fn transactions(changes: Vec<Change>) -> Result<Vec<Vec<Change>>> {
 
     for change in changes {
         // A row `put` accepted has to load too: alone in a transaction it may use all of one.
-        let alone = Command::Write {
-            request: [0; 16],
-            changes: vec![change],
-        };
-        let alone_len = alone.encode()?.len();
+        let alone_len = Command::encode_write([0; 16], std::slice::from_ref(&change))?.len();
         if alone_len > crypto::MAX_BODY {
             return Err(Error::new(
                 "single row exceeds maximum operation payload limit",
             ));
         }
         let change_bytes = alone_len.saturating_sub(67);
-        let Command::Write { mut changes, .. } = alone else {
-            unreachable!()
-        };
-        let change = changes.pop().expect("single change");
         if !current_chunk.is_empty()
             && (current_chunk.len() >= MAX_WRITES || current_bytes + change_bytes > MAX_BATCH_BYTES)
         {
@@ -1305,8 +1304,11 @@ fn plan_rows(view: &View, doc: &Value, existing: Existing) -> Result<Plan> {
         unchanged: 0,
     };
     let mut seen_keys = BTreeSet::new();
+    let mut lookup_key = (String::new(), String::new());
     for &logical in TABLES {
         let (_, collection) = resolve_table(logical)?;
+        lookup_key.0.clear();
+        lookup_key.0.push_str(collection);
         let items = match obj.get(logical) {
             None => &[][..],
             Some(Value::Array(items)) => items.as_slice(),
@@ -1318,11 +1320,11 @@ fn plan_rows(view: &View, doc: &Value, existing: Existing) -> Result<Plan> {
             let mut item_val = item.clone();
             if logical == "emails" {
                 let skey = storage_key(logical, &nat)?;
+                lookup_key.1.clear();
+                lookup_key.1.push_str(&skey);
                 // A key that stands is not written, so what is stored there decides nothing here.
-                let stands = matches!(existing, Existing::Keep)
-                    && view
-                        .cells
-                        .contains_key(&(collection.to_owned(), skey.clone()));
+                let stands =
+                    matches!(existing, Existing::Keep) && view.cells.contains_key(&lookup_key);
                 if !stands {
                     inherit_email_state(view, &skey, &mut item_val)?;
                 }
@@ -1330,13 +1332,14 @@ fn plan_rows(view: &View, doc: &Value, existing: Existing) -> Result<Plan> {
             let normalized = normalize_row(logical, &nat, item_val)?;
             let final_nat = natural_key_of(logical, &nat, &normalized);
             let skey = storage_key(logical, &final_nat)?;
-            let key_pair = (collection.to_owned(), skey);
-            if !seen_keys.insert(key_pair.clone()) {
+            if !seen_keys.insert((collection, skey.clone())) {
                 return Err(Error::new(
                     "snapshot document contains duplicate primary keys in table",
                 ));
             }
-            let cell = view.cells.get(&key_pair);
+            lookup_key.1.clear();
+            lookup_key.1.push_str(&skey);
+            let cell = view.cells.get(&lookup_key);
             let settled = match existing {
                 Existing::Keep => cell.is_some(),
                 // A dump of exactly this state changes nothing, a conflict it shows included.
@@ -1356,8 +1359,8 @@ fn plan_rows(view: &View, doc: &Value, existing: Existing) -> Result<Plan> {
                 ));
             }
             plan.changes.push(Change {
-                collection: key_pair.0,
-                key: key_pair.1,
+                collection: collection.to_owned(),
+                key: skey,
                 value: Some(normalized),
             });
             written += 1;
@@ -1395,7 +1398,7 @@ pub fn rekey_at(dir: &Path) -> Result<Value> {
 
 /// In a kept folder until all of its rows have reached the new dataset. It holds that folder's
 /// place in the order the folders were set aside.
-const REKEY_UNFINISHED: &str = "rekey-unfinished";
+pub(crate) const REKEY_UNFINISHED: &str = "rekey-unfinished";
 
 /// The folder an earlier rekey of `dir` kept and did not finish moving, if any.
 fn unfinished_rekey(dir: &Path) -> Result<Option<PathBuf>> {
@@ -1474,6 +1477,23 @@ fn deletions(view: &View) -> Vec<Change> {
             key: key.clone(),
             value: Some(json!({"_deleted": true})),
         })
+        .collect()
+}
+
+/// The records `db` holds that write cells and its read leaves out, a forked writer's or one
+/// waiting for its parent. A refused record is pending too and never held a row, and a merge writes
+/// no cell.
+pub(crate) fn withheld_operations(db: &Database) -> Vec<astream_wire::sync::Digest> {
+    db.view()
+        .causal
+        .pending
+        .iter()
+        .filter(|id| {
+            db.history.command(id).is_some_and(|(_, command)| {
+                command.changes().is_some_and(|changes| !changes.is_empty())
+            })
+        })
+        .copied()
         .collect()
 }
 
@@ -1599,15 +1619,25 @@ fn is_password_flag(cell: &str) -> bool {
 /// Read non-flag email passwords from an optional workbook (`alab-emails.xlsx` or
 /// `AI Email Accounting.xlsx`) in `secrets_dir` (`Emails` tab, column C), so `bootstrap`
 /// populates real passwords even when `alab-emails.csv` only carries has-password flags (`1`).
-fn read_xlsx_email_passwords(secrets_dir: &Path) -> BTreeMap<String, Zeroizing<String>> {
+/// Returns them with the workbooks that are there and could not be read: a file that holds them
+/// and fails to open must not read as one that holds none.
+fn read_xlsx_email_passwords(
+    secrets_dir: &Path,
+) -> (BTreeMap<String, Zeroizing<String>>, Vec<&'static str>) {
     let mut out = BTreeMap::new();
+    let mut unread = Vec::new();
     for filename in ["alab-emails.xlsx", "AI Email Accounting.xlsx"] {
         let path = secrets_dir.join(filename);
-        let Ok((bytes, _)) = aterm_uds::atomic_file::read_regular(&path, 64 * 1024 * 1024) else {
-            continue;
+        let bytes = match aterm_uds::atomic_file::read_regular(&path, 64 * 1024 * 1024) {
+            Ok((bytes, _)) => Zeroizing::new(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                unread.push(filename);
+                continue;
+            }
         };
-        let bytes = Zeroizing::new(bytes);
         let Ok(mut records) = crate::alab::import::xlsx::tab(&bytes, "Emails") else {
+            unread.push(filename);
             continue;
         };
         for row in records.iter().skip(1) {
@@ -1624,7 +1654,7 @@ fn read_xlsx_email_passwords(secrets_dir: &Path) -> BTreeMap<String, Zeroizing<S
             break;
         }
     }
-    out
+    (out, unread)
 }
 
 fn default_webmail_url(provider: &str) -> &'static str {
@@ -1790,7 +1820,8 @@ pub fn bootstrap_from_secrets(db: &mut Database, secrets_dir: &Path) -> Result<V
         computers_map.insert(label, obj);
     }
 
-    let xlsx_passwords = read_xlsx_email_passwords(secrets_dir);
+    let (xlsx_passwords, unread_workbooks) = read_xlsx_email_passwords(secrets_dir);
+    let no_passwords = xlsx_passwords.is_empty();
     let emails_bytes = crate::import::read_bounded(&secrets_dir.join("alab-emails.csv"))?;
     let emails_records = crate::import::parse(&emails_bytes)?;
     let mut emails_map: BTreeMap<String, Map> = BTreeMap::new();
@@ -2081,7 +2112,16 @@ pub fn bootstrap_from_secrets(db: &mut Database, secrets_dir: &Path) -> Result<V
         "phones": phones_map.into_values().map(Value::Object).collect::<Vec<_>>(),
         "ai_accounts": ai_accounts_map.into_values().map(Value::Object).collect::<Vec<_>>(),
     });
-    import_rows(db, &doc, Existing::Keep)
+    let mut report = import_rows(db, &doc, Existing::Keep)?;
+    if !unread_workbooks.is_empty()
+        && let Some(fields) = report.as_object_mut()
+    {
+        fields.insert("unread_workbooks".into(), json!(unread_workbooks));
+        if no_passwords {
+            fields.insert("ok".into(), json!(false));
+        }
+    }
+    Ok(report)
 }
 
 fn resolve_peer_addr(dir: &Path, raw: &str) -> Result<SocketAddr> {
@@ -2311,6 +2351,10 @@ pub(crate) fn try_run_with(
     // these writes would edit a copy no one reads (one-mesh design §4.7, A7).
     if matches!(cmd, "put" | "delete" | "load" | "bootstrap" | "rekey") {
         crate::alab::import::covered::refuse_writes(&dir)?;
+    }
+    // Ahead of a verb's own usage, so every spelling names the rekey. A round refuses for itself.
+    if !matches!(cmd, "rekey" | "sync" | "serve") {
+        refuse_unfinished(&dir)?;
     }
     match cmd {
         "tables" | "status" => {
@@ -3401,6 +3445,56 @@ mod tests {
                 "{one} {other:?}"
             );
         }
+    }
+
+    /// A none word says what an empty cell says, and stays masked, so a stdout dump of it cannot
+    /// clear a password elsewhere.
+    /// NEGATIVE CONTROL: with `redact_row` taking any non-empty cell as set:
+    /// `` left: Bool(true) right: Bool(false) ``.
+    #[test]
+    fn a_none_word_reads_as_no_password() {
+        let row = |stored: &str| json!({"email": "root@example.com", "password": stored});
+        for stored in ["0", "none", " No "] {
+            let shown = redact_row("emails", row(stored), false);
+            assert_eq!(shown["has_password"], json!(false), "{stored}");
+            assert_eq!(shown["password"], json!(REDACTED), "{stored}");
+        }
+        for stored in ["1", "yes", "real-password"] {
+            let shown = redact_row("emails", row(stored), false);
+            assert_eq!(shown["has_password"], json!(true), "{stored}");
+            assert_eq!(shown["password"], json!(REDACTED), "{stored}");
+        }
+    }
+
+    /// A workbook that is there and cannot be read is named, and when it was the only source of
+    /// passwords `bootstrap` is not ok: rows it writes stand, so a repaired file comes too late.
+    /// NEGATIVE CONTROL: with `read_xlsx_email_passwords` skipping it silently:
+    /// `` left: Null right: Array([String("alab-emails.xlsx")]) ``.
+    #[test]
+    fn a_workbook_that_cannot_be_read_is_named() {
+        let tmp = aterm_tempfile::tempdir().expect("tempdir");
+        let sheets = tmp.path().join("sheets");
+        std::fs::create_dir(&sheets).unwrap();
+        for (name, text) in [
+            ("alab-phones.csv", "phone\n"),
+            ("alab-computers.csv", "label\n"),
+            (
+                "alab-emails.csv",
+                "email\nflag@example.com,,1,active,proton,,,\n",
+            ),
+            ("ai-accounts.csv", "m\n"),
+            ("alab-emails.xlsx", "not a workbook"),
+        ] {
+            std::fs::write(sheets.join(name), text).unwrap();
+        }
+        let mut db = replica(&tmp.path().join("db"));
+        let report = bootstrap_from_secrets(&mut db, &sheets).unwrap();
+        assert_eq!(report["unread_workbooks"], json!(["alab-emails.xlsx"]));
+        assert_eq!(report["ok"], json!(false));
+        std::fs::remove_file(sheets.join("alab-emails.xlsx")).unwrap();
+        let report = bootstrap_from_secrets(&mut db, &sheets).unwrap();
+        assert_eq!(report.get("unread_workbooks"), None);
+        assert_eq!(report["ok"], json!(true));
     }
 
     #[test]

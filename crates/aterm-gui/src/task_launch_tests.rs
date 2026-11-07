@@ -1373,7 +1373,9 @@ fn a_prompt_is_taken_once_one_screen_generation_has_held_for_the_settle() {
 }
 
 /// A WORKER'S LINE IS TRIED AGAIN ONLY WHERE NOTHING WAS WRITTEN ([`launch_line_typed`]): the
-/// fence's refusals, which it makes before a byte is written, are [`Untyped::Unsettled`]; a line
+/// fence's refusals, which it makes before a byte is written, and input queued before the line
+/// that had not all gone (a report on Windows; third review of the turn-deadline work,
+/// 2026-11-06), are [`Untyped::Unsettled`]; a line
 /// written whole or in part is typed and never tried again, and a person's use or a write the
 /// sink did not take (a short write among them) stalls the task: the first says a person came, the
 /// second names a cause no shell or person made ([`Untyped::Blocked`]).
@@ -1381,7 +1383,11 @@ fn a_prompt_is_taken_once_one_screen_generation_has_held_for_the_settle() {
 fn only_a_press_that_wrote_nothing_is_tried_again() {
     use crate::control::GuardedInput;
     use crate::input::Delivery;
-    for unsettled in [GuardedInput::Changed, GuardedInput::Skipped] {
+    for unsettled in [
+        GuardedInput::Changed,
+        GuardedInput::Skipped,
+        GuardedInput::Queued,
+    ] {
         assert_eq!(
             launch_line_typed(unsettled),
             Err(Untyped::Unsettled),
@@ -2933,16 +2939,26 @@ fn native_google_worker_installs_before_preparing_its_guard() {
         expected.env = vec![("HOME".into(), "/verified/native/home".into())];
         expected.args = Ok(vec!["--gemini_dir=/verified/native/home/.gemini".into()]);
         expected.unset = vec!["GEMINI_API_KEY"];
-        let result = admit_prepared_worker(cli, cli.plain(), None, &|_| {}, &|| (), &store, |_| {
-            assert!(
-                store.present.get(),
-                "preparation ran before native installation"
-            );
-            store.asked.borrow_mut().push("prepare".into());
-            prepared.set(true);
-            alive.set(true);
-            Ok((expected.clone(), Guard(&alive)))
-        });
+        let result = admit_prepared_worker(
+            cli,
+            cli.plain(),
+            None,
+            &|_| {},
+            &|| (),
+            &store,
+            |admitted| {
+                admitted.prepare(cli, None, |_| {
+                    assert!(
+                        store.present.get(),
+                        "preparation ran before native installation"
+                    );
+                    store.asked.borrow_mut().push("prepare".into());
+                    prepared.set(true);
+                    alive.set(true);
+                    Ok((expected.clone(), Guard(&alive)))
+                })
+            },
+        );
         if !lays {
             assert!(matches!(result, Err(Refused::Program(_))));
             assert!(!prepared.get());
@@ -3056,8 +3072,8 @@ fn prepared_worker_retains_holds_and_rechecks_replacement_sign_in() {
         asked: std::cell::RefCell::new(Vec::new()),
     };
     let (admitted, ()) =
-        admit_prepared_worker(agy, agy.plain(), None, &|_| {}, &|| (), &held, |starter| {
-            Ok((starter, ()))
+        admit_prepared_worker(agy, agy.plain(), None, &|_| {}, &|| (), &held, |admitted| {
+            admitted.prepare(agy, None, |starter| Ok((starter, ())))
         })
         .unwrap();
     assert!(
@@ -3104,9 +3120,11 @@ fn prepared_worker_retains_holds_and_rechecks_replacement_sign_in() {
         &|_| {},
         &|| (),
         &store,
-        |starter| {
-            std::fs::remove_file(&auth).unwrap();
-            Ok((starter, Guard(&dropped)))
+        |admitted| {
+            admitted.prepare(grok, Some(root.path()), |starter| {
+                std::fs::remove_file(&auth).unwrap();
+                Ok((starter, Guard(&dropped)))
+            })
         },
     );
     assert!(matches!(result, Err(Refused::SignedOut(_))));

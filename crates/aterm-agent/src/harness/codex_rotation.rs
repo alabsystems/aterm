@@ -24,6 +24,18 @@ impl super::provider_read::WallDoor for WallUse {
 }
 
 pub trait UsageReader {
+    fn read_on(
+        &self,
+        seat: &Seat<'_>,
+        home: &Path,
+        expected_email: Option<&str>,
+        now: i64,
+        wait: Duration,
+        use_token: super::provider_read::Use,
+    ) -> Option<IdentifiedUsage> {
+        let _ = seat;
+        self.read(home, expected_email, now, wait, use_token)
+    }
     fn read(
         &self,
         home: &Path,
@@ -59,6 +71,24 @@ pub struct LiveUsage<'a> {
 }
 
 impl UsageReader for LiveUsage<'_> {
+    fn read_on(
+        &self,
+        seat: &Seat<'_>,
+        home: &Path,
+        expected_email: Option<&str>,
+        now: i64,
+        wait: Duration,
+        use_token: super::provider_read::Use,
+    ) -> Option<IdentifiedUsage> {
+        let directory = home.parent()?;
+        super::cli::cleanup_codex_enrollments(
+            &seat.store(Cli::Codex),
+            &seat.config_dir.join(Cli::Codex.accounts().roster_file),
+            now,
+            directory,
+        );
+        self.read(home, expected_email, now, wait, use_token)
+    }
     fn read(
         &self,
         home: &Path,
@@ -327,64 +357,21 @@ fn with_selection_writer<T>(
         {
             return Err("target-unavailable");
         }
-        let source_custody = super::accounts_sync::codex_completion_source(env, source)
-            .map_err(|_| "source-unreadable")?;
-        let target_custody = super::accounts_sync::codex_completion_source(env, target)
-            .map_err(|_| "source-unreadable")?;
-        if source_custody.held_by.is_some() || target_custody.held_by.is_some() {
-            return Err("source-held");
-        }
-        for (row, custody) in [(*source, &source_custody), (*target, &target_custody)] {
-            if custody.fleet.as_ref().is_some_and(|fleet| {
-                fleet.roster.accounts.iter().any(|account| {
-                    account.label == row.label
-                        && (account.vendor != row.vendor
-                            || !row.expected_identity_email().is_some_and(|email| {
-                                accounts::email_matches(email, &account.email)
-                            }))
-                })
-            }) {
-                return Err("source-conflict");
-            }
-        }
-        if receipt.old_auth == receipt.new_auth {
-            return Err("same-login");
-        }
-        let mut paths = vec![receipt.old_auth.clone()];
-        if phase != SelectionPhase::Rollback {
-            paths.push(receipt.new_auth.clone());
-        }
-        paths.sort();
-        let _auth_locks = paths
-            .iter()
-            .map(|path| {
-                codex_app_login::AuthLock::try_take(path)
-                    .map_err(|_| "auth-lock")?
-                    .ok_or("auth-busy")
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let old_home = receipt.old_auth.parent().ok_or("auth-path")?;
-        let new_home = receipt.new_auth.parent().ok_or("auth-path")?;
-        if !crate::ai::facts::codex_file_store(old_home)
-            || codex_app_login::renewal_identity(old_home).as_ref()
-                != Some(&receipt.intent.identity)
-            || (phase != SelectionPhase::Rollback
-                && (!crate::ai::facts::codex_file_store(new_home)
-                    || codex_app_login::renewal_identity(new_home).as_ref() != Some(expected)))
-        {
-            return Err("identity-mismatch");
-        }
+        let custody = super::codex_account_custody::lock(
+            env,
+            source,
+            target,
+            &receipt.old_auth,
+            &receipt.new_auth,
+            &receipt.intent.identity,
+            (phase != SelectionPhase::Rollback).then_some(expected),
+        )?;
         let (latest, warnings) = crate::supervise::SupervisorConfig::from_path(Some(config));
         if !warnings.is_empty()
             || latest.accounts != policy.accounts
             || latest.relaunch != policy.relaunch
             || latest.resume_limits != policy.resume_limits
-            || super::accounts_sync::codex_completion_source(env, source)
-                .map_err(|_| "source-unreadable")?
-                != source_custody
-            || super::accounts_sync::codex_completion_source(env, target)
-                .map_err(|_| "source-unreadable")?
-                != target_custody
+            || !custody.unchanged(env)?
         {
             return Err("policy-changed");
         }
@@ -570,7 +557,8 @@ fn prepare_quota_wall<T, R: Clone>(
             &old_auth,
             Some(&source.label),
         )));
-    let Some(observed) = reader.read(
+    let Some(observed) = reader.read_on(
+        seat,
         &old_auth,
         source.expected_identity_email(),
         seat.now,
@@ -614,7 +602,8 @@ fn prepare_quota_wall<T, R: Clone>(
         ) else {
             return false;
         };
-        let Some(usage) = reader.read(
+        let Some(usage) = reader.read_on(
+            seat,
             &new_auth,
             row.expected_identity_email(),
             seat.now,

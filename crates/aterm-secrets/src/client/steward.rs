@@ -355,34 +355,86 @@ pub(crate) fn local_recipient_denial_held(paths: &Paths, _lock: &StateLock) -> c
     local_recipient_denied(&Reads::new(paths))
 }
 
+/// [`local_recipient_judgement`] under the shared state lock `_lock` holds.
+fn local_recipient_judgement_held(paths: &Paths, _lock: &StateLock) -> crate::Result<Judgement> {
+    local_recipient_judgement(&Reads::new(paths))
+}
+
+/// What this Mac's denial check could judge of it ([`local_recipient_judgement`]).
+pub(super) enum Judgement {
+    /// Authenticated evidence denies this Mac.
+    Denied,
+    /// Every piece of evidence was read and none denies this Mac.
+    Clear,
+    /// The authenticated cached envelope was read and does not deny this Mac, and the applied
+    /// records that judge it further are absent (the error is why custody failed). This Mac has
+    /// been judged, by older evidence: what a lost log costs, not a check that cannot read this
+    /// Mac at all. Records that are there and cannot be read (refused by their mode, corrupt, of
+    /// another lineage) may hold this Mac's removal, so they are an `Err`, never this.
+    EnvelopeClear(crate::Error),
+}
+
+/// Whether authenticated evidence denies this Mac: `Err` where a read fails before the cached
+/// envelope has judged it ([`Judgement::EnvelopeClear`] reads as `Err` here too).
 pub(super) fn local_recipient_denied(reads: &Reads<'_>) -> crate::Result<bool> {
+    match local_recipient_judgement(reads)? {
+        Judgement::Denied => Ok(true),
+        Judgement::Clear => Ok(false),
+        Judgement::EnvelopeClear(error) => Err(error),
+    }
+}
+
+/// [`local_recipient_denied`], telling a check the cached envelope answered with the records
+/// gone ([`Judgement::EnvelopeClear`]) from one that could not judge this Mac (`Err`).
+pub(super) fn local_recipient_judgement(reads: &Reads<'_>) -> crate::Result<Judgement> {
     let Some(identity) = reads.identity()? else {
-        return Ok(false);
+        return Ok(Judgement::Clear);
     };
     let my_rec = identity.recipient();
     let recipient = my_rec.to_bech32();
     let cfg = reads.config()?;
     // With no configuration custody never reads state, and an unreadable state still fails here.
     reads.state()?;
-    let custody = reads.custody();
-    if custody.is_err() {
-        // Missing retained records cannot erase a denial authenticated by the cached
-        // envelope. This fallback grants nothing; a complete log still resolves restores.
-        if let Some(envelope) = reads.verified()?
-            && let Some(roster) = log_entries::denial_roster(None, Some(envelope), identity)?
-            && matches!(
-                roster_denies_local(reads.paths(), identity, &roster, cfg, &recipient),
-                Ok(true)
-            )
-        {
-            return Ok(true);
+    let custody = match reads.custody() {
+        Ok(custody) => custody,
+        Err(error) => {
+            // Missing retained records cannot erase a denial authenticated by the cached
+            // envelope. This fallback grants nothing; a complete log still resolves restores.
+            // With no envelope nothing judged this Mac; an envelope whose roster holds no
+            // denial of it judges it clear, the records-gone case a warm role outlasts.
+            let Some(envelope) = reads.verified()? else {
+                return Err(error);
+            };
+            // Only records that are gone leave the envelope's judgement standing: records still
+            // there that cannot be read may hold a removal the envelope is behind.
+            let clear = |error| {
+                if crate::records_storage::absent(&reads.paths().records_file()).unwrap_or(false) {
+                    Ok(Judgement::EnvelopeClear(error))
+                } else {
+                    Err(error)
+                }
+            };
+            let Some(roster) = log_entries::denial_roster(None, Some(envelope), identity)? else {
+                return clear(error);
+            };
+            return match roster_denies_local(reads.paths(), identity, &roster, cfg, &recipient) {
+                Ok(true) => Ok(Judgement::Denied),
+                Ok(false) => clear(error),
+                Err(_) => Err(error),
+            };
         }
-    }
-    let custody = custody?;
+    };
+    let denied = |denied: bool| {
+        if denied {
+            Judgement::Denied
+        } else {
+            Judgement::Clear
+        }
+    };
     let local_log = custody.as_ref().map(HeldLog::log);
     if let Some(log) = local_log {
         if log.removes(&my_rec) {
-            return Ok(true);
+            return Ok(Judgement::Denied);
         }
         let behind = reads.verified()?.is_some_and(|envelope| {
             log_entries::log_base(Some(log), envelope, identity).ok()
@@ -394,19 +446,19 @@ pub(super) fn local_recipient_denied(reads: &Reads<'_>) -> crate::Result<bool> {
                 &my_rec,
             )
         {
-            return Ok(true);
+            return Ok(Judgement::Denied);
         }
     }
     let r = roster::denial_swarm_roster(reads)?;
     if let Some(log) = local_log
         && log_entries::recipient_denied_by_roster_or_log(r.as_ref(), log, &my_rec)
     {
-        return Ok(true);
+        return Ok(Judgement::Denied);
     }
     let Some(r) = r else {
-        return Ok(false);
+        return Ok(Judgement::Clear);
     };
-    roster_denies_local(reads.paths(), identity, &r, cfg, &recipient)
+    roster_denies_local(reads.paths(), identity, &r, cfg, &recipient).map(denied)
 }
 
 /// Whether `r` denies this Mac. Where it denies nodes and nothing else denies this Mac, the device
@@ -581,6 +633,13 @@ pub(crate) enum AlabRoleObservation {
     Denied,
     /// No new authority; only a previously verified role with this exact context may stand.
     Unavailable(Option<AlabRoleContext>),
+    /// [`Self::Unavailable`] where the denial check itself failed before any authenticated
+    /// evidence judged this Mac (an unreadable vault file, state or records file; records that
+    /// are absent leave the cached envelope's judgement, [`Judgement::EnvelopeClear`]), so this
+    /// Mac may be denied and cannot read that it is. A fault of a moment stands as
+    /// [`Self::Unavailable`] does; one that lasts must not hold a role for as long as it lasts
+    /// (`cli::ROLE_UNJUDGED_POLLS`).
+    Unjudged(AlabRoleContext),
 }
 
 /// Observe role eligibility without fetching, repairing, or provisioning identity. Negative
@@ -603,7 +662,8 @@ fn observe_alab_member_with(
     let observed = observe_alab_role_inner(paths, allow_bootstrap_label);
     let context = match &observed {
         AlabRoleObservation::Allowed { context, .. }
-        | AlabRoleObservation::Unavailable(Some(context)) => context,
+        | AlabRoleObservation::Unavailable(Some(context))
+        | AlabRoleObservation::Unjudged(context) => context,
         _ => return observed,
     };
     before_recheck();
@@ -624,7 +684,7 @@ fn observe_alab_member_with(
 }
 
 fn observe_alab_role_inner(paths: &Paths, allow_bootstrap_label: bool) -> AlabRoleObservation {
-    use AlabRoleObservation::{Allowed, Denied, Missing, NotApplicable, Unavailable};
+    use AlabRoleObservation::{Allowed, Denied, Missing, NotApplicable, Unavailable, Unjudged};
     let config = match super::config(paths) {
         Ok(Some(config)) => config,
         Ok(None) => return Missing,
@@ -654,26 +714,41 @@ fn observe_alab_role_inner(paths: &Paths, allow_bootstrap_label: bool) -> AlabRo
         recipient: identity.recipient().0,
     };
     let unavailable = || Unavailable(Some(context.clone()));
-    let denial_or_unavailable = |denial: crate::Result<bool>| {
-        // An error refuses every other reader and here keeps a held role. One read of the vault
-        // file failing answers its whole observation, hiding the cached envelope's denial, so a
-        // failed observation gets one more, from the files as they are now.
-        let denial = denial.or_else(|_| local_recipient_denied(&Reads::new(paths)));
-        // Even corrupt state cannot hide an explicit configured-lineage removal.
-        let denied = denial.unwrap_or_else(|_| {
-            log_entries::trusted_configured_log(paths, &config)
-                .ok()
-                .flatten()
-                .is_some_and(|held| {
-                    held.log.removes(&identity.recipient())
-                        || log_entries::recipient_denied_by_roster_or_log(
-                            None,
-                            &held.log,
-                            &identity.recipient(),
-                        )
-                })
-        });
-        if denied { Denied } else { unavailable() }
+    // Even corrupt state cannot hide an explicit configured-lineage removal.
+    let removed = || {
+        log_entries::trusted_configured_log(paths, &config)
+            .ok()
+            .flatten()
+            .is_some_and(|held| {
+                held.log.removes(&identity.recipient())
+                    || log_entries::recipient_denied_by_roster_or_log(
+                        None,
+                        &held.log,
+                        &identity.recipient(),
+                    )
+            })
+    };
+    let denial_or_unavailable = |denial: crate::Result<Judgement>| {
+        // One read of the vault file failing answers its whole observation, hiding the cached
+        // envelope's denial, so a check short of a whole judgement gets one more, from the files
+        // as they are now.
+        let denial = match denial {
+            Ok(Judgement::EnvelopeClear(_)) | Err(_) => {
+                local_recipient_judgement(&Reads::new(paths))
+            }
+            whole => whole,
+        };
+        match denial {
+            Ok(Judgement::Denied) => Denied,
+            Ok(Judgement::Clear) => unavailable(),
+            // The cached envelope judged this Mac and the records are gone: unavailable
+            // custody, which a warm role outlasts (`docs/measured/vault-cold-server-role-2026-11-04.md`).
+            Ok(Judgement::EnvelopeClear(_)) if !removed() => unavailable(),
+            Ok(Judgement::EnvelopeClear(_)) => Denied,
+            // Nothing judged this Mac: it may be denied and cannot read that it is.
+            Err(_) if !removed() => Unjudged(context.clone()),
+            Err(_) => Denied,
+        }
     };
     // Keep one shared observation through label resolution. Contention with an apply
     // is unavailable evidence, not an authenticated reason to withdraw a retained role.
@@ -682,7 +757,7 @@ fn observe_alab_role_inner(paths: &Paths, allow_bootstrap_label: bool) -> AlabRo
         Ok(StateObservation::Absent | StateObservation::Busy) | Err(_) => {
             // Negative evidence remains useful during contention. Its absence or an
             // unreadable snapshot grants no new authority and preserves only a held role.
-            return denial_or_unavailable(local_recipient_denied(&Reads::new(paths)));
+            return denial_or_unavailable(local_recipient_judgement(&Reads::new(paths)));
         }
     };
     let state = load_state(paths);
@@ -694,10 +769,10 @@ fn observe_alab_role_inner(paths: &Paths, allow_bootstrap_label: bool) -> AlabRo
     }
     // Use the same handoff-aware, causally ordered denial view as admission. This is
     // independent of successful materialization and therefore precedes its health gates.
-    match local_recipient_denial_held(paths, &role_lock) {
-        Ok(true) => return Denied,
-        Ok(false) => {}
-        Err(error) => return denial_or_unavailable(Err(error)),
+    match local_recipient_judgement_held(paths, &role_lock) {
+        Ok(Judgement::Denied) => return Denied,
+        Ok(Judgement::Clear) => {}
+        partial => return denial_or_unavailable(partial),
     }
     let Ok(state) = state else {
         return unavailable();
@@ -1039,7 +1114,7 @@ pub(super) fn check_standby_eligibility(
         {
             Ok(own_label.ok_or_else(|| "this member has no valid DNS host label yet".to_owned()))
         }
-        AlabRoleObservation::Unavailable(_) => Ok(Err(
+        AlabRoleObservation::Unavailable(_) | AlabRoleObservation::Unjudged(_) => Ok(Err(
             "this Mac's ALab membership evidence is unavailable; waiting for local vault recovery"
                 .to_owned(),
         )),

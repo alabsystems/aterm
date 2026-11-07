@@ -41,8 +41,8 @@ use aterm_agent::harness::upgrade_wake::{ActivationWake, WakeTrigger};
 use aterm_agent::harness::witness::{self, RouteKey, Target};
 use aterm_agent::supervise::memory::AgentMemory;
 use aterm_agent::supervise::policy::turn_end::{
-    AccountAdvice, AccountAt, AccountBad, AccountPoint, HeldBy, Reach, Ready, RestartAnswer,
-    RestartAsk, RestartClaim, RosterWord, SignInNext,
+    AccountAdvice, AccountAt, AccountBad, AccountPoint, AskAgain, HeldBy, Reach, Ready,
+    RestartAnswer, RestartAsk, RestartClaim, RosterWord, SignInNext,
 };
 use aterm_agent::supervise::policy::{
     ResetAsk, ResetEnd, ResetGo, ResetNo, ResetOffer, ResetOutcome, ResetWord,
@@ -1449,6 +1449,11 @@ pub(crate) struct Kept {
     /// tab's `status` names no task any more (Land carries no exit past a landing,
     /// [`relaunch::carried`]).
     task_landed: bool,
+    /// Since when the session's loop owes the close of the `/usage` panel its own probe opened
+    /// ([`WorkerIdle::own_panel`]): the held deadline counts no time under it
+    /// ([`HarnessWaits::own_panel`]). Kept for the session across its workers, so a successor
+    /// seeded with the same owed panel keeps its first opening.
+    own_panel: Option<Instant>,
 }
 
 /// What the host keeps of a session's work record reads across its workers, for the agent group
@@ -2449,12 +2454,15 @@ const WALL_AGAIN: u8 = 3;
 
 const WALL_AGAIN_AFTER: Duration = Duration::from_secs(30);
 
-/// The advice of a session whose evidence lags its screen ([`WorkerIdle::account_lags`]).
+/// The advice of a session whose evidence lags its screen ([`WorkerIdle::account_lags`]): the
+/// host's own ask at `again`, or the roster's wait where it ends first, each with its own reason
+/// ([`AccountAdvice::Again`]); a move it advises then is made.
 fn account_lagging(advised: Option<AccountAdvice>, again: Instant) -> Option<AccountAdvice> {
     match advised {
-        None => Some(AccountAdvice::Wait { until: again }),
-        Some(AccountAdvice::Wait { until }) => Some(AccountAdvice::Wait {
-            until: until.min(again),
+        Some(wait @ AccountAdvice::Wait { until }) if until <= again => Some(wait),
+        None | Some(AccountAdvice::Wait { .. }) => Some(AccountAdvice::Again {
+            until: again,
+            why: AskAgain::Unwritten,
         }),
         other => other,
     }
@@ -2462,15 +2470,38 @@ fn account_lagging(advised: Option<AccountAdvice>, again: Instant) -> Option<Acc
 
 const RESET_AGAIN_AFTER: Duration = WALL_AGAIN_AFTER;
 
-/// The advice of a session whose account's limit reset is in flight (`accounts::reset_in_flight`).
-fn account_resetting(advised: Option<AccountAdvice>, again: Instant) -> Option<AccountAdvice> {
-    match advised {
-        Some(AccountAdvice::Wait { until }) => Some(AccountAdvice::Wait {
-            until: until.min(again),
-        }),
-        Some(resume @ AccountAdvice::Resume { .. }) => Some(resume),
-        _ => Some(AccountAdvice::Wait { until: again }),
-    }
+/// The advice of a session whose account's limit reset is in flight (`accounts::reset_in_flight`):
+/// the host's own ask, at the roster's wait where it ends first, since nobody moves off the account
+/// then and no other account's opening moves the session. A turn end's hold stands, to the sooner
+/// of its instant and the ask ([`AccountAdvice::Hold`]), and a junior's move that would yield the
+/// account (F19's `yields`) holds the same way at a turn end; a wall acts on no hold, so there that
+/// move is the ask, as every other is. A Resume stands.
+fn account_resetting(
+    advised: Option<AccountAdvice>,
+    at_wall: bool,
+    again: Instant,
+) -> Option<AccountAdvice> {
+    let soonest = |until: Instant| until.min(again);
+    Some(match advised {
+        Some(resume @ AccountAdvice::Resume { .. }) => resume,
+        Some(AccountAdvice::Hold { until }) => AccountAdvice::Hold {
+            until: soonest(until),
+        },
+        Some(AccountAdvice::Move {
+            yields: Some(until),
+            ..
+        }) if !at_wall => AccountAdvice::Hold {
+            until: soonest(until),
+        },
+        Some(AccountAdvice::Wait { until }) => AccountAdvice::Again {
+            until: soonest(until),
+            why: AskAgain::Reset,
+        },
+        _ => AccountAdvice::Again {
+            until: again,
+            why: AskAgain::Reset,
+        },
+    })
 }
 
 const WALL_LOCK_HELD: &str = "lock-held";
@@ -6248,6 +6279,18 @@ impl IdleHost for WorkerIdle {
         (self.hooks.fact)(&self.sid, crate::HarnessFact::SwitchAsked(asked));
     }
 
+    /// The panel the loop's own probe opened stands or is gone ([`Kept::own_panel`]): no wake of its
+    /// own, since the held deadline looks again within [`HELD_RELOOK`].
+    fn own_panel(&self, open: bool) {
+        with_kept_of(&self.kept, |k| {
+            k.own_panel = if open {
+                Some(k.own_panel.unwrap_or_else(Instant::now))
+            } else {
+                None
+            };
+        });
+    }
+
     /// What aterm checked at the landing (§14.9, slice 9b): stored under the tab's leaf lock with
     /// no wake of its own, since the loop tells it before the face whose wake follows.
     fn land_receipt(&self, receipt: Option<&aterm_agent::harness::acts::LandReceipt>) {
@@ -8538,6 +8581,7 @@ impl WorkerIdle {
             );
             return account_resetting(
                 advised,
+                at_wall,
                 Instant::now() + (self.hooks.pause)(RESET_AGAIN_AFTER),
             );
         }
@@ -9179,7 +9223,11 @@ impl WorkerIdle {
                  shortly",
                 self.sid
             );
-            return account_resetting(None, Instant::now() + (self.hooks.pause)(RESET_AGAIN_AFTER));
+            return account_resetting(
+                None,
+                point.at_wall(),
+                Instant::now() + (self.hooks.pause)(RESET_AGAIN_AFTER),
+            );
         }
         let seen = self.lost_seen(&look, point, seat.now)?;
         let (at, _, _) = account_point_read(seat, &look, point, seen);
@@ -15383,6 +15431,7 @@ fn host_pass(
     host.startups.waits = HarnessWaits {
         grace: Duration::from_secs(u64::from(cfg.human_grace_s)),
         relaunching: relaunches_pending(&host.workers, restored.iter().map(String::as_str)),
+        own_panel: own_panels(&host.workers),
     };
     let startup_at = look_at_startups(&mut host.startups, Instant::now(), active, &off, hooks);
     let fault_at = host_faults_due(shared, Instant::now());
@@ -16003,9 +16052,20 @@ pub(crate) struct HarnessWaits {
     pub(crate) grace: Duration,
     /// The sessions whose agent's exit a worker holds.
     pub(crate) relaunching: std::collections::HashSet<String>,
+    /// The sessions whose loop owes the close of the `/usage` panel its own probe opened, and
+    /// since when ([`Kept::own_panel`]).
+    pub(crate) own_panel: HashMap<String, Instant>,
 }
 
 impl HarnessWaits {
+    /// THE PROBE'S OWN PANEL IS NO HELD SCREEN: until when the panel the session's loop opened for
+    /// its accounts probe keeps the held deadlines off it, the deadline `after` from its opening.
+    /// The probe closes its panel within seconds, so its whole life counts nothing; a panel the
+    /// probe cannot close stands past that, and the deadline then runs from there as on any screen.
+    fn own_panel_until(&self, sid: &str, after: Duration) -> Option<Instant> {
+        self.own_panel.get(sid).map(|opened| *opened + after)
+    }
+
     /// When the harness's hold for a hand on the session ends, on a screen it holds an act on for one ([`waits_out_a_hand`]).
     fn hands_off_until(&self, read: &HeldRead, hand: Option<Instant>) -> Option<Instant> {
         if !waits_out_a_hand(read) {
@@ -16033,6 +16093,15 @@ pub(crate) fn driver_holds(lease: Option<&crate::Lease>, now_us: u64, ours: &str
         }) => *expires_us > now_us && holder != ours,
         None => false,
     }
+}
+
+/// [`HarnessWaits::own_panel`] as the pass reads it.
+fn own_panels(workers: &Workers) -> HashMap<String, Instant> {
+    workers
+        .0
+        .iter()
+        .filter_map(|(sid, w)| with_kept_of(&w.kept, |k| k.own_panel).map(|at| (sid.clone(), at)))
+        .collect()
 }
 
 /// [`HarnessWaits::relaunching`] as the pass reads it.
@@ -16261,8 +16330,10 @@ fn look_at_startups(
             (StartupState::Working, StartupSeen::Holds(hold)) => {
                 // The harness's own waits count no more here than at the held deadline.
                 // An agent's exit in hand for a relaunch (whose shell a successor that
-                // never saw the worker start reads as no agent) is not judged, and the
-                // deadline falls a whole one after the last look that found it so. On a
+                // never saw the worker start reads as no agent), and the panel the loop's own
+                // probe opened (no composer under it, [`HarnessWaits::own_panel_until`]), are
+                // not judged, and the deadline falls a whole one after the last look that
+                // found it so. On a
                 // screen the harness holds an act on for a hand, it falls no sooner than a
                 // whole one after that hold ends, a driver's counted from the last look
                 // that found it standing.
@@ -16274,9 +16345,13 @@ fn look_at_startups(
                 // launcher holding its launch for a pool has typed nothing either, but what it waits
                 // for may be days off: that stalls at this same deadline, naming the hold, and a
                 // hold that ends first leaves the line typed then a whole deadline to start in.
-                if books.waits.relaunching.contains(&w.sid) {
+                let panel = books
+                    .waits
+                    .own_panel_until(&w.sid, STARTUP_DEADLINE)
+                    .filter(|until| now < *until);
+                if books.waits.relaunching.contains(&w.sid) || panel.is_some() {
                     books.off.insert(w.sid.clone(), now);
-                    soonest(now + HELD_RELOOK);
+                    soonest(panel.map_or(now + HELD_RELOOK, |until| until.min(now + HELD_RELOOK)));
                     continue;
                 }
                 if w.installing {
@@ -16349,6 +16424,14 @@ fn judge_held(
         books.held.remove(&w.sid);
         return None;
     }
+    if let Some(until) = books
+        .waits
+        .own_panel_until(&w.sid, books.held_after)
+        .filter(|until| now < *until)
+    {
+        books.held.remove(&w.sid);
+        return Some(until.min(now + HELD_RELOOK));
+    }
     let clock = books
         .held
         .entry(w.sid.clone())
@@ -16389,8 +16472,13 @@ fn look_at_held_stall(
         .held
         .entry(w.sid.clone())
         .or_insert_with(|| HeldClock::at(read, now));
+    let own_panel = books
+        .waits
+        .own_panel_until(&w.sid, books.held_after)
+        .is_some_and(|until| now < until);
     if read.may_be_held()
         && !books.waits.relaunching.contains(&w.sid)
+        && !own_panel
         && clock.progress == read.progress
     {
         return Some(now + HELD_RELOOK);

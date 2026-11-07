@@ -350,6 +350,17 @@ impl Run {
         crate::libtest::environment_refusals(&self.output)
             .map(|names| crate::libtest::refusal_reason("every failing test", &names, &self.output))
     }
+
+    /// How this child ended, for a NOT RUN row whose child named no cause of its own: its exit
+    /// code, or that it had none (a signal ended it, the run's interrupt among them).
+    #[must_use]
+    pub fn unnamed_cause(&self) -> String {
+        let ended = self.code.map_or_else(
+            || "ended with no exit code (a signal ended it, the run's interrupt among them)".into(),
+            |code| format!("exited {code}"),
+        );
+        format!("it {ended} and named no cause (what it printed is in the check's log)")
+    }
 }
 
 /// Whether a failed child's log says the disk ran out: when it accounts for its failures as failed

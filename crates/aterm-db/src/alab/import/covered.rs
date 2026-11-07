@@ -22,6 +22,9 @@
 //! never holds) stays uncovered, so the owner sees it before the replica goes. Every other
 //! finding about a replica cell (it differs, the owner kept another value, it is conflicted,
 //! protected, unmapped, withheld) leaves it uncovered, listed by key and column for the owner.
+//! So does a record the replica holds and its dump leaves out (a forked writer's, or one waiting
+//! for its parent): it is no cell of the dump, its rows are not in the registry, and it is counted
+//! and listed once as `withheld-operations`, with no key, and bound into the keyed digest.
 
 use super::{Kind, Plan};
 use crate::{Error, Result};
@@ -38,8 +41,10 @@ const MAX_RECORD: usize = 64 * 1024;
 const MAX_LISTED: usize = 256;
 
 /// The HKDF label of a replica's keyed digest: its own domain, apart from the registry's
-/// (`att::secret_digest`), so a replica digest never compares equal to a table digest.
-const REPLICA_DIGEST: &[u8] = b"aterm/fleet-db/replica-digest/1\0";
+/// (`att::secret_digest`), so a replica digest never compares equal to a table digest. Its version
+/// is the judgement's: a record an earlier judge wrote cannot pass a deletion's digest check, so
+/// its replica is imported again first.
+const REPLICA_DIGEST: &[u8] = b"aterm/fleet-db/replica-digest/2\0";
 
 /// One replica cell the registry does not cover: where, and the finding's word, never a value.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -123,15 +128,24 @@ pub fn judge(plan: &Plan, flag_agrees: &dyn Fn(&super::Finding) -> bool) -> Vec<
 }
 
 /// A replica's keyed digest: HMAC-SHA-256 over its whole dump (`fleet_db::dump_all` with its
-/// passwords), keyed by HKDF of the `[everyone]` epoch key, so two holders compare replicas
-/// under the same epoch without a value or an unsalted digest leaving either Mac.
-pub fn replica_digest(dump: &[u8], everyone_key: &[u8; 32]) -> String {
+/// passwords) and the ids of the records that dump leaves out, keyed by HKDF of the `[everyone]`
+/// epoch key, so two holders compare replicas under the same epoch without a value or an unsalted
+/// digest leaving either Mac, and a withheld record that arrives after an import changes it.
+pub fn replica_digest(
+    dump: &[u8],
+    withheld: &[astream_wire::sync::Digest],
+    everyone_key: &[u8; 32],
+) -> String {
     use ring::hmac;
     use zeroize::Zeroizing;
     let prk = Zeroizing::new(aterm_digest::hkdf_extract(REPLICA_DIGEST, everyone_key));
     let derived = Zeroizing::new(aterm_digest::hkdf_expand_32(&prk, REPLICA_DIGEST));
-    let tag = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, &*derived), dump);
-    aterm_codec::hex::encode_lower(tag.as_ref())
+    let mut context = hmac::Context::with_key(&hmac::Key::new(hmac::HMAC_SHA256, &*derived));
+    context.update(dump);
+    for id in withheld {
+        context.update(id);
+    }
+    aterm_codec::hex::encode_lower(context.sign().as_ref())
 }
 
 /// What an import recorded beside its replica.

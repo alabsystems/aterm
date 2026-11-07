@@ -246,7 +246,10 @@ pub fn prune_staging_dirs(
     let live = live_staging_dirs(dist, processes);
     dirs.iter()
         .map(|dir| {
-            if let Some((_, pids)) = live.iter().find(|(live_dir, _)| live_dir == dir) {
+            if let Ok(idx) =
+                live.binary_search_by(|(live_dir, _)| live_dir.as_path().cmp(dir.as_path()))
+            {
+                let (_, pids) = &live[idx];
                 return format!(
                     "kept {}: pid {} runs out of it",
                     dir.display(),

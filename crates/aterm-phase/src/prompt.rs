@@ -3898,6 +3898,12 @@ pub mod fixtures {
         include_str!("fixtures/claude-2.1.308-usage-dismissed-inline.txt");
     pub const USAGE_DISMISSED_FULLSCREEN_2_1_308: &str =
         include_str!("fixtures/claude-2.1.308-usage-dismissed-fullscreen.txt");
+    pub const USAGE_WEEK_ONLY_INLINE_2_1_318: &str =
+        include_str!("fixtures/claude-2.1.318-usage-week-only-inline.txt");
+    pub const USAGE_WEEK_ONLY_FULLSCREEN_2_1_318: &str =
+        include_str!("fixtures/claude-2.1.318-usage-week-only-fullscreen.txt");
+    pub const USAGE_DISMISSED_FULLSCREEN_2_1_318: &str =
+        include_str!("fixtures/claude-2.1.318-usage-dismissed-fullscreen.txt");
     pub const BOX_BASH_TOUCH_2_1_307: &str =
         include_str!("fixtures/claude-2.1.307-box-bash-touch.txt");
     pub const BOX_WRITE_CREATE_2_1_307: &str =

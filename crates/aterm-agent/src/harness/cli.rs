@@ -13785,6 +13785,14 @@ pub(super) fn opener_link(
 }
 
 fn drop_staging(staging: &Path, err: &mut dyn Write) {
+    if super::codex_app_login::retains_credential_custody(staging) {
+        let _ = writeln!(
+            err,
+            "aterm harness accounts: credential custody is kept at {}",
+            staging.display()
+        );
+        return;
+    }
     if let Err(e) = std::fs::remove_dir_all(staging)
         && e.kind() != io::ErrorKind::NotFound
     {
@@ -14967,6 +14975,7 @@ fn drove_words(outcome: &super::login_drive::Outcome) -> String {
         Outcome::CompletedHeld => {
             "its completed native response was retained without publishing a sign-in".to_string()
         }
+        Outcome::CustodyHeld => "an existing saved native response blocks this attempt".to_string(),
         Outcome::Exited(Some(code)) => {
             format!("the sign-in exited {code} without saying it signed in")
         }
@@ -15013,7 +15022,12 @@ struct SignInPolicy<'a> {
 
 /// The route, pinned hosts and staging directory one of `cli`'s sign-ins of `row` runs with, under the machine's sign-in lock ([`accounts::Store::signin_within`]); `Err` is the renewal's end, already told.
 struct SignInPlan {
+    native_required: bool,
+    native_grant: Option<super::codex_grant_owner::RetainedGrant>,
+    publication: super::codex_app_login::PublicationCustody,
     enrollment: Option<super::codex_enrollment::Request>,
+    artifact: Option<super::codex_enrollment::Artifact>,
+    recovered: Option<codex_enrollment_recovery::Publication>,
     route: &'static crate::ai::connector::Route,
     hosts: &'static [&'static str],
     staging: PathBuf,
@@ -15033,6 +15047,22 @@ struct SignInPlan {
 }
 
 impl SignInPlan {
+    fn require_publication(
+        &self,
+        host: &dyn AccountsHost,
+        store: &accounts::Store,
+    ) -> Result<(), String> {
+        if !self.publication.is_saved() {
+            return Ok(());
+        }
+        if host.work_cancelled() {
+            return Err("account work was cancelled".into());
+        }
+        self._begun.check_store(store)?;
+        self.publication.require_current(&self.staging)?;
+        self._begun.check_store(store)?;
+        self.publication.require_work_current()
+    }
     fn require_workflow(
         &self,
         raw: &Roster,
@@ -15040,6 +15070,15 @@ impl SignInPlan {
         label: &str,
     ) -> Result<(), String> {
         self.parent.require_current(logins, label)?;
+        if let Some(recovered) = &self.recovered {
+            let current = super::codex_app_login::enrollment_bytes_current(
+                &recovered.admission,
+                &recovered.digest,
+            );
+            if !current || recovered.deadline.passed() {
+                return Err("recovered enrollment credential changed".into());
+            }
+        }
         if let Some(request) = &self.enrollment {
             logins.enrollment.require_running(request)?;
         }
@@ -15089,9 +15128,12 @@ impl SignInPlan {
         host: &dyn AccountsHost,
         row: &accounts::Row,
         store: &accounts::Store,
+        native: Option<&super::codex_enrollment::NativeContext<'_>>,
     ) -> super::login_drive::Drove {
         use super::login_drive::{Drove, Outcome};
         let request = super::login_drive::Request {
+            publication: Some(&self.publication),
+            enrollment: self.artifact.as_ref(),
             recovery: self.native_recovery,
             admission: self.native_admission.as_ref(),
             cli,
@@ -15101,6 +15143,71 @@ impl SignInPlan {
             store,
             hosts: self.hosts,
         };
+        if let Some(native) = native {
+            let Some(operation) = self.enrollment.as_ref().filter(|_| cli == Cli::Codex) else {
+                return Drove {
+                    outcome: Outcome::NotRun(
+                        "native ownership requires its enrolled Codex row".into(),
+                    ),
+                    host: None,
+                };
+            };
+            let prepared = (|| {
+                let records = store
+                    .read_account_records(
+                        Some(
+                            &native
+                                .env
+                                .accounts_roster_for(cli)
+                                .ok_or("account roster unavailable")?,
+                        ),
+                        host.now(),
+                    )
+                    .map_err(|_| "account records unavailable")?;
+                self.require_workflow(&records.raw_roster, &records.logins, &row.label)?;
+                let fence =
+                    accounts::pool_authority_revision(&records.raw_roster, &records.logins)?;
+                super::codex_grant_owner::prepare(
+                    native.env,
+                    operation,
+                    &super::codex_app_login::auth_path_in_home(&self.staging),
+                    &fence,
+                )
+            })();
+            let prepared = match prepared {
+                Ok(prepared) => prepared,
+                Err(_) => {
+                    return Drove {
+                        outcome: Outcome::NotRun("native grant custody unavailable".into()),
+                        host: None,
+                    };
+                }
+            };
+            let Some(home) = native.env.home.as_deref() else {
+                return Drove {
+                    outcome: Outcome::NotRun("native account home unavailable".into()),
+                    host: None,
+                };
+            };
+            let (mut drove, outcome) = super::login_drive::sign_in_live_scoped_custody(
+                &request,
+                home,
+                &|name| std::env::var_os(name),
+                Some(native.scope.clone()),
+                prepared,
+            )
+            .into_parts();
+            if let Some(outcome) = outcome {
+                self.native_grant = native.capture(outcome);
+                if let Some(grant) = &self.native_grant
+                    && super::codex_enrollment::retain_grant(native.env, operation, grant).is_err()
+                {
+                    drove.outcome =
+                        Outcome::Unverified("native grant reference publication is pending".into());
+                }
+            }
+            return drove;
+        }
         if !matches!(self.route.drive, crate::ai::connector::Drive::NativeGoogle) {
             return host.vendor_sign_in(&request);
         }
@@ -15482,7 +15589,12 @@ fn sign_in_plan(
         }
     };
     Ok(SignInPlan {
+        native_required: false,
+        native_grant: None,
+        publication: super::codex_app_login::PublicationCustody::default(),
         enrollment: None,
+        artifact: None,
+        recovered: None,
         route,
         hosts,
         staging,
@@ -15736,7 +15848,20 @@ fn bind_signed_in(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Renewal {
+    if plan.require_publication(host, store).is_err() {
+        return Renewal::Deferred;
+    }
     if host.work_cancelled() {
+        return Renewal::Deferred;
+    }
+    if plan.native_required && plan.native_grant.is_none() {
+        return Renewal::Deferred;
+    }
+    if plan
+        .artifact
+        .as_ref()
+        .is_some_and(|artifact| !artifact.work_current())
+    {
         return Renewal::Deferred;
     }
     let label = row.label.as_str();
@@ -15746,6 +15871,9 @@ fn bind_signed_in(
     };
     let has_login = || crate::ai::connector::stored_login_file(c, &plan.staging).is_some();
     if !has_login() {
+        if plan.publication.is_saved() {
+            return Renewal::Deferred;
+        }
         drop_staging(&plan.staging, err);
         say(
             err,
@@ -15756,6 +15884,9 @@ fn bind_signed_in(
     let now = host.now().max(floor);
     let policy_unchanged = || signin_policy_current(cli, row, roster_path, own_dir);
     if let Err(why) = policy_unchanged() {
+        if plan.publication.require_work_current().is_err() {
+            return Renewal::Deferred;
+        }
         say(
             err,
             &format!(
@@ -15777,6 +15908,9 @@ fn bind_signed_in(
                     accounts::Proof::Status
                 }
                 reported => {
+                    if plan.require_publication(host, store).is_err() {
+                        return Renewal::Deferred;
+                    }
                     let different = reported.is_some();
                     if let Some(reported) = &reported {
                         say(
@@ -15790,11 +15924,13 @@ fn bind_signed_in(
                     }
                     let recorded =
                         accounts_observe_signin(store, roster_path, now, err, |raw, _, logins| {
+                            plan.require_publication(host, store)?;
                             plan.require_workflow(raw, logins, label)?;
                             signin_policy_matches(row, raw, own_dir)?;
                             if !different {
                                 accounts::admit_workflow(logins, label)?;
                             }
+                            plan.require_publication(host, store)?;
                             Ok(if different {
                                 accounts::note_wrong_account(logins, label, now)
                             } else {
@@ -15822,6 +15958,9 @@ fn bind_signed_in(
                             },
                         ),
                     );
+                    if plan.require_publication(host, store).is_err() {
+                        return Renewal::Deferred;
+                    }
                     return if different && recorded {
                         Renewal::WrongAccount
                     } else {
@@ -15861,6 +16000,7 @@ fn bind_signed_in(
         now,
         &mut note,
         |raw, state, logins| {
+            plan.require_publication(host, store)?;
             if host.work_cancelled() {
                 return Err(RenewalFailure::cancelled().to_string());
             }
@@ -15868,6 +16008,33 @@ fn bind_signed_in(
             // and before creating any recoverable completion checkpoint.
             plan.require_workflow(raw, logins, label)?;
             signin_policy_matches(row, raw, own_dir)?;
+            if let Some(artifact) = &plan.artifact {
+                codex_enrollment_recovery::require_binding(
+                    artifact.staging(),
+                    store,
+                    raw,
+                    state,
+                    logins,
+                )?;
+                plan._begun.check_store(store)?;
+                if !artifact.work_current() {
+                    return Err("enrollment producer work expired".into());
+                }
+            }
+            if let Some(recovered) = &plan.recovered {
+                codex_enrollment_recovery::require_current(
+                    &recovered.admission,
+                    Some(recovered.claim),
+                    store,
+                    raw,
+                    state,
+                    logins,
+                )?;
+                plan._begun.check_store(store)?;
+                if recovered.deadline.passed() || host.work_cancelled() {
+                    return Err("enrollment recovery work expired".into());
+                }
+            }
             plan.check_native_google(cli, email, store)?;
             #[cfg(unix)]
             if let Some(snapshot) = &plan.reauthentication {
@@ -15935,16 +16102,106 @@ fn bind_signed_in(
             if host.work_cancelled() {
                 return Err(RenewalFailure::cancelled().to_string());
             }
+            if plan.native_required {
+                let request = plan
+                    .enrollment
+                    .as_ref()
+                    .ok_or("native grant has no operation")?;
+                let grant = plan
+                    .native_grant
+                    .as_ref()
+                    .ok_or("native grant has no retained response")?;
+                logins.enrollment.attach_grant(request, grant)?;
+            }
             if !email.is_empty() {
+                plan.require_publication(host, store)?;
                 let checkpoint = if let Some(request) = &plan.enrollment {
-                    accounts::write_enrollment_checkpoint(
-                        request,
-                        email,
-                        &plan.staging_text,
-                        proof,
-                        now,
-                        logins,
-                    )
+                    if let Some(recovered) = &plan.recovered {
+                        codex_enrollment_recovery::require_current(
+                            &recovered.admission,
+                            Some(recovered.claim),
+                            store,
+                            raw,
+                            state,
+                            logins,
+                        )?;
+                        plan._begun.check_store(store)?;
+                        if recovered.deadline.passed()
+                            || !super::codex_app_login::enrollment_bytes_current(
+                                &recovered.admission,
+                                &recovered.digest,
+                            )
+                        {
+                            return Err("enrollment recovery work or credential changed".into());
+                        }
+                    }
+                    let admission = plan
+                        .artifact
+                        .as_ref()
+                        .map(|artifact| artifact.staging())
+                        .or_else(|| plan.recovered.as_ref().map(|view| &view.admission))
+                        .ok_or("enrollment has no native admission")?;
+                    let digest = super::codex_app_login::sealed_enrollment_digest(admission)?
+                        .ok_or("enrollment has no sealed native response")?;
+                    logins.enrollment.seal_publication(request, digest)?;
+                    let existing = if plan.recovered.is_some() {
+                        accounts::read_renewal_checkpoint_checked_for(
+                            Cli::Codex,
+                            &plan.staging,
+                            &plan.staging,
+                            now,
+                        )
+                        .map_err(|_| "enrollment checkpoint unavailable")?
+                    } else {
+                        None
+                    };
+                    if let Some(recovered) = &plan.recovered {
+                        let current = super::codex_app_login::enrollment_bytes_current(
+                            &recovered.admission,
+                            &recovered.digest,
+                        );
+                        plan._begun.check_store(store)?;
+                        if !recovered.admission.directories_current() {
+                            return Err("enrollment recovery directories changed".into());
+                        }
+                        if !current || recovered.deadline.passed() || host.work_cancelled() {
+                            return Err("enrollment recovery work or credential changed".into());
+                        }
+                    }
+                    if let Some(artifact) = &plan.artifact {
+                        plan._begun.check_store(store)?;
+                        if !artifact.staging().directories_current()
+                            || !artifact.work_current()
+                            || host.work_cancelled()
+                        {
+                            return Err("enrollment directory or work changed".into());
+                        }
+                    }
+                    if let Some(checkpoint) = existing {
+                        if plan.recovered.as_ref().is_some_and(|recovered| {
+                            codex_enrollment_recovery::checkpoint_matches(
+                                &recovered.admission,
+                                &checkpoint,
+                                email,
+                            )
+                        }) {
+                            Ok(())
+                        } else {
+                            Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "enrollment checkpoint differs",
+                            ))
+                        }
+                    } else {
+                        accounts::write_enrollment_checkpoint(
+                            request,
+                            email,
+                            &plan.staging_text,
+                            proof,
+                            now,
+                            logins,
+                        )
+                    }
                 } else if cli == Cli::Agy {
                     #[cfg(unix)]
                     {
@@ -15980,6 +16237,19 @@ fn bind_signed_in(
                 checkpoint
                     .map_err(|why| format!("completion checkpoint could not be saved: {why}"))?;
             }
+            if plan
+                .recovered
+                .as_ref()
+                .is_some_and(|view| view.deadline.passed())
+                || plan
+                    .artifact
+                    .as_ref()
+                    .is_some_and(|artifact| !artifact.work_current())
+                || host.work_cancelled()
+            {
+                return Err("enrollment publication work expired".into());
+            }
+            plan.require_publication(host, store)?;
             let events = accounts::note_renewed(
                 state,
                 logins,
@@ -16014,6 +16284,9 @@ fn bind_signed_in(
                 // Publication advanced the parent generation. A failed cleanup cannot
                 // authorize this old pending copy on a later admitted attempt.
                 let _ = grant.finish_recovery();
+            }
+            if plan.enrollment.is_some() {
+                cleanup_codex_enrollments(store, roster_path, now, &plan.staging);
             }
             let (var, value) = accounts::login_env_for(
                 cli,
@@ -16087,6 +16360,9 @@ fn bind_signed_in(
             Renewal::Renewed
         }
         Err(why) => {
+            if plan.require_publication(host, store).is_err() {
+                return Renewal::Deferred;
+            }
             say(
                 err,
                 &format!(
@@ -16150,6 +16426,7 @@ pub(super) fn renew_one_for(
         (own_dir, sign_in),
         None,
         None,
+        None,
         out,
         err,
     )
@@ -16168,6 +16445,7 @@ fn renew_one_for_operation(
     (own_dir, sign_in): (Option<&str>, SignIn),
     enrollment: Option<&super::codex_enrollment::Request>,
     provider_attempted: Option<&std::cell::Cell<bool>>,
+    native: Option<&super::codex_enrollment::NativeContext<'_>>,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Renewal {
@@ -16200,6 +16478,62 @@ fn renew_one_for_operation(
         Err(renewal) => return renewal,
     };
     plan.enrollment = enrollment.cloned();
+    plan.native_required = native.is_some();
+    if let Some(request) = enrollment {
+        let admitted = store.transact_roster_logins_within(
+            &accounts::LOCK_LADDER,
+            roster_path,
+            floor,
+            &mut None,
+            |raw, state, logins| {
+                if host.work_cancelled() {
+                    return Err("enrollment work cancelled".into());
+                }
+                plan._begun.check_store(store)?;
+                plan.require_workflow(raw, logins, label)?;
+                signin_policy_matches(row, raw, own_dir)?;
+                let staging = super::codex_enrollment::Staging {
+                    request: request.clone(),
+                    store: std::fs::canonicalize(&store.dir)
+                        .map_err(|_| "enrollment store unavailable")?,
+                    directory: std::fs::canonicalize(&plan.staging)
+                        .map_err(|_| "enrollment staging unavailable")?,
+                    store_identity: Some(super::codex_enrollment::DirectoryIdentity::capture(
+                        &store.dir,
+                    )?),
+                    directory_identity: Some(super::codex_enrollment::DirectoryIdentity::capture(
+                        &plan.staging,
+                    )?),
+                    parent: plan.parent,
+                    workflow: plan.workflow.value(),
+                    policy: accounts::pool_authority_revision(raw, logins)?,
+                    selection: state
+                        .pending_pin
+                        .as_ref()
+                        .map(accounts::PendingSelection::identity),
+                };
+                if let Some(owned) = plan._begun.selection()
+                    && Some(accounts::PendingSelection::identity(owned)) != staging.selection
+                {
+                    return Err("enrollment selection changed".into());
+                }
+                plan.artifact = Some(logins.enrollment.bind_staging(staging)?);
+                Ok(Vec::new())
+            },
+        );
+        if admitted.is_err() {
+            return Renewal::Deferred;
+        }
+        let Some(artifact) = &plan.artifact else {
+            return Renewal::Deferred;
+        };
+        let directory = artifact.staging().directory.clone();
+        let Some(text) = directory.to_str() else {
+            return Renewal::Deferred;
+        };
+        plan.staging_text = text.to_owned();
+        plan.staging = directory;
+    }
     let renewal = (|| {
         let records = match store.read_account_records(Some(roster_path), floor) {
             Ok(records) => records,
@@ -16270,11 +16604,14 @@ fn renew_one_for_operation(
         if let Some(attempted) = provider_attempted {
             attempted.set(true);
         }
-        let drove = plan.drive(cli, host, row, store);
-        if matches!(&drove.outcome, Outcome::CompletedHeld) {
+        let drove = plan.drive(cli, host, row, store, native);
+        if matches!(
+            &drove.outcome,
+            Outcome::CompletedHeld | Outcome::CustodyHeld
+        ) {
             let _ = writeln!(
                 err,
-                "aterm harness accounts renew: {label}: the completed native login is kept at {}; no binding changed",
+                "aterm harness accounts renew: {label}: native login custody is kept at {}; no binding changed",
                 plan.staging.display()
             );
             return Renewal::Deferred;
@@ -16282,6 +16619,7 @@ fn renew_one_for_operation(
         // This exact native outcome promises no provider action or retained
         // completion. PageNotOpened and generic failure make no such promise.
         if matches!(&drove.outcome, Outcome::NotRun(_))
+            && !plan.publication.is_saved()
             && let Some(attempted) = provider_attempted
         {
             attempted.set(false);
@@ -16292,6 +16630,9 @@ fn renew_one_for_operation(
         let now = host.now().max(floor);
         let policy_unchanged = || signin_policy_current(cli, row, roster_path, own_dir);
         if let Err(why) = policy_unchanged() {
+            if plan.publication.require_work_current().is_err() {
+                return Renewal::Deferred;
+            }
             let _ = writeln!(
                 err,
                 "aterm harness accounts renew: {label}: {why}; no binding changed; the login is kept at {}",
@@ -16304,6 +16645,7 @@ fn renew_one_for_operation(
                 accounts::Event::new(now, kind, label).because(&drove.why(plan.route.flow));
             event.workflow = Some(workflow);
             accounts_observe_signin(store, roster_path, now, err, |raw, _, logins| {
+                plan.require_publication(host, store)?;
                 plan.require_workflow(raw, logins, label)?;
                 signin_policy_matches(row, raw, own_dir)?;
                 if kind == accounts::Kind::SignIn {
@@ -16312,6 +16654,7 @@ fn renew_one_for_operation(
                 if let Some(action) = person_step(cli, &drove.outcome) {
                     accounts::note_sign_in_task(logins, label, action, now);
                 }
+                plan.require_publication(host, store)?;
                 Ok(vec![event])
             })
             .is_ok()
@@ -16321,13 +16664,21 @@ fn renew_one_for_operation(
                 email: Some(said), ..
             } if accounts::email_matches(email, said) => accounts::Proof::Status,
             Outcome::SignedIn { email: Some(_), .. } => {
+                if plan.require_publication(host, store).is_err() {
+                    return Renewal::Deferred;
+                }
                 let _ = writeln!(out, "{label}: REFUSED: wrong account");
                 let recorded =
                     accounts_observe_signin(store, roster_path, now, err, |raw, _, logins| {
+                        plan.require_publication(host, store)?;
                         plan.require_workflow(raw, logins, label)?;
                         signin_policy_matches(row, raw, own_dir)?;
+                        plan.require_publication(host, store)?;
                         Ok(accounts::note_wrong_account(logins, label, now))
                     });
+                if plan.require_publication(host, store).is_err() {
+                    return Renewal::Deferred;
+                }
                 if cli != Cli::Codex && recorded.is_ok() {
                     drop_staging(&plan.staging, err);
                 }
@@ -16361,7 +16712,13 @@ fn renew_one_for_operation(
             Outcome::SignedIn { page: true, .. } => accounts::Proof::Page,
             Outcome::SignedIn { .. } => accounts::Proof::Unchecked,
             other => {
+                if plan.publication.is_saved() {
+                    return Renewal::Deferred;
+                }
                 let recorded = record(err, accounts::Kind::SignIn);
+                if plan.require_publication(host, store).is_err() {
+                    return Renewal::Deferred;
+                }
                 if recorded {
                     drop_staging(&plan.staging, err);
                 }
@@ -16791,6 +17148,8 @@ fn run_accounts_login_for(
     let _ = out.flush();
     let _ = err.flush();
     let exited = host.vendor_login(&super::login_drive::Request {
+        publication: None,
+        enrollment: None,
         recovery: plan.native_recovery,
         admission: None,
         cli,
@@ -18797,21 +19156,38 @@ pub fn main_entry(argv: Vec<OsString>) -> ExitCode {
     run(&cmd, &env, &mut out, &mut err)
 }
 
+#[path = "cli_codex_enrollment_recovery.rs"]
+mod codex_enrollment_recovery;
+pub(in crate::harness) use codex_enrollment_recovery::cleanup_codex_enrollments;
+use codex_enrollment_recovery::recover_codex_enrollment;
+
 /// Typed native enrollment entry. The authenticated owner has resolved the row;
 /// operation custody is committed before the existing sign-in route can run.
+#[cfg(test)]
 pub(super) fn enroll_codex_operation(
     env: &Env,
     host: &dyn AccountsHost,
     request: &super::codex_enrollment::Request,
 ) -> Result<super::codex_enrollment::Status, String> {
-    enroll_codex_operation_admitted(env, host, request, &|| {})
+    enroll_codex_operation_admitted(env, host, request, None)
 }
 
+#[cfg(any(test, debug_assertions))]
 pub(super) fn enroll_codex_operation_admitted(
     env: &Env,
     host: &dyn AccountsHost,
     request: &super::codex_enrollment::Request,
-    admitted_work: &dyn Fn(),
+    admitted_work: Option<&super::codex_enrollment::Admission<'_>>,
+) -> Result<super::codex_enrollment::Status, String> {
+    enroll_codex_operation_custody(env, host, request, admitted_work, None)
+}
+
+pub(super) fn enroll_codex_operation_custody(
+    env: &Env,
+    host: &dyn AccountsHost,
+    request: &super::codex_enrollment::Request,
+    admitted_work: Option<&super::codex_enrollment::Admission<'_>>,
+    native: Option<&super::codex_enrollment::NativeContext<'_>>,
 ) -> Result<super::codex_enrollment::Status, String> {
     use super::codex_enrollment::Phase;
     if !request.valid() {
@@ -18827,6 +19203,25 @@ pub(super) fn enroll_codex_operation_admitted(
         .read_account_records(Some(&path), env.now)
         .map_err(|_| "account records unavailable")?;
     if let Some(status) = records.logins.enrollment.lookup(request)? {
+        if status.phase == Phase::Applied {
+            if let Some(admission) = records.logins.enrollment.staged(request)? {
+                cleanup_codex_enrollments(&store, &path, env.now, &admission.directory);
+            }
+        } else if status.phase == Phase::Running
+            && records.logins.enrollment.is_retired(request)?
+            && records.logins.enrollment.staged(request)?.is_some()
+        {
+            if let Some(admitted_work) = admitted_work {
+                recover_codex_enrollment(env, host, request, &store, &path, admitted_work)?;
+            }
+            return store
+                .load_logins(env.now)
+                .map_err(|_| "account records unavailable")?
+                .0
+                .enrollment
+                .lookup(request)?
+                .ok_or_else(|| "enrollment operation disappeared".into());
+        }
         return Ok(status);
     }
     let row = records
@@ -18856,7 +19251,11 @@ pub(super) fn enroll_codex_operation_admitted(
             logins: &records.logins,
         },
         |_, logins| {
-            admitted = logins.enrollment.admit(request)?;
+            admitted = if native.is_some() {
+                logins.enrollment.admit_native(request)?
+            } else {
+                logins.enrollment.admit(request)?
+            };
             Ok(Vec::new())
         },
     )?;
@@ -18871,7 +19270,9 @@ pub(super) fn enroll_codex_operation_admitted(
     }
     // Only the driver whose new admission reached durable commit receives the
     // work-retirement capability. Replayed requests never reach this callback.
-    admitted_work();
+    if let Some(admitted_work) = admitted_work {
+        admitted_work.original();
+    }
     let provider_attempted = std::cell::Cell::new(false);
     let result = renew_one_for_operation(
         Cli::Codex,
@@ -18882,6 +19283,7 @@ pub(super) fn enroll_codex_operation_admitted(
         (raw.dir.as_deref(), person_sign_in(Cli::Codex, &row.label)),
         Some(request),
         Some(&provider_attempted),
+        native,
         &mut quiet,
         &mut io::sink(),
     );
@@ -18945,6 +19347,7 @@ pub(super) fn cancel_codex_operation(
                     .lookup(request)?
                     .ok_or("unknown enrollment operation")?;
             }
+            logins.enrollment.retire_recorded_cancellation(request)?;
             Ok(Vec::new())
         },
     )?;

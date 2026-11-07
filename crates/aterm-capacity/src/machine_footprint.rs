@@ -60,13 +60,16 @@ const FILE_MAX: u64 = 16 << 20;
 /// of which adds work to the same directories and takes none away (for verify, a check that
 /// builds); a word of any other kind (the cells chosen, `--compile-only`) changes what the rest
 /// write, so it must be the same in both.
-fn does_at_least(done: &str, asked: &str, more: &[String]) -> bool {
-    let done: Vec<&str> = done.split_whitespace().collect();
-    let asked: Vec<&str> = asked.split_whitespace().collect();
-    asked.iter().all(|w| done.contains(w))
+fn does_at_least(done: &str, asked: &str, asked_words: &[&str], more: &[String]) -> bool {
+    if done == asked {
+        return true;
+    }
+    asked_words
+        .iter()
+        .all(|&w| done.split_whitespace().any(|d| d == w))
         && done
-            .iter()
-            .all(|w| asked.contains(w) || more.iter().any(|m| m == w))
+            .split_whitespace()
+            .all(|w| asked_words.contains(&w) || more.iter().any(|m| m == w))
 }
 
 /// WHAT A RUN BUILT, as the machine's record keeps it: the work, which a run bounding it must
@@ -186,6 +189,24 @@ impl MachineFootprints {
                 self.rows.len() - 1
             }
         };
+        self.push_at(at, run);
+    }
+
+    fn push_borrowed(&mut self, selection: &Selection, run: Footprint) {
+        let at = match self.rows.iter().position(|r| r.selection == *selection) {
+            Some(at) => at,
+            None => {
+                self.rows.push(Kept {
+                    selection: selection.clone(),
+                    runs: Vec::new(),
+                });
+                self.rows.len() - 1
+            }
+        };
+        self.push_at(at, run);
+    }
+
+    fn push_at(&mut self, at: usize, run: Footprint) {
         let runs = &mut self.rows[at].runs;
         runs.push(run);
         let over = runs.len().saturating_sub(KEPT);
@@ -235,10 +256,11 @@ impl MachineFootprints {
             .map(|r| r.peak.saturating_sub(r.grew))
             .min()
             .map_or(holds, |least| least.min(holds));
+        let asked_words: Vec<&str> = selection.work.split_whitespace().collect();
         let same: Vec<(&Kept, u64)> = self
             .rows
             .iter()
-            .filter(|r| does_at_least(&r.selection.work, &selection.work, more))
+            .filter(|r| does_at_least(&r.selection.work, &selection.work, &asked_words, more))
             .filter_map(|r| r.figure(floor, cold).map(|f| (r, f)))
             .collect();
         let mut best: Option<Cover> = same
@@ -376,8 +398,8 @@ impl MachineFootprints {
                 if let (Some(peak), Some(grew), Some(at_ms)) =
                     (num("peak"), num("grew"), num("at_ms"))
                 {
-                    out.push(
-                        selection.clone(),
+                    out.push_borrowed(
+                        &selection,
                         Footprint {
                             peak,
                             grew,

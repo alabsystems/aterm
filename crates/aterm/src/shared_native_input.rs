@@ -200,7 +200,7 @@ fn recover_locked(
         Ok(())
     };
     allowed()?;
-    let Some((plan, input)) = plan(paths, deadline)? else {
+    let Some((mut plan, input)) = plan(paths, deadline)? else {
         return Ok(false);
     };
     let proposals = Proposals::at_until(paths.clone(), deadline);
@@ -289,23 +289,30 @@ fn recover_locked(
         return Ok(false);
     }
     Inputs::decode(credential.value().as_slice(), provider)?;
-    let mut value = plan["value"].clone();
-    value.as_object_mut().unwrap().insert(
-        "secret_ref".into(),
-        json!({"vault":expected.name,"entry":entry}),
-    );
     let request = super::super::digest(plan["request"].as_str().unwrap())?;
+    let operation = plan["operation"]
+        .as_str()
+        .map(super::super::digest)
+        .transpose()?;
     allowed()?;
     imported::current(paths, key, &plan["origin"], deadline)?;
-    let attached = match plan["operation"].as_str() {
-        Some(operation) => proposals.replace_if_current(
-            request,
-            "accounts",
-            key,
-            super::super::digest(operation)?,
-            value,
-        ),
-        None => proposals.create_if_absent(request, "accounts", key, value),
+    let key = key.to_owned();
+    let mut value = plan
+        .as_object_mut()
+        .and_then(|object| object.remove("value"))
+        .unwrap_or(Value::Null);
+    value.as_object_mut().unwrap().insert(
+        "secret_ref".into(),
+        Value::Object(aterm_json::Map::from([
+            ("vault".to_string(), Value::String(expected.name)),
+            ("entry".to_string(), Value::String(entry)),
+        ])),
+    );
+    let attached = match operation {
+        Some(operation) => {
+            proposals.replace_if_current(request, "accounts", &key, operation, value)
+        }
+        None => proposals.create_if_absent(request, "accounts", &key, value),
     };
     attached.map_err(
         |_| "native key is stored; proposal attachment is pending a conflict resolution",
@@ -345,7 +352,10 @@ pub(super) fn set_after_pending(
     if !snapshot.history_complete() {
         return Err("native intake proposal history is incomplete; wait for sync repair".into());
     }
-    let imported = imported::resolve(paths, key, deadline)?;
+    let mut imported = imported::resolve(paths, key, deadline)?;
+    let origin = imported.as_mut().map_or(Value::Null, |row| {
+        std::mem::replace(&mut row.origin, Value::Null)
+    });
     let key = imported.as_ref().map_or(key, |row| row.key.as_str());
     let cell = snapshot.cells.get(&("accounts".into(), key.into()));
     let (candidate, operation) = match cell {
@@ -389,11 +399,43 @@ pub(super) fn set_after_pending(
     if request == [0; 16] {
         return Err("native intake request is unavailable".into());
     }
-    let plan = json!({"schema":1,"key":key,"provider":provider.name(),"table":aterm_codec::hex::encode_lower(&snapshot.scope.digest()),
-        "operation":operation.map(|op|aterm_codec::hex::encode_lower(&op)),"request":aterm_codec::hex::encode_lower(&request),
-        "origin":imported.as_ref().map(|row|&row.origin),
-        "commitment":aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(wrapped.expose())),"value":value,
-        "context":context(&admin.config),"previous":previous.map(|digest|aterm_codec::hex::encode_lower(&digest))});
+    let plan = Value::Object(aterm_json::Map::from([
+        ("schema".to_string(), Value::Number(1u64.into())),
+        ("key".to_string(), Value::String(key.to_string())),
+        (
+            "provider".to_string(),
+            Value::String(provider.name().to_string()),
+        ),
+        (
+            "table".to_string(),
+            Value::String(aterm_codec::hex::encode_lower(&snapshot.scope.digest())),
+        ),
+        (
+            "operation".to_string(),
+            operation.map_or(Value::Null, |op| {
+                Value::String(aterm_codec::hex::encode_lower(&op))
+            }),
+        ),
+        (
+            "request".to_string(),
+            Value::String(aterm_codec::hex::encode_lower(&request)),
+        ),
+        ("origin".to_string(), origin),
+        (
+            "commitment".to_string(),
+            Value::String(aterm_codec::hex::encode_lower(
+                &aterm_digest::Sha256::digest(wrapped.expose()),
+            )),
+        ),
+        ("value".to_string(), value),
+        ("context".to_string(), Value::String(context(&admin.config))),
+        (
+            "previous".to_string(),
+            previous.map_or(Value::Null, |digest| {
+                Value::String(aterm_codec::hex::encode_lower(&digest))
+            }),
+        ),
+    ]));
     let metadata =
         aterm_json::to_vec(&plan).map_err(|_| "native attachment could not be encoded")?;
     if metadata.len() > 64 * 1024 {

@@ -12,7 +12,7 @@ use crate::client::{Call, Github};
 use crate::error::{Error, Kind, Result, Sub};
 use crate::fx::Fx;
 use crate::github::{How, Probe, TagObjects};
-use crate::model::{ReleaseObject, Sha256Digest, from_json};
+use crate::model::{ReleaseObject, Sha256Digest, from_json_owned};
 use crate::policy::{Access, RouteTarget};
 use crate::slug::Slug;
 
@@ -170,16 +170,13 @@ impl Poller<'_> {
         elapsed: Duration,
         on: &mut dyn FnMut(WaitEvent<'_>),
     ) {
-        let last: String = gh
-            .redactor()
-            .apply(&unmet(conditions, seen))
-            .chars()
-            .take(LAST_MAX)
-            .collect();
-        on(WaitEvent::Heartbeat {
-            elapsed,
-            last: &last,
-        });
+        let raw = unmet(conditions, seen);
+        let redacted = gh.redactor().apply_cow(&raw);
+        let last = match redacted.char_indices().nth(LAST_MAX) {
+            Some((end, _)) => &redacted[..end],
+            None => &redacted,
+        };
+        on(WaitEvent::Heartbeat { elapsed, last });
     }
 
     /// Poll `conditions` until they all hold, one is impossible, the poller is blind, or the timeout passes.
@@ -443,7 +440,7 @@ impl Observer {
                 .with_repo(self.slug.to_string())),
             },
             Ok(answered) => {
-                let release: ReleaseObject = from_json(&answered.json()?)?;
+                let release: ReleaseObject = from_json_owned(answered.json()?)?;
                 self.etag.clone_from(&answered.etag);
                 self.last = Some(Some(release.clone()));
                 Ok(Some(release))
@@ -565,9 +562,8 @@ impl Condition for ReleaseCondition {
             }
             ReleaseCond::Digest { name, digest } => {
                 let named = r.and_then(|r| r.assets.iter().find(|a| &a.name == name));
-                let got = named.and_then(|a| a.digest.clone());
+                let got = named.and_then(|a| a.digest.as_deref());
                 let holds = got
-                    .as_deref()
                     .and_then(Sha256Digest::parse)
                     .is_some_and(|d| d == *digest);
                 verdict(holds, got.map_or(Value::Null, Value::from))

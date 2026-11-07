@@ -1002,7 +1002,8 @@ impl AutopilotMenu {
         out
     }
 
-    /// Compact 22-bit accessibility epoch over session, spoken title, cancel deadline, and rows.
+    /// Compact accessibility epoch ([`crate::a11y_tree::menu_epoch_from`]) over session, spoken
+    /// title, cancel deadline, and rows.
     #[cfg(a11y_tree)]
     #[must_use]
     fn a11y_epoch(&self) -> u32 {
@@ -1176,6 +1177,7 @@ impl App {
         anchor: (usize, usize),
         keyboard: bool,
     ) {
+        self.settle_rename_edit(wid);
         self.close_autopilot_menu();
         self.autopilot_menu_spent = None;
         self.note_land_at_offer();

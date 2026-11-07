@@ -10042,12 +10042,8 @@ impl App {
             }
             MenuAction::RecordUnseenKeys => self.toggle_unseen_keys(),
             #[cfg(target_os = "macos")]
-            MenuAction::ChangeNickname => self.change_nickname(),
-            #[cfg(target_os = "macos")]
             MenuAction::RenameMachine => self.rename_machine(),
             // Not offered here: the machine menu is macOS's.
-            #[cfg(not(target_os = "macos"))]
-            MenuAction::ChangeNickname => {}
             #[cfg(not(target_os = "macos"))]
             MenuAction::RenameMachine => {}
             MenuAction::CloseTab => {

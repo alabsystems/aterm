@@ -209,6 +209,10 @@ pub struct Standings {
     /// Each retired key whose seat is current, and the seat's node key now: the key rotations a
     /// sender carries held mail across (§11 C3).
     pub rotated: BTreeMap<[u8; 32], [u8; 32]>,
+    /// Where each key of [`Self::rotated`] stands among the keys its seat replaced, by the order
+    /// the log says it replaced them (`Membership::retired`): 0 the one it replaced last. A
+    /// ring names a seat's last retired nodes ([`ringed_of`], §11 C3b).
+    pub recency: BTreeMap<[u8; 32], usize>,
 }
 
 impl Standings {
@@ -246,6 +250,9 @@ impl Standings {
         for (old, id) in retired_of {
             if let Some(new) = seated.get(&id) {
                 standings.rotated.insert(old, *new);
+                if let Some(at) = membership.retired(id).iter().position(|key| *key == old) {
+                    standings.recency.insert(old, at);
+                }
             }
         }
         standings
@@ -268,6 +275,8 @@ impl Standings {
             standings
                 .rotated
                 .retain(|_, new| !outs.removed.contains(new) && !outs.retired.contains(new));
+            let rotated = &standings.rotated;
+            standings.recency.retain(|old, _| rotated.contains_key(old));
             for key in &outs.retired {
                 if !standings.removed.contains(key) {
                     standings.current.remove(key);
@@ -1460,7 +1469,7 @@ impl Mesh {
             if key == self.me.key || !applied.verdict.origins.contains(&key) {
                 return incoming.refuse("out");
             }
-            (host, retired_of(read, &key))
+            (host, ringed_of(read, &key))
         };
         let peer_buf = principal_buf(&key);
         let peer = principal_str(&peer_buf);
@@ -1593,18 +1602,34 @@ pub fn ring(fleet: &str, me: &str, peer: &str, olds: &BTreeSet<String>) -> Vec<S
     aterm_link::federate::peer_ring(fleet, me, peer, olds)
 }
 
-/// The retired nodes of the seat whose node key is `key` now, by `read`: each key a rotation
-/// replaced with it (`Standings::rotated`), as a node, but one that names a current seat's node
-/// too, as the hand-off leaves it out (`Handoff::retired`): a ring granting it would let the
-/// seat write as that other Mac.
+/// The retired nodes of the seat whose node key is `key` now that its ring names, by `read` (§11
+/// C3b): of the keys a rotation replaced with it (`Standings::rotated`), as nodes, the
+/// [`RING_OLDS_MAX`](aterm_link::federate::RING_OLDS_MAX) it replaced last (`Standings::recency`,
+/// [`aterm_link::federate::ringed`]). A key that names a current seat's node too is left out, as
+/// the hand-off leaves it out (`Handoff::retired`): a ring granting it would let the seat write as
+/// that other Mac. Mail under a node the seat replaced earlier is older, so the likelier to have
+/// gone past the mail rule's maximum age; and the seat's pushes carry the ones a ring grants alone
+/// (`granted_olds`), so a ring may name any of them.
 #[must_use]
-pub fn retired_of(read: &Standings, key: &[u8; 32]) -> BTreeSet<String> {
-    read.rotated
+pub fn ringed_of(read: &Standings, key: &[u8; 32]) -> BTreeSet<String> {
+    let mut olds = BTreeSet::new();
+    let mut rank: BTreeMap<String, usize> = BTreeMap::new();
+    for old in read
+        .rotated
         .iter()
         .filter(|(_, now)| *now == key)
-        .filter(|(old, _)| !read.current.iter().any(|cur| cur[..8] == old[..8]))
-        .map(|(old, _)| astream_broker::identity_principal(old))
-        .collect()
+        .map(|(old, _)| old)
+        .filter(|old| !read.current.iter().any(|cur| cur[..8] == old[..8]))
+    {
+        let node = astream_broker::identity_principal(old);
+        if let Some(at) = read.recency.get(old) {
+            rank.entry(node.clone())
+                .and_modify(|was| *was = (*was).min(*at))
+                .or_insert(*at);
+        }
+        olds.insert(node);
+    }
+    aterm_link::federate::ringed(&olds, &rank)
 }
 
 /// Which producers continue others' sequences on this Mac's (`me`) `bus.log`, by `read`: each

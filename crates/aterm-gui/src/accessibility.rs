@@ -30,27 +30,6 @@ pub(crate) fn push_visible_row<'a>(
     text.push('\n');
 }
 
-/// Rendered rows read by an accessibility snapshot.
-#[cfg(any(a11y_tree, test))]
-pub(crate) trait CellRows {
-    /// Row `r`'s cells in `cols`, left to right.
-    fn cells_in(&self, r: usize, cols: std::ops::Range<usize>)
-    -> impl Iterator<Item = &RenderCell>;
-}
-
-#[cfg(any(a11y_tree, test))]
-impl CellRows for [Vec<RenderCell>] {
-    fn cells_in(
-        &self,
-        r: usize,
-        cols: std::ops::Range<usize>,
-    ) -> impl Iterator<Item = &RenderCell> {
-        let row: &[RenderCell] = self.get(r).map_or(&[], Vec::as_slice);
-        let end = cols.end.max(cols.start).min(row.len());
-        row[cols.start.min(row.len())..end].iter()
-    }
-}
-
 /// A plain-text and cursor snapshot of the visible grid for assistive technology.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg(any(a11y_tree, test))]
@@ -81,7 +60,7 @@ impl AccessibleSnapshot {
     /// Builds a snapshot of the rectangle `rows` × `cols` within `rows_cells`.
     #[must_use]
     pub(crate) fn from_cells_in(
-        rows_cells: &(impl CellRows + ?Sized),
+        rows_cells: &[Vec<RenderCell>],
         rows: std::ops::Range<usize>,
         cols: std::ops::Range<usize>,
         cursor: Option<(usize, usize)>,
@@ -89,7 +68,9 @@ impl AccessibleSnapshot {
         let width = cols.len();
         let mut text = String::with_capacity(rows.len() * (width + 1));
         for r in rows.clone() {
-            push_visible_row(&mut text, rows_cells.cells_in(r, cols.clone()), width);
+            let row = rows_cells.get(r).map_or(&[][..], Vec::as_slice);
+            let end = cols.end.max(cols.start).min(row.len());
+            push_visible_row(&mut text, &row[cols.start.min(row.len())..end], width);
         }
         Self {
             text,

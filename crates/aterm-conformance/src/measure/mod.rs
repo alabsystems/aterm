@@ -15,9 +15,39 @@ pub mod spin;
 pub mod starvation;
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-static ONE_TAKE: Mutex<()> = Mutex::new(());
+static TAKES: RwLock<()> = RwLock::new(());
+
+/// Count instruments have private worlds. A timing instrument excludes every other take.
+struct Take<'a> {
+    _count: Option<RwLockReadGuard<'a, ()>>,
+    _timing: Option<RwLockWriteGuard<'a, ()>>,
+}
+
+fn take(timing: bool) -> Take<'static> {
+    take_on(&TAKES, timing)
+}
+
+fn take_on(gate: &RwLock<()>, timing: bool) -> Take<'_> {
+    if timing {
+        Take {
+            _count: None,
+            _timing: Some(
+                gate.write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ),
+        }
+    } else {
+        Take {
+            _count: Some(
+                gate.read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ),
+            _timing: None,
+        }
+    }
+}
 
 /// What a process has used since it started, as `proc_pid_rusage` (`RUSAGE_INFO_V4`) reads it.
 #[cfg(target_os = "macos")]
@@ -196,4 +226,21 @@ pub(crate) fn create_stdio_file(path: &std::path::Path) -> std::io::Result<std::
         opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
     opts.open(path)
+}
+
+#[cfg(test)]
+mod take_tests {
+    #[test]
+    fn count_takes_share_custody_and_a_timing_take_excludes_them() {
+        let gate = super::RwLock::new(());
+        let count = super::take_on(&gate, false);
+        assert!(gate.try_read().is_ok());
+        assert!(gate.try_write().is_err());
+        drop(count);
+        let timing = super::take_on(&gate, true);
+        assert!(gate.try_read().is_err());
+        assert!(gate.try_write().is_err());
+        drop(timing);
+        assert!(gate.try_write().is_ok());
+    }
 }

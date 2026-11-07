@@ -5,7 +5,10 @@
 //! This module grants no provider, process, credential or session assignment authority.
 
 use super::accounts::{self, Binding};
+#[path = "codex_owner_witness.rs"]
+mod owner_witness;
 use aterm_json::Value;
+pub(super) use owner_witness::{OwnerAnchorWriter, OwnerAttempt, OwnerWitness};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -102,7 +105,144 @@ struct Record {
     request: Option<Request>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rejected: Option<RejectedIntent>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    native_required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    grant_reference: Option<super::codex_grant_owner::GrantReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_witness: Option<OwnerWitness>,
     status: Status,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    staging: Option<Staging>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    retired: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sealed_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery: Option<RecoveryClaim>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryClaim {
+    generation: u64,
+    retired: bool,
+}
+
+/// Immutable metadata of one durably admitted native attempt. No credential is kept here.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Staging {
+    pub request: Request,
+    pub store: std::path::PathBuf,
+    pub directory: std::path::PathBuf,
+    pub store_identity: Option<DirectoryIdentity>,
+    pub directory_identity: Option<DirectoryIdentity>,
+    pub parent: accounts::RenewalParent,
+    pub workflow: u64,
+    pub policy: String,
+    pub selection: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct DirectoryIdentity {
+    dev: u64,
+    ino: u64,
+    volume: Option<[u8; 16]>,
+}
+
+impl DirectoryIdentity {
+    pub(super) fn capture(path: &std::path::Path) -> Result<Self, String> {
+        #[cfg(unix)]
+        {
+            let identity = aterm_uds::directory_identity::read(path)
+                .map_err(|_| "enrollment directory identity unavailable")?;
+            Ok(Self {
+                dev: identity.dev,
+                ino: identity.ino,
+                volume: identity.volume,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Err("native enrollment directory identity unavailable on this platform".into())
+        }
+    }
+
+    fn matches(&self, path: &std::path::Path) -> bool {
+        Self::capture(path).is_ok_and(|current| {
+            self.ino == current.ino
+                && match (self.volume, current.volume) {
+                    (Some(left), Some(right)) => left == right,
+                    _ => self.dev == current.dev,
+                }
+        })
+    }
+}
+
+impl Staging {
+    pub(super) fn directories_current(&self) -> bool {
+        self.store_identity
+            .as_ref()
+            .is_some_and(|identity| identity.matches(&self.store))
+            && self
+                .directory_identity
+                .as_ref()
+                .is_some_and(|identity| identity.matches(&self.directory))
+    }
+}
+
+/// Only the original signer/writer admission constructs this native receipt destination.
+#[derive(Debug)]
+pub struct Artifact {
+    staging: Staging,
+    deadline: std::sync::OnceLock<super::wake_deadline::WakeDeadline>,
+}
+
+pub(super) struct AppliedArtifact {
+    admission: Staging,
+    digest: String,
+    generation: u64,
+}
+
+impl AppliedArtifact {
+    pub(super) fn admission(&self) -> &Staging {
+        &self.admission
+    }
+    pub(super) fn digest(&self) -> &str {
+        &self.digest
+    }
+    pub(super) fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+impl Artifact {
+    pub(super) fn staging(&self) -> &Staging {
+        &self.staging
+    }
+
+    pub(super) fn bind_deadline(
+        &self,
+        deadline: super::wake_deadline::WakeDeadline,
+    ) -> Result<(), String> {
+        if self.deadline.set(deadline).is_err() && self.deadline.get() != Some(&deadline) {
+            return Err("enrollment producer deadline changed".into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn work_current(&self) -> bool {
+        self.deadline
+            .get()
+            .is_some_and(|deadline| !deadline.passed())
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 impl Record {
@@ -110,7 +250,10 @@ impl Record {
         match (&self.request, &self.rejected) {
             (Some(request), None) if request.valid() => Some(request.intent()),
             (None, Some(intent))
-                if intent.valid()
+                if !self.native_required
+                    && self.grant_reference.is_none()
+                    && self.owner_witness.is_none()
+                    && intent.valid()
                     && self.status
                         == (Status {
                             phase: Phase::Refused,
@@ -130,17 +273,48 @@ impl Record {
 #[serde(transparent)]
 pub struct Operations(
     BTreeMap<String, Record>,
+    #[serde(skip)] BTreeMap<String, RetirementReceipt>,
     #[serde(skip)] std::collections::BTreeSet<String>,
     #[serde(skip)] std::collections::BTreeSet<String>,
+    #[serde(skip)] BTreeMap<String, (Option<OwnerWitness>, OwnerWitness)>,
+    #[serde(skip)] BTreeMap<String, u64>,
 );
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RetirementReceipt {
+    Original,
+    Recovery(u64),
+    RecordedCancellation,
+}
 
 impl Operations {
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
-    pub(crate) fn has_rejected(&self) -> bool {
-        self.0.values().any(|record| record.rejected.is_some())
+    pub(crate) fn has_owner_witness(&self) -> bool {
+        self.0.values().any(|record| record.owner_witness.is_some())
+    }
+
+    pub(crate) fn requires_extended(&self) -> bool {
+        self.0.values().any(|record| {
+            record.rejected.is_some() || record.native_required || record.grant_reference.is_some()
+        })
+    }
+
+    pub(crate) fn has_artifacts(&self) -> bool {
+        self.0.values().any(|record| {
+            record.staging.is_some() || record.retired || record.sealed_digest.is_some()
+        })
+    }
+
+    pub(super) fn owns_staging_path(&self, path: &std::path::Path) -> bool {
+        self.0.values().any(|record| {
+            record
+                .staging
+                .as_ref()
+                .is_some_and(|admission| admission.directory == path)
+        })
     }
 
     pub(crate) fn encode(&self) -> Value {
@@ -154,6 +328,23 @@ impl Operations {
             || book.0.len() > MAX_OPERATIONS
             || book.0.iter().any(|(id, record)| {
                 record.intent().is_none_or(|intent| id != &intent.id)
+                    || record.owner_witness.as_ref().is_some_and(|witness| {
+                        !witness.valid()
+                            || !record.native_required
+                            || record.grant_reference.is_none()
+                            || record.status.phase != Phase::Applied
+                    })
+                    || record
+                        .grant_reference
+                        .as_ref()
+                        .is_some_and(|reference| !reference.valid())
+                    || (record.grant_reference.is_some() && !record.native_required)
+                    || (record.native_required
+                        && record.status.phase == Phase::Applied
+                        && record.grant_reference.is_none())
+                    || record.recovery.as_ref().is_some_and(|claim| {
+                        claim.generation == 0 || !record.retired || record.staging.is_none()
+                    })
                     || match record.status.phase {
                         Phase::Applied => !record.status.generation.is_some_and(|n| n > 0),
                         _ => record.status.generation.is_some(),
@@ -249,7 +440,14 @@ impl Operations {
             Record {
                 request: None,
                 rejected: Some(intent.clone()),
+                native_required: false,
+                grant_reference: None,
+                owner_witness: None,
                 status: status.clone(),
+                staging: None,
+                retired: false,
+                sealed_digest: None,
+                recovery: None,
             },
         );
         self.2.insert(intent.id.clone());
@@ -277,6 +475,13 @@ impl Operations {
             Record {
                 request: Some(request.clone()),
                 rejected: None,
+                native_required: false,
+                grant_reference: None,
+                owner_witness: None,
+                staging: None,
+                retired: false,
+                sealed_digest: None,
+                recovery: None,
                 status: Status {
                     phase: Phase::Running,
                     generation: None,
@@ -284,6 +489,144 @@ impl Operations {
             },
         );
         Ok(true)
+    }
+
+    pub(crate) fn admit_native(&mut self, request: &Request) -> Result<bool, String> {
+        let fresh = self.admit(request)?;
+        if fresh {
+            self.0
+                .get_mut(&request.id)
+                .expect("admitted")
+                .native_required = true;
+        }
+        Ok(fresh)
+    }
+
+    pub(super) fn attach_grant(
+        &mut self,
+        request: &Request,
+        grant: &super::codex_grant_owner::RetainedGrant,
+    ) -> Result<(), String> {
+        self.require_running(request)?;
+        if !grant.matches_request(request) {
+            return Err("retained grant belongs to another operation".into());
+        }
+        let reference = grant.reference();
+        let record = self.0.get_mut(&request.id).expect("checked record");
+        if !record.native_required {
+            return Err("operation did not admit native ownership".into());
+        }
+        match &record.grant_reference {
+            Some(existing) if existing == &reference => Ok(()),
+            Some(_) => Err("operation already retained another grant".into()),
+            None => {
+                record.grant_reference = Some(reference);
+                self.3.insert(request.id.clone());
+                Ok(())
+            }
+        }
+    }
+
+    pub(super) fn authenticates_published_grant(
+        &self,
+        binding: &super::codex_grant_owner::GrantBinding,
+    ) -> bool {
+        binding.generation > 0
+            && self.0.get(&binding.request.id).is_some_and(|record| {
+                record.request.as_ref() == Some(&binding.request)
+                    && record.native_required
+                    && record.grant_reference.as_ref() == Some(&binding.reference)
+                    && record.status
+                        == (Status {
+                            phase: Phase::Applied,
+                            generation: Some(binding.generation),
+                        })
+            })
+    }
+
+    /// Correlation data only: native owner admission must authenticate the receipt
+    /// and current source before this can authorize credential materialization.
+    pub(super) fn published_grant(
+        &self,
+        label: &str,
+        actual_success_generation: u64,
+    ) -> Option<super::codex_grant_owner::GrantBinding> {
+        if actual_success_generation == 0 {
+            return None;
+        }
+        let mut matches = self.0.values().filter_map(|record| {
+            let request = record.request.as_ref()?;
+            let reference = record.grant_reference.as_ref()?;
+            (request.label == label
+                && record.native_required
+                && reference.valid()
+                && record.status
+                    == (Status {
+                        phase: Phase::Applied,
+                        generation: Some(actual_success_generation),
+                    }))
+            .then(|| super::codex_grant_owner::GrantBinding {
+                request: request.clone(),
+                reference: reference.clone(),
+                generation: actual_success_generation,
+            })
+        });
+        let unique = matches.next()?;
+        matches.next().is_none().then_some(unique)
+    }
+
+    pub(super) fn owner_witness(
+        &self,
+        binding: &super::codex_grant_owner::GrantBinding,
+    ) -> Result<Option<OwnerWitness>, String> {
+        if !self.authenticates_published_grant(binding) {
+            return Err("grant is not canonically published".into());
+        }
+        Ok(self
+            .0
+            .get(&binding.request.id)
+            .expect("authenticated record")
+            .owner_witness
+            .clone())
+    }
+
+    pub(super) fn cas_owner_witness(
+        &mut self,
+        transition: &super::codex_grant_owner::OwnerWitnessTransition,
+    ) -> Result<(), String> {
+        let binding = transition.binding();
+        let expected = transition.expected();
+        let next = transition.next();
+        if !next.valid() || self.owner_witness(binding)?.as_ref() != expected {
+            return Err("owner witness changed".into());
+        }
+        match expected {
+            None if transition.is_fresh_activation()
+                && next.revision.generation == 1
+                && next.pending.is_none() => {}
+            Some(old)
+                if !transition.is_fresh_activation()
+                    && next.revision.generation >= old.revision.generation
+                    && (next.revision.generation != old.revision.generation
+                        || next.revision.digest == old.revision.digest)
+                    && (next.revision.generation == old.revision.generation
+                        || (old.pending.is_some() && next.pending.is_none()))
+                    && !(old.pending.is_some()
+                        && next.pending.is_some()
+                        && old.pending != next.pending) => {}
+            _ => return Err("invalid owner witness transition".into()),
+        }
+        if expected == Some(next) {
+            return Ok(());
+        }
+        let previous = expected.cloned();
+        self.0
+            .get_mut(&binding.request.id)
+            .expect("authenticated record")
+            .owner_witness = Some(next.clone());
+        self.4
+            .insert(binding.request.id.clone(), (previous, next.clone()));
+        Ok(())
     }
 
     pub(crate) fn require_running(&self, request: &Request) -> Result<(), String> {
@@ -294,6 +637,31 @@ impl Operations {
             }) => Ok(()),
             _ => Err("enrollment operation is no longer running".into()),
         }
+    }
+
+    fn refuse_rejected(
+        &mut self,
+        rejection: &super::codex_grant_owner::RetiredRejection,
+    ) -> Result<(), String> {
+        let request = rejection.request();
+        let status = self
+            .lookup(request)?
+            .ok_or("enrollment operation unavailable")?;
+        if status.phase != Phase::Running {
+            return Ok(());
+        }
+        let record = self.0.get(&request.id).expect("checked request");
+        // Historical outcome evidence cannot retire a newer recovery owner.
+        if record.recovery.as_ref().is_some_and(|claim| !claim.retired) {
+            return Ok(());
+        }
+        if !record.native_required
+            || record.grant_reference.is_some()
+            || record.owner_witness.is_some()
+        {
+            return Err("provider rejection conflicts with retained credentials".into());
+        }
+        self.finish(request, Phase::Refused)
     }
 
     pub(crate) fn finish(&mut self, request: &Request, phase: Phase) -> Result<(), String> {
@@ -311,8 +679,36 @@ impl Operations {
 
     /// Transaction-local marker; the account generation guard fills the actual
     /// committed success generation and refuses a marker without a Renewed event.
+    pub(super) fn checkpoint_reference(
+        &self,
+        request: &Request,
+    ) -> Result<Option<super::codex_grant_owner::GrantReference>, String> {
+        self.require_running(request)?;
+        let record = self.0.get(&request.id).expect("checked record");
+        if record.native_required && record.grant_reference.is_none() {
+            return Err("native enrollment has no retained grant".into());
+        }
+        Ok(record.grant_reference.clone())
+    }
+
+    pub(super) fn requires_native_grant(&self, request: &Request) -> Result<bool, String> {
+        self.require_running(request)?;
+        Ok(self
+            .0
+            .get(&request.id)
+            .expect("checked record")
+            .native_required)
+    }
+
     pub(crate) fn publishing(&mut self, request: &Request) -> Result<(), String> {
         self.require_running(request)?;
+        if self
+            .0
+            .get(&request.id)
+            .is_some_and(|record| record.native_required && record.grant_reference.is_none())
+        {
+            return Err("native enrollment has no retained grant authority".into());
+        }
         self.0
             .get_mut(&request.id)
             .expect("checked record")
@@ -322,6 +718,47 @@ impl Operations {
     }
 
     pub(crate) fn retire(&mut self, proof: &Retired) -> Result<(), String> {
+        let status = self
+            .lookup(&proof.request)?
+            .ok_or("unknown enrollment operation")?;
+        if !matches!(status.phase, Phase::Running | Phase::CancelRequested) {
+            return Ok(());
+        }
+        let record = self.0.get_mut(&proof.request.id).expect("checked record");
+        match &proof.kind {
+            RetiredKind::Original => {
+                if record.recovery.as_ref().is_some_and(|claim| !claim.retired) {
+                    return Err("a newer recovery still owns account work".into());
+                }
+                if record.retired {
+                    return self.retire_recorded_cancellation(&proof.request);
+                }
+                record.retired = true;
+            }
+            RetiredKind::Recovery(generation) => {
+                let claim = record
+                    .recovery
+                    .as_mut()
+                    .filter(|claim| &claim.generation == generation)
+                    .ok_or("enrollment recovery claim changed")?;
+                if claim.retired {
+                    return self.retire_recorded_cancellation(&proof.request);
+                }
+                claim.retired = true;
+            }
+        }
+        if self
+            .lookup(&proof.request)?
+            .is_some_and(|status| status.phase == Phase::Running)
+        {
+            self.0
+                .get_mut(&proof.request.id)
+                .expect("checked record")
+                .retired = true;
+            self.1
+                .insert(proof.request.id.clone(), proof.kind.receipt());
+            return Ok(());
+        }
         match self.lookup(&proof.request)? {
             Some(Status {
                 phase: Phase::Cancelled,
@@ -338,7 +775,154 @@ impl Operations {
             .expect("checked record")
             .status
             .phase = Phase::Cancelled;
-        self.1.insert(proof.request.id.clone());
+        self.1
+            .insert(proof.request.id.clone(), proof.kind.receipt());
+        Ok(())
+    }
+
+    pub(super) fn bind_staging(&mut self, staging: Staging) -> Result<Artifact, String> {
+        self.require_running(&staging.request)?;
+        let record = self.0.get_mut(&staging.request.id).expect("checked record");
+        if record.staging.is_some() || record.retired {
+            return Err("enrollment already owns an attempt".into());
+        }
+        record.staging = Some(staging.clone());
+        Ok(Artifact {
+            staging,
+            deadline: std::sync::OnceLock::new(),
+        })
+    }
+
+    pub(super) fn staged(&self, request: &Request) -> Result<Option<&Staging>, String> {
+        self.lookup(request)?
+            .ok_or("unknown enrollment operation")?;
+        Ok(self
+            .0
+            .get(&request.id)
+            .and_then(|record| record.staging.as_ref()))
+    }
+
+    pub(super) fn is_retired(&self, request: &Request) -> Result<bool, String> {
+        self.lookup(request)?
+            .ok_or("unknown enrollment operation")?;
+        Ok(self.0.get(&request.id).is_some_and(|record| {
+            record.retired && record.recovery.as_ref().is_none_or(|claim| claim.retired)
+        }))
+    }
+
+    pub(super) fn claim_recovery(&mut self, request: &Request) -> Result<u64, String> {
+        self.require_running(request)?;
+        if !self.is_retired(request)? || self.staged(request)?.is_none() {
+            return Err("enrollment recovery is not retired".into());
+        }
+        let generation = self
+            .0
+            .get(&request.id)
+            .and_then(|record| record.recovery.as_ref())
+            .map_or(0, |claim| claim.generation)
+            .checked_add(1)
+            .ok_or("enrollment recovery generation exhausted")?;
+        self.0
+            .get_mut(&request.id)
+            .expect("checked record")
+            .recovery = Some(RecoveryClaim {
+            generation,
+            retired: false,
+        });
+        self.5.insert(request.id.clone(), generation);
+        Ok(generation)
+    }
+
+    pub(super) fn require_recovery(
+        &self,
+        request: &Request,
+        generation: u64,
+    ) -> Result<(), String> {
+        self.require_running(request)?;
+        if self.0.get(&request.id).is_some_and(|record| {
+            record.retired
+                && record
+                    .recovery
+                    .as_ref()
+                    .is_some_and(|claim| claim.generation == generation && !claim.retired)
+        }) {
+            Ok(())
+        } else {
+            Err("enrollment recovery claim changed".into())
+        }
+    }
+
+    /// An exact retired native attempt may be revalidated locally under a fresh admission.
+    /// This is metadata only; it authorizes neither a provider request nor publication.
+    pub fn recoverable(&self, request: &Request) -> Result<bool, String> {
+        Ok(self
+            .lookup(request)?
+            .is_some_and(|status| status.phase == Phase::Running)
+            && self.is_retired(request)?
+            && self.staged(request)?.is_some())
+    }
+
+    pub(super) fn retire_recorded_cancellation(&mut self, request: &Request) -> Result<(), String> {
+        if self
+            .lookup(request)?
+            .is_some_and(|status| status.phase == Phase::CancelRequested)
+            && self.is_retired(request)?
+        {
+            self.0
+                .get_mut(&request.id)
+                .expect("checked record")
+                .status
+                .phase = Phase::Cancelled;
+            self.1
+                .insert(request.id.clone(), RetirementReceipt::RecordedCancellation);
+        }
+        Ok(())
+    }
+
+    pub(super) fn applied_artifact(
+        &self,
+        home: &std::path::Path,
+        bindings: &BTreeMap<String, Binding>,
+    ) -> Option<AppliedArtifact> {
+        self.0.values().find_map(|record| {
+            let admission = record.staging.as_ref()?;
+            let generation = record.status.generation?;
+            let binding = bindings.get(&admission.request.label)?;
+            if record.status.phase != Phase::Applied
+                || generation == 0
+                || admission.directory != home
+                || binding.last_success_generation < generation
+                || (binding.dir.as_deref() != home.to_str()
+                    && binding.last_success_generation == generation)
+            {
+                return None;
+            }
+            Some(AppliedArtifact {
+                admission: admission.clone(),
+                digest: record.sealed_digest.clone()?,
+                generation,
+            })
+        })
+    }
+
+    pub(super) fn seal_publication(
+        &mut self,
+        request: &Request,
+        digest: String,
+    ) -> Result<(), String> {
+        self.require_running(request)?;
+        if !hex(&digest, 64) {
+            return Err("invalid enrollment digest".into());
+        }
+        let record = self.0.get_mut(&request.id).expect("checked record");
+        if record
+            .sealed_digest
+            .as_ref()
+            .is_some_and(|previous| previous != &digest)
+        {
+            return Err("enrollment payload changed".into());
+        }
+        record.sealed_digest = Some(digest);
         Ok(())
     }
 
@@ -353,27 +937,61 @@ impl Operations {
                 self.0.get(id).is_none_or(|new| {
                     new.request != old.request
                         || new.rejected != old.rejected
+                        || new.native_required != old.native_required
+                        || (new.grant_reference != old.grant_reference
+                            && !(old.status.phase == Phase::Running
+                                && old.grant_reference.is_none()
+                                && new.grant_reference.is_some()
+                                && new.native_required
+                                && self.3.contains(id)))
+                        || (new.owner_witness != old.owner_witness
+                            && !self.4.get(id).is_some_and(|(expected, next)| {
+                                expected == &old.owner_witness
+                                    && new.owner_witness.as_ref() == Some(next)
+                                    && old.status.phase == Phase::Applied
+                                    && new.status == old.status
+                            }))
+                        || (old.staging.is_some() && new.staging != old.staging)
+                        || (old.sealed_digest.is_some() && new.sealed_digest != old.sealed_digest)
+                        || (old.retired && !new.retired)
+                        || (old.retired != new.retired
+                            && self.1.get(id) != Some(&RetirementReceipt::Original))
+                        || (old.staging.is_none()
+                            && new.staging.is_some()
+                            && old.status.phase != Phase::Running)
                         || (old.status.phase != Phase::Running
                             && new != old
+                            && !self.4.contains_key(id)
                             && !(old.status.phase == Phase::CancelRequested
                                 && new.status.phase == Phase::Cancelled
                                 && new.status.generation.is_none()
-                                && self.1.contains(id)))
+                                && self.1.contains_key(id)))
                 })
             })
         {
             return Err("enrollment operation custody was erased or altered".into());
         }
-        for id in &self.1 {
-            if !before
-                .0
-                .get(id)
-                .is_some_and(|old| old.status.phase == Phase::CancelRequested)
-                || !self
-                    .0
-                    .get(id)
-                    .is_some_and(|new| new.status.phase == Phase::Cancelled)
-            {
+        for (id, receipt) in &self.1 {
+            if !before.0.get(id).is_some_and(|old| {
+                matches!(old.status.phase, Phase::CancelRequested | Phase::Running)
+                    && match receipt {
+                        RetirementReceipt::Original => {
+                            old.recovery.as_ref().is_none_or(|claim| claim.retired)
+                        }
+                        RetirementReceipt::Recovery(generation) => {
+                            old.retired
+                                && old.recovery.as_ref().is_some_and(|claim| {
+                                    claim.generation == *generation && !claim.retired
+                                })
+                        }
+                        RetirementReceipt::RecordedCancellation => {
+                            old.retired && old.recovery.as_ref().is_none_or(|claim| claim.retired)
+                        }
+                    }
+            }) || !self.0.get(id).is_some_and(|new| {
+                new.status.phase == Phase::Cancelled
+                    || (new.status.phase == Phase::Running && new.retired)
+            }) {
                 return Err("invalid enrollment retirement evidence".into());
             }
         }
@@ -381,16 +999,68 @@ impl Operations {
             if record.intent().is_none_or(|intent| id != &intent.id) {
                 return Err("invalid enrollment operation".into());
             }
+            if let Some(staging) = &record.staging
+                && (record.request.as_ref() != Some(&staging.request)
+                    || !staging.store.is_absolute()
+                    || !staging.directory.is_absolute()
+                    || staging.workflow == 0
+                    || !hex(&staging.policy, 64))
+            {
+                return Err("invalid enrollment staging admission".into());
+            }
             let old = before.0.get(id);
+            if let Some(old) = old
+                && old.recovery != record.recovery
+            {
+                let claimed = record.recovery.as_ref().is_some_and(|claim| {
+                    !claim.retired
+                        && self.5.get(id) == Some(&claim.generation)
+                        && old.retired
+                        && old.status.phase == Phase::Running
+                        && old
+                            .recovery
+                            .as_ref()
+                            .is_none_or(|previous| previous.retired)
+                        && old
+                            .recovery
+                            .as_ref()
+                            .map_or(0, |previous| previous.generation)
+                            .checked_add(1)
+                            == Some(claim.generation)
+                });
+                let retired = old
+                    .recovery
+                    .as_ref()
+                    .zip(record.recovery.as_ref())
+                    .is_some_and(|(previous, claim)| {
+                        previous.generation == claim.generation
+                            && !previous.retired
+                            && claim.retired
+                            && self.1.get(id)
+                                == Some(&RetirementReceipt::Recovery(claim.generation))
+                    });
+                if !claimed && !retired {
+                    return Err("enrollment recovery has no ownership receipt".into());
+                }
+            }
             if record.status.phase == Phase::Cancelled
                 && !old.is_some_and(|old| old.status.phase == Phase::Cancelled)
-                && !self.1.contains(id)
+                && !self.1.contains_key(id)
             {
                 return Err("enrollment cancellation has no retirement evidence".into());
             }
             if old.is_none() {
+                if record.retired
+                    || record.staging.is_some()
+                    || record.sealed_digest.is_some()
+                    || record.recovery.is_some()
+                {
+                    return Err("new enrollment has no retired native attempt".into());
+                }
                 let new_row = record.request.is_some()
                     && record.rejected.is_none()
+                    && record.grant_reference.is_none()
+                    && record.owner_witness.is_none()
                     && record.status
                         == (Status {
                             phase: Phase::Running,
@@ -411,6 +1081,9 @@ impl Operations {
             if old.is_some_and(|old| old.status.phase == Phase::Running)
                 && record.status.phase == Phase::Applied
             {
+                if record.native_required && record.grant_reference.is_none() {
+                    return Err("native publication has no retained grant reference".into());
+                }
                 let request = record
                     .request
                     .as_ref()
@@ -439,31 +1112,174 @@ impl Operations {
                 return Err("invalid no-action refusal evidence".into());
             }
         }
+        for id in &self.3 {
+            if !before.0.get(id).is_some_and(|old| {
+                old.status.phase == Phase::Running
+                    && old.native_required
+                    && old.grant_reference.is_none()
+            }) || !self
+                .0
+                .get(id)
+                .is_some_and(|record| record.grant_reference.is_some() && record.native_required)
+            {
+                return Err("invalid retained grant attachment evidence".into());
+            }
+        }
+        for (id, (expected, next)) in &self.4 {
+            if !next.valid()
+                || !before.0.get(id).is_some_and(|old| {
+                    old.status.phase == Phase::Applied
+                        && old.native_required
+                        && old.grant_reference.is_some()
+                        && &old.owner_witness == expected
+                })
+                || !self.0.get(id).is_some_and(|new| {
+                    new.owner_witness.as_ref() == Some(next) && new.status.phase == Phase::Applied
+                })
+            {
+                return Err("invalid owner witness mutation evidence".into());
+            }
+        }
+        self.4.clear();
+        self.5.clear();
         self.1.clear();
         self.2.clear();
+        self.3.clear();
         Ok(())
+    }
+}
+
+#[derive(Default)]
+struct NativeRuntime {
+    pending: std::sync::Mutex<
+        Option<(
+            Box<super::codex_grant_owner::RetentionFailure>,
+            super::account_work::Scope,
+        )>,
+    >,
+    reference: std::sync::Mutex<Option<super::codex_grant_owner::GrantReference>>,
+}
+
+pub(super) struct NativeContext<'a> {
+    pub(super) env: &'a super::cli::Env,
+    runtime: &'a std::sync::Arc<NativeRuntime>,
+    pub(super) scope: &'a super::account_work::Scope,
+}
+
+impl NativeRuntime {
+    fn capture(
+        &self,
+        outcome: super::codex_grant_owner::CaptureOutcome,
+        scope: &super::account_work::Scope,
+    ) -> Option<super::codex_grant_owner::RetainedGrant> {
+        use super::codex_grant_owner::CaptureOutcome;
+        match outcome {
+            CaptureOutcome::Verified(grant) => {
+                *self.reference.lock().unwrap_or_else(|e| e.into_inner()) = Some(grant.reference());
+                Some(grant)
+            }
+            CaptureOutcome::Unverified(_retained) => None,
+            CaptureOutcome::NotDispatched(_receipt) => None,
+            CaptureOutcome::Rejected(_receipt) => None,
+            CaptureOutcome::Pending(failure) => {
+                *self.pending.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some((failure, scope.clone()));
+                None
+            }
+        }
+    }
+}
+
+impl NativeContext<'_> {
+    pub(super) fn capture(
+        &self,
+        outcome: super::codex_grant_owner::CaptureOutcome,
+    ) -> Option<super::codex_grant_owner::RetainedGrant> {
+        self.runtime.capture(outcome, self.scope)
     }
 }
 
 /// Work owner minted before dispatch; only a successful durable new admission
 /// enables its request-bound retirement proof.
 pub struct Work {
+    native: std::sync::Arc<NativeRuntime>,
     request: Request,
     scope: super::account_work::Scope,
     admitted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    recovery: std::sync::Arc<std::sync::Mutex<Option<u64>>>,
 }
 
 /// Native adapter handle which never retains provider work.
 pub struct Control {
+    native: std::sync::Arc<NativeRuntime>,
     request: Request,
     cancellation: super::account_work::Cancellation,
     admitted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    recovery: std::sync::Arc<std::sync::Mutex<Option<u64>>>,
 }
 
 /// Evidence of retirement for the exact durably admitted request. Fields are
 /// private; a newly minted scope for a replayed ID cannot construct this proof.
 pub struct Retired {
     request: Request,
+    kind: RetiredKind,
+}
+
+enum RetiredKind {
+    Original,
+    Recovery(u64),
+}
+
+impl RetiredKind {
+    fn receipt(&self) -> RetirementReceipt {
+        match self {
+            Self::Original => RetirementReceipt::Original,
+            Self::Recovery(generation) => RetirementReceipt::Recovery(*generation),
+        }
+    }
+}
+
+pub(super) struct Admission<'a> {
+    original: &'a std::sync::atomic::AtomicBool,
+    recovery: &'a std::sync::Mutex<Option<u64>>,
+}
+
+impl Admission<'_> {
+    pub(super) fn original(&self) {
+        self.original
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    pub(super) fn recovery(&self, generation: u64) -> Result<(), String> {
+        let mut owned = self
+            .recovery
+            .lock()
+            .map_err(|_| "enrollment recovery owner unavailable")?;
+        if owned.is_some() {
+            return Err("enrollment work already owns a recovery".into());
+        }
+        *owned = Some(generation);
+        Ok(())
+    }
+}
+
+fn retired_for(
+    request: &Request,
+    original: &std::sync::atomic::AtomicBool,
+    recovery: &std::sync::Mutex<Option<u64>>,
+    retired: bool,
+) -> Option<Retired> {
+    if !retired {
+        return None;
+    }
+    let kind = if original.load(std::sync::atomic::Ordering::Acquire) {
+        RetiredKind::Original
+    } else {
+        RetiredKind::Recovery((*recovery.lock().ok()?)?)
+    };
+    Some(Retired {
+        request: request.clone(),
+        kind,
+    })
 }
 
 impl Retired {
@@ -478,16 +1294,22 @@ impl Retired {
 
 pub fn owned_work(request: Request, scope: super::account_work::Scope) -> (Work, Control) {
     let admitted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let native = std::sync::Arc::new(NativeRuntime::default());
+    let recovery = std::sync::Arc::new(std::sync::Mutex::new(None));
     let control = Control {
+        native: native.clone(),
         request: request.clone(),
         cancellation: scope.cancellation(),
         admitted: admitted.clone(),
+        recovery: recovery.clone(),
     };
     (
         Work {
+            native,
             request,
             scope,
             admitted,
+            recovery,
         },
         control,
     )
@@ -501,33 +1323,241 @@ impl Work {
         env: &super::cli::Env,
         host: &dyn super::cli::AccountsHost,
     ) -> Result<Status, String> {
-        let _scope = self.scope;
-        super::cli::enroll_codex_operation_admitted(env, host, &self.request, &|| {
-            self.admitted
-                .store(true, std::sync::atomic::Ordering::Release)
-        })
+        let cancellation = self.scope.cancellation();
+        let admission = Admission {
+            original: &self.admitted,
+            recovery: &self.recovery,
+        };
+        let result =
+            super::cli::enroll_codex_operation_admitted(env, host, &self.request, Some(&admission));
+        drop(self.scope);
+        if result
+            .as_ref()
+            .is_ok_and(|status| matches!(status.phase, Phase::Running | Phase::CancelRequested))
+            && let Some(proof) = retired_for(
+                &self.request,
+                &self.admitted,
+                &self.recovery,
+                cancellation.retired(),
+            )
+        {
+            return proof.finish(env);
+        }
+        result
+    }
+
+    #[cfg(test)]
+    pub(in crate::harness) fn fixture_capture_after_native_admission(
+        &self,
+        env: &super::cli::Env,
+        outcome: super::codex_grant_owner::CaptureOutcome,
+    ) {
+        let store = env.accounts_store_for(accounts::Cli::Codex).unwrap();
+        let (logins, warning) = store.load_logins(env.now).unwrap();
+        assert!(warning.is_none());
+        let record = logins.enrollment.0.get(&self.request.id).unwrap();
+        assert!(
+            record.request.as_ref() == Some(&self.request)
+                && record.native_required
+                && record.status.phase == Phase::Running
+                && record.grant_reference.is_none()
+        );
+        self.admitted
+            .store(true, std::sync::atomic::Ordering::Release);
+        let _ = self.native.capture(outcome, &self.scope);
     }
 
     pub fn run(self, env: &super::cli::Env) -> Result<Status, String> {
-        super::cli::enroll_codex_operation_admitted(
-            env,
-            &super::cli::LiveAccounts::manual_work(self.scope),
-            &self.request,
-            &|| {
-                self.admitted
-                    .store(true, std::sync::atomic::Ordering::Release)
-            },
-        )
+        let cancellation = self.scope.cancellation();
+        let host = super::cli::LiveAccounts::manual_work(self.scope.clone());
+        let admission = Admission {
+            original: &self.admitted,
+            recovery: &self.recovery,
+        };
+        let result = {
+            let context = NativeContext {
+                env,
+                runtime: &self.native,
+                scope: &self.scope,
+            };
+            super::cli::enroll_codex_operation_custody(
+                env,
+                &host,
+                &self.request,
+                Some(&admission),
+                Some(&context),
+            )
+        };
+        drop(host);
+        drop(self.scope);
+        if result
+            .as_ref()
+            .is_ok_and(|status| matches!(status.phase, Phase::Running | Phase::CancelRequested))
+            && let Some(proof) = retired_for(
+                &self.request,
+                &self.admitted,
+                &self.recovery,
+                cancellation.retired(),
+            )
+        {
+            return proof.finish(env);
+        }
+        result
     }
 }
 
+/// Signal-worker reconciliation of authenticated no-send evidence. Read-only
+/// discovery never calls this, and an unknown Attempted record is never proof.
+pub fn settle_not_dispatched(env: &super::cli::Env, request: &Request) -> Result<(), String> {
+    let Some(receipt) = super::codex_grant_owner::recover_not_dispatched(env, request)? else {
+        return Ok(());
+    };
+    if !receipt.matches_request(request) {
+        return Err("no-dispatch request changed".into());
+    }
+    let store = env
+        .accounts_store_for(accounts::Cli::Codex)
+        .ok_or("account store unavailable")?;
+    store.transact_logins(env.now, &mut None, |_, logins| {
+        let status = logins
+            .enrollment
+            .lookup(request)?
+            .ok_or("enrollment operation unavailable")?;
+        if status.phase == Phase::Running
+            && logins
+                .enrollment
+                .0
+                .get(&request.id)
+                .is_some_and(|record| record.recovery.as_ref().is_none_or(|claim| claim.retired))
+        {
+            logins.enrollment.finish(request, Phase::Refused)?;
+        }
+        Ok(Vec::new())
+    })?;
+    Ok(())
+}
+
+fn finish_rejected(
+    env: &super::cli::Env,
+    rejection: &super::codex_grant_owner::RetiredRejection,
+) -> Result<(), String> {
+    let store = env
+        .accounts_store_for(accounts::Cli::Codex)
+        .ok_or("account store unavailable")?;
+    store.transact_logins(env.now, &mut None, |_, logins| {
+        logins.enrollment.refuse_rejected(rejection)?;
+        Ok(Vec::new())
+    })?;
+    Ok(())
+}
+
+fn settle_rejected(env: &super::cli::Env, retired: &Retired) -> Result<(), String> {
+    let Some(rejection) = super::codex_grant_owner::retain_rejection_retirement(env, retired)?
+    else {
+        return Ok(());
+    };
+    finish_rejected(env, &rejection)
+}
+
+/// Signal-worker recovery of a provider rejection whose exact owned resources
+/// were already proved retired before host loss. This never infers retirement.
+pub fn settle_retired_rejection(env: &super::cli::Env, request: &Request) -> Result<(), String> {
+    let Some(rejection) = super::codex_grant_owner::recover_rejection_retirement(env, request)?
+    else {
+        return Ok(());
+    };
+    finish_rejected(env, &rejection)
+}
+
 impl Control {
+    /// Retry only encryption/publication of an already completed response.
+    /// No provider request is replayed and no canonical account is adopted here.
+    pub fn settle_custody(&self, env: &super::cli::Env) -> Result<(), String> {
+        let pending = self
+            .native
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some((failure, scope)) = pending {
+            // The returned carrier still owns the completed response on failure;
+            // capture restores that carrier and the original scope before drop.
+            let _ = self.native.capture(failure.retry(), &scope);
+        }
+        // An owned retry still holds the grant journal claim. Do not reopen
+        // that claim, or prevent cancellation from revoking publication while
+        // storage settlement retains the original work scope.
+        if self
+            .native
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none()
+        {
+            let store = env
+                .accounts_store_for(accounts::Cli::Codex)
+                .ok_or("account store unavailable")?;
+            let (logins, warning) = store.load_logins(env.now)?;
+            if warning.is_some() {
+                return Err("account state unavailable".into());
+            }
+            // These proofs can only refuse Running. They are not prerequisites
+            // for an already requested cancellation: actual Scope retirement
+            // must remain usable even if a persisted outcome becomes unreadable.
+            if logins
+                .enrollment
+                .lookup(&self.request)?
+                .is_some_and(|status| status.phase == Phase::Running)
+            {
+                settle_not_dispatched(env, &self.request)?;
+                if let Some(retired) = self.retired() {
+                    settle_rejected(env, &retired)?;
+                }
+            }
+        }
+        let reference = self
+            .native
+            .reference
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(reference) = reference {
+            let store = env
+                .accounts_store_for(accounts::Cli::Codex)
+                .ok_or("account store unavailable")?;
+            store.transact_logins(env.now, &mut None, |_, logins| {
+                let status = logins
+                    .enrollment
+                    .lookup(&self.request)?
+                    .ok_or("enrollment operation unavailable")?;
+                if status.phase == Phase::Running {
+                    let grant = super::codex_grant_owner::recover(env, &self.request, &reference)?;
+                    logins.enrollment.attach_grant(&self.request, &grant)?;
+                }
+                Ok(Vec::new())
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Whether this invocation actually committed a new original or recovery admission.
+    /// This observation is not a retirement or publication grant.
+    pub fn owns_admitted_work(&self) -> bool {
+        self.admitted.load(std::sync::atomic::Ordering::Acquire)
+            || self.recovery.lock().is_ok_and(|owned| owned.is_some())
+    }
+    pub fn owned_by(&self, lifetime: &super::account_work::Lifetime) -> bool {
+        self.cancellation.owned_by(lifetime)
+    }
     /// Revoke durable publication before requesting provider cancellation.
     pub fn cancel(&self, env: &super::cli::Env) -> Result<Status, String> {
         let status = cancel(env, &self.request)?;
         if status.phase == Phase::CancelRequested {
             self.cancellation.cancel();
         }
+        // Publication is revoked and the actual worker observes cancellation
+        // even if storage settlement fails. Pending still owns its work scope.
+        self.settle_custody(env)?;
         Ok(status)
     }
 
@@ -538,21 +1568,28 @@ impl Control {
     }
 
     pub fn retired(&self) -> Option<Retired> {
-        (self.admitted.load(std::sync::atomic::Ordering::Acquire) && self.cancellation.retired())
-            .then(|| Retired {
-                request: self.request.clone(),
-            })
+        retired_for(
+            &self.request,
+            &self.admitted,
+            &self.recovery,
+            self.cancellation.retired(),
+        )
     }
 }
 
-/// Run one operation through the existing native staged sign-in. An untrusted
-/// control request must first be admitted by the native session adapter.
-pub fn enroll(
+pub(super) fn retain_grant(
     env: &super::cli::Env,
-    scope: super::account_work::Scope,
     request: &Request,
-) -> Result<Status, String> {
-    super::cli::enroll_codex_operation(env, &super::cli::LiveAccounts::manual_work(scope), request)
+    grant: &super::codex_grant_owner::RetainedGrant,
+) -> Result<(), String> {
+    let store = env
+        .accounts_store_for(accounts::Cli::Codex)
+        .ok_or("account store unavailable")?;
+    store.transact_logins(env.now, &mut None, |_, logins| {
+        logins.enrollment.attach_grant(request, grant)?;
+        Ok(Vec::new())
+    })?;
+    Ok(())
 }
 
 /// Persist a no-provider-action refusal in the same durable account writer.
@@ -579,6 +1616,166 @@ pub fn cancel(env: &super::cli::Env, request: &Request) -> Result<Status, String
 mod tests {
     use super::*;
 
+    #[test]
+    fn new_or_replayed_metadata_cannot_mint_retired_work() {
+        let empty = Operations::default();
+        let mut forged = empty.clone();
+        let request = request();
+        forged.admit(&request).unwrap();
+        forged.0.get_mut(&request.id).unwrap().retired = true;
+        assert!(
+            forged
+                .commit(&empty, &Default::default(), &Default::default())
+                .is_err()
+        );
+        let mut running = empty.clone();
+        running.admit(&request).unwrap();
+        running
+            .commit(&empty, &Default::default(), &Default::default())
+            .unwrap();
+        let mut changed = running.clone();
+        changed.0.get_mut(&request.id).unwrap().retired = true;
+        assert!(
+            changed
+                .commit(&running, &Default::default(), &Default::default())
+                .is_err()
+        );
+        let lifetime = super::super::account_work::Lifetime::default();
+        let (work, control) = owned_work(request, lifetime.enter().unwrap());
+        drop(work);
+        assert!(
+            control.retired().is_none(),
+            "a fresh scope is not the original admitted work"
+        );
+    }
+
+    #[test]
+    fn original_and_stale_retirement_cannot_retire_a_new_recovery_claim() {
+        let request = request();
+        let root = aterm_tempfile::tempdir().unwrap();
+        let mut book = Operations::default();
+        let before = book.clone();
+        book.admit(&request).unwrap();
+        book.commit(&before, &Default::default(), &Default::default())
+            .unwrap();
+        let before = book.clone();
+        book.bind_staging(Staging {
+            request: request.clone(),
+            store: root.path().to_path_buf(),
+            directory: root.path().join("staging"),
+            store_identity: None,
+            directory_identity: None,
+            parent: accounts::RenewalParent::capture(&accounts::Logins::default(), &request.label),
+            workflow: 1,
+            policy: "d".repeat(64),
+            selection: None,
+        })
+        .unwrap();
+        book.commit(&before, &Default::default(), &Default::default())
+            .unwrap();
+        let lifetime = super::super::account_work::Lifetime::default();
+        let (original, control) = owned_work(request.clone(), lifetime.enter().unwrap());
+        original
+            .admitted
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert!(control.retired().is_none());
+        drop(original);
+        let original = control.retired().unwrap();
+        let before = book.clone();
+        book.retire(&original).unwrap();
+        book.commit(&before, &Default::default(), &Default::default())
+            .unwrap();
+        let before = book.clone();
+        let generation = book.claim_recovery(&request).unwrap();
+        book.commit(&before, &Default::default(), &Default::default())
+            .unwrap();
+        let active = book.clone();
+        assert!(book.retire(&original).is_err());
+        assert_eq!(book, active);
+        let scope = lifetime.enter().unwrap();
+        let detached = scope.clone();
+        let (recovery, control) = owned_work(request.clone(), scope);
+        let admission = Admission {
+            original: &recovery.admitted,
+            recovery: &recovery.recovery,
+        };
+        admission.recovery(generation).unwrap();
+        drop(recovery);
+        assert!(
+            control.retired().is_none(),
+            "detached original recovery resources remain owned"
+        );
+        drop(detached);
+        let proof = control.retired().unwrap();
+        let before = book.clone();
+        book.retire(&proof).unwrap();
+        book.commit(&before, &Default::default(), &Default::default())
+            .unwrap();
+        let mut restored = Operations::decode(&book.encode()).unwrap();
+        assert!(restored.recoverable(&request).unwrap());
+        let before = restored.clone();
+        let second = restored.claim_recovery(&request).unwrap();
+        assert_eq!(second, generation + 1);
+        restored
+            .commit(&before, &Default::default(), &Default::default())
+            .unwrap();
+        let active = restored.clone();
+        assert!(restored.retire(&proof).is_err());
+        assert_eq!(restored, active);
+        // A serialized edit cannot launder an old original or recovery proof
+        // into retirement of the currently live claim.
+        for stale in [&original, &proof] {
+            let mut forged = Operations::decode(&restored.encode()).unwrap();
+            forged
+                .0
+                .get_mut(&request.id)
+                .unwrap()
+                .recovery
+                .as_mut()
+                .unwrap()
+                .retired = true;
+            let _ = forged.retire(stale);
+            assert!(
+                forged
+                    .commit(&restored, &Default::default(), &Default::default())
+                    .is_err()
+            );
+        }
+        let (second_work, second_control) = owned_work(request.clone(), lifetime.enter().unwrap());
+        Admission {
+            original: &second_work.admitted,
+            recovery: &second_work.recovery,
+        }
+        .recovery(second)
+        .unwrap();
+        drop(second_work);
+        let second_proof = second_control.retired().unwrap();
+        let before = restored.clone();
+        restored.retire(&second_proof).unwrap();
+        restored
+            .commit(&before, &Default::default(), &Default::default())
+            .unwrap();
+        let before = restored.clone();
+        let third = restored.claim_recovery(&request).unwrap();
+        assert_eq!(third, second + 1);
+        restored
+            .commit(&before, &Default::default(), &Default::default())
+            .unwrap();
+        let active = restored.clone();
+        assert!(restored.retire(&proof).is_err());
+        assert!(restored.retire(&second_proof).is_err());
+        assert_eq!(restored, active);
+        let mut exhausted = restored;
+        exhausted.0.get_mut(&request.id).unwrap().recovery = Some(RecoveryClaim {
+            generation: u64::MAX,
+            retired: true,
+        });
+        let exhausted = Operations::decode(&exhausted.encode()).unwrap();
+        let mut attempted = exhausted.clone();
+        assert!(attempted.claim_recovery(&request).is_err());
+        assert_eq!(attempted, exhausted);
+    }
+
     fn request() -> Request {
         Request {
             id: "a".repeat(32),
@@ -586,6 +1783,144 @@ mod tests {
             label: "work".into(),
             revision: "c".repeat(64),
         }
+    }
+
+    #[test]
+    fn native_admission_requires_authenticated_receipt_before_publication() {
+        let request = request();
+        let empty = Operations::default();
+        let mut running = empty.clone();
+        assert!(running.admit_native(&request).unwrap());
+        running
+            .commit(&empty, &Default::default(), &Default::default())
+            .unwrap();
+        assert!(running.requires_extended());
+        assert!(running.checkpoint_reference(&request).is_err());
+        assert!(running.clone().publishing(&request).is_err());
+        let mut downgraded = running.clone();
+        downgraded.0.get_mut(&request.id).unwrap().native_required = false;
+        assert!(
+            downgraded
+                .commit(&running, &Default::default(), &Default::default())
+                .is_err()
+        );
+        // Deserialization is correlation data, never a live retained capability.
+        let reference = aterm_json::from_value(aterm_json::json!({
+            "operation": request.id, "capability": "d".repeat(64),
+            "issuance_digest": "e".repeat(64), "producer_mac": "f".repeat(64)
+        }))
+        .unwrap();
+        let mut forged = running.clone();
+        forged.0.get_mut(&request.id).unwrap().grant_reference = Some(reference);
+        assert!(
+            forged
+                .commit(&running, &Default::default(), &Default::default())
+                .is_err()
+        );
+        assert!(
+            forged
+                .commit(&empty, &Default::default(), &Default::default())
+                .is_err()
+        );
+        assert!(forged.published_grant(&request.label, 9).is_none());
+        forged.0.get_mut(&request.id).unwrap().status = Status {
+            phase: Phase::Applied,
+            generation: Some(9),
+        };
+        let binding = forged.published_grant(&request.label, 9).unwrap();
+        assert_eq!(binding.request, request);
+        assert_eq!(binding.generation, 9);
+        assert!(forged.published_grant(&request.label, 0).is_none());
+        assert!(forged.published_grant(&request.label, 8).is_none());
+        assert!(forged.published_grant("other", 9).is_none());
+        let mut duplicate = forged.0.get(&request.id).unwrap().clone();
+        let duplicate_id = "e".repeat(32);
+        duplicate.request.as_mut().unwrap().id = duplicate_id.clone();
+        forged.0.insert(duplicate_id, duplicate);
+        assert!(
+            forged.published_grant(&request.label, 9).is_none(),
+            "ambiguous published receipt is not selected"
+        );
+        let mut legacy = Operations::default();
+        legacy.admit(&request).unwrap();
+        assert!(!legacy.admit_native(&request).unwrap());
+        assert!(
+            !legacy.requires_extended(),
+            "replay cannot upgrade ownership mode"
+        );
+    }
+
+    #[test]
+    fn owner_witness_requires_canonical_schema_and_private_mutation_evidence() {
+        let request = request();
+        let mut before = Operations::default();
+        before.admit_native(&request).unwrap();
+        // Synthetic correlation data supplies no encrypted owner authority.
+        let reference = aterm_json::from_value(aterm_json::json!({
+            "operation":request.id, "capability":"d".repeat(64), "issuance_digest":"e".repeat(64), "producer_mac":"f".repeat(64)
+        })).unwrap();
+        let record = before.0.get_mut(&request.id).unwrap();
+        record.grant_reference = Some(reference);
+        record.status = Status {
+            phase: Phase::Applied,
+            generation: Some(9),
+        };
+        let binding = before.published_grant(&request.label, 9).unwrap();
+        assert!(before.owner_witness(&binding).unwrap().is_none());
+        let witness = OwnerWitness {
+            revision: super::super::codex_session_slot::Revision {
+                generation: 1,
+                digest: "1".repeat(64),
+            },
+            journal_digest: "2".repeat(64),
+            pending: None,
+        };
+        let mut forged = before.clone();
+        forged.0.get_mut(&request.id).unwrap().owner_witness = Some(witness.clone());
+        assert!(
+            forged
+                .commit(&before, &Default::default(), &Default::default())
+                .is_err()
+        );
+        let mut logins = accounts::Logins {
+            enrollment: forged,
+            ..Default::default()
+        };
+        let text = logins.to_json();
+        let mut doc: Value = aterm_json::from_str(&text).unwrap();
+        assert_eq!(doc["schema"].as_u64(), Some(9));
+        let decoded = accounts::Logins::from_json(&text, 1_800_000_000).unwrap();
+        assert_eq!(
+            decoded.enrollment.owner_witness(&binding).unwrap(),
+            Some(witness.clone())
+        );
+        doc.as_object_mut()
+            .unwrap()
+            .insert("schema".into(), Value::from(8));
+        assert!(accounts::Logins::from_json(&doc.to_string(), 1_800_000_000).is_err());
+        let mut wrong = binding.clone();
+        wrong.generation = 8;
+        assert!(decoded.enrollment.owner_witness(&wrong).is_err());
+        logins
+            .enrollment
+            .0
+            .get_mut(&request.id)
+            .unwrap()
+            .owner_witness
+            .as_mut()
+            .unwrap()
+            .pending = Some(OwnerAttempt {
+            operation: "3".repeat(32),
+            request_digest: "4".repeat(64),
+            base_generation: 2,
+            base_digest: witness.revision.digest.clone(),
+            token_digest: "5".repeat(64),
+        });
+        assert!(
+            accounts::Logins::from_json(&logins.to_json(), 1_800_000_000).is_err(),
+            "pending attempt must match canonical current revision"
+        );
+        assert!(!format!("{witness:?}").contains(&"2".repeat(64)));
     }
 
     #[test]
@@ -600,13 +1935,20 @@ mod tests {
                 .commit(&running, &Default::default(), &Default::default())
                 .is_err()
         );
-        assert!(
-            running
-                .clone()
-                .retire(&Retired {
-                    request: request.clone()
-                })
-                .is_err()
+        let mut settled = running.clone();
+        settled
+            .retire(&Retired {
+                request: request.clone(),
+                kind: RetiredKind::Original,
+            })
+            .unwrap();
+        settled
+            .commit(&running, &Default::default(), &Default::default())
+            .unwrap();
+        assert!(settled.is_retired(&request).unwrap());
+        assert_eq!(
+            settled.lookup(&request).unwrap().unwrap().phase,
+            Phase::Running
         );
         let mut pending = running.clone();
         pending.finish(&request, Phase::CancelRequested).unwrap();
@@ -623,10 +1965,18 @@ mod tests {
         let mut retired = pending.clone();
         let mut wrong = request.clone();
         wrong.caller = "f".repeat(64);
-        assert!(retired.retire(&Retired { request: wrong }).is_err());
+        assert!(
+            retired
+                .retire(&Retired {
+                    request: wrong,
+                    kind: RetiredKind::Original
+                })
+                .is_err()
+        );
         retired
             .retire(&Retired {
                 request: request.clone(),
+                kind: RetiredKind::Original,
             })
             .unwrap();
         retired
@@ -643,6 +1993,7 @@ mod tests {
         restored
             .retire(&Retired {
                 request: request.clone(),
+                kind: RetiredKind::Original,
             })
             .unwrap();
         assert!(
@@ -655,7 +2006,14 @@ mod tests {
         assert_eq!(restored, before);
         let mut wrong = request;
         wrong.caller = "f".repeat(64);
-        assert!(restored.retire(&Retired { request: wrong }).is_err());
+        assert!(
+            restored
+                .retire(&Retired {
+                    request: wrong,
+                    kind: RetiredKind::Original
+                })
+                .is_err()
+        );
     }
 
     #[test]

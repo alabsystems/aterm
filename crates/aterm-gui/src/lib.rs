@@ -100,6 +100,8 @@ fn visible_leaf_plan_builds() -> usize {
 mod a11y_adapter;
 #[cfg(a11y_tree)]
 mod a11y_backend;
+#[cfg(all(test, a11y_tree))]
+mod a11y_painted_words_tests;
 #[cfg(a11y_tree)]
 mod a11y_tree;
 mod about;
@@ -457,6 +459,22 @@ pub(crate) fn secrets_sync_while_wanted(work: &mut dyn FnMut()) -> bool {
 /// This process's once-only starts of its vault workers and its converge lane.
 static SECRETS_LANES: secrets_lanes::Lanes = secrets_lanes::Lanes::new();
 
+/// Register the composing application's notification when a window's converge child ends.
+/// The callback can run on the child reaper: it must only queue work, without reading state
+/// or inferring readiness from the child's exit. A process without a callback does nothing.
+pub fn on_converge_pass_ended(ended: fn()) {
+    converge_lane::on_pass_ended(ended);
+}
+
+/// Supply the application's narrowly authorized macOS naming operation. A rename runs on the
+/// name writer, never the window thread, and this operation must not raise a password prompt.
+#[cfg(target_os = "macos")]
+pub fn on_system_machine_name_apply(
+    apply: fn(aterm_types::machine_name::Number) -> Result<(), String>,
+) {
+    machine_title::on_system_name_apply(apply);
+}
+
 /// Start the converge pass's window lane (`converge_lane`: `aterm init --converge --trigger
 /// window` at once and every `secrets_join::MEND_EVERY`): the launch's setup starts it whatever
 /// it does but close its review unanswered (beside a resumed run, which its `sync.peers` leaves
@@ -715,6 +733,8 @@ mod lab_deck;
 mod lab_screen;
 #[cfg(all(windows, debug_assertions))]
 pub use jumplist_win::the_shell_keeps_what_a_commit_puts_in_a_test_identitys_jump_list;
+#[cfg(all(unix, any(debug_assertions, feature = "dev-seams")))]
+pub mod lab_window_custody;
 mod launch;
 #[cfg(target_os = "macos")]
 mod launch_record_renewal;
@@ -3370,7 +3390,7 @@ impl OutageWait {
 enum Wake {
     AccountsDrained {
         serial: u64,
-        drained: aterm_agent::harness::account_work::Drained,
+        drained: app_account_work::Settlement,
     },
     MailChanged,
     #[cfg(target_os = "macos")]
@@ -7658,9 +7678,18 @@ struct WindowState {
     current_title: String,
     store_title: (u64, String),
     input_scratch: RenderInput,
-    /// The layout `input_scratch`'s cells were composed under.
+    /// What the client last read of this window's terminals.
     #[cfg(a11y_tree)]
-    composed_layout: a11y_tree::ComposedLayout,
+    a11y_reads: a11y_tree::ClientReads,
+    /// When a parked window may next tell its client.
+    #[cfg(a11y_tree)]
+    a11y_parked_next: Option<Instant>,
+    /// When a read its pace held back is due.
+    #[cfg(a11y_tree)]
+    a11y_parked_due: Option<Instant>,
+    /// The last read found a synchronized update open and waited it out.
+    #[cfg(a11y_tree)]
+    a11y_parked_held: bool,
     pane_scratch: RenderInput,
     composed_focus_scratch: RenderInput,
     unfocused_pane_scratch: std::collections::BTreeMap<usize, RenderInput>,
@@ -8789,7 +8818,13 @@ impl WindowState {
             store_title: (u64::MAX, String::new()),
             input_scratch: RenderInput::empty(),
             #[cfg(a11y_tree)]
-            composed_layout: a11y_tree::ComposedLayout::default(),
+            a11y_reads: a11y_tree::ClientReads::default(),
+            #[cfg(a11y_tree)]
+            a11y_parked_next: None,
+            #[cfg(a11y_tree)]
+            a11y_parked_due: None,
+            #[cfg(a11y_tree)]
+            a11y_parked_held: false,
             pane_scratch: RenderInput::empty(),
             composed_focus_scratch: RenderInput::empty(),
             unfocused_pane_scratch: std::collections::BTreeMap::new(),
@@ -16664,23 +16699,6 @@ impl App {
     }
 
     #[cfg(a11y_tree)]
-    fn grid_snapshot(&self, id: WindowId) -> Option<accessibility::AccessibleSnapshot> {
-        let ws = self.windows.get(&id)?;
-        let strip = usize::from(self.chrome_rows(id));
-        let rows = strip.min(ws.input_scratch.cells.len())..ws.input_scratch.cells.len();
-        let cursor = ws.input_scratch.cursor_visible.then_some((
-            ws.input_scratch.cursor_row.saturating_sub(strip),
-            ws.input_scratch.cursor_col,
-        ));
-        Some(accessibility::AccessibleSnapshot::from_cells_in(
-            &claude_footer::ProgramCells::of(&ws.input_scratch, &ws.claude_footer_undo),
-            rows,
-            0..ws.cols as usize,
-            cursor,
-        ))
-    }
-
-    #[cfg(a11y_tree)]
     fn update_accessibility(&mut self, id: WindowId, plan: &tab_model::VisibleLeafPlan) {
         self.push_a11y_tree_with_plan(id, Some(plan));
     }
@@ -17962,6 +17980,8 @@ impl ApplicationHandler<Wake> for App {
         self.service_video_wake();
         let effect_now = Instant::now();
         self.settle_rest(effect_now);
+        #[cfg(a11y_tree)]
+        self.serve_parked_tells(effect_now);
         for ws in self.windows.values_mut() {
             if ws.service_due_terminal_effect_tick(effect_now)
                 && let Some(window) = ws.os_window.as_ref()
@@ -18552,6 +18572,15 @@ impl ApplicationHandler<Wake> for App {
                     &mut deadline_owner,
                     d,
                     metrics::DeadlineOwner::PresentRetry,
+                );
+            }
+            #[cfg(a11y_tree)]
+            if let Some(d) = ws.a11y_parked_due {
+                fold_owned_deadline(
+                    &mut deadline,
+                    &mut deadline_owner,
+                    d,
+                    metrics::DeadlineOwner::ParkedTell,
                 );
             }
             if !surface_attempt_allowed {
@@ -27218,6 +27247,8 @@ pub fn main_entry_with_network(
 
     if !headless && aterm_update::enabled() {
         aterm_update::set_required_team_id(crate::app_config::update_required_team_id(&config));
+        #[cfg(target_os = "macos")]
+        crate::network_moved::observe_for_updater();
         let health_proxy = event_loop.create_proxy();
         let staged_proxy = event_loop.create_proxy();
         let checked_proxy = event_loop.create_proxy();
@@ -28524,6 +28555,8 @@ pub fn main_entry_with_network(
         .is_some_and(|manifest| !manifest.windows.is_empty());
     app.note_launch_tab(restoring);
     app.recover_developer_tools_install(0);
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    app.seed_lab_installer_custody();
     app.developer_tools_first_look();
     if !headless {
         let launch_ms = aterm_time::unix_millis()

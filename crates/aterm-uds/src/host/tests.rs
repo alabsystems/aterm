@@ -887,6 +887,24 @@ fn the_user_cache_follows_each_platform_convention() {
     assert_eq!(user_cache("linux", None, None, "browser"), None);
 }
 
+#[test]
+fn installed_tools_can_be_selected_without_restoring_the_test_home() {
+    let owner = Path::new("/fixture/installed-tools");
+    let isolated = Path::new("/fixture/release-state");
+    assert_eq!(
+        tool_home_from(Some(owner.into()), Some(isolated.into())),
+        Some(owner.into())
+    );
+    assert_eq!(
+        tool_home_from(None, Some(isolated.into())),
+        Some(isolated.into())
+    );
+    assert_eq!(
+        tool_home_from(Some("relative".into()), Some(isolated.into())),
+        Some(isolated.into())
+    );
+}
+
 /// A SITE SPAWNS THE OS'S OWN PROGRAM BY THE ONE PATH ITS ROW LISTS (§9 A41): the first of
 /// the row's places, evaluated at compile time, so a site names a program and never a path
 /// of its own. NEGATIVE CONTROLS: a row the OS does not provide (fish, pinned by the tree),

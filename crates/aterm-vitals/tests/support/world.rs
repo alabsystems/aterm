@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use aterm_vitals::jobs::{
     Block, CallHint, Consumer, Fault, Fd, FdKind, GateWord, InputGate, JobCounters, JobProc,
-    JobTab, JobTick, Jobs, JobsView, LanesSeen, Machine, NamedWait, ProcState, SweepProc, TermWord,
-    ThreadState, TtyMode,
+    JobTab, JobTick, Jobs, JobsView, LanesSeen, LeaderExit, Machine, NamedWait, ProcState,
+    SweepProc, TermWord, ThreadState, TtyMode,
 };
 
 /// The world's clock at the start, ms (any value; the engine reads deltas).
@@ -181,6 +181,8 @@ pub struct World {
     /// When aterm's Developer Tools grant took effect, on the world's clock (each held row's
     /// start is its `born`).
     pub grant_ms: Option<u64>,
+    /// The watched leaders' ends the next tick hands the engine ([`JobTick::exits`]).
+    pub exits: Vec<LeaderExit>,
 }
 
 impl Default for World {
@@ -210,6 +212,7 @@ impl World {
             looked: HashMap::new(),
             versions: true,
             grant_ms: None,
+            exits: Vec::new(),
         };
         let mut aterm = Proc::new(100, 1, "aterm");
         aterm.sid = 100;
@@ -535,6 +538,7 @@ impl World {
             process_limit: self.limit,
             held: self.held(),
             grant_ms: self.grant_ms,
+            exits: std::mem::take(&mut self.exits),
         };
         let view = self.jobs.absorb(&tick);
         for t in &mut self.tabs {

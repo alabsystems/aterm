@@ -228,6 +228,32 @@ pub fn open_evtonly(_path: &Path, _want: Kind) -> io::Result<OwnedFd> {
     Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
+/// An event-only descriptor of an ordinary file or directory, refusing every symlink at
+/// the kernel open. The caller can take owner, mode and version from this same descriptor.
+/// # Errors
+/// As [`open_evtonly`]; other filesystem object kinds are refused.
+#[cfg(target_os = "macos")]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn open_evtonly_path(path: &Path) -> io::Result<OwnedFd> {
+    use std::os::fd::AsFd as _;
+    let fd = open_with(path, O_EVTONLY | libc::O_NONBLOCK)?;
+    if !matches!(
+        kind_of_mode(fstat_of(fd.as_fd())?.st_mode),
+        Kind::Dir | Kind::File
+    ) {
+        return Err(io::Error::from_raw_os_error(libc::EFTYPE));
+    }
+    Ok(fd)
+}
+
+/// See the macOS twin: nothing is opened here.
+/// # Errors
+/// Always `Unsupported`.
+#[cfg(not(target_os = "macos"))]
+pub fn open_evtonly_path(_path: &Path) -> io::Result<OwnedFd> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
+}
+
 /// A READER OF THE REGULAR FILE AT `path` (`O_RDONLY | O_NONBLOCK | O_NOFOLLOW_ANY | O_CLOEXEC`,
 /// then `fstat`): a FIFO's open returns at once, and anything but a regular file is refused.
 /// # Errors

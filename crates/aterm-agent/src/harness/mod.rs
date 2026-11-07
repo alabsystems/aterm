@@ -47,16 +47,22 @@ pub mod claims;
 #[cfg(unix)]
 pub mod claude_homes;
 pub mod cli;
+mod codex_account_custody;
 pub mod codex_alab;
 pub mod codex_app_login;
+pub mod codex_assignment;
 pub mod codex_enrollment;
 #[cfg(unix)]
 pub mod codex_exec_handoff;
 pub mod codex_facts;
+mod codex_grant_owner;
 pub mod codex_renewal;
 pub mod codex_rollout;
 pub mod codex_rotation;
+pub mod codex_session_slot;
 pub mod codex_shown;
+pub mod codex_source_gate;
+pub mod codex_source_registry;
 pub mod codex_steps;
 pub mod codex_tap;
 pub mod contract;

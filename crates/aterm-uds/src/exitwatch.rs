@@ -116,8 +116,18 @@ impl ExitWatch {
     /// The target's `wait(2)`-encoded status if the kernel has recorded one.
     #[cfg(target_vendor = "apple")]
     #[must_use]
-    #[cfg_attr(trust_verify, trust::skip)]
     pub fn exit_status(&self) -> Option<i32> {
+        self.exit_status_within(std::time::Duration::ZERO)
+    }
+
+    /// [`Self::exit_status`], waiting up to `within` for the kernel to queue it: macOS stops
+    /// listing a dying process's pid before it queues the exit's event (1 µs to 1.2 ms later
+    /// under load, `atpkg`'s `build_admit_hold`), so a reader that found the pid gone waits
+    /// briefly rather than read the exit as one with no status.
+    #[cfg(target_vendor = "apple")]
+    #[must_use]
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub fn exit_status_within(&self, within: std::time::Duration) -> Option<i32> {
         use std::os::fd::AsRawFd as _;
         if let Some(status) = self.seen.get() {
             return Some(*status);
@@ -131,8 +141,8 @@ impl ExitWatch {
             udata: std::ptr::null_mut(),
         };
         let timeout = kq::Timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
+            tv_sec: i64::try_from(within.as_secs()).unwrap_or(i64::MAX),
+            tv_nsec: i64::from(within.subsec_nanos()),
         };
         // SAFETY: one event slot and one timespec, both live for the call.
         let rc = unsafe {
@@ -162,6 +172,13 @@ impl ExitWatch {
     #[cfg(not(target_vendor = "apple"))]
     #[must_use]
     pub fn exit_status(&self) -> Option<i32> {
+        self.seen.get().copied()
+    }
+
+    /// See the Darwin twin.
+    #[cfg(not(target_vendor = "apple"))]
+    #[must_use]
+    pub fn exit_status_within(&self, _within: std::time::Duration) -> Option<i32> {
         self.seen.get().copied()
     }
 
@@ -495,6 +512,39 @@ mod tests {
         killed.kill().expect("SIGKILL");
         let _ = killed.wait();
         assert_eq!(wait_for(&watch), 0x9, "SIGKILL");
+    }
+
+    /// A timed read waits for an exit the kernel has not queued yet, and answers nothing for a
+    /// process that lives on past its bound.
+    #[test]
+    fn a_timed_read_waits_for_the_exit_and_no_longer() {
+        let mut lives = Command::new("/bin/sleep")
+            .arg("600")
+            .spawn()
+            .expect("spawn");
+        let watch = ExitWatch::watch(lives.id()).expect("watch a live child");
+        assert_eq!(
+            watch.exit_status_within(std::time::Duration::from_millis(20)),
+            None,
+            "alive: nothing to read"
+        );
+        let _ = lives.kill();
+        let _ = lives.wait();
+
+        let mut exits = Command::new("/bin/sh")
+            .args(["-c", "read _; exit 3"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn");
+        let watch = ExitWatch::watch(exits.id()).expect("watch a live child");
+        drop(exits.stdin.take());
+        // A hang detector, not a latency budget (AGENTS.md).
+        assert_eq!(
+            watch.exit_status_within(std::time::Duration::from_mins(1)),
+            Some(0x0300),
+            "exit(3), read as soon as it was queued"
+        );
+        let _ = exits.wait();
     }
 
     /// A pid that names nothing cannot be watched.

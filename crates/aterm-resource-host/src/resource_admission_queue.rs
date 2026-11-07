@@ -103,8 +103,11 @@ impl Owner {
                 .try_recv()
             {
                 Ok(result) => {
-                    pending.recipe = Some(result?);
                     pending.probe = None;
+                    let Some(recipe) = result? else {
+                        return Ok(Advance::Wait);
+                    };
+                    pending.recipe = Some(recipe);
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(Advance::Wait),
                 Err(_) => return Err(refused("recipe probe unavailable")),

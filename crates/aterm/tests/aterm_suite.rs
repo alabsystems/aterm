@@ -38,6 +38,8 @@ mod standin;
 
 #[cfg(target_os = "macos")]
 mod accounts_upkeep_live_headless;
+#[cfg(target_os = "macos")]
+mod agent_call_telemetry_live_headless;
 #[cfg(unix)]
 mod agent_prime_live_headless;
 #[cfg(unix)]

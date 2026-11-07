@@ -150,3 +150,58 @@ fn checked_completion_reads_keep_unavailable_io_distinct_from_invalid_data() {
             .is_some()
     );
 }
+
+#[test]
+fn managed_checkpoint_has_distinct_schema_and_cannot_enter_legacy_recovery() {
+    let world = aterm_tempfile::TempDir::new().unwrap();
+    let staging = world.path().join("owner+1");
+    std::fs::create_dir(&staging).unwrap();
+    let request = super::super::codex_enrollment::Request {
+        id: "a".repeat(32),
+        caller: "b".repeat(64),
+        label: "owner".into(),
+        revision: "c".repeat(64),
+    };
+    let mut logins = Logins::default();
+    logins.enrollment.admit(&request).unwrap();
+    write_enrollment_checkpoint(
+        &request,
+        "ann@example.com",
+        staging.to_str().unwrap(),
+        Proof::Status,
+        1_800_000_000,
+        &logins,
+    )
+    .unwrap();
+    let bytes = std::fs::read(staging.join(RENEWAL_CHECKPOINT_FILE)).unwrap();
+    let mut doc: Value = aterm_json::from_slice(&bytes).unwrap();
+    assert!(
+        decode_renewal_checkpoint(Cli::Codex, &bytes)
+            .unwrap()
+            .native_grant
+            .is_none()
+    );
+    doc.as_object_mut().unwrap().insert(
+        "native_grant".into(),
+        aterm_json::json!({
+            "operation":request.id, "capability":"d".repeat(64), "issuance_digest":"e".repeat(64),
+            "producer_mac":"f".repeat(64)
+        }),
+    );
+    assert!(
+        decode_renewal_checkpoint(Cli::Codex, &aterm_json::to_vec(&doc).unwrap()).is_none(),
+        "legacy schema cannot conceal a managed reference"
+    );
+    doc.as_object_mut()
+        .unwrap()
+        .insert("schema".into(), Value::from(7));
+    let managed =
+        decode_renewal_checkpoint(Cli::Codex, &aterm_json::to_vec(&doc).unwrap()).unwrap();
+    assert!(
+        managed.native_grant.is_some(),
+        "native recovery must authenticate this correlation data"
+    );
+    assert_eq!(managed.enrollment, Some(request));
+    doc.as_object_mut().unwrap().remove("native_grant");
+    assert!(decode_renewal_checkpoint(Cli::Codex, &aterm_json::to_vec(&doc).unwrap()).is_none());
+}

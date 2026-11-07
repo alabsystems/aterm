@@ -806,9 +806,10 @@ pub(super) fn known_macs_from_roster(
                 .filter_map(|a| Label::parse(a).ok())
                 .collect(),
             node: member
-                .node_id
-                .clone()
-                .filter(|node| aterm_codec::hex::is_lower(node, 32)),
+                .node_key
+                .as_deref()
+                .and_then(aterm_net::fleet::NodeKey::from_hex)
+                .map(|key| aterm_net::fleet_member::node_principal(key)[2..].to_owned()),
             hosts: Vec::new(),
         })
         .collect()
@@ -903,6 +904,15 @@ type Unread = Vec<(SheetKind, String)>;
 struct Replica {
     dir: PathBuf,
     dump: zeroize::Zeroizing<Vec<u8>>,
+    /// The records it holds and that dump leaves out ([`crate::fleet_db::withheld_operations`]).
+    withheld: Vec<Digest>,
+}
+
+impl Replica {
+    /// Its keyed digest under `key` ([`import::covered::replica_digest`]).
+    fn digest(&self, key: &[u8; 32]) -> String {
+        import::covered::replica_digest(&self.dump, &self.withheld, key)
+    }
 }
 
 /// The name the replica's sources carry (`lab-db#emails`, …).
@@ -926,8 +936,11 @@ pub(crate) fn replica_dir(paths: &Paths) -> PathBuf {
 /// one.
 ///
 /// # Errors
-/// No replica is there, its fleet key is not held here, or it cannot be read.
+/// No replica is there, a rekey of it was cut short, its fleet key is not held here, or it cannot
+/// be read.
 fn read_replica(dir: &Path) -> Result<Replica> {
+    // Ahead of the folder check: right after a rekey's rename the replica is in the kept folder.
+    crate::fleet_db::refuse_unfinished(dir)?;
     // fleet_db's `local::CONFIG`: a folder without it holds no replica, and opening one would make
     // it.
     if !std::fs::symlink_metadata(dir.join("database.json")).is_ok_and(|meta| meta.is_file()) {
@@ -937,6 +950,7 @@ fn read_replica(dir: &Path) -> Result<Replica> {
     }
     let db = crate::fleet_db::open_at(dir)?;
     let document = crate::fleet_db::dump_all(&db, true)?;
+    let withheld = crate::fleet_db::withheld_operations(&db);
     drop(db);
     let dump = zeroize::Zeroizing::new(
         aterm_json::to_vec(&document)
@@ -945,6 +959,7 @@ fn read_replica(dir: &Path) -> Result<Replica> {
     Ok(Replica {
         dir: dir.to_owned(),
         dump,
+        withheld,
     })
 }
 
@@ -966,7 +981,7 @@ pub(crate) fn everyone(paths: &Paths) -> Option<(Digest, zeroize::Zeroizing<[u8;
 /// epoch. It imports nothing and prints no value.
 ///
 /// # Errors
-/// No replica is here, or this Mac holds no `[everyone]` key.
+/// No replica is here, a rekey of it was cut short, or this Mac holds no `[everyone]` key.
 fn replica_digest_report(paths: &Paths) -> Result<Value> {
     let replica = read_replica(&replica_dir(paths))?;
     let (epoch, key) = everyone(paths).ok_or_else(|| {
@@ -990,7 +1005,8 @@ fn replica_digest_report(paths: &Paths) -> Result<Value> {
         "replica": REPLICA,
         "epoch": &epoch[..8],
         "rows": rows,
-        "digest": import::covered::replica_digest(&replica.dump, &key),
+        "withheld": replica.withheld.len(),
+        "digest": replica.digest(&key),
     }))
 }
 
@@ -1008,21 +1024,32 @@ fn record_coverage(
     vendors: &dyn Vendors,
     now_ms: u64,
 ) -> Result<Value> {
-    let uncovered = uncovered(handle, sheets, vendors, now_ms, true)?;
+    let mut listed = uncovered(handle, sheets, vendors, now_ms, true)?;
+    let count = listed.len() + replica.withheld.len();
+    // No cell of the dump, and first, so the listing's cap cannot drop it.
+    if !replica.withheld.is_empty() {
+        listed.insert(
+            0,
+            import::covered::Uncovered {
+                kind: "withheld-operations",
+                collection: None,
+                pk: None,
+                column: None,
+            },
+        );
+    }
     let held = everyone(paths);
     let record = import::covered::Record {
-        covered: uncovered.is_empty(),
-        uncovered: uncovered.len(),
-        digest: held
-            .as_ref()
-            .map(|(_, key)| import::covered::replica_digest(&replica.dump, key)),
+        covered: count == 0,
+        uncovered: count,
+        digest: held.as_ref().map(|(_, key)| replica.digest(key)),
         epoch: held
             .as_ref()
             .map(|(epoch, _)| aterm_codec::hex::encode_lower(epoch)),
         at_ms: now_ms,
     };
-    import::covered::write(&replica.dir, &record, &uncovered)?;
-    Ok(record.json(&uncovered))
+    import::covered::write(&replica.dir, &record, &listed)?;
+    Ok(record.json(&listed))
 }
 
 /// The cells of `sheets` the registry does not cover, `sheets` planned alone against the
@@ -1521,6 +1548,13 @@ fn import(
     let matches = matches_registry(&plan);
     insert(&mut report, "dry_run", json!(true));
     insert(&mut report, "unread", json!(unread));
+    if let Some((replica, _)) = &replica {
+        insert(
+            &mut report,
+            "replica_withheld",
+            json!(replica.withheld.len()),
+        );
+    }
     let records = crate::att::pack(std::mem::take(&mut plan.rows))?.len();
     insert(&mut report, "records", json!(records));
     insert(&mut report, "seeds", json!(seeds));

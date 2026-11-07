@@ -418,6 +418,11 @@ fn a_page_that_moves_in_a_parked_window_reaches_its_client() {
 
     page.reload();
     page.app.redraw_window(page.wid);
+    assert_eq!(page.sent(), 0, "held to the parked window's pace");
+    let due = page.app.windows[&page.wid].a11y_parked_due;
+
+    page.app
+        .serve_parked_tells(due.expect("and due at its end"));
 
     assert_eq!(page.read(), "after");
     assert_eq!(page.sent(), 1);

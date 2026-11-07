@@ -88,9 +88,7 @@ pub fn judge(row: &AosRow, main_us: &[u64], off_main: bool) -> ShapeVerdict {
 /// # Errors
 /// [`CouldNotRun`] when the instance did not start or a request failed; [`CouldNotRun::Unanswered`] when a repair answered without the fields.
 pub fn measure(rig: &Rig, row: &AosRow) -> Result<AosReport, CouldNotRun> {
-    let _one = super::ONE_TAKE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _one = super::take(true);
     let budget = Budget::from_now(BUDGET_SECS);
     let mut scratch = Scratch::new("ataos")
         .map_err(|e| CouldNotRun::Refused(format!("cannot make a scratch world: {e}")))?;

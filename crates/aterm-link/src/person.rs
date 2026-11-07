@@ -2298,6 +2298,7 @@ mod tests {
             me: here.clone(),
             members: [here.clone(), there.clone()].into(),
             moved: [(retired.to_owned(), there.clone())].into(),
+            rank: std::collections::BTreeMap::new(),
             gone: std::collections::BTreeSet::new(),
         }
         .write(&keys)
@@ -2396,6 +2397,7 @@ mod tests {
                 (old_here.to_owned(), here.clone()),
             ]
             .into(),
+            rank: std::collections::BTreeMap::new(),
             gone: std::collections::BTreeSet::new(),
         }
         .write(&keys)

@@ -140,8 +140,17 @@ pub struct CcHost {
     pub shim_dir: Option<PathBuf>,
     /// The symlink naming the active developer directory, read without spawning anything.
     pub xcode_select_link: PathBuf,
-    /// The developer directory when the link is absent: where the Command Line Tools install.
+    /// The developer directory when no override, selection or Xcode compiler is present:
+    /// where the Command Line Tools install.
     pub default_developer_dir: PathBuf,
+    /// Xcode's standard developer directory, which Apple discovers before standalone tools
+    /// when no override or selection is set. `None` where Xcode is not a candidate.
+    pub xcode_developer_dir: Option<PathBuf>,
+    /// The inherited `DEVELOPER_DIR`, which Apple's tools read before the system selection.
+    pub developer_dir_override: Option<PathBuf>,
+    /// The inherited SDK override. An explicit SDK is mutable outside Apple's install receipts,
+    /// so a successful probe using it is not cached.
+    pub sdkroot_override: Option<PathBuf>,
     /// How long each compiler probe may take: [`PROBE_TIMEOUT`] on this machine.
     pub bound: Duration,
     /// Where the build probe makes its private directory.
@@ -156,6 +165,10 @@ impl CcHost {
             shim_dir: cfg!(target_os = "macos").then(|| PathBuf::from("/usr/bin")),
             xcode_select_link: PathBuf::from("/var/db/xcode_select_link"),
             default_developer_dir: PathBuf::from("/Library/Developer/CommandLineTools"),
+            xcode_developer_dir: cfg!(target_os = "macos")
+                .then(|| PathBuf::from(aterm_types::clt_shim::XCODE_DEVELOPER)),
+            developer_dir_override: std::env::var_os("DEVELOPER_DIR").map(PathBuf::from),
+            sdkroot_override: std::env::var_os("SDKROOT").map(PathBuf::from),
             bound: PROBE_TIMEOUT,
             tmp_root: std::env::temp_dir(),
         }
@@ -169,6 +182,29 @@ impl CcHost {
             bound: FIRST_COMPILE_BOUND,
             ..Self::this_machine()
         }
+    }
+
+    /// The developer directory Apple's tools use, looking through aterm's temporary shim.
+    fn developer_dir(&self) -> PathBuf {
+        self.developer_dir_override
+            .as_deref()
+            .filter(|dir| {
+                !dir.as_os_str().is_empty() && !aterm_types::clt_shim::is_shim_developer_dir(dir)
+            })
+            .map(Path::to_path_buf)
+            .or_else(|| std::fs::read_link(&self.xcode_select_link).ok())
+            .or_else(|| {
+                self.xcode_developer_dir
+                    .clone()
+                    .filter(|dir| holds_clang(dir))
+            })
+            .unwrap_or_else(|| self.default_developer_dir.clone())
+    }
+
+    fn sdkroot(&self) -> Option<&Path> {
+        self.sdkroot_override
+            .as_deref()
+            .filter(|sdk| !sdk.as_os_str().is_empty())
     }
 }
 
@@ -236,22 +272,25 @@ pub fn probe_cached(path_var: Option<&OsStr>, host: &CcHost, cache: Option<&CcCa
 }
 
 /// What a `Ready` verdict for `located` depends on, read without spawning: the compiler as it is
-/// now ([`crate::probe_cache::identity`]), the active developer directory (`xcode-select`'s
-/// link, else the default) and the identity of the `clang` it holds, the Command Line Tools
-/// receipt's time, the SDK a build would fall back to, `SDKROOT` and the `PATH` the build sees.
-/// `None` when the compiler cannot be read.
+/// now ([`crate::probe_cache::identity`]), the active developer directory (`DEVELOPER_DIR`,
+/// else `xcode-select`'s link, else Xcode or the standalone tools), the identity of its `clang`,
+/// the Command Line Tools receipt's time, the SDK a build would fall back to and the `PATH`
+/// the build sees. `None` when the compiler cannot be read or an explicit SDK is used:
+/// changes within that SDK have no Apple install receipt to retire a cached success.
 fn cc_key(
     located: &Located,
     path_var: Option<&OsStr>,
     host: &CcHost,
     cache: &CcCache,
 ) -> Option<String> {
+    if host.sdkroot().is_some() {
+        return None;
+    }
     let (kind, cc) = match located {
         Located::Plain(cc) => ("plain", cc),
         Located::Shim(cc) => ("shim", cc),
     };
-    let developer_dir = std::fs::read_link(&host.xcode_select_link)
-        .unwrap_or_else(|_| host.default_developer_dir.clone());
+    let developer_dir = host.developer_dir();
     let receipt = std::fs::metadata(&cache.receipt)
         .and_then(|meta| meta.modified())
         .ok()
@@ -262,14 +301,11 @@ fn cc_key(
     // The compiler the developer directory holds, where `locate` looks for it: an Xcode
     // install, update or replacement rewrites it while the Command Line Tools receipt stays,
     // and an update that leaves `cc` refusing (a license not yet agreed to) must probe again.
-    let clang = [
-        developer_dir.join("usr/bin/clang"),
-        developer_dir.join("Toolchains/XcodeDefault.xctoolchain/usr/bin/clang"),
-    ]
-    .iter()
-    .map(|clang| crate::probe_cache::identity(clang).unwrap_or_else(|| "absent".to_owned()))
-    .collect::<Vec<_>>()
-    .join(" ");
+    let clang = clang_paths(&developer_dir)
+        .iter()
+        .map(|clang| crate::probe_cache::identity(clang).unwrap_or_else(|| "absent".to_owned()))
+        .collect::<Vec<_>>()
+        .join(" ");
     fn lossy(value: Option<&OsStr>) -> String {
         value
             .map(|v| v.to_string_lossy().into_owned())
@@ -282,7 +318,6 @@ fn cc_key(
         Some(clang),
         Some(receipt),
         Some(sdk),
-        Some(lossy(std::env::var_os("SDKROOT").as_deref())),
         Some(lossy(path_var)),
     ])
 }
@@ -303,7 +338,7 @@ pub fn probe_with(path_var: Option<&OsStr>, host: &CcHost) -> CcVerdict {
 fn probe_located(located: Located, path_var: Option<&OsStr>, host: &CcHost) -> CcVerdict {
     let cc = match located {
         Located::Plain(cc) => {
-            return match ask(&cc, &cc, &["--version"], host.bound) {
+            return match ask(&cc, &cc, &["--version"], host) {
                 CcVerdict::Ready { driver } => build_probe(&cc, driver, path_var, host),
                 other => other,
             };
@@ -311,7 +346,7 @@ fn probe_located(located: Located, path_var: Option<&OsStr>, host: &CcHost) -> C
         Located::Shim(cc) => cc,
     };
     let shim_dir = cc.parent().unwrap_or(Path::new("/usr/bin"));
-    match ask(&shim_dir.join("xcrun"), &cc, &["--find", "cc"], host.bound) {
+    match ask(&shim_dir.join("xcrun"), &cc, &["--find", "cc"], host) {
         CcVerdict::Ready { driver } => build_probe(&cc, driver, path_var, host),
         other => other,
     }
@@ -332,13 +367,35 @@ enum Located {
 }
 
 /// The read-only half of [`probe_with`]: the first `cc` on `path_var`, and for the install
-/// shim whether the active developer directory (the link, else the default) holds a
-/// `clang`; [`CcVerdict::NoDriver`] or [`CcVerdict::NoDeveloperDir`] when the probe stops
+/// shim whether the active developer directory (the override, else the link, else Xcode or
+/// the tools) holds a `clang`; [`CcVerdict::NoDriver`] or [`CcVerdict::NoDeveloperDir`] when it stops
 /// there. Nothing is spawned.
 fn locate(path_var: Option<&OsStr>, host: &CcHost) -> Result<Located, CcVerdict> {
+    use aterm_types::clt_shim;
+    let own = clt_shim::shim_dir();
+    // A shell can change HOME or its state root while retaining the launch's PATH and
+    // developer directory. Those inherited setup tools are not the new account's compiler.
+    let inherited = std::env::var_os(clt_shim::SHIM_ENV).map(PathBuf::from);
+    let developer = std::env::var_os(clt_shim::DEVELOPER_DIR_ENV).map(PathBuf::from);
+    let developer_shim = developer
+        .as_deref()
+        .filter(|dir| clt_shim::is_shim_developer_dir(dir))
+        .and_then(Path::parent);
+    let shims = [own.as_deref(), inherited.as_deref(), developer_shim];
+    locate_without_setup_shim(path_var, host, &shims)
+}
+
+/// Setup's temporary tools report that installation is needed; they are not compilers.
+/// Look past them before deciding whether the actual compiler is missing or broken.
+fn locate_without_setup_shim(
+    path_var: Option<&OsStr>,
+    host: &CcHost,
+    setup_shims: &[Option<&Path>],
+) -> Result<Located, CcVerdict> {
     let Some(cc) = path_var.and_then(|path| {
         std::env::split_paths(path)
             .filter(|dir| dir.is_absolute())
+            .filter(|dir| !setup_shims.contains(&Some(dir.as_path())))
             .map(|dir| dir.join("cc"))
             .find(|candidate| is_executable(candidate))
     }) else {
@@ -351,19 +408,28 @@ fn locate(path_var: Option<&OsStr>, host: &CcHost) -> Result<Located, CcVerdict>
     if !is_shim {
         return Ok(Located::Plain(cc));
     }
-    let developer_dir = std::fs::read_link(&host.xcode_select_link)
-        .unwrap_or_else(|_| host.default_developer_dir.clone());
-    let holds_clang = [
-        developer_dir.join("usr/bin/clang"),
-        developer_dir.join("Toolchains/XcodeDefault.xctoolchain/usr/bin/clang"),
-    ]
-    .iter()
-    .any(|clang| is_executable(clang));
-    if holds_clang {
+    let developer_dir = host.developer_dir();
+    if holds_clang(&developer_dir) {
         Ok(Located::Shim(cc))
     } else {
         Err(CcVerdict::NoDeveloperDir)
     }
+}
+
+/// The two places Apple keeps the compiler under a developer directory.
+fn clang_paths(developer: &Path) -> [PathBuf; 2] {
+    [
+        developer.join("usr/bin/clang"),
+        developer
+            .join(aterm_types::clt_shim::DEFAULT_TOOLCHAIN_BIN)
+            .join("clang"),
+    ]
+}
+
+fn holds_clang(developer: &Path) -> bool {
+    clang_paths(developer)
+        .iter()
+        .any(|clang| is_executable(clang))
 }
 
 /// The build probe's program: the include proves the headers (the SDK on macOS, libc's on
@@ -374,20 +440,23 @@ const PROBE_SOURCE: &str = "#include <stdio.h>\nint main(void) { return 0; }\n";
 /// `host.tmp_root`, within `host.bound`: `Ready { driver: resolved }` only when it exits 0
 /// and wrote a non-empty program, which is never run. The directory is always removed.
 fn build_probe(cc: &Path, resolved: PathBuf, path_var: Option<&OsStr>, host: &CcHost) -> CcVerdict {
-    let nanos = aterm_time::since_epoch().map_or(0, |d| d.as_nanos());
-    let dir = host
-        .tmp_root
-        .join(format!("atpkg-cc-{}-{nanos}", std::process::id()));
-    if let Err(error) = private_dir(&dir) {
-        return CcVerdict::Unproven {
-            driver: resolved,
-            why: format!(
-                "no private directory under {}: {error}",
-                host.tmp_root.display()
-            ),
-        };
-    }
-    let _removed = RemoveOnDrop(&dir);
+    let scratch = match aterm_tempfile::Builder::new()
+        .prefix("atpkg-cc-")
+        .suffix(".noindex")
+        .tempdir_in(&host.tmp_root)
+    {
+        Ok(scratch) => scratch,
+        Err(error) => {
+            return CcVerdict::Unproven {
+                driver: resolved,
+                why: format!(
+                    "no private directory under {}: {error}",
+                    host.tmp_root.display()
+                ),
+            };
+        }
+    };
+    let dir = scratch.path();
     let source = dir.join("probe.c");
     let program = dir.join("probe.out");
     let write_source = || -> std::io::Result<()> {
@@ -410,25 +479,28 @@ fn build_probe(cc: &Path, resolved: PathBuf, path_var: Option<&OsStr>, host: &Cc
     }
     let run_cc = |sdkroot: Option<&Path>| {
         let mut cmd = aterm_uds::spawnfd::command(cc);
-        cmd.arg("-o").arg(&program).arg(&source).current_dir(&dir);
+        cmd.arg("-o").arg(&program).arg(&source).current_dir(dir);
+        cmd.env_remove("DEVELOPER_DIR").env_remove("SDKROOT");
+        if let Some(developer) = &host.developer_dir_override {
+            cmd.env("DEVELOPER_DIR", developer);
+        }
         if let Some(path) = path_var {
             cmd.env("PATH", path);
         }
-        if let Some(sdk) = sdkroot {
+        if let Some(sdk) = sdkroot.or(host.sdkroot()) {
             cmd.env("SDKROOT", sdk);
         }
         crate::doctor::output_bounded_capturing(&mut cmd, host.bound)
     };
     let mut result = run_cc(None);
     if matches!(&result, Some(out) if !out.status.success())
-        && std::env::var_os("SDKROOT").is_none()
+        && host.sdkroot().is_none()
         && host
             .shim_dir
             .as_deref()
             .is_some_and(|shim| cc.parent() == Some(shim))
     {
-        let developer_dir = std::fs::read_link(&host.xcode_select_link)
-            .unwrap_or_else(|_| host.default_developer_dir.clone());
+        let developer_dir = host.developer_dir();
         let sdk = developer_dir.join("SDKs/MacOSX.sdk");
         if sdk.is_dir() {
             let _ = std::fs::remove_file(&program);
@@ -459,28 +531,6 @@ fn build_probe(cc: &Path, resolved: PathBuf, path_var: Option<&OsStr>, host: &Cc
     }
 }
 
-/// Create `dir`, readable by this user only; an existing path is an error, never reused.
-pub(crate) fn private_dir(dir: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        std::fs::DirBuilder::new().mode(0o700).create(dir)
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::DirBuilder::new().create(dir)
-    }
-}
-
-/// Removes the probe's directory however the probe ends.
-pub(crate) struct RemoveOnDrop<'a>(pub(crate) &'a Path);
-
-impl Drop for RemoveOnDrop<'_> {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(self.0);
-    }
-}
-
 /// A refusing compiler's first non-empty stderr line, or its exit when it said nothing.
 fn first_stderr_line(out: &std::process::Output) -> String {
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -499,9 +549,17 @@ fn first_stderr_line(out: &std::process::Output) -> String {
 
 /// Run `bin args…` within `bound` as a verdict about `driver`: exit 0 is Ready (naming the
 /// path `xcrun` printed, if any), any other exit is Broken with the first stderr line.
-fn ask(bin: &Path, driver: &Path, args: &[&str], bound: Duration) -> CcVerdict {
+fn ask(bin: &Path, driver: &Path, args: &[&str], host: &CcHost) -> CcVerdict {
+    let bound = host.bound;
     let mut cmd = aterm_uds::spawnfd::command(bin);
     cmd.args(args);
+    cmd.env_remove("DEVELOPER_DIR").env_remove("SDKROOT");
+    if let Some(developer) = &host.developer_dir_override {
+        cmd.env("DEVELOPER_DIR", developer);
+    }
+    if let Some(sdk) = host.sdkroot() {
+        cmd.env("SDKROOT", sdk);
+    }
     match crate::doctor::output_bounded_capturing(&mut cmd, bound) {
         None => CcVerdict::Unanswered {
             driver: driver.to_path_buf(),
@@ -574,9 +632,38 @@ mod tests {
             shim_dir: None,
             xcode_select_link: root.join("no-link"),
             default_developer_dir: root.join("no-developer-dir"),
+            xcode_developer_dir: None,
+            developer_dir_override: None,
+            sdkroot_override: None,
             bound: ANSWER,
             tmp_root,
         }
+    }
+
+    #[test]
+    fn setup_shim_does_not_turn_missing_tools_into_a_broken_compiler() {
+        let root = scratch("setup-shim");
+        let setup = root.join("clt-shim");
+        let inherited = root.join("old-home/clt-shim");
+        let apple = root.join("usr-bin");
+        // These must never run: discovery alone can tell the tools are missing.
+        script(&setup.join("cc"), "exit 69");
+        script(&inherited.join("cc"), "exit 69");
+        script(&apple.join("cc"), "exit 1");
+        let host = CcHost {
+            shim_dir: Some(apple.clone()),
+            ..plain_host(&root)
+        };
+        let path = std::env::join_paths([&inherited, &setup, &apple]).unwrap();
+        assert!(matches!(
+            locate_without_setup_shim(Some(&path), &host, &[Some(&setup), Some(&inherited)]),
+            Err(CcVerdict::NoDeveloperDir)
+        ));
+        // An unmarked PATH compiler retains priority, including its failures.
+        assert!(matches!(
+            locate_without_setup_shim(Some(&path), &host, &[Some(&setup)]),
+            Ok(Located::Plain(cc)) if cc == inherited.join("cc")
+        ));
     }
 
     /// A fake `cc` that answers `--version` and, asked `-o <out> <src>`, builds: it writes
@@ -683,6 +770,9 @@ mod tests {
             shim_dir: Some(shim.clone()),
             xcode_select_link: root.join("xcode_select_link"),
             default_developer_dir: clang_dir.clone(),
+            xcode_developer_dir: None,
+            developer_dir_override: None,
+            sdkroot_override: None,
             bound: ANSWER,
             tmp_root: tmp_root.clone(),
         };
@@ -973,12 +1063,95 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// An Xcode update replaces the compiler the selected developer directory holds while the
+    #[test]
+    fn a_changed_explicit_sdk_cannot_reuse_a_cached_success() {
+        let root = scratch("mutable-sdk");
+        let bin = root.join("bin");
+        let sdk = root.join("external SDK");
+        std::fs::create_dir_all(&sdk).unwrap();
+        let usable = sdk.join("usable");
+        std::fs::write(&usable, "headers and libraries").unwrap();
+        script(
+            &bin.join("cc"),
+            "case \"$1\" in --version) echo cc;; -o) if [ -f \"$SDKROOT/usable\" ]; then printf x > \"$2\"; else echo 'SDK no longer usable' >&2; exit 1; fi;; esac",
+        );
+        let host = CcHost {
+            sdkroot_override: Some(sdk),
+            ..plain_host(&root)
+        };
+        let cache = CcCache {
+            file: root.join("state/cc"),
+            receipt: root.join("no-receipt"),
+        };
+        let path = Some(bin.as_os_str());
+        assert_eq!(
+            probe_cached(path, &host, Some(&cache)),
+            CcVerdict::Ready {
+                driver: bin.join("cc")
+            }
+        );
+        std::fs::remove_file(&usable).unwrap();
+        assert!(matches!(
+            probe_cached(path, &host, Some(&cache)),
+            CcVerdict::Broken { why, .. } if why == "SDK no longer usable"
+        ));
+    }
+
+    #[test]
+    fn a_developer_override_controls_discovery_and_retires_the_cached_compiler() {
+        let root = scratch("developer-override");
+        let shim = root.join("usr-bin");
+        let first = root.join("first");
+        let second = root.join("second");
+        let asked = root.join("asked");
+        for developer in [&first, &second] {
+            script(&developer.join("usr/bin/clang"), "exit 0");
+        }
+        script(&shim.join("xcrun"), "echo \"$DEVELOPER_DIR/usr/bin/cc\"");
+        script(
+            &shim.join("cc"),
+            &format!(
+                "echo \"$DEVELOPER_DIR\" >> '{}'; [ \"$1\" = -o ] && printf x > \"$2\"",
+                asked.display()
+            ),
+        );
+        let mut host = CcHost {
+            shim_dir: Some(shim.clone()),
+            ..plain_host(&root)
+        };
+        let cache = CcCache {
+            file: root.join("state/cc"),
+            receipt: root.join("no-receipt"),
+        };
+        let path = Some(shim.as_os_str());
+        assert_eq!(
+            probe_cached(path, &host, Some(&cache)),
+            CcVerdict::NoDeveloperDir
+        );
+        for (index, developer) in [&first, &second].into_iter().enumerate() {
+            host.developer_dir_override = Some(developer.clone());
+            let ready = CcVerdict::Ready {
+                driver: developer.join("usr/bin/cc"),
+            };
+            assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+            assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+            let calls = std::fs::read_to_string(&asked).unwrap();
+            assert_eq!(calls.lines().count(), index + 1);
+            assert_eq!(calls.lines().last(), developer.to_str());
+        }
+        host.developer_dir_override = Some(root.join("clt-shim/developer"));
+        assert_eq!(
+            probe_cached(path, &host, Some(&cache)),
+            CcVerdict::NoDeveloperDir
+        );
+    }
+
+    /// An Xcode update replaces the automatically discovered compiler while the
     /// Command Line Tools receipt stays: the kept verdict retires and the shim is asked again,
     /// so a `cc` the update left refusing (a license not yet agreed to) is seen. NEGATIVE
     /// CONTROL: with the same compiler in place the kept verdict answers and nothing spawns.
     #[test]
-    fn an_xcode_update_retires_the_kept_cc_verdict() {
+    fn an_automatic_xcode_is_discovered_and_its_update_retires_the_cache() {
         let root = scratch("kept-xcode");
         let shim = root.join("usr-bin");
         let asked = root.join("asked");
@@ -999,9 +1172,9 @@ mod tests {
         let host = CcHost {
             shim_dir: Some(shim.clone()),
             xcode_select_link: root.join("xcode_select_link"),
+            xcode_developer_dir: Some(xcode.clone()),
             ..plain_host(&root)
         };
-        std::os::unix::fs::symlink(&xcode, &host.xcode_select_link).unwrap();
         let receipt = root.join("receipt");
         std::fs::write(&receipt, "1").unwrap();
         let cache = CcCache {
@@ -1009,6 +1182,11 @@ mod tests {
             receipt,
         };
         let path = Some(shim.as_os_str());
+        let without_xcode = CcHost {
+            xcode_developer_dir: None,
+            ..host.clone()
+        };
+        assert_eq!(probe_with(path, &without_xcode), CcVerdict::NoDeveloperDir);
         let runs = || std::fs::read_to_string(&asked).map_or(0, |text| text.lines().count());
         let ready = CcVerdict::Ready {
             driver: xcode.join("usr/bin/cc"),

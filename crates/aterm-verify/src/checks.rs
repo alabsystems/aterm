@@ -97,8 +97,9 @@ pub const CHECKS: [Spec; 19] = [
         also: "",
         runs: "targo-tippy <selection> --all-targets -- -D warnings; a change cone has up to two \
                passes, that one over what the change touched and default targets over the rest \
-               that link it, and leaves out what it holds only by a dev edge (under release, the \
-               required-features targets and -p aterm --release)",
+               that link it, and leaves out what it holds only by a dev edge; also \
+               -p aterm --release whenever the selection reaches aterm (under release, the \
+               required-features targets too)",
     },
     Spec {
         check: Check::Test,
@@ -333,6 +334,18 @@ impl Check {
     #[must_use]
     pub fn narrows(self) -> bool {
         self.spec().reach == Reach::Selection
+    }
+
+    /// Does this check build its selection with this host's cargo: a stage that hands the `-p`
+    /// specs to `targo` for this machine's target (the lint, the test build, the doctests)?
+    #[must_use]
+    pub fn builds_selection(self) -> bool {
+        self.narrows()
+            && self
+                .spec()
+                .stages
+                .iter()
+                .any(|s| matches!(s, StageId::Tippy | StageId::TestCompile | StageId::Doctests))
     }
 
     /// Does this check read `scope`, given how the run selected it?

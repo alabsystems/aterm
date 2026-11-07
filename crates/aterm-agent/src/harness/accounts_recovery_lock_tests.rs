@@ -125,6 +125,79 @@ fn shared_non_claude_checkpoints_require_the_authorized_provider_adapter() {
 }
 
 #[test]
+fn generic_recovery_preserves_native_enrollment_headers_and_bound_paths() {
+    use super::super::codex_enrollment::{Request, Staging};
+    for bound_path in [false, true] {
+        let bed = Bed::new(Cli::Codex);
+        let staging = bed.checkpoint("account");
+        aterm_uds::atomic_file::write(&bed.path, &fs::read(&bed.path).unwrap(), 0o600).unwrap();
+        let request = Request {
+            id: "a".repeat(32),
+            caller: "b".repeat(64),
+            label: "account".into(),
+            revision: "c".repeat(64),
+        };
+        bed.store
+            .transact_logins(NOW, &mut None, |_, logins| {
+                logins.enrollment.admit(&request)?;
+                Ok(Vec::new())
+            })
+            .unwrap();
+        if bound_path {
+            bed.store
+                .transact_logins(NOW, &mut None, |_, logins| {
+                    let parent = accounts::RenewalParent::capture(logins, &request.label);
+                    logins.enrollment.bind_staging(Staging {
+                        request: request.clone(),
+                        store: bed.store.dir.clone(),
+                        directory: staging.clone(),
+                        store_identity: None,
+                        directory_identity: None,
+                        parent,
+                        workflow: 1,
+                        policy: "d".repeat(64),
+                        selection: None,
+                    })?;
+                    Ok(Vec::new())
+                })
+                .unwrap();
+            // The legacy header has no enrollment field; the durable bound
+            // destination must independently prevent generic adoption.
+        } else {
+            let logins = bed.store.load_logins(NOW).unwrap().0;
+            fs::remove_file(staging.join(accounts::RENEWAL_CHECKPOINT_FILE)).unwrap();
+            accounts::write_enrollment_checkpoint(
+                &request,
+                "account@example.test",
+                staging.to_str().unwrap(),
+                accounts::Proof::Status,
+                NOW,
+                &logins,
+            )
+            .unwrap();
+        }
+        let before = account_files(&bed.store);
+        let checkpoint = fs::read(staging.join(accounts::RENEWAL_CHECKPOINT_FILE)).unwrap();
+        let auth = fs::read(staging.join("auth.json")).unwrap();
+        assert!(!recover_interrupted_staging_renewals_with(
+            Cli::Codex,
+            &bed.store,
+            &bed.path,
+            &bed.guard(),
+            NOW,
+            &[],
+            || {}
+        ));
+        assert_eq!(account_files(&bed.store), before);
+        assert_eq!(
+            fs::read(staging.join(accounts::RENEWAL_CHECKPOINT_FILE)).unwrap(),
+            checkpoint
+        );
+        assert_eq!(fs::read(staging.join("auth.json")).unwrap(), auth);
+    }
+}
+
+#[test]
 fn recovered_login_preserves_claims_replaced_during_admission() {
     for cli in CLIS {
         for activity_changed in [false, true] {

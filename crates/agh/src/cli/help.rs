@@ -67,7 +67,7 @@ fn flag_lines(flags: &[FlagSpec]) -> String {
     let mut text = String::new();
     let indent = " ".repeat(width + 4);
     for (spec, flag) in specs.iter().zip(flags) {
-        let words: Vec<String> = flag.help.split(' ').map(str::to_string).collect();
+        let words: Vec<&str> = flag.help.split(' ').collect();
         let help = wrap(&words, &indent, MAX_LINE);
         let mut line = format!("  {spec}");
         line.extend(std::iter::repeat_n(' ', width - spec.chars().count() + 2));
@@ -126,10 +126,11 @@ fn routing_page() -> String {
     text
 }
 
-fn wrap(words: &[String], indent: &str, width: usize) -> String {
+fn wrap<S: AsRef<str>>(words: &[S], indent: &str, width: usize) -> String {
     let mut text = String::new();
     let mut line = String::from(indent);
     for word in words {
+        let word = word.as_ref();
         if line.len() > indent.len() && line.len() + 1 + word.len() > width {
             text.push_str(&line);
             text.push('\n');

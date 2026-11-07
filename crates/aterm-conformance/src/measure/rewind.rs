@@ -217,9 +217,7 @@ pub fn steps_standing(sched: &SchedReading, max_p99_us: u64) -> Starvation {
 /// # Errors
 /// [`CouldNotRun`] when the instance did not start, a request failed, the output was not one chain, or a step's fold was never shown; [`CouldNotRun::Unanswered`] when the subject lacks a verb or a field the row reads.
 pub fn measure(rig: &Rig, row: &RewindRow) -> Result<RewindReport, CouldNotRun> {
-    let _one = super::ONE_TAKE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _one = super::take(!matches!(row.scene, RewindScene::Idle { .. }));
     let budget = Budget::from_now(BUDGET_SECS);
     let mut scratch = Scratch::new("atrewind")
         .map_err(|e| CouldNotRun::Refused(format!("cannot make a scratch world: {e}")))?;

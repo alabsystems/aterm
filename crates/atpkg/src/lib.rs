@@ -134,6 +134,7 @@ pub mod prerequisite;
 /// Readings a doctor keeps between runs under keys that name what they depend on.
 pub mod probe_cache;
 pub mod progress;
+pub mod project_compiler;
 /// Folders guarded by macOS TCC consent dialogs so unattended lanes never open them.
 pub mod protected;
 /// Flip when quiet.

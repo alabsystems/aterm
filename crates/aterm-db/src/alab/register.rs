@@ -10,7 +10,7 @@
 //!
 //! A Mac's identity here is its Commons uuid, its fleet node and its membership label. The
 //! IOPlatformUUID stays in this process: only a keyed digest of it ([`keys::hw_hint`]) is written.
-//! No Mac edits an existing machine row, and a hint match without the §6 evidence is a finding,
+//! A Mac publishes its own node once on the machine row it adopted. A hint match without the §6 evidence is a finding,
 //! never an adoption, because VM clones share a machine identifier.
 
 use super::{
@@ -61,7 +61,7 @@ pub struct Probe {
     /// Computer and local host names (§4.7): the names the owner gave this Mac. `hostname` is not
     /// one, since a network can supply it.
     pub hosts: Vec<String>,
-    /// The fleet node id, when this Mac has one.
+    /// The key-derived node principal, 16 lower-case hex digits without `n-`.
     pub node: Option<String>,
     pub platform_uuid: String,
 }
@@ -246,13 +246,17 @@ fn stated(
     held: Option<&Value>,
     mac: &str,
     predecessor: Option<&str>,
+    label: Option<&str>,
 ) -> Result<BTreeMap<&'static str, Value>> {
     let probe = input.probe;
     let hosts = hosts_cell(&probe.hosts);
     let readings: [(&'static str, Option<Value>); 13] = [
         ("mac", Some(Value::from(mac))),
         ("predecessor", predecessor.map(Value::from)),
-        ("label", input.me.label.as_deref().map(Value::from)),
+        (
+            "label",
+            label.or(input.me.label.as_deref()).map(Value::from),
+        ),
         (
             "hosts",
             (!hosts.is_empty())
@@ -347,6 +351,30 @@ fn automatic(
     )
 }
 
+/// Only the enrollment adopting this row publishes its node. An owner's value or conflict
+/// stays authoritative; a later pass never overwrites it or spends another record on it.
+fn own_node(input: &Input<'_>, machines: &Projection, mac: &str) -> Result<Vec<Change>> {
+    let Some(node) = input.probe.node.as_deref().filter(|node| {
+        node.len() == 16
+            && node
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }) else {
+        return Ok(Vec::new());
+    };
+    if machines
+        .rows
+        .get(mac)
+        .is_some_and(|row| row.fields.contains_key("node"))
+        || machines.rows.iter().any(|(pk, row)| {
+            pk != mac && row.live() && row.get("node").and_then(Value::as_str) == Some(node)
+        })
+    {
+        return Ok(Vec::new());
+    }
+    Ok(vec![automatic(&MACHINE, mac, "node", Value::from(node))?])
+}
+
 /// The first Mac to report an unseen model writes its key and what it knows; the owner fills in
 /// the rest.
 fn model_birth(cells: &Cells, probe: &Probe) -> Result<Vec<Change>> {
@@ -375,9 +403,8 @@ fn machine_birth(
 ) -> Result<Vec<Change>> {
     let probe = input.probe;
     let live_rows = || machines.rows.values().filter(|row| row.live());
-    let node_named = |node: &str| {
-        live_rows().any(|row| row.get("fleet_node").and_then(Value::as_str) == Some(node))
-    };
+    let node_named =
+        |node: &str| live_rows().any(|row| row.get("node").and_then(Value::as_str) == Some(node));
     let host_named = |host: &str| {
         live_rows().any(|row| {
             row.get("hosts")
@@ -401,8 +428,12 @@ fn machine_birth(
         )?,
         automatic(&MACHINE, pk, LIFECYCLE, Value::from("live"))?,
     ];
-    if let Some(node) = probe.node.as_deref().filter(|node| !node_named(node)) {
-        changes.push(automatic(&MACHINE, pk, "fleet_node", Value::from(node))?);
+    if let Some(node) = probe
+        .node
+        .as_deref()
+        .filter(|node| aterm_codec::hex::is_lower(node, 16) && !node_named(node))
+    {
+        changes.push(automatic(&MACHINE, pk, "node", Value::from(node))?);
     }
     let mut hosts = hosts_cell(&probe.hosts);
     hosts.retain(|host| !host_named(host));
@@ -424,6 +455,41 @@ fn goes_by(row: &Row, label: &str) -> bool {
             .fields
             .get("aliases")
             .is_some_and(|field| field.has_member(label))
+}
+
+/// Registry rows reserve labels, including planned and retired rows. Log names are hints,
+/// never a second label allocator. Prefer this Mac's local hostname tag when it is free.
+fn birth_label(input: &Input<'_>, machines: &Projection) -> Result<String> {
+    let held = |label: &str| {
+        machines.rows.values().any(|row| {
+            goes_by(row, label)
+                || row.fields.get("label").is_some_and(|field| {
+                    field
+                        .candidates()
+                        .iter()
+                        .any(|c| c.value.x.as_str() == Some(label))
+                })
+        })
+    };
+    if let Some(label) = input
+        .probe
+        .hosts
+        .iter()
+        .find_map(|host| aterm_secrets::swarm_roster::leading_m_label(host).map(|(_, label)| label))
+        .filter(|label| !held(label))
+    {
+        return Ok(label);
+    }
+    use std::fmt::Write as _;
+    let mut label = String::with_capacity(8);
+    for number in 1..=aterm_types::machine_name::Number::MAX {
+        label.clear();
+        let _ = write!(label, "m{number}");
+        if !held(&label) {
+            return Ok(label);
+        }
+    }
+    Err(Error::new("machine labels exhausted"))
 }
 
 /// The machines live enrollments other than this one are bound to.
@@ -565,7 +631,7 @@ fn pick(
     }
     let live_rows = || machines.rows.iter().filter(|(_, row)| row.live());
     fn node_of(row: &Row) -> Option<&str> {
-        row.get("fleet_node").and_then(Value::as_str)
+        row.get("node").and_then(Value::as_str)
     }
     // A row stating another fleet node is another Mac, whatever else it shares with this one.
     let no_other_node = |row: &Row| node_of(row).is_none_or(|n| probe.node.as_deref() == Some(n));
@@ -656,20 +722,18 @@ fn pick(
 /// What this Mac should write now over the registry it holds.
 ///
 /// # Errors
-/// `hw.model` makes no model key, or a cell this Mac would write breaks its column's rules.
+/// `hw.model` makes no model key, all machine numbers are reserved, or a cell this Mac would
+/// write breaks its column's rules.
 pub fn plan(input: &Input<'_>, cells: &Cells, facts: &OwnedRead) -> Result<Plan> {
     let me = input.me;
     let today = day_of(input.now_ms);
     if let Some(own) = facts.rows.get(&me.uuid)
         && let Some(mac) = text(&own.value, "mac")
     {
+        let machines = cell::project(&MACHINE, cells);
         // A binding is for good, so a machine row the owner ended holds this Mac rather than
         // have it restate facts under a row nobody uses any more; only the owner moves it.
-        if cell::project(&MACHINE, cells)
-            .rows
-            .get(mac)
-            .is_some_and(|row| !row.live())
-        {
+        if machines.rows.get(mac).is_some_and(|row| !row.live()) {
             return Ok(Plan::quiet(
                 Outcome::Held,
                 vec![finding(
@@ -680,7 +744,18 @@ pub fn plan(input: &Input<'_>, cells: &Cells, facts: &OwnedRead) -> Result<Plan>
             ));
         }
         let seen = own.value.get("seen").and_then(Value::as_u64).unwrap_or(0);
-        let row = stated(input, Some(&own.value), mac, None)?;
+        let node = own_node(input, &machines, mac)?;
+        let label = machines
+            .rows
+            .get(mac)
+            .filter(|row| {
+                row.fields
+                    .get("label")
+                    .is_some_and(|field| !field.conflicted())
+            })
+            .and_then(|row| row.get("label"))
+            .and_then(Value::as_str);
+        let row = stated(input, Some(&own.value), mac, None, label)?;
         // Host names move without the Mac changing (a Bonjour clash renames the local host), and a
         // change spends a record of a lifetime quota, so they ride the 30-day rewrite. The other
         // fields move at most once a day.
@@ -690,8 +765,17 @@ pub fn plan(input: &Input<'_>, cells: &Cells, facts: &OwnedRead) -> Result<Plan>
             .filter(|c| !matches!(c.name, "n" | "seen" | "at" | "hosts"))
             .any(|c| row.get(c.name) != own.value.get(c.name));
         let due = seen.saturating_add(REFRESH_DAYS) <= today || (changed && seen < today);
-        if !due {
+        if !due && node.is_empty() {
             return Ok(Plan::quiet(Outcome::Unchanged, Vec::new()));
+        }
+        if !due {
+            return Ok(Plan {
+                outcome: Outcome::Refreshed {
+                    mac: mac.to_owned(),
+                },
+                changes: node,
+                findings: Vec::new(),
+            });
         }
         let n = own
             .value
@@ -700,6 +784,7 @@ pub fn plan(input: &Input<'_>, cells: &Cells, facts: &OwnedRead) -> Result<Plan>
             .unwrap_or(0)
             .saturating_add(1);
         let mut changes = model_birth(cells, input.probe)?;
+        changes.extend(node);
         changes.push(facts_change(
             &me.uuid,
             row,
@@ -722,14 +807,6 @@ pub fn plan(input: &Input<'_>, cells: &Cells, facts: &OwnedRead) -> Result<Plan>
     if !input.heard {
         return Ok(Plan::quiet(Outcome::Deferred, findings));
     }
-    let Some(label) = me.label.as_deref() else {
-        findings.push(finding(
-            "no-label",
-            MACHINE_FACTS.name,
-            vec![me.uuid.clone()],
-        ));
-        return Ok(Plan::quiet(Outcome::Held, findings));
-    };
     let machines = cell::project(&MACHINE, cells);
     let own_pk = keys::machine_pk(&me.uuid);
     let (outcome, mac, predecessor, births) = match pick(input, &machines, facts, &mut findings) {
@@ -764,31 +841,52 @@ pub fn plan(input: &Input<'_>, cells: &Cells, facts: &OwnedRead) -> Result<Plan>
                 return Ok(Plan::quiet(Outcome::Held, findings));
             }
             None => {
-                // A label is unique among live rows (§4.6), and a binding is for good: a birth
-                // beside the row holding this label would leave its preferences on that row.
-                let holders: Vec<String> = machines
-                    .rows
-                    .iter()
-                    .filter(|(_, row)| row.live() && goes_by(row, label))
-                    .map(|(pk, _)| pk.clone())
-                    .collect();
-                if !holders.is_empty() {
-                    findings.push(finding("label-held", MACHINE.name, holders));
-                    return Ok(Plan::quiet(Outcome::Held, findings));
-                }
+                let label = birth_label(input, &machines)?;
                 (
                     Outcome::Born {
                         mac: own_pk.clone(),
                     },
                     own_pk.clone(),
                     None,
-                    machine_birth(input, &machines, &own_pk, label)?,
+                    machine_birth(input, &machines, &own_pk, &label)?,
                 )
             }
         },
     };
-    let row = stated(input, None, &mac, predecessor.as_deref())?;
+    let label = births
+        .iter()
+        .find(|change| change.collection == MACHINE.name && change.key.ends_with(".label"))
+        .and_then(|change| change.value.as_ref())
+        .and_then(|value| value.get("x"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            machines
+                .rows
+                .get(&mac)
+                .filter(|row| {
+                    row.fields
+                        .get("label")
+                        .is_some_and(|field| !field.conflicted())
+                })
+                .and_then(|row| row.get("label"))
+                .and_then(Value::as_str)
+        });
+    let label = match label {
+        Some(label) => label.to_owned(),
+        None => birth_label(input, &machines)?,
+    };
+    let row = stated(input, None, &mac, predecessor.as_deref(), Some(&label))?;
     let mut changes = model_birth(cells, input.probe)?;
+    if births.is_empty() {
+        changes.extend(own_node(input, &machines, &mac)?);
+        if machines
+            .rows
+            .get(&mac)
+            .is_some_and(|row| !row.fields.contains_key("label"))
+        {
+            changes.push(automatic(&MACHINE, &mac, "label", Value::from(label))?);
+        }
+    }
     changes.extend(births);
     changes.push(facts_change(&me.uuid, row, 1, today, input.now_ms));
     Ok(Plan {

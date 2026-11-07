@@ -275,19 +275,19 @@ fn shaped_reply() -> Error {
     .with_next("run it without --record: a tape cannot hold this answer")
 }
 
-fn shell_word(arg: &str) -> String {
+fn shell_word(arg: &str) -> std::borrow::Cow<'_, str> {
     let plain = |b: u8| b.is_ascii_alphanumeric() || b"_./:=@%+,-".contains(&b);
     if !arg.is_empty() && arg.bytes().all(plain) {
-        return arg.to_string();
+        return std::borrow::Cow::Borrowed(arg);
     }
-    format!("'{}'", arg.replace('\'', r"'\''"))
+    std::borrow::Cow::Owned(format!("'{}'", arg.replace('\'', r"'\''")))
 }
 
 fn live_next(header: &tape::TapeHeader) -> String {
     let mut live = String::from("record it live: agh --record NEW");
     for arg in &header.argv {
         live.push(' ');
-        live.push_str(&shell_word(&Redactor::shapes(arg)));
+        live.push_str(&shell_word(&Redactor::shapes_cow(arg)));
     }
     live
 }
@@ -1247,7 +1247,7 @@ impl Fx {
                 // change could not replay as this run reads it, so the tape is discarded.
                 let raw = answer();
                 let changes =
-                    |text: &str| Redactor::shapes(text) != text || text.contains(['\r', '\n']);
+                    |text: &str| Redactor::shapes_cow(text) != text || text.contains(['\r', '\n']);
                 if changes(question) || changes(profile) || changes(&raw) {
                     return Err(self.shaped_out(sink, shaped_request()));
                 }

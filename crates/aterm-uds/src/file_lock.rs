@@ -33,6 +33,29 @@ pub fn lock_exclusive_until_with(
     lock_exclusive_with_deadline(file, Some(deadline), busy, held)
 }
 
+/// Acquire an exclusive lock on an already validated file with no deadline and no polling: a
+/// blocking `flock` that sleeps in the kernel until the holder lets go (a signal's interruption
+/// waits again). The caller must explicitly unlock before closing or transferring ownership.
+///
+/// # Errors
+/// The lock's own error.
+#[cfg(unix)]
+pub(crate) fn lock_exclusive_blocking(file: &std::fs::File) -> io::Result<()> {
+    crate::keep_out_of_children(file)?;
+    loop {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the caller retains the validated file and explicitly unlocks before close"
+        )]
+        let taken = file.lock();
+        match taken {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Shared contention wait; `None` retains an unrepresentable duration's unbounded wait.
 pub(crate) fn lock_exclusive_with_deadline(
     file: &std::fs::File,

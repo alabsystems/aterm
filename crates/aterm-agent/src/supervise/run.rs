@@ -2551,6 +2551,9 @@ pub struct Session<'a, C: Ctl> {
     /// ([`IdleHost::login_discover`]): once per lost login.
     login_discovered: bool,
     probe: UsageProbe,
+    /// What the host was last told of the probe's own panel ([`IdleHost::own_panel`]): `true`
+    /// while it was told one stands.
+    probe_panel_told: bool,
     probe_fold: Option<(Option<u16>, Option<usize>)>,
     probe_off: bool,
     turn_live: bool,
@@ -2875,6 +2878,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             login_seen: None,
             login_discovered: false,
             probe: UsageProbe::Idle,
+            probe_panel_told: false,
             probe_fold: None,
             probe_off: false,
             turn_live: false,
@@ -5363,6 +5367,7 @@ impl<'a, C: Ctl> Session<'a, C> {
                     since: self.fx.mono(),
                 };
                 self.probe_seed = Some(wrote);
+                self.tell_own_panel();
             }
             if review.unattended()
                 && let Some(open) = approvals::reset_owed(&body, self.setup.sid.as_deref())

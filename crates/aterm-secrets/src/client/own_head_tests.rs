@@ -27,6 +27,14 @@ fn approve_on_the_lower_side(lab: &SplitAdmins) -> Approved {
     );
     let mx_id = read_identity(&mx).unwrap().unwrap();
     approve_request(&lab.st1, &mx_id.recipient().to_bech32()).expect("st1 approves mx on s1");
+    // This recovery fixture represents a pre-B2 approval with a historical label row.
+    // Production approvals no longer create that table.
+    if crate::swarm_roster::SwarmRoster::from_document(&admin_open(&lab.st1).unwrap().doc)
+        .unwrap()
+        .is_some()
+    {
+        admin_seed_swarm_roster(&lab.st1, &[]).unwrap();
+    }
     sync(&mx, None).expect("mx reads its approval");
     assert_eq!(load_state(&mx).unwrap().membership, Stored::In, "CONTROL");
     for step in [b"v1".as_slice(), b"v2", b"v3-from-higher-seq"] {
@@ -40,7 +48,7 @@ fn approve_on_the_lower_side(lab: &SplitAdmins) -> Approved {
 }
 
 /// `st1` starts a swarm roster with no rows, and `s2` and `st2` take it before the split: an
-/// approval then gives its Mac a row, which a carry must bring back with the Mac.
+/// historical approval fixture supplies the row a carry must bring back with the Mac.
 fn seed_roster(lab: &SplitAdmins) {
     let a1 = admin_open(&lab.st1).unwrap();
     let mut d1 = a1.doc.clone();
@@ -159,9 +167,9 @@ fn addressed(url: &str, id: &Identity) -> bool {
     open_lockers(&parsed, id).unwrap().is_some()
 }
 
-/// Every server serves a version that lists `id` in `[machines]`, gives it a row where the version
-/// keeps a swarm roster, and is sealed to it, and the admin's newest version keeps its admission
-/// evidence.
+/// Every server serves a version that lists `id` in `[machines]` and is sealed to it, and the
+/// admin's newest version keeps its admission evidence. Historical label rows are checked
+/// separately: an admission never needs a newly allocated roster label.
 fn assert_let_in(lab: &SplitAdmins, name: &str, id: &Identity) {
     let urls = [lab.url1.clone(), lab.url2.clone()];
     let recipient = id.recipient().to_bech32();
@@ -172,17 +180,6 @@ fn assert_let_in(lab: &SplitAdmins, name: &str, id: &Identity) {
             head.url,
             head.envelope.seq
         );
-        if crate::swarm_roster::SwarmRoster::from_document(&head.doc)
-            .unwrap()
-            .is_some()
-        {
-            assert!(
-                roster_label(&head.doc, id).is_some(),
-                "{} serves seq {} with no roster row for {name}",
-                head.url,
-                head.envelope.seq
-            );
-        }
     }
     for url in &urls {
         assert!(addressed(url, id), "{url} seals no locker to {name}");
@@ -263,8 +260,8 @@ fn publish_after_the_heal(lab: &SplitAdmins, urls: &[String]) {
 /// NEGATIVE CONTROL: the draft plan's `readmit` bypass dropped: "the newest version lost mx's
 /// admission"; the overlay's Commons host bypass dropped: "mx lost Commons control in the envelope
 /// … serves"; the overlay's removal bypass dropped: "… serves seq 16 without mx in
-/// [machines]"; the roster carry in `carry_lost`, the merge of heads' bypass or the
-/// half-done-revoke repair's bypass dropped: "… serves seq 15 with no roster row for mx".
+/// [machines]". Restoring the old allocator gives the carried Mac a replacement roster row,
+/// which the historical-table assertion below refuses.
 #[test]
 fn an_approval_lost_at_the_heal_comes_back_after_the_other_side_mirrored_it_away() {
     let _answering = ServersAnswering::set();
@@ -272,7 +269,7 @@ fn an_approval_lost_at_the_heal_comes_back_after_the_other_side_mirrored_it_away
     let urls = [lab.url1.clone(), lab.url2.clone()];
     seed_roster(&lab);
     let Approved { mx, mx_id } = approve_on_the_lower_side(&lab);
-    let approved = roster_row(&admin_open(&lab.st1).unwrap().doc, &mx_id)
+    let _approved = roster_row(&admin_open(&lab.st1).unwrap().doc, &mx_id)
         .expect("CONTROL: the approval gives mx a roster row");
     heal(&lab);
     publish_after_the_heal(&lab, &urls);
@@ -286,9 +283,14 @@ fn an_approval_lost_at_the_heal_comes_back_after_the_other_side_mirrored_it_away
         let _ = sync_with_candidates(&lab.st1, None, &urls);
     }
     assert_let_in(&lab, "mx", &mx_id);
-    // `st2`'s merge of heads denied mx's label when it pruned the row of a Mac its log left out
-    // (still open): the carried Mac keeps its name under a fresh label.
-    assert_row_carried(&lab, &mx_id, &approved, false);
+    // The old historical label is denied. Carry the approved recipient and its control back,
+    // without allocating a replacement roster label. Owner labels live in the registry.
+    for head in read_server_heads(&lab.st1, &urls).unwrap() {
+        assert!(
+            roster_label(&head.doc, &mx_id).is_none(),
+            "a carry must not allocate a replacement roster label"
+        );
+    }
     super::log_entries_tests::assert_in_commons_control(&lab.st1, &urls, &[("mx", &mx_id)]);
     let _ = sync_with_candidates(&mx, None, &urls);
     assert_eq!(load_state(&mx).unwrap().membership, Stored::In);

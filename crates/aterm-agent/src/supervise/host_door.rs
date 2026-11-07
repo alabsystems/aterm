@@ -692,6 +692,15 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
         let _ = read;
     }
 
+    /// THE PANEL THE LOOP'S OWN PROBE OPENED STANDS (`true`) OR IS GONE (`false`): told on each
+    /// change between none owed and one owed (a `/usage` the probe entered, or one a restart finds
+    /// the previous loop's), each told only on a change. A loop that ends with it still owed says
+    /// nothing more: its successor, seeded from the ledger, owes the same panel. The host's held
+    /// deadline counts no time under it; a notification nothing the loop decides reads back.
+    fn own_panel(&self, open: bool) {
+        let _ = open;
+    }
+
     act fn reset_take(&self, ask: &ResetAsk) -> ResetWord {
         let _ = ask;
         ResetWord::No(ResetNo::NoHost)

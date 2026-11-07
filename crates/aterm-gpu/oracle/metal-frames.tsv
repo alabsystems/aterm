@@ -10,8 +10,11 @@
 # which Metal's production present into an `Rgba16Float` drawable must
 # equal, and `blit/*` and `crown/*` are wgpu's present blit and crown rows,
 # which the Metal rows run standalone (`metal::blit`) must equal. Every row
-# was drawn by wgpu; a stated re-record names the rows it redrew and their
-# drawer here. src/frame_record_tests.rs compares these rows as a signal on
+# was drawn by wgpu but two; a stated re-record names the rows it redrew and
+# their drawer here. Added 2026-10-30 (HR-ORACLE's review), frames wgpu never
+# drew: `heat/present/cropped-haze` and `rim/present/cropped`, recorded from
+# the first-party Metal arm on this Mac, each 0 off its CPU twin.
+# src/frame_record_tests.rs compares these rows as a signal on
 # the adapter they name (its `frame-record` lines are these rows, and
 # `frame-record: moved:` names a frame drawn otherwise); since
 # ORACLE-ADAPTER (2026-10-26) the verdict is each frame's CPU twin, decided
@@ -117,6 +120,8 @@ aarch64	Apple M4 Pro	heat/present/1	264x126	38ccb385f95200dae15e379a934f7a46821e
 aarch64	Apple M4 Pro	heat/present/2	264x126	1bd219378504d52d34a1394a1e00a1a908ed92d3c82230766a6c8f8e47e9f283
 aarch64	Apple M4 Pro	heat/present/changed	264x126	bd92a91fc2bb9d883b7ff06f1d7a78406feaa38e1ae2b45c2fece173defd740f
 aarch64	Apple M4 Pro	heat/present/cropped	275x72	a1ba142210ef67850ae2cc170f6270453957f79a63c9351909f53e1f2be21bc5
+aarch64	Apple M4 Pro	heat/present/cropped-haze	275x72	e9fcc9d0e71ac763cee6a042c0ca512c3a0d9e46679b307896b11249f472d043
+aarch64	Apple M4 Pro	rim/present/cropped	891x709	f2f3de5609a419dbb157e02709b1597c777665e53bf412625d5a920a1594de92
 aarch64	Apple M4 Pro	window/opaque/readback	264x126	87dae35f182fff91fdecae1c121460ba5019f837b46d4f6e79b37b8948425d86
 aarch64	Apple M4 Pro	window/translucent/readback	264x126	9bd20846de2ed766cb65b7b12f0b7207b3544fae830559edd80c8751e70d78e3
 aarch64	Apple M4 Pro	window/opaque/layer	273x133	3f8af62584ac3172cfce247bca5ff0dd98e5e9924470de8b8d03d4ed061e9ae2

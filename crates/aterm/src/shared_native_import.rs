@@ -85,11 +85,39 @@ pub(super) fn resolve(
     let key = aterm_codec::hex::encode_lower(&hash.finalize());
     let table_hex = aterm_codec::hex::encode_lower(&table);
     let op_hex = aterm_codec::hex::encode_lower(&candidate.operation);
-    let origin = json!({"selector":selector,"table":table_hex,"operation":op_hex});
-    let value = json!({"provider":provider.name(),"method":"api-key","email":row["email"],"source":{
-        "import":{"kind":"source-ref","value":format!("{table_hex}:{selector}")},
-        "import-operation":{"kind":"source-ref","value":op_hex}
-    }});
+    let import_ref = format!("{table_hex}:{selector}");
+    let origin = Value::Object(aterm_json::Map::from([
+        ("selector".to_string(), Value::String(selector.to_string())),
+        ("table".to_string(), Value::String(table_hex)),
+        ("operation".to_string(), Value::String(op_hex.clone())),
+    ]));
+    let value = Value::Object(aterm_json::Map::from([
+        (
+            "provider".to_string(),
+            Value::String(provider.name().to_string()),
+        ),
+        ("method".to_string(), Value::String("api-key".to_string())),
+        ("email".to_string(), row["email"].clone()),
+        (
+            "source".to_string(),
+            Value::Object(aterm_json::Map::from([
+                (
+                    "import".to_string(),
+                    Value::Object(aterm_json::Map::from([
+                        ("kind".to_string(), Value::String("source-ref".to_string())),
+                        ("value".to_string(), Value::String(import_ref)),
+                    ])),
+                ),
+                (
+                    "import-operation".to_string(),
+                    Value::Object(aterm_json::Map::from([
+                        ("kind".to_string(), Value::String("source-ref".to_string())),
+                        ("value".to_string(), Value::String(op_hex)),
+                    ])),
+                ),
+            ])),
+        ),
+    ]));
     aterm_db::accounts::validate(&value).map_err(|e| e.to_string())?;
     Ok(Some(Imported { key, value, origin }))
 }

@@ -1046,6 +1046,23 @@ fn file_holds(path: &Path, needle: &[u8]) -> std::io::Result<bool> {
     }
 }
 
+/// Compiled managed-auth ABI support. The caller separately proves the mapped
+/// image, account source and grant custody; these bytes confer no authority.
+pub(super) fn managed_credential_capable(
+    path: &Path,
+    source_domain: bool,
+) -> std::io::Result<bool> {
+    for mark in [
+        "aterm machine credential slot v1",
+        "aterm machine credential slot pending v1",
+    ] {
+        if !file_holds(path, mark.as_bytes())? {
+            return Ok(false);
+        }
+    }
+    Ok(!source_domain || file_holds(path, b"aterm session credential source v1")?)
+}
+
 /// A codex-alab package laid out at `root` for another crate's test: `codex-package.json`, the
 /// [`ALAB_BUILD_JSON`] marker and `bin/codex` (`bin/codex.exe` on Windows, as atpkg names a
 /// build's executable: `atpkg::store::ToolName::exe_file`), whose bytes spell

@@ -236,6 +236,12 @@ mod local_signins {
         2
     }
 }
+#[cfg(target_os = "macos")]
+mod cpu_observation;
+#[cfg(target_os = "macos")]
+mod idle_cpu;
+#[cfg(all(target_os = "macos", debug_assertions))]
+mod installer_handoff;
 #[cfg(all(target_os = "macos", debug_assertions))]
 mod local_signins_heal;
 #[cfg(target_os = "macos")]
@@ -293,8 +299,6 @@ mod record;
 #[cfg(target_os = "macos")]
 mod recorder;
 #[cfg(target_os = "macos")]
-mod recording_cpu;
-#[cfg(target_os = "macos")]
 mod reduce;
 #[cfg(target_os = "macos")]
 mod relaunch_agy;
@@ -324,6 +328,17 @@ mod scn;
 mod screen;
 #[cfg(target_os = "macos")]
 mod seamless;
+#[cfg(all(target_os = "macos", not(debug_assertions)))]
+mod installer_handoff {
+    pub fn cold_cmd(_: &[String]) -> crate::Res {
+        Err(crate::Fail::die("cold-handoff requires a debug lab image"))
+    }
+    pub fn cmd(_: &[String]) -> crate::Res {
+        Err(crate::Fail::die(
+            "installer-handoff requires a debug lab image",
+        ))
+    }
+}
 #[cfg(target_os = "macos")]
 mod seamless_carry;
 #[cfg(target_os = "macos")]
@@ -459,6 +474,9 @@ usage: targo --unverified lab <command> [tag] [args]
                                  prefix with its twin and reroute stub, the instance rerouting; `claude --by-name`
                                  LAB_JAIL_SCAN=1: the instance's disk scans read the jail's processes alone (a debug
                                  build's ATERM_DEBUG_JAIL_MARK), so `aterm harness disk free` can free in the lab)
+                                 LAB_ROUTE_SEAM=1: the instance reads the stub's base URL as Claude Code's default
+                                 route (ATERM_DEBUG_LAB_DEFAULT_ROUTE), so a tab launched on a roster row's stored
+                                 login (no --subscriber) is that row's process to the accounts host
   claude [tag] [-e K=V]... [--no-wait] [--prepare-only] [--relay] [--subscriber] [--debug-log] [--by-name] [-- claude args]
                                  launch the managed Claude Code in tab 1 (--relay: behind the PTY relay; --subscriber: a
                                  fake claude.ai OAuth token, for `limit` headers; --debug-log: a scratch debug log;
@@ -884,6 +902,11 @@ Outside any lab (no jail, no stub):
                                  actual GUI retains its original lane/memory after keeper and owner crash; debug lab
   window-handoff-app --aterm ABS --out ABS [--cut-keeper]
                                  authenticated launchd handoff and normal Quit or keeper-lifeline closure; debug lab
+  installer-handoff --aterm ABS --out ABS [--handoffs N]
+                                 live same-image handoff with an inert receipt-bound installer terminal; debug lab
+  cold-handoff --aterm ABS --out ABS [--handoffs N]
+                                 verify repeated in-place updates of a private native window with no terminal sessions
+                                 both default to 2 handoffs; N is 1..32, with one-minute progress hang detectors
   trail-census <png> [--dims FILE|--origin X,Y --cell WxH] [--clean PNG] [--caret ROW,COL] [--pet X0,Y0,X1,Y1]...
                [--selection RRGGBB] [--pixels FILE] [--mud-max N] [--glyph-min X] ...
                                  the Prism Glass census of a trail frame and its clean twin, layer by layer: OKLab mud,
@@ -913,6 +936,9 @@ Outside any lab (no jail, no stub):
                                  re-derive a windowed aos-repair run's measured phase from its kept trace (`--help` for details)
   resource-attribution [--aterm PATH]
                                  private two-tab delegated resource attribution check
+  idle-cpu --output FILE [--aterm PATH] [--duration-ms N] [--interval-ms N] [--settle-ms N] [--band app|agent]
+                                 all observed threads in one private headless idle instance, no video or status polling;
+                                 exact deltas refuse missing/reset/late counters, native cleanup and boundary metrics
   recording-cpu --pid PID --aterm PATH --sock PATH --output PATH --duration-ms N --interval-ms N
                                  read-only named-thread CPU and sampled temporal queue observations; no verdict
   git-starts [--minutes N] [--every-ms M]
@@ -1246,7 +1272,8 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "paths" => verbs::cmd_paths(),
         "instance" => instance::cmd_instance(args),
         "resource-attribution" => resource_attribution::cmd(args),
-        "recording-cpu" => recording_cpu::cmd(args),
+        "recording-cpu" => cpu_observation::cmd(args),
+        "idle-cpu" => idle_cpu::cmd(args),
         "disk-lane" => disk_lane::cmd_disk_lane(args),
         "disk-ask" => disk_ask_lane::cmd_disk_ask(args),
         "slot-capture" => slot_lane::cmd_slot_capture(args),
@@ -1287,6 +1314,8 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "codex-measure" => codex_measure::cmd_codex_measure(args),
         "claude-measure" => claude_measure::cmd_claude_measure(args),
         "seamless" => seamless::cmd_seamless(args),
+        "installer-handoff" => installer_handoff::cmd(args),
+        "cold-handoff" => installer_handoff::cold_cmd(args),
         "linux" => linux::cmd_linux(args),
         "windows" => windows::cmd_windows(args),
         "mac" => mac::cmd_mac(args),

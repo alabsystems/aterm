@@ -649,7 +649,9 @@ impl Runtime {
                     }
                     match runtime.table.dial(addr, DIAL_WITHIN) {
                         Ok(link)
-                            if principal_of(&link) == named
+                            if crate::logs::principal_str(&crate::logs::principal_buf(
+                                link.peer().key.bytes(),
+                            )) == named
                                 && proves_a_seat(&runtime.mesh, &link) =>
                         {
                             linked = true;

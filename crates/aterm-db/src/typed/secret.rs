@@ -303,6 +303,12 @@ pub(crate) fn flag_says_str(raw: &str) -> Option<bool> {
     }
 }
 
+/// Whether a password cell's text claims a password: it is neither blank nor a none word. A
+/// has-password word and a password both do.
+pub fn cell_claims(cell: &str) -> bool {
+    !cell.trim().is_empty() && flag_says_str(cell) != Some(false)
+}
+
 /// A password cell as a conflict judges it, so that two spellings of one claim do not disagree: no
 /// cell, a blank one and a none word read as null, a has-password word reads as `1`, and anything
 /// else, a password included, as itself.

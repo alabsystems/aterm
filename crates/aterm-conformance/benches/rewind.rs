@@ -138,7 +138,21 @@ mod measuring {
             &["ATERM_REWIND_BIN", "ATERM_PAINT_BIN"],
             aterm_tempfile::bin_exe("fake-tui"),
         );
-        support::run("rewind", ROWS, |row| take(&rig, row))
+        support::run_classified(
+            "rewind",
+            ROWS,
+            |row| match row {
+                Row::View(RewindRow {
+                    scene: RewindScene::Idle { .. },
+                    ..
+                })
+                | Row::Cost(CostRow::IdleRss { .. } | CostRow::BusyRss { .. }) => {
+                    support::Kind::Count { windowed: false }
+                }
+                _ => support::Kind::Timing,
+            },
+            |row| take(&rig, row),
+        )
     }
 
     /// A separate explicit collection mode: never mounted in the acceptance row list.

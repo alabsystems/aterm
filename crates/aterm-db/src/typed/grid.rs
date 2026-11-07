@@ -237,11 +237,12 @@ fn show_raw(cell: Option<&crate::database::Cell>, field: Option<&Field>, reveal:
             _ => String::new(),
         };
     };
-    let values: Vec<String> = super::cell::origins(cell)
+    let values: Vec<String> = super::cell::origins_refs(cell)
         .into_iter()
         .map(|(_, value)| {
-            let x = CellValue::decode(&value).map_or(value, |v| v.x);
-            compact(&raw_masked(&x, reveal))
+            let decoded = CellValue::decode(value).ok();
+            let x = decoded.as_ref().map_or(value, |v| &v.x);
+            compact(&raw_masked(x, reveal))
         })
         .collect();
     match values.len() {

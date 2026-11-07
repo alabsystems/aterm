@@ -457,6 +457,372 @@ struct SuccessfulEnrollmentHost {
     artifact: RefCell<Option<(PathBuf, Vec<u8>)>>,
 }
 
+#[cfg(unix)]
+struct SealedEnrollmentHost {
+    now: i64,
+    cut: Option<crate::harness::codex_app_login::EnrollmentCut>,
+    calls: std::cell::Cell<usize>,
+    stage: RefCell<Option<PathBuf>>,
+}
+
+#[cfg(unix)]
+impl AccountsHost for SealedEnrollmentHost {
+    fn stdin_is_terminal(&self) -> bool {
+        false
+    }
+    fn auth_status(&self, _: &str) -> Result<Captured, String> {
+        panic!("native recovery starts no status process")
+    }
+    fn unaskable(&self) -> Option<String> {
+        None
+    }
+    fn login(&self, _: Option<&str>) -> Result<i32, String> {
+        panic!("native recovery starts no login process")
+    }
+    fn now(&self) -> i64 {
+        self.now
+    }
+    fn codex_account(&self, home: &Path) -> Option<String> {
+        crate::harness::codex_app_login::read_account_email(home)
+    }
+    fn vendor_sign_in(
+        &self,
+        request: &crate::harness::login_drive::Request<'_>,
+    ) -> crate::harness::login_drive::Drove {
+        assert_eq!(
+            self.calls.replace(self.calls.get() + 1),
+            0,
+            "the retained request must never repeat its provider effect"
+        );
+        assert!(
+            request.store.signin_now().unwrap().is_none(),
+            "the actual original signer owns the provider attempt"
+        );
+        *self.stage.borrow_mut() = Some(request.staging.to_path_buf());
+        let work = self.work_scope();
+        crate::harness::codex_app_login::tests::native_enrollment_exchange_fixture(
+            request,
+            self.cut,
+            self.now,
+            work.as_ref(),
+            "main@example.test",
+        )
+    }
+}
+
+#[cfg(unix)]
+fn enrollment_request(bed: &Bed) -> crate::harness::codex_enrollment::Request {
+    let records = bed
+        .store
+        .read_account_records(Some(&bed.path), bed.env.now)
+        .unwrap();
+    crate::harness::codex_enrollment::Request {
+        id: "e".repeat(32),
+        caller: "b".repeat(64),
+        label: "main".into(),
+        revision: accounts::pool_authority_revision(&records.raw_roster, &records.logins).unwrap(),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn original_native_enrollment_publishes_one_canonical_home_and_unblocks_refresh() {
+    use crate::harness::{account_work::Lifetime, codex_enrollment as enrollment};
+    let bed = Bed::new(Cli::Codex);
+    let request = enrollment_request(&bed);
+    let lifetime = Lifetime::default();
+    let host = SealedEnrollmentHost {
+        now: bed.env.now + 1,
+        cut: None,
+        calls: std::cell::Cell::new(0),
+        stage: RefCell::new(None),
+    };
+    let (work, _) = enrollment::owned_work(request.clone(), lifetime.enter().unwrap());
+    let applied = work.run_with_host(&bed.env, &host).unwrap();
+    assert_eq!(applied.phase, enrollment::Phase::Applied);
+    assert!(applied.generation.is_some());
+    let stage = host.stage.borrow().clone().unwrap();
+    assert_eq!(std::fs::canonicalize(&stage).unwrap(), stage);
+    let records = bed
+        .store
+        .read_account_records(Some(&bed.path), bed.env.now)
+        .unwrap();
+    assert_eq!(
+        records.logins.get("main").unwrap().dir.as_deref(),
+        stage.to_str()
+    );
+    assert!(!stage.join("auth.json.refreshed").exists());
+    let before = std::fs::read(stage.join("auth.json")).unwrap();
+    let (repeat, _) = enrollment::owned_work(request, lifetime.enter().unwrap());
+    assert_eq!(repeat.run_with_host(&bed.env, &host).unwrap(), applied);
+    assert_eq!(std::fs::read(stage.join("auth.json")).unwrap(), before);
+    assert_eq!(host.calls.get(), 1);
+    crate::harness::codex_app_login::tests::native_enrollment_refresh_fixture(
+        &stage,
+        bed.env.now + 2,
+    );
+    assert!(lifetime.pause().unwrap().try_wait().is_ok());
+}
+
+#[cfg(unix)]
+#[path = "cli_native_recovery_controls.rs"]
+mod native_recovery_controls;
+
+#[cfg(unix)]
+#[path = "cli_ordinary_publication_tests.rs"]
+mod ordinary_publication;
+
+#[cfg(unix)]
+#[test]
+fn native_recovery_reuses_only_its_exact_preexisting_completion_header() {
+    use crate::harness::{
+        account_work::Lifetime, codex_app_login::EnrollmentCut, codex_enrollment as enrollment,
+    };
+    for matches in [false, true] {
+        let bed = Bed::new(Cli::Codex);
+        let request = enrollment_request(&bed);
+        let lifetime = Lifetime::default();
+        let host = SealedEnrollmentHost {
+            now: bed.env.now + 1,
+            cut: Some(EnrollmentCut::AfterAuthFlush),
+            calls: std::cell::Cell::new(0),
+            stage: RefCell::new(None),
+        };
+        let (work, _) = enrollment::owned_work(request.clone(), lifetime.enter().unwrap());
+        assert_eq!(
+            work.run_with_host(&bed.env, &host).unwrap().phase,
+            enrollment::Phase::Running
+        );
+        let stage = host.stage.borrow().clone().unwrap();
+        let signer = bed.store.signin_now().unwrap().unwrap();
+        let cut = bed.store.transact_roster_logins_within(
+            &accounts::LOCK_LADDER,
+            &bed.path,
+            bed.env.now,
+            &mut None,
+            |_, _, logins| {
+                signer
+                    .check_store(&bed.store)
+                    .map_err(|_| "signer changed")?;
+                accounts::write_enrollment_checkpoint(
+                    &request,
+                    if matches {
+                        "main@example.test"
+                    } else {
+                        "other@example.test"
+                    },
+                    stage.to_str().unwrap(),
+                    accounts::Proof::Status,
+                    bed.env.now,
+                    logins,
+                )
+                .map_err(|_| "checkpoint write failed")?;
+                Err("synthetic cut after the actual completion-header write".into())
+            },
+        );
+        drop(signer);
+        assert!(cut.is_err());
+        let header = std::fs::read(stage.join(accounts::RENEWAL_CHECKPOINT_FILE)).unwrap();
+        let receipt = std::fs::read(stage.join("auth.json.refreshed")).unwrap();
+        let (recover, _) = enrollment::owned_work(request.clone(), lifetime.enter().unwrap());
+        let result = recover.run_with_host(&bed.env, &host).unwrap();
+        assert_eq!(
+            result.phase,
+            if matches {
+                enrollment::Phase::Applied
+            } else {
+                enrollment::Phase::Running
+            }
+        );
+        assert_eq!(host.calls.get(), 1);
+        assert_eq!(
+            std::fs::read(stage.join(accounts::RENEWAL_CHECKPOINT_FILE)).unwrap(),
+            header
+        );
+        if matches {
+            assert!(result.generation.is_some());
+            assert!(!stage.join("auth.json.refreshed").exists());
+        } else {
+            assert!(result.generation.is_none());
+            assert_eq!(
+                std::fs::read(stage.join("auth.json.refreshed")).unwrap(),
+                receipt
+            );
+            let records = bed
+                .store
+                .read_account_records(Some(&bed.path), bed.env.now)
+                .unwrap();
+            assert_eq!(
+                records.logins.get("main").unwrap().dir.as_deref(),
+                bed.dirs[0].to_str()
+            );
+            for _ in 0..2 {
+                let (poll, _) = enrollment::owned_work(request.clone(), lifetime.enter().unwrap());
+                assert_eq!(poll.run_with_host(&bed.env, &host).unwrap(), result);
+                let current = bed
+                    .store
+                    .read_account_records(Some(&bed.path), bed.env.now)
+                    .unwrap();
+                assert_eq!(current.logins, records.logins);
+            }
+            assert_eq!(host.calls.get(), 1);
+            assert_eq!(
+                std::fs::read(stage.join("auth.json.refreshed")).unwrap(),
+                receipt
+            );
+            assert_eq!(
+                std::fs::read(stage.join(accounts::RENEWAL_CHECKPOINT_FILE)).unwrap(),
+                header
+            );
+        }
+        assert!(lifetime.pause().unwrap().try_wait().is_ok());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_sealed_native_response_recovers_only_after_original_work_retirement_without_http_replay() {
+    use crate::harness::{
+        account_work::Lifetime, codex_app_login::EnrollmentCut, codex_enrollment as enrollment,
+    };
+    for cut in [
+        EnrollmentCut::AfterSeal,
+        EnrollmentCut::AfterAuthWrite,
+        EnrollmentCut::AfterAuthFlush,
+    ] {
+        let bed = Bed::new(Cli::Codex);
+        let request = enrollment_request(&bed);
+        let old_auth = std::fs::read(bed.dirs[0].join("auth.json")).unwrap();
+        let lifetime = Lifetime::default();
+        let scope = lifetime.enter().unwrap();
+        let detached = scope.clone();
+        let (work, original) = enrollment::owned_work(request.clone(), scope);
+        let host = SealedEnrollmentHost {
+            now: bed.env.now + 1,
+            cut: Some(cut),
+            calls: std::cell::Cell::new(0),
+            stage: RefCell::new(None),
+        };
+        assert_eq!(
+            work.run_with_host(&bed.env, &host).unwrap().phase,
+            enrollment::Phase::Running
+        );
+        assert!(
+            original.retired().is_none(),
+            "a real retained scope prevents retirement evidence"
+        );
+        let stage = host.stage.borrow().clone().unwrap();
+        let receipt = stage.join("auth.json.refreshed");
+        let exact = std::fs::read(&receipt).unwrap();
+        let (replayed, replay_control) =
+            enrollment::owned_work(request.clone(), lifetime.enter().unwrap());
+        assert_eq!(
+            replayed.run_with_host(&bed.env, &host).unwrap().phase,
+            enrollment::Phase::Running
+        );
+        assert!(
+            replay_control.retired().is_none(),
+            "a fresh replay scope cannot retire the original work"
+        );
+        assert_eq!(std::fs::read(&receipt).unwrap(), exact);
+        assert!(!stage.join(accounts::RENEWAL_CHECKPOINT_FILE).exists());
+        assert_eq!(
+            std::fs::read(bed.dirs[0].join("auth.json")).unwrap(),
+            old_auth
+        );
+        drop(detached);
+        original.retired().unwrap().finish(&bed.env).unwrap();
+        let (recover, _) = enrollment::owned_work(request.clone(), lifetime.enter().unwrap());
+        let applied = recover.run_with_host(&bed.env, &host).unwrap();
+        assert_eq!(applied.phase, enrollment::Phase::Applied);
+        assert!(applied.generation.is_some());
+        assert_eq!(host.calls.get(), 1);
+        let records = bed
+            .store
+            .read_account_records(Some(&bed.path), bed.env.now)
+            .unwrap();
+        assert_eq!(
+            records.logins.get("main").unwrap().dir.as_deref(),
+            stage.to_str()
+        );
+        assert!(stage.join(accounts::RENEWAL_CHECKPOINT_FILE).is_file());
+        assert!(!receipt.exists());
+        assert_eq!(
+            std::fs::read(bed.dirs[0].join("auth.json")).unwrap(),
+            old_auth
+        );
+        let (repeat, _) = enrollment::owned_work(request, lifetime.enter().unwrap());
+        assert_eq!(repeat.run_with_host(&bed.env, &host).unwrap(), applied);
+        assert_eq!(host.calls.get(), 1);
+        assert!(bed.store.signin_now().unwrap().is_some());
+        lifetime
+            .pause()
+            .unwrap()
+            .try_wait()
+            .expect("all actual original and recovery resources retired");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_first_native_seal_cannot_claim_a_recoverable_response() {
+    use crate::harness::{
+        account_work::Lifetime, codex_app_login::EnrollmentCut, codex_enrollment as enrollment,
+    };
+    let bed = Bed::new(Cli::Codex);
+    let old_auth = std::fs::read(bed.dirs[0].join("auth.json")).unwrap();
+    let request = enrollment_request(&bed);
+    let lifetime = Lifetime::default();
+    let host = SealedEnrollmentHost {
+        now: bed.env.now + 1,
+        cut: Some(EnrollmentCut::BeforeSeal),
+        calls: std::cell::Cell::new(0),
+        stage: RefCell::new(None),
+    };
+    let (work, _) = enrollment::owned_work(request.clone(), lifetime.enter().unwrap());
+    assert_eq!(
+        work.run_with_host(&bed.env, &host).unwrap().phase,
+        enrollment::Phase::Running
+    );
+    let stage = host.stage.borrow().clone().unwrap();
+    assert!(!stage.join("auth.json.refreshed").exists());
+    assert!(!stage.join(accounts::RENEWAL_CHECKPOINT_FILE).exists());
+    let (repeat, _) = enrollment::owned_work(request, lifetime.enter().unwrap());
+    if let Ok(status) = repeat.run_with_host(&bed.env, &host) {
+        assert_eq!(status.phase, enrollment::Phase::Running);
+    }
+    assert_eq!(host.calls.get(), 1);
+    assert_eq!(
+        std::fs::read(bed.dirs[0].join("auth.json")).unwrap(),
+        old_auth
+    );
+    let records = bed
+        .store
+        .read_account_records(Some(&bed.path), bed.env.now)
+        .unwrap();
+    assert_eq!(
+        records
+            .logins
+            .enrollment
+            .retained_for(&"b".repeat(64))
+            .unwrap()[0]
+            .1
+            .phase,
+        enrollment::Phase::Running
+    );
+    assert!(
+        bed.store
+            .load_logins(bed.env.now)
+            .unwrap()
+            .0
+            .get("main")
+            .unwrap()
+            .dir
+            .as_deref()
+            == bed.dirs[0].to_str()
+    );
+}
+
 impl AccountsHost for SuccessfulEnrollmentHost {
     fn stdin_is_terminal(&self) -> bool {
         false
@@ -492,13 +858,14 @@ impl AccountsHost for SuccessfulEnrollmentHost {
                 host: None,
             };
         }
-        crate::harness::login_drive::Drove {
-            outcome: crate::harness::login_drive::Outcome::SignedIn {
-                email: Some("main@example.test".into()),
-                page: false,
-            },
-            host: None,
-        }
+        let work = self.work_scope();
+        crate::harness::codex_app_login::tests::native_enrollment_exchange_fixture(
+            req,
+            None,
+            self.now,
+            work.as_ref(),
+            "main@example.test",
+        )
     }
 }
 
@@ -825,3 +1192,7 @@ fn enrollment_uses_only_typed_no_action_for_provider_route_refusal() {
         assert_eq!(host.calls.get(), 1, "exact ID never dispatches twice");
     }
 }
+
+#[cfg(unix)]
+#[path = "cli_native_owner_recovery_tests.rs"]
+mod native_owner_recovery;

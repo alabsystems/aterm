@@ -254,6 +254,14 @@ fn wanted(ctx: &Ctx) -> Vec<StageId> {
     wanted
 }
 
+/// Whether the selected, unskipped plan can compile. This is decided before disk admission,
+/// without resolving the unit graph or consulting the stage-memory planner.
+pub(crate) fn has_compiler_stage(ctx: &Ctx) -> bool {
+    wanted(ctx)
+        .into_iter()
+        .any(|id| !named_skip(ctx, id) && crate::memory::compiles(id))
+}
+
 /// Whether the test compile also builds the measuring matrices' benches
 /// ([`crate::stages::measuring_bench_args`]): it is the workspace's and the release's own
 /// (`release`, `--as-release`: [`Ctx::checkers_in_tests`]). `ship release` runs that compile
@@ -335,9 +343,10 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
 
 /// The unshaped test compile `s` claims at least its estimate `e` ([`crate::shape::Shaped::Whole`])
 /// and a fifth more: its stage's lookup ([`crate::memory::need`]) reads its checkout's record
-/// first, however light (a run after a plain build had compiled it), and never the narrower
-/// selections it holds, where the estimate reads every checkout's record and their cover. Where
-/// that raises its claim, its time line says by what.
+/// first, however light (a run after a plain build had compiled it), and the narrower selections
+/// it holds only where nothing else is kept and they name every crate of it, by their least cover
+/// ([`crate::memory::composed`]), where the estimate reads every checkout's record and the
+/// narrower selections' heaviest cover. Where that raises its claim, its time line says by what.
 fn at_least(ctx: &Ctx, s: &mut StageSpec, e: &crate::shape::Estimate, book: &crate::memory::Book) {
     let floor = aterm_capacity::peak_claim(e.peak);
     if floor <= s.mem {
@@ -922,7 +931,8 @@ mod tests {
             claims(&ctx(&checks, scope.clone()).with_memory(book)),
             [
                 (StageId::TestCompile, 12 * GIB),
-                (StageId::Test, 0),
+                // Unmeasured, the test run claims cold: it runs binaries together.
+                (StageId::Test, 12 * GIB),
                 (StageId::Tippy, 12 * GIB),
                 (StageId::Formatting, 0),
             ]

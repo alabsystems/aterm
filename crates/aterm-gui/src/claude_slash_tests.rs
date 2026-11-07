@@ -1886,3 +1886,102 @@ fn the_slash_press_conforms_to_its_model() {
 /// The top rule's key, clicked: its ghost and Claude's tag.
 #[path = "claude_top_key_tests.rs"]
 mod top_key;
+
+/// A SLASH PRESS WAITS OUT INPUT QUEUED AHEAD OF ITS WRITES (third review of the turn-deadline
+/// work, 2026-11-06): while a job of the session's ordered egress is still queued (a report or
+/// a person's key on Windows, a paste draining), the press writes neither its rest nor its
+/// Enter, ahead of that input, and it does not end either: each is written at a later poll once
+/// the queue drained, within the press's deadline. NEGATIVE CONTROL: read as a busy sink, the
+/// queued input ended the press at its rest (`InputRejected`) or left the command typed at its
+/// Enter (`LeftTyped`).
+#[test]
+fn a_slash_press_waits_out_input_queued_ahead_of_its_writes() {
+    let (mut app, wid, session, mut reader) = idle();
+    let slash = Slash::TopEffort(true);
+    app.press_slash(wid, session, slash)
+        .expect("the press begins");
+    assert_eq!(pty(&mut reader, 1), b"/");
+    echo(&app, session, CARET, "/");
+    let sink = app.pool.get(session).expect("session").ctx.sink.clone();
+    let at = Instant::now();
+    sink.claim_ordered_egress();
+    app.advance_slash_presses(at);
+    assert!(
+        pty(&mut reader, 0).is_empty(),
+        "no rest overtakes the queued input"
+    );
+    assert_eq!(ended(&app, session), None, "the press waits at its rest");
+    sink.retire_ordered_egress();
+    app.advance_slash_presses(at);
+    assert_eq!(pty(&mut reader, rest(slash).len()), rest(slash));
+    echo(&app, session, CARET, &slash.text());
+    app.advance_slash_presses(at);
+    sink.claim_ordered_egress();
+    app.advance_slash_presses(at + QUIET);
+    assert!(
+        pty(&mut reader, 0).is_empty(),
+        "no Enter overtakes the queued input"
+    );
+    assert_eq!(ended(&app, session), None, "the press waits at its Enter");
+    sink.retire_ordered_egress();
+    app.advance_slash_presses(at + QUIET);
+    app.advance_slash_presses(at + QUIET + QUIET);
+    assert_eq!(
+        pty(&mut reader, 1),
+        b"\r",
+        "the Enter once the queue drained"
+    );
+    assert_eq!(stage(&app, session), Some(Stage::Entered));
+}
+
+/// A SLASH PRESS HELD BY INPUT THAT NEVER GOES ENDS AT ITS DEADLINE (fourth review of the
+/// turn-deadline work, 2026-11-06): a program that stopped reading leaves the queue standing, and
+/// the press waiting at its rest stops once its deadline passed (`InputQueued`), saying the `/` it
+/// left, so a later click is no `InFlight` and no rest is typed long after. NEGATIVE CONTROL: with
+/// no deadline on the wait, the press stands after its deadline.
+#[test]
+fn a_slash_press_held_by_input_that_never_goes_ends_at_its_deadline() {
+    let (mut app, wid, session, mut reader) = idle();
+    let slash = Slash::TopEffort(true);
+    app.press_slash(wid, session, slash)
+        .expect("the press begins");
+    assert_eq!(pty(&mut reader, 1), b"/");
+    echo(&app, session, CARET, "/");
+    let sink = app.pool.get(session).expect("session").ctx.sink.clone();
+    let at = Instant::now();
+    sink.claim_ordered_egress();
+    app.advance_slash_presses(at);
+    assert_eq!(ended(&app, session), None, "the press waits at its rest");
+    app.advance_slash_presses(at + ECHO);
+    assert_eq!(
+        ended(&app, session),
+        Some(SlashEnd::Stopped(SlashRefusal::InputQueued))
+    );
+    assert_eq!(
+        said(&app, wid, session).as_deref(),
+        Some("earlier input is still being sent to Claude; / is left in the composer")
+    );
+    assert!(pty(&mut reader, 0).is_empty(), "no rest was typed");
+    sink.retire_ordered_egress();
+}
+
+/// A SLASH PRESS BEHIND QUEUED INPUT TYPES NOTHING AND SAYS WHY (fifth review of the
+/// turn-deadline work, 2026-11-06): with a job of the session's ordered egress still queued, the
+/// press writes no probe `/` and is refused at once as `InputQueued`, saying nothing was typed.
+/// NEGATIVE CONTROL: read as a rejected write, it said "input was not accepted; try again".
+#[test]
+fn a_slash_press_behind_queued_input_types_nothing_and_says_why() {
+    let (mut app, wid, session, mut reader) = idle();
+    let sink = app.pool.get(session).expect("session").ctx.sink.clone();
+    sink.claim_ordered_egress();
+    assert_eq!(
+        app.press_slash(wid, session, Slash::TopEffort(true)),
+        Err(SlashRefusal::InputQueued)
+    );
+    assert_eq!(
+        said(&app, wid, session).as_deref(),
+        Some("earlier input is still being sent to Claude; nothing typed")
+    );
+    assert!(pty(&mut reader, 0).is_empty(), "no probe was typed");
+    sink.retire_ordered_egress();
+}

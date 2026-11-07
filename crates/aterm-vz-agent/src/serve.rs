@@ -238,16 +238,16 @@ struct Started {
 /// `execve` through its close-on-exec pipe, never as an exit status). As the lane user a
 /// refusal names the `cwd` with the program, since the root agent may see a directory the
 /// user cannot enter.
-fn not_started(exec: &Exec, identity: &Identity, e: &io::Error) -> String {
+fn not_started(exec: &Exec, switched_uid: Option<u32>, e: &io::Error) -> String {
     let program = String::from_utf8_lossy(exec.argv.first().map_or(&[][..], Vec::as_slice));
     let cwd = Path::new(OsStr::from_bytes(&exec.cwd));
-    match identity {
-        Identity::Keep if cwd.is_dir() => format!("{program}: {e}"),
-        Identity::Keep => format!("cwd {}: {e}", cwd.display()),
-        Identity::Switch { uid, .. } if cwd.is_dir() => {
+    match switched_uid {
+        None if cwd.is_dir() => format!("{program}: {e}"),
+        None => format!("cwd {}: {e}", cwd.display()),
+        Some(uid) if cwd.is_dir() => {
             format!("{program} in cwd {} (as uid {uid}): {e}", cwd.display())
         }
-        Identity::Switch { uid, .. } => format!("cwd {} (as uid {uid}): {e}", cwd.display()),
+        Some(uid) => format!("cwd {} (as uid {uid}): {e}", cwd.display()),
     }
 }
 
@@ -322,13 +322,19 @@ fn start(exec: &Exec, identity: Identity) -> Result<Started, String> {
         None
     };
     let cwd = OsStr::from_bytes(&exec.cwd);
+    let switched_uid = match &identity {
+        Identity::Keep => None,
+        Identity::Switch { uid, .. } => Some(*uid),
+    };
     match identity {
         Identity::Keep => {
             cmd.current_dir(cwd);
         }
-        Identity::Switch { .. } => switch_identity(&mut cmd, &identity, cwd)?,
+        Identity::Switch { .. } => switch_identity(&mut cmd, identity, cwd)?,
     }
-    let child = cmd.spawn().map_err(|e| not_started(exec, &identity, &e))?;
+    let child = cmd
+        .spawn()
+        .map_err(|e| not_started(exec, switched_uid, &e))?;
     // The command holds the merged pipe's write ends; only the child may keep them, so
     // the reader sees EOF when the command's side closes.
     drop(cmd);
@@ -342,10 +348,10 @@ fn start(exec: &Exec, identity: Identity) -> Result<Started, String> {
 #[cfg(target_os = "linux")]
 fn switch_identity(
     cmd: &mut impl std::os::unix::process::CommandExt,
-    identity: &Identity,
+    identity: Identity,
     cwd: &OsStr,
 ) -> Result<(), String> {
-    if let Identity::Switch { uid, gid, groups } = identity.clone() {
+    if let Identity::Switch { uid, gid, groups } = identity {
         let dir = std::ffi::CString::new(cwd.as_bytes())
             .map_err(|_| format!("cwd {}: holds a NUL byte", cwd.to_string_lossy()))?;
         // SAFETY: the hook runs in the forked child before its exec and calls only
@@ -363,7 +369,7 @@ fn switch_identity(
 
 /// Off Linux only [`Identity::Keep`] runs: the identity switch is the guest's.
 #[cfg(not(target_os = "linux"))]
-fn switch_identity(_cmd: &mut impl Sized, identity: &Identity, _cwd: &OsStr) -> Result<(), String> {
+fn switch_identity(_cmd: &mut impl Sized, identity: Identity, _cwd: &OsStr) -> Result<(), String> {
     match identity {
         Identity::Keep => Ok(()),
         Identity::Switch { .. } => Err("the identity switch runs only in the Linux guest".into()),

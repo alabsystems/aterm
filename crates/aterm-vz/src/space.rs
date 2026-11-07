@@ -59,7 +59,7 @@ fn resolved(path: &Path) -> std::path::PathBuf {
         }
         match (at.parent(), at.file_name()) {
             (Some(parent), Some(name)) => {
-                rest.push(name.to_os_string());
+                rest.push(name);
                 at = parent;
             }
             _ => return path.to_path_buf(),

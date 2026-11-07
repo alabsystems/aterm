@@ -1251,23 +1251,19 @@ mod tests {
     }
     #[test]
     fn only_foreground_waiters_outside_the_sample_and_every_release_preempt_a_stage() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let ledger = aterm_capacity::Ledger::at(dir.path());
-        let claim = aterm_capacity::admit_with(
-            &ledger,
-            &aterm_capacity::Live,
-            aterm_capacity::Need::new("fixture"),
-            aterm_capacity::Admit::Wait,
-            aterm_capacity::Pace::default(),
-            &mut |_| {},
-        )
-        .unwrap();
-        let mut row = claim.record().clone();
-        // An ordinary waiter whatever runs this test: `Live` admits a need at Release rank
-        // inside a release run (`ATERM_RELEASE_RUN`), and every release preempts a stage.
-        row.need.rank = aterm_capacity::Rank::Ordinary;
-        row.checkout = "/sample".into();
-        row.held = None;
+        let mut row = aterm_capacity::Record {
+            accounting: aterm_capacity::Accounting::Holder,
+            pid: 1,
+            start_ms: 1,
+            seq: 0,
+            checkout: "/sample".into(),
+            need: aterm_capacity::Need::new("fixture"),
+            timing: aterm_capacity::TimingEvidence::default(),
+            held: None,
+            credit: Vec::new(),
+            wrote: None,
+            next_ms: None,
+        };
         assert!(!stage_should_yield(
             Path::new("/sample"),
             std::slice::from_ref(&row)
@@ -1277,7 +1273,11 @@ mod tests {
             Path::new("/sample"),
             std::slice::from_ref(&row)
         ));
-        row.held = claim.record().held;
+        row.held = Some(aterm_capacity::Held {
+            admitted_ms: 1,
+            cores: 0,
+            alone: false,
+        });
         assert!(!stage_should_yield(
             Path::new("/sample"),
             std::slice::from_ref(&row)

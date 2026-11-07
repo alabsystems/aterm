@@ -133,7 +133,12 @@ fn serve_connection_mode(
     // The production lane establishes blocking mode before authentication too.
     stream.set_nonblocking(false)?;
     stream.set_write_timeout(Some(MUST_HAPPEN))?;
-    let _connection = ConnectionScope::enter(&context.store, &context.proxy, &stream);
+    let _connection = ConnectionScope::enter(
+        &context.store,
+        &context.proxy,
+        &stream,
+        &context.account_services.source_registry,
+    );
     let _direct = DirectPeer::enter();
     let mut unread = control_lanes::Unread::default();
     let mut reader = control_lanes::LaneReader::new(&stream, &mut unread);
@@ -296,6 +301,18 @@ fn accept_until(listener: &CtlListener, deadline: Instant) -> io::Result<CtlStre
     }
 }
 
+// These are protocol nonces and a document digest, not credential material.
+fn private_credential_requests(sid: &str) -> [String; 2] {
+    let operation = "01".repeat(16);
+    let digest = "a".repeat(64);
+    [
+        format!("@{sid} codex-auth source operation={operation}"),
+        format!(
+            "@{sid} codex-auth refresh slot=6162 operation={operation} expected_digest={digest}"
+        ),
+    ]
+}
+
 fn observe_policy(
     socket: &str,
     sid: &str,
@@ -311,7 +328,10 @@ fn observe_policy(
         format!(
             "@{sid} codex-accounts-change enrollment-poll schema=1 operation=0123456789abcdef0123456789abcdef"
         ),
-    ] {
+    ]
+    .into_iter()
+    .chain(private_credential_requests(sid))
+    {
         let mut wrong = aterm_agent::RelayClient::connect_local(socket, "invalid-fixture-token")?
             .bounded(MUST_HAPPEN);
         if !matches!(wrong.request_line(&request).as_deref(), Ok("ERR auth")) {
@@ -344,6 +364,13 @@ fn observe_policy(
         if ordinary.request_line(&request)? != expected {
             return Err(failure(
                 "authenticated non-Codex peer gained enrollment authority",
+            ));
+        }
+    }
+    for request in private_credential_requests(sid) {
+        if ordinary.request_line(&request)? != "ERR codex-auth denied" {
+            return Err(failure(
+                "authenticated non-Codex peer gained private credential access",
             ));
         }
     }
@@ -384,6 +411,13 @@ fn observe_policy(
         }
     }
     // Dropping the actual connector supplies EOF to the real connection guard.
+    for request in private_credential_requests(sid) {
+        if client.request_line(&request)? != "ERR codex-auth denied" {
+            return Err(failure(
+                "beside-token harness gained private credential access",
+            ));
+        }
+    }
     drop(client);
     Ok(())
 }
@@ -482,6 +516,7 @@ fn run_native_host_fixture_inner(
         store,
         proxy: event_loop.create_proxy(),
         account_services: AccountServices {
+            source_registry: Arc::new(Default::default()),
             lifetime: Default::default(),
             interactive_browser: false,
         },
@@ -494,7 +529,7 @@ fn run_native_host_fixture_inner(
     let worker = std::thread::Builder::new()
         .name("native-host-fixture".into())
         .spawn(move || {
-            for expected_authenticated in [false, false, false, false, true, true] {
+            for expected_authenticated in [false, false, false, false, false, false, true, true] {
                 let stream = accept_until(&listener, Instant::now() + MUST_HAPPEN)?;
                 if serve_connection(&context, stream)? != expected_authenticated {
                     return Err(failure("fixture peer authentication differed"));

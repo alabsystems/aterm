@@ -261,66 +261,6 @@ fn a_title_read_before_an_update_commits_is_kept() {
 }
 
 #[test]
-fn the_nickname_alert_reads_change_cancel_and_the_random_noun_from_its_response() {
-    use crate::appkit::consts::{
-        NS_ALERT_FIRST_BUTTON_RETURN, NS_ALERT_SECOND_BUTTON_RETURN, NS_ALERT_THIRD_BUTTON_RETURN,
-    };
-    assert_eq!(NICK_BUTTONS, ["Change", "Cancel", "New Random Noun"]);
-    assert_eq!(
-        nick_answer(NS_ALERT_FIRST_BUTTON_RETURN, || "Kestrel".to_owned()),
-        NickAnswer::Typed("Kestrel".to_owned())
-    );
-    let unread = || -> String { panic!("only Change reads the field") };
-    assert_eq!(
-        nick_answer(NS_ALERT_SECOND_BUTTON_RETURN, unread),
-        NickAnswer::Cancel
-    );
-    assert_eq!(
-        nick_answer(NS_ALERT_THIRD_BUTTON_RETURN, unread),
-        NickAnswer::Random
-    );
-    // `NSModalResponseAbort`: a modal session ended by something other than a button.
-    assert_eq!(nick_answer(-1001, unread), NickAnswer::Cancel);
-}
-
-#[test]
-fn a_typed_nickname_is_trimmed_and_a_word_that_is_none_is_refused_by_name() {
-    let typed = |text: &str| NickAnswer::Typed(text.to_owned());
-    assert!(matches!(
-        nick_to(&typed("  Kestrel \n"), "heron"),
-        Ok(Some(NickTo::Word(nick))) if nick.as_str() == "Kestrel"
-    ));
-    assert!(matches!(
-        nick_to(&NickAnswer::Random, "heron"),
-        Ok(Some(NickTo::Random))
-    ));
-    assert!(matches!(nick_to(&NickAnswer::Cancel, "heron"), Ok(None)));
-    assert_eq!(
-        nick_to(&typed("   "), "heron").err().as_deref(),
-        Some("Type a nickname first.")
-    );
-    let refused = nick_to(&typed("m12"), "heron").expect_err("a number shape is no nickname");
-    assert!(
-        refused.starts_with("\u{201c}m12\u{201d} is no nickname: ") && refused.ends_with('.'),
-        "{refused}"
-    );
-}
-
-#[test]
-fn an_untouched_field_changes_nothing_but_another_case_is_a_change() {
-    let typed = |text: &str| NickAnswer::Typed(text.to_owned());
-    assert!(
-        matches!(nick_to(&typed("heron"), "heron"), Ok(None)),
-        "the held word typed back is no change, so a drawn noun stays drawn"
-    );
-    assert!(matches!(nick_to(&typed(" heron "), "heron"), Ok(None)));
-    assert!(matches!(
-        nick_to(&typed("Heron"), "heron"),
-        Ok(Some(NickTo::Word(nick))) if nick.as_str() == "Heron"
-    ));
-}
-
-#[test]
 fn the_view_starts_the_field_at_the_stored_word_not_the_title_s_form() {
     let root = state();
     let dir = root.path();
@@ -338,45 +278,11 @@ fn the_view_starts_the_field_at_the_stored_word_not_the_title_s_form() {
 }
 
 #[test]
-fn the_alert_names_the_number_and_puts_the_last_refusal_first() {
-    let body = nickname_alert_body(&view("m8", "Heron", true), None);
-    assert!(body.contains("beside its number, m8."), "{body}");
-    assert!(body.contains("random noun"), "{body}");
-    let again = nickname_alert_body(&view("m8", "Heron", true), Some("Type a nickname first."));
-    assert_eq!(again, format!("Type a nickname first.\n\n{body}"));
-}
-
-#[test]
-fn a_nickname_change_is_refused_to_a_gesture_the_person_did_not_make_and_before_a_read() {
-    let mut app = crate::App::headless_for_test();
-    app.machine_view = Some(view("m8", "Heron", true));
-    for mark in 0..3 {
-        app.agents.controller_gesture = mark == 0;
-        app.agents.assistive_gesture = mark == 1;
-        app.agents.relayed_gesture = mark == 2;
-        app.change_nickname();
-        assert_eq!(
-            app.pending_action_refusal.take().as_deref(),
-            Some(NICK_PERSON_ONLY),
-            "mark {mark}"
-        );
-    }
-    app.agents.relayed_gesture = false;
-    app.machine_view = None;
-    app.change_nickname();
-    assert_eq!(
-        app.pending_action_refusal.take().as_deref(),
-        Some(NICK_UNREAD)
-    );
-}
-
-#[test]
 fn a_failed_set_is_kept_for_the_next_press_unless_a_later_press_superseded_it() {
     let mut app = crate::App::headless_for_test();
     let unset = |generation| NameUnset {
         generation,
         asked: Asked {
-            kind: EditKind::Nickname,
             number: None,
             nick: Some("Kestrel".to_owned()),
         },
@@ -392,56 +298,21 @@ fn a_failed_set_is_kept_for_the_next_press_unless_a_later_press_superseded_it() 
     assert_eq!(app.machine_unset, Some(unset(2)));
 }
 
-/// Rename sets a nickname alone as Change Nickname… does and another number as `aterm name set`
-/// does; fields that ask for nothing set nothing.
-#[test]
-fn rename_writes_what_its_fields_ask() {
-    use crate::machine_rename_sheet::RenameTo;
-    assert!(rename_change(RenameTo::Keep).is_none());
-    let word = Nickname::parse("Puffin").expect("a nickname");
-    assert!(matches!(
-        rename_change(RenameTo::Nick(word.clone())),
-        Some(NameChange::Nickname(NickTo::Word(set))) if set == word
-    ));
-    let to = NameTo {
-        num: Number::new(86).expect("a number"),
-        nick: Some(word),
-    };
-    assert!(matches!(
-        rename_change(RenameTo::Name(to.clone())),
-        Some(NameChange::Name(set)) if set == to
-    ));
-}
-
-/// A set that fails keeps what its press typed, field by field, for the next press of the same
-/// menu row, which takes it; a press of the other row leaves it for its own.
-#[test]
-fn a_failed_set_refills_the_next_press_of_its_own_row() {
-    let asked = Asked {
-        kind: EditKind::Name,
-        number: Some("m86".to_owned()),
-        nick: None,
-    };
-    let failed = unset_of(3, &asked, "the vault is busy");
-    assert_eq!(failed.why, "The name was not changed: the vault is busy.");
-    assert_eq!(failed.asked, asked);
-    let mut kept = Some(failed.clone());
-    assert_eq!(unset_for(&mut kept, EditKind::Nickname), None);
-    assert_eq!(kept.as_ref(), Some(&failed), "left for Rename");
-    assert_eq!(unset_for(&mut kept, EditKind::Name), Some(failed));
-    assert_eq!(kept, None, "taken");
-}
-
 #[test]
 fn a_machine_rename_refuses_a_gesture_the_person_did_not_make() {
     let mut app = crate::App::headless_for_test();
     app.machine_view = Some(view("m184", "Linnet", true));
-    app.agents.controller_gesture = true;
-    app.rename_machine();
-    assert_eq!(
-        app.pending_action_refusal.take().as_deref(),
-        Some(NAME_PERSON_ONLY)
-    );
+    for mark in 0..3 {
+        app.agents.controller_gesture = mark == 0;
+        app.agents.assistive_gesture = mark == 1;
+        app.agents.relayed_gesture = mark == 2;
+        app.rename_machine();
+        assert_eq!(
+            app.pending_action_refusal.take().as_deref(),
+            Some(NAME_PERSON_ONLY),
+            "mark {mark}"
+        );
+    }
     assert_eq!(app.machine_sets, 0);
 }
 
@@ -474,7 +345,6 @@ fn the_writer_applies_number_and_nickname_requests_in_submission_order() {
             to,
             generation: u64::try_from(generation).expect("a generation"),
             asked: Asked {
-                kind: EditKind::Name,
                 number: None,
                 nick: None,
             },
@@ -503,6 +373,9 @@ fn the_writer_applies_number_and_nickname_requests_in_submission_order() {
                 set_nick(root.path(), &to, ByKind::Person, || Ok(None), stamp, false)
                     .expect("sets a nickname")
                     .name
+            }
+            NameChange::Synchronize(_) => {
+                unreachable!("this writer-order fixture queues edits only")
             }
         };
         applied.push((job.generation, name.title(), name.rev));

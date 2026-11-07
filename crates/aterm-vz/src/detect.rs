@@ -142,16 +142,35 @@ impl Watch {
 
     /// A `Booting` frame naming `jobs` arrived at `now`.
     pub fn booting(&mut self, jobs: &[Job], now: Duration) {
-        let key = job_key_refs(jobs);
-        if !job_key_matches(&self.jobs_key, &key) {
-            self.jobs_key = key
-                .into_iter()
-                .map(|(id, u, s)| (id, u.to_owned(), s.to_owned()))
-                .collect();
-            self.jobs_since = now;
+        let sorted_match = self.jobs_key.len() == jobs.len()
+            && jobs.windows(2).all(|w| w[0].id <= w[1].id)
+            && self
+                .jobs_key
+                .iter()
+                .zip(jobs)
+                .all(|((id, u, s), j)| *id == j.id && u == &j.unit && s == &j.state);
+        if !sorted_match {
+            let key = job_key_refs(jobs);
+            if !job_key_matches(&self.jobs_key, &key) {
+                self.jobs_key = key
+                    .into_iter()
+                    .map(|(id, u, s)| (id, u.to_owned(), s.to_owned()))
+                    .collect();
+                self.jobs_since = now;
+            }
         }
-        self.jobs.clear();
-        self.jobs.extend_from_slice(jobs);
+        if self.jobs.len() == jobs.len() {
+            for (dst, src) in self.jobs.iter_mut().zip(jobs) {
+                dst.id = src.id;
+                dst.unit.clone_from(&src.unit);
+                dst.kind.clone_from(&src.kind);
+                dst.state.clone_from(&src.state);
+                dst.elapsed_ms = src.elapsed_ms;
+            }
+        } else {
+            self.jobs.clear();
+            self.jobs.extend_from_slice(jobs);
+        }
     }
 
     /// The agent said `Ready` at `now`.

@@ -1555,6 +1555,58 @@ impl<'a> Deck<'a> {
         }
     }
 
+    /// An event's cap pip, the rounded square `(x, y, w, h)` whose bottom row is the axis rail's
+    /// (the second review of the R3 lens fixes, 2026-11-06): it stands up from the rail, as a
+    /// gap's notch does, and its px on the rail's row are drawn only on the rail's `pieces`
+    /// ([`Self::rail_pieces`]), so over row 0's cap, where the rail breaks at 1×, the pip keeps
+    /// the break's device px of ground over the cap, and at 2× the ground row under the rail stays
+    /// ground. Where the rail stands under all of it the pip is one panel; elsewhere each part is
+    /// the same panel under a clip, so the pip keeps its corners.
+    fn pip(&mut self, (x, y, w, h): Rect, pieces: &[(f32, f32)], radius: f32, ink: Rgb) {
+        if !self.draw || w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        let fill = rgba(ink, 0xFF);
+        let rail_y = y + h - 1.0;
+        if pieces.iter().any(|&(a, b)| a <= x && x + w <= b) {
+            self.p.prims.push(panel(x, y, w, h, radius, fill));
+            return;
+        }
+        let above = (h > 1.0).then_some((x, y, w, h - 1.0));
+        let feet = pieces.iter().filter_map(|&(a, b)| {
+            let (a, b) = (a.max(x), b.min(x + w));
+            (b > a).then_some((a, rail_y, b - a, 1.0))
+        });
+        for (cx, cy, cw, ch) in above.into_iter().chain(feet) {
+            self.p.prims.push(DrawPrim::ClipPush {
+                x: cx,
+                y: cy,
+                w: cw,
+                h: ch,
+            });
+            self.p.prims.push(panel(x, y, w, h, radius, fill));
+            self.p.prims.push(DrawPrim::ClipPop);
+        }
+    }
+
+    /// The column a time gap's notch stands in, from `end`, its end's column (the span's first
+    /// column at its newer end, where `newer` holds, and its last at its older end): `end` itself
+    /// where no pip stands within a device px of it, else the first column inward, toward the
+    /// span's other end, with a device px of ground between it and every pip, each `w` px wide
+    /// from its left px in `pips` (the second review's own review, 2026-11-06). Vitals sets an
+    /// aterm crash and its restart at a crash gap's two ends and a wake at a sleep gap's newer
+    /// end, and a pip stands up from the rail as tall as a notch, so on the end itself the pip
+    /// would hide its notch.
+    fn notch_column(end: f32, newer: bool, pips: &[f32], w: f32) -> f32 {
+        let mut c = end;
+        // Each step passes one pip, never to meet it again, so this ends within `pips.len()`
+        // steps.
+        while let Some(&a) = pips.iter().find(|&&a| a - 1.0 <= c && c < a + w + 1.0) {
+            c = if newer { a + w + 1.0 } else { a - 2.0 };
+        }
+        c
+    }
+
     /// The device-px span `x0..x1` `strip`'s fine band stands in at rest
     /// ([`fine_band_slots`]): from its newest box's left edge to its oldest's right edge.
     fn fine_band_span(&self, strip: &Strip) -> Option<(f32, f32)> {
@@ -1632,7 +1684,10 @@ impl<'a> Deck<'a> {
     /// breaks and drops exactly where they do: the R3 lens fixes' review, 2026-11-06) and whose
     /// notches stand on that span of the rail, their foot its px (that review's own review), and
     /// vertical event marker lines + cap pips for [`StripEvent`]s (`Crash`, `Restart`,
-    /// `SleepWake`, `PressureSpike`).
+    /// `SleepWake`, `PressureSpike`), each pip standing up from the rail, its foot the rail's px
+    /// ([`Self::pip`]; the second review, 2026-11-06). The events are placed first, so a notch
+    /// an event's pip would stand on steps inward clear of it ([`Self::notch_column`]; the second
+    /// review's own review, 2026-11-06).
     fn strip_axis_and_events(
         &mut self,
         strip: &Strip,
@@ -1660,6 +1715,41 @@ impl<'a> Deck<'a> {
             return;
         };
         let horizon = strip.spec.horizon_ms();
+        // Each event's pip and line, `(pip's left px, line's left px, kind)`, placed before the
+        // gaps are drawn, so a gap's notch can stand clear of every pip.
+        let mut events: Vec<&StripEvent> = words
+            .strip_events
+            .iter()
+            .filter(|ev| ev.at_unix_ms <= now_ms && now_ms - ev.at_unix_ms <= horizon)
+            .collect();
+        // Highest-severity events first (Crash > Restart > PressureSpike > SleepWake), then newest.
+        events.sort_by(|a, b| {
+            b.kind
+                .cmp(&a.kind)
+                .then_with(|| b.at_unix_ms.cmp(&a.at_unix_ms))
+        });
+        let mut drawn_xs: Vec<i32> = Vec::with_capacity(6);
+        let lw = (0.85 * self.s).round().max(1.0) as f32;
+        let pip = (2.2 * self.s).round().max(2.0) as f32;
+        let mut marks: Vec<(f32, f32, StripEventKind)> = Vec::with_capacity(6);
+        for ev in events {
+            if drawn_xs.len() >= 6 {
+                break;
+            }
+            let Some(x_pt) = strip.x_at_age_ms(now_ms - ev.at_unix_ms) else {
+                continue;
+            };
+            let ex = (x_pt * self.s) as f32;
+            let bucket_px = ex.round() as i32;
+            if drawn_xs.iter().any(|&px| (px - bucket_px).abs() <= 1) {
+                continue;
+            }
+            drawn_xs.push(bucket_px);
+            let lx = (ex - lw / 2.0).round().clamp(x0, (x1 - lw).max(x0));
+            let px_pip = (ex - pip / 2.0).round().clamp(x0, (x1 - pip).max(x0));
+            marks.push((px_pip, lx, ev.kind));
+        }
+        let pips: Vec<f32> = marks.iter().map(|m| m.0).collect();
         for gap in words.time_gaps.iter().rev().take(4) {
             if gap.end_ms <= now_ms - horizon || gap.start_ms >= now_ms {
                 continue;
@@ -1681,53 +1771,34 @@ impl<'a> Deck<'a> {
                 self.rail(&pieces, (gx0, gx1), y_axis, gink);
                 // Each end's notch stands up from the rail's row; its foot on that row is the gap's
                 // own rail, just drawn, so where the rail breaks over a cap the notch does too and
-                // keeps a device px of ground over the cap.
+                // keeps a device px of ground over the cap. Where an event's pip stands on an end
+                // or within a device px of its notch, the notch steps inward, clear of the pip
+                // ([`Self::notch_column`]).
                 let nh = (2.0 * self.s as f32).round().max(2.0);
-                self.rect((gx0, y_axis + 1.0 - nh, 1.0, nh - 1.0), 0.0, gink);
-                if gx1 - gx0 >= 2.0 {
-                    self.rect((gx1 - 1.0, y_axis + 1.0 - nh, 1.0, nh - 1.0), 0.0, gink);
+                let newer = Self::notch_column(gx0, true, &pips, pip);
+                let older =
+                    (gx1 - gx0 >= 2.0).then(|| Self::notch_column(gx1 - 1.0, false, &pips, pip));
+                for c in [Some(newer), older.filter(|&c| c != newer)]
+                    .into_iter()
+                    .flatten()
+                {
+                    if gx0 <= c && c < gx1 {
+                        self.rect((c, y_axis + 1.0 - nh, 1.0, nh - 1.0), 0.0, gink);
+                    }
                 }
             }
         }
-        if words.strip_events.is_empty() {
+        if marks.is_empty() {
             return;
         }
-        let spans = Self::strip_spans(y0, last, holes);
-        let mut events: Vec<&StripEvent> = words
-            .strip_events
-            .iter()
-            .filter(|ev| ev.at_unix_ms <= now_ms && now_ms - ev.at_unix_ms <= horizon)
-            .collect();
-        // Highest-severity events first (Crash > Restart > PressureSpike > SleepWake), then newest.
-        events.sort_by(|a, b| {
-            b.kind
-                .cmp(&a.kind)
-                .then_with(|| b.at_unix_ms.cmp(&a.at_unix_ms))
-        });
-        let mut drawn_xs: Vec<i32> = Vec::with_capacity(6);
-        let lw = (0.85 * self.s).round().max(1.0) as f32;
-        let mut lines: Vec<(f32, StripEventKind)> = Vec::with_capacity(6);
-        for ev in events {
-            if drawn_xs.len() >= 6 {
-                break;
-            }
-            let Some(x_pt) = strip.x_at_age_ms(now_ms - ev.at_unix_ms) else {
-                continue;
-            };
-            let ex = (x_pt * self.s) as f32;
-            let bucket_px = ex.round() as i32;
-            if drawn_xs.iter().any(|&px| (px - bucket_px).abs() <= 1) {
-                continue;
-            }
-            drawn_xs.push(bucket_px);
-            let ev_ink = self.event_ink(ev.kind);
-            let lx = (ex - lw / 2.0).round().clamp(x0, (x1 - lw).max(x0));
-            let pip = (2.2 * self.s).round().max(2.0) as f32;
-            let px_pip = (ex - pip / 2.0).round().clamp(x0, (x1 - pip).max(x0));
-            let py_pip = (y_axis + 0.5 - pip / 2.0).round().max(0.0);
-            self.rect((px_pip, py_pip, pip, pip), (0.5 * self.s) as f32, ev_ink);
-            lines.push((lx, ev.kind));
+        for &(px_pip, _, kind) in &marks {
+            let pip_rect = (px_pip, y_axis + 1.0 - pip, pip, pip);
+            let ev_ink = self.event_ink(kind);
+            self.pip(pip_rect, &pieces, (0.5 * self.s) as f32, ev_ink);
         }
+        let lines: Vec<(f32, StripEventKind)> =
+            marks.iter().map(|&(_, lx, kind)| (lx, kind)).collect();
+        let spans = Self::strip_spans(y0, last, holes);
         let rows: Vec<(f32, f32)> = spans
             .iter()
             .map(|&(a, b)| (self.px(a), self.px(b)))

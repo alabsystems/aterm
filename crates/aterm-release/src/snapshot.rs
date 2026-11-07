@@ -394,11 +394,12 @@ pub(crate) fn git_text(dir: &Path, args: &[&str]) -> Result<String, String> {
         .map_err(|e| format!("git {} printed non-UTF-8: {e}", args.join(" ")))
 }
 
-fn object_id(kind: &str, data: &[u8], hex_digits: usize) -> Option<String> {
-    let algorithm = match hex_digits {
+fn object_id_matches(kind: &str, data: &[u8], oid: &str) -> bool {
+    const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
+    let algorithm = match oid.len() {
         40 => &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
         64 => &ring::digest::SHA256,
-        _ => return None,
+        _ => return false,
     };
     let mut hash = ring::digest::Context::new(algorithm);
     hash.update(kind.as_bytes());
@@ -408,7 +409,12 @@ fn object_id(kind: &str, data: &[u8], hex_digits: usize) -> Option<String> {
     let tail_len = cursor.position() as usize;
     hash.update(&header_tail[..tail_len]);
     hash.update(data);
-    Some(aterm_codec::hex::encode_lower(hash.finish().as_ref()))
+    let digest = hash.finish();
+    let expected = oid.as_bytes();
+    digest.as_ref().iter().enumerate().all(|(i, &b)| {
+        expected.get(i * 2) == Some(&HEX_LOWER[(b >> 4) as usize])
+            && expected.get(i * 2 + 1) == Some(&HEX_LOWER[(b & 0x0f) as usize])
+    })
 }
 
 struct ObjectReader {
@@ -416,6 +422,7 @@ struct ObjectReader {
     child: aterm_uds::spawnfd::Child,
     stdin: Option<std::process::ChildStdin>,
     stdout: BufReader<std::process::ChildStdout>,
+    header: Vec<u8>,
 }
 
 impl ObjectReader {
@@ -437,6 +444,7 @@ impl ObjectReader {
             child,
             stdin: Some(stdin),
             stdout: BufReader::new(stdout),
+            header: Vec::with_capacity(128),
         })
     }
 
@@ -459,20 +467,21 @@ impl ObjectReader {
         }
         let stdin = self.stdin.as_mut().ok_or("git cat-file is closed")?;
         stdin
-            .write_all(format!("{oid}\n").as_bytes())
+            .write_all(oid.as_bytes())
+            .and_then(|()| stdin.write_all(b"\n"))
             .and_then(|()| stdin.flush())
             .map_err(|e| format!("ask git cat-file in {dir} for {oid}: {e}"))?;
-        let mut header = Vec::new();
+        self.header.clear();
         (&mut self.stdout)
             .take(MAX_HEADER_BYTES)
-            .read_until(b'\n', &mut header)
+            .read_until(b'\n', &mut self.header)
             .map_err(|e| format!("read git cat-file in {dir}: {e}"))?;
-        if !header.ends_with(b"\n") {
+        if !self.header.ends_with(b"\n") {
             return Err(format!(
                 "git cat-file in {dir} answered a truncated or oversized header for {oid}"
             ));
         }
-        let line = String::from_utf8_lossy(&header);
+        let line = String::from_utf8_lossy(&self.header);
         let line = line.trim_end_matches('\n');
         let mut words = line.split(' ');
         let (Some(echo), Some(seen), Some(size), None) =
@@ -500,7 +509,7 @@ impl ObjectReader {
         if data.pop() != Some(b'\n') || data.len() as u64 != size {
             return Err(format!("git cat-file in {dir} cut the {kind} {oid} short"));
         }
-        if object_id(kind, &data, oid.len()).as_deref() != Some(oid) {
+        if !object_id_matches(kind, &data, oid) {
             return Err(format!(
                 "the object store of {dir} answered the {kind} {oid} with bytes that are not \
                  that object (a corrupted or substituted object)"
@@ -809,7 +818,7 @@ fn read_blobs(repos: &[PathBuf], entries: &[TreeEntry], sync: &mut Syncer) -> Re
                     result = Err(format!("read blob {}: cut short", entry.oid));
                     break;
                 }
-                if object_id("blob", &data, entry.oid.len()).as_deref() != Some(&entry.oid) {
+                if !object_id_matches("blob", &data, &entry.oid) {
                     result = Err(format!(
                         "the object store of {} answered {} with bytes that are not that \
                          object (a corrupted or substituted object): refusing {}",
@@ -916,9 +925,8 @@ impl Syncer {
         let same = match &existing {
             Some(meta) if meta.file_type().is_file() => {
                 meta.len() == data.len() as u64
-                    && crate::durable::read_file(&full)
+                    && crate::durable::regular_file_equals(&full, data)
                         .map_err(|e| format!("read {}: {e}", full.display()))?
-                        == data
                     && {
                         set_mode(&full, meta, exec)?;
                         true
@@ -1294,9 +1302,9 @@ fn cached_archives<'a>(
         let index_path = index.path();
         for (krate, file_name) in &crate_files {
             let archive = index_path.join(file_name);
-            match crate::durable::read_file(&archive) {
-                Ok(bytes) => {
-                    let matches = sha256_hex(&bytes) == krate.checksum;
+            match crate::durable::sha256_file_with_meta(&archive) {
+                Ok((sha, _)) => {
+                    let matches = sha == krate.checksum;
                     found.push((*krate, archive, matches));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1574,9 +1582,8 @@ fn listing(root: &Path) -> Result<Listing, String> {
                 line.extend_from_slice(&path_bytes(&target));
                 line
             } else if ft.is_file() {
-                let (bytes, meta) = crate::durable::read_file_with_meta(&path)
+                let (sha, meta) = crate::durable::sha256_file_with_meta(&path)
                     .map_err(|e| format!("read {}: {e}", path.display()))?;
-                let sha = sha256_hex(&bytes);
                 format!("file\0{:o}\0{sha}", file_mode(&meta)).into_bytes()
             } else {
                 return Err(format!(
@@ -1599,10 +1606,6 @@ fn file_mode(meta: &fs::Metadata) -> u32 {
 #[cfg(not(unix))]
 fn file_mode(_meta: &fs::Metadata) -> u32 {
     0o644
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(bytes))
 }
 
 fn digest_of(listing: &Listing) -> String {

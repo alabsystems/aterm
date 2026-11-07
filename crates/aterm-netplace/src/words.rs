@@ -135,18 +135,25 @@ pub fn internet_short(place: &Place) -> &'static str {
 #[must_use]
 pub fn internet_long(place: &Place, words: &Words<'_>) -> String {
     let endpoint = place.internet.endpoint.as_deref().unwrap_or("the API");
-    let at = place
-        .internet
-        .at_ms
-        .map(|ms| words.clock(ms))
-        .unwrap_or_default();
+    let at = || {
+        place
+            .internet
+            .at_ms
+            .map(|ms| words.clock(ms))
+            .unwrap_or_default()
+    };
     match (place.internet.state, place.internet.source) {
         (InternetState::Ok, InternetSource::TurnReply) => {
-            format!("internet ok (a session's turn got a reply from {endpoint} at {at})")
+            format!(
+                "internet ok (a session's turn got a reply from {endpoint} at {})",
+                at()
+            )
         }
-        (InternetState::Ok, _) => format!("internet ok ({endpoint} answered {at})"),
+        (InternetState::Ok, _) => format!("internet ok ({endpoint} answered {})", at()),
         (InternetState::Down, InternetSource::Path) => "internet down (no network path)".to_owned(),
-        (InternetState::Down, _) => format!("internet down ({endpoint} did not answer at {at})"),
+        (InternetState::Down, _) => {
+            format!("internet down ({endpoint} did not answer at {})", at())
+        }
         (InternetState::PathUp, _) => "internet path up, not measured on this network".to_owned(),
         (InternetState::Unknown, _) => "internet unknown (nothing measures it here)".to_owned(),
     }

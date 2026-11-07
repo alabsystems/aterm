@@ -967,6 +967,133 @@ fn the_traffic_line_names_the_busier_direction_with_no_capacity_known() {
     );
 }
 
+/// The Network lens's Traffic line, folded to its one line where "↓ … · ↑ …" does not fit, names
+/// the busier direction with its arrow and its live rate (the second review of the R3 lens fixes,
+/// 2026-11-06): the direction that binds, by the larger share of its own capacity, as the deck
+/// row's arrow, the Now line and the throughput trace beside it take it, not the larger raw rate.
+/// Peak basis on asymmetric links, each direction binding in turn, once with the larger raw rate
+/// and once with the smaller (the second review's own review, 2026-11-06): the binding direction's
+/// 4 MB/s of its 5 MB/s peak (80 %) beside the other's 10 of its 50 (20 %), and its 40 of 50
+/// (80 %) beside the other's 1 of 5 (20 %). Laid at every lens size from 160 to 320 pt wide, where
+/// the line takes its full form at some and its short form at others. NEGATIVE CONTROLS: the
+/// larger raw rate (`rx.max(tx)`, as main drew it) says "10 MB/s" beside a trace that ends at
+/// sending's 4.0; sending's arrow always, as one scene where sending binds could not tell from the
+/// rule, says "↑ 10 MB/s" where receiving's 4.0 binds; the smaller raw rate's direction says
+/// "↑ 1.0 MB/s" where receiving's 40 binds.
+#[test]
+fn the_traffic_lines_short_form_names_the_busier_direction() {
+    let n = aterm_vitals::ring::RING_BUCKETS;
+    let cell = |v: f64| Cell {
+        mean: Some(v),
+        max: Some(v),
+        n: 1.0,
+        over_n: 0.0,
+    };
+    let m = FaceMetrics::helvetica_neue();
+    // `(rx, tx, rx_cap, tx_cap)`, B/s.
+    let links = [
+        (10e6, 4e6, 50e6, 5e6),
+        (4e6, 10e6, 5e6, 50e6),
+        (40e6, 1e6, 50e6, 5e6),
+        (1e6, 40e6, 5e6, 50e6),
+    ];
+    for (rx, tx, rx_cap, tx_cap) in links {
+        let mut snap = lens_scene(Scene::Calm);
+        let sending = tx / tx_cap > rx / rx_cap;
+        let view = &mut snap.resources[Resource::Network.index()];
+        view.basis = aterm_vitals::model::CapBasis::Peak;
+        view.capacity = Some(rx_cap);
+        view.now = Some(rx);
+        view.heat_now = Some((tx / tx_cap).max(rx / rx_cap) as f32);
+        view.ring = (0..n).map(|_| cell(rx)).collect();
+        view.second = Some(aterm_vitals::model::Series {
+            now: Some(tx),
+            capacity: Some(tx_cap),
+            ring: (0..n).map(|_| cell(tx)).collect(),
+            long: Arc::from([]),
+            recent: Arc::from([]),
+            // `ResourceView::of`'s rule: the larger share binds.
+            binds: sending,
+        });
+        snap.net = Some(aterm_vitals::NetView {
+            rates: Some(aterm_vitals::LinkRates {
+                rx_bps: rx,
+                tx_bps: tx,
+                rx_pps: 6_000.0,
+                tx_pps: 1_000.0,
+                ..aterm_vitals::LinkRates::default()
+            }),
+            state: aterm_vitals::NetState::Online,
+            ..aterm_vitals::NetView::default()
+        });
+        let (arrow, mark, rate) = if sending {
+            ('\u{2191}', words::Mark::Up, tx)
+        } else {
+            ('\u{2193}', words::Mark::Down, rx)
+        };
+        let tag = format!("receiving {rx} of {rx_cap} B/s, sending {tx} of {tx_cap}");
+        let view = &snap.resources[Resource::Network.index()];
+        assert_eq!(
+            words::well(Resource::Network, view).map(|w| w.0),
+            Some(mark),
+            "PRECONDITION {tag}: the deck row's arrow is the binding direction's"
+        );
+        let (trace, unit, _) = net_trace(two_columns(&snap, &m));
+        assert_eq!(
+            (trace.vals.iter().rev().flatten().next().copied(), unit),
+            (Some(rate / 1e6), "MB/s"),
+            "PRECONDITION {tag}: the trace ends at the binding direction's rate"
+        );
+        let full = format!(
+            "\u{2193} {} \u{b7} \u{2191} {}",
+            net_rate_word(rx),
+            net_rate_word(tx)
+        );
+        let short = format!("{arrow} {}", net_rate_word(rate));
+        let input = input(&snap, dark_inks());
+        let mut forms = [0_usize; 2];
+        for lw in (160..=320).step_by(4).map(f64::from) {
+            for lh in (90..=250).step_by(8).map(f64::from) {
+                let laid = lay_lens(
+                    &shell(lw, lh, 2.0),
+                    &input,
+                    &pinned(Instrument::Network),
+                    &m,
+                    false,
+                );
+                let Some(label) = laid.boxes.iter().find(|b| b.text == "Traffic") else {
+                    continue;
+                };
+                let Some(line) = laid
+                    .boxes
+                    .iter()
+                    .find(|b| b.r[0] > label.r[2] && b.r[1] < label.r[3] && label.r[1] < b.r[3])
+                else {
+                    panic!("{tag}, {lw}×{lh}: the Traffic line's words beside its label");
+                };
+                if line.text == full {
+                    forms[0] += 1;
+                    continue;
+                }
+                assert!(
+                    line.text == short
+                        || (line.text.ends_with('\u{2026}') && line.text.starts_with(arrow)),
+                    "{tag}, {lw}×{lh}: the Traffic line says {:?}, not the busier direction's \
+                     {short:?}",
+                    line.text
+                );
+                forms[1] += usize::from(line.text == short);
+            }
+        }
+        assert!(
+            forms.iter().all(|&n| n > 50),
+            "CONTROL {tag}: the Traffic line laid in its full form ({}) and its short form ({})",
+            forms[0],
+            forms[1]
+        );
+    }
+}
+
 #[test]
 fn the_disk_lens_says_its_reading() {
     let snap = lens_scene(Scene::Calm);

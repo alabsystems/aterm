@@ -18,4 +18,4 @@ mod reader;
 #[cfg(unix)]
 pub mod schema;
 #[cfg(unix)]
-pub use reader::{Host, Instance, PinnedHelper, Store};
+pub use reader::{Host, Instance, PinnedHelper, PinnedProgram, Store};

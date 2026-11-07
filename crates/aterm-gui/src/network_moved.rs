@@ -294,8 +294,33 @@ fn process() -> &'static Arc<Moved> {
     static PROCESS: OnceLock<Arc<Moved>> = OnceLock::new();
     PROCESS.get_or_init(|| {
         let moved = Arc::new(Moved::herded_by(process_spread(), members_here));
+        #[cfg(all(target_os = "macos", not(test)))]
+        aterm_update::set_network_change_probe(updater_probe(&moved));
         start_sources(&moved);
         moved
+    })
+}
+
+/// Start this process's network observation for its automatic updater even
+/// when no fleet, account, or converge consumer has requested a watch yet.
+#[cfg(target_os = "macos")]
+pub(crate) fn observe_for_updater() {
+    if aterm_update::automatic() {
+        let _ = process();
+    }
+}
+
+/// Use a separate consuming watch so an updater check cannot steal another
+/// network consumer's notification. Keep the fleet's settling/spread policy.
+#[cfg(any(target_os = "macos", test))]
+fn updater_probe(moved: &Arc<Moved>) -> Box<dyn Fn() -> bool + Send + Sync> {
+    let watch = Mutex::new(moved.watch());
+    Box::new(move || {
+        watch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take_at(Instant::now())
+            .is_some()
     })
 }
 
@@ -452,19 +477,21 @@ pub(crate) fn watch_at_once() -> Watch {
     process().watch_at_once()
 }
 
-/// Whether aterm's own LAN traffic can go out now: on macOS the root LAN broker answers a hello
-/// ([`aterm_uds::lan::broker::hello`]), since there is no direct path; elsewhere always, as the
-/// LAN is used in-process there. A LAN lane that waits for it waits for the broker's socket,
-/// never for a person.
+/// Whether aterm's own LAN traffic can go out now: on macOS a hello is answered
+/// ([`aterm_uds::lan::broker::hello`]) by the root LAN broker or, while none is installed, by the
+/// allowed direct path ([`aterm_uds::lan::direct`]), the only ways out with no alert; elsewhere
+/// always, as the LAN is used in-process there. A LAN lane that waits for it waits for the
+/// broker's socket, never for a person.
 pub(crate) fn lan_answers() -> bool {
     lan_unavailable().is_none()
 }
 
 /// Why aterm's own LAN traffic cannot go out now, in the broker's own words (its error's
-/// `Display`, [`aterm_uds::lan::LanError::Unavailable`] where no root broker serves); `None`
-/// once the broker answers its hello, and always off macOS ([`lan_answers`]). A process under
-/// the loopback guard ([`aterm_net::loopback::confined`], a debug build's isolated fleet world)
-/// reaches the loopback alone, which needs no broker, so for it this is always `None` too.
+/// `Display`, [`aterm_uds::lan::LanError::Unavailable`] where no root broker serves and no
+/// direct path does); `None` once a hello is answered, and always off macOS ([`lan_answers`]). A
+/// process under the loopback guard ([`aterm_net::loopback::confined`], a debug build's isolated
+/// fleet world) reaches the loopback alone, which needs no broker, so for it this is always
+/// `None` too.
 pub(crate) fn lan_unavailable() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
@@ -958,6 +985,25 @@ const SETTLE_LOOKS: usize = 15;
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn updater_gets_its_own_settled_network_changes_without_stealing_other_consumers() {
+        let moved = Arc::new(Moved::spread_by(Duration::from_secs(30)));
+        let probe = updater_probe(&moved);
+        let mut other = moved.watch();
+        assert!(!probe());
+        let future = Instant::now() + Duration::from_secs(60);
+        moved.tell_at(Woke::Route, future);
+        assert!(!probe(), "the updater respects the network settling delay");
+        moved.tell_at(Woke::Place, Instant::now() - Duration::from_secs(60));
+        assert!(probe());
+        assert!(!probe(), "one check per settled move");
+        assert_eq!(
+            other.take(),
+            Some(Woke::Route),
+            "its pending route was not consumed"
+        );
+    }
 
     /// One minute: a wait for something that must happen.
     pub(crate) const HANG: Duration = Duration::from_secs(60);

@@ -9665,6 +9665,9 @@ pub enum ProbeGate {
     Question,
     NotTurnEnd,
     ActOwed,
+    /// Land owes its land check at this point (`TurnEndState::land_check_owed`): the check goes first,
+    /// and the probe waits for a later turn end.
+    LandCheck,
     Person,
     Watching,
     NoLedger,
@@ -9685,7 +9688,7 @@ pub enum ProbeGate {
 
 impl ProbeGate {
     /// Every gate, for a reader of the words.
-    pub const ALL: [ProbeGate; 27] = [
+    pub const ALL: [ProbeGate; 28] = [
         ProbeGate::NotDue,
         ProbeGate::NotIdle,
         ProbeGate::NotAuthoritative,
@@ -9697,6 +9700,7 @@ impl ProbeGate {
         ProbeGate::Question,
         ProbeGate::NotTurnEnd,
         ProbeGate::ActOwed,
+        ProbeGate::LandCheck,
         ProbeGate::Person,
         ProbeGate::Watching,
         ProbeGate::NoLedger,
@@ -9730,6 +9734,7 @@ impl ProbeGate {
             ProbeGate::Question => "question",
             ProbeGate::NotTurnEnd => "not-turn-end",
             ProbeGate::ActOwed => "act-owed",
+            ProbeGate::LandCheck => "land-check",
             ProbeGate::Person => "person",
             ProbeGate::Watching => "watching",
             ProbeGate::NoLedger => "no-ledger",
@@ -10113,14 +10118,43 @@ pub enum AccountAdvice {
         until: Instant,
     },
     /// At a turn end, the session's own account is another Mac's to use (its senior live claim,
-    /// `docs/DESIGN-fluid-swarm-2026-10-28.md` F19) and no row can take the session: what the turn
-    /// end would type waits until then, when the host is asked again ([`account_hold`]).
+    /// `docs/DESIGN-fluid-swarm-2026-10-28.md` F19) and the session cannot move off it: no row can
+    /// take it, or a limit reset in flight on the account bars the move (R18 of
+    /// `docs/SPEC-claude-accounts-resets-2026-10-02.md`). What the turn end would type waits until
+    /// then, when the host is asked again ([`account_hold`]).
     Hold {
         until: Instant,
+    },
+    /// The host cannot advise yet and is asked again at `until`, for `why`: a wait as
+    /// [`AccountAdvice::Wait`]'s, but no other account's opening. The roster never advises it
+    /// ([`Self::of_roster_at`]).
+    Again {
+        until: Instant,
+        why: AskAgain,
     },
     Resume {
         cleared_at: i64,
     },
+}
+
+/// Why the host asks again in place of advising ([`AccountAdvice::Again`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskAgain {
+    /// The session's limit record is not written yet.
+    Unwritten,
+    /// A limit reset is in flight on the session's account.
+    Reset,
+}
+
+impl AskAgain {
+    /// The reason a wait until the next ask records.
+    #[must_use]
+    pub const fn why(self) -> &'static str {
+        match self {
+            Self::Unwritten => "the limit's record is not written yet: asked again",
+            Self::Reset => "a limit reset is in flight: asked again",
+        }
+    }
 }
 
 impl AccountAdvice {
@@ -17465,6 +17499,13 @@ impl TurnEndState {
                 ProbeGate::NotTurnEnd,
             ),
             (owed, ProbeGate::ActOwed),
+            // THE LAND CHECK GOES FIRST: it is one step of the landing, typed at its defense's
+            // point ([`decide_turn_end`]); a probe there would put its panel between the defense
+            // and the check, and the check's answer is what ends the task.
+            (
+                reading.autopilot == Autopilot::Land && self.land.check_owed,
+                ProbeGate::LandCheck,
+            ),
             (
                 reading.person.is_some_and(|ago| ago < grace),
                 ProbeGate::Person,
@@ -22065,19 +22106,23 @@ fn act_at_point(
 /// ahead it advised was not made (`Session::ahead_deferred`). At a point, a held act whose move
 /// the decider would ask is that move's fallback instead ([`act_at_point`]), so the hold stands
 /// only where the decider does not ask it (refused within the hour, or the hour's moves made), and
-/// at the loop's fallback once the relaunch deferred or refused it.
+/// at the loop's fallback once the relaunch deferred or refused it. The wait gives one reason for
+/// every hold: a Hold carries no cause, and is advised both where no row can take the session and
+/// where one can but a limit reset in flight bars the move.
 pub(crate) fn account_hold(
     advised: Option<&AccountAdvice>,
     now: Instant,
     act: &TurnEndAction,
 ) -> Option<TurnEndAction> {
-    let (until, yet) = match advised {
-        Some(AccountAdvice::Hold { until }) => (until, "no other account can take the session yet"),
-        Some(AccountAdvice::Move {
+    let Some(
+        AccountAdvice::Hold { until }
+        | AccountAdvice::Move {
             yields: Some(until),
             ..
-        }) => (until, "its move off it cannot be made yet"),
-        _ => return None,
+        },
+    ) = advised
+    else {
+        return None;
     };
     if matches!(
         act,
@@ -22093,7 +22138,7 @@ pub(crate) fn account_hold(
     }
     Some(TurnEndAction::WaitUntil {
         until: (*until).max(later(now, ACCOUNT_WAIT_FLOOR)),
-        why: format!("this account cannot run here, and {yet}"),
+        why: "this account cannot run here, and the session cannot move off it yet".to_string(),
         wait: WaitKind::Other,
     })
 }
@@ -23266,7 +23311,7 @@ fn account_first(
             }
         }
         (
-            AccountAdvice::Wait { until },
+            AccountAdvice::Wait { until } | AccountAdvice::Again { until, .. },
             TurnEndAction::WaitUntil {
                 until: due,
                 why,
@@ -23276,9 +23321,13 @@ fn account_first(
             let at = (*until).max(later(now, ACCOUNT_WAIT_FLOOR));
             let own_reset = reading.reset_at.is_some_and(|reset| at >= reset);
             if at < due && !own_reset {
+                let said = match advice {
+                    AccountAdvice::Again { why, .. } => why.why(),
+                    _ => "another account can be used then",
+                };
                 TurnEndAction::WaitUntil {
                     until: at,
-                    why: "another account can be used then".to_string(),
+                    why: said.to_string(),
                     wait: WaitKind::Other,
                 }
             } else {
@@ -23289,7 +23338,10 @@ fn account_first(
                 }
             }
         }
-        (AccountAdvice::Wait { .. } | AccountAdvice::Hold { .. }, today) => today,
+        (
+            AccountAdvice::Wait { .. } | AccountAdvice::Again { .. } | AccountAdvice::Hold { .. },
+            today,
+        ) => today,
         (AccountAdvice::Resume { cleared_at }, today) => {
             if state
                 .account_resumed
@@ -23409,6 +23461,7 @@ pub(super) fn login_wall_waits(
     }
     let (n, free) = state.account_moves_of(now);
     let (until, why) = match (reading.advised(), free) {
+        (Some(AccountAdvice::Again { until, why }), _) => (*until, why.why().to_string()),
         (Some(AccountAdvice::Wait { until }), _) if reading.login_superseded => {
             (*until, "its renewed login can be used then".to_string())
         }

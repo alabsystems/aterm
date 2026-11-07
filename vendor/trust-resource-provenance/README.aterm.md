@@ -1,6 +1,6 @@
 # Vendored shared native resource provenance
 
-Upstream: Trust `c1256ef3a39692eef82fc8ef99b3a2f2bef4f852`, `crates/trust-resource-provenance`.
+Upstream: Trust `1f4f39cd0f69a0e86c201698637913c2ad65956d`, `crates/trust-resource-provenance`.
 
 All Rust source, README and license bytes are exact upstream. The manifest
 only redirects libc/serde/JSON/hash/tempfile to maintained first-party local

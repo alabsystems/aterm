@@ -7,7 +7,15 @@ use crate::ai::facts::{ClaudeAccounts, Managed};
 use crate::ai::permission::Level;
 use crate::ai::state::{Mark, State};
 use crate::ai::store::Record;
-use crate::ai::testing::{FakeRunner, machine, ran};
+use crate::ai::testing::{FakeRunner, machine as bare_machine, ran};
+
+fn machine(installed: &[&str]) -> crate::ai::testing::Box3 {
+    let machine = bare_machine(installed);
+    // The real native profile is private before credential fixtures create
+    // nested login directories; reviewer HOME overrides remain independent.
+    drop(crate::harness::codex_source_gate::SourceWorkLease::for_home(&machine.home).unwrap());
+    machine
+}
 use crate::harness::accounts_overlay::links_here;
 
 fn change() -> Change {
@@ -322,6 +330,7 @@ fn a_reviewer_that_cannot_authenticate_gives_way_to_the_next_and_a_timeout_does_
     };
     let now = || 1_800_000_000;
     let host = Host {
+        source_home: Some(&b.home),
         config: None,
         runner: &FakeRunner::quiet(),
         var: &var,
@@ -417,6 +426,7 @@ fn a_reviewer_runs_from_its_shim_in_the_repository_with_the_askers_environment_a
     let runner = FakeRunner::with(|_| Ok(ran(0, "fine", "")));
     let now = || 0;
     let host = Host {
+        source_home: Some(&b.home),
         config: None,
         runner: &runner,
         var: &var,
@@ -511,6 +521,67 @@ fn a_reviewer_runs_from_its_shim_in_the_repository_with_the_askers_environment_a
 }
 
 #[test]
+fn a_codex_review_holds_source_exclusion_until_its_owned_runner_returns() {
+    use crate::harness::codex_source_gate::PublicationLock;
+    for failed in [false, true] {
+        let b = machine(&["codex"]);
+        let store = Store::at(&b.state);
+        let facts = vec![facts_of(&CODEX, b.twin("codex"))];
+        let rows = [row_of(&CODEX, State::Idle)];
+        let cands = candidates(&[&CODEX], Some(&["codex"]), "nobody", &rows, 0);
+        let during = b.home.clone();
+        let runner = FakeRunner::with(move |_| {
+            assert!(
+                PublicationLock::for_home(&during).is_err(),
+                "actual runner must hold source exclusion"
+            );
+            if failed {
+                Err(RunFailed::Timeout)
+            } else {
+                Ok(ran(0, "no findings", ""))
+            }
+        });
+        let vars = vec![("HOME".to_owned(), b.home.display().to_string())];
+        let var = |name: &str| {
+            vars.iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        };
+        let host = Host {
+            source_home: Some(&b.home),
+            config: None,
+            runner: &runner,
+            var: &var,
+            vars: &vars,
+            store: &store,
+            now: &|| 0,
+        };
+        let _answers = run_review(
+            &host,
+            &cands,
+            &facts,
+            &Ask {
+                change: &change(),
+                asker: "nobody",
+                words: None,
+                count: 1,
+                budget: Duration::from_secs(5),
+                level: Level::Yolo,
+            },
+        );
+        assert_eq!(
+            runner.calls().len(),
+            1,
+            "must exercise actual run_one runner path"
+        );
+        PublicationLock::for_home(&b.home)
+            .unwrap()
+            .current()
+            .unwrap();
+    }
+}
+
+#[test]
 fn the_primers_marker_never_reaches_the_asker_and_a_failure_says_why() {
     assert_eq!(
         strip_markers("no findings\n\nATERM-TASK-DONE\n"),
@@ -532,6 +603,7 @@ fn the_primers_marker_never_reaches_the_asker_and_a_failure_says_why() {
     let var = |_: &str| None;
     let now = || 0;
     let host = Host {
+        source_home: Some(&b.home),
         config: None,
         runner: &runner,
         var: &var,
@@ -715,6 +787,7 @@ fn an_outcome_under_another_home_is_recorded_nowhere() {
     };
     let other = |k: &str| (k == "CODEX_HOME").then(|| "/profiles/w/.codex".to_string());
     let host = Host {
+        source_home: Some(&b.home),
         config: None,
         runner: &runner,
         var: &other,
@@ -729,6 +802,7 @@ fn an_outcome_under_another_home_is_recorded_nowhere() {
     );
     let none = |_: &str| None;
     let host = Host {
+        source_home: Some(&b.home),
         config: None,
         runner: &runner,
         var: &none,
@@ -758,6 +832,7 @@ fn a_limit_keeps_the_cli_out_of_reviews_for_a_while() {
     let now = || 1_000;
     let none = |_: &str| None;
     let host = Host {
+        source_home: Some(&b.home),
         config: None,
         runner: &runner,
         var: &none,
@@ -819,6 +894,7 @@ fn review_auth_after_login(replacement_at: Option<i64>) -> (Record, Option<Recor
     let var = |_: &str| None;
     let now = || 300;
     let host = Host {
+        source_home: Some(&b.home),
         config: None,
         runner: &runner,
         var: &var,
@@ -911,6 +987,7 @@ fn review_at(c: &'static Connector, level: Level) -> (Vec<Answer>, Vec<Vec<Strin
     let none = |_: &str| None;
     let now = || 0;
     let host = Host {
+        source_home: Some(&b.home),
         config: None,
         runner: &runner,
         var: &none,
@@ -1248,6 +1325,7 @@ fn a_skipped_reviewer_names_what_a_person_does_first() {
         let none = |_: &str| None;
         let now = || 0;
         let host = Host {
+            source_home: Some(&b.home),
             config: None,
             runner: &runner,
             var: &none,
@@ -1281,6 +1359,7 @@ fn scripted_claude_answer(exit: i32, stdout: String, stderr: String) -> Answer {
     let none = |_: &str| None;
     let now = || 1_000;
     let host = Host {
+        source_home: Some(&b.home),
         config: None,
         runner: &runner,
         var: &none,
@@ -1396,6 +1475,7 @@ fn review_on_frozen_login_with_env(
     });
     let now = || 300;
     let host = Host {
+        source_home: Some(&b.home),
         config: None,
         runner: &runner,
         var: &var,
@@ -1595,6 +1675,7 @@ fn a_pooled_codex_review_on_a_row_of_its_own_needs_a_build_that_reads_codex_auth
         Ok(ran(0, "", ""))
     });
     let host = Host {
+        source_home: Some(&b.home),
         config: None,
         runner: &runner,
         var: &var,
@@ -1774,6 +1855,7 @@ fn a_pooled_codex_review_limit_marks_only_the_serving_account_so_the_next_accoun
     let runner_limit = FakeRunner::with(|_| Ok(ran(1, "", "ERROR: You've hit your usage limit")));
     let now = || now_val;
     let host_limit = Host {
+        source_home: Some(&b.home),
         config: None,
         runner: &runner_limit,
         var: &var,
@@ -2183,6 +2265,7 @@ impl ReviewPool {
         let reviewers: Vec<&'static Connector> = vec![c];
         let cands = candidates(&reviewers, Some(&[c.id]), "claude", &rows, Self::NOW);
         let host = Host {
+            source_home: Some(&self.b.home),
             config: None,
             runner,
             var: &var,
@@ -2897,6 +2980,7 @@ fn a_later_review_wave_uses_current_selection_and_refuses_unusable_accounts() {
         let var = |key: &str| (key == "HOME").then(|| home.clone());
         let store = Store::at(&claude.b.state);
         let host = Host {
+            source_home: Some(&claude.b.home),
             config: None,
             runner: &runner,
             var: &var,
@@ -2985,6 +3069,7 @@ fn a_roster_created_between_review_waves_controls_the_later_login() {
     let var = |key: &str| (key == "HOME").then(|| home.clone());
     let store = Store::at(&later.b.state);
     let host = Host {
+        source_home: Some(&later.b.home),
         config: None,
         runner: &runner,
         var: &var,
@@ -3060,6 +3145,7 @@ fn prepare_from(pool: &ReviewPool, original: &Facts) -> PreparedReview {
     let store = Store::at(&pool.b.state);
     prepare_review(
         &Host {
+            source_home: Some(&pool.b.home),
             config: None,
             runner: &runner,
             var: &var,
@@ -3246,6 +3332,7 @@ fn a_codex_storage_change_after_preparation_refuses_the_child() {
         let store = Store::at(&pool.b.state);
         let (answer, outcome) = run_prepared(
             &Host {
+                source_home: Some(&pool.b.home),
                 config: None,
                 runner: &runner,
                 var: &|_| None,
@@ -3290,6 +3377,7 @@ fn review_storage_case(initial: i64, selected: i64, current: i64) -> [bool; 5] {
     let store = Store::at(&pool.b.state);
     let _ = run_prepared(
         &Host {
+            source_home: Some(&pool.b.home),
             config: None,
             runner: &runner,
             var: &|_| None,
@@ -3330,6 +3418,7 @@ fn review_storage_case(initial: i64, selected: i64, current: i64) -> [bool; 5] {
     let var = |key: &str| (key == "HOME").then(|| home.clone());
     let answers = run_review(
         &Host {
+            source_home: Some(&pool.b.home),
             config: None,
             runner: &runner,
             var: &var,
@@ -3504,6 +3593,7 @@ fn explicit_codex_homes_use_their_own_backend_fence() {
         let store = Store::at(&pool.b.state);
         let runner = FakeRunner::quiet();
         let host = Host {
+            source_home: Some(&pool.b.home),
             config: None,
             runner: &runner,
             var: &var,
@@ -3573,6 +3663,7 @@ fn a_review_checks_the_same_explicit_home_it_passes_to_the_child() {
         let runner = FakeRunner::quiet();
         let prepared = prepare_review(
             &Host {
+                source_home: Some(&pool.b.home),
                 config: None,
                 runner: &runner,
                 var: &var,
@@ -3609,6 +3700,7 @@ fn removing_a_review_home_override_requires_fresh_default_account_context() {
     let runner = FakeRunner::quiet();
     let prepared = prepare_review(
         &Host {
+            source_home: Some(&pool.b.home),
             config: None,
             runner: &runner,
             var: &var,
@@ -3622,6 +3714,7 @@ fn removing_a_review_home_override_requires_fresh_default_account_context() {
     assert!(prepared.observation.is_none());
     let _ = run_prepared(
         &Host {
+            source_home: Some(&pool.b.home),
             config: None,
             runner: &runner,
             var: &var,
@@ -3746,6 +3839,7 @@ fn a_discovered_codex_roster_keeps_current_recovery_advice() {
         let var = |key: &str| (key == "HOME").then(|| home.clone());
         let (answer, outcome) = run_prepared(
             &Host {
+                source_home: Some(&pool.b.home),
                 config: None,
                 runner: &runner,
                 var: &var,
@@ -3910,6 +4004,7 @@ fn preparation_case_for(cli: crate::harness::accounts::Cli, scope: i64, changed:
     let home = pool.b.home.display().to_string();
     let var = |key: &str| (key == "HOME").then(|| home.clone());
     let host = Host {
+        source_home: Some(&pool.b.home),
         config: None,
         runner: &runner,
         var: &var,
@@ -4366,6 +4461,7 @@ fn isolated_claude_review_outcomes_preserve_default_health() {
                 _ => unreachable!(),
             });
             let host = Host {
+                source_home: Some(&b.home),
                 config: None,
                 runner: &runner,
                 var: &var,

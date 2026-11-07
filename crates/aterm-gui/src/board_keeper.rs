@@ -3,8 +3,8 @@
 
 //! The fleet task board's keeper in the aterm serving this Mac (`aterm_ctl::board::keep`): one
 //! thread per process, started by the window's control server and by the node job, of which the
-//! one holding the board's keeper lock waits on its open rows and the others take over within
-//! seconds of its exit (`docs/DESIGN-fleet-task-board-2026-11-04.md`).
+//! one holding the board's keeper lock waits on its open rows and the others, asleep on that
+//! lock, take over the moment it exits (`docs/DESIGN-fleet-task-board-2026-11-04.md`).
 
 use std::path::PathBuf;
 

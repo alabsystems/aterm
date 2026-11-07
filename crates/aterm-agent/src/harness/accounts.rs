@@ -121,6 +121,10 @@ pub(super) fn finish_workflow_projection_for_test(
 #[path = "accounts_shared.rs"]
 pub mod shared;
 
+#[path = "accounts_native_publication.rs"]
+mod native_publication;
+pub(in crate::harness) use native_publication::ActualPublicationPermit;
+
 #[path = "accounts_sync_commit.rs"]
 mod sync_commit;
 #[cfg(test)]
@@ -2017,7 +2021,7 @@ const RENEWAL_CHECKPOINT_MAX: u64 = 4096;
 
 /// The binding a completed sign-in is allowed to replace. An absent or legacy binding has
 /// no unique generation, so any intervening renewal conservatively invalidates its proof.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct RenewalParent {
     generation: Option<u64>,
     clock: u64,
@@ -2116,6 +2120,7 @@ impl RenewalParent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RenewalCheckpoint {
+    pub native_grant: Option<super::codex_grant_owner::GrantReference>,
     pub enrollment: Option<super::codex_enrollment::Request>,
     pub region: Option<Region>,
     pub label: String,
@@ -2301,7 +2306,13 @@ fn write_checkpoint(
 ) -> io::Result<()> {
     let staging = Path::new(staging_text);
     std::fs::canonicalize(staging)?;
+    let native_grant = enrollment
+        .map(|request| logins.enrollment.checkpoint_reference(request))
+        .transpose()
+        .map_err(io::Error::other)?
+        .flatten();
     let checkpoint = RenewalCheckpoint {
+        native_grant: native_grant.clone(),
         enrollment: enrollment.cloned(),
         region,
         label: label.to_owned(),
@@ -2330,7 +2341,9 @@ fn write_checkpoint(
     let mut doc = Map::new();
     doc.insert(
         "schema".into(),
-        Value::from(if enrollment.is_some() {
+        Value::from(if native_grant.is_some() {
+            7
+        } else if enrollment.is_some() {
             6
         } else if google_principal.is_some() {
             5
@@ -2340,6 +2353,12 @@ fn write_checkpoint(
             2
         }),
     );
+    if let Some(reference) = native_grant {
+        doc.insert(
+            "native_grant".into(),
+            aterm_json::to_value(reference).map_err(io::Error::other)?,
+        );
+    }
     if let Some(request) = enrollment {
         doc.insert(
             "enrollment".into(),
@@ -2511,11 +2530,19 @@ fn decode_renewal_checkpoint(cli: Cli, bytes: &[u8]) -> Option<RenewalCheckpoint
         (2, cli) if !matches!(cli, Cli::Kimi | Cli::Agy) => None,
         (3, Cli::Kimi) => Some(Region::parse(doc.get("region")?.as_str()?)?),
         (5, Cli::Agy) => None,
-        (6, Cli::Codex) => None,
+        (6 | 7, Cli::Codex) => None,
         _ => return None,
     };
     let checkpoint = RenewalCheckpoint {
-        enrollment: if doc.get("schema")?.as_u64()? == 6 {
+        native_grant: if doc.get("schema")?.as_u64()? == 7 {
+            Some(aterm_json::from_value(doc.get("native_grant")?.clone()).ok()?)
+        } else {
+            if doc.get("native_grant").is_some() {
+                return None;
+            }
+            None
+        },
+        enrollment: if matches!(doc.get("schema")?.as_u64()?, 6 | 7) {
             let request: super::codex_enrollment::Request =
                 aterm_json::from_value(doc.get("enrollment")?.clone()).ok()?;
             if !request.valid() || request.label != doc.get("label")?.as_str()? {
@@ -3029,23 +3056,27 @@ impl Logins {
         let mut o = Map::new();
         o.insert(
             "schema".to_owned(),
-            Value::from(if self.enrollment.has_rejected() {
-                8
-            } else if !self.enrollment.is_empty() {
-                7
-            } else if self
-                .labels
-                .values()
-                .any(|binding| binding.google_principal.is_some())
-            {
-                6
-            } else if !self.native_rotations.is_empty() {
-                5
-            } else if self.shared.is_empty() {
-                LOGINS_SCHEMA
-            } else {
-                4
-            }),
+            Value::from(
+                if self.enrollment.has_owner_witness() || self.enrollment.has_artifacts() {
+                    9
+                } else if self.enrollment.requires_extended() {
+                    8
+                } else if !self.enrollment.is_empty() {
+                    7
+                } else if self
+                    .labels
+                    .values()
+                    .any(|binding| binding.google_principal.is_some())
+                {
+                    6
+                } else if !self.native_rotations.is_empty() {
+                    5
+                } else if self.shared.is_empty() {
+                    LOGINS_SCHEMA
+                } else {
+                    4
+                },
+            ),
         );
         if !self.enrollment.is_empty() {
             o.insert("enrollment".into(), self.enrollment.encode());
@@ -3161,18 +3192,18 @@ impl Logins {
         }
         let schema = doc.get("schema").and_then(Value::as_u64);
         let legacy = match schema {
-            Some(4..=8) => false,
+            Some(4..=9) => false,
             Some(2 | LOGINS_SCHEMA) => false,
             Some(1) => true,
             Some(other) => {
                 return Err(Unread::NotOurs(format!(
-                    "schema {other}; this build reads schemas 1, 2, {LOGINS_SCHEMA}, 4, 5, 6, 7 and 8"
+                    "schema {other}; this build reads schemas 1, 2, {LOGINS_SCHEMA}, 4, 5, 6, 7, 8 and 9"
                 )));
             }
             None => return Err(Unread::NotOurs("names no schema".to_string())),
         };
         let shared = if schema == Some(4)
-            || (matches!(schema, Some(5..=8)) && doc.get("shared").is_some())
+            || (matches!(schema, Some(5..=9)) && doc.get("shared").is_some())
         {
             shared::State::from_json(&doc["shared"]).map_err(Unread::NotOurs)?
         } else {
@@ -3185,7 +3216,7 @@ impl Logins {
         };
         let mut native_rotations = BTreeMap::new();
         if schema == Some(5)
-            || (matches!(schema, Some(6..=8)) && doc.get("native_rotations").is_some())
+            || (matches!(schema, Some(6..=9)) && doc.get("native_rotations").is_some())
         {
             let entries = doc
                 .get("native_rotations")
@@ -3326,7 +3357,7 @@ impl Logins {
                 )));
             }
             if binding.google_principal.is_some()
-                && (!matches!(schema, Some(6..=8))
+                && (!matches!(schema, Some(6..=9))
                     || binding.proved_by != Some(Proof::Status)
                     || binding.proved_email.is_none()
                     || binding.proved_dir.is_none()
@@ -3375,12 +3406,22 @@ impl Logins {
                 sign_in_receipts.insert(label.clone(), receipt);
             }
         }
-        let enrollment = if matches!(schema, Some(7 | 8)) {
+        let enrollment = if matches!(schema, Some(7..=9)) {
             let book = super::codex_enrollment::Operations::decode(&doc["enrollment"])
                 .map_err(Unread::NotOurs)?;
-            if schema == Some(7) && book.has_rejected() {
+            if schema != Some(9) && book.has_owner_witness() {
                 return Err(Unread::NotOurs(
-                    "opaque rejected intent requires schema 8".into(),
+                    "owner freshness witnesses require schema 9".into(),
+                ));
+            }
+            if schema == Some(7) && book.requires_extended() {
+                return Err(Unread::NotOurs(
+                    "native enrollment custody requires schema 8".into(),
+                ));
+            }
+            if schema != Some(9) && book.has_artifacts() {
+                return Err(Unread::NotOurs(
+                    "native artifact custody requires schema 9".into(),
                 ));
             }
             book
@@ -6028,6 +6069,12 @@ pub enum PendingSelection {
 }
 
 impl PendingSelection {
+    pub(super) fn identity(&self) -> String {
+        match self {
+            Self::Account(request) => format!("account:{}:{}", request.label, request.nonce),
+            Self::Next(request) => format!("next:{}", request.nonce),
+        }
+    }
     /// The specific-account request, if this selection names one.
     #[must_use]
     pub const fn account(&self) -> Option<&PinRequest> {

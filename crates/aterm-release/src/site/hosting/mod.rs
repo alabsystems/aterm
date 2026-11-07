@@ -330,7 +330,10 @@ pub fn deploy(
             .call(
                 "POST",
                 &client.api(&format!("v1beta1/{version}:populateFiles")),
-                Body::Json(&aterm_json::json!({"files": Value::Object(named)})),
+                Body::Json(&Value::Object(Map::from([(
+                    "files".to_string(),
+                    Value::Object(named),
+                )]))),
                 &bearer,
             )
             .map_err(|why| not_released(format!("naming the files: {why}"), v))?;

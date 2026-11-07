@@ -58,16 +58,17 @@ fn resolve(
     live: Option<&Github>,
     honour_loose: bool,
 ) -> Result<Configured> {
-    let snapshot = crate::config::load_routing_snapshot(dirs, honour_loose)
-        .map_err(|refusal| refusal.error)?;
-    if let Some((validated, _)) = &snapshot
-        && !validated.joins_vault()
+    let snapshot = match crate::config::load_routing_snapshot(dirs, honour_loose)
+        .map_err(|refusal| refusal.error)?
     {
-        return Ok(Configured {
-            router: Ok(Router::from_validated(validated.clone())),
-            adoption: None,
-        });
-    }
+        Some((validated, _)) if !validated.joins_vault() => {
+            return Ok(Configured {
+                router: Ok(Router::from_validated(validated)),
+                adoption: None,
+            });
+        }
+        snapshot => snapshot,
+    };
     let adoption = vault::run_with_rows(dirs, env, live, snapshot.as_ref().map(|(_, rows)| rows));
     let router = match &adoption {
         Some(adoption) => adoption.router(),

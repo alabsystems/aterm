@@ -61,19 +61,42 @@ fn broker_uid() -> u32 {
 /// Dial the broker, exchange hellos and send `request` (none: a hello alone).
 fn open(request: Option<&Request>) -> Result<Session, LanError> {
     let path = super::dialled_socket();
-    open_at(request, &path, super::protocol())
+    open_at(request, &path, super::protocol(), Absent::Direct)
 }
 
-fn open_at(request: Option<&Request>, path: &Path, ours: u32) -> Result<Session, LanError> {
+/// What a dial that finds no broker does.
+#[derive(Clone, Copy)]
+enum Absent {
+    /// Takes this process's own server when macOS already allowed this code (`super::direct`):
+    /// a LAN use.
+    Direct,
+    /// Reads [`Unavailable::NotInstalled`]: a question about the broker itself
+    /// ([`super::Arrivals`]), which this process's own server cannot answer.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        expect(dead_code, reason = "broker arrivals are watched on macOS")
+    )]
+    NotInstalled,
+}
+
+fn open_at(
+    request: Option<&Request>,
+    path: &Path,
+    ours: u32,
+    absent: Absent,
+) -> Result<Session, LanError> {
     let stream = match crate::connect::until(path, Instant::now() + DIAL_HANG) {
         Ok(stream) => stream,
-        // No broker: this process's own server, when macOS already allowed this code
-        // (`super::direct`); a broker that answers, refuses or speaks another protocol is the
-        // broker, and its answer stands.
+        // No broker: this process's own server, when the caller makes a LAN use and macOS
+        // already allowed this code (`super::direct`); a broker that answers, refuses or speaks
+        // another protocol is the broker, and its answer stands.
         Err(error) if not_installed(&error) => {
-            return match super::direct::open() {
-                Ok((stream, allowed)) => exchange(stream, request, ours, Some(allowed)),
-                Err(_) => Err(Unavailable::NotInstalled.into()),
+            return match absent {
+                Absent::Direct => match super::direct::open() {
+                    Ok((stream, allowed)) => exchange(stream, request, ours, Some(allowed)),
+                    Err(_) => Err(Unavailable::NotInstalled.into()),
+                },
+                Absent::NotInstalled => Err(Unavailable::NotInstalled.into()),
             };
         }
         Err(error) => return Err(error.into()),
@@ -282,18 +305,21 @@ pub fn resolve(name: &str, within: Duration) -> Result<Vec<IpAddr>, LanError> {
     }
 }
 
-/// The broker's hello alone: whether a broker serves, and which.
+/// The broker's hello alone: whether a LAN use would be served now, and by which broker. With
+/// no broker installed it can be this process's own server ([`BrokerHello::direct`], `Some`).
 ///
 /// # Errors
-/// [`LanError::Unavailable`] (no broker, another protocol, or not the root broker), or the
-/// exchange's error.
+/// [`LanError::Unavailable`] (no broker and no direct path, another protocol, or not the root
+/// broker), or the exchange's error.
 pub fn hello() -> Result<BrokerHello, LanError> {
     open(None).map(|session| session.broker)
 }
 
+/// The hello of the broker at `path` alone, never this process's own server: whether a broker
+/// answers there ([`super::Arrivals`]).
 #[cfg(target_os = "macos")]
 pub(super) fn hello_at(path: &Path, protocol: u32) -> Result<BrokerHello, LanError> {
-    open_at(None, path, protocol).map(|session| session.broker)
+    open_at(None, path, protocol, Absent::NotInstalled).map(|session| session.broker)
 }
 
 /// What a Bonjour request hears, as it hears it: a blocking iterator, whose descriptor a poll

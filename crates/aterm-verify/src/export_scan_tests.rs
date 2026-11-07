@@ -212,7 +212,20 @@ fn checkout(lib: &str) -> (aterm_tempfile::TempDir, Ctx) {
 
 fn verdict(ctx: &Ctx) -> (Vec<Outcome>, Vec<String>) {
     let mut r = Report::new("export-scan");
-    run(ctx, &mut r);
+    run_with(ctx, &mut r, || {
+        let wants = &[atpkg::prerequisite::Prerequisite::Gitleaks];
+        if let Some(prefix) = std::env::var_os("ATERM_TEST_PACKAGE_PREFIX") {
+            atpkg::prerequisite::configured_in(
+                &atpkg::store::Layout {
+                    prefix: prefix.into(),
+                },
+                wants,
+                "export-scan test",
+            )
+        } else {
+            atpkg::prerequisite::configured(wants, "export-scan test")
+        }
+    });
     (
         r.outcomes().map(|(o, _)| o).collect(),
         r.findings().iter().map(|f| f.id.clone()).collect(),

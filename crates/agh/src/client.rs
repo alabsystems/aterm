@@ -299,11 +299,18 @@ impl Call {
             std::borrow::Cow::Borrowed(&self.path)
         } else {
             let join = if self.path.contains('?') { '&' } else { '?' };
-            std::borrow::Cow::Owned(format!(
-                "{}{join}{}",
-                self.path,
-                crate::path::query(&self.query)
-            ))
+            let cap = self.path.len()
+                + 1
+                + self
+                    .query
+                    .iter()
+                    .map(|(k, v)| k.len() + v.len() + 2)
+                    .sum::<usize>();
+            let mut out = String::with_capacity(cap);
+            out.push_str(&self.path);
+            out.push(join);
+            crate::path::query_into(&mut out, &self.query);
+            std::borrow::Cow::Owned(out)
         }
     }
 
@@ -1676,8 +1683,10 @@ fn after_prefix<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
 
 /// Retarget `call` to a moved repository's new slug.
 pub(crate) fn retarget(call: &mut Call, old: &Slug, new: &Slug) {
-    if let Some(rest) = after_prefix(&call.path, &repo_root(old)).map(str::to_string) {
-        call.path = format!("{}{rest}", repo_root(new));
+    if let Some(rest) = after_prefix(&call.path, &repo_root(old)) {
+        let mut path = repo_root(new);
+        path.push_str(rest);
+        call.path = path;
     }
     if repo_of(&call.route).is_some_and(|slug| slug == old) {
         call.route.target = RouteTarget::Repo(new.clone());
@@ -2805,12 +2814,12 @@ impl Github {
                 .with_tried(vec![sent])
                 .with_next(next));
         }
-        let probe = Call::get(root.clone(), call.route.clone())
+        let probe_path = root.trim_start_matches('/').to_string();
+        let probe = Call::get(root, call.route.clone())
             .probe_404(false)
             .follow_moved(false)
             .retry(Some(RetryPolicy::NONE))
             .deadlines(call.deadlines);
-        let probe_path = root.trim_start_matches('/').to_string();
         let mut probe_sent = 0;
         match self.run_counted(&probe, decided, Reading::Whole, &mut probe_sent) {
             Ok(got) => {

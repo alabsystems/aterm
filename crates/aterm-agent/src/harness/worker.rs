@@ -1160,6 +1160,36 @@ impl From<&str> for Refused {
     }
 }
 
+/// The declared file source of an admitted Codex starter. Selector metadata
+/// only: no auth bytes are read and no native grant authority is inferred.
+#[must_use]
+pub fn declared_codex_auth_file(
+    starter: &Starter,
+    home: Option<&Path>,
+    cwd: &Path,
+) -> Option<PathBuf> {
+    let selected = |name: &str| {
+        starter
+            .env
+            .iter()
+            .rev()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    };
+    if let Some(path) = selected("CODEX_AUTH_PATH") {
+        let path = PathBuf::from(path);
+        return path.is_absolute().then_some(path);
+    }
+    let selected_home = selected("HOME").map(Path::new).or(home);
+    let home = match selected("CODEX_HOME").filter(|home| !home.is_empty()) {
+        Some(home) => super::codex_rollout::codex_home(Some(home), None, Some(cwd))?,
+        None => selected_home
+            .filter(|home| home.is_absolute())?
+            .join(".codex"),
+    };
+    Some(home.join("auth.json"))
+}
+
 /// A worker's starter that its launcher admitted ([`admit`]). [`fn@line`] takes one in place of
 /// a bare [`Starter`], so no line can be written without the sign-in and install checks.
 #[derive(Clone, Debug, PartialEq, Eq)]

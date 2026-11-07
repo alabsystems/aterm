@@ -145,6 +145,10 @@ pub(crate) enum SlashRefusal {
     Person,
     /// The input seam took no write.
     InputRejected,
+    /// Input queued for the program before the press's write was still being written to it: at
+    /// the probe, at once; at the rest, once the press's deadline passed. Nothing of the write
+    /// was sent. aterm knows only that its own queue has not drained, not why.
+    InputQueued,
     /// What aterm typed stands in the composer, not run.
     LeftTyped,
     /// The composer took other text than aterm typed.
@@ -188,6 +192,7 @@ impl SlashRefusal {
             Self::Moved => "Claude was drawing; click again".to_owned(),
             Self::Person => "you typed; nothing more sent".to_owned(),
             Self::InputRejected => "input was not accepted; try again".to_owned(),
+            Self::InputQueued => left("earlier input is still being sent to Claude"),
             Self::LeftTyped => format!("{text} is in the composer; press Enter to run it"),
             Self::Changed => "the composer changed; nothing more sent".to_owned(),
             Self::NoAnswer => format!("Claude did not answer {text}"),
@@ -751,6 +756,9 @@ impl App {
                     );
                     return Err(SlashRefusal::InputRejected);
                 }
+                // Input queued before the probe had not all gone: nothing written, the
+                // person's to click again once it has.
+                GuardedInput::Queued => return Err(SlashRefusal::InputQueued),
                 GuardedInput::Pressed(Delivery::BusyZero | Delivery::Failed) => {
                     return Err(SlashRefusal::InputRejected);
                 }
@@ -925,7 +933,24 @@ impl App {
                         p.deadline = now + ECHO;
                         p.writes += 1;
                     }),
-                    GuardedInput::Changed | GuardedInput::Skipped | GuardedInput::Person => {}
+                    // Input queued before the rest that has still not gone at the press's
+                    // deadline (a program that stopped reading, or a long paste) ends the press,
+                    // its `/` left.
+                    GuardedInput::Queued if now >= press.deadline => {
+                        self.end_slash(
+                            session,
+                            SlashEnd::Stopped(SlashRefusal::InputQueued),
+                            "/",
+                            None,
+                        );
+                        return;
+                    }
+                    // Nothing written: looked at again at the next poll, input queued before it
+                    // having gone by then.
+                    GuardedInput::Changed
+                    | GuardedInput::Skipped
+                    | GuardedInput::Person
+                    | GuardedInput::Queued => {}
                     GuardedInput::Pressed(_) => {
                         self.end_slash(
                             session,
@@ -958,7 +983,10 @@ impl App {
                         });
                         self.request_footer_now(session, press.pgid);
                     }
-                    GuardedInput::Changed | GuardedInput::Skipped | GuardedInput::Person => {
+                    GuardedInput::Changed
+                    | GuardedInput::Skipped
+                    | GuardedInput::Person
+                    | GuardedInput::Queued => {
                         self.with_press(session, |p| p.stage = Stage::Typed { quiet: None });
                     }
                     GuardedInput::Pressed(_) => {

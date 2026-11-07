@@ -159,16 +159,21 @@ fn read_journal(
 }
 
 /// The witnessed length of one enrolled table store (`table`, recovery or primary); `None` where
-/// the claim is absent, pending, damaged or misnamed.
+/// the claim is absent, unreadable, pending, damaged or misnamed.
 ///
 /// # Errors
-/// Unused (always returns `Ok`); signature matches [`held_lengths`].
+/// The claim directory cannot be listed, as [`held_lengths`] fails on it.
 pub fn held_length(paths: &Paths, table: Digest, recovery: bool) -> Result<Option<u64>> {
     let region = region(recovery);
     let (claim_dir, _) = dirs(paths, region);
     let name = format!("{}.claim", aterm_codec::hex::encode_lower(&table));
     let Ok(claim) = private_file::read_private(&claim_dir, &name, CLAIM_LEN) else {
-        return Ok(None);
+        // Only on a miss: a directory that is absent holds no store, one that cannot be
+        // listed is a store this reader cannot read.
+        return match std::fs::read_dir(&claim_dir) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+            _ => Ok(None),
+        };
     };
     if let Ok(Some((scope, witness))) = ready(&claim, region)
         && scope.digest() == table

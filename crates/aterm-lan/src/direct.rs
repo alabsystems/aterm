@@ -9,8 +9,10 @@
 //! A Mac updated from a build with no broker (0.158.0 and earlier) holds that allowance for aterm
 //! and no broker until a person types the Mac password the broker's install needs; this keeps
 //! its LAN meanwhile, raising no alert, since macOS asks only code it has no answer for. The
-//! process makes its own LAN sockets and DNS-SD calls as it did before the broker, and stops
-//! the moment the broker answers or macOS's answer changes (each session reads both).
+//! process makes its own LAN sockets and DNS-SD calls as it did before the broker. Each session
+//! reads both when it opens, so once the broker answers, or macOS's answer for this account
+//! changes, the next session goes to the broker or finds no path; a session already open (a
+//! browse, an advert) runs until its client ends it.
 //!
 //! macOS judges a LAN use by the process's responsible app, which is not always aterm: an `aterm`
 //! command typed in Terminal is Terminal's to answer for. So the path serves only a process whose
@@ -34,7 +36,14 @@ struct Direct {
     /// Whether macOS answers this process's LAN use as `code`'s own
     /// ([`responsible_is_this_code`]; a test's stand-in).
     responsible: fn(&grant::Code) -> Result<(), String>,
+    /// Where the server's connection lines go ([`quiet`]; a test's recorder).
+    log: fn(std::fmt::Arguments<'_>),
 }
+
+/// The direct path's server log: nothing. Its one client is this process, which hears every
+/// failure as the broker's frame and says it in its own words; the broker's log lines would
+/// otherwise land on this process's stderr (a person's terminal, or `ssh`'s from `lan fdpass`).
+fn quiet(_: std::fmt::Arguments<'_>) {}
 
 /// Whether the app macOS holds responsible for this process (the one whose Local Network answer
 /// it applies) is `code`'s executable, or this process itself.
@@ -65,7 +74,7 @@ fn responsible_is_this_code(code: &grant::Code) -> Result<(), String> {
 /// `pid`'s executable, from `proc_pidpath`.
 fn pid_path(pid: i32) -> Option<std::path::PathBuf> {
     use std::os::unix::ffi::OsStrExt as _;
-    let mut buf = vec![0u8; 4 * 1024];
+    let mut buf = [0u8; 4 * 1024];
     let len = u32::try_from(buf.len()).ok()?;
     // SAFETY: `buf` is writable for `len` bytes, all `proc_pidpath` may write.
     let wrote = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), len) };
@@ -83,8 +92,13 @@ impl Direct {
 
     fn shared(&self) -> &Arc<Shared> {
         // Admitted by uid: the one peer is this process, at the socketpair's other end.
-        self.shared
-            .get_or_init(|| Arc::new(Shared::new(Admission::SameUid, crate::bonjour::system())))
+        self.shared.get_or_init(|| {
+            Arc::new(Shared::new(
+                Admission::SameUid,
+                crate::bonjour::system(),
+                self.log,
+            ))
+        })
     }
 }
 
@@ -107,6 +121,7 @@ static DIRECT: Direct = Direct {
     shared: OnceLock::new(),
     plist: grant::NEHELPER_PLIST,
     responsible: responsible_is_this_code,
+    log: quiet,
 };
 
 /// Give this process the allowed direct path (`aterm`'s start does, once). It reads nothing until
@@ -120,6 +135,7 @@ pub fn provide_direct() {
 mod tests {
     use std::io::{Read as _, Write as _};
     use std::net::{Ipv4Addr, TcpListener};
+    use std::sync::Mutex;
     use std::time::Duration;
 
     use aterm_uds::lan::wire::Target;
@@ -130,9 +146,12 @@ mod tests {
     /// A hang detector, never a latency budget.
     const MUST_HAPPEN: Duration = Duration::from_secs(60);
 
+    /// The account the fixtures' configuration is for.
+    const GUEST_USER: &str = "E8D0C90E-068E-4C80-AC44-6815AE2AC56B";
+
     /// The direct path as this test binary's code sees it: macOS's record read from `plist` (a
-    /// fixture), the code named as released 0.158.0's, and macOS answering for this process as
-    /// that code (the responsible app's stand-in).
+    /// fixture), the code named as released 0.158.0's run by the fixtures' account, and macOS
+    /// answering for this process as that code (the responsible app's stand-in).
     fn path_reading(plist: &'static str) -> &'static Direct {
         path_answered_as(plist, |_| Ok(()))
     }
@@ -141,18 +160,36 @@ mod tests {
         plist: &'static str,
         responsible: fn(&grant::Code) -> Result<(), String>,
     ) -> &'static Direct {
+        path_of(plist, responsible, GUEST_USER, quiet)
+    }
+
+    fn path_of(
+        plist: &'static str,
+        responsible: fn(&grant::Code) -> Result<(), String>,
+        user: &str,
+        log: fn(std::fmt::Arguments<'_>),
+    ) -> &'static Direct {
         let direct = Box::leak(Box::new(Direct {
             code: OnceLock::new(),
             shared: OnceLock::new(),
             plist,
             responsible,
+            log,
         }));
         let _ = direct.code.set(Ok(grant::Code {
             identifier: "com.aterm.aterm".into(),
             team: Some("A66A9P66Z7".into()),
             executable: "/Applications/aterm.app/Contents/MacOS/aterm".into(),
+            user: user.into(),
         }));
         direct
+    }
+
+    /// The lines [`record`] heard: one test's server log.
+    static RECORDED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    fn record(line: std::fmt::Arguments<'_>) {
+        RECORDED.lock().unwrap().push(line.to_string());
     }
 
     fn fixture(name: &str) -> &'static str {
@@ -245,6 +282,21 @@ mod tests {
             matches!(got, Err(LanError::Unavailable(Unavailable::NotInstalled))),
             "{got:?}"
         );
+        // macOS's allowance on record for another account of this Mac: this account's own
+        // question is still unanswered, so no direct path.
+        let other_account = path_of(
+            fixture("nehelper-granted.plist"),
+            |_| Ok(()),
+            "5D773287-9015-4E7D-A8F3-7CE6088E62D5",
+            quiet,
+        );
+        let got = seam_here(no_broker(&root), || {
+            direct::seam_here(other_account, broker::hello)
+        });
+        assert!(
+            matches!(got, Err(LanError::Unavailable(Unavailable::NotInstalled))),
+            "{got:?}"
+        );
         // A broker that speaks another protocol at the socket: Outdated, though macOS allowed
         // this code.
         let socket = root.path().join("run").join("broker.sock");
@@ -267,6 +319,47 @@ mod tests {
                 Err(LanError::Unavailable(Unavailable::Outdated { .. }))
             ),
             "{got:?}"
+        );
+    }
+
+    /// A request the direct path fails reaches its client as the broker's error, and the server's
+    /// line for it goes to the path's own log, never the broker's stderr: the production path's
+    /// log is [`quiet`], so nothing lands on the person's terminal. NEGATIVE CONTROL: with the
+    /// connection's lines written by the broker's own log again, the recorder hears nothing.
+    #[test]
+    fn a_failed_direct_request_is_the_clients_alone_to_say() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let recorded = path_of(
+            fixture("nehelper-granted.plist"),
+            |_| Ok(()),
+            GUEST_USER,
+            record,
+        );
+        let closed = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = closed.local_addr().unwrap();
+        drop(closed);
+        let got = seam_here(no_broker(&root), || {
+            direct::seam_here(recorded, || {
+                broker::connect(
+                    &Target::Addr(addr),
+                    addr.port(),
+                    MUST_HAPPEN,
+                    ConnectOptions::default(),
+                )
+            })
+        });
+        let Err(LanError::Io(error)) = got else {
+            panic!("a refused connect is the act's error: {got:?}");
+        };
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::ConnectionRefused,
+            "{error}"
+        );
+        let lines = RECORDED.lock().unwrap().clone();
+        assert!(
+            lines.iter().any(|line| line.contains("refused")),
+            "the server's line went to the path's log: {lines:?}"
         );
     }
 }

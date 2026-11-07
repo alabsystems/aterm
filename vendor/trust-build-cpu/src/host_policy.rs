@@ -5,7 +5,24 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::{Monitor, Pool, SlotState};
+use crate::{Monitor, Observation, Pool, SlotState};
+
+/// Cached bounded reads only: implementations must not perform RPC, OS process
+/// scans or recursively lock the native pool inside admission transactions.
+pub trait ObservationSource: Send + Sync {
+    /// Last original observation plus independent conservative claimable memory.
+    fn latest(&self) -> Option<(Observation, u64)>;
+    /// A previously working source going stale must pause fresh work.
+    fn ever_observed(&self) -> bool;
+}
+impl ObservationSource for Monitor {
+    fn latest(&self) -> Option<(Observation, u64)> {
+        Monitor::latest(self)
+    }
+    fn ever_observed(&self) -> bool {
+        Monitor::ever_observed(self)
+    }
+}
 
 /// Connect cached live monitoring to the shared pool's admission veto.
 ///
@@ -13,7 +30,8 @@ use crate::{Monitor, Pool, SlotState};
 /// Every admitted worker must still acquire its own actual pool lease.
 pub struct HostPolicy {
     pool: Pool,
-    monitor: Option<Arc<Monitor>>,
+    monitor: Option<Arc<dyn ObservationSource>>,
+    required: bool,
     per_worker: NonZeroU64,
     reserve: u64,
     fallback_memory: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
@@ -32,7 +50,24 @@ impl HostPolicy {
         reserve: u64,
         fallback_memory: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
     ) -> Self {
-        Self { pool, monitor, per_worker, reserve, fallback_memory, native_cpu: Arc::new(|| 0) }
+        Self {
+            pool,
+            monitor: monitor.map(|monitor| monitor as Arc<dyn ObservationSource>),
+            required: false,
+            per_worker,
+            reserve,
+            fallback_memory,
+            native_cpu: Arc::new(|| 0),
+        }
+    }
+
+    /// Require the actual native custodian's cached observations even before
+    /// its first successful sample. Missing input pauses work; it never becomes
+    /// a fabricated successful observation or a GUI-dependent fallback.
+    pub fn with_observation_source(mut self, source: Arc<dyn ObservationSource>) -> Self {
+        self.monitor = Some(source);
+        self.required = true;
+        self
     }
 
     /// Supply validated process CPU measurements. An absent/unknown owner
@@ -68,7 +103,7 @@ impl HostPolicy {
                     )
                     .min(self.pool.slots().get());
             }
-            if monitor.ever_observed() {
+            if self.required || monitor.ever_observed() {
                 return 0;
             }
         }
@@ -101,5 +136,67 @@ mod tests {
         let unknown =
             HostPolicy::new(pool, None, NonZeroU64::new(1000).unwrap(), 200, Arc::new(|| None));
         assert_eq!(unknown.limit(), 0);
+    }
+    #[test]
+    fn required_native_cache_adapts_and_never_refreshes_or_falls_back_on_loss() {
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        use crate::{Measurements, MemoryPressure, ThermalPressure};
+        struct Cache(Mutex<Option<(Observation, u64)>>);
+        impl ObservationSource for Cache {
+            fn latest(&self) -> Option<(Observation, u64)> {
+                self.0.lock().unwrap().clone()
+            }
+            fn ever_observed(&self) -> bool {
+                false
+            } // required input, no invented success
+        }
+        let _fixture = crate::tests::kernel_fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Pool::open_in(dir.path(), NonZeroU32::new(8).unwrap()).unwrap();
+        let source = Arc::new(Cache(Mutex::new(None)));
+        let policy =
+            HostPolicy::new(pool, None, NonZeroU64::new(1000).unwrap(), 0, Arc::new(|| Some(9000)))
+                .with_observation_source(source.clone());
+        assert_eq!(policy.limit(), 0);
+        let received = Instant::now();
+        let sample = |busy, pressure| {
+            Observation::from_measurements(Measurements {
+                received,
+                age: Duration::ZERO,
+                window: Duration::from_secs(1),
+                cpus: 8,
+                busy_millicores: Some(busy),
+                available_memory: Some(9000),
+                pressure,
+                thermal: ThermalPressure::Nominal,
+            })
+            .unwrap()
+        };
+        *source.0.lock().unwrap() = Some((sample(4000, MemoryPressure::Normal), 9000));
+        assert_eq!(policy.limit_at(received, 0), 4);
+        *source.0.lock().unwrap() = Some((sample(7000, MemoryPressure::Normal), 9000));
+        assert_eq!(policy.limit_at(received, 0), 1);
+        *source.0.lock().unwrap() = Some((sample(0, MemoryPressure::Normal), 9000));
+        assert_eq!(policy.limit_at(received, 0), 8);
+        assert_eq!(policy.limit_at(received + Duration::from_secs(4), 0), 0);
+        *source.0.lock().unwrap() = Some((sample(0, MemoryPressure::Critical), 9000));
+        assert_eq!(policy.limit_at(received, 0), 0);
+        *source.0.lock().unwrap() = None;
+        assert_eq!(policy.limit(), 0);
+        assert!(
+            Observation::from_measurements(Measurements {
+                received,
+                age: Duration::ZERO,
+                window: Duration::from_secs(1),
+                cpus: 8,
+                busy_millicores: Some(0),
+                available_memory: Some(9000),
+                pressure: MemoryPressure::Unknown,
+                thermal: ThermalPressure::Nominal,
+            })
+            .is_err()
+        );
     }
 }

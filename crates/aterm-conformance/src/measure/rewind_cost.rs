@@ -351,9 +351,7 @@ pub fn idle_verdict(
 /// [`CouldNotRun`] when an instance did not start, a request failed, a drain never reported,
 /// the recording writer ended, or required status counters are unavailable.
 pub fn measure(rig: &Rig, row: &CostRow) -> Result<CostReport, CouldNotRun> {
-    let _one = super::ONE_TAKE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _one = super::take(matches!(row, CostRow::Throughput { .. }));
     let budget = Budget::from_now(BUDGET_SECS);
     match *row {
         CostRow::Throughput {

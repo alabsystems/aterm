@@ -12,6 +12,7 @@ pub(super) struct Borrowed<'a> {
     pub fence: &'a Fence,
     pub debt: &'a ExternalDebt,
     pub peer: Peer,
+    pub proof: Option<&'a crate::resource_producer::TransportProof>,
 }
 impl member::MemberCustody for Borrowed<'_> {
     fn launch(&mut self, command: &mut spawnfd::Command) -> Result<CohortChild, LaunchError> {
@@ -65,6 +66,9 @@ impl member::MemberCustody for Borrowed<'_> {
         }
     }
     fn validate(&mut self) -> io::Result<()> {
+        if let Some(proof) = self.proof {
+            proof.validate()?;
+        }
         self.fence.check_current()?;
         if !self.job.launched
             || self.job.reaped

@@ -1338,8 +1338,22 @@ fn panel_title(row: &str) -> Option<(String, &str)> {
 }
 
 /// The rate-limit windows Claude Code painted on its `/usage` panel, read off the rows of aterm's own parsed grid.
+///
+/// Rows with no Settings panel around them prove nothing of where they came from, so fewer than two
+/// windows read as none: one `Current session: 99% used` in prose is not a panel. The Usage tab's own
+/// reader ([`usage_panel_read`]) has the panel's header, tab mark and tail for that proof and takes
+/// even one window.
 #[must_use]
 pub fn usage_panel_windows(rows: &[String]) -> Vec<PanelWindow> {
+    let out = panel_windows(rows);
+    if out.len() < 2 {
+        return Vec::new();
+    }
+    out
+}
+
+/// Every window block on `rows`, each read whether or not any other is there ([`usage_panel_windows`]).
+fn panel_windows(rows: &[String]) -> Vec<PanelWindow> {
     let titles: Vec<(usize, String, String)> = rows
         .iter()
         .enumerate()
@@ -1384,9 +1398,6 @@ pub fn usage_panel_windows(rows: &[String]) -> Vec<PanelWindow> {
                 reset_text: reset.map(|r| r.trim().to_owned()).filter(|r| !r.is_empty()),
             });
         }
-    }
-    if out.len() < 2 {
-        return Vec::new();
     }
     out
 }
@@ -1444,11 +1455,15 @@ pub const USAGE_COMMAND: &str = "/usage";
 pub enum PanelRead {
     /// No row only the Usage tab draws is under the header: another tab, or something that is not this panel.
     NotUsage,
-    /// The tab says its figures are not settled.
+    /// The tab says its figures are not settled, or the whole tab is on the grid with neither the
+    /// session's nor the week's window on it (a load that has drawn the Session block alone).
     Unsettled,
     /// The panel's tail is not on the grid.
     Fold,
-    /// The whole tab is on the grid with nothing unsettled on it: its windows, the session's and the week's among them.
+    /// The whole tab is on the grid with nothing unsettled on it: its windows, the session's
+    /// (`five_hour`) or the week's (`seven_day`) among them. Claude Code draws a window only where
+    /// the account has its figure (2.1.318 draws no `Current session` for an account with no
+    /// five-hour figure), so either one is a whole read.
     Settled(Vec<PanelWindow>),
 }
 
@@ -1470,9 +1485,9 @@ pub fn usage_panel_read(rows: &[String], header: usize) -> PanelRead {
     if !tail {
         return PanelRead::Fold;
     }
-    let windows = usage_panel_windows(under);
+    let windows = panel_windows(under);
     let has = |name: &str| windows.iter().any(|w| w.name == name);
-    if has(SESSION_WINDOW) && has(WEEK_WINDOW) {
+    if has(SESSION_WINDOW) || has(WEEK_WINDOW) {
         PanelRead::Settled(windows)
     } else {
         PanelRead::Unsettled
@@ -3462,7 +3477,7 @@ mod tests {
     }
 
     #[test]
-    fn a_whole_panel_missing_the_session_or_the_week_is_unsettled() {
+    fn a_whole_panel_with_the_session_or_the_week_is_settled_and_with_neither_is_not() {
         let whole = settled();
         let title = |name: &str| {
             whole
@@ -3481,19 +3496,128 @@ mod tests {
             out.extend_from_slice(&whole[to..]);
             out
         };
+        let week_only = {
+            let mut out = whole[..session].to_vec();
+            out.extend_from_slice(&whole[week..fable]);
+            out.extend_from_slice(&whole[rest..]);
+            out
+        };
+        // Claude Code draws a window only for a figure the account has: each whole tab with one
+        // of the two is a read, its other windows with it.
         let only_session = without(week, rest);
         assert!(only_session.iter().any(|r| r.contains("1% used")));
-        assert_eq!(read(&only_session), PanelRead::Unsettled);
-        let no_week = without(week, fable);
-        assert_eq!(usage_panel_windows(&no_week).len(), 2);
-        assert_eq!(read(&no_week), PanelRead::Unsettled);
-        let no_session = without(session, week);
-        assert_eq!(usage_panel_windows(&no_session).len(), 2);
-        assert_eq!(read(&no_session), PanelRead::Unsettled);
-
+        assert_eq!(
+            figures(&read(&only_session)),
+            [("five_hour".to_string(), 1)]
+        );
+        assert_eq!(
+            figures(&read(&without(week, fable))),
+            [
+                ("five_hour".to_string(), 1),
+                ("seven_day_overage_included".to_string(), 0)
+            ]
+        );
+        assert_eq!(
+            figures(&read(&without(session, week))),
+            [
+                ("seven_day".to_string(), 10),
+                ("seven_day_overage_included".to_string(), 0)
+            ]
+        );
+        assert_eq!(figures(&read(&week_only)), [("seven_day".to_string(), 10)]);
         assert_eq!(
             figures(&read(&without(fable, rest))),
             [("five_hour".to_string(), 1), ("seven_day".to_string(), 10)]
+        );
+        // A whole tab with neither is no read, whatever other window it shows; and one window off
+        // any panel is still no window set.
+        let fable_only = without(session, fable);
+        assert!(
+            fable_only
+                .iter()
+                .any(|r| r.trim() == "Current week (Fable)")
+        );
+        assert_eq!(read(&without(session, rest)), PanelRead::Unsettled);
+        assert_eq!(read(&fable_only), PanelRead::Unsettled);
+        assert!(usage_panel_windows(&fable_only).is_empty());
+    }
+
+    /// 2.1.318'S PANEL WITH NO SESSION WINDOW IS READ WHOLE (HP1). Measured in the lab on both
+    /// renderers (`claude-2.1.318-usage-week-only-*.txt`): an account whose answers carry no
+    /// five-hour figure gets the week's window alone, no `Current session` (and on the fullscreen
+    /// renderer the weekly warning in the panel's rule). As measured the tab also carries the lab's
+    /// enrich error (its usage body's read refused by the black hole), so it is not settled; the
+    /// same tab with its body read (that row gone, and the hint row without the retry the error
+    /// alone adds, §0 of docs/SPEC-claude-accounts-probe-2026-10-01.md) is settled on the week with
+    /// its reset, and samples the week with no session. Negative control: the reader before HP1 took the panel's
+    /// windows through the two-window guard ([`usage_panel_windows`]) and settled only on the
+    /// session's and the week's together; it reads nothing off this tab.
+    #[test]
+    fn the_2_1_318_panel_with_no_session_window_is_read_whole() {
+        const READ_AT: i64 = 1_793_980_920; // 2026-11-06T16:02:00Z, 08:02 in Los Angeles
+        const RESET: i64 = 1_794_255_720; // 2026-11-09T20:22:00Z, Nov 9 at 12:22pm there
+        const PST: i64 = -8 * 3600;
+        let zones = |zone: &str, _: i64| (zone == "America/Los_Angeles").then_some(PST);
+        let refused = aterm_phase::anchor!("usage.could_not_refresh");
+        for (what, text, reset_text, reset) in [
+            (
+                "fullscreen",
+                fx::USAGE_WEEK_ONLY_FULLSCREEN_2_1_318,
+                "Nov 9 at 12:22pm (America/Los_Angeles)",
+                RESET,
+            ),
+            (
+                "inline",
+                fx::USAGE_WEEK_ONLY_INLINE_2_1_318,
+                "Nov 9 at 12:21pm (America/Los_Angeles)",
+                RESET - 60,
+            ),
+        ] {
+            let measured = fx::screen(text);
+            assert_eq!(
+                read(&measured),
+                PanelRead::Unsettled,
+                "{what}: the lab's enrich error"
+            );
+            let retry = format!("r to retry · {}", aterm_phase::anchor!("prompt.cancel"));
+            let whole: Vec<String> = measured
+                .iter()
+                .filter(|r| r.trim() != refused)
+                .map(|r| r.replacen(&retry, aterm_phase::anchor!("prompt.cancel"), 1))
+                .collect();
+            assert_eq!(whole.len() + 1, measured.len(), "{what}: one row cut");
+            assert!(
+                !measured.iter().any(|r| aterm_phase::panel_tail(r))
+                    && whole.iter().any(|r| aterm_phase::panel_tail(r)),
+                "{what}: the hint without its retry"
+            );
+            let got = read(&whole);
+            assert_eq!(figures(&got), [("seven_day".to_string(), 98)], "{what}");
+            let PanelRead::Settled(windows) = got else {
+                unreachable!()
+            };
+            assert_eq!(windows[0].reset_text.as_deref(), Some(reset_text), "{what}");
+            let sample = panel_sample(&windows, READ_AT, PST, &zones).expect("a sample");
+            assert_eq!(
+                (sample.session_pct, sample.week_pct, sample.week_reset),
+                (None, Some(98), Some(reset)),
+                "{what}"
+            );
+
+            // CONTROL: the reader before HP1 reads no window off it, so no read at all.
+            let under = &whole[header_of(&whole) + 1..];
+            assert!(usage_panel_windows(under).is_empty(), "{what}");
+            let has = |name: &str| windows.iter().any(|w| w.name == name);
+            assert!(!(has(SESSION_WINDOW) && has(WEEK_WINDOW)), "{what}");
+        }
+        let fullscreen = fx::screen(fx::USAGE_WEEK_ONLY_FULLSCREEN_2_1_318);
+        let rule = aterm_phase::settings_panel(&fullscreen)
+            .expect("the panel")
+            .rule;
+        assert!(
+            fullscreen[rule].contains("You've used 98% of your weekly limit"),
+            "{:?}",
+            fullscreen[rule]
         );
     }
 

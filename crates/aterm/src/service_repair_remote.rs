@@ -3,7 +3,7 @@
 
 //! Client composition for bounded service repair over the native fleet Drive.
 
-use aterm_json::{Value, json};
+use aterm_json::Value;
 use aterm_secrets::service_repair as transaction;
 use std::path::Path;
 
@@ -89,9 +89,14 @@ fn sign_prepared(
         REQUEST_DOMAIN,
         &aterm_json::to_vec(&body).map_err(|e| e.to_string())?,
     );
-    Ok(
-        json!({"request":body,"key":identity.key().hex(),"signature":aterm_codec::hex::encode_lower(&signature)}),
-    )
+    Ok(Value::Object(aterm_json::Map::from([
+        ("request".to_string(), body),
+        ("key".to_string(), identity.key().hex().into()),
+        (
+            "signature".to_string(),
+            aterm_codec::hex::encode_lower(&signature).into(),
+        ),
+    ])))
 }
 
 fn valid_job_word(job: &str) -> bool {
@@ -171,7 +176,7 @@ pub(super) fn execute(args: &[String]) -> Result<Value, String> {
             if !valid_job_word(job) {
                 return Err("job must be server or subscriber".into());
             }
-            json!({"job":job})
+            Value::Object(aterm_json::Map::from([("job".to_string(), job.into())]))
         }
         "prepare" => {
             options(rest, &["--job", "--image", "--nonce", "--out"])?;
@@ -192,7 +197,11 @@ pub(super) fn execute(args: &[String]) -> Result<Value, String> {
                 );
             }
             local_identity = Some(identity()?);
-            json!({"job":job,"image":image,"nonce":nonce})
+            Value::Object(aterm_json::Map::from([
+                ("job".to_string(), job.into()),
+                ("image".to_string(), image.into()),
+                ("nonce".to_string(), nonce.into()),
+            ]))
         }
         "activate" => {
             options(rest, &["--request"])?;
@@ -202,7 +211,7 @@ pub(super) fn execute(args: &[String]) -> Result<Value, String> {
             }
             let signed = read_signed(Path::new(path))?;
             transaction::parse_request(&signed["request"]).map_err(|e| e.to_string())?;
-            json!({"signed":signed})
+            Value::Object(aterm_json::Map::from([("signed".to_string(), signed)]))
         }
         _ => {
             return Err(
@@ -234,6 +243,7 @@ pub(super) fn execute(args: &[String]) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aterm_json::json;
     #[test]
     fn remote_options_admit_only_explicit_paired_fields() {
         let args = vec!["--job".into(), "server".into()];

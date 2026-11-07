@@ -10,18 +10,26 @@
 //! `metal::blit`).
 //!
 //! The verdict is each frame's CPU twin (docs/AUDIT-third-party-2026-10-15.md
-//! ORACLE-ADAPTER): the CPU renderer's frame of the same input for a
-//! readback, and for a present, a layer, a video frame, an EDR present and a
-//! blit or crown row the CPU's run of the present's shaders over it
-//! ([`blit_twin`], the CPU's bloom, card and crown laws), each held to the
-//! parity suites' tolerance ([`twin_law`]). The arm's atlas takes its
-//! glyphs from the CPU renderer it wraps, so a twin draws with the faces the
-//! arm does: the verdict is decided alike on any adapter (another Mac's GPU,
-//! llvmpipe, WARP) and through a font or OS update, and moves only when the
-//! arm draws otherwise than aterm's own renderer. The frames no twin here
-//! draws (the shimmer's, a bloom over ramped or fx light, a crown on a
-//! cropped destination) are named in the output and held by the `distinct`
-//! pairs.
+//! ORACLE-ADAPTER and HR-ORACLE): the CPU renderer's frame of the same input
+//! for a readback, and for a layered readback, a present, a layer, a video
+//! frame, an EDR present and a blit or crown row the CPU's run of the
+//! present's passes over it (the CPU's bloom law, [`shimmer_twin`], the
+//! card, [`blit_twin`] under the uniform [`twin_uniform`] derives from the
+//! CPU's laws rather than from the arm's builder, and the crown's laws at
+//! the frame's offset and visible rows), each held to the parity suites'
+//! tolerance ([`twin_law`]). The arm's atlas takes its glyphs from the CPU
+//! renderer it wraps, so a twin draws with the faces the arm does: the
+//! verdict is decided alike on any adapter (another Mac's GPU, llvmpipe,
+//! WARP) and through a font or OS update, and moves only when the arm draws
+//! otherwise than aterm's own renderer. Every frame has a twin but a video
+//! take the adapter holds converted (Display P3, scRGB), which the output
+//! names; a present over a layer no twin draws (a bloom over ramped or fx
+//! light, a crown under a glide) fails the test, so the fixture that brings
+//! one brings its twin. Controls hold each twinned layer to showing: a
+//! frame that runs it must fail its twin drawn without the bloom, without
+//! the shimmer, without the crown or with a wider drop border ([`Mutant`]);
+//! a cropped present, as every GUI present is, carries the shimmer and the
+//! crown, and one at a window's size the drop border's width.
 //!
 //! Each frame's SHA-256 is also held against the record of the arm this
 //! build presents with: `oracle/metal-frames.tsv` (macOS),
@@ -41,10 +49,12 @@
 //! The test prints every frame's row (`frame-record` lines) whether it
 //! passes or not. A recorded row changes only by a stated re-record, never by
 //! a mode of the test: those lines copied into the file by hand, from a tree
-//! whose arm code did not change and whose frames hold to their twins, with
-//! the commit naming the rows, why they moved (the system update, before and
-//! after) and that the arm drew them, and the record's header naming their
-//! drawer.
+//! whose frames hold to their twins and whose arm code did not change but by
+//! a fix that brought them to their twins, with the commit naming the rows,
+//! why they moved (the system update, before and after, or the fix) and that
+//! the arm drew them, and the record's header naming their drawer. A frame
+//! the oracle gains is recorded the same way, from the arm, once it holds to
+//! its twin.
 
 use super::replay_fixtures::*;
 use super::*;
@@ -259,13 +269,19 @@ type Twins = std::collections::BTreeMap<String, Drawn>;
 
 /// What [`draw_frames`] drew: every frame the record describes, in drawing
 /// order; the frames each fixture claims to differ (`(a, b)`: the input
-/// changed between them); the twin of each frame aterm's CPU side draws
-/// too; and the shape of each readback held to the CPU renderer's frame, as
-/// the arm encoded it ([`Self::shape`]).
+/// changed between them) and to equal (a readback redrawn over its
+/// residency); the twin of each frame aterm's CPU side draws too, and why
+/// any other has none; the controls, each a frame's twin drawn as a
+/// [`Mutant`], which that frame must fail; and the shape of each readback
+/// held to the CPU renderer's frame, as the arm encoded it
+/// ([`Self::shape`]).
 struct Drawing {
     frames: Named,
     distinct: Vec<(String, String)>,
+    same: Vec<(String, String)>,
     twins: Twins,
+    untwinned: Vec<(String, String)>,
+    mutants: Vec<(String, Mutant, Drawn)>,
     shapes: std::collections::BTreeMap<String, String>,
 }
 
@@ -279,13 +295,36 @@ impl Drawing {
         );
     }
 
-    /// `frame`, drawn as `name`, with its twin when it has one.
-    fn push(&mut self, name: String, frame: Drawn, twin: Option<Drawn>) {
-        if let Some(twin) = twin {
-            self.twins.insert(name.clone(), twin);
-        }
+    /// `frame`, drawn as `name`, and its twin.
+    fn push(&mut self, name: String, frame: Drawn, twin: Drawn) {
+        self.twins.insert(name.clone(), twin);
         self.frames.push((name, frame));
     }
+
+    /// `frame`, drawn as `name`, which no twin stands for on this adapter,
+    /// and why.
+    fn push_untwinned(&mut self, name: String, frame: Drawn, why: String) {
+        self.untwinned.push((name.clone(), why));
+        self.frames.push((name, frame));
+    }
+}
+
+/// A twin drawn otherwise than the law says, for a control: the frame as
+/// drawn must fail it, so the layer the mutant changes shows in that frame
+/// past the twin law's bar, and an arm that drops or drifts it fails its
+/// twin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mutant {
+    /// The law's twin.
+    Law,
+    /// Without the bloom.
+    NoBloom,
+    /// Without the heat shimmer.
+    NoShimmer,
+    /// Without the SDR crown.
+    NoCrown,
+    /// The drop overlay's border two pixels wider than the CPU presenter's.
+    WideBorder,
 }
 
 /// Every frame the record describes, with each one's CPU twin where aterm
@@ -300,7 +339,10 @@ fn draw_frames_with(family: Option<&str>) -> Drawing {
     let mut d = Drawing {
         frames: Vec::new(),
         distinct: Vec::new(),
+        same: Vec::new(),
         twins: Twins::new(),
+        untwinned: Vec::new(),
+        mutants: Vec::new(),
         shapes: std::collections::BTreeMap::new(),
     };
 
@@ -332,7 +374,7 @@ fn draw_frames_with(family: Option<&str>) -> Drawing {
                     );
                 }
             }
-            d.push(frame, f.into(), Some(twin.clone()));
+            d.push(frame, f.into(), twin.clone());
         }
     }
     gpu.set_cursor_opacity(0.5);
@@ -350,7 +392,7 @@ fn draw_frames_with(family: Option<&str>) -> Drawing {
         "cursor_opacity 0.5 routes the cursor fill through CursorBlend"
     );
     let twin = cpu_twin(&mut gpu, &cursor);
-    d.push("cursor_blend/readback/0".to_owned(), f.into(), Some(twin));
+    d.push("cursor_blend/readback/0".to_owned(), f.into(), twin);
     gpu.set_cursor_opacity(1.0);
 
     // The readback's present-time layers: bloom, the shimmer with its phase
@@ -364,24 +406,36 @@ fn draw_frames_with(family: Option<&str>) -> Drawing {
         "the heat scene drives the shimmer, and its haze has blank rows to rise through"
     );
     let card: Vec<u8> = (0..24 * 10 * 4).map(|i| (i * 37 % 256) as u8).collect();
+    let tray = TrayQuad {
+        rgba: &card,
+        pw: 24,
+        ph: 10,
+        dx: 5,
+        dy: 3,
+        scrim: None,
+        serial: 0,
+        delta: None,
+        above: &[],
+    };
+    let layered = |gpu: &mut GpuRenderer, mutant| -> Drawn {
+        layered_source(gpu, &heat, Some(&tray), mutant).into()
+    };
+    let twin = layered(&mut gpu, Mutant::Law);
     let mut win = WindowGpu::new();
     for pass in 0..3 {
-        let tray = TrayQuad {
-            rgba: &card,
-            pw: 24,
-            ph: 10,
-            dx: 5,
-            dy: 3,
-            scrim: None,
-            serial: 0,
-            delta: None,
-            above: &[],
-        };
         let f = gpu
             .try_render_input(&mut win, &heat, Some(tray))
             .expect("the layered readback");
         drew_on(&gpu, "heat/layered");
-        d.push(format!("heat/layered/{pass}"), f.into(), None);
+        d.push(format!("heat/layered/{pass}"), f.into(), twin.clone());
+    }
+    for mutant in [Mutant::NoBloom, Mutant::NoShimmer] {
+        let bare = layered(&mut gpu, mutant);
+        d.mutants.push(("heat/layered/0".to_owned(), mutant, bare));
+    }
+    for pass in ["1", "2"] {
+        d.same
+            .push(("heat/layered/0".to_owned(), format!("heat/layered/{pass}")));
     }
     d.distinct
         .push(("heat/readback".to_owned(), "heat/layered/0".to_owned()));
@@ -394,7 +448,7 @@ fn draw_frames_with(family: Option<&str>) -> Drawing {
     drew_on(&gpu, "heat/readback");
     d.shape("heat/readback", &gpu, epoch);
     let twin = cpu_twin(&mut gpu, &heat);
-    d.push("heat/readback".to_owned(), f.into(), Some(twin));
+    d.push("heat/readback".to_owned(), f.into(), twin);
 
     // The production present into the virtual target: the dirty-row scissor
     // over the resident offscreen, the present copy, bloom, shimmer, the
@@ -448,16 +502,34 @@ fn draw_frames_with(family: Option<&str>) -> Drawing {
             );
             drew_on(&gpu, name);
             let card = with_tray.then(tray);
-            let twin = present_twin(
-                &mut gpu,
-                &win,
-                input,
-                (invert, overlay),
-                None,
-                exact,
-                card.as_ref(),
-            );
-            d.push(format!("{name}/present/{pass}"), f.into(), twin);
+            let twin = |gpu: &mut GpuRenderer, mutant| {
+                present_twin(
+                    gpu,
+                    &win,
+                    input,
+                    (invert, overlay),
+                    None,
+                    exact,
+                    card.as_ref(),
+                    mutant,
+                )
+            };
+            let law = twin(&mut gpu, Mutant::Law);
+            let frame = format!("{name}/present/{pass}");
+            if overlay.is_some() && *name == "text_cursor" {
+                let wide = twin(&mut gpu, Mutant::WideBorder);
+                d.mutants.push((frame.clone(), Mutant::WideBorder, wide));
+            }
+            let layers: &[Mutant] = match (pass, *name) {
+                (0, "heat") => &[Mutant::NoBloom, Mutant::NoShimmer, Mutant::NoCrown],
+                (0, "glow_halo") => &[Mutant::NoBloom],
+                _ => &[],
+            };
+            for &mutant in layers {
+                let bare = twin(&mut gpu, mutant);
+                d.mutants.push((frame.clone(), mutant, bare));
+            }
+            d.push(frame, f.into(), law);
         }
         let mut changed = input.clone();
         changed.row_rev_lane = 0;
@@ -466,7 +538,16 @@ fn draw_frames_with(family: Option<&str>) -> Drawing {
         }
         let f = presented(&mut gpu, &mut win, &changed, false, None, None, None);
         drew_on(&gpu, name);
-        let twin = present_twin(&mut gpu, &win, &changed, (false, None), None, exact, None);
+        let twin = present_twin(
+            &mut gpu,
+            &win,
+            &changed,
+            (false, None),
+            None,
+            exact,
+            None,
+            Mutant::Law,
+        );
         d.push(format!("{name}/present/changed"), f.into(), twin);
         let crop = PresentCrop {
             source_y: (fh / 4) as u32,
@@ -483,16 +564,65 @@ fn draw_frames_with(family: Option<&str>) -> Drawing {
             Some((crop, dest)),
         );
         drew_on(&gpu, name);
-        let twin = present_twin(
-            &mut gpu,
-            &win,
-            &changed,
-            (false, None),
-            Some(crop),
-            dest,
-            None,
-        );
-        d.push(format!("{name}/present/cropped"), f.into(), twin);
+        let twin = |gpu: &mut GpuRenderer, mutant| {
+            present_twin(
+                gpu,
+                &win,
+                &changed,
+                (false, None),
+                Some(crop),
+                dest,
+                None,
+                mutant,
+            )
+        };
+        let law = twin(&mut gpu, Mutant::Law);
+        let frame = format!("{name}/present/cropped");
+        // The crown on a cropped destination. (The changed cell letters the
+        // blank row the heat scene's haze rises through, so it has none.)
+        if matches!(*name, "glow_halo" | "heat") {
+            let bare = twin(&mut gpu, Mutant::NoCrown);
+            d.mutants.push((frame.clone(), Mutant::NoCrown, bare));
+        }
+        d.push(frame, f.into(), law);
+        if *name == "heat" {
+            // The shimmer on a cropped destination, as every GUI present
+            // takes it: the scene as it stands, its haze row and the comet
+            // in the visible rows.
+            let (_, ch) = gpu.cell_size();
+            let crop = PresentCrop {
+                source_y: (ch / 2) as u32,
+                height: (3 * ch) as u32,
+            };
+            let dest = (fw as u32 + 11, crop.height + 9);
+            let f = presented(
+                &mut gpu,
+                &mut win,
+                input,
+                false,
+                None,
+                None,
+                Some((crop, dest)),
+            );
+            drew_on(&gpu, name);
+            let twin = |gpu: &mut GpuRenderer, mutant| {
+                present_twin(
+                    gpu,
+                    &win,
+                    input,
+                    (false, None),
+                    Some(crop),
+                    dest,
+                    None,
+                    mutant,
+                )
+            };
+            let law = twin(&mut gpu, Mutant::Law);
+            let frame = "heat/present/cropped-haze".to_owned();
+            let bare = twin(&mut gpu, Mutant::NoShimmer);
+            d.mutants.push((frame.clone(), Mutant::NoShimmer, bare));
+            d.push(frame, f.into(), law);
+        }
         d.distinct
             .push((format!("{name}/present/0"), format!("{name}/present/1")));
         d.distinct
@@ -504,6 +634,7 @@ fn draw_frames_with(family: Option<&str>) -> Drawing {
         "text_cursor/present/0".to_owned(),
         "text_cursor/present/changed".to_owned(),
     ));
+    rim_present_frame(&mut gpu, &mut d);
 
     // The translucent window: a background opacity under 1 reaches the
     // readback's alpha (the virtual present's target is opaque).
@@ -522,7 +653,7 @@ fn draw_frames_with(family: Option<&str>) -> Drawing {
         let frame = format!("window/{label}/readback");
         d.shape(&frame, &gpu, epoch);
         let twin = cpu_twin(&mut gpu, &input);
-        d.push(frame, f.into(), Some(twin));
+        d.push(frame, f.into(), twin);
     }
     d.distinct.push((
         "window/opaque/readback".to_owned(),
@@ -538,6 +669,66 @@ fn draw_frames_with(family: Option<&str>) -> Drawing {
     #[cfg(target_os = "macos")]
     crown_row_frames(&mut d);
     d
+}
+
+/// The drop overlay's border at a window's size, as `rim/present/cropped`:
+/// a frame at least 880 x 840 cropped to 700 visible rows, under the
+/// level-up rim's widest scale (40/16). The law's base is 3 px over the
+/// visible rows where the source's short side alone gives 4, so the shader's
+/// reading of a 7 px border, the rows the law takes and the scale each show
+/// in the frame; the replay fixtures' frames sit at the law's 2 px floor.
+fn rim_present_frame(gpu: &mut GpuRenderer, d: &mut Drawing) {
+    use aterm_render::drop_overlay_border_px;
+    let (cw, ch) = gpu.cell_size();
+    let (rows, cols) = (840usize.div_ceil(ch), 880usize.div_ceil(cw));
+    let mut term = aterm_core::terminal::Terminal::new(rows as u16, cols as u16);
+    term.process(b"$ the rim over a window >_\r\n");
+    term.process(b"\x1b[32mcharged\x1b[0m plain 0123456789");
+    let input = term.cell_frame(rows, cols);
+    let (fw, fh) = gpu.frame_size(rows, cols);
+    let crop = PresentCrop {
+        source_y: ch as u32,
+        height: 700,
+    };
+    assert!(
+        drop_overlay_border_px(fw, 700, 40) == 7 && drop_overlay_border_px(fw, fh, 40) == 10,
+        "the rim frame ({fw}x{fh}) takes 7 px over its visible rows and 10 over its source"
+    );
+    let overlay = DropOverlay {
+        accent: 0x0040_a0ff,
+        wash_a: 40,
+        border_a: 200,
+        border_scale_q4: 40,
+    };
+    let dest = (fw as u32 + 11, crop.height + 9);
+    let mut win = WindowGpu::new();
+    let f = presented(
+        gpu,
+        &mut win,
+        &input,
+        false,
+        Some(overlay),
+        None,
+        Some((crop, dest)),
+    );
+    drew_on(gpu, "rim");
+    let twin = |gpu: &mut GpuRenderer, mutant| {
+        present_twin(
+            gpu,
+            &win,
+            &input,
+            (false, Some(overlay)),
+            Some(crop),
+            dest,
+            None,
+            mutant,
+        )
+    };
+    let frame = "rim/present/cropped".to_owned();
+    let wide = twin(gpu, Mutant::WideBorder);
+    d.mutants.push((frame.clone(), Mutant::WideBorder, wide));
+    let law = twin(gpu, Mutant::Law);
+    d.push(frame, f.into(), law);
 }
 
 /// What the arm's encode of a readback staged ([`GpuRenderer::frame_shape`]), and whether the
@@ -583,74 +774,191 @@ fn cpu_twin(gpu: &mut GpuRenderer, input: &RenderInput) -> Drawn {
     gpu.cpu.render_input(input).into()
 }
 
-/// Whether a present of `input` runs a layer no twin here draws: the
-/// shimmer, a bloom over ramped or fx light (the CPU's bloom law takes the
-/// flat glow quads), or a crown on a destination the frame does not fill
-/// exactly.
-fn present_untwinned(gpu: &GpuRenderer, input: &RenderInput, exact: bool) -> bool {
-    let bloom = gpu.enable_bloom && fx_gpu::bloom_source_live(input);
-    gpu.shimmer_live(input)
-        || (bloom
-            && (!input.cursor_glow_add_ramps.items.is_empty()
-                || input.fx_layers.iter().any(|l| l.bloom)))
-        || (fx_gpu::crown_glow_present(input) && !exact)
-}
-
-/// The uniform a present of a `src` frame into a `dw` x `dh` destination
-/// writes ([`GpuRenderer::present_uniforms`]' blit uniform on an SDR,
-/// opaque destination).
-fn present_uniform(
+/// The blit uniform a present of `input`'s `sw` x `sh` frame into a `dw` x
+/// `dh` SDR, opaque destination asks for, derived from aterm's CPU laws and
+/// never from the arm's builder (`present_blit_uniform`), so a drift there
+/// moves the arm off its twin: the frame placed by
+/// `aterm_render::frame_placement`, the crop's rows of it, the bands in the
+/// page's background (the CPU presenter's `present_band_bg`), the chrome rows
+/// the CPU renderer declares, and the drop overlay's accent, its wash and
+/// border alphas and its border width over the visible frame
+/// (`aterm_render::drop_overlay_border_px`, the CPU presenter's law).
+fn twin_uniform(
     gpu: &GpuRenderer,
-    win: &WindowGpu,
     input: &RenderInput,
     (invert, overlay): (bool, Option<DropOverlay>),
     crop: Option<PresentCrop>,
     (sw, sh): (u32, u32),
     (dw, dh): (u32, u32),
 ) -> BlitUniform {
-    let mut u = present_blit_uniform(
-        invert,
-        overlay,
-        crop,
-        sw,
-        sh,
-        dw,
-        dh,
-        frame_live_bg(input, gpu.theme.bg),
-    );
-    u.chrome_y0 = win.chrome_y0 as f32;
-    u.chrome_y1 = win.chrome_y1 as f32;
-    u.encode_srgb = if gpu.ctx.srgb_offscreen { 0.0 } else { 1.0 };
+    let unit = |packed: u32, shift: u32| ((packed >> shift) & 0xff) as f32 / 255.0;
+    let (visible_y, visible_h) = crop.map_or((0, sh), |c| {
+        let y = c.source_y.min(sh);
+        (y, c.height.min(sh - y))
+    });
+    let place = aterm_render::frame_placement(dw as usize, dh as usize, sw as usize, sh as usize);
+    let band = if input.default_bg == aterm_core::render::COLOR_UNSET {
+        gpu.theme.bg
+    } else {
+        input.default_bg
+    };
+    let chrome = gpu.cpu.chrome_extent_px(sh as usize);
+    let mut u = BlitUniform {
+        flag: u32::from(invert),
+        overlay: u32::from(overlay.is_some()),
+        border_px: 0.0,
+        encode_srgb: if gpu.ctx.srgb_offscreen { 0.0 } else { 1.0 },
+        accent: [0.0; 3],
+        chrome_y1: chrome.end as f32,
+        dims: [sw as f32, sh as f32],
+        wash_a: 0.0,
+        border_a: 0.0,
+        band: [unit(band, 16), unit(band, 8), unit(band, 0), 1.0],
+        content_off: [place.x.origin as f32, place.y.origin as f32],
+        hdr: 0.0,
+        translucent: 0.0,
+        sdr_white_scale: 1.0,
+        visible_y: visible_y as f32,
+        visible_h: visible_h as f32,
+        premult: 0.0,
+        chrome_y0: chrome.start as f32,
+        chrome_pad: [0.0; 3],
+    };
+    if let Some(o) = overlay {
+        let border = aterm_render::drop_overlay_border_px(
+            sw as usize,
+            visible_h as usize,
+            o.border_scale_q4,
+        );
+        u.border_px = border as f32;
+        u.accent = [unit(o.accent, 16), unit(o.accent, 8), unit(o.accent, 0)];
+        u.wash_a = f32::from(o.wash_a) / 255.0;
+        u.border_a = f32::from(o.border_a) / 255.0;
+    }
     u
 }
 
-/// The CPU's frame of `input` with the present's layers over it, as the
-/// present copy holds it before the blit: the bloom by its CPU law
-/// (`aterm_render::bloom::apply`) and the card ([`tray_twin`]).
-fn present_source(
+/// The CPU's frame of `input` with the present-time layers over it, as an
+/// armed readback's offscreen and a present's copy hold it before the blit:
+/// the bloom by its CPU law (`aterm_render::bloom::apply` at the page's
+/// strength) and the shimmer ([`shimmer_twin`]), each unless the mutant drops
+/// it, and the card ([`tray_twin`]). The CPU's bloom law takes the flat glow
+/// quads, so a bloom over ramped or fx light has no twin and fails here.
+fn layered_source(
     gpu: &mut GpuRenderer,
     input: &RenderInput,
     tray: Option<&TrayQuad<'_>>,
-) -> Option<Frame> {
+    mutant: Mutant,
+) -> Frame {
     let mut src = gpu.cpu.render_input(input);
-    if gpu.enable_bloom && fx_gpu::bloom_source_live(input) {
+    if mutant != Mutant::NoBloom && gpu.enable_bloom && fx_gpu::bloom_source_live(input) {
+        assert!(
+            input.cursor_glow_add_ramps.items.is_empty()
+                && !input.fx_layers.iter().any(|l| l.bloom),
+            "no twin draws a bloom over ramped or fx light: give the frame one"
+        );
         let params = aterm_render::bloom::BloomParams {
             strength: page_bloom_strength(gpu.bloom_strength, input, gpu.theme.bg),
             radius: gpu.bloom_radius,
         };
-        aterm_render::bloom::apply(&mut src, &input.cursor_glow_add, input.rows, params).ok()?;
+        aterm_render::bloom::apply(&mut src, &input.cursor_glow_add, input.rows, params)
+            .expect("the CPU's bloom admits the CPU's frame");
+    }
+    if mutant != Mutant::NoShimmer {
+        shimmer_twin(gpu, input, &mut src);
     }
     if let Some(tray) = tray {
         tray_twin(&mut src, tray);
     }
-    Some(src)
+    src
+}
+
+/// `shaders/shimmer.metal`'s `fs_shimmer` on the CPU (`shimmer.glsl` and
+/// `shimmer.hlsl` are its twins), as the readback's in-place pass and the
+/// present draw it into an `Rgba8Unorm` frame where the shimmer is live:
+/// each texel of the region (`shimmer_region`) takes the frame as it stood at
+/// its centre displaced by the haze's ripple at the pinned phase, read
+/// through the arm's linear, clamp-to-edge sampler, and stores it as a byte.
+/// The arm shimmers before the glide moves the band, so a shimmer under a
+/// glide has no twin and fails here.
+fn shimmer_twin(gpu: &GpuRenderer, input: &RenderInput, frame: &mut Frame) {
+    use std::f32::consts::TAU;
+    if !gpu.shimmer_live(input) {
+        return;
+    }
+    let (fw, fh) = (frame.width, frame.height);
+    let Some(r) = gpu.shimmer_region(input, fw as u32, fh as u32) else {
+        return;
+    };
+    assert_eq!(
+        input.scroll_frac_px, 0,
+        "no twin draws a shimmer under a glide: give the frame one"
+    );
+    let (cw, ch) = gpu.cell_size();
+    let amp = (ch as f32 / 18.0).clamp(0.75, SHIMMER_AMP_PX);
+    let period = (ch as f32).max(4.0);
+    let rolloff = (cw as f32).max(1.0);
+    let phase = gpu.shimmer_phase();
+    let still = frame.pixels.clone();
+    let texel = |x: usize, y: usize| {
+        let p = still[y * fw + x];
+        [p >> 16 & 0xff, p >> 8 & 0xff, p & 0xff, 255 - (p >> 24)].map(|v| v as f32 / 255.0)
+    };
+    let mix = |a: f32, b: f32, t: f32| a + (b - a) * t;
+    for y in r.y0 as usize..r.y1 as usize {
+        for x in r.x0 as usize..r.x1 as usize {
+            let p = [x as f32 + 0.5, y as f32 + 0.5];
+            let xb = ((p[0] - r.band_x0) / r.band_w.max(1e-3) - 0.5).clamp(0.0, 63.0);
+            let i0 = xb.floor() as usize;
+            let heat = mix(r.heat[i0], r.heat[(i0 + 1).min(63)], xb.fract());
+            let a = ((r.hot_top - p[1]) / r.rise.max(1.0)).clamp(0.0, 1.0);
+            let vfade = 1.0 - a * a * (3.0 - 2.0 * a);
+            let xr = (p[0] - r.x0 as f32).min(r.x1 as f32 - p[0]);
+            let e = (xr / rolloff.max(1.0)).clamp(0.0, 1.0);
+            let xfade = e * e * (3.0 - 2.0 * e);
+            let ky = TAU / period.max(4.0);
+            let col = p[0] * ky;
+            let w1 = (ky * p[1]
+                + TAU * (0.55 * phase)
+                + 1.7 * (0.37 * col + TAU * (0.09 * phase)).sin())
+            .sin();
+            let w2 = (1.93 * ky * p[1] + TAU * (0.83 * phase) + 0.61 * col).sin();
+            let wx = (1.31 * ky * p[1] + TAU * (0.70 * phase) + 1.11 * col).sin();
+            let env = amp * heat.clamp(0.0, 1.0) * vfade * xfade;
+            let mut d = [0.30 * wx * env, 0.94 * (0.62 * w1 + 0.38 * w2) * env];
+            let m = d[0].hypot(d[1]);
+            if m > amp {
+                d = d.map(|v| v * (amp / m));
+            }
+            // The sampler's texel space: centres on the half pixel, clamped
+            // to the frame's interior, then to its edge texels.
+            let sx = (p[0] + d[0]).clamp(0.5, fw as f32 - 0.5) - 0.5;
+            let sy = (p[1] + d[1]).clamp(0.5, fh as f32 - 0.5) - 0.5;
+            let (x0, y0) = (sx.floor() as usize, sy.floor() as usize);
+            let (x1, y1) = ((x0 + 1).min(fw - 1), (y0 + 1).min(fh - 1));
+            let (tx, ty) = (sx.fract(), sy.fract());
+            let (t00, t10, t01, t11) = (texel(x0, y0), texel(x1, y0), texel(x0, y1), texel(x1, y1));
+            let c = [0, 1, 2, 3].map(|k| {
+                let v = mix(mix(t00[k], t10[k], tx), mix(t01[k], t11[k], tx), ty);
+                (v.clamp(0.0, 1.0) * 255.0).round() as u32
+            });
+            frame.pixels[y * fw + x] = ((255 - c[3]) << 24) | (c[0] << 16) | (c[1] << 8) | c[2];
+        }
+    }
 }
 
 /// The twin of a present of `input` into a `dest` destination read back as
-/// RGBA: [`present_source`] through [`blit_twin`] under the present's
-/// uniform, and the SDR crown by its CPU law (`aterm_render::bloom::sdr_crown`)
-/// at the budget the present eased to; `None` where the present runs a
-/// layer no twin draws ([`present_untwinned`]).
+/// RGBA: [`layered_source`] through [`blit_twin`] under [`twin_uniform`],
+/// then the SDR crown by its CPU law (`aterm_render::bloom::sdr_crown`) at
+/// the budget the present eased to, drawn at the frame's offset in the
+/// destination and cut to its visible rows there, as the arm's crown pass is
+/// scissored; drawn otherwise where `mutant` says. The arm draws a crown
+/// under a glide at the glide's offset, so that crown has no twin and fails
+/// here.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the present's own tuple (input, effects, crop, destination, card) plus the twin's window and mutant"
+)]
 fn present_twin(
     gpu: &mut GpuRenderer,
     win: &WindowGpu,
@@ -659,39 +967,70 @@ fn present_twin(
     crop: Option<PresentCrop>,
     dest: (u32, u32),
     tray: Option<&TrayQuad<'_>>,
-) -> Option<Drawn> {
+    mutant: Mutant,
+) -> Drawn {
     let (fw, fh) = gpu.frame_size(input.rows, input.cols);
     let size = (fw as u32, fh as u32);
-    if present_untwinned(gpu, input, crop.is_none() && dest == size) {
-        return None;
+    let src = layered_source(gpu, input, tray, mutant);
+    let mut u = twin_uniform(gpu, input, effects, crop, size, dest);
+    if mutant == Mutant::WideBorder {
+        u.border_px += 2.0;
     }
-    let src = present_source(gpu, input, tray)?;
-    let u = present_uniform(gpu, win, input, effects, crop, size, dest);
     let texels = blit_twin(&src.rgba_bytes(), size, &u, dest);
     let (dw, dh) = (dest.0 as usize, dest.1 as usize);
-    if !fx_gpu::crown_glow_present(input) || win.sdr_glow_level <= 0.0 {
-        return Some(Drawn::twin(dw, dh, &texels, Dest::Rgba8));
+    if !fx_gpu::crown_glow_present(input) || win.sdr_glow_level <= 0.0 || mutant == Mutant::NoCrown
+    {
+        return Drawn::twin(dw, dh, &texels, Dest::Rgba8);
     }
-    // The crown blends into the destination's bytes.
-    let mut frame = Frame {
-        width: dw,
-        height: dh,
-        pixels: texels
-            .iter()
-            .map(|px| {
-                let [r, g, b, a] = px.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u32);
-                ((255 - a) << 24) | (r << 16) | (g << 8) | b
-            })
-            .collect(),
+    assert_eq!(
+        input.scroll_frac_px, 0,
+        "no twin draws a crown under a glide: give the frame one"
+    );
+    // The crown blends into the destination's bytes. It draws in the
+    // frame's space, so run its law over a frame-sized canvas holding the
+    // destination texels each visible frame texel lands on, and put those
+    // back.
+    let mut out: Vec<u32> = texels
+        .iter()
+        .map(|px| {
+            let [r, g, b, a] = px.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u32);
+            ((255 - a) << 24) | (r << 16) | (g << 8) | b
+        })
+        .collect();
+    let visible = u.visible_y as usize..(u.visible_y + u.visible_h) as usize;
+    let (ox, oy) = (u.content_off[0] as i64, u.content_off[1] as i64);
+    let landing: Vec<Option<usize>> = (0..fw * fh)
+        .map(|i| {
+            let (x, y) = ((i % fw) as i64 + ox, (i / fw) as i64 + oy);
+            (visible.contains(&(i / fw))
+                && (0..dw as i64).contains(&x)
+                && (0..dh as i64).contains(&y))
+            .then(|| y as usize * dw + x as usize)
+        })
+        .collect();
+    let mut canvas = Frame {
+        width: fw,
+        height: fh,
+        pixels: landing.iter().map(|at| at.map_or(0, |i| out[i])).collect(),
     };
     aterm_render::bloom::sdr_crown(
-        &mut frame,
+        &mut canvas,
         &input.cursor_glow_add,
         input.rows,
         win.sdr_glow_level,
     )
-    .ok()?;
-    Some(frame.into())
+    .expect("the CPU's crown admits a frame-sized canvas");
+    for (at, px) in landing.iter().zip(&canvas.pixels) {
+        if let Some(i) = at {
+            out[*i] = *px;
+        }
+    }
+    Frame {
+        width: dw,
+        height: dh,
+        pixels: out,
+    }
+    .into()
 }
 
 /// The card a present composites over its frame (`shaders/tray.metal`
@@ -768,16 +1107,15 @@ fn window_layer_frames(d: &mut Drawing, family: Option<&str>) {
                 })
                 .collect(),
         };
-        let twin = (!present_untwinned(&gpu, &input, false)).then(|| {
-            let src = gpu.cpu.render_input(&input);
-            let size = (src.width as u32, src.height as u32);
-            let mut u = present_uniform(&gpu, &win, &input, (false, None), None, size, (dw, dh));
-            if translucent {
-                u = u.with_translucency(gpu.backdrop_margin_alpha());
-            }
-            let texels = blit_twin(&src.rgba_bytes(), size, &u, (dw, dh));
-            Drawn::twin(dw as usize, dh as usize, &texels, Dest::Bgra8)
-        });
+        let src = layered_source(&mut gpu, &input, None, Mutant::Law);
+        let size = (src.width as u32, src.height as u32);
+        let mut u = twin_uniform(&gpu, &input, (false, None), None, size, (dw, dh));
+        if translucent {
+            u.translucent = 1.0;
+            u.band[3] = gpu.backdrop_margin_alpha();
+        }
+        let texels = blit_twin(&src.rgba_bytes(), size, &u, (dw, dh));
+        let twin = Drawn::twin(dw as usize, dh as usize, &texels, Dest::Bgra8);
         d.push(format!("window/{label}/layer"), frame.into(), twin);
     }
     d.distinct.push((
@@ -834,41 +1172,30 @@ fn video_take_frames(d: &mut Drawing, family: Option<&str>) {
     );
     // A take of an 8-bit sRGB destination holds its texels as RGBA8; a
     // converted one (Display P3, scRGB) has no twin here.
-    let order = matches!(take.format, "bgra8" | "rgba8").then_some(Dest::Rgba8);
+    let eight_bit = matches!(take.format, "bgra8" | "rgba8");
     for (i, ((f, t_us), input)) in take.frames.iter().zip(times).zip(inputs).enumerate() {
         assert_eq!(f.t_us, t_us, "video: frame {i}'s time");
-        let size = (f.w, f.h);
-        let twin = order
-            .filter(|_| !present_untwinned(&gpu, input, true))
-            .map(|dest| {
-                let src = gpu.cpu.render_input(input);
-                let u = present_uniform(
-                    &gpu,
-                    &win,
-                    input,
-                    (false, None),
-                    None,
-                    (src.width as u32, src.height as u32),
-                    size,
-                );
-                let texels = blit_twin(
-                    &src.rgba_bytes(),
-                    (src.width as u32, src.height as u32),
-                    &u,
-                    size,
-                );
-                Drawn::twin(f.w as usize, f.h as usize, &texels, dest)
-            });
-        d.push(
-            format!("video/take/{i}"),
-            Drawn {
-                width: f.w as usize,
-                height: f.h as usize,
-                texel: Texel::Unorm8,
-                bytes: f.rgba.to_vec(),
-            },
-            twin,
-        );
+        let name = format!("video/take/{i}");
+        let drawn = Drawn {
+            width: f.w as usize,
+            height: f.h as usize,
+            texel: Texel::Unorm8,
+            bytes: f.rgba.to_vec(),
+        };
+        if !eight_bit {
+            let why = format!(
+                "the take holds it as {}, which no twin converts",
+                take.format
+            );
+            d.push_untwinned(name, drawn, why);
+            continue;
+        }
+        let src = layered_source(&mut gpu, input, None, Mutant::Law);
+        let size = (src.width as u32, src.height as u32);
+        let u = twin_uniform(&gpu, input, (false, None), None, size, (f.w, f.h));
+        let texels = blit_twin(&src.rgba_bytes(), size, &u, (f.w, f.h));
+        let twin = Drawn::twin(f.w as usize, f.h as usize, &texels, Dest::Rgba8);
+        d.push(name, drawn, twin);
     }
     d.distinct
         .push(("video/take/0".to_owned(), "video/take/2".to_owned()));
@@ -937,7 +1264,7 @@ fn edr_present_frames(d: &mut Drawing, family: Option<&str>) {
                 texel: Texel::Linear,
                 bytes: px.iter().flat_map(|v| v.to_le_bytes()).collect(),
             },
-            Some(twin),
+            twin,
         );
     }
     d.distinct
@@ -986,7 +1313,7 @@ fn edr_twin(
     let size = (fw as u32, fh as u32);
     let src = gpu.cpu.render_input(input);
     let scale = win.sdr_white_scale.max(1.0);
-    let mut u = present_uniform(gpu, win, input, (false, None), None, size, dest);
+    let mut u = twin_uniform(gpu, input, (false, None), None, size, dest);
     u.hdr = 1.0;
     u.sdr_white_scale = scale;
     let mut texels = blit_twin(&src.rgba_bytes(), size, &u, dest);
@@ -1174,9 +1501,9 @@ fn blit_input() -> RenderInput {
     term.cell_frame(ROWS, COLS)
 }
 
-/// The blit uniform a case writes, over a `sw` x `sh` source into a `dw` x
-/// `dh` destination: the present's uniform with the chrome extent the source
-/// frame set, then the case's arms.
+/// The blit uniform a case hands the arm, over a `sw` x `sh` source into a
+/// `dw` x `dh` destination: the arm's present uniform (`present_blit_uniform`)
+/// with the chrome extent the source frame set, then the case's arms.
 #[cfg(target_os = "macos")]
 fn blit_uniform(
     gpu: &GpuRenderer,
@@ -1202,6 +1529,28 @@ fn blit_uniform(
     want.hdr = f32::from(u8::from(c.hdr));
     want.sdr_white_scale = c.sdr_white_scale;
     want
+}
+
+/// The uniform a case's twin reads: [`twin_uniform`] (the CPU's laws, not
+/// the arm's builder) under the case's arms.
+#[cfg(target_os = "macos")]
+fn blit_twin_uniform(
+    gpu: &GpuRenderer,
+    input: &RenderInput,
+    c: &BlitCase,
+    source: (u32, u32),
+    dest: (u32, u32),
+) -> BlitUniform {
+    let mut u = twin_uniform(gpu, input, (c.invert, c.overlay), c.crop, source, dest);
+    if let Some((band_a, premult)) = c.translucent {
+        u.translucent = 1.0;
+        u.band[3] = band_a;
+        u.premult = f32::from(u8::from(premult));
+    }
+    u.encode_srgb = f32::from(u8::from(c.encode_srgb || !gpu.ctx.srgb_offscreen));
+    u.hdr = f32::from(u8::from(c.hdr));
+    u.sdr_white_scale = c.sdr_white_scale;
+    u
 }
 
 /// The Metal present blit (`shaders/blit.metal`, `Pipeline::Blit`) over
@@ -1245,7 +1594,7 @@ fn blit_frames(d: &mut Drawing, family: Option<&str>) {
         );
         size = (f.width as u32, f.height as u32);
         let twin = cpu_twin(&mut gpu, &input);
-        d.push(format!("blit/source/{label}"), f, Some(twin));
+        d.push(format!("blit/source/{label}"), f, twin);
     }
     let (sw, sh) = size;
     let overlay = DropOverlay {
@@ -1366,16 +1715,28 @@ fn blit_frames(d: &mut Drawing, family: Option<&str>) {
             PixelFormat::Bgra8Unorm => (Texel::Unorm8, Dest::Bgra8),
             _ => (Texel::Unorm8, Dest::Rgba8),
         };
-        let texels = blit_twin(&src.rgba_bytes(), (sw, sh), &uniform, (dw, dh));
+        let twin = |mutant| {
+            let mut u = blit_twin_uniform(&gpu, &input, c, (sw, sh), (dw, dh));
+            if mutant == Mutant::WideBorder {
+                u.border_px += 2.0;
+            }
+            let texels = blit_twin(&src.rgba_bytes(), (sw, sh), &u, (dw, dh));
+            Drawn::twin(dw as usize, dh as usize, &texels, dest)
+        };
+        let name = format!("blit/{}", c.name);
+        if c.overlay.is_some() {
+            d.mutants
+                .push((name.clone(), Mutant::WideBorder, twin(Mutant::WideBorder)));
+        }
         d.push(
-            format!("blit/{}", c.name),
+            name,
             Drawn {
                 width: dw as usize,
                 height: dh as usize,
                 texel,
                 bytes,
             },
-            Some(Drawn::twin(dw as usize, dh as usize, &texels, dest)),
+            twin(Mutant::Law),
         );
     }
     gpu.set_background_opacity(1.0);
@@ -1444,7 +1805,7 @@ fn crown_row_frames(d: &mut Drawing) {
                 texel: if hdr { Texel::Half } else { Texel::Unorm8 },
                 bytes,
             },
-            Some(twin),
+            twin,
         );
     }
 }
@@ -1728,15 +2089,17 @@ fn judge(arch: &str, adapter: &str, frames: &Named, twins: &Twins) -> Verdict {
 const UNRECORDED_ADAPTER: &str = "Apple M5 Max (injected)";
 
 /// This build's arm against its CPU twins, decided alike on every adapter:
-/// each frame with a twin under the twin law ([`twin_law`]). The frames
-/// with none (`frame-record: untwinned:` lines: the shimmer's, a bloom over
-/// ramped or fx light, a crown on a cropped destination) are held only by
-/// their controls (`distinct`), which ask that two frames differ, on every
-/// adapter: the record's rows print one moved but never fail it.
-/// Where it holds this adapter, the record's rows are a signal: a frame
-/// drawn otherwise than wgpu drew it is printed, and the verdict line counts
-/// them, but a system update moves them too, so they never fail the
-/// verdict. A texel planted in one twinned frame must fail that frame's twin
+/// each frame under the twin law ([`twin_law`]) against its twin, which
+/// every frame has but a video take this adapter holds converted (a
+/// `frame-record: untwinned:` line names it and why). Each mutant twin
+/// ([`Mutant`]: without the bloom, the shimmer or the crown, a wider drop
+/// border)
+/// must fail its frame, so the layer it changes shows there past the law's
+/// bar; the `distinct` pairs must differ and the `same` pairs be
+/// byte-identical. Where it holds this adapter, the record's rows are a
+/// signal: a frame drawn otherwise than wgpu drew it is printed, and the
+/// verdict line counts them, but a system update moves them too, so they
+/// never fail the verdict. A texel planted in one twinned frame must fail that frame's twin
 /// and no other on this adapter and on [`UNRECORDED_ADAPTER`], and on D3D11,
 /// whose arm has the seam, a byte flipped inside the arm must move its frame
 /// off its twin.
@@ -1747,7 +2110,10 @@ fn armed_frames_hold_to_their_cpu_twins() {
     let Drawing {
         frames,
         distinct,
+        same,
         twins,
+        untwinned,
+        mutants,
         shapes,
     } = draw_frames();
     let drawn = rows_of(&frames);
@@ -1765,14 +2131,21 @@ fn armed_frames_hold_to_their_cpu_twins() {
             "{a} and {b} differ in their input, so their frames must differ"
         );
     }
+    for (a, b) in &same {
+        assert_eq!(
+            digests.get(a.as_str()),
+            digests.get(b.as_str()),
+            "{a} and {b} draw one input over its residency, so their frames must be byte-identical"
+        );
+    }
     for name in twins.keys() {
         assert!(
             digests.contains_key(name.as_str()),
             "the twin of {name} stands for a frame that was drawn"
         );
     }
-    for (name, _) in frames.iter().filter(|(n, _)| !twins.contains_key(n)) {
-        crate::stderr_line!("frame-record: untwinned: {name}");
+    for (name, why) in &untwinned {
+        crate::stderr_line!("frame-record: untwinned: {name}: {why}");
     }
     let verdict = judge(arch, &adapter, &frames, &twins);
     let record = match &verdict.record {
@@ -1808,10 +2181,32 @@ fn armed_frames_hold_to_their_cpu_twins() {
         verdict.twinned,
         with_shapes(&verdict.findings, &shapes)
     );
+    mutants_fail_their_frames(&frames, &mutants);
     planted_texel_is_decided(arch, &adapter, &frames, &twins);
     #[cfg(windows)]
     flipped_instance_byte_fails_its_twin();
     end_unless_the_colour_row_ran();
+}
+
+/// The controls on the twinned layers: each frame fails its twin drawn as
+/// each of its mutants, so the bloom, the shimmer, the crown on a cropped
+/// destination and the drop border's width each show in the frames that run
+/// them past the twin law's bar, and an arm that drops or drifts one fails
+/// its twin.
+fn mutants_fail_their_frames(frames: &Named, mutants: &[(String, Mutant, Drawn)]) {
+    for (name, mutant, twin) in mutants {
+        let (_, drawn) = frames
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("the control's frame {name} was drawn"));
+        let finding = twin_law(name, drawn, twin).err().unwrap_or_else(|| {
+            panic!(
+                "{name} holds to its twin drawn as {mutant:?}: that layer does not show in it past \
+                 the twin law's bar, so an arm that dropped or drifted it would pass"
+            )
+        });
+        crate::stderr_line!("frame-record: control: {mutant:?} fails {finding}");
+    }
 }
 
 /// The checked-in bundled face `file`'s path.
@@ -1856,6 +2251,7 @@ fn armed_frames_hold_to_their_cpu_twins_on_bundled_faces() {
             distinct,
             twins,
             shapes,
+            ..
         } = draw_frames_with(Some(&family));
         let drawn = rows_of(&frames);
         let digests: std::collections::BTreeMap<&str, &str> = drawn

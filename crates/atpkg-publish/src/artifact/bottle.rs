@@ -1058,6 +1058,7 @@ pub fn pack_bottle_with(
         version: version.clone(),
         build: request.build,
         exposes,
+        shim_env: pinned::invocation_environment(&bottle_def, &version),
     };
     let row = BottleRow {
         triple: request.triple,

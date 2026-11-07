@@ -2475,13 +2475,21 @@ impl std::ops::Deref for ReleaseBody {
 }
 
 fn release_create_payload(tag: &str, title: &str, body: &ReleaseBody) -> Result<Vec<u8>> {
-    aterm_json::to_vec(&aterm_json::json!({
-        "tag_name": tag,
-        "name": title,
-        "body": &**body,
-        "draft": true,
-        "prerelease": false,
-    }))
+    #[derive(Serialize)]
+    struct Payload<'a> {
+        tag_name: &'a str,
+        name: &'a str,
+        body: &'a str,
+        draft: bool,
+        prerelease: bool,
+    }
+    aterm_json::to_vec(&Payload {
+        tag_name: tag,
+        name: title,
+        body,
+        draft: true,
+        prerelease: false,
+    })
     .map_err(|error| Error::new(format!("serialize release request: {error}")))
 }
 
@@ -2673,15 +2681,23 @@ fn appcast_listing_row(release: &aterm_json::Value) -> String {
                 Some("aterm-appcast.toml" | "aterm-appcast.toml.sig")
             )
         })
-        .map(|a| aterm_json::json!({"id": a["id"].clone(), "name": a["name"].clone()}))
+        .map(|a| {
+            aterm_json::Value::Object(aterm_json::Map::from([
+                ("id".to_string(), a["id"].clone()),
+                ("name".to_string(), a["name"].clone()),
+            ]))
+        })
         .collect();
-    aterm_json::json!({
-        "release_id": release["id"].clone(),
-        "tag": release["tag_name"].clone(),
-        "draft": release["draft"].clone(),
-        "target_commitish": release["target_commitish"].clone(),
-        "assets": assets,
-    })
+    aterm_json::Value::Object(aterm_json::Map::from([
+        ("release_id".to_string(), release["id"].clone()),
+        ("tag".to_string(), release["tag_name"].clone()),
+        ("draft".to_string(), release["draft"].clone()),
+        (
+            "target_commitish".to_string(),
+            release["target_commitish"].clone(),
+        ),
+        ("assets".to_string(), aterm_json::Value::Array(assets)),
+    ]))
     .to_string()
 }
 
@@ -7942,11 +7958,13 @@ fn cut_roster_seq(ctx: &CutCtx) -> Result<Option<u64>> {
 /// The roster document this cut publishes: the signing profile's, which `stage_roster_assets`
 /// writes into `dist/` only later (a pair left there by an earlier generation never ships), or,
 /// for a recovered cut that rebuilt its pair from the published release, that pair.
-fn shipped_roster(ctx: &CutCtx) -> Option<Vec<u8>> {
+fn shipped_roster(ctx: &CutCtx) -> Option<std::borrow::Cow<'_, [u8]>> {
     match &ctx.roster {
-        Some(document) => Some(document.bytes.clone()),
+        Some(document) => Some(std::borrow::Cow::Borrowed(document.bytes.as_slice())),
         None if ctx.attaches_roster() => {
-            gates::read_bounded_bytes(&ctx.dist.join(roster::ROSTER_ASSET), 16 << 20).ok()
+            gates::read_bounded_bytes(&ctx.dist.join(roster::ROSTER_ASSET), 16 << 20)
+                .ok()
+                .map(std::borrow::Cow::Owned)
         }
         None => None,
     }

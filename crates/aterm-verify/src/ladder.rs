@@ -207,6 +207,24 @@ impl Report {
         self.record_child(run, outcome, label);
     }
 
+    /// An oracle's row, `outcome` read from `run`'s exit: one that decided nothing names `named`
+    /// (what the machine or the oracle said), else how `run` ended ([`Run::unnamed_cause`]), so
+    /// its NOT RUN row is never bare; any other outcome is [`Report::record_child`]'s.
+    pub fn record_oracle(
+        &mut self,
+        run: &Run,
+        outcome: Outcome,
+        label: &str,
+        named: Option<String>,
+    ) {
+        if outcome == Outcome::Fail(Severity::CouldNotRun) {
+            let why = named.unwrap_or_else(|| run.unnamed_cause());
+            self.cannot_run(format!("{label} — {why}"));
+        } else {
+            self.record_child(run, outcome, label);
+        }
+    }
+
     /// The environment's failure, if this child had one, recorded as a COULD
     /// NOT RUN row under `label`: `true` when it was.
     pub fn child_could_not_run(&mut self, run: &Run, label: &str) -> bool {
@@ -376,6 +394,52 @@ mod tests {
         assert_eq!(t.gate_failures, ["a finding"]);
         assert_eq!(t.could_not_run, ["no driver"]);
         assert!(t.failed());
+    }
+
+    /// An oracle that decided nothing and printed no reason still names one on its row: how it
+    /// ended (LR-6). CONTROL: [`Report::record_child`], which the oracles took before, leaves the
+    /// bare label; a named cause and a pass keep theirs.
+    #[test]
+    fn an_oracle_that_decided_nothing_names_how_it_ended_on_its_row() {
+        let run = |code: Option<i32>| Run {
+            stopped_at: None,
+            ok: code == Some(0),
+            output: "== x86_64-pc-windows-msvc\n".into(),
+            code,
+            spawn_error: None,
+            usage: None,
+        };
+        let row = |run: &Run, outcome: Outcome, named: Option<&str>| {
+            let mut r = Report::new("cells");
+            r.record_oracle(run, outcome, "win32 oracle", named.map(str::to_string));
+            r.outcomes()
+                .map(|(o, l)| (o, l.to_string()))
+                .collect::<Vec<_>>()
+        };
+        let nr = Outcome::Fail(Severity::CouldNotRun);
+        for code in [None, Some(3)] {
+            assert_eq!(
+                row(&run(code), nr, None),
+                [(nr, format!("win32 oracle — {}", run(code).unnamed_cause()))]
+            );
+        }
+        assert!(run(Some(3)).unnamed_cause().contains(" 3 "));
+        assert_ne!(run(None).unnamed_cause(), run(Some(3)).unnamed_cause());
+        assert_eq!(
+            row(&run(Some(3)), nr, Some("no cached windows-sys0.61.2")),
+            [(nr, "win32 oracle — no cached windows-sys0.61.2".to_string())]
+        );
+        assert_eq!(
+            row(&run(Some(0)), Outcome::Ok, None),
+            [(Outcome::Ok, "win32 oracle".to_string())]
+        );
+        let mut old = Report::new("cells");
+        old.record_child(&run(None), nr, "win32 oracle");
+        assert_eq!(
+            old.outcomes().collect::<Vec<_>>(),
+            [(nr, "win32 oracle")],
+            "negative control: the bare row this replaces"
+        );
     }
 
     #[test]

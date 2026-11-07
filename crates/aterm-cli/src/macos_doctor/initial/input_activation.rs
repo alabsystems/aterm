@@ -12,7 +12,7 @@ pub enum InputSetupScope {
     Inactive,
     /// Caps was verified or carried; only this revision admits attachment activation.
     Applied(u64),
-    /// Caps is still owed; this revision permits observations that wake its existing pass.
+    /// Caps is still owed; this revision permits observations and scoped coordinator resumption.
     Pending(u64),
 }
 
@@ -114,7 +114,7 @@ fn accepted(records: &Records) -> Option<u64> {
         .then_some(progress.revision)
 }
 
-fn revision_at(root: &Path) -> Result<Option<u64>, String> {
+pub(super) fn revision_at(root: &Path) -> Result<Option<u64>, String> {
     Ok(accepted(
         &observation_at(root).map_err(|why| why.to_string())?.records,
     ))

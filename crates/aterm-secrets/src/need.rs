@@ -1102,7 +1102,7 @@ fn retired_line(want: &Want, retirement: &Retirement) -> String {
             retirement.evidence
         ),
         Reason::Lapsed => format!(
-            "lapsed: the lab heard nothing from this Mac on it for 30 days; its next pass raises it again while it is still needed{note}"
+            "lapsed: the lab heard nothing from this Mac on it for 30 days; this Mac raises it again as it takes this in, while it is still needed{note}"
         ),
         Reason::RequesterGone => format!(
             "requester gone: the vault no longer names this Mac's recipient ({}); this Mac's new incarnation raises its own{note}",

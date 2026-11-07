@@ -15608,6 +15608,9 @@ fn recover_interrupted_staging_renewals_checked(
         else {
             return false;
         };
+        if proof.enrollment.is_some() {
+            return false;
+        }
         candidate.proof = proof;
         true
     });
@@ -15637,6 +15640,11 @@ fn recover_interrupted_staging_renewals_checked(
         if recovered_labels.contains(&proof.label) {
             continue;
         }
+        // Managed grants require the native owner's authenticated encrypted
+        // recovery path. A surviving stage file grants no ownership authority.
+        if proof.native_grant.is_some() {
+            continue;
+        }
         // All candidates use the same writer. Do not multiply its contention
         // wait by the number of checkpoints while holding every provider's sign-in.
         let Ok(Some(writer)) = store.acquire_within(ladder) else {
@@ -15654,6 +15662,9 @@ fn recover_interrupted_staging_renewals_checked(
                     // A prior candidate's transaction or this writer wait may outlive
                     // the refreshed proof. Keep the selected path and proof together.
                     if admitted.is_some_and(|turn| turn.check_store(store).is_err())
+                        || proof.enrollment.is_some()
+                        || logins.enrollment.owns_staging_path(&dir)
+                        || logins.enrollment.owns_staging_path(&actual_dir)
                         || fs::canonicalize(&dir).ok().as_ref() != Some(&actual_dir)
                         || !staged_login_present(cli, &actual_dir)
                         || accounts::read_renewal_checkpoint_for(cli, &dir, &actual_dir, now)

@@ -2633,6 +2633,86 @@ NEW@example.com,m22,global,
     );
 }
 
+/// A `fleet-accounts.toml` beside the roster that is a symlink to a regular file counts as
+/// present, as `Path::is_file` reads it: with `[fleet] accounts_source` naming the source and
+/// no sync due, Claude Code's pool reads as synced, not as provisioning pending that nothing
+/// clears. CONTROL: with no fleet file at all, the same machine is pending.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_symlinked_fleet_file_counts_as_present() {
+    use aterm_agent::harness::cli::Env;
+    use aterm_converge::Probe;
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("aterm-doctor-fleet-link-")
+        .tempdir()
+        .expect("a scratch directory");
+    let root = dir.path().canonicalize().unwrap();
+    let (home, config, state) = (root.join("home"), root.join("config"), root.join("state"));
+    for d in [&home, &config, &state] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let source = root.join("source-accounts.toml");
+    std::fs::write(
+        &source,
+        "[[account]]\nlabel = \"m16\"\nmachines = [\"m16\"]\nemail = \"claude-one@example.com\"\n",
+    )
+    .unwrap();
+    aterm_uds::atomic_file::write(
+        &config.join("aterm.toml"),
+        format!(
+            "[fleet]\nmachine = \"m16\"\naccounts_source = \"{}\"\n",
+            source.display()
+        )
+        .as_bytes(),
+        0o600,
+    )
+    .unwrap();
+    std::fs::write(
+        config.join("accounts.toml"),
+        "[[account]]\nlabel = \"m16\"\nclass = \"dedicated\"\nemail = \"claude-one@example.com\"\n",
+    )
+    .unwrap();
+    let env = Env {
+        state,
+        aterm_state: None,
+        cwd: home.clone(),
+        home: Some(home.clone()),
+        claude_dir: Some(home.join(".claude")),
+        claude_config_unusable: None,
+        claude_profile: Some(home.join(".claude.json")),
+        claude_custom_oauth: false,
+        claude_session: None,
+        claude_pid: None,
+        codex_thread: None,
+        agy_conversation: None,
+        codex_home: None,
+        codex_login: None,
+        now: 1_792_660_000,
+        tz_s: 0,
+        sid: String::new(),
+        sock: None,
+        config: Some(config.join("aterm.toml")),
+        claude_tmp: None,
+        claude_running: None,
+    };
+    let pending = format!("{:?}", super::ai_accounts_claude_probe(&env));
+    assert!(pending.starts_with("Change"), "CONTROL: {pending}");
+    std::os::unix::fs::symlink(&source, config.join("fleet-accounts.toml")).unwrap();
+    assert!(
+        !aterm_agent::harness::accounts_sync::needs_init_accounts_sync(
+            &home,
+            &env.state,
+            &config.join("accounts.toml"),
+            env.now
+        )
+    );
+    let probe = super::ai_accounts_claude_probe(&env);
+    assert!(
+        matches!(&probe, Probe::Ok { now } if now.starts_with("1 accounts synced")),
+        "{probe:?}"
+    );
+}
+
 /// `base.clt` plans the install wherever the git init runs is missing (the tools', else
 /// Xcode's), beside a compiler that builds or refuses too: the GitHub setup's clones need it,
 /// and System State opens the install's tab for exactly that wait. A compiler that did not

@@ -376,15 +376,11 @@ pub(crate) struct SessionRoot {
     pub(crate) children: Vec<i32>,
 }
 
-const SHELLS: &[&str] = &[
-    "sh", "bash", "zsh", "fish", "dash", "ash", "ksh", "mksh", "oksh", "loksh", "pdksh", "yash",
-    "tcsh", "csh", "nu", "xonsh", "elvish", "ion", "pwsh", "rc", "es",
-];
-
-/// Whether `comm` names a shell (a leading login `-` ignored).
+/// Whether `comm` names a shell (a leading login `-` ignored): the jobs engine's one list,
+/// which also tells an agent call's wrapper from the program it ran
+/// ([`aterm_vitals::jobs::is_shell_name`]).
 pub(crate) fn is_shell_name(comm: &str) -> bool {
-    let name = comm.trim_start_matches('-');
-    SHELLS.contains(&name)
+    aterm_vitals::jobs::is_shell_name(comm)
 }
 
 /// [`SessionRoot`] of `pid`, or `None` when the table cannot answer (gone, a zombie, a platform without the calls).

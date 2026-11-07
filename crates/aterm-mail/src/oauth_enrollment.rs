@@ -227,6 +227,12 @@ fn request(stream: &mut TcpStream, end: Instant) -> Result<zeroize::Zeroizing<St
 }
 
 fn decode(text: &str) -> Result<String, Error> {
+    if !text.as_bytes().iter().any(|&b| matches!(b, b'+' | b'%')) {
+        if text.chars().any(char::is_control) {
+            return Err(error(ErrorKind::InvalidResponse));
+        }
+        return Ok(text.to_owned());
+    }
     let mut bytes = zeroize::Zeroizing::new(Vec::with_capacity(text.len()));
     let mut input = text.bytes();
     while let Some(byte) = input.next() {

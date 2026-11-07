@@ -125,7 +125,7 @@ ON A HOST
     here apply --plain [--name m<N>]
                               install Apple's Command Line Tools from aterm's own
                               baseline, reading no file, and with --name give the Mac
-                              its swarm label as Computer Name and Local hostname;
+                              its registry label as Computer Name and Local hostname;
                               prints no report and exits with why the tools did not
                               finish (`aterm init`'s root half)
     agent <cmd>               the host agent, which the controller runs over SSH
@@ -602,7 +602,7 @@ fn here(sys: &dyn System, args: &[String]) -> ExitCode {
                 Some(label) if name.is_none() => name = Some(label),
                 Some(_) => return refuse("here: --name is given once"),
                 None => {
-                    return refuse("here: --name takes a swarm label: m and a number (m42)");
+                    return refuse("here: --name takes a machine label: m and a number (m42)");
                 }
             },
             _ => rest.push(arg),

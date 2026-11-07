@@ -114,19 +114,19 @@ fn encode_condition(slug: &str) -> String {
 /// A write's event as the body writes it: redacted, then `pct::encode`d, so it holds no
 /// blank, CR or LF (each of the four words is written as it is).
 fn encode_event(event: &str) -> String {
-    aterm_codec::pct::encode(&Redactor::shapes(event))
+    aterm_codec::pct::encode(&Redactor::shapes_cow(event))
 }
 
 /// The tag as the body writes it: as it is, unless it holds a byte that is not ASCII
 /// graphic, `=` or `%`; then `pct::encode`d with each `=` then `%3D`.
-fn encode_tag(tag: &str) -> String {
+fn encode_tag(tag: &str) -> std::borrow::Cow<'_, str> {
     let plain = tag
         .bytes()
         .all(|b| b.is_ascii_graphic() && b != b'=' && b != b'%');
     if plain {
-        tag.to_string()
+        std::borrow::Cow::Borrowed(tag)
     } else {
-        aterm_codec::pct::encode(tag).replace('=', "%3D")
+        std::borrow::Cow::Owned(aterm_codec::pct::encode(tag).replace('=', "%3D"))
     }
 }
 
@@ -150,7 +150,7 @@ impl Notice {
                     out.push('+');
                 }
                 if redact {
-                    out.push_str(&encode_condition(&Redactor::shapes(slug)));
+                    out.push_str(&encode_condition(&Redactor::shapes_cow(slug)));
                 } else {
                     out.push_str(&encode_condition(slug));
                 }
@@ -267,11 +267,12 @@ impl Notice {
             if !out.is_empty() {
                 out.push(' ');
             }
-            out.push_str(&Redactor::shapes(word));
+            out.push_str(&Redactor::shapes_cow(word));
         };
         push_word("v=1");
         push_word(&format!("repo={}", self.repo));
-        push_word(&format!("tag={}", encode_tag(&Redactor::shapes(&self.tag))));
+        let redacted_tag = Redactor::shapes_cow(&self.tag);
+        push_word(&format!("tag={}", encode_tag(&redacted_tag)));
         push_word(&format!("event={}", self.event));
         if let Some(n) = self.n {
             push_word(&format!("n={n}"));
@@ -536,12 +537,15 @@ fn mux_nested(env: &dyn EnvSource) -> bool {
     }
     let (tmux, sty) = (var("TMUX"), var("STY"));
     if let Some(base) = var("ATERM_MUX_BASE") {
-        let now = format!(
-            "{}|{}",
-            tmux.as_deref().unwrap_or(""),
-            sty.as_deref().unwrap_or("")
-        );
-        return base != now && (tmux.is_some() || sty.is_some());
+        // The whole of `base` against `$TMUX|$STY`, without joining them: a `|` inside
+        // `TMUX` (a `tmux -L 'a|b'` socket) leaves no split point to cut at.
+        let (now_tmux, now_sty) = (tmux.as_deref().unwrap_or(""), sty.as_deref().unwrap_or(""));
+        let same = base.len() == now_tmux.len() + 1 + now_sty.len()
+            && base
+                .strip_prefix(now_tmux)
+                .and_then(|rest| rest.strip_prefix('|'))
+                == Some(now_sty);
+        return !same && (tmux.is_some() || sty.is_some());
     }
     if var("ATERM_MUX_OUTER_SESSION_ID")
         .or_else(|| var("ATERM_PARENT_SESSION_ID"))
@@ -832,5 +836,22 @@ mod tests {
             raw: "UNSET",
         };
         assert!(mux_nested(&pane));
+    }
+
+    /// `ATERM_MUX_BASE` is `$TMUX|$STY` joined, so a tab begun under a tmux whose socket name
+    /// holds a `|` (`tmux -L 'a|b'`) is the same multiplexer, not one nested in it; a pane
+    /// opened later under another `TMUX` is nested.
+    #[test]
+    fn a_bar_inside_tmux_is_the_same_session() {
+        use super::mux_nested;
+        let tmux = "/tmp/tmux-501/a|b,123,0";
+        let tab = |now: &str| {
+            crate::identity::MapEnv::new()
+                .with("ATERM_PARENT_SESSION_ID", "s-01")
+                .with("ATERM_MUX_BASE", &format!("{tmux}|"))
+                .with("TMUX", now)
+        };
+        assert!(!mux_nested(&tab(tmux)));
+        assert!(mux_nested(&tab("/tmp/tmux-501/default,9,0")));
     }
 }

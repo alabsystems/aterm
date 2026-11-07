@@ -13,7 +13,7 @@ use crate::wall::{ApiCause, Placement, Wall, WallKind};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 14, "0.14");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 15, "0.15");
 
 #[derive(Debug, Clone, Copy)]
 struct Frame {
@@ -1231,23 +1231,17 @@ fn wall_of(message: &str) -> Option<(WallKind, Option<String>)> {
     }
     let lower = rest.to_lowercase();
     // A transport error is the connection's, never the API's answer: the host dropped or
-    // unreachable (v6 §14.17.5's network outage).
-    let unreachable = code.is_none()
-        && (crate::wall::is_unreachable(rest)
-            || lower.contains("fetch failed")
-            || lower.starts_with(const { crate::anchor!("muse.wall.transport_error") }));
-    Some((
-        WallKind::ApiError {
-            code,
-            retryable: code.is_none_or(|c| matches!(c, 408 | 409 | 429) || c >= 500),
-            cause: if unreachable {
-                ApiCause::Unreachable
-            } else {
-                ApiCause::Server
-            },
-        },
-        None,
-    ))
+    // unreachable (v6 §14.17.5's network outage). Its words name the cause only of an error
+    // that printed no status; a status names its own ([`crate::wall::api_wall`]).
+    let unnamed = if crate::wall::is_unreachable(rest)
+        || lower.contains("fetch failed")
+        || lower.starts_with(const { crate::anchor!("muse.wall.transport_error") })
+    {
+        ApiCause::Unreachable
+    } else {
+        ApiCause::Server
+    };
+    Some((crate::wall::api_wall(code, unnamed), None))
 }
 
 /// Extracts Muse Code's own login-remedy clause from an authentication wall message.

@@ -14,7 +14,7 @@ use crate::{
     },
     typed::{
         cell::{self, Cells},
-        grid::tests::Book,
+        grid::tests::{Book, put},
         secret::{self, Sealer as _},
     },
 };
@@ -813,6 +813,740 @@ fn a_conflicted_tier_decides_no_account() {
             .iter()
             .any(|f| f.kind == Kind::DumpConflicted && f.column.as_deref() == Some("tier"))
     );
+}
+
+fn reports_conflict(plan: &Plan, column: &str) -> bool {
+    plan.findings
+        .iter()
+        .any(|f| f.kind == Kind::DumpConflicted && f.column.as_deref() == Some(column))
+}
+
+/// A concurrent value is a disagreement whichever of the two a row shows, its own cell empty or
+/// not, in every column the registry could carry, so the digest order cannot decide `covered`.
+/// Absent, null and blank say nothing, and a column carried nowhere is no disagreement.
+/// NEGATIVE CONTROL: with `dump` not calling `disagreements`, an empty cell beside a note is
+/// recorded covered: `` notes [] ``.
+#[test]
+fn a_concurrent_value_is_a_finding_whichever_value_the_row_shows() {
+    let email_cases = [
+        ("notes", json!("one Mac's note")),
+        ("status", json!("suspended")),
+        ("phone", json!("+1 415-555-0102")),
+        ("webmail_url", json!("https://mail.example.invalid/")),
+        ("root_account", json!("box02@proton.example")),
+        ("provider", json!("gmail")),
+        ("services", json!(["claude"])),
+        ("assigned_computers", json!(["m3"])),
+    ];
+    for (column, text) in email_cases {
+        let full = with(email_row(1), &[(column, text)]);
+        let empty = with(email_row(1), &[(column, json!(null))]);
+        for (own, other) in [(&empty, &full), (&full, &empty)] {
+            let own = with(own.clone(), &[("_conflicts", json!([other]))]);
+            let plan = planned(
+                &sheets(&emails(vec![own]), Mode::Authoritative),
+                &Cells::new(),
+            );
+            assert!(
+                reports_conflict(&plan, column),
+                "{column} {:?}",
+                kinds(&plan)
+            );
+        }
+    }
+    let phone = |label: &str, linked: Value| {
+        json!({"phone": "+1 415-555-0102", "label": label, "status": "active",
+            "linked_emails": linked})
+    };
+    for (column, own, other) in [
+        ("label", phone("alpha", json!([])), phone("beta", json!([]))),
+        (
+            "linked_emails",
+            phone("alpha", json!([])),
+            phone("alpha", json!(["box01@proton.example"])),
+        ),
+    ] {
+        let own = with(own, &[("_conflicts", json!([other]))]);
+        let plan = planned(
+            &sheets(&json!({"phones": [own]}), Mode::Authoritative),
+            &Cells::new(),
+        );
+        assert!(
+            reports_conflict(&plan, column),
+            "{column} {:?}",
+            kinds(&plan)
+        );
+    }
+    let computer = |column: &str, value: Value| {
+        with(
+            json!({"label": "m40", "status": "active"}),
+            &[(column, value)],
+        )
+    };
+    let own = with(
+        computer("assigned_emails", json!([])),
+        &[(
+            "_conflicts",
+            json!([computer("assigned_emails", json!(["box01@proton.example"]))]),
+        )],
+    );
+    let plan = planned(
+        &sheets(&json!({"computers": [own]}), Mode::Authoritative),
+        &Cells::new(),
+    );
+    assert!(
+        reports_conflict(&plan, "assigned_emails"),
+        "{:?}",
+        kinds(&plan)
+    );
+    let own = with(
+        computer("ip", json!("192.0.2.1")),
+        &[("_conflicts", json!([computer("ip", json!("192.0.2.2"))]))],
+    );
+    let plan = planned(
+        &sheets(&json!({"computers": [own]}), Mode::Authoritative),
+        &Cells::new(),
+    );
+    assert!(!reports_conflict(&plan, "ip"), "{:?}", kinds(&plan));
+
+    let mut absent = email_row(1);
+    absent.as_object_mut().unwrap().remove("notes");
+    for other in [absent, with(email_row(1), &[("notes", json!("   "))])] {
+        let own = with(email_row(1), &[("_conflicts", json!([other]))]);
+        let plan = planned(
+            &sheets(&emails(vec![own]), Mode::Authoritative),
+            &Cells::new(),
+        );
+        assert!(
+            !kinds(&plan).contains(&"dump-conflicted"),
+            "{:?}",
+            kinds(&plan)
+        );
+    }
+}
+
+/// A row's kind the replica holds concurrent values for decides nothing, whichever it shows: not
+/// an alias link, a kind, a mailbox or where its password goes.
+/// NEGATIVE CONTROL: with `undecided` always false, the row showing `alias` is linked to its root
+/// and the row showing `root` mints a mailbox: `` left: Some(..) right: None ``.
+#[test]
+fn a_conflicted_account_type_decides_nothing() {
+    let root = with(
+        email_row(1),
+        &[("root_account", json!("box02@proton.example"))],
+    );
+    let alias = with(root.clone(), &[("account_type", json!("alias"))]);
+    let pk = keys::address_pk("box01@proton.example").unwrap();
+    for (own, other) in [(&root, &alias), (&alias, &root)] {
+        let own = with(own.clone(), &[("_conflicts", json!([other]))]);
+        let plan = planned(
+            &sheets(&emails(vec![own]), Mode::Authoritative),
+            &Cells::new(),
+        );
+        for column in ["kind", "alias_of", "mailbox", "password"] {
+            assert_eq!(value(&plan, "address", &pk, column), None, "{column}");
+        }
+        assert!(
+            reports_conflict(&plan, "account_type"),
+            "{:?}",
+            kinds(&plan)
+        );
+    }
+}
+
+/// The address an account signs in with decides its row: one the replica holds concurrent values
+/// for makes no account and no address.
+/// NEGATIVE CONTROL: with `dump_account`'s `email` refusal dropped, the digest order picks the
+/// login: `` assertion failed: !plan.planned.iter().any(|p| p.collection == "account") ``.
+#[test]
+fn a_conflicted_account_email_decides_no_login() {
+    let mut dump = every_column();
+    let account = dump["ai_accounts"].get_index(0).unwrap().clone();
+    let other = with(account.clone(), &[("email", json!("other@proton.example"))]);
+    let accounts = json!([with(account, &[("_conflicts", json!([other]))])]);
+    dump.as_object_mut()
+        .unwrap()
+        .insert("ai_accounts".to_owned(), accounts);
+    let plan = planned(&sheets(&dump, Mode::Authoritative), &Cells::new());
+    assert!(!plan.planned.iter().any(|p| p.collection == "account"));
+    assert!(reports_conflict(&plan, "email"), "{:?}", kinds(&plan));
+    let other = keys::address_pk("other@proton.example").unwrap();
+    assert_eq!(value(&plan, "address", &other, "addr"), None);
+}
+
+/// What the plan takes back: every write of nothing, an unset element or an ended row.
+fn withdrawn(plan: &Plan) -> Vec<String> {
+    plan.planned
+        .iter()
+        .filter(|p| {
+            p.step == Step::Write && (p.x == json!("ended") || p.x.is_null() || p.x == json!(false))
+        })
+        .map(|p| format!("{}.{}={}", p.collection, p.column, p.x))
+        .collect()
+}
+
+/// `earlier` as sheets an import read under `later`'s keys: a later build's read of the same bytes.
+fn under_the_keys_of(earlier: &mut [Sheet], later: &[Sheet]) {
+    for (sheet, same) in earlier.iter_mut().zip(later) {
+        sheet.source.clone_from(&same.source);
+        sheet.sha256.clone_from(&same.sha256);
+    }
+}
+
+/// A dump of this one computer row and no other table's.
+fn computers(row: Value) -> Value {
+    json!({"emails": [], "computers": [row], "phones": [], "ai_accounts": []})
+}
+
+/// What a sheet does not state may be what a disagreement in it hides, so a sheet with one takes
+/// nothing back: no cell or set element, and no preference, of any row an earlier read of it wrote.
+/// NEGATIVE CONTROL: with `ReadNow::settled` always true:
+/// `` assertion `left == right` failed: login `` and `` left: ["preference.row=\"ended\""] ``.
+#[test]
+fn a_conflict_takes_back_nothing_an_earlier_read_stated() {
+    let account = json!({
+        "id": "claude:box01@proton.example", "provider": "anthropic", "service": "claude",
+        "email": "box01@proton.example", "receiving_mailbox": "box01@proton.example",
+        "assigned_computers": ["m3"], "tier": "1", "status": "active", "notes": "max plan",
+    });
+    let computer = json!({
+        "label": "m3", "status": "active", "location": "SF", "aliases": "m4",
+        "assigned_accounts": [],
+    });
+    let dump = |accounts: Value, computer: Value| {
+        json!({
+            "emails": [email_row(1)], "phones": [], "computers": [computer],
+            "ai_accounts": accounts,
+        })
+    };
+    let concurrent = |row: &Value, changes: &[(&str, Value)]| {
+        with(
+            row.clone(),
+            &[("_conflicts", json!([with(row.clone(), changes)]))],
+        )
+    };
+    let on_account =
+        |changes: &[(&str, Value)]| dump(json!([concurrent(&account, changes)]), computer.clone());
+    let shown = dump(json!([account.clone()]), computer.clone());
+    let receives = with(
+        account.clone(),
+        &[("receiving_mailbox", json!("box02@proton.example"))],
+    );
+    let unassigned = with(account.clone(), &[("assigned_computers", json!([]))]);
+    let assigned = with(
+        computer.clone(),
+        &[("assigned_accounts", json!(["claude:box01@proton.example"]))],
+    );
+    // A login with a password states its own mailbox, so only a row without one leaves the cell to
+    // the `ai_accounts` row these two cases read.
+    let bare = |accounts: Value| {
+        json!({
+            "emails": [with(email_row(1), &[("password", json!(null))])],
+            "phones": [], "computers": [computer.clone()], "ai_accounts": accounts,
+        })
+    };
+    let cases = [
+        (
+            "login",
+            shown.clone(),
+            on_account(&[("email", json!("other@proton.example"))]),
+        ),
+        ("tier", shown.clone(), on_account(&[("tier", json!("2"))])),
+        (
+            "placement",
+            shown.clone(),
+            on_account(&[("assigned_computers", json!(["m5"]))]),
+        ),
+        (
+            "delete",
+            shown.clone(),
+            on_account(&[("_deleted", json!(true))]),
+        ),
+        (
+            "aliases",
+            shown.clone(),
+            dump(
+                json!([account.clone()]),
+                concurrent(&computer, &[("aliases", json!("m6"))]),
+            ),
+        ),
+        (
+            "machine placement",
+            dump(json!([unassigned.clone()]), assigned.clone()),
+            dump(
+                json!([unassigned.clone()]),
+                concurrent(&assigned, &[("assigned_accounts", json!([]))]),
+            ),
+        ),
+        (
+            "a mailbox beside a login",
+            bare(json!([receives.clone()])),
+            bare(json!([concurrent(
+                &receives,
+                &[("email", json!("other@proton.example"))]
+            )])),
+        ),
+        (
+            "mailbox from another row",
+            bare(json!([receives.clone()])),
+            bare(json!([concurrent(
+                &receives,
+                &[("receiving_mailbox", json!("box03@proton.example"))]
+            )])),
+        ),
+        (
+            "kind",
+            emails(vec![email_row(1), email_row(2)]),
+            emails(vec![
+                concurrent(
+                    &email_row(1),
+                    &[
+                        ("account_type", json!("alias")),
+                        ("root_account", json!("box02@proton.example")),
+                    ],
+                ),
+                email_row(2),
+            ]),
+        ),
+    ];
+    for (case, shown, conflicted) in cases {
+        let conflicted = sheets(&conflicted, Mode::Authoritative);
+        let mut earlier = sheets(&shown, Mode::Authoritative);
+        under_the_keys_of(&mut earlier, &conflicted);
+        let mut book = Book::new();
+        let cells = apply(&mut book, &planned(&earlier, &Cells::new()));
+        let plan = planned(&conflicted, &cells);
+        assert!(
+            kinds(&plan).contains(&"dump-conflicted"),
+            "{case}: {:?}",
+            kinds(&plan)
+        );
+        assert_eq!(withdrawn(&plan), Vec::<String>::new(), "{case}");
+    }
+}
+
+/// A disagreement in one sheet stops the sources read beside it too: what they no longer state may
+/// be what it hides. Alone, the same read takes back.
+/// NEGATIVE CONTROL: with `ReadNow::settled` always true:
+/// `` left: ["machine.aliases.m4=false"] right: [] ``.
+#[test]
+fn a_disagreement_takes_nothing_back_from_a_source_read_beside_it() {
+    let own = json!({"label": "m3", "status": "active", "location": "SF"});
+    let later = sheets(&computers(own.clone()), Mode::Authoritative);
+    let mut earlier = sheets(
+        &computers(with(own, &[("aliases", json!("m4"))])),
+        Mode::Authoritative,
+    );
+    under_the_keys_of(&mut earlier, &later);
+    let mut book = Book::new();
+    let cells = apply(&mut book, &planned(&earlier, &Cells::new()));
+    assert_eq!(
+        withdrawn(&planned(&later, &cells)),
+        ["machine.aliases.m4=false"]
+    );
+
+    let other = json!({"label": "m5", "status": "active", "location": "NY"});
+    let disputed = with(
+        other.clone(),
+        &[(
+            "_conflicts",
+            json!([with(other, &[("location", json!("LA"))])]),
+        )],
+    );
+    let beside = dump_sheets(
+        "fleet-db-m105.json",
+        &aterm_json::to_vec(&computers(disputed)).unwrap(),
+        Mode::Authoritative,
+        &KEY,
+    )
+    .unwrap();
+    let read: Vec<Sheet> = later.into_iter().chain(beside).collect();
+    let plan = planned(&read, &cells);
+    assert!(
+        kinds(&plan).contains(&"dump-conflicted"),
+        "{:?}",
+        kinds(&plan)
+    );
+    assert_eq!(withdrawn(&plan), Vec::<String>::new());
+}
+
+/// A receiving address several rows say reads as nothing, and the sheet still states it, so the
+/// mailbox it gave stays until the address is settled.
+/// NEGATIVE CONTROL: with the `address_unread` term gone from `finish`:
+/// `` left: ["address.mailbox=null"] right: [] ``.
+#[test]
+fn an_ambiguous_receiving_address_takes_no_mailbox_back() {
+    let read = sheets(
+        &json!({
+            "emails": [with(email_row(1), &[("password", json!(null))])],
+            "phones": [], "computers": [],
+            "ai_accounts": [{
+                "id": "claude:box01@proton.example", "provider": "anthropic", "service": "claude",
+                "email": "box01@proton.example", "receiving_mailbox": "box02@proton.example",
+                "tier": "1", "status": "active",
+            }],
+        }),
+        Mode::Authoritative,
+    );
+    let says = |name: &str| {
+        let pk = keys::address_pk(name).unwrap();
+        vec![
+            put(&ADDRESS, &pk, "addr", json!("box02@proton.example")),
+            put(&ADDRESS, &pk, "row", json!("live")),
+        ]
+    };
+    let mut book = Book::new();
+    book.write(2, &[], says("cy@proton.example"));
+    let held = book.cells();
+    let cells = apply(&mut book, &planned(&read, &held));
+    let login = keys::address_pk("box01@proton.example").unwrap();
+    assert!(
+        cell::project(&ADDRESS, &cells).rows[&login]
+            .get("mailbox")
+            .is_some_and(|mailbox| mailbox.as_str().is_some())
+    );
+    let seen = book.all();
+    book.write(2, &seen, says("dan@proton.example"));
+    let plan = planned(&read, &book.cells());
+    assert!(
+        kinds(&plan).contains(&"address-ambiguous"),
+        "{:?}",
+        kinds(&plan)
+    );
+    assert_eq!(withdrawn(&plan), Vec::<String>::new());
+}
+
+/// One list cell made of two columns: a disagreement on either leaves it as it is, rather than
+/// writing what the other column alone says.
+/// NEGATIVE CONTROL: with `dump_computer` writing the list anyway: the panic names `aliases`.
+#[test]
+fn a_disagreement_on_either_nickname_column_leaves_the_list() {
+    let computer = json!({
+        "label": "m3", "status": "active", "aliases": "The Studio", "nickname_aliases": "studio",
+    });
+    for (column, value) in [("aliases", "Old Studio"), ("nickname_aliases", "old")] {
+        let other = with(computer.clone(), &[(column, json!(value))]);
+        let own = with(computer.clone(), &[("_conflicts", json!([other]))]);
+        let plan = planned(&sheets(&computers(own), Mode::Authoritative), &Cells::new());
+        assert!(
+            !plan.planned.iter().any(|p| p.column == "nickname_aliases"),
+            "{column}"
+        );
+        assert!(reports_conflict(&plan, column), "{:?}", kinds(&plan));
+    }
+}
+
+/// A concurrent delete is reported on a row whose read stops before it looks: a tier that holds no
+/// membership. The mark is otherwise unseen, and it stops the whole run taking back.
+/// NEGATIVE CONTROL: with `disagreements` skipping a whole-row mark, the panic prints `` [] ``.
+#[test]
+fn a_concurrent_delete_is_reported_on_a_row_its_read_skips() {
+    let own = json!({
+        "id": "claude:box01@proton.example", "provider": "anthropic", "service": "claude",
+        "email": "box01@proton.example", "tier": "0", "status": "active",
+        "_conflicts": [{"_deleted": true}],
+    });
+    let plan = planned(
+        &sheets(
+            &json!({"emails": [], "phones": [], "computers": [], "ai_accounts": [own]}),
+            Mode::Authoritative,
+        ),
+        &Cells::new(),
+    );
+    assert!(
+        kinds(&plan).contains(&"dump-conflicted"),
+        "{:?}",
+        kinds(&plan)
+    );
+}
+
+/// A protected row holds no mailbox, so a receiving address beside it is reported unless the row's
+/// link to its root says it; one no key can read is reported on any row. Each is what the registry
+/// would otherwise never hold, with the replica reading as covered.
+/// NEGATIVE CONTROL: with `dump_account` passing a protected row's address over: the first
+/// assertion fails.
+#[test]
+fn a_receiving_mailbox_nothing_holds_is_reported() {
+    let reported = |row: Value, receiving: &str| {
+        let plan = planned(
+            &sheets(
+                &json!({
+                    "emails": [row], "phones": [], "computers": [],
+                    "ai_accounts": [{
+                        "id": "claude:box01@proton.example", "provider": "anthropic",
+                        "service": "claude", "email": "box01@proton.example",
+                        "receiving_mailbox": receiving, "tier": "1", "status": "active",
+                    }],
+                }),
+                Mode::Authoritative,
+            ),
+            &Cells::new(),
+        );
+        plan.findings
+            .iter()
+            .any(|f| f.kind == Kind::Unmapped && f.column.as_deref() == Some("receiving_mailbox"))
+    };
+    let plain = with(email_row(1), &[("password", json!(null))]);
+    let protected = with(plain.clone(), &[("protected", json!(true))]);
+    let alias = with(
+        protected.clone(),
+        &[
+            ("account_type", json!("alias")),
+            ("root_account", json!("box02@proton.example")),
+        ],
+    );
+    assert!(reported(protected.clone(), "box02@proton.example"));
+    assert!(!reported(protected, "box01@proton.example"));
+    assert!(!reported(alias.clone(), "box02@proton.example"));
+    assert!(reported(alias, "box03@proton.example"));
+    assert!(reported(plain.clone(), "not an address"));
+    assert!(!reported(plain, "box02@proton.example"));
+}
+
+/// A placeholder stays `planned` when the same bytes are read again: fleet_db called every row
+/// `active`, so an import of an unknown machine settles at once. Any other word moves it.
+/// NEGATIVE CONTROL: with `held_planned` always false, the second read writes `active`, which the
+/// panic lists.
+#[test]
+fn a_placeholder_stays_planned_when_read_again() {
+    let computer = |status: &str| computers(json!({"label": "m3", "status": status}));
+    let read = sheets(&computer("active"), Mode::Authoritative);
+    let mut book = Book::new();
+    let cells = apply(&mut book, &planned(&read, &Cells::new()));
+    let again = planned(&read, &cells);
+    assert!(again.rows.is_empty(), "{:?}", again.planned);
+    let moved = planned(&sheets(&computer("parked"), Mode::Authoritative), &cells);
+    assert!(
+        moved
+            .planned
+            .iter()
+            .any(|p| p.column == "status" && p.x == json!("parked")),
+        "{:?}",
+        moved.planned
+    );
+}
+
+/// A row with no key holds what no registry row can, so it is reported in each table that has one.
+/// NEGATIVE CONTROL: with `dump_computer` returning silently: the panic names `computers`.
+#[test]
+fn a_row_with_no_key_is_reported() {
+    for table in ["computers", "phones"] {
+        let mut dump = emails(Vec::new());
+        dump.as_object_mut()
+            .unwrap()
+            .insert(table.to_owned(), json!([{"notes": "a note"}]));
+        let plan = planned(&sheets(&dump, Mode::Authoritative), &Cells::new());
+        assert!(
+            plan.findings.iter().any(|f| f.kind == Kind::FreeText),
+            "{table}"
+        );
+    }
+}
+
+/// A column the design carries nowhere hides nothing a read could state, so a disagreement on it
+/// leaves its sheet able to take back what an earlier read of it wrote.
+/// NEGATIVE CONTROL: with `dump_sheets` marking a dropped column, `disagreements` names it and the
+/// sheet takes nothing back: the first assertion fails with `` ["dump-conflicted"] ``.
+#[test]
+fn a_disagreement_on_a_column_nothing_carries_still_takes_back() {
+    let own = json!({"label": "m3", "status": "active", "location": "SF", "ip": "192.0.2.1"});
+    let other = with(own.clone(), &[("ip", json!("192.0.2.2"))]);
+    let later = sheets(
+        &computers(with(own.clone(), &[("_conflicts", json!([other]))])),
+        Mode::Authoritative,
+    );
+    let mut earlier = sheets(
+        &computers(with(own, &[("aliases", json!("m4"))])),
+        Mode::Authoritative,
+    );
+    under_the_keys_of(&mut earlier, &later);
+    let mut book = Book::new();
+    let cells = apply(&mut book, &planned(&earlier, &Cells::new()));
+    let plan = planned(&later, &cells);
+    assert!(
+        !kinds(&plan).contains(&"dump-conflicted"),
+        "{:?}",
+        kinds(&plan)
+    );
+    assert_eq!(withdrawn(&plan), ["machine.aliases.m4=false"]);
+}
+
+/// A column this build does not name may be a credential by a word no list holds, so its text never
+/// enters the sheet a review reads. Its row still counts as holding something, and two such columns
+/// stay two findings, even where the guard refuses both names.
+/// NEGATIVE CONTROL: with `dump_sheets` keeping the cell's text, the sheet holds it: the assertion
+/// over the cells fails with `` green heron lake ``.
+#[test]
+fn a_column_this_build_does_not_name_stays_out_of_the_sheet() {
+    let other = with(
+        email_row(1),
+        &[
+            ("recovery_phrase", json!("green heron lake")),
+            ("passphrase", json!("slow amber wind")),
+            ("passcode", json!("tall quiet stone")),
+        ],
+    );
+    let row = with(
+        email_row(1),
+        &[
+            ("recovery_phrase", json!("green heron lake")),
+            ("passphrase", json!("blue otter river")),
+            ("passcode", json!("grey silent reef")),
+            ("_conflicts", json!([other])),
+        ],
+    );
+    let keyless = json!({"recovery_phrase": "green heron lake"});
+    let read = sheets(&emails(vec![row, keyless]), Mode::Authoritative);
+    let sheet = read
+        .iter()
+        .find(|sheet| sheet.kind == SheetKind::FleetDb(Dump::Emails))
+        .unwrap();
+    assert_eq!(sheet.rows.len(), 2);
+    let cells = sheet.rows.iter().flatten().cloned().collect::<Vec<_>>();
+    for phrase in ["green heron lake", "blue otter river", "grey silent reef"] {
+        assert!(!cells.contains(&phrase.to_owned()), "{phrase}");
+    }
+    let plan = planned(&read, &Cells::new());
+    let refused = plan
+        .findings
+        .iter()
+        .filter(|f| f.kind == Kind::DumpConflicted && f.column.is_none())
+        .collect::<Vec<_>>();
+    assert_eq!(refused.len(), 2, "{refused:?}");
+    assert!(refused.iter().all(|f| f.at.len() == 1), "{refused:?}");
+    assert!(
+        plan.findings
+            .iter()
+            .any(|f| f.at.iter().any(|at| at.row == 3)),
+        "{:?}",
+        kinds(&plan)
+    );
+}
+
+/// A concurrent password is one finding that names its column, whichever values both sides hold.
+/// NEGATIVE CONTROL: with `disagreements` passing `password` through the guard:
+/// `` left: [None] right: [Some("password")] ``.
+#[test]
+fn a_conflicted_password_is_listed_once_by_its_column() {
+    for (own, other) in [
+        (json!(null), json!("1")),
+        (json!("synthetic-pass-a"), json!("synthetic-pass-b")),
+    ] {
+        let other = with(email_row(1), &[("password", other)]);
+        let row = with(
+            email_row(1),
+            &[("password", own), ("_conflicts", json!([other]))],
+        );
+        let plan = planned(
+            &sheets(&emails(vec![row]), Mode::Authoritative),
+            &Cells::new(),
+        );
+        let columns: Vec<Option<&str>> = plan
+            .findings
+            .iter()
+            .filter(|f| f.kind == Kind::DumpConflicted)
+            .map(|f| f.column.as_deref())
+            .collect();
+        assert_eq!(columns, [Some("password")]);
+    }
+}
+
+/// A column only a concurrent value holds is carried or reported as one a row holds, whichever
+/// value the digest order showed; only what a read adds is no column. A concurrent value's cell
+/// never enters the sheet.
+/// NEGATIVE CONTROL: with `dump_sheets` reading headers from the rows alone, it is not reported:
+/// `` assertion failed: unmapped(&plan) ``.
+#[test]
+fn a_column_only_a_concurrent_value_holds_is_reported() {
+    let unmapped = |plan: &Plan| {
+        plan.findings
+            .iter()
+            .any(|f| f.kind == Kind::Unmapped && f.collection == Some("address"))
+    };
+    let other = with(
+        email_row(1),
+        &[("recovery_password", json!("synthetic-recovery-1"))],
+    );
+    let own = with(email_row(1), &[("_conflicts", json!([other]))]);
+    let sheet = sheets(&emails(vec![own]), Mode::Authoritative);
+    let plan = planned(&sheet, &Cells::new());
+    assert!(unmapped(&plan));
+    assert!(!written(&plan).contains("synthetic-recovery"));
+
+    let own = with(
+        email_row(1),
+        &[("_recovery_password", json!("synthetic-1"))],
+    );
+    let plan = planned(
+        &sheets(&emails(vec![own]), Mode::Authoritative),
+        &Cells::new(),
+    );
+    assert!(unmapped(&plan));
+
+    let read = with(
+        email_row(1),
+        &[
+            ("_conflicts", json!([{"_deleted": true}])),
+            ("has_password", json!(true)),
+        ],
+    );
+    let sheet = sheets(&emails(vec![read]), Mode::Authoritative);
+    for added in ["_conflicts", "_deleted", "has_password"] {
+        assert!(!sheet[0].headers.iter().any(|h| h == added), "{added}");
+    }
+    let dump = json!({"computers": [{"label": "m40", "has_password": "synthetic-1"}]});
+    let sheet = sheets(&dump, Mode::Authoritative);
+    assert!(sheet[0].headers.iter().any(|h| h == "has_password"));
+}
+
+/// A none word claims no password and no login, in a replica's cell as in a sheet's: it makes no
+/// mailbox, and is judged against the registry where a replica holds it.
+/// NEGATIVE CONTROL: with `dump_email`'s none-word arm dropped, `0` mints a mailbox:
+/// `` left: Some(String("mb-3cf52c7f9324e875")) right: None ``.
+#[test]
+fn a_none_word_makes_no_mailbox() {
+    let dump = emails(vec![
+        with(email_row(1), &[("password", json!("0"))]),
+        with(email_row(2), &[("password", json!(null))]),
+        with(
+            email_row(3),
+            &[
+                ("password", json!("none")),
+                ("account_type", json!("alias")),
+                ("root_account", json!("box02@proton.example")),
+            ],
+        ),
+    ]);
+    let plan = planned(&sheets(&dump, Mode::Authoritative), &Cells::new());
+    let pk = |n: usize| keys::address_pk(&format!("box{n:02}@proton.example")).unwrap();
+    assert_eq!(value(&plan, "address", &pk(1), "mailbox"), None);
+    assert_eq!(value(&plan, "address", &pk(2), "mailbox"), None);
+    assert!(
+        !plan
+            .findings
+            .iter()
+            .any(|f| f.kind == Kind::Unmapped && f.column.as_deref() == Some("password")),
+        "{:?}",
+        kinds(&plan)
+    );
+    assert_eq!(
+        kinds(&plan)
+            .iter()
+            .filter(|k| **k == "secret-flag-like")
+            .count(),
+        2,
+        "{:?}",
+        kinds(&plan)
+    );
+
+    let text = "Email Address,Root Account,Password,Status,Provider,Activation Phone Number,\
+                Protection Flag,Notes\nbox01@proton.example,,0,Active,proton,,,\n\
+                box02@proton.example,,1,Active,proton,,,\n";
+    let sheet = Sheet::parse(SheetKind::Emails, "alab-emails.csv", text.as_bytes()).unwrap();
+    assert_eq!(sheet.password_flags().1, 1);
+    let plan = planned(std::slice::from_ref(&sheet), &Cells::new());
+    assert_eq!(value(&plan, "address", &pk(1), "mailbox"), None);
+    assert!(value(&plan, "address", &pk(2), "mailbox").is_some());
 }
 
 /// A list column is read item by item: an alias holding a space stays one nickname alias, never

@@ -5059,10 +5059,15 @@ fn traffic_section(c: Ctx<'_>) -> Section<'_> {
         subs.push("download and upload".into());
         let rx_w = net_rate_word(r.rx_bps);
         let tx_w = net_rate_word(r.tx_bps);
-        let line = vec![
-            format!("\u{2193} {rx_w} \u{b7} \u{2191} {tx_w}"),
-            net_rate_word(r.rx_bps.max(r.tx_bps)),
-        ];
+        // The short form names the busier direction, the series that binds (the larger share of
+        // its own capacity, as the deck row's arrow and the trace's columns take it), with its
+        // arrow and its live rate, not the larger raw rate (the second review, 2026-11-06).
+        let busier = if view.second.as_ref().is_some_and(|s| s.binds) {
+            format!("\u{2191} {tx_w}")
+        } else {
+            format!("\u{2193} {rx_w}")
+        };
+        let line = vec![format!("\u{2193} {rx_w} \u{b7} \u{2191} {tx_w}"), busier];
         return list_section(
             c,
             "Traffic now".into(),
@@ -5076,8 +5081,8 @@ fn traffic_section(c: Ctx<'_>) -> Section<'_> {
         );
     }
     // The busier direction is the series that binds: the larger share of its own capacity, or
-    // with no share known the larger rate, the rule the trace's columns and the deck's row use;
-    // `view.now` is receiving's alone.
+    // with no share known the larger rate, the rule the deck's row takes on its 10 s "now" and
+    // the trace takes on each minute's mean; `view.now` is receiving's alone.
     let forms = match view.binding().now {
         Some(bps) => {
             let w = net_rate_word(bps);

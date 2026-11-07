@@ -572,11 +572,12 @@ pub fn live_vault_heard(log: &str) -> Vec<&str> {
 /// `service` as [`LAB_VAULT_INSTANCE`] (`dns-sd -R`, in the background while the row runs).
 ///
 /// Everything the lane itself sends the server goes to 127.0.0.1: this runs before setup's
-/// elevation installs the broker, and on a broker build aterm has no direct path to a LAN
-/// address, so a `secrets create` dialled at one fails; a `curl` to one from `tart exec` would
-/// put the guest agent's own Local Network alert on screen for the whole launch. Only the app's
-/// browse and dial, through the broker, cross the LAN. A wait on the server answering is a
-/// one-minute hang detector.
+/// elevation installs the broker, and an aterm that `tart exec` runs has no direct path to a LAN
+/// address (macOS holds the guest agent responsible for it, and a fresh guest allowed nothing:
+/// `aterm_uds::lan::direct`), so a `secrets create` dialled at one fails; a `curl` to one from
+/// `tart exec` would put the guest agent's own Local Network alert on screen for the whole
+/// launch. Only the app's browse and dial, through the broker, cross the LAN. A wait on the
+/// server answering is a one-minute hang detector.
 fn lab_vault_setup(aterm: &str, home: &str, port: u16, service: &str) -> String {
     let local = format!("http://127.0.0.1:{port}");
     format!(
@@ -704,9 +705,250 @@ pub(super) fn first_launch_vault(g: &Guest, ask: &Ask, row: &mut Row) -> Result<
     Ok(())
 }
 
+/// What `aterm.log` says when the GUI's Commons waits on a broker: `Commons … repair: LanHeld`.
+const LAN_HELD: &str = ": LanHeld";
+
+/// `lan-allowed`: an update on a Mac whose aterm a person once allowed on the local network keeps
+/// aterm's own LAN with no broker installed and no password typed (the design's §5 direct path,
+/// `docs/measured/lan-update-2026-11-06.md`, which measured it by hand first).
+///
+/// The base holds macOS's answer of Allow for the app built here, for the image's account
+/// ([`crate::mac::Prep::lan_allow`]), and the row runs with `--sudo-asks`, so setup's one Mac
+/// password goes unanswered and no broker is installed. The clone's record must still read as
+/// that allowance through the reader the app uses, else the row is NOT RUN. Then the app is
+/// opened, and from its first shell tab (the app responsible for what it runs): `aterm lan
+/// status` must serve itself under the allowance, and two `ssh`s with `ProxyCommand=aterm lan
+/// fdpass` must each reach a peer ([`dial_reached`]): one to the guest's address on tart's
+/// network (the direct path's connect), one to its own `.local` name (the direct path's resolve,
+/// then a connect to whichever address it gave). NEGATIVE CONTROL: the same `lan status`
+/// under `tart exec`, which macOS holds the guest agent responsible for, must read no broker and
+/// no allowance. The row fails too on a broker loaded before or after (an elevation nobody
+/// answered cannot install one), a `LanHeld` in `aterm.log` (the GUI's own Commons waiting on a
+/// broker), and any Local Network alert about aterm.
+pub(super) fn lan_allowed(g: &Guest, row: &mut Row) -> Result<(), Fail> {
+    use crate::mac::{NUX_APP_EXE, not_run};
+    if g.aterm != NUX_APP_EXE {
+        return Err(not_run(format!(
+            "the base's answer names {NUX_APP_EXE}, and this guest's aterm is {}",
+            g.aterm
+        )));
+    }
+    let said = g.sh(
+        "/usr/bin/dscl . -read /Users/$(/usr/bin/id -un) GeneratedUID",
+        STEP,
+    )?;
+    let user = said.split_whitespace().nth(1).ok_or_else(|| {
+        not_run(format!(
+            "the account's GeneratedUID: {}",
+            squeeze(&said, 120)
+        ))
+    })?;
+    let code = aterm_lan::grant::Code {
+        identifier: "com.aterm.aterm".to_owned(),
+        team: None,
+        executable: g.aterm.clone(),
+        user: user.to_owned(),
+    };
+    let record =
+        g.vm.exec(
+            &format!("/bin/cat {}", aterm_lan::grant::NEHELPER_PLIST),
+            STEP,
+        )
+        .map_err(Fail::die)?;
+    let allowance = aterm_lan::grant::allowed(&record.stdout, &code)
+        .map_err(|why| not_run(format!("the clone's nehelper record allows nothing: {why}")))?;
+    row.cell("macOS's answer in the clone", Value::Text(allowance));
+    if let Some(d) = read_launchctl(&g.run(&super::broker_print(false), STEP)?) {
+        return Err(Fail::die(format!(
+            "a LAN broker is loaded before the open (state={}): the row measures a Mac with none",
+            d.state
+        )));
+    }
+    g.sh(super::PROMPT_MARKER, STEP)?;
+    let (opened, prompt) = super::open_until_prompt(g, "lan-allowed")?;
+    let open_ms = super::secs_to_ms(opened);
+    g.mark_ms.set(Some(open_ms));
+    super::prompt_cell(row, "open to prompt", prompt);
+    if prompt.is_none() {
+        return Ok(());
+    }
+    let sid = shell_tab(g)?;
+    let host = g.sh("/usr/sbin/scutil --get LocalHostName", STEP)?;
+    let host = format!("{}.local", host.trim());
+    let addresses = phrase::inet_addresses(&g.run("/sbin/ifconfig -a 2>/dev/null || true", STEP)?);
+    let Some(lan) = phrase::lan_address(&addresses) else {
+        return Err(Fail::die(
+            "the guest has no address on tart's network to dial",
+        ));
+    };
+    let ssh = |to: &str| {
+        format!(
+            "/usr/bin/ssh -o ProxyCommand=\"{} lan fdpass %h %p 20\" -o ProxyUseFdpass=yes \
+             -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+             -o PreferredAuthentications=publickey admin@{to} true",
+            g.aterm
+        )
+    };
+    let typed = [
+        ("tab-lan", format!("{} lan status", g.aterm)),
+        ("tab-dial-address", ssh(&lan.to_string())),
+        ("tab-dial-name", ssh(&host)),
+    ];
+    let mut said = BTreeMap::new();
+    for (tag, line) in typed {
+        let out = format!("{GUEST_NUX}/{tag}.out");
+        let rc = format!("{GUEST_NUX}/{tag}.rc");
+        let sent = g.run(
+            &format!(
+                "{} ctl @{sid} send '{line} > {out} 2>&1; echo $? > {rc}\\n' 2>&1",
+                g.aterm
+            ),
+            STEP,
+        )?;
+        if !sent.trim_start().starts_with("OK") {
+            return Err(Fail::die(format!(
+                "aterm ctl send to the shell tab said {}",
+                squeeze(sent.trim(), 160)
+            )));
+        }
+        g.await_line(&rc, tag).map_err(Fail::die)?;
+        said.insert(tag, (g.read(&out)?, g.read(&rc)?.trim().to_owned()));
+    }
+    let (status, _) = &said["tab-lan"];
+    let from_tab = read_lan_status(status);
+    let expected = format!("com.aterm.aterm at {}", g.aterm);
+    row.cell(
+        "aterm lan status in the first tab",
+        Value::Text(squeeze(status.trim(), 300)),
+    );
+    if !matches!(&from_tab, LanStatus::Direct(words) if words.contains(&expected)) {
+        row.fail(format!(
+            "the first tab's aterm lan status did not serve itself under macOS's allowance of {expected}"
+        ));
+    }
+    // The connect to an address on the local network, and the name's resolve, each the direct
+    // path's: own name may resolve to loopback as well as the LAN address, so its dial is held to
+    // reaching a peer by the resolved name, not to which address macOS listed first.
+    for (tag, to, what) in [
+        (
+            "tab-dial-address",
+            lan.to_string(),
+            "the guest's address on tart's network",
+        ),
+        ("tab-dial-name", host.clone(), "the guest's own .local name"),
+    ] {
+        let (dial, dial_rc) = &said[tag];
+        row.cell(
+            format!("ssh to {to} through aterm lan fdpass, from the first tab"),
+            Value::Text(format!("exit {dial_rc}: {}", squeeze(dial.trim(), 300))),
+        );
+        if !dial_reached(dial, dial_rc) {
+            row.fail(format!(
+                "an ssh to {what} ({to}) through aterm lan fdpass reached no peer"
+            ));
+        }
+    }
+    let control = g.run(&format!("{} lan status 2>&1", g.aterm), STEP)?;
+    row.cell(
+        "aterm lan status under tart exec (negative control)",
+        Value::Text(squeeze(control.trim(), 300)),
+    );
+    if !matches!(read_lan_status(&control), LanStatus::Not(why) if why.contains("not installed")) {
+        row.fail(
+            "under tart exec, whose responsible app is the guest agent, aterm lan status did not \
+             read the broker as not installed: the responsible-app guard did not hold"
+                .to_owned(),
+        );
+    }
+    let log = g.log()?;
+    let held: Vec<&str> = log.lines().filter(|l| l.contains(LAN_HELD)).collect();
+    row.cell("aterm.log's LanHeld lines", Value::Count(held.len() as u64));
+    if !held.is_empty() {
+        row.fail(format!(
+            "the GUI waited on a broker: {}",
+            squeeze(&held.join(" | "), 200)
+        ));
+    }
+    if let Some(d) = read_launchctl(&g.run(&super::broker_print(false), STEP)?) {
+        row.fail(format!(
+            "a LAN broker came to serve during the row (state={}), with nobody to type the password",
+            d.state
+        ));
+    }
+    alert_cells(g, row, open_ms, None)
+}
+
+/// The shell tab of the app [`Guest`] opened: its session id, found within the one-minute hang
+/// detector.
+fn shell_tab(g: &Guest) -> Result<String, Fail> {
+    let started = std::time::Instant::now();
+    loop {
+        crate::stop::check()?;
+        let sessions = g.run(&format!("{} ctl ls 2>/dev/null", g.aterm), STEP)?;
+        if let Some(sid) = crate::mac_nux_guest::shell_session(&sessions) {
+            return Ok(sid.to_owned());
+        }
+        if started.elapsed() >= super::STALL {
+            return Err(Fail::die(format!(
+                "aterm ctl ls listed no shell within {} s: {}",
+                super::STALL.as_secs(),
+                squeeze(sessions.trim(), 200)
+            )));
+        }
+        crate::stop::sleep(crate::mac::POLL)?;
+    }
+}
+
+/// Whether an `ssh … true` whose `ProxyCommand` is `aterm lan fdpass` reached a peer through the
+/// connection fdpass passed it: it exited 0; sshd refused the key-less batch login (`Permission
+/// denied`) or finished its key exchange (`Permanently added`); or the peer, which `ssh` names by
+/// the passed socket's address, closed or reset it (`Connection closed by ::1 port 22`). ssh's
+/// `UNKNOWN port 65535` names no peer, and fdpass's own failures (no broker, no allowance, a name
+/// that did not resolve, a refused or timed-out connect) pass no connection. Pure.
+#[must_use]
+pub fn dial_reached(out: &str, rc: &str) -> bool {
+    let by_a_peer = |line: &str| {
+        ["Connection closed by ", "Connection reset by "]
+            .iter()
+            .find_map(|said| line.split_once(said))
+            .and_then(|(_, rest)| rest.split_once(" port "))
+            .is_some_and(|(peer, _)| !peer.is_empty() && peer != "UNKNOWN")
+    };
+    rc.trim() == "0"
+        || out.contains("Permission denied")
+        || out.contains("Permanently added")
+        || out.lines().any(by_a_peer)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a reached peer says (2026-11-06's guests: sshd's refusal, and a close by `::1`
+    /// when the guest's own name resolved to loopback). NEGATIVE CONTROLS: a broker that is not
+    /// installed, a name that did not resolve, a refused connect, and ssh's close of a proxy
+    /// that passed nothing (`UNKNOWN port 65535`) are no reach.
+    #[test]
+    fn a_dial_reached_only_a_peer() {
+        assert!(dial_reached("", "0"));
+        for out in [
+            "admin@h.local: Permission denied (publickey,password,keyboard-interactive).",
+            "Warning: Permanently added 'h.local' (ED25519) to the list of known hosts.",
+            "Connection closed by ::1 port 22",
+            "Connection reset by 192.168.64.5 port 22",
+        ] {
+            assert!(dial_reached(out, "255"), "{out}");
+        }
+        for out in [
+            "aterm lan fdpass: the LAN broker is not installed: setup's Mac password installs it",
+            "ssh: Could not resolve hostname h.local: nodename nor servname provided, or not known",
+            "ssh: connect to host h.local port 22: Connection refused",
+            "ssh: connect to host 192.168.64.5 port 22: Operation timed out",
+            "Connection closed by UNKNOWN port 65535",
+        ] {
+            assert!(!dial_reached(out, "255"), "{out}");
+        }
+    }
 
     fn ndjson(ts: &str, message: &str) -> String {
         format!(

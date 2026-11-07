@@ -32921,7 +32921,20 @@ fn an_unanswered_relaunch_line_may_have_run() {
             .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
             .expect("the line within the hang detector");
         assert_eq!(got, Err(RelaunchLineError::Unanswered), "{name}");
-        let asked = asked.lock().map(|a| a.clone()).unwrap_or_default();
+        // The window logs the line after it reads it and never answers it, so nothing orders that
+        // log before the client's own read timeout: the wait reads the log. The client has
+        // returned and the window logs its lines in order, so once the line is there nothing
+        // can follow it.
+        let read = || asked.lock().map(|a| a.clone()).unwrap_or_default();
+        let asked = aterm_spec::wait::within(
+            aterm_spec::wait::MUST_HAPPEN,
+            Duration::from_millis(10),
+            || {
+                let seen = read();
+                seen.iter().any(|l| l.contains(typing)).then_some(seen)
+            },
+        )
+        .unwrap_or_else(read);
         let at = asked
             .iter()
             .position(|l| l.contains(typing))

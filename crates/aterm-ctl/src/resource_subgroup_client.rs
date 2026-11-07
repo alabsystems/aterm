@@ -387,6 +387,20 @@ impl RemoteChild {
             cancel_written: 0,
         })
     }
+    /// Observe an independently authenticated transport's private lifecycle channel.
+    /// This constructor authenticates no endpoint and establishes no admission,
+    /// process-control, resource or settlement authority. The submitting transport
+    /// must retain this observer after any possibly delivered rights transfer.
+    /// # Errors
+    /// Invalid binding, descriptor inheritance protection or socket configuration.
+    pub fn from_private_events(binding: admission::Binding, events: OwnedFd) -> io::Result<Self> {
+        admission::Cancel {
+            binding: binding.clone(),
+        }
+        .encode()?;
+        aterm_uds::keep_out_of_children(&events)?;
+        Self::new(CtlStream::from(events), binding, None, None, None)
+    }
     /// Connect anew to a pinned native host and submit this member once. Never retries admission.
     /// # Errors
     /// NotSubmitted precedes any rights attempt. Unknown retains the child after possible delivery;
